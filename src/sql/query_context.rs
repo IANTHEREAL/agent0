@@ -10,6 +10,7 @@ use std::sync::Arc;
 tokio::task_local! {
     static CONNECTION_ID: i32;
     static CURRENT_DATABASE_NAME: Arc<str>;
+    static USE_OPTIMIZER: bool;
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +53,11 @@ impl QueryContext {
         CURRENT_DATABASE_NAME.try_with(|name| name.clone()).ok()
     }
 
+    /// Whether the CBO optimizer pipeline is enabled for this statement.
+    pub(crate) fn use_optimizer() -> bool {
+        USE_OPTIMIZER.try_with(|v| *v).unwrap_or(false)
+    }
+
     /// Build a QueryContext from task-local storage.
     ///
     /// Use this for code paths that don't receive an explicit QueryContext
@@ -78,6 +84,7 @@ impl QueryContext {
 pub(crate) async fn with_query_context<R, Fut>(
     connection_id: i32,
     database_name: Arc<str>,
+    use_optimizer: bool,
     fut: Fut,
 ) -> R
 where
@@ -91,7 +98,7 @@ where
         CONNECTION_ID
             .scope(
                 connection_id,
-                CURRENT_DATABASE_NAME.scope(database_name, fut),
+                CURRENT_DATABASE_NAME.scope(database_name, USE_OPTIMIZER.scope(use_optimizer, fut)),
             )
             .await
     }
@@ -101,7 +108,7 @@ where
         CONNECTION_ID
             .scope(
                 connection_id,
-                CURRENT_DATABASE_NAME.scope(database_name, fut),
+                CURRENT_DATABASE_NAME.scope(database_name, USE_OPTIMIZER.scope(use_optimizer, fut)),
             )
             .await
     }
@@ -130,7 +137,7 @@ mod tests {
 
     #[tokio::test]
     async fn from_task_locals_reads_query_identity() {
-        let ctx = with_query_context(77, Arc::from("tenant_db"), async {
+        let ctx = with_query_context(77, Arc::from("tenant_db"), false, async {
             QueryContext::from_task_locals()
         })
         .await;

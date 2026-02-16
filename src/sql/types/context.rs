@@ -22,13 +22,11 @@ pub struct TypeContext<'a> {
 }
 
 impl<'a> TypeContext<'a> {
+    /// Create a single-table context (test helper).
+    #[cfg(test)]
     pub fn single(schema: &'a TableSchema) -> Self {
-        let mut ctx = Self {
-            tables: HashMap::new(),
-            column_index: HashMap::new(),
-            single_table: Some(schema),
-        };
-        ctx.add_table("", schema);
+        let mut ctx = Self::empty();
+        ctx.single_table = Some(schema);
         ctx
     }
 

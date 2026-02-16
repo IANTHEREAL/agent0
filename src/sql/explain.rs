@@ -4,10 +4,17 @@ use std::fmt::Write;
 
 use sqlparser::ast::{Expr, Query, Select, SetExpr, Statement, TableFactor, TableWithJoins};
 
+use super::analyzer::types::{
+    AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind, BinaryOp,
+    JoinCondition, JoinType as AnalyzedJoinType, TypedExpr, TypedExprKind,
+};
+use super::analyzer::AnalyzedQuery;
 use super::operators::HashJoinConfig;
+use super::optimizer::logical_planner::expr_has_aggregate;
 use super::planner::{
-    analyze_predicates, choose_best_access_path_for_filter, choose_join_algorithm,
-    JoinAlgorithmChoice, PredicateInfo, ScanType,
+    analyze_predicates, analyze_typed_predicates, choose_best_access_path_for_filter,
+    choose_best_access_path_for_typed_filter, choose_join_algorithm, JoinAlgorithmChoice,
+    PredicateInfo, ScanType,
 };
 use crate::types::TableSchema;
 
@@ -62,6 +69,11 @@ pub enum PlanNode {
         alias: Option<String>,
         cost: PlanCost,
     },
+    Filter {
+        condition: String,
+        cost: PlanCost,
+        child: Box<PlanNode>,
+    },
     Result {
         cost: PlanCost,
     },
@@ -98,6 +110,460 @@ pub fn generate_plan(
         },
     }
 }
+
+// ── Analyzed (TypedExpr) plan generation ──────────────────────────────
+
+/// Generate a plan from an [`AnalyzedQuery`], using the typed planner path.
+///
+/// This ensures EXPLAIN sees the same query tree as execution (views expanded,
+/// types resolved, etc.).  Uses `choose_best_access_path_for_typed_filter`
+/// for index selection — full parity with the execution path.
+pub fn generate_plan_from_analyzed(
+    query: &AnalyzedQuery,
+    schema_lookup: &impl Fn(&str) -> Option<TableSchema>,
+    row_count_lookup: &impl Fn(&str) -> usize,
+) -> PlanNode {
+    let mut plan = generate_analyzed_body(&query.body, schema_lookup, row_count_lookup);
+
+    // ORDER BY
+    if !query.order_by.is_empty() {
+        let sort_keys: Vec<String> = query
+            .order_by
+            .iter()
+            .map(|o| format_typed_expr(&o.expr))
+            .collect();
+        let child_cost = get_plan_cost(&plan);
+        let sort_cost =
+            child_cost.total + (child_cost.rows as f64 * (child_cost.rows as f64).log2().max(1.0));
+        plan = PlanNode::Sort {
+            sort_key: sort_keys,
+            cost: PlanCost {
+                startup: sort_cost,
+                total: sort_cost,
+                rows: child_cost.rows,
+                width: child_cost.width,
+            },
+            child: Box::new(plan),
+        };
+    }
+
+    // LIMIT
+    if let Some(limit_expr) = &query.limit {
+        if let Some(limit_val) = extract_typed_limit_value(limit_expr) {
+            let child_cost = get_plan_cost(&plan);
+            let limited_rows = limit_val.min(child_cost.rows);
+            plan = PlanNode::Limit {
+                count: limit_val,
+                cost: PlanCost {
+                    startup: child_cost.startup,
+                    total: child_cost.startup + (limited_rows as f64 * 0.01),
+                    rows: limited_rows,
+                    width: child_cost.width,
+                },
+                child: Box::new(plan),
+            };
+        }
+    }
+
+    plan
+}
+
+fn generate_analyzed_body(
+    body: &AnalyzedQueryBody,
+    schema_lookup: &impl Fn(&str) -> Option<TableSchema>,
+    row_count_lookup: &impl Fn(&str) -> usize,
+) -> PlanNode {
+    match body {
+        AnalyzedQueryBody::Select(select) => {
+            generate_analyzed_select_plan(select, schema_lookup, row_count_lookup)
+        }
+        AnalyzedQueryBody::Values(_) | AnalyzedQueryBody::SetOperation { .. } => PlanNode::Result {
+            cost: PlanCost::default(),
+        },
+    }
+}
+
+fn generate_analyzed_select_plan(
+    select: &AnalyzedSelect,
+    schema_lookup: &impl Fn(&str) -> Option<TableSchema>,
+    row_count_lookup: &impl Fn(&str) -> usize,
+) -> PlanNode {
+    if select.from.is_empty() {
+        return PlanNode::Result {
+            cost: PlanCost {
+                startup: 0.0,
+                total: 0.01,
+                rows: 1,
+                width: 4,
+            },
+        };
+    }
+
+    let predicates = select
+        .where_clause
+        .as_ref()
+        .map(|expr| analyze_typed_predicates(expr))
+        .unwrap_or_default();
+
+    // Build plan from the first FROM item
+    let mut plan = generate_analyzed_table_ref_plan(
+        &select.from[0],
+        &predicates,
+        select.where_clause.as_ref(),
+        schema_lookup,
+        row_count_lookup,
+    );
+
+    // Additional FROM items (implicit cross joins)
+    for table_ref in select.from.iter().skip(1) {
+        let right_plan =
+            generate_analyzed_table_ref_plan(table_ref, &[], None, schema_lookup, row_count_lookup);
+        let left_cost = get_plan_cost(&plan);
+        let right_cost = get_plan_cost(&right_plan);
+        let total_rows = left_cost.rows.saturating_mul(right_cost.rows);
+        let total_cost = left_cost.total + right_cost.total + (total_rows as f64 * 0.01);
+        plan = PlanNode::NestedLoop {
+            join_type: "Inner".to_string(),
+            cost: PlanCost {
+                startup: 0.0,
+                total: total_cost,
+                rows: total_rows.max(1),
+                width: DEFAULT_ROW_WIDTH,
+            },
+            children: vec![plan, right_plan],
+        };
+    }
+
+    // GROUP BY / aggregate-only queries
+    let has_aggregates = select
+        .projection
+        .iter()
+        .any(|p| expr_has_aggregate(&p.expr));
+    if !select.group_by.is_empty() || has_aggregates {
+        let keys: Vec<String> = select
+            .group_by
+            .iter()
+            .map(|e| format_typed_expr(e))
+            .collect();
+        let strategy = if select.group_by.is_empty() {
+            "Aggregate"
+        } else {
+            "HashAggregate"
+        };
+        let child_cost = get_plan_cost(&plan);
+        let agg_rows = if select.group_by.is_empty() {
+            1
+        } else {
+            (child_cost.rows / 10).max(1)
+        };
+        plan = PlanNode::Aggregate {
+            strategy: strategy.to_string(),
+            keys,
+            cost: PlanCost {
+                startup: child_cost.total,
+                total: child_cost.total + (agg_rows as f64 * 0.1),
+                rows: agg_rows,
+                width: child_cost.width,
+            },
+            child: Box::new(plan),
+        };
+
+        // HAVING → Filter after aggregate
+        if let Some(having) = &select.having {
+            let filter_str = format_typed_expr(having);
+            let agg_cost = get_plan_cost(&plan);
+            let filtered_rows = (agg_cost.rows / 3).max(1);
+            plan = PlanNode::Filter {
+                condition: filter_str,
+                cost: PlanCost {
+                    startup: agg_cost.startup,
+                    total: agg_cost.total + (filtered_rows as f64 * 0.01),
+                    rows: filtered_rows,
+                    width: agg_cost.width,
+                },
+                child: Box::new(plan),
+            };
+        }
+    }
+
+    plan
+}
+
+fn generate_analyzed_table_ref_plan(
+    table_ref: &AnalyzedTableRef,
+    predicates: &[PredicateInfo],
+    filter_expr: Option<&TypedExpr>,
+    schema_lookup: &impl Fn(&str) -> Option<TableSchema>,
+    row_count_lookup: &impl Fn(&str) -> usize,
+) -> PlanNode {
+    let alias_name = table_ref.alias.clone();
+
+    match &table_ref.kind {
+        AnalyzedTableRefKind::Table { name, .. } => {
+            let table_name = name.rsplit('.').next().unwrap_or(name.as_str());
+            let estimated_rows = row_count_lookup(table_name);
+
+            if let Some(schema) = schema_lookup(table_name).or_else(|| schema_lookup(name)) {
+                let access_path = choose_best_access_path_for_typed_filter(
+                    0,
+                    &schema,
+                    filter_expr,
+                    estimated_rows,
+                );
+
+                generate_scan_node(
+                    table_name,
+                    alias_name,
+                    &access_path.scan_type,
+                    &predicates,
+                    filter_expr.map(|e| format_typed_expr(e)),
+                    estimated_rows,
+                    &schema,
+                )
+            } else {
+                let filter = filter_expr.map(|e| format_typed_expr(e));
+                PlanNode::SeqScan {
+                    table_name: table_name.to_string(),
+                    alias: alias_name,
+                    filter,
+                    cost: PlanCost {
+                        startup: 0.0,
+                        total: estimated_rows as f64 * 0.01 + 1.0,
+                        rows: estimated_rows.max(1),
+                        width: DEFAULT_ROW_WIDTH,
+                    },
+                }
+            }
+        }
+        AnalyzedTableRefKind::Subquery(subquery) => {
+            generate_plan_from_analyzed(subquery, schema_lookup, row_count_lookup)
+        }
+        AnalyzedTableRefKind::Join {
+            left,
+            right,
+            join_type,
+            condition,
+            ..
+        } => {
+            let left_plan =
+                generate_analyzed_table_ref_plan(left, &[], None, schema_lookup, row_count_lookup);
+            let right_plan =
+                generate_analyzed_table_ref_plan(right, &[], None, schema_lookup, row_count_lookup);
+            let left_cost = get_plan_cost(&left_plan);
+            let right_cost = get_plan_cost(&right_plan);
+            let total_rows = left_cost.rows.saturating_mul(right_cost.rows);
+            let total_cost = left_cost.total + right_cost.total + (total_rows as f64 * 0.01);
+
+            let jt = match join_type {
+                AnalyzedJoinType::Inner => "Inner",
+                AnalyzedJoinType::Left => "Left",
+                AnalyzedJoinType::Right => "Right",
+                AnalyzedJoinType::Full => "Full",
+                AnalyzedJoinType::Cross => "Cross",
+            }
+            .to_string();
+
+            let cost = PlanCost {
+                startup: 0.0,
+                total: total_cost,
+                rows: total_rows.max(1),
+                width: DEFAULT_ROW_WIDTH,
+            };
+
+            // Detect equi-join to show HashJoin vs NestedLoop (matching executor)
+            let left_col_count = count_table_ref_columns(left);
+            let is_hash_eligible = has_typed_equi_join_keys(condition, left_col_count);
+
+            if is_hash_eligible && !matches!(join_type, AnalyzedJoinType::Cross) {
+                let hash_cond = match condition {
+                    JoinCondition::On(expr) => Some(format_typed_expr(expr)),
+                    JoinCondition::Using(cols) => Some(format!(
+                        "USING ({})",
+                        cols.iter()
+                            .map(|c| c.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                    JoinCondition::None => None,
+                };
+                PlanNode::HashJoin {
+                    join_type: jt,
+                    hash_cond,
+                    cost,
+                    children: vec![left_plan, right_plan],
+                }
+            } else {
+                PlanNode::NestedLoop {
+                    join_type: jt,
+                    cost,
+                    children: vec![left_plan, right_plan],
+                }
+            }
+        }
+        AnalyzedTableRefKind::Function { func, .. } => PlanNode::TableFunctionScan {
+            function_name: func.name.clone(),
+            alias: alias_name,
+            cost: PlanCost {
+                startup: 0.0,
+                total: 11.0,
+                rows: 1000,
+                width: DEFAULT_ROW_WIDTH,
+            },
+        },
+    }
+}
+
+/// Count the number of output columns from an analyzed table reference.
+fn count_table_ref_columns(table_ref: &AnalyzedTableRef) -> usize {
+    match &table_ref.kind {
+        AnalyzedTableRefKind::Table { schema, .. } => schema.columns.len(),
+        AnalyzedTableRefKind::Join { left, right, .. } => {
+            count_table_ref_columns(left) + count_table_ref_columns(right)
+        }
+        AnalyzedTableRefKind::Subquery(q) => q.output_schema.len(),
+        AnalyzedTableRefKind::Function { output_columns, .. } => output_columns.len(),
+    }
+}
+
+/// Check if a typed join condition contains equi-join keys (for EXPLAIN display).
+fn has_typed_equi_join_keys(condition: &JoinCondition, left_col_count: usize) -> bool {
+    match condition {
+        JoinCondition::Using(cols) => cols.iter().all(|c| c.left_type == c.right_type),
+        JoinCondition::On(expr) => check_equi_join_expr(expr, left_col_count),
+        JoinCondition::None => false,
+    }
+}
+
+/// Check if an expression tree contains at least one `col_left = col_right` equi-join key.
+fn check_equi_join_expr(expr: &TypedExpr, left_col_count: usize) -> bool {
+    match &expr.kind {
+        TypedExprKind::BinaryOp { op, left, right } => {
+            if matches!(op, BinaryOp::Eq) {
+                if let (
+                    TypedExprKind::ColumnRef {
+                        column_index: li, ..
+                    },
+                    TypedExprKind::ColumnRef {
+                        column_index: ri, ..
+                    },
+                ) = (&left.kind, &right.kind)
+                {
+                    return (*li < left_col_count && *ri >= left_col_count)
+                        || (*ri < left_col_count && *li >= left_col_count);
+                }
+            }
+            if matches!(op, BinaryOp::And) {
+                return check_equi_join_expr(left, left_col_count)
+                    || check_equi_join_expr(right, left_col_count);
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Generate a PlanNode from a resolved ScanType.
+///
+/// Shared between AST and analyzed paths to avoid duplicating the match arms.
+fn generate_scan_node(
+    table_name: &str,
+    alias: Option<String>,
+    scan_type: &ScanType,
+    predicates: &[PredicateInfo],
+    filter_str: Option<String>,
+    estimated_rows: usize,
+    schema: &TableSchema,
+) -> PlanNode {
+    match scan_type {
+        ScanType::IndexScan {
+            index_name,
+            estimated_rows: est_rows,
+            ..
+        }
+        | ScanType::IndexRangeScan {
+            index_name,
+            estimated_rows: est_rows,
+            ..
+        }
+        | ScanType::IndexBoundedRangeScan {
+            index_name,
+            estimated_rows: est_rows,
+            ..
+        }
+        | ScanType::InListScan {
+            index_name,
+            estimated_rows: est_rows,
+            ..
+        } => {
+            let index_cond = predicates
+                .iter()
+                .map(|p| format_predicate(p))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            PlanNode::IndexScan {
+                table_name: table_name.to_string(),
+                alias,
+                index_name: index_name.clone(),
+                index_cond: if index_cond.is_empty() {
+                    None
+                } else {
+                    Some(index_cond)
+                },
+                filter: None,
+                cost: PlanCost {
+                    startup: 0.15,
+                    total: 0.15 + (*est_rows as f64 * 0.01),
+                    rows: (*est_rows).max(1),
+                    width: estimate_row_width(schema),
+                },
+            }
+        }
+        ScanType::GinIndexScan {
+            index_name,
+            estimated_rows: est_rows,
+            ..
+        } => PlanNode::IndexScan {
+            table_name: table_name.to_string(),
+            alias,
+            index_name: index_name.clone(),
+            index_cond: filter_str.clone(),
+            filter: None,
+            cost: PlanCost {
+                startup: 0.15,
+                total: 0.15 + (*est_rows as f64 * 0.01),
+                rows: (*est_rows).max(1),
+                width: estimate_row_width(schema),
+            },
+        },
+        ScanType::FullTableScan => PlanNode::SeqScan {
+            table_name: table_name.to_string(),
+            alias,
+            filter: filter_str,
+            cost: PlanCost {
+                startup: 0.0,
+                total: estimated_rows as f64 * 0.01 + 1.0,
+                rows: estimated_rows.max(1),
+                width: estimate_row_width(schema),
+            },
+        },
+    }
+}
+
+/// Format a typed expression for EXPLAIN output.
+fn format_typed_expr(expr: &TypedExpr) -> String {
+    format!("{}", expr)
+}
+
+/// Extract a limit value from a typed constant expression.
+fn extract_typed_limit_value(expr: &TypedExpr) -> Option<usize> {
+    match &expr.kind {
+        TypedExprKind::Constant(crate::types::Value::Int32(v)) => Some(*v as usize),
+        TypedExprKind::Constant(crate::types::Value::Int64(v)) => Some(*v as usize),
+        _ => None,
+    }
+}
+
+// ── AST-based plan generation (legacy, kept for non-SELECT statements) ──
 
 fn generate_query_plan(
     query: &Query,
@@ -556,6 +1022,7 @@ fn get_plan_cost(plan: &PlanNode) -> PlanCost {
         PlanNode::Sort { cost, .. } => cost.clone(),
         PlanNode::Limit { cost, .. } => cost.clone(),
         PlanNode::Aggregate { cost, .. } => cost.clone(),
+        PlanNode::Filter { cost, .. } => cost.clone(),
         PlanNode::TableFunctionScan { cost, .. } => cost.clone(),
         PlanNode::Result { cost } => cost.clone(),
     }
@@ -816,6 +1283,20 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
             if !key_display.is_empty() {
                 writeln!(output, "{}{}", " ".repeat(indent), key_display).unwrap();
             }
+            format_plan_node(output, child, indent + 6, false);
+        }
+        PlanNode::Filter {
+            condition,
+            cost,
+            child,
+        } => {
+            writeln!(
+                output,
+                "{}Filter  (cost={:.2}..{:.2} rows={} width={})",
+                prefix, cost.startup, cost.total, cost.rows, cost.width
+            )
+            .unwrap();
+            writeln!(output, "{}  Filter: {}", " ".repeat(indent), condition).unwrap();
             format_plan_node(output, child, indent + 6, false);
         }
         PlanNode::TableFunctionScan {

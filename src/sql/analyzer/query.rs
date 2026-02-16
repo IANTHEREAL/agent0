@@ -943,6 +943,8 @@ impl<'a> Analyzer<'a> {
                         left_index: left_col.column_index - left_start,
                         right_index: right_col.column_index - right_start,
                         data_type: unified_type,
+                        left_type: left_col.data_type.clone(),
+                        right_type: right_col.data_type.clone(),
                     });
                 }
                 Ok(JoinCondition::Using(resolved))
@@ -982,6 +984,8 @@ impl<'a> Analyzer<'a> {
                             left_index: lc.column_index - left_start,
                             right_index: rc.column_index - right_start,
                             data_type: unified_type,
+                            left_type: lc.data_type.clone(),
+                            right_type: rc.data_type.clone(),
                         });
                         seen.insert(lower);
                     }

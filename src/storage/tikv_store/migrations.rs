@@ -33,25 +33,4 @@ impl TikvStore {
         migrations.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(migrations)
     }
-
-    pub async fn get_migration(
-        &self,
-        txn: &mut Transaction,
-        name: &str,
-    ) -> Result<Option<MigrationRecord>> {
-        let key = self.key(&encode_migration_key(name));
-        match txn.get(key).await? {
-            Some(data) => {
-                let record: MigrationRecord = bincode::deserialize(&data)
-                    .context("Failed to deserialize migration record")?;
-                Ok(Some(record))
-            }
-            None => Ok(None),
-        }
-    }
-
-    pub async fn migration_exists(&self, txn: &mut Transaction, name: &str) -> Result<bool> {
-        let key = self.key(&encode_migration_key(name));
-        Ok(txn.get(key).await?.is_some())
-    }
 }

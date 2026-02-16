@@ -104,6 +104,29 @@ impl Executor {
             .analyze_query(&expanded_query)
             .map_err(SqlError::from)?;
 
+        // ── CBO optimizer routing gate ──────────────────────────────
+        // When `SET tipg.use_optimizer = on`, eligible queries are routed through
+        // the new optimizer pipeline: AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator.
+        // Phase 1: single-table SELECTs without locks or SELECT INTO.
+        if crate::sql::query_context::QueryContext::use_optimizer()
+            && expanded_query.locks.is_empty()
+            && is_optimizer_eligible(&analyzed)
+        {
+            let result = self
+                .execute_via_optimizer(txn, db_id, sequence_values, search_path, &analyzed, ctes)
+                .await?;
+
+            // SELECT INTO post-processing.
+            if let SetExpr::Select(select) = &*expanded_query.body {
+                if let Some(ref into) = select.into {
+                    return self
+                        .create_table_from_result(txn, db_id, search_path, &into.name, result)
+                        .await;
+                }
+            }
+            return Ok(result);
+        }
+
         // Single-point routing gate: ALL capability / routing decisions are made here.
         let plan = plan_query(&analyzed, &expanded_query.locks).map_err(SqlError::from)?;
         tracing::debug!(target: "pipeline", "{}", plan.trace_summary());
@@ -2623,6 +2646,116 @@ impl Executor {
                 Ok(Box::new(TableScanOperator::new(schema)) as BoxedOperator)
             }
         }
+    }
+
+    /// Execute a query through the CBO optimizer pipeline.
+    ///
+    /// `AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator → execute`
+    ///
+    /// Phase 1: handles single-table SELECTs. Returns Err to fall back to the
+    /// current path if the optimizer cannot handle the query.
+    async fn execute_via_optimizer(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
+        analyzed: &AnalyzedQuery,
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> Result<ExecuteResult> {
+        use crate::sql::operators::execute_operator_tree_with_ctes;
+        use crate::sql::optimizer::{BuildContext, LogicalPlanner, PhysicalPlanner};
+
+        tracing::debug!(target: "optimizer", "routing query through CBO pipeline");
+
+        // Step 1: AnalyzedQuery → LogicalPlan
+        let logical = LogicalPlanner::build(analyzed);
+
+        // Step 2: LogicalPlan → PhysicalPlan
+        let physical = PhysicalPlanner::plan(&logical);
+
+        // Step 3: Resolve table schemas for the operator bridge.
+        let mut build_ctx = BuildContext::new();
+        if let AnalyzedQueryBody::Select(select) = &analyzed.body {
+            for table_ref in &select.from {
+                if let AnalyzedTableRefKind::Table { ref name, .. } = table_ref.kind {
+                    let alias = table_ref.alias.as_deref().unwrap_or(name);
+                    let cte_key = name.to_lowercase();
+                    if let Some((cte_schema, _)) = ctes.get(&cte_key) {
+                        build_ctx = build_ctx.with_schema(name.clone(), cte_schema.clone());
+                    } else if let Some(table_schema) =
+                        self.store().get_schema(txn, db_id, name).await?
+                    {
+                        let mut schema = table_schema;
+                        let short = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+                        if !short.eq_ignore_ascii_case(alias) {
+                            schema.from_alias = Some(alias.to_string());
+                        }
+                        build_ctx = build_ctx.with_schema(name.clone(), schema);
+                    } else {
+                        // Virtual/info_schema tables — fall back.
+                        return Err(anyhow!(
+                            "Optimizer cannot resolve table schema for '{}'",
+                            name
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Step 4: PhysicalPlan → BoxedOperator
+        let mut operator = physical.build_operators(&build_ctx)?;
+
+        // Step 5: Execute the operator tree.
+        let store = self.store().clone();
+        let rows = execute_operator_tree_with_ctes(
+            &mut operator,
+            txn,
+            store,
+            db_id,
+            search_path,
+            sequence_values,
+            ctes,
+        )
+        .await?;
+
+        // Build result.
+        let columns: Vec<String> = analyzed
+            .output_schema
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        let column_types: Vec<DataType> = analyzed
+            .output_schema
+            .iter()
+            .map(|(_, dt)| dt.clone())
+            .collect();
+
+        Ok(ExecuteResult::Select {
+            columns,
+            column_types: Some(column_types),
+            rows,
+            timezone: crate::session_context::current_timezone(),
+        })
+    }
+}
+
+/// Check whether a query is eligible for the CBO optimizer pipeline.
+///
+/// Phase 1 eligibility: single-table SELECT without correlated subqueries,
+/// table functions, or complex features that the optimizer doesn't handle yet.
+fn is_optimizer_eligible(analyzed: &AnalyzedQuery) -> bool {
+    match &analyzed.body {
+        AnalyzedQueryBody::Select(select) => {
+            // Must have exactly one FROM table.
+            if select.from.len() != 1 {
+                return false;
+            }
+            // Must be a simple table reference (not a subquery, join, or function).
+            matches!(select.from[0].kind, AnalyzedTableRefKind::Table { .. })
+        }
+        // Set operations and VALUES not supported in Phase 1.
+        _ => false,
     }
 }
 

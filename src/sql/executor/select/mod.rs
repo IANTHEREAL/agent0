@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use tikv_client::Transaction;
 
 mod analyzed;
-pub(crate) mod order;
 
 impl Executor {
     pub(crate) fn execute_query_with_outer_ctes<'a>(

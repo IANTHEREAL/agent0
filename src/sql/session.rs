@@ -61,6 +61,11 @@ pub(crate) struct SessionSettings {
     transaction_isolation: Option<String>,
     default_transaction_read_only: Option<String>,
 
+    /// When true, route eligible queries through the CBO optimizer pipeline
+    /// (`AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator`).
+    /// Default: false. Set via `SET tipg.use_optimizer = on`.
+    use_optimizer: bool,
+
     /// Generic storage for GUC parameters that tipg does not actively use but
     /// drivers expect to SET/SHOW without error (e.g. `extra_float_digits`,
     /// `DateStyle`, `work_mem`). Values are stored as-is for `SHOW` readback.
@@ -193,6 +198,18 @@ impl SessionSettings {
             "pgtikv.max_sort_bytes" => {
                 self.max_sort_bytes = Self::parse_byte_size(&value)?;
             }
+            "tipg.use_optimizer" => {
+                let normalized = value.trim().to_lowercase();
+                match normalized.as_str() {
+                    "on" | "true" | "yes" | "1" => self.use_optimizer = true,
+                    "off" | "false" | "no" | "0" => self.use_optimizer = false,
+                    _ => {
+                        return Err(anyhow!(
+                            "parameter \"tipg.use_optimizer\" requires a Boolean value"
+                        ))
+                    }
+                }
+            }
             "timezone" => {
                 crate::types::timestamp::TimeZoneSpec::try_parse(&value)?;
                 self.timezone = Some(value);
@@ -291,6 +308,7 @@ impl SessionSettings {
                 Some(self.idle_in_transaction_session_timeout_ms.to_string())
             }
             "pgtikv.max_sort_bytes" => Some(self.max_sort_bytes.to_string()),
+            "tipg.use_optimizer" => Some(if self.use_optimizer { "on" } else { "off" }.to_string()),
             // Report canonical Postgres defaults for driver/tool compatibility.
             "datestyle" => Some("ISO, MDY".to_string()),
             "intervalstyle" => Some("postgres".to_string()),
@@ -361,6 +379,10 @@ impl SessionSettings {
 
     pub(crate) fn max_sort_bytes(&self) -> usize {
         self.max_sort_bytes
+    }
+
+    pub(crate) fn use_optimizer(&self) -> bool {
+        self.use_optimizer
     }
 }
 
@@ -559,6 +581,10 @@ impl Session {
 
     pub(crate) fn max_sort_bytes(&self) -> usize {
         self.settings.max_sort_bytes()
+    }
+
+    pub(crate) fn use_optimizer(&self) -> bool {
+        self.settings.use_optimizer()
     }
 
     pub async fn create_savepoint(&mut self, name: String) -> Result<()> {

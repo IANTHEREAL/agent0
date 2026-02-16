@@ -397,29 +397,6 @@ pub(super) fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
-pub(super) fn parse_bool_pg(s: &str) -> Option<bool> {
-    let s = s.trim();
-    if s.eq_ignore_ascii_case("true")
-        || s.eq_ignore_ascii_case("t")
-        || s.eq_ignore_ascii_case("yes")
-        || s.eq_ignore_ascii_case("y")
-        || s.eq_ignore_ascii_case("on")
-        || s == "1"
-    {
-        Some(true)
-    } else if s.eq_ignore_ascii_case("false")
-        || s.eq_ignore_ascii_case("f")
-        || s.eq_ignore_ascii_case("no")
-        || s.eq_ignore_ascii_case("n")
-        || s.eq_ignore_ascii_case("off")
-        || s == "0"
-    {
-        Some(false)
-    } else {
-        None
-    }
-}
-
 pub(super) fn add_values(left: Value, right: Value) -> Result<Value> {
     let left = crate::sql::types::cast::coerce_text_to_numeric(left)?;
     let right = crate::sql::types::cast::coerce_text_to_numeric(right)?;
@@ -871,34 +848,6 @@ pub fn compare_order_by_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_bool_pg_accepts_on_off() {
-        assert_eq!(parse_bool_pg("on"), Some(true));
-        assert_eq!(parse_bool_pg("ON"), Some(true));
-        assert_eq!(parse_bool_pg("  oN "), Some(true));
-
-        assert_eq!(parse_bool_pg("off"), Some(false));
-        assert_eq!(parse_bool_pg("OFF"), Some(false));
-        assert_eq!(parse_bool_pg("\tOff\n"), Some(false));
-    }
-
-    #[test]
-    fn test_parse_bool_pg_existing_variants() {
-        assert_eq!(parse_bool_pg("true"), Some(true));
-        assert_eq!(parse_bool_pg("t"), Some(true));
-        assert_eq!(parse_bool_pg("yes"), Some(true));
-        assert_eq!(parse_bool_pg("y"), Some(true));
-        assert_eq!(parse_bool_pg("1"), Some(true));
-
-        assert_eq!(parse_bool_pg("false"), Some(false));
-        assert_eq!(parse_bool_pg("f"), Some(false));
-        assert_eq!(parse_bool_pg("no"), Some(false));
-        assert_eq!(parse_bool_pg("n"), Some(false));
-        assert_eq!(parse_bool_pg("0"), Some(false));
-
-        assert_eq!(parse_bool_pg("maybe"), None);
-    }
 
     #[test]
     fn test_add_interval_to_timestamp_millis_min_does_not_panic() {

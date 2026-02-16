@@ -5,7 +5,6 @@
 //! - `Assignment`: INSERT/UPDATE column coercion — medium
 //! - `Implicit`: Comparison coercion — strictest
 
-use super::coercion::comparison_target_type;
 use crate::sql::error::SqlError;
 use crate::types::{DataType, Value};
 use anyhow::{anyhow, Result};
@@ -512,46 +511,6 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
     }
 }
 
-/// Coerce two values to a common type for comparison.
-///
-/// Same-type and Null pairs are returned as-is (no cloning needed at call site
-/// for same-type fast path). Cross-type pairs are cast via `CastContext::Implicit`.
-pub(crate) fn coerce_pair(left: Value, right: Value) -> Result<(Value, Value)> {
-    let lt = left.data_type();
-    let rt = right.data_type();
-
-    // Null or same type → return as-is
-    if lt.is_none() || rt.is_none() || lt == rt {
-        return Ok((left, right));
-    }
-
-    let lt = lt.unwrap();
-    let rt = rt.unwrap();
-
-    let target = comparison_target_type(&lt, &rt).ok_or_else(|| {
-        anyhow!(
-            "could not determine comparison type for {:?} and {:?}",
-            lt,
-            rt
-        )
-    })?;
-
-    let cl = cast(left, &target, CastContext::Implicit)?;
-    let cr = cast(right, &target, CastContext::Implicit)?;
-    Ok((cl, cr))
-}
-
-/// Coerce a value to boolean via implicit cast.
-///
-/// Text values are parsed as booleans; non-text values pass through unchanged.
-/// Replaces the old `coerce_text_literal_to_bool` which had a literal-only guard.
-pub(crate) fn coerce_to_bool(val: Value) -> Result<Value> {
-    match val {
-        Value::Text(s) => cast(Value::Text(s), &DataType::Boolean, CastContext::Implicit),
-        other => Ok(other),
-    }
-}
-
 /// Coerce a Text value to a numeric type for arithmetic operations.
 ///
 /// Tries Int64 first, then Float64. Non-text values pass through unchanged.
@@ -844,62 +803,6 @@ mod tests {
             .unwrap(),
             Value::Boolean(false)
         );
-    }
-
-    // ---- coerce_pair ----
-    #[test]
-    fn coerce_pair_text_to_int32() {
-        let (l, r) = coerce_pair(Value::Text("42".into()), Value::Int32(10)).unwrap();
-        assert_eq!(l, Value::Int32(42));
-        assert_eq!(r, Value::Int32(10));
-    }
-
-    #[test]
-    fn coerce_pair_text_to_bool() {
-        let (l, r) = coerce_pair(Value::Text("true".into()), Value::Boolean(false)).unwrap();
-        assert_eq!(l, Value::Boolean(true));
-        assert_eq!(r, Value::Boolean(false));
-    }
-
-    #[test]
-    fn coerce_pair_text_to_date() {
-        let (l, r) = coerce_pair(Value::Text("2024-01-01".into()), Value::Date(19723)).unwrap();
-        // Both should be Date
-        assert!(matches!(l, Value::Date(_)));
-        assert_eq!(r, Value::Date(19723));
-    }
-
-    #[test]
-    fn coerce_pair_text_parse_error() {
-        let result = coerce_pair(Value::Text("abc".into()), Value::Int32(1));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn coerce_pair_same_type_passthrough() {
-        let (l, r) = coerce_pair(Value::Int32(1), Value::Int32(2)).unwrap();
-        assert_eq!(l, Value::Int32(1));
-        assert_eq!(r, Value::Int32(2));
-    }
-
-    #[test]
-    fn coerce_pair_null_passthrough() {
-        let (l, r) = coerce_pair(Value::Null, Value::Int32(42)).unwrap();
-        assert_eq!(l, Value::Null);
-        assert_eq!(r, Value::Int32(42));
-    }
-
-    #[test]
-    fn coerce_pair_int32_int64_widening() {
-        let (l, r) = coerce_pair(Value::Int32(1), Value::Int64(2)).unwrap();
-        assert_eq!(l, Value::Int64(1));
-        assert_eq!(r, Value::Int64(2));
-    }
-
-    #[test]
-    fn coerce_pair_json_incomparable() {
-        let result = coerce_pair(Value::Json("{}".into()), Value::Int32(1));
-        assert!(result.is_err());
     }
 
     // ---- coerce_text_to_numeric ----

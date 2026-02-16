@@ -73,9 +73,11 @@ impl Executor {
         let savepoints = session.savepoints();
         let connection_id = session.connection_id();
         let database_name = session.current_database_name_arc();
+        let use_optimizer = session.use_optimizer();
         crate::sql::query_context::with_query_context(
             connection_id,
             database_name,
+            use_optimizer,
             statement_time::with_timestamps(
                 statement_ts,
                 transaction_ts,

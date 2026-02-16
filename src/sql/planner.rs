@@ -306,10 +306,12 @@ pub fn analyze_predicates(expr: &Expr) -> Vec<PredicateInfo> {
     predicates
 }
 
-/// Choose the best access path for an optional filter expression.
+/// Choose the best access path for an optional AST filter expression.
 ///
-/// This extends the equality-based index selection with JSONB `@>` scans that can use
-/// a GIN-like inverted index.
+/// **Legacy:** Only used by the EXPLAIN AST fallback path (non-SELECT statements
+/// and analysis error recovery).  The primary path uses
+/// [`choose_best_access_path_for_typed_filter`] which operates on the Analyzer's
+/// TypedExpr IR.
 pub fn choose_best_access_path_for_filter(
     _db_id: u64,
     schema: &TableSchema,
@@ -343,8 +345,8 @@ pub fn choose_best_access_path_for_filter(
 /// Choose the best access path using a typed filter expression (from the Analyzer).
 ///
 /// This is the TypedExpr equivalent of [`choose_best_access_path_for_filter`].
-/// Expression-index matching and GIN are not yet supported on the typed path;
-/// those optimizations require Expr-level AST matching (a follow-up).
+/// Supports B-tree index selection, GIN index selection, expression-index matching,
+/// and partial-index predicate implication — full parity with the AST path.
 pub fn choose_best_access_path_for_typed_filter(
     _db_id: u64,
     schema: &TableSchema,
@@ -359,8 +361,22 @@ pub fn choose_best_access_path_for_typed_filter(
     };
 
     let predicates = analyze_typed_predicates(filter_expr);
-    // Pass `None` for the AST filter — expression-index matching not yet typed.
-    choose_best_access_path_with_filter(schema, &predicates, None, estimated_table_rows)
+    let mut best = choose_best_access_path_with_typed_filter(
+        schema,
+        &predicates,
+        filter_expr,
+        estimated_table_rows,
+    );
+
+    // GIN index selection (@@, @>, <@ operators on JSONB/Array/Tsvector columns).
+    if let Some(gin_path) = choose_gin_access_path_typed(schema, filter_expr, estimated_table_rows)
+    {
+        if gin_path.cost < best.cost {
+            best = gin_path;
+        }
+    }
+
+    best
 }
 
 /// Extract [`PredicateInfo`] from a [`TypedExpr`] tree.
@@ -692,6 +708,62 @@ fn choose_best_access_path_with_filter(
             }
         }
 
+        if let Some((scan_type, cost)) =
+            evaluate_index(schema, index, predicates, estimated_table_rows)
+        {
+            if cost < best_path.cost {
+                best_path = AccessPath { scan_type, cost };
+            }
+        }
+    }
+
+    best_path
+}
+
+/// Typed-filter version of [`choose_best_access_path_with_filter`].
+///
+/// Uses a [`TypedExpr`] filter for expression-index matching and partial-index
+/// predicate implication, replacing the AST-based logic.
+fn choose_best_access_path_with_typed_filter(
+    schema: &TableSchema,
+    predicates: &[PredicateInfo],
+    typed_filter: &super::analyzer::types::TypedExpr,
+    estimated_table_rows: usize,
+) -> AccessPath {
+    let mut best_path = AccessPath {
+        scan_type: ScanType::FullTableScan,
+        cost: estimated_table_rows as f64,
+    };
+
+    for index in &schema.indexes {
+        if !is_planner_usable_index(index) {
+            continue;
+        }
+
+        // Partial-index predicate implication: check that the query filter
+        // implies the index predicate (e.g. WHERE status = 'active' implies
+        // a partial index on status = 'active').
+        if let Some(index_predicate) = index.predicate.as_deref() {
+            if !query_implies_index_predicate_typed(typed_filter, index_predicate) {
+                continue;
+            }
+        }
+
+        // Expression-index matching (e.g. CREATE INDEX ON t (lower(name))).
+        if !index.expressions.is_empty() {
+            if let Some((scan_type, cost)) =
+                evaluate_expression_index_typed(index, typed_filter, estimated_table_rows)
+            {
+                if cost < best_path.cost {
+                    best_path = AccessPath { scan_type, cost };
+                }
+            }
+            if index.columns.is_empty() {
+                continue;
+            }
+        }
+
+        // Regular B-tree column index matching.
         if let Some((scan_type, cost)) =
             evaluate_index(schema, index, predicates, estimated_table_rows)
         {
@@ -1043,11 +1115,205 @@ fn estimate_selectivity(index: &IndexDef, matched_cols: usize, full_match: bool)
     base_selectivity.max(0.0001)
 }
 
-// NOTE: Expression-based GIN indexes (e.g. `to_tsvector('chinese', col)`)
-// are maintained on the write path but NOT yet used for query planning.
-// The planner currently only matches simple column-based GIN indexes.
-// Expression index scan support requires matching function-call predicates
-// in extract_gin_contains_predicate — tracked as a known limitation.
+// ── TypedExpr expression-index and partial-index support ──────────
+
+/// Render a [`Value`] as a SQL literal string.
+///
+/// Text values are single-quoted (e.g. `'hello'`), numbers are unquoted,
+/// booleans are `true`/`false`, NULL is `NULL`.  This must match the way
+/// sqlparser renders literals so that normalization produces identical strings
+/// for the AST and TypedExpr code paths.
+fn value_to_sql_literal(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".to_string(),
+        Value::Boolean(b) => format!("{}", b),
+        Value::Int32(i) => format!("{}", i),
+        Value::Int64(i) => format!("{}", i),
+        Value::Float64(f) => format!("{}", f),
+        Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        _ => format!("{}", v),
+    }
+}
+
+/// Semantic SQL canonicalizer for [`TypedExpr`].
+///
+/// Produces a normalized SQL string suitable for matching against expression-index
+/// definitions.  Unlike `TypedExpr::Display` which is presentation-oriented:
+/// - CAST uses proper SQL type names (not `{:?}` Debug format)
+/// - ColumnRef uses the column name directly (lowercased)
+/// - Function calls use canonical `func(args)` syntax
+/// - Minimal parenthesization (only around binary ops)
+///
+/// The output is fed through [`normalize_expr_string`] for final comparison
+/// against index definitions parsed via `parse_predicate_expr` → `normalize_expr_for_match`.
+fn typed_expr_to_canonical_sql(expr: &super::analyzer::types::TypedExpr) -> String {
+    use super::analyzer::types::TypedExprKind;
+
+    match &expr.kind {
+        TypedExprKind::Constant(v) => value_to_sql_literal(v),
+        TypedExprKind::ColumnRef { column_name, .. } => column_name.to_lowercase(),
+        TypedExprKind::BinaryOp { left, op, right } => {
+            format!(
+                "({} {} {})",
+                typed_expr_to_canonical_sql(left),
+                op,
+                typed_expr_to_canonical_sql(right)
+            )
+        }
+        TypedExprKind::UnaryOp { op, operand } => {
+            format!("({}{})", op, typed_expr_to_canonical_sql(operand))
+        }
+        TypedExprKind::Cast {
+            expr, target_type, ..
+        } => {
+            // Use DataType::Display which produces proper SQL names (e.g. "TEXT", "BIGINT")
+            format!(
+                "CAST({} AS {})",
+                typed_expr_to_canonical_sql(expr),
+                target_type
+            )
+        }
+        TypedExprKind::FunctionCall { func, args, .. } => {
+            let arg_strs: Vec<String> = args.iter().map(typed_expr_to_canonical_sql).collect();
+            format!("{}({})", func.name.to_lowercase(), arg_strs.join(", "))
+        }
+        // For expression-index matching, other node types are unlikely to appear in
+        // index definitions.  Fall back to Display for a best-effort string.
+        other_kind => {
+            let temp = super::analyzer::types::TypedExpr {
+                kind: other_kind.clone(),
+                data_type: expr.data_type.clone(),
+            };
+            format!("{}", temp)
+        }
+    }
+}
+
+/// Extract conjuncts from a typed expression tree (AND decomposition).
+fn extract_typed_conjuncts(
+    expr: &super::analyzer::types::TypedExpr,
+) -> Vec<&super::analyzer::types::TypedExpr> {
+    use super::analyzer::types::{BinaryOp as TypedBinaryOp, TypedExprKind};
+
+    match &expr.kind {
+        TypedExprKind::BinaryOp {
+            left,
+            op: TypedBinaryOp::And,
+            right,
+        } => {
+            let mut result = extract_typed_conjuncts(left);
+            result.extend(extract_typed_conjuncts(right));
+            result
+        }
+        _ => vec![expr],
+    }
+}
+
+/// Check if a typed query filter implies a partial-index predicate.
+///
+/// Mirrors [`query_implies_index_predicate`]: the index predicate is stored as a
+/// string, so we parse it to AST and normalize.  The query conjuncts come from the
+/// TypedExpr tree via [`typed_expr_to_canonical_sql`] + [`normalize_expr_string`].
+fn query_implies_index_predicate_typed(
+    filter: &super::analyzer::types::TypedExpr,
+    index_predicate: &str,
+) -> bool {
+    let Some(index_pred_expr) = parse_predicate_expr(index_predicate) else {
+        return false;
+    };
+
+    let query_conjuncts: Vec<String> = extract_typed_conjuncts(filter)
+        .iter()
+        .map(|c| normalize_expr_string(typed_expr_to_canonical_sql(c)))
+        .collect();
+
+    extract_conjuncts(&index_pred_expr)
+        .iter()
+        .map(normalize_expr_for_match)
+        .all(|idx_conj| query_conjuncts.iter().any(|q| q == &idx_conj))
+}
+
+/// Evaluate expression-index applicability using a typed filter.
+///
+/// Mirrors [`evaluate_expression_index`] + [`match_expression_predicates`]:
+/// for each expression in the index, check if any typed filter conjunct
+/// of the form `expr = constant` matches (after canonical normalization).
+fn evaluate_expression_index_typed(
+    index: &IndexDef,
+    filter: &super::analyzer::types::TypedExpr,
+    estimated_table_rows: usize,
+) -> Option<(ScanType, f64)> {
+    let values = match_expression_predicates_typed(index, filter)?;
+    let selectivity = estimate_selectivity(index, values.len(), true);
+    let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
+    let cost = 1.0 + estimated_rows as f64 * 0.5;
+
+    Some((
+        ScanType::IndexScan {
+            index_id: index.id,
+            index_name: index.name.clone(),
+            values,
+            estimated_rows,
+        },
+        cost,
+    ))
+}
+
+/// Match expression-index expressions against typed filter conjuncts.
+///
+/// For each index expression string:
+/// 1. Parse to AST → `normalize_expr_for_match` (the "index side")
+/// 2. For each typed filter conjunct of the form `lhs = rhs`:
+///    - Canonicalize lhs/rhs via `typed_expr_to_canonical_sql` → `normalize_expr_string`
+///    - If one side matches the index expression, the other must be a constant value
+fn match_expression_predicates_typed(
+    index: &IndexDef,
+    filter: &super::analyzer::types::TypedExpr,
+) -> Option<Vec<Value>> {
+    use super::analyzer::types::{BinaryOp as TypedBinaryOp, TypedExprKind};
+
+    if index.expressions.is_empty() {
+        return None;
+    }
+
+    let filter_conjuncts = extract_typed_conjuncts(filter);
+    let mut values = Vec::with_capacity(index.expressions.len());
+
+    for expr_str in &index.expressions {
+        let expr_ast = parse_predicate_expr(expr_str)?;
+        let normalized_expr = normalize_expr_for_match(&expr_ast);
+        let mut matched_value = None;
+
+        for conjunct in &filter_conjuncts {
+            if let TypedExprKind::BinaryOp {
+                left,
+                op: TypedBinaryOp::Eq,
+                right,
+            } = &conjunct.kind
+            {
+                let left_norm = normalize_expr_string(typed_expr_to_canonical_sql(left));
+                let right_norm = normalize_expr_string(typed_expr_to_canonical_sql(right));
+
+                if left_norm == normalized_expr {
+                    if let TypedExprKind::Constant(v) = &right.kind {
+                        matched_value = Some(v.clone());
+                        break;
+                    }
+                }
+                if right_norm == normalized_expr {
+                    if let TypedExprKind::Constant(v) = &left.kind {
+                        matched_value = Some(v.clone());
+                        break;
+                    }
+                }
+            }
+        }
+
+        values.push(matched_value?);
+    }
+
+    Some(values)
+}
 fn choose_gin_access_path(
     schema: &TableSchema,
     filter_expr: &Expr,
@@ -1173,6 +1439,103 @@ fn gin_predicate_priority(value: &Value) -> u8 {
         Value::Array(_) => 1,
         Value::Json(_) | Value::Jsonb(_) => 2,
         _ => 3,
+    }
+}
+
+// ── TypedExpr GIN index support ──────────────────────────────────────
+
+/// Choose GIN access path from a [`TypedExpr`] filter tree.
+///
+/// Mirrors [`choose_gin_access_path`] but works on the Analyzer's typed IR
+/// instead of AST nodes.  Recognizes `BinaryOp` nodes with operators:
+/// - `TsMatch` (`@@`) — full-text search
+/// - `JsonContains` / `ArrayContains` (`@>`) — containment
+fn choose_gin_access_path_typed(
+    schema: &TableSchema,
+    filter_expr: &super::analyzer::types::TypedExpr,
+    estimated_table_rows: usize,
+) -> Option<AccessPath> {
+    let (column, pattern) = extract_gin_contains_predicate_typed(filter_expr)?;
+
+    let col_idx = schema.column_index(&column)?;
+    let col_type = &schema.columns.get(col_idx)?.data_type;
+
+    let is_gin_compatible = matches!(
+        col_type,
+        DataType::Json | DataType::Jsonb | DataType::Array(_) | DataType::Tsvector
+    );
+    if !is_gin_compatible {
+        return None;
+    }
+
+    let index = schema.indexes.iter().find(|idx| {
+        idx.method
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("gin"))
+            .unwrap_or(false)
+            && idx.columns.len() == 1
+            && idx.expressions.is_empty()
+            && idx.predicate.is_none()
+            && idx.columns[0].eq_ignore_ascii_case(&column)
+    })?;
+
+    let selectivity = 0.01_f64;
+    let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
+    let cost = 0.5 + (estimated_rows as f64 * 0.2);
+
+    Some(AccessPath {
+        scan_type: ScanType::GinIndexScan {
+            index_id: index.id,
+            index_name: index.name.clone(),
+            column,
+            pattern,
+            estimated_rows,
+        },
+        cost,
+    })
+}
+
+/// Extract the best GIN-eligible predicate from a typed expression tree.
+///
+/// Mirrors [`extract_gin_contains_predicate`].
+fn extract_gin_contains_predicate_typed(
+    expr: &super::analyzer::types::TypedExpr,
+) -> Option<(String, Value)> {
+    let predicates = collect_gin_predicates_typed(expr);
+    if predicates.is_empty() {
+        return None;
+    }
+    predicates
+        .into_iter()
+        .min_by_key(|(_, value)| gin_predicate_priority(value))
+}
+
+/// Collect all GIN-eligible (column, pattern) pairs from a typed expression tree.
+///
+/// Mirrors [`collect_gin_predicates`].
+fn collect_gin_predicates_typed(expr: &super::analyzer::types::TypedExpr) -> Vec<(String, Value)> {
+    use super::analyzer::types::{BinaryOp as TypedBinaryOp, TypedExprKind};
+
+    match &expr.kind {
+        TypedExprKind::BinaryOp { left, op, right } => match op {
+            TypedBinaryOp::And => {
+                let mut predicates = collect_gin_predicates_typed(left);
+                predicates.extend(collect_gin_predicates_typed(right));
+                predicates
+            }
+            TypedBinaryOp::TsMatch | TypedBinaryOp::JsonContains | TypedBinaryOp::ArrayContains => {
+                // left should be a column ref, right should be a constant
+                match (&left.kind, &right.kind) {
+                    (
+                        TypedExprKind::ColumnRef { column_name, .. },
+                        TypedExprKind::Constant(pattern),
+                    ) => vec![(column_name.to_lowercase(), pattern.clone())],
+                    _ => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
     }
 }
 
@@ -2667,5 +3030,437 @@ mod tests {
         };
 
         assert!(split_join_condition(&expr, &left, &right).is_none());
+    }
+
+    // ── Cross-path parity tests (TypedExpr vs AST) ──────────────────
+
+    use super::super::analyzer::types::{
+        BinaryOp as TypedBinaryOp, ResolvedFunction, TypedExpr, TypedExprKind,
+    };
+
+    fn typed_constant(v: Value, dt: DataType) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::Constant(v),
+            data_type: dt,
+        }
+    }
+
+    fn typed_column(name: &str, dt: DataType) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: 0,
+                column_name: name.to_string(),
+            },
+            data_type: dt,
+        }
+    }
+
+    fn typed_binop(
+        left: TypedExpr,
+        op: TypedBinaryOp,
+        right: TypedExpr,
+        dt: DataType,
+    ) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            },
+            data_type: dt,
+        }
+    }
+
+    fn gin_schema() -> TableSchema {
+        TableSchema {
+            name: "docs".to_string(),
+            table_id: 1,
+            columns: vec![
+                crate::types::ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                crate::types::ColumnDef {
+                    name: "body".to_string(),
+                    data_type: DataType::Tsvector,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                crate::types::ColumnDef {
+                    name: "data".to_string(),
+                    data_type: DataType::Jsonb,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![0],
+            indexes: vec![
+                IndexDef {
+                    id: 1,
+                    name: "idx_body_gin".to_string(),
+                    columns: vec!["body".to_string()],
+                    unique: false,
+                    method: Some("gin".to_string()),
+                    predicate: None,
+                    expressions: Vec::new(),
+                },
+                IndexDef {
+                    id: 2,
+                    name: "idx_data_gin".to_string(),
+                    columns: vec!["data".to_string()],
+                    unique: false,
+                    method: Some("gin".to_string()),
+                    predicate: None,
+                    expressions: Vec::new(),
+                },
+            ],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+            from_alias: None,
+        }
+    }
+
+    #[test]
+    fn test_gin_typed_tsmatch_selects_gin_index() {
+        let schema = gin_schema();
+        // body @@ to_tsquery('hello')
+        let filter = typed_binop(
+            typed_column("body", DataType::Tsvector),
+            TypedBinaryOp::TsMatch,
+            typed_constant(Value::Tsquery("hello".to_string()), DataType::Tsquery),
+            DataType::Boolean,
+        );
+
+        let path = choose_best_access_path_for_typed_filter(0, &schema, Some(&filter), 10000);
+        match &path.scan_type {
+            ScanType::GinIndexScan {
+                index_name, column, ..
+            } => {
+                assert_eq!(index_name, "idx_body_gin");
+                assert_eq!(column, "body");
+            }
+            other => panic!("expected GinIndexScan, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_gin_typed_json_contains_selects_gin_index() {
+        let schema = gin_schema();
+        // data @> '{"key": "val"}'::jsonb
+        let filter = typed_binop(
+            typed_column("data", DataType::Jsonb),
+            TypedBinaryOp::JsonContains,
+            typed_constant(
+                Value::Jsonb(r#"{"key": "val"}"#.to_string()),
+                DataType::Jsonb,
+            ),
+            DataType::Boolean,
+        );
+
+        let path = choose_best_access_path_for_typed_filter(0, &schema, Some(&filter), 10000);
+        match &path.scan_type {
+            ScanType::GinIndexScan {
+                index_name, column, ..
+            } => {
+                assert_eq!(index_name, "idx_data_gin");
+                assert_eq!(column, "data");
+            }
+            other => panic!("expected GinIndexScan, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_gin_typed_no_gin_index_falls_back() {
+        // Schema without GIN index
+        let schema = TableSchema {
+            name: "plain".to_string(),
+            table_id: 1,
+            columns: vec![crate::types::ColumnDef {
+                name: "body".to_string(),
+                data_type: DataType::Tsvector,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+            from_alias: None,
+        };
+
+        let filter = typed_binop(
+            typed_column("body", DataType::Tsvector),
+            TypedBinaryOp::TsMatch,
+            typed_constant(Value::Tsquery("hello".to_string()), DataType::Tsquery),
+            DataType::Boolean,
+        );
+
+        let path = choose_best_access_path_for_typed_filter(0, &schema, Some(&filter), 10000);
+        assert!(matches!(path.scan_type, ScanType::FullTableScan));
+    }
+
+    #[test]
+    fn test_expression_index_typed_lower() {
+        // Schema with expression index on lower(name)
+        let schema = TableSchema {
+            name: "users".to_string(),
+            table_id: 1,
+            columns: vec![crate::types::ColumnDef {
+                name: "name".to_string(),
+                data_type: DataType::Text,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![IndexDef {
+                id: 1,
+                name: "idx_lower_name".to_string(),
+                columns: vec![],
+                unique: false,
+                method: None,
+                predicate: None,
+                expressions: vec!["lower(name)".to_string()],
+            }],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+            from_alias: None,
+        };
+
+        // WHERE lower(name) = 'alice'
+        let lower_call = TypedExpr {
+            kind: TypedExprKind::FunctionCall {
+                func: ResolvedFunction {
+                    name: "lower".to_string(),
+                    kind: super::super::analyzer::types::FunctionKind::Builtin,
+                    return_type: DataType::Text,
+                },
+                args: vec![typed_column("name", DataType::Text)],
+                order_by: vec![],
+                filter: None,
+            },
+            data_type: DataType::Text,
+        };
+        let filter = typed_binop(
+            lower_call,
+            TypedBinaryOp::Eq,
+            typed_constant(Value::Text("alice".to_string()), DataType::Text),
+            DataType::Boolean,
+        );
+
+        let path = choose_best_access_path_for_typed_filter(0, &schema, Some(&filter), 10000);
+        match &path.scan_type {
+            ScanType::IndexScan {
+                index_name, values, ..
+            } => {
+                assert_eq!(index_name, "idx_lower_name");
+                assert_eq!(values, &[Value::Text("alice".to_string())]);
+            }
+            other => panic!("expected IndexScan for expression index, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_partial_index_typed_exact_predicate() {
+        // Schema with partial index: WHERE status = 'active'
+        let schema = TableSchema {
+            name: "orders".to_string(),
+            table_id: 1,
+            columns: vec![
+                crate::types::ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                crate::types::ColumnDef {
+                    name: "status".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![0],
+            indexes: vec![IndexDef {
+                id: 1,
+                name: "idx_active_orders".to_string(),
+                columns: vec!["id".to_string()],
+                unique: false,
+                method: None,
+                predicate: Some("status = 'active'".to_string()),
+                expressions: Vec::new(),
+            }],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+            from_alias: None,
+        };
+
+        // WHERE status = 'active' AND id = 42
+        let filter = typed_binop(
+            typed_binop(
+                typed_column("status", DataType::Text),
+                TypedBinaryOp::Eq,
+                typed_constant(Value::Text("active".to_string()), DataType::Text),
+                DataType::Boolean,
+            ),
+            TypedBinaryOp::And,
+            typed_binop(
+                typed_column("id", DataType::Int64),
+                TypedBinaryOp::Eq,
+                typed_constant(Value::Int64(42), DataType::Int64),
+                DataType::Boolean,
+            ),
+            DataType::Boolean,
+        );
+
+        let path = choose_best_access_path_for_typed_filter(0, &schema, Some(&filter), 10000);
+        match &path.scan_type {
+            ScanType::IndexScan {
+                index_name, values, ..
+            } => {
+                assert_eq!(index_name, "idx_active_orders");
+                assert_eq!(values, &[Value::Int64(42)]);
+            }
+            other => panic!("expected IndexScan for partial index, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_partial_index_typed_missing_predicate() {
+        // Same schema as above, but query doesn't include the partial predicate
+        let schema = TableSchema {
+            name: "orders".to_string(),
+            table_id: 1,
+            columns: vec![
+                crate::types::ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                crate::types::ColumnDef {
+                    name: "status".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![0],
+            indexes: vec![IndexDef {
+                id: 1,
+                name: "idx_active_orders".to_string(),
+                columns: vec!["id".to_string()],
+                unique: false,
+                method: None,
+                predicate: Some("status = 'active'".to_string()),
+                expressions: Vec::new(),
+            }],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+            from_alias: None,
+        };
+
+        // WHERE id = 42 (missing status = 'active')
+        let filter = typed_binop(
+            typed_column("id", DataType::Int64),
+            TypedBinaryOp::Eq,
+            typed_constant(Value::Int64(42), DataType::Int64),
+            DataType::Boolean,
+        );
+
+        let path = choose_best_access_path_for_typed_filter(0, &schema, Some(&filter), 10000);
+        // Should NOT use the partial index since the predicate isn't satisfied
+        assert!(
+            matches!(path.scan_type, ScanType::FullTableScan),
+            "expected FullTableScan when partial predicate not satisfied, got {:?}",
+            path.scan_type
+        );
+    }
+
+    #[test]
+    fn test_canonicalizer_parity_with_ast_lower() {
+        // Verify that typed_expr_to_canonical_sql produces strings that normalize
+        // to the same value as AST normalize_expr_for_match for common patterns
+        let lower_call = TypedExpr {
+            kind: TypedExprKind::FunctionCall {
+                func: ResolvedFunction {
+                    name: "lower".to_string(),
+                    kind: super::super::analyzer::types::FunctionKind::Builtin,
+                    return_type: DataType::Text,
+                },
+                args: vec![typed_column("name", DataType::Text)],
+                order_by: vec![],
+                filter: None,
+            },
+            data_type: DataType::Text,
+        };
+
+        let typed_canonical = normalize_expr_string(typed_expr_to_canonical_sql(&lower_call));
+        let ast_expr = parse_predicate_expr("lower(name)").unwrap();
+        let ast_canonical = normalize_expr_for_match(&ast_expr);
+        assert_eq!(typed_canonical, ast_canonical);
+    }
+
+    #[test]
+    fn test_canonicalizer_parity_with_ast_cast() {
+        // CAST(x AS TEXT)
+        let cast_expr = TypedExpr {
+            kind: TypedExprKind::Cast {
+                expr: Box::new(typed_column("x", DataType::Int64)),
+                target_type: DataType::Text,
+                cast_context: crate::sql::types::CastContext::Explicit,
+            },
+            data_type: DataType::Text,
+        };
+
+        let typed_canonical = normalize_expr_string(typed_expr_to_canonical_sql(&cast_expr));
+        // AST: CAST(x AS TEXT) — sqlparser emits this same form
+        let ast_expr = parse_predicate_expr("CAST(x AS TEXT)").unwrap();
+        let ast_canonical = normalize_expr_for_match(&ast_expr);
+        assert_eq!(typed_canonical, ast_canonical);
     }
 }

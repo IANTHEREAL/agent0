@@ -52,35 +52,22 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Executor/Operators
 - All persistent data must be isolated per keyspace (`_sys_*`, table rows, indexes, auth, and future stats).
 - Process-level global state is limited to in-memory caches/config/logging.
 
+## Sprint 1 Completed
+
+- **Task 1:** Analyzer → Typed IR pipeline (single execution path for all SELECT queries)
+- **#56** NLJ streaming — NLJ now streams outer side, materializes only build side (`src/sql/operators/join.rs`)
+- **#609** SELECT privilege enforcement — `require_table_privilege(Select)` on every base table (`mod.rs:85-99`)
+- **#634/#635** COPY CSV fixes — order-independent option parsing, ESCAPE self-escaping (`copy_format.rs`)
+- Legacy removal: `infer_expr_type`, `executor/subquery.rs`, boolean validator, comparison coercion fallback
+
 ## Current Problems (Active)
 
-### P1 — JOIN executor fully materializes intermediate rows (#56)
+### P1 — Cost-Based Optimizer (#728)
 
-- Symptom: OOM on large joins; LIMIT applied after full materialization.
-- Root layer: `Executor` (`src/sql/operators/join.rs`) — NLJ calls `collect_all()` on both sides.
-- PostgreSQL behavior: NLJ streams the outer side; never materializes both.
-- Direction: stream probe side via `next()`, materialize only build side.
-
-### P1 — RBAC: SELECT privilege not enforced (#609)
-
-- Symptom: any authenticated user can SELECT from any table.
-- Root layer: `Executor` (`src/sql/executor/select/analyzed/mod.rs`) — no privilege gate.
-- PostgreSQL behavior: SELECT requires SELECT privilege on each referenced base table.
-- Direction: extract base tables from AnalyzedQuery, call `require_table_privilege()` per table.
-- Note: DDL/DML privilege checks are fully wired (24+ call sites in `statement.rs`).
-
-### P1 — COPY CSV parsing bugs (#634, #635)
-
-- Symptom: DELIMITER/NULL parsing order-dependent; ESCAPE character not escaped.
-- Root layer: `src/sql/executor/core/copy.rs`.
-- PostgreSQL behavior: COPY options are order-independent; ESCAPE within data is always escaped.
-- Direction: fix parsing to match PostgreSQL COPY semantics.
-
-### P2 — Planner dual-path: AST vs TypedExpr access-path selection
-
-- Root layer: `src/sql/planner.rs` — two functions: `choose_best_access_path_for_filter` (AST) and `choose_best_access_path_for_typed_filter` (TypedExpr). Typed version lacks GIN/expression-index support.
-- Direction: port all capabilities to typed path, remove AST path. Blocks optimizer (Task 2).
-- Deferred to Phase 2A (pre-optimizer cleanup).
+- Next major milestone: `AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator`.
+- **Planner dual-path resolved:** TypedExpr path now has full GIN + expression-index + partial-index support. EXPLAIN uses the analyzed pipeline (view expansion → Analyzer → typed planner). AST path retained only for non-SELECT EXPLAIN and analysis error fallback.
+- Phase 1: LogicalPlan pipeline for single-table SELECTs (no optimizer rules, no statistics).
+- Phases 2-4: Statistics (#706), join reordering/decorrelation (#705), plan cache (#707).
 
 ## Repository Layout (stable)
 

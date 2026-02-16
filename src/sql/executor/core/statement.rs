@@ -1098,7 +1098,44 @@ impl Executor {
 
         let row_count_lookup = |_table_name: &str| -> usize { 1000 };
 
-        let plan = explain::generate_plan(statement, schema_lookup, row_count_lookup);
+        // For SELECT/WITH queries, run the same analysis pipeline as execution
+        // (view expansion → catalog snapshot → Analyzer) so EXPLAIN shows the
+        // same plan that actually runs.  Non-SELECT statements use the legacy
+        // AST-based plan generation.
+        let plan = if let Statement::Query(query) = statement {
+            use crate::sql::executor::core::catalog_prefetch::build_catalog_snapshot;
+            use crate::sql::executor::core::view_rewrite::expand_views_in_query;
+
+            let expanded =
+                expand_views_in_query(self.store().as_ref(), txn, db_id, search_path, query)
+                    .await?;
+            let catalog = build_catalog_snapshot(
+                self.store().as_ref(),
+                txn,
+                db_id,
+                search_path,
+                self.tenant_keyspace(),
+                &expanded,
+                &HashMap::new(),
+            )
+            .await?;
+            let mut analyzer = Analyzer::new(&catalog);
+            match analyzer.analyze_query(&expanded) {
+                Ok(analyzed) => explain::generate_plan_from_analyzed(
+                    &analyzed,
+                    &schema_lookup,
+                    &row_count_lookup,
+                ),
+                Err(_) => {
+                    // Fallback to AST path if analysis fails (e.g. invalid query)
+                    explain::generate_plan(statement, &schema_lookup, &row_count_lookup)
+                }
+            }
+        } else {
+            // Non-SELECT statements (DDL, DML) — use AST path
+            // (these produce a trivial Result node)
+            explain::generate_plan(statement, &schema_lookup, &row_count_lookup)
+        };
         let mut plan_text = explain::format_plan_text(&plan, 0);
         if let (Some(actual_rows), Some(execution_time_ms)) = (actual_rows, execution_time_ms) {
             use std::fmt::Write;

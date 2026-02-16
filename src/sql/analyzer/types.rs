@@ -839,6 +839,10 @@ pub struct ResolvedUsingColumn {
     pub right_index: usize,
     /// Unified data type (after coercion if needed).
     pub data_type: DataType,
+    /// Original left column type (before coercion).
+    pub left_type: DataType,
+    /// Original right column type (before coercion).
+    pub right_type: DataType,
 }
 
 // ── CTE ─────────────────────────────────────────────────────

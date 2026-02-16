@@ -26,24 +26,3 @@ pub fn compile_row_expr_for_table(
     let typed = Analyzer::analyze_expr_with_scope(&catalog, scope, expr).map_err(SqlError::from)?;
     Ok(fold_typed_expr(&typed, qctx))
 }
-
-/// Compile an AST expression with multi-table (join) row scope.
-pub fn compile_join_expr(
-    expr: &sqlparser::ast::Expr,
-    tables: &[(&str, &TableSchema)],
-    qctx: &QueryContext,
-) -> Result<TypedExpr> {
-    let catalog = NullCatalog;
-    let mut scope = Scope::new();
-    for (alias, schema) in tables {
-        let cols: Vec<(String, crate::types::DataType, bool)> = schema
-            .columns
-            .iter()
-            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
-            .collect();
-        scope.add_table(alias, &cols);
-    }
-
-    let typed = Analyzer::analyze_expr_with_scope(&catalog, scope, expr).map_err(SqlError::from)?;
-    Ok(fold_typed_expr(&typed, qctx))
-}

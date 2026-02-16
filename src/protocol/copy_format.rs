@@ -118,24 +118,6 @@ impl CopyOptions {
     }
 }
 
-/// Encode a row of values into PostgreSQL COPY text format.
-///
-/// Format rules:
-/// - Columns separated by TAB
-/// - Rows terminated by NEWLINE
-/// - NULL represented as `\N`
-/// - Special chars escaped: backslash, tab, newline, carriage return
-#[inline]
-pub fn encode_row(values: &[Value], buf: &mut Vec<u8>) {
-    for (i, value) in values.iter().enumerate() {
-        if i > 0 {
-            buf.push(TAB);
-        }
-        encode_value(value, buf, TAB);
-    }
-    buf.push(NEWLINE);
-}
-
 /// Encode a row using the given options (supports text and CSV formats).
 #[inline]
 pub fn encode_row_with_options(values: &[Value], buf: &mut Vec<u8>, opts: &CopyOptions) {
@@ -387,20 +369,21 @@ mod tests {
     #[test]
     fn test_encode_null() {
         let mut buf = Vec::new();
-        encode_row(&[Value::Null], &mut buf);
+        encode_row_with_options(&[Value::Null], &mut buf, &CopyOptions::default());
         assert_eq!(buf, b"\\N\n");
     }
 
     #[test]
     fn test_encode_basic_types() {
         let mut buf = Vec::new();
-        encode_row(
+        encode_row_with_options(
             &[
                 Value::Int32(42),
                 Value::Boolean(true),
                 Value::Text("hello".to_string()),
             ],
             &mut buf,
+            &CopyOptions::default(),
         );
         assert_eq!(buf, b"42\tt\thello\n");
     }
@@ -408,27 +391,36 @@ mod tests {
     #[test]
     fn test_escape_special_chars() {
         let mut buf = Vec::new();
-        encode_row(&[Value::Text("a\tb\nc\\d".to_string())], &mut buf);
+        encode_row_with_options(
+            &[Value::Text("a\tb\nc\\d".to_string())],
+            &mut buf,
+            &CopyOptions::default(),
+        );
         assert_eq!(buf, b"a\\tb\\nc\\\\d\n");
     }
 
     #[test]
     fn test_encode_bytes() {
         let mut buf = Vec::new();
-        encode_row(&[Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef])], &mut buf);
+        encode_row_with_options(
+            &[Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef])],
+            &mut buf,
+            &CopyOptions::default(),
+        );
         assert_eq!(buf, b"\\\\xdeadbeef\n");
     }
 
     #[test]
     fn test_encode_array() {
         let mut buf = Vec::new();
-        encode_row(
+        encode_row_with_options(
             &[Value::Array(vec![
                 Value::Int32(1),
                 Value::Int32(2),
                 Value::Null,
             ])],
             &mut buf,
+            &CopyOptions::default(),
         );
         assert_eq!(buf, b"{1,2,NULL}\n");
     }
@@ -436,12 +428,13 @@ mod tests {
     #[test]
     fn test_encode_text_array() {
         let mut buf = Vec::new();
-        encode_row(
+        encode_row_with_options(
             &[Value::Array(vec![
                 Value::Text("a".to_string()),
                 Value::Text("b\"c".to_string()),
             ])],
             &mut buf,
+            &CopyOptions::default(),
         );
         assert_eq!(buf, b"{\"a\",\"b\\\"c\"}\n");
     }
@@ -449,15 +442,27 @@ mod tests {
     #[test]
     fn test_encode_float_special() {
         let mut buf = Vec::new();
-        encode_row(&[Value::Float64(f64::NAN)], &mut buf);
+        encode_row_with_options(
+            &[Value::Float64(f64::NAN)],
+            &mut buf,
+            &CopyOptions::default(),
+        );
         assert_eq!(buf, b"NaN\n");
 
         buf.clear();
-        encode_row(&[Value::Float64(f64::INFINITY)], &mut buf);
+        encode_row_with_options(
+            &[Value::Float64(f64::INFINITY)],
+            &mut buf,
+            &CopyOptions::default(),
+        );
         assert_eq!(buf, b"Infinity\n");
 
         buf.clear();
-        encode_row(&[Value::Float64(f64::NEG_INFINITY)], &mut buf);
+        encode_row_with_options(
+            &[Value::Float64(f64::NEG_INFINITY)],
+            &mut buf,
+            &CopyOptions::default(),
+        );
         assert_eq!(buf, b"-Infinity\n");
     }
 
@@ -834,11 +839,19 @@ mod tests {
     fn test_vector_copy_uses_pgvector_format() {
         // Integer-valued floats must omit .0 in COPY output (pgvector compat).
         let mut buf = Vec::new();
-        encode_row(&[Value::Vector(vec![1.0, 2.0, 3.0])], &mut buf);
+        encode_row_with_options(
+            &[Value::Vector(vec![1.0, 2.0, 3.0])],
+            &mut buf,
+            &CopyOptions::default(),
+        );
         assert_eq!(buf, b"[1,2,3]\n");
 
         buf.clear();
-        encode_row(&[Value::Vector(vec![1.0, 2.5, 3.0])], &mut buf);
+        encode_row_with_options(
+            &[Value::Vector(vec![1.0, 2.5, 3.0])],
+            &mut buf,
+            &CopyOptions::default(),
+        );
         assert_eq!(buf, b"[1,2.5,3]\n");
     }
 }
