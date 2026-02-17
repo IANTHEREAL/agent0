@@ -9,6 +9,7 @@ use crate::sql::analyzer::types::{
     AnalyzedProjection, JoinCondition, JoinType, SetOpKind, TypedExpr, TypedFunctionArg,
     TypedOrderByExpr,
 };
+use crate::sql::operators::WindowFunctionExpr;
 use crate::sql::planner::ScanType;
 
 /// A physical plan tree node.
@@ -130,7 +131,10 @@ pub enum PhysicalNode {
     },
 
     /// Window function evaluation.
-    Window { input: Box<PhysicalPlan> },
+    Window {
+        window_functions: Vec<WindowFunctionExpr>,
+        input: Box<PhysicalPlan>,
+    },
 
     // ── Binary operators ────────────────────────────────
     /// Nested-loop join.

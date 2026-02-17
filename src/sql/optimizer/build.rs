@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Result};
 
 use super::physical_plan::{PhysicalNode, PhysicalPlan};
-use crate::sql::analyzer::types::{JoinCondition, JoinType, SetOpKind, TypedExpr, TypedExprKind};
+use crate::sql::analyzer::types::{
+    JoinCondition, JoinType, SetOpKind, TypedExpr, TypedExprKind, TypedOrderByExpr,
+};
 use crate::sql::operators::AggregateExpr;
 use crate::sql::operators::{
     BoxedOperator, DistinctOnOperator, DistinctOperator, FilterOperator, HashAggregateOperator,
@@ -257,11 +259,15 @@ impl PhysicalPlan {
                 Ok(Box::new(DistinctOnOperator::new(child, on_exprs.clone())))
             }
 
-            PhysicalNode::Window { input } => {
-                // Phase 1: Window node is opaque — pass through child.
-                // Full window support requires carrying WindowFunctionExpr (Phase 2).
+            PhysicalNode::Window {
+                window_functions,
+                input,
+            } => {
                 let child = input.build_operators(ctx)?;
-                Ok(child)
+                Ok(Box::new(crate::sql::operators::WindowOperator::new(
+                    child,
+                    window_functions.clone(),
+                )))
             }
 
             // ── Binary operators ────────────────────────────────
@@ -846,6 +852,50 @@ pub(crate) fn rewrite_post_aggregate_expr(
                 data_type: expr.data_type.clone(),
             })
         }
+        // WindowCall: preserve the wrapper but recurse into children (args,
+        // partition_by, order_by) to rewrite any aggregate/group-by references.
+        // This handles mixed expressions like `LAG(COUNT(*)) OVER (ORDER BY dept)`.
+        TypedExprKind::WindowCall {
+            func,
+            args,
+            partition_by,
+            order_by,
+            window_frame,
+        } => {
+            let rewritten_args: Vec<TypedExpr> = args
+                .iter()
+                .map(|a| rewrite_post_aggregate_expr(a, group_by, group_by_count, aggregate_exprs))
+                .collect::<Result<Vec<_>>>()?;
+            let rewritten_partition: Vec<TypedExpr> = partition_by
+                .iter()
+                .map(|e| rewrite_post_aggregate_expr(e, group_by, group_by_count, aggregate_exprs))
+                .collect::<Result<Vec<_>>>()?;
+            let rewritten_order: Vec<TypedOrderByExpr> = order_by
+                .iter()
+                .map(|ob| {
+                    Ok(TypedOrderByExpr {
+                        expr: rewrite_post_aggregate_expr(
+                            &ob.expr,
+                            group_by,
+                            group_by_count,
+                            aggregate_exprs,
+                        )?,
+                        asc: ob.asc,
+                        nulls_first: ob.nulls_first,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(TypedExpr {
+                kind: TypedExprKind::WindowCall {
+                    func: func.clone(),
+                    args: rewritten_args,
+                    partition_by: rewritten_partition,
+                    order_by: rewritten_order,
+                    window_frame: window_frame.clone(),
+                },
+                data_type: expr.data_type.clone(),
+            })
+        }
         // Leaf nodes (constants, etc.) pass through unchanged.
         _ => Ok(expr.clone()),
     }
@@ -972,6 +1022,25 @@ pub(crate) fn collect_agg_exprs_from(
         TypedExprKind::MinMax { args, .. } => {
             for arg in args {
                 collect_agg_exprs_from(arg, output_name, agg_exprs, agg_names, agg_types);
+            }
+        }
+        // WindowCall: recurse into children to find aggregate sub-expressions.
+        // Handles cases like `ROW_NUMBER() OVER (ORDER BY COUNT(*))` and
+        // `LAG(COUNT(*)) OVER (...)`.
+        TypedExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_agg_exprs_from(arg, output_name, agg_exprs, agg_names, agg_types);
+            }
+            for e in partition_by {
+                collect_agg_exprs_from(e, output_name, agg_exprs, agg_names, agg_types);
+            }
+            for ob in order_by {
+                collect_agg_exprs_from(&ob.expr, output_name, agg_exprs, agg_names, agg_types);
             }
         }
         _ => {}

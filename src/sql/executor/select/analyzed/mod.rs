@@ -2701,32 +2701,32 @@ impl Executor {
         // before optimize(), so the physical planner can do access-path selection.
         // The pre-loaded schemas are then shared with BuildContext (Step 3) to
         // eliminate redundant catalog reads.
+        //
+        // Uses collect_query_table_refs to recursively walk the query body,
+        // handling Select, SetOperation, and Values bodies uniformly.
         let mut planning_ctx = PlanningContext::empty();
-        if let AnalyzedQueryBody::Select(select) = &analyzed.body {
+        let table_refs = crate::sql::optimizer::collect_query_table_refs(analyzed);
+        {
             let mut stats_attempted = std::collections::HashSet::new();
-            for table_ref in &select.from {
-                for (name, schema, _alias) in collect_table_refs(table_ref) {
-                    // Load statistics.
-                    let tid = schema.table_id;
-                    let stats = if stats_attempted.insert(tid) {
-                        self.get_or_load_stats(txn, db_id, tid).await?
-                    } else {
-                        self.stats_cache().get_full_stats(db_id, tid)
-                    };
-                    if let Some(stats) = stats {
-                        planning_ctx.table_stats.insert(name.to_string(), stats);
-                    }
-                    // Load full table schema (with index metadata) for access-path selection.
-                    // CTE schemas are not loaded here — they have no indexes.
-                    let cte_key = name.to_lowercase();
-                    if ctes.get(&cte_key).is_none() {
-                        if let Some(table_schema) =
-                            self.store().get_schema(txn, db_id, name).await?
-                        {
-                            planning_ctx
-                                .table_schemas
-                                .insert(name.to_string(), table_schema);
-                        }
+            for (name, schema, _alias) in &table_refs {
+                // Load statistics.
+                let tid = schema.table_id;
+                let stats = if stats_attempted.insert(tid) {
+                    self.get_or_load_stats(txn, db_id, tid).await?
+                } else {
+                    self.stats_cache().get_full_stats(db_id, tid)
+                };
+                if let Some(stats) = stats {
+                    planning_ctx.table_stats.insert(name.to_string(), stats);
+                }
+                // Load full table schema (with index metadata) for access-path selection.
+                // CTE schemas are not loaded here — they have no indexes.
+                let cte_key = name.to_lowercase();
+                if ctes.get(&cte_key).is_none() {
+                    if let Some(table_schema) = self.store().get_schema(txn, db_id, name).await? {
+                        planning_ctx
+                            .table_schemas
+                            .insert(name.to_string(), table_schema);
                     }
                 }
             }
@@ -2739,30 +2739,26 @@ impl Executor {
         // Step 3: Build BuildContext from pre-loaded schemas in PlanningContext.
         // Handles CTE schemas and alias assignment.
         let mut build_ctx = BuildContext::new();
-        if let AnalyzedQueryBody::Select(select) = &analyzed.body {
-            for table_ref in &select.from {
-                for (name, _schema, alias) in collect_table_refs(table_ref) {
-                    let display_alias = alias.unwrap_or(name);
-                    let cte_key = name.to_lowercase();
-                    if let Some((cte_schema, _)) = ctes.get(&cte_key) {
-                        build_ctx = build_ctx.with_schema(name.to_string(), cte_schema.clone());
-                    } else if let Some(table_schema) = planning_ctx.table_schemas.get(name) {
-                        let mut schema = table_schema.clone();
-                        let short = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-                        if !short.eq_ignore_ascii_case(display_alias) {
-                            schema.from_alias = Some(display_alias.to_string());
-                        }
-                        build_ctx = build_ctx.with_schema(name.to_string(), schema);
-                    } else {
-                        // Eligibility gate rejects virtual catalog tables, so this
-                        // should be unreachable. Hard error to surface bugs early.
-                        return Err(anyhow!(
-                            "Optimizer cannot resolve table schema for '{}' \
-                             (should have been rejected by eligibility check)",
-                            name
-                        ));
-                    }
+        for (name, _schema, alias) in &table_refs {
+            let display_alias = alias.unwrap_or(name);
+            let cte_key = name.to_lowercase();
+            if let Some((cte_schema, _)) = ctes.get(&cte_key) {
+                build_ctx = build_ctx.with_schema(name.to_string(), cte_schema.clone());
+            } else if let Some(table_schema) = planning_ctx.table_schemas.get(*name) {
+                let mut schema = table_schema.clone();
+                let short = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+                if !short.eq_ignore_ascii_case(display_alias) {
+                    schema.from_alias = Some(display_alias.to_string());
                 }
+                build_ctx = build_ctx.with_schema(name.to_string(), schema);
+            } else {
+                // Eligibility gate rejects virtual catalog tables, so this
+                // should be unreachable. Hard error to surface bugs early.
+                return Err(anyhow!(
+                    "Optimizer cannot resolve table schema for '{}' \
+                     (should have been rejected by eligibility check)",
+                    name
+                ));
             }
         }
 
@@ -2800,29 +2796,6 @@ impl Executor {
             rows,
             timezone: crate::session_context::current_timezone(),
         })
-    }
-}
-
-/// Recursively collect all Table refs from a join tree.
-///
-/// Returns `(table_name, table_schema, optional_alias)` for each leaf table.
-pub(crate) fn collect_table_refs(
-    table_ref: &AnalyzedTableRef,
-) -> Vec<(
-    &str,
-    &crate::sql::analyzer::types::TableRefSchema,
-    Option<&str>,
-)> {
-    match &table_ref.kind {
-        AnalyzedTableRefKind::Table { name, schema } => {
-            vec![(name.as_str(), schema, table_ref.alias.as_deref())]
-        }
-        AnalyzedTableRefKind::Join { left, right, .. } => {
-            let mut refs = collect_table_refs(left);
-            refs.extend(collect_table_refs(right));
-            refs
-        }
-        _ => vec![],
     }
 }
 

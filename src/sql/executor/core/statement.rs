@@ -1136,35 +1136,32 @@ impl Executor {
                         // Build PlanningContext with real table statistics and schemas,
                         // identical to execution path — uses get_or_load_stats
                         // to warm cache from persisted TiKV stats on miss.
+                        //
+                        // Uses collect_query_table_refs to recursively walk the
+                        // query body, handling SetOperation branches uniformly.
                         let mut planning_ctx = crate::sql::optimizer::PlanningContext::empty();
-                        if let crate::sql::analyzer::types::AnalyzedQueryBody::Select(select) =
-                            &analyzed.body
                         {
+                            let table_refs =
+                                crate::sql::optimizer::collect_query_table_refs(&analyzed);
                             let mut stats_attempted = HashSet::new();
-                            for table_ref in &select.from {
-                                for (name, schema, _alias) in
-                                    crate::sql::executor::select::analyzed::collect_table_refs(
-                                        table_ref,
-                                    )
+                            for (name, schema, _alias) in &table_refs {
+                                let tid = schema.table_id;
+                                let stats = if stats_attempted.insert(tid) {
+                                    self.get_or_load_stats(txn, db_id, tid).await?
+                                } else {
+                                    self.stats_cache().get_full_stats(db_id, tid)
+                                };
+                                if let Some(stats) = stats {
+                                    planning_ctx.table_stats.insert(name.to_string(), stats);
+                                }
+                                // Load full table schema (with index metadata)
+                                // for access-path selection — mirrors execution path.
+                                if let Some(table_schema) =
+                                    self.store().get_schema(txn, db_id, name).await?
                                 {
-                                    let tid = schema.table_id;
-                                    let stats = if stats_attempted.insert(tid) {
-                                        self.get_or_load_stats(txn, db_id, tid).await?
-                                    } else {
-                                        self.stats_cache().get_full_stats(db_id, tid)
-                                    };
-                                    if let Some(stats) = stats {
-                                        planning_ctx.table_stats.insert(name.to_string(), stats);
-                                    }
-                                    // Load full table schema (with index metadata)
-                                    // for access-path selection — mirrors execution path.
-                                    if let Some(table_schema) =
-                                        self.store().get_schema(txn, db_id, name).await?
-                                    {
-                                        planning_ctx
-                                            .table_schemas
-                                            .insert(name.to_string(), table_schema);
-                                    }
+                                    planning_ctx
+                                        .table_schemas
+                                        .insert(name.to_string(), table_schema);
                                 }
                             }
                         }

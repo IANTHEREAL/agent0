@@ -251,7 +251,7 @@ EXPLAIN query
 
 **Purpose**: Cost-based query optimization. Transforms `AnalyzedQuery` into an optimized physical plan.
 
-**Current status**: Phase 2 complete. Single-table SELECTs with selectivity estimation. Gated by `tipg.use_optimizer` GUC (default OFF).
+**Current status**: Default ON. Covers single-table, multi-table joins, set operations (UNION/INTERSECT/EXCEPT), CTEs, window functions, and DISTINCT ON. Includes selectivity estimation and index selection. Safety valve: `SET tipg.use_optimizer = off`.
 
 ```
 AnalyzedQuery
@@ -498,8 +498,8 @@ AFTER triggers: deferred to commit (src/sql/trigger_worker.rs)
 | Milestone | Description | Key Files |
 |-----------|-------------|-----------|
 | Analyzer pipeline | Single-path typed IR for all SELECT queries | `analyzer/` |
-| CBO Phase 1 | LogicalPlan → PhysicalPlan → BoxedOperator pipeline | `optimizer/` |
-| CBO Phase 2 | ANALYZE + selectivity estimation + stats cache | `optimizer/selectivity.rs`, `stats.rs` |
+| CBO optimizer | LogicalPlan → PhysicalPlan → BoxedOperator pipeline (default ON, multi-table + set ops + CTEs + window + DISTINCT ON) | `optimizer/` |
+| ANALYZE + stats | Selectivity estimation + stats cache + warm-up | `optimizer/selectivity.rs`, `stats.rs` |
 | Legacy cleanup | Removed 10 legacy code items, single execution path | All |
 | Privilege enforcement | SELECT privilege on every base table | `executor/core/statement.rs` |
 | 35+ catalog views | pg_catalog + information_schema compatibility | `catalog/` |

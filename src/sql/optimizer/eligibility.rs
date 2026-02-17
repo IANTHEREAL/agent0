@@ -5,30 +5,63 @@
 //! guards (locks, SELECT INTO) — this helper covers query shape + expression
 //! safety only.
 
+use std::collections::HashSet;
+
 use crate::sql::analyzer::types::{
     AnalyzedDistinct, AnalyzedQuery, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef,
-    AnalyzedTableRefKind, JoinCondition, TypedExpr, TypedExprKind,
+    AnalyzedTableRefKind, JoinCondition,
 };
 use crate::sql::expr::classify::needs_async;
 use crate::sql::optimizer::logical_planner::expr_has_aggregate;
 
 /// Check whether a query is eligible for the CBO optimizer pipeline.
 ///
-/// Phase 3 eligibility covers:
-/// - SELECT body only (no SetOperation, no VALUES)
-/// - FROM non-empty; may be a single join tree (`A JOIN B`) OR multiple
-///   comma-separated tables (`FROM a, b`). The analyzer keeps comma FROM as
-///   separate entries in `select.from`; the logical planner builds implicit
-///   CROSS JOINs for them (`LogicalPlanner::build_from`).
-/// - All leaf table refs are Table (no subquery, no function)
+/// Eligibility covers:
+/// - SELECT body (with real tables, no subquery/function leaves, no async exprs)
+/// - SetOperation body (UNION/INTERSECT/EXCEPT) when all branches are
+///   individually eligible (recursive check)
+/// - CTEs (WITH clauses): CTE names are threaded through to prevent
+///   false rejection by the virtual catalog table check
+/// - FROM non-empty for SELECT branches; may be a single join tree
+///   (`A JOIN B`) OR multiple comma-separated tables (`FROM a, b`)
 /// - No expression position contains async expressions (subqueries,
 ///   catalog-dependent functions)
 pub fn is_optimizer_eligible(analyzed: &AnalyzedQuery) -> bool {
+    is_eligible_inner(analyzed, &HashSet::new())
+}
+
+/// Inner eligibility check that threads CTE names from parent to child queries.
+///
+/// `inherited_cte_names` carries CTE names defined at outer query levels,
+/// ensuring that CTE table references in SetOperation branches or nested
+/// scopes are not falsely rejected as virtual catalog tables.
+fn is_eligible_inner(analyzed: &AnalyzedQuery, inherited_cte_names: &HashSet<String>) -> bool {
+    // Merge this query's CTE names with inherited ones (case-insensitive).
+    let mut cte_names = inherited_cte_names.clone();
+    for cte in &analyzed.ctes {
+        cte_names.insert(cte.name.to_lowercase());
+    }
+
     let select = match &analyzed.body {
         AnalyzedQueryBody::Select(select) => select,
-        // SetOperation and Values not supported in optimizer build
-        // (build.rs would fail).
-        _ => return false,
+        AnalyzedQueryBody::SetOperation { left, right, .. } => {
+            // Recursively check each branch independently, threading CTE names.
+            // Branches containing VALUES, TableFunction, or subquery leaves
+            // will be rejected by the recursive check (they hit hard errors
+            // at build.rs Values/TableFunction handlers).
+            if !is_eligible_inner(left, &cte_names) || !is_eligible_inner(right, &cte_names) {
+                return false;
+            }
+            // Check top-level ORDER BY for async expressions.
+            for ob in &analyzed.order_by {
+                if needs_async(&ob.expr) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        // Values not supported in optimizer build (build.rs would fail).
+        AnalyzedQueryBody::Values(_) => return false,
     };
 
     // Must have at least one FROM item.
@@ -38,7 +71,13 @@ pub fn is_optimizer_eligible(analyzed: &AnalyzedQuery) -> bool {
 
     // All leaf table refs must be simple Tables (no subquery, no function).
     // Handles both single join trees and comma-separated FROM items.
-    if !select.from.iter().all(all_leaves_are_tables) {
+    // CTE names are passed through to avoid false rejection when a CTE
+    // shadows a virtual catalog table name (e.g. WITH pg_type AS (...)).
+    if !select
+        .from
+        .iter()
+        .all(|tr| all_leaves_are_tables(tr, &cte_names))
+    {
         return false;
     }
 
@@ -47,36 +86,18 @@ pub fn is_optimizer_eligible(analyzed: &AnalyzedQuery) -> bool {
         return false;
     }
 
-    // Reject CTEs — the optimizer doesn't handle WITH clauses.
-    if !analyzed.ctes.is_empty() {
-        return false;
-    }
-
-    // Reject window functions anywhere — projection, ORDER BY, HAVING.
-    if select
-        .projection
-        .iter()
-        .any(|p| expr_contains_window(&p.expr))
-    {
-        return false;
-    }
-    for ob in &analyzed.order_by {
-        if expr_contains_window(&ob.expr) {
-            return false;
-        }
-    }
-    if let Some(ref having) = select.having {
-        if expr_contains_window(having) {
+    // Reject window functions in DISTINCT ON — PostgreSQL does not allow
+    // window functions outside SELECT list and ORDER BY.
+    if let AnalyzedDistinct::DistinctOn(on_exprs) = &select.distinct {
+        if on_exprs
+            .iter()
+            .any(|e| super::window_rewrite::contains_window(e))
+        {
             return false;
         }
     }
 
-    // Reject DISTINCT ON — requires specialized ordering semantics.
-    if matches!(select.distinct, AnalyzedDistinct::DistinctOn(_)) {
-        return false;
-    }
-
-    // Reject aggregate queries whose ORDER BY / HAVING cannot be rewritten
+    // Reject aggregate queries whose ORDER BY / HAVING / DISTINCT ON cannot be rewritten
     // to post-aggregate column positions.  This is a compile-time feasibility
     // check so that optimize() never needs a runtime fallback path.
     if !select.group_by.is_empty()
@@ -94,8 +115,9 @@ pub fn is_optimizer_eligible(analyzed: &AnalyzedQuery) -> bool {
     true
 }
 
-/// Check whether all ORDER BY / HAVING expressions in an aggregate query
-/// can be rewritten to reference post-aggregate column positions.
+/// Check whether all ORDER BY / HAVING / DISTINCT ON expressions in an
+/// aggregate query can be rewritten to reference post-aggregate column
+/// positions.
 ///
 /// Performs a dry-run of `rewrite_post_aggregate_expr` — if any expression
 /// fails to rewrite, the query is not eligible for the optimizer.
@@ -135,16 +157,32 @@ fn can_rewrite_post_aggregate(select: &AnalyzedSelect, query: &AnalyzedQuery) ->
         }
     }
 
+    // Trial-rewrite DISTINCT ON expressions.
+    if let AnalyzedDistinct::DistinctOn(on_exprs) = &select.distinct {
+        for expr in on_exprs {
+            if super::build::rewrite_post_aggregate_expr(expr, group_by, group_by_count, &agg_exprs)
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+
     true
 }
 
 /// Recursively check that all leaves in a table ref tree are `Table` variants
-/// backed by real KV-persisted schemas (not virtual catalog tables).
-fn all_leaves_are_tables(table_ref: &AnalyzedTableRef) -> bool {
+/// backed by real KV-persisted schemas or CTE definitions (not virtual catalog
+/// tables). CTE names are checked first to prevent false rejection when a CTE
+/// shadows a catalog table name (e.g. `WITH pg_type AS (...)`).
+fn all_leaves_are_tables(table_ref: &AnalyzedTableRef, cte_names: &HashSet<String>) -> bool {
     match &table_ref.kind {
-        AnalyzedTableRefKind::Table { name, .. } => !is_virtual_catalog_table(name),
+        AnalyzedTableRefKind::Table { name, .. } => {
+            // CTE names are valid — resolved from ExecutionContext::cte_tables at runtime.
+            cte_names.contains(&name.to_lowercase()) || !is_virtual_catalog_table(name)
+        }
         AnalyzedTableRefKind::Join { left, right, .. } => {
-            all_leaves_are_tables(left) && all_leaves_are_tables(right)
+            all_leaves_are_tables(left, cte_names) && all_leaves_are_tables(right, cte_names)
         }
         // Subquery and Function table refs not supported.
         _ => false,
@@ -214,37 +252,6 @@ fn has_any_async_expr(select: &AnalyzedSelect, query: &AnalyzedQuery) -> bool {
     }
 
     false
-}
-
-/// Recursively check if an expression contains a window function call.
-fn expr_contains_window(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        TypedExprKind::WindowCall { .. } => true,
-        TypedExprKind::BinaryOp { left, right, .. } => {
-            expr_contains_window(left) || expr_contains_window(right)
-        }
-        TypedExprKind::UnaryOp { operand, .. } => expr_contains_window(operand),
-        TypedExprKind::Cast { expr, .. } => expr_contains_window(expr),
-        TypedExprKind::FunctionCall { args, .. } => args.iter().any(expr_contains_window),
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            operand.as_ref().map_or(false, |e| expr_contains_window(e))
-                || when_clauses
-                    .iter()
-                    .any(|(w, t)| expr_contains_window(w) || expr_contains_window(t))
-                || else_result
-                    .as_ref()
-                    .map_or(false, |e| expr_contains_window(e))
-        }
-        TypedExprKind::AggregateCall { args, filter, .. } => {
-            args.iter().any(expr_contains_window)
-                || filter.as_ref().map_or(false, |f| expr_contains_window(f))
-        }
-        _ => false,
-    }
 }
 
 /// Recursively check JOIN ON conditions for async expressions.

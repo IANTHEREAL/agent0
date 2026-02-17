@@ -88,7 +88,7 @@ impl PhysicalPlanner {
             | LogicalNode::Limit { input, .. }
             | LogicalNode::Distinct { input }
             | LogicalNode::DistinctOn { input, .. }
-            | LogicalNode::Window { input } => Self::resolve_stats(input, ctx),
+            | LogicalNode::Window { input, .. } => Self::resolve_stats(input, ctx),
             // Multi-input / opaque → no stats.
             _ => None,
         }
@@ -492,11 +492,16 @@ impl PhysicalPlanner {
                 }
             }
 
-            LogicalNode::Window { input } => {
+            LogicalNode::Window {
+                window_functions,
+                input,
+                ..
+            } => {
                 let child = Self::plan_node(input, ctx);
                 let cost = child.cost.clone();
                 PhysicalPlan {
                     node: PhysicalNode::Window {
+                        window_functions: window_functions.clone(),
                         input: Box::new(child),
                     },
                     schema: logical.schema.clone(),

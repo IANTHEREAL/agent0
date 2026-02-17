@@ -1319,7 +1319,7 @@ pub fn physical_plan_to_plan_node(
                 child: Box::new(child),
             }
         }
-        PhysicalNode::Window { input } => {
+        PhysicalNode::Window { input, .. } => {
             // Window functions don't have a dedicated PlanNode — show child.
             physical_plan_to_plan_node(input)
         }

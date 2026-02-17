@@ -7,7 +7,8 @@
 //! ```text
 //! FROM       → Scan / Join / Subquery
 //! WHERE      → Filter
-//! ORDER BY   → Sort          ← on full scan-scope rows
+//! [WINDOW]   → Window        ← appends window columns (if present)
+//! ORDER BY   → Sort          ← on full-width (or post-window) rows
 //! SELECT     → Project       ← narrows to output columns
 //! DISTINCT   → Distinct / DistinctOn
 //! ```
@@ -18,8 +19,10 @@
 //! WHERE      → Filter
 //! GROUP BY   → Aggregate
 //! HAVING     → Filter (rewritten)
+//! [WINDOW]   → Window        ← appends window columns (if present)
 //! ORDER BY   → Sort   (rewritten)
-//! DISTINCT   → Distinct
+//! SELECT     → Project       ← only when window functions present
+//! DISTINCT   → Distinct / DistinctOn
 //! ```
 //!
 //! Precondition: the caller has verified `is_optimizer_eligible()`, which
@@ -27,9 +30,12 @@
 //! function therefore always returns a plan (no `Option`).
 
 use super::logical_plan::{LogicalNode, LogicalPlan, PlanSchema};
+use super::window_rewrite::{
+    collect_window_calls_from_expr, contains_window, rewrite_for_post_window,
+};
 use crate::sql::analyzer::types::{
-    AnalyzedDistinct, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind,
-    TypedExpr, TypedExprKind, TypedOrderByExpr,
+    AnalyzedDistinct, AnalyzedProjection, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef,
+    AnalyzedTableRefKind, TypedExpr, TypedExprKind, TypedOrderByExpr,
 };
 use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::operators::AggregateExpr;
@@ -116,24 +122,39 @@ impl LogicalPlanner {
             plan = plan.filter(predicate.clone());
         }
 
+        // Detect window functions in projection or ORDER BY.
+        let proj_has_win = select.projection.iter().any(|p| contains_window(&p.expr));
+        let order_has_win = order_by.iter().any(|ob| contains_window(&ob.expr));
+        let has_win = proj_has_win || order_has_win;
+
         let proj_schema = PlanSchema::from_columns(output_schema.to_vec());
         if !select.group_by.is_empty()
             || has_aggregates(&select.projection)
             || select.having.is_some()
         {
             // ── Aggregate path ──
-            // Sort and HAVING must be rewritten to reference post-aggregate
-            // column positions instead of scan-scope column indices.
-            plan = plan.aggregate(
-                select.group_by.clone(),
-                select.projection.clone(),
-                proj_schema,
-            );
-
-            // Extract aggregate metadata needed for rewriting.
+            // Extract aggregate metadata needed for rewriting.  Must run on the
+            // FULL projection (including window items) so that aggregates inside
+            // window expressions (e.g. LAG(COUNT(*))) are captured.
             let group_by = &select.group_by;
             let group_by_count = group_by.len();
             let aggregate_exprs = Self::collect_aggregate_exprs(&select.projection);
+
+            let agg_projection = if has_win {
+                // Build a raw projection [group_by_cols..., agg_calls...] so the
+                // Aggregate outputs clean columns without a post-projection that
+                // would choke on WindowCall nodes.
+                Self::build_raw_aggregate_projection(group_by, &aggregate_exprs, &select.projection)
+            } else {
+                select.projection.clone()
+            };
+            let agg_schema = PlanSchema::from_columns(
+                agg_projection
+                    .iter()
+                    .map(|p| (p.output_name.clone(), p.expr.data_type.clone()))
+                    .collect(),
+            );
+            plan = plan.aggregate(select.group_by.clone(), agg_projection, agg_schema);
 
             // HAVING → Filter (rewritten)
             if let Some(having) = &select.having {
@@ -147,8 +168,25 @@ impl LogicalPlanner {
                 plan = plan.filter(rewritten);
             }
 
-            // ORDER BY (rewritten)
-            if !order_by.is_empty() {
+            if has_win {
+                // ── Aggregate + Window path ──
+                // Post-aggregate rewrite the full projection (keeping WindowCalls
+                // intact — rewrite_post_aggregate_expr now recurses into WindowCall
+                // children), then extract window functions and build Window node.
+                let rewritten_proj: Vec<TypedExpr> = select
+                    .projection
+                    .iter()
+                    .map(|p| {
+                        super::build::rewrite_post_aggregate_expr(
+                            &p.expr,
+                            group_by,
+                            group_by_count,
+                            &aggregate_exprs,
+                        )
+                        .expect("eligibility gate guarantees projection rewrite succeeds")
+                    })
+                    .collect();
+
                 let rewritten_order: Vec<TypedOrderByExpr> = order_by
                     .iter()
                     .map(|ob| {
@@ -166,39 +204,213 @@ impl LogicalPlanner {
                         }
                     })
                     .collect();
-                plan = plan.sort(rewritten_order);
+
+                // Extract window functions from BOTH projection and ORDER BY.
+                let input_col_count = plan.schema.columns.len();
+                let mut window_functions =
+                    Self::extract_window_funcs(&rewritten_proj, &select.projection);
+                for ob in &rewritten_order {
+                    collect_window_calls_from_expr(
+                        &ob.expr,
+                        "order_by_window",
+                        &mut window_functions,
+                    );
+                }
+
+                // Build window output schema (input columns + window columns).
+                let mut win_schema_cols = plan.schema.columns.clone();
+                for wf in &window_functions {
+                    win_schema_cols.push((wf.output_name.clone(), wf.output_type.clone()));
+                }
+                let win_schema = PlanSchema::from_columns(win_schema_cols);
+                plan = plan.window(window_functions, win_schema);
+
+                // Rewrite projection and ORDER BY: WindowCall → ColumnRef.
+                // Use a shared counter so indices match the extraction order
+                // (projection first, then ORDER BY).
+                let mut win_counter = 0usize;
+                let final_proj: Vec<AnalyzedProjection> = rewritten_proj
+                    .iter()
+                    .zip(select.projection.iter())
+                    .map(|(expr, orig)| AnalyzedProjection {
+                        expr: rewrite_for_post_window(expr, input_col_count, &mut win_counter),
+                        output_name: orig.output_name.clone(),
+                    })
+                    .collect();
+                let final_order: Vec<TypedOrderByExpr> = rewritten_order
+                    .iter()
+                    .map(|ob| TypedOrderByExpr {
+                        expr: rewrite_for_post_window(&ob.expr, input_col_count, &mut win_counter),
+                        asc: ob.asc,
+                        nulls_first: ob.nulls_first,
+                    })
+                    .collect();
+
+                // Sort → DistinctOn/Project/Distinct
+                if !final_order.is_empty() {
+                    plan = plan.sort(final_order);
+                }
+                match &select.distinct {
+                    AnalyzedDistinct::DistinctOn(on_exprs) => {
+                        // Rewrite on_exprs for post-aggregate positions.
+                        let rewritten_on: Vec<TypedExpr> = on_exprs
+                            .iter()
+                            .map(|e| {
+                                super::build::rewrite_post_aggregate_expr(
+                                    e,
+                                    group_by,
+                                    group_by_count,
+                                    &aggregate_exprs,
+                                )
+                                .expect("eligibility gate guarantees DISTINCT ON rewrite succeeds")
+                            })
+                            .collect();
+                        plan = plan.distinct_on(rewritten_on);
+                        plan = plan.project(final_proj, proj_schema);
+                    }
+                    _ => {
+                        plan = plan.project(final_proj, proj_schema);
+                        if matches!(select.distinct, AnalyzedDistinct::Distinct) {
+                            plan = plan.distinct();
+                        }
+                    }
+                }
+            } else {
+                // ── Aggregate without windows ──
+                // ORDER BY (rewritten)
+                if !order_by.is_empty() {
+                    let rewritten_order: Vec<TypedOrderByExpr> = order_by
+                        .iter()
+                        .map(|ob| {
+                            let expr = super::build::rewrite_post_aggregate_expr(
+                                &ob.expr,
+                                group_by,
+                                group_by_count,
+                                &aggregate_exprs,
+                            )
+                            .expect("eligibility gate guarantees ORDER BY rewrite succeeds");
+                            TypedOrderByExpr {
+                                expr,
+                                asc: ob.asc,
+                                nulls_first: ob.nulls_first,
+                            }
+                        })
+                        .collect();
+                    plan = plan.sort(rewritten_order);
+                }
+
+                // DISTINCT / DISTINCT ON (on post-aggregate rows)
+                match &select.distinct {
+                    AnalyzedDistinct::All => {}
+                    AnalyzedDistinct::Distinct => {
+                        plan = plan.distinct();
+                    }
+                    AnalyzedDistinct::DistinctOn(on_exprs) => {
+                        let rewritten_on: Vec<TypedExpr> = on_exprs
+                            .iter()
+                            .map(|e| {
+                                super::build::rewrite_post_aggregate_expr(
+                                    e,
+                                    group_by,
+                                    group_by_count,
+                                    &aggregate_exprs,
+                                )
+                                .expect("eligibility gate guarantees DISTINCT ON rewrite succeeds")
+                            })
+                            .collect();
+                        plan = plan.distinct_on(rewritten_on);
+                    }
+                }
+            }
+        } else if has_win {
+            // ── Non-aggregate + Window path ──
+            // Window is inserted before Sort/Project.
+
+            // Extract window functions from BOTH projection and ORDER BY.
+            let input_col_count = plan.schema.columns.len();
+            let projection_exprs: Vec<TypedExpr> =
+                select.projection.iter().map(|p| p.expr.clone()).collect();
+            let mut window_functions =
+                Self::extract_window_funcs(&projection_exprs, &select.projection);
+            for ob in order_by {
+                collect_window_calls_from_expr(&ob.expr, "order_by_window", &mut window_functions);
             }
 
-            // DISTINCT (on post-aggregate rows)
+            // Build window output schema (input columns + window columns).
+            let mut win_schema_cols = plan.schema.columns.clone();
+            for wf in &window_functions {
+                win_schema_cols.push((wf.output_name.clone(), wf.output_type.clone()));
+            }
+            let win_schema = PlanSchema::from_columns(win_schema_cols);
+            plan = plan.window(window_functions, win_schema);
+
+            // Rewrite projection and ORDER BY: WindowCall → ColumnRef.
+            // Use a shared counter so indices match the extraction order
+            // (projection first, then ORDER BY).
+            let mut win_counter = 0usize;
+            let rewritten_proj: Vec<AnalyzedProjection> = select
+                .projection
+                .iter()
+                .map(|p| AnalyzedProjection {
+                    expr: rewrite_for_post_window(&p.expr, input_col_count, &mut win_counter),
+                    output_name: p.output_name.clone(),
+                })
+                .collect();
+            let rewritten_order: Vec<TypedOrderByExpr> = order_by
+                .iter()
+                .map(|ob| TypedOrderByExpr {
+                    expr: rewrite_for_post_window(&ob.expr, input_col_count, &mut win_counter),
+                    asc: ob.asc,
+                    nulls_first: ob.nulls_first,
+                })
+                .collect();
+
+            // Sort → DistinctOn/Project/Distinct
+            if !rewritten_order.is_empty() {
+                plan = plan.sort(rewritten_order);
+            }
             match &select.distinct {
-                AnalyzedDistinct::All => {}
-                AnalyzedDistinct::Distinct => {
-                    plan = plan.distinct();
+                AnalyzedDistinct::DistinctOn(on_exprs) => {
+                    // DISTINCT ON on_exprs reference pre-projection full-width rows.
+                    // After Window, full-width rows are still present (Window only appends).
+                    plan = plan.distinct_on(on_exprs.clone());
+                    plan = plan.project(rewritten_proj, proj_schema);
                 }
-                AnalyzedDistinct::DistinctOn(_) => {
-                    // DISTINCT ON is rejected by eligibility gate.
-                    unreachable!("DISTINCT ON rejected by eligibility gate");
+                _ => {
+                    plan = plan.project(rewritten_proj, proj_schema);
+                    if matches!(select.distinct, AnalyzedDistinct::Distinct) {
+                        plan = plan.distinct();
+                    }
                 }
             }
         } else {
-            // ── Non-aggregate path ──
+            // ── Non-aggregate, no window path ──
             // Sort on full-width rows (before projection narrows them).
             if !order_by.is_empty() {
                 plan = plan.sort(order_by.to_vec());
             }
 
-            // Project (narrows columns)
-            plan = plan.project(select.projection.clone(), proj_schema);
-
-            // DISTINCT (on projected rows)
+            // DISTINCT ON vs plain DISTINCT have different placement relative
+            // to Project:
+            //
+            // - DISTINCT ON evaluates on_exprs against pre-projection full-width
+            //   rows (the on_exprs may reference columns not in the output).
+            //   Ordering: Sort → DistinctOn → Project
+            //
+            // - Plain DISTINCT deduplicates on the projected output columns.
+            //   Ordering: Sort → Project → Distinct
             match &select.distinct {
-                AnalyzedDistinct::All => {}
-                AnalyzedDistinct::Distinct => {
-                    plan = plan.distinct();
+                AnalyzedDistinct::DistinctOn(on_exprs) => {
+                    // DistinctOn on full-width rows, then narrow via Project.
+                    plan = plan.distinct_on(on_exprs.clone());
+                    plan = plan.project(select.projection.clone(), proj_schema);
                 }
-                AnalyzedDistinct::DistinctOn(_) => {
-                    // DISTINCT ON is rejected by eligibility gate.
-                    unreachable!("DISTINCT ON rejected by eligibility gate");
+                _ => {
+                    // Project first (narrows columns), then optionally Distinct.
+                    plan = plan.project(select.projection.clone(), proj_schema);
+                    if matches!(select.distinct, AnalyzedDistinct::Distinct) {
+                        plan = plan.distinct();
+                    }
                 }
             }
         }
@@ -223,6 +435,169 @@ impl LogicalPlanner {
             );
         }
         agg_exprs
+    }
+
+    /// Build a "raw" aggregate projection for the aggregate + window path.
+    ///
+    /// Returns `[group_by_col_0, ..., agg_call_0, agg_call_1, ...]` — each
+    /// item is either a group-by ColumnRef or a bare AggregateCall.  This
+    /// ensures:
+    /// - ALL aggregate functions are captured (including those inside window
+    ///   expressions like `ROW_NUMBER() OVER (ORDER BY COUNT(*))`)
+    /// - `build_aggregate_operator` outputs clean group-by + aggregate columns
+    ///   without adding a post-projection that can't evaluate WindowCall nodes
+    /// - The Window node and final Project handle the full expression mapping
+    fn build_raw_aggregate_projection(
+        group_by: &[TypedExpr],
+        aggregate_exprs: &[AggregateExpr],
+        full_projection: &[AnalyzedProjection],
+    ) -> Vec<AnalyzedProjection> {
+        let mut raw = Vec::new();
+
+        // Group-by columns.
+        for (i, gb) in group_by.iter().enumerate() {
+            let name = match &gb.kind {
+                TypedExprKind::ColumnRef { column_name, .. } => column_name.clone(),
+                _ => format!("group_by_{}", i),
+            };
+            raw.push(AnalyzedProjection {
+                expr: gb.clone(),
+                output_name: name,
+            });
+        }
+
+        // Bare aggregate calls (already deduplicated by collect_aggregate_exprs).
+        for (i, ae) in aggregate_exprs.iter().enumerate() {
+            // Find the original TypedExpr for this aggregate in the full projection
+            // so we preserve the exact data type and expression structure.
+            let agg_expr = Self::find_aggregate_typed_expr(ae, full_projection);
+            let name = format!("agg_{}", i);
+            raw.push(AnalyzedProjection {
+                expr: agg_expr,
+                output_name: name,
+            });
+        }
+
+        raw
+    }
+
+    /// Find the TypedExpr for a given AggregateExpr in the projection tree.
+    fn find_aggregate_typed_expr(
+        ae: &AggregateExpr,
+        projection: &[AnalyzedProjection],
+    ) -> TypedExpr {
+        for proj in projection {
+            if let Some(found) = Self::find_agg_in_expr(&proj.expr, ae) {
+                return found;
+            }
+        }
+        // Fallback: reconstruct a minimal AggregateCall.
+        // This shouldn't happen because collect_aggregate_exprs guarantees all
+        // aggregates come from the projection, but be safe.
+        TypedExpr {
+            kind: TypedExprKind::AggregateCall {
+                func: crate::sql::analyzer::types::ResolvedFunction {
+                    name: ae.func_name.clone(),
+                    kind: crate::sql::analyzer::types::FunctionKind::Builtin,
+                    return_type: ae
+                        .arg
+                        .as_ref()
+                        .map_or(crate::types::DataType::Int64, |a| a.data_type.clone()),
+                },
+                args: ae.arg.iter().cloned().collect(),
+                distinct: ae.distinct,
+                filter: ae.filter.as_ref().map(|f| Box::new(f.clone())),
+                order_by: ae.order_by.clone(),
+            },
+            data_type: ae
+                .arg
+                .as_ref()
+                .map_or(crate::types::DataType::Int64, |a| a.data_type.clone()),
+        }
+    }
+
+    /// Search an expression tree for an AggregateCall matching the given AggregateExpr.
+    fn find_agg_in_expr(expr: &TypedExpr, target: &AggregateExpr) -> Option<TypedExpr> {
+        match &expr.kind {
+            TypedExprKind::AggregateCall {
+                func,
+                args,
+                distinct,
+                filter,
+                order_by,
+            } => {
+                if super::build::aggregate_identity_matches(
+                    target, func, args, *distinct, filter, order_by,
+                ) {
+                    return Some(expr.clone());
+                }
+                None
+            }
+            TypedExprKind::BinaryOp { left, right, .. } => Self::find_agg_in_expr(left, target)
+                .or_else(|| Self::find_agg_in_expr(right, target)),
+            TypedExprKind::UnaryOp { operand, .. } | TypedExprKind::Cast { expr: operand, .. } => {
+                Self::find_agg_in_expr(operand, target)
+            }
+            TypedExprKind::FunctionCall { args, .. } => {
+                args.iter().find_map(|a| Self::find_agg_in_expr(a, target))
+            }
+            TypedExprKind::WindowCall {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => args
+                .iter()
+                .chain(partition_by.iter())
+                .find_map(|a| Self::find_agg_in_expr(a, target))
+                .or_else(|| {
+                    order_by
+                        .iter()
+                        .find_map(|ob| Self::find_agg_in_expr(&ob.expr, target))
+                }),
+            TypedExprKind::Case {
+                operand,
+                when_clauses,
+                else_result,
+            } => operand
+                .as_ref()
+                .and_then(|o| Self::find_agg_in_expr(o, target))
+                .or_else(|| {
+                    when_clauses.iter().find_map(|(w, t)| {
+                        Self::find_agg_in_expr(w, target)
+                            .or_else(|| Self::find_agg_in_expr(t, target))
+                    })
+                })
+                .or_else(|| {
+                    else_result
+                        .as_ref()
+                        .and_then(|e| Self::find_agg_in_expr(e, target))
+                }),
+            TypedExprKind::Coalesce(args) | TypedExprKind::MinMax { args, .. } => {
+                args.iter().find_map(|a| Self::find_agg_in_expr(a, target))
+            }
+            TypedExprKind::NullIf(a, b) => {
+                Self::find_agg_in_expr(a, target).or_else(|| Self::find_agg_in_expr(b, target))
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract `WindowFunctionExpr` from a list of typed expressions.
+    ///
+    /// `exprs` and `projection` must be the same length — `exprs[i]` is the
+    /// (possibly post-aggregate-rewritten) expression and `projection[i]`
+    /// provides the output name.
+    fn extract_window_funcs(
+        exprs: &[TypedExpr],
+        projection: &[AnalyzedProjection],
+    ) -> Vec<crate::sql::operators::WindowFunctionExpr> {
+        let mut result = Vec::new();
+        for (i, expr) in exprs.iter().enumerate() {
+            let output_name = &projection[i].output_name;
+            collect_window_calls_from_expr(expr, output_name, &mut result);
+        }
+        result
     }
 
     fn build_from(from: &[AnalyzedTableRef]) -> LogicalPlan {

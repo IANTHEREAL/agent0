@@ -102,7 +102,13 @@ fn rewrite_children(plan: LogicalPlan) -> LogicalPlan {
             on_exprs,
             input: Box::new(rewrite_plan(*input)),
         },
-        LogicalNode::Window { input } => LogicalNode::Window {
+        LogicalNode::Window {
+            window_functions,
+            input_col_count,
+            input,
+        } => LogicalNode::Window {
+            window_functions,
+            input_col_count,
             input: Box::new(rewrite_plan(*input)),
         },
         LogicalNode::Join {
@@ -424,7 +430,13 @@ fn elim_rewrite_children(plan: LogicalPlan) -> LogicalPlan {
             on_exprs,
             input: Box::new(eliminate_cross_joins(*input)),
         },
-        LogicalNode::Window { input } => LogicalNode::Window {
+        LogicalNode::Window {
+            window_functions,
+            input_col_count,
+            input,
+        } => LogicalNode::Window {
+            window_functions,
+            input_col_count,
             input: Box::new(eliminate_cross_joins(*input)),
         },
         LogicalNode::Join {

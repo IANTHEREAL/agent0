@@ -12,6 +12,7 @@ use crate::sql::analyzer::types::{
     AnalyzedProjection, JoinCondition, JoinType, SetOpKind, TypedExpr, TypedFunctionArg,
     TypedOrderByExpr,
 };
+use crate::sql::operators::WindowFunctionExpr;
 use crate::types::DataType;
 
 /// A logical plan tree node.
@@ -117,8 +118,15 @@ pub enum LogicalNode {
     },
 
     /// Window function evaluation.
-    #[allow(dead_code)] // Phase 2+
-    Window { input: Box<LogicalPlan> },
+    ///
+    /// Carries window function definitions and the input column count
+    /// needed to construct `WindowOperator` (which appends window output
+    /// columns after the input columns).
+    Window {
+        window_functions: Vec<WindowFunctionExpr>,
+        input_col_count: usize,
+        input: Box<LogicalPlan>,
+    },
 
     // ── Binary operators ────────────────────────────────
     /// Join two inputs.
@@ -247,6 +255,25 @@ impl LogicalPlan {
                 input: Box::new(self),
             },
             schema,
+        }
+    }
+
+    /// Wrap this plan in a Window node.
+    ///
+    /// The output schema extends the input with one column per window function.
+    pub fn window(
+        self,
+        window_functions: Vec<WindowFunctionExpr>,
+        output_schema: PlanSchema,
+    ) -> Self {
+        let input_col_count = self.schema.columns.len();
+        Self {
+            node: LogicalNode::Window {
+                window_functions,
+                input_col_count,
+                input: Box::new(self),
+            },
+            schema: output_schema,
         }
     }
 }
