@@ -165,11 +165,6 @@ jobs:
         working-directory: orm-tests
         run: npm ci
 
-      - name: Generate Prisma client
-        working-directory: orm-tests
-        continue-on-error: true
-        run: npx prisma generate
-
       - name: Run ORM tests
         working-directory: orm-tests
         run: npm test
