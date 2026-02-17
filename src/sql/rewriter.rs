@@ -38,11 +38,70 @@ pub fn rewrite_query(query: AnalyzedQuery) -> AnalyzedQuery {
         return query;
     };
 
-    if can_flatten(inner_query) {
-        flatten_subquery(query)
-    } else {
-        query
+    if !can_flatten(inner_query) {
+        return query;
     }
+
+    // Criterion 9: no subquery expressions in outer clauses.
+    // Subquery bodies (ScalarSubquery, Exists, InSubquery, AnyAll, ArraySubquery)
+    // may contain correlated refs (scope_depth > 0) that reference the outer row
+    // by column_index. Our remap does not descend into subquery bodies, so after
+    // a non-identity column remap those correlated refs would read the wrong
+    // outer column — producing silent wrong results.
+    if outer_has_subquery_exprs(select, &query.order_by) {
+        return query;
+    }
+
+    flatten_subquery(query)
+}
+
+/// Return true if any outer expression (projection, WHERE, GROUP BY, HAVING,
+/// DISTINCT ON, ORDER BY) contains a subquery expression node.
+fn outer_has_subquery_exprs(select: &AnalyzedSelect, order_by: &[TypedOrderByExpr]) -> bool {
+    let is_subquery_node = |e: &TypedExpr| {
+        matches!(
+            e.kind,
+            TypedExprKind::ScalarSubquery(_)
+                | TypedExprKind::ArraySubquery(_)
+                | TypedExprKind::Exists { .. }
+                | TypedExprKind::InSubquery { .. }
+                | TypedExprKind::AnyAll { .. }
+        )
+    };
+
+    for proj in &select.projection {
+        if expr_any(&proj.expr, &is_subquery_node) {
+            return true;
+        }
+    }
+    if let Some(ref w) = select.where_clause {
+        if expr_any(w, &is_subquery_node) {
+            return true;
+        }
+    }
+    for expr in &select.group_by {
+        if expr_any(expr, &is_subquery_node) {
+            return true;
+        }
+    }
+    if let Some(ref h) = select.having {
+        if expr_any(h, &is_subquery_node) {
+            return true;
+        }
+    }
+    if let AnalyzedDistinct::DistinctOn(ref exprs) = select.distinct {
+        for expr in exprs {
+            if expr_any(expr, &is_subquery_node) {
+                return true;
+            }
+        }
+    }
+    for ob in order_by {
+        if expr_any(&ob.expr, &is_subquery_node) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Check whether the inner subquery meets all conservative flattenable criteria.
@@ -267,9 +326,15 @@ fn flatten_subquery(query: AnalyzedQuery) -> AnalyzedQuery {
 
 // ── WHERE merge ──────────────────────────────────────────────────────────
 
-/// Merge inner and outer WHERE clauses. The inner WHERE is wrapped with IS TRUE
-/// to guard against NULL short-circuit: the evaluator evaluates RHS when LHS is
-/// NULL, so IS TRUE converts NULL→FALSE which short-circuits correctly.
+/// Merge inner and outer WHERE clauses.
+///
+/// When both are present, the inner WHERE is wrapped with IS TRUE to guard
+/// against NULL short-circuit in AND evaluation: the evaluator evaluates RHS
+/// when LHS is NULL, so IS TRUE converts NULL→FALSE which short-circuits.
+///
+/// When only the inner WHERE is present, it is used directly — NULL in WHERE
+/// context is already falsy, and wrapping with IS TRUE would suppress planner
+/// predicate extraction for index selection.
 fn merge_where(
     inner_where: Option<TypedExpr>,
     outer_where: Option<TypedExpr>,
@@ -278,8 +343,10 @@ fn merge_where(
         (None, None) => None,
         (None, Some(outer)) => Some(outer),
         (Some(inner), None) => {
-            // Wrap inner with IS TRUE for NULL safety.
-            Some(wrap_is_true(inner))
+            // No wrapping — NULL is already falsy in WHERE context, and IS TRUE
+            // would prevent the planner from extracting predicates like `a = 1`
+            // for index selection (planner only recognizes bare comparisons).
+            Some(inner)
         }
         (Some(inner), Some(outer)) => {
             let guarded_inner = wrap_is_true(inner);
@@ -1084,7 +1151,8 @@ mod tests {
 
     #[test]
     fn test_where_merge_inner_only() {
-        // Only inner WHERE → becomes outer WHERE (wrapped in IS TRUE)
+        // Only inner WHERE → becomes outer WHERE directly (NOT wrapped in IS TRUE,
+        // because IS TRUE suppresses planner predicate extraction for index selection).
         let inner_where = col_ref(2, "active", DataType::Boolean);
         let inner = simple_inner_query(
             "users",
@@ -1104,9 +1172,10 @@ mod tests {
             panic!("expected Select");
         };
         let w = s.where_clause.as_ref().expect("should have WHERE");
+        // Inner WHERE should be used directly — a bare ColumnRef, not IS TRUE wrapped.
         assert!(
-            matches!(w.kind, TypedExprKind::IsTest { test: IsTestKind::True, negated: false, .. }),
-            "inner-only WHERE should become IS TRUE"
+            matches!(w.kind, TypedExprKind::ColumnRef { column_index: 2, .. }),
+            "inner-only WHERE should be used directly without IS TRUE wrapping"
         );
     }
 
@@ -1301,13 +1370,16 @@ mod tests {
     }
 
     #[test]
-    fn test_remap_stops_at_subquery_boundary() {
-        // Outer WHERE has a ScalarSubquery containing ColumnRef { scope_depth: 0, column_index: 0 }
-        // This ref belongs to the subquery's scope, NOT the outer scope — must NOT be remapped.
+    fn test_no_flatten_outer_subquery_expr() {
+        // Outer WHERE has a ScalarSubquery — flattening must be skipped because
+        // subquery bodies may contain correlated refs (scope_depth > 0) whose
+        // column_index references the outer row layout. Column remap does not
+        // descend into subquery bodies, so after non-identity remap those
+        // correlated refs would read the wrong outer column.
         let inner = simple_inner_query(
             "users",
             vec![
-                projection(2, "c", DataType::Int64), // mapping = [2]
+                projection(2, "c", DataType::Int64), // non-identity mapping = [2]
             ],
             None,
         );
@@ -1338,30 +1410,82 @@ mod tests {
         );
 
         let result = rewrite_query(query);
-        assert!(is_table_from(&result, "users"));
+        // Must NOT flatten — outer contains subquery expression
+        assert!(
+            is_subquery_from(&result),
+            "should bail out when outer has subquery expressions"
+        );
+    }
 
-        // The outer ColumnRef (col0) should be remapped to col2
-        let AnalyzedQueryBody::Select(ref s) = result.body else {
-            panic!("expected Select");
-        };
-        let w = s.where_clause.as_ref().unwrap();
-        // The outer where is remapped, then merged. No inner WHERE so the
-        // merged result is just the remapped outer where directly.
-        if let TypedExprKind::BinaryOp { ref left, ref right, .. } = w.kind {
-            // Left should be remapped col0 → col2
-            if let TypedExprKind::ColumnRef { column_index, .. } = &left.kind {
-                assert_eq!(*column_index, 2, "outer col0 should be remapped to col2");
-            } else {
-                panic!("expected ColumnRef on left side");
-            }
-            // Right should be ScalarSubquery — untouched
-            assert!(
-                matches!(right.kind, TypedExprKind::ScalarSubquery(_)),
-                "ScalarSubquery should remain unchanged"
-            );
-        } else {
-            panic!("expected BinaryOp in WHERE");
-        }
+    #[test]
+    fn test_no_flatten_outer_exists_expr() {
+        // Outer WHERE has an Exists subquery — must not flatten.
+        let inner = simple_inner_query(
+            "users",
+            vec![projection(0, "id", DataType::Int64)],
+            None,
+        );
+
+        let exists_expr = TypedExpr::new(
+            TypedExprKind::Exists {
+                subquery: Box::new(simple_inner_query(
+                    "other",
+                    vec![projection(0, "x", DataType::Int64)],
+                    None,
+                )),
+                negated: false,
+            },
+            DataType::Boolean,
+        );
+
+        let query = wrap_as_outer(
+            inner,
+            "v",
+            vec![projection(0, "id", DataType::Int64)],
+            Some(exists_expr),
+        );
+
+        let result = rewrite_query(query);
+        assert!(
+            is_subquery_from(&result),
+            "should bail out when outer has EXISTS expression"
+        );
+    }
+
+    #[test]
+    fn test_no_flatten_outer_in_subquery_expr() {
+        // Outer WHERE has IN (subquery) — must not flatten.
+        let inner = simple_inner_query(
+            "users",
+            vec![projection(0, "id", DataType::Int64)],
+            None,
+        );
+
+        let in_subquery_expr = TypedExpr::new(
+            TypedExprKind::InSubquery {
+                expr: Box::new(col_ref(0, "id", DataType::Int64)),
+                subquery: Box::new(simple_inner_query(
+                    "other",
+                    vec![projection(0, "x", DataType::Int64)],
+                    None,
+                )),
+                negated: false,
+            },
+            DataType::Boolean,
+        );
+
+        let query = wrap_as_outer(
+            inner,
+            "v",
+            vec![projection(0, "id", DataType::Int64)],
+            Some(in_subquery_expr),
+        );
+
+        let result = rewrite_query(query);
+        assert!(
+            is_subquery_from(&result),
+            "should bail out when outer has IN (subquery) expression"
+        );
     }
 
     #[test]
