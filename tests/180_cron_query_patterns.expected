@@ -1,0 +1,89 @@
+schedule
+1
+(1 row)
+schedule
+2
+(1 row)
+schedule
+3
+(1 row)
+schedule
+4
+(1 row)
+schedule
+5
+(1 row)
+alter_job
+NULL
+(1 row)
+alter_job
+NULL
+(1 row)
+jobname
+refresh_mv
+stats_update
+(2 rows)
+jobname
+backup_daily
+vacuum_hourly
+(2 rows)
+jobname
+backup_daily
+refresh_mv
+stats_update
+(3 rows)
+jobname
+stats_update
+vacuum_hourly
+(2 rows)
+jobname
+refresh_mv
+stats_update
+(2 rows)
+jobname|schedule
+refresh_mv|*/15 * * * *
+stats_update|*/30 * * * *
+vacuum_hourly|0 * * * *
+backup_daily|0 2 * * *
+cleanup_logs|0 3 * * *
+(5 rows)
+jobname
+vacuum_hourly
+stats_update
+refresh_mv
+cleanup_logs
+backup_daily
+(5 rows)
+jobname
+backup_daily
+vacuum_hourly
+refresh_mv
+(3 rows)
+jobname
+refresh_mv
+cleanup_logs
+(2 rows)
+active|cnt
+f|2
+t|3
+(2 rows)
+jobname
+backup_daily
+cleanup_logs
+vacuum_hourly
+(3 rows)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)

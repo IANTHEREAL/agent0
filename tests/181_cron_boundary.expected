@@ -1,0 +1,93 @@
+schedule
+1
+(1 row)
+command
+SELECT 'hello world'
+(1 row)
+schedule
+2
+(1 row)
+command
+SELECT 1; SELECT 2
+(1 row)
+schedule
+3
+(1 row)
+is_long
+t
+(1 row)
+alter_job
+NULL
+(1 row)
+schedule|command|active
+0 0 * * *|SELECT 'hello world'|t
+(1 row)
+schedule
+4
+(1 row)
+schedule
+5
+(1 row)
+schedule
+6
+(1 row)
+schedule
+7
+(1 row)
+schedule
+8
+(1 row)
+schedule
+9
+(1 row)
+schedule
+10
+(1 row)
+count
+10
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+f
+(1 row)
+unschedule
+f
+(1 row)
+unschedule
+t
+(1 row)
+schedule
+11
+(1 row)
+schedule|command
+*/20 * * * *|SELECT 200
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)

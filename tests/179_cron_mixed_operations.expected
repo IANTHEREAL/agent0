@@ -1,0 +1,66 @@
+schedule
+1
+(1 row)
+schedule
+2
+(1 row)
+schedule
+3
+(1 row)
+count
+3
+(1 row)
+count
+2
+(1 row)
+count
+1
+(1 row)
+alter_job
+NULL
+(1 row)
+jobname|active
+cleanup|f
+(1 row)
+alter_job
+NULL
+(1 row)
+jobname|active
+cleanup|t
+(1 row)
+unschedule
+t
+(1 row)
+count
+2
+(1 row)
+unschedule
+t
+(1 row)
+count
+1
+(1 row)
+unschedule
+t
+(1 row)
+count
+0
+(1 row)
+schedule
+4
+(1 row)
+jobid|jobname
+4|new_job
+(1 row)
+unschedule
+t
+(1 row)
+schedule
+5
+(1 row)
+jobid|schedule|command
+5|0 6 * * *|SELECT 99
+(1 row)
+unschedule
+t
+(1 row)

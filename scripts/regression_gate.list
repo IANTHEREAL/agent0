@@ -41,6 +41,10 @@ tests/174_cron_alter_job.sql
 tests/175_cron_error_handling.sql
 tests/176_cron_extension_lifecycle.sql
 tests/177_cron_virtual_table.sql
+tests/178_cron_expressions.sql
+tests/179_cron_mixed_operations.sql
+tests/180_cron_query_patterns.sql
+tests/181_cron_boundary.sql
 tests/218_gin_correctness.sql
 
 [orm]
