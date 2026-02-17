@@ -13,9 +13,8 @@ use crate::sql::error::SqlError;
 use sqlparser::ast::{LockClause, LockType, NonBlock};
 use std::fmt;
 
-use super::materialize::has_catalog_dependent_function;
 use super::rewrite::{has_aggregates, has_windows};
-use super::subquery::has_unresolved_subquery;
+use crate::sql::expr::classify::{has_catalog_dependent_function, has_unresolved_subquery};
 
 // ── Public types ────────────────────────────────────────────────────
 

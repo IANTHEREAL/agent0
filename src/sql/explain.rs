@@ -1135,6 +1135,209 @@ fn format_value(value: &crate::types::Value) -> String {
     }
 }
 
+// ── PhysicalPlan → PlanNode translator ──────────────────────────────
+//
+// Used when the optimizer path is active (GUC on + eligible). Translates the
+// optimizer's PhysicalPlan to the display-oriented PlanNode tree so EXPLAIN
+// shows the same plan that execution actually uses.
+
+/// Convert a PhysicalPlan tree into a PlanNode tree for EXPLAIN display.
+pub fn physical_plan_to_plan_node(
+    phys: &crate::sql::optimizer::physical_plan::PhysicalPlan,
+) -> PlanNode {
+    use crate::sql::optimizer::physical_plan::PhysicalNode;
+
+    let cost = PlanCost {
+        startup: phys.cost.startup,
+        total: phys.cost.total,
+        rows: phys.cost.rows,
+        width: phys.schema.columns.len().saturating_mul(DEFAULT_ROW_WIDTH),
+    };
+
+    match &phys.node {
+        PhysicalNode::SeqScan { table_name, alias } => PlanNode::SeqScan {
+            table_name: table_name.clone(),
+            alias: alias.clone(),
+            filter: None,
+            cost,
+        },
+        PhysicalNode::IndexScan {
+            table_name,
+            alias,
+            index_name,
+        } => PlanNode::IndexScan {
+            table_name: table_name.clone(),
+            alias: alias.clone(),
+            index_name: index_name.clone(),
+            index_cond: None,
+            filter: None,
+            cost,
+        },
+        PhysicalNode::Filter { predicate, input } => {
+            let child = physical_plan_to_plan_node(input);
+            PlanNode::Filter {
+                condition: format_typed_expr(predicate),
+                cost,
+                child: Box::new(child),
+            }
+        }
+        PhysicalNode::Project { input, .. } => {
+            // Project is implicit in EXPLAIN — show the child directly.
+            physical_plan_to_plan_node(input)
+        }
+        PhysicalNode::NestedLoopJoin {
+            left,
+            right,
+            join_type,
+            ..
+        } => {
+            let left_node = physical_plan_to_plan_node(left);
+            let right_node = physical_plan_to_plan_node(right);
+            PlanNode::NestedLoop {
+                join_type: format!("{:?}", join_type),
+                cost,
+                children: vec![left_node, right_node],
+            }
+        }
+        PhysicalNode::HashJoin {
+            left,
+            right,
+            join_type,
+            condition,
+            ..
+        } => {
+            let left_node = physical_plan_to_plan_node(left);
+            let right_node = physical_plan_to_plan_node(right);
+            let cond_str = match condition {
+                JoinCondition::On(expr) => Some(format_typed_expr(expr)),
+                JoinCondition::Using(cols) => Some(
+                    cols.iter()
+                        .map(|c| c.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+                JoinCondition::None => None,
+            };
+            PlanNode::HashJoin {
+                join_type: format!("{:?}", join_type),
+                hash_cond: cond_str,
+                cost,
+                children: vec![left_node, right_node],
+            }
+        }
+        PhysicalNode::Sort { order_by, input } => {
+            let child = physical_plan_to_plan_node(input);
+            let sort_keys: Vec<String> = order_by
+                .iter()
+                .map(|ob| {
+                    let dir = if ob.asc { "ASC" } else { "DESC" };
+                    format!("{} {}", format_typed_expr(&ob.expr), dir)
+                })
+                .collect();
+            PlanNode::Sort {
+                sort_key: sort_keys,
+                cost,
+                child: Box::new(child),
+            }
+        }
+        PhysicalNode::TopNSort {
+            order_by,
+            limit,
+            input,
+        } => {
+            let child = physical_plan_to_plan_node(input);
+            let sort_keys: Vec<String> = order_by
+                .iter()
+                .map(|ob| {
+                    let dir = if ob.asc { "ASC" } else { "DESC" };
+                    format!("{} {}", format_typed_expr(&ob.expr), dir)
+                })
+                .collect();
+            let sorted = PlanNode::Sort {
+                sort_key: sort_keys,
+                cost: cost.clone(),
+                child: Box::new(child),
+            };
+            PlanNode::Limit {
+                count: *limit,
+                cost,
+                child: Box::new(sorted),
+            }
+        }
+        PhysicalNode::Limit { input, .. } => {
+            let child = physical_plan_to_plan_node(input);
+            PlanNode::Limit {
+                count: phys.cost.rows,
+                cost,
+                child: Box::new(child),
+            }
+        }
+        PhysicalNode::HashAggregate {
+            group_by, input, ..
+        } => {
+            let child = physical_plan_to_plan_node(input);
+            let keys: Vec<String> = group_by.iter().map(format_typed_expr).collect();
+            let strategy = if keys.is_empty() {
+                "Plain".to_string()
+            } else {
+                "HashAggregate".to_string()
+            };
+            PlanNode::Aggregate {
+                strategy,
+                keys,
+                cost,
+                child: Box::new(child),
+            }
+        }
+        PhysicalNode::StreamAggregate {
+            group_by, input, ..
+        } => {
+            let child = physical_plan_to_plan_node(input);
+            let keys: Vec<String> = group_by.iter().map(format_typed_expr).collect();
+            PlanNode::Aggregate {
+                strategy: "GroupAggregate".to_string(),
+                keys,
+                cost,
+                child: Box::new(child),
+            }
+        }
+        PhysicalNode::Distinct { input } | PhysicalNode::DistinctOn { input, .. } => {
+            let child = physical_plan_to_plan_node(input);
+            PlanNode::Aggregate {
+                strategy: "Unique".to_string(),
+                keys: vec![],
+                cost,
+                child: Box::new(child),
+            }
+        }
+        PhysicalNode::Window { input } => {
+            // Window functions don't have a dedicated PlanNode — show child.
+            physical_plan_to_plan_node(input)
+        }
+        PhysicalNode::SetOperation { left, right, .. } => {
+            // Approximate as nested loop for display purposes.
+            let left_node = physical_plan_to_plan_node(left);
+            let right_node = physical_plan_to_plan_node(right);
+            PlanNode::NestedLoop {
+                join_type: "SetOperation".to_string(),
+                cost,
+                children: vec![left_node, right_node],
+            }
+        }
+        PhysicalNode::Empty | PhysicalNode::Values { .. } => PlanNode::Result { cost },
+        PhysicalNode::TableFunction {
+            function_name,
+            alias,
+            ..
+        } => PlanNode::TableFunctionScan {
+            function_name: function_name.clone(),
+            alias: alias.clone(),
+            cost,
+        },
+        PhysicalNode::Subquery { subplan, .. } => physical_plan_to_plan_node(subplan),
+    }
+}
+
 pub fn format_plan_text(plan: &PlanNode, indent: usize) -> String {
     let mut output = String::new();
     format_plan_node(&mut output, plan, indent, true);

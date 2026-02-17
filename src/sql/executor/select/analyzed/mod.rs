@@ -7,9 +7,9 @@
 //! Handles FOR UPDATE/SHARE row locking and SELECT INTO natively.
 
 use crate::sql::analyzer::types::{
-    AnalyzedDistinct, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind,
-    BinaryOp as TypedBinaryOp, JoinCondition, SetOpKind, TypedExpr, TypedExprKind,
-    TypedFunctionArg, TypedOrderByExpr,
+    reindex_join_condition, AnalyzedDistinct, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef,
+    AnalyzedTableRefKind, BinaryOp as TypedBinaryOp, JoinCondition, SetOpKind, TypedExpr,
+    TypedExprKind, TypedFunctionArg, TypedOrderByExpr,
 };
 use crate::sql::analyzer::{AnalyzedQuery, Analyzer};
 use crate::sql::executor::core::catalog_prefetch::build_catalog_snapshot;
@@ -112,10 +112,10 @@ impl Executor {
         // ── CBO optimizer routing gate ──────────────────────────────
         // When `SET tipg.use_optimizer = on`, eligible queries are routed through
         // the new optimizer pipeline: AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator.
-        // Phase 1: single-table SELECTs without locks or SELECT INTO.
+        // Phase 3: single-table and multi-table joins without locks or SELECT INTO.
         if crate::sql::query_context::QueryContext::use_optimizer()
             && expanded_query.locks.is_empty()
-            && is_optimizer_eligible(&analyzed)
+            && crate::sql::optimizer::eligibility::is_optimizer_eligible(&analyzed)
         {
             let result = self
                 .execute_via_optimizer(txn, db_id, sequence_values, search_path, &analyzed, ctes)
@@ -2657,8 +2657,7 @@ impl Executor {
     ///
     /// `AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator → execute`
     ///
-    /// Phase 1: handles single-table SELECTs. Returns Err to fall back to the
-    /// current path if the optimizer cannot handle the query.
+    /// Phase 3: handles single-table SELECTs and multi-table JOINs.
     async fn execute_via_optimizer(
         &self,
         txn: &mut Transaction,
@@ -2669,52 +2668,45 @@ impl Executor {
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
         use crate::sql::operators::execute_operator_tree_with_ctes;
-        use crate::sql::optimizer::{
-            BuildContext, LogicalPlanner, PhysicalPlanner, PlanningContext,
-        };
+        use crate::sql::optimizer::{BuildContext, PlanningContext};
 
         tracing::debug!(target: "optimizer", "routing query through CBO pipeline");
 
-        // Step 1: AnalyzedQuery → LogicalPlan
-        let logical = LogicalPlanner::build(analyzed);
-
-        // Step 1.5: Build PlanningContext with table statistics (if available).
+        // Step 1: Build PlanningContext with table statistics (if available).
+        // Recursively collect from join trees.
         let mut planning_ctx = PlanningContext::empty();
         if let AnalyzedQueryBody::Select(select) = &analyzed.body {
             for table_ref in &select.from {
-                if let AnalyzedTableRefKind::Table {
-                    ref name,
-                    ref schema,
-                } = table_ref.kind
-                {
+                for (name, schema, _alias) in collect_table_refs(table_ref) {
                     if let Some(stats) = self.stats_cache().get_full_stats(db_id, schema.table_id) {
-                        planning_ctx.table_stats.insert(name.clone(), stats);
+                        planning_ctx.table_stats.insert(name.to_string(), stats);
                     }
                 }
             }
         }
 
-        // Step 2: LogicalPlan → PhysicalPlan
-        let physical = PhysicalPlanner::plan(&logical, &planning_ctx);
+        // Step 2: AnalyzedQuery → PhysicalPlan (shared entrypoint)
+        let physical = crate::sql::optimizer::optimize(analyzed, &planning_ctx);
 
         // Step 3: Resolve table schemas for the operator bridge.
+        // Recursively collect from join trees.
         let mut build_ctx = BuildContext::new();
         if let AnalyzedQueryBody::Select(select) = &analyzed.body {
             for table_ref in &select.from {
-                if let AnalyzedTableRefKind::Table { ref name, .. } = table_ref.kind {
-                    let alias = table_ref.alias.as_deref().unwrap_or(name);
+                for (name, _schema, alias) in collect_table_refs(table_ref) {
+                    let display_alias = alias.unwrap_or(name);
                     let cte_key = name.to_lowercase();
                     if let Some((cte_schema, _)) = ctes.get(&cte_key) {
-                        build_ctx = build_ctx.with_schema(name.clone(), cte_schema.clone());
+                        build_ctx = build_ctx.with_schema(name.to_string(), cte_schema.clone());
                     } else if let Some(table_schema) =
                         self.store().get_schema(txn, db_id, name).await?
                     {
                         let mut schema = table_schema;
                         let short = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-                        if !short.eq_ignore_ascii_case(alias) {
-                            schema.from_alias = Some(alias.to_string());
+                        if !short.eq_ignore_ascii_case(display_alias) {
+                            schema.from_alias = Some(display_alias.to_string());
                         }
-                        build_ctx = build_ctx.with_schema(name.clone(), schema);
+                        build_ctx = build_ctx.with_schema(name.to_string(), schema);
                     } else {
                         // Virtual/info_schema tables — fall back.
                         return Err(anyhow!(
@@ -2763,22 +2755,26 @@ impl Executor {
     }
 }
 
-/// Check whether a query is eligible for the CBO optimizer pipeline.
+/// Recursively collect all Table refs from a join tree.
 ///
-/// Phase 1 eligibility: single-table SELECT without correlated subqueries,
-/// table functions, or complex features that the optimizer doesn't handle yet.
-fn is_optimizer_eligible(analyzed: &AnalyzedQuery) -> bool {
-    match &analyzed.body {
-        AnalyzedQueryBody::Select(select) => {
-            // Must have exactly one FROM table.
-            if select.from.len() != 1 {
-                return false;
-            }
-            // Must be a simple table reference (not a subquery, join, or function).
-            matches!(select.from[0].kind, AnalyzedTableRefKind::Table { .. })
+/// Returns `(table_name, table_schema, optional_alias)` for each leaf table.
+pub(crate) fn collect_table_refs(
+    table_ref: &AnalyzedTableRef,
+) -> Vec<(
+    &str,
+    &crate::sql::analyzer::types::TableRefSchema,
+    Option<&str>,
+)> {
+    match &table_ref.kind {
+        AnalyzedTableRefKind::Table { name, schema } => {
+            vec![(name.as_str(), schema, table_ref.alias.as_deref())]
         }
-        // Set operations and VALUES not supported in Phase 1.
-        _ => false,
+        AnalyzedTableRefKind::Join { left, right, .. } => {
+            let mut refs = collect_table_refs(left);
+            refs.extend(collect_table_refs(right));
+            refs
+        }
+        _ => vec![],
     }
 }
 

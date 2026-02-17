@@ -1,6 +1,7 @@
 //! Expression evaluation logic
 
 pub mod bridge;
+pub mod classify;
 pub mod compile;
 pub mod functions;
 mod numeric;

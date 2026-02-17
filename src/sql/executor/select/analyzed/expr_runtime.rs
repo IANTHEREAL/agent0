@@ -22,8 +22,8 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tikv_client::Transaction;
 
-use super::materialize::has_catalog_dependent_function;
-use super::subquery::{has_unresolved_subquery, split_where_for_async};
+use super::subquery::split_where_for_async;
+use crate::sql::expr::classify::{has_catalog_dependent_function, has_unresolved_subquery};
 
 // ── Supporting types ──────────────────────────────────────────────
 
@@ -429,7 +429,7 @@ impl<'a> ExprRuntime<'a> {
 
 /// Check if a TypedExpr needs async (per-row) materialization.
 pub(super) fn needs_async(expr: &TypedExpr) -> bool {
-    has_unresolved_subquery(expr) || has_catalog_dependent_function(expr)
+    crate::sql::expr::classify::needs_async(expr)
 }
 
 /// Execute an async nested-loop join with per-row ON condition materialization.

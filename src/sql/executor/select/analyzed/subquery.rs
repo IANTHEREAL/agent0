@@ -5,6 +5,7 @@ use crate::sql::analyzer::types::{
     JoinCondition, TypedExpr, TypedExprKind, TypedOrderByExpr,
 };
 use crate::sql::analyzer::AnalyzedQuery;
+use crate::sql::expr::classify::has_unresolved_subquery;
 use crate::types::{DataType, Row, Value};
 
 /// Check if an AnalyzedQuery references outer scope columns (correlated).
@@ -533,70 +534,6 @@ pub(super) fn substitute_outer_refs_in_expr(expr: &TypedExpr, outer_row: &Row) -
 }
 
 // ── WHERE clause splitting for async subquery handling ────────
-
-/// Check if a TypedExpr tree contains any non-materialized subquery node.
-/// Used to detect expressions that can't be evaluated synchronously by FilterOperator.
-pub(super) fn has_unresolved_subquery(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        TypedExprKind::ScalarSubquery(_)
-        | TypedExprKind::ArraySubquery(_)
-        | TypedExprKind::Exists { .. }
-        | TypedExprKind::InSubquery { .. }
-        | TypedExprKind::AnyAll { .. } => true,
-        TypedExprKind::BinaryOp { left, right, .. } => {
-            has_unresolved_subquery(left) || has_unresolved_subquery(right)
-        }
-        TypedExprKind::UnaryOp { operand, .. }
-        | TypedExprKind::Cast { expr: operand, .. }
-        | TypedExprKind::IsTest { expr: operand, .. } => has_unresolved_subquery(operand),
-        TypedExprKind::Between {
-            expr, low, high, ..
-        } => {
-            has_unresolved_subquery(expr)
-                || has_unresolved_subquery(low)
-                || has_unresolved_subquery(high)
-        }
-        TypedExprKind::InList { expr, list, .. } => {
-            has_unresolved_subquery(expr) || list.iter().any(has_unresolved_subquery)
-        }
-        TypedExprKind::Like { expr, pattern, .. }
-        | TypedExprKind::SimilarTo { expr, pattern, .. } => {
-            has_unresolved_subquery(expr) || has_unresolved_subquery(pattern)
-        }
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            operand.as_ref().is_some_and(|e| has_unresolved_subquery(e))
-                || when_clauses
-                    .iter()
-                    .any(|(w, t)| has_unresolved_subquery(w) || has_unresolved_subquery(t))
-                || else_result
-                    .as_ref()
-                    .is_some_and(|e| has_unresolved_subquery(e))
-        }
-        TypedExprKind::Coalesce(args)
-        | TypedExprKind::MinMax { args, .. }
-        | TypedExprKind::ArrayLiteral(args)
-        | TypedExprKind::Row(args) => args.iter().any(has_unresolved_subquery),
-        TypedExprKind::NullIf(a, b) => has_unresolved_subquery(a) || has_unresolved_subquery(b),
-        TypedExprKind::FunctionCall { args, filter, .. } => {
-            args.iter().any(has_unresolved_subquery)
-                || filter.as_ref().is_some_and(|f| has_unresolved_subquery(f))
-        }
-        TypedExprKind::AggregateCall { args, filter, .. } => {
-            args.iter().any(has_unresolved_subquery)
-                || filter.as_ref().is_some_and(|f| has_unresolved_subquery(f))
-        }
-        TypedExprKind::ArrayIndex { array, index } => {
-            has_unresolved_subquery(array) || has_unresolved_subquery(index)
-        }
-        TypedExprKind::JsonAccess { expr, .. } => has_unresolved_subquery(expr),
-        TypedExprKind::Constant(_) | TypedExprKind::ColumnRef { .. } => false,
-        _ => false,
-    }
-}
 
 /// Split a WHERE clause (AND-conjunction) into sync and async parts.
 ///
