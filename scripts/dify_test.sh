@@ -13,6 +13,7 @@ PG_TIKV_PORT=${PG_TIKV_PORT:-5433}
 PG_TIKV_HOST=${PG_TIKV_HOST:-0.0.0.0}
 PD_ENDPOINTS=${PD_ENDPOINTS:-127.0.0.1:46515}
 DIFY_KEYSPACE=${DIFY_KEYSPACE:-dify}
+PG_TIKV_ADMIN_PASSWORD=${PG_TIKV_ADMIN_PASSWORD:-admin}
 
 # Colors
 RED='\033[0;31m'
@@ -42,6 +43,7 @@ Environment Variables:
     PG_TIKV_HOST    pg-tikv listen address (default: 0.0.0.0)
     PD_ENDPOINTS    TiKV PD endpoints (default: 127.0.0.1:46515)
     DIFY_KEYSPACE   Keyspace/tenant name (default: dify)
+    PG_TIKV_ADMIN_PASSWORD  Bootstrap/admin password for pg-tikv (default: admin)
 
 Examples:
     $0 start                    # Start everything
@@ -77,6 +79,10 @@ start_pgtikv() {
     PD_ENDPOINTS="$PD_ENDPOINTS" \
     PG_PORT="$PG_TIKV_PORT" \
     PG_LISTEN_ADDR="$PG_TIKV_HOST" \
+    PG_KEYSPACE="$DIFY_KEYSPACE" \
+    PGTIKV_BOOTSTRAP_ADMIN_USER=admin \
+    PGTIKV_BOOTSTRAP_ADMIN_PASSWORD="$PG_TIKV_ADMIN_PASSWORD" \
+    PGTIKV_INSECURE=1 \
     ./target/release/pg-tikv > /tmp/pgtikv-dify.log 2>&1 &
     
     # Wait for startup
@@ -110,7 +116,7 @@ setup_dify_env() {
     sed -i "s|^DB_HOST=.*|DB_HOST=host.docker.internal|" .env
     sed -i "s|^DB_PORT=.*|DB_PORT=${PG_TIKV_PORT}|" .env
     sed -i "s|^DB_USERNAME=.*|DB_USERNAME=${DIFY_KEYSPACE}.admin|" .env
-    sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=admin|" .env
+    sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${PG_TIKV_ADMIN_PASSWORD}|" .env
     sed -i "s|^DB_DATABASE=.*|DB_DATABASE=postgres|" .env
     
     # Also update plugin daemon database

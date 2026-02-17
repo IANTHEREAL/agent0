@@ -190,13 +190,16 @@ Note: `scripts/tikv_admin.py start` uses PD client port `2379` by default (and P
 
 ```bash
 cargo build --release
-PD_ENDPOINTS=127.0.0.1:<pd_port> PG_PORT=5433 ./target/release/pg-tikv
+PD_ENDPOINTS=127.0.0.1:<pd_port> \
+PG_PORT=5433 \
+PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=admin \
+./target/release/pg-tikv
 ```
 
 Connect (requires `psql`):
 
 ```bash
-export PG_DSN='postgres://admin:admin@127.0.0.1:5433/postgres'
+export PG_DSN='postgres://admin:admin@127.0.0.1:5433/postgres'  # password comes from bootstrap
 PGPASSWORD=admin psql -h 127.0.0.1 -p 5433 -U admin -d postgres -c 'SELECT 1'
 ```
 

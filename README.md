@@ -377,7 +377,7 @@ bash scripts/regression_gate.sh
 bash scripts/regression_gate.sh --dsn "$PG_DSN"
 
 # Tier-2 E2E suites (app-like smoke tests; requires running pg-tikv)
-PG_DSN=postgres://admin:admin@127.0.0.1:5433/postgres bash scripts/e2e_tests.sh sqlalchemy_smoke
+PG_DSN=postgres://admin:<password>@127.0.0.1:5433/postgres bash scripts/e2e_tests.sh sqlalchemy_smoke
 
 # Full automated test suite (slower; broader coverage)
 ./run_tests.sh
@@ -392,7 +392,7 @@ python3 scripts/integration_test.py
 cd orm-tests && npm test
 
 # Go/GORM smoke test (requires running server + Go)
-export PG_DSN="postgres://admin:admin@127.0.0.1:5433/postgres?sslmode=disable"
+export PG_DSN="postgres://admin:<password>@127.0.0.1:5433/postgres?sslmode=disable"
 (cd e2e/gorm_smoke && go test ./... -count=1)
 # Or via the runner:
 bash scripts/e2e_tests.sh gorm_smoke

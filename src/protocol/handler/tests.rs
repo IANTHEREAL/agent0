@@ -4,6 +4,7 @@ use crate::types::Value;
 use async_trait::async_trait;
 use bytes::Buf;
 use bytes::Bytes;
+use pgwire::api::auth::ServerParameterProvider;
 use pgwire::api::portal::Format;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::ExtendedQueryHandler;
@@ -274,6 +275,87 @@ fn test_update_tx_status_after_execution_keeps_status_for_other_commands() {
     );
 }
 
+#[test]
+fn parse_startup_options_supports_quoted_values() {
+    assert_eq!(
+        parse_startup_options("-c application_name='my app'"),
+        vec![("application_name".to_string(), "my app".to_string())]
+    );
+
+    assert_eq!(
+        parse_startup_options(r#"-c search_path="public, ext""#),
+        vec![("search_path".to_string(), "public, ext".to_string())]
+    );
+
+    assert_eq!(
+        parse_startup_options(r#"-c application_name='my app' -c search_path="public, ext""#),
+        vec![
+            ("application_name".to_string(), "my app".to_string()),
+            ("search_path".to_string(), "public, ext".to_string())
+        ]
+    );
+}
+
+#[test]
+fn parse_startup_options_supports_backslash_escaping() {
+    // Allow spaces without quotes via backslash-escape.
+    assert_eq!(
+        parse_startup_options("-c application_name=my\\ app"),
+        vec![("application_name".to_string(), "my app".to_string())]
+    );
+}
+
+#[test]
+fn test_parameter_status_includes_common_keys() {
+    let mut client = TestClient::new();
+    client
+        .metadata_mut()
+        .insert(METADATA_ACTUAL_USER.to_string(), "admin".to_string());
+    client
+        .metadata_mut()
+        .insert("application_name".to_string(), "pg-tikv-tests".to_string());
+    client
+        .metadata_mut()
+        .insert(METADATA_AUTH_IS_SUPERUSER.to_string(), "on".to_string());
+
+    let params = PgServerParameterProvider
+        .server_parameters(&client)
+        .expect("server parameters should be provided");
+
+    for key in [
+        "server_version",
+        "server_version_num",
+        "server_encoding",
+        "client_encoding",
+        "DateStyle",
+        "TimeZone",
+        "standard_conforming_strings",
+        "integer_datetimes",
+        "IntervalStyle",
+        "application_name",
+        "search_path",
+        "default_transaction_isolation",
+        "is_superuser",
+        "session_authorization",
+    ] {
+        assert!(
+            params.contains_key(key),
+            "missing ParameterStatus key '{}'",
+            key
+        );
+    }
+
+    assert_eq!(
+        params.get("application_name").map(String::as_str),
+        Some("pg-tikv-tests")
+    );
+    assert_eq!(params.get("is_superuser").map(String::as_str), Some("on"));
+    assert_eq!(
+        params.get("session_authorization").map(String::as_str),
+        Some("admin")
+    );
+}
+
 #[derive(Debug)]
 struct TestClient {
     inner: DefaultClient<String>,
@@ -471,7 +553,10 @@ async fn execute_honors_max_rows_and_suspends_portal() {
 
     let mut client = TestClient::new();
     client.set_state(PgWireConnectionState::ReadyForQuery);
-    client.portal_store().put_portal(Arc::new(portal.clone()));
+    client
+        .portal_store()
+        .put_portal(Arc::new(portal.clone()))
+        .unwrap();
 
     on_execute_with_tx_status_fix(
         &handler,
@@ -569,7 +654,7 @@ async fn execute_errors_when_suspended_portal_count_exceeds_limit() {
             vec![],
         );
         let portal = Portal::try_new(&bind, statement.clone()).expect("portal");
-        client.portal_store().put_portal(Arc::new(portal));
+        client.portal_store().put_portal(Arc::new(portal)).unwrap();
 
         on_execute_with_tx_status_fix(
             &handler,
@@ -600,7 +685,7 @@ async fn execute_errors_when_suspended_portal_count_exceeds_limit() {
         vec![],
     );
     let portal = Portal::try_new(&bind, statement).expect("portal");
-    client.portal_store().put_portal(Arc::new(portal));
+    client.portal_store().put_portal(Arc::new(portal)).unwrap();
 
     let err = on_execute_with_tx_status_fix(
         &handler,
@@ -646,7 +731,7 @@ async fn execute_max_rows_zero_returns_all_rows() {
 
     let mut client = TestClient::new();
     client.set_state(PgWireConnectionState::ReadyForQuery);
-    client.portal_store().put_portal(Arc::new(portal));
+    client.portal_store().put_portal(Arc::new(portal)).unwrap();
 
     on_execute_with_tx_status_fix(
         &handler,
@@ -696,7 +781,7 @@ async fn execute_errors_when_suspension_buffer_exceeds_limit() {
 
     let mut client = TestClient::new();
     client.set_state(PgWireConnectionState::ReadyForQuery);
-    client.portal_store().put_portal(Arc::new(portal));
+    client.portal_store().put_portal(Arc::new(portal)).unwrap();
 
     let err = on_execute_with_tx_status_fix(
         &handler,
@@ -1654,6 +1739,51 @@ fn test_substitute_parameters_uuid_binary_format_renders_uuid_literal() {
         substitute_parameters("SELECT $1", &portal).unwrap(),
         "SELECT '550e8400-e29b-41d4-a716-446655440000'::uuid"
     );
+}
+
+#[test]
+fn test_substitute_parameters_date_binary_format_renders_date_literal() {
+    let stmt = Arc::new(StoredStatement::new(
+        "stmt".to_string(),
+        "SELECT $1".to_string(),
+        vec![Type::DATE],
+    ));
+    let mut portal: Portal<String> = Portal::default();
+    portal.name = "portal".to_string();
+    portal.statement = stmt;
+    portal.parameter_format = Format::UnifiedBinary;
+    // Postgres DATE binary: i32 days since 2000-01-01.
+    portal.parameters = vec![Some(Bytes::copy_from_slice(&1i32.to_be_bytes()))];
+    portal.result_column_format = Format::UnifiedText;
+
+    assert_eq!(
+        substitute_parameters("SELECT $1", &portal).unwrap(),
+        "SELECT '2000-01-02'::date"
+    );
+}
+
+#[test]
+fn test_substitute_parameters_unsupported_binary_type_returns_feature_not_supported() {
+    let stmt = Arc::new(StoredStatement::new(
+        "stmt".to_string(),
+        "SELECT $1".to_string(),
+        vec![Type::JSONB],
+    ));
+    let mut portal: Portal<String> = Portal::default();
+    portal.name = "portal".to_string();
+    portal.statement = stmt;
+    portal.parameter_format = Format::UnifiedBinary;
+    portal.parameters = vec![Some(Bytes::from_static(b"{"))];
+    portal.result_column_format = Format::UnifiedText;
+
+    let err = substitute_parameters("SELECT $1", &portal).unwrap_err();
+    match err {
+        PgWireError::UserError(info) => {
+            assert_eq!(info.code, "0A000");
+            assert!(info.message.contains("unsupported binary parameter type"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]

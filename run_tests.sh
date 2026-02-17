@@ -131,7 +131,12 @@ echo "- Mode: release" >> "$REPORT_FILE"
 echo "" >> "$REPORT_FILE"
 
 echo "[3/5] Starting pg-tikv on port $PG_PORT..."
-PD_ENDPOINTS="127.0.0.1:$PD_PORT" PG_PORT="$PG_PORT" "$SCRIPT_DIR/target/release/pg-tikv" > /tmp/pgtikv-test.log 2>&1 &
+PD_ENDPOINTS="127.0.0.1:$PD_PORT" \
+PG_PORT="$PG_PORT" \
+PGTIKV_BOOTSTRAP_ADMIN_USER="$PG_USER" \
+PGTIKV_BOOTSTRAP_ADMIN_PASSWORD="$PG_PASSWORD" \
+PGTIKV_INSECURE=1 \
+"$SCRIPT_DIR/target/release/pg-tikv" > /tmp/pgtikv-test.log 2>&1 &
 PGTIKV_PID=$!
 
 for i in $(seq 1 30); do

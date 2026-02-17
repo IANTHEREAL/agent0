@@ -4,21 +4,29 @@ pg-tikv is configured through environment variables.
 
 ## Environment Variables
 
+This document is a convenience overview. The authoritative list of config keys + defaults is `docs/sot/ops-config.md`.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD endpoints (comma-separated) |
 | `PG_PORT` | `5433` | PostgreSQL protocol listen port |
+| `PG_LISTEN_ADDR` | `127.0.0.1` | Listen address (loopback by default) |
+| `PG_KEYSPACE` | `default` | Default keyspace when not specified in username |
+| `PG_TLS_CERT` | (unset) | TLS cert path (PEM); enable TLS only when both cert+key are set |
+| `PG_TLS_KEY` | (unset) | TLS key path (PEM; PKCS#8 or RSA) |
+| `PG_REQUIRE_TLS` | `false` | Require TLS for all pgwire connections |
+| `PGTIKV_BOOTSTRAP_ADMIN_USER` | `admin` | Initial superuser name for bootstrapping |
+| `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD` | (unset) | Initial superuser password for bootstrapping (required when no superuser exists yet) |
+| `PGTIKV_DEV` | `false` | Dev-only escape hatch (legacy insecure bootstrap) |
+| `PGTIKV_INSECURE` | `false` | Explicit insecure posture escape hatch |
 | `PGTIKV_TOKIO_STACK_MB` | `4` | Tokio worker thread stack size (MB) |
-| `PG_NAMESPACE` | (empty) | Key prefix for data isolation |
-| `PG_KEYSPACE` | (empty) | Default keyspace when not specified in username |
-| `PG_PASSWORD` | (empty) | Fallback password for all users |
 
 ## Examples
 
 ### Basic Configuration
 
 ```bash
-./target/release/pg-tikv
+PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=<password> ./target/release/pg-tikv
 ```
 
 Uses all defaults:
@@ -29,19 +37,15 @@ Uses all defaults:
 ### Custom PD Endpoints
 
 ```bash
-PD_ENDPOINTS=10.0.0.1:2379,10.0.0.2:2379,10.0.0.3:2379 ./target/release/pg-tikv
+PD_ENDPOINTS=10.0.0.1:2379,10.0.0.2:2379,10.0.0.3:2379 \
+PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=<password> \
+./target/release/pg-tikv
 ```
 
 ### Custom Port
 
 ```bash
-PG_PORT=5432 ./target/release/pg-tikv
-```
-
-### With Fallback Password
-
-```bash
-PG_PASSWORD=master_secret ./target/release/pg-tikv
+PG_PORT=5432 PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=<password> ./target/release/pg-tikv
 ```
 
 ### Full Production Example
@@ -50,6 +54,10 @@ PG_PASSWORD=master_secret ./target/release/pg-tikv
 PD_ENDPOINTS=pd1.example.com:2379,pd2.example.com:2379 \
 PG_PORT=5432 \
 PG_KEYSPACE=production \
+PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=<strong_password> \
+PG_TLS_CERT=/path/to/server.crt \
+PG_TLS_KEY=/path/to/server.key \
+PG_REQUIRE_TLS=1 \
 ./target/release/pg-tikv
 ```
 
@@ -100,10 +108,10 @@ Examples:
 
 ```bash
 # Default keyspace
-psql "postgresql://admin:admin@localhost:5433/postgres"
+psql "postgresql://admin:<password>@localhost:5433/postgres"
 
 # With keyspace in username
-psql "postgresql://tenant_a.admin:admin@localhost:5433/postgres"
+psql "postgresql://tenant_a.admin:<password>@localhost:5433/postgres"
 ```
 
 ### Driver Configuration
@@ -117,7 +125,7 @@ conn = psycopg2.connect(
     host="localhost",
     port=5433,
     user="tenant_a.admin",
-    password="admin",
+    password="<password>",
     database="postgres"
 )
 ```
@@ -131,7 +139,7 @@ const client = new Client({
     host: 'localhost',
     port: 5433,
     user: 'tenant_a.admin',
-    password: 'admin',
+    password: '<password>',
     database: 'postgres'
 });
 ```
@@ -142,7 +150,7 @@ const client = new Client({
 import "github.com/jackc/pgx/v5"
 
 conn, err := pgx.Connect(context.Background(), 
-    "postgres://tenant_a.admin:admin@localhost:5433/postgres")
+    "postgres://tenant_a.admin:<password>@localhost:5433/postgres")
 ```
 
 **Rust (tokio-postgres)**:
@@ -151,7 +159,7 @@ conn, err := pgx.Connect(context.Background(),
 use tokio_postgres::NoTls;
 
 let (client, connection) = tokio_postgres::connect(
-    "host=localhost port=5433 user=tenant_a.admin password=admin dbname=postgres",
+    "host=localhost port=5433 user=tenant_a.admin password=<password> dbname=postgres",
     NoTls,
 ).await?;
 ```

@@ -1,5 +1,6 @@
 mod auth;
 mod cli;
+mod config;
 mod extensions;
 mod observability;
 mod pool;
@@ -16,6 +17,7 @@ use pgwire::tokio::process_socket;
 use pool::TikvClientPool;
 use protocol::DynamicHandlerFactory;
 use std::env;
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -127,6 +129,10 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     });
     let default_keyspace = cli_args.keyspace.or_else(|| env::var("PG_KEYSPACE").ok());
 
+    let require_tls = config::env_bool("PG_REQUIRE_TLS");
+    let dev_mode = config::env_bool("PGTIKV_DEV");
+    let insecure_mode = config::env_bool("PGTIKV_INSECURE");
+
     let tls_cert = cli_args.tls_cert.or_else(|| env::var("PG_TLS_CERT").ok());
     let tls_key = cli_args.tls_key.or_else(|| env::var("PG_TLS_KEY").ok());
 
@@ -140,6 +146,19 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
         info!("Default keyspace: default");
     }
     info!("Password authentication: enabled (via AuthManager)");
+    if require_tls {
+        info!("TLS requirement: enabled (PG_REQUIRE_TLS=1)");
+    }
+    if dev_mode {
+        warn!(
+            "PGTIKV_DEV=1 enabled: legacy insecure dev behaviors may be allowed (DO NOT use in production)"
+        );
+    }
+    if insecure_mode {
+        warn!(
+            "PGTIKV_INSECURE=1 enabled: allowing explicitly insecure pgwire posture (DO NOT use in production)"
+        );
+    }
 
     let pd_addrs: Vec<String> = pd_endpoints
         .split(',')
@@ -167,11 +186,49 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
         }
     };
 
+    if require_tls && tls_acceptor.is_none() {
+        return Err(anyhow::anyhow!(
+            "PG_REQUIRE_TLS=1 but TLS is not configured. Set PG_TLS_CERT and PG_TLS_KEY."
+        ));
+    }
+
+    let listen_is_loopback = is_loopback_listen_addr(&pg_listen_addr);
+    if !listen_is_loopback && tls_acceptor.is_none() && !(insecure_mode || dev_mode) {
+        return Err(anyhow::anyhow!(
+            "Refusing to start without TLS on non-loopback PG_LISTEN_ADDR={}. Enable TLS (PG_TLS_CERT/PG_TLS_KEY) or explicitly opt into insecure mode (PGTIKV_INSECURE=1 or PGTIKV_DEV=1).",
+            pg_listen_addr
+        ));
+    }
+
     let client_pool = Arc::new(TikvClientPool::new(pd_addrs.clone()));
 
-    // Verify PD is reachable before accepting connections.
-    // TiKV client connections are created lazily per-keyspace on first client request.
-    check_pd_health(&pd_addrs[0]).await?;
+    let startup_keyspace = default_keyspace
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    info!("Connecting to TiKV with keyspace '{}'...", startup_keyspace);
+
+    let store = client_pool
+        .get_client(Some(startup_keyspace.clone()))
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "Failed to connect to TiKV (keyspace '{}'): {}",
+                startup_keyspace,
+                e
+            );
+            e
+        })?;
+
+    info!("TiKV connection verified");
+
+    // Fail-fast auth bootstrap for the startup keyspace (secure-by-default posture).
+    // Per-connection bootstrap still runs in pgwire auth path (idempotent).
+    {
+        let auth_manager = auth::AuthManager::new();
+        let mut txn = store.begin().await?;
+        auth_manager.bootstrap(&mut txn).await?;
+        txn.commit().await?;
+    }
 
     client_pool.spawn_reaper();
 
@@ -205,5 +262,17 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
                 tracing::error!("Connection error: {}", e);
             }
         });
+    }
+}
+
+fn is_loopback_listen_addr(addr: &str) -> bool {
+    let trimmed = addr.trim();
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    match trimmed.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
     }
 }

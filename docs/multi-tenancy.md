@@ -72,7 +72,7 @@ tiup ctl:v8.5.4 pd -u http://127.0.0.1:2379 keyspace list
 ### 3. Start pg-tikv
 
 ```bash
-PD_ENDPOINTS=127.0.0.1:2379 ./target/release/pg-tikv
+PD_ENDPOINTS=127.0.0.1:2379 PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=<password> ./target/release/pg-tikv
 ```
 
 ## Username Routing
@@ -106,7 +106,7 @@ or
 ```bash
 # Connect to tenant_a
 psql -h 127.0.0.1 -p 5433 -U tenant_a.admin
-# Password: admin (default)
+# Password: (bootstrapped per keyspace)
 
 # Connect to tenant_b
 psql -h 127.0.0.1 -p 5433 -U tenant_b.admin
@@ -200,14 +200,18 @@ psql -h 127.0.0.1 -p 5433 -U myuser
 You can also set a different default keyspace via environment variable:
 
 ```bash
-PG_KEYSPACE=my_default ./target/release/pg-tikv
+PG_KEYSPACE=my_default PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=<password> ./target/release/pg-tikv
 ```
 
 ## Bootstrap User
 
-Each keyspace automatically creates a default `admin` user with password `admin` on first connection. This user has superuser privileges and can create other users.
+When a keyspace has no superuser yet, pg-tikv bootstraps the initial superuser only when you explicitly set:
+- `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD` (required)
+- `PGTIKV_BOOTSTRAP_ADMIN_USER` (optional; default `admin`)
 
-**Security Note**: Change the admin password immediately in production:
+**Dev-only**: `PGTIKV_DEV=1` enables legacy insecure bootstrap behavior intended for local development only.
+
+**Security Note**: In production, use a strong bootstrap password and enable TLS (`PG_TLS_CERT` + `PG_TLS_KEY`).
 
 ```sql
 ALTER ROLE admin WITH PASSWORD 'new_secure_password';

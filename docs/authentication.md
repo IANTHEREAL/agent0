@@ -8,17 +8,21 @@ pg-tikv implements PostgreSQL-compatible authentication and role-based access co
 - **Per-Keyspace Users**: Each keyspace has its own user database
 - **RBAC**: Role-based access control with privileges on tables
 - **Superuser**: Full access to all operations
-- **Bootstrap User**: Default `admin` user created automatically
+- **Bootstrap User**: First superuser created via explicit bootstrap env vars
 
 ## Default User
 
-Each keyspace automatically creates a default superuser on first connection:
+There is **no implicit default password** in non-dev mode. When a keyspace has no superuser yet, bootstrap the initial superuser by setting:
+- `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD` (required)
+- `PGTIKV_BOOTSTRAP_ADMIN_USER` (optional; default `admin`)
 
-| Username | Password | Privileges |
-|----------|----------|------------|
-| `admin` | `admin` | SUPERUSER, LOGIN, CREATEDB, CREATEROLE |
+Then connect as `<keyspace>.<user>` (or `user` for the default keyspace).
 
-**Important**: Change the default password in production:
+**Dev-only**: `PGTIKV_DEV=1` enables legacy insecure bootstrap behavior intended for local development only.
+
+**Important**: In production, enable TLS (`PG_TLS_CERT` + `PG_TLS_KEY`) and consider setting `PG_REQUIRE_TLS=1`.
+
+Change the admin password using:
 
 ```sql
 ALTER ROLE admin WITH PASSWORD 'your_secure_password';
@@ -231,16 +235,6 @@ psql -h 127.0.0.1 -p 5433 -U tenant_b.admin
 CREATE ROLE app WITH PASSWORD 'tenant_b_app_pass' LOGIN;
 GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO app;
 ```
-
-## Fallback Password
-
-For compatibility and testing, you can set a fallback password via environment variable:
-
-```bash
-PG_PASSWORD=master_password ./target/release/pg-tikv
-```
-
-This password works for any user if database authentication fails. **Do not use in production.**
 
 ## Security Best Practices
 

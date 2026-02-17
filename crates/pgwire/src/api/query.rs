@@ -153,7 +153,7 @@ pub trait ExtendedQueryHandler: Send + Sync {
     {
         let parser = self.query_parser();
         let stmt = StoredStatement::parse(&message, parser).await?;
-        client.portal_store().put_statement(Arc::new(stmt));
+        client.portal_store().put_statement(Arc::new(stmt))?;
         client
             .send(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
             .await?;
@@ -176,7 +176,7 @@ pub trait ExtendedQueryHandler: Send + Sync {
 
         if let Some(statement) = client.portal_store().get_statement(statement_name) {
             let portal = Portal::try_new(&message, statement)?;
-            client.portal_store().put_portal(Arc::new(portal));
+            client.portal_store().put_portal(Arc::new(portal))?;
             client
                 .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
                 .await?;
@@ -292,7 +292,7 @@ pub trait ExtendedQueryHandler: Send + Sync {
                                 statement: stmt.statement.clone(),
                                 parameter_types: parameter_types.to_vec(),
                             };
-                            client.portal_store().put_statement(Arc::new(updated));
+                            client.portal_store().put_statement(Arc::new(updated))?;
                         }
                     }
                     send_describe_response(client, &describe_response).await?;

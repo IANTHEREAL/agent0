@@ -12,6 +12,8 @@ SHOW server_encoding;
 SHOW DateStyle;
 SHOW integer_datetimes;
 SHOW IntervalStyle;
+SHOW search_path;
+SHOW default_transaction_isolation;
 SHOW is_superuser;
 SHOW session_authorization;
 
@@ -19,6 +21,8 @@ SELECT current_setting('server_encoding') AS server_encoding;
 SELECT current_setting('DateStyle') AS datestyle;
 SELECT current_setting('integer_datetimes') AS integer_datetimes;
 SELECT current_setting('IntervalStyle') AS intervalstyle;
+SELECT current_setting('search_path') AS search_path;
+SELECT current_setting('default_transaction_isolation') AS default_transaction_isolation;
 SELECT current_setting('is_superuser') AS is_superuser;
 SELECT current_setting('session_authorization') AS session_authorization;
 

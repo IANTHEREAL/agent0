@@ -584,7 +584,7 @@ Core service (Rust):
 - `AGENT.md` / `CLAUDE.md`: dev conventions and architecture/capability positioning (navigation only; must be verified in code).
 - `docs/architecture.md`: component layering and some limitations (**has clear inconsistencies with README**, see the next conflict list).
 - `docs/multi-tenancy.md`: keyspace isolation, username routing (`tenant.user`/`tenant:user`), default keyspace, bootstrap admin positioning.
-- `docs/authentication.md`: cleartext password, RBAC, fallback password (`PG_PASSWORD`) positioning.
+- `docs/authentication.md`: cleartext password, RBAC, and bootstrap positioning.
 - `docs/extensions.md`: `http` extension security restrictions and limits (port/SSRF/concurrency/max calls per statement, etc.).
 - `docs/configuration.md`: environment variables and deployment examples (includes some possibly outdated log examples).
 - `docs/README.md`: docs index and “supported features” positioning (includes JOIN support scope entries).
@@ -652,8 +652,8 @@ Multi-tenancy (keyspace):
 
 Authentication / RBAC:
 - **Auth method**: Cleartext password (`docs/authentication.md`); production requires TLS (same doc).
-- **Bootstrap admin**: default `admin/admin` per keyspace (multiple docs claim “auto-created on first connect”; verify trigger conditions and idempotency in code).
-- **Fallback password**: `PG_PASSWORD` as a “global fallback password for all users” for test compatibility (docs explicitly state “do not use in production”).
+- **Bootstrap admin**: explicit initial superuser bootstrap via `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD` (optionally `PGTIKV_BOOTSTRAP_ADMIN_USER`), per keyspace; `PGTIKV_DEV=1` enables legacy dev bootstrap (insecure).
+- **Fallback password**: no global fallback password mechanism is implemented; authentication depends on per-user passwords.
 
 HTTP extension:
 - **Default privilege**: only SUPERUSER may execute (`docs/extensions.md`).

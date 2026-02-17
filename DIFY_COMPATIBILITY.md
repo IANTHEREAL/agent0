@@ -194,7 +194,12 @@ cd ~/lab/pg-tikv
 uv run scripts/tikv_admin.py start --name dify-test --persistent
 
 # 2. Start pg-tikv
-PD_ENDPOINTS=127.0.0.1:<pd_port> PG_PORT=5433 PG_LISTEN_ADDR=0.0.0.0 ./target/release/pg-tikv
+PD_ENDPOINTS=127.0.0.1:<pd_port> \
+PG_PORT=5433 \
+PG_LISTEN_ADDR=0.0.0.0 \
+PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=admin \
+PGTIKV_INSECURE=1 \
+./target/release/pg-tikv
 
 # 3. Configure and start Dify
 cd ~/lab/dify/docker
@@ -202,7 +207,7 @@ cd ~/lab/dify/docker
 #   DB_HOST=<your-host-ip>  (use `ip route get 1 | awk '{print $7}'` to find)
 #   DB_PORT=5433
 #   DB_USERNAME=admin
-#   DB_PASSWORD=admin
+#   DB_PASSWORD=admin  (bootstrapped via `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD`)
 #   COMPOSE_PROFILES=weaviate  (remove postgresql profile)
 #   EXPOSE_NGINX_PORT=8088     (if port 80 is in use)
 

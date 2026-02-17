@@ -17,6 +17,7 @@ use crate::api::{
     ClientInfo, ClientPortalStore, DefaultClient, ErrorHandler, PgWireConnectionState,
     PgWireServerHandlers,
 };
+use crate::api::METADATA_USER;
 use crate::error::{ErrorInfo, PgWireError, PgWireResult};
 use crate::messages::response::ReadyForQuery;
 use crate::messages::response::{SslResponse, TransactionStatus};
@@ -68,6 +69,7 @@ impl<S> Decoder for PgWireMessageServerCodec<S> {
 #[cfg(test)]
 mod tests {
     use super::process_message;
+    use super::process_error;
     use super::PgWireMessageServerCodec;
     use crate::api::auth::noop::NoopStartupHandler;
     use crate::api::copy::NoopCopyHandler;
@@ -75,16 +77,21 @@ mod tests {
     use crate::api::query::SimpleQueryHandler;
     use crate::api::results::Response;
     use crate::api::{ClientInfo, DefaultClient, PgWireConnectionState};
-    use crate::error::{PgWireError, PgWireResult};
+    use crate::error::{ErrorInfo, PgWireError, PgWireResult};
     use crate::messages::copy::CopyDone;
+    use crate::messages::extendedquery::Sync as SyncMessage;
     use crate::messages::response::TransactionStatus;
-    use crate::messages::PgWireFrontendMessage;
+    use crate::messages::simplequery::Query;
+    use crate::messages::startup::Startup;
+    use crate::messages::{PgWireBackendMessage, PgWireFrontendMessage};
     use async_trait::async_trait;
+    use bytes::BytesMut;
     use futures::Sink;
     use std::fmt::Debug;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use tokio::io::{duplex, AsyncReadExt};
+    use tokio::time::{timeout, Duration};
     use tokio_util::codec::Framed;
 
     #[derive(Debug)]
@@ -115,6 +122,27 @@ mod tests {
         }
     }
 
+    async fn read_backend_message(client_io: &mut tokio::io::DuplexStream) -> PgWireBackendMessage {
+        let mut buf = BytesMut::with_capacity(256);
+        loop {
+            if let Some(msg) = PgWireBackendMessage::decode(&mut buf).expect("decode backend msg") {
+                return msg;
+            }
+            let n = client_io.read_buf(&mut buf).await.expect("read");
+            assert!(n > 0, "EOF before backend message");
+        }
+    }
+
+    fn get_error_field<'a>(
+        err: &'a crate::messages::response::ErrorResponse,
+        code: u8,
+    ) -> Option<&'a str> {
+        err.fields
+            .iter()
+            .find(|(field_code, _)| *field_code == code)
+            .map(|(_, value)| value.as_str())
+    }
+
     #[tokio::test]
     async fn copy_done_simple_protocol_uses_current_transaction_status() {
         let (mut client_io, server_io) = duplex(64);
@@ -138,6 +166,177 @@ mod tests {
         let mut buf = [0u8; 6];
         client_io.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, [b'Z', 0, 0, 0, 5, b'T']);
+    }
+
+    #[tokio::test]
+    async fn missing_user_in_startup_returns_28000_and_closes_socket() {
+        let (mut client_io, server_io) = duplex(256);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let client_info = DefaultClient::<String>::new(addr, false);
+        let mut socket = Framed::new(server_io, PgWireMessageServerCodec::new(client_info));
+        socket.set_state(PgWireConnectionState::AwaitingStartup);
+
+        let startup = Startup::default();
+        let err = process_message(
+            PgWireFrontendMessage::Startup(startup),
+            &mut socket,
+            Arc::new(DummyStartupHandler),
+            Arc::new(DummySimpleQueryHandler),
+            Arc::new(PlaceholderExtendedQueryHandler),
+            Arc::new(NoopCopyHandler),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PgWireError::UserNameRequired));
+
+        process_error(&mut socket, err, false).await.unwrap();
+
+        let PgWireBackendMessage::ErrorResponse(err) = read_backend_message(&mut client_io).await
+        else {
+            panic!("expected ErrorResponse");
+        };
+        assert_eq!(get_error_field(&err, b'S'), Some("FATAL"));
+        assert_eq!(get_error_field(&err, b'C'), Some("28000"));
+
+        let mut extra = [0u8; 1];
+        let n = timeout(Duration::from_millis(100), client_io.read(&mut extra))
+            .await
+            .expect("read should not block")
+            .expect("read");
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn not_ready_for_query_is_error_and_waits_for_sync() {
+        let (mut client_io, server_io) = duplex(512);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let client_info = DefaultClient::<String>::new(addr, false);
+        let mut socket = Framed::new(server_io, PgWireMessageServerCodec::new(client_info));
+        socket.set_state(PgWireConnectionState::QueryInProgress);
+
+        let err = process_message(
+            PgWireFrontendMessage::Query(Query::new("SELECT 1".to_owned())),
+            &mut socket,
+            Arc::new(DummyStartupHandler),
+            Arc::new(DummySimpleQueryHandler),
+            Arc::new(PlaceholderExtendedQueryHandler),
+            Arc::new(NoopCopyHandler),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PgWireError::NotReadyForQuery));
+
+        // Even for simple protocol, NotReadyForQuery should be treated as a protocol
+        // violation and the server should wait for Sync to resynchronize.
+        process_error(&mut socket, err, false).await.unwrap();
+        assert_eq!(socket.state(), PgWireConnectionState::AwaitingSync);
+
+        let PgWireBackendMessage::ErrorResponse(err) = read_backend_message(&mut client_io).await
+        else {
+            panic!("expected ErrorResponse");
+        };
+        assert_eq!(get_error_field(&err, b'S'), Some("ERROR"));
+        assert_eq!(get_error_field(&err, b'C'), Some("08P01"));
+
+        process_message(
+            PgWireFrontendMessage::Sync(SyncMessage::new()),
+            &mut socket,
+            Arc::new(DummyStartupHandler),
+            Arc::new(DummySimpleQueryHandler),
+            Arc::new(PlaceholderExtendedQueryHandler),
+            Arc::new(NoopCopyHandler),
+        )
+        .await
+        .unwrap();
+
+        let PgWireBackendMessage::ReadyForQuery(rfq) = read_backend_message(&mut client_io).await
+        else {
+            panic!("expected ReadyForQuery");
+        };
+        // Per PostgreSQL protocol: 'E' means "in a failed transaction block".
+        // When idle (no BEGIN), to_error_state() correctly preserves Idle.
+        assert_eq!(rfq.status, TransactionStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn not_ready_for_query_in_transaction_returns_error_status() {
+        let (mut client_io, server_io) = duplex(512);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let client_info = DefaultClient::<String>::new(addr, false);
+        let mut socket = Framed::new(server_io, PgWireMessageServerCodec::new(client_info));
+        socket.set_state(PgWireConnectionState::QueryInProgress);
+        socket.set_transaction_status(TransactionStatus::Transaction);
+
+        let err = process_message(
+            PgWireFrontendMessage::Query(Query::new("SELECT 1".to_owned())),
+            &mut socket,
+            Arc::new(DummyStartupHandler),
+            Arc::new(DummySimpleQueryHandler),
+            Arc::new(PlaceholderExtendedQueryHandler),
+            Arc::new(NoopCopyHandler),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PgWireError::NotReadyForQuery));
+
+        process_error(&mut socket, err, false).await.unwrap();
+        assert_eq!(socket.state(), PgWireConnectionState::AwaitingSync);
+
+        let PgWireBackendMessage::ErrorResponse(err) = read_backend_message(&mut client_io).await
+        else {
+            panic!("expected ErrorResponse");
+        };
+        assert_eq!(get_error_field(&err, b'S'), Some("ERROR"));
+        assert_eq!(get_error_field(&err, b'C'), Some("08P01"));
+
+        process_message(
+            PgWireFrontendMessage::Sync(SyncMessage::new()),
+            &mut socket,
+            Arc::new(DummyStartupHandler),
+            Arc::new(DummySimpleQueryHandler),
+            Arc::new(PlaceholderExtendedQueryHandler),
+            Arc::new(NoopCopyHandler),
+        )
+        .await
+        .unwrap();
+
+        let PgWireBackendMessage::ReadyForQuery(rfq) = read_backend_message(&mut client_io).await
+        else {
+            panic!("expected ReadyForQuery");
+        };
+        // Per PostgreSQL protocol: 'E' means "in a failed transaction block".
+        // When inside a transaction, to_error_state() correctly transitions to Error.
+        assert_eq!(rfq.status, TransactionStatus::Error);
+    }
+
+    #[tokio::test]
+    async fn fatal_user_error_closes_socket_and_preserves_sqlstate() {
+        let (mut client_io, server_io) = duplex(256);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let client_info = DefaultClient::<String>::new(addr, false);
+        let mut socket = Framed::new(server_io, PgWireMessageServerCodec::new(client_info));
+        socket.set_state(PgWireConnectionState::ReadyForQuery);
+
+        let error = PgWireError::UserError(Box::new(ErrorInfo::new(
+            "FATAL".to_owned(),
+            "3D000".to_owned(),
+            "database \"nope\" does not exist".to_owned(),
+        )));
+        process_error(&mut socket, error, false).await.unwrap();
+
+        let PgWireBackendMessage::ErrorResponse(err) = read_backend_message(&mut client_io).await
+        else {
+            panic!("expected ErrorResponse");
+        };
+        assert_eq!(get_error_field(&err, b'S'), Some("FATAL"));
+        assert_eq!(get_error_field(&err, b'C'), Some("3D000"));
+
+        let mut extra = [0u8; 1];
+        let n = timeout(Duration::from_millis(100), client_io.read(&mut extra))
+            .await
+            .expect("read should not block")
+            .expect("read");
+        assert_eq!(n, 0);
     }
 }
 
@@ -213,8 +412,20 @@ where
     C: CopyHandler,
 {
     match socket.state() {
-        PgWireConnectionState::AwaitingStartup
-        | PgWireConnectionState::AuthenticationInProgress => {
+        PgWireConnectionState::AwaitingStartup => {
+            if let PgWireFrontendMessage::Startup(ref startup) = message {
+                let user = startup
+                    .parameters
+                    .get(METADATA_USER)
+                    .map(|v| v.trim())
+                    .unwrap_or_default();
+                if user.is_empty() {
+                    return Err(PgWireError::UserNameRequired);
+                }
+            }
+            authenticator.on_startup(socket, message).await?;
+        }
+        PgWireConnectionState::AuthenticationInProgress => {
             authenticator.on_startup(socket, message).await?;
         }
         // From Postgres docs:
@@ -317,14 +528,45 @@ async fn process_error<S, ST>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
 {
+    let mut wait_for_sync = wait_for_sync;
     match error {
         PgWireError::UserError(error_info) => {
-            socket
-                .feed(PgWireBackendMessage::ErrorResponse((*error_info).into()))
-                .await?;
+            let fatal = matches!(error_info.severity.as_str(), "FATAL" | "PANIC");
+            if fatal {
+                socket
+                    .send(PgWireBackendMessage::ErrorResponse((*error_info).into()))
+                    .await?;
+                return socket.close().await;
+            } else {
+                socket
+                    .feed(PgWireBackendMessage::ErrorResponse((*error_info).into()))
+                    .await?;
+            }
         }
         PgWireError::ApiError(e) => {
             let error_info = ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string());
+            socket
+                .feed(PgWireBackendMessage::ErrorResponse(error_info.into()))
+                .await?;
+        }
+        PgWireError::UserNameRequired => {
+            let error_info = ErrorInfo::new(
+                "FATAL".to_owned(),
+                "28000".to_owned(),
+                "no PostgreSQL user name specified in startup packet".to_owned(),
+            );
+            socket
+                .send(PgWireBackendMessage::ErrorResponse(error_info.into()))
+                .await?;
+            return socket.close().await;
+        }
+        PgWireError::NotReadyForQuery => {
+            wait_for_sync = true;
+            let error_info = ErrorInfo::new(
+                "ERROR".to_owned(),
+                "08P01".to_owned(),
+                "connection is not ready for query".to_owned(),
+            );
             socket
                 .feed(PgWireBackendMessage::ErrorResponse(error_info.into()))
                 .await?;

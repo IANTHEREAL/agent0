@@ -254,6 +254,16 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                         None => "NULL".to_string(),
                     }
                 }
+                t if *t == Type::DATE => {
+                    use chrono::NaiveDate;
+                    match portal.parameter::<NaiveDate>(i, &param_type)? {
+                        Some(date) => {
+                            let date_str = date.format("%Y-%m-%d").to_string();
+                            format!("{}::date", quoting::quote_literal(&date_str))
+                        }
+                        None => "NULL".to_string(),
+                    }
+                }
                 t if *t == Type::UUID => {
                     let uuid = uuid::Uuid::from_slice(param_bytes.as_ref())
                         .map_err(|e| invalid_param(e.to_string()))?;
@@ -330,10 +340,15 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                     }
                 }
                 _ => {
-                    return Err(invalid_param(format!(
-                        "unsupported binary parameter type {}",
-                        param_type.name()
-                    )));
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "0A000".to_string(),
+                        format!(
+                            "unsupported binary parameter type {} for parameter ${}",
+                            param_type.name(),
+                            i + 1
+                        ),
+                    ))));
                 }
             }
         } else {

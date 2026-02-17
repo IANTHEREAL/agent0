@@ -1,3 +1,4 @@
+use crate::config;
 use crate::txn::{txn_delete, txn_put};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -7,7 +8,7 @@ use tikv_client::Transaction;
 const USER_KEY_PREFIX: &[u8] = b"_sys_user_";
 const ROLE_KEY_PREFIX: &[u8] = b"_sys_role_";
 const DEFAULT_ADMIN_USER: &str = "admin";
-const DEFAULT_ADMIN_PASSWORD: &str = "admin";
+const LEGACY_DEV_ADMIN_PASSWORD: &str = "admin";
 const SCAN_LIMIT: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -260,12 +261,62 @@ impl AuthManager {
     }
 
     pub async fn bootstrap(&self, txn: &mut Transaction) -> Result<()> {
-        if self.get_user(txn, DEFAULT_ADMIN_USER).await?.is_none() {
-            let admin = User::new_superuser(DEFAULT_ADMIN_USER, DEFAULT_ADMIN_PASSWORD);
-            self.create_user(txn, admin).await?;
-            tracing::info!("Created default admin user");
+        if self.has_any_superuser(txn).await? {
+            return Ok(());
         }
+
+        if config::env_bool("PGTIKV_DEV") {
+            // Legacy dev bootstrap (explicit opt-in only).
+            if self.get_user(txn, DEFAULT_ADMIN_USER).await?.is_none() {
+                let admin = User::new_superuser(DEFAULT_ADMIN_USER, LEGACY_DEV_ADMIN_PASSWORD);
+                self.create_user(txn, admin).await?;
+                tracing::warn!(
+                    "PGTIKV_DEV=1: bootstrapped legacy default superuser '{}' (password omitted)",
+                    DEFAULT_ADMIN_USER
+                );
+            }
+            return Ok(());
+        }
+
+        let bootstrap_user = config::env_string("PGTIKV_BOOTSTRAP_ADMIN_USER")
+            .unwrap_or_else(|| DEFAULT_ADMIN_USER.to_string());
+        let bootstrap_password =
+            config::env_string("PGTIKV_BOOTSTRAP_ADMIN_PASSWORD").ok_or_else(|| {
+                anyhow!(
+                    "No superuser exists yet. Set PGTIKV_BOOTSTRAP_ADMIN_PASSWORD to bootstrap the initial superuser (optionally PGTIKV_BOOTSTRAP_ADMIN_USER), or set PGTIKV_DEV=1 for local development."
+                )
+            })?;
+
+        if let Some(existing) = self.get_user(txn, &bootstrap_user).await? {
+            if existing.is_superuser {
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "Bootstrap user '{}' already exists but is not a superuser",
+                bootstrap_user
+            ));
+        }
+
+        let admin = User::new_superuser(&bootstrap_user, &bootstrap_password);
+        self.create_user(txn, admin).await?;
+        tracing::info!("Bootstrapped initial superuser '{}'", bootstrap_user);
         Ok(())
+    }
+
+    async fn has_any_superuser(&self, txn: &mut Transaction) -> Result<bool> {
+        let prefix = USER_KEY_PREFIX.to_vec();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+
+        let range: tikv_client::BoundRange = (prefix..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        for pair in pairs {
+            let user: User = bincode::deserialize(pair.value())?;
+            if user.is_superuser {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub async fn create_user(&self, txn: &mut Transaction, user: User) -> Result<()> {

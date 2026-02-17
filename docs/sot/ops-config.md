@@ -26,10 +26,15 @@
 |---|---|---|---|---|
 | `PD_ENDPOINTS` | env | `127.0.0.1:2379` | `src/main.rs` (`async_main`) | Comma-separated PD endpoints. |
 | `PG_PORT` | env | `5433` | `src/main.rs` (`async_main`) | Listening port; parse failures fall back to default. |
-| `PG_LISTEN_ADDR` | env | `127.0.0.1` | `src/main.rs` (`async_main`) | Listening address; set to `0.0.0.0` to accept non-loopback connections. |
+| `PG_LISTEN_ADDR` | env | `127.0.0.1` | `src/main.rs` (`async_main`) | Listening address; set to `0.0.0.0` to accept non-loopback connections. When set to non-loopback and TLS is disabled, startup fails unless `PGTIKV_INSECURE=1` or `PGTIKV_DEV=1`. |
 | `PG_KEYSPACE` | env | `default` | `src/main.rs` (`async_main`); `src/sql/trigger_worker.rs` (`bootstrap_active_keyspaces`) | Default tenant keyspace when client username has no explicit keyspace; also used as trigger worker fallback active keyspace. |
 | `PG_TLS_CERT` | env | unset (TLS disabled) | `src/main.rs` (`async_main`) | TLS is enabled only when both `PG_TLS_CERT` and `PG_TLS_KEY` are set and `tls::setup_tls` succeeds. |
 | `PG_TLS_KEY` | env | unset (TLS disabled) | `src/main.rs` (`async_main`) | See `PG_TLS_CERT`. |
+| `PG_REQUIRE_TLS` | env | `false` | `src/main.rs` (`async_main`) | When enabled, server requires TLS for all pgwire connections; startup fails if TLS is not configured. |
+| `PGTIKV_INSECURE` | env | `false` | `src/main.rs` (`async_main`); `src/protocol/handler/dynamic.rs` (`on_startup`) | Explicit escape hatch: allows starting without TLS on non-loopback binds and allows non-TLS cleartext auth for non-loopback clients (unsafe; DO NOT use in production). |
+| `PGTIKV_DEV` | env | `false` | `src/main.rs` (`async_main`); `src/auth/rbac.rs` (`AuthManager::bootstrap`) | Dev-only escape hatch: allows legacy insecure bootstrap (default superuser) and relaxes non-TLS auth restrictions (unsafe; DO NOT use in production). |
+| `PGTIKV_BOOTSTRAP_ADMIN_USER` | env | `admin` | `src/auth/rbac.rs` (`AuthManager::bootstrap`) | Initial superuser username for bootstrapping when no superuser exists yet. |
+| `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD` | env | unset | `src/auth/rbac.rs` (`AuthManager::bootstrap`) | Required to bootstrap the first superuser when no superuser exists yet (non-dev mode). MUST NOT be logged. |
 | `PGTIKV_TOKIO_STACK_MB` | env | `4` | `src/main.rs` (`main`) | Per-runtime worker thread stack size (MiB); must parse as `usize` and be `> 0`. |
 | `PGTIKV_OBS_ENABLED` | env | `true` | `src/observability.rs` (`ObservabilityConfig::from_env`) | Boolean parsing is best-effort; invalid values keep the default. |
 | `PGTIKV_OBS_SAMPLE_EVERY` | env | `1000` | `src/observability.rs` (`ObservabilityConfig::from_env`) | Sample 1 in N statements; must parse as `u64` and be `> 0`. |
@@ -56,7 +61,7 @@
 
 ## Verification (Gates)
 - `ci:.github/workflows/orm-tests.yml/lint` (required): `cargo fmt -- --check && cargo clippy`
-- `ci:.github/workflows/orm-tests.yml/test` (required): `./run_tests.sh` (covers default non-TLS boot path; does not assert TLS handshake)
+- `ci:.github/workflows/orm-tests.yml/test` (required): `./run_tests.sh` (boots a local non-TLS instance with explicit bootstrap + insecure flags; does not assert TLS handshake)
 
 ## Change Management
 - Any PR that adds/removes/renames a config key, changes a default, or changes security posture (TLS / HTTP insecure) MUST update this document and keep `docs/sot/modules.yaml` + `docs/sot/README.md` consistent.

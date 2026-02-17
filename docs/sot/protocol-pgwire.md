@@ -14,7 +14,10 @@
 
 ## External Contracts
 - **[Stable] Authentication mechanism**
-  - The server MUST request cleartext password authentication on startup (`Authentication::CleartextPassword`).
+  - The server MUST use cleartext password authentication on startup (`Authentication::CleartextPassword`) when accepting a connection.
+  - When the connection is non-TLS:
+    - if `PG_REQUIRE_TLS=1`, the server MUST reject the connection deterministically;
+    - otherwise, non-loopback clients are rejected unless `PGTIKV_INSECURE=1` or `PGTIKV_DEV=1`.
   - Evidence: `src/protocol/handler/dynamic.rs` (`impl StartupHandler for DynamicPgHandler`, `on_startup`).
 
 - **[Stable] Tenant keyspace routing via username**
@@ -48,7 +51,10 @@
 This module MUST NOT redefine config keys. Relevant keys are defined exactly once in `./ops-config.md`:
 - `PG_PORT`
 - `PG_TLS_CERT`, `PG_TLS_KEY`
+- `PG_REQUIRE_TLS`
 - `PG_KEYSPACE`
+- `PGTIKV_INSECURE`
+- `PGTIKV_DEV`
 - `PGTIKV_MAX_SUSPENDED_PORTALS`
 - `PGTIKV_MAX_SUSPENDED_PORTAL_BUFFER_ROWS`
 - `PGTIKV_MAX_SUSPENDED_PORTAL_BUFFER_BYTES`

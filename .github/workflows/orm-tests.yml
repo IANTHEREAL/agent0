@@ -143,7 +143,11 @@ jobs:
 
       - name: Start pg-tikv
         run: |
-          PD_ENDPOINTS=127.0.0.1:2379 PG_PORT=$PG_PORT ./target/release/pg-tikv > /tmp/pgtikv.log 2>&1 &
+          PD_ENDPOINTS=127.0.0.1:2379 \
+            PG_PORT=$PG_PORT \
+            PGTIKV_BOOTSTRAP_ADMIN_USER=$PG_USER \
+            PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=$PG_PASSWORD \
+            ./target/release/pg-tikv > /tmp/pgtikv.log 2>&1 &
           echo "PG_TIKV_PID=$!" >> $GITHUB_ENV
           # Wait for pg-tikv to be ready
           for i in $(seq 1 30); do

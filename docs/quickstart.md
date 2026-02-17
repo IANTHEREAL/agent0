@@ -71,7 +71,7 @@ cargo build --release --locked
 ### Basic Start
 
 ```bash
-./target/release/pg-tikv
+PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=admin ./target/release/pg-tikv
 ```
 
 ### With Custom Configuration
@@ -80,12 +80,18 @@ cargo build --release --locked
 PD_ENDPOINTS=127.0.0.1:2379 \
 PG_PORT=5433 \
 PG_KEYSPACE=default \
+PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=admin \
 ./target/release/pg-tikv
 ```
 
 ## Security Note
 
-By default, pg-tikv binds to `127.0.0.1:${PG_PORT}`. To accept non-loopback connections, explicitly set `PG_LISTEN_ADDR=0.0.0.0` (or a specific interface address). The current bootstrap behavior creates a superuser `admin` with password `admin` per keyspace; do not expose this to the public internet. For production-like usage, change the default password and enable TLS (see `docs/authentication.md` and `docs/release-notes-v0.1.0.md`).
+pg-tikv is **secure-by-default**:
+- By default, pg-tikv binds to `127.0.0.1:${PG_PORT}`.
+- The first superuser is bootstrapped only when you explicitly set `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD` (and optionally `PGTIKV_BOOTSTRAP_ADMIN_USER`).
+- Non-loopback binds without TLS are refused unless you explicitly opt into insecure mode (`PGTIKV_INSECURE=1` or `PGTIKV_DEV=1`).
+
+For production-like usage, enable TLS (`PG_TLS_CERT` + `PG_TLS_KEY`), set `PG_REQUIRE_TLS=1`, and use a strong bootstrap password. See `docs/authentication.md` and `docs/release-notes-v0.1.0.md`.
 
 ## Connecting
 
@@ -96,7 +102,7 @@ pg_isready -h 127.0.0.1 -p 5433
 psql -h 127.0.0.1 -p 5433 -U admin -d postgres -c "SELECT 1;"
 # Or open an interactive shell:
 psql -h 127.0.0.1 -p 5433 -U admin -d postgres
-# Password: admin (default)
+# Password: (the value you used for `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD`)
 ```
 
 ### Multi-Tenant Connection
@@ -104,11 +110,11 @@ psql -h 127.0.0.1 -p 5433 -U admin -d postgres
 ```bash
 # Connect to tenant_a keyspace
 psql -h 127.0.0.1 -p 5433 -U tenant_a.admin -d postgres
-# Password: admin
+# Password: (bootstrapped per keyspace)
 
 # Connect to tenant_b keyspace
 psql -h 127.0.0.1 -p 5433 -U tenant_b.admin -d postgres
-# Password: admin
+# Password: (bootstrapped per keyspace)
 ```
 
 ## First Steps

@@ -285,11 +285,16 @@ if [[ "$START_ENV" -eq 1 ]]; then
   (cd "$ROOT_DIR" && cargo build --release --quiet)
   echo ""
 
-  echo "Starting pg-tikv on ${PG_HOST}:${PG_PORT} (PD_ENDPOINTS=${PD_ENDPOINTS})..."
-  pushd "$ROOT_DIR" >/dev/null
-  PD_ENDPOINTS="$PD_ENDPOINTS" PG_PORT="$PG_PORT" ./target/release/pg-tikv > /tmp/pgtikv-regression.log 2>&1 &
-  PGTIKV_PID=$!
-  popd >/dev/null
+	  echo "Starting pg-tikv on ${PG_HOST}:${PG_PORT} (PD_ENDPOINTS=${PD_ENDPOINTS})..."
+	  pushd "$ROOT_DIR" >/dev/null
+	  PD_ENDPOINTS="$PD_ENDPOINTS" \
+	  PG_PORT="$PG_PORT" \
+	  PGTIKV_BOOTSTRAP_ADMIN_USER="$PG_USER" \
+	  PGTIKV_BOOTSTRAP_ADMIN_PASSWORD="$PG_PASSWORD" \
+	  PGTIKV_INSECURE=1 \
+	  ./target/release/pg-tikv > /tmp/pgtikv-regression.log 2>&1 &
+	  PGTIKV_PID=$!
+	  popd >/dev/null
 
   # Wait for readiness
   if command -v pg_isready >/dev/null 2>&1; then

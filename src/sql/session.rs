@@ -340,6 +340,9 @@ impl SessionSettings {
             "server_version_num" => Some("160000".to_string()),
             "server_encoding" => Some("UTF8".to_string()),
             "search_path" => Some(self.search_path.join(", ")),
+            "datestyle" => Some("ISO, MDY".to_string()),
+            "integer_datetimes" => Some("on".to_string()),
+            "intervalstyle" => Some("postgres".to_string()),
             "statement_timeout" => Some(self.statement_timeout_ms.to_string()),
             "lock_timeout" => Some(self.lock_timeout_ms.to_string()),
             "idle_in_transaction_session_timeout" => {
@@ -347,10 +350,6 @@ impl SessionSettings {
             }
             "pgtikv.max_sort_bytes" => Some(self.max_sort_bytes.to_string()),
             "tipg.use_optimizer" => Some(if self.use_optimizer { "on" } else { "off" }.to_string()),
-            // Report canonical Postgres defaults for driver/tool compatibility.
-            "datestyle" => Some("ISO, MDY".to_string()),
-            "intervalstyle" => Some("postgres".to_string()),
-            "integer_datetimes" => Some("on".to_string()),
             "timezone" => Some(self.timezone.as_deref().unwrap_or("UTC").to_string()),
             "application_name" => Some(self.application_name.as_deref().unwrap_or("").to_string()),
             "client_encoding" => Some(
@@ -397,6 +396,7 @@ impl SessionSettings {
                     .unwrap_or("repeatable read")
                     .to_string(),
             ),
+            "default_transaction_isolation" => Some("read committed".to_string()),
             "default_transaction_read_only" => Some(
                 self.default_transaction_read_only
                     .as_deref()
@@ -610,7 +610,7 @@ impl Session {
         match name {
             "is_superuser" => Some(if self.is_superuser { "on" } else { "off" }.to_string()),
             // Session authorization is the authenticated session user (login role).
-            "session_authorization" => Some(
+            "session_authorization" | "session.authorization" => Some(
                 self.session_user
                     .as_deref()
                     .or(self.current_user.as_deref())

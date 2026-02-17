@@ -20,7 +20,7 @@ pub mod transaction;
 
 pub const DEFAULT_NAME: &str = "POSTGRESQL_DEFAULT_NAME";
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum PgWireConnectionState {
     #[default]
     AwaitingSslRequest,
@@ -114,7 +114,7 @@ impl<S> DefaultClient<S> {
             state: PgWireConnectionState::default(),
             transaction_status: TransactionStatus::Idle,
             metadata: HashMap::new(),
-            portal_store: store::MemPortalStore::new(),
+            portal_store: store::MemPortalStore::default(),
         }
     }
 }

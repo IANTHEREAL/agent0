@@ -290,11 +290,53 @@ fn extract_placeholder_index_from_expr(expr: &sqlparser::ast::Expr) -> Option<us
 }
 
 fn parse_startup_options(options: &str) -> Vec<(String, String)> {
-    let tokens: Vec<&str> = options.split_whitespace().collect();
+    fn tokenize_options(options: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+        let mut quote: Option<char> = None;
+        let mut chars = options.chars();
+
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    } else {
+                        current.push('\\');
+                    }
+                }
+                '\'' | '"' => {
+                    if quote == Some(ch) {
+                        quote = None;
+                    } else if quote.is_none() {
+                        quote = Some(ch);
+                    } else {
+                        current.push(ch);
+                    }
+                }
+                ch if ch.is_whitespace() => {
+                    if quote.is_some() {
+                        current.push(ch);
+                    } else if !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                }
+                ch => current.push(ch),
+            }
+        }
+
+        if !current.is_empty() {
+            tokens.push(current);
+        }
+
+        tokens
+    }
+
+    let tokens = tokenize_options(options);
     let mut settings = Vec::new();
     let mut i = 0usize;
     while i < tokens.len() {
-        if tokens[i] == "-c" {
+        if tokens[i].as_str() == "-c" {
             if let Some(kv) = tokens.get(i + 1) {
                 if let Some((key, value)) = kv.split_once('=') {
                     settings.push((key.to_string(), value.to_string()));

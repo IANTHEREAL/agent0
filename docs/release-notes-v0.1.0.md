@@ -21,6 +21,8 @@ v0.1.0 ships a PostgreSQL wire-protocol frontend backed by TiKV (transactional A
 
 ## Defaults & Configuration
 
+> Note: this document describes **v0.1.0**. Newer versions have hardened defaults (loopback bind, explicit bootstrap, TLS posture). For the current config keys and defaults, see `docs/sot/ops-config.md`.
+
 - **Listen address**: `0.0.0.0` (all interfaces)
 - **Listen port**: `PG_PORT=5433`
 - **PD endpoints**: `PD_ENDPOINTS=127.0.0.1:2379` (comma-separated)

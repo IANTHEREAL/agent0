@@ -22,6 +22,7 @@ use super::{
     METADATA_AUTH_IS_SUPERUSER, METADATA_KEYSPACE,
 };
 use crate::auth::{AuthManager, Privilege};
+use crate::config;
 use crate::observability;
 use crate::pool::{TenantHandle, TikvClientPool};
 use crate::sql::{ExecuteResult, Executor, Session};
@@ -44,7 +45,7 @@ use pgwire::api::{
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
-use pgwire::messages::response::{CommandComplete, ErrorResponse, NoticeResponse};
+use pgwire::messages::response::{CommandComplete, NoticeResponse};
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use sqlparser::ast::{CopySource, CopyTarget, Expr, Ident, Statement};
@@ -408,7 +409,15 @@ impl DynamicPgHandler {
         username: Option<String>,
         is_superuser: bool,
         database: String,
-    ) -> Result<(), String> {
+    ) -> PgWireResult<()> {
+        let fatal_internal = |message: String| -> PgWireError {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_owned(),
+                "XX000".to_owned(),
+                message,
+            )))
+        };
+
         let effective_keyspace = keyspace
             .or_else(|| self.default_keyspace.clone())
             .unwrap_or_else(|| "default".to_string());
@@ -422,7 +431,7 @@ impl DynamicPgHandler {
             let handle = pool
                 .acquire(Some(effective_keyspace.clone()))
                 .await
-                .map_err(|e| format!("Failed to get client from pool: {}", e))?;
+                .map_err(|e| fatal_internal(format!("Failed to get client from pool: {}", e)))?;
             let s = handle.store().clone();
             let tc = handle.trigger_cache().clone();
             let sc = handle.stats_cache().clone();
@@ -436,7 +445,7 @@ impl DynamicPgHandler {
                 Some(effective_keyspace.clone()),
             )
             .await
-            .map_err(|e| format!("Failed to connect to TiKV: {}", e))?;
+            .map_err(|e| fatal_internal(format!("Failed to connect to TiKV: {}", e)))?;
             (
                 Arc::new(s),
                 Arc::new(TriggerBodyCache::new()),
@@ -460,16 +469,23 @@ impl DynamicPgHandler {
         };
         let database_name = database_name.to_ascii_lowercase();
 
-        let mut db_txn = store.begin().await.map_err(|e| e.to_string())?;
+        let mut db_txn = store
+            .begin()
+            .await
+            .map_err(|e| fatal_internal(e.to_string()))?;
         let database_id = match store
             .get_database_id(&mut db_txn, &database_name)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| fatal_internal(e.to_string()))?
         {
             Some(id) => id,
             None => {
                 db_txn.rollback().await.ok();
-                return Err(format!("database \"{}\" does not exist", database_name));
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".to_owned(),
+                    "3D000".to_owned(),
+                    format!("database \"{}\" does not exist", database_name),
+                ))));
             }
         };
         db_txn.rollback().await.ok();
@@ -880,22 +896,60 @@ impl StartupHandler for DynamicPgHandler {
             PgWireFrontendMessage::Startup(ref startup) => {
                 pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
 
-                if let Some(raw_user) = client.metadata().get(METADATA_USER).cloned() {
-                    let (keyspace, actual_user) = parse_tenant_username(&raw_user);
+                let raw_user = client
+                    .metadata()
+                    .get(METADATA_USER)
+                    .cloned()
+                    .filter(|u| !u.trim().is_empty())
+                    .ok_or(PgWireError::UserNameRequired)?;
 
-                    if let Some(ks) = &keyspace {
-                        client
-                            .metadata_mut()
-                            .insert(METADATA_KEYSPACE.to_string(), ks.clone());
-                        debug!("Extracted keyspace '{}' from username '{}'", ks, raw_user);
-                    }
+                let (keyspace, actual_user) = parse_tenant_username(&raw_user);
+
+                if let Some(ks) = &keyspace {
                     client
                         .metadata_mut()
-                        .insert(METADATA_ACTUAL_USER.to_string(), actual_user.clone());
-                    debug!("Actual user: {}", actual_user);
+                        .insert(METADATA_KEYSPACE.to_string(), ks.clone());
+                    debug!("Extracted keyspace '{}' from username '{}'", ks, raw_user);
                 }
+                client
+                    .metadata_mut()
+                    .insert(METADATA_ACTUAL_USER.to_string(), actual_user.clone());
+                debug!("Actual user: {}", actual_user);
 
                 client.set_state(PgWireConnectionState::AuthenticationInProgress);
+
+                let require_tls = config::env_bool("PG_REQUIRE_TLS");
+                let dev_mode = config::env_bool("PGTIKV_DEV");
+                let insecure_mode = config::env_bool("PGTIKV_INSECURE");
+
+                if require_tls && !client.is_secure() {
+                    let error_info = ErrorInfo::new(
+                        "FATAL".to_owned(),
+                        "28000".to_owned(),
+                        "TLS is required (PG_REQUIRE_TLS=1). Reconnect with sslmode=require and ensure server TLS is configured (PG_TLS_CERT/PG_TLS_KEY).".to_string(),
+                    );
+                    return Err(PgWireError::UserError(Box::new(error_info)));
+                }
+
+                if !client.is_secure() {
+                    let peer_ip = client.socket_addr().ip();
+                    let allow_cleartext = peer_ip.is_loopback() || dev_mode || insecure_mode;
+                    if !allow_cleartext {
+                        let error_info = ErrorInfo::new(
+                            "FATAL".to_owned(),
+                            "28000".to_owned(),
+                            "Cleartext password authentication without TLS is disabled by default for non-loopback clients. Enable TLS (PG_TLS_CERT/PG_TLS_KEY) or explicitly opt into insecure mode (PGTIKV_DEV=1 or PGTIKV_INSECURE=1).".to_string(),
+                        );
+                        return Err(PgWireError::UserError(Box::new(error_info)));
+                    }
+
+                    if !peer_ip.is_loopback() && (dev_mode || insecure_mode) {
+                        warn!(
+                            "Allowing non-TLS cleartext auth for non-loopback connection from {} (PGTIKV_DEV={}, PGTIKV_INSECURE={})",
+                            peer_ip, dev_mode, insecure_mode
+                        );
+                    }
+                }
                 client
                     .send(PgWireBackendMessage::Authentication(
                         Authentication::CleartextPassword,
@@ -910,7 +964,7 @@ impl StartupHandler for DynamicPgHandler {
                     .metadata()
                     .get(METADATA_ACTUAL_USER)
                     .cloned()
-                    .unwrap_or_else(|| "admin".to_string());
+                    .ok_or(PgWireError::UserNameRequired)?;
                 let database = client
                     .metadata()
                     .get(METADATA_DATABASE)
@@ -924,25 +978,13 @@ impl StartupHandler for DynamicPgHandler {
                 match auth_result {
                     Ok((is_authenticated, is_superuser)) => {
                         if is_authenticated {
-                            if let Err(e) = self
-                                .init_executor(
-                                    keyspace.clone(),
-                                    Some(actual_user.clone()),
-                                    is_superuser,
-                                    database,
-                                )
-                                .await
-                            {
-                                let error_info =
-                                    ErrorInfo::new("FATAL".to_owned(), "XX000".to_owned(), e);
-                                client
-                                    .feed(PgWireBackendMessage::ErrorResponse(ErrorResponse::from(
-                                        error_info,
-                                    )))
-                                    .await?;
-                                client.close().await?;
-                                return Ok(());
-                            }
+                            self.init_executor(
+                                keyspace.clone(),
+                                Some(actual_user.clone()),
+                                is_superuser,
+                                database,
+                            )
+                            .await?;
 
                             let mut session_guard = self.session.lock().await;
                             if let Some(session) = session_guard.as_mut() {
@@ -995,22 +1037,19 @@ impl StartupHandler for DynamicPgHandler {
                                     actual_user
                                 ),
                             );
-                            client
-                                .feed(PgWireBackendMessage::ErrorResponse(ErrorResponse::from(
-                                    error_info,
-                                )))
-                                .await?;
-                            client.close().await?;
+                            return Err(PgWireError::UserError(Box::new(error_info)));
                         }
                     }
                     Err(e) => {
-                        let error_info = ErrorInfo::new("FATAL".to_owned(), "XX000".to_owned(), e);
-                        client
-                            .feed(PgWireBackendMessage::ErrorResponse(ErrorResponse::from(
-                                error_info,
-                            )))
-                            .await?;
-                        client.close().await?;
+                        let sqlstate = if e.contains("PGTIKV_BOOTSTRAP_ADMIN_PASSWORD")
+                            || e.contains("bootstrap")
+                        {
+                            "28000"
+                        } else {
+                            "XX000"
+                        };
+                        let error_info = ErrorInfo::new("FATAL".to_owned(), sqlstate.to_owned(), e);
+                        return Err(PgWireError::UserError(Box::new(error_info)));
                     }
                 }
             }
@@ -1683,14 +1722,14 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                             statement.statement.clone(),
                             describe_response.parameters,
                         ));
-                        client.portal_store().put_statement(updated.clone());
+                        client.portal_store().put_statement(updated.clone())?;
                         statement = updated;
                     }
                 }
             }
 
             let portal = Portal::try_new(&message, statement)?;
-            client.portal_store().put_portal(Arc::new(portal));
+            client.portal_store().put_portal(Arc::new(portal))?;
             client
                 .send(PgWireBackendMessage::BindComplete(
                     pgwire::messages::extendedquery::BindComplete::new(),

@@ -12,10 +12,13 @@
 - Extension feature contracts (authoritative: `./extensions-gin.md` for extension surfaces).
 
 ## External Contracts
-- **[Stable] Auth bootstrap: default admin user**
-  - On first authentication attempt for a tenant/keyspace, the server MUST bootstrap a default superuser user `admin` with password `admin` if it does not already exist.
-  - Evidence: `src/auth/rbac.rs` (`AuthManager::bootstrap`, `DEFAULT_ADMIN_USER/PASSWORD`), `src/protocol/handler/dynamic.rs` (`authenticate_user` calls `bootstrap`).
-  - Security note: this is a security-sensitive default; changes require DR/ADR per #368.
+- **[Stable] Auth bootstrap: explicit initial superuser**
+  - If no superuser exists yet for a tenant/keyspace:
+    - the server MUST bootstrap an initial superuser only when `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD` is explicitly set (optionally `PGTIKV_BOOTSTRAP_ADMIN_USER`);
+    - otherwise (non-dev mode), startup/authentication MUST fail-closed with an actionable error.
+  - When `PGTIKV_DEV=1` is explicitly set, the server MAY use legacy dev bootstrap behavior (insecure; intended for local development only).
+  - Evidence: `src/auth/rbac.rs` (`AuthManager::bootstrap`), `src/protocol/handler/dynamic.rs` (`authenticate_user` calls `bootstrap`), `src/main.rs` (startup fail-fast bootstrap for default keyspace).
+  - Security note: this is security-sensitive; changes require DR/ADR per #368.
 
 - **[Stable] Password hashing/verification (persistent)**
   - Passwords MUST be stored as `SHA-256(password || salt)` with a per-user random salt (hex-encoded).
@@ -45,9 +48,7 @@
   - Evidence: `src/sql/executor/database.rs` (`session.is_superuser()` checks), `src/sql/executor/extensions.rs`, `src/extensions/http.rs` (`context::is_superuser`), `tests/88_http_permission.sql` + `tests/88_http_permission.errors`.
 
 ## Configuration
-This module currently defines no module-specific runtime config keys.
-
-If you need tenant selection or protocol/security-related env vars, they are defined exactly once in `./ops-config.md` (cross-link only).
+This module MUST NOT redefine config keys. Relevant keys are defined exactly once in `./ops-config.md` (cross-link only).
 
 ## Entrypoints
 - `src/auth/password.rs`

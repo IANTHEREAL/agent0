@@ -405,9 +405,9 @@ psql -h 127.0.0.1 -p 5433 -U admin -c "SELECT 1"
 FATAL: password authentication failed
 ```
 
-The default admin password is `admin`. Reset it using:
+In non-dev mode, there is no implicit default admin password. The initial admin password comes from `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD` at bootstrap time (or `admin` when using `PGTIKV_DEV=1`). Reset it using:
 ```bash
-pg-tikv-admin reset-password <tenant> --admin-password admin --user admin
+pg-tikv-admin reset-password <tenant> --admin-password <current_admin_password> --user admin
 ```
 
 ### Keyspace creation failed

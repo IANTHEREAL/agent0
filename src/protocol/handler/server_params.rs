@@ -52,6 +52,10 @@ impl ServerParameterProvider for PgServerParameterProvider {
         insert_setting("standard_conforming_strings", "standard_conforming_strings");
         insert_setting("application_name", "application_name");
         insert_setting("search_path", "search_path");
+        insert_setting(
+            "default_transaction_isolation",
+            "default_transaction_isolation",
+        );
 
         params.insert("session_authorization".to_owned(), session_authorization);
         params.insert("is_superuser".to_owned(), is_superuser);

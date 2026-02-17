@@ -50,11 +50,11 @@ tiup playground --mode tikv-slim
 
 # Build and run pg-tikv
 cargo build --release
-./target/release/pg-tikv
+PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=<password> ./target/release/pg-tikv
 
 # Connect with psql
 psql -h 127.0.0.1 -p 5433 -U admin
-# Default password: admin
+# Password: (the value you used for `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD`)
 ```
 
 See [Quick Start Guide](./quickstart.md) for detailed instructions.

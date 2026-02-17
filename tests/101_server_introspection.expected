@@ -28,6 +28,12 @@ on
 intervalstyle
 postgres
 (1 row)
+search_path
+public, extensions
+(1 row)
+default_transaction_isolation
+read committed
+(1 row)
 is_superuser
 on
 (1 row)
@@ -45,6 +51,12 @@ on
 (1 row)
 intervalstyle
 postgres
+(1 row)
+search_path
+public, extensions
+(1 row)
+default_transaction_isolation
+read committed
 (1 row)
 is_superuser
 on
