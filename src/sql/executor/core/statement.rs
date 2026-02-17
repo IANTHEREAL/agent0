@@ -1123,6 +1123,9 @@ impl Executor {
             let mut analyzer = Analyzer::new(&catalog);
             match analyzer.analyze_query(&expanded) {
                 Ok(analyzed) => {
+                    // Same rewrite as execution path — invariant: EXPLAIN = execution.
+                    let analyzed = crate::sql::rewriter::rewrite_query(analyzed);
+
                     // When the optimizer GUC is on and the query is eligible,
                     // use the shared optimize() entrypoint so EXPLAIN shows
                     // the same plan that execution actually uses.
