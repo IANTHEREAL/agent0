@@ -1190,7 +1190,18 @@ impl<'a> Analyzer<'a> {
     // ── Helper: function analysis ───────────────────────────
 
     fn analyze_function(&mut self, func: &Function) -> Result<TypedExpr, AnalyzerError> {
-        let func_name = function_name_upper(func);
+        let mut func_name = function_name_upper(func);
+
+        // Preserve schema prefix for schema-qualified functions (e.g., cron.schedule).
+        // function_name_upper() only takes the last segment of ObjectName, stripping
+        // schema qualifiers. We need the full qualified name for dispatch in classify.rs,
+        // materialize.rs, and typed_eval.rs.
+        if func.name.0.len() > 1 {
+            let schema = func.name.0[0].value.to_lowercase();
+            if schema == "cron" {
+                func_name = format!("cron.{}", func_name);
+            }
+        }
 
         // Extract function arguments
         let args = self.extract_function_args(func)?;
