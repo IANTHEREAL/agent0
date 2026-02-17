@@ -137,7 +137,6 @@ pub enum PhysicalNode {
     },
 
     /// Hash join (equi-join only).
-    #[allow(dead_code)] // Phase 2+
     HashJoin {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,

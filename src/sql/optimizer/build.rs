@@ -220,7 +220,7 @@ impl PhysicalPlan {
                 let left_op = left.build_operators(ctx)?;
                 let right_op = right.build_operators(ctx)?;
                 let (left_key_indices, right_key_indices, filter) =
-                    extract_hash_join_keys(condition)?;
+                    extract_hash_join_keys(condition, left.schema.columns.len())?;
                 let hj_type = match join_type {
                     JoinType::Inner => HashJoinType::Inner,
                     JoinType::Left => HashJoinType::Left,
@@ -357,75 +357,20 @@ fn extract_on_condition(condition: &JoinCondition) -> Option<TypedExpr> {
 
 /// Extract equi-join key indices from a JoinCondition for hash join.
 ///
+/// Delegates to `join_keys::try_extract_equi_keys` for validated, rebased indices.
 /// Returns (left_key_indices, right_key_indices, optional_residual_filter).
 fn extract_hash_join_keys(
     condition: &JoinCondition,
+    left_width: usize,
 ) -> Result<(Vec<usize>, Vec<usize>, Option<TypedExpr>)> {
-    match condition {
-        JoinCondition::Using(cols) => {
-            let left_indices: Vec<usize> = cols.iter().map(|c| c.left_index).collect();
-            let right_indices: Vec<usize> = cols.iter().map(|c| c.right_index).collect();
-            Ok((left_indices, right_indices, None))
-        }
-        JoinCondition::On(expr) => {
-            // Try to extract equi-join keys from the ON expression.
-            let mut left_indices = Vec::new();
-            let mut right_indices = Vec::new();
-            if extract_equi_keys(expr, &mut left_indices, &mut right_indices) {
-                Ok((left_indices, right_indices, None))
-            } else {
-                // Non-equi ON: fall back to cross join + filter.
-                // This shouldn't happen (physical planner should use NLJ for non-equi),
-                // but handle gracefully.
-                Err(anyhow!(
-                    "HashJoin requires equi-join keys but got non-equi condition"
-                ))
-            }
-        }
-        JoinCondition::None => {
-            // Cross join — no keys needed.
-            Ok((vec![], vec![], None))
-        }
-    }
-}
-
-/// Try to extract column-ref = column-ref equi-join keys from an expression.
-fn extract_equi_keys(
-    expr: &TypedExpr,
-    left_indices: &mut Vec<usize>,
-    right_indices: &mut Vec<usize>,
-) -> bool {
-    match &expr.kind {
-        TypedExprKind::BinaryOp {
-            left,
-            op: crate::sql::analyzer::types::BinaryOp::And,
-            right,
-        } => {
-            extract_equi_keys(left, left_indices, right_indices)
-                && extract_equi_keys(right, left_indices, right_indices)
-        }
-        TypedExprKind::BinaryOp {
-            left,
-            op: crate::sql::analyzer::types::BinaryOp::Eq,
-            right,
-        } => {
-            if let (
-                TypedExprKind::ColumnRef {
-                    column_index: li, ..
-                },
-                TypedExprKind::ColumnRef {
-                    column_index: ri, ..
-                },
-            ) = (&left.kind, &right.kind)
-            {
-                left_indices.push(*li);
-                right_indices.push(*ri);
-                true
-            } else {
-                false
-            }
-        }
-        _ => false,
+    match super::join_keys::try_extract_equi_keys(condition, left_width) {
+        Some((left_keys, right_keys)) => Ok((left_keys, right_keys, None)),
+        None => match condition {
+            JoinCondition::None => Ok((vec![], vec![], None)),
+            _ => Err(anyhow!(
+                "HashJoin requires equi-join keys but got non-equi condition"
+            )),
+        },
     }
 }
 
@@ -1609,6 +1554,101 @@ mod tests {
         );
         assert!(agg_exprs[0].order_by[0].asc);
         assert!(!agg_exprs[1].order_by[0].asc);
+    }
+
+    /// Regression test (B1): HashJoin build path must receive right key indices
+    /// that are local to the right child (0-based), not combined-schema indices.
+    /// Prior to the fix, col[0]=col[2] with left_width=2 would pass right_index=2
+    /// instead of 0, causing out-of-bounds hash lookups.
+    #[test]
+    fn test_hash_join_right_keys_are_local() {
+        let left_schema = test_table_schema();
+        let right_schema = TableSchema::new(
+            "other_table".to_string(),
+            2,
+            vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "val".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            vec![0],
+        );
+        let ctx = BuildContext::new()
+            .with_schema("test_table".to_string(), left_schema)
+            .with_schema("other_table".to_string(), right_schema);
+
+        // ON test_table.id (col[0]) = other_table.id (col[2] in combined schema)
+        // left_width = 2 (test_table has 2 columns: id, name)
+        let plan = PhysicalPlan {
+            node: PhysicalNode::HashJoin {
+                left: Box::new(PhysicalPlan {
+                    node: PhysicalNode::SeqScan {
+                        table_name: "test_table".to_string(),
+                        alias: None,
+                    },
+                    schema: make_schema(&[("id", DataType::Int32), ("name", DataType::Text)]),
+                    cost: PhysicalCost::default(),
+                }),
+                right: Box::new(PhysicalPlan {
+                    node: PhysicalNode::SeqScan {
+                        table_name: "other_table".to_string(),
+                        alias: None,
+                    },
+                    schema: make_schema(&[("id", DataType::Int32), ("val", DataType::Text)]),
+                    cost: PhysicalCost::default(),
+                }),
+                join_type: JoinType::Inner,
+                condition: JoinCondition::On(TypedExpr {
+                    kind: TypedExprKind::BinaryOp {
+                        left: Box::new(TypedExpr {
+                            kind: TypedExprKind::ColumnRef {
+                                scope_depth: 0,
+                                column_index: 0,
+                                column_name: "id".to_string(),
+                            },
+                            data_type: DataType::Int32,
+                        }),
+                        op: TypedBinaryOp::Eq,
+                        right: Box::new(TypedExpr {
+                            kind: TypedExprKind::ColumnRef {
+                                scope_depth: 0,
+                                column_index: 2,
+                                column_name: "id".to_string(),
+                            },
+                            data_type: DataType::Int32,
+                        }),
+                    },
+                    data_type: DataType::Boolean,
+                }),
+                left_is_build: true,
+            },
+            schema: make_schema(&[
+                ("id", DataType::Int32),
+                ("name", DataType::Text),
+                ("id", DataType::Int32),
+                ("val", DataType::Text),
+            ]),
+            cost: PhysicalCost::default(),
+        };
+
+        // Build must succeed (not panic from out-of-bounds index)
+        let op = plan.build_operators(&ctx).unwrap();
+        assert_eq!(op.name(), "HashJoin");
     }
 
     #[test]

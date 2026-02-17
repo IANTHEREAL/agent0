@@ -135,7 +135,10 @@ fn can_flatten(inner: &AnalyzedQuery) -> bool {
     if inner_select.from.len() != 1 {
         return false;
     }
-    if !matches!(inner_select.from[0].kind, AnalyzedTableRefKind::Table { .. }) {
+    if !matches!(
+        inner_select.from[0].kind,
+        AnalyzedTableRefKind::Table { .. }
+    ) {
         return false;
     }
 
@@ -149,9 +152,10 @@ fn can_flatten(inner: &AnalyzedQuery) -> bool {
 
     // Criterion 8: inner WHERE has no correlated refs (scope_depth > 0)
     if let Some(ref where_expr) = inner_select.where_clause {
-        let has_correlated = expr_any(where_expr, &|e| {
-            matches!(e.kind, TypedExprKind::ColumnRef { scope_depth, .. } if scope_depth > 0)
-        });
+        let has_correlated = expr_any(
+            where_expr,
+            &|e| matches!(e.kind, TypedExprKind::ColumnRef { scope_depth, .. } if scope_depth > 0),
+        );
         if has_correlated {
             return false;
         }
@@ -218,16 +222,27 @@ fn flatten_subquery(query: AnalyzedQuery) -> AnalyzedQuery {
     }
 
     // Defensive guard: verify all outer refs will be in bounds after remap.
-    if !remap_is_safe(&outer_projection.iter().map(|p| &p.expr).collect::<Vec<_>>(), &column_map, &base_names)
-        || !remap_is_safe(&outer_where.iter().collect::<Vec<_>>(), &column_map, &base_names)
-        || !remap_is_safe(&outer_group_by.iter().collect::<Vec<_>>(), &column_map, &base_names)
-        || !remap_is_safe(&outer_having.iter().collect::<Vec<_>>(), &column_map, &base_names)
-        || !remap_is_safe(
-            &order_by.iter().map(|ob| &ob.expr).collect::<Vec<_>>(),
-            &column_map,
-            &base_names,
-        )
-        || !distinct_remap_is_safe(&outer_distinct, &column_map, &base_names)
+    if !remap_is_safe(
+        &outer_projection.iter().map(|p| &p.expr).collect::<Vec<_>>(),
+        &column_map,
+        &base_names,
+    ) || !remap_is_safe(
+        &outer_where.iter().collect::<Vec<_>>(),
+        &column_map,
+        &base_names,
+    ) || !remap_is_safe(
+        &outer_group_by.iter().collect::<Vec<_>>(),
+        &column_map,
+        &base_names,
+    ) || !remap_is_safe(
+        &outer_having.iter().collect::<Vec<_>>(),
+        &column_map,
+        &base_names,
+    ) || !remap_is_safe(
+        &order_by.iter().map(|ob| &ob.expr).collect::<Vec<_>>(),
+        &column_map,
+        &base_names,
+    ) || !distinct_remap_is_safe(&outer_distinct, &column_map, &base_names)
     {
         // Out-of-bounds column reference — bail out, return original query.
         let restored_body = AnalyzedQueryBody::Select(AnalyzedSelect {
@@ -382,7 +397,6 @@ fn wrap_is_true(expr: TypedExpr) -> TypedExpr {
     )
 }
 
-
 // ── Bounds checking ──────────────────────────────────────────────────────
 
 /// Check that all ColumnRef { scope_depth: 0 } in the given expressions have
@@ -428,11 +442,7 @@ fn distinct_remap_is_safe(
 /// Does NOT descend into subquery expression boundaries (ScalarSubquery, Exists,
 /// InSubquery.subquery, AnyAll.subquery, ArraySubquery) — those have independent
 /// scopes where scope_depth: 0 means something different.
-fn remap_column_refs(
-    expr: TypedExpr,
-    column_map: &[usize],
-    base_names: &[String],
-) -> TypedExpr {
+fn remap_column_refs(expr: TypedExpr, column_map: &[usize], base_names: &[String]) -> TypedExpr {
     let TypedExpr { kind, data_type } = expr;
 
     let new_kind = match kind {
@@ -663,11 +673,7 @@ fn remap_column_refs(
     TypedExpr::new(new_kind, data_type)
 }
 
-fn remap_vec(
-    exprs: Vec<TypedExpr>,
-    column_map: &[usize],
-    base_names: &[String],
-) -> Vec<TypedExpr> {
+fn remap_vec(exprs: Vec<TypedExpr>, column_map: &[usize], base_names: &[String]) -> Vec<TypedExpr> {
     exprs
         .into_iter()
         .map(|e| remap_column_refs(e, column_map, base_names))
@@ -888,7 +894,13 @@ mod tests {
             panic!("expected Select");
         };
         let where_clause = s.where_clause.as_ref().expect("should have WHERE");
-        assert!(matches!(where_clause.kind, TypedExprKind::BinaryOp { op: BinaryOp::And, .. }));
+        assert!(matches!(
+            where_clause.kind,
+            TypedExprKind::BinaryOp {
+                op: BinaryOp::And,
+                ..
+            }
+        ));
     }
 
     // ── Negative tests: non-flattenable cases ────────────────────────
@@ -911,12 +923,7 @@ mod tests {
             output_schema: vec![],
         };
 
-        let query = wrap_as_outer(
-            inner,
-            "v",
-            vec![projection(0, "id", DataType::Int64)],
-            None,
-        );
+        let query = wrap_as_outer(inner, "v", vec![projection(0, "id", DataType::Int64)], None);
         let result = rewrite_query(query);
         assert!(is_subquery_from(&result));
     }
@@ -942,12 +949,7 @@ mod tests {
             output_schema: vec![],
         };
 
-        let query = wrap_as_outer(
-            inner,
-            "v",
-            vec![projection(0, "id", DataType::Int64)],
-            None,
-        );
+        let query = wrap_as_outer(inner, "v", vec![projection(0, "id", DataType::Int64)], None);
         let result = rewrite_query(query);
         assert!(is_subquery_from(&result));
     }
@@ -970,12 +972,7 @@ mod tests {
             output_schema: vec![],
         };
 
-        let query = wrap_as_outer(
-            inner,
-            "v",
-            vec![projection(0, "id", DataType::Int64)],
-            None,
-        );
+        let query = wrap_as_outer(inner, "v", vec![projection(0, "id", DataType::Int64)], None);
         let result = rewrite_query(query);
         assert!(is_subquery_from(&result));
     }
@@ -1025,11 +1022,7 @@ mod tests {
     #[test]
     fn test_no_flatten_multi_from() {
         // Outer has 2 FROM sources
-        let inner = simple_inner_query(
-            "users",
-            vec![projection(0, "id", DataType::Int64)],
-            None,
-        );
+        let inner = simple_inner_query("users", vec![projection(0, "id", DataType::Int64)], None);
 
         let query = AnalyzedQuery {
             ctes: vec![],
@@ -1194,7 +1187,13 @@ mod tests {
         let w = s.where_clause.as_ref().expect("should have WHERE");
         // Inner WHERE should be used directly — a bare ColumnRef, not IS TRUE wrapped.
         assert!(
-            matches!(w.kind, TypedExprKind::ColumnRef { column_index: 2, .. }),
+            matches!(
+                w.kind,
+                TypedExprKind::ColumnRef {
+                    column_index: 2,
+                    ..
+                }
+            ),
             "inner-only WHERE should be used directly without IS TRUE wrapping"
         );
     }
@@ -1202,11 +1201,7 @@ mod tests {
     #[test]
     fn test_order_by_remap() {
         // Inner: SELECT col1 AS a FROM users → mapping = [1]
-        let inner = simple_inner_query(
-            "users",
-            vec![projection(1, "b", DataType::Int64)],
-            None,
-        );
+        let inner = simple_inner_query("users", vec![projection(1, "b", DataType::Int64)], None);
 
         let query = AnalyzedQuery {
             ctes: vec![],
@@ -1244,11 +1239,7 @@ mod tests {
     #[test]
     fn test_outer_group_by_remap() {
         // Inner: SELECT col2 AS x FROM users → mapping = [2]
-        let inner = simple_inner_query(
-            "users",
-            vec![projection(2, "c", DataType::Text)],
-            None,
-        );
+        let inner = simple_inner_query("users", vec![projection(2, "c", DataType::Text)], None);
 
         let query = AnalyzedQuery {
             ctes: vec![],
@@ -1285,11 +1276,7 @@ mod tests {
     #[test]
     fn test_outer_having_remap() {
         // Inner: SELECT col1 AS x FROM users → mapping = [1]
-        let inner = simple_inner_query(
-            "users",
-            vec![projection(1, "b", DataType::Int64)],
-            None,
-        );
+        let inner = simple_inner_query("users", vec![projection(1, "b", DataType::Int64)], None);
 
         let having = TypedExpr::new(
             TypedExprKind::BinaryOp {
@@ -1343,11 +1330,7 @@ mod tests {
     #[test]
     fn test_outer_distinct_on_remap() {
         // Inner: SELECT col3 AS x FROM users → mapping = [3]
-        let inner = simple_inner_query(
-            "users",
-            vec![projection(3, "d", DataType::Text)],
-            None,
-        );
+        let inner = simple_inner_query("users", vec![projection(3, "d", DataType::Text)], None);
 
         let query = AnalyzedQuery {
             ctes: vec![],
@@ -1380,7 +1363,10 @@ mod tests {
         };
         if let AnalyzedDistinct::DistinctOn(ref exprs) = s.distinct {
             if let TypedExprKind::ColumnRef { column_index, .. } = &exprs[0].kind {
-                assert_eq!(*column_index, 3, "DISTINCT ON col0 should remap to base col3");
+                assert_eq!(
+                    *column_index, 3,
+                    "DISTINCT ON col0 should remap to base col3"
+                );
             } else {
                 panic!("expected ColumnRef in DISTINCT ON");
             }
@@ -1440,11 +1426,7 @@ mod tests {
     #[test]
     fn test_no_flatten_outer_exists_expr() {
         // Outer WHERE has an Exists subquery — must not flatten.
-        let inner = simple_inner_query(
-            "users",
-            vec![projection(0, "id", DataType::Int64)],
-            None,
-        );
+        let inner = simple_inner_query("users", vec![projection(0, "id", DataType::Int64)], None);
 
         let exists_expr = TypedExpr::new(
             TypedExprKind::Exists {
@@ -1475,11 +1457,7 @@ mod tests {
     #[test]
     fn test_no_flatten_outer_in_subquery_expr() {
         // Outer WHERE has IN (subquery) — must not flatten.
-        let inner = simple_inner_query(
-            "users",
-            vec![projection(0, "id", DataType::Int64)],
-            None,
-        );
+        let inner = simple_inner_query("users", vec![projection(0, "id", DataType::Int64)], None);
 
         let in_subquery_expr = TypedExpr::new(
             TypedExprKind::InSubquery {
@@ -1555,11 +1533,7 @@ mod tests {
     #[test]
     fn test_out_of_bounds_column_ref_no_panic() {
         // Inner projects 1 column but outer refs col1 (out of bounds)
-        let inner = simple_inner_query(
-            "users",
-            vec![projection(0, "id", DataType::Int64)],
-            None,
-        );
+        let inner = simple_inner_query("users", vec![projection(0, "id", DataType::Int64)], None);
 
         let query = wrap_as_outer(
             inner,
@@ -1573,6 +1547,9 @@ mod tests {
 
         let result = rewrite_query(query);
         // Should NOT flatten — defensive guard kicks in
-        assert!(is_subquery_from(&result), "should bail out on out-of-bounds ref");
+        assert!(
+            is_subquery_from(&result),
+            "should bail out on out-of-bounds ref"
+        );
     }
 }

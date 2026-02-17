@@ -321,7 +321,7 @@ fn is_foldable_function_call(
     !is_volatile_or_side_effecting_builtin(&func.name)
 }
 
-fn is_volatile_or_side_effecting_builtin(name: &str) -> bool {
+pub(crate) fn is_volatile_or_side_effecting_builtin(name: &str) -> bool {
     matches!(
         name.to_ascii_uppercase().as_str(),
         "NEXTVAL"

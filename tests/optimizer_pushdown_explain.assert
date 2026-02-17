@@ -1,0 +1,27 @@
+# Optimizer predicate pushdown EXPLAIN plan-shape assertions.
+#
+# LIMITATION: The assertion engine (integration_test.py) checks global
+# substring presence — it CANNOT verify relative position of nodes.
+# Plan-tree structure (Filter above/below Join) is verified by unit tests
+# 2-20 in src/sql/optimizer/rewrite.rs::tests.
+#
+# These assertions verify: (1) optimizer produces plans with expected
+# operators and conditions, (2) filter conditions appear in EXPLAIN output.
+
+# E1-E4: All plans should show a Filter operator
+Filter
+
+# E1: left-only filter condition (a.x = 10) appears
+(x = 10)
+
+# E2: left-only filter condition (a.x > 10) appears
+(x > 10)
+
+# E3: right-side filter condition (b.y > 100) appears
+(y > 100)
+
+# E4: split push — both conditions appear
+(y > 50)
+
+# Hash Join appears for equi-join queries (E1-E4 use a.id = b.id)
+Hash Join

@@ -15,14 +15,15 @@
 
 use super::logical_plan::{LogicalNode, LogicalPlan};
 use super::physical_plan::{PhysicalCost, PhysicalNode, PhysicalPlan};
-use super::selectivity;
 use super::statistics::TableStatistics;
-use crate::sql::analyzer::types::TypedExprKind;
+use super::{join_keys, selectivity};
+use crate::sql::analyzer::types::{JoinCondition, JoinType, TypedExprKind};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 const DEFAULT_ESTIMATED_ROWS: usize = 1000;
 const TOPN_THRESHOLD: usize = 1000;
+const DEFAULT_JOIN_SEL: f64 = 0.1;
 
 /// Context for physical planning, carrying table statistics.
 ///
@@ -79,6 +80,75 @@ impl PhysicalPlanner {
             // Multi-input / opaque → no stats.
             _ => None,
         }
+    }
+
+    /// Estimate join output rows.
+    ///
+    /// Strategy:
+    /// 1. Equi-joins with stats on BOTH sides: 1/max(NDV_left, NDV_right) per key pair.
+    ///    Column lookup uses `selectivity::get_column_stats` (case-insensitive, ambiguity-safe).
+    /// 2. Equi-joins without stats on one/both sides: DEFAULT_JOIN_SEL.
+    /// 3. Non-equi / cross joins: Cartesian product (selectivity = 1.0).
+    /// 4. Clamp to join-type semantic lower bound.
+    fn estimate_join_rows(
+        left_logical: &LogicalPlan,
+        right_logical: &LogicalPlan,
+        left_rows: usize,
+        right_rows: usize,
+        join_type: &JoinType,
+        condition: &JoinCondition,
+        ctx: &PlanningContext,
+    ) -> usize {
+        let left_width = left_logical.schema.columns.len();
+
+        let selectivity = if let Some((left_keys, right_keys)) =
+            join_keys::try_extract_equi_keys(condition, left_width)
+        {
+            let left_stats = Self::resolve_stats(left_logical, ctx);
+            let right_stats = Self::resolve_stats(right_logical, ctx);
+
+            match (left_stats, right_stats) {
+                (Some(ls), Some(rs)) => {
+                    let mut sel = 1.0;
+                    for (&lk, &rk) in left_keys.iter().zip(right_keys.iter()) {
+                        let left_col_name =
+                            left_logical.schema.columns.get(lk).map(|(n, _)| n.as_str());
+                        let right_col_name = right_logical
+                            .schema
+                            .columns
+                            .get(rk)
+                            .map(|(n, _)| n.as_str());
+
+                        let left_ndv = left_col_name
+                            .and_then(|n| selectivity::get_column_stats(ls, n))
+                            .map(|c| selectivity::n_distinct_raw(c, ls.row_count));
+                        let right_ndv = right_col_name
+                            .and_then(|n| selectivity::get_column_stats(rs, n))
+                            .map(|c| selectivity::n_distinct_raw(c, rs.row_count));
+
+                        sel *= match (left_ndv, right_ndv) {
+                            (Some(l), Some(r)) => 1.0 / l.max(r).max(1.0),
+                            _ => DEFAULT_JOIN_SEL,
+                        };
+                    }
+                    sel
+                }
+                _ => DEFAULT_JOIN_SEL,
+            }
+        } else {
+            1.0 // Non-equi or cross — Cartesian
+        };
+
+        let inner_est = ((left_rows as f64) * (right_rows as f64) * selectivity).ceil() as usize;
+
+        let min_rows = match join_type {
+            JoinType::Left => left_rows,
+            JoinType::Right => right_rows,
+            JoinType::Full => left_rows.max(right_rows),
+            _ => 0, // Inner, Cross: no structural minimum
+        };
+
+        inner_est.max(min_rows).max(1)
     }
 
     fn plan_node(logical: &LogicalPlan, ctx: &PlanningContext) -> PhysicalPlan {
@@ -358,23 +428,43 @@ impl PhysicalPlanner {
             } => {
                 let left_phys = Self::plan_node(left, ctx);
                 let right_phys = Self::plan_node(right, ctx);
-                let total_rows = left_phys.cost.rows.saturating_mul(right_phys.cost.rows);
+                let left_rows = left_phys.cost.rows;
+                let right_rows = right_phys.cost.rows;
+                let left_width = left.schema.columns.len();
+
+                let total_rows = Self::estimate_join_rows(
+                    left, right, left_rows, right_rows, join_type, condition, ctx,
+                );
                 let total_cost =
                     left_phys.cost.total + right_phys.cost.total + total_rows as f64 * 0.01;
                 let cost = PhysicalCost {
                     startup: 0.0,
                     total: total_cost,
-                    rows: total_rows.max(1),
+                    rows: total_rows,
                 };
 
-                // Phase 1: always NLJ. Hash join selection in Phase 2+.
-                PhysicalPlan {
-                    node: PhysicalNode::NestedLoopJoin {
+                // Algorithm selection: HashJoin for pure equi-joins, NLJ otherwise.
+                // Mixed ON (equi + residual) → NLJ for now (limitation L1).
+                let node = if join_keys::try_extract_equi_keys(condition, left_width).is_some() {
+                    let left_is_build = left_rows <= right_rows;
+                    PhysicalNode::HashJoin {
                         left: Box::new(left_phys),
                         right: Box::new(right_phys),
                         join_type: *join_type,
                         condition: condition.clone(),
-                    },
+                        left_is_build,
+                    }
+                } else {
+                    PhysicalNode::NestedLoopJoin {
+                        left: Box::new(left_phys),
+                        right: Box::new(right_phys),
+                        join_type: *join_type,
+                        condition: condition.clone(),
+                    }
+                };
+
+                PhysicalPlan {
+                    node,
                     schema: logical.schema.clone(),
                     cost,
                 }
@@ -1270,5 +1360,379 @@ mod tests {
             "gate8: got {}",
             physical.cost.rows
         );
+    }
+
+    // ── Join algorithm selection + cardinality tests ─────
+
+    use crate::sql::optimizer::logical_plan::LogicalNode;
+
+    fn make_join_plan(
+        left_rows: usize,
+        right_rows: usize,
+        join_type: JoinType,
+        condition: JoinCondition,
+    ) -> (LogicalPlan, PlanningContext) {
+        let left = LogicalPlan::scan(
+            "left_t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![
+                ("id".to_string(), DataType::Int64),
+                ("val".to_string(), DataType::Text),
+            ]),
+        );
+        let right = LogicalPlan::scan(
+            "right_t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![
+                ("id".to_string(), DataType::Int64),
+                ("name".to_string(), DataType::Text),
+            ]),
+        );
+        let mut schema_cols = left.schema.columns.clone();
+        schema_cols.extend(right.schema.columns.clone());
+        let join = LogicalPlan {
+            node: LogicalNode::Join {
+                left: Box::new(left),
+                right: Box::new(right),
+                join_type,
+                condition,
+            },
+            schema: PlanSchema::from_columns(schema_cols),
+        };
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats.insert(
+            "left_t".to_string(),
+            make_table_stats(left_rows, HashMap::new()),
+        );
+        ctx.table_stats.insert(
+            "right_t".to_string(),
+            make_table_stats(right_rows, HashMap::new()),
+        );
+        (join, ctx)
+    }
+
+    fn equi_on_condition() -> JoinCondition {
+        // col[0] = col[2] (left.id = right.id, left_width=2)
+        JoinCondition::On(TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(TypedExpr {
+                    kind: TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: 0,
+                        column_name: "id".to_string(),
+                    },
+                    data_type: DataType::Int64,
+                }),
+                op: BinaryOp::Eq,
+                right: Box::new(TypedExpr {
+                    kind: TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: 2,
+                        column_name: "id".to_string(),
+                    },
+                    data_type: DataType::Int64,
+                }),
+            },
+            data_type: DataType::Boolean,
+        })
+    }
+
+    fn non_equi_on_condition() -> JoinCondition {
+        // col[0] > col[2]
+        JoinCondition::On(TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(TypedExpr {
+                    kind: TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: 0,
+                        column_name: "id".to_string(),
+                    },
+                    data_type: DataType::Int64,
+                }),
+                op: BinaryOp::Gt,
+                right: Box::new(TypedExpr {
+                    kind: TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: 2,
+                        column_name: "id".to_string(),
+                    },
+                    data_type: DataType::Int64,
+                }),
+            },
+            data_type: DataType::Boolean,
+        })
+    }
+
+    #[test]
+    fn test_hash_join_for_equi() {
+        let (join, ctx) = make_join_plan(1000, 1000, JoinType::Inner, equi_on_condition());
+        let physical = PhysicalPlanner::plan(&join, &ctx);
+        assert!(
+            matches!(physical.node, PhysicalNode::HashJoin { .. }),
+            "equi-join should produce HashJoin, got {:?}",
+            std::mem::discriminant(&physical.node)
+        );
+    }
+
+    #[test]
+    fn test_nlj_for_non_equi() {
+        let (join, ctx) = make_join_plan(1000, 1000, JoinType::Inner, non_equi_on_condition());
+        let physical = PhysicalPlanner::plan(&join, &ctx);
+        assert!(
+            matches!(physical.node, PhysicalNode::NestedLoopJoin { .. }),
+            "non-equi should produce NLJ"
+        );
+    }
+
+    #[test]
+    fn test_nlj_for_cross() {
+        let (join, ctx) = make_join_plan(1000, 1000, JoinType::Cross, JoinCondition::None);
+        let physical = PhysicalPlanner::plan(&join, &ctx);
+        assert!(
+            matches!(physical.node, PhysicalNode::NestedLoopJoin { .. }),
+            "cross join should produce NLJ"
+        );
+    }
+
+    #[test]
+    fn test_cardinality_with_stats() {
+        // Left=10000 rows, NDV(id)=100. Right=5000 rows, NDV(id)=200.
+        // sel = 1/max(100,200) = 1/200, rows = ceil(10000 * 5000 / 200) = 250000.
+        let left = LogicalPlan::scan(
+            "left_t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![
+                ("id".to_string(), DataType::Int64),
+                ("val".to_string(), DataType::Text),
+            ]),
+        );
+        let right = LogicalPlan::scan(
+            "right_t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![
+                ("id".to_string(), DataType::Int64),
+                ("name".to_string(), DataType::Text),
+            ]),
+        );
+        let mut schema_cols = left.schema.columns.clone();
+        schema_cols.extend(right.schema.columns.clone());
+        let join = LogicalPlan {
+            node: LogicalNode::Join {
+                left: Box::new(left),
+                right: Box::new(right),
+                join_type: JoinType::Inner,
+                condition: equi_on_condition(),
+            },
+            schema: PlanSchema::from_columns(schema_cols),
+        };
+
+        let mut left_cols = HashMap::new();
+        left_cols.insert("id".to_string(), make_col_stats(0.0, 100.0));
+        let mut right_cols = HashMap::new();
+        right_cols.insert("id".to_string(), make_col_stats(0.0, 200.0));
+
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("left_t".to_string(), make_table_stats(10000, left_cols));
+        ctx.table_stats
+            .insert("right_t".to_string(), make_table_stats(5000, right_cols));
+
+        let physical = PhysicalPlanner::plan(&join, &ctx);
+        assert_eq!(
+            physical.cost.rows, 250000,
+            "cardinality with stats: got {}",
+            physical.cost.rows
+        );
+    }
+
+    #[test]
+    fn test_cardinality_no_stats() {
+        // Both sides default 1000 rows, no stats → DEFAULT_JOIN_SEL = 0.1
+        // rows = ceil(1000 * 1000 * 0.1) = 100000
+        let (join, ctx) = make_join_plan(1000, 1000, JoinType::Inner, equi_on_condition());
+        let physical = PhysicalPlanner::plan(&join, &ctx);
+        assert_eq!(
+            physical.cost.rows, 100000,
+            "cardinality no stats: got {}",
+            physical.cost.rows
+        );
+    }
+
+    #[test]
+    fn test_left_join_lower_bound() {
+        // LEFT JOIN: L=1000, R=10 with NDV(id)=1000 → inner_est = ceil(1000*10/1000) = 10.
+        // But LEFT JOIN must return >= left_rows=1000.
+        let left = LogicalPlan::scan(
+            "left_t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![
+                ("id".to_string(), DataType::Int64),
+                ("val".to_string(), DataType::Text),
+            ]),
+        );
+        let right = LogicalPlan::scan(
+            "right_t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![
+                ("id".to_string(), DataType::Int64),
+                ("name".to_string(), DataType::Text),
+            ]),
+        );
+        let mut schema_cols = left.schema.columns.clone();
+        schema_cols.extend(right.schema.columns.clone());
+        let join = LogicalPlan {
+            node: LogicalNode::Join {
+                left: Box::new(left),
+                right: Box::new(right),
+                join_type: JoinType::Left,
+                condition: equi_on_condition(),
+            },
+            schema: PlanSchema::from_columns(schema_cols),
+        };
+
+        let mut left_cols = HashMap::new();
+        left_cols.insert("id".to_string(), make_col_stats(0.0, 1000.0));
+        let mut right_cols = HashMap::new();
+        right_cols.insert("id".to_string(), make_col_stats(0.0, 1000.0));
+
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("left_t".to_string(), make_table_stats(1000, left_cols));
+        ctx.table_stats
+            .insert("right_t".to_string(), make_table_stats(10, right_cols));
+
+        let physical = PhysicalPlanner::plan(&join, &ctx);
+        assert!(
+            physical.cost.rows >= 1000,
+            "LEFT JOIN lower bound: got {}",
+            physical.cost.rows
+        );
+    }
+
+    #[test]
+    fn test_right_join_lower_bound() {
+        // RIGHT JOIN: must return >= right_rows.
+        let left = LogicalPlan::scan(
+            "left_t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![
+                ("id".to_string(), DataType::Int64),
+                ("val".to_string(), DataType::Text),
+            ]),
+        );
+        let right = LogicalPlan::scan(
+            "right_t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![
+                ("id".to_string(), DataType::Int64),
+                ("name".to_string(), DataType::Text),
+            ]),
+        );
+        let mut schema_cols = left.schema.columns.clone();
+        schema_cols.extend(right.schema.columns.clone());
+        let join = LogicalPlan {
+            node: LogicalNode::Join {
+                left: Box::new(left),
+                right: Box::new(right),
+                join_type: JoinType::Right,
+                condition: equi_on_condition(),
+            },
+            schema: PlanSchema::from_columns(schema_cols),
+        };
+
+        let mut left_cols = HashMap::new();
+        left_cols.insert("id".to_string(), make_col_stats(0.0, 1000.0));
+        let mut right_cols = HashMap::new();
+        right_cols.insert("id".to_string(), make_col_stats(0.0, 1000.0));
+
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("left_t".to_string(), make_table_stats(10, left_cols));
+        ctx.table_stats
+            .insert("right_t".to_string(), make_table_stats(1000, right_cols));
+
+        let physical = PhysicalPlanner::plan(&join, &ctx);
+        assert!(
+            physical.cost.rows >= 1000,
+            "RIGHT JOIN lower bound: got {}",
+            physical.cost.rows
+        );
+    }
+
+    #[test]
+    fn test_full_join_lower_bound() {
+        // FULL JOIN: must return >= max(left_rows, right_rows).
+        let left = LogicalPlan::scan(
+            "left_t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![
+                ("id".to_string(), DataType::Int64),
+                ("val".to_string(), DataType::Text),
+            ]),
+        );
+        let right = LogicalPlan::scan(
+            "right_t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![
+                ("id".to_string(), DataType::Int64),
+                ("name".to_string(), DataType::Text),
+            ]),
+        );
+        let mut schema_cols = left.schema.columns.clone();
+        schema_cols.extend(right.schema.columns.clone());
+        let join = LogicalPlan {
+            node: LogicalNode::Join {
+                left: Box::new(left),
+                right: Box::new(right),
+                join_type: JoinType::Full,
+                condition: equi_on_condition(),
+            },
+            schema: PlanSchema::from_columns(schema_cols),
+        };
+
+        let mut left_cols = HashMap::new();
+        left_cols.insert("id".to_string(), make_col_stats(0.0, 1000.0));
+        let mut right_cols = HashMap::new();
+        right_cols.insert("id".to_string(), make_col_stats(0.0, 1000.0));
+
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("left_t".to_string(), make_table_stats(500, left_cols));
+        ctx.table_stats
+            .insert("right_t".to_string(), make_table_stats(800, right_cols));
+
+        let physical = PhysicalPlanner::plan(&join, &ctx);
+        assert!(
+            physical.cost.rows >= 800,
+            "FULL JOIN lower bound: got {}",
+            physical.cost.rows
+        );
+    }
+
+    #[test]
+    fn test_cross_join_cartesian() {
+        // Cross join: no selectivity reduction → rows = L * R
+        let (join, ctx) = make_join_plan(100, 200, JoinType::Cross, JoinCondition::None);
+        let physical = PhysicalPlanner::plan(&join, &ctx);
+        assert_eq!(
+            physical.cost.rows, 20000,
+            "cross join cartesian: got {}",
+            physical.cost.rows
+        );
+    }
+
+    #[test]
+    fn test_build_side_smaller() {
+        // L=100, R=10000 → left is smaller → left_is_build = true
+        let (join, ctx) = make_join_plan(100, 10000, JoinType::Inner, equi_on_condition());
+        let physical = PhysicalPlanner::plan(&join, &ctx);
+        if let PhysicalNode::HashJoin { left_is_build, .. } = &physical.node {
+            assert!(
+                *left_is_build,
+                "smaller left should be build side, got left_is_build=false"
+            );
+        } else {
+            panic!("expected HashJoin");
+        }
     }
 }

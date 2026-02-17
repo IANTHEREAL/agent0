@@ -501,7 +501,7 @@ fn not_dispatch(operand: &TypedExpr, stats: &TableStatistics) -> f64 {
 
 /// Raw effective n_distinct — can be 0.0 for all-NULL columns.
 /// Used by GROUP BY estimation where 0 non-null groups is a valid answer.
-fn n_distinct_raw(col: &ColumnStatistics, row_count: usize) -> f64 {
+pub(super) fn n_distinct_raw(col: &ColumnStatistics, row_count: usize) -> f64 {
     if col.n_distinct >= 0.0 {
         col.n_distinct
     } else {
@@ -517,7 +517,7 @@ fn n_distinct_for_eq(col: &ColumnStatistics, row_count: usize) -> f64 {
 
 // ── Helper: column lookup (case-insensitive, ambiguity-safe) ─
 
-fn get_column_stats<'a>(
+pub(super) fn get_column_stats<'a>(
     stats: &'a TableStatistics,
     col_name: &str,
 ) -> Option<&'a ColumnStatistics> {
