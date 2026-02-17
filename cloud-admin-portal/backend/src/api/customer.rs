@@ -701,6 +701,10 @@ pub async fn create_database(
         ));
     }
 
+    // Install default extensions (non-fatal)
+    pg.bootstrap_default_extensions(&tenant_id, &admin_user, &password)
+        .await;
+
     db::update_tenant_state(&state.db, &tenant_id, tenant_state::ACTIVE, None).await?;
     db::set_tenant_customer_id(&state.db, &tenant_id, &auth.customer_id).await?;
 
@@ -1565,6 +1569,9 @@ pub async fn branch_database(
             )));
         }
     }
+
+    pg.bootstrap_default_extensions(&tenant_id, &admin_user, &password)
+        .await;
 
     db::update_tenant_state(&state.db, &tenant_id, tenant_state::ACTIVE, None).await?;
     db::set_tenant_customer_id(&state.db, &tenant_id, &auth.customer_id).await?;

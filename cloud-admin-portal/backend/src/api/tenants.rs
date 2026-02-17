@@ -173,6 +173,9 @@ pub async fn create_tenant(
         ));
     }
 
+    pg.bootstrap_default_extensions(&tenant_id, &admin_user, &password)
+        .await;
+
     db::update_tenant_state(&state.db, &tenant_id, tenant_state::ACTIVE, None).await?;
     db::insert_audit_log(
         &state.db,
