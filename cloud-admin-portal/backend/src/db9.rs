@@ -121,6 +121,9 @@ enum DbAction {
         name: String,
         #[arg(long)]
         region: Option<String>,
+        /// Admin password (default: random)
+        #[arg(long)]
+        password: Option<String>,
     },
     /// List your databases
     List,
@@ -524,8 +527,8 @@ async fn main() {
         } => cmd_sh(&api, &cli.api_url, id.as_deref(), command.as_deref()).await,
         Commands::Completion { shell } => cmd_completion(shell),
         Commands::Db { ref action } => match action {
-            DbAction::Create { name, region } => {
-                cmd_db_create(&api, &cli.effective_output(), name, region.as_deref()).await
+            DbAction::Create { name, region, password } => {
+                cmd_db_create(&api, &cli.effective_output(), name, region.as_deref(), password.as_deref()).await
             }
             DbAction::List => cmd_db_list(&api, &cli.effective_output()).await,
             DbAction::Status { id } => cmd_db_status(&api, &cli.effective_output(), id).await,
@@ -898,13 +901,13 @@ async fn cmd_init(api: &ApiClient, output: &OutputFormat) {
             eprintln!("Database name cannot be empty.");
             process::exit(1);
         }
-        cmd_db_create(api, output, name, None).await;
+        cmd_db_create(api, output, name, None, None).await;
     }
 
     println!("\nYou're all set! Run 'db9 --help' to see all available commands.");
 }
 
-async fn cmd_db_create(api: &ApiClient, output: &OutputFormat, name: &str, region: Option<&str>) {
+async fn cmd_db_create(api: &ApiClient, output: &OutputFormat, name: &str, region: Option<&str>, password: Option<&str>) {
     let token = match load_token() {
         Ok(t) => t,
         Err(_) => {
@@ -941,6 +944,13 @@ async fn cmd_db_create(api: &ApiClient, output: &OutputFormat, name: &str, regio
     let mut body = serde_json::json!({ "name": name });
     if let Some(r) = region {
         body["region"] = Value::String(r.to_string());
+    }
+    if let Some(p) = password {
+        if p.is_empty() {
+            eprintln!("Error: --password cannot be empty");
+            process::exit(1);
+        }
+        body["admin_password"] = Value::String(p.to_string());
     }
 
     let data = api
