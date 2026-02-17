@@ -42,7 +42,7 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 ### Module Boundaries
 
 - `Analyzer` (`src/sql/analyzer/`): name resolution, scope checking, and type inference; outputs `AnalyzedQuery` / `TypedExpr`.
-- `Optimizer` (`src/sql/optimizer/`): `AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator`. Phase 1 live for single-table SELECTs (gated by `tipg.use_optimizer` GUC, default OFF).
+- `Optimizer` (`src/sql/optimizer/`): `AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator`. Handles single-table and multi-table queries. Gated by `tipg.use_optimizer` GUC (default ON). Safety valve: `SET tipg.use_optimizer = off`.
 - `Operators` (`src/sql/operators/`): physical operators (scan, filter, project, sort, aggregate, hash_join, NLJ, window, CTE, set_operation, table_function).
 - `Executor` (`src/sql/executor/`): DDL/DML dispatch, SELECT execution (analyzed path at `executor/select/analyzed/`).
 - `Catalog` (`src/sql/catalog/`): `information_schema` / `pg_catalog` compatibility surface (35+ virtual table implementations).
@@ -69,7 +69,7 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 - `AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator` pipeline implemented in `src/sql/optimizer/`.
 - **Planner dual-path resolved:** TypedExpr path has full GIN + expression-index + partial-index support. EXPLAIN uses the analyzed pipeline (view expansion → Analyzer → typed planner). AST path retained only for non-SELECT EXPLAIN and analysis error fallback.
 - Phase 1 scope: single-table SELECTs, no optimizer rules, no statistics.
-- GUC `tipg.use_optimizer` (default OFF) — opt-in with graceful fallback.
+- GUC `tipg.use_optimizer` (default ON) — safety valve: `SET tipg.use_optimizer = off` disables for current session.
 - Handler decomposed: `view_infer.rs`, `schema_resolve.rs`, `type_infer.rs` extracted from monolithic handler.
 - Index name uniqueness enforced within schema (#777).
 
@@ -81,11 +81,12 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 
 ## Current Problems (Active)
 
-### P1 — CBO Phases 2-4
+### P1 — CBO Remaining Phases
 
-- Phase 2: Table statistics (#706) — `ANALYZE` command, row count / distinct / histogram collection.
-- Phase 3: Join reordering / decorrelation (#705) — multi-table cost-based join ordering.
-- Phase 4: Plan cache (#707) — parameterized plan reuse.
+- Phase 2: Table statistics (#706) — COMPLETE (ANALYZE, persistence, warmup, invalidation).
+- Phase 3: Join optimization (#705) — predicate pushdown, cross-join elimination, hash join selection DONE. Remaining: cost-based join reordering, subquery decorrelation.
+- Phase 4: Plan cache (#707) — NOT STARTED (deferred until optimizer is stable as default).
+- Index selection in optimizer path — COMPLETE (btree parity: point, range, bounded-range, in-list, expression indexes, partial indexes; GIN excluded).
 
 ## Repository Layout (stable)
 

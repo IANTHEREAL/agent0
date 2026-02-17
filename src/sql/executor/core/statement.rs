@@ -1130,9 +1130,10 @@ impl Executor {
                     // use the shared optimize() entrypoint so EXPLAIN shows
                     // the same plan that execution actually uses.
                     if crate::sql::query_context::QueryContext::use_optimizer()
+                        && expanded.locks.is_empty()
                         && crate::sql::optimizer::eligibility::is_optimizer_eligible(&analyzed)
                     {
-                        // Build PlanningContext with real table statistics,
+                        // Build PlanningContext with real table statistics and schemas,
                         // identical to execution path — uses get_or_load_stats
                         // to warm cache from persisted TiKV stats on miss.
                         let mut planning_ctx = crate::sql::optimizer::PlanningContext::empty();
@@ -1155,11 +1156,24 @@ impl Executor {
                                     if let Some(stats) = stats {
                                         planning_ctx.table_stats.insert(name.to_string(), stats);
                                     }
+                                    // Load full table schema (with index metadata)
+                                    // for access-path selection — mirrors execution path.
+                                    if let Some(table_schema) =
+                                        self.store().get_schema(txn, db_id, name).await?
+                                    {
+                                        planning_ctx
+                                            .table_schemas
+                                            .insert(name.to_string(), table_schema);
+                                    }
                                 }
                             }
                         }
-                        let physical = crate::sql::optimizer::optimize(&analyzed, &planning_ctx);
-                        explain::physical_plan_to_plan_node(&physical)
+                        {
+                            // Eligibility gate guarantees optimize() always succeeds.
+                            let physical =
+                                crate::sql::optimizer::optimize(&analyzed, &planning_ctx);
+                            explain::physical_plan_to_plan_node(&physical)
+                        }
                     } else {
                         explain::generate_plan_from_analyzed(
                             &analyzed,

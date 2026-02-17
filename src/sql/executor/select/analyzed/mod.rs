@@ -120,7 +120,6 @@ impl Executor {
             let result = self
                 .execute_via_optimizer(txn, db_id, sequence_values, search_path, &analyzed, ctes)
                 .await?;
-
             // SELECT INTO post-processing.
             if let SetExpr::Select(select) = &*expanded_query.body {
                 if let Some(ref into) = select.into {
@@ -2677,10 +2676,11 @@ impl Executor {
         }
     }
 
-    /// Execute a query through the CBO optimizer pipeline.
+    /// Try to execute a query through the CBO optimizer pipeline.
     ///
     /// `AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator → execute`
     ///
+    /// Precondition: the caller has verified `is_optimizer_eligible()`.
     /// Phase 3: handles single-table SELECTs and multi-table JOINs.
     async fn execute_via_optimizer(
         &self,
@@ -2696,14 +2696,17 @@ impl Executor {
 
         tracing::debug!(target: "optimizer", "routing query through CBO pipeline");
 
-        // Step 1: Build PlanningContext with table statistics (if available).
-        // Recursively collect from join trees.  Uses get_or_load_stats to
-        // warm the in-memory cache from persisted TiKV stats on cache miss.
+        // Step 1: Build PlanningContext with table statistics and schemas.
+        // Pre-load both stats and full TableSchema (including index metadata)
+        // before optimize(), so the physical planner can do access-path selection.
+        // The pre-loaded schemas are then shared with BuildContext (Step 3) to
+        // eliminate redundant catalog reads.
         let mut planning_ctx = PlanningContext::empty();
         if let AnalyzedQueryBody::Select(select) = &analyzed.body {
             let mut stats_attempted = std::collections::HashSet::new();
             for table_ref in &select.from {
                 for (name, schema, _alias) in collect_table_refs(table_ref) {
+                    // Load statistics.
                     let tid = schema.table_id;
                     let stats = if stats_attempted.insert(tid) {
                         self.get_or_load_stats(txn, db_id, tid).await?
@@ -2713,15 +2716,28 @@ impl Executor {
                     if let Some(stats) = stats {
                         planning_ctx.table_stats.insert(name.to_string(), stats);
                     }
+                    // Load full table schema (with index metadata) for access-path selection.
+                    // CTE schemas are not loaded here — they have no indexes.
+                    let cte_key = name.to_lowercase();
+                    if ctes.get(&cte_key).is_none() {
+                        if let Some(table_schema) =
+                            self.store().get_schema(txn, db_id, name).await?
+                        {
+                            planning_ctx
+                                .table_schemas
+                                .insert(name.to_string(), table_schema);
+                        }
+                    }
                 }
             }
         }
 
-        // Step 2: AnalyzedQuery → PhysicalPlan (shared entrypoint)
+        // Step 2: AnalyzedQuery → PhysicalPlan (shared entrypoint).
+        // Eligibility gate guarantees this always succeeds.
         let physical = crate::sql::optimizer::optimize(analyzed, &planning_ctx);
 
-        // Step 3: Resolve table schemas for the operator bridge.
-        // Recursively collect from join trees.
+        // Step 3: Build BuildContext from pre-loaded schemas in PlanningContext.
+        // Handles CTE schemas and alias assignment.
         let mut build_ctx = BuildContext::new();
         if let AnalyzedQueryBody::Select(select) = &analyzed.body {
             for table_ref in &select.from {
@@ -2730,19 +2746,19 @@ impl Executor {
                     let cte_key = name.to_lowercase();
                     if let Some((cte_schema, _)) = ctes.get(&cte_key) {
                         build_ctx = build_ctx.with_schema(name.to_string(), cte_schema.clone());
-                    } else if let Some(table_schema) =
-                        self.store().get_schema(txn, db_id, name).await?
-                    {
-                        let mut schema = table_schema;
+                    } else if let Some(table_schema) = planning_ctx.table_schemas.get(name) {
+                        let mut schema = table_schema.clone();
                         let short = schema.name.rsplit('.').next().unwrap_or(&schema.name);
                         if !short.eq_ignore_ascii_case(display_alias) {
                             schema.from_alias = Some(display_alias.to_string());
                         }
                         build_ctx = build_ctx.with_schema(name.to_string(), schema);
                     } else {
-                        // Virtual/info_schema tables — fall back.
+                        // Eligibility gate rejects virtual catalog tables, so this
+                        // should be unreachable. Hard error to surface bugs early.
                         return Err(anyhow!(
-                            "Optimizer cannot resolve table schema for '{}'",
+                            "Optimizer cannot resolve table schema for '{}' \
+                             (should have been rejected by eligibility check)",
                             name
                         ));
                     }

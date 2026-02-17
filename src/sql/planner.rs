@@ -379,6 +379,24 @@ pub fn choose_best_access_path_for_typed_filter(
     best
 }
 
+/// Choose the best B-tree access path for a typed filter expression.
+///
+/// Used by the CBO physical planner for access-path selection.
+/// Unlike [`choose_best_access_path_for_typed_filter`], this function
+/// **excludes GIN index selection** — GIN queries receive SeqScan from
+/// the optimizer path until a future milestone implements real GIN execution.
+///
+/// Covers: B-tree point lookup, range scan, bounded-range scan, in-list scan,
+/// expression-index matching, and partial-index predicate implication.
+pub fn choose_btree_access_path_for_typed_filter(
+    schema: &TableSchema,
+    filter: &super::analyzer::types::TypedExpr,
+    estimated_table_rows: usize,
+) -> AccessPath {
+    let predicates = analyze_typed_predicates(filter);
+    choose_best_access_path_with_typed_filter(schema, &predicates, filter, estimated_table_rows)
+}
+
 /// Extract [`PredicateInfo`] from a [`TypedExpr`] tree.
 ///
 /// Simpler than the AST version: column names and constant values are already

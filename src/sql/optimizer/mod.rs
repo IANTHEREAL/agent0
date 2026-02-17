@@ -25,6 +25,10 @@ use physical_plan::PhysicalPlan;
 
 /// Single optimizer entrypoint: AnalyzedQuery → PhysicalPlan.
 ///
+/// Precondition: the caller has verified `is_optimizer_eligible()`.
+/// The eligibility gate guarantees that all expression rewrites (aggregate
+/// ORDER BY / HAVING) will succeed, so this function always returns a plan.
+///
 /// Execution (`execute_via_optimizer`) and EXPLAIN (`statement.rs`) both call
 /// this function when `use_optimizer` is on and the query is eligible, ensuring
 /// they produce identical plans — no drift.

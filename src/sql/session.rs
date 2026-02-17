@@ -63,7 +63,8 @@ pub(crate) struct SessionSettings {
 
     /// When true, route eligible queries through the CBO optimizer pipeline
     /// (`AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator`).
-    /// Default: false. Set via `SET tipg.use_optimizer = on`.
+    /// Default: true. Safety valve: `SET tipg.use_optimizer = off` disables
+    /// the optimizer for the current session (e.g. to work around a regression).
     use_optimizer: bool,
 
     /// Generic storage for GUC parameters that tipg does not actively use but
@@ -77,6 +78,7 @@ impl SessionSettings {
         Self {
             search_path: vec!["public".to_string(), "extensions".to_string()],
             max_sort_bytes: DEFAULT_MAX_SORT_BYTES,
+            use_optimizer: true,
             ..Default::default()
         }
     }
@@ -308,7 +310,7 @@ impl SessionSettings {
             "pgtikv.max_sort_bytes" | "tipg.max_sort_bytes" => {
                 self.max_sort_bytes = DEFAULT_MAX_SORT_BYTES
             }
-            "tipg.use_optimizer" => self.use_optimizer = false,
+            "tipg.use_optimizer" => self.use_optimizer = true,
             "timezone" => self.timezone = None,
             "application_name" => self.application_name = None,
             "client_encoding" => self.client_encoding = None,

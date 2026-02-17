@@ -1,0 +1,53 @@
+-- Result equivalence: optimizer ON must produce same results as optimizer OFF.
+-- Each pair of queries (OFF then ON) must show identical data rows.
+
+-- Tests 1+2: GROUP BY + COUNT
+-- Both OFF and ON must show A=3, B=2, C=1
+A        |   3
+B        |   2
+C        |   1
+A        |   3
+B        |   2
+C        |   1
+
+-- Tests 3+4: GROUP BY + SUM
+-- Both OFF and ON must show A=50, B=60, C=50
+A        |    50
+B        |    60
+C        |    50
+A        |    50
+B        |    60
+C        |    50
+
+-- Tests 5+6: DISTINCT
+A
+B
+C
+A
+B
+C
+
+-- Tests 7+8: ORDER BY + LIMIT (top 3 by value DESC)
+5 | C        |    50
+4 | B        |    40
+3 | A        |    30
+5 | C        |    50
+4 | B        |    40
+3 | A        |    30
+
+-- Tests 9+10: CTE
+A        |    50
+B        |    60
+C        |    50
+A        |    50
+B        |    60
+C        |    50
+
+-- Tests 11+12: Subquery WHERE value > AVG(value)
+-- AVG = (10+20+30+40+50+10)/6 = 26.67, so rows with value > 26.67 are: 3,4,5
+3 | A        |    30
+4 | B        |    40
+5 | C        |    50
+3 | A        |    30
+4 | B        |    40
+5 | C        |    50

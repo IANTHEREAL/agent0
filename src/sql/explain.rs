@@ -1164,15 +1164,24 @@ pub fn physical_plan_to_plan_node(
         PhysicalNode::IndexScan {
             table_name,
             alias,
-            index_name,
-        } => PlanNode::IndexScan {
-            table_name: table_name.clone(),
-            alias: alias.clone(),
-            index_name: index_name.clone(),
-            index_cond: None,
-            filter: None,
-            cost,
-        },
+            scan_type,
+        } => {
+            let index_name = match scan_type {
+                ScanType::IndexScan { index_name, .. }
+                | ScanType::IndexRangeScan { index_name, .. }
+                | ScanType::IndexBoundedRangeScan { index_name, .. }
+                | ScanType::InListScan { index_name, .. } => index_name.clone(),
+                _ => "unknown".to_string(),
+            };
+            PlanNode::IndexScan {
+                table_name: table_name.clone(),
+                alias: alias.clone(),
+                index_name,
+                index_cond: None,
+                filter: None,
+                cost,
+            }
+        }
         PhysicalNode::Filter { predicate, input } => {
             let child = physical_plan_to_plan_node(input);
             PlanNode::Filter {

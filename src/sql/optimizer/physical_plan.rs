@@ -9,6 +9,7 @@ use crate::sql::analyzer::types::{
     AnalyzedProjection, JoinCondition, JoinType, SetOpKind, TypedExpr, TypedFunctionArg,
     TypedOrderByExpr,
 };
+use crate::sql::planner::ScanType;
 
 /// A physical plan tree node.
 #[derive(Debug, Clone)]
@@ -44,12 +45,16 @@ pub enum PhysicalNode {
         alias: Option<String>,
     },
 
-    /// B-tree index scan (point lookup or range).
-    #[allow(dead_code)] // Phase 2+
+    /// B-tree index scan (point lookup, range, bounded-range, or in-list).
+    ///
+    /// Carries the full [`ScanType`] from the legacy planner, which encodes
+    /// the index identity, lookup values, and range bounds needed to
+    /// construct the appropriate scan operator in the build phase.
+    /// GIN scans are excluded — they remain on SeqScan until a future milestone.
     IndexScan {
         table_name: String,
         alias: Option<String>,
-        index_name: String,
+        scan_type: ScanType,
     },
 
     /// No-input operator (for SELECT without FROM).

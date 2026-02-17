@@ -18,6 +18,7 @@ use super::physical_plan::{PhysicalCost, PhysicalNode, PhysicalPlan};
 use super::statistics::TableStatistics;
 use super::{join_keys, selectivity};
 use crate::sql::analyzer::types::{JoinCondition, JoinType, TypedExprKind};
+use crate::types::TableSchema;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -25,26 +26,37 @@ const DEFAULT_ESTIMATED_ROWS: usize = 1000;
 const TOPN_THRESHOLD: usize = 1000;
 const DEFAULT_JOIN_SEL: f64 = 0.1;
 
-/// Context for physical planning, carrying table statistics.
+/// Context for physical planning, carrying table statistics and schemas.
 ///
 /// Built by the executor before calling `PhysicalPlanner::plan()`.
 /// When no statistics are available (empty context), the planner
 /// falls back to exact legacy heuristics.
+///
+/// `table_schemas` carries full [`TableSchema`] (including index metadata)
+/// for access-path selection. Pre-loaded by the executor and shared with
+/// [`BuildContext`](super::BuildContext) to eliminate redundant catalog reads.
 pub struct PlanningContext {
     pub table_stats: HashMap<String, Arc<TableStatistics>>,
+    pub table_schemas: HashMap<String, TableSchema>,
 }
 
 impl PlanningContext {
-    /// Create an empty context (no statistics — legacy behavior).
+    /// Create an empty context (no statistics or schemas — legacy behavior).
     pub fn empty() -> Self {
         Self {
             table_stats: HashMap::new(),
+            table_schemas: HashMap::new(),
         }
     }
 
     /// Look up table statistics by name.
     pub fn get_stats(&self, table_name: &str) -> Option<&TableStatistics> {
         self.table_stats.get(table_name).map(|arc| arc.as_ref())
+    }
+
+    /// Look up table schema by name.
+    pub fn get_schema(&self, table_name: &str) -> Option<&TableSchema> {
+        self.table_schemas.get(table_name)
     }
 }
 
@@ -221,15 +233,54 @@ impl PhysicalPlanner {
                 } else {
                     (child.cost.rows / 3).max(1) // exact legacy
                 };
+
+                // Access-path selection: when Filter sits above SeqScan and
+                // we have index metadata, try btree index selection.
+                // GIN is excluded — GIN queries stay on SeqScan (Option A).
+                let scan_node = if let PhysicalNode::SeqScan { table_name, alias } = &child.node {
+                    if let Some(schema) = ctx.get_schema(table_name) {
+                        let access_path =
+                            crate::sql::planner::choose_btree_access_path_for_typed_filter(
+                                schema,
+                                predicate,
+                                child.cost.rows,
+                            );
+                        match &access_path.scan_type {
+                            crate::sql::planner::ScanType::FullTableScan => None,
+                            _ => {
+                                let index_cost = PhysicalCost {
+                                    startup: 0.0,
+                                    total: access_path.cost,
+                                    rows: child.cost.rows,
+                                };
+                                Some(PhysicalPlan {
+                                    node: PhysicalNode::IndexScan {
+                                        table_name: table_name.clone(),
+                                        alias: alias.clone(),
+                                        scan_type: access_path.scan_type,
+                                    },
+                                    schema: child.schema.clone(),
+                                    cost: index_cost,
+                                })
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let effective_child = scan_node.unwrap_or(child);
                 let cost = PhysicalCost {
-                    startup: child.cost.startup,
-                    total: child.cost.total + rows as f64 * 0.01,
+                    startup: effective_child.cost.startup,
+                    total: effective_child.cost.total + rows as f64 * 0.01,
                     rows,
                 };
                 PhysicalPlan {
                     node: PhysicalNode::Filter {
                         predicate: predicate.clone(),
-                        input: Box::new(child),
+                        input: Box::new(effective_child),
                     },
                     schema: logical.schema.clone(),
                     cost,
@@ -309,14 +360,34 @@ impl PhysicalPlanner {
             } => {
                 let child = Self::plan_node(input, ctx);
 
-                // Check for TopN optimization: Sort + Limit with small limit
-                if let (
-                    Some(limit_expr),
+                // Check for TopN optimization: Sort + Limit with small limit.
+                // After the plan restructuring, the shape for non-aggregate
+                // queries is Limit → Project → Sort, so we look through a
+                // single Project node when the direct child is not a Sort.
+                let (sort_order_by, sort_input, project_wrapper) = match &child.node {
                     PhysicalNode::Sort {
                         order_by,
-                        input: sort_input,
-                    },
-                ) = (limit, &child.node)
+                        input: si,
+                    } => (Some(order_by), Some(si), None),
+                    PhysicalNode::Project {
+                        projections,
+                        input: proj_input,
+                    } => {
+                        if let PhysicalNode::Sort {
+                            order_by,
+                            input: si,
+                        } = &proj_input.node
+                        {
+                            (Some(order_by), Some(si), Some(projections))
+                        } else {
+                            (None, None, None)
+                        }
+                    }
+                    _ => (None, None, None),
+                };
+
+                if let (Some(limit_expr), Some(order_by), Some(sort_input)) =
+                    (limit, sort_order_by, sort_input)
                 {
                     if let Some(limit_val) = extract_constant_usize(limit_expr) {
                         let offset_val = offset
@@ -330,19 +401,33 @@ impl PhysicalPlanner {
                                 total: sort_input.cost.total + effective_limit as f64 * 0.01,
                                 rows: limit_val,
                             };
+                            let topn_plan = PhysicalPlan {
+                                node: PhysicalNode::TopNSort {
+                                    order_by: order_by.clone(),
+                                    limit: effective_limit,
+                                    input: sort_input.clone(),
+                                },
+                                schema: sort_input.schema.clone(),
+                                cost: topn_cost.clone(),
+                            };
+                            // Re-wrap in Project if we looked through one.
+                            let limit_child = if let Some(projections) = project_wrapper {
+                                PhysicalPlan {
+                                    node: PhysicalNode::Project {
+                                        projections: projections.clone(),
+                                        input: Box::new(topn_plan),
+                                    },
+                                    schema: child.schema.clone(),
+                                    cost: topn_cost.clone(),
+                                }
+                            } else {
+                                topn_plan
+                            };
                             return PhysicalPlan {
                                 node: PhysicalNode::Limit {
                                     limit: limit.clone(),
                                     offset: offset.clone(),
-                                    input: Box::new(PhysicalPlan {
-                                        node: PhysicalNode::TopNSort {
-                                            order_by: order_by.clone(),
-                                            limit: effective_limit,
-                                            input: sort_input.clone(),
-                                        },
-                                        schema: child.schema.clone(),
-                                        cost: topn_cost.clone(),
-                                    }),
+                                    input: Box::new(limit_child),
                                 },
                                 schema: logical.schema.clone(),
                                 cost: topn_cost,
@@ -1733,6 +1818,214 @@ mod tests {
             );
         } else {
             panic!("expected HashJoin");
+        }
+    }
+
+    // ── Access-path selection tests ─────────────────────
+
+    use crate::types::{ColumnDef, IndexDef};
+
+    fn make_schema_with_index() -> TableSchema {
+        let mut schema = TableSchema::new(
+            "t".to_string(),
+            1,
+            vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    primary_key: true,
+                    unique: true,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            vec![0],
+        );
+        schema.indexes.push(IndexDef {
+            name: "idx_t_id".to_string(),
+            id: 100,
+            columns: vec!["id".to_string()],
+            unique: true,
+            method: Some("btree".to_string()),
+            predicate: None,
+            expressions: vec![],
+        });
+        schema
+    }
+
+    #[test]
+    fn test_filter_above_scan_selects_index() {
+        // Filter(id = 42) above Scan("t") with btree index on id
+        // → should produce IndexScan, not SeqScan
+        let schema = make_schema_with_index();
+        let mut ctx = PlanningContext::empty();
+        ctx.table_schemas.insert("t".to_string(), schema);
+        // Also add stats so row estimates are realistic
+        ctx.table_stats
+            .insert("t".to_string(), make_table_stats(10000, HashMap::new()));
+
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![
+                ("id".to_string(), DataType::Int64),
+                ("name".to_string(), DataType::Text),
+            ]),
+        );
+        let predicate = TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(simple_column("id", DataType::Int64)),
+                op: BinaryOp::Eq,
+                right: Box::new(simple_constant(
+                    crate::types::Value::Int32(42),
+                    DataType::Int64,
+                )),
+            },
+            data_type: DataType::Boolean,
+        };
+        let filter = scan.filter(predicate);
+        let physical = PhysicalPlanner::plan(&filter, &ctx);
+
+        // Outermost should be Filter
+        if let PhysicalNode::Filter { input, .. } = &physical.node {
+            assert!(
+                matches!(input.node, PhysicalNode::IndexScan { .. }),
+                "expected IndexScan under Filter, got {:?}",
+                std::mem::discriminant(&input.node)
+            );
+            if let PhysicalNode::IndexScan { scan_type, .. } = &input.node {
+                assert!(
+                    matches!(scan_type, crate::sql::planner::ScanType::IndexScan { .. }),
+                    "expected point-lookup IndexScan, got {:?}",
+                    scan_type
+                );
+            }
+        } else {
+            panic!(
+                "expected Filter, got {:?}",
+                std::mem::discriminant(&physical.node)
+            );
+        }
+    }
+
+    #[test]
+    fn test_filter_above_scan_no_schema_stays_seqscan() {
+        // Filter above Scan without schema in context → stays SeqScan
+        let ctx = PlanningContext::empty();
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+        );
+        let predicate = TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(simple_column("id", DataType::Int64)),
+                op: BinaryOp::Eq,
+                right: Box::new(simple_constant(
+                    crate::types::Value::Int32(42),
+                    DataType::Int64,
+                )),
+            },
+            data_type: DataType::Boolean,
+        };
+        let filter = scan.filter(predicate);
+        let physical = PhysicalPlanner::plan(&filter, &ctx);
+
+        if let PhysicalNode::Filter { input, .. } = &physical.node {
+            assert!(
+                matches!(input.node, PhysicalNode::SeqScan { .. }),
+                "expected SeqScan without schema metadata"
+            );
+        } else {
+            panic!("expected Filter");
+        }
+    }
+
+    #[test]
+    fn test_filter_above_scan_no_matching_index_stays_seqscan() {
+        // Filter on column 'name' but only index on 'id' → SeqScan
+        let schema = make_schema_with_index();
+        let mut ctx = PlanningContext::empty();
+        ctx.table_schemas.insert("t".to_string(), schema);
+
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![
+                ("id".to_string(), DataType::Int64),
+                ("name".to_string(), DataType::Text),
+            ]),
+        );
+        let predicate = TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(simple_column("name", DataType::Text)),
+                op: BinaryOp::Eq,
+                right: Box::new(simple_constant(
+                    crate::types::Value::Text("alice".to_string()),
+                    DataType::Text,
+                )),
+            },
+            data_type: DataType::Boolean,
+        };
+        let filter = scan.filter(predicate);
+        let physical = PhysicalPlanner::plan(&filter, &ctx);
+
+        if let PhysicalNode::Filter { input, .. } = &physical.node {
+            assert!(
+                matches!(input.node, PhysicalNode::SeqScan { .. }),
+                "expected SeqScan when no index matches filter column"
+            );
+        } else {
+            panic!("expected Filter");
+        }
+    }
+
+    #[test]
+    fn test_filter_above_scan_range_predicate() {
+        // Filter(id > 100) with btree index → should produce IndexScan (range)
+        let schema = make_schema_with_index();
+        let mut ctx = PlanningContext::empty();
+        ctx.table_schemas.insert("t".to_string(), schema);
+        ctx.table_stats
+            .insert("t".to_string(), make_table_stats(10000, HashMap::new()));
+
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+        );
+        let predicate = TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(simple_column("id", DataType::Int64)),
+                op: BinaryOp::Gt,
+                right: Box::new(simple_constant(
+                    crate::types::Value::Int32(100),
+                    DataType::Int64,
+                )),
+            },
+            data_type: DataType::Boolean,
+        };
+        let filter = scan.filter(predicate);
+        let physical = PhysicalPlanner::plan(&filter, &ctx);
+
+        if let PhysicalNode::Filter { input, .. } = &physical.node {
+            assert!(
+                matches!(input.node, PhysicalNode::IndexScan { .. }),
+                "expected IndexScan for range predicate, got {:?}",
+                std::mem::discriminant(&input.node)
+            );
+        } else {
+            panic!("expected Filter");
         }
     }
 }

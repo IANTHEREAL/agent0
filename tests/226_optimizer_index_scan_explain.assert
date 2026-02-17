@@ -1,0 +1,25 @@
+-- Test 1: Point lookup on indexed column should show Index Scan
+Index Scan using idx_ois_name on ois_test
+
+-- Test 2: Range predicate should show Index Scan
+Index Scan using idx_ois_age on ois_test
+
+-- Test 3: PK lookup should show Index Scan
+Index Scan
+
+-- Test 4: LIKE with leading wildcard cannot use btree → Seq Scan
+Seq Scan on ois_test
+
+-- Test 5: Result correctness (point lookup, optimizer ON)
+Alice
+
+-- Test 6: Result correctness (range scan, optimizer ON)
+Charlie
+Diana
+Eve
+
+-- Test 7: Same results with optimizer OFF
+Alice
+Charlie
+Diana
+Eve

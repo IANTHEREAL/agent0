@@ -19,6 +19,8 @@ use crate::sql::operators::{
     NestedLoopJoinOperator, ProjectOperator, SetOperationOperator, SetOperationType, SortOperator,
     TableScanOperator,
 };
+use crate::sql::operators::{InListScanOperator, IndexScanOperator, RangeIndexScanOperator};
+use crate::sql::planner::ScanType;
 use crate::types::{DataType, TableSchema, Value};
 
 /// Context needed to translate a [`PhysicalPlan`] into operator trees.
@@ -64,14 +66,85 @@ impl PhysicalPlan {
                 Ok(Box::new(TableScanOperator::new(schema)))
             }
 
-            PhysicalNode::IndexScan { table_name, .. } => {
-                // Phase 1: index scan falls back to seq scan.
-                // Full index scan support requires access-path selection integration (Phase 2).
+            PhysicalNode::IndexScan {
+                table_name,
+                alias,
+                scan_type,
+            } => {
                 let schema = ctx
                     .table_schemas
                     .get(table_name)
                     .ok_or_else(|| anyhow!("Table schema not found: {}", table_name))?;
-                Ok(Box::new(TableScanOperator::new(schema.clone())))
+                let mut schema = schema.clone();
+                if let Some(a) = alias {
+                    schema.from_alias = Some(a.clone());
+                }
+                match scan_type {
+                    ScanType::IndexScan {
+                        index_id,
+                        index_name,
+                        values,
+                        ..
+                    } => Ok(Box::new(IndexScanOperator::new_with_scan_limit(
+                        schema,
+                        *index_id,
+                        index_name.clone(),
+                        values.clone(),
+                        None,
+                    ))),
+                    ScanType::IndexRangeScan {
+                        index_id,
+                        index_name,
+                        prefix_values,
+                        ..
+                    } => Ok(Box::new(RangeIndexScanOperator::new(
+                        schema,
+                        *index_id,
+                        index_name.clone(),
+                        prefix_values.clone(),
+                        None,
+                        true,
+                        None,
+                        true,
+                    ))),
+                    ScanType::IndexBoundedRangeScan {
+                        index_id,
+                        index_name,
+                        prefix_values,
+                        range_start,
+                        start_inclusive,
+                        range_end,
+                        end_inclusive,
+                        ..
+                    } => Ok(Box::new(RangeIndexScanOperator::new(
+                        schema,
+                        *index_id,
+                        index_name.clone(),
+                        prefix_values.clone(),
+                        range_start.clone(),
+                        *start_inclusive,
+                        range_end.clone(),
+                        *end_inclusive,
+                    ))),
+                    ScanType::InListScan {
+                        index_id,
+                        index_name,
+                        column_values,
+                        ..
+                    } => Ok(Box::new(InListScanOperator::new(
+                        schema,
+                        *index_id,
+                        index_name.clone(),
+                        column_values.clone(),
+                    ))),
+                    // FullTableScan and GinIndexScan should not appear in PhysicalNode::IndexScan —
+                    // the physical planner only emits btree variants here.
+                    other => Err(anyhow!(
+                        "Unexpected ScanType {:?} in PhysicalNode::IndexScan for table '{}'",
+                        other,
+                        table_name
+                    )),
+                }
             }
 
             PhysicalNode::Empty => {
@@ -379,7 +452,7 @@ fn extract_hash_join_keys(
 /// Compares all 6 identity fields: `func_name`, `distinct`, `arg`, `delimiter`,
 /// `filter`, and `order_by`.  This is the single source of truth for aggregate
 /// dedup (collection) and slot lookup (rewrite) to prevent drift.
-fn aggregate_identity_matches(
+pub(crate) fn aggregate_identity_matches(
     ae: &AggregateExpr,
     func: &crate::sql::analyzer::types::ResolvedFunction,
     args: &[TypedExpr],
@@ -573,7 +646,7 @@ fn contains_aggregate(expr: &TypedExpr) -> bool {
 ///
 /// Returns `Err` if an aggregate call cannot be matched to an extracted slot,
 /// rather than silently falling back to slot 0 (which would produce wrong results).
-fn rewrite_post_aggregate_expr(
+pub(crate) fn rewrite_post_aggregate_expr(
     expr: &TypedExpr,
     group_by: &[TypedExpr],
     group_by_count: usize,
@@ -779,7 +852,7 @@ fn rewrite_post_aggregate_expr(
 }
 
 /// Find the index of a GROUP BY expression that matches `expr`.
-fn find_matching_group_by(expr: &TypedExpr, group_by: &[TypedExpr]) -> Option<usize> {
+pub(crate) fn find_matching_group_by(expr: &TypedExpr, group_by: &[TypedExpr]) -> Option<usize> {
     // Fast path: ColumnRef-to-ColumnRef matching by column_index + name
     for (i, gb) in group_by.iter().enumerate() {
         if let (
@@ -811,7 +884,7 @@ fn find_matching_group_by(expr: &TypedExpr, group_by: &[TypedExpr]) -> Option<us
 }
 
 /// Recursively collect AggregateCall nodes from a TypedExpr.
-fn collect_agg_exprs_from(
+pub(crate) fn collect_agg_exprs_from(
     expr: &TypedExpr,
     output_name: &str,
     agg_exprs: &mut Vec<AggregateExpr>,
