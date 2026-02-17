@@ -66,6 +66,8 @@ pub async fn get_information_schema_data_filtered(
                 .name,
         ),
     };
+    let current_user_name =
+        QueryContext::current_user_name().unwrap_or_else(|| Arc::from("postgres"));
 
     let mut scan_ctx = ScanContext {
         store,
@@ -75,7 +77,7 @@ pub async fn get_information_schema_data_filtered(
         user_tables: &user_tables,
         schemas: &schemas,
         schema_oids: &schema_oids,
-        current_user: "postgres",
+        current_user: current_user_name.as_ref(),
         is_superuser: crate::extensions::context::is_superuser(),
     };
     let rows = vt.scan(&mut scan_ctx).await?;

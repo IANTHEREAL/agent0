@@ -144,7 +144,7 @@ impl Executor {
                             &self.store(),
                             txn,
                             db_id,
-                            "postgres",
+                            qctx.current_user.as_ref(),
                             qctx.database_name.as_ref(),
                             crate::extensions::context::is_superuser(),
                             &func.name,

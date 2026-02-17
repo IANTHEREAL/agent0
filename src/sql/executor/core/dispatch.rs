@@ -73,10 +73,12 @@ impl Executor {
         let savepoints = session.savepoints();
         let connection_id = session.connection_id();
         let database_name = session.current_database_name_arc();
+        let current_user: Arc<str> = Arc::from(session.current_user().unwrap_or("postgres"));
         let use_optimizer = session.use_optimizer();
         crate::sql::query_context::with_query_context(
             connection_id,
             database_name,
+            current_user,
             use_optimizer,
             statement_time::with_timestamps(
                 statement_ts,

@@ -64,6 +64,7 @@ mod tests {
         QueryContext::new(
             7,
             Arc::from("db703"),
+            Arc::from("postgres"),
             1_700_000_000_000,
             1_700_000_000_000,
             Arc::from("UTC"),

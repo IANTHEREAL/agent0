@@ -726,7 +726,7 @@ fn eval_function_call(name: &str, args: Vec<Value>, qctx: &QueryContext) -> Resu
         }
         "CURRENT_SCHEMA" => return Ok(Value::Text("public".to_string())),
         "CURRENT_USER" | "SESSION_USER" | "USER" => {
-            return Ok(Value::Text("postgres".to_string()));
+            return Ok(Value::Text(qctx.current_user.as_ref().to_string()));
         }
         "VERSION" => {
             return Ok(Value::Text(crate::sql::expr::VERSION_STRING.to_string()));
@@ -837,6 +837,7 @@ mod tests {
         QueryContext::new(
             1,                     // connection_id
             Arc::from("postgres"), // database_name
+            Arc::from("postgres"), // current_user
             1_700_000_000_000,     // statement_timestamp_ms
             1_700_000_000_000,     // transaction_timestamp_ms
             Arc::from("UTC"),      // timezone
@@ -895,6 +896,7 @@ mod tests {
         let qctx = QueryContext::new(
             42,
             Arc::from("mydb"),
+            Arc::from("postgres"),
             1_700_000_000_111,
             1_700_000_000_222,
             Arc::from("UTC"),
@@ -931,6 +933,7 @@ mod tests {
         let qctx = QueryContext::new(
             1,
             Arc::from("postgres"),
+            Arc::from("postgres"),
             1_700_000_000_000,
             1_700_000_000_123,
             Arc::from("UTC"),
@@ -952,6 +955,7 @@ mod tests {
         let qctx = QueryContext::new(
             99,
             Arc::from("postgres"),
+            Arc::from("postgres"),
             1_700_000_000_000,
             1_700_000_000_000,
             Arc::from("UTC"),
@@ -970,6 +974,7 @@ mod tests {
         let qctx = QueryContext::new(
             1,
             Arc::from("mydb"),
+            Arc::from("postgres"),
             1_700_000_000_000,
             1_700_000_000_000,
             Arc::from("UTC"),
@@ -2234,8 +2239,9 @@ mod tests {
         let qctx = QueryContext::new(
             1,
             Arc::from("postgres"),
-            1_700_000_000_000, // statement ts
-            1_700_000_000_000, // transaction ts
+            Arc::from("postgres"),
+            1_700_000_000_000,
+            1_700_000_000_000,
             Arc::from("UTC"),
         );
         let func = TypedExpr::new(
@@ -2259,7 +2265,8 @@ mod tests {
     fn test_pg_backend_pid_uses_explicit_qctx() {
         let row = empty_row();
         let qctx = QueryContext::new(
-            42, // connection_id = 42
+            42,
+            Arc::from("postgres"),
             Arc::from("postgres"),
             1_700_000_000_000,
             1_700_000_000_000,
@@ -2289,7 +2296,8 @@ mod tests {
         let row = empty_row();
         let qctx = QueryContext::new(
             1,
-            Arc::from("mydb"), // database_name = "mydb"
+            Arc::from("mydb"),
+            Arc::from("postgres"),
             1_700_000_000_000,
             1_700_000_000_000,
             Arc::from("UTC"),
