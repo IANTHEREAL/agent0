@@ -555,10 +555,19 @@ pub async fn create_database(
         }
     }
 
+    if let Some(ref p) = req.admin_password {
+        if p.is_empty() {
+            return Err(AppError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "admin_password cannot be empty",
+            ));
+        }
+    }
+
     let tenant_id = generate_tenant_id();
     let keyspace = make_keyspace(&tenant_id);
     let admin_user = DEFAULT_ADMIN_USER.to_string();
-    let password = generate_password();
+    let password = req.admin_password.clone().unwrap_or_else(generate_password);
 
     if db::get_tenant_by_id(&state.db, &tenant_id).await?.is_some() {
         return Err(AppError::conflict("ID collision, please retry"));

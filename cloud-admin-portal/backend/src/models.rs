@@ -340,6 +340,7 @@ pub struct LoginRequest {
 pub struct CreateDatabaseRequest {
     pub name: String,
     pub region: Option<String>,
+    pub admin_password: Option<String>,
 }
 
 #[derive(Deserialize)]
