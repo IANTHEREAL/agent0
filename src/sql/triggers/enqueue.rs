@@ -77,9 +77,11 @@ pub(crate) async fn enqueue_after_triggers(
         };
 
         if trigger_body_needs_async(&func.body) {
-            let remaining = quota
-                .max_queue_depth
-                .saturating_sub(quota.current_depth.load(std::sync::atomic::Ordering::Relaxed));
+            let remaining = quota.max_queue_depth.saturating_sub(
+                quota
+                    .current_depth
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
             if remaining == 0 {
                 continue;
             }

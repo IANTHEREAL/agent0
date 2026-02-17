@@ -77,9 +77,16 @@ modules:
         symbols: [Executor]
       - path: src/sql/expr/mod.rs
         symbols: [eval_expr, eval_join_expr]
-      - path: src/sql/triggers.rs
-      - path: src/sql/trigger_queue.rs
-      - path: src/sql/trigger_worker.rs
+      - path: src/sql/triggers/mod.rs
+      - path: src/sql/triggers/cache.rs
+      - path: src/sql/triggers/before.rs
+      - path: src/sql/triggers/rewrite.rs
+      - path: src/sql/triggers/queue.rs
+      - path: src/sql/triggers/worker.rs
+      - path: src/sql/triggers/enqueue.rs
+      - path: src/sql/triggers/execute.rs
+      - path: src/sql/triggers/claim.rs
+      - path: src/sql/triggers/gc.rs
       - path: src/sql/executor/triggers.rs
       - path: src/observability.rs
     gate_tests:
@@ -310,7 +317,7 @@ modules:
       - path: src/tls.rs
       - path: src/observability.rs
       - path: src/extensions/http.rs
-      - path: src/sql/trigger_worker.rs
+      - path: src/sql/triggers/worker.rs
       - path: src/protocol/handler/portal.rs
       - path: docs/configuration.md
     gate_tests:

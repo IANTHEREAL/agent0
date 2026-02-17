@@ -122,8 +122,7 @@ impl TriggerWorker {
         if upper == "NULL" {
             return Ok(false);
         }
-        if upper.starts_with("RETURN NEW") || upper.starts_with("RETURN OLD") || upper == "RETURN"
-        {
+        if upper.starts_with("RETURN NEW") || upper.starts_with("RETURN OLD") || upper == "RETURN" {
             return Ok(true);
         }
         if upper.starts_with("RETURN NULL") {

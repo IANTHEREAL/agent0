@@ -48,8 +48,10 @@ mod timezone;
 pub(crate) mod triggers;
 
 // Compat aliases — external consumers keep working with old paths:
-pub(crate) use triggers::worker as trigger_worker; // main.rs, dml_analyzed.rs, core/mod.rs
-pub(crate) use triggers::queue as trigger_queue; // dml_analyzed.rs, table_utils.rs
+//   trigger_worker → main.rs, dml_analyzed.rs, core/mod.rs
+//   trigger_queue  → dml_analyzed.rs, table_utils.rs
+pub(crate) use triggers::queue as trigger_queue;
+pub(crate) use triggers::worker as trigger_worker;
 pub mod types;
 mod udt;
 pub(crate) mod wildcard;

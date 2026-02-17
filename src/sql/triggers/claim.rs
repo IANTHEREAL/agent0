@@ -265,11 +265,7 @@ impl Default for MemTxn {
 #[cfg(test)]
 #[async_trait]
 impl TriggerQueueTxn for MemTxn {
-    async fn scan(
-        &mut self,
-        range: BoundRange,
-        limit: u32,
-    ) -> Result<Vec<tikv_client::KvPair>> {
+    async fn scan(&mut self, range: BoundRange, limit: u32) -> Result<Vec<tikv_client::KvPair>> {
         let (start, end) = range.into_keys();
         let start: Vec<u8> = start.into();
         let take = usize::try_from(limit).unwrap_or(usize::MAX);

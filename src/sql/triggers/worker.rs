@@ -1,8 +1,6 @@
 //! Background worker for asynchronous AFTER triggers.
 
-use super::queue::{
-    encode_trigger_dlq_key, encode_trigger_queue_key, EventStatus, TriggerEvent,
-};
+use super::queue::{encode_trigger_dlq_key, encode_trigger_queue_key, EventStatus, TriggerEvent};
 use crate::observability;
 use crate::pool::TikvClientPool;
 use crate::sql::error::SqlError;
