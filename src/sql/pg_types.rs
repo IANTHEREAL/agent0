@@ -49,6 +49,9 @@ pub(crate) const BUILTIN_PG_TYPES: &[BuiltinPgType] = &[
     BuiltinPgType { oid: OID_INT4,        typname: "int4",        typlen:  4, typbyval: "t", typtype: "b", typcategory: "N", typcollation:   0 },
     BuiltinPgType { oid: OID_TEXT,        typname: "text",        typlen: -1, typbyval: "f", typtype: "b", typcategory: "S", typcollation: 100 },
     BuiltinPgType { oid: OID_OID,         typname: "oid",         typlen:  4, typbyval: "t", typtype: "b", typcategory: "N", typcollation:   0 },
+    BuiltinPgType { oid: OID_TID,         typname: "tid",         typlen:  6, typbyval: "f", typtype: "b", typcategory: "U", typcollation:   0 },
+    BuiltinPgType { oid: OID_XID,         typname: "xid",         typlen:  4, typbyval: "t", typtype: "b", typcategory: "U", typcollation:   0 },
+    BuiltinPgType { oid: OID_CID,         typname: "cid",         typlen:  4, typbyval: "t", typtype: "b", typcategory: "U", typcollation:   0 },
     BuiltinPgType { oid: OID_JSON,        typname: "json",        typlen: -1, typbyval: "f", typtype: "b", typcategory: "U", typcollation:   0 },
     BuiltinPgType { oid: OID_FLOAT4,      typname: "float4",      typlen:  4, typbyval: "t", typtype: "b", typcategory: "N", typcollation:   0 },
     BuiltinPgType { oid: OID_FLOAT8,      typname: "float8",      typlen:  8, typbyval: "t", typtype: "b", typcategory: "N", typcollation:   0 },
@@ -137,5 +140,12 @@ mod tests {
             format_type_name_for_oid(OID_TIME),
             Some("time without time zone")
         );
+    }
+
+    #[test]
+    fn typname_for_system_attribute_oids_exists() {
+        assert_eq!(typname_for_oid(OID_TID), Some("tid"));
+        assert_eq!(typname_for_oid(OID_XID), Some("xid"));
+        assert_eq!(typname_for_oid(OID_CID), Some("cid"));
     }
 }

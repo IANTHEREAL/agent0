@@ -257,7 +257,10 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Result<Value> {
             Ok(Value::Numeric(d))
         }
         DataType::Tsvector => Ok(Value::Tsvector(unescaped)),
-        DataType::Tsquery => Ok(Value::Tsquery(unescaped)),
+        DataType::Tsquery => {
+            crate::sql::fts::validate_tsquery_syntax(&unescaped)?;
+            Ok(Value::Tsquery(unescaped))
+        }
     }
 }
 

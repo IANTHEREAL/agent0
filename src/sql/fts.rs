@@ -1,3 +1,4 @@
+use crate::sql::error::SqlError;
 use crate::types::Value;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -165,7 +166,7 @@ pub fn ts_match(tsvector: &Value, tsquery: &Value) -> Result<Value> {
     };
 
     let tsvector_words = extract_tsvector_words(tsvector_str);
-    let matches = match_tsquery(&tsvector_words, tsquery_str);
+    let matches = match_tsquery(&tsvector_words, tsquery_str)?;
 
     Ok(Value::Boolean(matches))
 }
@@ -183,36 +184,30 @@ fn extract_tsvector_words(tsvector: &str) -> HashSet<String> {
     words
 }
 
-fn match_tsquery(tsvector_words: &HashSet<String>, tsquery: &str) -> bool {
-    let tokens = tokenize_tsquery(tsquery);
+pub(crate) fn validate_tsquery_syntax(tsquery: &str) -> Result<()> {
+    let tokens = tokenize_tsquery(tsquery)?;
     if tokens.is_empty() {
-        return true;
+        return Ok(());
     }
 
-    if let Some(result) = TsQueryEvaluator::new(&tokens, tsvector_words).eval() {
-        result
-    } else {
-        // Keep legacy permissive behavior as a fallback for malformed input.
-        legacy_match_tsquery(tsvector_words, tsquery)
-    }
+    let words = HashSet::new();
+    let mut evaluator = TsQueryEvaluator::new(&tokens, &words);
+    evaluator
+        .eval()
+        .ok_or_else(|| invalid_tsquery_syntax(tsquery))
+        .map(|_| ())
 }
 
-fn legacy_match_tsquery(tsvector_words: &HashSet<String>, tsquery: &str) -> bool {
-    let query_terms: Vec<String> = tsquery
-        .split(|c: char| matches!(c, '&' | '|' | '!'))
-        .map(|s| s.trim().trim_matches('\'').to_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if query_terms.is_empty() {
-        return true;
+fn match_tsquery(tsvector_words: &HashSet<String>, tsquery: &str) -> Result<bool> {
+    let tokens = tokenize_tsquery(tsquery)?;
+    if tokens.is_empty() {
+        return Ok(true);
     }
 
-    if tsquery.contains('|') {
-        query_terms.iter().any(|term| tsvector_words.contains(term))
-    } else {
-        query_terms.iter().all(|term| tsvector_words.contains(term))
-    }
+    let mut evaluator = TsQueryEvaluator::new(&tokens, tsvector_words);
+    evaluator
+        .eval()
+        .ok_or_else(|| invalid_tsquery_syntax(tsquery))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,7 +220,7 @@ enum TsQueryToken {
     Term(String),
 }
 
-fn tokenize_tsquery(tsquery: &str) -> Vec<TsQueryToken> {
+fn tokenize_tsquery(tsquery: &str) -> Result<Vec<TsQueryToken>> {
     let mut tokens = Vec::new();
     let mut chars = tsquery.chars().peekable();
 
@@ -257,17 +252,22 @@ fn tokenize_tsquery(tsquery: &str) -> Vec<TsQueryToken> {
             '\'' => {
                 chars.next(); // opening quote
                 let mut term = String::new();
+                let mut closed = false;
                 while let Some(c) = chars.next() {
                     if c == '\'' {
                         if chars.peek() == Some(&'\'') {
                             chars.next();
                             term.push('\'');
                         } else {
+                            closed = true;
                             break;
                         }
                     } else {
                         term.push(c);
                     }
+                }
+                if !closed {
+                    return Err(invalid_tsquery_syntax(tsquery));
                 }
                 if !term.is_empty() {
                     tokens.push(TsQueryToken::Term(term.to_lowercase()));
@@ -290,7 +290,15 @@ fn tokenize_tsquery(tsquery: &str) -> Vec<TsQueryToken> {
         }
     }
 
-    tokens
+    Ok(tokens)
+}
+
+fn invalid_tsquery_syntax(tsquery: &str) -> anyhow::Error {
+    SqlError::InvalidInputSyntax {
+        type_name: "tsquery".to_string(),
+        value: tsquery.to_string(),
+    }
+    .into()
 }
 
 struct TsQueryEvaluator<'a> {
@@ -538,6 +546,14 @@ mod tests {
         let tsquery = Value::Tsquery("('hello' | 'rust') & !'world'".to_string());
         let result = ts_match(&tsvector, &tsquery).unwrap();
         assert_eq!(result, Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_ts_match_invalid_tsquery_errors() {
+        let tsvector = Value::Tsvector("'hello':1A 'world':2A".to_string());
+        let tsquery = Value::Tsquery("'hello' & (".to_string());
+        let err = ts_match(&tsvector, &tsquery).unwrap_err().to_string();
+        assert!(err.contains("invalid input syntax for type tsquery"));
     }
 
     #[test]

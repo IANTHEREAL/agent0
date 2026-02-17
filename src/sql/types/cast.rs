@@ -372,6 +372,13 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             Ok(Value::Json(s))
         }
 
+        // ===== Full-text search =====
+        (Value::Text(s), DataType::Tsquery) => {
+            crate::sql::fts::validate_tsquery_syntax(&s)?;
+            Ok(Value::Tsquery(s))
+        }
+        (Value::Tsquery(s), DataType::Tsquery) => Ok(Value::Tsquery(s)),
+
         // ===== Numeric =====
         (Value::Text(s), DataType::Numeric { scale, .. }) => {
             let mut d = Decimal::from_str(s.trim()).map_err(|_| SqlError::InvalidInputSyntax {
@@ -803,6 +810,29 @@ mod tests {
             .unwrap(),
             Value::Boolean(false)
         );
+    }
+
+    #[test]
+    fn text_to_tsquery_validates_syntax() {
+        let r = cast(
+            Value::Text("'hello' & !'world'".into()),
+            &DataType::Tsquery,
+            CastContext::Explicit,
+        )
+        .unwrap();
+        assert_eq!(r, Value::Tsquery("'hello' & !'world'".into()));
+    }
+
+    #[test]
+    fn text_to_tsquery_invalid_syntax_errors() {
+        let err = cast(
+            Value::Text("'hello' & (".into()),
+            &DataType::Tsquery,
+            CastContext::Explicit,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("invalid input syntax for type tsquery"));
     }
 
     // ---- coerce_text_to_numeric ----
