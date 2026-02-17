@@ -511,24 +511,18 @@ fn eval_unary(op: &UnaryOp, val: Value) -> Result<Value> {
             _ => Err(anyhow!("NOT requires boolean operand")),
         },
         UnaryOp::Minus => match val {
-            Value::Int32(i) => i
-                .checked_neg()
-                .map(Value::Int32)
-                .ok_or_else(|| {
-                    SqlError::NumericValueOutOfRange {
-                        message: "integer out of range".into(),
-                    }
-                    .into()
-                }),
-            Value::Int64(i) => i
-                .checked_neg()
-                .map(Value::Int64)
-                .ok_or_else(|| {
-                    SqlError::NumericValueOutOfRange {
-                        message: "bigint out of range".into(),
-                    }
-                    .into()
-                }),
+            Value::Int32(i) => i.checked_neg().map(Value::Int32).ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "integer out of range".into(),
+                }
+                .into()
+            }),
+            Value::Int64(i) => i.checked_neg().map(Value::Int64).ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "bigint out of range".into(),
+                }
+                .into()
+            }),
             Value::Float64(f) => Ok(Value::Float64(-f)),
             Value::Numeric(d) => Ok(Value::Numeric(-d)),
             _ => Err(anyhow!(

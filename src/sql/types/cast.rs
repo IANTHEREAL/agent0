@@ -159,14 +159,12 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 .into()
             })
         }
-        (Value::Int64(n), DataType::Int32) => i32::try_from(n)
-            .map(Value::Int32)
-            .map_err(|_| {
-                SqlError::NumericValueOutOfRange {
-                    message: "integer out of range".into(),
-                }
-                .into()
-            }),
+        (Value::Int64(n), DataType::Int32) => i32::try_from(n).map(Value::Int32).map_err(|_| {
+            SqlError::NumericValueOutOfRange {
+                message: "integer out of range".into(),
+            }
+            .into()
+        }),
         (Value::Float64(f), DataType::Int32) => match context {
             CastContext::Explicit => {
                 let rounded = round_half_away_from_zero(f);
@@ -187,14 +185,12 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                     .into());
                 }
                 let n = f as i64;
-                i32::try_from(n)
-                    .map(Value::Int32)
-                    .map_err(|_| {
-                        SqlError::NumericValueOutOfRange {
-                            message: "integer out of range".into(),
-                        }
-                        .into()
-                    })
+                i32::try_from(n).map(Value::Int32).map_err(|_| {
+                    SqlError::NumericValueOutOfRange {
+                        message: "integer out of range".into(),
+                    }
+                    .into()
+                })
             }
         },
         (Value::Numeric(d), DataType::Int32) => {
@@ -212,15 +208,14 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                             .into()
                         })
                 }
-                CastContext::Assignment | CastContext::Implicit => d
-                    .to_i32()
-                    .map(Value::Int32)
-                    .ok_or_else(|| {
+                CastContext::Assignment | CastContext::Implicit => {
+                    d.to_i32().map(Value::Int32).ok_or_else(|| {
                         SqlError::NumericValueOutOfRange {
                             message: "integer out of range".into(),
                         }
                         .into()
-                    }),
+                    })
+                }
             }
         }
         // Bool → Int32: Explicit only
@@ -265,15 +260,14 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                             .into()
                         })
                 }
-                CastContext::Assignment | CastContext::Implicit => d
-                    .to_i64()
-                    .map(Value::Int64)
-                    .ok_or_else(|| {
+                CastContext::Assignment | CastContext::Implicit => {
+                    d.to_i64().map(Value::Int64).ok_or_else(|| {
                         SqlError::NumericValueOutOfRange {
                             message: "bigint out of range".into(),
                         }
                         .into()
-                    }),
+                    })
+                }
             }
         }
 
@@ -292,15 +286,12 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
         (Value::Numeric(d), DataType::Float64) => {
             use rust_decimal::prelude::ToPrimitive;
             match context {
-                CastContext::Explicit => d
-                    .to_f64()
-                    .map(Value::Float64)
-                    .ok_or_else(|| {
-                        SqlError::NumericValueOutOfRange {
-                            message: "numeric value out of range for double precision".into(),
-                        }
-                        .into()
-                    }),
+                CastContext::Explicit => d.to_f64().map(Value::Float64).ok_or_else(|| {
+                    SqlError::NumericValueOutOfRange {
+                        message: "numeric value out of range for double precision".into(),
+                    }
+                    .into()
+                }),
                 CastContext::Assignment | CastContext::Implicit => {
                     Ok(Value::Float64(d.to_f64().unwrap_or(f64::NAN)))
                 }
@@ -446,11 +437,9 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             Ok(Value::Numeric(d))
         }
         (Value::Float64(f), DataType::Numeric { scale, .. }) => {
-            let mut d = Decimal::try_from(f).map_err(|_| {
-                SqlError::InvalidInputSyntax {
-                    type_name: "numeric".into(),
-                    value: f.to_string(),
-                }
+            let mut d = Decimal::try_from(f).map_err(|_| SqlError::InvalidInputSyntax {
+                type_name: "numeric".into(),
+                value: f.to_string(),
             })?;
             if let Some(s) = scale {
                 d.rescale(*s);
@@ -1014,7 +1003,11 @@ mod tests {
 
     #[test]
     fn int64_to_int32_overflow_returns_22003() {
-        let result = cast(Value::Int64(i64::MAX), &DataType::Int32, CastContext::Explicit);
+        let result = cast(
+            Value::Int64(i64::MAX),
+            &DataType::Int32,
+            CastContext::Explicit,
+        );
         let err = result.unwrap_err();
         let sql_err = err.downcast_ref::<SqlError>().expect("should be SqlError");
         assert_eq!(sql_err.sqlstate(), "22003");
