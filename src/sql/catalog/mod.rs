@@ -1,6 +1,8 @@
 mod check_constraints;
 mod columns;
 mod constraint_column_usage;
+mod cron_job;
+mod cron_job_run_details;
 pub(crate) mod helpers;
 mod key_column_usage;
 mod pg_am;
@@ -51,6 +53,8 @@ pub struct ScanContext<'a> {
     pub user_tables: &'a [String],
     pub schemas: &'a [String],
     pub schema_oids: &'a HashMap<String, u32>,
+    pub current_user: &'a str,
+    pub is_superuser: bool,
 }
 
 #[async_trait]
@@ -105,6 +109,8 @@ impl CatalogRegistry {
         registry.register(Box::new(table_privileges::TablePrivileges));
         registry.register(Box::new(table_constraints::TableConstraints));
         registry.register(Box::new(tables::Tables));
+        registry.register(Box::new(cron_job::CronJobTable));
+        registry.register(Box::new(cron_job_run_details::CronJobRunDetailsTable));
         registry
     }
 

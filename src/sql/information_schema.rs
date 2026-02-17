@@ -8,6 +8,9 @@ use tikv_client::Transaction;
 
 pub fn get_information_schema_schema(table_name: &str) -> Option<TableSchema> {
     let lower = table_name.to_lowercase();
+    if lower.starts_with("cron.") {
+        return global_catalog().get(&lower).map(|vt| vt.schema());
+    }
     let name = lower
         .strip_prefix("information_schema.")
         .or_else(|| lower.strip_prefix("pg_catalog."))
@@ -31,10 +34,14 @@ pub async fn get_information_schema_data_filtered(
     filter: &VirtualTableFilter,
 ) -> Result<(TableSchema, Vec<Row>)> {
     let lower = table_name.to_lowercase();
-    let name = lower
-        .strip_prefix("information_schema.")
-        .or_else(|| lower.strip_prefix("pg_catalog."))
-        .unwrap_or(&lower);
+    let name = if lower.starts_with("cron.") {
+        lower.as_str()
+    } else {
+        lower
+            .strip_prefix("information_schema.")
+            .or_else(|| lower.strip_prefix("pg_catalog."))
+            .unwrap_or(&lower)
+    };
 
     let vt = global_catalog()
         .get(name)
@@ -68,6 +75,8 @@ pub async fn get_information_schema_data_filtered(
         user_tables: &user_tables,
         schemas: &schemas,
         schema_oids: &schema_oids,
+        current_user: "postgres",
+        is_superuser: crate::extensions::context::is_superuser(),
     };
     let rows = vt.scan(&mut scan_ctx).await?;
     Ok((vt.schema(), rows))

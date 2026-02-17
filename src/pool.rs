@@ -303,6 +303,20 @@ impl TikvClientPool {
             .map(|e| e.active_connections.load(Ordering::Relaxed))
     }
 
+    pub async fn list_active_keyspaces(&self) -> Vec<String> {
+        let tenants = self.tenants.read().await;
+        tenants
+            .iter()
+            .filter_map(|(keyspace, entry)| {
+                if entry.active_connections.load(Ordering::Relaxed) > 0 {
+                    Some(keyspace.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Run a single eviction pass. Removes tenants that have zero active
     /// connections and have been idle longer than the configured timeout.
     /// Returns the list of evicted keyspace names.

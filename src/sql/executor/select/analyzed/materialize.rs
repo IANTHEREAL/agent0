@@ -134,6 +134,31 @@ impl Executor {
                         return Ok(TypedExpr::new(TypedExprKind::Constant(val), DataType::Text));
                     }
 
+                    if crate::sql::executor::split_cron_scalar_function_name(&func.name).is_some() {
+                        let mut arg_values = Vec::with_capacity(new_args.len());
+                        let dummy_row = Row::new(vec![]);
+                        for arg in &new_args {
+                            arg_values.push(eval_typed_expr(arg, &dummy_row, qctx)?);
+                        }
+                        if let Some(result) = crate::sql::executor::execute_cron_scalar_function(
+                            &self.store(),
+                            txn,
+                            db_id,
+                            "postgres",
+                            qctx.database_name.as_ref(),
+                            crate::extensions::context::is_superuser(),
+                            &func.name,
+                            &arg_values,
+                        )
+                        .await
+                        {
+                            return Ok(TypedExpr::new(
+                                TypedExprKind::Constant(result?),
+                                expr.data_type.clone(),
+                            ));
+                        }
+                    }
+
                     Ok(TypedExpr {
                         kind: TypedExprKind::FunctionCall {
                             func: func.clone(),

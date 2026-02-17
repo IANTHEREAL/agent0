@@ -3,6 +3,7 @@
 //! This module contains the main executor and all execution-related submodules.
 
 mod core;
+mod cron;
 mod cte;
 mod database;
 mod ddl;
@@ -17,3 +18,6 @@ mod udt;
 mod user_function;
 
 pub use core::*;
+pub(crate) use cron::{
+    execute_cron_scalar_function, split_cron_scalar_function_name, try_execute_cron_scalar_function,
+};

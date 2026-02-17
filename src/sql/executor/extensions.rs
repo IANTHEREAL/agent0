@@ -10,6 +10,7 @@ use crate::sql::operators::{BoxedOperator, TableFunctionScanOperator};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, ObjectName, TableAlias};
 use tikv_client::Transaction;
+use tracing::info;
 
 use crate::extensions::EXTENSIONS_SCHEMA;
 use crate::types::{Row, TableSchema, Value};
@@ -440,6 +441,7 @@ impl Executor {
 
         let desc = descriptor(&ext_name)
             .ok_or_else(|| anyhow!("Extension '{}' is not available", ext_name))?;
+        let ext_default_schema = desc.default_schema.to_string();
 
         let is_autocommit = !session.is_in_transaction();
         if is_autocommit {
@@ -457,7 +459,9 @@ impl Executor {
                 .schema_exists(txn, db_id, desc.default_schema)
                 .await?
             {
-                return Err(anyhow!("schema '{}' does not exist", desc.default_schema));
+                self.store()
+                    .create_schema(txn, db_id, desc.default_schema, false)
+                    .await?;
             }
 
             if self
@@ -477,6 +481,10 @@ impl Executor {
             let ext = InstalledExtension::new(desc);
             self.store().put_extension(txn, db_id, &ext).await?;
 
+            if ext_name == "pg_cron" {
+                self.store().set_cron_enabled(txn, db_id).await?;
+            }
+
             Ok(super::super::ExecuteResult::CreateExtension {
                 ext_name: ext_name.clone(),
             })
@@ -491,13 +499,29 @@ impl Executor {
             }
         }
 
-        // Auto-add "extensions" to search_path so the extension's functions
-        // are immediately usable without a manual SET search_path.
         if result.is_ok() {
             let sp = session.search_path();
-            if !sp.iter().any(|s| s.eq_ignore_ascii_case(EXTENSIONS_SCHEMA)) {
-                let mut new_sp = sp.to_vec();
+            let mut new_sp = sp.to_vec();
+            let mut modified = false;
+
+            if !new_sp
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(EXTENSIONS_SCHEMA))
+            {
                 new_sp.push(EXTENSIONS_SCHEMA.to_string());
+                modified = true;
+            }
+
+            if !ext_default_schema.eq_ignore_ascii_case(EXTENSIONS_SCHEMA)
+                && !new_sp
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(&ext_default_schema))
+            {
+                new_sp.push(ext_default_schema);
+                modified = true;
+            }
+
+            if modified {
                 session.set_search_path(new_sp);
             }
         }
@@ -531,9 +555,34 @@ impl Executor {
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
 
+            if ext_name == "pg_cron" {
+                self.store().remove_cron_enabled(txn, db_id).await?;
+                self.store().delete_all_cron_data(txn, db_id).await?;
+                info!(
+                    "DROP EXTENSION pg_cron: all cron data deleted for db_id={}",
+                    db_id
+                );
+            }
+
             let dropped = self.store().drop_extension(txn, db_id, &ext_name).await?;
             if !dropped && !if_exists {
                 return Err(anyhow!("extension \"{}\" does not exist", ext_name));
+            }
+
+            if ext_name == "pg_cron" {
+                let cron_tables: Vec<String> = self
+                    .store()
+                    .list_tables(txn, db_id)
+                    .await?
+                    .into_iter()
+                    .filter(|t| t.starts_with("cron."))
+                    .collect();
+                if cron_tables.is_empty() {
+                    let _ = self
+                        .store()
+                        .drop_schema_cascade(txn, db_id, "cron", true)
+                        .await;
+                }
             }
 
             Ok(super::super::ExecuteResult::DropExtension {

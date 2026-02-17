@@ -686,6 +686,15 @@ fn eval_array_index(arr_val: Value, idx_val: Value) -> Result<Value> {
 /// read timestamps and session info from the explicit `QueryContext`.
 fn eval_function_call(name: &str, args: Vec<Value>, qctx: &QueryContext) -> Result<Value> {
     let func_name_upper = name.to_uppercase();
+    let (schema_name, unqualified_name) = split_qualified_function_name(&func_name_upper);
+
+    if schema_name.is_some_and(|schema| schema.eq_ignore_ascii_case("CRON")) {
+        if let Some(result) =
+            crate::sql::executor::try_execute_cron_scalar_function(unqualified_name, &args)
+        {
+            return result;
+        }
+    }
 
     // Context-dependent builtins that need QueryContext.
     match func_name_upper.as_str() {
@@ -740,9 +749,16 @@ fn eval_function_call(name: &str, args: Vec<Value>, qctx: &QueryContext) -> Resu
 
     // Standard registry lookup.
     let registry = crate::sql::expr::functions::get_registry();
-    match registry.get(func_name_upper.as_str()) {
+    match registry.get(unqualified_name) {
         Some(f) => f(args),
         None => Err(SqlError::Unsupported(format!("unknown function: {}", name)).into()),
+    }
+}
+
+fn split_qualified_function_name(name: &str) -> (Option<&str>, &str) {
+    match name.rsplit_once('.') {
+        Some((schema, func)) => (Some(schema), func),
+        None => (None, name),
     }
 }
 

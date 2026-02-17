@@ -89,6 +89,13 @@ const FS9_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
     default_schema: EXTENSIONS_SCHEMA,
 };
 
+const PG_CRON_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
+    name: "pg_cron",
+    oid: 2004,
+    version: "1.0.0",
+    default_schema: "cron",
+};
+
 /// Lookup an extension descriptor by name (case-insensitive).
 pub fn descriptor(name: &str) -> Option<&'static ExtensionDescriptor> {
     if name.eq_ignore_ascii_case(HTTP_EXTENSION.name) {
@@ -102,6 +109,9 @@ pub fn descriptor(name: &str) -> Option<&'static ExtensionDescriptor> {
     }
     if name.eq_ignore_ascii_case(FS9_EXTENSION.name) {
         return Some(&FS9_EXTENSION);
+    }
+    if name.eq_ignore_ascii_case(PG_CRON_EXTENSION.name) {
+        return Some(&PG_CRON_EXTENSION);
     }
     None
 }
@@ -138,5 +148,13 @@ mod tests {
         assert_eq!(desc.name, "fs9");
         assert_eq!(desc.default_schema, "extensions");
         assert_eq!(desc.oid, 2003);
+    }
+
+    #[test]
+    fn descriptor_pg_cron_is_registered() {
+        let desc = descriptor("pg_cron").expect("pg_cron must be registered");
+        assert_eq!(desc.name, "pg_cron");
+        assert_eq!(desc.default_schema, "cron");
+        assert_eq!(desc.oid, 2004);
     }
 }

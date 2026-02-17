@@ -1,0 +1,290 @@
+use super::*;
+use crate::cron::types::{CronJob, CronRun};
+
+impl TikvStore {
+    pub async fn put_cron_job(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        job: &CronJob,
+    ) -> Result<()> {
+        let key = self.key(&encode_cron_job_key_v2(db_id, job.job_id));
+        let data = bincode::serialize(job).context("Failed to serialize cron job")?;
+        txn_put(txn, key, data).await?;
+        Ok(())
+    }
+
+    pub async fn get_cron_job(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        job_id: i64,
+    ) -> Result<Option<CronJob>> {
+        let key = self.key(&encode_cron_job_key_v2(db_id, job_id));
+        match txn.get(key).await? {
+            Some(data) => Ok(Some(
+                bincode::deserialize(&data).context("Failed to deserialize cron job")?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn list_cron_jobs(&self, txn: &mut Transaction, db_id: u64) -> Result<Vec<CronJob>> {
+        let prefix = encode_cron_job_prefix_v2(db_id);
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix.clone()..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        let mut jobs = Vec::new();
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let job: CronJob =
+                bincode::deserialize(pair.value()).context("Failed to deserialize cron job")?;
+            jobs.push(job);
+        }
+        Ok(jobs)
+    }
+
+    pub async fn delete_cron_job(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        job_id: i64,
+    ) -> Result<()> {
+        let key = self.key(&encode_cron_job_key_v2(db_id, job_id));
+        txn_delete(txn, key).await?;
+        Ok(())
+    }
+
+    pub async fn find_cron_job_by_name(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        jobname: &str,
+        username: &str,
+    ) -> Result<Option<CronJob>> {
+        let jobs = self.list_cron_jobs(txn, db_id).await?;
+        Ok(jobs
+            .into_iter()
+            .find(|j| j.username == username && j.jobname.as_deref() == Some(jobname)))
+    }
+
+    pub async fn put_cron_run(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        run: &CronRun,
+    ) -> Result<()> {
+        let key = self.key(&encode_cron_run_key_v2(db_id, run.run_id));
+        let data = bincode::serialize(run).context("Failed to serialize cron run")?;
+        txn_put(txn, key, data).await?;
+        Ok(())
+    }
+
+    pub async fn get_cron_run(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        run_id: i64,
+    ) -> Result<Option<CronRun>> {
+        let key = self.key(&encode_cron_run_key_v2(db_id, run_id));
+        match txn.get(key).await? {
+            Some(data) => Ok(Some(
+                bincode::deserialize(&data).context("Failed to deserialize cron run")?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn list_cron_runs_for_job(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        job_id: i64,
+        limit: usize,
+    ) -> Result<Vec<CronRun>> {
+        let prefix = encode_cron_run_prefix_v2(db_id);
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix.clone()..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        let mut runs = Vec::new();
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let run: CronRun =
+                bincode::deserialize(pair.value()).context("Failed to deserialize cron run")?;
+            if run.job_id == job_id {
+                runs.push(run);
+                if runs.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(runs)
+    }
+
+    pub async fn list_all_cron_runs(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        limit: usize,
+    ) -> Result<Vec<CronRun>> {
+        let prefix = encode_cron_run_prefix_v2(db_id);
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix.clone()..end).into();
+        let scan_limit = scan_limit_to_u32(Some(limit));
+        let pairs = txn.scan(range, scan_limit).await?;
+
+        let mut runs = Vec::new();
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let run: CronRun =
+                bincode::deserialize(pair.value()).context("Failed to deserialize cron run")?;
+            runs.push(run);
+        }
+        Ok(runs)
+    }
+
+    pub async fn try_claim_cron_run(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        job_id: i64,
+        scheduled_min: i64,
+    ) -> Result<bool> {
+        let key = self.key(&encode_cron_claim_key_v2(db_id, job_id, scheduled_min));
+        if txn.get(key.clone()).await?.is_some() {
+            return Ok(false);
+        }
+        txn_put(txn, key, vec![1]).await?;
+        Ok(true)
+    }
+
+    pub async fn delete_cron_runs_for_job(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        job_id: i64,
+    ) -> Result<()> {
+        let prefix = encode_cron_run_prefix_v2(db_id);
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix.clone()..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let run: CronRun =
+                bincode::deserialize(pair.value()).context("Failed to deserialize cron run")?;
+            if run.job_id == job_id {
+                txn_delete(txn, key.to_vec()).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn set_cron_enabled(&self, txn: &mut Transaction, db_id: u64) -> Result<()> {
+        let key = self.key(&encode_cron_enabled_key_v2(db_id));
+        txn_put(txn, key, vec![1u8]).await?;
+        Ok(())
+    }
+
+    pub async fn remove_cron_enabled(&self, txn: &mut Transaction, db_id: u64) -> Result<()> {
+        let key = self.key(&encode_cron_enabled_key_v2(db_id));
+        if txn.get(key.clone()).await?.is_some() {
+            txn_delete(txn, key).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn is_cron_enabled(&self, txn: &mut Transaction, db_id: u64) -> Result<bool> {
+        let key = self.key(&encode_cron_enabled_key_v2(db_id));
+        Ok(txn.get(key).await?.is_some())
+    }
+
+    pub async fn delete_all_cron_data(&self, txn: &mut Transaction, db_id: u64) -> Result<()> {
+        let prefixes = [
+            encode_cron_job_prefix_v2(db_id),
+            encode_cron_run_prefix_v2(db_id),
+            encode_cron_claim_prefix_v2(db_id),
+        ];
+
+        for prefix in &prefixes {
+            let mut end = prefix.clone();
+            end.push(0xFF);
+            let range: BoundRange = (prefix.clone()..end).into();
+            let pairs = txn.scan(range, SCAN_LIMIT).await?;
+            for pair in pairs {
+                let key: &[u8] = pair.key().as_ref().into();
+                if key.starts_with(prefix) {
+                    txn_delete(txn, key.to_vec()).await?;
+                }
+            }
+        }
+
+        let seq_keys = [
+            self.key(&encode_next_cron_job_id_key_v2(db_id)),
+            self.key(&encode_next_cron_run_id_key_v2(db_id)),
+        ];
+        for key in seq_keys {
+            if txn.get(key.clone()).await?.is_some() {
+                txn_delete(txn, key).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn next_cron_job_id(&self, db_id: u64) -> Result<i64> {
+        let key = self.key(&encode_next_cron_job_id_key_v2(db_id));
+        self.autocommit_update_key(key, |current| {
+            let next_val = match current {
+                Some(data) => {
+                    let id = i64::from_be_bytes(
+                        data.try_into()
+                            .map_err(|_| anyhow!("Invalid cron job ID format"))?,
+                    );
+                    id.checked_add(1)
+                        .ok_or_else(|| anyhow!("Cron job ID overflow"))?
+                }
+                None => 1,
+            };
+            Ok((Some(next_val.to_be_bytes().to_vec()), next_val))
+        })
+        .await
+    }
+
+    pub async fn next_cron_run_id(&self, db_id: u64) -> Result<i64> {
+        let key = self.key(&encode_next_cron_run_id_key_v2(db_id));
+        self.autocommit_update_key(key, |current| {
+            let next_val = match current {
+                Some(data) => {
+                    let id = i64::from_be_bytes(
+                        data.try_into()
+                            .map_err(|_| anyhow!("Invalid cron run ID format"))?,
+                    );
+                    id.checked_add(1)
+                        .ok_or_else(|| anyhow!("Cron run ID overflow"))?
+                }
+                None => 1,
+            };
+            Ok((Some(next_val.to_be_bytes().to_vec()), next_val))
+        })
+        .await
+    }
+}

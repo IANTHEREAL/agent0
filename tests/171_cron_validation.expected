@@ -1,0 +1,29 @@
+schedule
+1
+(1 row)
+schedule
+2
+(1 row)
+schedule
+3
+(1 row)
+schedule
+4
+(1 row)
+count
+4
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+ERROR:  invalid cron expression: 6-field expressions (with seconds) are not supported. Use 5-field syntax.
+ERROR:  invalid cron expression: empty string
