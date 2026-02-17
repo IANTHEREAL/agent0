@@ -2062,7 +2062,7 @@ async fn cmd_cron_history(
 async fn cmd_cron_enable(api: &ApiClient, output: &OutputFormat, id: &str, job: &str) {
     let job_id = resolve_job_id_expr(job);
     let sql = format!(
-        "UPDATE cron.job SET active = true WHERE jobid = {}",
+        "SELECT cron.alter_job({}, NULL, NULL, NULL, NULL, true)",
         job_id
     );
     let data = execute_sql(api, id, &sql).await;
@@ -2077,7 +2077,7 @@ async fn cmd_cron_enable(api: &ApiClient, output: &OutputFormat, id: &str, job: 
 async fn cmd_cron_disable(api: &ApiClient, output: &OutputFormat, id: &str, job: &str) {
     let job_id = resolve_job_id_expr(job);
     let sql = format!(
-        "UPDATE cron.job SET active = false WHERE jobid = {}",
+        "SELECT cron.alter_job({}, NULL, NULL, NULL, NULL, false)",
         job_id
     );
     let data = execute_sql(api, id, &sql).await;
