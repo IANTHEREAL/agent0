@@ -4,8 +4,12 @@
 //! helper predicates. Both execution routing (`executor/select/analyzed/mod.rs`)
 //! and optimizer eligibility (`optimizer/eligibility.rs`) import from here —
 //! no duplication, no dependency inversion.
+//!
+//! Also provides `is_volatile` and `has_correlated_ref` for predicate pushdown.
 
-use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
+use crate::sql::analyzer::types::{FunctionKind, TypedExpr, TypedExprKind};
+use crate::sql::expr::typed_fold::is_volatile_or_side_effecting_builtin;
+use crate::sql::expr::typed_visit::expr_any;
 
 /// Check if a TypedExpr needs async (per-row) materialization.
 ///
@@ -195,4 +199,33 @@ pub(crate) fn has_catalog_dependent_function(expr: &TypedExpr) -> bool {
         }
         _ => false,
     }
+}
+
+/// Check if a TypedExpr contains a volatile or side-effecting function.
+///
+/// Delegates to [`is_volatile_or_side_effecting_builtin`] for builtins (single
+/// source of truth shared with constant folding). User-defined functions are
+/// conservatively treated as volatile since we have no volatility metadata.
+///
+/// Note: `NOW`/`STATEMENT_TIMESTAMP`/`CURRENT_TIMESTAMP` are statement-stable
+/// and intentionally NOT in the volatile list — they can be pushed down.
+pub(crate) fn is_volatile(expr: &TypedExpr) -> bool {
+    expr_any(expr, &|e| match &e.kind {
+        TypedExprKind::FunctionCall { func, .. } => match func.kind {
+            FunctionKind::Builtin => is_volatile_or_side_effecting_builtin(&func.name),
+            FunctionKind::UserDefined { .. } => true,
+        },
+        _ => false,
+    })
+}
+
+/// Check if a TypedExpr contains a correlated reference (scope_depth > 0).
+///
+/// Correlated predicates reference outer queries and must never be pushed
+/// below joins — they depend on per-row context from the outer scope.
+pub(crate) fn has_correlated_ref(expr: &TypedExpr) -> bool {
+    expr_any(
+        expr,
+        &|e| matches!(&e.kind, TypedExprKind::ColumnRef { scope_depth, .. } if *scope_depth > 0),
+    )
 }

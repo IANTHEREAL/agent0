@@ -10,6 +10,7 @@ pub mod logical_plan;
 pub mod logical_planner;
 pub mod physical_plan;
 pub mod physical_planner;
+pub mod rewrite;
 pub mod selectivity;
 pub mod statistics;
 
@@ -29,6 +30,8 @@ use physical_plan::PhysicalPlan;
 pub fn optimize(analyzed: &AnalyzedQuery, planning_ctx: &PlanningContext) -> PhysicalPlan {
     // Step 1: AnalyzedQuery → LogicalPlan
     let logical = LogicalPlanner::build(analyzed);
-    // Step 2: LogicalPlan → PhysicalPlan (cost-based)
-    PhysicalPlanner::plan(&logical, planning_ctx)
+    // Step 2: Apply rewrite rules (predicate pushdown, etc.)
+    let optimized = rewrite::apply_rewrites(logical);
+    // Step 3: LogicalPlan → PhysicalPlan (cost-based)
+    PhysicalPlanner::plan(&optimized, planning_ctx)
 }
