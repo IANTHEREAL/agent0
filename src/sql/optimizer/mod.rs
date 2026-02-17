@@ -6,6 +6,7 @@
 
 pub mod build;
 pub mod eligibility;
+pub mod join_keys;
 pub mod logical_plan;
 pub mod logical_planner;
 pub mod physical_plan;

@@ -22,3 +22,6 @@ Filter
 
 # E4: split push — both conditions appear
 (y > 50)
+
+# Hash Join appears for equi-join queries (E1-E4 use a.id = b.id)
+Hash Join
