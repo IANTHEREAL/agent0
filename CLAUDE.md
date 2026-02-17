@@ -103,8 +103,7 @@ pg-tikv/
 │   │   ├── binder/            # Legacy name binding
 │   │   ├── planner.rs         # Query planner (index selection, scan planning)
 │   │   ├── explain.rs         # EXPLAIN (uses analyzed pipeline)
-│   │   ├── triggers.rs        # BEFORE trigger body compilation + cache
-│   │   ├── trigger_worker.rs  # Background async trigger processing
+│   │   ├── triggers/           # Trigger subsystem (cache, before, queue, worker, enqueue, execute, claim, gc)
 │   │   ├── stats.rs           # TableStatsCache (per-tenant)
 │   │   └── ...
 │   ├── protocol/
@@ -138,7 +137,7 @@ pg-tikv/
 | Change key encoding | `src/storage/encoding.rs` |
 | Catalog / pg_catalog views | `src/sql/catalog/` (35+ pg_* view implementations) |
 | Multi-tenancy | `src/pool.rs` + username parsing in handler |
-| Triggers | `src/sql/triggers.rs` (body cache) + `src/sql/executor/triggers.rs` (DDL) + `src/sql/trigger_worker.rs` (async) |
+| Triggers | `src/sql/triggers/` (cache, before, queue, worker, enqueue, execute, claim, gc) + `src/sql/executor/triggers.rs` (DDL) |
 | Transaction state | `src/txn/` (state.rs, savepoints.rs) |
 
 ## Build & Test Commands

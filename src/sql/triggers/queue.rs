@@ -74,7 +74,7 @@ fn node_id() -> u64 {
 
 /// Generate a roughly time-ordered, cluster-safe trigger event ID.
 ///
-/// Layout (MSB → LSB):
+/// Layout (MSB -> LSB):
 /// - 42 bits: milliseconds since unix epoch
 /// - 10 bits: node id (`PGTIKV_TRIGGER_NODE_ID`, 0..=1023)
 /// - 12 bits: per-millisecond sequence (0..=4095)

@@ -1,6 +1,6 @@
 use crate::types::{Row, TableSchema, Value};
 
-use super::quoting;
+use crate::sql::quoting;
 
 pub(crate) fn substitute_row_references(
     expr: &str,
