@@ -36,8 +36,12 @@ tests/157_join_select_correlated_scalar_subquery_issue428.sql
 tests/158_join_on_correlated_subquery_right_alias_issue87.sql
 tests/170_cron_basic.sql
 tests/171_cron_validation.sql
-tests/218_gin_correctness.sql
 tests/173_cron_upsert.sql
+tests/174_cron_alter_job.sql
+tests/175_cron_error_handling.sql
+tests/176_cron_extension_lifecycle.sql
+tests/177_cron_virtual_table.sql
+tests/218_gin_correctness.sql
 
 [orm]
 orm-tests/pg-client/

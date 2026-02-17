@@ -1,0 +1,48 @@
+schedule
+1
+(1 row)
+schedule|command|active
+* * * * *|SELECT 1|t
+(1 row)
+alter_job
+NULL
+(1 row)
+schedule|command
+*/15 * * * *|SELECT 1
+(1 row)
+alter_job
+NULL
+(1 row)
+schedule|command
+*/15 * * * *|SELECT 2
+(1 row)
+alter_job
+NULL
+(1 row)
+schedule|command
+0 3 * * *|VACUUM
+(1 row)
+alter_job
+NULL
+(1 row)
+active
+f
+(1 row)
+alter_job
+NULL
+(1 row)
+active
+t
+(1 row)
+alter_job
+NULL
+(1 row)
+schedule|active
+30 2 * * 1|f
+(1 row)
+ERROR:  cron.alter_job: job 9999 not found
+ERROR:  invalid cron expression: expected 5 fields (minute hour day month weekday), got 4
+ERROR:  cron.alter_job: cross-database scheduling not supported
+unschedule
+t
+(1 row)

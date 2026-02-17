@@ -1,0 +1,15 @@
+ERROR:  extension pg_cron is not installed
+ERROR:  extension pg_cron is not installed
+ERROR:  extension pg_cron is not installed
+unschedule
+f
+(1 row)
+unschedule
+f
+(1 row)
+ERROR:  cron.schedule_in_database is not supported
+ERROR:  cron.schedule() requires 2 or 3 arguments, got 0
+ERROR:  cron.schedule() requires 2 or 3 arguments, got 4
+ERROR:  cron.unschedule() requires exactly 1 argument, got 0
+ERROR:  cron.unschedule() requires exactly 1 argument, got 2
+ERROR:  cron.alter_job() requires 1 to 6 arguments, got 0
