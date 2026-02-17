@@ -93,16 +93,45 @@ COALESCE, NULLIF, GREATEST, LEAST, gen_random_uuid()
 
 pg-tikv supports built-in extensions (compiled into the server binary) that can be enabled per-tenant:
 
-```sql
--- Requires SUPERUSER
-CREATE EXTENSION http;
+| Extension | Description |
+|-----------|-------------|
+| `http` | HTTP client functions (`http_get`, `http_post`, etc.) |
+| `pg_cron` | Distributed cron scheduler (pg_cron V2 compatible) |
 
--- Supabase-style table functions under the `extensions` schema
-SELECT status, content_type, content
-FROM extensions.http_get('https://example.com');
+```sql
+CREATE EXTENSION http;
+CREATE EXTENSION pg_cron;
 ```
 
 See `docs/extensions.md` for details and security restrictions.
+
+### Cron Jobs (pg_cron)
+
+pg_cron V2-compatible distributed cron scheduler. Schedule SQL commands to run on a recurring basis.
+
+```sql
+CREATE EXTENSION pg_cron;
+
+-- Schedule a job (returns job ID)
+SELECT cron.schedule('nightly_vacuum', '0 3 * * *', 'VACUUM');
+SELECT cron.schedule('*/5 * * * *', 'SELECT 1');
+
+-- List jobs
+SELECT * FROM cron.job ORDER BY jobid;
+
+-- Modify a job (job_id, schedule, command, database, username, active)
+SELECT cron.alter_job(1, '0 4 * * *');              -- change schedule
+SELECT cron.alter_job(1, NULL, NULL, NULL, NULL, false);  -- disable
+
+-- Delete a job
+SELECT cron.unschedule('nightly_vacuum');  -- by name
+SELECT cron.unschedule(1);                -- by ID
+
+-- View execution history
+SELECT * FROM cron.job_run_details ORDER BY runid DESC LIMIT 10;
+
+DROP EXTENSION pg_cron;
+```
 
 ## Quick Start
 
@@ -478,6 +507,7 @@ db9
 │   ├── dump <id> [--ddl-only]        # Export schema/data as SQL
 │   ├── users <id> list|create|delete # Manage database users
 │   ├── inspect <id> <subcommand>     # Observability (see below)
+│   ├── cron <id> <subcommand>        # Cron job management (see below)
 │   └── branch create|list|delete     # Database branching
 ├── gen types <id> --lang ts|python   # Generate type definitions
 ├── migration
@@ -499,6 +529,18 @@ db9 db inspect <id> schemas      # List schemas
 db9 db inspect <id> tables       # List tables with row counts
 db9 db inspect <id> indexes      # List indexes
 db9 db inspect <id> slow-queries # Slow queries sorted by p99 latency
+```
+
+#### Cron Subcommands
+
+```bash
+db9 db cron <id> list                                           # List all cron jobs
+db9 db cron <id> create '*/5 * * * *' 'SELECT 1' --name my_job # Create with name
+db9 db cron <id> create '0 * * * *' 'VACUUM'                   # Create without name
+db9 db cron <id> enable my_job                                  # Enable (by name or ID)
+db9 db cron <id> disable 1                                      # Disable (by name or ID)
+db9 db cron <id> history --job my_job --limit 50                # Execution history
+db9 db cron <id> delete my_job                                  # Delete (by name or ID)
 ```
 
 ### Examples
