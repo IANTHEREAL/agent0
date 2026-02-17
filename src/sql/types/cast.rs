@@ -372,6 +372,13 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             Ok(Value::Json(s))
         }
 
+        // ===== Full-text search =====
+        (Value::Text(s), DataType::Tsquery) => {
+            crate::sql::fts::validate_tsquery_syntax(&s)?;
+            Ok(Value::Tsquery(s))
+        }
+        (Value::Tsquery(s), DataType::Tsquery) => Ok(Value::Tsquery(s)),
+
         // ===== Numeric =====
         (Value::Text(s), DataType::Numeric { scale, .. }) => {
             let mut d = Decimal::from_str(s.trim()).map_err(|_| SqlError::InvalidInputSyntax {
@@ -553,6 +560,7 @@ fn normalize_regtype(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::error::SqlError;
     use rust_decimal::Decimal;
 
     // ---- Float64 → Int32 ----
@@ -803,6 +811,43 @@ mod tests {
             .unwrap(),
             Value::Boolean(false)
         );
+    }
+
+    #[test]
+    fn text_to_tsquery_validates_syntax() {
+        let r = cast(
+            Value::Text("'hello' & !'world'".into()),
+            &DataType::Tsquery,
+            CastContext::Explicit,
+        )
+        .unwrap();
+        assert_eq!(r, Value::Tsquery("'hello' & !'world'".into()));
+    }
+
+    #[test]
+    fn text_to_tsquery_invalid_syntax_errors() {
+        let err = cast(
+            Value::Text("'hello' & (".into()),
+            &DataType::Tsquery,
+            CastContext::Explicit,
+        )
+        .unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected typed SqlError for tsquery syntax");
+        assert_eq!(sql_err.sqlstate(), "42601");
+        assert!(sql_err.to_string().contains("no operand in tsquery"));
+    }
+
+    #[test]
+    fn text_to_empty_tsquery_is_valid() {
+        let r = cast(
+            Value::Text("".into()),
+            &DataType::Tsquery,
+            CastContext::Explicit,
+        )
+        .unwrap();
+        assert_eq!(r, Value::Tsquery("".into()));
     }
 
     // ---- coerce_text_to_numeric ----

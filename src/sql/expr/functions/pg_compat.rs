@@ -105,7 +105,7 @@ pub fn format_type(args: Vec<Value>) -> Result<Value> {
         Value::Null => return Ok(Value::Null),
         _ => 0,
     };
-    let type_name = pg_types::typname_for_oid(oid).unwrap_or("text");
+    let type_name = pg_types::format_type_name_for_oid(oid).unwrap_or("text");
     Ok(Value::Text(type_name.to_string()))
 }
 
@@ -352,7 +352,7 @@ mod tests {
         );
         assert_eq!(
             format_type(vec![Value::Int32(1083)]).unwrap(),
-            Value::Text("time".into())
+            Value::Text("time without time zone".into())
         );
         assert_eq!(
             format_type(vec![Value::Int32(1186)]).unwrap(),

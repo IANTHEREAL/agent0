@@ -738,7 +738,7 @@ async fn lookup_typname_by_oid(
     db_id: u64,
     oid: i64,
 ) -> Result<Option<String>> {
-    if let Some(t) = crate::sql::pg_types::typname_for_oid(oid) {
+    if let Some(t) = crate::sql::pg_types::format_type_name_for_oid(oid) {
         return Ok(Some(t.to_string()));
     }
 

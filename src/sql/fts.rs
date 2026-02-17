@@ -1,3 +1,4 @@
+use crate::sql::error::SqlError;
 use crate::types::Value;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -165,7 +166,7 @@ pub fn ts_match(tsvector: &Value, tsquery: &Value) -> Result<Value> {
     };
 
     let tsvector_words = extract_tsvector_words(tsvector_str);
-    let matches = match_tsquery(&tsvector_words, tsquery_str);
+    let matches = match_tsquery(&tsvector_words, tsquery_str)?;
 
     Ok(Value::Boolean(matches))
 }
@@ -183,21 +184,247 @@ fn extract_tsvector_words(tsvector: &str) -> HashSet<String> {
     words
 }
 
-fn match_tsquery(tsvector_words: &HashSet<String>, tsquery: &str) -> bool {
-    let query_terms: Vec<String> = tsquery
-        .split(|c: char| matches!(c, '&' | '|' | '!'))
-        .map(|s| s.trim().trim_matches('\'').to_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if query_terms.is_empty() {
-        return true;
+pub(crate) fn validate_tsquery_syntax(tsquery: &str) -> Result<()> {
+    let tokens = tokenize_tsquery(tsquery).map_err(|e| invalid_tsquery_syntax(tsquery, e))?;
+    if tokens.is_empty() {
+        return Ok(());
     }
 
-    if tsquery.contains('|') {
-        query_terms.iter().any(|term| tsvector_words.contains(term))
-    } else {
-        query_terms.iter().all(|term| tsvector_words.contains(term))
+    let words = HashSet::new();
+    let mut evaluator = TsQueryEvaluator::new(&tokens, &words);
+    evaluator
+        .eval()
+        .map_err(|e| invalid_tsquery_syntax(tsquery, e))
+        .map(|_| ())
+}
+
+fn match_tsquery(tsvector_words: &HashSet<String>, tsquery: &str) -> Result<bool> {
+    let tokens = tokenize_tsquery(tsquery).map_err(|e| invalid_tsquery_syntax(tsquery, e))?;
+    if tokens.is_empty() {
+        return Ok(false);
+    }
+
+    let mut evaluator = TsQueryEvaluator::new(&tokens, tsvector_words);
+    evaluator
+        .eval()
+        .map_err(|e| invalid_tsquery_syntax(tsquery, e))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TsQueryToken {
+    Not,
+    And,
+    Or,
+    LParen,
+    RParen,
+    Term(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TsQueryParseError {
+    Syntax,
+    NoOperand,
+}
+
+fn tokenize_tsquery(tsquery: &str) -> std::result::Result<Vec<TsQueryToken>, TsQueryParseError> {
+    let mut tokens = Vec::new();
+    let mut chars = tsquery.chars().peekable();
+
+    while let Some(ch) = chars.peek().copied() {
+        match ch {
+            c if c.is_whitespace() => {
+                chars.next();
+            }
+            '!' => {
+                chars.next();
+                tokens.push(TsQueryToken::Not);
+            }
+            '&' => {
+                chars.next();
+                tokens.push(TsQueryToken::And);
+            }
+            '|' => {
+                chars.next();
+                tokens.push(TsQueryToken::Or);
+            }
+            '(' => {
+                chars.next();
+                tokens.push(TsQueryToken::LParen);
+            }
+            ')' => {
+                chars.next();
+                tokens.push(TsQueryToken::RParen);
+            }
+            '\'' => {
+                chars.next(); // opening quote
+                let mut term = String::new();
+                let mut closed = false;
+                while let Some(c) = chars.next() {
+                    if c == '\'' {
+                        if chars.peek() == Some(&'\'') {
+                            chars.next();
+                            term.push('\'');
+                        } else {
+                            closed = true;
+                            break;
+                        }
+                    } else {
+                        term.push(c);
+                    }
+                }
+                if !closed {
+                    return Err(TsQueryParseError::Syntax);
+                }
+                if !term.is_empty() {
+                    tokens.push(TsQueryToken::Term(term.to_lowercase()));
+                }
+            }
+            _ => {
+                let mut term = String::new();
+                while let Some(c) = chars.peek().copied() {
+                    if c.is_whitespace() || matches!(c, '!' | '&' | '|' | '(' | ')') {
+                        break;
+                    }
+                    term.push(c);
+                    chars.next();
+                }
+                let normalized = term.trim().trim_matches('\'').to_lowercase();
+                if !normalized.is_empty() {
+                    tokens.push(TsQueryToken::Term(normalized));
+                }
+            }
+        }
+    }
+
+    Ok(tokens)
+}
+
+fn invalid_tsquery_syntax(tsquery: &str, err: TsQueryParseError) -> anyhow::Error {
+    match err {
+        TsQueryParseError::Syntax => SqlError::TsquerySyntax {
+            query: tsquery.to_string(),
+        }
+        .into(),
+        TsQueryParseError::NoOperand => SqlError::TsqueryNoOperand {
+            query: tsquery.to_string(),
+        }
+        .into(),
+    }
+}
+
+struct TsQueryEvaluator<'a> {
+    tokens: &'a [TsQueryToken],
+    pos: usize,
+    words: &'a HashSet<String>,
+}
+
+impl<'a> TsQueryEvaluator<'a> {
+    fn new(tokens: &'a [TsQueryToken], words: &'a HashSet<String>) -> Self {
+        Self {
+            tokens,
+            pos: 0,
+            words,
+        }
+    }
+
+    fn eval(&mut self) -> std::result::Result<bool, TsQueryParseError> {
+        let value = self.parse_or()?;
+        if self.pos != self.tokens.len() {
+            return Err(TsQueryParseError::Syntax);
+        }
+        Ok(value)
+    }
+
+    fn parse_or(&mut self) -> std::result::Result<bool, TsQueryParseError> {
+        let mut value = self.parse_and()?;
+        while self.consume_or() {
+            let rhs = self.parse_and()?;
+            value = value || rhs;
+        }
+        Ok(value)
+    }
+
+    fn parse_and(&mut self) -> std::result::Result<bool, TsQueryParseError> {
+        let mut value = self.parse_unary()?;
+        while self.consume_and() {
+            let rhs = self.parse_unary()?;
+            value = value && rhs;
+        }
+        Ok(value)
+    }
+
+    fn parse_unary(&mut self) -> std::result::Result<bool, TsQueryParseError> {
+        if self.consume_not() {
+            Ok(!self.parse_unary()?)
+        } else {
+            self.parse_primary()
+        }
+    }
+
+    fn parse_primary(&mut self) -> std::result::Result<bool, TsQueryParseError> {
+        if self.consume_lparen() {
+            let value = self.parse_or()?;
+            if !self.consume_rparen() {
+                return Err(TsQueryParseError::Syntax);
+            }
+            return Ok(value);
+        }
+
+        self.consume_term()
+            .map(|term| self.words.contains(term.as_str()))
+            .ok_or_else(|| {
+                // Unexpected operator token → "syntax error in tsquery" (matches PG)
+                // End-of-input → "no operand in tsquery" (matches PG)
+                match self.peek_token() {
+                    Some(TsQueryToken::And | TsQueryToken::Or | TsQueryToken::RParen) => {
+                        TsQueryParseError::Syntax
+                    }
+                    _ => TsQueryParseError::NoOperand,
+                }
+            })
+    }
+
+    fn consume_and(&mut self) -> bool {
+        self.consume_if(|token| matches!(token, TsQueryToken::And))
+    }
+
+    fn consume_or(&mut self) -> bool {
+        self.consume_if(|token| matches!(token, TsQueryToken::Or))
+    }
+
+    fn consume_not(&mut self) -> bool {
+        self.consume_if(|token| matches!(token, TsQueryToken::Not))
+    }
+
+    fn consume_lparen(&mut self) -> bool {
+        self.consume_if(|token| matches!(token, TsQueryToken::LParen))
+    }
+
+    fn consume_rparen(&mut self) -> bool {
+        self.consume_if(|token| matches!(token, TsQueryToken::RParen))
+    }
+
+    fn consume_term(&mut self) -> Option<String> {
+        match self.peek_token() {
+            Some(TsQueryToken::Term(term)) => {
+                self.pos += 1;
+                Some(term.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn consume_if(&mut self, predicate: impl FnOnce(&TsQueryToken) -> bool) -> bool {
+        if self.peek_token().is_some_and(predicate) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek_token(&self) -> Option<&'a TsQueryToken> {
+        self.tokens.get(self.pos)
     }
 }
 
@@ -321,6 +548,94 @@ mod tests {
     fn test_ts_match_no_match() {
         let tsvector = Value::Tsvector("'hello':1A 'world':2A".to_string());
         let tsquery = Value::Tsquery("'foo'".to_string());
+        let result = ts_match(&tsvector, &tsquery).unwrap();
+        assert_eq!(result, Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_ts_match_not_operator() {
+        let tsvector = Value::Tsvector("'hello':1A 'rust':2A".to_string());
+        let tsquery = Value::Tsquery("'hello' & !'world'".to_string());
+        let result = ts_match(&tsvector, &tsquery).unwrap();
+        assert_eq!(result, Value::Boolean(true));
+
+        let tsvector = Value::Tsvector("'hello':1A 'world':2A".to_string());
+        let result = ts_match(&tsvector, &tsquery).unwrap();
+        assert_eq!(result, Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_ts_match_parentheses_precedence() {
+        let tsvector = Value::Tsvector("'hello':1A 'world':2A".to_string());
+        let tsquery = Value::Tsquery("('hello' | 'rust') & !'world'".to_string());
+        let result = ts_match(&tsvector, &tsquery).unwrap();
+        assert_eq!(result, Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_ts_match_invalid_tsquery_errors() {
+        let tsvector = Value::Tsvector("'hello':1A 'world':2A".to_string());
+        let tsquery = Value::Tsquery("'hello' & (".to_string());
+        let err = ts_match(&tsvector, &tsquery).unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected typed SqlError for tsquery syntax");
+        assert_eq!(sql_err.sqlstate(), "42601");
+        assert!(sql_err.to_string().contains("no operand in tsquery"));
+    }
+
+    #[test]
+    fn test_ts_match_syntax_error_leading_and() {
+        let tsvector = Value::Tsvector("'foo':1A".to_string());
+        let tsquery = Value::Tsquery("& foo".to_string());
+        let err = ts_match(&tsvector, &tsquery).unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected typed SqlError");
+        assert_eq!(sql_err.sqlstate(), "42601");
+        assert!(sql_err.to_string().contains("syntax error in tsquery"));
+    }
+
+    #[test]
+    fn test_ts_match_syntax_error_double_and() {
+        let tsvector = Value::Tsvector("'foo':1A".to_string());
+        let tsquery = Value::Tsquery("'foo' && 'bar'".to_string());
+        let err = ts_match(&tsvector, &tsquery).unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected typed SqlError");
+        assert_eq!(sql_err.sqlstate(), "42601");
+        assert!(sql_err.to_string().contains("syntax error in tsquery"));
+    }
+
+    #[test]
+    fn test_ts_match_syntax_error_leading_or() {
+        let tsvector = Value::Tsvector("'foo':1A".to_string());
+        let tsquery = Value::Tsquery("| foo".to_string());
+        let err = ts_match(&tsvector, &tsquery).unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected typed SqlError");
+        assert_eq!(sql_err.sqlstate(), "42601");
+        assert!(sql_err.to_string().contains("syntax error in tsquery"));
+    }
+
+    #[test]
+    fn test_ts_match_syntax_error_leading_rparen() {
+        let tsvector = Value::Tsvector("'foo':1A".to_string());
+        let tsquery = Value::Tsquery(") foo".to_string());
+        let err = ts_match(&tsvector, &tsquery).unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected typed SqlError");
+        assert_eq!(sql_err.sqlstate(), "42601");
+        assert!(sql_err.to_string().contains("syntax error in tsquery"));
+    }
+
+    #[test]
+    fn test_ts_match_empty_tsquery_is_false() {
+        let tsvector = Value::Tsvector("'hello':1A".to_string());
+        let tsquery = Value::Tsquery("".to_string());
         let result = ts_match(&tsvector, &tsquery).unwrap();
         assert_eq!(result, Value::Boolean(false));
     }

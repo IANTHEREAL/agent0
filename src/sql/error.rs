@@ -21,6 +21,12 @@ pub enum SqlError {
     #[error("syntax error: {0}")]
     Syntax(String),
 
+    #[error("syntax error in tsquery: \"{query}\"")]
+    TsquerySyntax { query: String },
+
+    #[error("no operand in tsquery: \"{query}\"")]
+    TsqueryNoOperand { query: String },
+
     // Object not found
     #[error("relation \"{0}\" does not exist")]
     RelationNotFound(String),
@@ -100,6 +106,8 @@ impl SqlError {
     pub fn sqlstate(&self) -> &'static str {
         match self {
             Self::Syntax(_) => "42601",
+            Self::TsquerySyntax { .. } => "42601",
+            Self::TsqueryNoOperand { .. } => "42601",
             Self::RelationNotFound(_) => "42P01",
             Self::ColumnNotFound { .. } => "42703",
             Self::AmbiguousColumn(_) => "42702",
@@ -168,6 +176,14 @@ mod tests {
     #[test]
     fn test_sqlstate_codes() {
         assert_eq!(SqlError::Syntax("bad".into()).sqlstate(), "42601");
+        assert_eq!(
+            SqlError::TsquerySyntax { query: "x".into() }.sqlstate(),
+            "42601"
+        );
+        assert_eq!(
+            SqlError::TsqueryNoOperand { query: "x".into() }.sqlstate(),
+            "42601"
+        );
         assert_eq!(SqlError::RelationNotFound("t".into()).sqlstate(), "42P01");
         assert_eq!(
             SqlError::ColumnNotFound { column: "c".into() }.sqlstate(),

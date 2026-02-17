@@ -560,7 +560,7 @@ pub async fn execute_create_table(
                 ColumnOption::Default(expr) => default_expr = Some(expr.to_string()),
                 ColumnOption::Check(expr) => {
                     check_constraints.push(CheckConstraint {
-                        name: None,
+                        name: opt.name.as_ref().map(normalize_ident),
                         expr: expr.to_string(),
                     });
                 }

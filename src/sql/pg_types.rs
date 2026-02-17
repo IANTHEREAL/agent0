@@ -8,6 +8,9 @@ pub(crate) const OID_INT2: i64 = 21;
 pub(crate) const OID_INT4: i64 = 23;
 pub(crate) const OID_TEXT: i64 = 25;
 pub(crate) const OID_OID: i64 = 26;
+pub(crate) const OID_TID: i64 = 27;
+pub(crate) const OID_XID: i64 = 28;
+pub(crate) const OID_CID: i64 = 29;
 pub(crate) const OID_JSON: i64 = 114;
 pub(crate) const OID_FLOAT4: i64 = 700;
 pub(crate) const OID_FLOAT8: i64 = 701;
@@ -46,6 +49,9 @@ pub(crate) const BUILTIN_PG_TYPES: &[BuiltinPgType] = &[
     BuiltinPgType { oid: OID_INT4,        typname: "int4",        typlen:  4, typbyval: "t", typtype: "b", typcategory: "N", typcollation:   0 },
     BuiltinPgType { oid: OID_TEXT,        typname: "text",        typlen: -1, typbyval: "f", typtype: "b", typcategory: "S", typcollation: 100 },
     BuiltinPgType { oid: OID_OID,         typname: "oid",         typlen:  4, typbyval: "t", typtype: "b", typcategory: "N", typcollation:   0 },
+    BuiltinPgType { oid: OID_TID,         typname: "tid",         typlen:  6, typbyval: "f", typtype: "b", typcategory: "U", typcollation:   0 },
+    BuiltinPgType { oid: OID_XID,         typname: "xid",         typlen:  4, typbyval: "t", typtype: "b", typcategory: "U", typcollation:   0 },
+    BuiltinPgType { oid: OID_CID,         typname: "cid",         typlen:  4, typbyval: "t", typtype: "b", typcategory: "U", typcollation:   0 },
     BuiltinPgType { oid: OID_JSON,        typname: "json",        typlen: -1, typbyval: "f", typtype: "b", typcategory: "U", typcollation:   0 },
     BuiltinPgType { oid: OID_FLOAT4,      typname: "float4",      typlen:  4, typbyval: "t", typtype: "b", typcategory: "N", typcollation:   0 },
     BuiltinPgType { oid: OID_FLOAT8,      typname: "float8",      typlen:  8, typbyval: "t", typtype: "b", typcategory: "N", typcollation:   0 },
@@ -69,6 +75,16 @@ pub(crate) fn typname_for_oid(oid: i64) -> Option<&'static str> {
         .iter()
         .find(|t| t.oid == oid)
         .map(|t| t.typname)
+}
+
+pub(crate) fn format_type_name_for_oid(oid: i64) -> Option<&'static str> {
+    match oid {
+        OID_TIME => Some("time without time zone"),
+        OID_TID => Some("tid"),
+        OID_XID => Some("xid"),
+        OID_CID => Some("cid"),
+        _ => typname_for_oid(oid),
+    }
 }
 
 pub(crate) fn oid_and_typlen_for_datatype(dt: &DataType) -> (i64, i32) {
@@ -113,5 +129,23 @@ mod tests {
             (OID_VARCHAR, -1),
             "VARCHAR(n) should map to OID_VARCHAR"
         );
+    }
+
+    #[test]
+    fn format_type_name_maps_catalog_only_oids() {
+        assert_eq!(format_type_name_for_oid(OID_CID), Some("cid"));
+        assert_eq!(format_type_name_for_oid(OID_XID), Some("xid"));
+        assert_eq!(format_type_name_for_oid(OID_TID), Some("tid"));
+        assert_eq!(
+            format_type_name_for_oid(OID_TIME),
+            Some("time without time zone")
+        );
+    }
+
+    #[test]
+    fn typname_for_system_attribute_oids_exists() {
+        assert_eq!(typname_for_oid(OID_TID), Some("tid"));
+        assert_eq!(typname_for_oid(OID_XID), Some("xid"));
+        assert_eq!(typname_for_oid(OID_CID), Some("cid"));
     }
 }
