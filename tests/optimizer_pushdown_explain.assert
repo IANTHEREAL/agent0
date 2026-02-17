@@ -25,3 +25,6 @@ Filter
 
 # Hash Join appears for equi-join queries (E1-E4 use a.id = b.id)
 Hash Join
+
+# E7: non-equi comma-join → Nested Loop survives
+Nested Loop

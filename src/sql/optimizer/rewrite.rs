@@ -6,9 +6,12 @@
 //! Currently implemented:
 //! - **PredicatePushdown**: pushes WHERE filter predicates below Join and Sort
 //!   nodes to reduce the number of rows entering those operators.
+//! - **CrossJoinElimination**: absorbs cross-table equi-predicates from Filter
+//!   into join ON conditions, converting Cross→Inner and enabling HashJoin.
 
 use std::collections::HashSet;
 
+use super::join_keys;
 use super::logical_plan::{LogicalNode, LogicalPlan, PlanSchema};
 use crate::sql::analyzer::types::{
     reindex_typed_expr, BinaryOp, JoinCondition, JoinType, TypedExpr, TypedExprKind,
@@ -27,7 +30,8 @@ trait LogicalRewriteRule {
 ///
 /// Called from `optimize()` between logical planning and physical planning.
 pub fn apply_rewrites(plan: LogicalPlan) -> LogicalPlan {
-    let rules: Vec<Box<dyn LogicalRewriteRule>> = vec![Box::new(PredicatePushdown)];
+    let rules: Vec<Box<dyn LogicalRewriteRule>> =
+        vec![Box::new(PredicatePushdown), Box::new(CrossJoinElimination)];
     let mut current = plan;
     for rule in &rules {
         current = rule.rewrite(current);
@@ -318,6 +322,340 @@ fn push_filter_through_join(
     }
 
     result
+}
+
+// ── Cross-join elimination ───────────────────────────────────
+
+struct CrossJoinElimination;
+
+impl LogicalRewriteRule for CrossJoinElimination {
+    fn rewrite(&self, plan: LogicalPlan) -> LogicalPlan {
+        eliminate_cross_joins(plan)
+    }
+}
+
+/// Bottom-up recursive: rewrite children first, then check if current node is
+/// `Filter over Inner/Cross join`.
+fn eliminate_cross_joins(plan: LogicalPlan) -> LogicalPlan {
+    // First, recursively rewrite children
+    let plan = elim_rewrite_children(plan);
+
+    // Then, check: Filter over Inner/Cross join?
+    let LogicalPlan { node, schema } = plan;
+    match node {
+        LogicalNode::Filter { predicate, input } => {
+            let LogicalPlan {
+                node: inner_node,
+                schema: inner_schema,
+            } = *input;
+            match inner_node {
+                LogicalNode::Join {
+                    left,
+                    right,
+                    join_type,
+                    condition,
+                } if matches!(join_type, JoinType::Inner | JoinType::Cross) => {
+                    absorb_equi_into_join(
+                        predicate,
+                        *left,
+                        *right,
+                        join_type,
+                        condition,
+                        inner_schema,
+                    )
+                }
+                other => LogicalPlan {
+                    node: LogicalNode::Filter {
+                        predicate,
+                        input: Box::new(LogicalPlan {
+                            node: other,
+                            schema: inner_schema,
+                        }),
+                    },
+                    schema,
+                },
+            }
+        }
+        other => LogicalPlan {
+            node: other,
+            schema,
+        },
+    }
+}
+
+/// Recursively rewrite all children of a plan node (for cross-join elimination).
+fn elim_rewrite_children(plan: LogicalPlan) -> LogicalPlan {
+    let schema = plan.schema;
+    let node = match plan.node {
+        LogicalNode::Filter { predicate, input } => LogicalNode::Filter {
+            predicate,
+            input: Box::new(eliminate_cross_joins(*input)),
+        },
+        LogicalNode::Project { projections, input } => LogicalNode::Project {
+            projections,
+            input: Box::new(eliminate_cross_joins(*input)),
+        },
+        LogicalNode::Aggregate {
+            group_by,
+            projections,
+            input,
+        } => LogicalNode::Aggregate {
+            group_by,
+            projections,
+            input: Box::new(eliminate_cross_joins(*input)),
+        },
+        LogicalNode::Sort { order_by, input } => LogicalNode::Sort {
+            order_by,
+            input: Box::new(eliminate_cross_joins(*input)),
+        },
+        LogicalNode::Limit {
+            limit,
+            offset,
+            input,
+        } => LogicalNode::Limit {
+            limit,
+            offset,
+            input: Box::new(eliminate_cross_joins(*input)),
+        },
+        LogicalNode::Distinct { input } => LogicalNode::Distinct {
+            input: Box::new(eliminate_cross_joins(*input)),
+        },
+        LogicalNode::DistinctOn { on_exprs, input } => LogicalNode::DistinctOn {
+            on_exprs,
+            input: Box::new(eliminate_cross_joins(*input)),
+        },
+        LogicalNode::Window { input } => LogicalNode::Window {
+            input: Box::new(eliminate_cross_joins(*input)),
+        },
+        LogicalNode::Join {
+            left,
+            right,
+            join_type,
+            condition,
+        } => LogicalNode::Join {
+            left: Box::new(eliminate_cross_joins(*left)),
+            right: Box::new(eliminate_cross_joins(*right)),
+            join_type,
+            condition,
+        },
+        LogicalNode::SetOperation {
+            op,
+            all,
+            left,
+            right,
+        } => LogicalNode::SetOperation {
+            op,
+            all,
+            left: Box::new(eliminate_cross_joins(*left)),
+            right: Box::new(eliminate_cross_joins(*right)),
+        },
+        LogicalNode::Subquery { subplan, alias } => LogicalNode::Subquery {
+            subplan: Box::new(eliminate_cross_joins(*subplan)),
+            alias,
+        },
+        // Leaf nodes — no children to rewrite
+        node @ (LogicalNode::Scan { .. }
+        | LogicalNode::Values { .. }
+        | LogicalNode::TableFunction { .. }
+        | LogicalNode::Empty) => node,
+    };
+    LogicalPlan { node, schema }
+}
+
+/// Check if a single conjunct is a cross-table equi-predicate.
+///
+/// Delegates to `join_keys::try_extract_equi_keys` — the same extractor used
+/// by physical_planner (algorithm selection) and build.rs (operator construction).
+/// This ensures zero semantic drift between rewrite-time and execution-time.
+fn is_absorbable_equi(expr: &TypedExpr, left_width: usize) -> bool {
+    let probe = JoinCondition::On(expr.clone());
+    join_keys::try_extract_equi_keys(&probe, left_width).is_some()
+}
+
+fn absorb_equi_into_join(
+    predicate: TypedExpr,
+    left: LogicalPlan,
+    right: LogicalPlan,
+    original_join_type: JoinType,
+    existing_condition: JoinCondition,
+    join_schema: PlanSchema,
+) -> LogicalPlan {
+    // Skip USING (already has equi-join semantics from analyzer)
+    if matches!(existing_condition, JoinCondition::Using(_)) {
+        return rebuild_filter_join(
+            predicate,
+            left,
+            right,
+            original_join_type,
+            existing_condition,
+            join_schema,
+        );
+    }
+
+    let left_width = left.schema.columns.len();
+    let conjuncts = split_conjunction(predicate);
+
+    let mut equi_preds = Vec::new();
+    let mut remaining = Vec::new();
+    for conj in conjuncts {
+        if is_absorbable_equi(&conj, left_width) {
+            equi_preds.push(conj);
+        } else {
+            remaining.push(conj);
+        }
+    }
+
+    if equi_preds.is_empty() {
+        // No cross-table equalities — reconstruct unchanged
+        let pred = conjuncts_to_predicate(remaining);
+        return rebuild_filter_join(
+            pred,
+            left,
+            right,
+            original_join_type,
+            existing_condition,
+            join_schema,
+        );
+    }
+
+    // Build candidate ON condition, deduplicating against existing ON keys
+    let candidate_on = match &existing_condition {
+        JoinCondition::On(existing) => {
+            // Deduplicate: only add equi_preds whose (left,right) key pairs are not
+            // already in existing ON. Must compare pairwise tuples — independent set
+            // membership would false-positive e.g. (a,b) against existing {(a,a),(b,b)}.
+            let existing_pairs: HashSet<(usize, usize)> = if let Some((elk, erk)) =
+                join_keys::try_extract_equi_keys(&existing_condition, left_width)
+            {
+                elk.into_iter().zip(erk).collect()
+            } else {
+                HashSet::new()
+            };
+            let mut new_equi = Vec::new();
+            for ep in &equi_preds {
+                let probe = JoinCondition::On(ep.clone());
+                if let Some((lk, rk)) = join_keys::try_extract_equi_keys(&probe, left_width) {
+                    let already_present = lk
+                        .iter()
+                        .zip(rk.iter())
+                        .all(|(l, r)| existing_pairs.contains(&(*l, *r)));
+                    if !already_present {
+                        new_equi.push(ep.clone());
+                    }
+                    // If already present, drop the duplicate (don't add to remaining either)
+                } else {
+                    new_equi.push(ep.clone());
+                }
+            }
+            if new_equi.is_empty() {
+                // All equi_preds were duplicates — nothing to absorb
+                if remaining.is_empty() {
+                    // No remaining predicates — just return the join unchanged
+                    return LogicalPlan {
+                        node: LogicalNode::Join {
+                            left: Box::new(left),
+                            right: Box::new(right),
+                            join_type: original_join_type,
+                            condition: existing_condition,
+                        },
+                        schema: join_schema,
+                    };
+                }
+                let pred = conjuncts_to_predicate(remaining);
+                return rebuild_filter_join(
+                    pred,
+                    left,
+                    right,
+                    original_join_type,
+                    existing_condition,
+                    join_schema,
+                );
+            }
+            equi_preds = new_equi;
+            let mut all = vec![existing.clone()];
+            all.extend(equi_preds.clone());
+            conjuncts_to_predicate(all)
+        }
+        JoinCondition::None => conjuncts_to_predicate(equi_preds.clone()),
+        JoinCondition::Using(_) => unreachable!(),
+    };
+
+    // Safety check: for INNER joins with existing ON, verify the merged
+    // condition is still pure-equi. If not, absorption would degrade
+    // HashJoin eligibility — put equi_preds back into remaining.
+    let should_absorb = match &existing_condition {
+        JoinCondition::None => true, // Cross join — always safe
+        JoinCondition::On(_) => {
+            // Only absorb if merged ON stays pure-equi
+            let probe = JoinCondition::On(candidate_on.clone());
+            join_keys::try_extract_equi_keys(&probe, left_width).is_some()
+        }
+        JoinCondition::Using(_) => unreachable!(),
+    };
+
+    if !should_absorb {
+        // Put equi_preds back into remaining, keep original condition
+        remaining.extend(equi_preds);
+        let pred = conjuncts_to_predicate(remaining);
+        return rebuild_filter_join(
+            pred,
+            left,
+            right,
+            original_join_type,
+            existing_condition,
+            join_schema,
+        );
+    }
+
+    let mut result = LogicalPlan {
+        node: LogicalNode::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinType::Inner, // Cross + equi → Inner
+            condition: JoinCondition::On(candidate_on),
+        },
+        schema: join_schema,
+    };
+
+    if !remaining.is_empty() {
+        let pred = conjuncts_to_predicate(remaining);
+        let schema = result.schema.clone();
+        result = LogicalPlan {
+            node: LogicalNode::Filter {
+                predicate: pred,
+                input: Box::new(result),
+            },
+            schema,
+        };
+    }
+    result
+}
+
+/// Rebuild a Filter over Join unchanged (helper to avoid duplication).
+fn rebuild_filter_join(
+    predicate: TypedExpr,
+    left: LogicalPlan,
+    right: LogicalPlan,
+    join_type: JoinType,
+    condition: JoinCondition,
+    join_schema: PlanSchema,
+) -> LogicalPlan {
+    let join = LogicalPlan {
+        node: LogicalNode::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type,
+            condition,
+        },
+        schema: join_schema.clone(),
+    };
+    LogicalPlan {
+        node: LogicalNode::Filter {
+            predicate,
+            input: Box::new(join),
+        },
+        schema: join_schema,
+    }
 }
 
 // ── Helpers (private to this module) ───────────────────────────
@@ -754,6 +1092,40 @@ mod tests {
         match &plan.node {
             LogicalNode::Filter { input, .. } => input,
             _ => panic!("expected Filter node"),
+        }
+    }
+
+    fn make_inner_join_on(
+        left: LogicalPlan,
+        right: LogicalPlan,
+        condition: JoinCondition,
+    ) -> LogicalPlan {
+        let mut combined = left.schema.columns.clone();
+        combined.extend(right.schema.columns.clone());
+        LogicalPlan {
+            node: LogicalNode::Join {
+                left: Box::new(left),
+                right: Box::new(right),
+                join_type: JoinType::Inner,
+                condition,
+            },
+            schema: PlanSchema::from_columns(combined),
+        }
+    }
+
+    /// Extract join type from a Join node.
+    fn get_join_type(plan: &LogicalPlan) -> &JoinType {
+        match &plan.node {
+            LogicalNode::Join { join_type, .. } => join_type,
+            _ => panic!("expected Join node"),
+        }
+    }
+
+    /// Extract join condition from a Join node.
+    fn get_join_condition(plan: &LogicalPlan) -> &JoinCondition {
+        match &plan.node {
+            LogicalNode::Join { condition, .. } => condition,
+            _ => panic!("expected Join node"),
         }
     }
 
@@ -1216,5 +1588,290 @@ mod tests {
                 name
             );
         }
+    }
+
+    // ── Cross-join elimination tests ──────────────────────
+
+    // Test 22: Cross join with equi filter → absorbed into Inner ON
+    #[test]
+    fn test_cross_join_with_equi_filter() {
+        let join = make_cross_join(left_scan(), right_scan());
+        // Filter(col0 = col2, Cross(A, B))
+        let plan = join.filter(eq_expr(col_ref(0, "a"), col_ref(2, "c")));
+        let result = eliminate_cross_joins(plan);
+
+        // Should be: Inner(ON col0=col2, A, B) — no Filter above
+        assert!(is_join(&result), "Top should be Join, not Filter");
+        assert_eq!(get_join_type(&result), &JoinType::Inner);
+        assert!(
+            matches!(get_join_condition(&result), JoinCondition::On(_)),
+            "Should have ON condition"
+        );
+    }
+
+    // Test 23: Cross join with multi-key equi filter
+    #[test]
+    fn test_cross_join_multi_key() {
+        let join = make_cross_join(left_scan(), right_scan());
+        // Filter(col0=col2 AND col1=col3, Cross(A, B))
+        let pred = and_expr(
+            eq_expr(col_ref(0, "a"), col_ref(2, "c")),
+            eq_expr(col_ref(1, "b"), col_ref(3, "d")),
+        );
+        let plan = join.filter(pred);
+        let result = eliminate_cross_joins(plan);
+
+        assert!(is_join(&result), "Top should be Join, not Filter");
+        assert_eq!(get_join_type(&result), &JoinType::Inner);
+        assert!(matches!(get_join_condition(&result), JoinCondition::On(_)));
+    }
+
+    // Test 24: Cross join with mixed predicates — equi absorbed, non-equi stays
+    #[test]
+    fn test_cross_join_mixed() {
+        let join = make_cross_join(left_scan(), right_scan());
+        // Filter(col0=col2 AND col0=const(1), Cross(A, B))
+        let pred = and_expr(
+            eq_expr(col_ref(0, "a"), col_ref(2, "c")),
+            eq_expr(col_ref(0, "a"), const_int(1)),
+        );
+        let plan = join.filter(pred);
+        let result = eliminate_cross_joins(plan);
+
+        // Should be: Filter(col0=const, Inner(ON col0=col2, A, B))
+        assert!(is_filter(&result), "Non-equi predicate stays as Filter");
+        let inner_join = filter_input(&result);
+        assert!(is_join(inner_join), "Inner should be Join");
+        assert_eq!(get_join_type(inner_join), &JoinType::Inner);
+        assert!(matches!(
+            get_join_condition(inner_join),
+            JoinCondition::On(_)
+        ));
+    }
+
+    // Test 25: Cross join with non-equi only — unchanged
+    #[test]
+    fn test_cross_join_no_equi() {
+        let join = make_cross_join(left_scan(), right_scan());
+        // Filter(col0 > col2, Cross(A, B))
+        let plan = join.filter(gt_expr(col_ref(0, "a"), col_ref(2, "c")));
+        let result = eliminate_cross_joins(plan);
+
+        // Should remain: Filter(col0 > col2, Cross(A, B))
+        assert!(is_filter(&result), "Should still be Filter above");
+        let inner = filter_input(&result);
+        assert!(is_join(inner));
+        assert_eq!(get_join_type(inner), &JoinType::Cross);
+    }
+
+    // Test 26: Left join not touched
+    #[test]
+    fn test_left_join_not_touched() {
+        let join = make_left_join(left_scan(), right_scan());
+        let plan = join.filter(eq_expr(col_ref(0, "a"), col_ref(2, "c")));
+        let result = eliminate_cross_joins(plan);
+
+        // Outer joins are skipped — should remain unchanged
+        assert!(is_filter(&result), "Filter should stay above Left join");
+        assert_eq!(get_join_type(filter_input(&result)), &JoinType::Left);
+    }
+
+    // Test 27: Nested cross joins — bottom-up absorption
+    #[test]
+    fn test_nested_cross_joins() {
+        // FROM a, b, c WHERE a.id=b.id AND b.id=c.id
+        // After pushdown: Filter(b.id=c.id, Cross(Filter(a.id=b.id, Cross(A, B)), C))
+        let a = make_scan("a", vec![("a_id", DataType::Int64)]);
+        let b = make_scan("b", vec![("b_id", DataType::Int64)]);
+        let c = make_scan("c", vec![("c_id", DataType::Int64)]);
+
+        // Inner cross join: Cross(A, B), width = 2 (a_id=0, b_id=1)
+        let ab = make_cross_join(a, b);
+        // Filter(a_id=b_id) over Cross(A, B)
+        let filter_ab = ab.filter(eq_expr(col_ref(0, "a_id"), col_ref(1, "b_id")));
+        // Outer cross join: Cross(filter_ab, C), width = 3 (a_id=0, b_id=1, c_id=2)
+        let abc = make_cross_join(filter_ab, c);
+        // Filter(b_id=c_id) over Cross(...)
+        let plan = abc.filter(eq_expr(col_ref(1, "b_id"), col_ref(2, "c_id")));
+
+        let result = eliminate_cross_joins(plan);
+
+        // Should be: Inner(ON b_id=c_id, Inner(ON a_id=b_id, A, B), C)
+        assert!(is_join(&result), "Top should be Join");
+        assert_eq!(get_join_type(&result), &JoinType::Inner);
+        assert!(matches!(get_join_condition(&result), JoinCondition::On(_)));
+
+        let left_child = join_left(&result);
+        assert!(is_join(left_child), "Left child should be Join");
+        assert_eq!(get_join_type(left_child), &JoinType::Inner);
+        assert!(matches!(
+            get_join_condition(left_child),
+            JoinCondition::On(_)
+        ));
+    }
+
+    // Test 28: Inner join — absorb additional pure equi predicate
+    #[test]
+    fn test_inner_join_absorb_pure_equi() {
+        // Inner(ON col0=col2, A, B) with Filter(col1=col3)
+        let join = make_inner_join_on(
+            left_scan(),
+            right_scan(),
+            JoinCondition::On(eq_expr(col_ref(0, "a"), col_ref(2, "c"))),
+        );
+        let plan = join.filter(eq_expr(col_ref(1, "b"), col_ref(3, "d")));
+        let result = eliminate_cross_joins(plan);
+
+        // Should be: Inner(ON col0=col2 AND col1=col3, A, B) — no Filter
+        assert!(is_join(&result), "Top should be Join, not Filter");
+        assert_eq!(get_join_type(&result), &JoinType::Inner);
+        // The merged ON should have both keys
+        if let JoinCondition::On(ref on_expr) = get_join_condition(&result) {
+            let indices = collect_column_indices(on_expr);
+            assert!(
+                indices.contains(&0)
+                    && indices.contains(&1)
+                    && indices.contains(&2)
+                    && indices.contains(&3),
+                "Merged ON should reference all 4 columns, got {:?}",
+                indices
+            );
+        } else {
+            panic!("Expected ON condition");
+        }
+    }
+
+    // Test 28b: Cross-pair dedup must not false-positive on independent key membership
+    //
+    // Existing ON: (l.a=r.c AND l.b=r.d)  → pairs {(0,0),(1,1)}
+    // Filter:      l.a=r.d                 → pair  (0,1) — NOT a duplicate
+    // Bug (fixed): independent contains checks saw a∈{a,b} and d∈{c,d} → true → dropped predicate
+    #[test]
+    fn test_dedup_cross_pair_not_false_positive() {
+        // ON col0=col2 AND col1=col3 (existing pairs: (0,0) and (1,1))
+        let existing_on = and_expr(
+            eq_expr(col_ref(0, "a"), col_ref(2, "c")),
+            eq_expr(col_ref(1, "b"), col_ref(3, "d")),
+        );
+        let join = make_inner_join_on(left_scan(), right_scan(), JoinCondition::On(existing_on));
+        // Filter: col0=col3 (pair (0,1) — cross-pair, not a duplicate)
+        let plan = join.filter(eq_expr(col_ref(0, "a"), col_ref(3, "d")));
+        let result = eliminate_cross_joins(plan);
+
+        // The cross-pair (0,1) must be absorbed (not dropped), producing a 3-key ON
+        assert!(is_join(&result), "Top should be Join (all equi → absorbed)");
+        assert_eq!(get_join_type(&result), &JoinType::Inner);
+        // Extract actual equi-key pairs and verify count + content.
+        // Column-index collection alone can't prove the cross-pair was retained
+        // because the existing ON already references all 4 columns.
+        let condition = get_join_condition(&result);
+        let (lk, rk) =
+            join_keys::try_extract_equi_keys(condition, 2).expect("merged ON must be pure-equi");
+        let pairs: Vec<(usize, usize)> = lk.into_iter().zip(rk).collect();
+        assert_eq!(pairs.len(), 3, "should have 3 key pairs, got {:?}", pairs);
+        assert!(
+            pairs.contains(&(0, 0)) && pairs.contains(&(1, 1)) && pairs.contains(&(0, 1)),
+            "expected pairs (0,0), (1,1), (0,1) — got {:?}",
+            pairs
+        );
+    }
+
+    // Test 29: Inner join — no absorb when merged ON would be mixed
+    #[test]
+    fn test_inner_join_no_absorb_mixed() {
+        // Inner(ON col0 > col2, A, B) with Filter(col0=col2)
+        let join = make_inner_join_on(
+            left_scan(),
+            right_scan(),
+            JoinCondition::On(gt_expr(col_ref(0, "a"), col_ref(2, "c"))),
+        );
+        let plan = join.filter(eq_expr(col_ref(0, "a"), col_ref(2, "c")));
+        let result = eliminate_cross_joins(plan);
+
+        // Should remain unchanged — merged ON would be mixed (gt + eq) → skip
+        assert!(
+            is_filter(&result),
+            "Filter should stay above (merged would be mixed)"
+        );
+        let inner = filter_input(&result);
+        assert!(is_join(inner));
+        assert_eq!(get_join_type(inner), &JoinType::Inner);
+    }
+
+    // Test 30: USING condition not modified
+    #[test]
+    fn test_using_not_modified() {
+        use crate::sql::analyzer::types::ResolvedUsingColumn;
+        let left = left_scan();
+        let right = right_scan();
+        let mut combined = left.schema.columns.clone();
+        combined.extend(right.schema.columns.clone());
+        let join = LogicalPlan {
+            node: LogicalNode::Join {
+                left: Box::new(left),
+                right: Box::new(right),
+                join_type: JoinType::Inner,
+                condition: JoinCondition::Using(vec![ResolvedUsingColumn {
+                    name: "id".to_string(),
+                    left_index: 0,
+                    right_index: 0,
+                    data_type: DataType::Int64,
+                    left_type: DataType::Int64,
+                    right_type: DataType::Int64,
+                }]),
+            },
+            schema: PlanSchema::from_columns(combined),
+        };
+        let plan = join.filter(eq_expr(col_ref(1, "b"), col_ref(3, "d")));
+        let result = eliminate_cross_joins(plan);
+
+        // USING joins are skipped — should remain unchanged
+        assert!(is_filter(&result), "Filter should stay above USING join");
+        assert!(matches!(
+            get_join_condition(filter_input(&result)),
+            JoinCondition::Using(_)
+        ));
+    }
+
+    // Test 31: Correlated ref not absorbed
+    #[test]
+    fn test_correlated_ref_not_absorbed() {
+        let join = make_cross_join(left_scan(), right_scan());
+        // Filter(correlated_col = col2, Cross(A, B))
+        let plan = join.filter(eq_expr(correlated_col_ref(0, "outer"), col_ref(2, "c")));
+        let result = eliminate_cross_joins(plan);
+
+        // Correlated ref rejected by join_keys extractor → stays as Filter + Cross
+        assert!(is_filter(&result), "Correlated ref stays as Filter");
+        let inner = filter_input(&result);
+        assert!(is_join(inner));
+        assert_eq!(get_join_type(inner), &JoinType::Cross);
+    }
+
+    // Test 32: End-to-end — pushdown then elimination via apply_rewrites
+    #[test]
+    fn test_apply_rewrites_pushdown_then_elim() {
+        let join = make_cross_join(left_scan(), right_scan());
+        // Filter(a=1 AND a.col0=b.col2, Cross(A, B))
+        let pred = and_expr(
+            eq_expr(col_ref(0, "a"), const_int(1)),
+            eq_expr(col_ref(0, "a"), col_ref(2, "c")),
+        );
+        let plan = join.filter(pred);
+        let result = apply_rewrites(plan);
+
+        // After pushdown: Filter(a.col0=b.col2, Cross(Filter(a=1, A), B))
+        // After elim: Inner(ON a.col0=b.col2, Filter(a=1, A), B)
+        assert!(is_join(&result), "Top should be Inner Join");
+        assert_eq!(get_join_type(&result), &JoinType::Inner);
+        assert!(matches!(get_join_condition(&result), JoinCondition::On(_)));
+        assert!(
+            is_filter(join_left(&result)),
+            "Left child should have pushed-down Filter(a=1)"
+        );
+        assert!(
+            !is_filter(join_right(&result)),
+            "Right child should not have a Filter"
+        );
     }
 }

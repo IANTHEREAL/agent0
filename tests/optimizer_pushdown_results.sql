@@ -37,5 +37,23 @@ SELECT a.id, b.y FROM opt_a a JOIN opt_b b ON a.id = b.aid WHERE a.x = 10 AND b.
 SET tipg.use_optimizer = on;
 SELECT a.id, b.y FROM opt_a a JOIN opt_b b ON a.id = b.aid WHERE a.x = 10 AND b.y > 50 ORDER BY a.id;
 
+-- Test 6: Comma-join with equi WHERE
+SET tipg.use_optimizer = off;
+SELECT a.id, b.y FROM opt_a a, opt_b b WHERE a.id = b.aid ORDER BY a.id;
+SET tipg.use_optimizer = on;
+SELECT a.id, b.y FROM opt_a a, opt_b b WHERE a.id = b.aid ORDER BY a.id;
+
+-- Test 7: Comma-join with equi + single-table filter
+SET tipg.use_optimizer = off;
+SELECT a.id, b.y FROM opt_a a, opt_b b WHERE a.id = b.aid AND a.x = 10 ORDER BY a.id;
+SET tipg.use_optimizer = on;
+SELECT a.id, b.y FROM opt_a a, opt_b b WHERE a.id = b.aid AND a.x = 10 ORDER BY a.id;
+
+-- Test 8: Comma-join non-equi
+SET tipg.use_optimizer = off;
+SELECT a.id, b.y FROM opt_a a, opt_b b WHERE a.x > b.y ORDER BY a.id, b.y;
+SET tipg.use_optimizer = on;
+SELECT a.id, b.y FROM opt_a a, opt_b b WHERE a.x > b.y ORDER BY a.id, b.y;
+
 DROP TABLE opt_b;
 DROP TABLE opt_a;

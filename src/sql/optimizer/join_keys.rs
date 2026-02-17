@@ -71,10 +71,14 @@ fn extract_validated(
         } => {
             if let (
                 TypedExprKind::ColumnRef {
-                    column_index: a, ..
+                    column_index: a,
+                    scope_depth: 0,
+                    ..
                 },
                 TypedExprKind::ColumnRef {
-                    column_index: b, ..
+                    column_index: b,
+                    scope_depth: 0,
+                    ..
                 },
             ) = (&left.kind, &right.kind)
             {
@@ -204,5 +208,23 @@ mod tests {
         let cond = JoinCondition::None;
         let result = try_extract_equi_keys(&cond, 2);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_correlated_ref_rejected() {
+        // ON correlated_col[0] = col[2], left_width=2
+        // scope_depth=1 on left → must reject
+        let correlated = TypedExpr {
+            kind: TypedExprKind::ColumnRef {
+                scope_depth: 1,
+                column_index: 0,
+                column_name: "outer_col".to_string(),
+            },
+            data_type: DataType::Int32,
+        };
+        let local = col_ref(2);
+        let cond = JoinCondition::On(eq_expr(correlated, local));
+        let result = try_extract_equi_keys(&cond, 2);
+        assert_eq!(result, None, "correlated ref must be rejected");
     }
 }

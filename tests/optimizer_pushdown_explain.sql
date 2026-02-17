@@ -19,5 +19,14 @@ EXPLAIN SELECT a.id, b.y FROM opt_a a LEFT JOIN opt_b b ON a.id = b.aid WHERE b.
 -- E4: INNER JOIN + mixed WHERE → split push to both sides
 EXPLAIN SELECT a.id, b.y FROM opt_a a JOIN opt_b b ON a.id = b.aid WHERE a.x = 10 AND b.y > 50;
 
+-- E5: Comma-join with equi WHERE → should show Hash Join (cross-join elimination)
+EXPLAIN SELECT a.id, b.y FROM opt_a a, opt_b b WHERE a.id = b.aid;
+
+-- E6: Comma-join with equi WHERE + single-table filter
+EXPLAIN SELECT a.id, b.y FROM opt_a a, opt_b b WHERE a.id = b.aid AND a.x = 10;
+
+-- E7: Comma-join with non-equi WHERE → stays as Nested Loop
+EXPLAIN SELECT a.id, b.y FROM opt_a a, opt_b b WHERE a.x > b.y;
+
 DROP TABLE opt_b;
 DROP TABLE opt_a;
