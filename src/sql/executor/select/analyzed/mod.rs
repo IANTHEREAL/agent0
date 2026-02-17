@@ -104,6 +104,11 @@ impl Executor {
             .analyze_query(&expanded_query)
             .map_err(SqlError::from)?;
 
+        // Post-analysis rewrite: flatten simple view subqueries back to
+        // direct table references so the optimizer and planner can use
+        // index-aware scan strategies.
+        let analyzed = crate::sql::rewriter::rewrite_query(analyzed);
+
         // ── CBO optimizer routing gate ──────────────────────────────
         // When `SET tipg.use_optimizer = on`, eligible queries are routed through
         // the new optimizer pipeline: AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator.

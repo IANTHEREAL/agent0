@@ -1122,11 +1122,15 @@ impl Executor {
             .await?;
             let mut analyzer = Analyzer::new(&catalog);
             match analyzer.analyze_query(&expanded) {
-                Ok(analyzed) => explain::generate_plan_from_analyzed(
-                    &analyzed,
-                    &schema_lookup,
-                    &row_count_lookup,
-                ),
+                Ok(analyzed) => {
+                    // Same rewrite as execution path — invariant: EXPLAIN = execution.
+                    let analyzed = crate::sql::rewriter::rewrite_query(analyzed);
+                    explain::generate_plan_from_analyzed(
+                        &analyzed,
+                        &schema_lookup,
+                        &row_count_lookup,
+                    )
+                }
                 Err(_) => {
                     // Fallback to AST path if analysis fails (e.g. invalid query)
                     explain::generate_plan(statement, &schema_lookup, &row_count_lookup)

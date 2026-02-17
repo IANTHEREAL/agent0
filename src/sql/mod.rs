@@ -38,6 +38,7 @@ pub(crate) mod quoting;
 pub(crate) mod raw_sql;
 mod rbac;
 mod result;
+pub(crate) mod rewriter;
 mod role_settings;
 mod sequences;
 mod statement_time;
