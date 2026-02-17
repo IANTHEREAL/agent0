@@ -328,13 +328,19 @@ fn flatten_subquery(query: AnalyzedQuery) -> AnalyzedQuery {
 
 /// Merge inner and outer WHERE clauses.
 ///
-/// When both are present, the inner WHERE is wrapped with IS TRUE to guard
-/// against NULL short-circuit in AND evaluation: the evaluator evaluates RHS
-/// when LHS is NULL, so IS TRUE converts NULL→FALSE which short-circuits.
+/// **Inner-only**: used directly — NULL is already falsy in WHERE context, and
+/// wrapping with IS TRUE would suppress planner predicate extraction.
 ///
-/// When only the inner WHERE is present, it is used directly — NULL in WHERE
-/// context is already falsy, and wrapping with IS TRUE would suppress planner
-/// predicate extraction for index selection.
+/// **Both present**: inner is wrapped with IS TRUE, then ANDed with outer.
+/// Reason: the evaluator (`typed_eval.rs:378`) evaluates the RHS when LHS is
+/// NULL. Without IS TRUE, a NULL inner predicate would cause `outer_where` to
+/// be evaluated on rows the original subquery would have discarded — which can
+/// surface errors (e.g. division by zero) that the pre-flatten path avoided.
+/// IS TRUE converts NULL→FALSE, which short-circuits AND correctly.
+///
+/// The planner can still extract outer predicates (the user's filter, most
+/// likely to match an index) because `collect_typed_predicates` recurses into
+/// both sides of AND. Only the inner predicates are opaque (wrapped in IS TRUE).
 fn merge_where(
     inner_where: Option<TypedExpr>,
     outer_where: Option<TypedExpr>,
@@ -349,15 +355,12 @@ fn merge_where(
             Some(inner)
         }
         (Some(inner), Some(outer)) => {
-            // No IS TRUE wrapping — `NULL AND x` already evaluates to NULL
-            // (or FALSE when x is FALSE), both of which exclude the row in
-            // WHERE context. Wrapping with IS TRUE would prevent the planner
-            // from extracting inner predicates (e.g. `a = 1`) for index
-            // selection, since the predicate extractor does not recognize
-            // `(a = 1) IS TRUE` as an extractable comparison.
+            // Wrap inner with IS TRUE: NULL→FALSE short-circuits AND, preventing
+            // outer_where evaluation on rows the original subquery would have
+            // discarded. Outer predicates remain extractable by the planner.
             Some(TypedExpr::new(
                 TypedExprKind::BinaryOp {
-                    left: Box::new(inner),
+                    left: Box::new(wrap_is_true(inner)),
                     op: crate::sql::analyzer::types::BinaryOp::And,
                     right: Box::new(outer),
                 },
@@ -365,6 +368,18 @@ fn merge_where(
             ))
         }
     }
+}
+
+fn wrap_is_true(expr: TypedExpr) -> TypedExpr {
+    use crate::sql::analyzer::types::IsTestKind;
+    TypedExpr::new(
+        TypedExprKind::IsTest {
+            expr: Box::new(expr),
+            test: IsTestKind::True,
+            negated: false,
+        },
+        crate::types::DataType::Boolean,
+    )
 }
 
 
@@ -1093,9 +1108,11 @@ mod tests {
     }
 
     #[test]
-    fn test_where_merge_both() {
-        // Inner has WHERE, outer has WHERE → merged as inner AND outer (no IS TRUE).
-        // IS TRUE is not used because it suppresses planner predicate extraction.
+    fn test_where_merge_both_is_true_guard() {
+        // Inner has WHERE, outer has WHERE → merged as (inner IS TRUE) AND outer.
+        // IS TRUE is required: the evaluator evaluates RHS when LHS is NULL
+        // (typed_eval.rs:378), so without IS TRUE a NULL inner predicate would
+        // cause outer evaluation on rows the original subquery discarded.
         let inner_where = col_ref(2, "active", DataType::Boolean);
         let inner = simple_inner_query(
             "users",
@@ -1138,10 +1155,17 @@ mod tests {
             panic!("expected AND at top level, got: {:?}", w.kind);
         };
 
-        // LHS: bare inner WHERE (ColumnRef), NOT wrapped in IS TRUE
+        // LHS: IS TRUE wrapping inner WHERE — prevents NULL from leaking to RHS
         assert!(
-            matches!(left.kind, TypedExprKind::ColumnRef { column_index: 2, .. }),
-            "LHS should be bare inner WHERE, not IS TRUE wrapped"
+            matches!(
+                left.kind,
+                TypedExprKind::IsTest {
+                    test: crate::sql::analyzer::types::IsTestKind::True,
+                    negated: false,
+                    ..
+                }
+            ),
+            "LHS should be IS TRUE wrapping inner WHERE"
         );
     }
 
