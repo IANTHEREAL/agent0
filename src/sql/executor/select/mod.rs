@@ -8,7 +8,7 @@ use sqlparser::ast::Query;
 use std::collections::HashMap;
 use tikv_client::Transaction;
 
-mod analyzed;
+pub(crate) mod analyzed;
 
 impl Executor {
     pub(crate) fn execute_query_with_outer_ctes<'a>(

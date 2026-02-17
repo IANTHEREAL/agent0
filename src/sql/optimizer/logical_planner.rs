@@ -176,19 +176,24 @@ impl LogicalPlanner {
                 right,
                 join_type,
                 condition,
-                ..
+                left_col_start,
             } => {
                 let left_plan = Self::build_table_ref(left);
                 let right_plan = Self::build_table_ref(right);
                 let mut combined_cols = left_plan.schema.columns.clone();
                 combined_cols.extend(right_plan.schema.columns.clone());
                 let schema = PlanSchema::from_columns(combined_cols);
+                // Normalize ON condition indices from global (analyzer scope) to local
+                // (relative to this join's combined schema). left_col_start is the global
+                // offset where this join's left child begins.
+                let normalized_condition =
+                    crate::sql::analyzer::types::reindex_join_condition(condition, *left_col_start);
                 LogicalPlan {
                     node: LogicalNode::Join {
                         left: Box::new(left_plan),
                         right: Box::new(right_plan),
                         join_type: *join_type,
-                        condition: condition.clone(),
+                        condition: normalized_condition,
                     },
                     schema,
                 }

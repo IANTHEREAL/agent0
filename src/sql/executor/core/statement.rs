@@ -1122,11 +1122,43 @@ impl Executor {
             .await?;
             let mut analyzer = Analyzer::new(&catalog);
             match analyzer.analyze_query(&expanded) {
-                Ok(analyzed) => explain::generate_plan_from_analyzed(
-                    &analyzed,
-                    &schema_lookup,
-                    &row_count_lookup,
-                ),
+                Ok(analyzed) => {
+                    // When the optimizer GUC is on and the query is eligible,
+                    // use the shared optimize() entrypoint so EXPLAIN shows
+                    // the same plan that execution actually uses.
+                    if crate::sql::query_context::QueryContext::use_optimizer()
+                        && crate::sql::optimizer::eligibility::is_optimizer_eligible(&analyzed)
+                    {
+                        // Build PlanningContext with real table statistics,
+                        // identical to execution path (mod.rs:2672-2680).
+                        let mut planning_ctx = crate::sql::optimizer::PlanningContext::empty();
+                        if let crate::sql::analyzer::types::AnalyzedQueryBody::Select(select) =
+                            &analyzed.body
+                        {
+                            for table_ref in &select.from {
+                                for (name, schema, _alias) in
+                                    crate::sql::executor::select::analyzed::collect_table_refs(
+                                        table_ref,
+                                    )
+                                {
+                                    if let Some(stats) =
+                                        self.stats_cache().get_full_stats(db_id, schema.table_id)
+                                    {
+                                        planning_ctx.table_stats.insert(name.to_string(), stats);
+                                    }
+                                }
+                            }
+                        }
+                        let physical = crate::sql::optimizer::optimize(&analyzed, &planning_ctx);
+                        explain::physical_plan_to_plan_node(&physical)
+                    } else {
+                        explain::generate_plan_from_analyzed(
+                            &analyzed,
+                            &schema_lookup,
+                            &row_count_lookup,
+                        )
+                    }
+                }
                 Err(_) => {
                     // Fallback to AST path if analysis fails (e.g. invalid query)
                     explain::generate_plan(statement, &schema_lookup, &row_count_lookup)
