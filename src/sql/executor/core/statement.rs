@@ -1143,6 +1143,13 @@ impl Executor {
                         {
                             let table_refs =
                                 crate::sql::optimizer::collect_query_table_refs(&analyzed);
+                            // Collect CTE names so we skip store schema loading for
+                            // them — mirrors execution path (mod.rs:2724).
+                            let cte_names: HashSet<String> = analyzed
+                                .ctes
+                                .iter()
+                                .map(|c| c.name.to_lowercase())
+                                .collect();
                             let mut stats_attempted = HashSet::new();
                             for (name, schema, _alias) in &table_refs {
                                 let tid = schema.table_id;
@@ -1156,12 +1163,16 @@ impl Executor {
                                 }
                                 // Load full table schema (with index metadata)
                                 // for access-path selection — mirrors execution path.
-                                if let Some(table_schema) =
-                                    self.store().get_schema(txn, db_id, name).await?
-                                {
-                                    planning_ctx
-                                        .table_schemas
-                                        .insert(name.to_string(), table_schema);
+                                // CTE schemas are not loaded here — they have no indexes.
+                                let cte_key = name.to_lowercase();
+                                if !cte_names.contains(&cte_key) {
+                                    if let Some(table_schema) =
+                                        self.store().get_schema(txn, db_id, name).await?
+                                    {
+                                        planning_ctx
+                                            .table_schemas
+                                            .insert(name.to_string(), table_schema);
+                                    }
                                 }
                             }
                         }
