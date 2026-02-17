@@ -242,6 +242,16 @@ fn test_sqlstate_for_executor_error() {
         ),
         (SqlError::FunctionNotFound("my_func".into()), "42883"),
         (SqlError::DuplicateRelation("my_idx".into()), "42P07"),
+        (
+            SqlError::NumericValueOutOfRange {
+                message: "integer out of range".into(),
+            },
+            "22003",
+        ),
+        (
+            SqlError::StringDataRightTruncation { max_length: 10u64 },
+            "22001",
+        ),
     ];
 
     for (sql_err, expected_code) in cases {

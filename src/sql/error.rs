@@ -65,8 +65,11 @@ pub enum SqlError {
         detail: String,
     },
 
-    #[error("numeric value out of range{}", if .detail.is_empty() { String::new() } else { format!(": {}", .detail) })]
-    NumericValueOutOfRange { detail: String },
+    #[error("{message}")]
+    NumericValueOutOfRange { message: String },
+
+    #[error("value too long for type character varying({max_length})")]
+    StringDataRightTruncation { max_length: u64 },
 
     // Runtime errors
     #[error("Division by zero")]
@@ -118,6 +121,7 @@ impl SqlError {
             Self::NotNullViolation { .. } => "23502",
             Self::CheckViolation { .. } => "23514",
             Self::NumericValueOutOfRange { .. } => "22003",
+            Self::StringDataRightTruncation { .. } => "22001",
             Self::DivisionByZero => "22012",
             Self::StatementTimeout => "57014",
             Self::LockNotAvailable { .. } => "55P03",

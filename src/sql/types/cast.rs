@@ -110,10 +110,10 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                     // Postgres: error if value exceeds length (unless excess is all spaces)
                     let trimmed = s.trim_end();
                     if trimmed.chars().count() > *max_len as usize {
-                        Err(anyhow!(
-                            "value too long for type character varying({})",
-                            max_len
-                        ))
+                        Err(SqlError::StringDataRightTruncation {
+                            max_length: *max_len,
+                        }
+                        .into())
                     } else {
                         Ok(Value::Text(s.chars().take(*max_len as usize).collect()))
                     }
@@ -161,12 +161,20 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
         }
         (Value::Int64(n), DataType::Int32) => i32::try_from(n)
             .map(Value::Int32)
-            .map_err(|_| anyhow!("integer out of range: {}", n)),
+            .map_err(|_| {
+                SqlError::NumericValueOutOfRange {
+                    message: "integer out of range".into(),
+                }
+                .into()
+            }),
         (Value::Float64(f), DataType::Int32) => match context {
             CastContext::Explicit => {
                 let rounded = round_half_away_from_zero(f);
                 if f.is_nan() || rounded < (i32::MIN as f64) || rounded > (i32::MAX as f64) {
-                    return Err(anyhow!("integer out of range"));
+                    return Err(SqlError::NumericValueOutOfRange {
+                        message: "integer out of range".into(),
+                    }
+                    .into());
                 }
                 Ok(Value::Int32(rounded as i32))
             }
@@ -181,7 +189,12 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 let n = f as i64;
                 i32::try_from(n)
                     .map(Value::Int32)
-                    .map_err(|_| anyhow!("integer out of range: {}", n))
+                    .map_err(|_| {
+                        SqlError::NumericValueOutOfRange {
+                            message: "integer out of range".into(),
+                        }
+                        .into()
+                    })
             }
         },
         (Value::Numeric(d), DataType::Int32) => {
@@ -192,12 +205,22 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                     d.round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
                         .to_i32()
                         .map(Value::Int32)
-                        .ok_or_else(|| anyhow!("numeric value out of range for integer"))
+                        .ok_or_else(|| {
+                            SqlError::NumericValueOutOfRange {
+                                message: "integer out of range".into(),
+                            }
+                            .into()
+                        })
                 }
                 CastContext::Assignment | CastContext::Implicit => d
                     .to_i32()
                     .map(Value::Int32)
-                    .ok_or_else(|| anyhow!("numeric value out of range for integer")),
+                    .ok_or_else(|| {
+                        SqlError::NumericValueOutOfRange {
+                            message: "integer out of range".into(),
+                        }
+                        .into()
+                    }),
             }
         }
         // Bool → Int32: Explicit only
@@ -220,7 +243,10 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
         (Value::Float64(n), DataType::Int64) if context == CastContext::Explicit => {
             let rounded = round_half_away_from_zero(n);
             if n.is_nan() || rounded < (i64::MIN as f64) || rounded > (i64::MAX as f64) {
-                return Err(anyhow!("bigint out of range"));
+                return Err(SqlError::NumericValueOutOfRange {
+                    message: "bigint out of range".into(),
+                }
+                .into());
             }
             Ok(Value::Int64(rounded as i64))
         }
@@ -232,12 +258,22 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                     d.round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
                         .to_i64()
                         .map(Value::Int64)
-                        .ok_or_else(|| anyhow!("numeric value out of range for bigint"))
+                        .ok_or_else(|| {
+                            SqlError::NumericValueOutOfRange {
+                                message: "bigint out of range".into(),
+                            }
+                            .into()
+                        })
                 }
                 CastContext::Assignment | CastContext::Implicit => d
                     .to_i64()
                     .map(Value::Int64)
-                    .ok_or_else(|| anyhow!("numeric value out of range for bigint")),
+                    .ok_or_else(|| {
+                        SqlError::NumericValueOutOfRange {
+                            message: "bigint out of range".into(),
+                        }
+                        .into()
+                    }),
             }
         }
 
@@ -259,7 +295,12 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 CastContext::Explicit => d
                     .to_f64()
                     .map(Value::Float64)
-                    .ok_or_else(|| anyhow!("numeric value out of range for double precision")),
+                    .ok_or_else(|| {
+                        SqlError::NumericValueOutOfRange {
+                            message: "numeric value out of range for double precision".into(),
+                        }
+                        .into()
+                    }),
                 CastContext::Assignment | CastContext::Implicit => {
                     Ok(Value::Float64(d.to_f64().unwrap_or(f64::NAN)))
                 }
@@ -405,8 +446,12 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             Ok(Value::Numeric(d))
         }
         (Value::Float64(f), DataType::Numeric { scale, .. }) => {
-            let mut d = Decimal::try_from(f)
-                .map_err(|_| anyhow!("invalid input for type numeric: \"{}\"", f))?;
+            let mut d = Decimal::try_from(f).map_err(|_| {
+                SqlError::InvalidInputSyntax {
+                    type_name: "numeric".into(),
+                    value: f.to_string(),
+                }
+            })?;
             if let Some(s) = scale {
                 d.rescale(*s);
             }
@@ -963,5 +1008,64 @@ mod tests {
     fn null_varchar_passthrough() {
         let r = cast(Value::Null, &DataType::Varchar(3), CastContext::Explicit).unwrap();
         assert_eq!(r, Value::Null);
+    }
+
+    // ---- SQLSTATE roundtrip tests ----
+
+    #[test]
+    fn int64_to_int32_overflow_returns_22003() {
+        let result = cast(Value::Int64(i64::MAX), &DataType::Int32, CastContext::Explicit);
+        let err = result.unwrap_err();
+        let sql_err = err.downcast_ref::<SqlError>().expect("should be SqlError");
+        assert_eq!(sql_err.sqlstate(), "22003");
+        assert_eq!(err.to_string(), "integer out of range");
+    }
+
+    #[test]
+    fn float_nan_to_int32_returns_22003() {
+        let result = cast(
+            Value::Float64(f64::NAN),
+            &DataType::Int32,
+            CastContext::Explicit,
+        );
+        let err = result.unwrap_err();
+        let sql_err = err.downcast_ref::<SqlError>().expect("should be SqlError");
+        assert_eq!(sql_err.sqlstate(), "22003");
+        assert_eq!(err.to_string(), "integer out of range");
+    }
+
+    #[test]
+    fn float_overflow_to_bigint_returns_22003() {
+        let result = cast(
+            Value::Float64(1e19),
+            &DataType::Int64,
+            CastContext::Explicit,
+        );
+        let err = result.unwrap_err();
+        let sql_err = err.downcast_ref::<SqlError>().expect("should be SqlError");
+        assert_eq!(sql_err.sqlstate(), "22003");
+        assert_eq!(err.to_string(), "bigint out of range");
+    }
+
+    #[test]
+    fn varchar_truncation_assignment_returns_22001() {
+        let result = cast(
+            Value::Text("hello world".into()),
+            &DataType::Varchar(3),
+            CastContext::Assignment,
+        );
+        let err = result.unwrap_err();
+        let sql_err = err.downcast_ref::<SqlError>().expect("should be SqlError");
+        assert_eq!(sql_err.sqlstate(), "22001");
+    }
+
+    #[test]
+    fn varchar_explicit_truncates_silently() {
+        let result = cast(
+            Value::Text("hello world".into()),
+            &DataType::Varchar(3),
+            CastContext::Explicit,
+        );
+        assert_eq!(result.unwrap(), Value::Text("hel".into()));
     }
 }

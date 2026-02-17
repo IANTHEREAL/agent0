@@ -514,11 +514,21 @@ fn eval_unary(op: &UnaryOp, val: Value) -> Result<Value> {
             Value::Int32(i) => i
                 .checked_neg()
                 .map(Value::Int32)
-                .ok_or_else(|| anyhow!("integer out of range")),
+                .ok_or_else(|| {
+                    SqlError::NumericValueOutOfRange {
+                        message: "integer out of range".into(),
+                    }
+                    .into()
+                }),
             Value::Int64(i) => i
                 .checked_neg()
                 .map(Value::Int64)
-                .ok_or_else(|| anyhow!("bigint out of range")),
+                .ok_or_else(|| {
+                    SqlError::NumericValueOutOfRange {
+                        message: "bigint out of range".into(),
+                    }
+                    .into()
+                }),
             Value::Float64(f) => Ok(Value::Float64(-f)),
             Value::Numeric(d) => Ok(Value::Numeric(-d)),
             _ => Err(anyhow!(
@@ -604,7 +614,7 @@ fn eval_shift_op(left: Value, right: Value, op_name: &str, is_left: bool) -> Res
         Value::Int32(l) => {
             if shift < 0 || shift >= 32 {
                 return Err(SqlError::NumericValueOutOfRange {
-                    detail: format!("shift count {} out of range for integer", shift),
+                    message: format!("shift count {} out of range for integer", shift),
                 }
                 .into());
             }
@@ -619,7 +629,7 @@ fn eval_shift_op(left: Value, right: Value, op_name: &str, is_left: bool) -> Res
         Value::Int64(l) => {
             if shift < 0 || shift >= 64 {
                 return Err(SqlError::NumericValueOutOfRange {
-                    detail: format!("shift count {} out of range for bigint", shift),
+                    message: format!("shift count {} out of range for bigint", shift),
                 }
                 .into());
             }

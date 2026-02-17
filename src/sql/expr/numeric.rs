@@ -40,7 +40,10 @@ impl NumericValue {
             NumericValue::Float64(n) => Ok(*n as i64),
             NumericValue::Decimal(n) => n.to_i64().ok_or_else(|| {
                 SqlError::NumericValueOutOfRange {
-                    detail: format!("{} cannot be converted to bigint", n),
+                    message: format!(
+                        "numeric value out of range: {} cannot be converted to bigint",
+                        n
+                    ),
                 }
                 .into()
             }),
@@ -52,9 +55,12 @@ impl NumericValue {
             NumericValue::Int32(n) => Ok(*n as f64),
             NumericValue::Int64(n) => Ok(*n as f64),
             NumericValue::Float64(n) => Ok(*n),
-            NumericValue::Decimal(n) => n
-                .to_f64()
-                .ok_or_else(|| anyhow!("numeric value out of range for double precision")),
+            NumericValue::Decimal(n) => n.to_f64().ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    message: "numeric value out of range for double precision".into(),
+                }
+                .into()
+            }),
         }
     }
 
@@ -64,7 +70,10 @@ impl NumericValue {
             NumericValue::Int64(n) => Ok(Decimal::from(*n)),
             NumericValue::Float64(n) => Decimal::try_from(*n).map_err(|_| {
                 SqlError::NumericValueOutOfRange {
-                    detail: format!("{} cannot be converted to numeric", n),
+                    message: format!(
+                        "numeric value out of range: {} cannot be converted to numeric",
+                        n
+                    ),
                 }
                 .into()
             }),
