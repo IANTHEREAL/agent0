@@ -560,6 +560,7 @@ fn normalize_regtype(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::error::SqlError;
     use rust_decimal::Decimal;
 
     // ---- Float64 → Int32 ----
@@ -830,9 +831,23 @@ mod tests {
             &DataType::Tsquery,
             CastContext::Explicit,
         )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("invalid input syntax for type tsquery"));
+        .unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected typed SqlError for tsquery syntax");
+        assert_eq!(sql_err.sqlstate(), "42601");
+        assert!(sql_err.to_string().contains("no operand in tsquery"));
+    }
+
+    #[test]
+    fn text_to_empty_tsquery_is_valid() {
+        let r = cast(
+            Value::Text("".into()),
+            &DataType::Tsquery,
+            CastContext::Explicit,
+        )
+        .unwrap();
+        assert_eq!(r, Value::Tsquery("".into()));
     }
 
     // ---- coerce_text_to_numeric ----
