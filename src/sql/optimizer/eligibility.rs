@@ -1,40 +1,35 @@
 //! Optimizer eligibility — shared by execution and EXPLAIN routing.
 //!
 //! Determines whether an `AnalyzedQuery` can be routed through the CBO
-//! pipeline. Execution-side routing (`mod.rs:111`) adds its own additional
-//! guards (locks, SELECT INTO) — this helper covers query shape + expression
-//! safety only.
+//! pipeline.  The caller is expected to have pre-materialized non-correlated
+//! async expressions before calling this check, so the only remaining
+//! ineligibility reasons are structural: aggregate ORDER BY/HAVING rewrite
+//! failures and window functions in DISTINCT ON.
 
 use std::collections::HashSet;
 
 use crate::sql::analyzer::types::{
-    AnalyzedDistinct, AnalyzedQuery, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef,
-    AnalyzedTableRefKind, JoinCondition,
+    AnalyzedDistinct, AnalyzedQuery, AnalyzedQueryBody, AnalyzedSelect,
 };
-use crate::sql::expr::classify::needs_async;
 use crate::sql::optimizer::logical_planner::expr_has_aggregate;
 
 /// Check whether a query is eligible for the CBO optimizer pipeline.
 ///
-/// Eligibility covers:
-/// - SELECT body (with real tables, no subquery/function leaves, no async exprs)
-/// - SetOperation body (UNION/INTERSECT/EXCEPT) when all branches are
-///   individually eligible (recursive check)
-/// - CTEs (WITH clauses): CTE names are threaded through to prevent
-///   false rejection by the virtual catalog table check
-/// - FROM non-empty for SELECT branches; may be a single join tree
-///   (`A JOIN B`) OR multiple comma-separated tables (`FROM a, b`)
-/// - No expression position contains async expressions (subqueries,
-///   catalog-dependent functions)
+/// After pre-materialization of async expressions by the caller, the
+/// optimizer handles all query shapes: single/multi-table, joins, set ops,
+/// CTEs, VALUES, tableless SELECT (empty FROM), table functions, virtual
+/// catalog tables, subquery FROM, and remaining async expressions (handled
+/// by post-processing).
+///
+/// The only remaining ineligibility reasons are:
+/// - Aggregate ORDER BY / HAVING / DISTINCT ON expressions that cannot be
+///   rewritten to post-aggregate column positions
+/// - Window functions in DISTINCT ON (PostgreSQL constraint)
 pub fn is_optimizer_eligible(analyzed: &AnalyzedQuery) -> bool {
     is_eligible_inner(analyzed, &HashSet::new())
 }
 
 /// Inner eligibility check that threads CTE names from parent to child queries.
-///
-/// `inherited_cte_names` carries CTE names defined at outer query levels,
-/// ensuring that CTE table references in SetOperation branches or nested
-/// scopes are not falsely rejected as virtual catalog tables.
 fn is_eligible_inner(analyzed: &AnalyzedQuery, inherited_cte_names: &HashSet<String>) -> bool {
     // Merge this query's CTE names with inherited ones (case-insensitive).
     let mut cte_names = inherited_cte_names.clone();
@@ -46,45 +41,17 @@ fn is_eligible_inner(analyzed: &AnalyzedQuery, inherited_cte_names: &HashSet<Str
         AnalyzedQueryBody::Select(select) => select,
         AnalyzedQueryBody::SetOperation { left, right, .. } => {
             // Recursively check each branch independently, threading CTE names.
-            // Branches containing VALUES, TableFunction, or subquery leaves
-            // will be rejected by the recursive check (they hit hard errors
-            // at build.rs Values/TableFunction handlers).
             if !is_eligible_inner(left, &cte_names) || !is_eligible_inner(right, &cte_names) {
                 return false;
             }
-            // Check top-level ORDER BY for async expressions.
-            for ob in &analyzed.order_by {
-                if needs_async(&ob.expr) {
-                    return false;
-                }
-            }
             return true;
         }
-        // Values not supported in optimizer build (build.rs would fail).
-        AnalyzedQueryBody::Values(_) => return false,
+        // VALUES body is now supported by the optimizer.
+        AnalyzedQueryBody::Values(_) => return true,
     };
 
-    // Must have at least one FROM item.
-    if select.from.is_empty() {
-        return false;
-    }
-
-    // All leaf table refs must be simple Tables (no subquery, no function).
-    // Handles both single join trees and comma-separated FROM items.
-    // CTE names are passed through to avoid false rejection when a CTE
-    // shadows a virtual catalog table name (e.g. WITH pg_type AS (...)).
-    if !select
-        .from
-        .iter()
-        .all(|tr| all_leaves_are_tables(tr, &cte_names))
-    {
-        return false;
-    }
-
-    // Reject if any expression position contains async expressions.
-    if has_any_async_expr(select, analyzed) {
-        return false;
-    }
+    // Empty FROM (tableless SELECT like `SELECT 1+1`) is handled by
+    // the logical planner via LogicalNode::Empty.
 
     // Reject window functions in DISTINCT ON — PostgreSQL does not allow
     // window functions outside SELECT list and ORDER BY.
@@ -171,120 +138,12 @@ fn can_rewrite_post_aggregate(select: &AnalyzedSelect, query: &AnalyzedQuery) ->
     true
 }
 
-/// Recursively check that all leaves in a table ref tree are `Table` variants
-/// backed by real KV-persisted schemas or CTE definitions (not virtual catalog
-/// tables). CTE names are checked first to prevent false rejection when a CTE
-/// shadows a catalog table name (e.g. `WITH pg_type AS (...)`).
-fn all_leaves_are_tables(table_ref: &AnalyzedTableRef, cte_names: &HashSet<String>) -> bool {
-    match &table_ref.kind {
-        AnalyzedTableRefKind::Table { name, .. } => {
-            // CTE names are valid — resolved from ExecutionContext::cte_tables at runtime.
-            cte_names.contains(&name.to_lowercase()) || !is_virtual_catalog_table(name)
-        }
-        AnalyzedTableRefKind::Join { left, right, .. } => {
-            all_leaves_are_tables(left, cte_names) && all_leaves_are_tables(right, cte_names)
-        }
-        // Subquery and Function table refs not supported.
-        _ => false,
-    }
-}
-
-/// Virtual catalog tables have no KV schema, no indexes, and no statistics —
-/// the optimizer cannot plan them.  Instead of fragile prefix matching, consult
-/// the authoritative `CatalogRegistry` which holds every registered virtual
-/// table by its bare name (e.g. `"pg_type"`, `"cron.job"`, `"columns"`).
-fn is_virtual_catalog_table(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    // Check the name as-is (handles bare names like "pg_type" and
-    // dotted names like "cron.job").
-    if crate::sql::catalog::global_catalog().get(&lower).is_some() {
-        return true;
-    }
-    // For schema-qualified names like "pg_catalog.pg_type" or
-    // "information_schema.columns", strip the schema prefix and retry.
-    let bare = lower
-        .strip_prefix("information_schema.")
-        .or_else(|| lower.strip_prefix("pg_catalog."));
-    bare.map_or(false, |b| {
-        crate::sql::catalog::global_catalog().get(b).is_some()
-    })
-}
-
-/// Check if any expression position in the query contains async expressions.
-///
-/// Walks: SELECT list, WHERE, HAVING, ORDER BY, all JOIN ON conditions.
-/// The optimizer path bypasses all legacy async materialization, so any async
-/// expression makes the query ineligible.
-fn has_any_async_expr(select: &AnalyzedSelect, query: &AnalyzedQuery) -> bool {
-    // SELECT list
-    for proj in &select.projection {
-        if needs_async(&proj.expr) {
-            return true;
-        }
-    }
-
-    // WHERE
-    if let Some(ref where_expr) = select.where_clause {
-        if needs_async(where_expr) {
-            return true;
-        }
-    }
-
-    // HAVING
-    if let Some(ref having_expr) = select.having {
-        if needs_async(having_expr) {
-            return true;
-        }
-    }
-
-    // ORDER BY
-    for ob in &query.order_by {
-        if needs_async(&ob.expr) {
-            return true;
-        }
-    }
-
-    // JOIN ON conditions (recursive)
-    for table_ref in &select.from {
-        if table_ref_has_async_condition(table_ref) {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Recursively check JOIN ON conditions for async expressions.
-fn table_ref_has_async_condition(table_ref: &AnalyzedTableRef) -> bool {
-    match &table_ref.kind {
-        AnalyzedTableRefKind::Table { .. } => false,
-        AnalyzedTableRefKind::Join {
-            left,
-            right,
-            condition,
-            ..
-        } => {
-            // Check ON condition
-            if let JoinCondition::On(ref expr) = condition {
-                if needs_async(expr) {
-                    return true;
-                }
-            }
-            // Recurse into children
-            table_ref_has_async_condition(left) || table_ref_has_async_condition(right)
-        }
-        // Subquery / Function — shouldn't reach here (rejected by
-        // all_leaves_are_tables), but be safe.
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql::analyzer::types::{
-        AnalyzedCte, AnalyzedProjection, FunctionKind, IsTestKind, JsonAccessOp, ResolvedFunction,
-        TableRefSchema, TypedExpr, TypedExprKind,
+        AnalyzedCte, AnalyzedProjection, AnalyzedTableRef, AnalyzedTableRefKind, FunctionKind,
+        IsTestKind, JsonAccessOp, ResolvedFunction, TableRefSchema, TypedExpr, TypedExprKind,
     };
     use crate::types::DataType;
 
@@ -345,7 +204,6 @@ mod tests {
         }
     }
 
-    /// Build a minimal eligible query with the given DISTINCT mode.
     fn query_with_distinct(distinct: AnalyzedDistinct) -> AnalyzedQuery {
         AnalyzedQuery {
             ctes: vec![],
@@ -508,9 +366,6 @@ mod tests {
 
     #[test]
     fn test_cte_shadowing_real_table_still_eligible() {
-        // WITH pg_type AS (SELECT 1 AS id FROM t) SELECT * FROM pg_type
-        // The CTE name "pg_type" shadows a virtual catalog table but should
-        // remain eligible because CTE names are threaded through.
         let inner_query = AnalyzedQuery {
             ctes: vec![],
             body: AnalyzedQueryBody::Select(AnalyzedSelect {

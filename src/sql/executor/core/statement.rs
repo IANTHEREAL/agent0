@@ -1133,7 +1133,6 @@ impl Executor {
                     // use the shared optimize() entrypoint so EXPLAIN shows
                     // the same plan that execution actually uses.
                     if crate::sql::query_context::QueryContext::use_optimizer()
-                        && expanded.locks.is_empty()
                         && crate::sql::optimizer::eligibility::is_optimizer_eligible(&analyzed)
                     {
                         // Build PlanningContext with real table statistics and schemas,

@@ -1,5 +1,53 @@
 # Worklog
 
+## 2026-02-17 — Issue #819: Expand Optimizer Coverage & Eliminate Dual-Path Gaps
+
+### Problem
+The CBO optimizer pipeline (AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator) could
+not handle several query shapes, causing them to fall back to the legacy execution path:
+- Async expressions (subqueries, catalog-dependent functions)
+- VALUES queries
+- Tableless SELECT (empty FROM)
+- Table functions in FROM (generate_series, etc.)
+- Virtual catalog tables (pg_catalog, information_schema)
+- Subquery FROM leaves
+- FOR UPDATE/SHARE row locking
+
+### Solution
+Expanded the optimizer execution path to handle all common query shapes:
+
+1. **Pre-materialization** of non-correlated async expressions (subqueries → constants)
+   before the eligibility check, so queries that previously fell back now route through
+   the optimizer.
+
+2. **BuildContext.preloaded_rows** — virtual catalog tables, CTEs, and table functions
+   are pre-loaded into a row cache that SeqScan checks before going to KV storage.
+
+3. **Values operator** — build.rs now evaluates VALUES rows at operator build time.
+
+4. **Table function pre-execution** — generate_series, extension functions, user
+   functions are executed during context preparation and stored as preloaded rows.
+
+5. **Post-processing pipeline** — async WHERE filter, row locks (FOR UPDATE/SHARE
+   with SKIP LOCKED/NOWAIT), async projection, deferred ORDER BY + LIMIT for queries
+   that need per-row async evaluation.
+
+6. **Relaxed eligibility** — removed gates for: async expressions, VALUES body, empty
+   FROM, non-table FROM refs (functions, subqueries), virtual catalog tables. Kept:
+   aggregate ORDER BY/HAVING rewrite failures, window-in-DISTINCT-ON.
+
+### Files Changed
+| File | Changes |
+|------|---------|
+| `src/sql/optimizer/eligibility.rs` | Relaxed: removed 5 gates (async, VALUES, empty FROM, non-table leaves, catalog tables) |
+| `src/sql/optimizer/build.rs` | Added preloaded_rows to BuildContext, SeqScan uses it; implemented Values + TableFunction operators |
+| `src/sql/executor/select/analyzed/mod.rs` | Pre-materialization before routing; expanded execute_via_optimizer with 9-step pipeline; helper functions for passthrough projection, schema building, table function pre-loading, lock application |
+| `src/sql/executor/core/statement.rs` | EXPLAIN: removed lock check from optimizer routing (locks handled by execution) |
+
+### Verification
+- `cargo check`: compiles, 6 warnings (all pre-existing)
+- `cargo test`: 1575 tests pass, 0 failures
+
 ## 2026-02-17 — Issue #698: Trigger Module Restructuring
 
 ### Problem

@@ -23,27 +23,41 @@ use crate::sql::operators::{
 };
 use crate::sql::operators::{InListScanOperator, IndexScanOperator, RangeIndexScanOperator};
 use crate::sql::planner::ScanType;
-use crate::types::{DataType, TableSchema, Value};
+use crate::types::{DataType, Row, TableSchema, Value};
 
 /// Context needed to translate a [`PhysicalPlan`] into operator trees.
 ///
 /// The caller pre-resolves all table schemas from the catalog/store and
 /// passes them here.  This keeps operator construction synchronous.
+///
+/// For virtual catalog tables, table functions, and CTEs, the caller also
+/// pre-loads row data into `preloaded_rows`.
 #[derive(Debug)]
 pub struct BuildContext {
     /// Pre-resolved table schemas, keyed by table name (as stored in the plan).
     pub table_schemas: HashMap<String, TableSchema>,
+    /// Pre-loaded row data for tables that don't live in KV storage
+    /// (virtual catalog tables, table functions, CTEs with materialized data).
+    pub preloaded_rows: HashMap<String, Vec<Row>>,
 }
 
 impl BuildContext {
     pub fn new() -> Self {
         Self {
             table_schemas: HashMap::new(),
+            preloaded_rows: HashMap::new(),
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_schema(mut self, name: String, schema: TableSchema) -> Self {
         self.table_schemas.insert(name, schema);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_preloaded_rows(mut self, name: String, rows: Vec<Row>) -> Self {
+        self.preloaded_rows.insert(name, rows);
         self
     }
 }
@@ -65,7 +79,15 @@ impl PhysicalPlan {
                 if let Some(a) = alias {
                     schema.from_alias = Some(a.clone());
                 }
-                Ok(Box::new(TableScanOperator::new(schema)))
+                // Use preloaded rows for virtual catalog tables, CTEs, etc.
+                if let Some(rows) = ctx.preloaded_rows.get(table_name) {
+                    Ok(Box::new(TableScanOperator::new_with_rows(
+                        schema,
+                        rows.clone(),
+                    )))
+                } else {
+                    Ok(Box::new(TableScanOperator::new(schema)))
+                }
             }
 
             PhysicalNode::IndexScan {
@@ -159,20 +181,72 @@ impl PhysicalPlan {
                 )))
             }
 
-            PhysicalNode::Values { .. } => {
-                // Phase 1: VALUES requires expression evaluation at build time.
-                // Deferred to Phase 2 — current path handles VALUES directly.
-                Err(anyhow!(
-                    "VALUES operator not yet supported in optimizer path"
-                ))
+            PhysicalNode::Values { rows } => {
+                // Evaluate constant expressions at build time to produce literal rows.
+                let qctx = crate::sql::query_context::QueryContext::from_task_locals();
+                let dummy_row = Row::new(vec![]);
+                let mut result_rows = Vec::with_capacity(rows.len());
+                for value_row in rows {
+                    let mut values = Vec::with_capacity(value_row.len());
+                    for expr in value_row {
+                        values.push(crate::sql::expr::typed_eval::eval_typed_expr(
+                            expr, &dummy_row, &qctx,
+                        )?);
+                    }
+                    result_rows.push(Row::new(values));
+                }
+                // Build schema from the plan's output schema.
+                let schema = TableSchema::new(
+                    "__values".to_string(),
+                    0,
+                    self.schema
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(_i, (name, dt))| crate::types::ColumnDef {
+                            name: name.clone(),
+                            data_type: dt.clone(),
+                            nullable: true,
+                            primary_key: false,
+                            unique: false,
+                            is_serial: false,
+                            default_expr: None,
+                        })
+                        .collect(),
+                    vec![],
+                );
+                Ok(Box::new(TableScanOperator::new_with_rows(
+                    schema,
+                    result_rows,
+                )))
             }
 
-            PhysicalNode::TableFunction { .. } => {
-                // Phase 1: table functions require async channel setup.
-                // Deferred to Phase 2.
-                Err(anyhow!(
-                    "TableFunction operator not yet supported in optimizer path"
-                ))
+            PhysicalNode::TableFunction {
+                function_name,
+                alias,
+                ..
+            } => {
+                // Table functions are pre-executed during context preparation.
+                // Look up by alias first (the key used during pre-loading), then by function name.
+                let key = alias.as_deref().unwrap_or(function_name.as_str());
+                let schema = ctx
+                    .table_schemas
+                    .get(key)
+                    .or_else(|| ctx.table_schemas.get(function_name.as_str()))
+                    .ok_or_else(|| {
+                        anyhow!("Table function schema not found: {}", function_name)
+                    })?;
+                let rows = ctx
+                    .preloaded_rows
+                    .get(key)
+                    .or_else(|| ctx.preloaded_rows.get(function_name.as_str()))
+                    .cloned()
+                    .unwrap_or_default();
+                let mut schema = schema.clone();
+                if let Some(a) = alias {
+                    schema.from_alias = Some(a.clone());
+                }
+                Ok(Box::new(TableScanOperator::new_with_rows(schema, rows)))
             }
 
             // ── Unary operators ─────────────────────────────────
