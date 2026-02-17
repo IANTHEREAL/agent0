@@ -840,6 +840,51 @@ mod tests {
     }
 
     #[test]
+    fn text_to_tsquery_syntax_error_leading_operator() {
+        let err = cast(
+            Value::Text("& foo".into()),
+            &DataType::Tsquery,
+            CastContext::Explicit,
+        )
+        .unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected typed SqlError for tsquery syntax");
+        assert_eq!(sql_err.sqlstate(), "42601");
+        assert!(sql_err.to_string().contains("syntax error in tsquery"));
+    }
+
+    #[test]
+    fn text_to_tsquery_syntax_error_double_operator() {
+        let err = cast(
+            Value::Text("'foo' && 'bar'".into()),
+            &DataType::Tsquery,
+            CastContext::Explicit,
+        )
+        .unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected typed SqlError for tsquery syntax");
+        assert_eq!(sql_err.sqlstate(), "42601");
+        assert!(sql_err.to_string().contains("syntax error in tsquery"));
+    }
+
+    #[test]
+    fn text_to_tsquery_syntax_error_leading_rparen() {
+        let err = cast(
+            Value::Text(") foo".into()),
+            &DataType::Tsquery,
+            CastContext::Explicit,
+        )
+        .unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected typed SqlError for tsquery syntax");
+        assert_eq!(sql_err.sqlstate(), "42601");
+        assert!(sql_err.to_string().contains("syntax error in tsquery"));
+    }
+
+    #[test]
     fn text_to_empty_tsquery_is_valid() {
         let r = cast(
             Value::Text("".into()),
