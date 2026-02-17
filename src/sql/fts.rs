@@ -372,7 +372,16 @@ impl<'a> TsQueryEvaluator<'a> {
 
         self.consume_term()
             .map(|term| self.words.contains(term.as_str()))
-            .ok_or(TsQueryParseError::NoOperand)
+            .ok_or_else(|| {
+                // Unexpected operator token → "syntax error in tsquery" (matches PG)
+                // End-of-input → "no operand in tsquery" (matches PG)
+                match self.peek_token() {
+                    Some(TsQueryToken::And | TsQueryToken::Or | TsQueryToken::RParen) => {
+                        TsQueryParseError::Syntax
+                    }
+                    _ => TsQueryParseError::NoOperand,
+                }
+            })
     }
 
     fn consume_and(&mut self) -> bool {
@@ -573,6 +582,54 @@ mod tests {
             .expect("expected typed SqlError for tsquery syntax");
         assert_eq!(sql_err.sqlstate(), "42601");
         assert!(sql_err.to_string().contains("no operand in tsquery"));
+    }
+
+    #[test]
+    fn test_ts_match_syntax_error_leading_and() {
+        let tsvector = Value::Tsvector("'foo':1A".to_string());
+        let tsquery = Value::Tsquery("& foo".to_string());
+        let err = ts_match(&tsvector, &tsquery).unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected typed SqlError");
+        assert_eq!(sql_err.sqlstate(), "42601");
+        assert!(sql_err.to_string().contains("syntax error in tsquery"));
+    }
+
+    #[test]
+    fn test_ts_match_syntax_error_double_and() {
+        let tsvector = Value::Tsvector("'foo':1A".to_string());
+        let tsquery = Value::Tsquery("'foo' && 'bar'".to_string());
+        let err = ts_match(&tsvector, &tsquery).unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected typed SqlError");
+        assert_eq!(sql_err.sqlstate(), "42601");
+        assert!(sql_err.to_string().contains("syntax error in tsquery"));
+    }
+
+    #[test]
+    fn test_ts_match_syntax_error_leading_or() {
+        let tsvector = Value::Tsvector("'foo':1A".to_string());
+        let tsquery = Value::Tsquery("| foo".to_string());
+        let err = ts_match(&tsvector, &tsquery).unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected typed SqlError");
+        assert_eq!(sql_err.sqlstate(), "42601");
+        assert!(sql_err.to_string().contains("syntax error in tsquery"));
+    }
+
+    #[test]
+    fn test_ts_match_syntax_error_leading_rparen() {
+        let tsvector = Value::Tsvector("'foo':1A".to_string());
+        let tsquery = Value::Tsquery(") foo".to_string());
+        let err = ts_match(&tsvector, &tsquery).unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected typed SqlError");
+        assert_eq!(sql_err.sqlstate(), "42601");
+        assert!(sql_err.to_string().contains("syntax error in tsquery"));
     }
 
     #[test]
