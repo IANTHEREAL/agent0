@@ -45,10 +45,11 @@ mod statement_time;
 pub mod stats;
 pub(crate) mod table_functions;
 mod timezone;
-mod trigger_queue;
-mod trigger_rewrite;
-pub(crate) mod trigger_worker;
 pub(crate) mod triggers;
+
+// Compat aliases — external consumers keep working with old paths:
+pub(crate) use triggers::worker as trigger_worker; // main.rs, dml_analyzed.rs, core/mod.rs
+pub(crate) use triggers::queue as trigger_queue; // dml_analyzed.rs, table_utils.rs
 pub mod types;
 mod udt;
 pub(crate) mod wildcard;

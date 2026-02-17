@@ -1,5 +1,51 @@
 # Worklog
 
+## 2026-02-17 — Issue #698: Trigger Module Restructuring
+
+### Problem
+The trigger subsystem spanned 4 flat files totaling ~3,261 lines. `trigger_worker.rs` at 2,005 lines mixed 5 distinct concerns (config, enqueue, claim, execute, GC), making navigation difficult.
+
+### Solution
+Converted 4 flat files into a `src/sql/triggers/` directory module with 10 clear file-per-concern files. Zero behavioral changes — pure file reorganization.
+
+### Files Changed
+| File | Action |
+|------|--------|
+| `src/sql/triggers/mod.rs` | **NEW** — module declarations + re-exports |
+| `src/sql/triggers/cache.rs` | **NEW** — from `triggers.rs` (TriggerBodyCache, CompiledTriggerBody) |
+| `src/sql/triggers/before.rs` | **NEW** — from `triggers.rs` (prefetch, apply) |
+| `src/sql/triggers/rewrite.rs` | **NEW** — 1:1 from `trigger_rewrite.rs` |
+| `src/sql/triggers/queue.rs` | **NEW** — 1:1 from `trigger_queue.rs` |
+| `src/sql/triggers/worker.rs` | **NEW** — from `trigger_worker.rs` (struct, config, run) |
+| `src/sql/triggers/enqueue.rs` | **NEW** — from `trigger_worker.rs` (enqueue_after_triggers) |
+| `src/sql/triggers/execute.rs` | **NEW** — from `trigger_worker.rs` (body execution, PL/pgSQL) |
+| `src/sql/triggers/claim.rs` | **NEW** — from `trigger_worker.rs` (TriggerQueueTxn, claim, quarantine) |
+| `src/sql/triggers/gc.rs` | **NEW** — from `trigger_worker.rs` (gc_loop, recover_orphans, DLQ) |
+| `src/sql/triggers.rs` | **DELETE** — replaced by `triggers/` directory |
+| `src/sql/trigger_worker.rs` | **DELETE** — split into worker/enqueue/execute/claim/gc |
+| `src/sql/trigger_queue.rs` | **DELETE** — moved to `triggers/queue.rs` |
+| `src/sql/trigger_rewrite.rs` | **DELETE** — moved to `triggers/rewrite.rs` |
+| `src/sql/mod.rs` | **EDIT** — remove 3 old module decls, add 2 compat aliases |
+| `src/sql/AGENTS.md` | **EDIT** — update trigger layout section |
+| `CLAUDE.md` | **EDIT** — update trigger layout + Where to Look table |
+
+### Key Design Decisions
+1. **Compat aliases** — `pub(crate) use triggers::worker as trigger_worker` + `triggers::queue as trigger_queue` in `mod.rs` absorb all external consumer references. Zero consumer file changes needed.
+2. **`pub(super)` field widening** — only 4 TriggerWorker fields (`worker_id`, `active_keyspaces`, `config`, `shutdown`) widened to `pub(super)` for cross-file access. Private struct `KeyspaceBackoff` stays private to avoid `private_interfaces` lint.
+3. **Tests stay in-place** — each file's `#[cfg(test)] mod tests` preserves access to private symbols. `MemTxn` mock lives at top-level of `claim.rs` with `#[cfg(test)] pub(super)` for cross-file test sharing.
+4. **Absolute paths for cross-module test imports** — used `crate::sql::triggers::queue::*` instead of fragile `super::super::*`.
+
+### Verification
+- `cargo build` — compiles with same 3 warnings as baseline (no new warnings)
+- `cargo test` — all 1465 tests pass
+- `cargo test trigger` — all 37 trigger tests pass
+- Old files gone: `trigger_queue.rs`, `trigger_worker.rs`, `trigger_rewrite.rs`, `triggers.rs` all deleted
+- Old module declarations removed from `mod.rs`
+- Compat aliases present: 2 `use triggers::* as` in `mod.rs`
+- Consumer files unchanged: `main.rs`, `dml_analyzed.rs`, `core/mod.rs`, `table_utils.rs`, `pool.rs`, `dynamic.rs`
+
+---
+
 ## 2026-02-17 — Query Rewriter: Subquery Flattening for Views
 
 ### Problem

@@ -138,8 +138,17 @@ src/sql/
 ├── session.rs             # Per-session state: GUCs, transaction, sequence counters
 ├── stats.rs               # TableStatsCache: row count + column statistics (per-tenant)
 ├── ddl.rs                 # CREATE/ALTER/DROP TABLE/INDEX/SCHEMA/ROLE/VIEW/TRIGGER/FUNCTION
-├── triggers.rs            # BEFORE trigger body compilation + caching
-├── trigger_worker.rs      # Background async trigger processing
+├── triggers/              # Trigger subsystem (BEFORE/AFTER)
+│   ├── mod.rs             # Module declarations + re-exports
+│   ├── cache.rs           # TriggerBodyCache, CompiledTriggerBody
+│   ├── before.rs          # prefetch_trigger_functions, apply_before_triggers_with_cache
+│   ├── rewrite.rs         # substitute_row_references, value_to_sql_literal
+│   ├── queue.rs           # TriggerEvent, EventStatus, key encoding, Snowflake IDs
+│   ├── worker.rs          # TriggerWorker struct, config, singleton, run()
+│   ├── enqueue.rs         # enqueue_after_triggers
+│   ├── execute.rs         # execute_trigger_body, PL/pgSQL subset
+│   ├── claim.rs           # TriggerQueueTxn trait, claim_events, quarantine
+│   └── gc.rs              # gc_loop, recover_orphans, DLQ cleanup
 ├── sequences.rs           # SEQUENCE management (NEXTVAL, SETVAL, CREATE, ALTER)
 ├── gin.rs                 # GIN index (full-text search) support
 ├── fts.rs                 # Full-text search tsquery/tsvector matching
@@ -167,7 +176,7 @@ src/sql/
 | DDL behavior | `ddl.rs` / `executor/ddl.rs` |
 | Add catalog view | `catalog/pg_*.rs` (implement VirtualTable trait) |
 | Statistics / ANALYZE | `stats.rs` + `executor/core/analyze.rs` + `optimizer/statistics.rs` |
-| Triggers | `triggers.rs` (body cache) + `executor/triggers.rs` (DDL) + `trigger_worker.rs` (async) |
+| Triggers | `triggers/` (cache, before, queue, worker, enqueue, execute, claim, gc) + `executor/triggers.rs` (DDL) |
 | Views | `executor/core/view_rewrite.rs` |
 | Privileges | `executor/core/statement.rs` + `rbac.rs` |
 | EXPLAIN | `explain.rs` (uses analyzed pipeline, not legacy AST) |
