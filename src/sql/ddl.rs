@@ -2111,6 +2111,12 @@ pub async fn execute_drop_index(
     Ok(None)
 }
 
+/// Execute an ALTER TABLE operation.
+///
+/// Returns `(result, invalidate_table_id)` — `invalidate_table_id` is
+/// `Some(table_id)` when the operation structurally changed the table in
+/// a way that invalidates ANALYZE statistics (column added/dropped/renamed/
+/// retyped), `None` otherwise.
 pub async fn execute_alter_table(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -2118,7 +2124,7 @@ pub async fn execute_alter_table(
     search_path: &[String],
     name: &ObjectName,
     operation: &AlterTableOperation,
-) -> Result<ExecuteResult> {
+) -> Result<(ExecuteResult, Option<u64>)> {
     let resolved =
         names::resolve_existing_table_name(store.as_ref(), txn, db_id, name, search_path)
             .await?
@@ -2137,6 +2143,11 @@ pub async fn execute_alter_table(
         &schema.foreign_keys,
         &mut schema.check_constraints,
     );
+
+    let table_id = schema.table_id;
+    // Set to true at mutation points that structurally change the table
+    // (column added/dropped/renamed/retyped) to signal stats invalidation.
+    let mut invalidate_stats = false;
 
     match operation {
         AlterTableOperation::AddColumn { column_def, .. } => {
@@ -2206,6 +2217,7 @@ pub async fn execute_alter_table(
             }
             schema.version += 1;
             store.update_schema(txn, db_id, schema).await?;
+            invalidate_stats = true;
         }
         AlterTableOperation::AddConstraint(constraint) => match constraint {
             TableConstraint::Unique {
@@ -2589,9 +2601,12 @@ pub async fn execute_alter_table(
                     schema.pk_constraint_name = None;
                     schema.version += 1;
                     store.update_schema(txn, db_id, schema).await?;
-                    return Ok(ExecuteResult::AlterTable {
-                        table_name: result_table_name,
-                    });
+                    return Ok((
+                        ExecuteResult::AlterTable {
+                            table_name: result_table_name,
+                        },
+                        None,
+                    ));
                 }
             }
 
@@ -2603,9 +2618,12 @@ pub async fn execute_alter_table(
                 schema.foreign_keys.remove(pos);
                 schema.version += 1;
                 store.update_schema(txn, db_id, schema).await?;
-                return Ok(ExecuteResult::AlterTable {
-                    table_name: result_table_name,
-                });
+                return Ok((
+                    ExecuteResult::AlterTable {
+                        table_name: result_table_name,
+                    },
+                    None,
+                ));
             }
 
             if let Some(pos) =
@@ -2614,9 +2632,12 @@ pub async fn execute_alter_table(
                 schema.check_constraints.remove(pos);
                 schema.version += 1;
                 store.update_schema(txn, db_id, schema).await?;
-                return Ok(ExecuteResult::AlterTable {
-                    table_name: result_table_name,
-                });
+                return Ok((
+                    ExecuteResult::AlterTable {
+                        table_name: result_table_name,
+                    },
+                    None,
+                ));
             }
 
             if let Some(pos) = schema
@@ -2629,9 +2650,12 @@ pub async fn execute_alter_table(
                     if !if_exists {
                         return Err(anyhow!("Constraint '{}' does not exist", constraint_name));
                     }
-                    return Ok(ExecuteResult::AlterTable {
-                        table_name: result_table_name,
-                    });
+                    return Ok((
+                        ExecuteResult::AlterTable {
+                            table_name: result_table_name,
+                        },
+                        None,
+                    ));
                 }
 
                 let (start, end) = index_prefix_range(db_id, schema.table_id, index.id);
@@ -2657,9 +2681,12 @@ pub async fn execute_alter_table(
 
                 schema.version += 1;
                 store.update_schema(txn, db_id, schema).await?;
-                return Ok(ExecuteResult::AlterTable {
-                    table_name: result_table_name,
-                });
+                return Ok((
+                    ExecuteResult::AlterTable {
+                        table_name: result_table_name,
+                    },
+                    None,
+                ));
             }
 
             if !if_exists {
@@ -2681,6 +2708,7 @@ pub async fn execute_alter_table(
 
             let col_name = normalize_ident(column_name);
             let col_idx = schema.column_index(&col_name);
+            let drop_changes_schema = should_invalidate_stats_for_drop_column(col_idx.is_some());
             match col_idx {
                 Some(idx) => {
                     if schema.pk_indices.contains(&idx) {
@@ -2739,6 +2767,7 @@ pub async fn execute_alter_table(
                     }
                     schema.version += 1;
                     store.update_schema(txn, db_id, schema).await?;
+                    invalidate_stats = drop_changes_schema;
                 }
                 None => {
                     if !if_exists {
@@ -2790,6 +2819,7 @@ pub async fn execute_alter_table(
             store
                 .rename_column_metadata(txn, db_id, &t, &old_name, &new_name)
                 .await?;
+            invalidate_stats = true;
         }
         AlterTableOperation::RenameTable { table_name } => {
             let new_table = table_name
@@ -2852,18 +2882,24 @@ pub async fn execute_alter_table(
                 fk.name = new;
                 schema.version += 1;
                 store.update_schema(txn, db_id, schema).await?;
-                return Ok(ExecuteResult::AlterTable {
-                    table_name: result_table_name,
-                });
+                return Ok((
+                    ExecuteResult::AlterTable {
+                        table_name: result_table_name,
+                    },
+                    None,
+                ));
             }
 
             if let Some(pos) = find_check_constraint_index(&schema, &table_object_name, &old) {
                 schema.check_constraints[pos].name = Some(new);
                 schema.version += 1;
                 store.update_schema(txn, db_id, schema).await?;
-                return Ok(ExecuteResult::AlterTable {
-                    table_name: result_table_name,
-                });
+                return Ok((
+                    ExecuteResult::AlterTable {
+                        table_name: result_table_name,
+                    },
+                    None,
+                ));
             }
 
             if let Some(idx) = schema
@@ -2887,9 +2923,12 @@ pub async fn execute_alter_table(
                 schema.version += 1;
                 store.update_schema(txn, db_id, schema).await?;
                 store.release_relation_name(txn, db_id, &old_full).await?;
-                return Ok(ExecuteResult::AlterTable {
-                    table_name: result_table_name,
-                });
+                return Ok((
+                    ExecuteResult::AlterTable {
+                        table_name: result_table_name,
+                    },
+                    None,
+                ));
             }
 
             return Err(anyhow!("Constraint '{}' does not exist", old));
@@ -2913,9 +2952,12 @@ pub async fn execute_alter_table(
                 }
                 AlterColumnOperation::SetNotNull => {
                     if !schema.columns[col_idx].nullable {
-                        return Ok(ExecuteResult::AlterTable {
-                            table_name: result_table_name,
-                        });
+                        return Ok((
+                            ExecuteResult::AlterTable {
+                                table_name: result_table_name,
+                            },
+                            None,
+                        ));
                     }
 
                     let (start, end) =
@@ -2966,10 +3008,17 @@ pub async fn execute_alter_table(
 
                     let (new_type, _) =
                         resolve_column_data_type(store, txn, db_id, search_path, data_type).await?;
-                    if schema.columns[col_idx].data_type == new_type {
-                        return Ok(ExecuteResult::AlterTable {
-                            table_name: result_table_name,
-                        });
+                    let type_changed = should_invalidate_stats_for_type_change(
+                        &schema.columns[col_idx].data_type,
+                        &new_type,
+                    );
+                    if !type_changed {
+                        return Ok((
+                            ExecuteResult::AlterTable {
+                                table_name: result_table_name,
+                            },
+                            None,
+                        ));
                     }
 
                     let affected_indexes: Vec<IndexDef> = schema
@@ -3064,15 +3113,34 @@ pub async fn execute_alter_table(
                     schema.columns[col_idx].data_type = new_type;
                     schema.version += 1;
                     store.update_schema(txn, db_id, schema).await?;
+                    invalidate_stats = type_changed;
                 }
             }
         }
         _ => return Err(SqlError::Unsupported("Unsupported ALTER".into()).into()),
     }
 
-    Ok(ExecuteResult::AlterTable {
-        table_name: result_table_name,
-    })
+    let invalidate_table = if invalidate_stats {
+        Some(table_id)
+    } else {
+        None
+    };
+    Ok((
+        ExecuteResult::AlterTable {
+            table_name: result_table_name,
+        },
+        invalidate_table,
+    ))
+}
+
+#[inline]
+fn should_invalidate_stats_for_drop_column(column_exists: bool) -> bool {
+    column_exists
+}
+
+#[inline]
+fn should_invalidate_stats_for_type_change(old_type: &DataType, new_type: &DataType) -> bool {
+    old_type != new_type
 }
 
 #[cfg(test)]
@@ -3284,6 +3352,24 @@ mod tests {
             "public",
             "idx_shared",
             Some("public.t1"),
+        ));
+    }
+
+    #[test]
+    fn drop_column_stats_invalidation_matches_schema_change() {
+        assert!(should_invalidate_stats_for_drop_column(true));
+        assert!(!should_invalidate_stats_for_drop_column(false));
+    }
+
+    #[test]
+    fn set_data_type_stats_invalidation_matches_type_change() {
+        assert!(!should_invalidate_stats_for_type_change(
+            &DataType::Int32,
+            &DataType::Int32
+        ));
+        assert!(should_invalidate_stats_for_type_change(
+            &DataType::Int32,
+            &DataType::Int64
         ));
     }
 }

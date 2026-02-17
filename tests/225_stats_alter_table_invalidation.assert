@@ -1,0 +1,20 @@
+# ALTER TABLE statistics invalidation regression test.
+#
+# Observable: EXPLAIN row estimates reflect whether ANALYZE stats are present.
+#   rows=5    → real statistics (ANALYZE collected 5 rows)
+#   rows=1000 → heuristic default (statistics cleared or never collected)
+
+# E1: After ANALYZE — real stats (rows=5)
+rows=5
+
+# E2: After no-op DROP COLUMN IF EXISTS — stats preserved (rows=5)
+rows=5
+
+# E3: After no-op ALTER COLUMN TYPE same type — stats preserved (rows=5)
+rows=5
+
+# E4: After structural ADD COLUMN — stats cleared (rows=1000)
+rows=1000
+
+# E5: After re-ANALYZE — stats restored (rows=5)
+rows=5

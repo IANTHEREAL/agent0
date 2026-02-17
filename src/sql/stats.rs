@@ -64,9 +64,9 @@ impl TableStatsCache {
 
     /// Remove all cached data for a table (row-count estimate + full stats).
     ///
-    /// Called on DROP TABLE to prevent stale statistics from influencing
-    /// the planner. ALTER TABLE invalidation will be added in PR2 when
-    /// ANALYZE populates stats that could actually go stale.
+    /// Called on DROP TABLE and structural ALTER TABLE operations
+    /// (AddColumn, DropColumn, RenameColumn, AlterColumn SET DATA TYPE)
+    /// to prevent stale statistics from influencing the planner.
     pub(crate) fn invalidate(&self, db_id: u64, table_id: u64) {
         self.inner.remove(&(db_id, table_id));
         self.full_stats.remove(&(db_id, table_id));
@@ -251,5 +251,85 @@ mod tests {
         // Full stats still reflect the ANALYZE-time value
         let full = cache.get_full_stats(1, 42).unwrap();
         assert_eq!(full.row_count, 1000);
+    }
+
+    /// Simulates the get_or_load_stats warm-up pattern:
+    /// cache miss → load from storage → populate cache → subsequent cache hit.
+    #[test]
+    fn test_warmup_miss_then_populate() {
+        let cache = TableStatsCache::new();
+
+        // Initial state: cache is empty (simulates post-restart).
+        assert!(cache.get_full_stats(1, 42).is_none());
+
+        // Simulate storage load returning stats — caller populates cache.
+        let loaded = Arc::new(TableStatistics {
+            table_id: 42,
+            row_count: 500,
+            last_analyzed: 2000,
+            columns: HashMap::new(),
+        });
+        cache.update_full_stats(1, 42, loaded);
+
+        // Subsequent lookups should hit the cache.
+        let cached = cache.get_full_stats(1, 42).unwrap();
+        assert_eq!(cached.row_count, 500);
+        assert_eq!(cache.get_estimate(1, 42), Some(500));
+    }
+
+    /// Simulates structural ALTER TABLE → ANALYZE cycle:
+    /// stats exist → invalidate (ALTER TABLE) → miss → re-populate (re-ANALYZE).
+    #[test]
+    fn test_invalidate_then_repopulate() {
+        let cache = TableStatsCache::new();
+
+        // Phase 1: ANALYZE populates stats.
+        let stats_v1 = Arc::new(TableStatistics {
+            table_id: 10,
+            row_count: 100,
+            last_analyzed: 1000,
+            columns: HashMap::new(),
+        });
+        cache.update_full_stats(1, 10, stats_v1);
+        assert!(cache.get_full_stats(1, 10).is_some());
+
+        // Phase 2: Structural ALTER TABLE invalidates.
+        cache.invalidate(1, 10);
+        assert!(cache.get_full_stats(1, 10).is_none());
+        assert!(cache.get_estimate(1, 10).is_none());
+
+        // Phase 3: Re-ANALYZE populates fresh stats.
+        let stats_v2 = Arc::new(TableStatistics {
+            table_id: 10,
+            row_count: 200,
+            last_analyzed: 2000,
+            columns: HashMap::new(),
+        });
+        cache.update_full_stats(1, 10, stats_v2);
+        let fresh = cache.get_full_stats(1, 10).unwrap();
+        assert_eq!(fresh.row_count, 200);
+        assert_eq!(fresh.last_analyzed, 2000);
+        assert_eq!(cache.get_estimate(1, 10), Some(200));
+    }
+
+    /// No-op ALTER TABLE should NOT call invalidate — stats survive.
+    /// This test documents the contract: only the caller decides to invalidate.
+    #[test]
+    fn test_noop_alter_preserves_stats() {
+        let cache = TableStatsCache::new();
+
+        let stats = Arc::new(TableStatistics {
+            table_id: 42,
+            row_count: 300,
+            last_analyzed: 1500,
+            columns: HashMap::new(),
+        });
+        cache.update_full_stats(1, 42, stats);
+
+        // Simulate no-op ALTER TABLE (no invalidate call) — stats survive.
+        // (The executor skips invalidation when ddl returns None.)
+        assert!(cache.get_full_stats(1, 42).is_some());
+        assert_eq!(cache.get_full_stats(1, 42).unwrap().row_count, 300);
+        assert_eq!(cache.get_estimate(1, 42), Some(300));
     }
 }

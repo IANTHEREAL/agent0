@@ -354,3 +354,10 @@ fn test_get_unsupported_reason() {
     assert!(get_unsupported_reason("SELECT $$abc$$").is_none());
     assert!(get_unsupported_reason("SELECT $tag$abc$tag$").is_none());
 }
+
+#[test]
+fn test_ephemeral_table_id_detection() {
+    assert!(super::is_ephemeral_table_id(0));
+    assert!(!super::is_ephemeral_table_id(1));
+    assert!(!super::is_ephemeral_table_id(42));
+}

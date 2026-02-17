@@ -326,7 +326,18 @@ impl Executor {
         name: &ObjectName,
         operation: &AlterTableOperation,
     ) -> Result<ExecuteResult> {
-        ddl::execute_alter_table(&self.store(), txn, db_id, search_path, name, operation).await
+        let (result, invalidate_table_id) =
+            ddl::execute_alter_table(&self.store(), txn, db_id, search_path, name, operation)
+                .await?;
+
+        // Invalidate cached + persisted statistics when the DDL structurally
+        // changed the table (column added/dropped/renamed/retyped).
+        if let Some(table_id) = invalidate_table_id {
+            self.stats_cache().invalidate(db_id, table_id);
+            self.store().delete_statistics(txn, db_id, table_id).await?;
+        }
+
+        Ok(result)
     }
 }
 

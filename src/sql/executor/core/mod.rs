@@ -60,6 +60,7 @@ use crate::auth::AuthManager;
 use crate::observability::TenantObservability;
 use crate::session_context;
 use crate::sql::error::SqlError;
+use crate::sql::optimizer::statistics::TableStatistics;
 use crate::storage::{with_kv_read_stats, KvReadStatsSnapshot, TikvStore};
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
@@ -75,6 +76,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tikv_client::Transaction;
 use tracing::debug;
+
+fn is_ephemeral_table_id(table_id: u64) -> bool {
+    table_id == 0
+}
 
 pub struct Executor {
     store: Arc<TikvStore>,
@@ -131,6 +136,39 @@ impl Executor {
 
     pub fn stats_cache(&self) -> &Arc<TableStatsCache> {
         &self.stats_cache
+    }
+
+    /// Load full table statistics, checking the in-memory cache first and
+    /// falling back to persisted statistics in TiKV.
+    ///
+    /// Returns `None` if no statistics exist (neither cached nor persisted).
+    /// Skips TiKV lookup for `table_id == 0` (CTE references).
+    pub(crate) async fn get_or_load_stats(
+        &self,
+        txn: &mut tikv_client::Transaction,
+        db_id: u64,
+        table_id: u64,
+    ) -> anyhow::Result<Option<Arc<TableStatistics>>> {
+        // Check in-memory cache first.
+        if let Some(stats) = self.stats_cache.get_full_stats(db_id, table_id) {
+            return Ok(Some(stats));
+        }
+
+        // CTE refs use table_id: 0 — no persisted stats to load.
+        if is_ephemeral_table_id(table_id) {
+            return Ok(None);
+        }
+
+        // Fall back to persisted statistics in TiKV.
+        match self.store.load_statistics(txn, db_id, table_id).await? {
+            Some(stats) => {
+                let stats = Arc::new(stats);
+                self.stats_cache
+                    .update_full_stats(db_id, table_id, Arc::clone(&stats));
+                Ok(Some(stats))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Record a keyspace that needs trigger worker activation.

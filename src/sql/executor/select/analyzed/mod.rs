@@ -2697,12 +2697,20 @@ impl Executor {
         tracing::debug!(target: "optimizer", "routing query through CBO pipeline");
 
         // Step 1: Build PlanningContext with table statistics (if available).
-        // Recursively collect from join trees.
+        // Recursively collect from join trees.  Uses get_or_load_stats to
+        // warm the in-memory cache from persisted TiKV stats on cache miss.
         let mut planning_ctx = PlanningContext::empty();
         if let AnalyzedQueryBody::Select(select) = &analyzed.body {
+            let mut stats_attempted = std::collections::HashSet::new();
             for table_ref in &select.from {
                 for (name, schema, _alias) in collect_table_refs(table_ref) {
-                    if let Some(stats) = self.stats_cache().get_full_stats(db_id, schema.table_id) {
+                    let tid = schema.table_id;
+                    let stats = if stats_attempted.insert(tid) {
+                        self.get_or_load_stats(txn, db_id, tid).await?
+                    } else {
+                        self.stats_cache().get_full_stats(db_id, tid)
+                    };
+                    if let Some(stats) = stats {
                         planning_ctx.table_stats.insert(name.to_string(), stats);
                     }
                 }
