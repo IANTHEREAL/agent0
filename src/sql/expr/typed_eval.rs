@@ -686,6 +686,15 @@ fn eval_array_index(arr_val: Value, idx_val: Value) -> Result<Value> {
 /// read timestamps and session info from the explicit `QueryContext`.
 fn eval_function_call(name: &str, args: Vec<Value>, qctx: &QueryContext) -> Result<Value> {
     let func_name_upper = name.to_uppercase();
+    let (schema_name, unqualified_name) = split_qualified_function_name(&func_name_upper);
+
+    if schema_name.is_some_and(|schema| schema.eq_ignore_ascii_case("CRON")) {
+        if let Some(result) =
+            crate::sql::executor::try_execute_cron_scalar_function(unqualified_name, &args)
+        {
+            return result;
+        }
+    }
 
     // Context-dependent builtins that need QueryContext.
     match func_name_upper.as_str() {
@@ -717,7 +726,7 @@ fn eval_function_call(name: &str, args: Vec<Value>, qctx: &QueryContext) -> Resu
         }
         "CURRENT_SCHEMA" => return Ok(Value::Text("public".to_string())),
         "CURRENT_USER" | "SESSION_USER" | "USER" => {
-            return Ok(Value::Text("postgres".to_string()));
+            return Ok(Value::Text(qctx.current_user.as_ref().to_string()));
         }
         "VERSION" => {
             return Ok(Value::Text(crate::sql::expr::VERSION_STRING.to_string()));
@@ -740,9 +749,16 @@ fn eval_function_call(name: &str, args: Vec<Value>, qctx: &QueryContext) -> Resu
 
     // Standard registry lookup.
     let registry = crate::sql::expr::functions::get_registry();
-    match registry.get(func_name_upper.as_str()) {
+    match registry.get(unqualified_name) {
         Some(f) => f(args),
         None => Err(SqlError::Unsupported(format!("unknown function: {}", name)).into()),
+    }
+}
+
+fn split_qualified_function_name(name: &str) -> (Option<&str>, &str) {
+    match name.rsplit_once('.') {
+        Some((schema, func)) => (Some(schema), func),
+        None => (None, name),
     }
 }
 
@@ -821,6 +837,7 @@ mod tests {
         QueryContext::new(
             1,                     // connection_id
             Arc::from("postgres"), // database_name
+            Arc::from("postgres"), // current_user
             1_700_000_000_000,     // statement_timestamp_ms
             1_700_000_000_000,     // transaction_timestamp_ms
             Arc::from("UTC"),      // timezone
@@ -879,6 +896,7 @@ mod tests {
         let qctx = QueryContext::new(
             42,
             Arc::from("mydb"),
+            Arc::from("postgres"),
             1_700_000_000_111,
             1_700_000_000_222,
             Arc::from("UTC"),
@@ -915,6 +933,7 @@ mod tests {
         let qctx = QueryContext::new(
             1,
             Arc::from("postgres"),
+            Arc::from("postgres"),
             1_700_000_000_000,
             1_700_000_000_123,
             Arc::from("UTC"),
@@ -936,6 +955,7 @@ mod tests {
         let qctx = QueryContext::new(
             99,
             Arc::from("postgres"),
+            Arc::from("postgres"),
             1_700_000_000_000,
             1_700_000_000_000,
             Arc::from("UTC"),
@@ -954,6 +974,7 @@ mod tests {
         let qctx = QueryContext::new(
             1,
             Arc::from("mydb"),
+            Arc::from("postgres"),
             1_700_000_000_000,
             1_700_000_000_000,
             Arc::from("UTC"),
@@ -2218,8 +2239,9 @@ mod tests {
         let qctx = QueryContext::new(
             1,
             Arc::from("postgres"),
-            1_700_000_000_000, // statement ts
-            1_700_000_000_000, // transaction ts
+            Arc::from("postgres"),
+            1_700_000_000_000,
+            1_700_000_000_000,
             Arc::from("UTC"),
         );
         let func = TypedExpr::new(
@@ -2243,7 +2265,8 @@ mod tests {
     fn test_pg_backend_pid_uses_explicit_qctx() {
         let row = empty_row();
         let qctx = QueryContext::new(
-            42, // connection_id = 42
+            42,
+            Arc::from("postgres"),
             Arc::from("postgres"),
             1_700_000_000_000,
             1_700_000_000_000,
@@ -2273,7 +2296,8 @@ mod tests {
         let row = empty_row();
         let qctx = QueryContext::new(
             1,
-            Arc::from("mydb"), // database_name = "mydb"
+            Arc::from("mydb"),
+            Arc::from("postgres"),
             1_700_000_000_000,
             1_700_000_000_000,
             Arc::from("UTC"),

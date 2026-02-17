@@ -1,6 +1,7 @@
 mod auth;
 mod cli;
 mod config;
+mod cron;
 mod extensions;
 mod observability;
 mod pool;
@@ -233,6 +234,7 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     client_pool.spawn_reaper();
 
     sql::trigger_worker::spawn_trigger_worker(client_pool.clone());
+    cron::worker::spawn_cron_worker(client_pool.clone());
 
     let listener = TcpListener::bind((pg_listen_addr.as_str(), pg_port)).await?;
     info!("PostgreSQL server listening on {}", listener.local_addr()?);

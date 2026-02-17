@@ -1,0 +1,72 @@
+schedule
+1
+(1 row)
+schedule
+2
+(1 row)
+schedule
+3
+(1 row)
+schedule
+4
+(1 row)
+schedule
+5
+(1 row)
+schedule
+6
+(1 row)
+schedule
+7
+(1 row)
+schedule
+8
+(1 row)
+schedule
+9
+(1 row)
+schedule
+10
+(1 row)
+count
+10
+(1 row)
+ERROR:  invalid cron expression: special strings like '@daily' are not supported. Use standard 5-field cron syntax.
+ERROR:  invalid cron expression: special strings like '@hourly' are not supported. Use standard 5-field cron syntax.
+ERROR:  invalid cron expression: special strings like '@reboot' are not supported. Use standard 5-field cron syntax.
+ERROR:  invalid cron expression: special strings like '@yearly' are not supported. Use standard 5-field cron syntax.
+ERROR:  invalid cron expression: interval syntax '30 seconds' is not supported. Use standard 5-field cron syntax (e.g. '*/5 * * * *').
+ERROR:  invalid cron expression: interval syntax '5 minutes' is not supported. Use standard 5-field cron syntax (e.g. '*/5 * * * *').
+ERROR:  invalid cron expression: expected 5 fields (minute hour day month weekday), got 3
+ERROR:  invalid cron expression: expected 5 fields (minute hour day month weekday), got 7
+ERROR:  invalid cron expression: empty string
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)

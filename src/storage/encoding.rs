@@ -56,6 +56,12 @@ const DB_SYS_COMMENT_PREFIX: &[u8] = b"sys_comment_";
 const DB_SYS_RELNAME_PREFIX: &[u8] = b"sys_relname_";
 const DB_SYS_SEQ_PREFIX: &[u8] = b"sys_seq_";
 const DB_SYS_STATS_PREFIX: &[u8] = b"sys_stats_";
+const DB_SYS_CRON_JOB_PREFIX_V2: &[u8] = b"sys_cron_job_";
+const DB_SYS_CRON_RUN_PREFIX_V2: &[u8] = b"sys_cron_run_";
+const DB_SYS_CRON_SEQ_PREFIX_V2: &[u8] = b"sys_next_cron_job_id";
+const DB_SYS_CRON_RUN_SEQ_PREFIX_V2: &[u8] = b"sys_next_cron_run_id";
+const DB_SYS_CRON_ENABLED_PREFIX_V2: &[u8] = b"sys_cron_enabled";
+const DB_SYS_CRON_CLAIM_PREFIX_V2: &[u8] = b"sys_cron_claim_";
 const SYS_SCHEMA_PREFIX: &[u8] = b"_sys_schema_";
 const TABLE_DATA_PREFIX: &[u8] = b"t_";
 const TABLE_INDEX_PREFIX: &[u8] = b"i_";
@@ -290,6 +296,65 @@ pub fn encode_extension_config_key_v2(db_id: u64, ext_name: &str) -> Vec<u8> {
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_EXTENSIONCFG_PREFIX);
     key.extend_from_slice(ext_name.as_bytes());
+    key
+}
+
+pub fn encode_cron_job_key_v2(db_id: u64, job_id: i64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_JOB_PREFIX_V2);
+    key.extend_from_slice(&job_id.to_be_bytes());
+    key
+}
+
+pub fn encode_cron_job_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_JOB_PREFIX_V2);
+    key
+}
+
+pub fn encode_cron_run_key_v2(db_id: u64, run_id: i64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_RUN_PREFIX_V2);
+    key.extend_from_slice(&run_id.to_be_bytes());
+    key
+}
+
+pub fn encode_cron_run_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_RUN_PREFIX_V2);
+    key
+}
+
+pub fn encode_cron_claim_key_v2(db_id: u64, job_id: i64, scheduled_min: i64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_CLAIM_PREFIX_V2);
+    key.extend_from_slice(&job_id.to_be_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&scheduled_min.to_be_bytes());
+    key
+}
+
+pub fn encode_cron_claim_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_CLAIM_PREFIX_V2);
+    key
+}
+
+pub fn encode_next_cron_job_id_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_SEQ_PREFIX_V2);
+    key
+}
+
+pub fn encode_next_cron_run_id_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_RUN_SEQ_PREFIX_V2);
+    key
+}
+
+pub fn encode_cron_enabled_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_ENABLED_PREFIX_V2);
     key
 }
 

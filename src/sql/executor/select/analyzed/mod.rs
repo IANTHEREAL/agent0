@@ -1668,6 +1668,30 @@ impl Executor {
                                     TypedFunctionArg::Named { expr, .. } => expr.clone(),
                                 })
                                 .collect();
+
+                            let mut scalar_arg_values = Vec::with_capacity(typed_args.len());
+                            for arg in &typed_args {
+                                scalar_arg_values.push(eval_typed_expr(arg, &dummy_row, &qc)?);
+                            }
+                            if let Some(result) =
+                                crate::sql::executor::execute_cron_scalar_function(
+                                    &self.store(),
+                                    txn,
+                                    db_id,
+                                    qc.current_user.as_ref(),
+                                    qc.database_name.as_ref(),
+                                    crate::extensions::context::is_superuser(),
+                                    &func.name,
+                                    &scalar_arg_values,
+                                )
+                                .await
+                            {
+                                return Ok(Box::new(TableScanOperator::new_with_rows(
+                                    schema.clone(),
+                                    vec![Row::new(vec![result?])],
+                                )) as BoxedOperator);
+                            }
+
                             let typed_expr = TypedExpr {
                                 kind: TypedExprKind::FunctionCall {
                                     func: func.clone(),

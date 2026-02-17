@@ -194,6 +194,53 @@ enum DbAction {
         #[command(subcommand)]
         action: BranchAction,
     },
+    /// Manage cron jobs (requires pg_cron extension)
+    Cron {
+        /// Database ID
+        id: String,
+        #[command(subcommand)]
+        action: CronAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CronAction {
+    /// List scheduled cron jobs
+    List,
+    /// Create a new cron job
+    Create {
+        /// Cron schedule expression (e.g., '*/5 * * * *')
+        schedule: String,
+        /// SQL command to execute
+        command: String,
+        /// Optional job name (enables upsert semantics)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Delete a cron job by ID or name
+    Delete {
+        /// Job ID (number) or job name (text)
+        job: String,
+    },
+    /// Show cron job execution history
+    History {
+        /// Filter by job ID or name
+        #[arg(long)]
+        job: Option<String>,
+        /// Maximum number of entries to show
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Enable a cron job
+    Enable {
+        /// Job ID (number) or job name (text)
+        job: String,
+    },
+    /// Disable a cron job
+    Disable {
+        /// Job ID (number) or job name (text)
+        job: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -613,6 +660,37 @@ async fn main() {
                 }
                 BranchAction::Delete { id } => {
                     cmd_db_branch_delete(&api, &cli.effective_output(), id).await
+                }
+            },
+            DbAction::Cron { id, action } => match action {
+                CronAction::List => cmd_cron_list(&api, &cli.effective_output(), id).await,
+                CronAction::Create {
+                    schedule,
+                    command,
+                    name,
+                } => {
+                    cmd_cron_create(
+                        &api,
+                        &cli.effective_output(),
+                        id,
+                        schedule,
+                        command,
+                        name.as_deref(),
+                    )
+                    .await
+                }
+                CronAction::Delete { job } => {
+                    cmd_cron_delete(&api, &cli.effective_output(), id, job).await
+                }
+                CronAction::History { job, limit } => {
+                    cmd_cron_history(&api, &cli.effective_output(), id, job.as_deref(), *limit)
+                        .await
+                }
+                CronAction::Enable { job } => {
+                    cmd_cron_enable(&api, &cli.effective_output(), id, job).await
+                }
+                CronAction::Disable { job } => {
+                    cmd_cron_disable(&api, &cli.effective_output(), id, job).await
                 }
             },
         },
@@ -1844,6 +1922,170 @@ async fn cmd_db_branch_delete(api: &ApiClient, output: &OutputFormat, id: &str) 
     match output {
         OutputFormat::Json => print_json(&data),
         _ => println!("Branch {id} has been deleted."),
+    }
+}
+
+fn escape_sql(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+fn resolve_job_id_expr(job: &str) -> String {
+    if job.parse::<i64>().is_ok() {
+        job.to_string()
+    } else {
+        format!("(SELECT jobid FROM cron.job WHERE jobname = '{}')", escape_sql(job))
+    }
+}
+
+fn check_sql_error(data: &Value) {
+    if let Some(err) = data.get("error").and_then(|v| v.as_str()) {
+        eprintln!("\x1b[31mERROR:\x1b[0m {err}");
+        process::exit(1);
+    }
+}
+
+async fn cmd_cron_list(api: &ApiClient, output: &OutputFormat, id: &str) {
+    let data = execute_sql(
+        api,
+        id,
+        "SELECT jobid, schedule, command, nodename, nodeport, database, username, active, jobname FROM cron.job ORDER BY jobid",
+    )
+    .await;
+    check_sql_error(&data);
+
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => repl::output::print_sql_result(
+            &data,
+            output,
+            false,
+            &None,
+            ExpandedMode::Off,
+            "NULL",
+            1,
+            repl::LinestyleMode::Ascii,
+        ),
+    }
+}
+
+async fn cmd_cron_create(
+    api: &ApiClient,
+    output: &OutputFormat,
+    id: &str,
+    schedule: &str,
+    command: &str,
+    name: Option<&str>,
+) {
+    let sql = match name {
+        Some(n) => format!(
+            "SELECT cron.schedule('{}', '{}', '{}')",
+            escape_sql(n),
+            escape_sql(schedule),
+            escape_sql(command)
+        ),
+        None => format!(
+            "SELECT cron.schedule('{}', '{}')",
+            escape_sql(schedule),
+            escape_sql(command)
+        ),
+    };
+    let data = execute_sql(api, id, &sql).await;
+    check_sql_error(&data);
+
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => repl::output::print_sql_result(
+            &data,
+            output,
+            false,
+            &None,
+            ExpandedMode::Off,
+            "NULL",
+            1,
+            repl::LinestyleMode::Ascii,
+        ),
+    }
+}
+
+async fn cmd_cron_delete(api: &ApiClient, output: &OutputFormat, id: &str, job: &str) {
+    let sql = if job.parse::<i64>().is_ok() {
+        format!("SELECT cron.unschedule({})", job)
+    } else {
+        format!("SELECT cron.unschedule('{}')", escape_sql(job))
+    };
+    let data = execute_sql(api, id, &sql).await;
+    check_sql_error(&data);
+
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => println!("Job '{}' deleted.", job),
+    }
+}
+
+async fn cmd_cron_history(
+    api: &ApiClient,
+    output: &OutputFormat,
+    id: &str,
+    job: Option<&str>,
+    limit: u32,
+) {
+    let where_clause = match job {
+        Some(j) if j.parse::<i64>().is_ok() => format!(" WHERE jobid = {}", j),
+        Some(j) => format!(
+            " WHERE jobid IN (SELECT jobid FROM cron.job WHERE jobname = '{}')",
+            escape_sql(j)
+        ),
+        None => String::new(),
+    };
+    let sql = format!(
+        "SELECT runid, jobid, status, return_message, start_time, end_time FROM cron.job_run_details{} ORDER BY runid DESC LIMIT {}",
+        where_clause, limit
+    );
+    let data = execute_sql(api, id, &sql).await;
+    check_sql_error(&data);
+
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => repl::output::print_sql_result(
+            &data,
+            output,
+            false,
+            &None,
+            ExpandedMode::Off,
+            "NULL",
+            1,
+            repl::LinestyleMode::Ascii,
+        ),
+    }
+}
+
+async fn cmd_cron_enable(api: &ApiClient, output: &OutputFormat, id: &str, job: &str) {
+    let job_id = resolve_job_id_expr(job);
+    let sql = format!(
+        "UPDATE cron.job SET active = true WHERE jobid = {}",
+        job_id
+    );
+    let data = execute_sql(api, id, &sql).await;
+    check_sql_error(&data);
+
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => println!("Job '{}' enabled.", job),
+    }
+}
+
+async fn cmd_cron_disable(api: &ApiClient, output: &OutputFormat, id: &str, job: &str) {
+    let job_id = resolve_job_id_expr(job);
+    let sql = format!(
+        "UPDATE cron.job SET active = false WHERE jobid = {}",
+        job_id
+    );
+    let data = execute_sql(api, id, &sql).await;
+    check_sql_error(&data);
+
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => println!("Job '{}' disabled.", job),
     }
 }
 

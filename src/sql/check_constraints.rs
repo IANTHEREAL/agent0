@@ -117,6 +117,7 @@ mod tests {
         let qctx = QueryContext::new(
             1,
             Arc::from("postgres"),
+            Arc::from("postgres"),
             1_700_000_000_000,
             1_700_000_000_000,
             Arc::from("UTC"),
@@ -152,6 +153,7 @@ mod tests {
 
         let qctx = QueryContext::new(
             1,
+            Arc::from("postgres"),
             Arc::from("postgres"),
             1_700_000_000_000,
             1_700_000_000_000,

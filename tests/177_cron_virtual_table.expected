@@ -1,0 +1,56 @@
+schedule
+1
+(1 row)
+schedule
+2
+(1 row)
+schedule
+3
+(1 row)
+alter_job
+NULL
+(1 row)
+jobid|schedule|command|nodename|nodeport|database|username|active|jobname
+1|* * * * *|SELECT 1|localhost|5433|postgres|admin|t|vtab_every_min
+2|0 * * * *|SELECT 2|localhost|5433|postgres|admin|f|vtab_hourly
+3|0 0 * * *|VACUUM|localhost|5433|postgres|admin|t|vtab_daily
+(3 rows)
+jobname
+vtab_daily
+vtab_every_min
+(2 rows)
+jobname
+vtab_hourly
+(1 row)
+jobname|schedule
+vtab_every_min|* * * * *
+(1 row)
+jobname
+vtab_daily
+(1 row)
+count
+3
+(1 row)
+count
+2
+(1 row)
+jobid|runid|job_pid|database|username|command|status|return_message|start_time|end_time
+(0 rows)
+count
+0
+(1 row)
+jobname
+vtab_every_min
+(1 row)
+schedule|command
+0 0 * * *|VACUUM
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)
+unschedule
+t
+(1 row)

@@ -1,0 +1,15 @@
+schedule
+1
+(1 row)
+schedule
+1
+(1 row)
+count
+1
+(1 row)
+schedule|command
+*/10 * * * *|SELECT 2
+(1 row)
+unschedule
+t
+(1 row)
