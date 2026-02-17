@@ -24,6 +24,7 @@ PostgreSQL-compatible distributed SQL database on TiKV. Implements pgwire protoc
 
 ### Operating Principles
 
+- **PostgreSQL is the specification.** All SQL semantics, type coercion rules, catalog behavior, error codes, and wire protocol responses must align with PostgreSQL. When in doubt, test against real PostgreSQL and match its behavior — do not invent custom semantics.
 - Correctness first, then speed; optimize diagnosis path, not by shortcuts.
 - Fix only at the root layer where the invariant is broken.
 - Never use wire/test-layer masking logic to hide internal inconsistency.
@@ -35,15 +36,16 @@ PostgreSQL-compatible distributed SQL database on TiKV. Implements pgwire protoc
 ### Execution Model (single path)
 
 ```
-Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Executor/Operators -> TiKV Store -> TiKV
+Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) -> Executor/Operators -> TiKV Store -> TiKV
 ```
 
 ### Module Boundaries
 
-- `Analyzer`: name resolution, scope checking, and type inference; outputs typed IR only.
-- `Typed IR`: explicit types, explicit function/aggregate resolution, deterministic execution contract.
-- `Executor/Operators`: physical execution (scan/filter/project/sort/aggregate/join), no hidden semantic fallback.
-- `Catalog`: `information_schema` / `pg_catalog` compatibility surface and metadata contract.
+- `Analyzer` (`src/sql/analyzer/`): name resolution, scope checking, and type inference; outputs `AnalyzedQuery` / `TypedExpr`.
+- `Optimizer` (`src/sql/optimizer/`): `AnalyzedQuery -> LogicalPlan -> PhysicalPlan -> BoxedOperator`. Phase 1 live for single-table SELECTs (gated by `tipg.use_optimizer` GUC, default OFF).
+- `Operators` (`src/sql/operators/`): physical operators (scan, filter, project, sort, aggregate, hash_join, NLJ, window, CTE, set_operation, table_function).
+- `Executor` (`src/sql/executor/`): DDL/DML dispatch, SELECT execution (analyzed path at `executor/select/analyzed/`).
+- `Catalog` (`src/sql/catalog/`): `information_schema` / `pg_catalog` compatibility surface (35+ virtual table implementations).
 - `Storage`: all persistent keys must remain keyspace-isolated via `TikvStore`.
 
 ### Multi-tenancy Invariant (Critical)
@@ -51,35 +53,50 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Executor/Operators
 - All persistent data must be isolated per keyspace (`_sys_*`, table rows, indexes, auth, and future stats).
 - Process-level global state is limited to in-memory caches/config/logging.
 
+## Completed Milestones
+
+### Sprint 1 — Analyzer + Legacy Cleanup
+
+- **Task 1:** Analyzer -> Typed IR pipeline (single execution path for all SELECT queries)
+- **#56** NLJ streaming — NLJ now streams outer side, materializes only build side (`src/sql/operators/join.rs`)
+- **#609** SELECT privilege enforcement — `require_table_privilege(Select)` on every base table
+- **#634/#635** COPY CSV fixes — order-independent option parsing, ESCAPE self-escaping
+- Legacy removal: `infer_expr_type`, `executor/subquery.rs`, boolean validator, comparison coercion fallback
+- All 10 legacy code items fully resolved (#772)
+
+### CBO Phase 1 — Planner Unification + Optimizer Pipeline (#778)
+
+- `AnalyzedQuery -> LogicalPlan -> PhysicalPlan -> BoxedOperator` pipeline implemented in `src/sql/optimizer/`.
+- **Planner dual-path resolved:** TypedExpr path has full GIN + expression-index + partial-index support. EXPLAIN uses the analyzed pipeline (view expansion -> Analyzer -> typed planner). AST path retained only for non-SELECT EXPLAIN and analysis error fallback.
+- Phase 1 scope: single-table SELECTs, no optimizer rules, no statistics.
+- GUC `tipg.use_optimizer` (default OFF) — opt-in with graceful fallback.
+- Handler decomposed: `view_infer.rs`, `schema_resolve.rs`, `type_infer.rs` extracted from monolithic handler.
+- Index name uniqueness enforced within schema (#777).
+
+### CBO Phase 2 — Statistics + Selectivity Estimation (#790)
+
+- `ANALYZE` command collects per-column statistics (distinct count, null fraction, most-common values, histograms).
+- `TableStatsCache` stores full column statistics per-tenant (`src/sql/stats.rs`).
+- Selectivity estimation wired into `PhysicalPlanner` (`src/sql/optimizer/selectivity.rs`).
+- Cardinality estimates propagated through LogicalPlan nodes.
+
+### Other Recent
+
+- **fs9** file system functions: `fs9_read`, `fs9_write`, `fs9_exists`, `fs9_size`, `fs9_mtime` with global read budget for OOM protection.
+- **FTS** Chinese tokenizer support for GIN full-text search (#774).
+- **Admin** API: rich DbError detail extraction, 200 with error body for SQL failures.
+
 ## Current Problems (Active)
 
-### P0 — TypeORM `synchronize` idempotency failure
+### P1 — CBO Phases 3-4
 
-- Symptom: `relation "... already exists"` during second initialize.
-- Root layer: `Executor` (`src/sql/executor/select/analyzed/mod.rs`) scalar-in-FROM branch.
-- Cause: FROM-function path returned `NULL` for zero-arg scalar functions (e.g. `current_schema()`, `current_database()`), causing ORM introspection mismatch.
-- Direction: evaluate a real `FunctionCall` typed expression in scalar-in-FROM path.
+- Phase 3: Join reordering / decorrelation (#705) — multi-table cost-based join ordering.
+- Phase 4: Plan cache (#707) — parameterized plan reuse.
 
-### P0 — Legacy FROM-function inconsistency for `CURRENT_DATABASE`
+### P2 — Architecture Gaps
 
-- Symptom: non-deterministic database-name behavior across execution paths.
-- Root layer: `Executor` (`src/sql/executor/table_utils.rs`).
-- Cause: hardcoded `"testdb"` in legacy FROM-function handling.
-- Direction: resolve from task-local/query context, no hardcoded DB name.
-
-### P1 — TypeORM test-suite cross contamination
-
-- Symptom: `typeorm_embeddings already exists` across suites.
-- Root layer: test lifecycle hygiene in `orm-tests/typeorm/*.test.ts`.
-- Cause: missing teardown for `typeorm_embeddings` in multiple suites using `synchronize: true`.
-- Direction: each suite must drop all objects it creates (explicit cleanup in `afterAll`).
-
-### P2 — `information_schema.columns.data_type` precision for `text` vs `varchar`
-
-- Symptom: ORM expectations vary on `text`/`character varying`.
-- Root layer: `Catalog` type model (`DataType` currently lacks independent `Varchar` variant).
-- Cause: single `DataType::Text` currently serves multiple SQL declarations.
-- Direction: solve via type-model evolution; do not patch via test-only masking.
+- #704: No query rewrite phase — missing standard SQL Rewriter module.
+- #708: No parallel / distributed query execution framework.
 
 ## Repository Layout (stable)
 
@@ -87,15 +104,33 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Executor/Operators
 pg-tikv/
 ├── src/
 │   ├── sql/
+│   │   ├── analyzer/          # Semantic analysis -> AnalyzedQuery/TypedExpr
+│   │   ├── optimizer/         # CBO: LogicalPlan -> PhysicalPlan -> operators
+│   │   ├── operators/         # Physical operators (scan, join, sort, agg, window...)
+│   │   ├── executor/          # DDL/DML dispatch + select/analyzed/ path
+│   │   ├── expr/              # Expression system + functions/ (14 categories)
+│   │   ├── catalog/           # information_schema + pg_catalog (35+ views)
+│   │   ├── types/             # Type inference, coercion, mapping
+│   │   ├── binder/            # Legacy name binding
+│   │   ├── planner.rs         # Query planner (index selection, scan planning)
+│   │   ├── explain.rs         # EXPLAIN (uses analyzed pipeline)
+│   │   ├── triggers.rs        # BEFORE trigger body compilation + cache
+│   │   ├── trigger_worker.rs  # Background async trigger processing
+│   │   ├── stats.rs           # TableStatsCache (per-tenant)
+│   │   └── ...
 │   ├── protocol/
+│   │   └── handler/           # pgwire handler (dynamic.rs + view_infer, schema_resolve, type_infer)
 │   ├── storage/
+│   ├── extensions/            # HTTP extensions + fs9 file operations
 │   ├── auth/
 │   ├── types/
+│   ├── txn/                   # Transaction state + savepoints
 │   ├── pool.rs
 │   ├── tls.rs
 │   └── main.rs
 ├── tests/         # SQL integration tests
 ├── orm-tests/     # TypeORM, Prisma, Sequelize compatibility
+├── docs/          # Architecture and design documents
 └── scripts/
 ```
 
@@ -103,13 +138,20 @@ pg-tikv/
 
 | Task | Location |
 |------|----------|
-| Add SQL function | `src/sql/expr.rs` / `src/sql/expr/functions/` |
-| Add SQL statement | `src/sql/executor.rs` + `src/sql/executor/` |
+| Add SQL function | `src/sql/expr/functions/` (14 categories: array, datetime, encoding, fs9, fts, json, math, misc, pg_compat, regex, string, uuid, vector) |
+| Add SQL statement | `src/sql/executor/` (DDL in `ddl.rs`, DML in `dml_analyzed.rs`, SELECT in `select/analyzed/`) |
 | Fix type inference | `src/sql/types/infer.rs` |
+| Fix analyzer / name resolution | `src/sql/analyzer/` (query.rs, expr.rs, scope.rs) |
+| Optimizer / query planning | `src/sql/optimizer/` (logical_planner.rs -> physical_planner.rs -> build.rs) |
+| Physical operators | `src/sql/operators/` (scan, join, hash_join, sort, aggregate, window, etc.) |
+| Index planning / scan strategy | `src/sql/planner.rs` |
+| EXPLAIN output | `src/sql/explain.rs` |
 | Add PostgreSQL type mapping | `src/protocol/handler/encode/types.rs` |
 | Change key encoding | `src/storage/encoding.rs` |
-| Catalog behavior | `src/sql/catalog/` + `src/sql/information_schema.rs` |
+| Catalog / pg_catalog views | `src/sql/catalog/` (35+ pg_* view implementations) |
 | Multi-tenancy | `src/pool.rs` + username parsing in handler |
+| Triggers | `src/sql/triggers.rs` (body cache) + `src/sql/executor/triggers.rs` (DDL) + `src/sql/trigger_worker.rs` (async) |
+| Transaction state | `src/txn/` (state.rs, savepoints.rs) |
 
 ## Build & Test Commands
 
@@ -133,3 +175,7 @@ cd orm-tests && npm test
 - `src/sql/AGENTS.md` - SQL execution details
 - `src/protocol/AGENTS.md` - Wire protocol details
 - `src/storage/AGENTS.md` - Storage layer details
+
+## Design Documents
+
+- `docs/architecture.md` - Comprehensive architecture design with principles and execution pipeline
