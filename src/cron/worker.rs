@@ -49,7 +49,7 @@ impl CronWorker {
     }
 
     async fn tick(&self, pool: &Arc<TikvClientPool>) -> Result<()> {
-        let keyspaces = pool.list_active_keyspaces().await;
+        let keyspaces = pool.list_all_keyspaces().await;
         if keyspaces.is_empty() {
             return Ok(());
         }
@@ -269,7 +269,7 @@ impl CronWorker {
         loop {
             interval.tick().await;
 
-            let keyspaces = pool.list_active_keyspaces().await;
+            let keyspaces = pool.list_all_keyspaces().await;
             for keyspace in keyspaces {
                 if let Err(e) = self.gc_keyspace(&pool, &keyspace).await {
                     warn!("cron GC error for {}: {}", keyspace, e);
