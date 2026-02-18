@@ -341,6 +341,36 @@ pub(super) fn substitute_outer_refs_in_expr(expr: &TypedExpr, outer_row: &Row) -
                 )
             }
         }
+        TypedExprKind::AnyAll {
+            expr: inner,
+            op,
+            subquery,
+            is_all,
+        } => {
+            let inner_sub = substitute_outer_refs_in_expr(inner, outer_row);
+            if is_correlated_query(subquery) {
+                let sub = substitute_outer_refs_in_query(subquery, outer_row);
+                TypedExpr::new(
+                    TypedExprKind::AnyAll {
+                        expr: Box::new(inner_sub),
+                        op: op.clone(),
+                        subquery: Box::new(sub),
+                        is_all: *is_all,
+                    },
+                    expr.data_type.clone(),
+                )
+            } else {
+                TypedExpr::new(
+                    TypedExprKind::AnyAll {
+                        expr: Box::new(inner_sub),
+                        op: op.clone(),
+                        subquery: subquery.clone(),
+                        is_all: *is_all,
+                    },
+                    expr.data_type.clone(),
+                )
+            }
+        }
         // Recurse into composite nodes.
         TypedExprKind::BinaryOp { left, right, op } => TypedExpr::new(
             TypedExprKind::BinaryOp {
@@ -528,7 +558,7 @@ pub(super) fn substitute_outer_refs_in_expr(expr: &TypedExpr, outer_row: &Row) -
         ),
         // Leaf nodes that don't contain column refs.
         TypedExprKind::Constant(_) => expr.clone(),
-        // Anything else: clone as-is (SimilarTo, WindowCall, MinMax, Row, ArrayLiteral, AnyAll).
+        // Anything else: clone as-is (SimilarTo, WindowCall, MinMax, Row, ArrayLiteral).
         _ => expr.clone(),
     }
 }

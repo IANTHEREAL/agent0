@@ -11,16 +11,13 @@ use crate::sql::analyzer::types::{
     BinaryOp as TypedBinaryOp, JoinCondition, TypedExpr, TypedExprKind, TypedFunctionArg,
     TypedOrderByExpr,
 };
-use crate::sql::analyzer::{AnalyzedQuery, Analyzer};
-use crate::sql::executor::core::catalog_prefetch::build_catalog_snapshot;
-use crate::sql::executor::core::view_rewrite::expand_views_in_query;
+use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::typed_eval::{eval_const_usize, eval_typed_expr};
 use crate::sql::sequences::resolve_sequence_full_name_from_value;
 use crate::sql::ExecuteResult;
 use crate::types::{DataType, Row, TableSchema, Value};
 
-use crate::sql::error::SqlError;
 use crate::sql::optimizer::{BuildContext, PlanningContext};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, ObjectName, Query, SetExpr};
@@ -51,51 +48,9 @@ impl Executor {
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
         current_role: Option<&str>,
     ) -> Result<ExecuteResult> {
-        // Pre-analysis rewrite: expand views into derived subqueries.
-        //
-        // Ensures the Analyzer and planner see a single query tree, and the
-        // executor never needs runtime view expansion in table loading.
-        let expanded_query =
-            expand_views_in_query(self.store().as_ref(), txn, db_id, search_path, query).await?;
-
-        // Build CatalogSnapshot (async: fetches table schemas from store).
-        let catalog = build_catalog_snapshot(
-            self.store().as_ref(),
-            txn,
-            db_id,
-            search_path,
-            self.tenant_keyspace(),
-            &expanded_query,
-            ctes,
-        )
-        .await?;
-
-        // ── SELECT privilege check ──────────────────────────────────
-        // Check that the current role has SELECT privilege on every base
-        // table referenced in this query.  Virtual catalog tables
-        // (information_schema, pg_catalog) are exempt.
-        if current_role.is_some() {
-            for table_name in catalog.base_table_full_names() {
-                self.require_table_privilege(
-                    txn,
-                    current_role,
-                    crate::auth::Privilege::Select,
-                    table_name,
-                )
-                .await?;
-            }
-        }
-
-        // Run the Analyzer (sync: name resolution + type checking).
-        let mut analyzer = Analyzer::new(&catalog);
-        let analyzed = analyzer
-            .analyze_query(&expanded_query)
-            .map_err(SqlError::from)?;
-
-        // Post-analysis rewrite: flatten simple view subqueries back to
-        // direct table references so the optimizer and planner can use
-        // index-aware scan strategies.
-        let analyzed = crate::sql::rewriter::rewrite_query(analyzed);
+        let (expanded_query, analyzed) = self
+            .analyze_then_rewrite_query(txn, db_id, search_path, query, ctes, current_role)
+            .await?;
 
         // ── Pre-materialize async expressions ──────────────────────
         // Resolve non-correlated subqueries → constants BEFORE the optimizer

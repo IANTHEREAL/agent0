@@ -277,325 +277,6 @@ fn preprocess_cte_materialized(sql: &str) -> Option<String> {
     Some(out.into_owned())
 }
 
-/// Rewrite `expr op ALL (SELECT ...)` and `expr op ANY (SELECT ...)` patterns
-/// into equivalent forms that `sqlparser` can parse.
-///
-/// Notes:
-/// - Empty subquery: `ALL(empty)` is true, `ANY(empty)` is false.
-/// - `NULL` values: the result can be `NULL` (unknown) per SQL 3-valued logic.
-/// - The rewrite preserves these edge cases via `COUNT(*)` / `COUNT(val)` checks.
-fn rewrite_all_any_subqueries(sql: &str) -> String {
-    let mut result = sql.to_string();
-
-    const DERIVED_ALIAS: &str = "__pgtikv_all_any";
-    const DERIVED_COL: &str = "__pgtikv_val";
-
-    fn scalar_over_subquery(subquery: &str, select_expr: &str) -> String {
-        format!(
-            "(SELECT {} FROM ({}) AS {}({}))",
-            select_expr, subquery, DERIVED_ALIAS, DERIVED_COL
-        )
-    }
-
-    fn count_all(subquery: &str) -> String {
-        scalar_over_subquery(subquery, "COUNT(*)")
-    }
-
-    fn count_nonnull(subquery: &str) -> String {
-        scalar_over_subquery(subquery, "COUNT(__pgtikv_val)")
-    }
-
-    fn max_val(subquery: &str) -> String {
-        scalar_over_subquery(subquery, "MAX(__pgtikv_val)")
-    }
-
-    fn min_val(subquery: &str) -> String {
-        scalar_over_subquery(subquery, "MIN(__pgtikv_val)")
-    }
-
-    fn cast_bool(expr: &str) -> String {
-        format!("CAST({} AS BOOLEAN)", expr)
-    }
-
-    fn rewrite_all(expr: &str, op: &str, subquery: &str) -> Option<String> {
-        let expr = format!("({})", expr);
-        let cnt_all = count_all(subquery);
-        let cnt_nonnull = count_nonnull(subquery);
-        let has_nulls = format!("{} < {}", cnt_nonnull, cnt_all);
-
-        let rewritten = match op {
-            ">=" => {
-                let max = max_val(subquery);
-                format!(
-                    "({})",
-                    format!(
-                        "CASE WHEN {} = 0 THEN TRUE \
-                         WHEN {} IS NULL THEN NULL \
-                         WHEN {} < {} THEN FALSE \
-                         WHEN {} THEN NULL \
-                         ELSE TRUE END",
-                        cnt_all, expr, expr, max, has_nulls
-                    )
-                )
-            }
-            ">" => {
-                let max = max_val(subquery);
-                format!(
-                    "({})",
-                    format!(
-                        "CASE WHEN {} = 0 THEN TRUE \
-                         WHEN {} IS NULL THEN NULL \
-                         WHEN {} <= {} THEN FALSE \
-                         WHEN {} THEN NULL \
-                         ELSE TRUE END",
-                        cnt_all, expr, expr, max, has_nulls
-                    )
-                )
-            }
-            "<=" => {
-                let min = min_val(subquery);
-                format!(
-                    "({})",
-                    format!(
-                        "CASE WHEN {} = 0 THEN TRUE \
-                         WHEN {} IS NULL THEN NULL \
-                         WHEN {} > {} THEN FALSE \
-                         WHEN {} THEN NULL \
-                         ELSE TRUE END",
-                        cnt_all, expr, expr, min, has_nulls
-                    )
-                )
-            }
-            "<" => {
-                let min = min_val(subquery);
-                format!(
-                    "({})",
-                    format!(
-                        "CASE WHEN {} = 0 THEN TRUE \
-                         WHEN {} IS NULL THEN NULL \
-                         WHEN {} >= {} THEN FALSE \
-                         WHEN {} THEN NULL \
-                         ELSE TRUE END",
-                        cnt_all, expr, expr, min, has_nulls
-                    )
-                )
-            }
-            "=" | "==" => {
-                let min = min_val(subquery);
-                let max = max_val(subquery);
-                format!(
-                    "({})",
-                    format!(
-                        "CASE WHEN {} = 0 THEN TRUE \
-                         WHEN {} IS NULL THEN NULL \
-                         WHEN {} = 0 THEN NULL \
-                         WHEN {} = {} AND {} = {} THEN \
-                             CASE WHEN {} THEN NULL ELSE TRUE END \
-                         ELSE FALSE END",
-                        cnt_all, expr, cnt_nonnull, expr, min, expr, max, has_nulls
-                    )
-                )
-            }
-            "<>" | "!=" => format!("({} NOT IN ({}))", expr, subquery),
-            _ => return None,
-        };
-
-        Some(cast_bool(&rewritten))
-    }
-
-    fn rewrite_any(expr: &str, op: &str, subquery: &str) -> Option<String> {
-        let expr = format!("({})", expr);
-        let cnt_all = count_all(subquery);
-        let cnt_nonnull = count_nonnull(subquery);
-        let has_nulls = format!("{} < {}", cnt_nonnull, cnt_all);
-
-        let rewritten = match op {
-            ">" => {
-                let min = min_val(subquery);
-                format!(
-                    "({})",
-                    format!(
-                        "CASE WHEN {} = 0 THEN FALSE \
-                         WHEN {} IS NULL THEN NULL \
-                         WHEN {} > {} THEN TRUE \
-                         WHEN {} THEN NULL \
-                         ELSE FALSE END",
-                        cnt_all, expr, expr, min, has_nulls
-                    )
-                )
-            }
-            ">=" => {
-                let min = min_val(subquery);
-                format!(
-                    "({})",
-                    format!(
-                        "CASE WHEN {} = 0 THEN FALSE \
-                         WHEN {} IS NULL THEN NULL \
-                         WHEN {} >= {} THEN TRUE \
-                         WHEN {} THEN NULL \
-                         ELSE FALSE END",
-                        cnt_all, expr, expr, min, has_nulls
-                    )
-                )
-            }
-            "<" => {
-                let max = max_val(subquery);
-                format!(
-                    "({})",
-                    format!(
-                        "CASE WHEN {} = 0 THEN FALSE \
-                         WHEN {} IS NULL THEN NULL \
-                         WHEN {} < {} THEN TRUE \
-                         WHEN {} THEN NULL \
-                         ELSE FALSE END",
-                        cnt_all, expr, expr, max, has_nulls
-                    )
-                )
-            }
-            "<=" => {
-                let max = max_val(subquery);
-                format!(
-                    "({})",
-                    format!(
-                        "CASE WHEN {} = 0 THEN FALSE \
-                         WHEN {} IS NULL THEN NULL \
-                         WHEN {} <= {} THEN TRUE \
-                         WHEN {} THEN NULL \
-                         ELSE FALSE END",
-                        cnt_all, expr, expr, max, has_nulls
-                    )
-                )
-            }
-            "=" | "==" => format!("({} IN ({}))", expr, subquery),
-            "<>" | "!=" => {
-                let min = min_val(subquery);
-                let max = max_val(subquery);
-                format!(
-                    "({})",
-                    format!(
-                        "CASE WHEN {} = 0 THEN FALSE \
-                         WHEN {} IS NULL THEN NULL \
-                         WHEN {} <> {} OR {} <> {} THEN TRUE \
-                         WHEN {} THEN NULL \
-                         ELSE FALSE END",
-                        cnt_all, expr, expr, min, expr, max, has_nulls
-                    )
-                )
-            }
-            _ => return None,
-        };
-
-        Some(cast_bool(&rewritten))
-    }
-
-    // Match: expr OP ALL (SELECT ...) or expr OP ANY (SELECT ...)
-    let all_pattern =
-        Regex::new(r"(?i)(\S+)\s*(>=|<=|>|<|=|<>|!=)\s*ALL\s*\(\s*(SELECT\s+)").unwrap();
-
-    let any_pattern =
-        Regex::new(r"(?i)(\S+)\s*(>=|<=|>|<|=|<>|!=)\s*ANY\s*\(\s*(SELECT\s+)").unwrap();
-
-    // Process ALL patterns: x OP ALL (SELECT col ...) -> x OP (SELECT AGG(col) ...)
-    while let Some(caps) = all_pattern.captures(&result) {
-        let full_match = caps.get(0).unwrap();
-        let expr = caps.get(1).unwrap().as_str();
-        let op = caps.get(2).unwrap().as_str();
-        let select_start = caps.get(3).unwrap().as_str();
-
-        let match_start = full_match.start();
-        let select_pos = full_match.end() - select_start.len();
-
-        if let Some((subquery, end_pos)) = extract_subquery(&result, select_pos) {
-            let op_upper = op.to_uppercase();
-            let replacement = match rewrite_all(expr, op_upper.as_str(), &subquery) {
-                Some(r) => r,
-                None => continue,
-            };
-
-            result = format!(
-                "{}{}{}",
-                &result[..match_start],
-                replacement,
-                &result[end_pos..]
-            );
-        } else {
-            break;
-        }
-    }
-
-    // Process ANY patterns: x OP ANY (SELECT col ...) -> x OP (SELECT AGG(col) ...) or x IN (...)
-    while let Some(caps) = any_pattern.captures(&result) {
-        let full_match = caps.get(0).unwrap();
-        let expr = caps.get(1).unwrap().as_str();
-        let op = caps.get(2).unwrap().as_str();
-        let select_start = caps.get(3).unwrap().as_str();
-
-        let match_start = full_match.start();
-        let select_pos = full_match.end() - select_start.len();
-
-        if let Some((subquery, end_pos)) = extract_subquery(&result, select_pos) {
-            let op_upper = op.to_uppercase();
-            let replacement = match rewrite_any(expr, op_upper.as_str(), &subquery) {
-                Some(r) => r,
-                None => continue,
-            };
-
-            result = format!(
-                "{}{}{}",
-                &result[..match_start],
-                replacement,
-                &result[end_pos..]
-            );
-        } else {
-            break;
-        }
-    }
-
-    result
-}
-
-/// Extract a subquery starting at the given position, handling nested parentheses.
-/// Returns the subquery string (including SELECT) and the position after the closing paren.
-fn extract_subquery(sql: &str, start: usize) -> Option<(String, usize)> {
-    let bytes = sql.as_bytes();
-    let mut depth = 1; // We're already inside the opening paren
-    let mut pos = start;
-    while pos < bytes.len() {
-        match bytes[pos] {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    // Found the matching close paren
-                    let subquery = sql[start..pos].to_string();
-                    return Some((subquery, pos + 1)); // +1 to skip the closing paren
-                }
-            }
-            b'\'' => {
-                // Skip string literals
-                pos += 1;
-                while pos < bytes.len() && bytes[pos] != b'\'' {
-                    if bytes[pos] == b'\\' {
-                        pos += 1; // Skip escaped char
-                    }
-                    pos += 1;
-                }
-            }
-            b'"' => {
-                // Skip quoted identifiers
-                pos += 1;
-                while pos < bytes.len() && bytes[pos] != b'"' {
-                    pos += 1;
-                }
-            }
-            _ => {}
-        }
-        pos += 1;
-    }
-
-    None // Couldn't find matching paren
-}
-
 fn preprocess_sql(sql: &str) -> String {
     let mut result = sql.to_string();
 
@@ -613,9 +294,9 @@ fn preprocess_sql(sql: &str) -> String {
         result = materialized;
     }
 
-    // Rewrite ALL/ANY subquery patterns
-    result = rewrite_all_any_subqueries(&result);
-
+    // Parse-compat rewrites only: these normalize syntax for sqlparser-rs
+    // limitations and must not perform semantic query-shape rewrites.
+    result = rewrite_all_any_subquery_parse_compat(&result);
     result = rewrite_jsonb_exists_ops(&result);
 
     result = rewrite_vector_distance_ops(&result);
@@ -1043,6 +724,116 @@ fn skip_ws_comments_backward(tokens: &[Token], mut idx: usize, start: usize) -> 
         idx -= 1;
     }
     idx
+}
+
+/// Parse-compat rewrite for `ANY/ALL (SELECT ...)`.
+///
+/// sqlparser-rs doesn't parse the direct PostgreSQL subquery form, but it does
+/// parse `ANY/ALL (ARRAY(SELECT ...))`. We only wrap the subquery shape here;
+/// semantic handling remains in Analyzer/Rewriter on typed IR.
+fn rewrite_all_any_subquery_parse_compat(sql: &str) -> String {
+    let mut current = sql.to_string();
+    loop {
+        let next = rewrite_all_any_subquery_parse_compat_once(&current);
+        if next == current {
+            return current;
+        }
+        current = next;
+    }
+}
+
+fn rewrite_all_any_subquery_parse_compat_once(sql: &str) -> String {
+    let tokens = tokenize_sql_for_rewrite(sql);
+    if tokens.is_empty() {
+        return sql.to_string();
+    }
+
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let tok = &tokens[idx];
+        if tok.kind != TokenKind::Word
+            || (!tok.text.eq_ignore_ascii_case("ANY") && !tok.text.eq_ignore_ascii_case("ALL"))
+        {
+            idx += 1;
+            continue;
+        }
+
+        let mut j = skip_ws_comments_forward(&tokens, idx + 1, tokens.len());
+        if j >= tokens.len() || tokens[j].kind != TokenKind::Punct || tokens[j].text != "(" {
+            idx += 1;
+            continue;
+        }
+
+        j = skip_ws_comments_forward(&tokens, j + 1, tokens.len());
+        if j >= tokens.len()
+            || tokens[j].kind != TokenKind::Word
+            || !tokens[j].text.eq_ignore_ascii_case("SELECT")
+        {
+            idx += 1;
+            continue;
+        }
+
+        let select_start = tokens[j].start;
+        if let Some((subquery, end_pos)) = extract_subquery(sql, select_start) {
+            replacements.push((select_start, end_pos, format!("ARRAY({}))", subquery)));
+            while idx < tokens.len() && tokens[idx].start < end_pos {
+                idx += 1;
+            }
+            continue;
+        }
+
+        idx += 1;
+    }
+
+    if replacements.is_empty() {
+        return sql.to_string();
+    }
+
+    replacements.sort_by_key(|(s, _, _)| *s);
+    let mut out = sql.to_string();
+    for (start, end, repl) in replacements.into_iter().rev() {
+        out.replace_range(start..end, &repl);
+    }
+    out
+}
+
+/// Extract a subquery starting at `start` (position of `SELECT`) and return:
+/// - subquery text (without the closing `)`)
+/// - end position just after that closing `)`
+fn extract_subquery(sql: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = sql.as_bytes();
+    let mut depth = 1; // caller is inside `(...` already
+    let mut pos = start;
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((sql[start..pos].to_string(), pos + 1));
+                }
+            }
+            b'\'' => {
+                pos += 1;
+                while pos < bytes.len() && bytes[pos] != b'\'' {
+                    if bytes[pos] == b'\\' {
+                        pos += 1;
+                    }
+                    pos += 1;
+                }
+            }
+            b'"' => {
+                pos += 1;
+                while pos < bytes.len() && bytes[pos] != b'"' {
+                    pos += 1;
+                }
+            }
+            _ => {}
+        }
+        pos += 1;
+    }
+    None
 }
 
 fn rewrite_jsonb_exists_ops(sql: &str) -> String {
@@ -1680,33 +1471,30 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_all_any_subqueries_parses() {
-        let sql = "SELECT 1 = ALL (SELECT x FROM t)";
-        let stmts = parse_sql(sql).unwrap();
+    fn test_all_any_subqueries_parse_via_parse_compat_wrapper() {
+        let all_sql = "SELECT 1 = ALL (SELECT x FROM t)";
+        let all_preprocessed = preprocess_sql(all_sql);
+        assert_eq!(all_preprocessed, "SELECT 1 = ALL (ARRAY(SELECT x FROM t))");
+        let stmts = parse_sql(all_sql).unwrap();
         assert_eq!(stmts.len(), 1);
 
-        let sql = "SELECT 1 > ANY (SELECT x FROM t)";
-        let stmts = parse_sql(sql).unwrap();
+        let any_sql = "SELECT 1 > ANY (SELECT x FROM t)";
+        let any_preprocessed = preprocess_sql(any_sql);
+        assert_eq!(any_preprocessed, "SELECT 1 > ANY (ARRAY(SELECT x FROM t))");
+        let stmts = parse_sql(any_sql).unwrap();
         assert_eq!(stmts.len(), 1);
     }
 
     #[test]
-    fn test_rewrite_all_any_subqueries_all_eq_uses_min_max_and_null_handling() {
-        let preprocessed = preprocess_sql("SELECT a = ALL (SELECT DISTINCT x FROM t)");
-        assert!(preprocessed.contains("MIN(__pgtikv_val)"));
-        assert!(preprocessed.contains("MAX(__pgtikv_val)"));
-        assert!(preprocessed.contains("COUNT(*)"));
-        assert!(preprocessed.contains("COUNT(__pgtikv_val)"));
-        assert!(preprocessed.contains("SELECT DISTINCT x FROM t"));
-    }
-
-    #[test]
-    fn test_rewrite_all_any_subqueries_empty_and_null_semantics_checks_present() {
-        let preprocessed = preprocess_sql("SELECT a >= ALL (SELECT x FROM t)");
-        assert!(preprocessed.contains("CASE WHEN"));
-        assert!(preprocessed.contains("= 0 THEN TRUE"));
-        assert!(preprocessed.contains("COUNT(__pgtikv_val)"));
-        assert!(preprocessed.contains("< (SELECT COUNT(*)"));
+    fn test_preprocess_keeps_all_any_inside_literals_and_comments() {
+        assert_eq!(
+            preprocess_sql("SELECT '1 = ALL (SELECT x FROM t)'"),
+            "SELECT '1 = ALL (SELECT x FROM t)'"
+        );
+        assert_eq!(
+            preprocess_sql("-- 1 > ANY (SELECT x FROM t)\nSELECT 1"),
+            "-- 1 > ANY (SELECT x FROM t)\nSELECT 1"
+        );
     }
 
     #[test]

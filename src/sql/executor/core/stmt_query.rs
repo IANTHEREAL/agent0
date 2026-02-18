@@ -1,9 +1,6 @@
 //! Query statement sub-dispatcher
 
-use super::catalog_prefetch::build_catalog_snapshot;
-use super::view_rewrite::expand_views_in_query;
 use super::*;
-use crate::sql::analyzer::Analyzer;
 
 impl Executor {
     pub(super) async fn execute_query_statement(
@@ -155,71 +152,56 @@ impl Executor {
 
         let row_count_lookup = |_table_name: &str| -> usize { 1000 };
 
-        // For SELECT/WITH queries, run the same analysis pipeline as execution
-        // (view expansion → catalog snapshot → Analyzer) so EXPLAIN shows the
-        // same plan that actually runs.  Non-SELECT statements use the legacy
-        // AST-based plan generation.
+        // For SELECT/WITH queries, use the exact same analyze+rewrite entry as
+        // execution. Non-SELECT statements use the AST trivial-plan path.
         let plan = if let Statement::Query(query) = statement {
-            let expanded =
-                expand_views_in_query(self.store().as_ref(), txn, db_id, search_path, query)
-                    .await?;
-            let catalog = build_catalog_snapshot(
-                self.store().as_ref(),
-                txn,
-                db_id,
-                search_path,
-                self.tenant_keyspace(),
-                &expanded,
-                &HashMap::new(),
-            )
-            .await?;
-            let mut analyzer = Analyzer::new(&catalog);
-            match analyzer.analyze_query(&expanded) {
-                Ok(analyzed) => {
-                    // Same rewrite as execution path — invariant: EXPLAIN = execution.
-                    let analyzed = crate::sql::rewriter::rewrite_query(analyzed);
+            let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
+            let (_expanded, analyzed) = self
+                .analyze_then_rewrite_query(
+                    txn,
+                    db_id,
+                    search_path,
+                    query,
+                    &empty_ctes,
+                    current_role,
+                )
+                .await?;
 
-                    // Always use the optimizer pipeline — single execution path.
-                    // Build PlanningContext with real table statistics and schemas,
-                    // identical to execution path.
-                    let mut planning_ctx = crate::sql::optimizer::PlanningContext::empty();
-                    {
-                        let table_refs = crate::sql::optimizer::collect_query_table_refs(&analyzed);
-                        let cte_names: HashSet<String> = analyzed
-                            .ctes
-                            .iter()
-                            .map(|c| c.name.to_lowercase())
-                            .collect();
-                        let mut stats_attempted = HashSet::new();
-                        for (name, schema, alias) in &table_refs {
-                            let ctx_key = crate::sql::optimizer::schema_map_key(name, *alias);
-                            let tid = schema.table_id;
-                            let stats = if stats_attempted.insert(tid) {
-                                self.get_or_load_stats(txn, db_id, tid).await?
-                            } else {
-                                self.stats_cache().get_full_stats(db_id, tid)
-                            };
-                            if let Some(stats) = stats {
-                                planning_ctx.table_stats.insert(ctx_key.clone(), stats);
-                            }
-                            let cte_key = name.to_lowercase();
-                            if !cte_names.contains(&cte_key) {
-                                if let Some(table_schema) =
-                                    self.store().get_schema(txn, db_id, name).await?
-                                {
-                                    planning_ctx.table_schemas.insert(ctx_key, table_schema);
-                                }
-                            }
+            // Always use the optimizer pipeline — single execution path.
+            // Build PlanningContext with real table statistics and schemas,
+            // identical to execution path.
+            let mut planning_ctx = crate::sql::optimizer::PlanningContext::empty();
+            {
+                let table_refs = crate::sql::optimizer::collect_query_table_refs(&analyzed);
+                let cte_names: HashSet<String> = analyzed
+                    .ctes
+                    .iter()
+                    .map(|c| c.name.to_lowercase())
+                    .collect();
+                let mut stats_attempted = HashSet::new();
+                for (name, schema, alias) in &table_refs {
+                    let ctx_key = crate::sql::optimizer::schema_map_key(name, *alias);
+                    let tid = schema.table_id;
+                    let stats = if stats_attempted.insert(tid) {
+                        self.get_or_load_stats(txn, db_id, tid).await?
+                    } else {
+                        self.stats_cache().get_full_stats(db_id, tid)
+                    };
+                    if let Some(stats) = stats {
+                        planning_ctx.table_stats.insert(ctx_key.clone(), stats);
+                    }
+                    let cte_key = name.to_lowercase();
+                    if !cte_names.contains(&cte_key) {
+                        if let Some(table_schema) =
+                            self.store().get_schema(txn, db_id, name).await?
+                        {
+                            planning_ctx.table_schemas.insert(ctx_key, table_schema);
                         }
                     }
-                    let physical = crate::sql::optimizer::optimize(&analyzed, &planning_ctx)?;
-                    explain::physical_plan_to_plan_node(&physical)
-                }
-                Err(_) => {
-                    // Fallback to AST path if analysis fails (e.g. invalid query)
-                    explain::generate_plan(statement, &schema_lookup, &row_count_lookup)
                 }
             }
+            let physical = crate::sql::optimizer::optimize(&analyzed, &planning_ctx)?;
+            explain::physical_plan_to_plan_node(&physical)
         } else {
             // Non-SELECT statements (DDL, DML) — use AST path
             // (these produce a trivial Result node)

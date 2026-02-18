@@ -1313,6 +1313,68 @@ fn analyze_in_subquery_single_column_ok() {
     assert!(analyzer.analyze_query(&query).is_ok());
 }
 
+#[test]
+fn analyze_any_subquery_produces_anyall_typed_expr() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query =
+        parse_query("SELECT id FROM users WHERE id = ANY (ARRAY(SELECT user_id FROM orders))");
+    let analyzed = analyzer.analyze_query(&query).unwrap();
+    let select = expect_select(&analyzed);
+    let where_expr = select.where_clause.as_ref().expect("missing WHERE clause");
+    match &where_expr.kind {
+        TypedExprKind::AnyAll {
+            op,
+            is_all,
+            subquery,
+            ..
+        } => {
+            assert_eq!(*op, BinaryOp::Eq);
+            assert!(!*is_all);
+            assert_eq!(subquery.output_schema.len(), 1);
+        }
+        other => panic!("expected AnyAll, got {:?}", std::mem::discriminant(other)),
+    }
+}
+
+#[test]
+fn analyze_all_subquery_produces_anyall_typed_expr() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query =
+        parse_query("SELECT id FROM users WHERE id >= ALL (ARRAY(SELECT user_id FROM orders))");
+    let analyzed = analyzer.analyze_query(&query).unwrap();
+    let select = expect_select(&analyzed);
+    let where_expr = select.where_clause.as_ref().expect("missing WHERE clause");
+    match &where_expr.kind {
+        TypedExprKind::AnyAll {
+            op,
+            is_all,
+            subquery,
+            ..
+        } => {
+            assert_eq!(*op, BinaryOp::GtEq);
+            assert!(*is_all);
+            assert_eq!(subquery.output_schema.len(), 1);
+        }
+        other => panic!("expected AnyAll, got {:?}", std::mem::discriminant(other)),
+    }
+}
+
+#[test]
+fn analyze_any_subquery_multi_column_rejected() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query(
+        "SELECT id FROM users WHERE id = ANY (ARRAY(SELECT order_id, amount FROM orders))",
+    );
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::ScalarSubqueryMultipleColumns { got: 2 }
+    ));
+}
+
 // ── Set operation validation (#718) ─────────────────────────
 
 #[test]

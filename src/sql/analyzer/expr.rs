@@ -561,6 +561,13 @@ impl<'a> Analyzer<'a> {
                 compare_op,
                 right,
             } => {
+                if let Expr::Subquery(subquery) = right.as_ref() {
+                    return self.analyze_any_all_subquery(left, compare_op, subquery, false);
+                }
+                if let Expr::ArraySubquery(subquery) = right.as_ref() {
+                    return self.analyze_any_all_subquery(left, compare_op, subquery, false);
+                }
+
                 let left_expr = self.analyze_expr(left)?;
                 let right_expr = self.analyze_expr(right)?;
 
@@ -643,6 +650,13 @@ impl<'a> Analyzer<'a> {
                 compare_op,
                 right,
             } => {
+                if let Expr::Subquery(subquery) = right.as_ref() {
+                    return self.analyze_any_all_subquery(left, compare_op, subquery, true);
+                }
+                if let Expr::ArraySubquery(subquery) = right.as_ref() {
+                    return self.analyze_any_all_subquery(left, compare_op, subquery, true);
+                }
+
                 let left_expr = self.analyze_expr(left)?;
                 let right_expr = self.analyze_expr(right)?;
 
@@ -655,20 +669,7 @@ impl<'a> Analyzer<'a> {
                             DataType::Boolean,
                         ));
                     }
-                    let op = match compare_op {
-                        BinaryOperator::Eq => BinaryOp::Eq,
-                        BinaryOperator::NotEq => BinaryOp::NotEq,
-                        BinaryOperator::Lt => BinaryOp::Lt,
-                        BinaryOperator::LtEq => BinaryOp::LtEq,
-                        BinaryOperator::Gt => BinaryOp::Gt,
-                        BinaryOperator::GtEq => BinaryOp::GtEq,
-                        other => {
-                            return Err(AnalyzerError::Unsupported(format!(
-                                "ALL with operator: {:?}",
-                                other,
-                            )));
-                        }
-                    };
+                    let op = self.any_all_compare_op(compare_op)?;
                     // Build: (left op elem[0]) AND (left op elem[1]) AND ...
                     let comparisons: Vec<TypedExpr> = elems
                         .into_iter()
@@ -708,6 +709,57 @@ impl<'a> Analyzer<'a> {
             other => Err(AnalyzerError::Unsupported(format!(
                 "expression type not yet supported: {:?}",
                 std::mem::discriminant(other),
+            ))),
+        }
+    }
+
+    fn analyze_any_all_subquery(
+        &mut self,
+        left: &Expr,
+        compare_op: &BinaryOperator,
+        subquery: &ast::Query,
+        is_all: bool,
+    ) -> Result<TypedExpr, AnalyzerError> {
+        let mut left_expr = self.analyze_expr(left)?;
+        let analyzed = self.analyze_query(subquery)?;
+        if analyzed.output_schema.len() != 1 {
+            return Err(AnalyzerError::ScalarSubqueryMultipleColumns {
+                got: analyzed.output_schema.len(),
+            });
+        }
+
+        let right_type = analyzed.output_schema[0].1.clone();
+        if left_expr.is_null_constant() {
+            left_expr = TypedExpr::null(right_type.clone());
+        } else if left_expr.data_type != right_type {
+            if let Some(target) = comparison_target_type(&left_expr.data_type, &right_type) {
+                left_expr = self.coerce_if_needed(left_expr, &target);
+            }
+        }
+
+        let op = self.any_all_compare_op(compare_op)?;
+        Ok(TypedExpr::new(
+            TypedExprKind::AnyAll {
+                expr: Box::new(left_expr),
+                op,
+                subquery: Box::new(analyzed),
+                is_all,
+            },
+            DataType::Boolean,
+        ))
+    }
+
+    fn any_all_compare_op(&self, compare_op: &BinaryOperator) -> Result<BinaryOp, AnalyzerError> {
+        match compare_op {
+            BinaryOperator::Eq => Ok(BinaryOp::Eq),
+            BinaryOperator::NotEq => Ok(BinaryOp::NotEq),
+            BinaryOperator::Lt => Ok(BinaryOp::Lt),
+            BinaryOperator::LtEq => Ok(BinaryOp::LtEq),
+            BinaryOperator::Gt => Ok(BinaryOp::Gt),
+            BinaryOperator::GtEq => Ok(BinaryOp::GtEq),
+            other => Err(AnalyzerError::Unsupported(format!(
+                "ANY/ALL with operator: {:?}",
+                other,
             ))),
         }
     }

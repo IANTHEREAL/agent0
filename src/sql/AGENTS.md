@@ -179,7 +179,7 @@ src/sql/
 | Triggers | `triggers/` (cache, before, queue, worker, enqueue, execute, claim, gc) + `executor/triggers.rs` (DDL) |
 | Views | `executor/core/view_rewrite.rs` |
 | Privileges | `executor/core/statement.rs` + `rbac.rs` |
-| EXPLAIN | `explain.rs` (uses analyzed pipeline, not legacy AST) |
+| EXPLAIN | `executor/core/stmt_query.rs` + `explain.rs` (SELECT/WITH uses analyzed pipeline; non-SELECT uses AST trivial plan) |
 
 ## Key Architectural Contracts
 
@@ -187,8 +187,9 @@ src/sql/
 2. **TypedExpr carries type**: Every `TypedExpr` node has a resolved `DataType`. All column refs -> positional indices. No unresolved names escape the Analyzer.
 3. **Optimizer is default ON**: CBO pipeline gated by `tipg.use_optimizer` GUC (default ON). Covers single-table, multi-table joins, set operations, CTEs, window functions, and DISTINCT ON. Safety valve: `SET tipg.use_optimizer = off`.
 4. **Volcano iterator model**: Operators implement `open() -> next() -> close()` lifecycle for streaming execution.
-5. **EXPLAIN matches execution**: EXPLAIN uses `generate_plan_from_analyzed()`, same index selection as runtime.
+5. **EXPLAIN matches execution for SELECT/WITH**: both paths share analyze+rewrite entry before optimizer planning.
 6. **Type coercion dual rules**: `common_type()` (Text wins for mixed types) vs `comparison_target_type()` (non-Text wins for comparisons). Both intentional, both in `coercion.rs`.
+7. **Parser rewrites are parse-compat only**: semantic rewrite authority is post-Analyzer.
 
 ## Tests
 
