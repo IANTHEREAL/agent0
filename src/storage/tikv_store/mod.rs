@@ -17,6 +17,7 @@ use tracing::{debug, info};
 // Submodules
 pub mod cron;
 mod database;
+pub mod worker;
 mod extensions;
 mod functions;
 mod indexes;
