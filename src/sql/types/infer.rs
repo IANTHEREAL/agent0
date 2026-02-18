@@ -212,6 +212,10 @@ impl<'a> TypeInferrer<'a> {
             Expr::Trim { .. } => Ok(DataType::Text),
             Expr::Position { .. } => Ok(DataType::Int32),
 
+            // CEIL/FLOOR are parsed as special AST nodes by sqlparser (not Expr::Function).
+            // PostgreSQL returns the same type as the argument (SameAsArg(0) semantics).
+            Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => self.infer(expr),
+
             Expr::Nested(inner) => self.infer(inner),
 
             Expr::ArrayAgg(arr) => {

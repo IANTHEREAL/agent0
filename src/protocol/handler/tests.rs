@@ -1,6 +1,6 @@
 use super::*;
 use crate::sql::InFailedSqlTransaction;
-use crate::types::Value;
+use crate::types::{Row, Value};
 use async_trait::async_trait;
 use bytes::Buf;
 use bytes::Bytes;
@@ -169,7 +169,7 @@ fn encode_value_to_string(value: &Value, col_type: Option<&DataType>) -> String 
     let fields = Arc::new(fields);
     let mut encoder = DataRowEncoder::new(fields);
     let tz = crate::types::timestamp::TimeZoneSpec::parse("UTC");
-    encode_value(&mut encoder, value, col_type, tz).unwrap();
+    encode_value(&mut encoder, value, col_type, tz, FieldFormat::Text).unwrap();
     let row = encoder.finish().unwrap();
 
     assert_eq!(row.field_count, 1);
@@ -1483,6 +1483,81 @@ fn test_result_to_response_empty_is_empty_query() {
 }
 
 #[tokio::test]
+async fn test_result_to_response_with_format_uses_per_column_formats() {
+    let resp = result_to_response_with_format(
+        ExecuteResult::Select {
+            columns: vec!["id".to_string(), "name".to_string()],
+            column_types: Some(vec![DataType::Int64, DataType::Text]),
+            rows: vec![Row::new(vec![
+                Value::Int64(42),
+                Value::Text("alice".to_string()),
+            ])],
+            timezone: Arc::<str>::from("UTC"),
+        },
+        &Format::Individual(vec![1, 0]),
+    )
+    .unwrap();
+
+    let Response::Query(query) = resp else {
+        panic!("expected query response");
+    };
+
+    let schema = query.row_schema();
+    assert_eq!(schema[0].format(), FieldFormat::Binary);
+    assert_eq!(schema[1].format(), FieldFormat::Text);
+
+    let rows: Vec<_> = query.data_rows().collect().await;
+    let row = rows
+        .into_iter()
+        .next()
+        .expect("row exists")
+        .expect("row ok");
+
+    let mut data = row.data.clone();
+    let len1 = data.get_i32();
+    assert_eq!(len1, 8);
+    assert_eq!(data.get_i64(), 42);
+
+    let len2 = data.get_i32();
+    assert_eq!(len2, 5);
+    let name = String::from_utf8(data.copy_to_bytes(len2 as usize).to_vec()).expect("utf8");
+    assert_eq!(name, "alice");
+}
+
+#[tokio::test]
+async fn test_result_to_response_with_format_falls_back_to_text_for_array_binary_request() {
+    let resp = result_to_response_with_format(
+        ExecuteResult::Select {
+            columns: vec!["arr".to_string()],
+            column_types: Some(vec![DataType::Array(Box::new(DataType::Int32))]),
+            rows: vec![Row::new(vec![Value::Array(vec![
+                Value::Int32(1),
+                Value::Int32(2),
+            ])])],
+            timezone: Arc::<str>::from("UTC"),
+        },
+        &Format::UnifiedBinary,
+    )
+    .unwrap();
+
+    let Response::Query(query) = resp else {
+        panic!("expected query response");
+    };
+
+    let schema = query.row_schema();
+    assert_eq!(schema[0].datatype(), &Type::INT4_ARRAY);
+    assert_eq!(schema[0].format(), FieldFormat::Text);
+
+    let rows: Vec<_> = query.data_rows().collect().await;
+    let row = rows
+        .into_iter()
+        .next()
+        .expect("row exists")
+        .expect("row ok");
+    assert_eq!(decode_single_text_field(&row), "{1,2}");
+}
+
+#[tokio::test]
 async fn test_extended_query_notice_emits_notice_response() {
     let mut client = RecordingSink::default();
     let results = crate::sql::ExecuteResults(vec![
@@ -1774,6 +1849,32 @@ fn test_substitute_parameters_date_binary_format_renders_date_literal() {
 
 #[test]
 fn test_substitute_parameters_unsupported_binary_type_returns_feature_not_supported() {
+    // Use a type that has no binary parameter decoding support (e.g., POINT)
+    let stmt = Arc::new(StoredStatement::new(
+        "stmt".to_string(),
+        "SELECT $1".to_string(),
+        vec![Type::POINT],
+    ));
+    let mut portal: Portal<String> = Portal::default();
+    portal.name = "portal".to_string();
+    portal.statement = stmt;
+    portal.parameter_format = Format::UnifiedBinary;
+    portal.parameters = vec![Some(Bytes::from_static(b"\x00\x00"))];
+    portal.result_column_format = Format::UnifiedText;
+
+    let err = substitute_parameters("SELECT $1", &portal).unwrap_err();
+    match err {
+        PgWireError::UserError(info) => {
+            assert_eq!(info.code, "0A000");
+            assert!(info.message.contains("unsupported binary parameter type"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn test_substitute_parameters_jsonb_binary_adds_cast() {
+    // JSONB binary: version byte (0x01) + JSON text
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
         "SELECT $1".to_string(),
@@ -1783,14 +1884,34 @@ fn test_substitute_parameters_unsupported_binary_type_returns_feature_not_suppor
     portal.name = "portal".to_string();
     portal.statement = stmt;
     portal.parameter_format = Format::UnifiedBinary;
-    portal.parameters = vec![Some(Bytes::from_static(b"{"))];
+    portal.parameters = vec![Some(Bytes::from_static(b"\x01{\"a\":1}"))];
+    portal.result_column_format = Format::UnifiedText;
+
+    let result = substitute_parameters("SELECT $1", &portal).unwrap();
+    assert_eq!(result, "SELECT '{\"a\":1}'::jsonb");
+}
+
+#[test]
+fn test_substitute_parameters_jsonb_binary_invalid_version_errors() {
+    let stmt = Arc::new(StoredStatement::new(
+        "stmt".to_string(),
+        "SELECT $1".to_string(),
+        vec![Type::JSONB],
+    ));
+    let mut portal: Portal<String> = Portal::default();
+    portal.name = "portal".to_string();
+    portal.statement = stmt;
+    portal.parameter_format = Format::UnifiedBinary;
+    portal.parameters = vec![Some(Bytes::from_static(b"\x02{\"a\":1}"))];
     portal.result_column_format = Format::UnifiedText;
 
     let err = substitute_parameters("SELECT $1", &portal).unwrap_err();
     match err {
         PgWireError::UserError(info) => {
-            assert_eq!(info.code, "0A000");
-            assert!(info.message.contains("unsupported binary parameter type"));
+            assert_eq!(info.code, "22P02");
+            assert!(info
+                .message
+                .contains("unsupported JSONB wire format version"));
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -1807,6 +1928,62 @@ fn test_encode_value_timestamp_negative_millis() {
         encode_value_to_string(&Value::Timestamp(-1001), Some(&col_type)),
         "1969-12-31 23:59:58.999000"
     );
+}
+
+#[test]
+fn test_encode_value_date_binary_uses_unix_epoch_days() {
+    let fields = Arc::new(vec![FieldInfo::new(
+        "d".to_string(),
+        None,
+        None,
+        Type::DATE,
+        FieldFormat::Binary,
+    )]);
+    let mut encoder = DataRowEncoder::new(fields);
+    let tz = crate::types::timestamp::TimeZoneSpec::parse("UTC");
+    encode_value(
+        &mut encoder,
+        &Value::Date(0),
+        Some(&DataType::Date),
+        tz,
+        FieldFormat::Binary,
+    )
+    .unwrap();
+    let row = encoder.finish().unwrap();
+
+    let mut data = row.data;
+    assert_eq!(data.get_i32(), 4);
+    // PostgreSQL DATE binary is days since 2000-01-01, so 1970-01-01 = -10957.
+    assert_eq!(data.get_i32(), -10_957);
+}
+
+#[test]
+fn test_encode_value_interval_binary_preserves_days_and_remainder() {
+    let fields = Arc::new(vec![FieldInfo::new(
+        "iv".to_string(),
+        None,
+        None,
+        Type::INTERVAL,
+        FieldFormat::Binary,
+    )]);
+    let mut encoder = DataRowEncoder::new(fields);
+    let tz = crate::types::timestamp::TimeZoneSpec::parse("UTC");
+    let iv = crate::types::IntervalValue::new(2, 2 * 86_400_000 + 3 * 3_600_000 + 123);
+    encode_value(
+        &mut encoder,
+        &Value::Interval(iv),
+        Some(&DataType::Interval),
+        tz,
+        FieldFormat::Binary,
+    )
+    .unwrap();
+    let row = encoder.finish().unwrap();
+
+    let mut data = row.data;
+    assert_eq!(data.get_i32(), 16);
+    assert_eq!(data.get_i64(), (3 * 3_600_000 + 123) * 1000);
+    assert_eq!(data.get_i32(), 2);
+    assert_eq!(data.get_i32(), 2);
 }
 
 #[test]

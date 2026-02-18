@@ -221,7 +221,7 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                     None => "NULL".to_string(),
                 },
                 t if *t == Type::INT2 => match portal.parameter::<i16>(i, &param_type)? {
-                    Some(v) => v.to_string(),
+                    Some(v) => format!("{}::int2", v),
                     None => "NULL".to_string(),
                 },
                 t if *t == Type::INT4 => match portal.parameter::<i32>(i, &param_type)? {
@@ -229,28 +229,32 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                     None => "NULL".to_string(),
                 },
                 t if *t == Type::INT8 => match portal.parameter::<i64>(i, &param_type)? {
-                    Some(v) => v.to_string(),
+                    Some(v) => format!("{}::int8", v),
                     None => "NULL".to_string(),
                 },
                 t if *t == Type::FLOAT4 => match portal.parameter::<f32>(i, &param_type)? {
-                    Some(v) => v.to_string(),
+                    Some(v) => format!("{}::float4", v),
                     None => "NULL".to_string(),
                 },
                 t if *t == Type::FLOAT8 => match portal.parameter::<f64>(i, &param_type)? {
-                    Some(v) => v.to_string(),
+                    Some(v) => format!("{}::float8", v),
                     None => "NULL".to_string(),
                 },
                 t if *t == Type::TIMESTAMPTZ => {
                     use chrono::{DateTime, Utc};
                     match portal.parameter::<DateTime<Utc>>(i, &param_type)? {
-                        Some(ts) => format!("'{}'", ts.format("%Y-%m-%d %H:%M:%S%.6f%:z")),
+                        Some(ts) => {
+                            format!("'{}'::timestamptz", ts.format("%Y-%m-%d %H:%M:%S%.6f%:z"))
+                        }
                         None => "NULL".to_string(),
                     }
                 }
                 t if *t == Type::TIMESTAMP => {
                     use chrono::NaiveDateTime;
                     match portal.parameter::<NaiveDateTime>(i, &param_type)? {
-                        Some(ts) => format!("'{}'", ts.format("%Y-%m-%d %H:%M:%S%.6f")),
+                        Some(ts) => {
+                            format!("'{}'::timestamp", ts.format("%Y-%m-%d %H:%M:%S%.6f"))
+                        }
                         None => "NULL".to_string(),
                     }
                 }
@@ -274,7 +278,11 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                     let repr = format!("\\x{}", hex);
                     format!("{}::bytea", quoting::quote_literal(&repr))
                 }
-                t if *t == Type::TEXT => {
+                t if *t == Type::TEXT
+                    || *t == Type::VARCHAR
+                    || *t == Type::BPCHAR
+                    || *t == Type::NAME =>
+                {
                     let s = std::str::from_utf8(param_bytes.as_ref())
                         .map_err(|e| invalid_param(e.to_string()))?;
                     quoting::quote_literal(s)
@@ -282,7 +290,25 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                 t if *t == Type::JSON => {
                     let s = std::str::from_utf8(param_bytes.as_ref())
                         .map_err(|e| invalid_param(e.to_string()))?;
-                    quoting::quote_literal(s)
+                    format!("{}::json", quoting::quote_literal(s))
+                }
+                t if *t == Type::JSONB => {
+                    let bytes = param_bytes.as_ref();
+                    if bytes.is_empty() {
+                        return Err(invalid_param("empty JSONB payload".to_string()));
+                    }
+                    // PostgreSQL JSONB binary format: version byte (0x01) + JSON text
+                    let json_bytes = if bytes[0] == 1 {
+                        &bytes[1..]
+                    } else {
+                        return Err(invalid_param(format!(
+                            "unsupported JSONB wire format version: {}",
+                            bytes[0]
+                        )));
+                    };
+                    let s = std::str::from_utf8(json_bytes)
+                        .map_err(|e| invalid_param(e.to_string()))?;
+                    format!("{}::jsonb", quoting::quote_literal(s))
                 }
                 // Type::UNKNOWN (OID 705) - pgx/GORM sends binary unknown when type is not inferred.
                 // Prefer fixed-width numeric decoding when payload contains NUL/control bytes
@@ -368,7 +394,7 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                 }
                 t if *t == Type::INT2 => trimmed
                     .parse::<i16>()
-                    .map(|v| v.to_string())
+                    .map(|v| format!("{}::int2", v))
                     .map_err(|e| invalid_param(e.to_string()))?,
                 t if *t == Type::INT4 => trimmed
                     .parse::<i32>()
@@ -376,7 +402,7 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                     .map_err(|e| invalid_param(e.to_string()))?,
                 t if *t == Type::INT8 => trimmed
                     .parse::<i64>()
-                    .map(|v| v.to_string())
+                    .map(|v| format!("{}::int8", v))
                     .map_err(|e| invalid_param(e.to_string()))?,
                 t if *t == Type::FLOAT4 => {
                     let v = trimmed
@@ -388,7 +414,7 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                             raw
                         )));
                     }
-                    v.to_string()
+                    format!("{}::float4", v)
                 }
                 t if *t == Type::FLOAT8 => {
                     let v = trimmed
@@ -400,7 +426,7 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                             raw
                         )));
                     }
-                    v.to_string()
+                    format!("{}::float8", v)
                 }
                 t if *t == Type::UUID => format!("{}::uuid", quoting::quote_literal(raw)),
                 t if *t == Type::BYTEA => format!("{}::bytea", quoting::quote_literal(raw)),

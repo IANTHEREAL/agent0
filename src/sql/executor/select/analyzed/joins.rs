@@ -4,12 +4,13 @@ use crate::sql::analyzer::types::{
     BinaryOp as TypedBinaryOp, JoinCondition, JoinType as AnalyzerJoinType, ResolvedUsingColumn,
     TypedExpr, TypedExprKind,
 };
+use crate::sql::expr::typed_eval::eval_const_usize as eval_const_usize_shared;
 use crate::sql::operators::{
     BoxedOperator, HashJoinConfig, HashJoinOperator, HashJoinType, JoinType as OpJoinType,
     NestedLoopJoinOperator,
 };
-use crate::types::{DataType, TableSchema, Value};
-use anyhow::{anyhow, Result};
+use crate::types::{DataType, TableSchema};
+use anyhow::Result;
 
 /// Build a synthetic TableSchema for set operation intermediate results.
 ///
@@ -44,25 +45,9 @@ pub(super) fn build_set_op_schema(columns: &[String], types: &[DataType]) -> Tab
 }
 
 /// Evaluate a constant TypedExpr to a usize (for LIMIT/OFFSET).
+/// Handles plain constants and constant casts (e.g., `0::int8`).
 pub(super) fn eval_const_usize(expr: &TypedExpr) -> Result<usize> {
-    match &expr.kind {
-        TypedExprKind::Constant(Value::Int32(n)) => {
-            if *n < 0 {
-                Err(anyhow!("LIMIT/OFFSET must not be negative"))
-            } else {
-                Ok(*n as usize)
-            }
-        }
-        TypedExprKind::Constant(Value::Int64(n)) => {
-            if *n < 0 {
-                Err(anyhow!("LIMIT/OFFSET must not be negative"))
-            } else {
-                Ok(*n as usize)
-            }
-        }
-        TypedExprKind::Constant(Value::Null) => Ok(0),
-        _ => Err(anyhow!("LIMIT/OFFSET must be a constant integer")),
-    }
+    eval_const_usize_shared(expr, true)
 }
 
 // ── JOIN helper functions ───────────────────────────────────────

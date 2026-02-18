@@ -1,6 +1,6 @@
 use crate::types::Value;
 use anyhow::{anyhow, Result};
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use std::collections::HashMap;
 
 use super::SqlFn;
@@ -43,39 +43,76 @@ pub fn abs(args: Vec<Value>) -> Result<Value> {
 }
 
 pub fn ceil(args: Vec<Value>) -> Result<Value> {
-    use rust_decimal::prelude::ToPrimitive;
     match args.into_iter().next() {
         Some(Value::Float64(n)) => Ok(Value::Float64(n.ceil())),
         Some(Value::Int32(n)) => Ok(Value::Int32(n)),
         Some(Value::Int64(n)) => Ok(Value::Int64(n)),
-        Some(Value::Numeric(d)) => {
-            let f = d
-                .to_f64()
-                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
-            Ok(Value::Float64(f.ceil()))
-        }
+        Some(Value::Numeric(d)) => Ok(Value::Numeric(d.ceil())),
         _ => Ok(Value::Null),
     }
 }
 
 pub fn floor(args: Vec<Value>) -> Result<Value> {
-    use rust_decimal::prelude::ToPrimitive;
     match args.into_iter().next() {
         Some(Value::Float64(n)) => Ok(Value::Float64(n.floor())),
         Some(Value::Int32(n)) => Ok(Value::Int32(n)),
         Some(Value::Int64(n)) => Ok(Value::Int64(n)),
-        Some(Value::Numeric(d)) => {
-            let f = d
-                .to_f64()
-                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
-            Ok(Value::Float64(f.floor()))
-        }
+        Some(Value::Numeric(d)) => Ok(Value::Numeric(d.floor())),
         _ => Ok(Value::Null),
     }
 }
 
+fn decimal_pow10(exp: u32) -> Result<Decimal> {
+    let mut factor = Decimal::ONE;
+    for _ in 0..exp {
+        factor = factor
+            .checked_mul(Decimal::TEN)
+            .ok_or_else(|| anyhow!("numeric value out of range"))?;
+    }
+    Ok(factor)
+}
+
+fn round_numeric_with_precision(d: Decimal, precision: i32) -> Result<Decimal> {
+    if precision >= 0 {
+        return Ok(d.round_dp(precision as u32));
+    }
+
+    let abs = precision.unsigned_abs();
+    if abs > 28 {
+        return Ok(Decimal::ZERO);
+    }
+
+    let factor = decimal_pow10(abs)?;
+    let shifted = d
+        .checked_div(factor)
+        .ok_or_else(|| anyhow!("numeric value out of range"))?;
+    let rounded = shifted.round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero);
+    rounded
+        .checked_mul(factor)
+        .ok_or_else(|| anyhow!("numeric value out of range"))
+}
+
+fn trunc_numeric_with_precision(d: Decimal, precision: i32) -> Result<Decimal> {
+    if precision >= 0 {
+        return Ok(d.round_dp_with_strategy(precision as u32, RoundingStrategy::ToZero));
+    }
+
+    let abs = precision.unsigned_abs();
+    if abs > 28 {
+        return Ok(Decimal::ZERO);
+    }
+
+    let factor = decimal_pow10(abs)?;
+    let shifted = d
+        .checked_div(factor)
+        .ok_or_else(|| anyhow!("numeric value out of range"))?;
+    let truncated = shifted.round_dp_with_strategy(0, RoundingStrategy::ToZero);
+    truncated
+        .checked_mul(factor)
+        .ok_or_else(|| anyhow!("numeric value out of range"))
+}
+
 pub fn round(args: Vec<Value>) -> Result<Value> {
-    use rust_decimal::prelude::ToPrimitive;
     let mut iter = args.into_iter();
     let val = iter.next();
     let precision = match iter.next() {
@@ -88,13 +125,7 @@ pub fn round(args: Vec<Value>) -> Result<Value> {
             let factor = 10_f64.powi(precision);
             Ok(Value::Float64((n * factor).round() / factor))
         }
-        Some(Value::Numeric(d)) => {
-            let n = d
-                .to_f64()
-                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
-            let factor = 10_f64.powi(precision);
-            Ok(Value::Float64((n * factor).round() / factor))
-        }
+        Some(Value::Numeric(d)) => Ok(Value::Numeric(round_numeric_with_precision(d, precision)?)),
         Some(Value::Int32(n)) => Ok(Value::Int32(n)),
         Some(Value::Int64(n)) => Ok(Value::Int64(n)),
         _ => Ok(Value::Null),
@@ -102,7 +133,6 @@ pub fn round(args: Vec<Value>) -> Result<Value> {
 }
 
 pub fn trunc(args: Vec<Value>) -> Result<Value> {
-    use rust_decimal::prelude::ToPrimitive;
     let mut iter = args.into_iter();
     let val = iter.next();
     let precision = match iter.next() {
@@ -115,13 +145,7 @@ pub fn trunc(args: Vec<Value>) -> Result<Value> {
             let factor = 10_f64.powi(precision);
             Ok(Value::Float64((n * factor).trunc() / factor))
         }
-        Some(Value::Numeric(d)) => {
-            let n = d
-                .to_f64()
-                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
-            let factor = 10_f64.powi(precision);
-            Ok(Value::Float64((n * factor).trunc() / factor))
-        }
+        Some(Value::Numeric(d)) => Ok(Value::Numeric(trunc_numeric_with_precision(d, precision)?)),
         Some(Value::Int32(n)) => Ok(Value::Int32(n)),
         Some(Value::Int64(n)) => Ok(Value::Int64(n)),
         _ => Ok(Value::Null),
@@ -379,6 +403,11 @@ mod tests {
             ceil(vec![Value::Float64(4.2)]).unwrap(),
             Value::Float64(5.0)
         );
+        // Numeric input → Numeric output (PostgreSQL semantics)
+        assert_eq!(
+            ceil(vec![Value::Numeric(Decimal::new(42, 1))]).unwrap(),
+            Value::Numeric(Decimal::new(5, 0))
+        );
     }
 
     #[test]
@@ -386,6 +415,51 @@ mod tests {
         assert_eq!(
             floor(vec![Value::Float64(4.8)]).unwrap(),
             Value::Float64(4.0)
+        );
+        // Numeric input → Numeric output (PostgreSQL semantics)
+        assert_eq!(
+            floor(vec![Value::Numeric(Decimal::new(48, 1))]).unwrap(),
+            Value::Numeric(Decimal::new(4, 0))
+        );
+    }
+
+    #[test]
+    fn test_round_numeric_negative_precision() {
+        assert_eq!(
+            round(vec![
+                Value::Numeric(Decimal::new(123456, 2)),
+                Value::Int32(-1)
+            ])
+            .unwrap(),
+            Value::Numeric(Decimal::new(1230, 0))
+        );
+        assert_eq!(
+            round(vec![
+                Value::Numeric(Decimal::new(-123456, 2)),
+                Value::Int32(-1)
+            ])
+            .unwrap(),
+            Value::Numeric(Decimal::new(-1230, 0))
+        );
+    }
+
+    #[test]
+    fn test_trunc_numeric_negative_precision() {
+        assert_eq!(
+            trunc(vec![
+                Value::Numeric(Decimal::new(123456, 2)),
+                Value::Int32(-1)
+            ])
+            .unwrap(),
+            Value::Numeric(Decimal::new(1230, 0))
+        );
+        assert_eq!(
+            trunc(vec![
+                Value::Numeric(Decimal::new(-123456, 2)),
+                Value::Int32(-1)
+            ])
+            .unwrap(),
+            Value::Numeric(Decimal::new(-1230, 0))
         );
     }
 

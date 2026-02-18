@@ -1,5 +1,5 @@
 use super::copy::copy_row_column_mismatch_error;
-use super::encode::{datatype_to_pgtype, result_to_response};
+use super::encode::{datatype_to_pgtype, effective_result_format, result_to_response};
 use super::errors::{
     ambiguous_column_error_with_position, in_failed_sql_transaction_pgwire_error,
     sqlstate_for_executor_error,
@@ -17,7 +17,7 @@ use super::{
     client_allows_notice, count_placeholders_in_expr, extract_placeholder_index_from_expr,
     infer_result_fields_from_query_ast, infer_types_from_expr, parse_startup_options,
     resolve_copy_columns, resolve_table_for_insert, rollback_autocommit_or_mark_failed,
-    send_notices_and_get_last_response, stub_describe_field, CopyContext,
+    send_notices_and_get_last_response_with_format, stub_describe_field, CopyContext,
     PgServerParameterProvider, TipgQueryParser, CONNECTION_ID_COUNTER, METADATA_ACTUAL_USER,
     METADATA_AUTH_IS_SUPERUSER, METADATA_KEYSPACE,
 };
@@ -174,10 +174,12 @@ impl DynamicPgHandler {
         };
 
         let mut types = vec![Type::TEXT; param_count];
+        let mut param_idx = 0usize;
 
-        if let Some(first_row) = values_list.first() {
-            let mut param_idx = 0usize;
-            for (col_idx, expr) in first_row.iter().enumerate() {
+        // Iterate ALL rows in the VALUES clause — batch INSERTs repeat
+        // the column pattern for each row (e.g. 3 rows × 6 cols = 18 params).
+        for row in &values_list {
+            for (col_idx, expr) in row.iter().enumerate() {
                 let col_name = column_order.get(col_idx)?;
                 let col_type = col_types.get(col_name);
 
@@ -1786,6 +1788,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
     {
         let executor = self.get_executor()?;
         let query = &portal.statement.statement;
+
         debug!("Extended query: {}", query);
 
         let final_query = substitute_parameters(query, portal)?;
@@ -1801,12 +1804,16 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         })?;
 
         match executor.execute(session, &final_query).await {
-            Ok(results) => Ok(send_notices_and_get_last_response(
-                client,
-                session.show_setting_value("client_min_messages"),
-                results,
-            )
-            .await?),
+            Ok(results) => {
+                let resp = send_notices_and_get_last_response_with_format(
+                    client,
+                    session.show_setting_value("client_min_messages"),
+                    results,
+                    &portal.result_column_format,
+                )
+                .await;
+                Ok(resp?)
+            }
             Err(e) => {
                 error!("Extended query execution error: {}", e);
                 Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -1907,6 +1914,25 @@ impl ExtendedQueryHandler for DynamicPgHandler {
     {
         let final_query = substitute_parameters(&portal.statement.statement, portal)?;
         let fields = self.infer_result_fields_from_query(&final_query).await;
+
+        // Per the PostgreSQL wire protocol, the RowDescription returned by
+        // Describe Portal must reflect the result format codes from Bind.
+        let fields: Vec<FieldInfo> = fields
+            .into_iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let requested = portal.result_column_format.format_for(i);
+                let format = effective_result_format(f.datatype(), requested);
+                FieldInfo::new(
+                    f.name().to_string(),
+                    f.table_id(),
+                    f.column_id(),
+                    f.datatype().clone(),
+                    format,
+                )
+            })
+            .collect();
+
         Ok(DescribePortalResponse::new(fields))
     }
 }

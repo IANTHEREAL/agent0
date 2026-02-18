@@ -14,6 +14,7 @@ use super::physical_plan::{PhysicalNode, PhysicalPlan};
 use crate::sql::analyzer::types::{
     JoinCondition, JoinType, SetOpKind, TypedExpr, TypedExprKind, TypedOrderByExpr,
 };
+use crate::sql::expr::typed_eval::eval_const_usize;
 use crate::sql::operators::AggregateExpr;
 use crate::sql::operators::{
     BoxedOperator, DistinctOnOperator, DistinctOperator, FilterOperator, HashAggregateOperator,
@@ -314,10 +315,13 @@ impl PhysicalPlan {
                 input,
             } => {
                 let child = input.build_operators(ctx)?;
-                let limit_val = limit.as_ref().map(eval_const_usize).transpose()?;
+                let limit_val = limit
+                    .as_ref()
+                    .map(|expr| eval_const_usize(expr, false))
+                    .transpose()?;
                 let offset_val = offset
                     .as_ref()
-                    .map(eval_const_usize)
+                    .map(|expr| eval_const_usize(expr, false))
                     .transpose()?
                     .unwrap_or(0);
                 Ok(Box::new(LimitOperator::new(child, limit_val, offset_val)))
@@ -424,30 +428,6 @@ impl PhysicalPlan {
 }
 
 // ── Helper functions ────────────────────────────────────────────
-
-/// Evaluate a TypedExpr that should be a non-negative constant integer (LIMIT/OFFSET).
-fn eval_const_usize(expr: &TypedExpr) -> Result<usize> {
-    match &expr.kind {
-        TypedExprKind::Constant(Value::Int32(n)) => {
-            if *n < 0 {
-                Err(anyhow!("LIMIT/OFFSET must not be negative"))
-            } else {
-                Ok(*n as usize)
-            }
-        }
-        TypedExprKind::Constant(Value::Int64(n)) => {
-            if *n < 0 {
-                Err(anyhow!("LIMIT/OFFSET must not be negative"))
-            } else {
-                Ok(*n as usize)
-            }
-        }
-        _ => Err(anyhow!(
-            "Expected constant integer for LIMIT/OFFSET, got: {:?}",
-            expr.kind
-        )),
-    }
-}
 
 /// Convert analyzer JoinType to operator JoinType.
 fn convert_join_type(jt: &JoinType) -> OpJoinType {
