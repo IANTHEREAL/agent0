@@ -185,11 +185,7 @@ impl WorkerEngine {
 
     /// Reconcile cron jobs for a single (keyspace, db_id).
     /// Returns (enqueued_count, cleaned_count).
-    async fn reconcile_cron_for_db(
-        &self,
-        keyspace: &str,
-        db_id: u64,
-    ) -> Result<(u32, u32)> {
+    async fn reconcile_cron_for_db(&self, keyspace: &str, db_id: u64) -> Result<(u32, u32)> {
         // 1. Scan existing cron queue entries from the system store
         let mut txn = self.system_store.begin().await?;
         let existing_queue = self
