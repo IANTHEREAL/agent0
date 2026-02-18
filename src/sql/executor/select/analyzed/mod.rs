@@ -3584,16 +3584,36 @@ impl Executor {
             let start = offset.min(locked_rows.len());
             let end = limit.map_or(locked_rows.len(), |l| (start + l).min(locked_rows.len()));
             Ok(locked_rows[start..end].to_vec())
-        } else if has_nowait {
-            self.store()
-                .lock_rows_nowait(txn, db_id, &table_name, &rows)
-                .await?;
-            Ok(rows)
         } else {
-            self.store()
-                .lock_rows(txn, db_id, &table_name, &rows)
-                .await?;
-            Ok(rows)
+            // Apply deferred LIMIT/OFFSET before locking to avoid locking
+            // more rows than needed. Without this, `FOR UPDATE LIMIT 1` would
+            // lock ALL scanned rows, causing SKIP LOCKED in other sessions to
+            // find no unlockable rows.
+            let mut rows_to_lock = rows;
+            if let Some((ref limit_expr, ref offset_expr)) = deferred_limit {
+                let limit = limit_expr.as_ref().map(eval_const_usize).transpose()?;
+                let offset = offset_expr
+                    .as_ref()
+                    .map(eval_const_usize)
+                    .transpose()?
+                    .unwrap_or(0);
+                if limit.is_some() || offset > 0 {
+                    let start = offset.min(rows_to_lock.len());
+                    let end =
+                        limit.map_or(rows_to_lock.len(), |l| (start + l).min(rows_to_lock.len()));
+                    rows_to_lock = rows_to_lock[start..end].to_vec();
+                }
+            }
+            if has_nowait {
+                self.store()
+                    .lock_rows_nowait(txn, db_id, &table_name, &rows_to_lock)
+                    .await?;
+            } else {
+                self.store()
+                    .lock_rows(txn, db_id, &table_name, &rows_to_lock)
+                    .await?;
+            }
+            Ok(rows_to_lock)
         }
     }
 }
