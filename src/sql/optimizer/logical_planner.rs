@@ -138,15 +138,64 @@ impl LogicalPlanner {
             // window expressions (e.g. LAG(COUNT(*))) are captured.
             let group_by = &select.group_by;
             let group_by_count = group_by.len();
-            let aggregate_exprs = Self::collect_aggregate_exprs(&select.projection);
+            let mut aggregate_exprs = Self::collect_aggregate_exprs(&select.projection);
+
+            // Also collect aggregates from HAVING and ORDER BY that may not
+            // appear in the projection (e.g., SELECT dept GROUP BY dept
+            // HAVING AVG(salary) > X).  These must be in aggregate_exprs
+            // (for rewrite index mapping) AND in agg_projection (so the
+            // Aggregate operator computes them).
+            let mut extra_agg_projections = Vec::new();
+            {
+                let pre_count = aggregate_exprs.len();
+                let mut names = Vec::new();
+                let mut types = Vec::new();
+                if let Some(having) = &select.having {
+                    super::build::collect_agg_exprs_from(
+                        having,
+                        "__having_agg",
+                        &mut aggregate_exprs,
+                        &mut names,
+                        &mut types,
+                    );
+                }
+                for ob in order_by {
+                    super::build::collect_agg_exprs_from(
+                        &ob.expr,
+                        "__order_agg",
+                        &mut aggregate_exprs,
+                        &mut names,
+                        &mut types,
+                    );
+                }
+                // Build synthetic AnalyzedProjection for each new aggregate.
+                // The final Project will strip them from the output.
+                for i in pre_count..aggregate_exprs.len() {
+                    let ae = &aggregate_exprs[i];
+                    let typed_expr = Self::find_aggregate_in_having_orderby(
+                        ae,
+                        select.having.as_ref(),
+                        order_by,
+                    );
+                    extra_agg_projections.push(AnalyzedProjection {
+                        output_name: names[i - pre_count].clone(),
+                        expr: typed_expr,
+                    });
+                }
+            }
 
             let agg_projection = if has_win {
                 // Build a raw projection [group_by_cols..., agg_calls...] so the
                 // Aggregate outputs clean columns without a post-projection that
                 // would choke on WindowCall nodes.
-                Self::build_raw_aggregate_projection(group_by, &aggregate_exprs, &select.projection)
+                // Include extended projection so HAVING/ORDER BY aggregates are found.
+                let mut extended = select.projection.to_vec();
+                extended.extend(extra_agg_projections);
+                Self::build_raw_aggregate_projection(group_by, &aggregate_exprs, &extended)
             } else {
-                select.projection.clone()
+                let mut proj = select.projection.clone();
+                proj.extend(extra_agg_projections);
+                proj
             };
             let agg_schema = PlanSchema::from_columns(
                 agg_projection
@@ -575,6 +624,26 @@ impl LogicalPlanner {
             }
             _ => None,
         }
+    }
+
+    /// Find the original TypedExpr for an AggregateExpr in HAVING/ORDER BY trees.
+    fn find_aggregate_in_having_orderby(
+        ae: &AggregateExpr,
+        having: Option<&TypedExpr>,
+        order_by: &[TypedOrderByExpr],
+    ) -> TypedExpr {
+        if let Some(h) = having {
+            if let Some(found) = Self::find_agg_in_expr(h, ae) {
+                return found;
+            }
+        }
+        for ob in order_by {
+            if let Some(found) = Self::find_agg_in_expr(&ob.expr, ae) {
+                return found;
+            }
+        }
+        // Fallback: use the reconstruction from find_aggregate_typed_expr
+        Self::find_aggregate_typed_expr(ae, &[])
     }
 
     /// Extract `WindowFunctionExpr` from a list of typed expressions.
