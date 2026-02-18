@@ -1,50 +1,10 @@
 use crate::cron::config::CronConfig;
 use crate::cron::types::CronRunStatus;
-use crate::pool::TikvClientPool;
 use crate::storage::TikvStore;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
-use tracing::{info, warn};
-
-pub(crate) fn spawn_cron_worker(_pool: Arc<TikvClientPool>) {
-    info!("CronWorker loop replaced by WorkerEngine queue scheduling");
-}
-
-pub(crate) async fn run_cron_gc_loop(pool: Arc<TikvClientPool>) {
-    let config = CronConfig::from_env();
-    let mut interval = tokio::time::interval(Duration::from_secs(config.gc_interval_sec));
-    loop {
-        interval.tick().await;
-
-        let keyspaces = pool.list_all_keyspaces().await;
-        for keyspace in keyspaces {
-            if let Err(e) = gc_keyspace(&pool, &keyspace, &config).await {
-                warn!("cron GC error for {}: {}", keyspace, e);
-            }
-        }
-    }
-}
-
-pub(crate) async fn gc_keyspace(
-    pool: &Arc<TikvClientPool>,
-    keyspace: &str,
-    config: &CronConfig,
-) -> Result<()> {
-    let handle = pool.acquire(Some(keyspace.to_string())).await?;
-    let store = handle.store().clone();
-
-    let mut txn = store.begin().await?;
-    let databases = store.list_databases(&mut txn).await?;
-    txn.commit().await?;
-
-    for db in databases {
-        gc_database(&store, db.id, config).await?;
-    }
-
-    Ok(())
-}
+use tracing::info;
 
 pub(crate) async fn gc_database(
     store: &Arc<TikvStore>,

@@ -1,92 +1,66 @@
 //! Trigger body execution (PL/pgSQL subset).
 
 use super::rewrite::substitute_row_references;
-use super::worker::TriggerWorker;
 use crate::sql::executor::Executor;
 use crate::types::{Row, TableSchema};
 use anyhow::Result;
 use std::collections::HashMap;
 use tikv_client::Transaction;
 
-impl TriggerWorker {
-    pub(super) async fn execute_trigger_body(
-        &self,
-        executor: &Executor,
-        txn: &mut Transaction,
-        db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
-        schema: &TableSchema,
-        body: &str,
-        old_row: Option<&Row>,
-        new_row: Option<&Row>,
-        search_path: &[String],
-    ) -> Result<()> {
-        // This is intentionally a small subset of PL/pgSQL tailored for triggers:
-        // - `NEW.col := <expr>` assignments
-        // - `RETURN <...>` terminators
-        // - Everything else is treated as a SQL statement and executed.
-        //
-        // It matches the existing BEFORE-trigger executor in `before.rs`, but adds
-        // SQL statement execution for AFTER triggers.
+pub(crate) async fn execute_trigger_body_standalone(
+    executor: &Executor,
+    txn: &mut Transaction,
+    db_id: u64,
+    sequence_values: &mut HashMap<String, i64>,
+    schema: &TableSchema,
+    body: &str,
+    old_row: Option<&Row>,
+    new_row: Option<&Row>,
+    search_path: &[String],
+) -> Result<()> {
+    // This is intentionally a small subset of PL/pgSQL tailored for triggers:
+    // - `NEW.col := <expr>` assignments
+    // - `RETURN <...>` terminators
+    // - Everything else is treated as a SQL statement and executed.
+    //
+    // It matches the existing BEFORE-trigger executor in `before.rs`, but adds
+    // SQL statement execution for AFTER triggers.
 
-        let mut new_values = match new_row {
-            Some(r) => r.values.clone(),
-            None => vec![crate::types::Value::Null; schema.columns.len()],
-        };
-        if new_values.len() < schema.columns.len() {
-            new_values.resize(schema.columns.len(), crate::types::Value::Null);
+    let mut new_values = match new_row {
+        Some(r) => r.values.clone(),
+        None => vec![crate::types::Value::Null; schema.columns.len()],
+    };
+    if new_values.len() < schema.columns.len() {
+        new_values.resize(schema.columns.len(), crate::types::Value::Null);
+    }
+
+    let Some((begin_pos, end_pos)) = plpgsql_outer_block_range(body) else {
+        return Ok(());
+    };
+    let block = &body[begin_pos..end_pos];
+
+    let mut stmt_buf = String::new();
+    for raw_line in block.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("--") {
+            continue;
         }
 
-        let Some((begin_pos, end_pos)) = plpgsql_outer_block_range(body) else {
-            return Ok(());
-        };
-        let block = &body[begin_pos..end_pos];
+        if !stmt_buf.is_empty() {
+            stmt_buf.push(' ');
+        }
+        stmt_buf.push_str(line);
 
-        let mut stmt_buf = String::new();
-        for raw_line in block.lines() {
-            let line = raw_line.trim();
-            if line.is_empty() || line.starts_with("--") {
-                continue;
-            }
-
-            if !stmt_buf.is_empty() {
-                stmt_buf.push(' ');
-            }
-            stmt_buf.push_str(line);
-
-            if !line.ends_with(';') {
-                continue;
-            }
-
-            let should_stop = {
-                let stmt = stmt_buf.trim().trim_end_matches(';').trim();
-                if stmt.is_empty() {
-                    false
-                } else {
-                    self.execute_trigger_statement(
-                        executor,
-                        txn,
-                        db_id,
-                        sequence_values,
-                        schema,
-                        old_row,
-                        &mut new_values,
-                        stmt,
-                        search_path,
-                    )
-                    .await?
-                }
-            };
-            stmt_buf.clear();
-            if should_stop {
-                return Ok(());
-            }
+        if !line.ends_with(';') {
+            continue;
         }
 
-        if !stmt_buf.trim().is_empty() {
-            let stmt = stmt_buf.trim();
-            let _ = self
-                .execute_trigger_statement(
+        let should_stop = {
+            let stmt = stmt_buf.trim().trim_end_matches(';').trim();
+            if stmt.is_empty() {
+                false
+            } else {
+                execute_trigger_statement_standalone(
                     executor,
                     txn,
                     db_id,
@@ -97,104 +71,120 @@ impl TriggerWorker {
                     stmt,
                     search_path,
                 )
-                .await?;
+                .await?
+            }
+        };
+        stmt_buf.clear();
+        if should_stop {
+            return Ok(());
         }
-
-        Ok(())
     }
 
-    async fn execute_trigger_statement(
-        &self,
-        executor: &Executor,
-        txn: &mut Transaction,
-        db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
-        schema: &TableSchema,
-        old_row: Option<&Row>,
-        new_values: &mut [crate::types::Value],
-        stmt: &str,
-        search_path: &[String],
-    ) -> Result<bool> {
-        let stmt = stmt.trim().trim_end_matches(';').trim();
-        let upper = stmt.to_uppercase();
+    if !stmt_buf.trim().is_empty() {
+        let stmt = stmt_buf.trim();
+        let _ = execute_trigger_statement_standalone(
+            executor,
+            txn,
+            db_id,
+            sequence_values,
+            schema,
+            old_row,
+            &mut new_values,
+            stmt,
+            search_path,
+        )
+        .await?;
+    }
 
-        // PL/pgSQL no-op statement.
-        if upper == "NULL" {
-            return Ok(false);
-        }
-        if upper.starts_with("RETURN NEW") || upper.starts_with("RETURN OLD") || upper == "RETURN" {
-            return Ok(true);
-        }
-        if upper.starts_with("RETURN NULL") {
-            return Ok(true);
-        }
+    Ok(())
+}
 
-        if upper.starts_with("NEW.") {
-            if let Some((col, expr)) = parse_new_assignment(stmt) {
-                if let Some(idx) = schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(col))
-                {
-                    let resolved_expr =
-                        substitute_row_references(expr, schema, new_values, old_row);
-                    let sql = format!("SELECT {}", resolved_expr);
-                    if let Ok(stmts) = crate::sql::parse_sql(&sql) {
-                        if let Some(sqlparser::ast::Statement::Query(query)) =
-                            stmts.into_iter().next()
-                        {
-                            if let sqlparser::ast::SetExpr::Select(select) = *query.body {
-                                if let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) =
-                                    select.projection.into_iter().next()
-                                {
-                                    let store = executor.store();
-                                    let value =
-                                        if crate::sql::sequences::expr_needs_async_eval(&expr) {
-                                            crate::sql::sequences::eval_expr_with_sequences(
-                                                &store,
-                                                txn,
-                                                db_id,
-                                                sequence_values,
-                                                search_path,
-                                                &expr,
-                                                None,
-                                                None,
-                                            )
-                                            .await?
-                                        } else {
-                                            crate::sql::expr::bridge::eval_const_ast_expr(&expr)?
-                                        };
+pub(crate) async fn execute_trigger_statement_standalone(
+    executor: &Executor,
+    txn: &mut Transaction,
+    db_id: u64,
+    sequence_values: &mut HashMap<String, i64>,
+    schema: &TableSchema,
+    old_row: Option<&Row>,
+    new_values: &mut [crate::types::Value],
+    stmt: &str,
+    search_path: &[String],
+) -> Result<bool> {
+    let stmt = stmt.trim().trim_end_matches(';').trim();
+    let upper = stmt.to_uppercase();
 
-                                    let coerced =
-                                        crate::sql::value_coercion::coerce_value_for_column(
-                                            value,
-                                            &schema.columns[idx],
-                                        )?;
-                                    new_values[idx] = coerced;
-                                }
+    // PL/pgSQL no-op statement.
+    if upper == "NULL" {
+        return Ok(false);
+    }
+    if upper.starts_with("RETURN NEW") || upper.starts_with("RETURN OLD") || upper == "RETURN" {
+        return Ok(true);
+    }
+    if upper.starts_with("RETURN NULL") {
+        return Ok(true);
+    }
+
+    if upper.starts_with("NEW.") {
+        if let Some((col, expr)) = parse_new_assignment(stmt) {
+            if let Some(idx) = schema
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(col))
+            {
+                let resolved_expr = substitute_row_references(expr, schema, new_values, old_row);
+                let sql = format!("SELECT {}", resolved_expr);
+                if let Ok(stmts) = crate::sql::parse_sql(&sql) {
+                    if let Some(sqlparser::ast::Statement::Query(query)) = stmts.into_iter().next()
+                    {
+                        if let sqlparser::ast::SetExpr::Select(select) = *query.body {
+                            if let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) =
+                                select.projection.into_iter().next()
+                            {
+                                let store = executor.store();
+                                let value = if crate::sql::sequences::expr_needs_async_eval(&expr) {
+                                    crate::sql::sequences::eval_expr_with_sequences(
+                                        &store,
+                                        txn,
+                                        db_id,
+                                        sequence_values,
+                                        search_path,
+                                        &expr,
+                                        None,
+                                        None,
+                                    )
+                                    .await?
+                                } else {
+                                    crate::sql::expr::bridge::eval_const_ast_expr(&expr)?
+                                };
+
+                                let coerced = crate::sql::value_coercion::coerce_value_for_column(
+                                    value,
+                                    &schema.columns[idx],
+                                )?;
+                                new_values[idx] = coerced;
                             }
                         }
                     }
                 }
             }
-            return Ok(false);
         }
-
-        // Treat as SQL statement.
-        let substituted = substitute_row_references(stmt, schema, new_values, old_row);
-        let statements = crate::sql::parse_sql(&substituted)?;
-        for s in &statements {
-            // Ignore result rows; errors propagate.
-            let _ = executor
-                .execute_statement_on_txn(txn, db_id, sequence_values, search_path, s, None)
-                .await?;
-        }
-
-        Ok(false)
+        return Ok(false);
     }
+
+    // Treat as SQL statement.
+    let substituted = substitute_row_references(stmt, schema, new_values, old_row);
+    let statements = crate::sql::parse_sql(&substituted)?;
+    for s in &statements {
+        // Ignore result rows; errors propagate.
+        let _ = executor
+            .execute_statement_on_txn(txn, db_id, sequence_values, search_path, s, None)
+            .await?;
+    }
+
+    Ok(false)
 }
 
-fn plpgsql_outer_block_range(body: &str) -> Option<(usize, usize)> {
+pub(crate) fn plpgsql_outer_block_range(body: &str) -> Option<(usize, usize)> {
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     enum BlockKind {
         Begin,
