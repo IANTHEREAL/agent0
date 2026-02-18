@@ -12,6 +12,7 @@ mod storage;
 mod tls;
 mod txn;
 mod types;
+mod worker;
 
 use anyhow::Result;
 use pgwire::tokio::process_socket;

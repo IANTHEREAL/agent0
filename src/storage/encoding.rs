@@ -62,6 +62,12 @@ const DB_SYS_CRON_SEQ_PREFIX_V2: &[u8] = b"sys_next_cron_job_id";
 const DB_SYS_CRON_RUN_SEQ_PREFIX_V2: &[u8] = b"sys_next_cron_run_id";
 const DB_SYS_CRON_ENABLED_PREFIX_V2: &[u8] = b"sys_cron_enabled";
 const DB_SYS_CRON_CLAIM_PREFIX_V2: &[u8] = b"sys_cron_claim_";
+
+// Worker system prefixes (global, not per-database)
+const WORKER_REGISTRY_PREFIX: &[u8] = b"_worker_registry_";
+const WORKER_QUEUE_PREFIX: &[u8] = b"_worker_queue_";
+const WORKER_CLAIM_PREFIX: &[u8] = b"_worker_claim_";
+
 const SYS_SCHEMA_PREFIX: &[u8] = b"_sys_schema_";
 const TABLE_DATA_PREFIX: &[u8] = b"t_";
 const TABLE_INDEX_PREFIX: &[u8] = b"i_";
@@ -356,6 +362,114 @@ pub fn encode_cron_enabled_key_v2(db_id: u64) -> Vec<u8> {
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_CRON_ENABLED_PREFIX_V2);
     key
+}
+
+// ============================================================================
+// Worker System Keys (Global, not per-database)
+// ============================================================================
+
+/// Encode a worker registry key (global).
+///
+/// Format: `_worker_registry_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}`
+pub fn encode_worker_registry_key(keyspace: &str, db_id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(WORKER_REGISTRY_PREFIX.len() + 2 + keyspace.len() + 1 + 8);
+    key.extend_from_slice(WORKER_REGISTRY_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key
+}
+
+/// Encode the prefix for all worker registry keys (global).
+pub fn encode_worker_registry_prefix() -> Vec<u8> {
+    WORKER_REGISTRY_PREFIX.to_vec()
+}
+
+/// Encode a worker queue key (global).
+///
+/// Format: `_worker_queue_{priority:u8}_{fire_time_ms:memcomparable}_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}_{task_id:be8}`
+///
+/// Priority byte comes first so lower values (higher priority) sort first.
+/// Fire time uses memcomparable encoding so earlier times sort first (handles negative values correctly).
+pub fn encode_worker_queue_key(
+    priority: u8,
+    fire_time_ms: i64,
+    keyspace: &str,
+    db_id: u64,
+    task_id: i64,
+) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(WORKER_QUEUE_PREFIX.len() + 1 + 8 + 2 + keyspace.len() + 1 + 8 + 8);
+    key.extend_from_slice(WORKER_QUEUE_PREFIX);
+    key.push(priority);
+    key.extend(memcomparable::to_vec(&fire_time_ms).unwrap());
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&task_id.to_be_bytes());
+    key
+}
+
+/// Encode the prefix for all worker queue keys (global).
+pub fn encode_worker_queue_prefix() -> Vec<u8> {
+    WORKER_QUEUE_PREFIX.to_vec()
+}
+
+/// Encode the exclusive upper bound for a worker queue range scan.
+///
+/// Used to scan all queue entries with a given priority and fire_time.
+/// Format: `_worker_queue_{priority:u8}_{fire_time_ms:memcomparable}` (no keyspace/db_id/task_id)
+pub fn encode_worker_queue_scan_end(priority: u8, fire_time_ms: i64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(WORKER_QUEUE_PREFIX.len() + 1 + 8);
+    key.extend_from_slice(WORKER_QUEUE_PREFIX);
+    key.push(priority);
+    key.extend(memcomparable::to_vec(&fire_time_ms).unwrap());
+    key
+}
+
+/// Decode fire_time_ms from a worker queue key.
+///
+/// Extracts the fire_time field from a queue key for sorting/filtering.
+/// Returns None if the key is too short or malformed.
+pub fn decode_worker_queue_fire_time(key: &[u8]) -> Option<i64> {
+    if key.len() < WORKER_QUEUE_PREFIX.len() + 1 {
+        return None;
+    }
+    let offset = WORKER_QUEUE_PREFIX.len() + 1;
+    let payload = &key[offset..];
+    let mut deserializer = Deserializer::new(payload);
+    serde::Deserialize::deserialize(&mut deserializer).ok()
+}
+
+/// Encode a worker claim key (global).
+///
+/// Format: `_worker_claim_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}_{task_id:be8}_{fire_time_min:be8}`
+pub fn encode_worker_claim_key(
+    keyspace: &str,
+    db_id: u64,
+    task_id: i64,
+    fire_time_min: i64,
+) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(WORKER_CLAIM_PREFIX.len() + 2 + keyspace.len() + 1 + 8 + 1 + 8 + 8);
+    key.extend_from_slice(WORKER_CLAIM_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&task_id.to_be_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&fire_time_min.to_be_bytes());
+    key
+}
+
+/// Encode the prefix for all worker claim keys (global).
+pub fn encode_worker_claim_prefix() -> Vec<u8> {
+    WORKER_CLAIM_PREFIX.to_vec()
 }
 
 pub fn encode_view_key_v2(db_id: u64, view_name: &str) -> Vec<u8> {
@@ -1404,5 +1518,130 @@ mod tests {
         let key3 = encode_pk_values(&[Value::Int32(2), Value::Text("a".to_string())]);
         assert!(key1 < key2, "same first col, second col determines order");
         assert!(key2 < key3, "first col determines order");
+    }
+
+    // ========================================================================
+    // Worker System Key Tests
+    // ========================================================================
+
+    #[test]
+    fn test_encode_worker_registry_key() {
+        let key = encode_worker_registry_key("myapp", 42);
+        assert!(key.starts_with(WORKER_REGISTRY_PREFIX));
+        // Verify keyspace length encoding
+        let keyspace_len_bytes =
+            &key[WORKER_REGISTRY_PREFIX.len()..WORKER_REGISTRY_PREFIX.len() + 2];
+        let keyspace_len = u16::from_be_bytes([keyspace_len_bytes[0], keyspace_len_bytes[1]]);
+        assert_eq!(keyspace_len, 5); // "myapp" is 5 bytes
+    }
+
+    #[test]
+    fn test_encode_worker_registry_prefix() {
+        let prefix = encode_worker_registry_prefix();
+        assert_eq!(prefix, WORKER_REGISTRY_PREFIX);
+    }
+
+    #[test]
+    fn test_encode_worker_queue_key() {
+        let key = encode_worker_queue_key(10, 1000, "myapp", 42, 100);
+        assert!(key.starts_with(WORKER_QUEUE_PREFIX));
+        // Verify priority byte is at correct position
+        let priority_byte = key[WORKER_QUEUE_PREFIX.len()];
+        assert_eq!(priority_byte, 10);
+    }
+
+    #[test]
+    fn test_worker_queue_key_priority_ordering() {
+        let key_p0 = encode_worker_queue_key(0, 1000, "myapp", 42, 100);
+        let key_p128 = encode_worker_queue_key(128, 1000, "myapp", 42, 100);
+        assert!(key_p0 < key_p128, "lower priority value should sort first");
+    }
+
+    #[test]
+    fn test_worker_queue_key_fire_time_ordering() {
+        let key_t1000 = encode_worker_queue_key(0, 1000, "myapp", 42, 100);
+        let key_t2000 = encode_worker_queue_key(0, 2000, "myapp", 42, 100);
+        assert!(key_t1000 < key_t2000, "earlier fire_time should sort first");
+    }
+
+    #[test]
+    fn test_encode_worker_queue_prefix() {
+        let prefix = encode_worker_queue_prefix();
+        assert_eq!(prefix, WORKER_QUEUE_PREFIX);
+    }
+
+    #[test]
+    fn test_encode_worker_queue_scan_end() {
+        let scan_end = encode_worker_queue_scan_end(10, 1000);
+        assert!(scan_end.starts_with(WORKER_QUEUE_PREFIX));
+        let priority_byte = scan_end[WORKER_QUEUE_PREFIX.len()];
+        assert_eq!(priority_byte, 10);
+    }
+
+    #[test]
+    fn test_decode_worker_queue_fire_time() {
+        let key = encode_worker_queue_key(10, 1234567890, "myapp", 42, 100);
+        let fire_time = decode_worker_queue_fire_time(&key).expect("decode");
+        assert_eq!(fire_time, 1234567890);
+    }
+
+    #[test]
+    fn test_decode_worker_queue_fire_time_roundtrip() {
+        let original_time = 9876543210i64;
+        let key = encode_worker_queue_key(5, original_time, "test", 1, 50);
+        let decoded_time = decode_worker_queue_fire_time(&key).expect("decode");
+        assert_eq!(decoded_time, original_time);
+    }
+
+    #[test]
+    fn test_decode_worker_queue_fire_time_invalid_key() {
+        let short_key = b"_worker_queue_";
+        assert_eq!(decode_worker_queue_fire_time(short_key), None);
+    }
+
+    #[test]
+    fn test_encode_worker_claim_key() {
+        let key = encode_worker_claim_key("myapp", 42, 100, 5000);
+        assert!(key.starts_with(WORKER_CLAIM_PREFIX));
+        // Verify keyspace length encoding
+        let keyspace_len_bytes = &key[WORKER_CLAIM_PREFIX.len()..WORKER_CLAIM_PREFIX.len() + 2];
+        let keyspace_len = u16::from_be_bytes([keyspace_len_bytes[0], keyspace_len_bytes[1]]);
+        assert_eq!(keyspace_len, 5); // "myapp" is 5 bytes
+    }
+
+    #[test]
+    fn test_encode_worker_claim_prefix() {
+        let prefix = encode_worker_claim_prefix();
+        assert_eq!(prefix, WORKER_CLAIM_PREFIX);
+    }
+
+    #[test]
+    fn test_worker_queue_key_big_endian_fire_time() {
+        let key_neg = encode_worker_queue_key(0, -1000i64, "app", 1, 1);
+        let key_zero = encode_worker_queue_key(0, 0i64, "app", 1, 1);
+        let key_pos = encode_worker_queue_key(0, 1000i64, "app", 1, 1);
+        assert!(key_neg < key_zero, "negative fire_time should sort first");
+        assert!(key_zero < key_pos, "zero should sort before positive");
+    }
+
+    #[test]
+    fn test_worker_registry_key_different_keyspaces() {
+        let key_a = encode_worker_registry_key("app_a", 42);
+        let key_b = encode_worker_registry_key("app_b", 42);
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn test_worker_registry_key_different_db_ids() {
+        let key_1 = encode_worker_registry_key("myapp", 1);
+        let key_2 = encode_worker_registry_key("myapp", 2);
+        assert_ne!(key_1, key_2);
+    }
+
+    #[test]
+    fn test_worker_claim_key_different_task_ids() {
+        let key_1 = encode_worker_claim_key("myapp", 42, 100, 5000);
+        let key_2 = encode_worker_claim_key("myapp", 42, 200, 5000);
+        assert_ne!(key_1, key_2);
     }
 }

@@ -129,6 +129,37 @@ impl TikvStore {
         Ok(store)
     }
 
+    /// Create a TikvStore for the system worker keyspace.
+    ///
+    /// Unlike `new_with_keyspace()`, this does NOT bootstrap databases — it's raw KV access only.
+    /// Used by the unified worker engine for cross-tenant task management.
+    pub async fn new_system(pd_endpoints: Vec<String>, keyspace: &str) -> Result<Self> {
+        info!("Connecting to TiKV at {:?} for system keyspace", pd_endpoints);
+        let mut config = Config::default().with_keyspace(keyspace);
+
+        // Enable TLS for PD/TiKV connection if cert files are provided
+        if let (Ok(ca), Ok(cert), Ok(key)) = (
+            std::env::var("TIKV_CA_PATH"),
+            std::env::var("TIKV_CERT_PATH"),
+            std::env::var("TIKV_KEY_PATH"),
+        ) {
+            info!("TiKV TLS enabled: ca={}, cert={}, key={}", ca, cert, key);
+            config = config.with_security(ca, cert, key);
+        }
+
+        let client = TransactionClient::new_with_config(pd_endpoints, config)
+            .await
+            .context("Failed to connect to TiKV")?;
+        let store = Self {
+            client: Some(Arc::new(client)),
+        };
+
+        store.check_format_version().await?;
+        info!("Initialized system store for keyspace: {}", keyspace);
+
+        Ok(store)
+    }
+
     #[cfg(test)]
     pub(crate) fn new_stub() -> Arc<Self> {
         use std::sync::OnceLock;

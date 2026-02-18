@@ -1,5 +1,6 @@
 use crate::sql::optimizer::statistics::TableStatistics;
 use dashmap::DashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Per-tenant cache for table statistics used by the query planner.
@@ -11,6 +12,9 @@ pub(crate) struct TableStatsCache {
     inner: DashMap<(u64, u64), usize>, // (db_id, table_id) → estimated row count
     /// Full column statistics collected by ANALYZE.
     full_stats: DashMap<(u64, u64), Arc<TableStatistics>>,
+    /// Per-table modification count since last ANALYZE.
+    /// Key: (db_id, table_id), Value: modification count (atomic for lock-free DML path)
+    mod_counts: DashMap<(u64, u64), AtomicU64>,
 }
 
 impl TableStatsCache {
@@ -18,6 +22,7 @@ impl TableStatsCache {
         Self {
             inner: DashMap::new(),
             full_stats: DashMap::new(),
+            mod_counts: DashMap::new(),
         }
     }
 
@@ -70,6 +75,42 @@ impl TableStatsCache {
     pub(crate) fn invalidate(&self, db_id: u64, table_id: u64) {
         self.inner.remove(&(db_id, table_id));
         self.full_stats.remove(&(db_id, table_id));
+    }
+
+    /// Increment modification count. Called on INSERT/UPDATE/DELETE.
+    pub(crate) fn bump_mod_count(&self, db_id: u64, table_id: u64, delta: u64) {
+        self.mod_counts
+            .entry((db_id, table_id))
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(delta, Ordering::Relaxed);
+    }
+
+    /// Get current modification count since last ANALYZE.
+    pub(crate) fn get_mod_count(&self, db_id: u64, table_id: u64) -> u64 {
+        self.mod_counts
+            .get(&(db_id, table_id))
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Reset modification count (called after ANALYZE completes).
+    pub(crate) fn reset_mod_count(&self, db_id: u64, table_id: u64) {
+        if let Some(v) = self.mod_counts.get(&(db_id, table_id)) {
+            v.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Check if table needs auto-ANALYZE based on threshold formula.
+    /// Formula: mod_count > threshold_base + 0.1 * estimated_rows
+    pub(crate) fn needs_auto_analyze(
+        &self,
+        db_id: u64,
+        table_id: u64,
+        threshold_base: u64,
+    ) -> bool {
+        let mod_count = self.get_mod_count(db_id, table_id);
+        let estimated_rows = self.get_estimate(db_id, table_id).unwrap_or(0) as u64;
+        mod_count > threshold_base + estimated_rows / 10
     }
 }
 
@@ -331,5 +372,94 @@ mod tests {
         assert!(cache.get_full_stats(1, 42).is_some());
         assert_eq!(cache.get_full_stats(1, 42).unwrap().row_count, 300);
         assert_eq!(cache.get_estimate(1, 42), Some(300));
+    }
+
+    #[test]
+    fn test_bump_mod_count_increments() {
+        let cache = TableStatsCache::new();
+        assert_eq!(cache.get_mod_count(1, 100), 0);
+
+        cache.bump_mod_count(1, 100, 5);
+        assert_eq!(cache.get_mod_count(1, 100), 5);
+
+        cache.bump_mod_count(1, 100, 3);
+        assert_eq!(cache.get_mod_count(1, 100), 8);
+    }
+
+    #[test]
+    fn test_reset_mod_count_resets_to_zero() {
+        let cache = TableStatsCache::new();
+        cache.bump_mod_count(1, 100, 10);
+        assert_eq!(cache.get_mod_count(1, 100), 10);
+
+        cache.reset_mod_count(1, 100);
+        assert_eq!(cache.get_mod_count(1, 100), 0);
+    }
+
+    #[test]
+    fn test_reset_mod_count_nonexistent_table() {
+        let cache = TableStatsCache::new();
+        cache.reset_mod_count(1, 999);
+        assert_eq!(cache.get_mod_count(1, 999), 0);
+    }
+
+    #[test]
+    fn test_needs_auto_analyze_with_1000_rows_threshold_50() {
+        let cache = TableStatsCache::new();
+        cache.update_estimate(1, 100, 1000);
+
+        let threshold = 50;
+        let expected_trigger = 50 + 1000 / 10;
+
+        assert!(!cache.needs_auto_analyze(1, 100, threshold));
+
+        cache.bump_mod_count(1, 100, expected_trigger);
+        assert!(!cache.needs_auto_analyze(1, 100, threshold));
+
+        cache.bump_mod_count(1, 100, 1);
+        assert!(cache.needs_auto_analyze(1, 100, threshold));
+    }
+
+    #[test]
+    fn test_needs_auto_analyze_with_zero_rows() {
+        let cache = TableStatsCache::new();
+        cache.update_estimate(1, 100, 0);
+
+        let threshold = 50;
+        assert!(!cache.needs_auto_analyze(1, 100, threshold));
+
+        cache.bump_mod_count(1, 100, 50);
+        assert!(!cache.needs_auto_analyze(1, 100, threshold));
+
+        cache.bump_mod_count(1, 100, 1);
+        assert!(cache.needs_auto_analyze(1, 100, threshold));
+    }
+
+    #[test]
+    fn test_needs_auto_analyze_no_estimate() {
+        let cache = TableStatsCache::new();
+
+        let threshold = 50;
+        assert!(!cache.needs_auto_analyze(1, 100, threshold));
+
+        cache.bump_mod_count(1, 100, 50);
+        assert!(!cache.needs_auto_analyze(1, 100, threshold));
+
+        cache.bump_mod_count(1, 100, 1);
+        assert!(cache.needs_auto_analyze(1, 100, threshold));
+    }
+
+    #[test]
+    fn test_mod_count_independent_per_table() {
+        let cache = TableStatsCache::new();
+        cache.bump_mod_count(1, 100, 10);
+        cache.bump_mod_count(1, 200, 20);
+
+        assert_eq!(cache.get_mod_count(1, 100), 10);
+        assert_eq!(cache.get_mod_count(1, 200), 20);
+
+        cache.reset_mod_count(1, 100);
+        assert_eq!(cache.get_mod_count(1, 100), 0);
+        assert_eq!(cache.get_mod_count(1, 200), 20);
     }
 }
