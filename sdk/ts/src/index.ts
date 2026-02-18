@@ -1,9 +1,5 @@
-import { createCustomerClient, type CustomerClientOptions } from './customer';
-import {
-  defaultCredentialStore,
-  type CredentialStore,
-  type Credentials,
-} from './credentials';
+import { createDb9Client } from './client';
+import type { CredentialStore } from './credentials';
 import type { FetchFn } from './http';
 import type { DatabaseResponse } from './types';
 
@@ -28,34 +24,12 @@ export interface InstantDatabaseResult {
 export async function instantDatabase(
   options: InstantDatabaseOptions = {}
 ): Promise<InstantDatabaseResult> {
-  const store = options.credentialStore ?? defaultCredentialStore();
   const dbName = options.name ?? 'default';
 
-  const creds = await store.load();
-  let token: string;
-
-  if (creds?.token) {
-    token = creds.token;
-  } else {
-    const publicClient = createCustomerClient({
-      baseUrl: options.baseUrl,
-      fetch: options.fetch,
-    });
-    const regResult = await publicClient.auth.anonymousRegister();
-    token = regResult.token;
-
-    await store.save({
-      token: regResult.token,
-      is_anonymous: regResult.is_anonymous,
-      anonymous_id: regResult.anonymous_id,
-      anonymous_secret: regResult.anonymous_secret,
-    });
-  }
-
-  const client = createCustomerClient({
+  const client = createDb9Client({
     baseUrl: options.baseUrl,
     fetch: options.fetch,
-    token,
+    credentialStore: options.credentialStore,
   });
 
   const existing = await client.databases.list();
@@ -86,8 +60,8 @@ function toResult(db: DatabaseResponse): InstantDatabaseResult {
   };
 }
 
-export { createCustomerClient } from './customer';
-export type { CustomerClientOptions, CustomerClient } from './customer';
+export { createDb9Client } from './client';
+export type { Db9ClientOptions, Db9Client } from './client';
 
 export {
   Db9Error,

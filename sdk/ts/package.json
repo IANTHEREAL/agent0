@@ -1,6 +1,6 @@
 {
   "name": "get-db9",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "TypeScript SDK for pg-tikv — instant PostgreSQL databases",
   "type": "module",
   "engines": {
@@ -15,10 +15,10 @@
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
     },
-    "./customer": {
-      "types": "./dist/customer.d.ts",
-      "import": "./dist/customer.js",
-      "require": "./dist/customer.cjs"
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js",
+      "require": "./dist/client.cjs"
     }
   },
   "files": [

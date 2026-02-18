@@ -1,5 +1,8 @@
 import { createHttpClient, type FetchFn, type HttpClient } from './http';
-import type { CredentialStore } from './credentials';
+import {
+  defaultCredentialStore,
+  type CredentialStore,
+} from './credentials';
 import type {
   RegisterRequest,
   CustomerResponse,
@@ -29,18 +32,19 @@ import type {
   CreateUserRequest,
 } from './types';
 
-export interface CustomerClientOptions {
+export interface Db9ClientOptions {
   baseUrl?: string;
   token?: string;
   fetch?: FetchFn;
   credentialStore?: CredentialStore;
 }
 
-export function createCustomerClient(options: CustomerClientOptions = {}) {
+export function createDb9Client(options: Db9ClientOptions = {}) {
   const baseUrl =
     options.baseUrl ?? 'https://db9.shared.aws.tidbcloud.com/api';
   let token = options.token;
   let tokenLoaded = !!token;
+  const store = options.credentialStore ?? defaultCredentialStore();
 
   // Public HTTP client — no Authorization header
   const publicClient = createHttpClient({
@@ -50,12 +54,23 @@ export function createCustomerClient(options: CustomerClientOptions = {}) {
 
   // Lazy-loading authenticated HTTP client
   async function getAuthClient(): Promise<HttpClient> {
-    if (!token && !tokenLoaded && options.credentialStore) {
-      const creds = await options.credentialStore.load();
-      if (creds) token = creds.token;
+    if (!token && !tokenLoaded) {
+      const creds = await store.load();
+      if (creds?.token) token = creds.token;
       tokenLoaded = true;
     }
-    if (!token) throw new Error('No authentication token available');
+    if (!token) {
+      const reg = await publicClient.post<AnonymousRegisterResponse>(
+        '/customer/anonymous-register'
+      );
+      token = reg.token;
+      await store.save({
+        token: reg.token,
+        is_anonymous: reg.is_anonymous,
+        anonymous_id: reg.anonymous_id,
+        anonymous_secret: reg.anonymous_secret,
+      });
+    }
     return createHttpClient({
       baseUrl,
       fetch: options.fetch,
@@ -243,4 +258,4 @@ export function createCustomerClient(options: CustomerClientOptions = {}) {
   };
 }
 
-export type CustomerClient = ReturnType<typeof createCustomerClient>;
+export type Db9Client = ReturnType<typeof createDb9Client>;

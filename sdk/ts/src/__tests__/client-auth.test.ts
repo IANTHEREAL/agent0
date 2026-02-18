@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { createCustomerClient } from '../customer';
+import { createDb9Client } from '../client';
 import { MemoryCredentialStore } from '../credentials';
 import type { FetchFn } from '../http';
 
@@ -17,7 +17,7 @@ function capturingFetch(status: number, body?: unknown) {
 
 const BASE = 'http://test:8090/api';
 
-describe('createCustomerClient – auth endpoints', () => {
+describe('createDb9Client – auth endpoints', () => {
   it('register() → POST /customer/register with body', async () => {
     const { fn, calls } = capturingFetch(200, {
       id: 'c1',
@@ -25,7 +25,7 @@ describe('createCustomerClient – auth endpoints', () => {
       created_at: '2026-01-01T00:00:00Z',
       status: 'active',
     });
-    const client = createCustomerClient({ baseUrl: BASE, fetch: fn });
+    const client = createDb9Client({ baseUrl: BASE, fetch: fn });
 
     const res = await client.auth.register({
       email: 'a@b.com',
@@ -46,7 +46,7 @@ describe('createCustomerClient – auth endpoints', () => {
       token: 'tok123',
       expires_at: '2026-12-31T00:00:00Z',
     });
-    const client = createCustomerClient({ baseUrl: BASE, fetch: fn });
+    const client = createDb9Client({ baseUrl: BASE, fetch: fn });
 
     const res = await client.auth.login({
       email: 'a@b.com',
@@ -66,7 +66,7 @@ describe('createCustomerClient – auth endpoints', () => {
       anonymous_id: 'aid',
       anonymous_secret: 'asec',
     });
-    const client = createCustomerClient({ baseUrl: BASE, fetch: fn });
+    const client = createDb9Client({ baseUrl: BASE, fetch: fn });
 
     const res = await client.auth.anonymousRegister();
 
@@ -81,7 +81,7 @@ describe('createCustomerClient – auth endpoints', () => {
       token: 'refreshed-tok',
       expires_at: '2026-12-31T00:00:00Z',
     });
-    const client = createCustomerClient({ baseUrl: BASE, fetch: fn });
+    const client = createDb9Client({ baseUrl: BASE, fetch: fn });
 
     const res = await client.auth.anonymousRefresh({
       anonymous_id: 'aid',
@@ -103,7 +103,7 @@ describe('createCustomerClient – auth endpoints', () => {
       created_at: '2026-01-01T00:00:00Z',
       status: 'active',
     });
-    const client = createCustomerClient({
+    const client = createDb9Client({
       baseUrl: BASE,
       fetch: fn,
       token: 'my-token',
@@ -124,7 +124,7 @@ describe('createCustomerClient – auth endpoints', () => {
       anonymous_id: 'aid',
       anonymous_secret: 'asec',
     });
-    const client = createCustomerClient({
+    const client = createDb9Client({
       baseUrl: BASE,
       fetch: fn,
       token: 'my-token',
@@ -146,7 +146,7 @@ describe('createCustomerClient – auth endpoints', () => {
       email: 'a@b.com',
       claimed: true,
     });
-    const client = createCustomerClient({
+    const client = createDb9Client({
       baseUrl: BASE,
       fetch: fn,
       token: 'my-token',
@@ -169,12 +169,12 @@ describe('createCustomerClient – auth endpoints', () => {
   });
 });
 
-describe('createCustomerClient – token endpoints', () => {
+describe('createDb9Client – token endpoints', () => {
   it('tokens.list() → GET /customer/tokens with Authorization header', async () => {
     const { fn, calls } = capturingFetch(200, [
       { id: 't1', name: 'default', created_at: '2026-01-01T00:00:00Z' },
     ]);
-    const client = createCustomerClient({
+    const client = createDb9Client({
       baseUrl: BASE,
       fetch: fn,
       token: 'my-token',
@@ -193,7 +193,7 @@ describe('createCustomerClient – token endpoints', () => {
 
   it('tokens.revoke() → DELETE /customer/tokens/:id with Authorization header', async () => {
     const { fn, calls } = capturingFetch(200, { message: 'Token revoked' });
-    const client = createCustomerClient({
+    const client = createDb9Client({
       baseUrl: BASE,
       fetch: fn,
       token: 'my-token',
@@ -210,7 +210,7 @@ describe('createCustomerClient – token endpoints', () => {
   });
 });
 
-describe('createCustomerClient – auth contract', () => {
+describe('createDb9Client – auth contract', () => {
   it('public endpoints do NOT send Authorization header', async () => {
     const { fn, calls } = capturingFetch(200, {
       id: 'c1',
@@ -218,7 +218,7 @@ describe('createCustomerClient – auth contract', () => {
       created_at: '2026-01-01T00:00:00Z',
       status: 'active',
     });
-    const client = createCustomerClient({
+    const client = createDb9Client({
       baseUrl: BASE,
       fetch: fn,
       token: 'my-token',
@@ -245,7 +245,7 @@ describe('createCustomerClient – auth contract', () => {
       created_at: '2026-01-01T00:00:00Z',
       status: 'active',
     });
-    const client = createCustomerClient({
+    const client = createDb9Client({
       baseUrl: BASE,
       fetch: fn,
       token: 'secret-tok',
@@ -263,17 +263,40 @@ describe('createCustomerClient – auth contract', () => {
     }
   });
 
-  it('throws when no token available for authenticated endpoint', async () => {
-    const { fn } = capturingFetch(200, {});
-    const client = createCustomerClient({ baseUrl: BASE, fetch: fn });
+  it('auto-registers anonymously when no token available', async () => {
+    const store = new MemoryCredentialStore();
+    const { fn, calls } = capturingFetch(200, {
+      token: 'anon-tok',
+      expires_at: '2026-12-31T00:00:00Z',
+      is_anonymous: true,
+      anonymous_id: 'aid',
+      anonymous_secret: 'asec',
+      id: 'c1',
+      email: 'a@b.com',
+      created_at: '2026-01-01T00:00:00Z',
+      status: 'active',
+    });
+    const client = createDb9Client({
+      baseUrl: BASE,
+      fetch: fn,
+      credentialStore: store,
+    });
 
-    await expect(client.auth.me()).rejects.toThrow(
-      'No authentication token available'
-    );
+    await client.auth.me();
+
+    expect(calls[0].url).toBe(`${BASE}/customer/anonymous-register`);
+    expect(calls[1].url).toBe(`${BASE}/customer/me`);
+    const saved = await store.load();
+    expect(saved).toEqual({
+      token: 'anon-tok',
+      is_anonymous: true,
+      anonymous_id: 'aid',
+      anonymous_secret: 'asec',
+    });
   });
 });
 
-describe('createCustomerClient – CredentialStore auto-loading', () => {
+describe('createDb9Client – CredentialStore auto-loading', () => {
   it('loads token from CredentialStore when no token provided', async () => {
     const store = new MemoryCredentialStore();
     await store.save({ token: 'store-tok' });
@@ -284,7 +307,7 @@ describe('createCustomerClient – CredentialStore auto-loading', () => {
       created_at: '2026-01-01T00:00:00Z',
       status: 'active',
     });
-    const client = createCustomerClient({
+    const client = createDb9Client({
       baseUrl: BASE,
       fetch: fn,
       credentialStore: store,
@@ -307,7 +330,7 @@ describe('createCustomerClient – CredentialStore auto-loading', () => {
       created_at: '2026-01-01T00:00:00Z',
       status: 'active',
     });
-    const client = createCustomerClient({
+    const client = createDb9Client({
       baseUrl: BASE,
       fetch: fn,
       token: 'explicit-tok',
@@ -321,18 +344,30 @@ describe('createCustomerClient – CredentialStore auto-loading', () => {
     ).toBe('Bearer explicit-tok');
   });
 
-  it('throws when CredentialStore is empty and no token', async () => {
+  it('auto-registers when CredentialStore is empty and no token', async () => {
     const store = new MemoryCredentialStore();
-    const { fn } = capturingFetch(200, {});
-    const client = createCustomerClient({
+    const { fn, calls } = capturingFetch(200, {
+      token: 'anon-tok',
+      expires_at: '2026-12-31T00:00:00Z',
+      is_anonymous: true,
+      anonymous_id: 'aid',
+      anonymous_secret: 'asec',
+      id: 'c1',
+      email: 'a@b.com',
+      created_at: '2026-01-01T00:00:00Z',
+      status: 'active',
+    });
+    const client = createDb9Client({
       baseUrl: BASE,
       fetch: fn,
       credentialStore: store,
     });
 
-    await expect(client.auth.me()).rejects.toThrow(
-      'No authentication token available'
-    );
+    await client.auth.me();
+
+    expect(calls[0].url).toBe(`${BASE}/customer/anonymous-register`);
+    const saved = await store.load();
+    expect(saved?.token).toBe('anon-tok');
   });
 
   it('loads from CredentialStore only once (caches result)', async () => {
@@ -352,7 +387,7 @@ describe('createCustomerClient – CredentialStore auto-loading', () => {
       created_at: '2026-01-01T00:00:00Z',
       status: 'active',
     });
-    const client = createCustomerClient({
+    const client = createDb9Client({
       baseUrl: BASE,
       fetch: fn,
       credentialStore: store,
@@ -365,9 +400,9 @@ describe('createCustomerClient – CredentialStore auto-loading', () => {
   });
 });
 
-describe('createCustomerClient – defaults', () => {
+describe('createDb9Client – defaults', () => {
   it('uses default baseUrl when not provided', () => {
-    const client = createCustomerClient();
+    const client = createDb9Client();
     expect(client).toBeDefined();
     expect(client.auth).toBeDefined();
     expect(client.tokens).toBeDefined();

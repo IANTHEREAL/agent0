@@ -29,14 +29,15 @@ const db = await instantDatabase({
 });
 ```
 
-## Customer API
+## Db9 Client
 
-Full typed client for the Customer API (register, databases, SQL, migrations).
+Full typed client for the API (register, databases, SQL, migrations).
 
 ```typescript
-import { createCustomerClient } from 'get-db9/customer';
+import { createDb9Client } from 'get-db9/client';
 
-const client = createCustomerClient({ token: 'your-token' });
+// No token needed. Automatically anonymous-registers and saves credentials.
+const client = createDb9Client();
 
 // Create a database
 const db = await client.databases.create({ name: 'myapp' });
@@ -69,14 +70,24 @@ await client.databases.applyMigration(db.id, {
 | `seed` | `string` | — | SQL to run after creation |
 | `seedFile` | `string` | — | SQL file content to run |
 
-### Customer client options
+### Db9 client options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `baseUrl` | `string` | Production URL | API endpoint |
-| `token` | `string` | — | Bearer token |
+| `token` | `string` | — | Bearer token (optional) |
 | `fetch` | `FetchFn` | `globalThis.fetch` | Custom fetch |
-| `credentialStore` | `CredentialStore` | — | Auto-load token |
+| `credentialStore` | `CredentialStore` | `FileCredentialStore` | Load/save token |
+
+## Zero-config client
+
+```typescript
+import { createDb9Client } from 'get-db9';
+
+// No token needed! Auto-registers anonymously
+const client = createDb9Client();
+const db = await client.databases.create({ name: 'myapp' });
+```
 
 ## Error Handling
 
