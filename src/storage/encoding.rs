@@ -1137,8 +1137,8 @@ pub fn deserialize_schema(data: &[u8]) -> Result<TableSchema> {
     }
 
     // Fallback: deserialize with legacy IndexDef (no `state` field), then upgrade.
-    let legacy: TableSchemaLegacy =
-        bincode::deserialize(payload).context("Failed to deserialize schema (tried both current and legacy formats)")?;
+    let legacy: TableSchemaLegacy = bincode::deserialize(payload)
+        .context("Failed to deserialize schema (tried both current and legacy formats)")?;
     Ok(legacy.into())
 }
 
