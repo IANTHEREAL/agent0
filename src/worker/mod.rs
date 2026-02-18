@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 
 static SYSTEM_STORE: OnceLock<Arc<TikvStore>> = OnceLock::new();
+static WORKER_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 
 /// Set the global system store. Called once during startup.
 pub fn set_system_store(store: Arc<TikvStore>) {
@@ -20,6 +21,16 @@ pub fn set_system_store(store: Arc<TikvStore>) {
 /// Get the global system store. Returns None if worker is disabled.
 pub fn get_system_store() -> Option<&'static Arc<TikvStore>> {
     SYSTEM_STORE.get()
+}
+
+pub fn set_worker_notify(notify: Arc<tokio::sync::Notify>) {
+    WORKER_NOTIFY.set(notify).ok();
+}
+
+pub fn wake_worker() {
+    if let Some(notify) = WORKER_NOTIFY.get() {
+        notify.notify_one();
+    }
 }
 
 /// Ensure the system keyspace exists in PD before connecting via the TiKV client.

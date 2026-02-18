@@ -1,8 +1,7 @@
-//! Enqueue path for AFTER triggers.
-
-use super::queue::{encode_trigger_queue_key, TriggerEvent, TriggerOp};
-use super::worker::trigger_worker;
-use crate::sql::executor::Executor;
+use super::execute::{execute_trigger_body_standalone, plpgsql_outer_block_range};
+use super::queue::TriggerOp;
+use super::rewrite::substitute_row_references;
+use crate::sql::executor::{Executor, PendingAsyncTrigger};
 use crate::storage::TikvStore;
 use crate::types::{Row, TriggerDef};
 use anyhow::Result;
@@ -24,10 +23,6 @@ fn trigger_body_needs_async(body: &str) -> bool {
     ASYNC_TRIGGER_KEYWORDS.iter().any(|kw| lower.contains(kw))
 }
 
-/// Execute AFTER-row triggers, synchronously when possible.
-///
-/// Triggers whose function body contains HTTP/extension calls are enqueued
-/// for asynchronous processing. All others execute in the current transaction.
 pub(crate) async fn enqueue_after_triggers(
     txn: &mut Transaction,
     db_id: u64,
@@ -42,11 +37,6 @@ pub(crate) async fn enqueue_after_triggers(
     sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
 ) -> Result<()> {
-    let worker = trigger_worker();
-    if !worker.config().enabled {
-        return Ok(());
-    }
-
     let op_str = match op {
         TriggerOp::Insert => "INSERT",
         TriggerOp::Update => "UPDATE",
@@ -66,9 +56,9 @@ pub(crate) async fn enqueue_after_triggers(
     }
 
     let schema = store.get_schema(txn, db_id, table_full_name).await?;
-
-    let quota = worker.get_quota(keyspace);
-    let mut queued_any = false;
+    let Some(schema) = schema else {
+        return Ok(());
+    };
 
     for trigger in after_triggers {
         let func = store.get_function(txn, db_id, &trigger.function).await?;
@@ -77,37 +67,20 @@ pub(crate) async fn enqueue_after_triggers(
         };
 
         if trigger_body_needs_async(&func.body) {
-            let remaining = quota.max_queue_depth.saturating_sub(
-                quota
-                    .current_depth
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            );
-            if remaining == 0 {
-                continue;
+            if let Some(sql) = flatten_trigger_body_to_sql(&func.body, &schema, new_row, old_row) {
+                executor.push_pending_async_trigger(PendingAsyncTrigger {
+                    keyspace: keyspace.to_string(),
+                    db_id,
+                    command: sql,
+                });
             }
-
-            let ev = TriggerEvent::new_pending(
-                trigger.name.clone(),
-                db_id,
-                table_full_name.to_string(),
-                op.clone(),
-                old_row.cloned(),
-                new_row.cloned(),
-            );
-            let key = encode_trigger_queue_key(ev.id);
-            let val = bincode::serialize(&ev)?;
-            crate::txn::txn_put(txn, key, val).await?;
-            quota
-                .current_depth
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            queued_any = true;
-        } else if let Some(schema) = &schema {
-            Box::pin(worker.execute_trigger_body(
+        } else {
+            Box::pin(execute_trigger_body_standalone(
                 executor,
                 txn,
                 db_id,
                 sequence_values,
-                schema,
+                &schema,
                 &func.body,
                 old_row,
                 new_row,
@@ -117,27 +90,131 @@ pub(crate) async fn enqueue_after_triggers(
         }
     }
 
-    if queued_any {
-        executor.schedule_trigger_activation(keyspace);
-        // Best-effort registry write for durable keyspace discovery
-        if let Some(system_store) = crate::worker::get_system_store() {
-            let _ = async {
-                let mut sys_txn = system_store.begin().await?;
-                system_store
-                    .update_registry_task_types(
-                        &mut sys_txn,
-                        keyspace,
-                        db_id,
-                        crate::worker::types::TASK_TYPE_ASYNC_TRIGGER,
-                        0,
-                    )
-                    .await?;
-                sys_txn.commit().await?;
-                Ok::<(), anyhow::Error>(())
-            }
-            .await;
+    Ok(())
+}
+
+pub(crate) fn flatten_trigger_body_to_sql(
+    body: &str,
+    schema: &crate::types::TableSchema,
+    new_row: Option<&Row>,
+    old_row: Option<&Row>,
+) -> Option<String> {
+    let mut new_values = match new_row {
+        Some(r) => r.values.clone(),
+        None => vec![crate::types::Value::Null; schema.columns.len()],
+    };
+    if new_values.len() < schema.columns.len() {
+        new_values.resize(schema.columns.len(), crate::types::Value::Null);
+    }
+
+    let (begin_pos, end_pos) = plpgsql_outer_block_range(body)?;
+    let block = &body[begin_pos..end_pos];
+
+    let mut statements = Vec::new();
+    let mut stmt_buf = String::new();
+
+    for raw_line in block.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("--") {
+            continue;
+        }
+
+        if !stmt_buf.is_empty() {
+            stmt_buf.push(' ');
+        }
+        stmt_buf.push_str(line);
+
+        if !line.ends_with(';') {
+            continue;
+        }
+
+        if let Some(sql) = flatten_trigger_statement(&stmt_buf, schema, &new_values, old_row) {
+            statements.push(sql);
+        }
+        stmt_buf.clear();
+    }
+
+    if !stmt_buf.trim().is_empty() {
+        if let Some(sql) = flatten_trigger_statement(&stmt_buf, schema, &new_values, old_row) {
+            statements.push(sql);
         }
     }
 
-    Ok(())
+    if statements.is_empty() {
+        None
+    } else {
+        Some(statements.join("; "))
+    }
+}
+
+fn flatten_trigger_statement(
+    stmt: &str,
+    schema: &crate::types::TableSchema,
+    new_values: &[crate::types::Value],
+    old_row: Option<&Row>,
+) -> Option<String> {
+    let stmt = stmt.trim().trim_end_matches(';').trim();
+    if stmt.is_empty() {
+        return None;
+    }
+
+    let upper = stmt.to_ascii_uppercase();
+    if upper == "NULL" || upper == "RETURN" || upper.starts_with("RETURN ") {
+        return None;
+    }
+
+    if parse_new_assignment(stmt).is_some() {
+        return None;
+    }
+
+    let substituted = substitute_row_references(stmt, schema, new_values, old_row);
+    if let Some(rest) = strip_prefix_ignore_ascii_case(&substituted, "PERFORM ") {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            None
+        } else {
+            Some(format!("SELECT {}", rest))
+        }
+    } else {
+        Some(substituted)
+    }
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+    if input.len() < prefix.len() {
+        return None;
+    }
+    let (head, tail) = input.split_at(prefix.len());
+    if head.eq_ignore_ascii_case(prefix) {
+        Some(tail)
+    } else {
+        None
+    }
+}
+
+fn parse_new_assignment(stmt: &str) -> Option<(&str, &str)> {
+    let s = stmt.trim().trim_end_matches(';').trim();
+    let rest = s.strip_prefix("NEW.").or_else(|| s.strip_prefix("new."))?;
+
+    if let Some(pos) = rest.find(":=") {
+        let col = rest[..pos].trim();
+        let expr = rest[pos + 2..].trim();
+        return Some((col, expr));
+    }
+    if let Some(pos) = rest.find('=') {
+        let before = rest.as_bytes().get(pos.wrapping_sub(1)).copied();
+        let after = rest.as_bytes().get(pos + 1).copied();
+        if before == Some(b':')
+            || before == Some(b'<')
+            || before == Some(b'>')
+            || before == Some(b'!')
+            || after == Some(b'=')
+        {
+            return None;
+        }
+        let col = rest[..pos].trim();
+        let expr = rest[pos + 1..].trim();
+        return Some((col, expr));
+    }
+    None
 }

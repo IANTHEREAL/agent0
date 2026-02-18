@@ -1,3 +1,6 @@
+use crate::cron::config::CronConfig;
+use crate::cron::worker::gc_database;
+use crate::pool::TikvClientPool;
 use crate::storage::TikvStore;
 use crate::worker::config::WorkerConfig;
 use anyhow::Result;
@@ -7,13 +10,19 @@ use tracing::{info, warn};
 
 pub struct WorkerGc {
     system_store: Arc<TikvStore>,
+    pool: Arc<TikvClientPool>,
     config: WorkerConfig,
 }
 
 impl WorkerGc {
-    pub fn new(system_store: Arc<TikvStore>, config: WorkerConfig) -> Self {
+    pub fn new(
+        system_store: Arc<TikvStore>,
+        pool: Arc<TikvClientPool>,
+        config: WorkerConfig,
+    ) -> Self {
         Self {
             system_store,
+            pool,
             config,
         }
     }
@@ -36,6 +45,43 @@ impl WorkerGc {
 
     async fn gc_tick(&self) -> Result<()> {
         self.cleanup_orphan_claims().await?;
+        self.cleanup_cron_runs().await?;
+        Ok(())
+    }
+
+    /// Scan worker registry for keyspaces with cron jobs and GC their run history.
+    async fn cleanup_cron_runs(&self) -> Result<()> {
+        let cron_config = CronConfig::from_env();
+
+        let mut txn = self.system_store.begin().await?;
+        let registry_entries = self.system_store.list_worker_registry(&mut txn).await?;
+        txn.commit().await?;
+
+        for entry in registry_entries {
+            if !entry.has_cron() {
+                continue;
+            }
+
+            let handle = match self.pool.acquire(Some(entry.keyspace.clone())).await {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(
+                        "cron GC: failed to acquire store for keyspace={}: {}",
+                        entry.keyspace, e
+                    );
+                    continue;
+                }
+            };
+            let store = handle.store().clone();
+
+            if let Err(e) = gc_database(&store, entry.db_id, &cron_config).await {
+                warn!(
+                    "cron GC error for keyspace={} db_id={}: {}",
+                    entry.keyspace, entry.db_id, e
+                );
+            }
+        }
+
         Ok(())
     }
 

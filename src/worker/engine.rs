@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
@@ -25,6 +26,7 @@ pub struct WorkerEngine {
     active_jobs: Arc<AtomicU32>,
     semaphore: Arc<Semaphore>,
     metrics: Arc<WorkerMetrics>,
+    notify: Arc<Notify>,
 }
 
 impl WorkerEngine {
@@ -34,6 +36,8 @@ impl WorkerEngine {
         pool: Arc<TikvClientPool>,
     ) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_jobs));
+        let notify = Arc::new(Notify::new());
+        crate::worker::set_worker_notify(notify.clone());
         Self {
             config,
             system_store,
@@ -41,6 +45,7 @@ impl WorkerEngine {
             active_jobs: Arc::new(AtomicU32::new(0)),
             semaphore,
             metrics: Arc::new(WorkerMetrics::new()),
+            notify,
         }
     }
 
@@ -56,7 +61,10 @@ impl WorkerEngine {
 
         let mut interval = tokio::time::interval(Duration::from_millis(self.config.poll_ms));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = self.notify.notified() => {}
+            }
             if let Err(e) = self.tick().await {
                 warn!("Worker tick error: {}", e);
             }

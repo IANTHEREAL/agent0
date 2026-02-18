@@ -81,6 +81,13 @@ fn is_ephemeral_table_id(table_id: u64) -> bool {
     table_id == 0
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PendingAsyncTrigger {
+    pub keyspace: String,
+    pub db_id: u64,
+    pub command: String,
+}
+
 pub struct Executor {
     store: Arc<TikvStore>,
     auth_manager: AuthManager,
@@ -93,6 +100,7 @@ pub struct Executor {
     /// transaction) and flushed only on successful commit so that the trigger
     /// worker never sees uncommitted events.
     pending_trigger_activations: Mutex<HashSet<String>>,
+    pending_async_triggers: Mutex<Vec<PendingAsyncTrigger>>,
 }
 
 impl Executor {
@@ -111,6 +119,7 @@ impl Executor {
             trigger_cache,
             stats_cache,
             pending_trigger_activations: Mutex::new(HashSet::new()),
+            pending_async_triggers: Mutex::new(Vec::new()),
         }
     }
 
@@ -171,28 +180,61 @@ impl Executor {
         }
     }
 
-    /// Record a keyspace that needs trigger worker activation.
-    /// Called during DML execution (inside the transaction); the actual
-    /// `mark_active` is deferred until after commit.
-    pub(crate) fn schedule_trigger_activation(&self, keyspace: &str) {
-        self.pending_trigger_activations
-            .lock()
-            .unwrap()
-            .insert(keyspace.to_string());
+    pub(crate) fn push_pending_async_trigger(&self, trigger: PendingAsyncTrigger) {
+        self.pending_async_triggers.lock().unwrap().push(trigger);
     }
 
-    /// Activate trigger workers for all accumulated keyspaces.
-    /// Must be called only after a successful commit.
     pub(crate) fn flush_trigger_activations(&self) {
-        let keyspaces: Vec<String> = self
-            .pending_trigger_activations
+        let triggers: Vec<PendingAsyncTrigger> = self
+            .pending_async_triggers
             .lock()
             .unwrap()
-            .drain()
+            .drain(..)
             .collect();
-        for ks in keyspaces {
-            super::super::trigger_worker::trigger_worker().mark_active(&ks);
+        if !triggers.is_empty() {
+            if let Some(system_store) = crate::worker::get_system_store() {
+                let system_store = system_store.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let mut txn = system_store.begin().await?;
+                        for (idx, trigger) in triggers.iter().enumerate() {
+                            let now_ms = chrono::Utc::now().timestamp_millis();
+                            let task_id = now_ms.saturating_add(idx as i64);
+                            let entry = crate::worker::types::TaskQueueEntry::new(
+                                trigger.keyspace.clone(),
+                                trigger.db_id,
+                                task_id,
+                                crate::worker::types::TaskType::AsyncTrigger,
+                                trigger.command.clone(),
+                                "admin".to_string(),
+                                200,
+                            );
+                            let fire_time = chrono::Utc::now().timestamp_millis();
+                            system_store
+                                .put_worker_queue_entry(&mut txn, &entry, fire_time)
+                                .await?;
+                            system_store
+                                .update_registry_task_types(
+                                    &mut txn,
+                                    &trigger.keyspace,
+                                    trigger.db_id,
+                                    crate::worker::types::TASK_TYPE_ASYNC_TRIGGER,
+                                    0,
+                                )
+                                .await?;
+                        }
+                        txn.commit().await?;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await;
+                    if let Err(e) = result {
+                        tracing::warn!("Failed to enqueue async triggers to worker: {}", e);
+                    }
+                    crate::worker::wake_worker();
+                });
+            }
         }
+        self.pending_trigger_activations.lock().unwrap().clear();
     }
 
     /// Discard pending activations without notifying trigger workers.
@@ -200,5 +242,6 @@ impl Executor {
     /// don't cause unnecessary worker wake-ups.
     pub(crate) fn clear_trigger_activations(&self) {
         self.pending_trigger_activations.lock().unwrap().clear();
+        self.pending_async_triggers.lock().unwrap().clear();
     }
 }
