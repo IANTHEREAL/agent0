@@ -58,7 +58,10 @@ async fn ensure_pd_keyspace(pd_endpoints: &[String], keyspace: &str) -> Result<(
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {
-                info!("PD keyspace '{}' ensured (created or already exists)", keyspace);
+                info!(
+                    "PD keyspace '{}' ensured (created or already exists)",
+                    keyspace
+                );
                 Ok(())
             } else {
                 let body_text = resp.text().await.unwrap_or_default();
