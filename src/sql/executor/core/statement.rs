@@ -1163,9 +1163,7 @@ impl Executor {
                         }
                     }
                     match crate::sql::optimizer::optimize(&analyzed, &planning_ctx) {
-                        Ok(physical) => {
-                            explain::physical_plan_to_plan_node(&physical)
-                        }
+                        Ok(physical) => explain::physical_plan_to_plan_node(&physical),
                         Err(_) => {
                             // Optimizer failed (e.g. unsupported aggregate rewrite) —
                             // fall back to AST-based EXPLAIN.

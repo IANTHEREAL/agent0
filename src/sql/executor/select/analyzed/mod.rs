@@ -1249,11 +1249,8 @@ impl Executor {
                         .await?;
                     // materialize_expr_for_row returns a TypedExpr with the async
                     // function resolved to a Constant. Evaluate to get the value.
-                    let val = crate::sql::expr::typed_eval::eval_typed_expr(
-                        &materialized,
-                        row,
-                        &qctx,
-                    )?;
+                    let val =
+                        crate::sql::expr::typed_eval::eval_typed_expr(&materialized, row, &qctx)?;
                     if *col_idx < row.values.len() {
                         row.values[*col_idx] = val;
                     }

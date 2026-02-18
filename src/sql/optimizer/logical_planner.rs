@@ -29,7 +29,6 @@
 //! all rewrite operations return `Result` so that failures are propagated
 //! as errors rather than panicking.
 
-use anyhow::Result;
 use super::logical_plan::{LogicalNode, LogicalPlan, PlanSchema};
 use super::window_rewrite::{
     collect_window_calls_from_expr, contains_window, rewrite_for_post_window,
@@ -41,6 +40,7 @@ use crate::sql::analyzer::types::{
 use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::operators::AggregateExpr;
 use crate::types::DataType;
+use anyhow::Result;
 
 /// Builds a [`LogicalPlan`] from an [`AnalyzedQuery`].
 pub struct LogicalPlanner;
@@ -642,9 +642,7 @@ impl LogicalPlanner {
                 // subqueries typically don't have complex HAVING. Use
                 // unwrap_or with an empty plan as absolute fallback.
                 let subplan = Self::build(subquery).unwrap_or_else(|_| {
-                    LogicalPlan::empty(PlanSchema::from_columns(
-                        subquery.output_schema.clone(),
-                    ))
+                    LogicalPlan::empty(PlanSchema::from_columns(subquery.output_schema.clone()))
                 });
                 let schema = subplan.schema.clone();
                 LogicalPlan {
