@@ -41,35 +41,38 @@ async fn ensure_pd_keyspace(pd_endpoints: &[String], keyspace: &str) -> Result<(
         .first()
         .ok_or_else(|| anyhow::anyhow!("No PD endpoints configured"))?;
 
-    let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10));
-
-    // Use mTLS if certs are available (matches TiKV client TLS config)
-    let scheme = if let (Ok(ca_path), Ok(cert_path), Ok(key_path)) = (
+    // Build HTTP client with mTLS if TLS certs are available
+    let (client, scheme) = if let (Ok(ca_path), Ok(cert_path), Ok(key_path)) = (
         std::env::var("TIKV_CA_PATH"),
         std::env::var("TIKV_CERT_PATH"),
         std::env::var("TIKV_KEY_PATH"),
     ) {
         let ca_pem = std::fs::read(&ca_path)
             .map_err(|e| anyhow::anyhow!("Failed to read CA cert {}: {}", ca_path, e))?;
-        let ca_cert = reqwest::Certificate::from_pem(&ca_pem)?;
-        builder = builder.add_root_certificate(ca_cert);
-
         let cert_pem = std::fs::read(&cert_path)
             .map_err(|e| anyhow::anyhow!("Failed to read client cert {}: {}", cert_path, e))?;
         let key_pem = std::fs::read(&key_path)
             .map_err(|e| anyhow::anyhow!("Failed to read client key {}: {}", key_path, e))?;
-        let mut identity_pem = cert_pem;
-        identity_pem.extend_from_slice(&key_pem);
-        let identity = reqwest::Identity::from_pem(&identity_pem)?;
-        builder = builder.identity(identity).use_rustls_tls();
 
-        "https"
+        // Build native-tls connector with mTLS
+        let ca = native_tls::Certificate::from_pem(&ca_pem)?;
+        let identity = native_tls::Identity::from_pkcs8(&cert_pem, &key_pem)?;
+        let tls = native_tls::TlsConnector::builder()
+            .add_root_certificate(ca)
+            .identity(identity)
+            .build()?;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .use_preconfigured_tls(tls)
+            .build()?;
+        (client, "https")
     } else {
-        "http"
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        (client, "http")
     };
-
-    let client = builder.build()?;
 
     let base_url = format!("{}://{}", scheme, pd_addr);
 
