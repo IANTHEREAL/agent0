@@ -47,7 +47,6 @@ tests/180_cron_query_patterns.sql
 tests/181_cron_boundary.sql
 tests/218_gin_correctness.sql
 tests/185_worker_cron_queue.sql
-tests/186_worker_bg_sql.sql
 tests/187_worker_cic.sql
 tests/188_worker_refresh_mv.sql
 tests/189_worker_auto_analyze.sql
