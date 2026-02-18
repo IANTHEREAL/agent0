@@ -1682,6 +1682,7 @@ impl Executor {
                                     crate::extensions::context::is_superuser(),
                                     &func.name,
                                     &scalar_arg_values,
+                                    self.tenant_keyspace(),
                                 )
                                 .await
                             {

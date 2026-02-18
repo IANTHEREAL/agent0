@@ -119,6 +119,24 @@ pub(crate) async fn enqueue_after_triggers(
 
     if queued_any {
         executor.schedule_trigger_activation(keyspace);
+        // Best-effort registry write for durable keyspace discovery
+        if let Some(system_store) = crate::worker::get_system_store() {
+            let _ = async {
+                let mut sys_txn = system_store.begin().await?;
+                system_store
+                    .update_registry_task_types(
+                        &mut sys_txn,
+                        keyspace,
+                        db_id,
+                        crate::worker::types::TASK_TYPE_ASYNC_TRIGGER,
+                        0,
+                    )
+                    .await?;
+                sys_txn.commit().await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+        }
     }
 
     Ok(())

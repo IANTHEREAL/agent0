@@ -263,6 +263,34 @@ impl TriggerWorker {
             .clone()
     }
 
+    /// Read keyspaces with async triggers from the worker registry.
+    /// Returns empty vec if system store is not available.
+    async fn registry_keyspaces(&self) -> Vec<String> {
+        let Some(system_store) = crate::worker::get_system_store() else {
+            return Vec::new();
+        };
+        let result = async {
+            let mut txn = system_store.begin().await?;
+            let entries = system_store.list_worker_registry(&mut txn).await?;
+            txn.rollback().await.ok();
+            let keyspaces: Vec<String> = entries
+                .into_iter()
+                .filter(|e| e.has_async_trigger())
+                .map(|e| e.keyspace)
+                .collect();
+            Ok::<Vec<String>, anyhow::Error>(keyspaces)
+        }
+        .await;
+
+        match result {
+            Ok(ks) => ks,
+            Err(e) => {
+                tracing::warn!("Failed to read trigger registry: {}", e);
+                Vec::new()
+            }
+        }
+    }
+
     fn should_process_keyspace(&self, keyspace: &str, now: Instant) -> bool {
         match self.keyspace_backoff.get(keyspace) {
             Some(backoff) => now >= backoff.next_retry_at,
@@ -315,7 +343,14 @@ impl TriggerWorker {
                 break;
             }
 
-            let keyspaces = self.take_active_keyspaces_snapshot();
+            let mut keyspaces = self.take_active_keyspaces_snapshot();
+            // Augment with registry (durable discovery for cross-restart visibility)
+            let registry_ks = self.registry_keyspaces().await;
+            for ks in registry_ks {
+                if !keyspaces.contains(&ks) {
+                    keyspaces.push(ks);
+                }
+            }
             if keyspaces.is_empty() {
                 continue;
             }
