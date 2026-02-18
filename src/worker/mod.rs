@@ -41,11 +41,23 @@ async fn ensure_pd_keyspace(pd_endpoints: &[String], keyspace: &str) -> Result<(
         .first()
         .ok_or_else(|| anyhow::anyhow!("No PD endpoints configured"))?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10));
 
-    let base_url = format!("http://{}", pd_addr);
+    // Use TLS if CA cert is available (matches TiKV client TLS config)
+    let scheme = if let Ok(ca_path) = std::env::var("TIKV_CA_PATH") {
+        let ca_pem = std::fs::read(&ca_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read CA cert {}: {}", ca_path, e))?;
+        let ca_cert = reqwest::Certificate::from_pem(&ca_pem)?;
+        builder = builder.add_root_certificate(ca_cert);
+        "https"
+    } else {
+        "http"
+    };
+
+    let client = builder.build()?;
+
+    let base_url = format!("{}://{}", scheme, pd_addr);
 
     // Try to create the keyspace (idempotent — PD returns 200 if already exists)
     let url = format!("{}/pd/api/v2/keyspaces", base_url);
