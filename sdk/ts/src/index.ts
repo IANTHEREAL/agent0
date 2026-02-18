@@ -89,9 +89,6 @@ function toResult(db: DatabaseResponse): InstantDatabaseResult {
 export { createCustomerClient } from './customer';
 export type { CustomerClientOptions, CustomerClient } from './customer';
 
-export { createAdminClient } from './admin';
-export type { AdminClientOptions, AdminClient } from './admin';
-
 export {
   Db9Error,
   Db9AuthError,

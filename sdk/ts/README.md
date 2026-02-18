@@ -56,26 +56,6 @@ await client.databases.applyMigration(db.id, {
 });
 ```
 
-## Admin API
-
-Full typed client for the Admin API (tenant management, batch operations, audit).
-
-```typescript
-import { createAdminClient } from 'get-db9/admin';
-
-const admin = createAdminClient({ apiKey: 'your-api-key' });
-
-// List tenants
-const { items } = await admin.tenants.list({ state: 'ACTIVE' });
-
-// Create tenant
-const tenant = await admin.tenants.create();
-console.log(tenant.connection_string);
-
-// Batch operations
-const batch = await admin.tenants.batchCreate({ count: 5 });
-```
-
 ## Configuration
 
 ### instantDatabase options
@@ -97,14 +77,6 @@ const batch = await admin.tenants.batchCreate({ count: 5 });
 | `token` | `string` | — | Bearer token |
 | `fetch` | `FetchFn` | `globalThis.fetch` | Custom fetch |
 | `credentialStore` | `CredentialStore` | — | Auto-load token |
-
-### Admin client options
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `baseUrl` | `string` | Production URL | API endpoint |
-| `apiKey` | `string` | — | X-API-Key header |
-| `fetch` | `FetchFn` | `globalThis.fetch` | Custom fetch |
 
 ## Error Handling
 

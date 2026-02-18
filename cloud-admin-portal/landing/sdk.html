@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>get-db9 — TypeScript SDK for db9</title>
-  <meta name="description" content="TypeScript SDK for get-db9 with instantDatabase, customer, and admin APIs.">
+  <meta name="description" content="TypeScript SDK for get-db9 with instantDatabase and customer APIs.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -421,7 +421,6 @@
 
     .api-badge.high { color: #fca5a5; border-color: rgba(252, 165, 165, 0.3); }
     .api-badge.customer { color: #7dd3fc; border-color: rgba(125, 211, 252, 0.3); }
-    .api-badge.admin { color: #c4b5fd; border-color: rgba(196, 181, 253, 0.3); }
 
     .api-content {
       background: var(--bg-card);
@@ -628,7 +627,7 @@
         <div>
           <span class="hero-badge">TypeScript SDK</span>
           <h1>Instant Postgres,<br><span class="gradient">one line of code</span></h1>
-          <p>Use the official <code>get-db9</code> package to create, seed, and manage PostgreSQL-compatible databases with typed customer and admin clients.</p>
+          <p>Use the official <code>get-db9</code> package to create, seed, and manage PostgreSQL-compatible databases with instant setup or full customer API control.</p>
 
           <div class="pkg-card" id="install">
             <div class="tabs" data-tab-group="pkg">
@@ -668,7 +667,6 @@
           <div class="editor-tabs" data-tab-group="editor">
             <button type="button" class="editor-tab active" data-tab="sdk">SDK</button>
             <button type="button" class="editor-tab" data-tab="customer">Customer API</button>
-            <button type="button" class="editor-tab" data-tab="admin">Admin API</button>
           </div>
 
           <div class="editor-panel active" data-panel="sdk">
@@ -693,16 +691,6 @@ console.<span class="fn">log</span>(db.<span class="prop">connectionString</span
 <span class="kw">const</span> result = <span class="kw">await</span> client.<span class="prop">databases</span>.<span class="fn">sql</span>(db.<span class="prop">id</span>, <span class="str">'SELECT * FROM users'</span>);
 console.<span class="fn">log</span>(result.<span class="prop">columns</span>, result.<span class="prop">rows</span>);</pre>
           </div>
-
-          <div class="editor-panel" data-panel="admin">
-            <div class="code-file">admin-example.ts</div>
-            <pre><span class="kw">import</span> { <span class="fn">createAdminClient</span> } <span class="kw">from</span> <span class="str">'get-db9/admin'</span>;
-
-<span class="kw">const</span> admin = <span class="fn">createAdminClient</span>({ <span class="prop">apiKey</span>: <span class="str">'your-api-key'</span> });
-<span class="kw">const</span> { <span class="prop">items</span> } = <span class="kw">await</span> admin.<span class="prop">tenants</span>.<span class="fn">list</span>({ <span class="prop">state</span>: <span class="str">'ACTIVE'</span> });
-<span class="kw">const</span> tenant = <span class="kw">await</span> admin.<span class="prop">tenants</span>.<span class="fn">create</span>();
-console.<span class="fn">log</span>(tenant.<span class="prop">connection_string</span>);</pre>
-          </div>
         </div>
       </div>
     </div>
@@ -712,7 +700,7 @@ console.<span class="fn">log</span>(tenant.<span class="prop">connection_string<
     <div class="container">
       <div class="section-label">API Reference</div>
       <h2 class="section-title">Choose your integration layer</h2>
-      <p class="section-desc">Use one high-level helper or compose full customer/admin clients for precise control over auth, tenants, SQL, and lifecycle operations.</p>
+      <p class="section-desc">Use the high-level instant API or compose the full customer client for precise control over auth, databases, SQL, and lifecycle operations.</p>
 
       <div class="api-layout">
         <aside class="api-nav" data-tab-group="api">
@@ -723,10 +711,6 @@ console.<span class="fn">log</span>(tenant.<span class="prop">connection_string<
           <button type="button" class="api-nav-btn" data-tab="customer-client">
             <span class="api-name">createCustomerClient</span>
             <span class="api-badge customer">CUSTOMER</span>
-          </button>
-          <button type="button" class="api-nav-btn" data-tab="admin-client">
-            <span class="api-name">createAdminClient</span>
-            <span class="api-badge admin">ADMIN</span>
           </button>
         </aside>
 
@@ -781,28 +765,6 @@ console.<span class="fn">log</span>(db.<span class="prop">databaseId</span>, db.
               </tbody>
             </table>
           </article>
-
-          <article class="api-panel" data-panel="admin-client">
-            <h3><code>createAdminClient(options?)</code></h3>
-            <p>Typed Admin API client for tenant CRUD, batch operations, session-backed SQL/user APIs, observability, and audit logs.</p>
-            <div class="api-subtitle">Example</div>
-            <div class="api-code">
-              <pre><span class="kw">import</span> { <span class="fn">createAdminClient</span> } <span class="kw">from</span> <span class="str">'get-db9/admin'</span>;
-
-<span class="kw">const</span> admin = <span class="fn">createAdminClient</span>({ <span class="prop">apiKey</span>: <span class="str">'your-api-key'</span> });
-<span class="kw">const</span> { <span class="prop">items</span> } = <span class="kw">await</span> admin.<span class="prop">tenants</span>.<span class="fn">list</span>({ <span class="prop">state</span>: <span class="str">'ACTIVE'</span> });
-<span class="kw">const</span> tenant = <span class="kw">await</span> admin.<span class="prop">tenants</span>.<span class="fn">create</span>();</pre>
-            </div>
-            <div class="api-subtitle">Parameters</div>
-            <table>
-              <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
-              <tbody>
-                <tr><td><code>baseUrl</code></td><td><code>string</code></td><td>Admin API endpoint (default production URL).</td></tr>
-                <tr><td><code>apiKey</code></td><td><code>string</code></td><td>Optional <code>X-API-Key</code> header for protected deployments.</td></tr>
-                <tr><td><code>fetch</code></td><td><code>FetchFn</code></td><td>Custom fetch implementation.</td></tr>
-              </tbody>
-            </table>
-          </article>
         </div>
       </div>
     </div>
@@ -835,9 +797,9 @@ console.<span class="fn">log</span>(db.<span class="prop">databaseId</span>, db.
           <p>Build output supports modern runtimes and existing Node workflows.</p>
         </div>
         <div class="feature">
-          <div class="feature-icon">&#128736;</div>
-          <h3>Three API layers</h3>
-          <p>Use high-level helpers, customer APIs, or admin APIs as needed.</p>
+          <div class="feature-icon">&#128260;</div>
+          <h3>Two API layers</h3>
+          <p>High-level instant API and full Customer API for complete control.</p>
         </div>
         <div class="feature">
           <div class="feature-icon">&#127793;</div>
