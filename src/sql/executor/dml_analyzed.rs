@@ -127,6 +127,13 @@ impl Executor {
             cnt += 1;
         }
 
+        // Bump mod_count for auto-ANALYZE tracking.
+        if cnt > 0 {
+            self.stats_cache()
+                .bump_mod_count(db_id, schema.table_id, cnt as u64);
+            self.maybe_enqueue_auto_analyze(db_id, schema.table_id, t);
+        }
+
         if del.returning.is_some() {
             let column_types = Some(build_returning_types_from_analyzed(&del.returning, &schema));
             Ok(ExecuteResult::Select {
@@ -321,6 +328,13 @@ impl Executor {
             }
 
             cnt += 1;
+        }
+
+        // Bump mod_count for auto-ANALYZE tracking.
+        if cnt > 0 {
+            self.stats_cache()
+                .bump_mod_count(db_id, schema.table_id, cnt as u64);
+            self.maybe_enqueue_auto_analyze(db_id, schema.table_id, t);
         }
 
         if upd.returning.is_some() {
@@ -706,6 +720,9 @@ impl Executor {
         if inserted > 0 {
             self.stats_cache()
                 .bump_estimate(db_id, schema.table_id, inserted as isize);
+            self.stats_cache()
+                .bump_mod_count(db_id, schema.table_id, inserted as u64);
+            self.maybe_enqueue_auto_analyze(db_id, schema.table_id, t);
         }
 
         if ins.returning.is_some() {
@@ -818,6 +835,70 @@ impl Executor {
             folded_expr
         };
         eval_typed_expr(&materialized, eval_row, qctx)
+    }
+
+    /// Best-effort, non-blocking enqueue of auto-ANALYZE when modification
+    /// count exceeds the PostgreSQL-style threshold (`base + 0.1 * row_est`).
+    fn maybe_enqueue_auto_analyze(&self, db_id: u64, table_id: u64, table_name: &str) {
+        const AUTO_ANALYZE_THRESHOLD: u64 = 50;
+        if !self
+            .stats_cache()
+            .needs_auto_analyze(db_id, table_id, AUTO_ANALYZE_THRESHOLD)
+        {
+            return;
+        }
+        // Reset immediately to prevent repeated enqueues from concurrent DML.
+        self.stats_cache().reset_mod_count(db_id, table_id);
+
+        let keyspace = self.tenant_keyspace().to_string();
+        let table_name = table_name.to_string();
+        tokio::spawn(async move {
+            let Some(system_store) = crate::worker::get_system_store() else {
+                return;
+            };
+            let store = system_store.clone();
+            let entry = crate::worker::types::TaskQueueEntry::new(
+                keyspace.clone(),
+                db_id,
+                table_id as i64,
+                crate::worker::types::TaskType::AutoAnalyze,
+                format!("ANALYZE \"{}\"", table_name),
+                "system".to_string(),
+                128,
+            );
+            let result: Result<(), anyhow::Error> = async {
+                let mut txn = store.begin().await?;
+                let existing = store
+                    .scan_queue_entries_for_task(&mut txn, &keyspace, db_id, table_id as i64)
+                    .await?;
+                if existing.is_empty() {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    store
+                        .put_worker_queue_entry(&mut txn, &entry, now_ms)
+                        .await?;
+                    store
+                        .update_registry_task_types(
+                            &mut txn,
+                            &keyspace,
+                            db_id,
+                            crate::worker::types::TASK_TYPE_AUTO_ANALYZE,
+                            0,
+                        )
+                        .await?;
+                    txn.commit().await?;
+                } else {
+                    txn.rollback().await.ok();
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(e) = result {
+                tracing::warn!("Failed to enqueue auto-ANALYZE for {}: {}", table_name, e);
+            }
+        });
     }
 }
 

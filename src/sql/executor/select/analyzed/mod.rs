@@ -1682,8 +1682,26 @@ impl Executor {
                                     crate::extensions::context::is_superuser(),
                                     &func.name,
                                     &scalar_arg_values,
+                                    self.tenant_keyspace(),
                                 )
                                 .await
+                            {
+                                return Ok(Box::new(TableScanOperator::new_with_rows(
+                                    schema.clone(),
+                                    vec![Row::new(vec![result?])],
+                                )) as BoxedOperator);
+                            }
+
+                            if let Some(result) = crate::sql::executor::execute_bg_sql_function(
+                                &self.store(),
+                                txn,
+                                db_id,
+                                qc.current_user.as_ref(),
+                                &func.name,
+                                &scalar_arg_values,
+                                self.tenant_keyspace(),
+                            )
+                            .await
                             {
                                 return Ok(Box::new(TableScanOperator::new_with_rows(
                                     schema.clone(),

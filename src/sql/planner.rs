@@ -13,6 +13,7 @@ use super::expr::bridge::eval_const_ast_expr;
 use super::names::normalize_ident;
 use super::operators::HashJoinConfig;
 use crate::types::{DataType, IndexDef, TableSchema, Value};
+use crate::worker::types::IndexState;
 
 /// Result of join algorithm selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -795,6 +796,9 @@ fn choose_best_access_path_with_typed_filter(
 }
 
 fn is_planner_usable_index(index: &IndexDef) -> bool {
+    if index.state != IndexState::Ready {
+        return false;
+    }
     if index.columns.is_empty() && index.expressions.is_empty() {
         return false;
     }
@@ -1955,6 +1959,7 @@ mod tests {
                 method: None,
                 predicate: None,
                 expressions: Vec::new(),
+                state: crate::worker::types::IndexState::Ready,
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
@@ -1988,6 +1993,7 @@ mod tests {
                 method: None,
                 predicate: Some("a = 10".to_string()),
                 expressions: Vec::new(),
+                state: crate::worker::types::IndexState::Ready,
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
@@ -2046,6 +2052,7 @@ mod tests {
                 method: None,
                 predicate: Some("status = 'active'".to_string()),
                 expressions: Vec::new(),
+                state: crate::worker::types::IndexState::Ready,
             }],
         );
         let filter = parse_where_expr("SELECT * FROM t WHERE status = 'active' AND name = 'foo'");
@@ -2065,6 +2072,7 @@ mod tests {
                 method: None,
                 predicate: Some("status = 'active'".to_string()),
                 expressions: Vec::new(),
+                state: crate::worker::types::IndexState::Ready,
             }],
         );
         let filter = parse_where_expr("SELECT * FROM t WHERE name = 'foo'");
@@ -2084,6 +2092,7 @@ mod tests {
                 method: None,
                 predicate: Some("status = 'active'".to_string()),
                 expressions: Vec::new(),
+                state: crate::worker::types::IndexState::Ready,
             }],
         );
         let filter = parse_where_expr("SELECT * FROM t WHERE status = 'inactive' AND name = 'foo'");
@@ -2107,6 +2116,7 @@ mod tests {
                 method: None,
                 predicate: Some("a = 1 AND b = 2".to_string()),
                 expressions: Vec::new(),
+                state: crate::worker::types::IndexState::Ready,
             }],
         );
         let filter = parse_where_expr("SELECT * FROM t WHERE a = 1 AND b = 2 AND c = 3");
@@ -2126,6 +2136,7 @@ mod tests {
                 method: None,
                 predicate: Some("a = 1 AND b = 2".to_string()),
                 expressions: Vec::new(),
+                state: crate::worker::types::IndexState::Ready,
             }],
         );
         let filter = parse_where_expr("SELECT * FROM t WHERE a = 1");
@@ -2145,6 +2156,7 @@ mod tests {
                 method: None,
                 predicate: None,
                 expressions: vec!["lower(name)".to_string()],
+                state: crate::worker::types::IndexState::Ready,
             }],
         );
         let filter = parse_where_expr("SELECT * FROM t WHERE lower(name) = 'foo'");
@@ -2164,6 +2176,7 @@ mod tests {
                 method: None,
                 predicate: None,
                 expressions: vec!["LOWER(name)".to_string()],
+                state: crate::worker::types::IndexState::Ready,
             }],
         );
         let filter = parse_where_expr("SELECT * FROM t WHERE lower(name) = 'bar'");
@@ -2197,6 +2210,7 @@ mod tests {
                 method: Some("gin".to_string()),
                 predicate: None,
                 expressions: Vec::new(),
+                state: crate::worker::types::IndexState::Ready,
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
@@ -2364,6 +2378,7 @@ mod tests {
                     method: None,
                     predicate: None,
                     expressions: Vec::new(),
+                    state: crate::worker::types::IndexState::Ready,
                 },
                 IndexDef {
                     id: 2,
@@ -2373,6 +2388,7 @@ mod tests {
                     method: None,
                     predicate: None,
                     expressions: Vec::new(),
+                    state: crate::worker::types::IndexState::Ready,
                 },
             ],
             check_constraints: vec![],
@@ -2412,6 +2428,7 @@ mod tests {
                     method: None,
                     predicate: None,
                     expressions: Vec::new(),
+                    state: crate::worker::types::IndexState::Ready,
                 },
                 IndexDef {
                     id: 2,
@@ -2421,6 +2438,7 @@ mod tests {
                     method: None,
                     predicate: None,
                     expressions: Vec::new(),
+                    state: crate::worker::types::IndexState::Ready,
                 },
             ],
             check_constraints: vec![],
@@ -2471,6 +2489,7 @@ mod tests {
                 method: None,
                 predicate: None,
                 expressions: Vec::new(),
+                state: crate::worker::types::IndexState::Ready,
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
@@ -2517,6 +2536,7 @@ mod tests {
                 method: None,
                 predicate: None,
                 expressions: Vec::new(),
+                state: crate::worker::types::IndexState::Ready,
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
@@ -2562,6 +2582,7 @@ mod tests {
                 method: None,
                 predicate: None,
                 expressions: Vec::new(),
+                state: crate::worker::types::IndexState::Ready,
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
@@ -2633,6 +2654,7 @@ mod tests {
                 method: None,
                 predicate: None,
                 expressions: Vec::new(),
+                state: crate::worker::types::IndexState::Ready,
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
@@ -2696,6 +2718,7 @@ mod tests {
                 method: None,
                 predicate: None,
                 expressions: Vec::new(),
+                state: crate::worker::types::IndexState::Ready,
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
@@ -2746,6 +2769,7 @@ mod tests {
                 method: None,
                 predicate: None,
                 expressions: Vec::new(),
+                state: crate::worker::types::IndexState::Ready,
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
@@ -2886,6 +2910,7 @@ mod tests {
                 method: None,
                 predicate: None,
                 expressions: Vec::new(),
+                state: crate::worker::types::IndexState::Ready,
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
@@ -3135,6 +3160,7 @@ mod tests {
                     method: Some("gin".to_string()),
                     predicate: None,
                     expressions: Vec::new(),
+                    state: crate::worker::types::IndexState::Ready,
                 },
                 IndexDef {
                     id: 2,
@@ -3144,6 +3170,7 @@ mod tests {
                     method: Some("gin".to_string()),
                     predicate: None,
                     expressions: Vec::new(),
+                    state: crate::worker::types::IndexState::Ready,
                 },
             ],
             check_constraints: vec![],
@@ -3264,6 +3291,7 @@ mod tests {
                 method: None,
                 predicate: None,
                 expressions: vec!["lower(name)".to_string()],
+                state: crate::worker::types::IndexState::Ready,
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
@@ -3341,6 +3369,7 @@ mod tests {
                 method: None,
                 predicate: Some("status = 'active'".to_string()),
                 expressions: Vec::new(),
+                state: crate::worker::types::IndexState::Ready,
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
@@ -3415,6 +3444,7 @@ mod tests {
                 method: None,
                 predicate: Some("status = 'active'".to_string()),
                 expressions: Vec::new(),
+                state: crate::worker::types::IndexState::Ready,
             }],
             check_constraints: vec![],
             foreign_keys: vec![],

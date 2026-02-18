@@ -700,7 +700,11 @@ fn eval_function_call(name: &str, args: Vec<Value>, qctx: &QueryContext) -> Resu
         }
     }
 
-    // Context-dependent builtins that need QueryContext.
+    if let Some(result) = crate::sql::executor::try_execute_bg_sql_function(unqualified_name, &args)
+    {
+        return result;
+    }
+
     match func_name_upper.as_str() {
         "NOW" | "CURRENT_TIMESTAMP" | "STATEMENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP" => {
             let precision = match args.first() {

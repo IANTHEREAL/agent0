@@ -149,6 +149,31 @@ impl Executor {
                             crate::extensions::context::is_superuser(),
                             &func.name,
                             &arg_values,
+                            self.tenant_keyspace(),
+                        )
+                        .await
+                        {
+                            return Ok(TypedExpr::new(
+                                TypedExprKind::Constant(result?),
+                                expr.data_type.clone(),
+                            ));
+                        }
+                    }
+
+                    if crate::sql::executor::is_bg_sql_function(&func.name) {
+                        let mut arg_values = Vec::with_capacity(new_args.len());
+                        let dummy_row = Row::new(vec![]);
+                        for arg in &new_args {
+                            arg_values.push(eval_typed_expr(arg, &dummy_row, qctx)?);
+                        }
+                        if let Some(result) = crate::sql::executor::execute_bg_sql_function(
+                            &self.store(),
+                            txn,
+                            db_id,
+                            qctx.current_user.as_ref(),
+                            &func.name,
+                            &arg_values,
+                            self.tenant_keyspace(),
                         )
                         .await
                         {

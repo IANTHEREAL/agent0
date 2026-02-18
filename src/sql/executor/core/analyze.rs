@@ -395,6 +395,7 @@ impl Executor {
                 self.store.store_statistics(txn, db_id, &stats).await?;
                 self.stats_cache()
                     .update_full_stats(db_id, schema.table_id, Arc::new(stats));
+                self.stats_cache().reset_mod_count(db_id, schema.table_id);
             } else {
                 // Bare ANALYZE: all accessible tables.
                 let all_tables = self.store.list_tables(txn, db_id).await?;
@@ -433,6 +434,7 @@ impl Executor {
                     self.store.store_statistics(txn, db_id, &stats).await?;
                     self.stats_cache()
                         .update_full_stats(db_id, schema.table_id, Arc::new(stats));
+                    self.stats_cache().reset_mod_count(db_id, schema.table_id);
                 }
             }
 

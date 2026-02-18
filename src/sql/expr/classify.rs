@@ -103,6 +103,9 @@ pub(crate) fn has_catalog_dependent_function(expr: &TypedExpr) -> bool {
             if crate::sql::executor::split_cron_scalar_function_name(name).is_some() {
                 return true;
             }
+            if crate::sql::executor::is_bg_sql_function(name) {
+                return true;
+            }
             args.iter().any(has_catalog_dependent_function)
                 || filter
                     .as_ref()
@@ -128,6 +131,9 @@ pub(crate) fn has_catalog_dependent_function(expr: &TypedExpr) -> bool {
             if crate::sql::executor::split_cron_scalar_function_name(name).is_some() {
                 return true;
             }
+            if crate::sql::executor::is_bg_sql_function(name) {
+                return true;
+            }
             args.iter().any(has_catalog_dependent_function)
                 || filter
                     .as_ref()
@@ -151,6 +157,9 @@ pub(crate) fn has_catalog_dependent_function(expr: &TypedExpr) -> bool {
                 return true;
             }
             if crate::sql::executor::split_cron_scalar_function_name(name).is_some() {
+                return true;
+            }
+            if crate::sql::executor::is_bg_sql_function(name) {
                 return true;
             }
             args.iter().any(has_catalog_dependent_function)

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::worker::types::IndexState;
 use anyhow::{anyhow, Result};
 
 pub mod date;
@@ -435,6 +436,8 @@ pub struct IndexDef {
     pub predicate: Option<String>,
     #[serde(default)]
     pub expressions: Vec<String>,
+    #[serde(default)]
+    pub state: IndexState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

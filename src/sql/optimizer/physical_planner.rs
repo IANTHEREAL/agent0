@@ -1864,6 +1864,7 @@ mod tests {
             method: Some("btree".to_string()),
             predicate: None,
             expressions: vec![],
+            state: crate::worker::types::IndexState::Ready,
         });
         schema
     }

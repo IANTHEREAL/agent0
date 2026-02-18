@@ -428,6 +428,7 @@ mod tests {
             method: Some("btree".to_string()),
             predicate: Some("email IS NOT NULL".to_string()),
             expressions: vec![],
+            state: crate::worker::types::IndexState::Ready,
         };
         let ddl = index_to_ddl("public.users", &idx);
         assert_eq!(

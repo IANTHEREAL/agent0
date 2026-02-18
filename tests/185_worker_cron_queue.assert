@@ -1,0 +1,6 @@
+# Worker cron queue assertions
+worker_test_job
+*/5 * * * *
+SELECT 1
+*/10 * * * *
+0

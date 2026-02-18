@@ -709,6 +709,92 @@ impl Executor {
         let view_obj = parse_refresh_materialized_view_name(sql)?;
         let view_name_for_error = view_obj.to_string();
 
+        // Detect CONCURRENTLY keyword
+        let concurrently = sql.to_uppercase().contains("CONCURRENTLY");
+
+        if concurrently {
+            // Enqueue as BgDdl task and return immediately
+            let is_autocommit = !session.is_in_transaction();
+            if is_autocommit {
+                session.begin().await?;
+            }
+
+            let result = async {
+                let db_id = session.current_database_id();
+                let (txn, _, search_path) = session
+                    .get_mut_txn_sequence_values_and_search_path()
+                    .expect("Transaction must be active");
+
+                // Resolve view name to validate it exists
+                let resolved = names::resolve_existing_materialized_view_name(
+                    self.store().as_ref(),
+                    txn,
+                    db_id,
+                    &view_obj,
+                    search_path,
+                )
+                .await?
+                .ok_or_else(|| {
+                    anyhow!("Materialized view '{}' does not exist", view_name_for_error)
+                })?;
+                let view_full_name = resolved.full;
+
+                // Enqueue BgDdl task
+                if let Some(system_store) = crate::worker::get_system_store() {
+                    let keyspace = self.tenant_keyspace().to_string();
+                    let username = session
+                        .current_user()
+                        .map(|u| u.to_string())
+                        .unwrap_or_default();
+
+                    // Create command: REFRESH MATERIALIZED VIEW view_name (without CONCURRENTLY)
+                    let command = format!("REFRESH MATERIALIZED VIEW {}", view_full_name);
+
+                    let entry = crate::worker::types::TaskQueueEntry::new(
+                        keyspace.clone(),
+                        db_id,
+                        0i64, // task_id not used for REFRESH MV
+                        crate::worker::types::TaskType::BgDdl,
+                        command,
+                        username,
+                        128, // default priority
+                    );
+
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let mut sys_txn = system_store.begin().await?;
+                    system_store
+                        .put_worker_queue_entry(&mut sys_txn, &entry, now_ms)
+                        .await?;
+                    system_store
+                        .update_registry_task_types(
+                            &mut sys_txn,
+                            &keyspace,
+                            db_id,
+                            crate::worker::types::TASK_TYPE_BG_DDL,
+                            0,
+                        )
+                        .await?;
+                    sys_txn.commit().await?;
+                }
+
+                Ok(ExecuteResult::RefreshMaterializedView {
+                    view_name: view_full_name,
+                })
+            }
+            .await;
+
+            if is_autocommit {
+                if result.is_ok() {
+                    session.commit().await?;
+                } else {
+                    session.rollback().await?;
+                }
+            }
+
+            return result;
+        }
+
+        // Non-concurrent path: execute synchronously
         let is_autocommit = !session.is_in_transaction();
         if is_autocommit {
             session.begin().await?;

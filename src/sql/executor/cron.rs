@@ -1,6 +1,8 @@
 use crate::cron::{parser, types::CronJob};
 use crate::storage::TikvStore;
 use crate::types::Value;
+use crate::worker::get_system_store;
+use crate::worker::types::{TaskQueueEntry, TaskType, TASK_TYPE_CRON};
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use tikv_client::Transaction;
@@ -26,6 +28,7 @@ pub(crate) async fn execute_cron_scalar_function(
     is_superuser: bool,
     func_name: &str,
     args: &[Value],
+    keyspace: &str,
 ) -> Option<Result<Value>> {
     let unqualified_name = match split_cron_scalar_function_name(func_name) {
         Some(name) => name,
@@ -34,15 +37,42 @@ pub(crate) async fn execute_cron_scalar_function(
     };
 
     match unqualified_name.to_ascii_lowercase().as_str() {
-        "schedule" => {
-            Some(execute_schedule(store, txn, db_id, current_user, database_name, args).await)
-        }
-        "unschedule" => {
-            Some(execute_unschedule(store, txn, db_id, current_user, is_superuser, args).await)
-        }
-        "alter_job" => {
-            Some(execute_alter_job(store, txn, db_id, current_user, is_superuser, args).await)
-        }
+        "schedule" => Some(
+            execute_schedule(
+                store,
+                txn,
+                db_id,
+                current_user,
+                database_name,
+                keyspace,
+                args,
+            )
+            .await,
+        ),
+        "unschedule" => Some(
+            execute_unschedule(
+                store,
+                txn,
+                db_id,
+                current_user,
+                is_superuser,
+                keyspace,
+                args,
+            )
+            .await,
+        ),
+        "alter_job" => Some(
+            execute_alter_job(
+                store,
+                txn,
+                db_id,
+                current_user,
+                is_superuser,
+                keyspace,
+                args,
+            )
+            .await,
+        ),
         "schedule_in_database" => Some(Err(anyhow!("cron.schedule_in_database is not supported"))),
         _ => None,
     }
@@ -54,6 +84,7 @@ async fn execute_schedule(
     db_id: u64,
     current_user: &str,
     database_name: &str,
+    keyspace: &str,
     args: &[Value],
 ) -> Result<Value> {
     let installed = store.get_extension(txn, db_id, "pg_cron").await?;
@@ -97,6 +128,7 @@ async fn execute_schedule(
             existing_job.username = current_user.to_string();
             existing_job.active = true;
             store.put_cron_job(txn, db_id, &existing_job).await?;
+            enqueue_cron_to_worker(keyspace, db_id, &existing_job).await;
             return Ok(Value::Int64(existing_job.job_id));
         }
     }
@@ -114,6 +146,7 @@ async fn execute_schedule(
         jobname,
     };
     store.put_cron_job(txn, db_id, &job).await?;
+    enqueue_cron_to_worker(keyspace, db_id, &job).await;
     Ok(Value::Int64(job_id))
 }
 
@@ -123,6 +156,7 @@ async fn execute_unschedule(
     db_id: u64,
     current_user: &str,
     is_superuser: bool,
+    keyspace: &str,
     args: &[Value],
 ) -> Result<Value> {
     let installed = store.get_extension(txn, db_id, "pg_cron").await?;
@@ -169,6 +203,7 @@ async fn execute_unschedule(
     let job_id = job.job_id;
     store.delete_cron_job(txn, db_id, job_id).await?;
     store.delete_cron_runs_for_job(txn, db_id, job_id).await?;
+    dequeue_cron_from_worker(keyspace, db_id, job_id).await;
 
     Ok(Value::Boolean(true))
 }
@@ -179,6 +214,7 @@ async fn execute_alter_job(
     db_id: u64,
     current_user: &str,
     is_superuser: bool,
+    keyspace: &str,
     args: &[Value],
 ) -> Result<Value> {
     let installed = store.get_extension(txn, db_id, "pg_cron").await?;
@@ -272,7 +308,88 @@ async fn execute_alter_job(
     }
 
     store.put_cron_job(txn, db_id, &job).await?;
+    enqueue_cron_to_worker(keyspace, db_id, &job).await;
     Ok(Value::Null)
+}
+
+fn compute_cron_next_fire(schedule: &str) -> Result<i64> {
+    let cron_schedule = parser::parse_cron_expression(schedule)?;
+    let now = chrono::Utc::now();
+    let next = parser::next_occurrence(&cron_schedule, now)
+        .ok_or_else(|| anyhow!("no next occurrence for schedule: {}", schedule))?;
+    Ok(next.timestamp_millis())
+}
+
+async fn enqueue_cron_to_worker(keyspace: &str, db_id: u64, job: &CronJob) {
+    let Some(system_store) = get_system_store() else {
+        return;
+    };
+
+    let next_fire = match compute_cron_next_fire(&job.schedule) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    let entry = TaskQueueEntry::new(
+        keyspace.to_string(),
+        db_id,
+        job.job_id,
+        TaskType::Cron,
+        job.command.clone(),
+        job.username.clone(),
+        128,
+    )
+    .with_schedule(job.schedule.clone());
+
+    let result = async {
+        let mut sys_txn = system_store.begin().await?;
+        let old_keys = system_store
+            .scan_queue_entries_for_task(&mut sys_txn, keyspace, db_id, job.job_id)
+            .await?;
+        for key in old_keys {
+            system_store
+                .delete_worker_queue_entry(&mut sys_txn, &key)
+                .await?;
+        }
+        system_store
+            .update_registry_task_types(&mut sys_txn, keyspace, db_id, TASK_TYPE_CRON, 0)
+            .await?;
+        system_store
+            .put_worker_queue_entry(&mut sys_txn, &entry, next_fire)
+            .await?;
+        sys_txn.commit().await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if let Err(e) = result {
+        tracing::warn!("Failed to enqueue cron job to worker queue: {}", e);
+    }
+}
+
+async fn dequeue_cron_from_worker(keyspace: &str, db_id: u64, job_id: i64) {
+    let Some(system_store) = get_system_store() else {
+        return;
+    };
+
+    let result = async {
+        let mut sys_txn = system_store.begin().await?;
+        let old_keys = system_store
+            .scan_queue_entries_for_task(&mut sys_txn, keyspace, db_id, job_id)
+            .await?;
+        for key in old_keys {
+            system_store
+                .delete_worker_queue_entry(&mut sys_txn, &key)
+                .await?;
+        }
+        sys_txn.commit().await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if let Err(e) = result {
+        tracing::warn!("Failed to dequeue cron job from worker queue: {}", e);
+    }
 }
 
 fn extract_text(value: &Value, arg_name: &str) -> Result<String> {
