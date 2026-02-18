@@ -41,8 +41,7 @@ async fn ensure_pd_keyspace(pd_endpoints: &[String], keyspace: &str) -> Result<(
         .first()
         .ok_or_else(|| anyhow::anyhow!("No PD endpoints configured"))?;
 
-    let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10));
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
 
     // Use mTLS if certs are available (matches TiKV client TLS config)
     let scheme = if let (Ok(ca_path), Ok(cert_path), Ok(key_path)) = (
