@@ -234,8 +234,49 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
 
     client_pool.spawn_reaper();
 
+    // Trigger worker (latency-sensitive, runs independently)
     sql::trigger_worker::spawn_trigger_worker(client_pool.clone());
-    cron::worker::spawn_cron_worker(client_pool.clone());
+
+    // Unified worker engine (system-keyspace task queue + GC)
+    {
+        let worker_config = worker::config::WorkerConfig::from_env();
+        if worker_config.enabled {
+            match worker::init_system_store(pd_addrs.clone(), &worker_config).await {
+                Ok(Some(system_store)) => {
+                    worker::set_system_store(system_store.clone());
+
+                    let engine = worker::engine::WorkerEngine::new(
+                        worker_config.clone(),
+                        system_store.clone(),
+                        client_pool.clone(),
+                    );
+                    tokio::spawn(async move { engine.run().await });
+
+                    let gc = worker::gc::WorkerGc::new(system_store, worker_config);
+                    tokio::spawn(async move { gc.run().await });
+
+                    info!("WorkerEngine and GC started");
+                }
+                Ok(None) => {
+                    info!("Worker engine disabled");
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to initialize system store: {}. Worker engine not started.",
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    // Cron GC (runs on tenant keyspaces, independent of worker engine)
+    {
+        let gc_pool = client_pool.clone();
+        tokio::spawn(async move {
+            cron::worker::run_cron_gc_loop(gc_pool).await;
+        });
+    }
 
     let listener = TcpListener::bind((pg_listen_addr.as_str(), pg_port)).await?;
     info!("PostgreSQL server listening on {}", listener.local_addr()?);
