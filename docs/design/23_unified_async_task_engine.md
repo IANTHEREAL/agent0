@@ -1,57 +1,57 @@
-# 统一异步任务引擎设计
+# Unified Async Task Engine Design
 
-## 状态
+## Status
 
-- **阶段**：设计中
-- **作者**：pg-tikv team
-- **日期**：2026-02-18
-- **关联文件**：`src/cron/`、`src/sql/triggers/`、`src/sql/executor/`、`src/storage/tikv_store/`
-
----
-
-## 问题陈述
-
-pg-tikv 当前有多个独立的异步执行系统，各自为政，存在以下问题：
-
-### 现状分析
-
-| 系统 | 实现位置 | 问题 |
-|------|--------|------|
-| **Cron** | `src/cron/worker.rs` | OnceLock 单例（line 506），每 60s 全量扫描所有 keyspace，串行执行，无法水平扩展 |
-| **Async Trigger** | `src/sql/triggers/worker.rs` | 独立 OnceLock（line 553），DashMap 内存队列，进程重启丢失，无持久化 |
-| **ANALYZE** | `src/sql/executor/core/analyze.rs` | 同步单事务（line 25），10K 批流式扫描（line 316），阻塞用户查询 |
-| **CREATE INDEX** | `src/sql/ddl.rs:1208-1514` | 同步回填，无 CONCURRENTLY 支持，长时间锁表 |
-| **REFRESH MATERIALIZED VIEW** | `src/sql/executor/procedure.rs:704` | 同步执行，无后台选项 |
-
-### 规模假设
-
-```
-总 tenant:                1,000,000
-启用 cron 的 tenant:       10,000   (1%)
-启用 async trigger 的 tenant: 50,000 (5%)
-总 cron job:              20,000   (avg 2/tenant)
-总 async trigger:         100,000  (avg 2/tenant)
-峰值 due job/分钟:        200-500
-峰值 async trigger/秒:    50-200
-pg-tikv 实例:             10+
-```
-
-### 核心痛点
-
-1. **多个独立系统** — 无法统一管理、监控、扩展
-2. **内存队列** — 进程重启丢失任务，无持久化保证
-3. **单点故障** — OnceLock 单例无法水平扩展
-4. **扫描效率低** — O(keyspace × db × job)，百万级 tenant 下不可接受
-5. **阻塞用户** — ANALYZE、CREATE INDEX 同步执行，影响 OLTP 性能
-6. **无优先级** — 所有任务平等对待，无法区分付费 tier
+- **Phase**: Implemented (Phase 1)
+- **Author**: pg-tikv team
+- **Date**: 2026-02-18
+- **Related files**: `src/worker/`, `src/cron/`, `src/sql/triggers/`, `src/sql/executor/`, `src/storage/tikv_store/`
 
 ---
 
-## 设计概览
+## Problem Statement
 
-### 核心思路
+pg-tikv currently has multiple independent async execution systems, each operating in isolation with the following issues:
 
-**统一异步任务引擎**：用 TiKV 本身做协调层，不引入外部依赖。所有异步任务（cron、async trigger、auto-ANALYZE、CREATE INDEX CONCURRENTLY、background SQL）共用一套 queue + claim + execute 机制。
+### Current State Analysis
+
+| System | Location | Problem |
+|--------|----------|---------|
+| **Cron** | `src/cron/worker.rs` | OnceLock singleton (line 506), full scan of all keyspaces every 60s, serial execution, cannot scale horizontally |
+| **Async Trigger** | `src/sql/triggers/worker.rs` | Separate OnceLock (line 553), DashMap in-memory queue, lost on process restart, no persistence |
+| **ANALYZE** | `src/sql/executor/core/analyze.rs` | Synchronous single-transaction (line 25), 10K batch streaming scan (line 316), blocks user queries |
+| **CREATE INDEX** | `src/sql/ddl.rs:1208-1514` | Synchronous backfill, no CONCURRENTLY support, long-duration table lock |
+| **REFRESH MATERIALIZED VIEW** | `src/sql/executor/procedure.rs:704` | Synchronous execution, no background option |
+
+### Scale Assumptions
+
+```
+Total tenants:                  1,000,000
+Tenants with cron enabled:         10,000   (1%)
+Tenants with async triggers:       50,000   (5%)
+Total cron jobs:                   20,000   (avg 2/tenant)
+Total async triggers:             100,000   (avg 2/tenant)
+Peak due jobs/minute:             200-500
+Peak async triggers/second:        50-200
+pg-tikv instances:                    10+
+```
+
+### Core Pain Points
+
+1. **Multiple independent systems** — Cannot be uniformly managed, monitored, or scaled
+2. **In-memory queues** — Tasks lost on process restart, no persistence guarantee
+3. **Single point of failure** — OnceLock singletons cannot scale horizontally
+4. **Inefficient scanning** — O(keyspace × db × job), unacceptable at million-tenant scale
+5. **Blocking users** — ANALYZE, CREATE INDEX execute synchronously, impacting OLTP performance
+6. **No priority** — All tasks treated equally, no way to differentiate paid tiers
+
+---
+
+## Design Overview
+
+### Core Idea
+
+**Unified Async Task Engine**: Use TiKV itself as the coordination layer with no external dependencies. All async tasks (cron, async triggers, auto-ANALYZE, CREATE INDEX CONCURRENTLY, background SQL) share a single queue + claim + execute mechanism.
 
 ```
                            ┌─────────────────────────┐
@@ -93,49 +93,49 @@ pg-tikv 实例:             10+
               └────────────┘       └────────────┘       └───────────┘
 ```
 
-### 关键决策
+### Key Decisions
 
-1. **Worker 通过 pgwire 连回 pg-tikv** 执行 SQL，不直接操作 TiKV 数据。保证完整 SQL 语义（事务、trigger、权限检查、search_path）。
-2. **TiKV 悲观事务做 claim**，天然分布式锁，不需要额外的 leader election。
-3. **同一套引擎服务所有异步任务**，通过 TaskType 区分。
+1. **Workers connect back to pg-tikv via pgwire** to execute SQL rather than operating on TiKV data directly. This guarantees full SQL semantics (transactions, triggers, privilege checks, search_path).
+2. **TiKV pessimistic transactions for claims** provide a natural distributed lock — no additional leader election needed.
+3. **A single engine serves all async task types**, differentiated by TaskType.
 
 ---
 
-## 任务类型
+## Task Types
 
-### TaskType 枚举
+### TaskType Enum
 
 ```rust
 enum TaskType {
-    Cron,           // 定时 SQL（cron.schedule）
-    AsyncTrigger,   // AFTER trigger 异步执行
-    AutoAnalyze,    // 自动 ANALYZE（表修改超过阈值）
-    BgDdl,          // CREATE INDEX CONCURRENTLY、REFRESH MATERIALIZED VIEW
-    BgSql,          // 用户提交的一次性后台任务（future）
+    Cron,           // Scheduled SQL (cron.schedule)
+    AsyncTrigger,   // AFTER trigger async execution
+    AutoAnalyze,    // Automatic ANALYZE (table modification exceeds threshold)
+    BgDdl,          // CREATE INDEX CONCURRENTLY, REFRESH MATERIALIZED VIEW
+    BgSql,          // User-submitted one-off background tasks
 }
 ```
 
-### 各任务类型的入队方式
+### Enqueue Methods by Task Type
 
-| TaskType | 入队时机 | next_fire_time | 优先级 |
-|----------|--------|----------------|--------|
-| **Cron** | `cron.schedule()` 时 | 根据 cron 表达式计算 | 低 |
-| **AsyncTrigger** | trigger fire 时 | `now` | 高 |
-| **AutoAnalyze** | 表修改计数超过阈值 | `now` | 中 |
-| **BgDdl** | `CREATE INDEX CONCURRENTLY` / `REFRESH MATERIALIZED VIEW` 时 | `now` | 中 |
-| **BgSql** | `SELECT pg_background_launch(...)` 时 | `now` | 低 |
+| TaskType | Enqueue Trigger | next_fire_time | Priority |
+|----------|----------------|----------------|----------|
+| **Cron** | `cron.schedule()` call | Computed from cron expression | Low |
+| **AsyncTrigger** | Trigger fires | `now` | High |
+| **AutoAnalyze** | Table modification count exceeds threshold | `now` | Medium |
+| **BgDdl** | `CREATE INDEX CONCURRENTLY` / `REFRESH MATERIALIZED VIEW` | `now` | Medium |
+| **BgSql** | `SELECT pg_background_launch(...)` | `now` | Low |
 
 ---
 
-## 详细设计
+## Detailed Design
 
-### 1. 全局任务注册表（Task Registry）
+### 1. Global Task Registry
 
-**问题**：当前需要扫描每个 keyspace 的每个 db 才能知道哪里有任务。
+**Problem**: Currently requires scanning every keyspace and every database to discover which have tasks.
 
-**方案**：在系统 keyspace（`_sys_worker`，不属于任何 tenant）中维护全局注册表。
+**Solution**: Maintain a global registry in a system keyspace (`_sys_worker`, not owned by any tenant).
 
-#### 注册表 key layout
+#### Registry Key Layout
 
 ```
 _worker_registry_{keyspace}_{db_id}  →  TaskRegistryEntry (bincode)
@@ -146,52 +146,52 @@ struct TaskRegistryEntry {
     keyspace: String,
     db_id: u64,
     task_types: u8,       // bitmask: 0x01=cron, 0x02=async_trigger, 0x04=auto_analyze, 0x08=bg_ddl, 0x10=bg_sql
-    job_count: u32,       // hint for load balancing, 不需要精确
+    job_count: u32,       // hint for load balancing, does not need to be exact
     registered_at: i64,   // epoch ms
 }
 ```
 
-#### 注册/注销时机
+#### Registration / Deregistration Timing
 
-| 操作 | 动作 |
-|------|------|
-| `CREATE EXTENSION pg_cron` | 写入 registry entry（`task_types \|= 0x01`） |
-| `DROP EXTENSION pg_cron` | 清除 cron bit；若 `task_types == 0` 则删除 entry |
-| `cron.schedule()` | 更新 `job_count += 1` |
-| `cron.unschedule()` | 更新 `job_count -= 1`；若 `job_count == 0` 清除 cron bit |
-| 首次 async trigger 创建 | 写入 registry entry（`task_types \|= 0x02`） |
-| 最后一个 async trigger 删除 | 清除 async_trigger bit |
-| 表首次启用 auto-ANALYZE | 写入 registry entry（`task_types \|= 0x04`） |
-| `CREATE INDEX CONCURRENTLY` | 写入 registry entry（`task_types \|= 0x08`） |
+| Operation | Action |
+|-----------|--------|
+| `CREATE EXTENSION pg_cron` | Write registry entry (`task_types \|= 0x01`) |
+| `DROP EXTENSION pg_cron` | Clear cron bit; if `task_types == 0` delete entry |
+| `cron.schedule()` | Update `job_count += 1` |
+| `cron.unschedule()` | Update `job_count -= 1`; if `job_count == 0` clear cron bit |
+| First async trigger created | Write registry entry (`task_types \|= 0x02`) |
+| Last async trigger deleted | Clear async_trigger bit |
+| Table first enables auto-ANALYZE | Write registry entry (`task_types \|= 0x04`) |
+| `CREATE INDEX CONCURRENTLY` | Write registry entry (`task_types \|= 0x08`) |
 
-#### 影响文件
+#### Affected Files
 
-- `src/sql/executor/cron.rs`：schedule/unschedule 时写 registry
-- `src/sql/triggers/enqueue.rs`：首次 async trigger 时写 registry
-- `src/sql/executor/core/analyze.rs`：auto-ANALYZE 启用时写 registry
-- `src/sql/ddl.rs`：CREATE INDEX CONCURRENTLY 时写 registry
-- `src/extensions/mod.rs`：CREATE/DROP EXTENSION 时写 registry
-- `src/storage/tikv_store/worker.rs`：新增 registry 读写方法
+- `src/sql/executor/cron.rs`: Write registry on schedule/unschedule
+- `src/sql/triggers/enqueue.rs`: Write registry on first async trigger
+- `src/sql/executor/core/analyze.rs`: Write registry when auto-ANALYZE enabled
+- `src/sql/ddl.rs`: Write registry on CREATE INDEX CONCURRENTLY
+- `src/extensions/mod.rs`: Write registry on CREATE/DROP EXTENSION
+- `src/storage/tikv_store/worker.rs`: New registry read/write methods
 
-#### 扫描代价
+#### Scan Cost
 
-Worker tick 时只需 **一次 prefix scan** `_worker_registry_` → 拿到所有有任务的 keyspace 列表。1 万条 entry ≈ 1MB，单次 scan < 50ms。
+Worker tick only needs **one prefix scan** `_worker_registry_` → gets the list of all keyspaces with tasks. 10K entries ≈ 1MB, single scan < 50ms.
 
 ---
 
-### 2. 预计算 Next-Fire-Time 索引
+### 2. Pre-computed Next-Fire-Time Index
 
-**问题**：当前每 tick 对每个 job 解析 cron 表达式并检查 `is_due()`。
+**Problem**: Currently each tick parses cron expressions for every job and checks `is_due()`.
 
-**方案**：每个任务维护一个 `next_fire_time`，写入全局有序队列。tick 时只 range scan `fire_time <= now`。
+**Solution**: Each task maintains a `next_fire_time`, written to a globally ordered queue. Tick only does a range scan for `fire_time <= now`.
 
-#### 队列 key layout
+#### Queue Key Layout
 
 ```
 _worker_queue_{next_fire_time_ms}_{keyspace}_{db_id}_{task_id}  →  TaskQueueEntry (bincode)
 ```
 
-`next_fire_time_ms` 使用 **big-endian i64**，自然有序。
+`next_fire_time_ms` uses **big-endian i64** for natural sort order.
 
 ```rust
 struct TaskQueueEntry {
@@ -200,59 +200,59 @@ struct TaskQueueEntry {
     task_id: i64,           // job_id / trigger_id / table_id / index_id
     task_type: TaskType,    // Cron | AsyncTrigger | AutoAnalyze | BgDdl | BgSql
     command: String,        // SQL to execute
-    username: String,       // 执行身份
-    schedule: Option<String>, // cron 表达式（仅 Cron 类型）
-    priority: u8,           // 0-255，高优先级先执行
+    username: String,       // execution identity
+    schedule: Option<String>, // cron expression (Cron type only)
+    priority: u8,           // 0-255, higher priority executes first
 }
 ```
 
-#### 写入时机
+#### Write Timing
 
-| 操作 | 动作 |
-|------|------|
-| `cron.schedule()` | 计算 next_fire_time，写入 queue |
-| job 执行完成后 | 计算下一次 next_fire_time，写入新 queue entry，删除旧 entry |
-| `cron.alter_job()` 修改 schedule | 删除旧 entry，计算新 next_fire_time，写入新 entry |
-| `cron.unschedule()` | 删除 queue entry |
-| trigger fire（async） | 写入 queue entry（`next_fire_time = now`） |
-| 表修改计数超过阈值 | 写入 queue entry（`next_fire_time = now`） |
-| `CREATE INDEX CONCURRENTLY` | 写入 queue entry（`next_fire_time = now`） |
-| `REFRESH MATERIALIZED VIEW CONCURRENTLY` | 写入 queue entry（`next_fire_time = now`） |
+| Operation | Action |
+|-----------|--------|
+| `cron.schedule()` | Compute next_fire_time, write to queue |
+| Job execution completes | Compute next next_fire_time, write new queue entry, delete old entry |
+| `cron.alter_job()` modifies schedule | Delete old entry, compute new next_fire_time, write new entry |
+| `cron.unschedule()` | Delete queue entry |
+| Async trigger fires | Write queue entry (`next_fire_time = now`) |
+| Table modification count exceeds threshold | Write queue entry (`next_fire_time = now`) |
+| `CREATE INDEX CONCURRENTLY` | Write queue entry (`next_fire_time = now`) |
+| `REFRESH MATERIALIZED VIEW CONCURRENTLY` | Write queue entry (`next_fire_time = now`) |
 
-#### Tick 流程（新）
+#### Tick Flow (New)
 
 ```
 every tick_interval:
   now = current_time_ms()
   entries = range_scan("_worker_queue_" .. "_worker_queue_{now}")
-  // 只返回 fire_time <= now 的 entry，O(due_jobs)
-  // 按 priority 排序
+  // Returns only entries with fire_time <= now, O(due_jobs)
+  // Sort by priority
   for entry in entries:
     spawn_claim_and_execute(entry)
 ```
 
-#### 扫描代价
+#### Scan Cost
 
-峰值 500 due jobs/分钟 + 50-200 async trigger/秒 → 每次 scan 最多返回 ~1000 条，< 500KB。
+Peak 500 due jobs/minute + 50-200 async triggers/second → each scan returns at most ~1000 entries, < 500KB.
 
-#### 影响文件
+#### Affected Files
 
-- `src/storage/tikv_store/worker.rs`：新增 queue 读写方法
-- `src/sql/executor/cron.rs`：schedule/unschedule/alter_job 时维护 queue
-- `src/sql/triggers/enqueue.rs`：trigger fire 时写入 queue
-- `src/sql/executor/core/analyze.rs`：auto-ANALYZE 时写入 queue
-- `src/sql/ddl.rs`：CREATE INDEX CONCURRENTLY 时写入 queue
-- `src/cron/worker.rs`：tick 改为 queue range scan
+- `src/storage/tikv_store/worker.rs`: New queue read/write methods
+- `src/sql/executor/cron.rs`: Maintain queue on schedule/unschedule/alter_job
+- `src/sql/triggers/enqueue.rs`: Write to queue on trigger fire
+- `src/sql/executor/core/analyze.rs`: Write to queue on auto-ANALYZE
+- `src/sql/ddl.rs`: Write to queue on CREATE INDEX CONCURRENTLY
+- `src/cron/worker.rs`: Change tick to queue range scan
 
 ---
 
-### 3. 多实例 Work Stealing
+### 3. Multi-Instance Work Stealing
 
-**问题**：单实例单例，无法水平扩展。
+**Problem**: Single-instance singleton cannot scale horizontally.
 
-**方案**：所有 worker 实例平等，通过 TiKV 悲观事务竞争 claim。
+**Solution**: All worker instances are equal peers competing for claims via TiKV pessimistic transactions.
 
-#### Claim 机制
+#### Claim Mechanism
 
 ```
 _worker_claim_{keyspace}_{db_id}_{task_id}_{fire_time_min}  →  WorkerClaim
@@ -260,142 +260,142 @@ _worker_claim_{keyspace}_{db_id}_{task_id}_{fire_time_min}  →  WorkerClaim
 
 ```rust
 struct WorkerClaim {
-    worker_id: String,     // 实例标识（hostname:pid 或 UUID）
+    worker_id: String,     // instance identifier (hostname:pid or UUID)
     claimed_at: i64,       // epoch ms
-    task_type: TaskType,   // 用于 GC 时区分
+    task_type: TaskType,   // used by GC to differentiate
 }
 ```
 
-#### 竞争流程
+#### Competition Flow
 
 ```rust
 async fn try_claim(txn, entry) -> bool {
     let key = claim_key(entry.keyspace, entry.db_id, entry.task_id, fire_minute);
     if txn.get(key).await?.is_some() {
-        return false;  // 已被其他 worker claim
+        return false;  // Already claimed by another worker
     }
     txn.put(key, serialize(WorkerClaim { ... }));
-    true  // TiKV 悲观事务保证只有一个 writer 成功
+    true  // TiKV pessimistic transaction guarantees only one writer succeeds
 }
 ```
 
-多个 worker 同时 scan 到同一批 due tasks，各自尝试 claim。TiKV 悲观事务保证同一个 key 只有一个 writer 成功 commit，其余自动 abort。**不需要 leader election。**
+Multiple workers scan the same batch of due tasks simultaneously, each attempting to claim. TiKV pessimistic transactions guarantee only one writer successfully commits per key; others automatically abort. **No leader election needed.**
 
-#### 负载均衡
+#### Load Balancing
 
-每个 worker 维护本地 `active_jobs` 计数器（AtomicU32）。当 `active_jobs >= max_concurrent_jobs` 时跳过本轮 claim，让其他 worker 接手。
+Each worker maintains a local `active_jobs` counter (AtomicU32). When `active_jobs >= max_concurrent_jobs`, it skips claiming for the current tick, letting other workers pick up work.
 
-无需复杂的分片或一致性哈希 — 随机竞争 + 背压足以在 10-50 个 worker 间均匀分布。
+No complex sharding or consistent hashing needed — random competition + backpressure is sufficient for even distribution across 10-50 workers.
 
-#### 影响文件
+#### Affected Files
 
-- `src/cron/worker.rs`：去掉 `OnceLock` 单例，改为可配置启动
-- `src/cron/config.rs`：新增 `worker_id` 配置
-- `src/sql/triggers/worker.rs`：同样改造
+- `src/cron/worker.rs`: Remove `OnceLock` singleton, switch to configurable startup
+- `src/cron/config.rs`: Add `worker_id` configuration
+- `src/sql/triggers/worker.rs`: Same refactoring
 
 ---
 
-### 4. 并发执行
+### 4. Concurrent Execution
 
-**问题**：串行执行 due tasks。
+**Problem**: Due tasks execute serially.
 
-**方案**：`tokio::JoinSet` + `Semaphore` 控制并发。
+**Solution**: `tokio::JoinSet` + `Semaphore` for concurrency control.
 
 ```rust
-let semaphore = Arc::new(Semaphore::new(config.max_concurrent_jobs)); // 默认 32
+let semaphore = Arc::new(Semaphore::new(config.max_concurrent_jobs)); // default 32
 let mut join_set = JoinSet::new();
 
 for entry in due_entries {
     let permit = semaphore.clone().acquire_owned().await?;
     join_set.spawn(async move {
-        let _permit = permit;  // 持有 permit 直到 job 完成
+        let _permit = permit;  // Hold permit until job completes
         claim_and_execute(entry).await
     });
 }
 
-// 等待所有 job 完成（或超时）
+// Wait for all jobs to complete (or timeout)
 while let Some(result) = join_set.join_next().await {
     handle_result(result);
 }
 ```
 
-#### 执行路径：通过 pgwire 连回 pg-tikv
+#### Execution Path: Connect Back to pg-tikv via pgwire
 
 ```rust
 async fn execute_task_sql(entry: &TaskQueueEntry) -> Result<()> {
-    // 连接到对应 tenant 的 pg-tikv
+    // Connect to the corresponding tenant's pg-tikv
     let connstr = format!(
         "host={} port={} user={}.{} password={} dbname=postgres",
         pg_host, pg_port, entry.keyspace, entry.username, service_password
     );
     let (client, conn) = tokio_postgres::connect(&connstr, NoTls).await?;
     tokio::spawn(conn);
-    
-    // 设置执行超时（可配置）
+
+    // Set execution timeout (configurable)
     client.execute("SET statement_timeout = ?", &[&config.statement_timeout_ms]).await?;
-    
+
     client.simple_query(&entry.command).await?;
     Ok(())
 }
 ```
 
-**为什么走 pgwire 而不是直接操作 TiKV**：
-- 保证完整 SQL 语义（事务、trigger、权限检查、search_path）
-- Worker 无需理解 pg-tikv 内部状态，纯无状态
-- 可以用标准连接池（deadpool-postgres）管理连接
-- 支持 statement_timeout、search_path 等 SQL 参数
+**Why pgwire instead of operating on TiKV directly**:
+- Guarantees full SQL semantics (transactions, triggers, privilege checks, search_path)
+- Worker doesn't need to understand pg-tikv internal state — purely stateless
+- Can use standard connection pool (deadpool-postgres) to manage connections
+- Supports statement_timeout, search_path, and other SQL parameters
 
-#### 影响文件
+#### Affected Files
 
-- `src/cron/worker.rs`：执行路径从 `Executor::execute_statement_on_txn` 改为 pgwire 连接
-- `Cargo.toml`：如果 worker 独立 binary 则新增 crate
+- `src/cron/worker.rs`: Change execution path from `Executor::execute_statement_on_txn` to pgwire connection
+- `Cargo.toml`: Add crate if worker is a separate binary
 
 ---
 
-### 5. Claim 生命周期
+### 5. Claim Lifecycle
 
-**问题**：claim key 无限累积。
+**Problem**: Claim keys accumulate indefinitely.
 
-**方案**：双重清理 — 执行完成后立即删除 + GC 兜底。
+**Solution**: Dual cleanup — immediate deletion on execution completion + GC as safety net.
 
-#### 正常流程
-
-```
-task 执行完成 → 写入 run_details → 删除 claim key → 写入下一次 queue entry（仅 Cron）
-```
-
-一个成功的 task 执行后 claim key 立即被删除，不累积。
-
-#### 异常流程（orphan）
-
-Worker crash 或 task 超时 → claim key 残留。GC 处理：
+#### Normal Flow
 
 ```
-GC 每 10 分钟:
+Task completes → write run_details → delete claim key → write next queue entry (Cron only)
+```
+
+A successful task execution immediately deletes its claim key — no accumulation.
+
+#### Abnormal Flow (Orphans)
+
+Worker crash or task timeout → claim key remains. GC handles it:
+
+```
+GC every 10 minutes:
   scan _worker_claim_ prefix
   for claim in claims:
     if claim.claimed_at < now - orphan_timeout:
       delete claim
-      // 不重新入队 — 等下一次 fire time 自然触发（Cron）
-      // 或标记为 failed（AsyncTrigger/BgDdl/BgSql）
+      // Do NOT re-enqueue — wait for next fire time to trigger naturally (Cron)
+      // Or mark as failed (AsyncTrigger/BgDdl/BgSql)
 ```
 
-#### 代价估算
+#### Cost Estimate
 
-正常情况下 claim key 存活时间 < 1 分钟。峰值 1000 task/min → 瞬时最多 1000 个 claim key。GC 只需处理异常残留。
+Under normal conditions, claim keys live < 1 minute. Peak 1000 tasks/min → at most 1000 concurrent claim keys. GC only handles abnormal residuals.
 
 ---
 
-### 6. GC 优化
+### 6. GC Optimization
 
-**问题**：当前 GC 全量扫描所有 keyspace。
+**Problem**: Current GC does a full scan of all keyspaces.
 
-**方案**：
+**Solution**:
 
-1. **走注册表**：GC 只扫描 `_worker_registry_` 中的 keyspace
-2. **分批处理**：每个 GC 周期处理一批（如 100 个 keyspace），下次继续
-3. **Jitter**：每个 worker 的 GC 定时器加随机偏移（0-60s），避免同时执行
-4. **Run retention 就地删除**：run 数据按 `_sys_cron_run_{db_id}_{run_id}` 存储，`run_id` 单调递增。保留最近 N 条只需 scan + 删除前缀。
+1. **Use registry**: GC only scans keyspaces listed in `_worker_registry_`
+2. **Batch processing**: Each GC cycle processes a batch (e.g., 100 keyspaces), continues next cycle
+3. **Jitter**: Each worker's GC timer adds random offset (0-60s) to avoid simultaneous execution
+4. **In-place run retention**: Run data stored as `_sys_cron_run_{db_id}_{run_id}` with `run_id` monotonically increasing. Keeping the last N entries only requires scan + delete prefix.
 
 ```rust
 async fn gc_tick(&self, cursor: &mut Option<String>) {
@@ -404,75 +404,75 @@ async fn gc_tick(&self, cursor: &mut Option<String>) {
         gc_keyspace(entry.keyspace, entry.db_id).await;
     }
     if batch.is_empty() {
-        *cursor = None;  // 重新开始
+        *cursor = None;  // Restart from beginning
     }
 }
 ```
 
 ---
 
-### 7. Auto-ANALYZE 设计
+### 7. Auto-ANALYZE Design
 
-**问题**：ANALYZE 同步执行，阻塞用户查询。
+**Problem**: ANALYZE executes synchronously, blocking user queries.
 
-**方案**：
+**Solution**:
 
-1. **修改计数器**：每个表维护 `mod_since_analyze` 计数器（原子操作）
-2. **阈值判断**：`mod_since_analyze > 50 + 0.1 × reltuples` 时触发
-3. **异步入队**：写入 queue entry（`next_fire_time = now`，`task_type = AutoAnalyze`）
-4. **后台执行**：worker 执行 `ANALYZE table_name`
+1. **Modification counter**: Each table maintains a `mod_since_analyze` counter (atomic operation)
+2. **Threshold check**: Trigger when `mod_since_analyze > 50 + 0.1 × reltuples`
+3. **Async enqueue**: Write queue entry (`next_fire_time = now`, `task_type = AutoAnalyze`)
+4. **Background execution**: Worker executes `ANALYZE table_name`
 
-#### 影响文件
+#### Affected Files
 
-- `src/sql/executor/dml_analyzed.rs`：INSERT/UPDATE/DELETE 时递增 `mod_since_analyze`
-- `src/sql/executor/core/analyze.rs`：ANALYZE 完成后重置计数器
-- `src/sql/stats.rs`：TableStatsCache 新增 `mod_since_analyze` 字段
+- `src/sql/executor/dml_analyzed.rs`: Increment `mod_since_analyze` on INSERT/UPDATE/DELETE
+- `src/sql/executor/core/analyze.rs`: Reset counter after ANALYZE completes
+- `src/sql/stats.rs`: Add `mod_since_analyze` field to TableStatsCache
 
 ---
 
-### 8. CREATE INDEX CONCURRENTLY 设计
+### 8. CREATE INDEX CONCURRENTLY Design
 
-**问题**：CREATE INDEX 同步回填，长时间锁表。
+**Problem**: CREATE INDEX synchronous backfill causes long-duration table locks.
 
-**方案**：两阶段执行
+**Solution**: Two-phase execution
 
-#### Phase 1：同步（schema 注册）
+#### Phase 1: Synchronous (Schema Registration)
 
 ```sql
 CREATE INDEX CONCURRENTLY idx_name ON table_name (col);
 ```
 
-1. 创建 index 元数据（`_sys_index_{db_id}_{index_id}`）
-2. 设置 `index_state = BUILDING`
-3. 返回成功给用户
+1. Create index metadata (`_sys_index_{db_id}_{index_id}`)
+2. Set `index_state = BUILDING`
+3. Return success to user
 
-#### Phase 2：异步（后台回填）
+#### Phase 2: Asynchronous (Background Backfill)
 
-1. Worker 从 queue 中取出 `BgDdl` 任务
-2. 执行 `REINDEX INDEX idx_name` 或等价的回填逻辑
-3. 完成后设置 `index_state = READY`
+1. Worker picks up `BgDdl` task from queue
+2. Executes `REINDEX INDEX idx_name` or equivalent backfill logic
+3. On completion, sets `index_state = READY`
 
-#### 新增类型
+#### New Types
 
 ```rust
 enum IndexState {
-    Building,   // 正在回填
-    Ready,      // 可用
-    Invalid,    // 需要重建
+    Building,   // Backfill in progress
+    Ready,      // Usable
+    Invalid,    // Needs rebuild
 }
 ```
 
-#### 影响文件
+#### Affected Files
 
-- `src/sql/ddl.rs`：CREATE INDEX CONCURRENTLY 改为两阶段
-- `src/sql/catalog/`：index 虚拟表返回 `index_state`
-- `src/sql/executor/core/index.rs`：新增 backfill 逻辑
+- `src/sql/ddl.rs`: Change CREATE INDEX CONCURRENTLY to two-phase
+- `src/sql/catalog/`: Index virtual tables return `index_state`
+- `src/sql/executor/core/index.rs`: New backfill logic
 
 ---
 
-### 9. 新 Key Layout（完整）
+### 9. Complete Key Layout
 
-#### 系统 keyspace（`_sys_worker`，跨 tenant）
+#### System Keyspace (`_sys_worker`, cross-tenant)
 
 ```
 _worker_registry_{keyspace}_{db_id}                              → TaskRegistryEntry
@@ -480,7 +480,7 @@ _worker_queue_{next_fire_time_ms}_{keyspace}_{db_id}_{task_id}   → TaskQueueEn
 _worker_claim_{keyspace}_{db_id}_{task_id}_{fire_time_min}       → WorkerClaim
 ```
 
-#### Tenant keyspace（保持不变）
+#### Tenant Keyspace (unchanged)
 
 ```
 _sys_cron_enabled_{db_id}                     → [1]
@@ -490,225 +490,229 @@ _sys_next_cron_job_id_{db_id}                 → i64
 _sys_next_cron_run_id_{db_id}                 → i64
 ```
 
-注意：`_sys_cron_claim_` 前缀**废弃**，claim 迁移到系统 keyspace。
+Note: The `_sys_cron_claim_` prefix is **deprecated** — claims are migrated to the system keyspace.
 
 ---
 
-## 部署模型
+## Deployment Model
 
-### Phase 1：进程内 worker（当前架构改进）
+### Phase 1: In-Process Worker (Current Architecture Improvement)
 
 ```
 pg-tikv process
 ├── SQL handler (pgwire)
-├── CronWorker (改用 queue scan + concurrent execution)
-└── TriggerWorker (保持独立，内存队列 → TiKV queue)
+├── WorkerEngine (queue scan + concurrent execution)
+└── WorkerGc (orphan claim cleanup + run retention)
 ```
 
-- 不拆分进程，最小改动
-- 仍然走进程内 `Executor` 执行 SQL
-- `list_all_keyspaces()` 改为 scan registry
-- 加并发执行
-- 触发器队列从内存迁移到 TiKV
+- No process split, minimal changes
+- Still uses in-process `Executor` for SQL execution
+- `list_all_keyspaces()` replaced with registry scan
+- Concurrent execution added
+- Trigger queue migrated from in-memory to TiKV
+- Controlled by `PGTIKV_WORKER_ENABLED` environment variable (default: `true`)
 
-### Phase 2：独立 worker 微服务
+### Phase 2: Standalone Worker Microservice
 
 ```
-pg-tikv process       ← 只做 SQL
-worker process(es)    ← 独立 binary，可独立扩缩
+pg-tikv process       ← SQL only
+worker process(es)    ← separate binary, independently scalable
 ```
 
-- Worker 通过 pgwire 连回 pg-tikv
-- Worker 可以用 Kubernetes HPA 按 queue 深度自动扩缩
-- pg-tikv 不再内置 `CronWorker`（配置 `PGTIKV_CRON_ENABLED=false`）
+- Workers connect back to pg-tikv via pgwire
+- Workers can use Kubernetes HPA to auto-scale based on queue depth
+- pg-tikv no longer embeds worker (set `PGTIKV_WORKER_ENABLED=false`)
+- Design spec: `docs/design/24_worker_binary_spec.md`
 
-### Phase 3：统一异步任务引擎
+### Phase 3: Full Unified Engine
 
 ```
 TaskQueueEntry.task_type:
-  Cron          → 定时 SQL
-  AsyncTrigger  → AFTER trigger 异步执行
-  AutoAnalyze   → 自动 ANALYZE
+  Cron          → Scheduled SQL
+  AsyncTrigger  → AFTER trigger async execution
+  AutoAnalyze   → Automatic ANALYZE
   BgDdl         → CREATE INDEX CONCURRENTLY / REFRESH MATERIALIZED VIEW
-  BgSql         → 用户提交的一次性后台任务
+  BgSql         → User-submitted one-off background tasks
 ```
 
-同一套 queue + claim + execute 机制，不同 task_type 只是入队方式不同。
+Same queue + claim + execute mechanism; different task_types only differ in enqueue method.
 
 ---
 
-## 迁移方案（零停机）
+## Migration Plan (Zero Downtime)
 
-### Step 1：添加 registry + queue（写双份）
+### Step 1: Add Registry + Queue (Dual-Write)
 
-1. 部署新版本 pg-tikv
-2. `cron.schedule()` 同时写 tenant keyspace 的 job **和** 系统 keyspace 的 queue entry
-3. Worker 仍然从 `list_all_keyspaces()` 扫描（旧路径），同时 **也** 从 queue 扫描（新路径）
-4. 对两个来源 dedup（claim key 相同）
+1. Deploy new version of pg-tikv
+2. `cron.schedule()` writes to both tenant keyspace job **and** system keyspace queue entry
+3. Worker still scans from `list_all_keyspaces()` (old path), **also** scans from queue (new path)
+4. Dedup from both sources (same claim key)
 
-### Step 2：回填存量数据
+### Step 2: Backfill Existing Data
 
-后台任务扫描所有 keyspace（一次性），将已有的 cron job 写入 registry + queue：
+Background task scans all keyspaces (one-time), writing existing cron jobs to registry + queue:
 
 ```sql
--- 管理员手动触发或自动执行
+-- Admin manually triggers or runs automatically
 SELECT _sys_backfill_cron_registry();
 ```
 
-### Step 3：切换到新路径
+### Step 3: Switch to New Path
 
-1. 确认 queue 中的 job 覆盖所有 tenant（对比 registry entry count vs 旧路径 scan count）
-2. 配置 `PGTIKV_CRON_USE_QUEUE=true`，worker 只从 queue 读取
-3. 观察 1-2 天确认稳定
+1. Confirm queue jobs cover all tenants (compare registry entry count vs old-path scan count)
+2. Set `PGTIKV_CRON_USE_QUEUE=true`, worker reads only from queue
+3. Observe for 1-2 days to confirm stability
 
-### Step 4：清理旧路径
+### Step 4: Clean Up Old Path
 
-1. 删除 `list_all_keyspaces()` 扫描逻辑
-2. 删除 `_sys_cron_claim_` 前缀（迁移到系统 keyspace）
-3. 保留 tenant keyspace 的 job/run 数据（cron.job / cron.job_run_details 虚拟表仍需要）
-
----
-
-## 配置
-
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `PGTIKV_WORKER_ENABLED` | `true` | 是否启动进程内 worker |
-| `PGTIKV_WORKER_POLL_MS` | `60000` | tick 间隔 |
-| `PGTIKV_WORKER_MAX_CONCURRENT_JOBS` | `32` | 单 worker 最大并发执行数 |
-| `PGTIKV_WORKER_ID` | `{hostname}:{pid}` | Worker 实例标识 |
-| `PGTIKV_WORKER_STATEMENT_TIMEOUT_MS` | `300000` | 单个 task 执行超时（5 分钟） |
-| `PGTIKV_WORKER_ORPHAN_TIMEOUT_SEC` | `300` | orphan claim 超时 |
-| `PGTIKV_WORKER_GC_BATCH_SIZE` | `100` | 每轮 GC 处理的 keyspace 数 |
-| `PGTIKV_WORKER_PG_HOST` | （同 pg-tikv） | Phase 2：worker 连回的 pg-tikv 地址 |
-| `PGTIKV_WORKER_PG_PORT` | （同 pg-tikv） | Phase 2：worker 连回的 pg-tikv 端口 |
-| `PGTIKV_AUTO_ANALYZE_ENABLED` | `true` | 是否启用自动 ANALYZE |
-| `PGTIKV_AUTO_ANALYZE_THRESHOLD` | `50` | 自动 ANALYZE 基础阈值 |
+1. Remove `list_all_keyspaces()` scanning logic
+2. Remove `_sys_cron_claim_` prefix (migrated to system keyspace)
+3. Retain tenant keyspace job/run data (cron.job / cron.job_run_details virtual tables still need them)
 
 ---
 
-## 故障模式
+## Configuration
 
-| 故障 | 影响 | 恢复 |
-|------|------|------|
-| Worker crash | 已 claim 的 task 不会执行 | orphan GC 在 5 分钟后清理 claim；下一个 fire time 自动重新入队 |
-| TiKV 分区 | worker 无法 scan queue 或 claim | tick 失败，warn 日志；TiKV 恢复后自动继续 |
-| pg-tikv 不可用 | worker claim 成功但 SQL 执行失败 | run_details 记录 failed；下次 fire time 重试 |
-| Queue entry 丢失 | task 不再触发 | 定期 reconcile：比对 registry 中的 keyspace 和 tenant keyspace 中的 job，补写缺失的 queue entry |
-| 时钟漂移 | task 早触发或晚触发 | claim 的 `fire_time_min` 做 minute 级截断，容忍 ±30s |
-| 所有 worker 下线 | 没有 task 执行 | queue 中的 entry 不会丢失，worker 恢复后从 queue 中 catch up |
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `PGTIKV_WORKER_ENABLED` | `true` | Enable in-process worker |
+| `PGTIKV_WORKER_POLL_MS` | `60000` | Tick interval |
+| `PGTIKV_WORKER_MAX_CONCURRENT_JOBS` | `32` | Max concurrent tasks per worker |
+| `PGTIKV_WORKER_ID` | `{hostname}:{pid}` | Worker instance identifier |
+| `PGTIKV_WORKER_STATEMENT_TIMEOUT_MS` | `300000` | Per-task execution timeout (5 minutes) |
+| `PGTIKV_WORKER_ORPHAN_TIMEOUT_SEC` | `300` | Orphan claim timeout |
+| `PGTIKV_WORKER_GC_BATCH_SIZE` | `100` | Keyspaces processed per GC cycle |
+| `PGTIKV_WORKER_PG_HOST` | (same as pg-tikv) | Phase 2: pg-tikv address for worker connection |
+| `PGTIKV_WORKER_PG_PORT` | (same as pg-tikv) | Phase 2: pg-tikv port for worker connection |
+| `PGTIKV_AUTO_ANALYZE_ENABLED` | `true` | Enable automatic ANALYZE |
+| `PGTIKV_AUTO_ANALYZE_THRESHOLD` | `50` | Auto-ANALYZE base threshold |
 
 ---
 
-## 监控指标
+## Failure Modes
 
-暴露以下 Prometheus metrics：
+| Failure | Impact | Recovery |
+|---------|--------|----------|
+| Worker crash | Claimed tasks won't execute | Orphan GC cleans claim after 5 min; next fire time re-enqueues automatically |
+| TiKV partition | Worker can't scan queue or claim | Tick fails, warn log; resumes automatically after TiKV recovers |
+| pg-tikv unavailable | Worker claims successfully but SQL fails | run_details records failed; retries on next fire time |
+| Queue entry lost | Task no longer triggers | Periodic reconcile: compare registry keyspaces with tenant keyspace jobs, backfill missing queue entries |
+| Clock skew | Task fires early or late | Claim's `fire_time_min` uses minute-level truncation, tolerates ±30s |
+| All workers offline | No tasks execute | Queue entries persist in TiKV; workers catch up when they come back |
+
+---
+
+## Monitoring Metrics
+
+Exposes the following Prometheus metrics:
 
 ```
 # Gauge
-pg_tikv_worker_queue_depth{task_type}           # 队列深度
-pg_tikv_worker_active_jobs{worker_id}           # 活跃 job 数
-pg_tikv_worker_claim_success_rate{task_type}    # claim 成功率
+pg_tikv_worker_queue_depth{task_type}           # Queue depth
+pg_tikv_worker_active_jobs{worker_id}           # Active job count
+pg_tikv_worker_claim_success_rate{task_type}    # Claim success rate
 
 # Counter
-pg_tikv_worker_tasks_executed_total{task_type, status}  # 执行总数
-pg_tikv_worker_tasks_failed_total{task_type, reason}    # 失败总数
+pg_tikv_worker_tasks_executed_total{task_type, status}  # Execution total
+pg_tikv_worker_tasks_failed_total{task_type, reason}    # Failure total
 
 # Histogram
-pg_tikv_worker_task_duration_seconds{task_type}  # 执行耗时
-pg_tikv_worker_queue_latency_seconds{task_type}  # 队列延迟
+pg_tikv_worker_task_duration_seconds{task_type}  # Execution duration
+pg_tikv_worker_queue_latency_seconds{task_type}  # Queue latency
 ```
 
 ---
 
-## 测试计划
+## Test Plan
 
-### 现有覆盖（保持不变）
+### Existing Coverage (Unchanged)
 
-- `src/cron/parser.rs` (24 tests) — cron 表达式解析
-- `src/cron/types.rs` (5 tests) — 序列化往返
-- `tests/170_cron_basic.sql` 等 (11 tests) — SQL regression
+- `src/cron/parser.rs` (24 tests) — Cron expression parsing
+- `src/cron/types.rs` (5 tests) — Serialization round-trips
+- `tests/170_cron_basic.sql` etc. (11 tests) — SQL regression
 
-### 新增测试：Phase 1
+### New Tests: Phase 1
 
 #### Unit Tests
 
-- TaskRegistryEntry / TaskQueueEntry / WorkerClaim bincode 往返
-- Queue key 排序（big-endian i64）
-- next_fire_time 计算（各种 cron 表达式）
-- Claim 去重（minute 级截断）
-- 并发控制（Semaphore 限制）
+- TaskRegistryEntry / TaskQueueEntry / WorkerClaim bincode round-trips
+- Queue key ordering (big-endian i64)
+- next_fire_time computation (various cron expressions)
+- Claim dedup (minute-level truncation)
+- Concurrency control (Semaphore limits)
 
 #### Storage Tests
 
-- Registry CRUD（需 TiKV）
-- Queue CRUD（需 TiKV）
-- Claim 竞争（需 TiKV）
+- Registry CRUD (requires TiKV)
+- Queue CRUD (requires TiKV)
+- Claim competition (requires TiKV)
 
 #### SQL Integration Tests
 
-- `tests/182_cron_execution_e2e.sql` — cron job 执行验证
-- `tests/183_cron_registry_integration.sql` — registry 写入验证
-- `tests/184_cron_queue_integration.sql` — queue 写入验证
+- `tests/185_worker_cron_queue.sql` — Cron queue integration
+- `tests/186_worker_bg_sql.sql` — Background SQL execution
+- `tests/187_worker_cic.sql` — CREATE INDEX CONCURRENTLY
+- `tests/188_worker_refresh_mv.sql` — REFRESH MATERIALIZED VIEW CONCURRENTLY
+- `tests/189_worker_auto_analyze.sql` — Auto-ANALYZE
 
-### 新增测试：Phase 2
+### New Tests: Phase 2
 
-- E2E：worker 进程执行 task
-- 多 worker 竞争：验证去重
-- Worker crash recovery：orphan GC 清理
+- E2E: Worker process executes tasks
+- Multi-worker competition: Verify dedup
+- Worker crash recovery: Orphan GC cleanup
 
-### 新增测试：Phase 3
+### New Tests: Phase 3
 
-- Async trigger 入队
-- Auto-ANALYZE 入队
-- CREATE INDEX CONCURRENTLY 两阶段
-- Background job 入队
+- Async trigger enqueue
+- Auto-ANALYZE enqueue
+- CREATE INDEX CONCURRENTLY two-phase
+- Background job enqueue
 
 ---
 
-## 实现优先级
+## Implementation Priority
 
-### P0（必须）
+### P0 (Must Have)
 
-1. Task registry + queue 基础设施
-2. Worker claim 机制（TiKV 悲观事务）
-3. Cron 迁移到新 queue
-4. 并发执行（Semaphore）
+1. Task registry + queue infrastructure
+2. Worker claim mechanism (TiKV pessimistic transactions)
+3. Cron migration to new queue
+4. Concurrent execution (Semaphore)
 
-### P1（重要）
+### P1 (Important)
 
-1. Async trigger 迁移到 TiKV queue
-2. Auto-ANALYZE 设计实现
-3. GC 优化（registry 扫描）
-4. 监控指标
+1. Async trigger migration to TiKV queue
+2. Auto-ANALYZE implementation
+3. GC optimization (registry scan)
+4. Monitoring metrics
 
-### P2（可选）
+### P2 (Optional)
 
 1. CREATE INDEX CONCURRENTLY
 2. REFRESH MATERIALIZED VIEW CONCURRENTLY
 3. Background job API
-4. 优先级队列
+4. Priority queue
 
 ---
 
 ## Future Work
 
-- **优先级队列**：不同 tenant 的 task 优先级不同（付费 tier）。可通过在 queue key 中加入 priority 字段实现。
-- **执行超时**：单个 task 的 SQL 执行超时。需要在 pgwire 连接上设置 `statement_timeout`。
-- **跨 region**：Worker 亲和性 — 优先 claim 同 region 的 task，减少跨 region SQL 执行延迟。
-- **任务依赖**：支持 task 之间的依赖关系（如 ANALYZE 完成后更新统计信息）。
-- **重试策略**：可配置的重试次数和退避策略。
+- **Priority queue**: Different task priorities per tenant (paid tiers). Can be implemented by adding a priority field to the queue key.
+- **Execution timeout**: Per-task SQL execution timeout. Requires setting `statement_timeout` on the pgwire connection.
+- **Cross-region**: Worker affinity — prefer claiming tasks in the same region to reduce cross-region SQL execution latency.
+- **Task dependencies**: Support dependencies between tasks (e.g., update statistics after ANALYZE completes).
+- **Retry strategy**: Configurable retry count and backoff strategy.
 
 ---
 
-## 总结
+## Summary
 
-统一异步任务引擎通过以下设计实现高效、可扩展的异步任务执行：
+The unified async task engine achieves efficient, scalable async task execution through:
 
-1. **全局 queue**：TiKV 本身做协调层，无需外部依赖
-2. **Work stealing**：多 worker 通过悲观事务竞争，无需 leader election
-3. **并发执行**：Semaphore 控制并发度，充分利用资源
-4. **持久化**：所有 task 持久化到 TiKV，进程重启不丢失
-5. **可扩展**：支持多种 task 类型，统一管理和监控
+1. **Global queue**: TiKV itself serves as the coordination layer — no external dependencies
+2. **Work stealing**: Multiple workers compete via pessimistic transactions — no leader election
+3. **Concurrent execution**: Semaphore controls concurrency — fully utilizes resources
+4. **Persistence**: All tasks persisted to TiKV — no data loss on process restart
+5. **Extensibility**: Supports multiple task types with unified management and monitoring
 
-TiKV 本身就是最好的协调层。
+TiKV itself is the best coordination layer.
