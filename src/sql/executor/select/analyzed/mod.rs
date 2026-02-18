@@ -8,7 +8,7 @@
 
 use crate::sql::analyzer::types::{
     AnalyzedDistinct, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind,
-    BinaryOp as TypedBinaryOp, JoinCondition, TypedExpr, TypedExprKind, TypedFunctionArg,
+    BinaryOp as TypedBinaryOp, JoinCondition, JoinType, TypedExpr, TypedExprKind, TypedFunctionArg,
     TypedOrderByExpr,
 };
 use crate::sql::analyzer::{AnalyzedQuery, Analyzer};
@@ -1108,7 +1108,7 @@ impl Executor {
         if let AnalyzedQueryBody::Select(ref mut select) = analyzed.body {
             let mut join_on_async_parts: Vec<TypedExpr> = Vec::new();
             for tr in &mut select.from {
-                extract_async_join_on_predicates(tr, &mut join_on_async_parts);
+                extract_async_join_on_predicates(tr, &mut join_on_async_parts)?;
             }
             if !join_on_async_parts.is_empty() {
                 // Merge with any existing async WHERE predicates.
@@ -2010,47 +2010,60 @@ fn eval_const_usize(expr: &TypedExpr) -> Result<usize> {
     }
 }
 
-/// Walks the FROM tree recursively. For each JOIN with an ON condition
-/// containing unresolved subqueries, splits the ON into sync and async parts.
-/// The sync part stays in the ON condition; the async parts are collected
-/// into `extracted` for post-join async WHERE evaluation.
+/// Walks the FROM tree recursively. For each INNER/CROSS JOIN with an ON
+/// condition containing unresolved subqueries, splits the ON into sync and
+/// async parts. The sync part stays in the ON condition; the async parts are
+/// collected into `extracted` for post-join async WHERE evaluation.
 ///
-/// Note: for outer joins (LEFT/RIGHT/FULL), this extraction technically
-/// changes semantics (ON → WHERE converts null-extension to inner-filter).
-/// However, the operator pipeline cannot evaluate subqueries in ON conditions
-/// (typed_eval returns an error), so extraction is necessary for correctness
-/// of execution. Pre-materialization has already resolved non-correlated
-/// subqueries to constants; only correlated subqueries remain here.
-fn extract_async_join_on_predicates(tr: &mut AnalyzedTableRef, extracted: &mut Vec<TypedExpr>) {
+/// For outer joins (LEFT/RIGHT/FULL), moving ON predicates to WHERE changes
+/// semantics (null-extended rows would be filtered instead of controlling
+/// match eligibility). Rather than silently producing wrong results, we
+/// return an error for this unsupported query shape.
+fn extract_async_join_on_predicates(
+    tr: &mut AnalyzedTableRef,
+    extracted: &mut Vec<TypedExpr>,
+) -> Result<()> {
     use crate::sql::expr::classify::has_unresolved_subquery;
 
     match &mut tr.kind {
         AnalyzedTableRefKind::Join {
             left,
             right,
+            join_type,
             condition,
             ..
         } => {
             // Recurse into children first.
-            extract_async_join_on_predicates(left, extracted);
-            extract_async_join_on_predicates(right, extracted);
+            extract_async_join_on_predicates(left, extracted)?;
+            extract_async_join_on_predicates(right, extracted)?;
 
             // Check and split the ON condition.
             if let JoinCondition::On(ref expr) = condition {
                 if has_unresolved_subquery(expr) {
-                    let (sync_part, async_part) = split_where_for_async(expr);
-                    *condition = match sync_part {
-                        Some(sync_expr) => JoinCondition::On(sync_expr),
-                        None => JoinCondition::None,
-                    };
-                    if let Some(async_expr) = async_part {
-                        extracted.push(async_expr);
+                    match join_type {
+                        JoinType::Inner | JoinType::Cross => {
+                            // ON→WHERE is semantically equivalent for inner joins.
+                            let (sync_part, async_part) = split_where_for_async(expr);
+                            *condition = match sync_part {
+                                Some(sync_expr) => JoinCondition::On(sync_expr),
+                                None => JoinCondition::None,
+                            };
+                            if let Some(async_expr) = async_part {
+                                extracted.push(async_expr);
+                            }
+                        }
+                        JoinType::Left | JoinType::Right | JoinType::Full => {
+                            return Err(anyhow!(
+                                "correlated subqueries in outer join ON conditions are not yet supported"
+                            ));
+                        }
                     }
                 }
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Extract the primary dependency (first ColumnRef argument) from an async

@@ -115,7 +115,7 @@ impl LogicalPlanner {
         order_by: &[TypedOrderByExpr],
     ) -> Result<LogicalPlan> {
         // 1. FROM clause → base plan
-        let mut plan = Self::build_from(&select.from);
+        let mut plan = Self::build_from(&select.from)?;
 
         // 2. WHERE → Filter
         if let Some(predicate) = &select.where_clause {
@@ -663,20 +663,16 @@ impl LogicalPlanner {
         result
     }
 
-    fn build_from(from: &[AnalyzedTableRef]) -> LogicalPlan {
+    fn build_from(from: &[AnalyzedTableRef]) -> Result<LogicalPlan> {
         if from.is_empty() {
-            return LogicalPlan::empty(PlanSchema::from_columns(vec![]));
+            return Ok(LogicalPlan::empty(PlanSchema::from_columns(vec![])));
         }
 
-        // build_table_ref is infallible for non-Subquery cases.
-        // Subquery case is handled by build() which returns Result, but
-        // FROM-level subqueries have already been flattened by the rewriter,
-        // so in practice this path is always infallible.
-        let mut plan = Self::build_table_ref(&from[0]);
+        let mut plan = Self::build_table_ref(&from[0])?;
 
         // Additional FROM items → cross joins
         for table_ref in from.iter().skip(1) {
-            let right = Self::build_table_ref(table_ref);
+            let right = Self::build_table_ref(table_ref)?;
             let mut combined_cols = plan.schema.columns.clone();
             combined_cols.extend(right.schema.columns.clone());
             let schema = PlanSchema::from_columns(combined_cols);
@@ -691,10 +687,10 @@ impl LogicalPlanner {
             };
         }
 
-        plan
+        Ok(plan)
     }
 
-    fn build_table_ref(table_ref: &AnalyzedTableRef) -> LogicalPlan {
+    fn build_table_ref(table_ref: &AnalyzedTableRef) -> Result<LogicalPlan> {
         match &table_ref.kind {
             AnalyzedTableRefKind::Table { name, schema } => {
                 let plan_schema = PlanSchema::from_columns(
@@ -704,23 +700,22 @@ impl LogicalPlanner {
                         .map(|(name, dt, _nullable)| (name.clone(), dt.clone()))
                         .collect(),
                 );
-                LogicalPlan::scan(name.clone(), table_ref.alias.clone(), plan_schema)
+                Ok(LogicalPlan::scan(
+                    name.clone(),
+                    table_ref.alias.clone(),
+                    plan_schema,
+                ))
             }
             AnalyzedTableRefKind::Subquery(subquery) => {
-                // Subquery build can fail on aggregate rewrites, but FROM
-                // subqueries typically don't have complex HAVING. Use
-                // unwrap_or with an empty plan as absolute fallback.
-                let subplan = Self::build(subquery).unwrap_or_else(|_| {
-                    LogicalPlan::empty(PlanSchema::from_columns(subquery.output_schema.clone()))
-                });
+                let subplan = Self::build(subquery)?;
                 let schema = subplan.schema.clone();
-                LogicalPlan {
+                Ok(LogicalPlan {
                     node: LogicalNode::Subquery {
                         subplan: Box::new(subplan),
                         alias: table_ref.alias.clone(),
                     },
                     schema,
-                }
+                })
             }
             AnalyzedTableRefKind::Join {
                 left,
@@ -729,8 +724,8 @@ impl LogicalPlanner {
                 condition,
                 left_col_start,
             } => {
-                let left_plan = Self::build_table_ref(left);
-                let right_plan = Self::build_table_ref(right);
+                let left_plan = Self::build_table_ref(left)?;
+                let right_plan = Self::build_table_ref(right)?;
                 let mut combined_cols = left_plan.schema.columns.clone();
                 combined_cols.extend(right_plan.schema.columns.clone());
                 let schema = PlanSchema::from_columns(combined_cols);
@@ -739,7 +734,7 @@ impl LogicalPlanner {
                 // offset where this join's left child begins.
                 let normalized_condition =
                     crate::sql::analyzer::types::reindex_join_condition(condition, *left_col_start);
-                LogicalPlan {
+                Ok(LogicalPlan {
                     node: LogicalNode::Join {
                         left: Box::new(left_plan),
                         right: Box::new(right_plan),
@@ -747,7 +742,7 @@ impl LogicalPlanner {
                         condition: normalized_condition,
                     },
                     schema,
-                }
+                })
             }
             AnalyzedTableRefKind::Function {
                 func,
@@ -755,14 +750,14 @@ impl LogicalPlanner {
                 output_columns,
             } => {
                 let plan_schema = PlanSchema::from_columns(output_columns.clone());
-                LogicalPlan {
+                Ok(LogicalPlan {
                     node: LogicalNode::TableFunction {
                         function_name: func.name.clone(),
                         args: args.clone(),
                         alias: table_ref.alias.clone(),
                     },
                     schema: plan_schema,
-                }
+                })
             }
         }
     }

@@ -1,5 +1,27 @@
 # Worklog
 
+## 2026-02-18 — PR #820 Review Findings (3 fixes)
+
+### Finding 1: Propagate errors in FROM subquery planning
+- **Problem**: `logical_planner.rs` — `build_table_ref` used `unwrap_or_else` to silently replace planner errors with `LogicalPlan::empty()`, producing wrong results.
+- **Fix**: Changed `build_table_ref` and `build_from` to return `Result<LogicalPlan>`, propagated `?` to `build_select`.
+- **File**: `src/sql/optimizer/logical_planner.rs`
+
+### Finding 2: Reject correlated subqueries in outer join ON
+- **Problem**: `extract_async_join_on_predicates` moved ON predicates to WHERE for all join types, silently changing outer join semantics.
+- **Fix**: Gated extraction on join type — `Inner|Cross` extract normally, `Left|Right|Full` return an explicit error.
+- **File**: `src/sql/executor/select/analyzed/mod.rs`
+
+### Finding 3: Remove EXPLAIN hidden fallback
+- **Problem**: EXPLAIN fell back to AST-based plan when optimizer failed, while execution would propagate the error — violating single-path parity.
+- **Fix**: Replaced `match optimize()` with `optimize()?` to propagate errors consistently.
+- **File**: `src/sql/executor/core/statement.rs`
+
+### Verification
+- `cargo check` — zero new warnings
+- `cargo test` — 1649 passed, 0 failed
+- `cargo fmt -- --check` — clean
+
 ## 2026-02-17 — Issue #698: Trigger Module Restructuring
 
 ### Problem
