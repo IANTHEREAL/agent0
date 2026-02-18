@@ -19,8 +19,12 @@ pub(crate) enum UniqueConflictResolution {
 }
 
 pub(crate) fn is_unique_duplicate_error(err: &anyhow::Error) -> bool {
+    if crate::storage::is_unique_index_duplicate_error(err) {
+        return true;
+    }
+    // Backward-compatible fallback for older error sites that still stringify.
     let msg = err.to_string();
-    msg.contains("Duplicate entry for unique index") || msg.contains("Duplicate entry")
+    msg.contains("Duplicate entry for unique index")
 }
 
 pub(crate) fn pk_types_for_schema(schema: &TableSchema) -> Vec<DataType> {
@@ -158,6 +162,12 @@ mod tests {
     #[test]
     fn duplicate_error_matcher_detects_known_message() {
         let e = anyhow::anyhow!("Duplicate entry for unique index");
+        assert!(is_unique_duplicate_error(&e));
+    }
+
+    #[test]
+    fn duplicate_error_matcher_detects_structured_error() {
+        let e = crate::storage::unique_index_duplicate_error();
         assert!(is_unique_duplicate_error(&e));
     }
 

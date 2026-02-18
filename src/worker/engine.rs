@@ -687,7 +687,14 @@ impl WorkerEngine {
             .find(|idx| idx.name == index_name)
             .cloned()
             .ok_or_else(|| anyhow!("Index '{}' not found on table '{}'", index_name, table_name))?;
-        let is_unique = index.unique;
+        if !should_start_cic_backfill(index.state) {
+            // Guard against duplicate/stale queue entries: CIC phases must start from Building.
+            warn!(
+                "Skipping CIC backfill task because index is not in Building state: table={} index={} state={:?}",
+                table_name, index_name, index.state
+            );
+            return Ok(());
+        }
 
         // Phase 1 (Building): backfill and atomically flip to WriteOnly.
         if let Err(e) = ddl::backfill_index_by_name(
@@ -703,39 +710,31 @@ impl WorkerEngine {
         }
 
         // Phase 2 (WriteOnly): catch-up scan on a fresh snapshot.
-        if let Err(e) = ddl::backfill_index_by_name(
+        if let Err(e) =
+            ddl::backfill_index_by_name(store, db_id, &table_name, &index_name, None).await
+        {
+            return Err(mark_invalid(e).await);
+        }
+
+        // Phase 3: reconcile stale entries and atomically expose index to planner.
+        if let Err(e) = ddl::reconcile_index(
             store,
             db_id,
             &table_name,
             &index_name,
-            if is_unique {
-                None
-            } else {
-                Some(IndexState::Ready)
-            },
+            Some(IndexState::Ready),
         )
         .await
         {
             return Err(mark_invalid(e).await);
         }
 
-        // Phase 3 (unique only): reconcile stale entries before exposing to planner.
-        if is_unique {
-            if let Err(e) = ddl::reconcile_unique_index(
-                store,
-                db_id,
-                &table_name,
-                &index_name,
-                Some(IndexState::Ready),
-            )
-            .await
-            {
-                return Err(mark_invalid(e).await);
-            }
-        }
-
         Ok(())
     }
+}
+
+fn should_start_cic_backfill(state: IndexState) -> bool {
+    matches!(state, IndexState::Building)
 }
 
 fn repair_incomplete_cic_states(schema: &mut crate::types::TableSchema) -> u32 {
@@ -846,7 +845,10 @@ mod tests {
     #[test]
     fn repair_incomplete_cic_states_noop_when_no_transient_state() {
         let mut schema = TableSchema {
-            indexes: vec![idx("i_ready", IndexState::Ready), idx("i_invalid", IndexState::Invalid)],
+            indexes: vec![
+                idx("i_ready", IndexState::Ready),
+                idx("i_invalid", IndexState::Invalid),
+            ],
             ..TableSchema::default()
         };
 
@@ -854,5 +856,13 @@ mod tests {
         assert_eq!(repaired, 0);
         assert_eq!(schema.indexes[0].state, IndexState::Ready);
         assert_eq!(schema.indexes[1].state, IndexState::Invalid);
+    }
+
+    #[test]
+    fn should_start_cic_backfill_only_when_building() {
+        assert!(should_start_cic_backfill(IndexState::Building));
+        assert!(!should_start_cic_backfill(IndexState::Ready));
+        assert!(!should_start_cic_backfill(IndexState::Invalid));
+        assert!(!should_start_cic_backfill(IndexState::WriteOnly));
     }
 }

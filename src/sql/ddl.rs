@@ -1766,7 +1766,64 @@ pub async fn backfill_index_by_name(
     Ok(())
 }
 
-async fn reconcile_unique_index_pass(
+fn reconcile_index_search_path(table_name: &str) -> Vec<String> {
+    let schema_name = table_name.split('.').next().unwrap_or("public");
+    if schema_name.eq_ignore_ascii_case("public") {
+        vec!["public".to_string(), "pg_catalog".to_string()]
+    } else {
+        vec![
+            schema_name.to_string(),
+            "public".to_string(),
+            "pg_catalog".to_string(),
+        ]
+    }
+}
+
+fn infer_index_value_types_for_reconcile(
+    index: &IndexDef,
+    schema: &TableSchema,
+    db_id: u64,
+    table_name: &str,
+) -> Result<Vec<DataType>> {
+    let mut types = Vec::with_capacity(index.columns.len() + index.expressions.len());
+
+    for col_name in &index.columns {
+        let col = schema
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(col_name))
+            .ok_or_else(|| {
+                anyhow!(
+                    "Index column '{}' not found while reconciling '{}'",
+                    col_name,
+                    index.name
+                )
+            })?;
+        types.push(col.data_type.clone());
+    }
+
+    let search_path = reconcile_index_search_path(table_name);
+    for expr_str in &index.expressions {
+        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+        let expr = sqlparser::parser::Parser::new(&dialect)
+            .try_with_sql(expr_str)
+            .and_then(|mut p| p.parse_expr())
+            .map_err(|e| {
+                anyhow!(
+                    "failed to parse index expression '{}' on '{}': {}",
+                    expr_str,
+                    index.name,
+                    e
+                )
+            })?;
+        let typed = analyze_row_level_expr(&expr, schema, db_id, &search_path)?;
+        types.push(typed.data_type.clone());
+    }
+
+    Ok(types)
+}
+
+async fn reconcile_index_pass(
     store: &Arc<TikvStore>,
     db_id: u64,
     table_name: &str,
@@ -1789,13 +1846,30 @@ async fn reconcile_unique_index_pass(
             .find(|idx| idx.name == index_name)
             .cloned()
             .ok_or_else(|| anyhow!("Index '{}' not found on table '{}'", index_name, table_name))?;
-        if !index.unique {
-            return Err(anyhow!(
-                "reconcile_unique_index can only be used for unique indexes"
-            ));
+
+        if !index_helpers::is_index_materializable(&index) {
+            if let Some(state) = set_state_on_commit {
+                let mut schema = store
+                    .get_schema(&mut txn, db_id, table_name)
+                    .await?
+                    .ok_or_else(|| SqlError::RelationNotFound(table_name.to_string()))?;
+                let idx = schema
+                    .indexes
+                    .iter_mut()
+                    .find(|idx| idx.name == index_name)
+                    .ok_or_else(|| {
+                        anyhow!("Index '{}' not found on table '{}'", index_name, table_name)
+                    })?;
+                idx.state = state;
+                store.update_schema(&mut txn, db_id, schema).await?;
+            }
+            txn.commit().await?;
+            return Ok(());
         }
 
         let pk_types = pk_types_for_schema(&schema);
+        let index_value_types =
+            infer_index_value_types_for_reconcile(&index, &schema, db_id, table_name)?;
         let (start, end) = index_prefix_range(db_id, schema.table_id, index.id);
         let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
         while let Some(batch) = scanner.next_batch(&mut txn).await? {
@@ -1804,8 +1878,18 @@ async fn reconcile_unique_index_pass(
                     let key: &[u8] = pair.key().as_ref().into();
                     key.to_vec()
                 };
-                let pk_values =
-                    crate::storage::decode_pk_from_index_suffix(pair.value().as_ref(), &pk_types)?;
+                let pk_values = if index.unique {
+                    crate::storage::decode_pk_from_index_suffix(pair.value().as_ref(), &pk_types)?
+                } else {
+                    store.decode_non_unique_pk_from_index_key(
+                        &scanned_key,
+                        db_id,
+                        schema.table_id,
+                        index.id,
+                        &index_value_types,
+                        &pk_types,
+                    )?
+                };
                 let existing_rows = store
                     .batch_get_rows(
                         &mut txn,
@@ -1824,11 +1908,16 @@ async fn reconcile_unique_index_pass(
                         let current_values = index_helpers::get_index_values_with_expressions(
                             &index, &schema, &row,
                         )?;
-                        let expected_key = store.make_unique_index_key(
+                        let expected_key = store.make_index_key(
                             db_id,
                             schema.table_id,
                             index.id,
                             &current_values,
+                            if index.unique {
+                                None
+                            } else {
+                                Some(pk_values.as_slice())
+                            },
                         );
                         scanned_key != expected_key
                     }
@@ -1881,17 +1970,19 @@ async fn reconcile_unique_index_pass(
     Ok(())
 }
 
-pub async fn reconcile_unique_index(
+pub async fn reconcile_index(
     store: &Arc<TikvStore>,
     db_id: u64,
     table_name: &str,
     index_name: &str,
     set_state_on_commit: Option<IndexState>,
 ) -> Result<()> {
-    // Pass 1: bulk cleanup with rotation.
-    reconcile_unique_index_pass(store, db_id, table_name, index_name, true, None).await?;
+    // Pass 1 may commit partial cleanup batches via transaction rotation. This is safe:
+    // Pass 2 always re-scans the full index range and is the authoritative verification
+    // pass before any Ready state transition is committed.
+    reconcile_index_pass(store, db_id, table_name, index_name, true, None).await?;
     // Pass 2: short final verification + optional atomic state flip.
-    reconcile_unique_index_pass(
+    reconcile_index_pass(
         store,
         db_id,
         table_name,
