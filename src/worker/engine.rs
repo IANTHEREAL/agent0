@@ -10,7 +10,7 @@ use crate::worker::config::WorkerConfig;
 use crate::worker::metrics::WorkerMetrics;
 use crate::worker::types::*;
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,6 +58,10 @@ impl WorkerEngine {
             "WorkerEngine starting (poll_ms={}, max_concurrent={})",
             self.config.poll_ms, self.config.max_concurrent_jobs
         );
+
+        if let Err(e) = self.reconcile_cron_jobs().await {
+            warn!("Cron reconciliation failed (engine will continue): {}", e);
+        }
 
         let mut interval = tokio::time::interval(Duration::from_millis(self.config.poll_ms));
         loop {
@@ -136,6 +140,160 @@ impl WorkerEngine {
         }
 
         Ok(())
+    }
+
+    /// Reconcile cron jobs at startup: ensure all active cron jobs have queue entries,
+    /// and remove queue entries for jobs that no longer exist or are inactive.
+    async fn reconcile_cron_jobs(&self) -> Result<()> {
+        info!("Starting cron job reconciliation...");
+
+        let mut txn = self.system_store.begin().await?;
+        let registry_entries = self.system_store.list_worker_registry(&mut txn).await?;
+        txn.commit().await?;
+
+        let mut total_enqueued = 0u32;
+        let mut total_cleaned = 0u32;
+
+        for entry in registry_entries {
+            if !entry.has_cron() {
+                continue;
+            }
+
+            match self
+                .reconcile_cron_for_db(&entry.keyspace, entry.db_id)
+                .await
+            {
+                Ok((enqueued, cleaned)) => {
+                    total_enqueued += enqueued;
+                    total_cleaned += cleaned;
+                }
+                Err(e) => {
+                    warn!(
+                        "Cron reconciliation error for keyspace={} db_id={}: {}",
+                        entry.keyspace, entry.db_id, e
+                    );
+                }
+            }
+        }
+
+        info!(
+            "Cron reconciliation complete: enqueued={} cleaned={}",
+            total_enqueued, total_cleaned
+        );
+        Ok(())
+    }
+
+    /// Reconcile cron jobs for a single (keyspace, db_id).
+    /// Returns (enqueued_count, cleaned_count).
+    async fn reconcile_cron_for_db(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<(u32, u32)> {
+        // 1. Scan existing cron queue entries from the system store
+        let mut txn = self.system_store.begin().await?;
+        let existing_queue = self
+            .system_store
+            .scan_cron_queue_entries_for_db(&mut txn, keyspace, db_id)
+            .await?;
+        txn.commit().await?;
+
+        let existing_job_ids: HashSet<i64> =
+            existing_queue.iter().map(|(_, task_id)| *task_id).collect();
+
+        // 2. Acquire tenant store and check cron state
+        let handle = self.pool.acquire(Some(keyspace.to_string())).await?;
+        let store = handle.store().clone();
+
+        let mut tenant_txn = store.begin().await?;
+        let cron_enabled = store.is_cron_enabled(&mut tenant_txn, db_id).await?;
+
+        if !cron_enabled {
+            tenant_txn.commit().await?;
+            // Cron disabled but registry has cron bit — clean up all queue entries
+            if !existing_queue.is_empty() {
+                let mut sys_txn = self.system_store.begin().await?;
+                for (key, _) in &existing_queue {
+                    self.system_store
+                        .delete_worker_queue_entry(&mut sys_txn, key)
+                        .await?;
+                }
+                sys_txn.commit().await?;
+            }
+            return Ok((0, existing_queue.len() as u32));
+        }
+
+        // 3. Load active cron jobs from tenant store
+        let cron_jobs = store.list_cron_jobs(&mut tenant_txn, db_id).await?;
+        tenant_txn.commit().await?;
+
+        let active_jobs: HashMap<i64, &crate::cron::types::CronJob> = cron_jobs
+            .iter()
+            .filter(|j| j.active)
+            .map(|j| (j.job_id, j))
+            .collect();
+        let active_job_ids: HashSet<i64> = active_jobs.keys().copied().collect();
+
+        let mut enqueued = 0u32;
+        let mut cleaned = 0u32;
+
+        // 4. Enqueue missing: active jobs not in queue
+        let missing: Vec<i64> = active_job_ids
+            .difference(&existing_job_ids)
+            .copied()
+            .collect();
+
+        if !missing.is_empty() {
+            let mut sys_txn = self.system_store.begin().await?;
+            for job_id in missing {
+                let job = active_jobs[&job_id];
+                let next_fire = match compute_next_fire_time(&job.schedule) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(
+                            "Cron reconciliation: invalid schedule for job_id={} schedule='{}': {}",
+                            job_id, job.schedule, e
+                        );
+                        continue;
+                    }
+                };
+                let queue_entry = TaskQueueEntry::new(
+                    keyspace.to_string(),
+                    db_id,
+                    job.job_id,
+                    TaskType::Cron,
+                    job.command.clone(),
+                    job.username.clone(),
+                    128,
+                )
+                .with_schedule(job.schedule.clone());
+                self.system_store
+                    .put_worker_queue_entry(&mut sys_txn, &queue_entry, next_fire)
+                    .await?;
+                enqueued += 1;
+            }
+            sys_txn.commit().await?;
+        }
+
+        // 5. Cleanup orphans: queue entries whose job_id is not in active jobs
+        let orphan_keys: Vec<Vec<u8>> = existing_queue
+            .into_iter()
+            .filter(|(_, task_id)| !active_job_ids.contains(task_id))
+            .map(|(key, _)| key)
+            .collect();
+
+        if !orphan_keys.is_empty() {
+            let mut sys_txn = self.system_store.begin().await?;
+            for key in &orphan_keys {
+                self.system_store
+                    .delete_worker_queue_entry(&mut sys_txn, key)
+                    .await?;
+            }
+            sys_txn.commit().await?;
+            cleaned = orphan_keys.len() as u32;
+        }
+
+        Ok((enqueued, cleaned))
     }
 
     async fn claim_and_execute(
