@@ -195,3 +195,27 @@ Removed the legacy SELECT execution fallback path, making the CBO optimizer the 
 ### Verification
 - `cargo check` — zero new warnings
 - `cargo test` — all 1649 tests pass
+
+### Review Finding: P1 scope collision in schema_map_key — False Positive
+
+**Claim**: `schema_map_key(table_name, alias)` can collide when the same `(table_name, alias)` pair appears in different query scopes (outer vs inner subquery), causing entries to overwrite and "be read by the wrong scan."
+
+**Analysis**: The collision is **benign (idempotent overwrite)**, not a bug.
+
+1. Same `(table_name, alias)` in different scopes → same physical table → same schema from `store().get_schema()`. Overwrite at line 1597 is idempotent.
+2. Different tables can never collide: `schema_map_key("users", Some("t"))` = `"users\0t"` ≠ `"orders\0t"`.
+3. CTEs are detected by name lookup (line 1568), applied uniformly per SQL scoping rules.
+4. Virtual catalog preloaded rows are scope-independent (same data regardless of scope).
+5. `build_operators` passes the same `BuildContext` to inner subqueries (line 420), so pre-loading inner refs into the same map is the correct design.
+
+**Verdict**: No code change needed. The composite key already handles all differentiation correctly.
+
+### Review Finding: Outer JOIN ON extraction — Stale Observation
+
+**Claim**: "extraction now only for INNER/CROSS" (based on commit 938af32).
+
+**Status**: Superseded by CI Failure 3 fix (commit 5b79899). Extraction now applies to ALL join types because the operator pipeline cannot evaluate subqueries in ON conditions regardless of join type. Pre-materialization resolves non-correlated subqueries before this point.
+
+### Cargo.lock Note
+
+Cargo.lock modification during test run is a dependency resolution artifact — not related to code changes. Safe to discard.
