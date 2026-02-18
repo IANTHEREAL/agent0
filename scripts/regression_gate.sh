@@ -290,6 +290,29 @@ sys.exit(1)
 PY
 }
 
+verify_worker_startup() {
+  local log_file="/tmp/pgtikv-regression.log"
+
+  for _ in $(seq 1 20); do
+    if grep -Fq "WorkerEngine and GC started" "$log_file" 2>/dev/null; then
+      echo "Worker startup verified."
+      return 0
+    fi
+
+    if grep -Fq "Failed to initialize system store:" "$log_file" 2>/dev/null; then
+      echo "ERROR: worker enabled but system-store initialization failed." >&2
+      sed -n '1,240p' "$log_file" || true
+      return 1
+    fi
+
+    sleep 1
+  done
+
+  echo "ERROR: worker enabled but startup success marker was not observed in time." >&2
+  sed -n '1,240p' "$log_file" || true
+  return 1
+}
+
 cleanup() {
   echo ""
   echo "=== Regression gate cleanup ==="
@@ -414,6 +437,11 @@ if [[ "$START_ENV" -eq 1 ]]; then
   fi
 
   echo "pg-tikv ready (PID: $PGTIKV_PID)"
+
+  if worker_is_enabled; then
+    verify_worker_startup
+  fi
+
   echo ""
 else
   echo "[2/$TOTAL_STEPS] Skipping TiKV/pg-tikv startup (--no-env/--dsn)"
