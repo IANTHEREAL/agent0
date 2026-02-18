@@ -1134,8 +1134,7 @@ impl Executor {
                     // identical to execution path.
                     let mut planning_ctx = crate::sql::optimizer::PlanningContext::empty();
                     {
-                        let table_refs =
-                            crate::sql::optimizer::collect_query_table_refs(&analyzed);
+                        let table_refs = crate::sql::optimizer::collect_query_table_refs(&analyzed);
                         let cte_names: HashSet<String> = analyzed
                             .ctes
                             .iter()
@@ -1151,9 +1150,7 @@ impl Executor {
                                 self.stats_cache().get_full_stats(db_id, tid)
                             };
                             if let Some(stats) = stats {
-                                planning_ctx
-                                    .table_stats
-                                    .insert(ctx_key.to_string(), stats);
+                                planning_ctx.table_stats.insert(ctx_key.to_string(), stats);
                             }
                             let cte_key = name.to_lowercase();
                             if !cte_names.contains(&cte_key) {
@@ -1168,8 +1165,7 @@ impl Executor {
                         }
                     }
                     {
-                        let physical =
-                            crate::sql::optimizer::optimize(&analyzed, &planning_ctx);
+                        let physical = crate::sql::optimizer::optimize(&analyzed, &planning_ctx);
                         explain::physical_plan_to_plan_node(&physical)
                     }
                 }

@@ -958,7 +958,6 @@ impl Executor {
         }) // end Box::pin
     }
 
-
     /// Execute a query through the CBO optimizer pipeline.
     ///
     /// This is the **single execution path** for ALL SELECT queries:
@@ -1069,31 +1068,29 @@ impl Executor {
             }
             if !join_on_async_parts.is_empty() {
                 // Merge with any existing async WHERE predicates.
-                let combined = join_on_async_parts.into_iter().fold(
-                    async_where_pred.take(),
-                    |acc, pred| match acc {
-                        None => Some(pred),
-                        Some(existing) => Some(TypedExpr {
-                            kind: TypedExprKind::BinaryOp {
-                                left: Box::new(existing),
-                                op: TypedBinaryOp::And,
-                                right: Box::new(pred),
-                            },
-                            data_type: DataType::Boolean,
-                        }),
-                    },
-                );
+                let combined =
+                    join_on_async_parts
+                        .into_iter()
+                        .fold(async_where_pred.take(), |acc, pred| match acc {
+                            None => Some(pred),
+                            Some(existing) => Some(TypedExpr {
+                                kind: TypedExprKind::BinaryOp {
+                                    left: Box::new(existing),
+                                    op: TypedBinaryOp::And,
+                                    right: Box::new(pred),
+                                },
+                                data_type: DataType::Boolean,
+                            }),
+                        });
                 async_where_pred = combined;
                 // Ensure passthrough mode is active so async filter has access
                 // to all source columns.
                 if !needs_passthrough {
                     if let AnalyzedQueryBody::Select(ref mut select) = analyzed.body {
-                        original_proj_exprs = Some(
-                            select.projection.iter().map(|p| p.expr.clone()).collect(),
-                        );
+                        original_proj_exprs =
+                            Some(select.projection.iter().map(|p| p.expr.clone()).collect());
                         let source_cols = collect_source_columns(select);
-                        base_schema =
-                            Some(build_schema_from_columns("__base", &source_cols));
+                        base_schema = Some(build_schema_from_columns("__base", &source_cols));
                         select.projection = create_passthrough_projection(&source_cols);
                         analyzed.output_schema = source_cols;
                     }
@@ -1506,9 +1503,7 @@ impl Executor {
                     self.stats_cache().get_full_stats(db_id, tid)
                 };
                 if let Some(stats) = stats {
-                    planning_ctx
-                        .table_stats
-                        .insert(ctx_key.to_string(), stats);
+                    planning_ctx.table_stats.insert(ctx_key.to_string(), stats);
                 }
                 planning_ctx
                     .table_schemas
@@ -1946,10 +1941,7 @@ fn eval_const_usize(expr: &TypedExpr) -> Result<usize> {
 /// containing unresolved subqueries, splits the ON into sync and async parts.
 /// The sync part stays in the ON condition; the async parts are collected into
 /// `extracted` for post-join async WHERE evaluation.
-fn extract_async_join_on_predicates(
-    tr: &mut AnalyzedTableRef,
-    extracted: &mut Vec<TypedExpr>,
-) {
+fn extract_async_join_on_predicates(tr: &mut AnalyzedTableRef, extracted: &mut Vec<TypedExpr>) {
     use crate::sql::expr::classify::has_unresolved_subquery;
 
     match &mut tr.kind {
