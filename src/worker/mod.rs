@@ -59,8 +59,10 @@ async fn ensure_pd_keyspace(pd_endpoints: &[String], keyspace: &str) -> Result<(
             .map_err(|e| anyhow::anyhow!("Failed to read client cert {}: {}", cert_path, e))?;
         let key_pem = std::fs::read(&key_path)
             .map_err(|e| anyhow::anyhow!("Failed to read client key {}: {}", key_path, e))?;
-        let identity = reqwest::Identity::from_pkcs8_pem(&cert_pem, &key_pem)?;
-        builder = builder.identity(identity);
+        let mut identity_pem = cert_pem;
+        identity_pem.extend_from_slice(&key_pem);
+        let identity = reqwest::Identity::from_pem(&identity_pem)?;
+        builder = builder.identity(identity).use_rustls_tls();
 
         "https"
     } else {
