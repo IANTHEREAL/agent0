@@ -9,8 +9,10 @@
 use std::collections::HashSet;
 
 use crate::sql::analyzer::types::{
-    AnalyzedDistinct, AnalyzedQuery, AnalyzedQueryBody, AnalyzedSelect,
+    AnalyzedDistinct, AnalyzedQuery, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef,
+    AnalyzedTableRefKind, JoinCondition,
 };
+use crate::sql::expr::classify::has_unresolved_subquery;
 use crate::sql::optimizer::logical_planner::expr_has_aggregate;
 
 /// Check whether a query is eligible for the CBO optimizer pipeline.
@@ -64,6 +66,21 @@ fn is_eligible_inner(analyzed: &AnalyzedQuery, inherited_cte_names: &HashSet<Str
         }
     }
 
+    // Reject queries with subquery-derived tables in FROM — the optimizer's
+    // collect_query_table_refs / logical planner don't handle these yet.
+    if has_subquery_from_leaf(select) {
+        return false;
+    }
+
+    // Reject queries with unresolved subquery expressions in JOIN ON conditions.
+    // Non-correlated subqueries in WHERE/projection are handled by
+    // pre-materialization + post-processing, but JOIN ON subqueries (especially
+    // correlated ones) can't be pre-materialized and the operator tree can't
+    // evaluate them per-row.
+    if has_subquery_in_join_on(select) {
+        return false;
+    }
+
     // Reject aggregate queries whose ORDER BY / HAVING / DISTINCT ON cannot be rewritten
     // to post-aggregate column positions.  This is a compile-time feasibility
     // check so that optimize() never needs a runtime fallback path.
@@ -82,12 +99,43 @@ fn is_eligible_inner(analyzed: &AnalyzedQuery, inherited_cte_names: &HashSet<Str
     true
 }
 
-/// Check whether all ORDER BY / HAVING / DISTINCT ON expressions in an
-/// aggregate query can be rewritten to reference post-aggregate column
-/// positions.
-///
-/// Performs a dry-run of `rewrite_post_aggregate_expr` — if any expression
-/// fails to rewrite, the query is not eligible for the optimizer.
+fn has_subquery_from_leaf(select: &AnalyzedSelect) -> bool {
+    select.from.iter().any(|tr| table_ref_has_subquery(tr))
+}
+
+fn table_ref_has_subquery(tr: &AnalyzedTableRef) -> bool {
+    match &tr.kind {
+        AnalyzedTableRefKind::Subquery(_) => true,
+        AnalyzedTableRefKind::Join { left, right, .. } => {
+            table_ref_has_subquery(left) || table_ref_has_subquery(right)
+        }
+        AnalyzedTableRefKind::Table { .. } | AnalyzedTableRefKind::Function { .. } => false,
+    }
+}
+
+fn has_subquery_in_join_on(select: &AnalyzedSelect) -> bool {
+    select.from.iter().any(|tr| join_on_has_subquery(tr))
+}
+
+fn join_on_has_subquery(tr: &AnalyzedTableRef) -> bool {
+    match &tr.kind {
+        AnalyzedTableRefKind::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            if let JoinCondition::On(expr) = condition {
+                if has_unresolved_subquery(expr) {
+                    return true;
+                }
+            }
+            join_on_has_subquery(left) || join_on_has_subquery(right)
+        }
+        _ => false,
+    }
+}
+
 fn can_rewrite_post_aggregate(select: &AnalyzedSelect, query: &AnalyzedQuery) -> bool {
     let group_by = &select.group_by;
     let group_by_count = group_by.len();

@@ -2763,7 +2763,7 @@ impl Executor {
         };
         let has_async_order_by = analyzed.order_by.iter().any(|o| needs_async(&o.expr));
         let has_locks = !locks.is_empty();
-        let needs_passthrough = has_async_projection || has_locks;
+        let needs_passthrough = has_async_projection || has_locks || has_async_where;
 
         // Save the final output schema before any modifications.
         let final_output_schema = analyzed.output_schema.clone();
