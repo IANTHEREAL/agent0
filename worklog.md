@@ -167,3 +167,11 @@ Removed the legacy SELECT execution fallback path, making the CBO optimizer the 
 - `cargo test` — all 1649 tests pass
 - Dead code grep: zero references to `execute_analyzed_query`, `plan_query`, `QueryPlan`
 - `use_optimizer` routing branches: zero remaining (only GUC infrastructure)
+
+### Review Fixes (P0/P1 from code review)
+
+**P0 Fix: Outer JOIN ON semantics** — `extract_async_join_on_predicates` now gates extraction on `JoinType::Inner | JoinType::Cross` only. For LEFT/RIGHT/FULL joins, async ON predicates are left in place to preserve null-extension semantics (moving ON→WHERE converts outer joins to inner filters).
+
+**P1 Fix: Scope-safe schema map keying** — Replaced alias-only keying (`alias.unwrap_or(name)`) with composite key via `schema_map_key(table_name, alias)` → `"table_name\0alias"`. This prevents collisions when the same alias appears in outer and inner subquery scopes for different tables (e.g., `FROM users AS t JOIN (SELECT * FROM orders AS t) AS sub`). Updated all 5 lookup sites: build.rs (SeqScan, IndexScan), physical_planner.rs (3 sites), prepare_optimizer_contexts, statement.rs EXPLAIN.
+
+**Finding 3 (landing artifacts)**: False positive — files exist on both branch and master. No action needed.

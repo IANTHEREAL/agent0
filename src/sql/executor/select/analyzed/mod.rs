@@ -1477,19 +1477,19 @@ impl Executor {
 
         let mut stats_attempted = std::collections::HashSet::new();
         for (name, _schema, alias) in &table_refs {
-            // Key by alias when present — critical for self-joins where the
-            // same table appears twice with different aliases.
-            let ctx_key = alias.unwrap_or(name);
+            // Use scope-safe composite key: "table_name\0alias" to prevent
+            // collisions when the same alias appears in different scopes
+            // (e.g., outer FROM users AS t vs inner subquery FROM orders AS t).
+            let ctx_key = crate::sql::optimizer::schema_map_key(name, *alias);
+            let alias_display = alias.unwrap_or(name);
             let cte_key = name.to_lowercase();
 
             // CTE: use CTE schema + rows.
             if let Some((cte_schema, cte_rows)) = ctes.get(&cte_key) {
                 build_ctx
                     .table_schemas
-                    .insert(ctx_key.to_string(), cte_schema.clone());
-                build_ctx
-                    .preloaded_rows
-                    .insert(ctx_key.to_string(), cte_rows.clone());
+                    .insert(ctx_key.clone(), cte_schema.clone());
+                build_ctx.preloaded_rows.insert(ctx_key, cte_rows.clone());
                 continue;
             }
 
@@ -1503,18 +1503,18 @@ impl Executor {
                     self.stats_cache().get_full_stats(db_id, tid)
                 };
                 if let Some(stats) = stats {
-                    planning_ctx.table_stats.insert(ctx_key.to_string(), stats);
+                    planning_ctx.table_stats.insert(ctx_key.clone(), stats);
                 }
                 planning_ctx
                     .table_schemas
-                    .insert(ctx_key.to_string(), table_schema.clone());
+                    .insert(ctx_key.clone(), table_schema.clone());
 
                 let mut s = table_schema;
                 let short = s.name.rsplit('.').next().unwrap_or(&s.name);
-                if !short.eq_ignore_ascii_case(ctx_key) {
-                    s.from_alias = Some(ctx_key.to_string());
+                if !short.eq_ignore_ascii_case(alias_display) {
+                    s.from_alias = Some(alias_display.to_string());
                 }
-                build_ctx.table_schemas.insert(ctx_key.to_string(), s);
+                build_ctx.table_schemas.insert(ctx_key, s);
                 continue;
             }
 
@@ -1528,15 +1528,11 @@ impl Executor {
                 .rsplit('.')
                 .next()
                 .unwrap_or(&virt_schema.name);
-            if !short.eq_ignore_ascii_case(ctx_key) {
-                virt_schema.from_alias = Some(ctx_key.to_string());
+            if !short.eq_ignore_ascii_case(alias_display) {
+                virt_schema.from_alias = Some(alias_display.to_string());
             }
-            build_ctx
-                .table_schemas
-                .insert(ctx_key.to_string(), virt_schema);
-            build_ctx
-                .preloaded_rows
-                .insert(ctx_key.to_string(), virt_rows);
+            build_ctx.table_schemas.insert(ctx_key.clone(), virt_schema);
+            build_ctx.preloaded_rows.insert(ctx_key, virt_rows);
         }
 
         // Also walk table functions in FROM and pre-execute them.
@@ -1937,23 +1933,38 @@ fn eval_const_usize(expr: &TypedExpr) -> Result<usize> {
     }
 }
 
-/// Walks the FROM tree recursively. For each JOIN with an ON condition
-/// containing unresolved subqueries, splits the ON into sync and async parts.
-/// The sync part stays in the ON condition; the async parts are collected into
-/// `extracted` for post-join async WHERE evaluation.
+/// Walks the FROM tree recursively. For each **INNER/CROSS** JOIN with an ON
+/// condition containing unresolved subqueries, splits the ON into sync and
+/// async parts. The sync part stays in the ON condition; the async parts are
+/// collected into `extracted` for post-join async WHERE evaluation.
+///
+/// For outer joins (LEFT/RIGHT/FULL), ON and WHERE have different semantics:
+/// ON determines which rows get null-extended, while WHERE filters after.
+/// Moving predicates from ON to WHERE would silently convert outer-join
+/// behavior into inner-filter behavior, so we leave them in place.
 fn extract_async_join_on_predicates(tr: &mut AnalyzedTableRef, extracted: &mut Vec<TypedExpr>) {
+    use crate::sql::analyzer::types::JoinType;
     use crate::sql::expr::classify::has_unresolved_subquery;
 
     match &mut tr.kind {
         AnalyzedTableRefKind::Join {
             left,
             right,
+            join_type,
             condition,
             ..
         } => {
             // Recurse into children first.
             extract_async_join_on_predicates(left, extracted);
             extract_async_join_on_predicates(right, extracted);
+
+            // Only extract async ON predicates for INNER/CROSS joins where
+            // ON and WHERE are semantically equivalent. For outer joins,
+            // leave the predicate in ON to preserve null-extension semantics.
+            let is_inner = matches!(join_type, JoinType::Inner | JoinType::Cross);
+            if !is_inner {
+                return;
+            }
 
             // Check and split the ON condition.
             if let JoinCondition::On(ref expr) = condition {

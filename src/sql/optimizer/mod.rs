@@ -20,6 +20,25 @@ pub use build::BuildContext;
 pub use logical_planner::LogicalPlanner;
 pub use physical_planner::{PhysicalPlanner, PlanningContext};
 
+/// Build a scope-safe key for schema/stats maps from a table name and optional alias.
+///
+/// When a query has subqueries, table refs from different scopes are collected
+/// into a single flat map. Using only the alias as key would cause collisions
+/// when the same alias appears in different scopes for different tables
+/// (e.g., `FROM users AS t JOIN (SELECT * FROM orders AS t) AS sub`).
+///
+/// This function produces a key that is unique per (table_name, alias) pair:
+/// - `FROM users` → `"users"`
+/// - `FROM users AS t` → `"users\0t"`
+/// - Self-join `FROM users AS a JOIN users AS b` → `"users\0a"`, `"users\0b"`
+/// - Cross-scope `FROM users AS t ... (SELECT * FROM orders AS t)` → `"users\0t"`, `"orders\0t"`
+pub fn schema_map_key(table_name: &str, alias: Option<&str>) -> String {
+    match alias {
+        Some(a) => format!("{}\0{}", table_name, a),
+        None => table_name.to_string(),
+    }
+}
+
 use crate::sql::analyzer::types::{
     AnalyzedQuery, AnalyzedQueryBody, AnalyzedTableRef, AnalyzedTableRefKind, TableRefSchema,
 };

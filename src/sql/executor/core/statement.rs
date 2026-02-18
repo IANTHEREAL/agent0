@@ -1142,7 +1142,7 @@ impl Executor {
                             .collect();
                         let mut stats_attempted = HashSet::new();
                         for (name, schema, alias) in &table_refs {
-                            let ctx_key = alias.unwrap_or(name);
+                            let ctx_key = crate::sql::optimizer::schema_map_key(name, *alias);
                             let tid = schema.table_id;
                             let stats = if stats_attempted.insert(tid) {
                                 self.get_or_load_stats(txn, db_id, tid).await?
@@ -1150,16 +1150,14 @@ impl Executor {
                                 self.stats_cache().get_full_stats(db_id, tid)
                             };
                             if let Some(stats) = stats {
-                                planning_ctx.table_stats.insert(ctx_key.to_string(), stats);
+                                planning_ctx.table_stats.insert(ctx_key.clone(), stats);
                             }
                             let cte_key = name.to_lowercase();
                             if !cte_names.contains(&cte_key) {
                                 if let Some(table_schema) =
                                     self.store().get_schema(txn, db_id, name).await?
                                 {
-                                    planning_ctx
-                                        .table_schemas
-                                        .insert(ctx_key.to_string(), table_schema);
+                                    planning_ctx.table_schemas.insert(ctx_key, table_schema);
                                 }
                             }
                         }

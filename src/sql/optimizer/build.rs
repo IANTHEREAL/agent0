@@ -71,17 +71,17 @@ impl PhysicalPlan {
         match &self.node {
             // ── Scan operators ──────────────────────────────────
             PhysicalNode::SeqScan { table_name, alias } => {
-                let key = alias.as_deref().unwrap_or(table_name);
+                let key = super::schema_map_key(table_name, alias.as_deref());
                 let schema = ctx
                     .table_schemas
-                    .get(key)
+                    .get(&key)
                     .ok_or_else(|| anyhow!("Table schema not found: {}", key))?;
                 let mut schema = schema.clone();
                 if let Some(a) = alias {
                     schema.from_alias = Some(a.clone());
                 }
                 // Use preloaded rows for virtual catalog tables, CTEs, etc.
-                if let Some(rows) = ctx.preloaded_rows.get(key) {
+                if let Some(rows) = ctx.preloaded_rows.get(&key) {
                     Ok(Box::new(TableScanOperator::new_with_rows(
                         schema,
                         rows.clone(),
@@ -96,10 +96,10 @@ impl PhysicalPlan {
                 alias,
                 scan_type,
             } => {
-                let key = alias.as_deref().unwrap_or(table_name);
+                let key = super::schema_map_key(table_name, alias.as_deref());
                 let schema = ctx
                     .table_schemas
-                    .get(key)
+                    .get(&key)
                     .ok_or_else(|| anyhow!("Table schema not found: {}", key))?;
                 let mut schema = schema.clone();
                 if let Some(a) = alias {
@@ -1198,8 +1198,9 @@ mod tests {
             schema: make_schema(&[("id", DataType::Int32), ("name", DataType::Text)]),
             cost: PhysicalCost::default(),
         };
-        // Key by alias "t" since alias-aware lookup uses alias as key.
-        let ctx = BuildContext::new().with_schema("t".to_string(), test_table_schema());
+        // Key by composite "table_name\0alias" for scope-safe lookup.
+        let key = crate::sql::optimizer::schema_map_key("test_table", Some("t"));
+        let ctx = BuildContext::new().with_schema(key, test_table_schema());
         let op = plan.build_operators(&ctx).unwrap();
         assert_eq!(op.schema().from_alias, Some("t".to_string()));
     }
