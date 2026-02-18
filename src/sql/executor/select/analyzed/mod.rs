@@ -15,6 +15,8 @@ use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::typed_eval::{eval_const_usize, eval_typed_expr};
 use crate::sql::sequences::resolve_sequence_full_name_from_value;
+use crate::sql::types::coercion::comparison_target_type;
+use crate::sql::types::CastContext;
 use crate::sql::ExecuteResult;
 use crate::types::{DataType, Row, TableSchema, Value};
 
@@ -271,12 +273,21 @@ impl Executor {
                         _ => return Err(anyhow!("Expected SELECT from ANY/ALL subquery")),
                     };
 
+                    let rhs_declared_type = subquery
+                        .output_schema
+                        .first()
+                        .map(|(_, dt)| dt.clone())
+                        .ok_or_else(|| anyhow!("ANY/ALL subquery has empty output schema"))?;
+
                     let values: Vec<TypedExpr> = rows
                         .into_iter()
                         .filter_map(|r| r.values.into_iter().next())
-                        .map(|v| TypedExpr {
-                            data_type: rewritten_expr.data_type.clone(),
-                            kind: TypedExprKind::Constant(v),
+                        .map(|v| {
+                            build_any_all_rhs_constant_expr(
+                                &rewritten_expr.data_type,
+                                &rhs_declared_type,
+                                v,
+                            )
                         })
                         .collect();
 
@@ -2126,4 +2137,109 @@ fn sort_projected_rows(
     let start = offset.min(rows.len());
     let end = limit.map_or(rows.len(), |l| (start + l).min(rows.len()));
     Ok(rows[start..end].to_vec())
+}
+
+/// Build a typed RHS constant for `AnyAll` comparisons.
+///
+/// Runtime comparison rejects cross-type values, so we must preserve the
+/// original Value type and insert explicit implicit-cast nodes when analyzer
+/// comparison coercion requires a target type.
+fn build_any_all_rhs_constant_expr(
+    lhs_type: &DataType,
+    rhs_declared_type: &DataType,
+    value: Value,
+) -> TypedExpr {
+    let rhs_type = value
+        .data_type()
+        .unwrap_or_else(|| rhs_declared_type.clone());
+    let rhs = TypedExpr::new(TypedExprKind::Constant(value), rhs_type);
+    coerce_any_all_rhs_for_comparison(lhs_type, rhs_declared_type, rhs)
+}
+
+fn coerce_any_all_rhs_for_comparison(
+    lhs_type: &DataType,
+    rhs_declared_type: &DataType,
+    rhs: TypedExpr,
+) -> TypedExpr {
+    let Some(target_type) = comparison_target_type(lhs_type, rhs_declared_type) else {
+        return rhs;
+    };
+
+    if rhs.data_type == target_type {
+        rhs
+    } else if rhs.is_null_constant() {
+        TypedExpr::null(target_type)
+    } else {
+        TypedExpr::new(
+            TypedExprKind::Cast {
+                expr: Box::new(rhs),
+                target_type: target_type.clone(),
+                cast_context: CastContext::Implicit,
+            },
+            target_type,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::expr::typed_eval::eval_typed_expr;
+    use crate::sql::query_context::QueryContext;
+    use std::sync::Arc;
+
+    fn test_qctx() -> QueryContext {
+        QueryContext::new(
+            1,
+            Arc::from("testdb"),
+            Arc::from("testuser"),
+            0,
+            0,
+            Arc::from("UTC"),
+        )
+    }
+
+    #[test]
+    fn any_all_rhs_uses_implicit_cast_when_comparison_type_differs() {
+        let rhs = build_any_all_rhs_constant_expr(
+            &DataType::Int32,
+            &DataType::Text,
+            Value::Text("1".into()),
+        );
+
+        match rhs.kind {
+            TypedExprKind::Cast {
+                target_type,
+                cast_context,
+                ..
+            } => {
+                assert_eq!(target_type, DataType::Int32);
+                assert_eq!(cast_context, CastContext::Implicit);
+            }
+            other => panic!("expected Cast rhs for mixed-type AnyAll, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn any_all_rhs_cast_avoids_runtime_cross_type_compare_error() {
+        let rhs = build_any_all_rhs_constant_expr(
+            &DataType::Int32,
+            &DataType::Text,
+            Value::Text("1".into()),
+        );
+        let expr = TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(TypedExpr::new(
+                    TypedExprKind::Constant(Value::Int32(1)),
+                    DataType::Int32,
+                )),
+                op: TypedBinaryOp::Eq,
+                right: Box::new(rhs),
+            },
+            DataType::Boolean,
+        );
+
+        let result = eval_typed_expr(&expr, &Row::new(vec![]), &test_qctx()).unwrap();
+        assert_eq!(result, Value::Boolean(true));
+    }
 }

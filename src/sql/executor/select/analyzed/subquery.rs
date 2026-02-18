@@ -117,14 +117,15 @@ pub(super) fn has_outer_ref(expr: &TypedExpr) -> bool {
                 || partition_by.iter().any(has_outer_ref)
                 || order_by.iter().any(|o| has_outer_ref(&o.expr))
         }
-        TypedExprKind::InSubquery { expr, .. } => has_outer_ref(expr),
+        TypedExprKind::InSubquery { expr, .. } | TypedExprKind::AnyAll { expr, .. } => {
+            has_outer_ref(expr)
+        }
         TypedExprKind::ArrayIndex { array, index } => has_outer_ref(array) || has_outer_ref(index),
         TypedExprKind::JsonAccess { expr, .. } => has_outer_ref(expr),
         TypedExprKind::Constant(_)
         | TypedExprKind::ScalarSubquery(_)
         | TypedExprKind::ArraySubquery(_)
         | TypedExprKind::Exists { .. }
-        | TypedExprKind::AnyAll { .. }
         | TypedExprKind::Default => false,
     }
 }
@@ -613,4 +614,90 @@ fn combine_and(parts: Vec<&TypedExpr>) -> Option<TypedExpr> {
             DataType::Boolean,
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::analyzer::types::{
+        AnalyzedDistinct, AnalyzedProjection, AnalyzedQueryBody, BinaryOp,
+    };
+
+    fn int_const(v: i32) -> TypedExpr {
+        TypedExpr::new(TypedExprKind::Constant(Value::Int32(v)), DataType::Int32)
+    }
+
+    fn scalar_values_query(v: i32) -> AnalyzedQuery {
+        AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Values(vec![vec![int_const(v)]]),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("v".to_string(), DataType::Int32)],
+        }
+    }
+
+    #[test]
+    fn has_outer_ref_recurses_into_any_all_lhs() {
+        let expr = TypedExpr::new(
+            TypedExprKind::AnyAll {
+                expr: Box::new(TypedExpr::new(
+                    TypedExprKind::ColumnRef {
+                        scope_depth: 1,
+                        column_index: 0,
+                        column_name: "x".to_string(),
+                    },
+                    DataType::Int32,
+                )),
+                op: BinaryOp::Eq,
+                subquery: Box::new(scalar_values_query(1)),
+                is_all: false,
+            },
+            DataType::Boolean,
+        );
+
+        assert!(has_outer_ref(&expr));
+    }
+
+    #[test]
+    fn is_correlated_query_detects_outer_ref_inside_any_all() {
+        let where_expr = TypedExpr::new(
+            TypedExprKind::AnyAll {
+                expr: Box::new(TypedExpr::new(
+                    TypedExprKind::ColumnRef {
+                        scope_depth: 1,
+                        column_index: 0,
+                        column_name: "outer_x".to_string(),
+                    },
+                    DataType::Int32,
+                )),
+                op: BinaryOp::Eq,
+                subquery: Box::new(scalar_values_query(1)),
+                is_all: false,
+            },
+            DataType::Boolean,
+        );
+
+        let query = AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection: vec![AnalyzedProjection {
+                    expr: int_const(1),
+                    output_name: "?column?".to_string(),
+                }],
+                from: vec![],
+                where_clause: Some(where_expr),
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("?column?".to_string(), DataType::Int32)],
+        };
+
+        assert!(is_correlated_query(&query));
+    }
 }
