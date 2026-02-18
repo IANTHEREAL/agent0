@@ -116,13 +116,35 @@ pub fn to_tsquery(args: Vec<Value>) -> Result<Value> {
     let tokenizer = get_tokenizer(config)
         .ok_or_else(|| anyhow::anyhow!("unknown text search configuration: {}", config))?;
 
-    let tokens = tokenizer(&text);
+    // Parse the input as tsquery expression, preserving operators
+    let tokens = tokenize_tsquery(&text).map_err(|e| match e {
+        TsQueryParseError::Syntax => anyhow::anyhow!("syntax error in tsquery: \"{}\"", text),
+        TsQueryParseError::NoOperand => anyhow::anyhow!("no operand in tsquery: \"{}\"", text),
+    })?;
 
+    // Rebuild the query, normalizing terms through the tokenizer
     let tsquery = tokens
         .into_iter()
-        .map(|word| format!("'{}'", word))
+        .map(|token| match token {
+            TsQueryToken::Term(term) => {
+                // Normalize the term through the tokenizer
+                let normalized = tokenizer(&term);
+                if normalized.is_empty() {
+                    // If tokenizer returns empty (e.g., stop words), keep original
+                    format!("'{}'", term.to_lowercase())
+                } else {
+                    // Use the first token from the tokenizer (stemmed form)
+                    format!("'{}'", normalized[0])
+                }
+            }
+            TsQueryToken::And => " & ".to_string(),
+            TsQueryToken::Or => " | ".to_string(),
+            TsQueryToken::Not => "!".to_string(),
+            TsQueryToken::LParen => "(".to_string(),
+            TsQueryToken::RParen => ")".to_string(),
+        })
         .collect::<Vec<_>>()
-        .join(" & ");
+        .join("");
 
     Ok(Value::Tsquery(tsquery))
 }
@@ -676,5 +698,118 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(result, Value::Tsquery(_)));
+    }
+
+    #[test]
+    fn test_to_tsquery_preserves_or_operator() {
+        // This is the key bug fix test - to_tsquery must preserve | operator
+        let result = to_tsquery(vec![
+            Value::Text("simple".to_string()),
+            Value::Text("cat | dog".to_string()),
+        ])
+        .unwrap();
+        match result {
+            Value::Tsquery(s) => {
+                assert!(
+                    s.contains(" | "),
+                    "Expected OR operator in tsquery, got: {}",
+                    s
+                );
+                assert!(
+                    !s.contains(" & "),
+                    "Should not have AND operator, got: {}",
+                    s
+                );
+            }
+            _ => panic!("Expected Tsquery value"),
+        }
+    }
+
+    #[test]
+    fn test_to_tsquery_preserves_and_operator() {
+        let result = to_tsquery(vec![
+            Value::Text("simple".to_string()),
+            Value::Text("cat & dog".to_string()),
+        ])
+        .unwrap();
+        match result {
+            Value::Tsquery(s) => {
+                assert!(
+                    s.contains(" & "),
+                    "Expected AND operator in tsquery, got: {}",
+                    s
+                );
+            }
+            _ => panic!("Expected Tsquery value"),
+        }
+    }
+
+    #[test]
+    fn test_to_tsquery_preserves_not_operator() {
+        let result = to_tsquery(vec![
+            Value::Text("simple".to_string()),
+            Value::Text("!cat".to_string()),
+        ])
+        .unwrap();
+        match result {
+            Value::Tsquery(s) => {
+                assert!(
+                    s.contains("!"),
+                    "Expected NOT operator in tsquery, got: {}",
+                    s
+                );
+            }
+            _ => panic!("Expected Tsquery value"),
+        }
+    }
+
+    #[test]
+    fn test_to_tsquery_preserves_parentheses() {
+        let result = to_tsquery(vec![
+            Value::Text("simple".to_string()),
+            Value::Text("(cat | dog) & bird".to_string()),
+        ])
+        .unwrap();
+        match result {
+            Value::Tsquery(s) => {
+                assert!(s.contains("("), "Expected open paren, got: {}", s);
+                assert!(s.contains(")"), "Expected close paren, got: {}", s);
+                assert!(s.contains(" | "), "Expected OR operator, got: {}", s);
+                assert!(s.contains(" & "), "Expected AND operator, got: {}", s);
+            }
+            _ => panic!("Expected Tsquery value"),
+        }
+    }
+
+    #[test]
+    fn test_to_tsquery_or_matches_correctly() {
+        // Test that OR queries actually match correctly
+        let tsvector = Value::Tsvector("'cat':1A".to_string());
+        let tsquery_result = to_tsquery(vec![
+            Value::Text("simple".to_string()),
+            Value::Text("cat | dog".to_string()),
+        ])
+        .unwrap();
+
+        let result = ts_match(&tsvector, &tsquery_result).unwrap();
+        assert_eq!(result, Value::Boolean(true), "cat should match 'cat | dog'");
+
+        // Test that dog also matches
+        let tsvector_dog = Value::Tsvector("'dog':1A".to_string());
+        let result_dog = ts_match(&tsvector_dog, &tsquery_result).unwrap();
+        assert_eq!(
+            result_dog,
+            Value::Boolean(true),
+            "dog should match 'cat | dog'"
+        );
+
+        // Test that bird does not match
+        let tsvector_bird = Value::Tsvector("'bird':1A".to_string());
+        let result_bird = ts_match(&tsvector_bird, &tsquery_result).unwrap();
+        assert_eq!(
+            result_bird,
+            Value::Boolean(false),
+            "bird should not match 'cat | dog'"
+        );
     }
 }
