@@ -274,13 +274,30 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                     let repr = format!("\\x{}", hex);
                     format!("{}::bytea", quoting::quote_literal(&repr))
                 }
-                t if *t == Type::TEXT => {
+                t if *t == Type::TEXT || *t == Type::VARCHAR || *t == Type::BPCHAR
+                    || *t == Type::NAME =>
+                {
                     let s = std::str::from_utf8(param_bytes.as_ref())
                         .map_err(|e| invalid_param(e.to_string()))?;
                     quoting::quote_literal(s)
                 }
                 t if *t == Type::JSON => {
                     let s = std::str::from_utf8(param_bytes.as_ref())
+                        .map_err(|e| invalid_param(e.to_string()))?;
+                    quoting::quote_literal(s)
+                }
+                t if *t == Type::JSONB => {
+                    let bytes = param_bytes.as_ref();
+                    if bytes.is_empty() {
+                        return Err(invalid_param("empty JSONB payload".to_string()));
+                    }
+                    // PostgreSQL JSONB binary format: version byte (0x01) + JSON text
+                    let json_bytes = if bytes[0] == 1 {
+                        &bytes[1..]
+                    } else {
+                        bytes
+                    };
+                    let s = std::str::from_utf8(json_bytes)
                         .map_err(|e| invalid_param(e.to_string()))?;
                     quoting::quote_literal(s)
                 }

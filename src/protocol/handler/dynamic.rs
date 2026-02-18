@@ -174,10 +174,12 @@ impl DynamicPgHandler {
         };
 
         let mut types = vec![Type::TEXT; param_count];
+        let mut param_idx = 0usize;
 
-        if let Some(first_row) = values_list.first() {
-            let mut param_idx = 0usize;
-            for (col_idx, expr) in first_row.iter().enumerate() {
+        // Iterate ALL rows in the VALUES clause — batch INSERTs repeat
+        // the column pattern for each row (e.g. 3 rows × 6 cols = 18 params).
+        for row in &values_list {
+            for (col_idx, expr) in row.iter().enumerate() {
                 let col_name = column_order.get(col_idx)?;
                 let col_type = col_types.get(col_name);
 

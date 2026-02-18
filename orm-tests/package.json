@@ -11,6 +11,8 @@
     "test:knex": "vitest run --project knex",
     "test:kysely": "vitest run kysely/",
     "test:drizzle": "vitest run --project drizzle",
+    "test:prisma": "vitest run prisma/",
+    "prisma:generate": "prisma generate",
     "test:connection": "vitest run -t 'connection'",
     "test:schema": "vitest run -t 'schema'",
     "test:crud": "vitest run -t 'crud'",
@@ -30,6 +32,7 @@
     "eslint": "^8.55.0",
     "tsx": "^4.6.0",
     "typescript": "^5.3.0",
+    "prisma": "^5.7.0",
     "vitest": "^1.0.0"
   },
   "dependencies": {
@@ -41,6 +44,7 @@
     "postgres": "^3.4.0",
     "reflect-metadata": "^0.2.0",
     "sequelize": "^6.35.0",
+    "@prisma/client": "^5.7.0",
     "typeorm": "^0.3.17"
   },
   "engines": {
