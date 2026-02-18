@@ -1102,73 +1102,9 @@ impl Executor {
             }
         }
 
-        // Extract correlated subqueries from JOIN ON conditions.
-        // After pre-materialization, non-correlated subqueries are already constants.
-        // - INNER/CROSS: async ON → merged with WHERE (semantically equivalent).
-        // - OUTER (LEFT/RIGHT/FULL): async ON → separate post-filter with
-        //   null-extension-aware logic to preserve correct outer join semantics.
-        let mut outer_join_async_info: Vec<OuterJoinAsyncInfo> = Vec::new();
-        if let AnalyzedQueryBody::Select(ref mut select) = analyzed.body {
-            let mut inner_async_parts: Vec<TypedExpr> = Vec::new();
-            let mut col_offset = 0;
-            for tr in &mut select.from {
-                col_offset = extract_async_join_on_predicates(
-                    tr,
-                    &mut inner_async_parts,
-                    &mut outer_join_async_info,
-                    col_offset,
-                )?;
-            }
-
-            // Inner join async ON → merge with WHERE (same as before).
-            if !inner_async_parts.is_empty() {
-                let combined =
-                    inner_async_parts
-                        .into_iter()
-                        .fold(async_where_pred.take(), |acc, pred| match acc {
-                            None => Some(pred),
-                            Some(existing) => Some(TypedExpr {
-                                kind: TypedExprKind::BinaryOp {
-                                    left: Box::new(existing),
-                                    op: TypedBinaryOp::And,
-                                    right: Box::new(pred),
-                                },
-                                data_type: DataType::Boolean,
-                            }),
-                        });
-                async_where_pred = combined;
-            }
-
-            // Validate: outer join async ON + GROUP BY/DISTINCT is not yet supported.
-            if !outer_join_async_info.is_empty() {
-                let has_grouping = !select.group_by.is_empty()
-                    || select.having.is_some()
-                    || !matches!(select.distinct, AnalyzedDistinct::All);
-                if has_grouping {
-                    return Err(anyhow!(
-                        "correlated subqueries in outer join ON conditions with GROUP BY/DISTINCT are not yet supported"
-                    ));
-                }
-            }
-
-            // Ensure passthrough mode is active when we have any extracted ON predicates.
-            let has_any_extracted = async_where_pred.is_some() || !outer_join_async_info.is_empty();
-            if has_any_extracted && !needs_passthrough {
-                if let AnalyzedQueryBody::Select(ref mut select) = analyzed.body {
-                    original_proj_exprs =
-                        Some(select.projection.iter().map(|p| p.expr.clone()).collect());
-                    let source_cols = collect_source_columns(select);
-                    base_schema = Some(build_schema_from_columns("__base", &source_cols));
-                    select.projection = create_passthrough_projection(&source_cols);
-                    analyzed.output_schema = source_cols;
-                }
-                let limit = analyzed.limit.take();
-                let offset = analyzed.offset.take();
-                if limit.is_some() || offset.is_some() {
-                    deferred_limit = Some((limit, offset));
-                }
-            }
-        }
+        // JOIN ON predicates (including correlated subqueries / catalog-dependent
+        // functions) are evaluated inside join operators so outer join
+        // null-extension semantics remain join-local and deterministic.
 
         if has_async_order_by {
             deferred_order_by = Some(analyzed.order_by.clone());
@@ -1210,20 +1146,6 @@ impl Executor {
             .await?;
 
         // ── Step 8: Post-processing ──
-
-        // 8-pre: Outer-join-aware async ON filter (before WHERE filter).
-        // Applies extracted outer join ON predicates with proper null-extension
-        // semantics: if all matched rows for an outer-side key fail, emit a
-        // null-extended row instead of dropping it.
-        for info in &outer_join_async_info {
-            let schema = base_schema
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| build_output_schema(&analyzed));
-            rows = rt
-                .filter_async_outer_join(rows, info, &schema, txn, sequence_values)
-                .await?;
-        }
 
         // 8a: Async WHERE filter (correlated subqueries, catalog functions).
         if let Some(ref async_pred) = async_where_pred {
@@ -2024,7 +1946,6 @@ impl Executor {
     }
 }
 
-/// Extract async (subquery-containing) predicates from JOIN ON conditions.
 /// Evaluate a constant TypedExpr to a usize (for LIMIT/OFFSET).
 fn eval_const_usize(expr: &TypedExpr) -> Result<usize> {
     match &expr.kind {
@@ -2044,94 +1965,6 @@ fn eval_const_usize(expr: &TypedExpr) -> Result<usize> {
         }
         TypedExprKind::Constant(Value::Null) => Ok(0),
         _ => Err(anyhow!("LIMIT/OFFSET must be a constant integer")),
-    }
-}
-
-/// Metadata for an outer join whose async ON predicate was extracted and needs
-/// outer-join-aware post-filtering (not simple WHERE filtering) to preserve
-/// null-extension semantics.
-struct OuterJoinAsyncInfo {
-    async_pred: TypedExpr,
-    join_type: crate::sql::analyzer::types::JoinType,
-    right_col_count: usize,
-    right_col_start: usize,
-}
-
-/// Walks the FROM tree recursively. For each JOIN with an ON condition
-/// containing unresolved subqueries, splits the ON into sync and async parts.
-/// The sync part stays in the ON condition; the async parts are collected for
-/// post-join evaluation.
-///
-/// - INNER/CROSS joins: async ON predicates go into `inner_extracted` and are
-///   merged with WHERE (semantically correct — WHERE = ON for inner joins).
-/// - OUTER joins (LEFT/RIGHT/FULL): async ON predicates go into
-///   `outer_join_info` with column metadata so the caller can apply
-///   outer-join-aware post-filtering that preserves null-extension semantics.
-///
-/// Returns the total column count for the subtree rooted at `tr`.
-fn extract_async_join_on_predicates(
-    tr: &mut AnalyzedTableRef,
-    inner_extracted: &mut Vec<TypedExpr>,
-    outer_join_info: &mut Vec<OuterJoinAsyncInfo>,
-    col_offset: usize,
-) -> Result<usize> {
-    use crate::sql::analyzer::types::JoinType;
-    use crate::sql::expr::classify::has_unresolved_subquery;
-
-    match &mut tr.kind {
-        AnalyzedTableRefKind::Join {
-            left,
-            right,
-            join_type,
-            condition,
-            ..
-        } => {
-            // Recurse into children first, accumulating column offsets.
-            let left_cols = extract_async_join_on_predicates(
-                left,
-                inner_extracted,
-                outer_join_info,
-                col_offset,
-            )?;
-            let right_col_start = col_offset + left_cols;
-            let right_cols = extract_async_join_on_predicates(
-                right,
-                inner_extracted,
-                outer_join_info,
-                right_col_start,
-            )?;
-            let total_cols = left_cols + right_cols;
-
-            // Check and split the ON condition.
-            if let JoinCondition::On(ref expr) = condition {
-                if has_unresolved_subquery(expr) {
-                    let (sync_part, async_part) = split_where_for_async(expr);
-                    *condition = match sync_part {
-                        Some(sync_expr) => JoinCondition::On(sync_expr),
-                        None => JoinCondition::None,
-                    };
-                    if let Some(async_expr) = async_part {
-                        match join_type {
-                            JoinType::Inner | JoinType::Cross => {
-                                inner_extracted.push(async_expr);
-                            }
-                            JoinType::Left | JoinType::Right | JoinType::Full => {
-                                outer_join_info.push(OuterJoinAsyncInfo {
-                                    async_pred: async_expr,
-                                    join_type: join_type.clone(),
-                                    right_col_count: right_cols,
-                                    right_col_start,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(total_cols)
-        }
-        AnalyzedTableRefKind::Table { schema, .. } => Ok(schema.columns.len()),
-        AnalyzedTableRefKind::Function { output_columns, .. } => Ok(output_columns.len()),
-        AnalyzedTableRefKind::Subquery(subquery) => Ok(subquery.output_schema.len()),
     }
 }
 

@@ -22,6 +22,7 @@ use async_trait::async_trait;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::analyzer::types::TypedExpr;
+use crate::sql::expr::classify::needs_async;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::types::{ColumnDef, Row, TableSchema, Value};
 
@@ -143,6 +144,43 @@ fn values_equal_for_join(left: &Value, right: &Value) -> bool {
         (Value::Int64(a), Value::Int32(b)) => *a == i64::from(*b),
         (Value::Numeric(a), Value::Numeric(b)) => a.normalize() == b.normalize(),
         _ => left == right,
+    }
+}
+
+async fn eval_join_filter(
+    filter: Option<&TypedExpr>,
+    row: &Row,
+    output_schema: &TableSchema,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<bool> {
+    match filter {
+        None => Ok(true),
+        Some(expr) => {
+            let result = if needs_async(expr) {
+                let materialized = ctx
+                    .executor
+                    .materialize_expr_for_row(
+                        expr,
+                        row,
+                        Some(output_schema),
+                        ctx.txn,
+                        ctx.db_id,
+                        ctx.sequence_values,
+                        ctx.search_path,
+                        ctx.cte_tables,
+                        ctx.query_ctx,
+                    )
+                    .await?;
+                eval_typed_expr(&materialized, row, ctx.query_ctx)?
+            } else {
+                eval_typed_expr(expr, row, ctx.query_ctx)?
+            };
+            match result {
+                Value::Boolean(b) => Ok(b),
+                Value::Null => Ok(false),
+                _ => Err(anyhow!("JOIN filter must be boolean")),
+            }
+        }
     }
 }
 
@@ -546,18 +584,7 @@ impl PhysicalOperator for HashJoinOperator {
         let build_col_count = self.build_child.schema().columns.len();
         let probe_col_count = self.probe_child.schema().columns.len();
         let filter = self.filter.as_ref();
-
-        let query_ctx = ctx.query_ctx;
-        let check_filter = |row: &Row| -> Result<bool> {
-            match filter {
-                None => Ok(true),
-                Some(expr) => match eval_typed_expr(expr, row, query_ctx)? {
-                    Value::Boolean(b) => Ok(b),
-                    Value::Null => Ok(false),
-                    _ => Err(anyhow!("JOIN filter must be boolean")),
-                },
-            }
-        };
+        let output_schema = &self.output_schema;
 
         let make_output_row = |probe_row: &Row, build_row: &Row| -> Row {
             let mut values = Vec::with_capacity(probe_row.values.len() + build_row.values.len());
@@ -628,7 +655,7 @@ impl PhysicalOperator for HashJoinOperator {
                                     }
 
                                     let out = make_output_row(probe_row, build_row);
-                                    if !check_filter(&out)? {
+                                    if !eval_join_filter(filter, &out, output_schema, ctx).await? {
                                         continue;
                                     }
 
