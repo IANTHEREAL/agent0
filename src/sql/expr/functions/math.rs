@@ -74,10 +74,9 @@ fn decimal_pow10(exp: u32) -> Result<Decimal> {
 
 fn round_numeric_with_precision(d: Decimal, precision: i32) -> Result<Decimal> {
     if precision >= 0 {
-        return Ok(d.round_dp_with_strategy(
-            precision as u32,
-            RoundingStrategy::MidpointAwayFromZero,
-        ));
+        return Ok(
+            d.round_dp_with_strategy(precision as u32, RoundingStrategy::MidpointAwayFromZero)
+        );
     }
 
     let abs = precision.unsigned_abs();
@@ -437,11 +436,7 @@ mod tests {
             Value::Numeric(Decimal::new(-3, 0))
         );
         assert_eq!(
-            round(vec![
-                Value::Numeric(Decimal::new(125, 2)),
-                Value::Int32(1)
-            ])
-            .unwrap(),
+            round(vec![Value::Numeric(Decimal::new(125, 2)), Value::Int32(1)]).unwrap(),
             Value::Numeric(Decimal::new(13, 1))
         );
     }
