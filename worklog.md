@@ -23,7 +23,7 @@ Added test 228 with 6 queries covering the gap:
 3. FULL JOIN + scalar subquery in ON (both sides null-extended)
 4. LEFT JOIN + subquery ON + GROUP BY (previously rejected, now works)
 5. LEFT JOIN + EXISTS subquery in ON
-6. FULL JOIN + EXISTS subquery in ON
+6. RIGHT JOIN + EXISTS subquery in ON (FULL JOIN + bare EXISTS is PG-illegal: 0A000)
 
 ### Files Changed
 - `tests/228_outer_join_async_on_subquery.sql` — NEW

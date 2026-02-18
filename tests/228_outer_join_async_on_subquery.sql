@@ -56,12 +56,13 @@ FROM ojsub_a a
 LEFT JOIN ojsub_b b ON EXISTS (SELECT 1 FROM ojsub_map m WHERE m.a_id = a.id AND m.b_id = b.id)
 ORDER BY a.id, b.id;
 
--- 6) FULL JOIN with EXISTS subquery in ON.
---    Both unmatched sides must be null-extended.
+-- 6) RIGHT JOIN with EXISTS subquery in ON.
+--    b.id=30 has no mapping -> must be null-extended on the left side.
+--    (FULL JOIN + bare EXISTS is PG-illegal: 0A000 requires merge/hash-joinable condition.)
 SELECT a.id AS a_id, a.val AS a_val, b.id AS b_id, b.val AS b_val
 FROM ojsub_a a
-FULL JOIN ojsub_b b ON EXISTS (SELECT 1 FROM ojsub_map m WHERE m.a_id = a.id AND m.b_id = b.id)
-ORDER BY COALESCE(a.id, 0), COALESCE(b.id, 0);
+RIGHT JOIN ojsub_b b ON EXISTS (SELECT 1 FROM ojsub_map m WHERE m.a_id = a.id AND m.b_id = b.id)
+ORDER BY COALESCE(a.id, 0), b.id;
 
 DROP TABLE ojsub_a;
 DROP TABLE ojsub_b;
