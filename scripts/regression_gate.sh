@@ -205,7 +205,9 @@ PY
 
 worker_is_enabled() {
   local raw="${PGTIKV_WORKER_ENABLED:-1}"
-  case "${raw,,}" in
+  local raw_lc
+  raw_lc="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  case "$raw_lc" in
     1|true|t|yes|y|on) return 0 ;;
     0|false|f|no|n|off) return 1 ;;
     *) return 0 ;;
