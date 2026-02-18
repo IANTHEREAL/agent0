@@ -13,9 +13,7 @@ use sqlparser::ast::{
 fn test_execute_statement_on_txn_signature_stays_boxed() {
     type ExecStmtFuture<'a> = std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = anyhow::Result<crate::sql::ExecuteResult>>
-                + Send
-                + 'a,
+            dyn std::future::Future<Output = anyhow::Result<crate::sql::ExecuteResult>> + Send + 'a,
         >,
     >;
 
