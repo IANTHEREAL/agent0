@@ -1,5 +1,40 @@
 # Worklog
 
+## 2026-02-18 — Add regression tests for outer JOIN ON with correlated subqueries
+
+### Problem
+Commit f8f8852 ("fix: evaluate async join ON in operators") moved async JOIN ON evaluation from executor post-processing into join operators. This is architecturally correct (operators own their matching logic, null-extension is preserved naturally). However, the commit added no SQL integration tests for LEFT/RIGHT/FULL JOIN with correlated subqueries in ON — the exact semantic path that was rewritten.
+
+Existing tests cover correlated subqueries in INNER JOIN ON (tests 155-158) and outer joins with USING/NATURAL (tests 107, 115, 116), but zero tests combine outer joins with subquery-containing ON clauses.
+
+### Analysis
+Code review of hash_join.rs and join.rs confirms:
+- Both operators call `needs_async()` → `materialize_expr_for_row()` for async ON conditions
+- Filter is applied during join matching (not post-join), so null-extension is naturally correct
+- All join types (INNER, LEFT, RIGHT, FULL) are handled
+- `OuterJoinAsyncInfo`, `extract_async_join_on_predicates`, `filter_async_outer_join` completely removed — no dead code
+
+The GROUP BY/DISTINCT restriction for outer join async ON was also removed in f8f8852. The new in-operator approach handles this correctly since aggregation happens after the join operator.
+
+### Fix
+Added test 228 with 6 queries covering the gap:
+1. LEFT JOIN + scalar subquery in ON (null-extension for unmatched rows)
+2. RIGHT JOIN + scalar subquery in ON (null-extension for unmatched rows)
+3. FULL JOIN + scalar subquery in ON (both sides null-extended)
+4. LEFT JOIN + subquery ON + GROUP BY (previously rejected, now works)
+5. LEFT JOIN + EXISTS subquery in ON
+6. FULL JOIN + EXISTS subquery in ON
+
+### Files Changed
+- `tests/228_outer_join_async_on_subquery.sql` — NEW
+- `tests/228_outer_join_async_on_subquery.expected` — NEW
+
+### Verification
+- Expected outputs derived from PostgreSQL semantics analysis
+- Need PG 17.7 verification for `.expected` file
+
+---
+
 ## 2026-02-18 — Revert Finding 2: Restore outer join ON subquery extraction
 
 ### Problem

@@ -1,0 +1,32 @@
+id|val|b_id|b_val
+1|alpha|10|ten
+2|beta|20|twenty
+3|gamma|NULL|NULL
+(3 rows)
+a_id|a_val|id|val
+1|alpha|10|ten
+2|beta|20|twenty
+NULL|NULL|30|thirty
+(3 rows)
+a_id|a_val|b_id|b_val
+NULL|NULL|30|thirty
+1|alpha|10|ten
+2|beta|20|twenty
+3|gamma|NULL|NULL
+(4 rows)
+val|match_count
+alpha|1
+beta|1
+gamma|0
+(3 rows)
+id|val|b_id|b_val
+1|alpha|10|ten
+2|beta|20|twenty
+3|gamma|NULL|NULL
+(3 rows)
+a_id|a_val|b_id|b_val
+NULL|NULL|30|thirty
+1|alpha|10|ten
+2|beta|20|twenty
+3|gamma|NULL|NULL
+(4 rows)
