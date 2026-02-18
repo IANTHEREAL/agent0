@@ -11,12 +11,6 @@ use sqlparser::ast::{
 
 #[test]
 fn test_execute_statement_on_txn_signature_stays_boxed() {
-    type ExecStmtFuture<'a> = std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = anyhow::Result<crate::sql::ExecuteResult>> + Send + 'a,
-        >,
-    >;
-
     let _execute_statement_on_txn: for<'a> fn(
         &'a super::Executor,
         &'a mut tikv_client::Transaction,
@@ -25,7 +19,7 @@ fn test_execute_statement_on_txn_signature_stays_boxed() {
         &'a [String],
         &'a sqlparser::ast::Statement,
         Option<&'a str>,
-    ) -> ExecStmtFuture<'a> = super::Executor::execute_statement_on_txn;
+    ) -> super::BoxStmtFuture<'a> = super::Executor::execute_statement_on_txn;
 }
 
 #[test]

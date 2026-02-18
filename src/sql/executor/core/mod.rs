@@ -13,6 +13,10 @@ mod retry;
 mod scan;
 mod settings_tableless;
 mod statement;
+mod stmt_ddl;
+mod stmt_dml;
+mod stmt_query;
+mod stmt_rbac;
 mod timeout;
 pub(crate) mod view_rewrite;
 
@@ -65,7 +69,7 @@ use crate::storage::{with_kv_read_stats, KvReadStatsSnapshot, TikvStore};
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    AlterIndexOperation, Expr, FunctionArg, FunctionArgExpr, Query, ReferentialAction, SelectItem,
+    AlterIndexOperation, Expr, FunctionArg, FunctionArgExpr, Query, SelectItem,
     SetExpr, Statement, TableFactor, TransactionAccessMode, TransactionIsolationLevel,
     TransactionMode, Visit, Visitor,
 };
@@ -245,3 +249,11 @@ impl Executor {
         self.pending_async_triggers.lock().unwrap().clear();
     }
 }
+
+/// Boxed future type for statement execution.
+///
+/// All entry points into the statement dispatch return this type to prevent
+/// callers from embedding the large dispatch state machine into their own
+/// async state machines.
+pub(crate) type BoxStmtFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<ExecuteResult>> + Send + 'a>>;
