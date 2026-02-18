@@ -15,7 +15,7 @@ use crate::sql::analyzer::{AnalyzedQuery, Analyzer};
 use crate::sql::executor::core::catalog_prefetch::build_catalog_snapshot;
 use crate::sql::executor::core::view_rewrite::expand_views_in_query;
 use crate::sql::executor::core::Executor;
-use crate::sql::expr::typed_eval::eval_typed_expr;
+use crate::sql::expr::typed_eval::{eval_const_usize, eval_typed_expr};
 use crate::sql::sequences::resolve_sequence_full_name_from_value;
 use crate::sql::ExecuteResult;
 use crate::types::{DataType, Row, TableSchema, Value};
@@ -1222,21 +1222,24 @@ impl Executor {
             let limit = deferred_limit
                 .as_ref()
                 .and_then(|(l, _)| l.as_ref())
-                .map(eval_const_usize)
+                .map(|expr| eval_const_usize(expr, true))
                 .transpose()?;
             let offset = deferred_limit
                 .as_ref()
                 .and_then(|(_, o)| o.as_ref())
-                .map(eval_const_usize)
+                .map(|expr| eval_const_usize(expr, true))
                 .transpose()?
                 .unwrap_or(0);
             rows = sort_projected_rows(rows, deferred_ob, &final_output_schema, limit, offset)?;
         } else if let Some((ref limit_expr, ref offset_expr)) = deferred_limit {
             // LIMIT/OFFSET deferred for locking but no deferred ORDER BY.
-            let limit = limit_expr.as_ref().map(eval_const_usize).transpose()?;
+            let limit = limit_expr
+                .as_ref()
+                .map(|expr| eval_const_usize(expr, true))
+                .transpose()?;
             let offset = offset_expr
                 .as_ref()
-                .map(eval_const_usize)
+                .map(|expr| eval_const_usize(expr, true))
                 .transpose()?
                 .unwrap_or(0);
             if limit.is_some() || offset > 0 {
@@ -1894,12 +1897,12 @@ impl Executor {
             let limit = deferred_limit
                 .as_ref()
                 .and_then(|(l, _)| l.as_ref())
-                .map(eval_const_usize)
+                .map(|expr| eval_const_usize(expr, true))
                 .transpose()?;
             let offset = deferred_limit
                 .as_ref()
                 .and_then(|(_, o)| o.as_ref())
-                .map(eval_const_usize)
+                .map(|expr| eval_const_usize(expr, true))
                 .transpose()?
                 .unwrap_or(0);
             let max_locks = limit.map(|l| offset + l);
@@ -1919,10 +1922,13 @@ impl Executor {
             // find no unlockable rows.
             let mut rows_to_lock = rows;
             if let Some((ref limit_expr, ref offset_expr)) = deferred_limit {
-                let limit = limit_expr.as_ref().map(eval_const_usize).transpose()?;
+                let limit = limit_expr
+                    .as_ref()
+                    .map(|expr| eval_const_usize(expr, true))
+                    .transpose()?;
                 let offset = offset_expr
                     .as_ref()
-                    .map(eval_const_usize)
+                    .map(|expr| eval_const_usize(expr, true))
                     .transpose()?
                     .unwrap_or(0);
                 if limit.is_some() || offset > 0 {
@@ -1943,30 +1949,6 @@ impl Executor {
             }
             Ok(rows_to_lock)
         }
-    }
-}
-
-/// Evaluate a constant TypedExpr to a usize (for LIMIT/OFFSET).
-/// Handles plain constants and constant casts (e.g., `0::int8`).
-fn eval_const_usize(expr: &TypedExpr) -> Result<usize> {
-    match &expr.kind {
-        TypedExprKind::Constant(Value::Int32(n)) => {
-            if *n < 0 {
-                Err(anyhow!("LIMIT/OFFSET must not be negative"))
-            } else {
-                Ok(*n as usize)
-            }
-        }
-        TypedExprKind::Constant(Value::Int64(n)) => {
-            if *n < 0 {
-                Err(anyhow!("LIMIT/OFFSET must not be negative"))
-            } else {
-                Ok(*n as usize)
-            }
-        }
-        TypedExprKind::Constant(Value::Null) => Ok(0),
-        TypedExprKind::Cast { expr: inner, .. } => eval_const_usize(inner),
-        _ => Err(anyhow!("LIMIT/OFFSET must be a constant integer")),
     }
 }
 

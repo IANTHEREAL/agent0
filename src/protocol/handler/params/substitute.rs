@@ -243,10 +243,9 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                 t if *t == Type::TIMESTAMPTZ => {
                     use chrono::{DateTime, Utc};
                     match portal.parameter::<DateTime<Utc>>(i, &param_type)? {
-                        Some(ts) => format!(
-                            "'{}'::timestamptz",
-                            ts.format("%Y-%m-%d %H:%M:%S%.6f%:z")
-                        ),
+                        Some(ts) => {
+                            format!("'{}'::timestamptz", ts.format("%Y-%m-%d %H:%M:%S%.6f%:z"))
+                        }
                         None => "NULL".to_string(),
                     }
                 }
@@ -279,7 +278,9 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                     let repr = format!("\\x{}", hex);
                     format!("{}::bytea", quoting::quote_literal(&repr))
                 }
-                t if *t == Type::TEXT || *t == Type::VARCHAR || *t == Type::BPCHAR
+                t if *t == Type::TEXT
+                    || *t == Type::VARCHAR
+                    || *t == Type::BPCHAR
                     || *t == Type::NAME =>
                 {
                     let s = std::str::from_utf8(param_bytes.as_ref())
@@ -300,7 +301,10 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                     let json_bytes = if bytes[0] == 1 {
                         &bytes[1..]
                     } else {
-                        bytes
+                        return Err(invalid_param(format!(
+                            "unsupported JSONB wire format version: {}",
+                            bytes[0]
+                        )));
                     };
                     let s = std::str::from_utf8(json_bytes)
                         .map_err(|e| invalid_param(e.to_string()))?;

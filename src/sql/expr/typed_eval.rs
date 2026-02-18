@@ -37,6 +37,37 @@ pub fn eval_typed_expr(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Resu
     })
 }
 
+/// Evaluate a constant TypedExpr as non-negative usize (LIMIT/OFFSET helper).
+///
+/// `null_as_zero` controls how `NULL` is handled:
+/// - `true`: `NULL` is treated as `0` (legacy executor behavior).
+/// - `false`: `NULL` is rejected as non-constant/non-integer.
+pub(crate) fn eval_const_usize(expr: &TypedExpr, null_as_zero: bool) -> Result<usize> {
+    match &expr.kind {
+        TypedExprKind::Constant(Value::Int32(n)) => {
+            if *n < 0 {
+                Err(anyhow!("LIMIT/OFFSET must not be negative"))
+            } else {
+                Ok(*n as usize)
+            }
+        }
+        TypedExprKind::Constant(Value::Int64(n)) => {
+            if *n < 0 {
+                Err(anyhow!("LIMIT/OFFSET must not be negative"))
+            } else {
+                Ok(*n as usize)
+            }
+        }
+        TypedExprKind::Constant(Value::Null) if null_as_zero => Ok(0),
+        TypedExprKind::Cast { expr: inner, .. } => eval_const_usize(inner, null_as_zero),
+        _ if null_as_zero => Err(anyhow!("LIMIT/OFFSET must be a constant integer")),
+        _ => Err(anyhow!(
+            "Expected constant integer for LIMIT/OFFSET, got: {:?}",
+            expr.kind
+        )),
+    }
+}
+
 fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Result<Value> {
     match &expr.kind {
         // ── Leaf nodes ──────────────────────────────────────
