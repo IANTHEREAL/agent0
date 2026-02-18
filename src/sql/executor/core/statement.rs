@@ -123,9 +123,7 @@ impl Executor {
             }
 
             // DML
-            Statement::Insert { .. }
-            | Statement::Delete { .. }
-            | Statement::Update { .. } => {
+            Statement::Insert { .. } | Statement::Delete { .. } | Statement::Update { .. } => {
                 Box::pin(self.execute_dml_statement(
                     txn,
                     db_id,
@@ -138,9 +136,7 @@ impl Executor {
             }
 
             // Query
-            Statement::Query(_)
-            | Statement::ShowTables { .. }
-            | Statement::Explain { .. } => {
+            Statement::Query(_) | Statement::ShowTables { .. } | Statement::Explain { .. } => {
                 Box::pin(self.execute_query_statement(
                     txn,
                     db_id,

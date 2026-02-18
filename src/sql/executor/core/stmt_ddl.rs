@@ -145,181 +145,170 @@ impl Executor {
                 if_exists,
                 cascade,
                 ..
-            } => {
-                match object_type {
-                    ObjectType::Table => {
-                        for name in names {
-                            let resolved = names::resolve_existing_table_name(
-                                self.store.as_ref(),
+            } => match object_type {
+                ObjectType::Table => {
+                    for name in names {
+                        let resolved = names::resolve_existing_table_name(
+                            self.store.as_ref(),
+                            txn,
+                            db_id,
+                            name,
+                            search_path,
+                        )
+                        .await?;
+                        if let Some(resolved) = resolved {
+                            self.require_privilege(
                                 txn,
-                                db_id,
-                                name,
-                                search_path,
+                                current_role,
+                                Privilege::DropTable,
+                                PrivilegeObject::Table {
+                                    schema: resolved.schema.clone(),
+                                    name: resolved.name.clone(),
+                                },
+                                "table",
+                                resolved.full.clone(),
                             )
                             .await?;
-                            if let Some(resolved) = resolved {
-                                self.require_privilege(
-                                    txn,
-                                    current_role,
-                                    Privilege::DropTable,
-                                    PrivilegeObject::Table {
-                                        schema: resolved.schema.clone(),
-                                        name: resolved.name.clone(),
-                                    },
-                                    "table",
-                                    resolved.full.clone(),
-                                )
-                                .await?;
-                            } else if !*if_exists {
-                                let resolved = names::resolve_ddl_object_name(name, search_path)?;
-                                self.require_privilege(
-                                    txn,
-                                    current_role,
-                                    Privilege::DropTable,
-                                    PrivilegeObject::Table {
-                                        schema: resolved.schema.clone(),
-                                        name: resolved.name.clone(),
-                                    },
-                                    "table",
-                                    resolved.full.clone(),
-                                )
-                                .await?;
-                            }
-                        }
-                        ddl::execute_drop_table(
-                            &self.store,
-                            txn,
-                            db_id,
-                            search_path,
-                            names,
-                            *if_exists,
-                            *cascade,
-                            &self.stats_cache,
-                        )
-                        .await
-                    }
-                    ObjectType::View => {
-                        for name in names {
-                            let resolved = names::resolve_existing_view_name(
-                                self.store.as_ref(),
+                        } else if !*if_exists {
+                            let resolved = names::resolve_ddl_object_name(name, search_path)?;
+                            self.require_privilege(
                                 txn,
-                                db_id,
-                                name,
-                                search_path,
+                                current_role,
+                                Privilege::DropTable,
+                                PrivilegeObject::Table {
+                                    schema: resolved.schema.clone(),
+                                    name: resolved.name.clone(),
+                                },
+                                "table",
+                                resolved.full.clone(),
                             )
                             .await?;
-                            if let Some(resolved) = resolved {
-                                self.require_privilege(
-                                    txn,
-                                    current_role,
-                                    Privilege::DropTable,
-                                    PrivilegeObject::Table {
-                                        schema: resolved.schema.clone(),
-                                        name: resolved.name.clone(),
-                                    },
-                                    "view",
-                                    resolved.full.clone(),
-                                )
-                                .await?;
-                            } else if !*if_exists {
-                                let resolved = names::resolve_ddl_object_name(name, search_path)?;
-                                self.require_privilege(
-                                    txn,
-                                    current_role,
-                                    Privilege::DropTable,
-                                    PrivilegeObject::Table {
-                                        schema: resolved.schema.clone(),
-                                        name: resolved.name.clone(),
-                                    },
-                                    "view",
-                                    resolved.full.clone(),
-                                )
-                                .await?;
-                            }
                         }
-                        ddl::execute_drop_view(
-                            &self.store,
-                            txn,
-                            db_id,
-                            search_path,
-                            names,
-                            *if_exists,
-                            *cascade,
-                        )
-                        .await
                     }
-                    ObjectType::Index => {
-                        self.require_privilege(
-                            txn,
-                            current_role,
-                            Privilege::SuperUser,
-                            PrivilegeObject::Global,
-                            "index",
-                            "index".to_string(),
-                        )
-                        .await?;
-                        self.execute_drop_index(txn, db_id, search_path, names, *if_exists)
-                            .await
-                    }
-                    ObjectType::Role => {
-                        self.require_privilege(
-                            txn,
-                            current_role,
-                            Privilege::CreateRole,
-                            PrivilegeObject::Global,
-                            "role",
-                            "role".to_string(),
-                        )
-                        .await?;
-                        rbac::execute_drop_role(&self.auth_manager, txn, names, *if_exists).await
-                    }
-                    ObjectType::Sequence => {
-                        self.require_privilege(
-                            txn,
-                            current_role,
-                            Privilege::SuperUser,
-                            PrivilegeObject::Global,
-                            "sequence",
-                            "sequence".to_string(),
-                        )
-                        .await?;
-                        sequences::execute_drop_sequence(
-                            &self.store,
-                            txn,
-                            db_id,
-                            search_path,
-                            names,
-                            *if_exists,
-                        )
-                        .await
-                    }
-                    ObjectType::Schema => {
-                        self.require_privilege(
-                            txn,
-                            current_role,
-                            Privilege::SuperUser,
-                            PrivilegeObject::Global,
-                            "schema",
-                            "schema".to_string(),
-                        )
-                        .await?;
-                        self.execute_drop_schema(
-                            txn,
-                            db_id,
-                            search_path,
-                            names,
-                            *if_exists,
-                            *cascade,
-                        )
-                        .await
-                    }
-                    _ => Err(SqlError::Unsupported(format!(
-                        "DROP {} is not supported",
-                        object_type
-                    ))
-                    .into()),
+                    ddl::execute_drop_table(
+                        &self.store,
+                        txn,
+                        db_id,
+                        search_path,
+                        names,
+                        *if_exists,
+                        *cascade,
+                        &self.stats_cache,
+                    )
+                    .await
                 }
-            }
+                ObjectType::View => {
+                    for name in names {
+                        let resolved = names::resolve_existing_view_name(
+                            self.store.as_ref(),
+                            txn,
+                            db_id,
+                            name,
+                            search_path,
+                        )
+                        .await?;
+                        if let Some(resolved) = resolved {
+                            self.require_privilege(
+                                txn,
+                                current_role,
+                                Privilege::DropTable,
+                                PrivilegeObject::Table {
+                                    schema: resolved.schema.clone(),
+                                    name: resolved.name.clone(),
+                                },
+                                "view",
+                                resolved.full.clone(),
+                            )
+                            .await?;
+                        } else if !*if_exists {
+                            let resolved = names::resolve_ddl_object_name(name, search_path)?;
+                            self.require_privilege(
+                                txn,
+                                current_role,
+                                Privilege::DropTable,
+                                PrivilegeObject::Table {
+                                    schema: resolved.schema.clone(),
+                                    name: resolved.name.clone(),
+                                },
+                                "view",
+                                resolved.full.clone(),
+                            )
+                            .await?;
+                        }
+                    }
+                    ddl::execute_drop_view(
+                        &self.store,
+                        txn,
+                        db_id,
+                        search_path,
+                        names,
+                        *if_exists,
+                        *cascade,
+                    )
+                    .await
+                }
+                ObjectType::Index => {
+                    self.require_privilege(
+                        txn,
+                        current_role,
+                        Privilege::SuperUser,
+                        PrivilegeObject::Global,
+                        "index",
+                        "index".to_string(),
+                    )
+                    .await?;
+                    self.execute_drop_index(txn, db_id, search_path, names, *if_exists)
+                        .await
+                }
+                ObjectType::Role => {
+                    self.require_privilege(
+                        txn,
+                        current_role,
+                        Privilege::CreateRole,
+                        PrivilegeObject::Global,
+                        "role",
+                        "role".to_string(),
+                    )
+                    .await?;
+                    rbac::execute_drop_role(&self.auth_manager, txn, names, *if_exists).await
+                }
+                ObjectType::Sequence => {
+                    self.require_privilege(
+                        txn,
+                        current_role,
+                        Privilege::SuperUser,
+                        PrivilegeObject::Global,
+                        "sequence",
+                        "sequence".to_string(),
+                    )
+                    .await?;
+                    sequences::execute_drop_sequence(
+                        &self.store,
+                        txn,
+                        db_id,
+                        search_path,
+                        names,
+                        *if_exists,
+                    )
+                    .await
+                }
+                ObjectType::Schema => {
+                    self.require_privilege(
+                        txn,
+                        current_role,
+                        Privilege::SuperUser,
+                        PrivilegeObject::Global,
+                        "schema",
+                        "schema".to_string(),
+                    )
+                    .await?;
+                    self.execute_drop_schema(txn, db_id, search_path, names, *if_exists, *cascade)
+                        .await
+                }
+                _ => Err(
+                    SqlError::Unsupported(format!("DROP {} is not supported", object_type)).into(),
+                ),
+            },
             Statement::Truncate { table_name, .. } => {
                 let resolved = names::resolve_existing_table_name(
                     self.store.as_ref(),
