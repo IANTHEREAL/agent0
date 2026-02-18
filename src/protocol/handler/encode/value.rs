@@ -355,11 +355,7 @@ fn encode_value_binary(
             let m = (total_secs % 3600) / 60;
             let s = total_secs % 60;
             if let Some(time) = NaiveTime::from_hms_micro_opt(h, m, s, frac_micros) {
-                encoder.encode_field_with_type_and_format(
-                    &time,
-                    &Type::TIME,
-                    FieldFormat::Binary,
-                )
+                encoder.encode_field_with_type_and_format(&time, &Type::TIME, FieldFormat::Binary)
             } else {
                 encoder.encode_field_with_type_and_format(
                     &"00:00:00",
@@ -451,7 +447,6 @@ fn int64_to_datetime(ts: i64) -> chrono::DateTime<chrono::Utc> {
     };
 
     let nanos = micros * 1000;
-    DateTime::<Utc>::from_timestamp(seconds, nanos).unwrap_or_else(|| {
-        DateTime::<Utc>::from_timestamp(0, 0).unwrap()
-    })
+    DateTime::<Utc>::from_timestamp(seconds, nanos)
+        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap())
 }

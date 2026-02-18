@@ -18,9 +18,8 @@ use super::{
     infer_result_fields_from_query_ast, infer_types_from_expr, parse_startup_options,
     resolve_copy_columns, resolve_table_for_insert, rollback_autocommit_or_mark_failed,
     send_notices_and_get_last_response, send_notices_and_get_last_response_with_format,
-    stub_describe_field, CopyContext,
-    PgServerParameterProvider, TipgQueryParser, CONNECTION_ID_COUNTER, METADATA_ACTUAL_USER,
-    METADATA_AUTH_IS_SUPERUSER, METADATA_KEYSPACE,
+    stub_describe_field, CopyContext, PgServerParameterProvider, TipgQueryParser,
+    CONNECTION_ID_COUNTER, METADATA_ACTUAL_USER, METADATA_AUTH_IS_SUPERUSER, METADATA_KEYSPACE,
 };
 use crate::auth::{AuthManager, Privilege};
 use crate::config;
