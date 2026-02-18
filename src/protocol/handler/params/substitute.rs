@@ -298,7 +298,14 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                         return Err(invalid_param("empty JSONB payload".to_string()));
                     }
                     // PostgreSQL JSONB binary format: version byte (0x01) + JSON text
-                    let json_bytes = if bytes[0] == 1 { &bytes[1..] } else { bytes };
+                    let json_bytes = if bytes[0] == 1 {
+                        &bytes[1..]
+                    } else {
+                        return Err(invalid_param(format!(
+                            "unsupported JSONB wire format version: {}",
+                            bytes[0]
+                        )));
+                    };
                     let s = std::str::from_utf8(json_bytes)
                         .map_err(|e| invalid_param(e.to_string()))?;
                     format!("{}::jsonb", quoting::quote_literal(s))

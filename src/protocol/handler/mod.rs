@@ -1,6 +1,7 @@
 use crate::sql::{ExecuteResult, Session};
 use crate::types::DataType;
 use futures::{Sink, SinkExt};
+use pgwire::api::portal::Format;
 use pgwire::api::results::Response;
 // Re-exported for tests (via `use super::*`)
 #[allow(unused_imports)]
@@ -392,7 +393,7 @@ where
         client,
         client_min_messages,
         results,
-        pgwire::api::results::FieldFormat::Text,
+        &Format::UnifiedText,
     )
     .await
 }
@@ -401,7 +402,7 @@ async fn send_notices_and_get_last_response_with_format<C>(
     client: &mut C,
     client_min_messages: Option<String>,
     results: crate::sql::ExecuteResults,
-    result_format: pgwire::api::results::FieldFormat,
+    result_format: &Format,
 ) -> PgWireResult<Response<'static>>
 where
     C: Sink<PgWireBackendMessage> + Unpin + Send + Sync,

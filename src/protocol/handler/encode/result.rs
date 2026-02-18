@@ -3,6 +3,7 @@ use super::value::encode_value;
 use crate::sql::ExecuteResult;
 use crate::types::{DataType, Value};
 use futures::stream;
+use pgwire::api::portal::Format;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::Type;
 use pgwire::error::PgWireResult;
@@ -12,12 +13,47 @@ use std::sync::Arc;
 pub(in crate::protocol::handler) fn result_to_response(
     result: ExecuteResult,
 ) -> PgWireResult<Response<'static>> {
-    result_to_response_with_format(result, FieldFormat::Text)
+    result_to_response_with_format(result, &Format::UnifiedText)
+}
+
+fn supports_binary_result_type(pg_type: &Type) -> bool {
+    matches!(
+        *pg_type,
+        Type::BOOL
+            | Type::INT4
+            | Type::INT8
+            | Type::FLOAT8
+            | Type::TEXT
+            | Type::VARCHAR
+            | Type::BPCHAR
+            | Type::NAME
+            | Type::BYTEA
+            | Type::TIMESTAMP
+            | Type::TIMESTAMPTZ
+            | Type::UUID
+            | Type::JSON
+            | Type::JSONB
+            | Type::DATE
+            | Type::TIME
+            | Type::NUMERIC
+            | Type::INTERVAL
+    )
+}
+
+pub(in crate::protocol::handler) fn effective_result_format(
+    pg_type: &Type,
+    requested_format: FieldFormat,
+) -> FieldFormat {
+    if requested_format == FieldFormat::Binary && !supports_binary_result_type(pg_type) {
+        FieldFormat::Text
+    } else {
+        requested_format
+    }
 }
 
 pub(in crate::protocol::handler) fn result_to_response_with_format(
     result: ExecuteResult,
-    result_format: FieldFormat,
+    result_format: &Format,
 ) -> PgWireResult<Response<'static>> {
     match result {
         ExecuteResult::Select {
@@ -44,6 +80,12 @@ pub(in crate::protocol::handler) fn result_to_response_with_format(
             } else {
                 vec![Type::TEXT; columns.len()]
             };
+
+            let field_formats: Vec<FieldFormat> = inferred_types
+                .iter()
+                .enumerate()
+                .map(|(i, pg_type)| effective_result_format(pg_type, result_format.format_for(i)))
+                .collect();
 
             let fixed_columns: Vec<String> = if columns.len() == 1 && columns[0] == "?column?" {
                 if let Some(first_row) = rows.first() {
@@ -72,7 +114,8 @@ pub(in crate::protocol::handler) fn result_to_response_with_format(
                 .enumerate()
                 .map(|(i, name)| {
                     let pg_type = inferred_types.get(i).cloned().unwrap_or(Type::TEXT);
-                    FieldInfo::new(name.clone(), None, None, pg_type, result_format)
+                    let format = field_formats.get(i).copied().unwrap_or(FieldFormat::Text);
+                    FieldInfo::new(name.clone(), None, None, pg_type, format)
                 })
                 .collect();
 
@@ -90,7 +133,8 @@ pub(in crate::protocol::handler) fn result_to_response_with_format(
                 let mut encoder = DataRowEncoder::new(fields.clone());
                 for (i, value) in row.values.iter().enumerate() {
                     let col_type = internal_types.get(i);
-                    encode_value(&mut encoder, value, col_type, tz, result_format)?;
+                    let format = field_formats.get(i).copied().unwrap_or(FieldFormat::Text);
+                    encode_value(&mut encoder, value, col_type, tz, format)?;
                 }
                 data_rows.push(encoder.finish());
             }

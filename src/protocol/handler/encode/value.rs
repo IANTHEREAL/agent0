@@ -34,35 +34,7 @@ fn encode_value_text(
                 col_type,
                 Some(DataType::Timestamp) | Some(DataType::TimestampTz)
             ) {
-                // Treat as timestamp - reuse the timestamp encoding logic
-                use chrono::{DateTime, Utc};
-                const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
-                const MAX_REASONABLE_UNIX_MS: i64 = 10_000_000_000_000;
-
-                let (seconds, micros) = if *i > MAX_REASONABLE_UNIX_MS {
-                    let pg_micros = i;
-                    let unix_secs = pg_micros.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECS;
-                    let micros = pg_micros.rem_euclid(1_000_000) as u32;
-                    (unix_secs, micros)
-                } else {
-                    let secs = i.div_euclid(1000);
-                    let millis = i.rem_euclid(1000) as u32;
-                    (secs, millis * 1000)
-                };
-
-                let nanos = micros * 1000;
-                if let Some(dt) = DateTime::<Utc>::from_timestamp(seconds, nanos) {
-                    let is_timestamptz = matches!(col_type, Some(DataType::TimestampTz));
-                    if is_timestamptz {
-                        encoder.encode_field(&tz.format_timestamptz(dt, micros))
-                    } else if micros == 0 {
-                        encoder.encode_field(&dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                    } else {
-                        encoder.encode_field(&dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
-                    }
-                } else {
-                    encoder.encode_field(&"1970-01-01 00:00:00".to_string())
-                }
+                encode_timestamp_text(encoder, *i, col_type, tz)
             } else {
                 encoder.encode_field(i)
             }
@@ -70,39 +42,7 @@ fn encode_value_text(
         Value::Float64(f) => encoder.encode_field(f),
         Value::Text(s) => encoder.encode_field(s),
         Value::Bytes(b) => encoder.encode_field(&format!("\\x{}", hex::encode(b))),
-        Value::Timestamp(ts) => {
-            use chrono::{DateTime, Utc};
-
-            const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
-            const MAX_REASONABLE_UNIX_MS: i64 = 10_000_000_000_000;
-
-            let (seconds, micros) = if *ts > MAX_REASONABLE_UNIX_MS {
-                let pg_micros = ts;
-                let unix_secs = pg_micros.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECS;
-                let micros = pg_micros.rem_euclid(1_000_000) as u32;
-                (unix_secs, micros)
-            } else {
-                let secs = ts.div_euclid(1000);
-                let millis = ts.rem_euclid(1000) as u32;
-                (secs, millis * 1000)
-            };
-
-            let nanos = micros * 1000;
-            if let Some(dt) = DateTime::<Utc>::from_timestamp(seconds, nanos) {
-                let is_timestamptz = matches!(col_type, Some(DataType::TimestampTz));
-
-                if is_timestamptz {
-                    encoder.encode_field(&tz.format_timestamptz(dt, micros))
-                } else if micros == 0 {
-                    encoder.encode_field(&dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                } else {
-                    encoder.encode_field(&dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
-                }
-            } else {
-                // Fallback: encode as ISO string if all else fails
-                encoder.encode_field(&format!("1970-01-01 00:00:00"))
-            }
-        }
+        Value::Timestamp(ts) => encode_timestamp_text(encoder, *ts, col_type, tz),
         Value::Interval(iv) => encoder.encode_field(&iv.to_string()),
         Value::Uuid(bytes) => {
             let uuid = uuid::Uuid::from_bytes(*bytes);
@@ -342,9 +282,8 @@ fn encode_value_binary(
             )
         }
         Value::Date(days) => {
-            use chrono::NaiveDate;
-            let pg_epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
-            let date = pg_epoch + chrono::Duration::days(*days as i64);
+            let date = crate::types::date::date_days_to_naive_date(*days)
+                .map_err(|e| PgWireError::ApiError(e.into()))?;
             encoder.encode_field_with_type_and_format(&date, &Type::DATE, FieldFormat::Binary)
         }
         Value::Time(micros) => {
@@ -367,8 +306,12 @@ fn encode_value_binary(
         Value::Interval(iv) => {
             // PostgreSQL binary interval: 8 bytes (microseconds) + 4 bytes (days) + 4 bytes (months)
             use bytes::BufMut;
-            let microseconds = iv.millis * 1000; // convert millis to micros
-            let days = 0i32; // IntervalValue stores sub-month precision in millis
+            const MILLIS_PER_DAY: i64 = 86_400_000;
+            let days_i64 = iv.millis / MILLIS_PER_DAY;
+            let days = i32::try_from(days_i64)
+                .map_err(|_| PgWireError::ApiError("interval day field out of range".into()))?;
+            let remainder_millis = iv.millis % MILLIS_PER_DAY;
+            let microseconds = remainder_millis * 1000;
             let mut buf = Vec::with_capacity(16);
             buf.put_i64(microseconds);
             buf.put_i32(days);
@@ -416,17 +359,34 @@ fn encode_value_binary(
             encoder.encode_field_with_type_and_format(d, &Type::NUMERIC, FieldFormat::Binary)
         }
         Value::Vector(vec) => {
-            // pgvector binary: not standard, fall back to text
+            // pgvector currently maps to TEXT OID in tipg; emit binary text bytes.
             encoder.encode_field_with_type_and_format(
                 &crate::types::format_vector_pg_text(vec),
                 &Type::TEXT,
-                FieldFormat::Text,
+                FieldFormat::Binary,
             )
         }
         Value::Tsvector(s) | Value::Tsquery(s) => {
             // Full-text types: encode as text (binary tsvector/tsquery is complex)
             encoder.encode_field_with_type_and_format(s, &Type::TEXT, FieldFormat::Text)
         }
+    }
+}
+
+fn encode_timestamp_text(
+    encoder: &mut DataRowEncoder,
+    ts: i64,
+    col_type: Option<&DataType>,
+    tz: crate::types::timestamp::TimeZoneSpec,
+) -> PgWireResult<()> {
+    let dt = int64_to_datetime(ts);
+    let micros = dt.timestamp_subsec_micros();
+    if matches!(col_type, Some(DataType::TimestampTz)) {
+        encoder.encode_field(&tz.format_timestamptz(dt, micros))
+    } else if micros == 0 {
+        encoder.encode_field(&dt.format("%Y-%m-%d %H:%M:%S").to_string())
+    } else {
+        encoder.encode_field(&dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
     }
 }
 
