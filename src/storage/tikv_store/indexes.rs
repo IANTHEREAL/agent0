@@ -1,6 +1,52 @@
 use super::*;
 
 impl TikvStore {
+    /// Encode an index key into the fully-prefixed KV key.
+    pub fn make_index_key(
+        &self,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        values: &[Value],
+        pk_values: Option<&[Value]>,
+    ) -> Vec<u8> {
+        self.key(&encode_index_key_v2(
+            db_id, table_id, index_id, values, pk_values,
+        ))
+    }
+
+    /// Decode primary-key values from a non-unique index key.
+    pub fn decode_non_unique_pk_from_index_key(
+        &self,
+        full_key: &[u8],
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        index_column_types: &[DataType],
+        pk_types: &[DataType],
+    ) -> Result<Vec<Value>> {
+        let fixed_prefix_len = self
+            .make_index_key(db_id, table_id, index_id, &[], None)
+            .len();
+        if full_key.len() <= fixed_prefix_len {
+            return Err(anyhow!("Non-unique index key too short"));
+        }
+
+        let mut offset = fixed_prefix_len;
+        for data_type in index_column_types {
+            let (_, consumed) = decode_value_memcomparable(&full_key[offset..], data_type)?;
+            offset += consumed;
+        }
+
+        if full_key.get(offset) != Some(&0x01) {
+            return Err(anyhow!("Non-unique index key missing PK separator"));
+        }
+        offset += 1;
+
+        let pk_bytes = &full_key[offset..];
+        decode_pk_from_index_suffix(pk_bytes, pk_types)
+    }
+
     pub async fn create_index_entry(
         &self,
         txn: &mut Transaction,
@@ -16,7 +62,7 @@ impl TikvStore {
                 db_id, table_id, index_id, values, None,
             ));
             if txn.get(idx_key.clone()).await?.is_some() {
-                return Err(anyhow!("Duplicate entry for unique index"));
+                return Err(crate::storage::unique_index_duplicate_error());
             }
             let idx_val = encode_pk_values(pk_values);
             txn_put(txn, idx_key, idx_val).await?;
@@ -394,5 +440,68 @@ impl TikvStore {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_non_unique_pk_from_index_key_roundtrip_single_pk() {
+        let store = TikvStore::new_stub();
+        let idx_values = vec![Value::Int32(42), Value::Text("abc".to_string())];
+        let pk_values = vec![Value::Int64(7)];
+        let key = store.make_index_key(1, 2, 3, &idx_values, Some(pk_values.as_slice()));
+
+        let decoded = store
+            .decode_non_unique_pk_from_index_key(
+                &key,
+                1,
+                2,
+                3,
+                &[DataType::Int32, DataType::Text],
+                &[DataType::Int64],
+            )
+            .expect("decode non-unique index PK");
+        assert_eq!(decoded, pk_values);
+    }
+
+    #[test]
+    fn decode_non_unique_pk_from_index_key_roundtrip_composite_pk() {
+        let store = TikvStore::new_stub();
+        let idx_values = vec![Value::Text("v".to_string())];
+        let pk_values = vec![Value::Int32(11), Value::Uuid([0; 16])];
+        let key = store.make_index_key(9, 8, 7, &idx_values, Some(pk_values.as_slice()));
+
+        let decoded = store
+            .decode_non_unique_pk_from_index_key(
+                &key,
+                9,
+                8,
+                7,
+                &[DataType::Text],
+                &[DataType::Int32, DataType::Uuid],
+            )
+            .expect("decode composite PK");
+        assert_eq!(decoded, pk_values);
+    }
+
+    #[test]
+    fn decode_non_unique_pk_from_index_key_rejects_unique_key_shape() {
+        let store = TikvStore::new_stub();
+        let key = store.make_index_key(1, 2, 3, &[Value::Int32(1)], None);
+
+        let err = store
+            .decode_non_unique_pk_from_index_key(
+                &key,
+                1,
+                2,
+                3,
+                &[DataType::Int32],
+                &[DataType::Int32],
+            )
+            .expect_err("unique key shape should be rejected");
+        assert!(err.to_string().contains("missing PK separator"));
     }
 }

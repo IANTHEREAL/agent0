@@ -12,12 +12,16 @@ use sqlparser::parser::Parser;
 use tikv_client::Transaction;
 
 use super::gin::extract_gin_token_hashes_from_row;
+use super::index_consistency::{
+    is_unique_duplicate_error, resolve_unique_index_conflict, UniqueConflictResolution,
+};
 use super::index_helpers;
 use super::projection::eval_default_expr;
 use super::sequences;
 use super::value_coercion::coerce_value_for_column;
 use crate::storage::TikvStore;
 use crate::types::{DataType, Row, TableSchema, Value};
+use crate::worker::types::IndexState;
 
 pub type EnumLabelCache = HashMap<String, HashSet<String>>;
 
@@ -167,6 +171,9 @@ pub async fn execute_insert_row(
         Ok(pk_values) => {
             let mut created_index_entries: Vec<(u64, Vec<Value>, bool)> = Vec::new();
             for index in &schema.indexes {
+                if matches!(index.state, IndexState::Building | IndexState::Invalid) {
+                    continue;
+                }
                 if !index_helpers::is_index_materializable(index) {
                     continue;
                 }
@@ -187,7 +194,33 @@ pub async fn execute_insert_row(
                     )
                     .await;
                 if let Err(e) = result {
-                    if e.to_string().contains("Duplicate entry") {
+                    if is_unique_duplicate_error(&e) {
+                        if index.unique
+                            && matches!(index.state, IndexState::WriteOnly | IndexState::Ready)
+                        {
+                            match resolve_unique_index_conflict(
+                                store,
+                                txn,
+                                db_id,
+                                schema,
+                                index,
+                                &idx_values,
+                                &pk_values,
+                            )
+                            .await?
+                            {
+                                UniqueConflictResolution::Idempotent
+                                | UniqueConflictResolution::StaleReplaced => {
+                                    created_index_entries.push((
+                                        index.id,
+                                        idx_values,
+                                        index.unique,
+                                    ));
+                                    continue;
+                                }
+                                UniqueConflictResolution::RealConflict => {}
+                            }
+                        }
                         match on_conflict {
                             ConflictBehavior::DoNothing => {
                                 rollback_inserted_index_entries(
@@ -278,6 +311,9 @@ pub async fn execute_insert_row(
             // Materialize supported GIN indexes only after B-Tree indexes succeed, so
             // ON CONFLICT paths don't need additional cleanup.
             for index in &schema.indexes {
+                if matches!(index.state, IndexState::Building | IndexState::Invalid) {
+                    continue;
+                }
                 let hashes = extract_gin_token_hashes_from_row(schema, index, &row)?;
                 if hashes.is_empty() {
                     continue;
@@ -369,6 +405,9 @@ async fn update_row_indexes(
     new_row: &Row,
 ) -> Result<()> {
     for index in &schema.indexes {
+        if matches!(index.state, IndexState::Building | IndexState::Invalid) {
+            continue;
+        }
         if index_helpers::index_values_unchanged(index, schema, old_row, new_row)? {
             continue;
         }
@@ -426,7 +465,7 @@ async fn update_row_indexes(
         let new_matches = index_helpers::eval_index_predicate(index, schema, new_row)?;
         if new_matches {
             let new_idx = index_helpers::get_index_values_with_expressions(index, schema, new_row)?;
-            store
+            let create_result = store
                 .create_index_entry(
                     txn,
                     db_id,
@@ -436,7 +475,25 @@ async fn update_row_indexes(
                     &pk_values,
                     index.unique,
                 )
-                .await?;
+                .await;
+            if let Err(e) = create_result {
+                if index.unique
+                    && matches!(index.state, IndexState::WriteOnly | IndexState::Ready)
+                    && is_unique_duplicate_error(&e)
+                {
+                    match resolve_unique_index_conflict(
+                        store, txn, db_id, schema, index, &new_idx, pk_values,
+                    )
+                    .await?
+                    {
+                        UniqueConflictResolution::Idempotent
+                        | UniqueConflictResolution::StaleReplaced => {}
+                        UniqueConflictResolution::RealConflict => return Err(e),
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
         }
     }
     Ok(())
@@ -480,6 +537,9 @@ async fn delete_row_storage_entries(
         .await?;
 
     for index in &schema.indexes {
+        if matches!(index.state, IndexState::Building | IndexState::Invalid) {
+            continue;
+        }
         let gin_hashes = extract_gin_token_hashes_from_row(schema, index, row)?;
         if !gin_hashes.is_empty() {
             store
@@ -899,6 +959,9 @@ pub async fn execute_update_row(
     }
 
     for index in &schema.indexes {
+        if matches!(index.state, IndexState::Building | IndexState::Invalid) {
+            continue;
+        }
         if !pk_changed && index_helpers::index_values_unchanged(index, schema, old_row, &new_row)? {
             continue;
         }
@@ -947,6 +1010,9 @@ pub async fn execute_update_row(
         .await?;
 
     for index in &schema.indexes {
+        if matches!(index.state, IndexState::Building | IndexState::Invalid) {
+            continue;
+        }
         if !pk_changed && index_helpers::index_values_unchanged(index, schema, old_row, &new_row)? {
             continue;
         }
@@ -973,7 +1039,7 @@ pub async fn execute_update_row(
         if new_matches {
             let new_idx =
                 index_helpers::get_index_values_with_expressions(index, schema, &new_row)?;
-            store
+            let create_result = store
                 .create_index_entry(
                     txn,
                     db_id,
@@ -983,7 +1049,25 @@ pub async fn execute_update_row(
                     &new_pks,
                     index.unique,
                 )
-                .await?;
+                .await;
+            if let Err(e) = create_result {
+                if index.unique
+                    && matches!(index.state, IndexState::WriteOnly | IndexState::Ready)
+                    && is_unique_duplicate_error(&e)
+                {
+                    match resolve_unique_index_conflict(
+                        store, txn, db_id, schema, index, &new_idx, &new_pks,
+                    )
+                    .await?
+                    {
+                        UniqueConflictResolution::Idempotent
+                        | UniqueConflictResolution::StaleReplaced => {}
+                        UniqueConflictResolution::RealConflict => return Err(e),
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
         }
     }
 

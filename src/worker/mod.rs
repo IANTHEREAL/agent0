@@ -8,7 +8,7 @@ use crate::storage::TikvStore;
 use anyhow::Result;
 use config::WorkerConfig;
 use std::sync::{Arc, OnceLock};
-use tracing::info;
+use tracing::{info, warn};
 
 static SYSTEM_STORE: OnceLock<Arc<TikvStore>> = OnceLock::new();
 static WORKER_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
@@ -39,6 +39,7 @@ pub fn wake_worker() {
 pub async fn init_system_store(
     pd_endpoints: Vec<String>,
     config: &WorkerConfig,
+    fallback_keyspace: Option<&str>,
 ) -> Result<Option<Arc<TikvStore>>> {
     if !config.enabled {
         info!("Worker engine disabled, skipping system store initialization");
@@ -50,8 +51,32 @@ pub async fn init_system_store(
         config.system_keyspace
     );
 
-    let store = TikvStore::new_system(pd_endpoints, &config.system_keyspace).await?;
-    let store = Arc::new(store);
-    info!("System store initialized successfully");
-    Ok(Some(store))
+    match TikvStore::new_system(pd_endpoints.clone(), &config.system_keyspace).await {
+        Ok(store) => {
+            let store = Arc::new(store);
+            info!("System store initialized successfully");
+            Ok(Some(store))
+        }
+        Err(primary_err) => {
+            let Some(fallback) = fallback_keyspace else {
+                return Err(primary_err);
+            };
+            if fallback.eq_ignore_ascii_case(&config.system_keyspace) {
+                return Err(primary_err);
+            }
+
+            warn!(
+                "System store init failed on keyspace '{}': {}. Falling back to startup keyspace '{}'",
+                config.system_keyspace, primary_err, fallback
+            );
+
+            let store = TikvStore::new_system(pd_endpoints, fallback).await?;
+            let store = Arc::new(store);
+            warn!(
+                "System store fallback active on keyspace '{}'; worker metadata is not isolated",
+                fallback
+            );
+            Ok(Some(store))
+        }
+    }
 }

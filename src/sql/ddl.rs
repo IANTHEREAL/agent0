@@ -16,6 +16,10 @@ use tikv_client::Transaction;
 
 use super::dml;
 use super::gin::{extract_gin_token_hashes_from_row, supported_gin_index_column};
+use super::index_consistency::{
+    is_unique_duplicate_error, pk_types_for_schema, resolve_unique_index_conflict,
+    UniqueConflictResolution,
+};
 use super::index_helpers;
 use super::names;
 use super::names::normalize_ident;
@@ -1338,6 +1342,8 @@ pub async fn execute_create_index(
                 .update_registry_task_types(&mut sys_txn, keyspace, db_id, TASK_TYPE_BG_DDL, 0)
                 .await?;
             sys_txn.commit().await?;
+            // Wake the worker immediately so CIC does not wait for the poll interval.
+            crate::worker::wake_worker();
         }
 
         return Ok(ExecuteResult::CreateIndex {
@@ -1592,6 +1598,7 @@ pub async fn backfill_index_by_name(
     db_id: u64,
     table_name: &str,
     index_name: &str,
+    set_state_on_commit: Option<IndexState>,
 ) -> Result<()> {
     let mut txn = store.begin().await?;
     let mut current_batch_writes = 0usize;
@@ -1611,15 +1618,7 @@ pub async fn backfill_index_by_name(
 
         let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
         let data_key_prefix = start.clone();
-        let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
-            vec![DataType::Uuid]
-        } else {
-            schema
-                .pk_indices
-                .iter()
-                .map(|&idx| schema.columns[idx].data_type.clone())
-                .collect()
-        };
+        let pk_types = pk_types_for_schema(&schema);
 
         if index_helpers::is_index_materializable(&index) {
             let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
@@ -1649,7 +1648,7 @@ pub async fn backfill_index_by_name(
                     }
                     let idx_values =
                         index_helpers::get_index_values_with_expressions(&index, &schema, &row)?;
-                    store
+                    let insert_result = store
                         .create_index_entry(
                             &mut txn,
                             db_id,
@@ -1659,7 +1658,28 @@ pub async fn backfill_index_by_name(
                             &pk_values,
                             index.unique,
                         )
-                        .await?;
+                        .await;
+                    if let Err(e) = insert_result {
+                        if index.unique && is_unique_duplicate_error(&e) {
+                            match resolve_unique_index_conflict(
+                                store,
+                                &mut txn,
+                                db_id,
+                                &schema,
+                                &index,
+                                &idx_values,
+                                &pk_values,
+                            )
+                            .await?
+                            {
+                                UniqueConflictResolution::Idempotent
+                                | UniqueConflictResolution::StaleReplaced => {}
+                                UniqueConflictResolution::RealConflict => return Err(e),
+                            }
+                        } else {
+                            return Err(e);
+                        }
+                    }
                     current_batch_writes += 1;
                     maybe_rotate_backfill_txn(
                         store,
@@ -1719,6 +1739,22 @@ pub async fn backfill_index_by_name(
             }
         }
 
+        if let Some(state) = set_state_on_commit {
+            let mut schema = store
+                .get_schema(&mut txn, db_id, table_name)
+                .await?
+                .ok_or_else(|| SqlError::RelationNotFound(table_name.to_string()))?;
+            let idx = schema
+                .indexes
+                .iter_mut()
+                .find(|idx| idx.name == index_name)
+                .ok_or_else(|| {
+                    anyhow!("Index '{}' not found on table '{}'", index_name, table_name)
+                })?;
+            idx.state = state;
+            store.update_schema(&mut txn, db_id, schema).await?;
+        }
+
         txn.commit().await?;
         Ok(())
     }
@@ -1730,6 +1766,233 @@ pub async fn backfill_index_by_name(
     }
 
     Ok(())
+}
+
+fn reconcile_index_search_path(table_name: &str) -> Vec<String> {
+    let schema_name = table_name.split('.').next().unwrap_or("public");
+    if schema_name.eq_ignore_ascii_case("public") {
+        vec!["public".to_string(), "pg_catalog".to_string()]
+    } else {
+        vec![
+            schema_name.to_string(),
+            "public".to_string(),
+            "pg_catalog".to_string(),
+        ]
+    }
+}
+
+fn infer_index_value_types_for_reconcile(
+    index: &IndexDef,
+    schema: &TableSchema,
+    db_id: u64,
+    table_name: &str,
+) -> Result<Vec<DataType>> {
+    let mut types = Vec::with_capacity(index.columns.len() + index.expressions.len());
+
+    for col_name in &index.columns {
+        let col = schema
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(col_name))
+            .ok_or_else(|| {
+                anyhow!(
+                    "Index column '{}' not found while reconciling '{}'",
+                    col_name,
+                    index.name
+                )
+            })?;
+        types.push(col.data_type.clone());
+    }
+
+    let search_path = reconcile_index_search_path(table_name);
+    for expr_str in &index.expressions {
+        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+        let expr = sqlparser::parser::Parser::new(&dialect)
+            .try_with_sql(expr_str)
+            .and_then(|mut p| p.parse_expr())
+            .map_err(|e| {
+                anyhow!(
+                    "failed to parse index expression '{}' on '{}': {}",
+                    expr_str,
+                    index.name,
+                    e
+                )
+            })?;
+        let typed = analyze_row_level_expr(&expr, schema, db_id, &search_path)?;
+        types.push(typed.data_type.clone());
+    }
+
+    Ok(types)
+}
+
+async fn reconcile_index_pass(
+    store: &Arc<TikvStore>,
+    db_id: u64,
+    table_name: &str,
+    index_name: &str,
+    allow_rotate: bool,
+    set_state_on_commit: Option<IndexState>,
+) -> Result<()> {
+    let mut txn = store.begin().await?;
+    let mut current_batch_writes = 0usize;
+    let mut has_committed_batches = false;
+
+    let result: Result<()> = async {
+        let schema = store
+            .get_schema(&mut txn, db_id, table_name)
+            .await?
+            .ok_or_else(|| SqlError::RelationNotFound(table_name.to_string()))?;
+        let index = schema
+            .indexes
+            .iter()
+            .find(|idx| idx.name == index_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("Index '{}' not found on table '{}'", index_name, table_name))?;
+
+        if !index_helpers::is_index_materializable(&index) {
+            if let Some(state) = set_state_on_commit {
+                let mut schema = store
+                    .get_schema(&mut txn, db_id, table_name)
+                    .await?
+                    .ok_or_else(|| SqlError::RelationNotFound(table_name.to_string()))?;
+                let idx = schema
+                    .indexes
+                    .iter_mut()
+                    .find(|idx| idx.name == index_name)
+                    .ok_or_else(|| {
+                        anyhow!("Index '{}' not found on table '{}'", index_name, table_name)
+                    })?;
+                idx.state = state;
+                store.update_schema(&mut txn, db_id, schema).await?;
+            }
+            txn.commit().await?;
+            return Ok(());
+        }
+
+        let pk_types = pk_types_for_schema(&schema);
+        let index_value_types =
+            infer_index_value_types_for_reconcile(&index, &schema, db_id, table_name)?;
+        let (start, end) = index_prefix_range(db_id, schema.table_id, index.id);
+        let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
+        while let Some(batch) = scanner.next_batch(&mut txn).await? {
+            for pair in batch {
+                let scanned_key: Vec<u8> = {
+                    let key: &[u8] = pair.key().as_ref().into();
+                    key.to_vec()
+                };
+                let pk_values = if index.unique {
+                    crate::storage::decode_pk_from_index_suffix(pair.value().as_ref(), &pk_types)?
+                } else {
+                    store.decode_non_unique_pk_from_index_key(
+                        &scanned_key,
+                        db_id,
+                        schema.table_id,
+                        index.id,
+                        &index_value_types,
+                        &pk_types,
+                    )?
+                };
+                let existing_rows = store
+                    .batch_get_rows(
+                        &mut txn,
+                        db_id,
+                        schema.table_id,
+                        vec![pk_values.clone()],
+                        &schema,
+                    )
+                    .await?;
+
+                let stale = if let Some(mut row) = existing_rows.into_iter().next() {
+                    fill_row_defaults(&mut row, &schema)?;
+                    if !index_helpers::eval_index_predicate(&index, &schema, &row)? {
+                        true
+                    } else {
+                        let current_values = index_helpers::get_index_values_with_expressions(
+                            &index, &schema, &row,
+                        )?;
+                        let expected_key = store.make_index_key(
+                            db_id,
+                            schema.table_id,
+                            index.id,
+                            &current_values,
+                            if index.unique {
+                                None
+                            } else {
+                                Some(pk_values.as_slice())
+                            },
+                        );
+                        scanned_key != expected_key
+                    }
+                } else {
+                    true
+                };
+
+                if stale {
+                    txn_delete(&mut txn, scanned_key).await?;
+                    current_batch_writes += 1;
+                    if allow_rotate {
+                        maybe_rotate_backfill_txn(
+                            store,
+                            &mut txn,
+                            &mut current_batch_writes,
+                            &mut has_committed_batches,
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+
+        if let Some(state) = set_state_on_commit {
+            let mut schema = store
+                .get_schema(&mut txn, db_id, table_name)
+                .await?
+                .ok_or_else(|| SqlError::RelationNotFound(table_name.to_string()))?;
+            let idx = schema
+                .indexes
+                .iter_mut()
+                .find(|idx| idx.name == index_name)
+                .ok_or_else(|| {
+                    anyhow!("Index '{}' not found on table '{}'", index_name, table_name)
+                })?;
+            idx.state = state;
+            store.update_schema(&mut txn, db_id, schema).await?;
+        }
+
+        txn.commit().await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = result {
+        let _ = txn.rollback().await;
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+pub async fn reconcile_index(
+    store: &Arc<TikvStore>,
+    db_id: u64,
+    table_name: &str,
+    index_name: &str,
+    set_state_on_commit: Option<IndexState>,
+) -> Result<()> {
+    // Pass 1 may commit partial cleanup batches via transaction rotation. This is safe:
+    // Pass 2 always re-scans the full index range and is the authoritative verification
+    // pass before any Ready state transition is committed.
+    reconcile_index_pass(store, db_id, table_name, index_name, true, None).await?;
+    // Pass 2: short final verification + optional atomic state flip.
+    reconcile_index_pass(
+        store,
+        db_id,
+        table_name,
+        index_name,
+        false,
+        set_state_on_commit,
+    )
+    .await
 }
 
 /// Resolve raw `RelationDep`s into fully-qualified dependency names.
