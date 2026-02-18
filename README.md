@@ -133,6 +133,20 @@ SELECT * FROM cron.job_run_details ORDER BY runid DESC LIMIT 10;
 DROP EXTENSION pg_cron;
 ```
 
+### Async Worker Engine
+
+pg-tikv includes a built-in async worker engine for background task execution. All instances share a global task queue in TiKV with automatic coordination — no leader election required.
+
+| Feature | SQL |
+|---------|-----|
+| Cron jobs | `SELECT cron.schedule(...)` |
+| Background index build | `CREATE INDEX CONCURRENTLY ...` |
+| Background MV refresh | `REFRESH MATERIALIZED VIEW CONCURRENTLY ...` |
+| Background SQL | `SELECT pg_background_launch('...')` |
+| Auto-ANALYZE | Automatic (triggered by DML modification count) |
+
+See [docs/worker.md](docs/worker.md) for configuration, deployment, and troubleshooting.
+
 ## Quick Start
 
 ```bash
