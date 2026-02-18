@@ -62,6 +62,12 @@ impl WorkerEngine {
         if let Err(e) = self.reconcile_cron_jobs().await {
             warn!("Cron reconciliation failed (engine will continue): {}", e);
         }
+        if let Err(e) = self.reconcile_incomplete_cic_indexes().await {
+            warn!(
+                "CIC index-state recovery failed (engine will continue): {}",
+                e
+            );
+        }
 
         let mut interval = tokio::time::interval(Duration::from_millis(self.config.poll_ms));
         loop {
@@ -290,6 +296,83 @@ impl WorkerEngine {
         }
 
         Ok((enqueued, cleaned))
+    }
+
+    /// Recover CIC indexes left in transitional states after process restart.
+    ///
+    /// Transitional states (`Building`/`WriteOnly`) are not durable across worker restarts:
+    /// they indicate an interrupted asynchronous build pipeline. We conservatively mark such
+    /// indexes `Invalid` so they are never used/read as complete.
+    async fn reconcile_incomplete_cic_indexes(&self) -> Result<()> {
+        let mut txn = self.system_store.begin().await?;
+        let registry_entries = self.system_store.list_worker_registry(&mut txn).await?;
+        txn.commit().await?;
+
+        for entry in registry_entries {
+            if !entry.has_bg_ddl() {
+                continue;
+            }
+            if let Err(e) = self
+                .reconcile_incomplete_cic_indexes_for_db(&entry.keyspace, entry.db_id)
+                .await
+            {
+                warn!(
+                    "CIC recovery error for keyspace={} db_id={}: {}",
+                    entry.keyspace, entry.db_id, e
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn reconcile_incomplete_cic_indexes_for_db(
+        &self,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<()> {
+        let handle = self.pool.acquire(Some(keyspace.to_string())).await?;
+        let store = handle.store().clone();
+        let mut txn = store.begin().await?;
+
+        let result: Result<u32> = async {
+            let mut repaired = 0u32;
+            let table_names = store.list_tables(&mut txn, db_id).await?;
+            for table_name in table_names {
+                let Some(mut schema) = store.get_schema(&mut txn, db_id, &table_name).await? else {
+                    continue;
+                };
+                let mut changed = false;
+                for idx in &mut schema.indexes {
+                    if matches!(idx.state, IndexState::Building | IndexState::WriteOnly) {
+                        idx.state = IndexState::Invalid;
+                        changed = true;
+                        repaired += 1;
+                    }
+                }
+                if changed {
+                    store.update_schema(&mut txn, db_id, schema).await?;
+                }
+            }
+            Ok(repaired)
+        }
+        .await;
+
+        match result {
+            Ok(repaired) => {
+                txn.commit().await?;
+                if repaired > 0 {
+                    warn!(
+                        "Recovered {} incomplete CIC indexes as Invalid in keyspace={} db_id={}",
+                        repaired, keyspace, db_id
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => {
+                txn.rollback().await.ok();
+                Err(e)
+            }
+        }
     }
 
     async fn claim_and_execute(
@@ -577,37 +660,87 @@ impl WorkerEngine {
 
     async fn execute_bg_ddl_backfill(store: &Arc<TikvStore>, entry: &TaskQueueEntry) -> Result<()> {
         let (table_name, index_name) = parse_backfill_index_command(&entry.command)?;
+        let db_id = entry.db_id;
 
-        match ddl::backfill_index_by_name(store, entry.db_id, &table_name, &index_name).await {
-            Ok(()) => {
-                ddl::update_index_state(
-                    store,
-                    entry.db_id,
-                    &table_name,
-                    &index_name,
-                    IndexState::Ready,
-                )
-                .await?;
-                Ok(())
+        let mark_invalid = |e: anyhow::Error| async {
+            if let Err(mark_err) =
+                ddl::update_index_state(store, db_id, &table_name, &index_name, IndexState::Invalid)
+                    .await
+            {
+                warn!(
+                    "Failed to mark index invalid after backfill failure: table={} index={} error={}",
+                    table_name, index_name, mark_err
+                );
             }
-            Err(e) => {
-                if let Err(mark_err) = ddl::update_index_state(
-                    store,
-                    entry.db_id,
-                    &table_name,
-                    &index_name,
-                    IndexState::Invalid,
-                )
-                .await
-                {
-                    warn!(
-                        "Failed to mark index invalid after backfill failure: table={} index={} error={}",
-                        table_name, index_name, mark_err
-                    );
-                }
-                Err(e)
+            e
+        };
+
+        let mut schema_txn = store.begin().await?;
+        let schema = match store
+            .get_schema(&mut schema_txn, db_id, &table_name)
+            .await?
+        {
+            Some(schema) => schema,
+            None => {
+                schema_txn.rollback().await.ok();
+                return Err(anyhow!("Table '{}' not found", table_name));
+            }
+        };
+        schema_txn.commit().await?;
+        let index = schema
+            .indexes
+            .iter()
+            .find(|idx| idx.name == index_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("Index '{}' not found on table '{}'", index_name, table_name))?;
+        let is_unique = index.unique;
+
+        // Phase 1 (Building): backfill and atomically flip to WriteOnly.
+        if let Err(e) = ddl::backfill_index_by_name(
+            store,
+            db_id,
+            &table_name,
+            &index_name,
+            Some(IndexState::WriteOnly),
+        )
+        .await
+        {
+            return Err(mark_invalid(e).await);
+        }
+
+        // Phase 2 (WriteOnly): catch-up scan on a fresh snapshot.
+        if let Err(e) = ddl::backfill_index_by_name(
+            store,
+            db_id,
+            &table_name,
+            &index_name,
+            if is_unique {
+                None
+            } else {
+                Some(IndexState::Ready)
+            },
+        )
+        .await
+        {
+            return Err(mark_invalid(e).await);
+        }
+
+        // Phase 3 (unique only): reconcile stale entries before exposing to planner.
+        if is_unique {
+            if let Err(e) = ddl::reconcile_unique_index(
+                store,
+                db_id,
+                &table_name,
+                &index_name,
+                Some(IndexState::Ready),
+            )
+            .await
+            {
+                return Err(mark_invalid(e).await);
             }
         }
+
+        Ok(())
     }
 }
 

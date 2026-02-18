@@ -1,6 +1,19 @@
 use super::*;
 
 impl TikvStore {
+    /// Encode a unique index key into the fully-prefixed KV key.
+    pub fn make_unique_index_key(
+        &self,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        values: &[Value],
+    ) -> Vec<u8> {
+        self.key(&encode_index_key_v2(
+            db_id, table_id, index_id, values, None,
+        ))
+    }
+
     pub async fn create_index_entry(
         &self,
         txn: &mut Transaction,
