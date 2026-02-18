@@ -33,6 +33,9 @@ __pycache__/
 # Worktrees
 .worktrees/
 
+# Runtime data
+data/
+
 # Environment
 .env
 .env.local
