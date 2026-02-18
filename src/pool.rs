@@ -317,6 +317,11 @@ impl TikvClientPool {
             .collect()
     }
 
+    pub async fn list_all_keyspaces(&self) -> Vec<String> {
+        let tenants = self.tenants.read().await;
+        tenants.keys().cloned().collect()
+    }
+
     /// Run a single eviction pass. Removes tenants that have zero active
     /// connections and have been idle longer than the configured timeout.
     /// Returns the list of evicted keyspace names.
