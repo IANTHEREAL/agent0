@@ -266,6 +266,28 @@ impl PgClient {
         false
     }
 
+    pub async fn bootstrap_default_extensions(
+        &self,
+        keyspace: &str,
+        user: &str,
+        password: &str,
+    ) {
+        const DEFAULT_EXTENSIONS: &[&str] = &["http", "fs9", "pg_cron"];
+        let client = match self.connect(keyspace, user, password).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("bootstrap_default_extensions: connect failed: {e}");
+                return;
+            }
+        };
+        for ext in DEFAULT_EXTENSIONS {
+            let sql = format!("CREATE EXTENSION IF NOT EXISTS \"{ext}\"");
+            if let Err(e) = client.simple_query(&sql).await {
+                tracing::warn!("bootstrap_default_extensions: {ext}: {e}");
+            }
+        }
+    }
+
     pub async fn list_users(
         &self,
         tenant_id: &str,
