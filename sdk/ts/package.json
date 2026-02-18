@@ -1,5 +1,5 @@
 {
-  "name": "db9",
+  "name": "get-db9",
   "version": "0.1.0",
   "description": "TypeScript SDK for pg-tikv — instant PostgreSQL databases",
   "type": "module",
@@ -40,7 +40,7 @@
     "postgres",
     "database",
     "sdk",
-    "db9",
+    "get-db9",
     "serverless"
   ],
   "license": "Apache-2.0",

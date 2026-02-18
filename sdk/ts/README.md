@@ -1,11 +1,11 @@
-# db9
+# get-db9
 
 TypeScript SDK for [pg-tikv](https://github.com/pgtikv/pg-tikv) — instant PostgreSQL-compatible databases on TiKV.
 
 ## Install
 
 ```bash
-npm install db9
+npm install get-db9
 ```
 
 ## Quick Start
@@ -13,7 +13,7 @@ npm install db9
 ### One-liner: Get a database instantly
 
 ```typescript
-import { instantDatabase } from 'db9';
+import { instantDatabase } from 'get-db9';
 
 const db = await instantDatabase();
 console.log(db.connectionString);
@@ -34,7 +34,7 @@ const db = await instantDatabase({
 Full typed client for the Customer API (register, databases, SQL, migrations).
 
 ```typescript
-import { createCustomerClient } from 'db9/customer';
+import { createCustomerClient } from 'get-db9/customer';
 
 const client = createCustomerClient({ token: 'your-token' });
 
@@ -61,7 +61,7 @@ await client.databases.applyMigration(db.id, {
 Full typed client for the Admin API (tenant management, batch operations, audit).
 
 ```typescript
-import { createAdminClient } from 'db9/admin';
+import { createAdminClient } from 'get-db9/admin';
 
 const admin = createAdminClient({ apiKey: 'your-api-key' });
 
@@ -109,7 +109,7 @@ const batch = await admin.tenants.batchCreate({ count: 5 });
 ## Error Handling
 
 ```typescript
-import { Db9Error, Db9AuthError, Db9NotFoundError } from 'db9';
+import { Db9Error, Db9AuthError, Db9NotFoundError } from 'get-db9';
 
 try {
   await client.databases.get('nonexistent');
@@ -129,7 +129,7 @@ try {
 Credentials are stored in `~/.db9/credentials` (TOML format), shared with the db9 CLI.
 
 ```typescript
-import { FileCredentialStore, MemoryCredentialStore } from 'db9';
+import { FileCredentialStore, MemoryCredentialStore } from 'get-db9';
 
 // File-based (default, shared with CLI)
 const fileStore = new FileCredentialStore();
