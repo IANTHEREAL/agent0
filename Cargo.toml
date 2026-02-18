@@ -45,8 +45,7 @@ chrono-tz = "0.10"
 regex = "1.10"
 rand = "0.8"
 sha2 = "0.10"
-reqwest = { version = "0.12", features = ["json", "native-tls"] }
-native-tls = "0.2"
+reqwest = { version = "0.12", features = ["json"] }
 itoa = "1.0"
 ryu = "1.0"
 rust_decimal = { version = "1.33", features = ["serde"] }

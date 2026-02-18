@@ -8,7 +8,7 @@ use crate::storage::TikvStore;
 use anyhow::Result;
 use config::WorkerConfig;
 use std::sync::{Arc, OnceLock};
-use tracing::{info, warn};
+use tracing::info;
 
 static SYSTEM_STORE: OnceLock<Arc<TikvStore>> = OnceLock::new();
 static WORKER_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
@@ -33,91 +33,8 @@ pub fn wake_worker() {
     }
 }
 
-/// Ensure the system keyspace exists in PD before connecting via the TiKV client.
-/// TiKV API v2 requires keyspaces to be registered in PD. If the keyspace does not
-/// exist, this creates it via the PD HTTP API (idempotent).
-async fn ensure_pd_keyspace(pd_endpoints: &[String], keyspace: &str) -> Result<()> {
-    let pd_addr = pd_endpoints
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("No PD endpoints configured"))?;
-
-    // Build HTTP client with mTLS if TLS certs are available
-    let (client, scheme) = if let (Ok(ca_path), Ok(cert_path), Ok(key_path)) = (
-        std::env::var("TIKV_CA_PATH"),
-        std::env::var("TIKV_CERT_PATH"),
-        std::env::var("TIKV_KEY_PATH"),
-    ) {
-        let ca_pem = std::fs::read(&ca_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read CA cert {}: {}", ca_path, e))?;
-        let cert_pem = std::fs::read(&cert_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read client cert {}: {}", cert_path, e))?;
-        let key_pem = std::fs::read(&key_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read client key {}: {}", key_path, e))?;
-
-        // Build native-tls connector with mTLS
-        let ca = native_tls::Certificate::from_pem(&ca_pem)?;
-        let identity = native_tls::Identity::from_pkcs8(&cert_pem, &key_pem)?;
-        let tls = native_tls::TlsConnector::builder()
-            .add_root_certificate(ca)
-            .identity(identity)
-            .build()?;
-
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .use_preconfigured_tls(tls)
-            .build()?;
-        (client, "https")
-    } else {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?;
-        (client, "http")
-    };
-
-    let base_url = format!("{}://{}", scheme, pd_addr);
-
-    // Try to create the keyspace (idempotent — PD returns 200 if already exists)
-    let url = format!("{}/pd/api/v2/keyspaces", base_url);
-    let body = serde_json::json!({
-        "name": keyspace,
-        "config": { "gc_management_type": "global_gc" }
-    });
-
-    match client.post(&url).json(&body).send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            if status.is_success() {
-                info!(
-                    "PD keyspace '{}' ensured (created or already exists)",
-                    keyspace
-                );
-                Ok(())
-            } else {
-                let body_text = resp.text().await.unwrap_or_default();
-                // 409 Conflict means keyspace already exists — that's fine
-                if status.as_u16() == 409 || body_text.contains("already exist") {
-                    info!("PD keyspace '{}' already exists", keyspace);
-                    Ok(())
-                } else {
-                    Err(anyhow::anyhow!(
-                        "PD create keyspace '{}' failed: {} {}",
-                        keyspace,
-                        status,
-                        body_text
-                    ))
-                }
-            }
-        }
-        Err(e) => {
-            warn!("PD HTTP API unreachable for keyspace creation: {}", e);
-            // Don't fail hard — the TiKV client connection will give a better error
-            Ok(())
-        }
-    }
-}
-
 /// Initialize the system store for the unified worker engine.
-/// Ensures the system keyspace exists in PD, then creates a TikvStore connection.
+/// The system keyspace must be pre-created in PD by the backend before pg-tikv starts.
 /// Returns None if worker is disabled via config.
 pub async fn init_system_store(
     pd_endpoints: Vec<String>,
@@ -132,9 +49,6 @@ pub async fn init_system_store(
         "Initializing system store for keyspace: {}",
         config.system_keyspace
     );
-
-    // Ensure the keyspace exists in PD before connecting
-    ensure_pd_keyspace(&pd_endpoints, &config.system_keyspace).await?;
 
     let store = TikvStore::new_system(pd_endpoints, &config.system_keyspace).await?;
     let store = Arc::new(store);
