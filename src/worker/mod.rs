@@ -84,4 +84,28 @@ mod tests {
             .expect("disabled worker should not attempt system-store init");
         assert!(store.is_none());
     }
+
+    #[tokio::test]
+    async fn test_init_system_store_enabled_failure_refuses_fallback() {
+        let mut cfg = WorkerConfig::default();
+        cfg.enabled = true;
+        cfg.system_keyspace = "_sys_worker".to_string();
+
+        let err = match init_system_store(vec!["127.0.0.1:1".to_string()], &cfg).await {
+            Ok(_) => panic!(
+                "enabled worker should fail without fallback when system keyspace is unavailable"
+            ),
+            Err(err) => err,
+        };
+        let msg = format!("{:#}", err);
+
+        assert!(
+            msg.contains("refusing fallback"),
+            "error should contain no-fallback guard, got: {msg}"
+        );
+        assert!(
+            msg.contains(&cfg.system_keyspace),
+            "error should include target system keyspace, got: {msg}"
+        );
+    }
 }
