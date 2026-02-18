@@ -613,11 +613,12 @@
   <header>
     <div class="container">
       <a href="/" class="logo"><span>db9</span></a>
-      <nav>
-        <a href="/">Home</a>
-        <a href="#" class="active-nav">SDK</a>
-        <a href="#install" class="nav-cta">Get Started</a>
-      </nav>
+       <nav>
+         <a href="/">Home</a>
+         <a href="#" class="active-nav">SDK</a>
+         <a href="/docs">Docs</a>
+         <a href="#install" class="nav-cta">Get Started</a>
+       </nav>
     </div>
   </header>
 
@@ -626,8 +627,8 @@
       <div class="hero-grid">
         <div>
           <span class="hero-badge">TypeScript SDK</span>
-          <h1>Instant Postgres,<br><span class="gradient">one line of code</span></h1>
-          <p>Use the official <code>get-db9</code> package to create, seed, and manage PostgreSQL-compatible databases with instant setup or full customer API control.</p>
+          <h1>Postgres for agents,<br><span class="gradient">one line of code</span></h1>
+           <p>Use the official <code>get-db9</code> package to create, seed, and manage PostgreSQL-compatible databases with instant setup or full client API control.</p>
 
           <div class="pkg-card" id="install">
             <div class="tabs" data-tab-group="pkg">
@@ -665,9 +666,9 @@
             <span class="editor-title">TypeScript SDK Examples</span>
           </div>
           <div class="editor-tabs" data-tab-group="editor">
-            <button type="button" class="editor-tab active" data-tab="sdk">SDK</button>
-            <button type="button" class="editor-tab" data-tab="customer">Customer API</button>
-          </div>
+             <button type="button" class="editor-tab active" data-tab="sdk">SDK</button>
+             <button type="button" class="editor-tab" data-tab="client">Client API</button>
+           </div>
 
           <div class="editor-panel active" data-panel="sdk">
             <div class="code-file">create-database.ts</div>
@@ -682,15 +683,15 @@ console.<span class="fn">log</span>(db.<span class="prop">connectionString</span
 <span class="kw">//</span> postgresql://tenant.admin:password@host:5433/postgres</pre>
           </div>
 
-          <div class="editor-panel" data-panel="customer">
-            <div class="code-file">customer-example.ts</div>
-            <pre><span class="kw">import</span> { <span class="fn">createCustomerClient</span> } <span class="kw">from</span> <span class="str">'get-db9/customer'</span>;
-
-<span class="kw">const</span> client = <span class="fn">createCustomerClient</span>({ <span class="prop">token</span>: <span class="str">'your-token'</span> });
-<span class="kw">const</span> db = <span class="kw">await</span> client.<span class="prop">databases</span>.<span class="fn">create</span>({ <span class="prop">name</span>: <span class="str">'myapp'</span> });
-<span class="kw">const</span> result = <span class="kw">await</span> client.<span class="prop">databases</span>.<span class="fn">sql</span>(db.<span class="prop">id</span>, <span class="str">'SELECT * FROM users'</span>);
-console.<span class="fn">log</span>(result.<span class="prop">columns</span>, result.<span class="prop">rows</span>);</pre>
-          </div>
+           <div class="editor-panel" data-panel="client">
+             <div class="code-file">client-example.ts</div>
+             <pre><span class="kw">import</span> { <span class="fn">createDb9Client</span> } <span class="kw">from</span> <span class="str">'get-db9/client'</span>;
+ 
+ <span class="kw">const</span> client = <span class="fn">createDb9Client</span>();
+ <span class="kw">const</span> db = <span class="kw">await</span> client.<span class="prop">databases</span>.<span class="fn">create</span>({ <span class="prop">name</span>: <span class="str">'myapp'</span> });
+ <span class="kw">const</span> result = <span class="kw">await</span> client.<span class="prop">databases</span>.<span class="fn">sql</span>(db.<span class="prop">id</span>, <span class="str">'SELECT * FROM users'</span>);
+ console.<span class="fn">log</span>(result.<span class="prop">columns</span>, result.<span class="prop">rows</span>);</pre>
+           </div>
         </div>
       </div>
     </div>
@@ -700,7 +701,7 @@ console.<span class="fn">log</span>(result.<span class="prop">columns</span>, re
     <div class="container">
       <div class="section-label">API Reference</div>
       <h2 class="section-title">Choose your integration layer</h2>
-      <p class="section-desc">Use the high-level instant API or compose the full customer client for precise control over auth, databases, SQL, and lifecycle operations.</p>
+       <p class="section-desc">Use the high-level instant API or compose the full client API for precise control over auth, databases, SQL, and lifecycle operations.</p>
 
       <div class="api-layout">
         <aside class="api-nav" data-tab-group="api">
@@ -708,10 +709,10 @@ console.<span class="fn">log</span>(result.<span class="prop">columns</span>, re
             <span class="api-name">instantDatabase</span>
             <span class="api-badge high">HIGH-LEVEL</span>
           </button>
-          <button type="button" class="api-nav-btn" data-tab="customer-client">
-            <span class="api-name">createCustomerClient</span>
-            <span class="api-badge customer">CUSTOMER</span>
-          </button>
+          <button type="button" class="api-nav-btn" data-tab="client-api">
+             <span class="api-name">createDb9Client</span>
+             <span class="api-badge customer">CLIENT</span>
+           </button>
         </aside>
 
         <div class="api-content">
@@ -743,28 +744,28 @@ console.<span class="fn">log</span>(db.<span class="prop">databaseId</span>, db.
             </table>
           </article>
 
-          <article class="api-panel" data-panel="customer-client">
-            <h3><code>createCustomerClient(options?)</code></h3>
-            <p>Typed Customer API client with auth, token, database, SQL, schema, dump, migration, branch, and user operations.</p>
-            <div class="api-subtitle">Example</div>
-            <div class="api-code">
-              <pre><span class="kw">import</span> { <span class="fn">createCustomerClient</span> } <span class="kw">from</span> <span class="str">'get-db9/customer'</span>;
-
-<span class="kw">const</span> client = <span class="fn">createCustomerClient</span>({ <span class="prop">token</span>: <span class="str">'your-token'</span> });
-<span class="kw">const</span> db = <span class="kw">await</span> client.<span class="prop">databases</span>.<span class="fn">create</span>({ <span class="prop">name</span>: <span class="str">'myapp'</span> });
-<span class="kw">const</span> result = <span class="kw">await</span> client.<span class="prop">databases</span>.<span class="fn">sql</span>(db.<span class="prop">id</span>, <span class="str">'SELECT * FROM users'</span>);</pre>
-            </div>
-            <div class="api-subtitle">Parameters</div>
-            <table>
-              <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
-              <tbody>
-                <tr><td><code>baseUrl</code></td><td><code>string</code></td><td>Customer API endpoint (default production URL).</td></tr>
-                <tr><td><code>token</code></td><td><code>string</code></td><td>Bearer token used for authenticated routes.</td></tr>
-                <tr><td><code>fetch</code></td><td><code>FetchFn</code></td><td>Custom fetch implementation.</td></tr>
-                <tr><td><code>credentialStore</code></td><td><code>CredentialStore</code></td><td>Optional lazy token loader when no token passed.</td></tr>
-              </tbody>
-            </table>
-          </article>
+           <article class="api-panel" data-panel="client-api">
+             <h3><code>createDb9Client(options?)</code></h3>
+             <p>Typed Client API with auth, database, SQL, schema, dump, migration, branch, and user operations. Auto-registers anonymously when no token provided.</p>
+             <div class="api-subtitle">Example</div>
+             <div class="api-code">
+               <pre><span class="kw">import</span> { <span class="fn">createDb9Client</span> } <span class="kw">from</span> <span class="str">'get-db9/client'</span>;
+ 
+ <span class="kw">const</span> client = <span class="fn">createDb9Client</span>();
+ <span class="kw">const</span> db = <span class="kw">await</span> client.<span class="prop">databases</span>.<span class="fn">create</span>({ <span class="prop">name</span>: <span class="str">'myapp'</span> });
+ <span class="kw">const</span> result = <span class="kw">await</span> client.<span class="prop">databases</span>.<span class="fn">sql</span>(db.<span class="prop">id</span>, <span class="str">'SELECT * FROM users'</span>);</pre>
+             </div>
+             <div class="api-subtitle">Parameters</div>
+             <table>
+               <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
+               <tbody>
+                 <tr><td><code>baseUrl</code></td><td><code>string</code></td><td>Client API endpoint (default production URL).</td></tr>
+                 <tr><td><code>token</code></td><td><code>string</code></td><td>Optional bearer token. If omitted, auto-registers anonymously.</td></tr>
+                 <tr><td><code>fetch</code></td><td><code>FetchFn</code></td><td>Custom fetch implementation.</td></tr>
+                 <tr><td><code>credentialStore</code></td><td><code>CredentialStore</code></td><td>Optional lazy token loader when no token passed.</td></tr>
+               </tbody>
+             </table>
+           </article>
         </div>
       </div>
     </div>
@@ -796,11 +797,11 @@ console.<span class="fn">log</span>(db.<span class="prop">databaseId</span>, db.
           <h3>ESM + CJS</h3>
           <p>Build output supports modern runtimes and existing Node workflows.</p>
         </div>
-        <div class="feature">
-          <div class="feature-icon">&#128260;</div>
-          <h3>Two API layers</h3>
-          <p>High-level instant API and full Customer API for complete control.</p>
-        </div>
+         <div class="feature">
+           <div class="feature-icon">&#128260;</div>
+           <h3>Two API layers</h3>
+           <p>High-level instant API and full Client API for complete control.</p>
+         </div>
         <div class="feature">
           <div class="feature-icon">&#127793;</div>
           <h3>Database seeding</h3>

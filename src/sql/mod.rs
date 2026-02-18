@@ -21,6 +21,7 @@ pub mod expr;
 pub(crate) mod fts;
 pub(crate) mod fts_tokenizers;
 mod gin;
+pub(crate) mod index_consistency;
 mod index_helpers;
 mod information_schema;
 mod jsonb;

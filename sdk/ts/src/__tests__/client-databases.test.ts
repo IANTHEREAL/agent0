@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { createCustomerClient } from '../customer';
+import { createDb9Client } from '../client';
 import type { FetchFn } from '../http';
 
 function capturingFetch(status: number, body?: unknown) {
@@ -18,7 +18,7 @@ const BASE = 'http://test:8090/api';
 const TOKEN = 'test-token';
 
 function authedClient(fetch: FetchFn) {
-  return createCustomerClient({ baseUrl: BASE, fetch, token: TOKEN });
+  return createDb9Client({ baseUrl: BASE, fetch, token: TOKEN });
 }
 
 function expectAuth(calls: { url: string; init?: RequestInit }[]) {

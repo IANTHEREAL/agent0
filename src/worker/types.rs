@@ -70,6 +70,8 @@ pub enum IndexState {
     Ready,
     Building,
     Invalid,
+    /// DML maintains the index but planner must not read from it yet.
+    WriteOnly,
 }
 
 impl Default for IndexState {
@@ -256,6 +258,7 @@ impl WorkerClaim {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::{Deserialize, Serialize};
 
     #[test]
     fn test_task_type_bitmask_conversion() {
@@ -425,11 +428,30 @@ mod tests {
 
     #[test]
     fn test_index_state_all_variants_roundtrip() {
-        let variants = vec![IndexState::Ready, IndexState::Building, IndexState::Invalid];
+        let variants = vec![
+            IndexState::Ready,
+            IndexState::Building,
+            IndexState::Invalid,
+            IndexState::WriteOnly,
+        ];
         for variant in variants {
             let data = bincode::serialize(&variant).expect("serialize");
             let decoded: IndexState = bincode::deserialize(&data).expect("deserialize");
             assert_eq!(decoded, variant);
         }
+    }
+
+    #[test]
+    fn test_index_state_bincode_backward_compat() {
+        #[derive(Serialize, Deserialize)]
+        enum OldIndexState {
+            Ready,
+            Building,
+            Invalid,
+        }
+
+        let old_invalid_bytes = bincode::serialize(&OldIndexState::Invalid).expect("serialize");
+        let decoded: IndexState = bincode::deserialize(&old_invalid_bytes).expect("deserialize");
+        assert_eq!(decoded, IndexState::Invalid);
     }
 }

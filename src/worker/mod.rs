@@ -5,7 +5,7 @@ pub mod metrics;
 pub mod types;
 
 use crate::storage::TikvStore;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use config::WorkerConfig;
 use std::sync::{Arc, OnceLock};
 use tracing::info;
@@ -35,6 +35,7 @@ pub fn wake_worker() {
 
 /// Initialize the system store for the unified worker engine.
 /// The system keyspace must be pre-created in PD by the backend before pg-tikv starts.
+/// No fallback keyspace is allowed, so worker metadata remains isolated.
 /// Returns None if worker is disabled via config.
 pub async fn init_system_store(
     pd_endpoints: Vec<String>,
@@ -50,8 +51,37 @@ pub async fn init_system_store(
         config.system_keyspace
     );
 
-    let store = TikvStore::new_system(pd_endpoints, &config.system_keyspace).await?;
+    let store = TikvStore::new_system(pd_endpoints, &config.system_keyspace)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to initialize isolated system keyspace '{}'; refusing fallback",
+                config.system_keyspace
+            )
+        })?;
     let store = Arc::new(store);
     info!("System store initialized successfully");
     Ok(Some(store))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_init_system_store_signature_has_no_fallback_keyspace() {
+        let cfg = WorkerConfig::default();
+        let fut = init_system_store(Vec::new(), &cfg);
+        drop(fut);
+    }
+
+    #[tokio::test]
+    async fn test_init_system_store_disabled_short_circuits() {
+        let mut cfg = WorkerConfig::default();
+        cfg.enabled = false;
+        let store = init_system_store(vec!["127.0.0.1:1".to_string()], &cfg)
+            .await
+            .expect("disabled worker should not attempt system-store init");
+        assert!(store.is_none());
+    }
 }

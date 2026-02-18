@@ -1,0 +1,1114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>db9 SDK Docs - get-db9 TypeScript API</title>
+  <meta name="description" content="Complete API documentation for the get-db9 TypeScript SDK.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0a0a0a;
+      --bg-elevated: #111111;
+      --bg-card: #161616;
+      --bg-code: #0d0d0d;
+      --border: #222222;
+      --border-subtle: #1a1a1a;
+      --text: #e8e8e8;
+      --text-secondary: #888888;
+      --text-muted: #555555;
+      --accent: #dc150b;
+      --accent-dim: #b01209;
+      --accent-glow: rgba(220, 21, 11, 0.1);
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: radial-gradient(circle at 20% -20%, rgba(220, 21, 11, 0.08), transparent 42%), var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    code, .mono { font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace; }
+    a { color: var(--accent); text-decoration: none; transition: opacity 0.2s; }
+    a:hover { opacity: 0.85; }
+
+    .container { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+    header {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 120;
+      background: rgba(10, 10, 10, 0.8);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    header .container {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 60px;
+    }
+
+    .logo {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--text);
+      letter-spacing: -0.5px;
+    }
+
+    .logo span { color: var(--accent); }
+
+    nav { display: flex; align-items: center; gap: 32px; }
+    nav a { color: var(--text-secondary); font-size: 14px; font-weight: 400; }
+    nav a:hover { color: var(--text); opacity: 1; }
+
+    .active-nav {
+      color: var(--text);
+      position: relative;
+      font-weight: 500;
+    }
+
+    .active-nav::after {
+      content: '';
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: -19px;
+      height: 2px;
+      background: var(--accent);
+    }
+
+    .nav-cta {
+      background: var(--accent);
+      color: #fff;
+      padding: 6px 16px;
+      border-radius: 6px;
+      font-weight: 500;
+      font-size: 13px;
+      border: 0;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .nav-cta:hover { background: var(--accent-dim); color: #fff; opacity: 1; }
+
+    main { padding: 98px 0 90px; }
+
+    .docs-top {
+      margin-bottom: 28px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 22px;
+      background: linear-gradient(140deg, rgba(220, 21, 11, 0.08), rgba(220, 21, 11, 0.02) 40%, rgba(0, 0, 0, 0) 70%), var(--bg-card);
+    }
+
+    .docs-kicker {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--accent-glow);
+      border: 1px solid rgba(220, 21, 11, 0.2);
+      border-radius: 999px;
+      padding: 5px 12px;
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 12px;
+    }
+
+    .docs-kicker::before {
+      content: '';
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 0 5px rgba(220, 21, 11, 0.14);
+    }
+
+    h1 {
+      font-size: clamp(30px, 4.3vw, 48px);
+      letter-spacing: -1.3px;
+      line-height: 1.08;
+      margin-bottom: 12px;
+    }
+
+    .lead {
+      font-size: 16px;
+      max-width: 760px;
+      color: var(--text-secondary);
+    }
+
+    .docs-layout {
+      display: grid;
+      grid-template-columns: 240px 1fr;
+      gap: 24px;
+      align-items: start;
+    }
+
+    .sidebar-toggle {
+      display: none;
+      width: 100%;
+      margin-bottom: 12px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 13px;
+      padding: 11px 14px;
+      border-radius: 10px;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .sidebar-toggle .mono { color: var(--accent); font-size: 12px; }
+
+    .docs-sidebar {
+      position: sticky;
+      top: 80px;
+      max-height: calc(100vh - 92px);
+      overflow-y: auto;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+
+    .docs-sidebar::-webkit-scrollbar { width: 8px; }
+    .docs-sidebar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 8px; }
+
+    .sidebar-title {
+      font-size: 11px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      padding: 8px 10px 10px;
+    }
+
+    .docs-sidebar a {
+      display: block;
+      font-size: 13px;
+      color: var(--text-secondary);
+      border-radius: 8px;
+      padding: 9px 10px;
+      margin-bottom: 4px;
+      border: 1px solid transparent;
+      transition: all 0.2s;
+    }
+
+    .docs-sidebar a:hover { color: var(--text); background: var(--bg-elevated); opacity: 1; }
+
+    .docs-sidebar a.active {
+      color: var(--text);
+      background: var(--accent-glow);
+      border-color: rgba(220, 21, 11, 0.25);
+    }
+
+    .docs-main {
+      min-width: 0;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 26px;
+    }
+
+    .doc-section {
+      padding: 8px 0 34px;
+      border-bottom: 1px solid var(--border-subtle);
+      scroll-margin-top: 84px;
+    }
+
+    .doc-section:last-child { border-bottom: 0; padding-bottom: 8px; }
+
+    .doc-section h2 {
+      font-size: 24px;
+      letter-spacing: -0.5px;
+      margin-bottom: 10px;
+    }
+
+    .section-note {
+      color: var(--text-secondary);
+      font-size: 15px;
+      margin-bottom: 16px;
+    }
+
+    .method-list {
+      list-style: none;
+      margin: 12px 0 16px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+
+    .method-list li {
+      font-size: 13px;
+      color: var(--text-secondary);
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border-subtle);
+      background: #121212;
+    }
+
+    .method-list li:last-child { border-bottom: 0; }
+    .method-list code { color: var(--text); font-size: 12px; }
+
+    .muted { color: var(--text-muted); }
+
+    ul, ol { margin: 8px 0 16px 20px; color: var(--text-secondary); }
+    .doc-section > ul li, .doc-section > ol li { margin-bottom: 6px; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #121212;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      margin: 12px 0 18px;
+    }
+
+    th, td {
+      text-align: left;
+      font-size: 13px;
+      padding: 11px 12px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+
+    th {
+      color: var(--text-muted);
+      font-size: 11px;
+      letter-spacing: 0.8px;
+      text-transform: uppercase;
+      font-weight: 700;
+      background: #151515;
+    }
+
+    td { color: var(--text-secondary); }
+    td code { color: var(--text); font-size: 12px; }
+
+    .code-block {
+      position: relative;
+      margin: 12px 0 18px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      background: var(--bg-code);
+    }
+
+    .code-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      background: #111111;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .code-lang {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: var(--text-muted);
+      letter-spacing: 0.6px;
+      text-transform: uppercase;
+    }
+
+    .copy-btn {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 5px 10px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-family: 'Inter', sans-serif;
+      cursor: pointer;
+      transition: all 0.2s;
+      flex-shrink: 0;
+    }
+
+    .copy-btn:hover { border-color: var(--text-muted); color: var(--text-secondary); }
+    .copy-btn.copied { border-color: var(--accent); color: var(--accent); }
+
+    pre {
+      margin: 0;
+      padding: 14px;
+      overflow-x: auto;
+      white-space: pre;
+      font-size: 12.5px;
+      line-height: 1.72;
+      color: var(--text);
+      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+      background: #0d0d0d;
+    }
+
+    .token-keyword { color: var(--accent); }
+    .token-string { color: #7bd88f; }
+    .token-comment { color: var(--text-muted); }
+    .token-number { color: #f59e0b; }
+    .token-type { color: #7dd3fc; }
+    .token-call { color: #fbbf24; }
+
+    .type-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 10px;
+    }
+
+    .type-card {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #121212;
+      padding: 12px;
+    }
+
+    .type-card h3 {
+      font-size: 14px;
+      margin-bottom: 6px;
+      color: var(--text);
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 600;
+    }
+
+    .type-card p { font-size: 13px; color: var(--text-secondary); }
+
+    .badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.6px;
+      text-transform: uppercase;
+      color: var(--accent);
+      background: var(--accent-glow);
+      border: 1px solid rgba(220, 21, 11, 0.25);
+      border-radius: 999px;
+      padding: 3px 8px;
+      margin-bottom: 10px;
+    }
+
+    footer {
+      border-top: 1px solid var(--border-subtle);
+      padding: 36px 0;
+      margin-top: 48px;
+    }
+
+    footer .container {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+    }
+
+    .footer-copy {
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    @media (max-width: 1040px) {
+      .docs-layout { grid-template-columns: 210px 1fr; }
+    }
+
+    @media (max-width: 980px) {
+      nav { display: none; }
+      .docs-layout { grid-template-columns: 1fr; }
+      .sidebar-toggle { display: block; }
+
+      .docs-sidebar {
+        position: fixed;
+        top: 60px;
+        left: 0;
+        width: min(320px, 90vw);
+        height: calc(100vh - 60px);
+        border-radius: 0;
+        border-left: 0;
+        border-top: 0;
+        transform: translateX(-100%);
+        transition: transform 0.25s ease;
+        z-index: 130;
+      }
+
+      .docs-sidebar.open { transform: translateX(0); }
+
+      .type-grid { grid-template-columns: 1fr; }
+      .docs-main { padding: 18px; }
+    }
+
+    @media (max-width: 640px) {
+      .container { padding: 0 16px; }
+      main { padding-top: 84px; }
+      .doc-section h2 { font-size: 22px; }
+      .docs-top { padding: 16px; }
+      th, td { padding: 10px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="container">
+      <a href="/" class="logo"><span>db9</span></a>
+      <nav>
+        <a href="/">Home</a>
+        <a href="/sdk">SDK</a>
+        <a href="#" class="active-nav">Docs</a>
+        <a href="#install" class="nav-cta" data-copy="npm install get-db9">Get Started</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <div class="container">
+      <section class="docs-top">
+        <span class="docs-kicker">TypeScript SDK v0.3.0</span>
+        <h1>Complete <code>get-db9</code> API Documentation</h1>
+        <p class="lead">Reference for every public export: installation, one-liner provisioning, full client surface, auth lifecycle, credential stores, error model, and all exported TypeScript interfaces.</p>
+      </section>
+
+      <div class="docs-layout">
+        <button type="button" class="sidebar-toggle" id="sidebar-toggle">Menu <span class="mono">(16 sections)</span></button>
+
+        <aside class="docs-sidebar" id="docs-sidebar">
+          <div class="sidebar-title">On This Page</div>
+          <a href="#install">1. Installation</a>
+          <a href="#quick-start">2. Quick Start</a>
+          <a href="#instant-database">3. instantDatabase(options?)</a>
+          <a href="#create-client">4. createDb9Client(options?)</a>
+          <a href="#authentication">5. Authentication</a>
+          <a href="#token-management">6. Token Management</a>
+          <a href="#database-management">7. Database Management</a>
+          <a href="#sql-execution">8. SQL Execution</a>
+          <a href="#schema-dump">9. Schema &amp; Dump</a>
+          <a href="#migrations">10. Migrations</a>
+          <a href="#branching">11. Branching</a>
+          <a href="#database-users">12. Database Users</a>
+          <a href="#auth-flow">13. Authentication Flow</a>
+          <a href="#credential-storage">14. Credential Storage</a>
+          <a href="#error-handling">15. Error Handling</a>
+          <a href="#typescript-types">16. TypeScript Types Reference</a>
+        </aside>
+
+        <article class="docs-main" id="docs-main">
+          <section class="doc-section" id="install">
+            <span class="badge">Section 01</span>
+            <h2>Installation</h2>
+            <p class="section-note">Install the SDK with your package manager. Runtime requirement is Node.js 18+ (native <code>fetch</code>), with TypeScript 5+ for full type exports.</p>
+
+            <div class="code-block" data-lang="bash">
+              <div class="code-head"><span class="code-lang">bash</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>npm install get-db9
+yarn add get-db9
+pnpm add get-db9
+bun add get-db9</code></pre>
+            </div>
+
+            <table>
+              <thead><tr><th>Requirement</th><th>Minimum</th><th>Notes</th></tr></thead>
+              <tbody>
+                <tr><td>Node.js</td><td><code>18.0.0+</code></td><td>Uses native <code>fetch</code> and modern ESM/CJS output.</td></tr>
+                <tr><td>TypeScript</td><td><code>5.0+</code></td><td>Required for complete type export support.</td></tr>
+                <tr><td>Credentials</td><td><code>~/.db9/credentials</code></td><td>Default token storage shared with db9 CLI.</td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="doc-section" id="quick-start">
+            <span class="badge">Section 02</span>
+            <h2>Quick Start</h2>
+            <p class="section-note"><code>instantDatabase()</code> automatically creates or reuses a database named <code>default</code>, with anonymous auth handled under the hood.</p>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">typescript</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>import { instantDatabase } from 'get-db9';
+
+const db = await instantDatabase({
+  name: 'myapp',
+  seed: 'CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT)'
+});
+
+console.log(db.databaseId);
+console.log(db.connectionString);
+console.log(db.adminUser, db.adminPassword);
+console.log(db.state, db.createdAt);</code></pre>
+            </div>
+
+            <p class="section-note">Result shape returned from <code>instantDatabase()</code>:</p>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">typescript</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>interface InstantDatabaseResult {
+  databaseId: string;
+  connectionString: string;
+  adminUser: string;
+  adminPassword: string;
+  state: string;
+  createdAt: string;
+}</code></pre>
+            </div>
+          </section>
+
+          <section class="doc-section" id="instant-database">
+            <span class="badge">Section 03</span>
+            <h2><code>instantDatabase(options?)</code></h2>
+            <p class="section-note">High-level API that wraps <code>createDb9Client()</code>, checks for an existing database by name, creates one if missing, and optionally executes seed SQL.</p>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">signature</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>function instantDatabase(
+  options?: InstantDatabaseOptions
+): Promise&lt;InstantDatabaseResult&gt;;</code></pre>
+            </div>
+
+            <table>
+              <thead><tr><th>Option</th><th>Type</th><th>Description</th></tr></thead>
+              <tbody>
+                <tr><td><code>name</code></td><td><code>string</code></td><td>Database name. Default: <code>'default'</code>.</td></tr>
+                <tr><td><code>baseUrl</code></td><td><code>string</code></td><td>Override API endpoint.</td></tr>
+                <tr><td><code>fetch</code></td><td><code>FetchFn</code></td><td>Custom fetch implementation.</td></tr>
+                <tr><td><code>credentialStore</code></td><td><code>CredentialStore</code></td><td>Token load/save strategy.</td></tr>
+                <tr><td><code>seed</code></td><td><code>string</code></td><td>SQL text executed via <code>client.databases.sql()</code>.</td></tr>
+                <tr><td><code>seedFile</code></td><td><code>string</code></td><td>SQL file content executed via <code>client.databases.sqlFile()</code>.</td></tr>
+              </tbody>
+            </table>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">example</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>const db = await instantDatabase({
+  name: 'analytics',
+  seedFile: `
+    CREATE TABLE events (
+      id BIGSERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `
+});</code></pre>
+            </div>
+          </section>
+
+          <section class="doc-section" id="create-client">
+            <span class="badge">Section 04</span>
+            <h2><code>createDb9Client(options?)</code></h2>
+            <p class="section-note">Low-level typed client exposing grouped APIs: <code>auth</code>, <code>tokens</code>, and <code>databases</code>. If no token is provided, it lazily loads from credential store and auto-registers anonymously when needed.</p>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">signature</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>function createDb9Client(options?: Db9ClientOptions): Db9Client;</code></pre>
+            </div>
+
+            <table>
+              <thead><tr><th>Option</th><th>Type</th><th>Description</th></tr></thead>
+              <tbody>
+                <tr><td><code>baseUrl</code></td><td><code>string</code></td><td>Default: <code>https://db9.shared.aws.tidbcloud.com/api</code>.</td></tr>
+                <tr><td><code>token</code></td><td><code>string</code></td><td>Optional bearer token; skips anonymous auto-flow.</td></tr>
+                <tr><td><code>fetch</code></td><td><code>FetchFn</code></td><td>Inject custom HTTP implementation.</td></tr>
+                <tr><td><code>credentialStore</code></td><td><code>CredentialStore</code></td><td>Load/save token state.</td></tr>
+              </tbody>
+            </table>
+
+            <ol>
+              <li>Create public client (no Authorization header).</li>
+              <li>Lazy-load token from credential store on first protected call.</li>
+              <li>If token missing, call <code>/customer/anonymous-register</code>.</li>
+              <li>Persist <code>token</code>, <code>anonymous_id</code>, and <code>anonymous_secret</code> in credential store.</li>
+              <li>Create auth client with <code>Authorization: Bearer &lt;token&gt;</code>.</li>
+            </ol>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">example</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>import { createDb9Client, MemoryCredentialStore } from 'get-db9';
+
+const client = createDb9Client({
+  baseUrl: 'https://db9.shared.aws.tidbcloud.com/api',
+  credentialStore: new MemoryCredentialStore()
+});</code></pre>
+            </div>
+          </section>
+
+          <section class="doc-section" id="authentication">
+            <span class="badge">Section 05</span>
+            <h2>Authentication (<code>client.auth</code>)</h2>
+            <p class="section-note">Seven auth methods support full account lifecycle including anonymous bootstrap and claim-to-registered conversion.</p>
+
+            <ul class="method-list">
+              <li><code>register(req: RegisterRequest): Promise&lt;CustomerResponse&gt;</code></li>
+              <li><code>login(req: LoginRequest): Promise&lt;LoginResponse&gt;</code></li>
+              <li><code>anonymousRegister(): Promise&lt;AnonymousRegisterResponse&gt;</code></li>
+              <li><code>anonymousRefresh(req: AnonymousRefreshRequest): Promise&lt;AnonymousRefreshResponse&gt;</code></li>
+              <li><code>me(): Promise&lt;CustomerResponse&gt;</code></li>
+              <li><code>getAnonymousSecret(): Promise&lt;AnonymousSecretResponse&gt;</code></li>
+              <li><code>claim(req: ClaimRequest): Promise&lt;ClaimResponse&gt;</code></li>
+            </ul>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">typescript</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>const customer = await client.auth.register({
+  email: 'dev@example.com',
+  password: 'S3curePass!'
+});
+
+const login = await client.auth.login({
+  email: 'dev@example.com',
+  password: 'S3curePass!'
+});
+
+const anon = await client.auth.anonymousRegister();
+const refreshed = await client.auth.anonymousRefresh({
+  anonymous_id: anon.anonymous_id,
+  anonymous_secret: anon.anonymous_secret
+});
+
+const me = await client.auth.me();
+const secret = await client.auth.getAnonymousSecret();
+const claimed = await client.auth.claim({
+  email: 'owner@example.com',
+  password: 'N3wPass!'
+});</code></pre>
+            </div>
+          </section>
+
+          <section class="doc-section" id="token-management">
+            <span class="badge">Section 06</span>
+            <h2>Token Management (<code>client.tokens</code>)</h2>
+            <p class="section-note">Inspect active customer tokens and revoke compromised/unused tokens.</p>
+
+            <ul class="method-list">
+              <li><code>list(): Promise&lt;TokenResponse[]&gt;</code></li>
+              <li><code>revoke(tokenId: string): Promise&lt;MessageResponse&gt;</code></li>
+            </ul>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">typescript</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>const tokens = await client.tokens.list();
+for (const token of tokens) {
+  console.log(token.id, token.name, token.created_at, token.expires_at);
+}
+
+await client.tokens.revoke(tokens[0].id);</code></pre>
+            </div>
+          </section>
+
+          <section class="doc-section" id="database-management">
+            <span class="badge">Section 07</span>
+            <h2>Database Management (<code>client.databases</code>)</h2>
+            <p class="section-note">Core lifecycle APIs: create, enumerate, inspect, delete, reset admin password, and read observability snapshots.</p>
+
+            <ul class="method-list">
+              <li><code>create(req: CreateDatabaseRequest): Promise&lt;DatabaseResponse&gt;</code></li>
+              <li><code>list(): Promise&lt;DatabaseResponse[]&gt;</code></li>
+              <li><code>get(databaseId: string): Promise&lt;DatabaseResponse&gt;</code></li>
+              <li><code>delete(databaseId: string): Promise&lt;MessageResponse&gt;</code></li>
+              <li><code>resetPassword(databaseId: string): Promise&lt;CustomerPasswordResetResponse&gt;</code></li>
+              <li><code>observability(databaseId: string): Promise&lt;TenantObservabilityResponse&gt;</code></li>
+            </ul>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">typescript</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>const db = await client.databases.create({
+  name: 'billing',
+  region: 'us-west',
+  admin_password: 'StrongAdminPass1'
+});
+
+const all = await client.databases.list();
+const current = await client.databases.get(db.id);
+
+const rotated = await client.databases.resetPassword(db.id);
+const metrics = await client.databases.observability(db.id);
+
+await client.databases.delete(db.id);</code></pre>
+            </div>
+          </section>
+
+          <section class="doc-section" id="sql-execution">
+            <span class="badge">Section 08</span>
+            <h2>SQL Execution</h2>
+            <p class="section-note">Execute SQL strings or SQL file content through the customer API. Both methods return <code>SqlResult</code>.</p>
+
+            <ul class="method-list">
+              <li><code>sql(databaseId: string, query: string): Promise&lt;SqlResult&gt;</code></li>
+              <li><code>sqlFile(databaseId: string, fileContent: string): Promise&lt;SqlResult&gt;</code></li>
+            </ul>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">typescript</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>const result = await client.databases.sql(
+  databaseId,
+  'SELECT id, email FROM users ORDER BY id LIMIT 10'
+);
+
+console.log(result.columns);
+console.log(result.rows);
+console.log(result.row_count, result.command, result.error);
+
+const fromFile = await client.databases.sqlFile(databaseId, `
+  CREATE TABLE audit_log (id BIGSERIAL PRIMARY KEY, event TEXT);
+  INSERT INTO audit_log(event) VALUES ('created');
+`);</code></pre>
+            </div>
+
+            <table>
+              <thead><tr><th><code>SqlResult</code> Field</th><th>Type</th><th>Description</th></tr></thead>
+              <tbody>
+                <tr><td><code>columns</code></td><td><code>ColumnInfo[]</code></td><td>Column metadata for result rows.</td></tr>
+                <tr><td><code>rows</code></td><td><code>unknown[][]</code></td><td>Result values matrix.</td></tr>
+                <tr><td><code>row_count</code></td><td><code>number</code></td><td>Rows affected/returned.</td></tr>
+                <tr><td><code>command</code></td><td><code>string</code></td><td>Executed command label (<code>SELECT</code>, <code>INSERT</code>, etc.).</td></tr>
+                <tr><td><code>error</code></td><td><code>string | undefined</code></td><td>Error message if command failed.</td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="doc-section" id="schema-dump">
+            <span class="badge">Section 09</span>
+            <h2>Schema &amp; Dump</h2>
+            <p class="section-note">Introspect schema objects or export SQL dump payloads.</p>
+
+            <ul class="method-list">
+              <li><code>schema(databaseId: string): Promise&lt;SchemaResponse&gt;</code></li>
+              <li><code>dump(databaseId: string, req?: DumpRequest): Promise&lt;DumpResponse&gt;</code></li>
+            </ul>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">typescript</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>const schema = await client.databases.schema(databaseId);
+for (const table of schema.tables) {
+  console.log(table.schema, table.name);
+}
+
+const ddlOnly = await client.databases.dump(databaseId, { ddl_only: true });
+console.log(ddlOnly.object_count);
+console.log(ddlOnly.sql);</code></pre>
+            </div>
+          </section>
+
+          <section class="doc-section" id="migrations">
+            <span class="badge">Section 10</span>
+            <h2>Migrations</h2>
+            <p class="section-note">Apply SQL migrations with checksums and inspect migration history metadata.</p>
+
+            <ul class="method-list">
+              <li><code>applyMigration(databaseId: string, req: MigrationApplyRequest): Promise&lt;MigrationApplyResponse&gt;</code></li>
+              <li><code>listMigrations(databaseId: string): Promise&lt;MigrationMetadata[]&gt;</code></li>
+            </ul>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">typescript</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>await client.databases.applyMigration(databaseId, {
+  name: '20260218_add_users',
+  sql: 'CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT NOT NULL);',
+  checksum: 'f0b9c43b'
+});
+
+const applied = await client.databases.listMigrations(databaseId);
+for (const migration of applied) {
+  console.log(migration.name, migration.applied_at, migration.checksum);
+}</code></pre>
+            </div>
+          </section>
+
+          <section class="doc-section" id="branching">
+            <span class="badge">Section 11</span>
+            <h2>Branching</h2>
+            <p class="section-note">Create database branches from an existing database using a new branch name.</p>
+
+            <ul class="method-list">
+              <li><code>branch(databaseId: string, req: BranchRequest): Promise&lt;DatabaseResponse&gt;</code></li>
+            </ul>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">typescript</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>const featureDb = await client.databases.branch(databaseId, {
+  name: 'feature-auth'
+});
+
+console.log(featureDb.id, featureDb.name, featureDb.connection_string);</code></pre>
+            </div>
+          </section>
+
+          <section class="doc-section" id="database-users">
+            <span class="badge">Section 12</span>
+            <h2>Database Users (<code>client.databases.users</code>)</h2>
+            <p class="section-note">Manage Postgres users inside a customer database.</p>
+
+            <ul class="method-list">
+              <li><code>list(databaseId: string): Promise&lt;UserResponse[]&gt;</code></li>
+              <li><code>create(databaseId: string, req: CreateUserRequest): Promise&lt;MessageResponse&gt;</code></li>
+              <li><code>delete(databaseId: string, username: string): Promise&lt;MessageResponse&gt;</code></li>
+            </ul>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">typescript</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>await client.databases.users.create(databaseId, {
+  username: 'app_user',
+  password: 'AppUserPass!'
+});
+
+const users = await client.databases.users.list(databaseId);
+users.forEach((u) =&gt; {
+  console.log(u.name, u.can_login, u.can_create_db, u.is_superuser);
+});
+
+await client.databases.users.delete(databaseId, 'app_user');</code></pre>
+            </div>
+          </section>
+
+          <section class="doc-section" id="auth-flow">
+            <span class="badge">Section 13</span>
+            <h2>Authentication Flow</h2>
+            <p class="section-note">Default client behavior for first-time users and progression from anonymous to registered identity.</p>
+
+            <div class="code-block" data-lang="flow">
+              <div class="code-head"><span class="code-lang">flow</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>Anonymous start
+  |
+  | createDb9Client() without token
+  v
+anonymousRegister() -> { token, anonymous_id, anonymous_secret }
+  |
+  | token persisted in CredentialStore
+  v
+Use client.* APIs as anonymous customer
+  |
+  | client.auth.claim({ email, password })
+  v
+Registered customer account (same identity now claimed)</code></pre>
+            </div>
+
+            <ol>
+              <li>Anonymous token is auto-provisioned and cached.</li>
+              <li><code>anonymousRefresh()</code> can rotate token using <code>anonymous_id</code> + <code>anonymous_secret</code>.</li>
+              <li><code>claim()</code> upgrades anonymous identity to email/password credentials.</li>
+            </ol>
+          </section>
+
+          <section class="doc-section" id="credential-storage">
+            <span class="badge">Section 14</span>
+            <h2>Credential Storage</h2>
+            <p class="section-note">Credential stores implement a shared async interface used by client auto-auth.</p>
+
+            <ul class="method-list">
+              <li><code>FileCredentialStore(path?)</code> - TOML file store at <code>~/.db9/credentials</code>.</li>
+              <li><code>MemoryCredentialStore</code> - volatile in-memory store for tests/serverless.</li>
+              <li><code>defaultCredentialStore()</code> - factory that returns <code>new FileCredentialStore()</code>.</li>
+            </ul>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">typescript</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>import {
+  createDb9Client,
+  FileCredentialStore,
+  MemoryCredentialStore,
+  defaultCredentialStore
+} from 'get-db9';
+
+const fileStore = new FileCredentialStore();
+const customStore = new FileCredentialStore('/tmp/db9-credentials.toml');
+const memStore = new MemoryCredentialStore();
+const store = defaultCredentialStore();
+
+const client = createDb9Client({ credentialStore: fileStore });</code></pre>
+            </div>
+          </section>
+
+          <section class="doc-section" id="error-handling">
+            <span class="badge">Section 15</span>
+            <h2>Error Handling</h2>
+            <p class="section-note">API failures throw <code>Db9Error</code> subclasses based on HTTP status code.</p>
+
+            <ul class="method-list">
+              <li><code>Db9Error</code> - base class with <code>statusCode</code>, <code>message</code>, and optional <code>response</code>.</li>
+              <li><code>Db9AuthError</code> - status <code>401</code>.</li>
+              <li><code>Db9NotFoundError</code> - status <code>404</code>.</li>
+              <li><code>Db9ConflictError</code> - status <code>409</code>.</li>
+            </ul>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">typescript</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>import {
+  Db9Error,
+  Db9AuthError,
+  Db9NotFoundError,
+  Db9ConflictError
+} from 'get-db9';
+
+try {
+  await client.databases.get('missing-id');
+} catch (error) {
+  if (error instanceof Db9NotFoundError) {
+    console.error('Database not found');
+  } else if (error instanceof Db9AuthError) {
+    console.error('Authentication required');
+  } else if (error instanceof Db9ConflictError) {
+    console.error('Conflict while processing request');
+  } else if (error instanceof Db9Error) {
+    console.error(`db9 API error ${error.statusCode}: ${error.message}`);
+  } else {
+    throw error;
+  }
+}</code></pre>
+            </div>
+          </section>
+
+          <section class="doc-section" id="typescript-types">
+            <span class="badge">Section 16</span>
+            <h2>TypeScript Types Reference (All Public Interfaces)</h2>
+            <p class="section-note">The package re-exports all interfaces from <code>./types</code> in addition to <code>InstantDatabaseOptions</code>, <code>InstantDatabaseResult</code>, <code>Db9ClientOptions</code>, and credential/http types.</p>
+
+            <div class="type-grid">
+              <div class="type-card"><h3>Common</h3><p><code>Endpoint</code>, <code>MessageResponse</code>, <code>HealthResponse</code>, <code>ColumnInfo</code>, <code>SqlResult</code>, <code>TenantState</code></p></div>
+              <div class="type-card"><h3>Customer Requests</h3><p><code>RegisterRequest</code>, <code>LoginRequest</code>, <code>CreateDatabaseRequest</code>, <code>SqlExecuteRequest</code>, <code>DumpRequest</code>, <code>MigrationApplyRequest</code>, <code>BranchRequest</code>, <code>ClaimRequest</code>, <code>AnonymousRefreshRequest</code>, <code>CreateUserRequest</code></p></div>
+              <div class="type-card"><h3>Customer Responses</h3><p><code>CustomerResponse</code>, <code>LoginResponse</code>, <code>AnonymousRegisterResponse</code>, <code>AnonymousRefreshResponse</code>, <code>AnonymousSecretResponse</code>, <code>ClaimResponse</code>, <code>DatabaseResponse</code>, <code>CustomerPasswordResetResponse</code>, <code>TokenResponse</code>, <code>DumpResponse</code>, <code>SchemaResponse</code>, <code>TableMetadata</code>, <code>ColumnMetadata</code>, <code>ViewMetadata</code>, <code>MigrationApplyResponse</code>, <code>MigrationMetadata</code>, <code>UserResponse</code>, <code>TenantObservabilityResponse</code>, <code>ObservabilitySummary</code>, <code>QuerySample</code></p></div>
+              <div class="type-card"><h3>Credential &amp; HTTP</h3><p><code>Credentials</code>, <code>CredentialStore</code>, <code>FetchFn</code>, <code>HttpClient</code>, <code>HttpClientOptions</code>, <code>InstantDatabaseOptions</code>, <code>InstantDatabaseResult</code>, <code>Db9ClientOptions</code>, <code>Db9Client</code>, <code>Endpoint</code></p></div>
+            </div>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">exports</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>export function instantDatabase(options?: InstantDatabaseOptions): Promise&lt;InstantDatabaseResult&gt;;
+export { createDb9Client } from './client';
+export type { Db9ClientOptions, Db9Client } from './client';
+export { Db9Error, Db9AuthError, Db9NotFoundError, Db9ConflictError } from './errors';
+export { FileCredentialStore, MemoryCredentialStore, defaultCredentialStore } from './credentials';
+export type * from './types';</code></pre>
+            </div>
+          </section>
+        </article>
+      </div>
+    </div>
+  </main>
+
+  <footer>
+    <div class="container">
+      <span class="footer-copy">&copy; 2026 db9</span>
+      <span class="footer-copy">get-db9 documentation</span>
+    </div>
+  </footer>
+
+  <script>
+    (() => {
+      const escapeHtml = (input) => input
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+
+      const highlight = (text) => {
+        let html = escapeHtml(text);
+        html = html.replace(/(\/\/[^\n]*)/g, '<span class="token-comment">$1</span>');
+        html = html.replace(/('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`(?:[^`\\]|\\.)*`)/g, '<span class="token-string">$1</span>');
+        html = html.replace(/\b(await|async|import|from|const|let|var|return|new|if|else|try|catch|throw|class|extends|interface|type|export|for|of|in)\b/g, '<span class="token-keyword">$1</span>');
+        html = html.replace(/\b(Promise|string|number|boolean|unknown|Response)\b/g, '<span class="token-type">$1</span>');
+        html = html.replace(/\b(\d+)\b/g, '<span class="token-number">$1</span>');
+        html = html.replace(/\b([A-Za-z_$][\w$]*)(?=\()/g, '<span class="token-call">$1</span>');
+        return html;
+      };
+
+      document.querySelectorAll('.code-block pre code').forEach((code) => {
+        const raw = code.textContent || '';
+        code.innerHTML = highlight(raw);
+      });
+
+      document.querySelectorAll('.copy-btn').forEach((button) => {
+        button.addEventListener('click', async () => {
+          const block = button.closest('.code-block');
+          const code = block ? block.querySelector('code') : null;
+          const text = code ? code.textContent : '';
+          if (!text) return;
+          try {
+            await navigator.clipboard.writeText(text);
+            const original = button.textContent;
+            button.textContent = 'Copied';
+            button.classList.add('copied');
+            setTimeout(() => {
+              button.textContent = original;
+              button.classList.remove('copied');
+            }, 1600);
+          } catch (_) {
+            button.textContent = 'Failed';
+          }
+        });
+      });
+
+      document.querySelectorAll('[data-copy]').forEach((trigger) => {
+        trigger.addEventListener('click', async (event) => {
+          event.preventDefault();
+          const copy = trigger.getAttribute('data-copy');
+          const href = trigger.getAttribute('href');
+          if (copy) {
+            try {
+              await navigator.clipboard.writeText(copy);
+            } catch (_) {
+              // noop
+            }
+          }
+          if (href?.startsWith('#')) {
+            const target = document.querySelector(href);
+            if (target) target.scrollIntoView({ behavior: 'smooth' });
+          }
+        });
+      });
+
+      const sidebar = document.getElementById('docs-sidebar');
+      const toggle = document.getElementById('sidebar-toggle');
+      if (toggle && sidebar) {
+        toggle.addEventListener('click', () => {
+          sidebar.classList.toggle('open');
+        });
+      }
+
+      const links = Array.from(document.querySelectorAll('.docs-sidebar a'));
+      const sectionMap = new Map();
+      links.forEach((link) => {
+        const id = link.getAttribute('href');
+        if (!id || !id.startsWith('#')) return;
+        const section = document.querySelector(id);
+        if (section) sectionMap.set(section, link);
+      });
+
+      const observer = new IntersectionObserver((entries) => {
+        entries.forEach((entry) => {
+          const link = sectionMap.get(entry.target);
+          if (!link) return;
+          if (entry.isIntersecting) {
+            links.forEach((item) => {
+              item.classList.remove('active');
+            });
+            link.classList.add('active');
+          }
+        });
+      }, { rootMargin: '-20% 0px -65% 0px', threshold: 0.1 });
+
+      sectionMap.forEach((_, section) => {
+        observer.observe(section);
+      });
+      if (links.length) links[0].classList.add('active');
+
+      links.forEach((link) => {
+        link.addEventListener('click', (event) => {
+          event.preventDefault();
+          const id = link.getAttribute('href');
+          if (!id) return;
+          const section = document.querySelector(id);
+          if (section) section.scrollIntoView({ behavior: 'smooth' });
+          if (sidebar && window.matchMedia('(max-width: 980px)').matches) {
+            sidebar.classList.remove('open');
+          }
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
