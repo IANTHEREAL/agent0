@@ -1,37 +1,5 @@
 # Worklog
 
-## 2026-02-18 — Root-cause fix: outer join ON→WHERE async extraction semantics
-
-### Problem
-`extract_async_join_on_predicates` unconditionally moved async ON predicates to WHERE for all join types. For INNER/CROSS this is correct (WHERE = ON). For OUTER joins (LEFT/RIGHT/FULL) it silently changes null-extension semantics: rows that should be null-extended are dropped instead.
-
-### Root cause
-The NLJ operator evaluates ON conditions synchronously. Correlated subqueries require async materialization, so they must be extracted. But merging them into WHERE applies simple filtering that drops rows failing the predicate — wrong for outer joins where those rows should be null-extended.
-
-### Fix (3 files)
-
-**`src/sql/executor/select/analyzed/mod.rs`:**
-- Added `OuterJoinAsyncInfo` struct to track extracted outer join ON predicates with column metadata (`right_col_start`, `right_col_count`, `join_type`).
-- Rewrote `extract_async_join_on_predicates` to discriminate by join type:
-  - INNER/CROSS → `inner_extracted` (merged with WHERE, semantically correct)
-  - LEFT/RIGHT/FULL → `outer_join_info` (separate post-filter)
-- Returns column count per subtree for accurate position tracking.
-- Added validation: outer join async ON + GROUP BY/DISTINCT → explicit error.
-- Wired outer join async filter into post-processing (step 8-pre, before WHERE filter).
-
-**`src/sql/executor/select/analyzed/expr_runtime.rs`:**
-- Added `filter_async_outer_join` method to `ExprRuntime`.
-- LEFT: groups rows by left-side key; null-extended rows pass through; matched rows evaluated; if all fail → emit null-extended row.
-- RIGHT: mirror of LEFT — groups by right-side key, null-extends left side.
-- FULL: delegates to LEFT logic (NLJ already handles right-side null-extension).
-
-### Verification
-- `cargo check` — zero new warnings
-- `cargo test` — 1649 passed, 0 failed
-- `cargo fmt -- --check` — clean
-
----
-
 ## 2026-02-18 — Revert Finding 2: Restore outer join ON subquery extraction
 
 ### Problem
