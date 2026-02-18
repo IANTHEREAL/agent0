@@ -10,6 +10,27 @@ use sqlparser::ast::{
 };
 
 #[test]
+fn test_execute_statement_on_txn_signature_stays_boxed() {
+    type ExecStmtFuture<'a> = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = anyhow::Result<crate::sql::ExecuteResult>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    let _execute_statement_on_txn: for<'a> fn(
+        &'a super::Executor,
+        &'a mut tikv_client::Transaction,
+        u64,
+        &'a mut std::collections::HashMap<String, i64>,
+        &'a [String],
+        &'a sqlparser::ast::Statement,
+        Option<&'a str>,
+    ) -> ExecStmtFuture<'a> = super::Executor::execute_statement_on_txn;
+}
+
+#[test]
 fn test_starts_with_ignore_ascii_case_is_byte_safe() {
     assert!(starts_with_ignore_ascii_case("rollback;", "ROLLBACK"));
     assert!(!starts_with_ignore_ascii_case("é💩€ROLLBACK", "ROLLBACK"));

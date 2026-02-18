@@ -61,8 +61,37 @@ impl Executor {
         .await
     }
 
-    /// Execute a parsed SQL statement on a given transaction
-    pub(crate) async fn execute_statement_on_txn(
+    /// Execute a parsed SQL statement on a given transaction.
+    ///
+    /// Return a boxed future so callers (`dispatch`, trigger execution,
+    /// procedures, user functions, worker engine) don't embed this large
+    /// statement-dispatch future directly into their own async state machines.
+    ///
+    /// This keeps the stack profile stable as statement arms evolve.
+    pub(crate) fn execute_statement_on_txn<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        db_id: u64,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        stmt: &'a Statement,
+        current_role: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExecuteResult>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.execute_statement_on_txn_impl(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                stmt,
+                current_role,
+            )
+            .await
+        })
+    }
+
+    async fn execute_statement_on_txn_impl(
         &self,
         txn: &mut Transaction,
         db_id: u64,
