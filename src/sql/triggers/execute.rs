@@ -134,7 +134,8 @@ pub(crate) async fn execute_trigger_statement_standalone(
                 let resolved_expr = substitute_row_references(expr, schema, new_values, old_row);
                 let sql = format!("SELECT {}", resolved_expr);
                 if let Ok(stmts) = crate::sql::parse_sql(&sql) {
-                    if let Some(sqlparser::ast::Statement::Query(query)) = stmts.into_iter().next() {
+                    if let Some(sqlparser::ast::Statement::Query(query)) = stmts.into_iter().next()
+                    {
                         if let sqlparser::ast::SetExpr::Select(select) = *query.body {
                             if let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) =
                                 select.projection.into_iter().next()

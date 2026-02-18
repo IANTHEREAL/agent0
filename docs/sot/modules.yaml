@@ -85,8 +85,8 @@ modules:
       - path: src/sql/triggers/worker.rs
       - path: src/sql/triggers/enqueue.rs
       - path: src/sql/triggers/execute.rs
-      - path: src/sql/triggers/claim.rs
-      - path: src/sql/triggers/gc.rs
+      - path: src/worker/engine.rs
+      - path: src/worker/gc.rs
       - path: src/sql/executor/triggers.rs
       - path: src/observability.rs
     gate_tests:

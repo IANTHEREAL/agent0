@@ -185,7 +185,12 @@ impl Executor {
     }
 
     pub(crate) fn flush_trigger_activations(&self) {
-        let triggers: Vec<PendingAsyncTrigger> = self.pending_async_triggers.lock().unwrap().drain(..).collect();
+        let triggers: Vec<PendingAsyncTrigger> = self
+            .pending_async_triggers
+            .lock()
+            .unwrap()
+            .drain(..)
+            .collect();
         if !triggers.is_empty() {
             if let Some(system_store) = crate::worker::get_system_store() {
                 let system_store = system_store.clone();

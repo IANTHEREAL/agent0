@@ -249,11 +249,8 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
                     );
                     tokio::spawn(async move { engine.run().await });
 
-                    let gc = worker::gc::WorkerGc::new(
-                        system_store,
-                        client_pool.clone(),
-                        worker_config,
-                    );
+                    let gc =
+                        worker::gc::WorkerGc::new(system_store, client_pool.clone(), worker_config);
                     tokio::spawn(async move { gc.run().await });
 
                     info!("WorkerEngine and GC started");
