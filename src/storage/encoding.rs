@@ -1119,14 +1119,88 @@ pub fn serialize_schema(schema: &TableSchema) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Deserialize a table schema
+/// Deserialize a table schema.
+///
+/// Handles backward compatibility: schemas serialized before the `IndexDef.state`
+/// field was added (pre-`ce73a8a`) are transparently upgraded by falling back to
+/// a legacy struct layout when the primary deserialization fails.
 pub fn deserialize_schema(data: &[u8]) -> Result<TableSchema> {
     const SCHEMA_MAGIC: &[u8] = b"PGTIKV_SCHEMA_V1\0";
 
     let payload = data.strip_prefix(SCHEMA_MAGIC).context(
         "Schema data missing PGTIKV_SCHEMA_V1 header (V1 legacy format no longer supported)",
     )?;
-    bincode::deserialize(payload).context("Failed to deserialize schema")
+
+    // Try current format first.
+    if let Ok(schema) = bincode::deserialize::<TableSchema>(payload) {
+        return Ok(schema);
+    }
+
+    // Fallback: deserialize with legacy IndexDef (no `state` field), then upgrade.
+    let legacy: TableSchemaLegacy =
+        bincode::deserialize(payload).context("Failed to deserialize schema (tried both current and legacy formats)")?;
+    Ok(legacy.into())
+}
+
+/// Legacy IndexDef without the `state` field (added in ce73a8a).
+#[derive(serde::Deserialize)]
+struct IndexDefLegacy {
+    pub name: String,
+    pub id: u64,
+    pub columns: Vec<String>,
+    pub unique: bool,
+    pub method: Option<String>,
+    pub predicate: Option<String>,
+    pub expressions: Vec<String>,
+}
+
+/// Legacy TableSchema matching the pre-ce73a8a serialization format.
+#[derive(serde::Deserialize)]
+struct TableSchemaLegacy {
+    pub name: String,
+    pub table_id: u64,
+    pub columns: Vec<crate::types::ColumnDef>,
+    pub version: u64,
+    pub pk_constraint_name: Option<String>,
+    pub pk_indices: Vec<usize>,
+    pub indexes: Vec<IndexDefLegacy>,
+    pub check_constraints: Vec<crate::types::CheckConstraint>,
+    pub foreign_keys: Vec<crate::types::ForeignKeyConstraint>,
+    pub owner: String,
+}
+
+impl From<TableSchemaLegacy> for TableSchema {
+    fn from(legacy: TableSchemaLegacy) -> Self {
+        use crate::types::IndexDef;
+        use crate::worker::types::IndexState;
+
+        TableSchema {
+            name: legacy.name,
+            table_id: legacy.table_id,
+            columns: legacy.columns,
+            version: legacy.version,
+            pk_constraint_name: legacy.pk_constraint_name,
+            pk_indices: legacy.pk_indices,
+            indexes: legacy
+                .indexes
+                .into_iter()
+                .map(|idx| IndexDef {
+                    name: idx.name,
+                    id: idx.id,
+                    columns: idx.columns,
+                    unique: idx.unique,
+                    method: idx.method,
+                    predicate: idx.predicate,
+                    expressions: idx.expressions,
+                    state: IndexState::Ready,
+                })
+                .collect(),
+            check_constraints: legacy.check_constraints,
+            foreign_keys: legacy.foreign_keys,
+            owner: legacy.owner,
+            from_alias: None,
+        }
+    }
 }
 
 /// Serialize a row
