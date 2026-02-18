@@ -1,6 +1,7 @@
 use crate::extensions::context::{with_context_opts, ExtensionContextOpts};
 use crate::observability;
 use crate::pool::TikvClientPool;
+use crate::cron::types::{CronRun, CronRunStatus};
 use crate::sql::parse_sql;
 use crate::sql::Executor;
 use crate::storage::TikvStore;
@@ -133,7 +134,38 @@ impl WorkerEngine {
         }
         txn.commit().await?;
 
-        let exec_result = Self::execute_task(pool, config, &entry).await;
+        let cron_run = if entry.task_type == TaskType::Cron {
+            Self::claim_and_record_cron_run(pool, &entry, fire_time_min).await?
+        } else {
+            None
+        };
+
+        let exec_result = if entry.task_type == TaskType::Cron && cron_run.is_none() {
+            Ok(0usize)
+        } else {
+            Self::execute_task(pool, config, &entry).await
+        };
+
+        if let Some((store, db_id, mut run, started_at)) = cron_run {
+            let (status, message) = match &exec_result {
+                Ok(completed_commands) => (
+                    CronRunStatus::Succeeded,
+                    Some(success_message(*completed_commands)),
+                ),
+                Err(e) => (CronRunStatus::Failed, Some(e.to_string())),
+            };
+
+            Self::finalize_cron_run(
+                &store,
+                db_id,
+                &mut run,
+                status,
+                message,
+                started_at,
+                now_ms(),
+            )
+            .await?;
+        }
 
         let mut txn = system_store.begin().await?;
         system_store
@@ -174,11 +206,104 @@ impl WorkerEngine {
         Ok(())
     }
 
+    async fn claim_and_record_cron_run(
+        pool: &Arc<TikvClientPool>,
+        entry: &TaskQueueEntry,
+        scheduled_minute: i64,
+    ) -> Result<Option<(Arc<TikvStore>, u64, CronRun, i64)>> {
+        let handle = pool.acquire(Some(entry.keyspace.clone())).await?;
+        let store = handle.store().clone();
+        let mut txn = store.begin().await?;
+
+        let claim_result = async {
+            if !store.is_cron_enabled(&mut txn, entry.db_id).await? {
+                return Ok(None);
+            }
+
+            let claimed = store
+                .try_claim_cron_run(&mut txn, entry.db_id, entry.task_id, scheduled_minute)
+                .await?;
+            if !claimed {
+                return Ok(None);
+            }
+
+            let database = store
+                .get_database_by_id(&mut txn, entry.db_id)
+                .await?
+                .map(|db| db.name)
+                .unwrap_or_else(|| "postgres".to_string());
+
+            let run_id = store.next_cron_run_id(entry.db_id).await?;
+            let started_at = now_ms();
+            let run = CronRun {
+                run_id,
+                job_id: entry.task_id,
+                job_pid: None,
+                database,
+                username: entry.username.clone(),
+                command: entry.command.clone(),
+                status: CronRunStatus::Running,
+                return_message: None,
+                start_time: Some(started_at),
+                end_time: None,
+            };
+            store.put_cron_run(&mut txn, entry.db_id, &run).await?;
+            Ok(Some((store, entry.db_id, run, started_at)))
+        }
+        .await;
+
+        match claim_result {
+            Ok(Some(run)) => {
+                txn.commit().await?;
+                Ok(Some(run))
+            }
+            Ok(None) => {
+                txn.rollback().await.ok();
+                Ok(None)
+            }
+            Err(e) => {
+                txn.rollback().await.ok();
+                Err(e)
+            }
+        }
+    }
+
+    async fn finalize_cron_run(
+        store: &Arc<TikvStore>,
+        db_id: u64,
+        run: &mut CronRun,
+        status: CronRunStatus,
+        return_message: Option<String>,
+        start_time: i64,
+        end_time: i64,
+    ) -> Result<()> {
+        let mut txn = store.begin().await?;
+        let finalize_result = async {
+            run.status = status;
+            run.return_message = return_message;
+            run.start_time = Some(start_time);
+            run.end_time = Some(end_time);
+            store.put_cron_run(&mut txn, db_id, run).await
+        }
+        .await;
+
+        match finalize_result {
+            Ok(()) => {
+                txn.commit().await?;
+                Ok(())
+            }
+            Err(e) => {
+                txn.rollback().await.ok();
+                Err(e)
+            }
+        }
+    }
+
     async fn execute_task(
         pool: &Arc<TikvClientPool>,
         _config: &WorkerConfig,
         entry: &TaskQueueEntry,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let handle = pool.acquire(Some(entry.keyspace.clone())).await?;
         let store = handle.store().clone();
         let exec = Executor::new(
@@ -189,7 +314,11 @@ impl WorkerEngine {
             handle.stats_cache().clone(),
         );
 
-        let search_path = vec!["public".to_string()];
+        let search_path = if entry.task_type == TaskType::Cron {
+            vec!["public".to_string(), "cron".to_string()]
+        } else {
+            vec!["public".to_string()]
+        };
         let ext_ctx = ExtensionContextOpts {
             is_superuser: true,
             allow_local_fs: false,
@@ -213,12 +342,12 @@ impl WorkerEngine {
                         .await?;
                 }
                 txn.commit().await?;
-                Ok(())
+                Ok(statements.len())
             }
             .await;
 
             match result {
-                Ok(()) => Ok(()),
+                Ok(completed_commands) => Ok(completed_commands),
                 Err(e) => {
                     let _ = txn.rollback().await;
                     Err(e)
@@ -226,6 +355,18 @@ impl WorkerEngine {
             }
         })
         .await
+    }
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn success_message(completed_commands: usize) -> String {
+    if completed_commands == 1 {
+        "1 command completed".to_string()
+    } else {
+        format!("{} commands completed", completed_commands)
     }
 }
 
