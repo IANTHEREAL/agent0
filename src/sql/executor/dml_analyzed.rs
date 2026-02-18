@@ -5,7 +5,7 @@
 //! evaluated via `eval_typed_expr`, no bridge/NullCatalog needed.
 
 use super::super::dml;
-use super::super::trigger_queue::TriggerOp;
+use super::super::triggers::queue::TriggerOp;
 use super::super::trigger_worker;
 use super::super::triggers;
 use super::super::ExecuteResult;

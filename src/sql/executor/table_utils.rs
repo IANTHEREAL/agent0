@@ -14,6 +14,24 @@ use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr};
 use std::collections::HashMap;
 use tikv_client::Transaction;
 
+fn worker_claim_keyspace_matches(key: &[u8], keyspace: &str) -> bool {
+    const PREFIX: &[u8] = b"_worker_claim_";
+    if !key.starts_with(PREFIX) {
+        return false;
+    }
+    let mut idx = PREFIX.len();
+    if idx + 2 > key.len() {
+        return false;
+    }
+    let keyspace_len = u16::from_be_bytes([key[idx], key[idx + 1]]) as usize;
+    idx += 2;
+    if idx + keyspace_len > key.len() {
+        return false;
+    }
+    let claim_keyspace = &key[idx..idx + keyspace_len];
+    claim_keyspace == keyspace.as_bytes()
+}
+
 impl Executor {
     pub(crate) async fn get_table_data(
         &self,
@@ -131,109 +149,48 @@ impl Executor {
         if t_upper == "_PGTIKV_SYS_TRIGGER_QUEUE_STATS"
             || t_upper.ends_with("._PGTIKV_SYS_TRIGGER_QUEUE_STATS")
         {
-            use super::super::trigger_queue::{
-                encode_trigger_dlq_prefix, encode_trigger_queue_prefix,
-            };
-            use super::super::trigger_queue::{now_ms_i64, EventStatus, TriggerEvent};
-            use std::ops::Bound;
-            use tikv_client::BoundRange;
-
-            let now_ms = now_ms_i64();
+            let now_ms = chrono::Utc::now().timestamp_millis();
             let cutoff_recent_ms = now_ms.saturating_sub(60_000);
 
             let mut pending = 0i64;
             let mut processing = 0i64;
-            let mut failed = 0i64;
+            let failed = 0i64;
             let mut latency_sum_ms: u64 = 0;
             let mut latency_cnt: u64 = 0;
             let mut events_last_min = 0i64;
+            let dlq_count = 0i64;
 
-            let prefix = encode_trigger_queue_prefix();
-            let mut end = prefix.clone();
-            end.push(0xFF);
-
-            let mut start: Option<Vec<u8>> = None;
-            loop {
-                let range: BoundRange = match start.as_ref() {
-                    None => (prefix.clone()..end.clone()).into(),
-                    Some(last) => BoundRange::new(
-                        Bound::Excluded(last.clone().into()),
-                        Bound::Excluded(end.clone().into()),
-                    ),
-                };
-
-                let mut batch_last = None;
-                let mut scanned = 0usize;
-                for pair in txn.scan(range, 256).await? {
-                    scanned += 1;
-                    let key_slice: &[u8] = pair.key().as_ref().into();
-                    let key_vec = key_slice.to_vec();
-                    batch_last = Some(key_vec);
-
-                    let ev: TriggerEvent = match bincode::deserialize(pair.value()) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-
-                    match ev.status {
-                        EventStatus::Pending => pending += 1,
-                        EventStatus::Processing => processing += 1,
-                        EventStatus::Failed => failed += 1,
-                        EventStatus::Done => {}
+            if let Some(system_store) = crate::worker::get_system_store() {
+                let mut sys_txn = system_store.begin().await?;
+                let queue_entries = system_store
+                    .scan_due_queue_entries(&mut sys_txn, i64::MAX, u32::MAX)
+                    .await?;
+                for (_key, entry) in queue_entries {
+                    if entry.task_type != crate::worker::types::TaskType::AsyncTrigger
+                        || entry.keyspace != self.tenant_keyspace()
+                    {
+                        continue;
                     }
-
-                    if now_ms >= ev.created_at_ms {
-                        latency_sum_ms += (now_ms - ev.created_at_ms) as u64;
+                    pending += 1;
+                    if now_ms >= entry.task_id {
+                        latency_sum_ms += (now_ms - entry.task_id) as u64;
                         latency_cnt += 1;
                     }
-
-                    // `id >> 22` is the event timestamp in ms.
-                    if (ev.id >> 22) as i64 >= cutoff_recent_ms {
+                    if entry.task_id >= cutoff_recent_ms {
                         events_last_min += 1;
                     }
                 }
 
-                if scanned < 256 {
-                    break;
+                let claims = system_store.list_worker_claims(&mut sys_txn).await?;
+                for (key, claim) in claims {
+                    if claim.task_type != crate::worker::types::TaskType::AsyncTrigger {
+                        continue;
+                    }
+                    if worker_claim_keyspace_matches(&key, self.tenant_keyspace()) {
+                        processing += 1;
+                    }
                 }
-                start = batch_last;
-                if start.is_none() {
-                    break;
-                }
-            }
-
-            // DLQ count (keys only; values not needed).
-            let dlq_prefix = encode_trigger_dlq_prefix();
-            let mut dlq_end = dlq_prefix.clone();
-            dlq_end.push(0xFF);
-            let mut dlq_count = 0i64;
-            let mut dlq_start: Option<Vec<u8>> = None;
-            loop {
-                let range: BoundRange = match dlq_start.as_ref() {
-                    None => (dlq_prefix.clone()..dlq_end.clone()).into(),
-                    Some(last) => BoundRange::new(
-                        Bound::Excluded(last.clone().into()),
-                        Bound::Excluded(dlq_end.clone().into()),
-                    ),
-                };
-
-                let mut batch_last = None;
-                let mut scanned = 0usize;
-                for pair in txn.scan(range, 256).await? {
-                    scanned += 1;
-                    let key_slice: &[u8] = pair.key().as_ref().into();
-                    let key_vec = key_slice.to_vec();
-                    batch_last = Some(key_vec);
-                    dlq_count += 1;
-                }
-
-                if scanned < 256 {
-                    break;
-                }
-                dlq_start = batch_last;
-                if dlq_start.is_none() {
-                    break;
-                }
+                sys_txn.rollback().await.ok();
             }
 
             let avg_latency_ms = if latency_cnt == 0 {
@@ -258,68 +215,10 @@ impl Executor {
         }
 
         if t_upper == "_PGTIKV_SYS_TRIGGER_DLQ" || t_upper.ends_with("._PGTIKV_SYS_TRIGGER_DLQ") {
-            use super::super::trigger_queue::{encode_trigger_dlq_prefix, TriggerEvent, TriggerOp};
-            use std::ops::Bound;
-            use tikv_client::BoundRange;
-
-            let prefix = encode_trigger_dlq_prefix();
-            let mut end = prefix.clone();
-            end.push(0xFF);
-
-            let mut rows = Vec::new();
-            let mut start: Option<Vec<u8>> = None;
-            loop {
-                let range: BoundRange = match start.as_ref() {
-                    None => (prefix.clone()..end.clone()).into(),
-                    Some(last) => BoundRange::new(
-                        Bound::Excluded(last.clone().into()),
-                        Bound::Excluded(end.clone().into()),
-                    ),
-                };
-
-                let mut batch_last = None;
-                let mut scanned = 0usize;
-                for pair in txn.scan(range, 256).await? {
-                    scanned += 1;
-                    let key_slice: &[u8] = pair.key().as_ref().into();
-                    let key_vec = key_slice.to_vec();
-                    batch_last = Some(key_vec);
-
-                    let ev: TriggerEvent = match bincode::deserialize(pair.value()) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-
-                    let op = match ev.operation {
-                        TriggerOp::Insert => "INSERT",
-                        TriggerOp::Update => "UPDATE",
-                        TriggerOp::Delete => "DELETE",
-                    };
-
-                    rows.push(Row::new(vec![
-                        Value::Int64(i64::try_from(ev.id).unwrap_or(i64::MAX)),
-                        Value::Text(ev.trigger_name),
-                        Value::Text(ev.table_name),
-                        Value::Text(op.to_string()),
-                        ev.error_msg.map(Value::Text).unwrap_or(Value::Null),
-                        Value::Int64(i64::from(ev.retry_count)),
-                        Value::Int64(ev.created_at_ms),
-                    ]));
-                }
-
-                if scanned < 256 {
-                    break;
-                }
-                start = batch_last;
-                if start.is_none() {
-                    break;
-                }
-            }
-
             let mut schema = virtual_table_schema("_PGTIKV_SYS_TRIGGER_DLQ").unwrap();
             schema.name = table_name.to_string();
 
-            return Ok((schema, rows));
+            return Ok((schema, Vec::new()));
         }
 
         if let Some((schema, rows)) = ctes.get(&t_lower) {
