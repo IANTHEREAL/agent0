@@ -341,15 +341,9 @@ impl WorkerEngine {
                 let Some(mut schema) = store.get_schema(&mut txn, db_id, &table_name).await? else {
                     continue;
                 };
-                let mut changed = false;
-                for idx in &mut schema.indexes {
-                    if matches!(idx.state, IndexState::Building | IndexState::WriteOnly) {
-                        idx.state = IndexState::Invalid;
-                        changed = true;
-                        repaired += 1;
-                    }
-                }
-                if changed {
+                let repaired_in_schema = repair_incomplete_cic_states(&mut schema);
+                if repaired_in_schema > 0 {
+                    repaired += repaired_in_schema;
                     store.update_schema(&mut txn, db_id, schema).await?;
                 }
             }
@@ -744,6 +738,17 @@ impl WorkerEngine {
     }
 }
 
+fn repair_incomplete_cic_states(schema: &mut crate::types::TableSchema) -> u32 {
+    let mut repaired = 0u32;
+    for idx in &mut schema.indexes {
+        if matches!(idx.state, IndexState::Building | IndexState::WriteOnly) {
+            idx.state = IndexState::Invalid;
+            repaired += 1;
+        }
+    }
+    repaired
+}
+
 fn parse_backfill_index_command(command: &str) -> Result<(String, String)> {
     let args = command
         .strip_prefix("__backfill_index ")
@@ -781,4 +786,73 @@ fn compute_next_fire_time(schedule: &str) -> Result<i64> {
     let next = next_occurrence(&cron_schedule, now)
         .ok_or_else(|| anyhow!("no next occurrence for cron schedule: {}", schedule))?;
     Ok(next.timestamp_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{DataType, IndexDef, TableSchema};
+
+    fn idx(name: &str, state: IndexState) -> IndexDef {
+        IndexDef {
+            name: name.to_string(),
+            id: 1,
+            columns: vec!["c1".to_string()],
+            unique: false,
+            method: None,
+            predicate: None,
+            expressions: vec![],
+            state,
+        }
+    }
+
+    #[test]
+    fn repair_incomplete_cic_states_repairs_building_and_writeonly() {
+        let mut schema = TableSchema {
+            name: "public.t".to_string(),
+            table_id: 1,
+            columns: vec![crate::types::ColumnDef {
+                name: "c1".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![
+                idx("i_ready", IndexState::Ready),
+                idx("i_building", IndexState::Building),
+                idx("i_invalid", IndexState::Invalid),
+                idx("i_write_only", IndexState::WriteOnly),
+            ],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: "postgres".to_string(),
+            from_alias: None,
+        };
+
+        let repaired = repair_incomplete_cic_states(&mut schema);
+        assert_eq!(repaired, 2);
+        assert_eq!(schema.indexes[0].state, IndexState::Ready);
+        assert_eq!(schema.indexes[1].state, IndexState::Invalid);
+        assert_eq!(schema.indexes[2].state, IndexState::Invalid);
+        assert_eq!(schema.indexes[3].state, IndexState::Invalid);
+    }
+
+    #[test]
+    fn repair_incomplete_cic_states_noop_when_no_transient_state() {
+        let mut schema = TableSchema {
+            indexes: vec![idx("i_ready", IndexState::Ready), idx("i_invalid", IndexState::Invalid)],
+            ..TableSchema::default()
+        };
+
+        let repaired = repair_incomplete_cic_states(&mut schema);
+        assert_eq!(repaired, 0);
+        assert_eq!(schema.indexes[0].state, IndexState::Ready);
+        assert_eq!(schema.indexes[1].state, IndexState::Invalid);
+    }
 }

@@ -39,4 +39,10 @@ SELECT count(*) || ':b_count' AS b_count_marker
 FROM cic_stale_test
 WHERE code = 'B';
 
+-- Real duplicate should still be rejected by unique index.
+INSERT INTO cic_stale_test(code) VALUES ('B') ON CONFLICT DO NOTHING;
+SELECT count(*) || ':b_count_after_conflict' AS b_count_after_conflict_marker
+FROM cic_stale_test
+WHERE code = 'B';
+
 DROP TABLE cic_stale_test;

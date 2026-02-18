@@ -153,10 +153,60 @@ pub(crate) async fn resolve_unique_index_conflict(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ColumnDef;
 
     #[test]
     fn duplicate_error_matcher_detects_known_message() {
         let e = anyhow::anyhow!("Duplicate entry for unique index");
         assert!(is_unique_duplicate_error(&e));
+    }
+
+    #[test]
+    fn pk_types_for_schema_defaults_to_uuid_without_pk() {
+        let schema = TableSchema {
+            columns: vec![ColumnDef {
+                name: "c".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            ..TableSchema::default()
+        };
+        assert_eq!(pk_types_for_schema(&schema), vec![DataType::Uuid]);
+    }
+
+    #[test]
+    fn pk_types_for_schema_uses_pk_indices_order() {
+        let schema = TableSchema {
+            columns: vec![
+                ColumnDef {
+                    name: "a".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "b".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            pk_indices: vec![1, 0],
+            ..TableSchema::default()
+        };
+        assert_eq!(
+            pk_types_for_schema(&schema),
+            vec![DataType::Text, DataType::Int32]
+        );
     }
 }
