@@ -462,4 +462,48 @@ mod tests {
         assert_eq!(cache.get_mod_count(1, 100), 0);
         assert_eq!(cache.get_mod_count(1, 200), 20);
     }
+
+    #[test]
+    fn test_bump_mod_count_multiple_small_increments() {
+        let cache = TableStatsCache::new();
+        for _ in 0..5 {
+            cache.bump_mod_count(1, 50, 1);
+        }
+        assert_eq!(cache.get_mod_count(1, 50), 5);
+    }
+
+    #[test]
+    fn test_needs_auto_analyze_large_table() {
+        let cache = TableStatsCache::new();
+        cache.update_estimate(1, 100, 10_000_000);
+        let threshold = 50;
+        let expected_trigger = 50 + 10_000_000 / 10;
+
+        cache.bump_mod_count(1, 100, expected_trigger);
+        assert!(!cache.needs_auto_analyze(1, 100, threshold));
+
+        cache.bump_mod_count(1, 100, 1);
+        assert!(cache.needs_auto_analyze(1, 100, threshold));
+    }
+
+    #[test]
+    fn test_mod_count_cross_database_isolation() {
+        let cache = TableStatsCache::new();
+        cache.bump_mod_count(1, 100, 10);
+        cache.bump_mod_count(2, 100, 20);
+
+        assert_eq!(cache.get_mod_count(1, 100), 10);
+        assert_eq!(cache.get_mod_count(2, 100), 20);
+
+        cache.reset_mod_count(1, 100);
+        assert_eq!(cache.get_mod_count(1, 100), 0);
+        assert_eq!(cache.get_mod_count(2, 100), 20);
+    }
+
+    #[test]
+    fn test_bump_estimate_without_prior_is_noop() {
+        let cache = TableStatsCache::new();
+        cache.bump_estimate(1, 999, 100);
+        assert_eq!(cache.get_estimate(1, 999), None);
+    }
 }

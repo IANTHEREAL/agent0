@@ -170,4 +170,45 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_parse_bool_true_variants() {
+        for input in &["1", "true", "t", "yes", "y", "on"] {
+            assert_eq!(parse_bool(input), Some(true), "input: {}", input);
+        }
+        for input in &[" TRUE ", " Yes ", " ON "] {
+            assert_eq!(parse_bool(input), Some(true), "trimmed input: {}", input);
+        }
+    }
+
+    #[test]
+    fn test_parse_bool_false_variants() {
+        for input in &["0", "false", "f", "no", "n", "off"] {
+            assert_eq!(parse_bool(input), Some(false), "input: {}", input);
+        }
+        for input in &[" FALSE ", " No ", " OFF "] {
+            assert_eq!(parse_bool(input), Some(false), "trimmed input: {}", input);
+        }
+    }
+
+    #[test]
+    fn test_parse_bool_invalid() {
+        for input in &["maybe", "", "2", "yep", "nope", "enabled"] {
+            assert_eq!(parse_bool(input), None, "input: {}", input);
+        }
+    }
+
+    #[test]
+    fn test_config_default_values() {
+        let cfg = WorkerConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.poll_ms, 60_000);
+        assert_eq!(cfg.max_concurrent_jobs, 32);
+        assert_eq!(cfg.statement_timeout_ms, 300_000);
+        assert_eq!(cfg.orphan_timeout_sec, 300);
+        assert_eq!(cfg.gc_batch_size, 100);
+        assert!(cfg.auto_analyze_enabled);
+        assert_eq!(cfg.auto_analyze_threshold, 50);
+        assert_eq!(cfg.system_keyspace, "_sys_worker");
+    }
 }

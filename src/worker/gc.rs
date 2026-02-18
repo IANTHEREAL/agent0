@@ -96,3 +96,39 @@ fn rand_jitter_secs(max_secs: u64) -> u64 {
         .unwrap_or(0);
     (seed % max_secs as u128) as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_orphan_timeout_calc() {
+        let now_ms: i64 = 1_700_000_000_000;
+        let orphan_timeout_sec: u64 = 300;
+        let timeout_ms = (orphan_timeout_sec as i64).saturating_mul(1000);
+        let cutoff = now_ms.saturating_sub(timeout_ms);
+
+        let old_claim = now_ms - 301_000;
+        assert!(old_claim < cutoff, "claim older than timeout should be detected as orphan");
+
+        let recent_claim = now_ms - 299_000;
+        assert!(recent_claim >= cutoff, "claim within timeout should NOT be orphaned");
+
+        let edge_claim = cutoff;
+        assert!(!(edge_claim < cutoff), "claim exactly at cutoff boundary is not orphaned");
+    }
+
+    #[test]
+    fn test_rand_jitter_secs_within_bounds() {
+        for max in [1u64, 10, 60, 120, 3600] {
+            let jitter = rand_jitter_secs(max);
+            assert!(jitter < max, "jitter {} should be < max {}", jitter, max);
+        }
+    }
+
+    #[test]
+    fn test_rand_jitter_secs_max_one() {
+        let jitter = rand_jitter_secs(1);
+        assert_eq!(jitter, 0, "jitter with max=1 must be 0");
+    }
+}

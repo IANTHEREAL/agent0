@@ -368,4 +368,68 @@ mod tests {
         assert_eq!(decoded.worker_id, "worker-1");
         assert_eq!(decoded.task_type, TaskType::AsyncTrigger);
     }
+
+    #[test]
+    fn test_task_queue_entry_default_schedule_is_none() {
+        let entry = TaskQueueEntry::new(
+            "ks".to_string(),
+            1,
+            10,
+            TaskType::BgSql,
+            "SELECT 1".to_string(),
+            "user".to_string(),
+            5,
+        );
+        assert_eq!(entry.schedule, None);
+    }
+
+    #[test]
+    fn test_task_registry_entry_multiple_bitmask_set() {
+        let mut entry = TaskRegistryEntry::new("ks".to_string(), 1);
+        entry.set_cron();
+        entry.set_bg_ddl();
+        assert!(entry.has_cron());
+        assert!(entry.has_bg_ddl());
+        assert!(!entry.has_bg_sql());
+        assert!(!entry.has_async_trigger());
+        assert!(!entry.has_auto_analyze());
+        assert!(!entry.is_empty());
+    }
+
+    #[test]
+    fn test_worker_claim_bincode_all_fields() {
+        let claim = WorkerClaim::new("host1:9999".to_string(), TaskType::AutoAnalyze);
+        let data = bincode::serialize(&claim).expect("serialize");
+        let decoded: WorkerClaim = bincode::deserialize(&data).expect("deserialize");
+
+        assert_eq!(decoded.worker_id, "host1:9999");
+        assert_eq!(decoded.claimed_at, claim.claimed_at);
+        assert_eq!(decoded.task_type, TaskType::AutoAnalyze);
+    }
+
+    #[test]
+    fn test_task_type_all_variants_roundtrip() {
+        let variants = vec![
+            TaskType::Cron,
+            TaskType::AsyncTrigger,
+            TaskType::AutoAnalyze,
+            TaskType::BgDdl,
+            TaskType::BgSql,
+        ];
+        for variant in variants {
+            let data = bincode::serialize(&variant).expect("serialize");
+            let decoded: TaskType = bincode::deserialize(&data).expect("deserialize");
+            assert_eq!(decoded, variant);
+        }
+    }
+
+    #[test]
+    fn test_index_state_all_variants_roundtrip() {
+        let variants = vec![IndexState::Ready, IndexState::Building, IndexState::Invalid];
+        for variant in variants {
+            let data = bincode::serialize(&variant).expect("serialize");
+            let decoded: IndexState = bincode::deserialize(&data).expect("deserialize");
+            assert_eq!(decoded, variant);
+        }
+    }
 }

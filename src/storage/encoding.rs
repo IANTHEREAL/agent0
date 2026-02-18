@@ -1673,4 +1673,51 @@ mod tests {
         let key_2 = encode_worker_claim_key("myapp", 42, 200, 5000);
         assert_ne!(key_1, key_2);
     }
+
+    #[test]
+    fn test_worker_registry_key_roundtrip_prefix() {
+        let key = encode_worker_registry_key("tenant_x", 7);
+        assert!(key.starts_with(b"_worker_registry_"));
+        let prefix = encode_worker_registry_prefix();
+        assert!(key.starts_with(&prefix));
+    }
+
+    #[test]
+    fn test_worker_claim_key_structure() {
+        let key = encode_worker_claim_key("demo", 10, 555, 9999);
+        assert!(key.starts_with(b"_worker_claim_"));
+        let prefix = encode_worker_claim_prefix();
+        assert!(key.starts_with(&prefix));
+    }
+
+    #[test]
+    fn test_worker_queue_key_same_time_same_priority_different_keyspace() {
+        let key_a = encode_worker_queue_key(5, 1000, "ks_alpha", 1, 1);
+        let key_b = encode_worker_queue_key(5, 1000, "ks_beta", 1, 1);
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn test_worker_bg_result_key_structure() {
+        let key = encode_worker_bg_result_key("myks", 3, 42);
+        assert!(key.starts_with(b"_worker_bg_result_"));
+        let ks_len_offset = WORKER_BG_RESULT_PREFIX.len();
+        let ks_len = u16::from_be_bytes([key[ks_len_offset], key[ks_len_offset + 1]]);
+        assert_eq!(ks_len, 4);
+    }
+
+    #[test]
+    fn test_worker_queue_scan_end_boundary() {
+        let scan_end = encode_worker_queue_scan_end(5, 2000);
+        let key_before = encode_worker_queue_key(5, 1999, "ks", 1, 1);
+        let key_at = encode_worker_queue_key(5, 2000, "ks", 1, 1);
+        assert!(
+            key_before < scan_end,
+            "key with earlier fire_time should be < scan_end"
+        );
+        assert!(
+            key_at >= scan_end,
+            "key at fire_time should be >= scan_end (scan_end is prefix)"
+        );
+    }
 }
