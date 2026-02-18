@@ -18,8 +18,8 @@ pub(crate) mod triggers;
 mod udt;
 mod user_function;
 
-pub use core::*;
 pub(crate) use bg_sql::{execute_bg_sql_function, is_bg_sql_function, try_execute_bg_sql_function};
+pub use core::*;
 pub(crate) use cron::{
     execute_cron_scalar_function, split_cron_scalar_function_name, try_execute_cron_scalar_function,
 };

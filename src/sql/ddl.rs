@@ -1627,12 +1627,14 @@ pub async fn backfill_index_by_name(
                 for pair in batch {
                     let key: &[u8] = pair.key().as_ref().into();
                     let pk_values = if schema.pk_indices.is_empty() {
-                        let pk_bytes = key.strip_prefix(data_key_prefix.as_slice()).ok_or_else(|| {
-                            anyhow!(
-                                "corrupted row key while backfilling index '{}'",
-                                index_name
-                            )
-                        })?;
+                        let pk_bytes =
+                            key.strip_prefix(data_key_prefix.as_slice())
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "corrupted row key while backfilling index '{}'",
+                                        index_name
+                                    )
+                                })?;
                         crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?
                     } else {
                         let mut row = crate::storage::deserialize_row(pair.value())?;
@@ -1674,12 +1676,14 @@ pub async fn backfill_index_by_name(
                 for pair in batch {
                     let key: &[u8] = pair.key().as_ref().into();
                     let pk_values = if schema.pk_indices.is_empty() {
-                        let pk_bytes = key.strip_prefix(data_key_prefix.as_slice()).ok_or_else(|| {
-                            anyhow!(
-                                "corrupted row key while backfilling index '{}'",
-                                index_name
-                            )
-                        })?;
+                        let pk_bytes =
+                            key.strip_prefix(data_key_prefix.as_slice())
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "corrupted row key while backfilling index '{}'",
+                                        index_name
+                                    )
+                                })?;
                         crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?
                     } else {
                         let mut row = crate::storage::deserialize_row(pair.value())?;

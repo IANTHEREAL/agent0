@@ -109,13 +109,22 @@ mod tests {
         let cutoff = now_ms.saturating_sub(timeout_ms);
 
         let old_claim = now_ms - 301_000;
-        assert!(old_claim < cutoff, "claim older than timeout should be detected as orphan");
+        assert!(
+            old_claim < cutoff,
+            "claim older than timeout should be detected as orphan"
+        );
 
         let recent_claim = now_ms - 299_000;
-        assert!(recent_claim >= cutoff, "claim within timeout should NOT be orphaned");
+        assert!(
+            recent_claim >= cutoff,
+            "claim within timeout should NOT be orphaned"
+        );
 
         let edge_claim = cutoff;
-        assert!(!(edge_claim < cutoff), "claim exactly at cutoff boundary is not orphaned");
+        assert!(
+            !(edge_claim < cutoff),
+            "claim exactly at cutoff boundary is not orphaned"
+        );
     }
 
     #[test]

@@ -46,10 +46,15 @@ pub(crate) async fn gc_keyspace(
     Ok(())
 }
 
-pub(crate) async fn gc_database(store: &Arc<TikvStore>, db_id: u64, config: &CronConfig) -> Result<()> {
+pub(crate) async fn gc_database(
+    store: &Arc<TikvStore>,
+    db_id: u64,
+    config: &CronConfig,
+) -> Result<()> {
     let now = now_ms();
-    let orphan_cutoff =
-        now.saturating_sub(i64::try_from(config.orphan_timeout_sec.saturating_mul(1000)).unwrap_or(i64::MAX));
+    let orphan_cutoff = now.saturating_sub(
+        i64::try_from(config.orphan_timeout_sec.saturating_mul(1000)).unwrap_or(i64::MAX),
+    );
     let retention_cutoff = now.saturating_sub(
         i64::try_from(
             config
@@ -67,7 +72,9 @@ pub(crate) async fn gc_database(store: &Arc<TikvStore>, db_id: u64, config: &Cro
             return Ok((0usize, 0usize));
         }
 
-        let runs = store.list_all_cron_runs(&mut txn, db_id, usize::MAX).await?;
+        let runs = store
+            .list_all_cron_runs(&mut txn, db_id, usize::MAX)
+            .await?;
         if runs.is_empty() {
             return Ok((0usize, 0usize));
         }
@@ -84,7 +91,8 @@ pub(crate) async fn gc_database(store: &Arc<TikvStore>, db_id: u64, config: &Cro
                 if let Some(start_ms) = run.start_time {
                     if start_ms < orphan_cutoff {
                         run.status = CronRunStatus::Failed;
-                        run.return_message = Some("orphan recovery: execution timed out".to_string());
+                        run.return_message =
+                            Some("orphan recovery: execution timed out".to_string());
                         run.end_time = Some(now);
                         recovered = recovered.saturating_add(1);
                     }
@@ -105,7 +113,9 @@ pub(crate) async fn gc_database(store: &Arc<TikvStore>, db_id: u64, config: &Cro
         }
 
         for job_id in job_ids {
-            store.delete_cron_runs_for_job(&mut txn, db_id, job_id).await?;
+            store
+                .delete_cron_runs_for_job(&mut txn, db_id, job_id)
+                .await?;
         }
 
         for kept_runs in keep_by_job.into_values() {

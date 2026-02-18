@@ -37,15 +37,42 @@ pub(crate) async fn execute_cron_scalar_function(
     };
 
     match unqualified_name.to_ascii_lowercase().as_str() {
-        "schedule" => {
-            Some(execute_schedule(store, txn, db_id, current_user, database_name, keyspace, args).await)
-        }
-        "unschedule" => {
-            Some(execute_unschedule(store, txn, db_id, current_user, is_superuser, keyspace, args).await)
-        }
-        "alter_job" => {
-            Some(execute_alter_job(store, txn, db_id, current_user, is_superuser, keyspace, args).await)
-        }
+        "schedule" => Some(
+            execute_schedule(
+                store,
+                txn,
+                db_id,
+                current_user,
+                database_name,
+                keyspace,
+                args,
+            )
+            .await,
+        ),
+        "unschedule" => Some(
+            execute_unschedule(
+                store,
+                txn,
+                db_id,
+                current_user,
+                is_superuser,
+                keyspace,
+                args,
+            )
+            .await,
+        ),
+        "alter_job" => Some(
+            execute_alter_job(
+                store,
+                txn,
+                db_id,
+                current_user,
+                is_superuser,
+                keyspace,
+                args,
+            )
+            .await,
+        ),
         "schedule_in_database" => Some(Err(anyhow!("cron.schedule_in_database is not supported"))),
         _ => None,
     }

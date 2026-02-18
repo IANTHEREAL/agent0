@@ -1,7 +1,7 @@
+use crate::cron::types::{CronRun, CronRunStatus};
 use crate::extensions::context::{with_context_opts, ExtensionContextOpts};
 use crate::observability;
 use crate::pool::TikvClientPool;
-use crate::cron::types::{CronRun, CronRunStatus};
 use crate::sql::ddl;
 use crate::sql::parse_sql;
 use crate::sql::Executor;
@@ -28,7 +28,11 @@ pub struct WorkerEngine {
 }
 
 impl WorkerEngine {
-    pub fn new(config: WorkerConfig, system_store: Arc<TikvStore>, pool: Arc<TikvClientPool>) -> Self {
+    pub fn new(
+        config: WorkerConfig,
+        system_store: Arc<TikvStore>,
+        pool: Arc<TikvClientPool>,
+    ) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_jobs));
         Self {
             config,
@@ -69,7 +73,10 @@ impl WorkerEngine {
             .await?;
         txn.commit().await?;
 
-        self.metrics.sample_tick(due_entries.len() as u64, self.active_jobs.load(Ordering::Relaxed));
+        self.metrics.sample_tick(
+            due_entries.len() as u64,
+            self.active_jobs.load(Ordering::Relaxed),
+        );
 
         if due_entries.is_empty() {
             return Ok(());
@@ -95,9 +102,15 @@ impl WorkerEngine {
             join_set.spawn(async move {
                 let _permit = permit;
                 active_jobs.fetch_add(1, Ordering::Relaxed);
-                let result =
-                    Self::claim_and_execute(&engine_system_store, &engine_pool, &engine_config, &engine_metrics, key, entry)
-                        .await;
+                let result = Self::claim_and_execute(
+                    &engine_system_store,
+                    &engine_pool,
+                    &engine_config,
+                    &engine_metrics,
+                    key,
+                    entry,
+                )
+                .await;
                 active_jobs.fetch_sub(1, Ordering::Relaxed);
 
                 if let Err(ref e) = result {

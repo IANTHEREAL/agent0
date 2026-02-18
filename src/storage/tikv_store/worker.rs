@@ -109,8 +109,7 @@ impl TikvStore {
             entry.db_id,
             entry.task_id,
         ));
-        let data =
-            bincode::serialize(entry).context("Failed to serialize worker queue entry")?;
+        let data = bincode::serialize(entry).context("Failed to serialize worker queue entry")?;
         txn_put(txn, key, data).await?;
         Ok(())
     }
@@ -146,11 +145,7 @@ impl TikvStore {
         Ok(results)
     }
 
-    pub async fn delete_worker_queue_entry(
-        &self,
-        txn: &mut Transaction,
-        key: &[u8],
-    ) -> Result<()> {
+    pub async fn delete_worker_queue_entry(&self, txn: &mut Transaction, key: &[u8]) -> Result<()> {
         txn_delete(txn, key.to_vec()).await?;
         Ok(())
     }
@@ -196,7 +191,12 @@ impl TikvStore {
         fire_time_min: i64,
         claim: &WorkerClaim,
     ) -> Result<bool> {
-        let key = self.key(&encode_worker_claim_key(keyspace, db_id, task_id, fire_time_min));
+        let key = self.key(&encode_worker_claim_key(
+            keyspace,
+            db_id,
+            task_id,
+            fire_time_min,
+        ));
         if txn.get(key.clone()).await?.is_some() {
             return Ok(false);
         }
@@ -217,7 +217,12 @@ impl TikvStore {
         task_id: i64,
         fire_time_min: i64,
     ) -> Result<()> {
-        let key = self.key(&encode_worker_claim_key(keyspace, db_id, task_id, fire_time_min));
+        let key = self.key(&encode_worker_claim_key(
+            keyspace,
+            db_id,
+            task_id,
+            fire_time_min,
+        ));
         txn_delete(txn, key).await?;
         Ok(())
     }
@@ -238,8 +243,8 @@ impl TikvStore {
             if !key.starts_with(&prefix) {
                 continue;
             }
-            let claim: WorkerClaim = bincode::deserialize(pair.value())
-                .context("Failed to deserialize worker claim")?;
+            let claim: WorkerClaim =
+                bincode::deserialize(pair.value()).context("Failed to deserialize worker claim")?;
             results.push((key.to_vec(), claim));
         }
         Ok(results)

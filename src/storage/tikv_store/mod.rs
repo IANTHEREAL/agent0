@@ -17,7 +17,6 @@ use tracing::{debug, info};
 // Submodules
 pub mod cron;
 mod database;
-pub mod worker;
 mod extensions;
 mod functions;
 mod indexes;
@@ -30,6 +29,7 @@ mod tables;
 mod triggers;
 mod types;
 mod views;
+pub mod worker;
 
 // Import helper functions for tests
 #[cfg(test)]
@@ -135,7 +135,10 @@ impl TikvStore {
     /// Unlike `new_with_keyspace()`, this does NOT bootstrap databases — it's raw KV access only.
     /// Used by the unified worker engine for cross-tenant task management.
     pub async fn new_system(pd_endpoints: Vec<String>, keyspace: &str) -> Result<Self> {
-        info!("Connecting to TiKV at {:?} for system keyspace", pd_endpoints);
+        info!(
+            "Connecting to TiKV at {:?} for system keyspace",
+            pd_endpoints
+        );
         let mut config = Config::default().with_keyspace(keyspace);
 
         // Enable TLS for PD/TiKV connection if cert files are provided

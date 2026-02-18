@@ -1127,6 +1127,16 @@ fn register_builtin_functions(r: &mut FunctionRegistry) {
         FunctionSignature::fixed(DataType::Int64).with_args(0, Some(0)),
     );
 
+    // Background SQL functions (worker engine)
+    r.register(
+        "PG_BACKGROUND_LAUNCH",
+        FunctionSignature::fixed(DataType::Int64).with_args(1, Some(1)),
+    );
+    r.register(
+        "PG_BACKGROUND_RESULT",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
+    );
+
     // Full-text search functions
     r.register(
         "TO_TSVECTOR",

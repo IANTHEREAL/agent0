@@ -734,17 +734,22 @@ impl Executor {
                     search_path,
                 )
                 .await?
-                .ok_or_else(|| anyhow!("Materialized view '{}' does not exist", view_name_for_error))?;
+                .ok_or_else(|| {
+                    anyhow!("Materialized view '{}' does not exist", view_name_for_error)
+                })?;
                 let view_full_name = resolved.full;
 
                 // Enqueue BgDdl task
                 if let Some(system_store) = crate::worker::get_system_store() {
                     let keyspace = self.tenant_keyspace().to_string();
-                    let username = session.current_user().map(|u| u.to_string()).unwrap_or_default();
-                    
+                    let username = session
+                        .current_user()
+                        .map(|u| u.to_string())
+                        .unwrap_or_default();
+
                     // Create command: REFRESH MATERIALIZED VIEW view_name (without CONCURRENTLY)
                     let command = format!("REFRESH MATERIALIZED VIEW {}", view_full_name);
-                    
+
                     let entry = crate::worker::types::TaskQueueEntry::new(
                         keyspace.clone(),
                         db_id,
@@ -754,14 +759,20 @@ impl Executor {
                         username,
                         128, // default priority
                     );
-                    
+
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     let mut sys_txn = system_store.begin().await?;
                     system_store
                         .put_worker_queue_entry(&mut sys_txn, &entry, now_ms)
                         .await?;
                     system_store
-                        .update_registry_task_types(&mut sys_txn, &keyspace, db_id, crate::worker::types::TASK_TYPE_BG_DDL, 0)
+                        .update_registry_task_types(
+                            &mut sys_txn,
+                            &keyspace,
+                            db_id,
+                            crate::worker::types::TASK_TYPE_BG_DDL,
+                            0,
+                        )
                         .await?;
                     sys_txn.commit().await?;
                 }

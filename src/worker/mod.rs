@@ -1,13 +1,13 @@
-pub mod types;
 pub mod config;
 pub mod engine;
 pub mod gc;
 pub mod metrics;
+pub mod types;
 
 use crate::storage::TikvStore;
+use anyhow::Result;
 use config::WorkerConfig;
 use std::sync::{Arc, OnceLock};
-use anyhow::Result;
 use tracing::info;
 
 static SYSTEM_STORE: OnceLock<Arc<TikvStore>> = OnceLock::new();
@@ -33,8 +33,11 @@ pub async fn init_system_store(
         info!("Worker engine disabled, skipping system store initialization");
         return Ok(None);
     }
-    
-    info!("Initializing system store for keyspace: {}", config.system_keyspace);
+
+    info!(
+        "Initializing system store for keyspace: {}",
+        config.system_keyspace
+    );
     let store = TikvStore::new_system(pd_endpoints, &config.system_keyspace).await?;
     let store = Arc::new(store);
     info!("System store initialized successfully");
