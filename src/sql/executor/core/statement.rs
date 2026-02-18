@@ -1162,9 +1162,15 @@ impl Executor {
                             }
                         }
                     }
-                    {
-                        let physical = crate::sql::optimizer::optimize(&analyzed, &planning_ctx);
-                        explain::physical_plan_to_plan_node(&physical)
+                    match crate::sql::optimizer::optimize(&analyzed, &planning_ctx) {
+                        Ok(physical) => {
+                            explain::physical_plan_to_plan_node(&physical)
+                        }
+                        Err(_) => {
+                            // Optimizer failed (e.g. unsupported aggregate rewrite) —
+                            // fall back to AST-based EXPLAIN.
+                            explain::generate_plan(statement, &schema_lookup, &row_count_lookup)
+                        }
                     }
                 }
                 Err(_) => {

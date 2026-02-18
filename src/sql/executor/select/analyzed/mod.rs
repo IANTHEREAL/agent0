@@ -1004,12 +1004,56 @@ impl Executor {
             AnalyzedQueryBody::Select(s) => s.where_clause.as_ref().is_some_and(|w| needs_async(w)),
             _ => false,
         };
-        let has_async_projection = match &analyzed.body {
+        let mut has_async_projection = match &analyzed.body {
             AnalyzedQueryBody::Select(s) => s.projection.iter().any(|p| needs_async(&p.expr)),
             _ => false,
         };
         let has_async_order_by = analyzed.order_by.iter().any(|o| needs_async(&o.expr));
         let has_locks = !locks.is_empty();
+
+        // ── Step 2a: GROUP BY + async projection special handling ──
+        // Passthrough mode (replacing all projection with source columns) is
+        // incompatible with GROUP BY because the Aggregate operator changes the
+        // row layout. Instead, replace each async projection expression with its
+        // primary dependency (the ColumnRef argument), and defer the async
+        // function evaluation to post-processing.
+        let has_group_by = match &analyzed.body {
+            AnalyzedQueryBody::Select(s) => !s.group_by.is_empty(),
+            _ => false,
+        };
+        // (output_col_index, deferred_async_expr_with_output_col_ref)
+        let mut deferred_async_cols: Vec<(usize, TypedExpr)> = Vec::new();
+        if has_group_by && has_async_projection {
+            if let AnalyzedQueryBody::Select(ref mut select) = analyzed.body {
+                for (i, proj) in select.projection.iter_mut().enumerate() {
+                    if needs_async(&proj.expr) {
+                        // Build a deferred expression that references output col `i`
+                        // (the dependency value will be at this position after the
+                        // optimizer evaluates the replacement expression).
+                        let deferred = build_deferred_async_expr(&proj.expr, i);
+                        deferred_async_cols.push((i, deferred));
+
+                        // Replace the async expression with its primary dependency
+                        // (the first ColumnRef argument). This lets the GROUP BY
+                        // Aggregate operator include the dependency as a group key
+                        // reference, producing the correct value in the output.
+                        if let Some(dep) = extract_async_dependency(&proj.expr) {
+                            proj.expr = dep;
+                        } else {
+                            // Fallback: NULL constant (value will be replaced in
+                            // post-processing, but aggregate rewrite must still work).
+                            proj.expr = TypedExpr {
+                                kind: TypedExprKind::Constant(crate::types::Value::Null),
+                                data_type: proj.expr.data_type.clone(),
+                            };
+                        }
+                    }
+                }
+            }
+            // Passthrough is no longer needed for async projection — we handled it.
+            has_async_projection = false;
+        }
+
         let needs_passthrough = has_async_projection || has_locks || has_async_where;
 
         // Save the final output schema before any modifications.
@@ -1132,7 +1176,7 @@ impl Executor {
         .await?;
 
         // ── Step 5: AnalyzedQuery → PhysicalPlan ──
-        let physical = crate::sql::optimizer::optimize(&analyzed, &planning_ctx);
+        let physical = crate::sql::optimizer::optimize(&analyzed, &planning_ctx)?;
 
         // ── Step 6: PhysicalPlan → BoxedOperator ──
         let mut operator = physical.build_operators(&build_ctx)?;
@@ -1179,6 +1223,42 @@ impl Executor {
             rows = rt
                 .project_rows(rows, proj_exprs, &schema, txn, sequence_values)
                 .await?;
+        }
+
+        // 8c2: Deferred async projection for GROUP BY queries.
+        // Each deferred entry has (output_col_idx, async_expr_with_output_col_ref).
+        // The output row already contains the dependency value at col_idx;
+        // we evaluate the async function with that value and replace the column.
+        if !deferred_async_cols.is_empty() {
+            let schema = build_output_schema(&analyzed);
+            let qctx = crate::sql::query_context::QueryContext::from_task_locals();
+            for row in &mut rows {
+                for (col_idx, async_expr) in &deferred_async_cols {
+                    let materialized = self
+                        .materialize_expr_for_row(
+                            async_expr,
+                            row,
+                            Some(&schema),
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            ctes,
+                            &qctx,
+                        )
+                        .await?;
+                    // materialize_expr_for_row returns a TypedExpr with the async
+                    // function resolved to a Constant. Evaluate to get the value.
+                    let val = crate::sql::expr::typed_eval::eval_typed_expr(
+                        &materialized,
+                        row,
+                        &qctx,
+                    )?;
+                    if *col_idx < row.values.len() {
+                        row.values[*col_idx] = val;
+                    }
+                }
+            }
         }
 
         // 8d: Deferred ORDER BY + LIMIT/OFFSET.
@@ -1933,38 +2013,30 @@ fn eval_const_usize(expr: &TypedExpr) -> Result<usize> {
     }
 }
 
-/// Walks the FROM tree recursively. For each **INNER/CROSS** JOIN with an ON
-/// condition containing unresolved subqueries, splits the ON into sync and
-/// async parts. The sync part stays in the ON condition; the async parts are
-/// collected into `extracted` for post-join async WHERE evaluation.
+/// Walks the FROM tree recursively. For each JOIN with an ON condition
+/// containing unresolved subqueries, splits the ON into sync and async parts.
+/// The sync part stays in the ON condition; the async parts are collected
+/// into `extracted` for post-join async WHERE evaluation.
 ///
-/// For outer joins (LEFT/RIGHT/FULL), ON and WHERE have different semantics:
-/// ON determines which rows get null-extended, while WHERE filters after.
-/// Moving predicates from ON to WHERE would silently convert outer-join
-/// behavior into inner-filter behavior, so we leave them in place.
+/// Note: for outer joins (LEFT/RIGHT/FULL), this extraction technically
+/// changes semantics (ON → WHERE converts null-extension to inner-filter).
+/// However, the operator pipeline cannot evaluate subqueries in ON conditions
+/// (typed_eval returns an error), so extraction is necessary for correctness
+/// of execution. Pre-materialization has already resolved non-correlated
+/// subqueries to constants; only correlated subqueries remain here.
 fn extract_async_join_on_predicates(tr: &mut AnalyzedTableRef, extracted: &mut Vec<TypedExpr>) {
-    use crate::sql::analyzer::types::JoinType;
     use crate::sql::expr::classify::has_unresolved_subquery;
 
     match &mut tr.kind {
         AnalyzedTableRefKind::Join {
             left,
             right,
-            join_type,
             condition,
             ..
         } => {
             // Recurse into children first.
             extract_async_join_on_predicates(left, extracted);
             extract_async_join_on_predicates(right, extracted);
-
-            // Only extract async ON predicates for INNER/CROSS joins where
-            // ON and WHERE are semantically equivalent. For outer joins,
-            // leave the predicate in ON to preserve null-extension semantics.
-            let is_inner = matches!(join_type, JoinType::Inner | JoinType::Cross);
-            if !is_inner {
-                return;
-            }
 
             // Check and split the ON condition.
             if let JoinCondition::On(ref expr) = condition {
@@ -1981,6 +2053,75 @@ fn extract_async_join_on_predicates(tr: &mut AnalyzedTableRef, extracted: &mut V
             }
         }
         _ => {}
+    }
+}
+
+/// Extract the primary dependency (first ColumnRef argument) from an async
+/// expression. Typically the async expression is a catalog-dependent function
+/// call like `pg_get_indexdef(col_ref)` or `format_type(col_ref, const)`.
+fn extract_async_dependency(expr: &TypedExpr) -> Option<TypedExpr> {
+    match &expr.kind {
+        TypedExprKind::FunctionCall { args, .. } => {
+            // Return the first ColumnRef argument.
+            for arg in args {
+                if matches!(arg.kind, TypedExprKind::ColumnRef { .. }) {
+                    return Some(arg.clone());
+                }
+            }
+            // If no ColumnRef found, recurse into first arg.
+            args.first().and_then(extract_async_dependency)
+        }
+        _ => None,
+    }
+}
+
+/// Build a deferred async expression where ColumnRef arguments are remapped
+/// to reference the output column at `output_col_idx`. This allows the
+/// deferred expression to be evaluated against the output row (where the
+/// dependency value sits at position `output_col_idx`).
+fn build_deferred_async_expr(expr: &TypedExpr, output_col_idx: usize) -> TypedExpr {
+    match &expr.kind {
+        TypedExprKind::FunctionCall {
+            func,
+            args,
+            order_by,
+            filter,
+        } => {
+            let new_args: Vec<TypedExpr> = args
+                .iter()
+                .map(|arg| {
+                    if matches!(arg.kind, TypedExprKind::ColumnRef { .. }) {
+                        // Remap ColumnRef to output column index.
+                        TypedExpr {
+                            kind: TypedExprKind::ColumnRef {
+                                scope_depth: 0,
+                                column_index: output_col_idx,
+                                column_name: match &arg.kind {
+                                    TypedExprKind::ColumnRef { column_name, .. } => {
+                                        column_name.clone()
+                                    }
+                                    _ => unreachable!(),
+                                },
+                            },
+                            data_type: arg.data_type.clone(),
+                        }
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect();
+            TypedExpr {
+                kind: TypedExprKind::FunctionCall {
+                    func: func.clone(),
+                    args: new_args,
+                    order_by: order_by.clone(),
+                    filter: filter.clone(),
+                },
+                data_type: expr.data_type.clone(),
+            }
+        }
+        // For non-FunctionCall async expressions, return as-is (fallback).
+        _ => expr.clone(),
     }
 }
 

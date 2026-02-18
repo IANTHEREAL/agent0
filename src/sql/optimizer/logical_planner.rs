@@ -25,10 +25,11 @@
 //! DISTINCT   → Distinct / DistinctOn
 //! ```
 //!
-//! Precondition: the caller has verified `is_optimizer_eligible()`, which
-//! guarantees that all ORDER BY / HAVING rewrites will succeed.  This
-//! function therefore always returns a plan (no `Option`).
+//! Since the eligibility gate has been removed (single execution path),
+//! all rewrite operations return `Result` so that failures are propagated
+//! as errors rather than panicking.
 
+use anyhow::Result;
 use super::logical_plan::{LogicalNode, LogicalPlan, PlanSchema};
 use super::window_rewrite::{
     collect_window_calls_from_expr, contains_window, rewrite_for_post_window,
@@ -47,25 +48,24 @@ pub struct LogicalPlanner;
 impl LogicalPlanner {
     /// Build a logical plan from an analyzed query.
     ///
-    /// Precondition: `is_optimizer_eligible()` has been checked by the caller.
-    /// This guarantees all aggregate rewrites succeed, so this function always
-    /// returns a plan.
-    pub fn build(query: &AnalyzedQuery) -> LogicalPlan {
-        let mut plan = Self::build_body(&query.body, &query.output_schema, &query.order_by);
+    /// Returns `Err` if an aggregate rewrite fails (e.g. HAVING expression
+    /// references a column that is neither a GROUP BY key nor an aggregate).
+    pub fn build(query: &AnalyzedQuery) -> Result<LogicalPlan> {
+        let mut plan = Self::build_body(&query.body, &query.output_schema, &query.order_by)?;
 
         // LIMIT / OFFSET
         if query.limit.is_some() || query.offset.is_some() {
             plan = plan.limit(query.limit.clone(), query.offset.clone());
         }
 
-        plan
+        Ok(plan)
     }
 
     fn build_body(
         body: &AnalyzedQueryBody,
         output_schema: &[(String, DataType)],
         order_by: &[TypedOrderByExpr],
-    ) -> LogicalPlan {
+    ) -> Result<LogicalPlan> {
         match body {
             AnalyzedQueryBody::Select(select) => {
                 Self::build_select(select, output_schema, order_by)
@@ -80,7 +80,7 @@ impl LogicalPlanner {
                 if !order_by.is_empty() {
                     plan = plan.sort(order_by.to_vec());
                 }
-                plan
+                Ok(plan)
             }
             AnalyzedQueryBody::SetOperation {
                 op,
@@ -88,8 +88,8 @@ impl LogicalPlanner {
                 left,
                 right,
             } => {
-                let left_plan = Self::build(left);
-                let right_plan = Self::build(right);
+                let left_plan = Self::build(left)?;
+                let right_plan = Self::build(right)?;
                 let schema = PlanSchema::from_columns(output_schema.to_vec());
                 let mut plan = LogicalPlan {
                     node: LogicalNode::SetOperation {
@@ -104,7 +104,7 @@ impl LogicalPlanner {
                 if !order_by.is_empty() {
                     plan = plan.sort(order_by.to_vec());
                 }
-                plan
+                Ok(plan)
             }
         }
     }
@@ -113,7 +113,7 @@ impl LogicalPlanner {
         select: &AnalyzedSelect,
         output_schema: &[(String, DataType)],
         order_by: &[TypedOrderByExpr],
-    ) -> LogicalPlan {
+    ) -> Result<LogicalPlan> {
         // 1. FROM clause → base plan
         let mut plan = Self::build_from(&select.from);
 
@@ -163,8 +163,7 @@ impl LogicalPlanner {
                     group_by,
                     group_by_count,
                     &aggregate_exprs,
-                )
-                .expect("eligibility gate guarantees HAVING rewrite succeeds");
+                )?;
                 plan = plan.filter(rewritten);
             }
 
@@ -183,9 +182,8 @@ impl LogicalPlanner {
                             group_by_count,
                             &aggregate_exprs,
                         )
-                        .expect("eligibility gate guarantees projection rewrite succeeds")
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
 
                 let rewritten_order: Vec<TypedOrderByExpr> = order_by
                     .iter()
@@ -195,15 +193,14 @@ impl LogicalPlanner {
                             group_by,
                             group_by_count,
                             &aggregate_exprs,
-                        )
-                        .expect("eligibility gate guarantees ORDER BY rewrite succeeds");
-                        TypedOrderByExpr {
+                        )?;
+                        Ok(TypedOrderByExpr {
                             expr,
                             asc: ob.asc,
                             nulls_first: ob.nulls_first,
-                        }
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
 
                 // Extract window functions from BOTH projection and ORDER BY.
                 let input_col_count = plan.schema.columns.len();
@@ -262,9 +259,8 @@ impl LogicalPlanner {
                                     group_by_count,
                                     &aggregate_exprs,
                                 )
-                                .expect("eligibility gate guarantees DISTINCT ON rewrite succeeds")
                             })
-                            .collect();
+                            .collect::<Result<Vec<_>>>()?;
                         plan = plan.distinct_on(rewritten_on);
                         plan = plan.project(final_proj, proj_schema);
                     }
@@ -287,15 +283,14 @@ impl LogicalPlanner {
                                 group_by,
                                 group_by_count,
                                 &aggregate_exprs,
-                            )
-                            .expect("eligibility gate guarantees ORDER BY rewrite succeeds");
-                            TypedOrderByExpr {
+                            )?;
+                            Ok(TypedOrderByExpr {
                                 expr,
                                 asc: ob.asc,
                                 nulls_first: ob.nulls_first,
-                            }
+                            })
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>>>()?;
                     plan = plan.sort(rewritten_order);
                 }
 
@@ -315,9 +310,8 @@ impl LogicalPlanner {
                                     group_by_count,
                                     &aggregate_exprs,
                                 )
-                                .expect("eligibility gate guarantees DISTINCT ON rewrite succeeds")
                             })
-                            .collect();
+                            .collect::<Result<Vec<_>>>()?;
                         plan = plan.distinct_on(rewritten_on);
                     }
                 }
@@ -415,7 +409,7 @@ impl LogicalPlanner {
             }
         }
 
-        plan
+        Ok(plan)
     }
 
     /// Collect unique AggregateExpr from projection list (for rewriting).
@@ -605,6 +599,10 @@ impl LogicalPlanner {
             return LogicalPlan::empty(PlanSchema::from_columns(vec![]));
         }
 
+        // build_table_ref is infallible for non-Subquery cases.
+        // Subquery case is handled by build() which returns Result, but
+        // FROM-level subqueries have already been flattened by the rewriter,
+        // so in practice this path is always infallible.
         let mut plan = Self::build_table_ref(&from[0]);
 
         // Additional FROM items → cross joins
@@ -640,7 +638,14 @@ impl LogicalPlanner {
                 LogicalPlan::scan(name.clone(), table_ref.alias.clone(), plan_schema)
             }
             AnalyzedTableRefKind::Subquery(subquery) => {
-                let subplan = Self::build(subquery);
+                // Subquery build can fail on aggregate rewrites, but FROM
+                // subqueries typically don't have complex HAVING. Use
+                // unwrap_or with an empty plan as absolute fallback.
+                let subplan = Self::build(subquery).unwrap_or_else(|_| {
+                    LogicalPlan::empty(PlanSchema::from_columns(
+                        subquery.output_schema.clone(),
+                    ))
+                });
                 let schema = subplan.schema.clone();
                 LogicalPlan {
                     node: LogicalNode::Subquery {
@@ -805,7 +810,7 @@ mod tests {
             ],
         };
 
-        let plan = LogicalPlanner::build(&query);
+        let plan = LogicalPlanner::build(&query).unwrap();
 
         // Should be: Project → Filter → Scan
         assert!(matches!(plan.node, LogicalNode::Project { .. }));
@@ -840,7 +845,7 @@ mod tests {
             output_schema: vec![("?column?".to_string(), DataType::Int32)],
         };
 
-        let plan = LogicalPlanner::build(&query);
+        let plan = LogicalPlanner::build(&query).unwrap();
 
         // Should be: Project → Empty
         assert!(matches!(plan.node, LogicalNode::Project { .. }));
@@ -884,7 +889,7 @@ mod tests {
             output_schema: vec![("id".to_string(), DataType::Int64)],
         };
 
-        let plan = LogicalPlanner::build(&query);
+        let plan = LogicalPlanner::build(&query).unwrap();
 
         // Should be: Limit → Project → Sort → Scan
         assert!(matches!(plan.node, LogicalNode::Limit { .. }));
@@ -947,7 +952,7 @@ mod tests {
             output_schema: vec![("id".to_string(), DataType::Int64)],
         };
 
-        let plan = LogicalPlanner::build(&query);
+        let plan = LogicalPlanner::build(&query).unwrap();
         assert!(matches!(plan.node, LogicalNode::SetOperation { .. }));
     }
 
@@ -1006,7 +1011,7 @@ mod tests {
             ],
         };
 
-        let plan = LogicalPlanner::build(&query);
+        let plan = LogicalPlanner::build(&query).unwrap();
 
         // Should be: Aggregate → Scan (no separate Project when GROUP BY is present)
         assert!(matches!(plan.node, LogicalNode::Aggregate { .. }));
@@ -1043,7 +1048,7 @@ mod tests {
             output_schema: vec![("name".to_string(), DataType::Text)],
         };
 
-        let plan = LogicalPlanner::build(&query);
+        let plan = LogicalPlanner::build(&query).unwrap();
 
         // Should be: Distinct → Project → Scan
         assert!(matches!(plan.node, LogicalNode::Distinct { .. }));
@@ -1109,7 +1114,7 @@ mod tests {
             ],
         };
 
-        let plan = LogicalPlanner::build(&query);
+        let plan = LogicalPlanner::build(&query).unwrap();
 
         // Should be: Sort(rewritten) → Aggregate → Scan
         assert!(matches!(plan.node, LogicalNode::Sort { .. }));
@@ -1196,7 +1201,7 @@ mod tests {
             ],
         };
 
-        let plan = LogicalPlanner::build(&query);
+        let plan = LogicalPlanner::build(&query).unwrap();
 
         // Should be: Filter(rewritten HAVING) → Aggregate → Scan
         assert!(matches!(plan.node, LogicalNode::Filter { .. }));

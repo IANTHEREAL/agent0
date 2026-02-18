@@ -999,7 +999,7 @@ mod tests {
             output_schema: vec![("id".to_string(), DataType::Int64)],
         };
 
-        let logical = LogicalPlanner::build(&query);
+        let logical = LogicalPlanner::build(&query).unwrap();
         let physical = PhysicalPlanner::plan(&logical, &ctx);
 
         // Scan should have 5000 rows (from stats)
@@ -1041,7 +1041,7 @@ mod tests {
             output_schema: vec![("id".to_string(), DataType::Int64)],
         };
 
-        let logical = LogicalPlanner::build(&query);
+        let logical = LogicalPlanner::build(&query).unwrap();
         let physical = PhysicalPlanner::plan(&logical, &PlanningContext::empty());
 
         assert!(matches!(physical.node, PhysicalNode::Project { .. }));
@@ -1085,7 +1085,7 @@ mod tests {
             output_schema: vec![("id".to_string(), DataType::Int64)],
         };
 
-        let logical = LogicalPlanner::build(&query);
+        let logical = LogicalPlanner::build(&query).unwrap();
         let physical = PhysicalPlanner::plan(&logical, &PlanningContext::empty());
 
         fn has_topn(plan: &PhysicalPlan) -> bool {
@@ -1155,7 +1155,7 @@ mod tests {
             ],
         };
 
-        let logical = LogicalPlanner::build(&query);
+        let logical = LogicalPlanner::build(&query).unwrap();
         let physical = PhysicalPlanner::plan(&logical, &PlanningContext::empty());
 
         assert!(matches!(physical.node, PhysicalNode::HashAggregate { .. }));

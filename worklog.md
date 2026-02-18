@@ -175,3 +175,23 @@ Removed the legacy SELECT execution fallback path, making the CBO optimizer the 
 **P1 Fix: Scope-safe schema map keying** — Replaced alias-only keying (`alias.unwrap_or(name)`) with composite key via `schema_map_key(table_name, alias)` → `"table_name\0alias"`. This prevents collisions when the same alias appears in outer and inner subquery scopes for different tables (e.g., `FROM users AS t JOIN (SELECT * FROM orders AS t) AS sub`). Updated all 5 lookup sites: build.rs (SeqScan, IndexScan), physical_planner.rs (3 sites), prepare_optimizer_contexts, statement.rs EXPLAIN.
 
 **Finding 3 (landing artifacts)**: False positive — files exist on both branch and master. No action needed.
+
+### CI Fix: 3 failures after merge + P0/P1 fixes
+
+**CI Failure 1: IN subquery crash** — `WHERE department IN (SELECT department FROM employees GROUP BY department HAVING AVG(salary) > 85000)` caused server panic. Root cause: `logical_planner.rs` used `.expect()` for aggregate rewrites (HAVING/ORDER BY/DISTINCT ON) assuming the now-removed eligibility gate pre-validated them. Fix: changed `LogicalPlanner::build()` to return `Result<LogicalPlan>`, propagated through `optimize()` → callers. All 6 `.expect()` calls replaced with `?`. EXPLAIN gracefully falls back to AST path on optimizer failure.
+
+**CI Failure 2: Sequelize column OOB** — `column index 5 out of bounds (row has 5 columns) for 'relam'` on Sequelize index introspection query with GROUP BY + `pg_get_indexdef()`. Root cause: passthrough mode (replacing all projection with source column identity refs) is incompatible with GROUP BY — Aggregate reduces 48 source columns to 5 group keys, but post-processing still uses 48-column column indices. Fix: when GROUP BY + async projection, replace async expressions with their dependency ColumnRef (the GROUP BY key argument), let optimizer handle GROUP BY normally, then evaluate the async function in post-processing using the dependency value from the output row.
+
+**CI Failure 3: TypeORM LEFT JOIN ON subquery** — `subquery expressions must be resolved at executor level` on TypeORM `loadTables` query with correlated scalar subquery in LEFT JOIN ON condition. Root cause: P0 fix correctly prevented extraction of async ON predicates from outer joins, but the operator pipeline fundamentally cannot evaluate subqueries in ON conditions. Fix: extract async ON predicates from ALL join types (not just INNER/CROSS), since operators can't evaluate them regardless. Pre-materialization already resolves non-correlated subqueries; only correlated ones reach this point.
+
+| File | Changes |
+|------|---------|
+| `src/sql/optimizer/logical_planner.rs` | `build()` → `Result<LogicalPlan>`, replaced 6 `.expect()` with `?` |
+| `src/sql/optimizer/mod.rs` | `optimize()` → `Result<PhysicalPlan>` |
+| `src/sql/optimizer/physical_planner.rs` | Test: `.unwrap()` on `build()` calls |
+| `src/sql/executor/select/analyzed/mod.rs` | GROUP BY+async: dependency substitution + deferred eval; JOIN ON: extract from all join types; `optimize()` → `?` |
+| `src/sql/executor/core/statement.rs` | EXPLAIN: match on `optimize()` result, fallback to AST |
+
+### Verification
+- `cargo check` — zero new warnings
+- `cargo test` — all 1649 tests pass

@@ -106,18 +106,19 @@ fn collect_join_tree_refs<'a>(
 
 /// Single optimizer entrypoint: AnalyzedQuery → PhysicalPlan.
 ///
-/// Precondition: the caller has verified `is_optimizer_eligible()`.
-/// The eligibility gate guarantees that all expression rewrites (aggregate
-/// ORDER BY / HAVING) will succeed, so this function always returns a plan.
+/// Returns `Err` if the logical planner cannot build a valid plan (e.g.
+/// aggregate rewrite failure for unsupported HAVING / ORDER BY patterns).
 ///
 /// Execution (`execute_via_optimizer`) and EXPLAIN (`statement.rs`) both call
-/// this function when `use_optimizer` is on and the query is eligible, ensuring
-/// they produce identical plans — no drift.
-pub fn optimize(analyzed: &AnalyzedQuery, planning_ctx: &PlanningContext) -> PhysicalPlan {
+/// this function, ensuring they produce identical plans — no drift.
+pub fn optimize(
+    analyzed: &AnalyzedQuery,
+    planning_ctx: &PlanningContext,
+) -> anyhow::Result<PhysicalPlan> {
     // Step 1: AnalyzedQuery → LogicalPlan
-    let logical = LogicalPlanner::build(analyzed);
+    let logical = LogicalPlanner::build(analyzed)?;
     // Step 2: Apply rewrite rules (predicate pushdown, etc.)
     let optimized = rewrite::apply_rewrites(logical);
     // Step 3: LogicalPlan → PhysicalPlan (cost-based)
-    PhysicalPlanner::plan(&optimized, planning_ctx)
+    Ok(PhysicalPlanner::plan(&optimized, planning_ctx))
 }
