@@ -115,6 +115,12 @@ impl TikvStore {
         Ok(())
     }
 
+    /// Scan all due queue entries across all priorities (0-255) up to the given time.
+    ///
+    /// Returns entries ordered by priority (lower value = higher priority sorts first),
+    /// then by fire_time (earlier times sort first). This single range scan covers all
+    /// priority levels in one pass, ensuring higher-priority tasks are processed before
+    /// lower-priority ones regardless of fire_time.
     pub async fn scan_due_queue_entries(
         &self,
         txn: &mut Transaction,
@@ -237,5 +243,38 @@ impl TikvStore {
             results.push((key.to_vec(), claim));
         }
         Ok(results)
+    }
+
+    // ========================================================================
+    // Background SQL result methods
+    // ========================================================================
+
+    pub async fn put_bg_result(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+        task_id: i64,
+        result_text: &str,
+    ) -> Result<()> {
+        let key = self.key(&encode_worker_bg_result_key(keyspace, db_id, task_id));
+        txn_put(txn, key, result_text.as_bytes().to_vec()).await?;
+        Ok(())
+    }
+
+    pub async fn get_bg_result(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+        task_id: i64,
+    ) -> Result<Option<String>> {
+        let key = self.key(&encode_worker_bg_result_key(keyspace, db_id, task_id));
+        match txn.get(key).await? {
+            Some(data) => Ok(Some(
+                String::from_utf8(data).context("Failed to decode bg result as UTF-8")?,
+            )),
+            None => Ok(None),
+        }
     }
 }

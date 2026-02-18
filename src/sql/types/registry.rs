@@ -1270,4 +1270,14 @@ fn register_builtin_functions(r: &mut FunctionRegistry) {
         "FS9_MTIME",
         FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
     );
+
+    // Background SQL functions
+    r.register(
+        "PG_BACKGROUND_LAUNCH",
+        FunctionSignature::fixed(DataType::Int64).with_args(1, Some(1)),
+    );
+    r.register(
+        "PG_BACKGROUND_RESULT",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
+    );
 }

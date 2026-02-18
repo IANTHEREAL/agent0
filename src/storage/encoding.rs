@@ -67,6 +67,7 @@ const DB_SYS_CRON_CLAIM_PREFIX_V2: &[u8] = b"sys_cron_claim_";
 const WORKER_REGISTRY_PREFIX: &[u8] = b"_worker_registry_";
 const WORKER_QUEUE_PREFIX: &[u8] = b"_worker_queue_";
 const WORKER_CLAIM_PREFIX: &[u8] = b"_worker_claim_";
+const WORKER_BG_RESULT_PREFIX: &[u8] = b"_worker_bg_result_";
 
 const SYS_SCHEMA_PREFIX: &[u8] = b"_sys_schema_";
 const TABLE_DATA_PREFIX: &[u8] = b"t_";
@@ -470,6 +471,22 @@ pub fn encode_worker_claim_key(
 /// Encode the prefix for all worker claim keys (global).
 pub fn encode_worker_claim_prefix() -> Vec<u8> {
     WORKER_CLAIM_PREFIX.to_vec()
+}
+
+/// Encode a worker background result key (global).
+///
+/// Format: `_worker_bg_result_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}_{task_id:be8}`
+pub fn encode_worker_bg_result_key(keyspace: &str, db_id: u64, task_id: i64) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(WORKER_BG_RESULT_PREFIX.len() + 2 + keyspace.len() + 1 + 8 + 1 + 8);
+    key.extend_from_slice(WORKER_BG_RESULT_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&task_id.to_be_bytes());
+    key
 }
 
 pub fn encode_view_key_v2(db_id: u64, view_name: &str) -> Vec<u8> {
@@ -1613,6 +1630,18 @@ mod tests {
     fn test_encode_worker_claim_prefix() {
         let prefix = encode_worker_claim_prefix();
         assert_eq!(prefix, WORKER_CLAIM_PREFIX);
+    }
+
+    #[test]
+    fn test_worker_queue_key_priority_before_time() {
+        // Higher priority (lower byte value) at later time should sort before lower priority at earlier time.
+        // This proves that priority byte comes BEFORE fire_time in the key encoding.
+        let key_high_late = encode_worker_queue_key(0, 2000, "ks", 1, 1);
+        let key_low_early = encode_worker_queue_key(128, 1000, "ks", 1, 1);
+        assert!(
+            key_high_late < key_low_early,
+            "priority must take precedence over fire_time"
+        );
     }
 
     #[test]

@@ -204,6 +204,23 @@ impl WorkerEngine {
                 }
             }
         }
+
+        if entry.task_type == TaskType::BgSql {
+            let result_text = match &exec_result {
+                Ok(_) => "OK".to_string(),
+                Err(e) => format!("ERROR: {}", e),
+            };
+            system_store
+                .put_bg_result(
+                    &mut txn,
+                    &entry.keyspace,
+                    entry.db_id,
+                    entry.task_id,
+                    &result_text,
+                )
+                .await?;
+        }
+
         txn.commit().await?;
 
         match exec_result {
