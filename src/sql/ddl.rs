@@ -1342,6 +1342,8 @@ pub async fn execute_create_index(
                 .update_registry_task_types(&mut sys_txn, keyspace, db_id, TASK_TYPE_BG_DDL, 0)
                 .await?;
             sys_txn.commit().await?;
+            // Wake the worker immediately so CIC does not wait for the poll interval.
+            crate::worker::wake_worker();
         }
 
         return Ok(ExecuteResult::CreateIndex {

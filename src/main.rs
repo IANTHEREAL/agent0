@@ -237,8 +237,19 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     // Unified worker engine (system-keyspace task queue + GC)
     {
         let worker_config = worker::config::WorkerConfig::from_env();
+        let worker_fallback_keyspace = if startup_keyspace.eq_ignore_ascii_case("default") {
+            "DEFAULT".to_string()
+        } else {
+            startup_keyspace.clone()
+        };
         if worker_config.enabled {
-            match worker::init_system_store(pd_addrs.clone(), &worker_config).await {
+            match worker::init_system_store(
+                pd_addrs.clone(),
+                &worker_config,
+                Some(&worker_fallback_keyspace),
+            )
+            .await
+            {
                 Ok(Some(system_store)) => {
                     worker::set_system_store(system_store.clone());
 
