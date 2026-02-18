@@ -6,6 +6,7 @@ use crate::sql::parse_sql;
 use crate::sql::Executor;
 use crate::storage::TikvStore;
 use crate::worker::config::WorkerConfig;
+use crate::worker::metrics::WorkerMetrics;
 use crate::worker::types::*;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -22,6 +23,7 @@ pub struct WorkerEngine {
     pool: Arc<TikvClientPool>,
     active_jobs: Arc<AtomicU32>,
     semaphore: Arc<Semaphore>,
+    metrics: Arc<WorkerMetrics>,
 }
 
 impl WorkerEngine {
@@ -33,7 +35,12 @@ impl WorkerEngine {
             pool,
             active_jobs: Arc::new(AtomicU32::new(0)),
             semaphore,
+            metrics: Arc::new(WorkerMetrics::new()),
         }
+    }
+
+    pub fn metrics(&self) -> &Arc<WorkerMetrics> {
+        &self.metrics
     }
 
     pub async fn run(&self) {
@@ -61,6 +68,8 @@ impl WorkerEngine {
             .await?;
         txn.commit().await?;
 
+        self.metrics.sample_tick(due_entries.len() as u64, self.active_jobs.load(Ordering::Relaxed));
+
         if due_entries.is_empty() {
             return Ok(());
         }
@@ -80,12 +89,13 @@ impl WorkerEngine {
             let engine_pool = self.pool.clone();
             let engine_config = self.config.clone();
             let active_jobs = self.active_jobs.clone();
+            let engine_metrics = self.metrics.clone();
 
             join_set.spawn(async move {
                 let _permit = permit;
                 active_jobs.fetch_add(1, Ordering::Relaxed);
                 let result =
-                    Self::claim_and_execute(&engine_system_store, &engine_pool, &engine_config, key, entry)
+                    Self::claim_and_execute(&engine_system_store, &engine_pool, &engine_config, &engine_metrics, key, entry)
                         .await;
                 active_jobs.fetch_sub(1, Ordering::Relaxed);
 
@@ -110,6 +120,7 @@ impl WorkerEngine {
         system_store: &Arc<TikvStore>,
         pool: &Arc<TikvClientPool>,
         config: &WorkerConfig,
+        metrics: &Arc<WorkerMetrics>,
         queue_key: Vec<u8>,
         entry: TaskQueueEntry,
     ) -> Result<()> {
@@ -127,6 +138,8 @@ impl WorkerEngine {
                 &claim,
             )
             .await?;
+
+        metrics.record_claim(claimed);
 
         if !claimed {
             txn.rollback().await.ok();
@@ -193,14 +206,20 @@ impl WorkerEngine {
         txn.commit().await?;
 
         match exec_result {
-            Ok(_) => info!(
-                "Worker task completed: keyspace={} db_id={} task_id={} type={:?}",
-                entry.keyspace, entry.db_id, entry.task_id, entry.task_type
-            ),
-            Err(ref e) => warn!(
-                "Worker task failed: keyspace={} db_id={} task_id={} type={:?} error={}",
-                entry.keyspace, entry.db_id, entry.task_id, entry.task_type, e
-            ),
+            Ok(_) => {
+                metrics.record_task_result(entry.task_type, true);
+                info!(
+                    "Worker task completed: keyspace={} db_id={} task_id={} type={:?}",
+                    entry.keyspace, entry.db_id, entry.task_id, entry.task_type
+                );
+            }
+            Err(ref e) => {
+                metrics.record_task_result(entry.task_type, false);
+                warn!(
+                    "Worker task failed: keyspace={} db_id={} task_id={} type={:?} error={}",
+                    entry.keyspace, entry.db_id, entry.task_id, entry.task_type, e
+                );
+            }
         }
 
         Ok(())
