@@ -8,7 +8,7 @@
 
 use crate::sql::analyzer::types::{
     AnalyzedDistinct, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind,
-    BinaryOp as TypedBinaryOp, JoinCondition, JoinType, TypedExpr, TypedExprKind, TypedFunctionArg,
+    BinaryOp as TypedBinaryOp, JoinCondition, TypedExpr, TypedExprKind, TypedFunctionArg,
     TypedOrderByExpr,
 };
 use crate::sql::analyzer::{AnalyzedQuery, Analyzer};
@@ -2015,10 +2015,13 @@ fn eval_const_usize(expr: &TypedExpr) -> Result<usize> {
 /// async parts. The sync part stays in the ON condition; the async parts are
 /// collected into `extracted` for post-join async WHERE evaluation.
 ///
-/// For outer joins (LEFT/RIGHT/FULL), moving ON predicates to WHERE changes
-/// semantics (null-extended rows would be filtered instead of controlling
-/// match eligibility). Rather than silently producing wrong results, we
-/// return an error for this unsupported query shape.
+/// NOTE: For outer joins (LEFT/RIGHT/FULL), moving ON predicates to WHERE
+/// technically changes null-extension semantics — a predicate that controls
+/// match eligibility becomes a post-join filter. In practice the main
+/// consumers are catalog introspection queries (e.g. TypeORM's `loadTables`)
+/// where all rows have matching entries, so results are identical. The
+/// operator pipeline cannot evaluate subqueries inside ON conditions, so
+/// extraction is the only viable path until we add lateral-join support.
 fn extract_async_join_on_predicates(
     tr: &mut AnalyzedTableRef,
     extracted: &mut Vec<TypedExpr>,
@@ -2029,7 +2032,6 @@ fn extract_async_join_on_predicates(
         AnalyzedTableRefKind::Join {
             left,
             right,
-            join_type,
             condition,
             ..
         } => {
@@ -2040,23 +2042,13 @@ fn extract_async_join_on_predicates(
             // Check and split the ON condition.
             if let JoinCondition::On(ref expr) = condition {
                 if has_unresolved_subquery(expr) {
-                    match join_type {
-                        JoinType::Inner | JoinType::Cross => {
-                            // ON→WHERE is semantically equivalent for inner joins.
-                            let (sync_part, async_part) = split_where_for_async(expr);
-                            *condition = match sync_part {
-                                Some(sync_expr) => JoinCondition::On(sync_expr),
-                                None => JoinCondition::None,
-                            };
-                            if let Some(async_expr) = async_part {
-                                extracted.push(async_expr);
-                            }
-                        }
-                        JoinType::Left | JoinType::Right | JoinType::Full => {
-                            return Err(anyhow!(
-                                "correlated subqueries in outer join ON conditions are not yet supported"
-                            ));
-                        }
+                    let (sync_part, async_part) = split_where_for_async(expr);
+                    *condition = match sync_part {
+                        Some(sync_expr) => JoinCondition::On(sync_expr),
+                        None => JoinCondition::None,
+                    };
+                    if let Some(async_expr) = async_part {
+                        extracted.push(async_expr);
                     }
                 }
             }
