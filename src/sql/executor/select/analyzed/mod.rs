@@ -193,16 +193,36 @@ impl Executor {
         analyzed: &AnalyzedQuery,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
-        self.execute_via_optimizer(
-            txn,
-            db_id,
-            sequence_values,
-            search_path,
-            analyzed,
-            ctes,
-            &[],
-        )
-        .await
+        // Check optimizer eligibility — subqueries bypass the top-level
+        // routing gate so we must check here.  Ineligible shapes (e.g.
+        // HAVING with aggregates not in projection) fall back to the
+        // legacy plan_query path.
+        let use_optimizer = crate::sql::query_context::QueryContext::use_optimizer();
+        if use_optimizer && crate::sql::optimizer::eligibility::is_optimizer_eligible(analyzed) {
+            self.execute_via_optimizer(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                analyzed,
+                ctes,
+                &[],
+            )
+            .await
+        } else {
+            let plan = plan_query(analyzed, &[]).map_err(SqlError::from)?;
+            self.execute_analyzed_query(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                analyzed,
+                &[],
+                ctes,
+                &plan,
+            )
+            .await
+        }
     }
 
     /// Execute a fully analyzed query, driven by the pre-computed `QueryPlan`.

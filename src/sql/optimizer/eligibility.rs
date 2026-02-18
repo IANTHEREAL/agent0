@@ -72,6 +72,14 @@ fn is_eligible_inner(analyzed: &AnalyzedQuery, inherited_cte_names: &HashSet<Str
         return false;
     }
 
+    // Reject self-joins (same table name appears more than once in FROM).
+    // The optimizer's prepare_optimizer_contexts stores schemas keyed by
+    // table name, so duplicate names overwrite each other and produce
+    // wrong column indices.
+    if has_duplicate_table_names(select) {
+        return false;
+    }
+
     // Reject queries with unresolved subquery expressions in JOIN ON conditions.
     // Non-correlated subqueries in WHERE/projection are handled by
     // pre-materialization + post-processing, but JOIN ON subqueries (especially
@@ -97,6 +105,26 @@ fn is_eligible_inner(analyzed: &AnalyzedQuery, inherited_cte_names: &HashSet<Str
     }
 
     true
+}
+
+fn has_duplicate_table_names(select: &AnalyzedSelect) -> bool {
+    let mut names = HashSet::new();
+    for tr in &select.from {
+        if !collect_table_names_unique(tr, &mut names) {
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_table_names_unique(tr: &AnalyzedTableRef, seen: &mut HashSet<String>) -> bool {
+    match &tr.kind {
+        AnalyzedTableRefKind::Table { name, .. } => seen.insert(name.to_lowercase()),
+        AnalyzedTableRefKind::Join { left, right, .. } => {
+            collect_table_names_unique(left, seen) && collect_table_names_unique(right, seen)
+        }
+        _ => true,
+    }
 }
 
 fn has_subquery_from_leaf(select: &AnalyzedSelect) -> bool {
