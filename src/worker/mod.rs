@@ -44,12 +44,24 @@ async fn ensure_pd_keyspace(pd_endpoints: &[String], keyspace: &str) -> Result<(
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10));
 
-    // Use TLS if CA cert is available (matches TiKV client TLS config)
-    let scheme = if let Ok(ca_path) = std::env::var("TIKV_CA_PATH") {
+    // Use mTLS if certs are available (matches TiKV client TLS config)
+    let scheme = if let (Ok(ca_path), Ok(cert_path), Ok(key_path)) = (
+        std::env::var("TIKV_CA_PATH"),
+        std::env::var("TIKV_CERT_PATH"),
+        std::env::var("TIKV_KEY_PATH"),
+    ) {
         let ca_pem = std::fs::read(&ca_path)
             .map_err(|e| anyhow::anyhow!("Failed to read CA cert {}: {}", ca_path, e))?;
         let ca_cert = reqwest::Certificate::from_pem(&ca_pem)?;
         builder = builder.add_root_certificate(ca_cert);
+
+        let cert_pem = std::fs::read(&cert_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read client cert {}: {}", cert_path, e))?;
+        let key_pem = std::fs::read(&key_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read client key {}: {}", key_path, e))?;
+        let identity = reqwest::Identity::from_pkcs8_pem(&cert_pem, &key_pem)?;
+        builder = builder.identity(identity);
+
         "https"
     } else {
         "http"
