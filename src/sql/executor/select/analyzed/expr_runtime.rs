@@ -402,6 +402,7 @@ impl<'a> ExprRuntime<'a> {
     ) -> Result<Vec<Row>> {
         if self.ctes.is_empty() {
             execute_operator_tree(
+                self.executor,
                 op,
                 txn,
                 self.executor.store(),
@@ -412,6 +413,7 @@ impl<'a> ExprRuntime<'a> {
             .await
         } else {
             execute_operator_tree_with_ctes(
+                self.executor,
                 op,
                 txn,
                 self.executor.store(),

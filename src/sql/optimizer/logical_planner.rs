@@ -25,9 +25,9 @@
 //! DISTINCT   → Distinct / DistinctOn
 //! ```
 //!
-//! Precondition: the caller has verified `is_optimizer_eligible()`, which
-//! guarantees that all ORDER BY / HAVING rewrites will succeed.  This
-//! function therefore always returns a plan (no `Option`).
+//! Since the eligibility gate has been removed (single execution path),
+//! all rewrite operations return `Result` so that failures are propagated
+//! as errors rather than panicking.
 
 use super::logical_plan::{LogicalNode, LogicalPlan, PlanSchema};
 use super::window_rewrite::{
@@ -40,6 +40,7 @@ use crate::sql::analyzer::types::{
 use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::operators::AggregateExpr;
 use crate::types::DataType;
+use anyhow::Result;
 
 /// Builds a [`LogicalPlan`] from an [`AnalyzedQuery`].
 pub struct LogicalPlanner;
@@ -47,25 +48,24 @@ pub struct LogicalPlanner;
 impl LogicalPlanner {
     /// Build a logical plan from an analyzed query.
     ///
-    /// Precondition: `is_optimizer_eligible()` has been checked by the caller.
-    /// This guarantees all aggregate rewrites succeed, so this function always
-    /// returns a plan.
-    pub fn build(query: &AnalyzedQuery) -> LogicalPlan {
-        let mut plan = Self::build_body(&query.body, &query.output_schema, &query.order_by);
+    /// Returns `Err` if an aggregate rewrite fails (e.g. HAVING expression
+    /// references a column that is neither a GROUP BY key nor an aggregate).
+    pub fn build(query: &AnalyzedQuery) -> Result<LogicalPlan> {
+        let mut plan = Self::build_body(&query.body, &query.output_schema, &query.order_by)?;
 
         // LIMIT / OFFSET
         if query.limit.is_some() || query.offset.is_some() {
             plan = plan.limit(query.limit.clone(), query.offset.clone());
         }
 
-        plan
+        Ok(plan)
     }
 
     fn build_body(
         body: &AnalyzedQueryBody,
         output_schema: &[(String, DataType)],
         order_by: &[TypedOrderByExpr],
-    ) -> LogicalPlan {
+    ) -> Result<LogicalPlan> {
         match body {
             AnalyzedQueryBody::Select(select) => {
                 Self::build_select(select, output_schema, order_by)
@@ -80,7 +80,7 @@ impl LogicalPlanner {
                 if !order_by.is_empty() {
                     plan = plan.sort(order_by.to_vec());
                 }
-                plan
+                Ok(plan)
             }
             AnalyzedQueryBody::SetOperation {
                 op,
@@ -88,8 +88,8 @@ impl LogicalPlanner {
                 left,
                 right,
             } => {
-                let left_plan = Self::build(left);
-                let right_plan = Self::build(right);
+                let left_plan = Self::build(left)?;
+                let right_plan = Self::build(right)?;
                 let schema = PlanSchema::from_columns(output_schema.to_vec());
                 let mut plan = LogicalPlan {
                     node: LogicalNode::SetOperation {
@@ -104,7 +104,7 @@ impl LogicalPlanner {
                 if !order_by.is_empty() {
                     plan = plan.sort(order_by.to_vec());
                 }
-                plan
+                Ok(plan)
             }
         }
     }
@@ -113,9 +113,9 @@ impl LogicalPlanner {
         select: &AnalyzedSelect,
         output_schema: &[(String, DataType)],
         order_by: &[TypedOrderByExpr],
-    ) -> LogicalPlan {
+    ) -> Result<LogicalPlan> {
         // 1. FROM clause → base plan
-        let mut plan = Self::build_from(&select.from);
+        let mut plan = Self::build_from(&select.from)?;
 
         // 2. WHERE → Filter
         if let Some(predicate) = &select.where_clause {
@@ -138,15 +138,64 @@ impl LogicalPlanner {
             // window expressions (e.g. LAG(COUNT(*))) are captured.
             let group_by = &select.group_by;
             let group_by_count = group_by.len();
-            let aggregate_exprs = Self::collect_aggregate_exprs(&select.projection);
+            let mut aggregate_exprs = Self::collect_aggregate_exprs(&select.projection);
+
+            // Also collect aggregates from HAVING and ORDER BY that may not
+            // appear in the projection (e.g., SELECT dept GROUP BY dept
+            // HAVING AVG(salary) > X).  These must be in aggregate_exprs
+            // (for rewrite index mapping) AND in agg_projection (so the
+            // Aggregate operator computes them).
+            let mut extra_agg_projections = Vec::new();
+            {
+                let pre_count = aggregate_exprs.len();
+                let mut names = Vec::new();
+                let mut types = Vec::new();
+                if let Some(having) = &select.having {
+                    super::build::collect_agg_exprs_from(
+                        having,
+                        "__having_agg",
+                        &mut aggregate_exprs,
+                        &mut names,
+                        &mut types,
+                    );
+                }
+                for ob in order_by {
+                    super::build::collect_agg_exprs_from(
+                        &ob.expr,
+                        "__order_agg",
+                        &mut aggregate_exprs,
+                        &mut names,
+                        &mut types,
+                    );
+                }
+                // Build synthetic AnalyzedProjection for each new aggregate.
+                // The final Project will strip them from the output.
+                for i in pre_count..aggregate_exprs.len() {
+                    let ae = &aggregate_exprs[i];
+                    let typed_expr = Self::find_aggregate_in_having_orderby(
+                        ae,
+                        select.having.as_ref(),
+                        order_by,
+                    );
+                    extra_agg_projections.push(AnalyzedProjection {
+                        output_name: names[i - pre_count].clone(),
+                        expr: typed_expr,
+                    });
+                }
+            }
 
             let agg_projection = if has_win {
                 // Build a raw projection [group_by_cols..., agg_calls...] so the
                 // Aggregate outputs clean columns without a post-projection that
                 // would choke on WindowCall nodes.
-                Self::build_raw_aggregate_projection(group_by, &aggregate_exprs, &select.projection)
+                // Include extended projection so HAVING/ORDER BY aggregates are found.
+                let mut extended = select.projection.to_vec();
+                extended.extend(extra_agg_projections);
+                Self::build_raw_aggregate_projection(group_by, &aggregate_exprs, &extended)
             } else {
-                select.projection.clone()
+                let mut proj = select.projection.clone();
+                proj.extend(extra_agg_projections);
+                proj
             };
             let agg_schema = PlanSchema::from_columns(
                 agg_projection
@@ -163,8 +212,7 @@ impl LogicalPlanner {
                     group_by,
                     group_by_count,
                     &aggregate_exprs,
-                )
-                .expect("eligibility gate guarantees HAVING rewrite succeeds");
+                )?;
                 plan = plan.filter(rewritten);
             }
 
@@ -183,9 +231,8 @@ impl LogicalPlanner {
                             group_by_count,
                             &aggregate_exprs,
                         )
-                        .expect("eligibility gate guarantees projection rewrite succeeds")
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
 
                 let rewritten_order: Vec<TypedOrderByExpr> = order_by
                     .iter()
@@ -195,15 +242,14 @@ impl LogicalPlanner {
                             group_by,
                             group_by_count,
                             &aggregate_exprs,
-                        )
-                        .expect("eligibility gate guarantees ORDER BY rewrite succeeds");
-                        TypedOrderByExpr {
+                        )?;
+                        Ok(TypedOrderByExpr {
                             expr,
                             asc: ob.asc,
                             nulls_first: ob.nulls_first,
-                        }
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
 
                 // Extract window functions from BOTH projection and ORDER BY.
                 let input_col_count = plan.schema.columns.len();
@@ -262,9 +308,8 @@ impl LogicalPlanner {
                                     group_by_count,
                                     &aggregate_exprs,
                                 )
-                                .expect("eligibility gate guarantees DISTINCT ON rewrite succeeds")
                             })
-                            .collect();
+                            .collect::<Result<Vec<_>>>()?;
                         plan = plan.distinct_on(rewritten_on);
                         plan = plan.project(final_proj, proj_schema);
                     }
@@ -287,15 +332,14 @@ impl LogicalPlanner {
                                 group_by,
                                 group_by_count,
                                 &aggregate_exprs,
-                            )
-                            .expect("eligibility gate guarantees ORDER BY rewrite succeeds");
-                            TypedOrderByExpr {
+                            )?;
+                            Ok(TypedOrderByExpr {
                                 expr,
                                 asc: ob.asc,
                                 nulls_first: ob.nulls_first,
-                            }
+                            })
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>>>()?;
                     plan = plan.sort(rewritten_order);
                 }
 
@@ -315,9 +359,8 @@ impl LogicalPlanner {
                                     group_by_count,
                                     &aggregate_exprs,
                                 )
-                                .expect("eligibility gate guarantees DISTINCT ON rewrite succeeds")
                             })
-                            .collect();
+                            .collect::<Result<Vec<_>>>()?;
                         plan = plan.distinct_on(rewritten_on);
                     }
                 }
@@ -415,7 +458,7 @@ impl LogicalPlanner {
             }
         }
 
-        plan
+        Ok(plan)
     }
 
     /// Collect unique AggregateExpr from projection list (for rewriting).
@@ -583,6 +626,26 @@ impl LogicalPlanner {
         }
     }
 
+    /// Find the original TypedExpr for an AggregateExpr in HAVING/ORDER BY trees.
+    fn find_aggregate_in_having_orderby(
+        ae: &AggregateExpr,
+        having: Option<&TypedExpr>,
+        order_by: &[TypedOrderByExpr],
+    ) -> TypedExpr {
+        if let Some(h) = having {
+            if let Some(found) = Self::find_agg_in_expr(h, ae) {
+                return found;
+            }
+        }
+        for ob in order_by {
+            if let Some(found) = Self::find_agg_in_expr(&ob.expr, ae) {
+                return found;
+            }
+        }
+        // Fallback: use the reconstruction from find_aggregate_typed_expr
+        Self::find_aggregate_typed_expr(ae, &[])
+    }
+
     /// Extract `WindowFunctionExpr` from a list of typed expressions.
     ///
     /// `exprs` and `projection` must be the same length — `exprs[i]` is the
@@ -600,16 +663,16 @@ impl LogicalPlanner {
         result
     }
 
-    fn build_from(from: &[AnalyzedTableRef]) -> LogicalPlan {
+    fn build_from(from: &[AnalyzedTableRef]) -> Result<LogicalPlan> {
         if from.is_empty() {
-            return LogicalPlan::empty(PlanSchema::from_columns(vec![]));
+            return Ok(LogicalPlan::empty(PlanSchema::from_columns(vec![])));
         }
 
-        let mut plan = Self::build_table_ref(&from[0]);
+        let mut plan = Self::build_table_ref(&from[0])?;
 
         // Additional FROM items → cross joins
         for table_ref in from.iter().skip(1) {
-            let right = Self::build_table_ref(table_ref);
+            let right = Self::build_table_ref(table_ref)?;
             let mut combined_cols = plan.schema.columns.clone();
             combined_cols.extend(right.schema.columns.clone());
             let schema = PlanSchema::from_columns(combined_cols);
@@ -624,10 +687,10 @@ impl LogicalPlanner {
             };
         }
 
-        plan
+        Ok(plan)
     }
 
-    fn build_table_ref(table_ref: &AnalyzedTableRef) -> LogicalPlan {
+    fn build_table_ref(table_ref: &AnalyzedTableRef) -> Result<LogicalPlan> {
         match &table_ref.kind {
             AnalyzedTableRefKind::Table { name, schema } => {
                 let plan_schema = PlanSchema::from_columns(
@@ -637,18 +700,22 @@ impl LogicalPlanner {
                         .map(|(name, dt, _nullable)| (name.clone(), dt.clone()))
                         .collect(),
                 );
-                LogicalPlan::scan(name.clone(), table_ref.alias.clone(), plan_schema)
+                Ok(LogicalPlan::scan(
+                    name.clone(),
+                    table_ref.alias.clone(),
+                    plan_schema,
+                ))
             }
             AnalyzedTableRefKind::Subquery(subquery) => {
-                let subplan = Self::build(subquery);
+                let subplan = Self::build(subquery)?;
                 let schema = subplan.schema.clone();
-                LogicalPlan {
+                Ok(LogicalPlan {
                     node: LogicalNode::Subquery {
                         subplan: Box::new(subplan),
                         alias: table_ref.alias.clone(),
                     },
                     schema,
-                }
+                })
             }
             AnalyzedTableRefKind::Join {
                 left,
@@ -657,8 +724,8 @@ impl LogicalPlanner {
                 condition,
                 left_col_start,
             } => {
-                let left_plan = Self::build_table_ref(left);
-                let right_plan = Self::build_table_ref(right);
+                let left_plan = Self::build_table_ref(left)?;
+                let right_plan = Self::build_table_ref(right)?;
                 let mut combined_cols = left_plan.schema.columns.clone();
                 combined_cols.extend(right_plan.schema.columns.clone());
                 let schema = PlanSchema::from_columns(combined_cols);
@@ -667,7 +734,7 @@ impl LogicalPlanner {
                 // offset where this join's left child begins.
                 let normalized_condition =
                     crate::sql::analyzer::types::reindex_join_condition(condition, *left_col_start);
-                LogicalPlan {
+                Ok(LogicalPlan {
                     node: LogicalNode::Join {
                         left: Box::new(left_plan),
                         right: Box::new(right_plan),
@@ -675,7 +742,7 @@ impl LogicalPlanner {
                         condition: normalized_condition,
                     },
                     schema,
-                }
+                })
             }
             AnalyzedTableRefKind::Function {
                 func,
@@ -683,14 +750,14 @@ impl LogicalPlanner {
                 output_columns,
             } => {
                 let plan_schema = PlanSchema::from_columns(output_columns.clone());
-                LogicalPlan {
+                Ok(LogicalPlan {
                     node: LogicalNode::TableFunction {
                         function_name: func.name.clone(),
                         args: args.clone(),
                         alias: table_ref.alias.clone(),
                     },
                     schema: plan_schema,
-                }
+                })
             }
         }
     }
@@ -805,7 +872,7 @@ mod tests {
             ],
         };
 
-        let plan = LogicalPlanner::build(&query);
+        let plan = LogicalPlanner::build(&query).unwrap();
 
         // Should be: Project → Filter → Scan
         assert!(matches!(plan.node, LogicalNode::Project { .. }));
@@ -840,7 +907,7 @@ mod tests {
             output_schema: vec![("?column?".to_string(), DataType::Int32)],
         };
 
-        let plan = LogicalPlanner::build(&query);
+        let plan = LogicalPlanner::build(&query).unwrap();
 
         // Should be: Project → Empty
         assert!(matches!(plan.node, LogicalNode::Project { .. }));
@@ -884,7 +951,7 @@ mod tests {
             output_schema: vec![("id".to_string(), DataType::Int64)],
         };
 
-        let plan = LogicalPlanner::build(&query);
+        let plan = LogicalPlanner::build(&query).unwrap();
 
         // Should be: Limit → Project → Sort → Scan
         assert!(matches!(plan.node, LogicalNode::Limit { .. }));
@@ -947,7 +1014,7 @@ mod tests {
             output_schema: vec![("id".to_string(), DataType::Int64)],
         };
 
-        let plan = LogicalPlanner::build(&query);
+        let plan = LogicalPlanner::build(&query).unwrap();
         assert!(matches!(plan.node, LogicalNode::SetOperation { .. }));
     }
 
@@ -1006,7 +1073,7 @@ mod tests {
             ],
         };
 
-        let plan = LogicalPlanner::build(&query);
+        let plan = LogicalPlanner::build(&query).unwrap();
 
         // Should be: Aggregate → Scan (no separate Project when GROUP BY is present)
         assert!(matches!(plan.node, LogicalNode::Aggregate { .. }));
@@ -1043,7 +1110,7 @@ mod tests {
             output_schema: vec![("name".to_string(), DataType::Text)],
         };
 
-        let plan = LogicalPlanner::build(&query);
+        let plan = LogicalPlanner::build(&query).unwrap();
 
         // Should be: Distinct → Project → Scan
         assert!(matches!(plan.node, LogicalNode::Distinct { .. }));
@@ -1109,7 +1176,7 @@ mod tests {
             ],
         };
 
-        let plan = LogicalPlanner::build(&query);
+        let plan = LogicalPlanner::build(&query).unwrap();
 
         // Should be: Sort(rewritten) → Aggregate → Scan
         assert!(matches!(plan.node, LogicalNode::Sort { .. }));
@@ -1196,7 +1263,7 @@ mod tests {
             ],
         };
 
-        let plan = LogicalPlanner::build(&query);
+        let plan = LogicalPlanner::build(&query).unwrap();
 
         // Should be: Filter(rewritten HAVING) → Aggregate → Scan
         assert!(matches!(plan.node, LogicalNode::Filter { .. }));

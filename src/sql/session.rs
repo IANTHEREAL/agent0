@@ -61,10 +61,8 @@ pub(crate) struct SessionSettings {
     transaction_isolation: Option<String>,
     default_transaction_read_only: Option<String>,
 
-    /// When true, route eligible queries through the CBO optimizer pipeline
-    /// (`AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator`).
-    /// Default: true. Safety valve: `SET tipg.use_optimizer = off` disables
-    /// the optimizer for the current session (e.g. to work around a regression).
+    /// Always true — the CBO optimizer pipeline is the single execution path.
+    /// `SET tipg.use_optimizer = off` is accepted but logs a NOTICE and stays ON.
     use_optimizer: bool,
 
     /// Generic storage for GUC parameters that tipg does not actively use but
@@ -203,8 +201,14 @@ impl SessionSettings {
             "tipg.use_optimizer" => {
                 let normalized = value.trim().to_lowercase();
                 match normalized.as_str() {
-                    "on" | "true" | "yes" | "1" => self.use_optimizer = true,
-                    "off" | "false" | "no" | "0" => self.use_optimizer = false,
+                    "on" | "true" | "yes" | "1" => { /* already on, no-op */ }
+                    "off" | "false" | "no" | "0" => {
+                        tracing::info!(
+                            "NOTICE: optimizer cannot be disabled; \
+                             tipg.use_optimizer setting ignored"
+                        );
+                        // Keep use_optimizer = true — single execution path.
+                    }
                     _ => {
                         return Err(anyhow!(
                             "parameter \"tipg.use_optimizer\" requires a Boolean value"
@@ -351,7 +355,7 @@ impl SessionSettings {
                 Some(self.idle_in_transaction_session_timeout_ms.to_string())
             }
             "pgtikv.max_sort_bytes" => Some(self.max_sort_bytes.to_string()),
-            "tipg.use_optimizer" => Some(if self.use_optimizer { "on" } else { "off" }.to_string()),
+            "tipg.use_optimizer" => Some("on".to_string()),
             "timezone" => Some(self.timezone.as_deref().unwrap_or("UTC").to_string()),
             "application_name" => Some(self.application_name.as_deref().unwrap_or("").to_string()),
             "client_encoding" => Some(

@@ -19,7 +19,25 @@ pub mod window_rewrite;
 pub use build::BuildContext;
 pub use logical_planner::LogicalPlanner;
 pub use physical_planner::{PhysicalPlanner, PlanningContext};
-pub use statistics::{ColumnStatistics, TableStatistics};
+
+/// Build a scope-safe key for schema/stats maps from a table name and optional alias.
+///
+/// When a query has subqueries, table refs from different scopes are collected
+/// into a single flat map. Using only the alias as key would cause collisions
+/// when the same alias appears in different scopes for different tables
+/// (e.g., `FROM users AS t JOIN (SELECT * FROM orders AS t) AS sub`).
+///
+/// This function produces a key that is unique per (table_name, alias) pair:
+/// - `FROM users` → `"users"`
+/// - `FROM users AS t` → `"users\0t"`
+/// - Self-join `FROM users AS a JOIN users AS b` → `"users\0a"`, `"users\0b"`
+/// - Cross-scope `FROM users AS t ... (SELECT * FROM orders AS t)` → `"users\0t"`, `"orders\0t"`
+pub fn schema_map_key(table_name: &str, alias: Option<&str>) -> String {
+    match alias {
+        Some(a) => format!("{}\0{}", table_name, a),
+        None => table_name.to_string(),
+    }
+}
 
 use crate::sql::analyzer::types::{
     AnalyzedQuery, AnalyzedQueryBody, AnalyzedTableRef, AnalyzedTableRefKind, TableRefSchema,
@@ -75,24 +93,32 @@ fn collect_join_tree_refs<'a>(
             collect_join_tree_refs(left, refs);
             collect_join_tree_refs(right, refs);
         }
-        _ => {}
+        AnalyzedTableRefKind::Subquery(subquery) => {
+            // Recurse into subquery body to collect inner table refs
+            // so their schemas get pre-loaded for the optimizer.
+            collect_body_refs(&subquery.body, refs);
+        }
+        AnalyzedTableRefKind::Function { .. } => {
+            // Table functions are pre-loaded separately by preload_table_functions.
+        }
     }
 }
 
 /// Single optimizer entrypoint: AnalyzedQuery → PhysicalPlan.
 ///
-/// Precondition: the caller has verified `is_optimizer_eligible()`.
-/// The eligibility gate guarantees that all expression rewrites (aggregate
-/// ORDER BY / HAVING) will succeed, so this function always returns a plan.
+/// Returns `Err` if the logical planner cannot build a valid plan (e.g.
+/// aggregate rewrite failure for unsupported HAVING / ORDER BY patterns).
 ///
 /// Execution (`execute_via_optimizer`) and EXPLAIN (`statement.rs`) both call
-/// this function when `use_optimizer` is on and the query is eligible, ensuring
-/// they produce identical plans — no drift.
-pub fn optimize(analyzed: &AnalyzedQuery, planning_ctx: &PlanningContext) -> PhysicalPlan {
+/// this function, ensuring they produce identical plans — no drift.
+pub fn optimize(
+    analyzed: &AnalyzedQuery,
+    planning_ctx: &PlanningContext,
+) -> anyhow::Result<PhysicalPlan> {
     // Step 1: AnalyzedQuery → LogicalPlan
-    let logical = LogicalPlanner::build(analyzed);
+    let logical = LogicalPlanner::build(analyzed)?;
     // Step 2: Apply rewrite rules (predicate pushdown, etc.)
     let optimized = rewrite::apply_rewrites(logical);
     // Step 3: LogicalPlan → PhysicalPlan (cost-based)
-    PhysicalPlanner::plan(&optimized, planning_ctx)
+    Ok(PhysicalPlanner::plan(&optimized, planning_ctx))
 }

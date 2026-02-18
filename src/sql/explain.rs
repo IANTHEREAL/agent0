@@ -118,6 +118,7 @@ pub fn generate_plan(
 /// This ensures EXPLAIN sees the same query tree as execution (views expanded,
 /// types resolved, etc.).  Uses `choose_best_access_path_for_typed_filter`
 /// for index selection — full parity with the execution path.
+#[allow(dead_code)]
 pub fn generate_plan_from_analyzed(
     query: &AnalyzedQuery,
     schema_lookup: &impl Fn(&str) -> Option<TableSchema>,
@@ -168,6 +169,7 @@ pub fn generate_plan_from_analyzed(
     plan
 }
 
+#[allow(dead_code)]
 fn generate_analyzed_body(
     body: &AnalyzedQueryBody,
     schema_lookup: &impl Fn(&str) -> Option<TableSchema>,
@@ -183,6 +185,7 @@ fn generate_analyzed_body(
     }
 }
 
+#[allow(dead_code)]
 fn generate_analyzed_select_plan(
     select: &AnalyzedSelect,
     schema_lookup: &impl Fn(&str) -> Option<TableSchema>,
@@ -289,6 +292,7 @@ fn generate_analyzed_select_plan(
     plan
 }
 
+#[allow(dead_code)]
 fn generate_analyzed_table_ref_plan(
     table_ref: &AnalyzedTableRef,
     predicates: &[PredicateInfo],

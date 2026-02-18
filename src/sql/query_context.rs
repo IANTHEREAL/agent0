@@ -63,6 +63,8 @@ impl QueryContext {
     }
 
     /// Whether the CBO optimizer pipeline is enabled for this statement.
+    /// Note: always ON in single-path architecture; retained for GUC infrastructure.
+    #[allow(dead_code)]
     pub(crate) fn use_optimizer() -> bool {
         USE_OPTIMIZER.try_with(|v| *v).unwrap_or(false)
     }

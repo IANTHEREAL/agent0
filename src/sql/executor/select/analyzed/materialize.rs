@@ -24,7 +24,7 @@ impl Executor {
     /// - correlated references via substitution (scope_depth → constants)
     /// - uncorrelated subqueries via execution (IN/EXISTS/Scalar/Array/ANYALL)
     /// - catalog-dependent functions (pg_get_indexdef, format_type, ...)
-    pub(super) async fn materialize_expr_for_row(
+    pub(crate) async fn materialize_expr_for_row(
         &self,
         expr: &TypedExpr,
         row: &Row,

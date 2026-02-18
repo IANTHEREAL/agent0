@@ -7,26 +7,21 @@
 //! Handles FOR UPDATE/SHARE row locking and SELECT INTO natively.
 
 use crate::sql::analyzer::types::{
-    reindex_join_condition, AnalyzedDistinct, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef,
-    AnalyzedTableRefKind, BinaryOp as TypedBinaryOp, JoinCondition, SetOpKind, TypedExpr,
-    TypedExprKind, TypedFunctionArg, TypedOrderByExpr,
+    AnalyzedDistinct, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind,
+    BinaryOp as TypedBinaryOp, JoinCondition, TypedExpr, TypedExprKind, TypedFunctionArg,
+    TypedOrderByExpr,
 };
 use crate::sql::analyzer::{AnalyzedQuery, Analyzer};
 use crate::sql::executor::core::catalog_prefetch::build_catalog_snapshot;
 use crate::sql::executor::core::view_rewrite::expand_views_in_query;
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::typed_eval::eval_typed_expr;
-use crate::sql::operators::{
-    BoxedOperator, DistinctOnOperator, DistinctOperator, FilterOperator, HashAggregateOperator,
-    JoinType as OpJoinType, LimitOperator, NestedLoopJoinOperator, PhysicalPlanner,
-    ProjectOperator, SetOperationOperator, SetOperationType, SortOperator, TableScanOperator,
-    WindowOperator,
-};
 use crate::sql::sequences::resolve_sequence_full_name_from_value;
 use crate::sql::ExecuteResult;
 use crate::types::{DataType, Row, TableSchema, Value};
 
 use crate::sql::error::SqlError;
+use crate::sql::optimizer::{BuildContext, PlanningContext};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, ObjectName, Query, SetExpr};
 use std::collections::HashMap;
@@ -35,17 +30,10 @@ use std::pin::Pin;
 use tikv_client::Transaction;
 
 mod expr_runtime;
-mod joins;
 mod materialize;
-pub(crate) mod query_plan;
-mod rewrite;
 mod subquery;
 
 use expr_runtime::*;
-use joins::*;
-
-use query_plan::*;
-use rewrite::*;
 use subquery::*;
 
 impl Executor {
@@ -109,43 +97,31 @@ impl Executor {
         // index-aware scan strategies.
         let analyzed = crate::sql::rewriter::rewrite_query(analyzed);
 
-        // ── CBO optimizer routing gate ──────────────────────────────
-        // When `SET tipg.use_optimizer = on`, eligible queries are routed through
-        // the new optimizer pipeline: AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator.
-        // Phase 3: single-table and multi-table joins without locks or SELECT INTO.
-        if crate::sql::query_context::QueryContext::use_optimizer()
-            && expanded_query.locks.is_empty()
-            && crate::sql::optimizer::eligibility::is_optimizer_eligible(&analyzed)
-        {
-            let result = self
-                .execute_via_optimizer(txn, db_id, sequence_values, search_path, &analyzed, ctes)
-                .await?;
-            // SELECT INTO post-processing.
-            if let SetExpr::Select(select) = &*expanded_query.body {
-                if let Some(ref into) = select.into {
-                    return self
-                        .create_table_from_result(txn, db_id, search_path, &into.name, result)
-                        .await;
-                }
-            }
-            return Ok(result);
-        }
+        // ── Pre-materialize async expressions ──────────────────────
+        // Resolve non-correlated subqueries → constants BEFORE the optimizer
+        // eligibility check. After this, most async expressions become literals
+        // and the query becomes optimizer-eligible.
+        let mut analyzed = analyzed;
+        self.pre_materialize_query_body(
+            &mut analyzed,
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            ctes,
+        )
+        .await?;
 
-        // Single-point routing gate: ALL capability / routing decisions are made here.
-        let plan = plan_query(&analyzed, &expanded_query.locks).map_err(SqlError::from)?;
-        tracing::debug!(target: "pipeline", "{}", plan.trace_summary());
-
-        // Execute through the analyzed path, driven by the plan.
+        // ── Single execution path: CBO optimizer pipeline ──────────
         let result = self
-            .execute_analyzed_query(
+            .execute_via_optimizer(
                 txn,
                 db_id,
                 sequence_values,
                 search_path,
                 &analyzed,
-                &expanded_query.locks,
                 ctes,
-                &plan,
+                &expanded_query.locks,
             )
             .await?;
 
@@ -161,7 +137,7 @@ impl Executor {
         Ok(result)
     }
 
-    /// Execute a subquery (no locks). Computes its own `QueryPlan` internally.
+    /// Execute a subquery (no locks) through the optimizer pipeline.
     ///
     /// Used for recursive execution: subqueries in FROM, correlated subqueries,
     /// set-operation branches, INSERT...SELECT, etc.
@@ -174,1562 +150,17 @@ impl Executor {
         analyzed: &AnalyzedQuery,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
-        let plan = plan_query(analyzed, &[]).map_err(SqlError::from)?;
-        self.execute_analyzed_query(
+        self.execute_via_optimizer(
             txn,
             db_id,
             sequence_values,
             search_path,
             analyzed,
-            &[],
             ctes,
-            &plan,
+            &[],
         )
         .await
     }
-
-    /// Execute a fully analyzed query, driven by the pre-computed `QueryPlan`.
-    ///
-    /// The `plan` captures ALL routing decisions (path, WHERE strategy, ORDER BY
-    /// strategy, projection strategy, etc.).  This function dispatches by
-    /// `plan.path` instead of re-computing predicates inline.
-    async fn execute_analyzed_query(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
-        search_path: &[String],
-        analyzed: &AnalyzedQuery,
-        _locks: &[sqlparser::ast::LockClause],
-        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
-        plan: &QueryPlan,
-    ) -> Result<ExecuteResult> {
-        // ── Dispatch by path (plan computed by caller) ──────────────
-        match plan.path {
-            ExecutionPath::SetOperation { op, all } => {
-                let AnalyzedQueryBody::SetOperation {
-                    ref left,
-                    ref right,
-                    ..
-                } = analyzed.body
-                else {
-                    return Err(anyhow!("Expected SetOperation in analyzed query"));
-                };
-                return self
-                    .execute_analyzed_set_op(
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        analyzed,
-                        op,
-                        all,
-                        left,
-                        right,
-                        ctes,
-                    )
-                    .await;
-            }
-            ExecutionPath::Values => {
-                let AnalyzedQueryBody::Values(value_rows) = &analyzed.body else {
-                    return Err(anyhow!("Expected VALUES in analyzed query"));
-                };
-                return self
-                    .execute_analyzed_values(
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        analyzed,
-                        value_rows,
-                        ctes,
-                    )
-                    .await;
-            }
-            ExecutionPath::Tableless => {
-                let AnalyzedQueryBody::Select(select) = &analyzed.body else {
-                    return Err(anyhow!("Expected SELECT in analyzed query"));
-                };
-                return self
-                    .execute_analyzed_tableless(
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        analyzed,
-                        select,
-                        ctes,
-                    )
-                    .await;
-            }
-            ExecutionPath::Join => {
-                if plan.lock.has_lock {
-                    return Err(anyhow!("FOR UPDATE/SHARE is not allowed with JOIN queries"));
-                }
-                return self
-                    .execute_analyzed_join(txn, db_id, sequence_values, search_path, analyzed, ctes)
-                    .await;
-            }
-            ExecutionPath::SingleTable => {
-                // Fall through to single-table path below.
-            }
-        }
-
-        let AnalyzedQueryBody::Select(select) = &analyzed.body else {
-            return Err(anyhow!("Expected SELECT in analyzed query"));
-        };
-
-        // Single-table path: get the table schema from the analyzer's resolved info.
-        let table_ref = &select.from[0];
-        let AnalyzedTableRefKind::Table { ref name, .. } = table_ref.kind else {
-            return Err(anyhow!("Expected table reference"));
-        };
-
-        // We need the full TableSchema (with indexes, table_id, etc.) for physical planning.
-        // The analyzer only stores column info. Re-fetch from store.
-        let alias = table_ref.alias.as_deref().unwrap_or(name);
-        let cte_key = name.to_lowercase();
-        let (schema, preloaded_rows) = if let Some((cte_schema, cte_rows)) = ctes.get(&cte_key) {
-            (cte_schema.clone(), Some(cte_rows.clone()))
-        } else {
-            // The Analyzer already resolved the name to a fully-qualified store key
-            // (e.g. "public.atm_users"). Use it directly instead of re-resolving.
-            if let Some(table_schema) = self.store().get_schema(txn, db_id, name).await? {
-                (table_schema, None)
-            } else {
-                // Try information_schema / virtual tables
-                let (schema, rows) = self
-                    .get_table_data(txn, db_id, sequence_values, search_path, name, ctes)
-                    .await?;
-                let is_virtual = schema.table_id == 0;
-                if is_virtual {
-                    (schema, Some(rows))
-                } else {
-                    (schema, None)
-                }
-            }
-        };
-
-        // Set up from_alias on schema if needed.
-        let mut schema = schema;
-        let schema_short_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-        if !schema_short_name.eq_ignore_ascii_case(alias) {
-            schema.from_alias = Some(alias.to_string());
-        }
-
-        let rt = ExprRuntime::new(self, db_id, search_path, ctes);
-
-        // Pre-materialize WHERE and split into sync/async parts.
-        let prepared_where = rt
-            .prepare_where(&select.where_clause, txn, sequence_values)
-            .await?;
-        let sync_where = prepared_where.sync_part;
-        let async_where = prepared_where.async_part;
-
-        // Pre-materialize ORDER BY and classify as inline or deferred.
-        let (order_by, deferred_order_by) = rt
-            .prepare_order_by(&analyzed.order_by, txn, sequence_values)
-            .await?;
-
-        let limit = analyzed
-            .limit
-            .as_ref()
-            .map(|e| eval_const_usize(e))
-            .transpose()?;
-        let offset = analyzed
-            .offset
-            .as_ref()
-            .map(|e| eval_const_usize(e))
-            .transpose()?
-            .unwrap_or(0);
-
-        // FOR UPDATE / FOR SHARE: use pre-computed lock info from plan.
-        let has_lock = plan.lock.has_lock;
-        let has_skip_locked = plan.lock.has_skip_locked;
-        let has_nowait = plan.lock.has_nowait;
-
-        if has_lock {
-            if schema.pk_indices.is_empty() {
-                return Err(anyhow!("FOR UPDATE/SHARE requires primary key"));
-            }
-            if plan.lock.has_for_share {
-                tracing::warn!(
-                    "FOR SHARE acquires exclusive locks on TiKV (no shared row locks); \
-                     this is stricter than PostgreSQL where FOR SHARE allows concurrent readers"
-                );
-            }
-            // Aggregate/window + DISTINCT checks already validated by plan_query().
-        }
-
-        // Build projection info from the analyzed output.
-        let is_wildcard_only = select
-            .projection
-            .iter()
-            .all(|p| matches!(p.expr.kind, TypedExprKind::ColumnRef { .. }))
-            && select.projection.len() == schema.columns.len()
-            && select
-                .projection
-                .iter()
-                .enumerate()
-                .all(|(i, p)| match &p.expr.kind {
-                    TypedExprKind::ColumnRef { column_index, .. } => *column_index == i,
-                    _ => false,
-                });
-
-        let columns: Vec<String> = analyzed
-            .output_schema
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect();
-        let column_types: Vec<DataType> = analyzed
-            .output_schema
-            .iter()
-            .map(|(_, dt)| dt.clone())
-            .collect();
-        // Pre-materialize async expressions (subqueries, sequences) in projection.
-        let projection_exprs = rt
-            .pre_materialize_projections(&select.projection, txn, sequence_values)
-            .await?;
-
-        let planner = PhysicalPlanner::new(search_path.to_vec());
-        let estimated_rows = self
-            .stats_cache()
-            .get_estimate(db_id, schema.table_id)
-            .unwrap_or(1000);
-
-        // Handle DISTINCT variants (using plan).
-        let is_distinct = matches!(plan.distinct, DistinctStrategy::Distinct);
-        let is_distinct_on = matches!(plan.distinct, DistinctStrategy::DistinctOn);
-
-        if is_distinct_on {
-            return self
-                .execute_analyzed_distinct_on(
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    &schema,
-                    &planner,
-                    estimated_rows,
-                    select,
-                    analyzed,
-                    &columns,
-                    &column_types,
-                    &projection_exprs,
-                    ctes,
-                    preloaded_rows,
-                )
-                .await;
-        }
-
-        // Aggregate/window path: build scan+filter, then route to shared pipeline.
-        if plan.features.has_aggregates || plan.features.has_windows {
-            let base_op: BoxedOperator = if let Some(rows) = preloaded_rows {
-                let mut op: BoxedOperator =
-                    Box::new(TableScanOperator::new_with_rows(schema.clone(), rows));
-                if let Some(ref f) = select.where_clause {
-                    op = Box::new(FilterOperator::new(op, f.clone()));
-                }
-                op
-            } else {
-                // Use planner for scan+filter only (no sort/limit — those come post-aggregate/window).
-                planner.plan_simple_select(
-                    db_id,
-                    schema.clone(),
-                    select.where_clause.as_ref(),
-                    Vec::new(),
-                    None,
-                    0,
-                    estimated_rows,
-                )?
-            };
-            return self
-                .execute_analyzed_pipeline(
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    base_op,
-                    analyzed,
-                    select,
-                    ctes,
-                )
-                .await;
-        }
-
-        // Build operator tree.
-        // For SKIP LOCKED, scan all matching rows without LIMIT/OFFSET so we can
-        // try-lock each row and apply pagination to the locked subset.
-        // Also defer LIMIT/OFFSET when ORDER BY is deferred (sorting must happen first).
-        let (exec_limit, exec_offset) = if has_skip_locked || deferred_order_by.is_some() {
-            (None, 0)
-        } else {
-            (limit, offset)
-        };
-
-        let preloaded_source: Option<BoxedOperator> = preloaded_rows.map(|rows| {
-            Box::new(TableScanOperator::new_with_rows(schema.clone(), rows)) as BoxedOperator
-        });
-
-        let base_operator = if let Some(mut op) = preloaded_source {
-            if let Some(ref f) = sync_where {
-                op = Box::new(FilterOperator::new(op, f.clone()));
-            }
-            if !order_by.is_empty() {
-                op = Box::new(SortOperator::new(op, order_by.clone()));
-            }
-            if exec_limit.is_some() || exec_offset > 0 {
-                op = Box::new(LimitOperator::new(op, exec_limit, exec_offset));
-            }
-            op
-        } else {
-            planner.plan_simple_select(
-                db_id,
-                schema.clone(),
-                sync_where.as_ref(),
-                order_by.clone(),
-                exec_limit,
-                exec_offset,
-                estimated_rows,
-            )?
-        };
-
-        let mut operator: BoxedOperator = if is_distinct && !is_wildcard_only {
-            // For DISTINCT with non-wildcard projection: project first, then deduplicate.
-            let project_op = Box::new(ProjectOperator::new(
-                base_operator,
-                projection_exprs.clone(),
-                columns.clone(),
-                column_types.clone(),
-            ));
-            Box::new(DistinctOperator::new(project_op))
-        } else if is_distinct {
-            Box::new(DistinctOperator::new(base_operator))
-        } else {
-            base_operator
-        };
-
-        let rows = rt
-            .run_operator_tree(&mut operator, txn, sequence_values)
-            .await?;
-
-        // Async post-filter: evaluate WHERE conjuncts with correlated subqueries per-row.
-        let rows = rt
-            .filter_async(rows, async_where.as_ref(), &schema, txn, sequence_values)
-            .await?;
-
-        // FOR UPDATE / FOR SHARE: lock rows before projection (need raw rows with PK).
-        let rows = if has_lock {
-            let table_name = &schema.name;
-            if has_skip_locked {
-                let max_locks = limit.map(|l| offset + l);
-                let locked_indices = self
-                    .store()
-                    .lock_rows_skip_locked(txn, db_id, table_name, &rows, max_locks)
-                    .await?;
-                let locked_rows: Vec<Row> =
-                    locked_indices.iter().map(|&i| rows[i].clone()).collect();
-                // Apply offset + limit to the locked subset.
-                let start = offset.min(locked_rows.len());
-                let end = limit.map_or(locked_rows.len(), |l| (start + l).min(locked_rows.len()));
-                locked_rows[start..end].to_vec()
-            } else if has_nowait {
-                self.store()
-                    .lock_rows_nowait(txn, db_id, table_name, &rows)
-                    .await?;
-                rows
-            } else {
-                self.store()
-                    .lock_rows(txn, db_id, table_name, &rows)
-                    .await?;
-                rows
-            }
-        } else {
-            rows
-        };
-
-        // Apply projection if not wildcard and not already applied in DISTINCT path.
-        let rows = if is_wildcard_only || (is_distinct && !is_wildcard_only) {
-            rows
-        } else {
-            rt.project_rows(rows, &projection_exprs, &schema, txn, sequence_values)
-                .await?
-        };
-
-        // Deferred ORDER BY: when ORDER BY contained subqueries (e.g. alias → ScalarSubquery),
-        // sorting was deferred to after projection. Now sort the projected rows.
-        // The ORDER BY expressions reference table-scope columns, but the Analyzer clones
-        // projection expressions for alias matches. We find the matching output column index
-        // by checking which output_schema column name matches the ORDER BY's column_name hint.
-        let rows = if let Some(ref deferred_ob) = deferred_order_by {
-            sort_projected_rows(rows, deferred_ob, &analyzed.output_schema, limit, offset)?
-        } else {
-            rows
-        };
-
-        Ok(ExecuteResult::Select {
-            columns,
-            column_types: Some(column_types),
-            rows,
-            timezone: crate::session_context::current_timezone(),
-        })
-    }
-
-    /// Execute DISTINCT ON through the analyzed path.
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_analyzed_distinct_on(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
-        search_path: &[String],
-        schema: &TableSchema,
-        planner: &PhysicalPlanner,
-        estimated_rows: usize,
-        select: &AnalyzedSelect,
-        analyzed: &AnalyzedQuery,
-        columns: &[String],
-        column_types: &[DataType],
-        projection_exprs: &[TypedExpr],
-        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
-        preloaded_rows: Option<Vec<Row>>,
-    ) -> Result<ExecuteResult> {
-        let AnalyzedDistinct::DistinctOn(ref on_exprs) = select.distinct else {
-            return Err(anyhow!("Expected DISTINCT ON"));
-        };
-
-        let where_clause = select.where_clause.clone();
-        let order_by = analyzed.order_by.clone();
-        let limit = analyzed
-            .limit
-            .as_ref()
-            .map(|e| eval_const_usize(e))
-            .transpose()?;
-        let offset = analyzed
-            .offset
-            .as_ref()
-            .map(|e| eval_const_usize(e))
-            .transpose()?
-            .unwrap_or(0);
-
-        // Build scan with filter only (no sort/limit yet — DISTINCT ON needs full sort).
-        let scan_operator: BoxedOperator = if let Some(rows) = preloaded_rows {
-            let mut op: BoxedOperator =
-                Box::new(TableScanOperator::new_with_rows(schema.clone(), rows));
-            if let Some(ref f) = where_clause {
-                op = Box::new(FilterOperator::new(op, f.clone()));
-            }
-            op
-        } else {
-            let typed_filter = where_clause.as_ref();
-            planner.plan_simple_select(
-                db_id,
-                schema.clone(),
-                typed_filter,
-                Vec::new(),
-                None,
-                0,
-                estimated_rows,
-            )?
-        };
-
-        // Sort by ORDER BY expressions (pre-projection).
-        let sorted: BoxedOperator = if !order_by.is_empty() {
-            Box::new(SortOperator::new(scan_operator, order_by))
-        } else {
-            scan_operator
-        };
-
-        // DISTINCT ON deduplication.
-        let distincted: BoxedOperator = Box::new(DistinctOnOperator::new(sorted, on_exprs.clone()));
-
-        // Project.
-        let projected: BoxedOperator = Box::new(ProjectOperator::new(
-            distincted,
-            projection_exprs.to_vec(),
-            columns.to_vec(),
-            column_types.to_vec(),
-        ));
-
-        // LIMIT/OFFSET.
-        let mut operator: BoxedOperator = if limit.is_some() || offset > 0 {
-            Box::new(LimitOperator::new(projected, limit, offset))
-        } else {
-            projected
-        };
-
-        let rt = ExprRuntime::new(self, db_id, search_path, ctes);
-        let rows = rt
-            .run_operator_tree(&mut operator, txn, sequence_values)
-            .await?;
-
-        Ok(ExecuteResult::Select {
-            columns: columns.to_vec(),
-            column_types: Some(column_types.to_vec()),
-            rows,
-            timezone: crate::session_context::current_timezone(),
-        })
-    }
-
-    // ── VALUES query path ──────────────────────────────────────
-
-    /// Execute an analyzed standalone VALUES query.
-    ///
-    /// Expressions are evaluated from typed IR with async materialization for
-    /// subqueries/catalog-dependent functions.
-    async fn execute_analyzed_values(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
-        search_path: &[String],
-        analyzed: &AnalyzedQuery,
-        value_rows: &[Vec<TypedExpr>],
-        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
-    ) -> Result<ExecuteResult> {
-        let columns: Vec<String> = analyzed
-            .output_schema
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-        let column_types: Vec<DataType> = analyzed
-            .output_schema
-            .iter()
-            .map(|(_, t)| t.clone())
-            .collect();
-
-        let schema = build_set_op_schema(&columns, &column_types);
-        let dummy_row = Row::new(vec![]);
-        let rt = ExprRuntime::new(self, db_id, search_path, ctes);
-
-        // Evaluate VALUES rows.
-        let mut rows = Vec::with_capacity(value_rows.len());
-        for expr_row in value_rows {
-            let mut pre_materialized = Vec::with_capacity(expr_row.len());
-            for expr in expr_row {
-                pre_materialized.push(rt.pre_materialize(expr, txn, sequence_values).await?);
-            }
-            let materialized = rt
-                .materialize_exprs_for_row(
-                    pre_materialized,
-                    &dummy_row,
-                    &schema,
-                    txn,
-                    sequence_values,
-                )
-                .await?;
-            let mut values = Vec::with_capacity(materialized.len());
-            for expr in &materialized {
-                values.push(rt.eval(expr, &dummy_row)?);
-            }
-            rows.push(Row::new(values));
-        }
-
-        // ORDER BY for VALUES: evaluate ORDER BY keys per row, then sort by keys.
-        if !analyzed.order_by.is_empty() {
-            let mut keyed_rows: Vec<(Row, Vec<Value>)> = Vec::with_capacity(rows.len());
-            for row in rows {
-                let mut keys = Vec::with_capacity(analyzed.order_by.len());
-                for ob in &analyzed.order_by {
-                    keys.push(
-                        rt.resolve_and_eval(&ob.expr, &row, &schema, txn, sequence_values)
-                            .await?,
-                    );
-                }
-                keyed_rows.push((row, keys));
-            }
-
-            crate::sql::expr::operators::sort_by_fallible(&mut keyed_rows, |a, b| {
-                for (idx, ob) in analyzed.order_by.iter().enumerate() {
-                    let ord = crate::sql::expr::compare_order_by_values(
-                        &a.1[idx],
-                        &b.1[idx],
-                        ob.asc,
-                        ob.nulls_first,
-                    )?;
-                    if ord != std::cmp::Ordering::Equal {
-                        return Ok(ord);
-                    }
-                }
-                Ok(std::cmp::Ordering::Equal)
-            })?;
-
-            rows = keyed_rows.into_iter().map(|(row, _)| row).collect();
-        }
-
-        // LIMIT/OFFSET for VALUES.
-        let limit = analyzed
-            .limit
-            .as_ref()
-            .map(|e| eval_const_usize(e))
-            .transpose()?;
-        let offset = analyzed
-            .offset
-            .as_ref()
-            .map(|e| eval_const_usize(e))
-            .transpose()?
-            .unwrap_or(0);
-        let start = offset.min(rows.len());
-        let end = limit.map_or(rows.len(), |l| (start + l).min(rows.len()));
-        let rows = rows[start..end].to_vec();
-
-        Ok(ExecuteResult::Select {
-            columns,
-            column_types: Some(column_types),
-            rows,
-            timezone: crate::session_context::current_timezone(),
-        })
-    }
-
-    // ── Tableless query path ───────────────────────────────────
-
-    /// Execute a tableless query (no FROM clause) through the analyzed path.
-    ///
-    /// Creates a zero-column dummy input with one row, then runs through the
-    /// standard operator pipeline (ProjectOperator handles SRF expansion).
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_analyzed_tableless(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
-        search_path: &[String],
-        analyzed: &AnalyzedQuery,
-        select: &AnalyzedSelect,
-        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
-    ) -> Result<ExecuteResult> {
-        // Build a zero-column schema with one empty row.
-        let dummy_schema = TableSchema {
-            name: "dual".to_string(),
-            table_id: 0,
-            columns: vec![],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            from_alias: None,
-        };
-        let dummy_row = Row::new(vec![]);
-        let base_op: BoxedOperator = Box::new(TableScanOperator::new_with_rows(
-            dummy_schema.clone(),
-            vec![dummy_row.clone()],
-        ));
-
-        // Aggregate/window path uses the shared pipeline.
-        if has_aggregates(select) || has_windows(select) {
-            return self
-                .execute_analyzed_pipeline(
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    base_op,
-                    analyzed,
-                    select,
-                    ctes,
-                )
-                .await;
-        }
-
-        // Non-aggregate path: project, then ORDER BY / LIMIT / DISTINCT.
-        let columns: Vec<String> = analyzed
-            .output_schema
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-        let column_types: Vec<DataType> = analyzed
-            .output_schema
-            .iter()
-            .map(|(_, t)| t.clone())
-            .collect();
-        let rt = ExprRuntime::new(self, db_id, search_path, ctes);
-
-        // Pre-materialize async expressions in projection.
-        let projection_exprs = rt
-            .pre_materialize_projections(&select.projection, txn, sequence_values)
-            .await?;
-
-        // Materialize catalog-dependent functions (e.g. pg_get_indexdef) in tableless context
-        // so the pure ProjectOperator can evaluate the remaining expression tree.
-        let projection_exprs_materialized = rt
-            .materialize_exprs_for_row(
-                projection_exprs,
-                &dummy_row,
-                &dummy_schema,
-                txn,
-                sequence_values,
-            )
-            .await?;
-
-        // Project first (handles SRF expansion).
-        let mut op: BoxedOperator = Box::new(ProjectOperator::new(
-            base_op,
-            projection_exprs_materialized,
-            columns.clone(),
-            column_types.clone(),
-        ));
-
-        // ORDER BY.
-        if !analyzed.order_by.is_empty() {
-            op = Box::new(SortOperator::new(op, analyzed.order_by.clone()));
-        }
-
-        // LIMIT / OFFSET.
-        let limit = analyzed
-            .limit
-            .as_ref()
-            .map(|e| eval_const_usize(e))
-            .transpose()?;
-        let offset = analyzed
-            .offset
-            .as_ref()
-            .map(|e| eval_const_usize(e))
-            .transpose()?
-            .unwrap_or(0);
-        if limit.is_some() || offset > 0 {
-            op = Box::new(LimitOperator::new(op, limit, offset));
-        }
-
-        // DISTINCT.
-        if matches!(&select.distinct, AnalyzedDistinct::Distinct) {
-            op = Box::new(DistinctOperator::new(op));
-        }
-
-        // Execute.
-        let rows = rt.run_operator_tree(&mut op, txn, sequence_values).await?;
-
-        Ok(ExecuteResult::Select {
-            columns,
-            column_types: Some(column_types),
-            rows,
-            timezone: crate::session_context::current_timezone(),
-        })
-    }
-
-    // ── Aggregate execution pipeline ────────────────────────────
-
-    /// Shared pipeline for queries with aggregates and/or window functions.
-    ///
-    /// Builds: [HashAggregate → HAVING] → [Window] → ORDER BY → LIMIT →
-    /// DISTINCT → Project → Execute.
-    ///
-    /// Called from both single-table and join paths when the query has
-    /// aggregates or window functions (or both). `base_op` is the FROM+WHERE
-    /// operator (pre-aggregate rows).
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_analyzed_pipeline(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
-        search_path: &[String],
-        base_op: BoxedOperator,
-        analyzed: &AnalyzedQuery,
-        select: &AnalyzedSelect,
-        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
-    ) -> Result<ExecuteResult> {
-        let has_agg = has_aggregates(select);
-        let has_win = has_windows(select);
-
-        let mut op: BoxedOperator = base_op;
-
-        // ── Phase 1: Aggregate ──────────────────────────────────
-        let agg_analysis = if has_agg {
-            let analysis = build_aggregate_analysis(select, &analyzed.order_by);
-
-            op = Box::new(HashAggregateOperator::new(
-                op,
-                analysis.group_by_exprs.clone(),
-                analysis.aggregate_exprs.clone(),
-                analysis.group_by_names.clone(),
-                analysis.group_by_types.clone(),
-                analysis.aggregate_names.clone(),
-                analysis.aggregate_types.clone(),
-            ));
-
-            // HAVING filter (rewritten for post-aggregate positions).
-            if let Some(ref having) = select.having {
-                let rewritten = rewrite_for_post_aggregate(having, &analysis);
-                op = Box::new(FilterOperator::new(op, rewritten));
-            }
-
-            Some(analysis)
-        } else {
-            None
-        };
-
-        // Rewrite projection and ORDER BY for post-aggregate positions.
-        let mut rewritten_projection: Vec<TypedExpr> = if let Some(ref analysis) = agg_analysis {
-            select
-                .projection
-                .iter()
-                .map(|p| rewrite_for_post_aggregate(&p.expr, analysis))
-                .collect()
-        } else {
-            select.projection.iter().map(|p| p.expr.clone()).collect()
-        };
-
-        let mut rewritten_order_by: Vec<TypedOrderByExpr> = if let Some(ref analysis) = agg_analysis
-        {
-            analyzed
-                .order_by
-                .iter()
-                .map(|o| TypedOrderByExpr {
-                    expr: rewrite_for_post_aggregate(&o.expr, analysis),
-                    asc: o.asc,
-                    nulls_first: o.nulls_first,
-                })
-                .collect()
-        } else {
-            analyzed.order_by.clone()
-        };
-
-        // ── Phase 2: Window functions ───────────────────────────
-        if has_win {
-            let input_col_count = op.schema().columns.len();
-
-            // Extract WindowCall nodes from (possibly rewritten) projection.
-            let window_functions = extract_window_functions(&rewritten_projection, select);
-            if !window_functions.is_empty() {
-                op = Box::new(WindowOperator::new(op, window_functions));
-
-                // Rewrite projection: WindowCall → ColumnRef at window output position.
-                let mut win_counter = 0usize;
-                rewritten_projection = rewritten_projection
-                    .iter()
-                    .map(|e| rewrite_for_post_window(e, input_col_count, &mut win_counter))
-                    .collect();
-
-                // Rewrite ORDER BY for window positions too (rare but valid).
-                let mut win_counter_ob = 0usize;
-                rewritten_order_by = rewritten_order_by
-                    .iter()
-                    .map(|o| TypedOrderByExpr {
-                        expr: rewrite_for_post_window(
-                            &o.expr,
-                            input_col_count,
-                            &mut win_counter_ob,
-                        ),
-                        asc: o.asc,
-                        nulls_first: o.nulls_first,
-                    })
-                    .collect();
-            }
-        }
-
-        // ── Phase 3: ORDER BY, LIMIT, DISTINCT, Project, Execute ─
-        if !rewritten_order_by.is_empty() {
-            op = Box::new(SortOperator::new(op, rewritten_order_by));
-        }
-
-        let limit = analyzed
-            .limit
-            .as_ref()
-            .map(|e| eval_const_usize(e))
-            .transpose()?;
-        let offset = analyzed
-            .offset
-            .as_ref()
-            .map(|e| eval_const_usize(e))
-            .transpose()?
-            .unwrap_or(0);
-        if limit.is_some() || offset > 0 {
-            op = Box::new(LimitOperator::new(op, limit, offset));
-        }
-
-        let columns: Vec<String> = analyzed
-            .output_schema
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-        let column_types: Vec<DataType> = analyzed
-            .output_schema
-            .iter()
-            .map(|(_, t)| t.clone())
-            .collect();
-
-        // DISTINCT ON: apply after aggregate/window, before final projection.
-        if let AnalyzedDistinct::DistinctOn(ref on_exprs) = select.distinct {
-            // Rewrite ON exprs for post-aggregate/window positions if needed.
-            let rewritten_on: Vec<TypedExpr> = if let Some(ref analysis) = agg_analysis {
-                on_exprs
-                    .iter()
-                    .map(|e| rewrite_for_post_aggregate(e, analysis))
-                    .collect()
-            } else {
-                on_exprs.clone()
-            };
-            op = Box::new(DistinctOnOperator::new(op, rewritten_on));
-        }
-
-        let rt = ExprRuntime::new(self, db_id, search_path, ctes);
-
-        // DISTINCT: project first, then deduplicate.
-        let is_distinct = matches!(&select.distinct, AnalyzedDistinct::Distinct);
-        if is_distinct {
-            let project_op = Box::new(ProjectOperator::new(
-                op,
-                rewritten_projection,
-                columns.clone(),
-                column_types.clone(),
-            ));
-            op = Box::new(DistinctOperator::new(project_op));
-
-            let rows = rt.run_operator_tree(&mut op, txn, sequence_values).await?;
-
-            return Ok(ExecuteResult::Select {
-                columns,
-                column_types: Some(column_types),
-                rows,
-                timezone: crate::session_context::current_timezone(),
-            });
-        }
-
-        // Execute operator tree, then apply projection.
-        let rows = rt.run_operator_tree(&mut op, txn, sequence_values).await?;
-
-        // Pipeline projection is always sync (aggregates/windows are already resolved).
-        let dummy_schema = TableSchema {
-            name: "pipeline".to_string(),
-            table_id: 0,
-            columns: vec![],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            from_alias: None,
-        };
-        let projected = rt
-            .project_rows(
-                rows,
-                &rewritten_projection,
-                &dummy_schema,
-                txn,
-                sequence_values,
-            )
-            .await?;
-
-        Ok(ExecuteResult::Select {
-            columns,
-            column_types: Some(column_types),
-            rows: projected,
-            timezone: crate::session_context::current_timezone(),
-        })
-    }
-
-    // ── JOIN execution path ─────────────────────────────────────
-
-    /// Execute a query with joins through the analyzed path.
-    async fn execute_analyzed_join(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
-        search_path: &[String],
-        analyzed: &AnalyzedQuery,
-        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
-    ) -> Result<ExecuteResult> {
-        let AnalyzedQueryBody::Select(select) = &analyzed.body else {
-            return Err(anyhow!("Expected SELECT in analyzed query"));
-        };
-
-        // Build the FROM operator tree (handles joins + implicit cross joins).
-        let from_op = self
-            .build_from_operators(txn, db_id, sequence_values, search_path, &select.from, ctes)
-            .await?;
-
-        let rt = ExprRuntime::new(self, db_id, search_path, ctes);
-
-        // Pre-materialize WHERE and split into sync/async parts.
-        let prepared_where = rt
-            .prepare_where(&select.where_clause, txn, sequence_values)
-            .await?;
-        let sync_where = prepared_where.sync_part;
-        let async_where = prepared_where.async_part;
-
-        let mut op: BoxedOperator = from_op;
-        if let Some(ref f) = sync_where {
-            op = Box::new(FilterOperator::new(op, f.clone()));
-        }
-
-        // Aggregate/window path: route to shared pipeline after FROM+WHERE.
-        if has_aggregates(select) || has_windows(select) {
-            if async_where.is_some() {
-                return Err(anyhow!(
-                    "correlated subqueries or catalog-dependent functions in WHERE are not yet supported with aggregates/windows"
-                ));
-            }
-            return self
-                .execute_analyzed_pipeline(
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    op,
-                    analyzed,
-                    select,
-                    ctes,
-                )
-                .await;
-        }
-
-        // Pre-materialize ORDER BY and classify as inline or deferred.
-        let (order_by, deferred_order_by) = rt
-            .prepare_order_by(&analyzed.order_by, txn, sequence_values)
-            .await?;
-
-        // Add ORDER BY.
-        if !order_by.is_empty() {
-            op = Box::new(SortOperator::new(op, order_by));
-        }
-
-        // Add LIMIT/OFFSET.
-        let limit = analyzed
-            .limit
-            .as_ref()
-            .map(|e| eval_const_usize(e))
-            .transpose()?;
-        let offset = analyzed
-            .offset
-            .as_ref()
-            .map(|e| eval_const_usize(e))
-            .transpose()?
-            .unwrap_or(0);
-        if deferred_order_by.is_none() && (limit.is_some() || offset > 0) {
-            op = Box::new(LimitOperator::new(op, limit, offset));
-        }
-
-        // DISTINCT handling.
-        let is_distinct = matches!(&select.distinct, AnalyzedDistinct::Distinct);
-        let is_distinct_on = matches!(&select.distinct, AnalyzedDistinct::DistinctOn(_));
-
-        // Build projection info from the analyzed output.
-        let columns: Vec<String> = analyzed
-            .output_schema
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-        let column_types: Vec<DataType> = analyzed
-            .output_schema
-            .iter()
-            .map(|(_, t)| t.clone())
-            .collect();
-        // Pre-materialize async expressions in projection.
-        let projection_exprs = rt
-            .pre_materialize_projections(&select.projection, txn, sequence_values)
-            .await?;
-
-        let input_col_count = op.schema().columns.len();
-        let is_wildcard_only = projection_exprs.len() == input_col_count
-            && projection_exprs
-                .iter()
-                .enumerate()
-                .all(|(i, p)| match &p.kind {
-                    TypedExprKind::ColumnRef { column_index, .. } => *column_index == i,
-                    _ => false,
-                });
-
-        // DISTINCT ON: sort + deduplicate + project + limit.
-        if is_distinct_on {
-            let AnalyzedDistinct::DistinctOn(ref on_exprs) = select.distinct else {
-                return Err(anyhow!("Expected DISTINCT ON"));
-            };
-
-            // Re-build without ORDER BY/LIMIT (DISTINCT ON needs full sort first).
-            let from_op = self
-                .build_from_operators(txn, db_id, sequence_values, search_path, &select.from, ctes)
-                .await?;
-            let mut dop: BoxedOperator = from_op;
-            if let Some(ref where_clause) = select.where_clause {
-                dop = Box::new(FilterOperator::new(dop, where_clause.clone()));
-            }
-            if !analyzed.order_by.is_empty() {
-                dop = Box::new(SortOperator::new(dop, analyzed.order_by.clone()));
-            }
-            dop = Box::new(DistinctOnOperator::new(dop, on_exprs.clone()));
-            dop = Box::new(ProjectOperator::new(
-                dop,
-                projection_exprs,
-                columns.clone(),
-                column_types.clone(),
-            ));
-            if limit.is_some() || offset > 0 {
-                dop = Box::new(LimitOperator::new(dop, limit, offset));
-            }
-
-            let rows = rt.run_operator_tree(&mut dop, txn, sequence_values).await?;
-
-            return Ok(ExecuteResult::Select {
-                columns,
-                column_types: Some(column_types),
-                rows,
-                timezone: crate::session_context::current_timezone(),
-            });
-        }
-
-        // DISTINCT with non-wildcard: project first, then deduplicate.
-        let projection_needs_materialization = projection_exprs.iter().any(|e| needs_async(e));
-        let mut post_distinct = false;
-        if is_distinct && !is_wildcard_only {
-            if projection_needs_materialization || async_where.is_some() {
-                // Can't use ProjectOperator for catalog-dependent functions or correlated subqueries.
-                // Apply DISTINCT after executor-level projection.
-                post_distinct = true;
-            } else {
-                let project_op = Box::new(ProjectOperator::new(
-                    op,
-                    projection_exprs.clone(),
-                    columns.clone(),
-                    column_types.clone(),
-                ));
-                op = Box::new(DistinctOperator::new(project_op));
-            }
-        } else if is_distinct {
-            op = Box::new(DistinctOperator::new(op));
-        }
-
-        // Execute operator tree.
-        let input_schema = op.schema().clone();
-        let rows = rt.run_operator_tree(&mut op, txn, sequence_values).await?;
-
-        // Async post-filter for WHERE parts that require per-row materialization.
-        let rows = rt
-            .filter_async(
-                rows,
-                async_where.as_ref(),
-                &input_schema,
-                txn,
-                sequence_values,
-            )
-            .await?;
-
-        // Apply projection (executor-level materialization for subqueries/catalog funcs).
-        let already_projected = is_distinct && !is_wildcard_only && !post_distinct;
-        let rows = if is_wildcard_only || already_projected {
-            rows
-        } else {
-            rt.project_rows(rows, &projection_exprs, &input_schema, txn, sequence_values)
-                .await?
-        };
-
-        // Post-projection DISTINCT (only needed when we couldn't use ProjectOperator).
-        let rows = if post_distinct {
-            let schema = build_set_op_schema(&columns, &column_types);
-            let mut dop: BoxedOperator =
-                Box::new(TableScanOperator::new_with_rows(schema, rows)) as BoxedOperator;
-            dop = Box::new(DistinctOperator::new(dop));
-            rt.run_operator_tree(&mut dop, txn, sequence_values).await?
-        } else {
-            rows
-        };
-
-        // Deferred ORDER BY: sort projected rows after per-row materialization and apply LIMIT/OFFSET.
-        let rows = if let Some(ref deferred_ob) = deferred_order_by {
-            sort_projected_rows(rows, deferred_ob, &analyzed.output_schema, limit, offset)?
-        } else {
-            rows
-        };
-
-        Ok(ExecuteResult::Select {
-            columns,
-            column_types: Some(column_types),
-            rows,
-            timezone: crate::session_context::current_timezone(),
-        })
-    }
-
-    // ── FROM operator tree builders ─────────────────────────────
-
-    /// Build operator tree from the FROM clause (handles joins + implicit cross joins).
-    fn build_from_operators<'a>(
-        &'a self,
-        txn: &'a mut Transaction,
-        db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
-        search_path: &'a [String],
-        from: &'a [AnalyzedTableRef],
-        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
-    ) -> Pin<Box<dyn Future<Output = Result<BoxedOperator>> + Send + 'a>> {
-        Box::pin(async move {
-            assert!(!from.is_empty(), "FROM clause must not be empty");
-
-            // Build operator for first FROM item.
-            let mut result = self
-                .build_table_ref_operator(txn, db_id, sequence_values, search_path, &from[0], ctes)
-                .await?;
-
-            // Implicit cross joins for additional FROM items (FROM a, b).
-            for table_ref in &from[1..] {
-                let right_op = self
-                    .build_table_ref_operator(
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        table_ref,
-                        ctes,
-                    )
-                    .await?;
-                result = Box::new(NestedLoopJoinOperator::new(
-                    result,
-                    right_op,
-                    OpJoinType::Cross,
-                    None,
-                ));
-            }
-
-            Ok(result)
-        })
-    }
-
-    /// Recursively build an operator from a single AnalyzedTableRef (may be a join tree).
-    fn build_table_ref_operator<'a>(
-        &'a self,
-        txn: &'a mut Transaction,
-        db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
-        search_path: &'a [String],
-        table_ref: &'a AnalyzedTableRef,
-        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
-    ) -> Pin<Box<dyn Future<Output = Result<BoxedOperator>> + Send + 'a>> {
-        Box::pin(async move {
-            match &table_ref.kind {
-                AnalyzedTableRefKind::Table { name, .. } => {
-                    let alias = table_ref.alias.as_deref().unwrap_or(name);
-                    self.build_scan_operator(
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        name,
-                        alias,
-                        ctes,
-                    )
-                    .await
-                }
-
-                AnalyzedTableRefKind::Join {
-                    left,
-                    right,
-                    join_type,
-                    condition,
-                    left_col_start,
-                } => {
-                    let mut left_op = self
-                        .build_table_ref_operator(
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            left,
-                            ctes,
-                        )
-                        .await?;
-                    let mut right_op = self
-                        .build_table_ref_operator(
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            right,
-                            ctes,
-                        )
-                        .await?;
-
-                    let left_schema = left_op.schema().clone();
-                    let right_schema = right_op.schema().clone();
-                    let left_col_count = left_schema.columns.len();
-
-                    // Reindex ON condition: global column indices → local indices
-                    // for this join pair. Needed when this join is nested inside a
-                    // larger join tree (e.g. `A JOIN (B JOIN C ON ...)`), where the
-                    // analyzer assigns global indices starting at left_col_start > 0.
-                    let local_condition = if *left_col_start > 0 {
-                        reindex_join_condition(condition, *left_col_start)
-                    } else {
-                        condition.clone()
-                    };
-
-                    // Pre-materialize async exprs in ON condition.
-                    let materialized_condition = match &local_condition {
-                        JoinCondition::On(expr) => {
-                            let m = self
-                                .pre_materialize_async_exprs(
-                                    expr,
-                                    txn,
-                                    db_id,
-                                    sequence_values,
-                                    search_path,
-                                    ctes,
-                                )
-                                .await?;
-                            JoinCondition::On(m)
-                        }
-                        other => other.clone(),
-                    };
-
-                    // If JOIN ON still contains correlated subqueries or catalog-dependent
-                    // functions, force a nested-loop join with per-row materialization.
-                    if let JoinCondition::On(ref on_expr) = materialized_condition {
-                        if needs_async(on_expr) {
-                            let rt = ExprRuntime::new(self, db_id, search_path, ctes);
-                            let left_rows = rt
-                                .run_operator_tree(&mut left_op, txn, sequence_values)
-                                .await?;
-                            let right_rows = rt
-                                .run_operator_tree(&mut right_op, txn, sequence_values)
-                                .await?;
-                            let output_schema =
-                                build_join_output_schema(&left_schema, &right_schema);
-                            let result_rows = execute_async_nested_loop_join(
-                                self,
-                                *join_type,
-                                &left_rows,
-                                &right_rows,
-                                on_expr,
-                                &output_schema,
-                                left_col_count,
-                                right_schema.columns.len(),
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?;
-                            return Ok(Box::new(TableScanOperator::new_with_rows(
-                                output_schema,
-                                result_rows,
-                            )) as BoxedOperator);
-                        }
-                    }
-                    build_join_operator(
-                        left_op,
-                        right_op,
-                        *join_type,
-                        &materialized_condition,
-                        left_col_count,
-                    )
-                }
-
-                AnalyzedTableRefKind::Subquery(inner_query) => {
-                    // Recursively execute the subquery and materialize results.
-                    let result = self
-                        .execute_subquery(
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            inner_query,
-                            ctes,
-                        )
-                        .await?;
-                    let (cols, types, rows) = match result {
-                        ExecuteResult::Select {
-                            columns,
-                            column_types,
-                            rows,
-                            ..
-                        } => (columns, column_types.unwrap_or_default(), rows),
-                        _ => {
-                            return Err(anyhow!(
-                                "Expected SELECT result from derived table subquery"
-                            ))
-                        }
-                    };
-
-                    let alias = table_ref.alias.as_deref().unwrap_or("subquery");
-                    let mut schema = build_set_op_schema(&cols, &types);
-                    schema.name = alias.to_string();
-                    schema.from_alias = Some(alias.to_string());
-                    Ok(Box::new(TableScanOperator::new_with_rows(schema, rows)) as BoxedOperator)
-                }
-
-                AnalyzedTableRefKind::Function {
-                    func,
-                    args,
-                    output_columns,
-                } => {
-                    // Build output schema from analyzer-resolved output columns.
-                    let schema = TableSchema {
-                        name: table_ref.alias.as_deref().unwrap_or(&func.name).to_string(),
-                        table_id: 0,
-                        columns: output_columns
-                            .iter()
-                            .map(|(name, dt)| crate::types::ColumnDef {
-                                name: name.clone(),
-                                data_type: dt.clone(),
-                                nullable: true,
-                                primary_key: false,
-                                unique: false,
-                                is_serial: false,
-                                default_expr: None,
-                            })
-                            .collect(),
-                        version: 1,
-                        pk_constraint_name: None,
-                        pk_indices: vec![],
-                        indexes: vec![],
-                        check_constraints: vec![],
-                        foreign_keys: vec![],
-                        owner: String::new(),
-                        from_alias: table_ref.alias.clone(),
-                    };
-
-                    // Evaluate typed args to concrete Values, then bridge to FunctionArg.
-                    let qc = crate::sql::query_context::QueryContext::from_task_locals();
-                    let dummy_row = Row::new(vec![]);
-                    let mut bridge_args: Vec<FunctionArg> = Vec::with_capacity(args.len());
-                    for tfa in args {
-                        let (name_opt, typed_expr) = match tfa {
-                            TypedFunctionArg::Positional(e) => (None, e),
-                            TypedFunctionArg::Named { name, expr } => (Some(name.clone()), expr),
-                        };
-                        let val = eval_typed_expr(typed_expr, &dummy_row, &qc)?;
-                        let sql_expr = crate::sql::value_coercion::value_to_sql_expr(&val);
-                        let fa = match name_opt {
-                            None => FunctionArg::Unnamed(FunctionArgExpr::Expr(sql_expr)),
-                            Some(n) => FunctionArg::Named {
-                                name: sqlparser::ast::Ident::new(n),
-                                arg: FunctionArgExpr::Expr(sql_expr),
-                            },
-                        };
-                        bridge_args.push(fa);
-                    }
-
-                    let func_upper = func.name.to_uppercase();
-
-                    let (_, rows) = if func_upper == "GENERATE_SERIES" {
-                        self.execute_generate_series(
-                            &bridge_args,
-                            schema.name.as_str(),
-                            None,
-                            0,
-                            None,
-                        )
-                        .await?
-                    } else if func_upper == "_PGTIKV_SYS_RECORD_MIGRATION" {
-                        self.execute_record_migration(txn, &bridge_args).await?
-                    } else {
-                        // Try extension table function.
-                        let obj_name =
-                            ObjectName(vec![sqlparser::ast::Ident::new(func.name.clone())]);
-                        if let Some(result) = self
-                            .try_execute_extension_table_function(
-                                txn,
-                                db_id,
-                                search_path,
-                                &obj_name,
-                                &bridge_args,
-                                None,
-                            )
-                            .await?
-                        {
-                            match result {
-                                crate::sql::executor::extensions::ExtensionTableFunctionResult::Batch(
-                                    _s,
-                                    rows,
-                                ) => (schema.clone(), rows),
-                                crate::sql::executor::extensions::ExtensionTableFunctionResult::Streaming(
-                                    _s,
-                                    mut operator,
-                                ) => {
-                                    let rt = ExprRuntime::new(self, db_id, search_path, ctes);
-                                    let rows = rt.run_operator_tree(&mut operator, txn, sequence_values).await?;
-                                    (schema.clone(), rows)
-                                }
-                            }
-                        } else if let Some((_, rows)) = self
-                            .try_execute_user_table_function(
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                &obj_name,
-                                &bridge_args,
-                                None,
-                            )
-                            .await?
-                        {
-                            (schema.clone(), rows)
-                        } else {
-                            // Scalar-in-FROM: construct FunctionCall and evaluate via typed_eval.
-                            let typed_args: Vec<TypedExpr> = args
-                                .iter()
-                                .map(|a| match a {
-                                    TypedFunctionArg::Positional(e) => e.clone(),
-                                    TypedFunctionArg::Named { expr, .. } => expr.clone(),
-                                })
-                                .collect();
-
-                            let mut scalar_arg_values = Vec::with_capacity(typed_args.len());
-                            for arg in &typed_args {
-                                scalar_arg_values.push(eval_typed_expr(arg, &dummy_row, &qc)?);
-                            }
-                            if let Some(result) =
-                                crate::sql::executor::execute_cron_scalar_function(
-                                    &self.store(),
-                                    txn,
-                                    db_id,
-                                    qc.current_user.as_ref(),
-                                    qc.database_name.as_ref(),
-                                    crate::extensions::context::is_superuser(),
-                                    &func.name,
-                                    &scalar_arg_values,
-                                    self.tenant_keyspace(),
-                                )
-                                .await
-                            {
-                                return Ok(Box::new(TableScanOperator::new_with_rows(
-                                    schema.clone(),
-                                    vec![Row::new(vec![result?])],
-                                )) as BoxedOperator);
-                            }
-
-                            if let Some(result) = crate::sql::executor::execute_bg_sql_function(
-                                &self.store(),
-                                txn,
-                                db_id,
-                                qc.current_user.as_ref(),
-                                &func.name,
-                                &scalar_arg_values,
-                                self.tenant_keyspace(),
-                            )
-                            .await
-                            {
-                                return Ok(Box::new(TableScanOperator::new_with_rows(
-                                    schema.clone(),
-                                    vec![Row::new(vec![result?])],
-                                )) as BoxedOperator);
-                            }
-
-                            let typed_expr = TypedExpr {
-                                kind: TypedExprKind::FunctionCall {
-                                    func: func.clone(),
-                                    args: typed_args,
-                                    order_by: vec![],
-                                    filter: None,
-                                },
-                                data_type: func.return_type.clone(),
-                            };
-                            let val = eval_typed_expr(&typed_expr, &dummy_row, &qc)?;
-                            (schema.clone(), vec![Row::new(vec![val])])
-                        }
-                    };
-
-                    Ok(Box::new(TableScanOperator::new_with_rows(schema, rows)) as BoxedOperator)
-                }
-            }
-        })
-    }
-
-    // ── Set operation execution path ──────────────────────────────
 
     // ── Subquery pre-materialization ────────────────────────────
 
@@ -2527,179 +958,15 @@ impl Executor {
         }) // end Box::pin
     }
 
-    /// Execute a set operation (UNION/INTERSECT/EXCEPT) through the analyzed path.
+    /// Execute a query through the CBO optimizer pipeline.
     ///
-    /// Recursively executes left and right branches, materializes their results,
-    /// combines them via SetOperationOperator, then applies outer ORDER BY/LIMIT.
+    /// This is the **single execution path** for ALL SELECT queries:
+    /// `AnalyzedQuery → pre-materialize → optimize → build → execute → post-process`
     ///
-    /// Returns `Pin<Box<...>>` to break the recursive async future sizing
-    /// (set operations can nest: `(A UNION B) INTERSECT C`).
-    #[allow(clippy::too_many_arguments)]
-    fn execute_analyzed_set_op<'a>(
-        &'a self,
-        txn: &'a mut Transaction,
-        db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
-        search_path: &'a [String],
-        analyzed: &'a AnalyzedQuery,
-        kind: SetOpKind,
-        all: bool,
-        left: &'a AnalyzedQuery,
-        right: &'a AnalyzedQuery,
-        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
-    ) -> Pin<Box<dyn Future<Output = Result<ExecuteResult>> + Send + 'a>> {
-        Box::pin(async move {
-            // Execute left branch.
-            let left_result = self
-                .execute_subquery(txn, db_id, sequence_values, search_path, left, ctes)
-                .await?;
-            let (left_columns, left_types, left_rows) = match left_result {
-                ExecuteResult::Select {
-                    columns,
-                    column_types,
-                    rows,
-                    ..
-                } => (columns, column_types.unwrap_or_default(), rows),
-                _ => {
-                    return Err(anyhow!(
-                        "Expected SELECT result from left branch of set operation"
-                    ))
-                }
-            };
-
-            // Execute right branch.
-            let right_result = self
-                .execute_subquery(txn, db_id, sequence_values, search_path, right, ctes)
-                .await?;
-            let right_rows = match right_result {
-                ExecuteResult::Select { rows, .. } => rows,
-                _ => {
-                    return Err(anyhow!(
-                        "Expected SELECT result from right branch of set operation"
-                    ))
-                }
-            };
-
-            // Build synthetic schemas for materializing both sides.
-            let schema = build_set_op_schema(&left_columns, &left_types);
-            let left_op: BoxedOperator =
-                Box::new(TableScanOperator::new_with_rows(schema.clone(), left_rows));
-            let right_op: BoxedOperator =
-                Box::new(TableScanOperator::new_with_rows(schema, right_rows));
-
-            // Map SetOpKind + ALL → SetOperationType.
-            let set_op_type = match (kind, all) {
-                (SetOpKind::Union, true) => SetOperationType::UnionAll,
-                (SetOpKind::Union, false) => SetOperationType::Union,
-                (SetOpKind::Intersect, true) => SetOperationType::IntersectAll,
-                (SetOpKind::Intersect, false) => SetOperationType::Intersect,
-                (SetOpKind::Except, true) => SetOperationType::ExceptAll,
-                (SetOpKind::Except, false) => SetOperationType::Except,
-            };
-            let mut op: BoxedOperator =
-                Box::new(SetOperationOperator::new(left_op, right_op, set_op_type));
-
-            // Apply outer ORDER BY (operates on the combined result).
-            if !analyzed.order_by.is_empty() {
-                op = Box::new(SortOperator::new(op, analyzed.order_by.clone()));
-            }
-
-            // Apply outer LIMIT/OFFSET.
-            let limit = analyzed
-                .limit
-                .as_ref()
-                .map(|e| eval_const_usize(e))
-                .transpose()?;
-            let offset = analyzed
-                .offset
-                .as_ref()
-                .map(|e| eval_const_usize(e))
-                .transpose()?
-                .unwrap_or(0);
-            if limit.is_some() || offset > 0 {
-                op = Box::new(LimitOperator::new(op, limit, offset));
-            }
-
-            // Execute operator tree.
-            let rt = ExprRuntime::new(self, db_id, search_path, ctes);
-            let rows = rt.run_operator_tree(&mut op, txn, sequence_values).await?;
-
-            // Output using the analyzed query's output schema.
-            let columns: Vec<String> = analyzed
-                .output_schema
-                .iter()
-                .map(|(n, _)| n.clone())
-                .collect();
-            let column_types: Vec<DataType> = analyzed
-                .output_schema
-                .iter()
-                .map(|(_, t)| t.clone())
-                .collect();
-
-            Ok(ExecuteResult::Select {
-                columns,
-                column_types: Some(column_types),
-                rows,
-                timezone: crate::session_context::current_timezone(),
-            })
-        }) // end Box::pin(async move { ... })
-    }
-
-    /// Build a TableScanOperator for a base table or CTE.
-    async fn build_scan_operator(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
-        search_path: &[String],
-        name: &str,
-        alias: &str,
-        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
-    ) -> Result<BoxedOperator> {
-        let cte_key = name.to_lowercase();
-        if let Some((cte_schema, cte_rows)) = ctes.get(&cte_key) {
-            let mut schema = cte_schema.clone();
-            let short = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-            if !short.eq_ignore_ascii_case(alias) {
-                schema.from_alias = Some(alias.to_string());
-            }
-            return Ok(
-                Box::new(TableScanOperator::new_with_rows(schema, cte_rows.clone()))
-                    as BoxedOperator,
-            );
-        }
-
-        // The Analyzer already resolved the name to a fully-qualified store key.
-        // Use it directly instead of re-resolving through ObjectName.
-        if let Some(mut schema) = self.store().get_schema(txn, db_id, name).await? {
-            let short = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-            if !short.eq_ignore_ascii_case(alias) {
-                schema.from_alias = Some(alias.to_string());
-            }
-            Ok(Box::new(TableScanOperator::new(schema)) as BoxedOperator)
-        } else {
-            // Virtual table (information_schema, etc.)
-            let (mut schema, rows) = self
-                .get_table_data(txn, db_id, sequence_values, search_path, name, ctes)
-                .await?;
-            let short = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-            if !short.eq_ignore_ascii_case(alias) {
-                schema.from_alias = Some(alias.to_string());
-            }
-            if schema.table_id == 0 {
-                Ok(Box::new(TableScanOperator::new_with_rows(schema, rows)) as BoxedOperator)
-            } else {
-                Ok(Box::new(TableScanOperator::new(schema)) as BoxedOperator)
-            }
-        }
-    }
-
-    /// Try to execute a query through the CBO optimizer pipeline.
-    ///
-    /// `AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator → execute`
-    ///
-    /// Precondition: the caller has verified `is_optimizer_eligible()`.
-    /// Phase 3: handles single-table SELECTs and multi-table JOINs.
+    /// Handles all query shapes: single-table, multi-table joins, set operations,
+    /// CTEs, VALUES, tableless SELECT, table functions, virtual catalog tables,
+    /// subqueries, correlated subqueries, catalog-dependent functions,
+    /// FOR UPDATE/SHARE row locking, and DISTINCT/DISTINCT ON.
     async fn execute_via_optimizer(
         &self,
         txn: &mut Transaction,
@@ -2708,102 +975,283 @@ impl Executor {
         search_path: &[String],
         analyzed: &AnalyzedQuery,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+        locks: &[sqlparser::ast::LockClause],
     ) -> Result<ExecuteResult> {
-        use crate::sql::operators::execute_operator_tree_with_ctes;
+        use crate::sql::expr::classify::needs_async;
         use crate::sql::optimizer::{BuildContext, PlanningContext};
 
         tracing::debug!(target: "optimizer", "routing query through CBO pipeline");
 
-        // Step 1: Build PlanningContext with table statistics and schemas.
-        // Pre-load both stats and full TableSchema (including index metadata)
-        // before optimize(), so the physical planner can do access-path selection.
-        // The pre-loaded schemas are then shared with BuildContext (Step 3) to
-        // eliminate redundant catalog reads.
-        //
-        // Uses collect_query_table_refs to recursively walk the query body,
-        // handling Select, SetOperation, and Values bodies uniformly.
-        let mut planning_ctx = PlanningContext::empty();
-        let table_refs = crate::sql::optimizer::collect_query_table_refs(analyzed);
-        {
-            let mut stats_attempted = std::collections::HashSet::new();
-            for (name, schema, _alias) in &table_refs {
-                // Load statistics.
-                let tid = schema.table_id;
-                let stats = if stats_attempted.insert(tid) {
-                    self.get_or_load_stats(txn, db_id, tid).await?
-                } else {
-                    self.stats_cache().get_full_stats(db_id, tid)
-                };
-                if let Some(stats) = stats {
-                    planning_ctx.table_stats.insert(name.to_string(), stats);
+        let rt = ExprRuntime::new(self, db_id, search_path, ctes);
+
+        // ── Step 1: Pre-materialize non-correlated async expressions ──
+        // Resolves IN subquery → InList, EXISTS → bool, ScalarSubquery → constant,
+        // ANY/ALL → expanded comparisons, ArraySubquery → array literal.
+        // Correlated subqueries (scope_depth > 0) are left as-is.
+        let mut analyzed = analyzed.clone();
+        self.pre_materialize_query_body(
+            &mut analyzed,
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            ctes,
+        )
+        .await?;
+
+        // ── Step 2: Determine post-processing needs ──
+        let has_async_where = match &analyzed.body {
+            AnalyzedQueryBody::Select(s) => s.where_clause.as_ref().is_some_and(|w| needs_async(w)),
+            _ => false,
+        };
+        let mut has_async_projection = match &analyzed.body {
+            AnalyzedQueryBody::Select(s) => s.projection.iter().any(|p| needs_async(&p.expr)),
+            _ => false,
+        };
+        let has_async_order_by = analyzed.order_by.iter().any(|o| needs_async(&o.expr));
+        let has_locks = !locks.is_empty();
+
+        // ── Step 2a: GROUP BY + async projection special handling ──
+        // Passthrough mode (replacing all projection with source columns) is
+        // incompatible with GROUP BY because the Aggregate operator changes the
+        // row layout. Instead, replace each async projection expression with its
+        // primary dependency (the ColumnRef argument), and defer the async
+        // function evaluation to post-processing.
+        let has_group_by = match &analyzed.body {
+            AnalyzedQueryBody::Select(s) => !s.group_by.is_empty(),
+            _ => false,
+        };
+        // (output_col_index, deferred_async_expr_with_output_col_ref)
+        let mut deferred_async_cols: Vec<(usize, TypedExpr)> = Vec::new();
+        if has_group_by && has_async_projection {
+            if let AnalyzedQueryBody::Select(ref mut select) = analyzed.body {
+                for (i, proj) in select.projection.iter_mut().enumerate() {
+                    if needs_async(&proj.expr) {
+                        // Build a deferred expression that references output col `i`
+                        // (the dependency value will be at this position after the
+                        // optimizer evaluates the replacement expression).
+                        let deferred = build_deferred_async_expr(&proj.expr, i);
+                        deferred_async_cols.push((i, deferred));
+
+                        // Replace the async expression with its primary dependency
+                        // (the first ColumnRef argument). This lets the GROUP BY
+                        // Aggregate operator include the dependency as a group key
+                        // reference, producing the correct value in the output.
+                        if let Some(dep) = extract_async_dependency(&proj.expr) {
+                            proj.expr = dep;
+                        } else {
+                            // Fallback: NULL constant (value will be replaced in
+                            // post-processing, but aggregate rewrite must still work).
+                            proj.expr = TypedExpr {
+                                kind: TypedExprKind::Constant(crate::types::Value::Null),
+                                data_type: proj.expr.data_type.clone(),
+                            };
+                        }
+                    }
                 }
-                // Load full table schema (with index metadata) for access-path selection.
-                // CTE schemas are not loaded here — they have no indexes.
-                let cte_key = name.to_lowercase();
-                if ctes.get(&cte_key).is_none() {
-                    if let Some(table_schema) = self.store().get_schema(txn, db_id, name).await? {
-                        planning_ctx
-                            .table_schemas
-                            .insert(name.to_string(), table_schema);
+            }
+            // Passthrough is no longer needed for async projection — we handled it.
+            has_async_projection = false;
+        }
+
+        let needs_passthrough = has_async_projection || has_locks || has_async_where;
+
+        // Save the final output schema before any modifications.
+        let final_output_schema = analyzed.output_schema.clone();
+
+        // ── Step 3: Prepare passthrough mode (strip async parts) ──
+        // When projection has async expressions or locks need raw rows,
+        // replace projection with passthrough (all source columns) and
+        // handle the real projection in post-processing.
+        let mut original_proj_exprs: Option<Vec<TypedExpr>> = None;
+        let mut base_schema: Option<TableSchema> = None;
+        let mut async_where_pred: Option<TypedExpr> = None;
+        let mut deferred_order_by: Option<Vec<TypedOrderByExpr>> = None;
+        let mut deferred_limit: Option<(Option<TypedExpr>, Option<TypedExpr>)> = None;
+
+        if needs_passthrough {
+            if let AnalyzedQueryBody::Select(ref mut select) = analyzed.body {
+                // Save original projection.
+                original_proj_exprs =
+                    Some(select.projection.iter().map(|p| p.expr.clone()).collect());
+
+                // Build base schema from source columns.
+                let source_cols = collect_source_columns(select);
+                base_schema = Some(build_schema_from_columns("__base", &source_cols));
+
+                // Replace projection with passthrough.
+                select.projection = create_passthrough_projection(&source_cols);
+                analyzed.output_schema = source_cols;
+            }
+
+            // Defer LIMIT/OFFSET for locking (scan all, lock, then paginate).
+            let limit = analyzed.limit.take();
+            let offset = analyzed.offset.take();
+            if limit.is_some() || offset.is_some() {
+                deferred_limit = Some((limit, offset));
+            }
+        }
+
+        if has_async_where {
+            if let AnalyzedQueryBody::Select(ref mut select) = analyzed.body {
+                if let Some(w) = select.where_clause.take() {
+                    let (sync_part, async_part) = split_where_for_async(&w);
+                    select.where_clause = sync_part;
+                    async_where_pred = async_part;
+                }
+            }
+        }
+
+        // JOIN ON predicates (including correlated subqueries / catalog-dependent
+        // functions) are evaluated inside join operators so outer join
+        // null-extension semantics remain join-local and deterministic.
+
+        if has_async_order_by {
+            deferred_order_by = Some(analyzed.order_by.clone());
+            analyzed.order_by.clear();
+            // Also defer LIMIT/OFFSET (ORDER BY must happen before LIMIT).
+            if deferred_limit.is_none() {
+                let limit = analyzed.limit.take();
+                let offset = analyzed.offset.take();
+                if limit.is_some() || offset.is_some() {
+                    deferred_limit = Some((limit, offset));
+                }
+            }
+        }
+
+        // ── Step 4: Pre-load table schemas, stats, virtual table data ──
+        let mut planning_ctx = PlanningContext::empty();
+        let mut build_ctx = BuildContext::new();
+        self.prepare_optimizer_contexts(
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            &analyzed,
+            ctes,
+            &mut planning_ctx,
+            &mut build_ctx,
+        )
+        .await?;
+
+        // ── Step 5: AnalyzedQuery → PhysicalPlan ──
+        let physical = crate::sql::optimizer::optimize(&analyzed, &planning_ctx)?;
+
+        // ── Step 6: PhysicalPlan → BoxedOperator ──
+        let mut operator = physical.build_operators(&build_ctx)?;
+
+        // ── Step 7: Execute operator tree ──
+        let mut rows = rt
+            .run_operator_tree(&mut operator, txn, sequence_values)
+            .await?;
+
+        // ── Step 8: Post-processing ──
+
+        // 8a: Async WHERE filter (correlated subqueries, catalog functions).
+        if let Some(ref async_pred) = async_where_pred {
+            let schema = base_schema
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| build_output_schema(&analyzed));
+            rows = rt
+                .filter_async(rows, Some(async_pred), &schema, txn, sequence_values)
+                .await?;
+        }
+
+        // 8b: FOR UPDATE/SHARE locking (before projection, raw rows have PK).
+        if has_locks {
+            rows = self
+                .apply_row_locks(
+                    rows,
+                    locks,
+                    &analyzed,
+                    &build_ctx,
+                    txn,
+                    db_id,
+                    &deferred_limit,
+                )
+                .await?;
+        }
+
+        // 8c: Apply original projection (async expressions + all expressions when passthrough).
+        if let Some(ref proj_exprs) = original_proj_exprs {
+            let schema = base_schema
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| build_output_schema(&analyzed));
+            rows = rt
+                .project_rows(rows, proj_exprs, &schema, txn, sequence_values)
+                .await?;
+        }
+
+        // 8c2: Deferred async projection for GROUP BY queries.
+        // Each deferred entry has (output_col_idx, async_expr_with_output_col_ref).
+        // The output row already contains the dependency value at col_idx;
+        // we evaluate the async function with that value and replace the column.
+        if !deferred_async_cols.is_empty() {
+            let schema = build_output_schema(&analyzed);
+            let qctx = crate::sql::query_context::QueryContext::from_task_locals();
+            for row in &mut rows {
+                for (col_idx, async_expr) in &deferred_async_cols {
+                    let materialized = self
+                        .materialize_expr_for_row(
+                            async_expr,
+                            row,
+                            Some(&schema),
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            ctes,
+                            &qctx,
+                        )
+                        .await?;
+                    // materialize_expr_for_row returns a TypedExpr with the async
+                    // function resolved to a Constant. Evaluate to get the value.
+                    let val =
+                        crate::sql::expr::typed_eval::eval_typed_expr(&materialized, row, &qctx)?;
+                    if *col_idx < row.values.len() {
+                        row.values[*col_idx] = val;
                     }
                 }
             }
         }
 
-        // Step 2: AnalyzedQuery → PhysicalPlan (shared entrypoint).
-        // Eligibility gate guarantees this always succeeds.
-        let physical = crate::sql::optimizer::optimize(analyzed, &planning_ctx);
-
-        // Step 3: Build BuildContext from pre-loaded schemas in PlanningContext.
-        // Handles CTE schemas and alias assignment.
-        let mut build_ctx = BuildContext::new();
-        for (name, _schema, alias) in &table_refs {
-            let display_alias = alias.unwrap_or(name);
-            let cte_key = name.to_lowercase();
-            if let Some((cte_schema, _)) = ctes.get(&cte_key) {
-                build_ctx = build_ctx.with_schema(name.to_string(), cte_schema.clone());
-            } else if let Some(table_schema) = planning_ctx.table_schemas.get(*name) {
-                let mut schema = table_schema.clone();
-                let short = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-                if !short.eq_ignore_ascii_case(display_alias) {
-                    schema.from_alias = Some(display_alias.to_string());
-                }
-                build_ctx = build_ctx.with_schema(name.to_string(), schema);
-            } else {
-                // Eligibility gate rejects virtual catalog tables, so this
-                // should be unreachable. Hard error to surface bugs early.
-                return Err(anyhow!(
-                    "Optimizer cannot resolve table schema for '{}' \
-                     (should have been rejected by eligibility check)",
-                    name
-                ));
+        // 8d: Deferred ORDER BY + LIMIT/OFFSET.
+        if let Some(ref deferred_ob) = deferred_order_by {
+            let limit = deferred_limit
+                .as_ref()
+                .and_then(|(l, _)| l.as_ref())
+                .map(eval_const_usize)
+                .transpose()?;
+            let offset = deferred_limit
+                .as_ref()
+                .and_then(|(_, o)| o.as_ref())
+                .map(eval_const_usize)
+                .transpose()?
+                .unwrap_or(0);
+            rows = sort_projected_rows(rows, deferred_ob, &final_output_schema, limit, offset)?;
+        } else if let Some((ref limit_expr, ref offset_expr)) = deferred_limit {
+            // LIMIT/OFFSET deferred for locking but no deferred ORDER BY.
+            let limit = limit_expr.as_ref().map(eval_const_usize).transpose()?;
+            let offset = offset_expr
+                .as_ref()
+                .map(eval_const_usize)
+                .transpose()?
+                .unwrap_or(0);
+            if limit.is_some() || offset > 0 {
+                let start = offset.min(rows.len());
+                let end = limit.map_or(rows.len(), |l| (start + l).min(rows.len()));
+                rows = rows[start..end].to_vec();
             }
         }
 
-        // Step 4: PhysicalPlan → BoxedOperator
-        let mut operator = physical.build_operators(&build_ctx)?;
-
-        // Step 5: Execute the operator tree.
-        let store = self.store().clone();
-        let rows = execute_operator_tree_with_ctes(
-            &mut operator,
-            txn,
-            store,
-            db_id,
-            search_path,
-            sequence_values,
-            ctes,
-        )
-        .await?;
-
-        // Build result.
-        let columns: Vec<String> = analyzed
-            .output_schema
+        // ── Step 9: Build result ──
+        let columns: Vec<String> = final_output_schema
             .iter()
             .map(|(name, _)| name.clone())
             .collect();
-        let column_types: Vec<DataType> = analyzed
-            .output_schema
+        let column_types: Vec<DataType> = final_output_schema
             .iter()
             .map(|(_, dt)| dt.clone())
             .collect();
@@ -2815,6 +1263,864 @@ impl Executor {
             timezone: crate::session_context::current_timezone(),
         })
     }
+
+    /// Pre-materialize all non-correlated async expressions in the query body.
+    ///
+    /// Walks all TypedExpr positions (projection, WHERE, HAVING, ORDER BY,
+    /// GROUP BY, DISTINCT ON, JOIN ON) and replaces non-correlated subqueries
+    /// with constants.
+    fn pre_materialize_query_body<'a>(
+        &'a self,
+        analyzed: &'a mut AnalyzedQuery,
+        txn: &'a mut Transaction,
+        db_id: u64,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            match &mut analyzed.body {
+                AnalyzedQueryBody::Select(ref mut select) => {
+                    // Projection.
+                    for proj in &mut select.projection {
+                        proj.expr = self
+                            .pre_materialize_async_exprs(
+                                &proj.expr,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                ctes,
+                            )
+                            .await?;
+                    }
+                    // WHERE.
+                    if let Some(ref w) = select.where_clause {
+                        let new_w = self
+                            .pre_materialize_async_exprs(
+                                w,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                ctes,
+                            )
+                            .await?;
+                        select.where_clause = Some(new_w);
+                    }
+                    // HAVING.
+                    if let Some(ref h) = select.having {
+                        let new_h = self
+                            .pre_materialize_async_exprs(
+                                h,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                ctes,
+                            )
+                            .await?;
+                        select.having = Some(new_h);
+                    }
+                    // GROUP BY.
+                    let group_exprs: Vec<TypedExpr> = select.group_by.clone();
+                    for (i, expr) in group_exprs.iter().enumerate() {
+                        select.group_by[i] = self
+                            .pre_materialize_async_exprs(
+                                expr,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                ctes,
+                            )
+                            .await?;
+                    }
+                    // DISTINCT ON.
+                    if let AnalyzedDistinct::DistinctOn(ref on_exprs) = select.distinct {
+                        let cloned: Vec<TypedExpr> = on_exprs.clone();
+                        let mut new_on = Vec::with_capacity(cloned.len());
+                        for expr in &cloned {
+                            new_on.push(
+                                self.pre_materialize_async_exprs(
+                                    expr,
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    ctes,
+                                )
+                                .await?,
+                            );
+                        }
+                        select.distinct = AnalyzedDistinct::DistinctOn(new_on);
+                    }
+                    // JOIN ON conditions (recursive through table ref tree).
+                    for tr in &mut select.from {
+                        self.pre_materialize_table_ref_on(
+                            tr,
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            ctes,
+                        )
+                        .await?;
+                    }
+                }
+                AnalyzedQueryBody::SetOperation {
+                    ref mut left,
+                    ref mut right,
+                    ..
+                } => {
+                    self.pre_materialize_query_body(
+                        left,
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        ctes,
+                    )
+                    .await?;
+                    self.pre_materialize_query_body(
+                        right,
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        ctes,
+                    )
+                    .await?;
+                }
+                AnalyzedQueryBody::Values(ref mut rows) => {
+                    for row in rows {
+                        for expr in row {
+                            *expr = self
+                                .pre_materialize_async_exprs(
+                                    expr,
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    ctes,
+                                )
+                                .await?;
+                        }
+                    }
+                }
+            }
+
+            // ORDER BY.
+            let order_by_clone: Vec<TypedOrderByExpr> = analyzed.order_by.clone();
+            for (i, ob) in order_by_clone.iter().enumerate() {
+                analyzed.order_by[i].expr = self
+                    .pre_materialize_async_exprs(
+                        &ob.expr,
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        ctes,
+                    )
+                    .await?;
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Pre-materialize JOIN ON conditions in a table ref tree.
+    fn pre_materialize_table_ref_on<'a>(
+        &'a self,
+        table_ref: &'a mut AnalyzedTableRef,
+        txn: &'a mut Transaction,
+        db_id: u64,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            match &mut table_ref.kind {
+                AnalyzedTableRefKind::Table { .. } | AnalyzedTableRefKind::Function { .. } => {
+                    Ok(())
+                }
+                AnalyzedTableRefKind::Subquery(_) => Ok(()),
+                AnalyzedTableRefKind::Join {
+                    left,
+                    right,
+                    condition,
+                    ..
+                } => {
+                    self.pre_materialize_table_ref_on(
+                        left,
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        ctes,
+                    )
+                    .await?;
+                    self.pre_materialize_table_ref_on(
+                        right,
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        ctes,
+                    )
+                    .await?;
+                    let new_cond = match condition {
+                        JoinCondition::On(ref expr) => {
+                            let new_expr = self
+                                .pre_materialize_async_exprs(
+                                    expr,
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    ctes,
+                                )
+                                .await?;
+                            Some(JoinCondition::On(new_expr))
+                        }
+                        _ => None,
+                    };
+                    if let Some(c) = new_cond {
+                        *condition = c;
+                    }
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    /// Pre-load table schemas, statistics, virtual table data, and table function
+    /// results into the PlanningContext and BuildContext.
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_optimizer_contexts(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
+        analyzed: &AnalyzedQuery,
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+        planning_ctx: &mut PlanningContext,
+        build_ctx: &mut BuildContext,
+    ) -> Result<()> {
+        // Walk the query body to collect all table references.
+        let table_refs = crate::sql::optimizer::collect_query_table_refs(analyzed);
+
+        let mut stats_attempted = std::collections::HashSet::new();
+        for (name, _schema, alias) in &table_refs {
+            // Use scope-safe composite key: "table_name\0alias" to prevent
+            // collisions when the same alias appears in different scopes
+            // (e.g., outer FROM users AS t vs inner subquery FROM orders AS t).
+            let ctx_key = crate::sql::optimizer::schema_map_key(name, *alias);
+            let alias_display = alias.unwrap_or(name);
+            let cte_key = name.to_lowercase();
+
+            // CTE: use CTE schema + rows.
+            if let Some((cte_schema, cte_rows)) = ctes.get(&cte_key) {
+                build_ctx
+                    .table_schemas
+                    .insert(ctx_key.clone(), cte_schema.clone());
+                build_ctx.preloaded_rows.insert(ctx_key, cte_rows.clone());
+                continue;
+            }
+
+            // Try KV table (regular user table).
+            if let Some(table_schema) = self.store().get_schema(txn, db_id, name).await? {
+                // Load statistics for cost-based optimization.
+                let tid = table_schema.table_id;
+                let stats = if stats_attempted.insert(tid) {
+                    self.get_or_load_stats(txn, db_id, tid).await?
+                } else {
+                    self.stats_cache().get_full_stats(db_id, tid)
+                };
+                if let Some(stats) = stats {
+                    planning_ctx.table_stats.insert(ctx_key.clone(), stats);
+                }
+                planning_ctx
+                    .table_schemas
+                    .insert(ctx_key.clone(), table_schema.clone());
+
+                let mut s = table_schema;
+                let short = s.name.rsplit('.').next().unwrap_or(&s.name);
+                if !short.eq_ignore_ascii_case(alias_display) {
+                    s.from_alias = Some(alias_display.to_string());
+                }
+                build_ctx.table_schemas.insert(ctx_key, s);
+                continue;
+            }
+
+            // Virtual catalog table (information_schema, pg_catalog, etc.).
+            // Pre-load data — these tables don't live in KV storage.
+            let (mut virt_schema, virt_rows) = self
+                .get_table_data(txn, db_id, sequence_values, search_path, name, ctes)
+                .await?;
+            let short = virt_schema
+                .name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&virt_schema.name);
+            if !short.eq_ignore_ascii_case(alias_display) {
+                virt_schema.from_alias = Some(alias_display.to_string());
+            }
+            build_ctx.table_schemas.insert(ctx_key.clone(), virt_schema);
+            build_ctx.preloaded_rows.insert(ctx_key, virt_rows);
+        }
+
+        // Also walk table functions in FROM and pre-execute them.
+        self.preload_table_functions(
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            analyzed,
+            ctes,
+            build_ctx,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Pre-execute table functions referenced in FROM and store results in BuildContext.
+    #[allow(clippy::too_many_arguments)]
+    fn preload_table_functions<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        db_id: u64,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        analyzed: &'a AnalyzedQuery,
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+        build_ctx: &'a mut BuildContext,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let body = &analyzed.body;
+            match body {
+                AnalyzedQueryBody::Select(select) => {
+                    for tr in &select.from {
+                        self.preload_table_function_refs(
+                            tr,
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            ctes,
+                            build_ctx,
+                        )
+                        .await?;
+                    }
+                }
+                AnalyzedQueryBody::SetOperation { left, right, .. } => {
+                    self.preload_table_functions(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        left,
+                        ctes,
+                        build_ctx,
+                    )
+                    .await?;
+                    self.preload_table_functions(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        right,
+                        ctes,
+                        build_ctx,
+                    )
+                    .await?;
+                }
+                AnalyzedQueryBody::Values(_) => {}
+            }
+            Ok(())
+        }) // end Box::pin
+    }
+
+    /// Pre-execute table function references in a table ref tree.
+    #[allow(clippy::too_many_arguments)]
+    fn preload_table_function_refs<'a>(
+        &'a self,
+        table_ref: &'a AnalyzedTableRef,
+        txn: &'a mut Transaction,
+        db_id: u64,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+        build_ctx: &'a mut BuildContext,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            match &table_ref.kind {
+                AnalyzedTableRefKind::Function {
+                    func,
+                    args,
+                    output_columns,
+                } => {
+                    let key = table_ref.alias.as_deref().unwrap_or(&func.name).to_string();
+
+                    // Build schema from analyzer-resolved output columns.
+                    let schema = TableSchema {
+                        name: key.clone(),
+                        table_id: 0,
+                        columns: output_columns
+                            .iter()
+                            .map(|(name, dt)| crate::types::ColumnDef {
+                                name: name.clone(),
+                                data_type: dt.clone(),
+                                nullable: true,
+                                primary_key: false,
+                                unique: false,
+                                is_serial: false,
+                                default_expr: None,
+                            })
+                            .collect(),
+                        version: 1,
+                        pk_constraint_name: None,
+                        pk_indices: vec![],
+                        indexes: vec![],
+                        check_constraints: vec![],
+                        foreign_keys: vec![],
+                        owner: String::new(),
+                        from_alias: table_ref.alias.clone(),
+                    };
+
+                    // Evaluate typed args to Values, then bridge to FunctionArg.
+                    let qc = crate::sql::query_context::QueryContext::from_task_locals();
+                    let dummy_row = Row::new(vec![]);
+                    let mut bridge_args: Vec<FunctionArg> = Vec::with_capacity(args.len());
+                    for tfa in args {
+                        let (name_opt, typed_expr) = match tfa {
+                            TypedFunctionArg::Positional(e) => (None, e),
+                            TypedFunctionArg::Named { name, expr } => (Some(name.clone()), expr),
+                        };
+                        let val = eval_typed_expr(typed_expr, &dummy_row, &qc)?;
+                        let sql_expr = crate::sql::value_coercion::value_to_sql_expr(&val);
+                        let fa = match name_opt {
+                            None => FunctionArg::Unnamed(FunctionArgExpr::Expr(sql_expr)),
+                            Some(n) => FunctionArg::Named {
+                                name: sqlparser::ast::Ident::new(n),
+                                arg: FunctionArgExpr::Expr(sql_expr),
+                            },
+                        };
+                        bridge_args.push(fa);
+                    }
+
+                    let func_upper = func.name.to_uppercase();
+
+                    let rows = if func_upper == "GENERATE_SERIES" {
+                        let (_, rows) = self
+                            .execute_generate_series(&bridge_args, &key, None, 0, None)
+                            .await?;
+                        rows
+                    } else if func_upper == "_PGTIKV_SYS_RECORD_MIGRATION" {
+                        let (_, rows) = self.execute_record_migration(txn, &bridge_args).await?;
+                        rows
+                    } else {
+                        // Try extension table function, user table function, or scalar-in-FROM.
+                        let obj_name =
+                            ObjectName(vec![sqlparser::ast::Ident::new(func.name.clone())]);
+                        if let Some(result) = self
+                            .try_execute_extension_table_function(
+                                txn,
+                                db_id,
+                                search_path,
+                                &obj_name,
+                                &bridge_args,
+                                None,
+                            )
+                            .await?
+                        {
+                            match result {
+                            crate::sql::executor::extensions::ExtensionTableFunctionResult::Batch(
+                                _,
+                                rows,
+                            ) => rows,
+                            crate::sql::executor::extensions::ExtensionTableFunctionResult::Streaming(
+                                _,
+                                mut op,
+                            ) => {
+                                let rt = ExprRuntime::new(self, db_id, search_path, ctes);
+                                rt.run_operator_tree(&mut op, txn, sequence_values).await?
+                            }
+                        }
+                        } else if let Some((_, rows)) = self
+                            .try_execute_user_table_function(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                &obj_name,
+                                &bridge_args,
+                                None,
+                            )
+                            .await?
+                        {
+                            rows
+                        } else {
+                            // Scalar-in-FROM: evaluate as function call.
+                            let typed_args: Vec<TypedExpr> = args
+                                .iter()
+                                .map(|a| match a {
+                                    TypedFunctionArg::Positional(e) => e.clone(),
+                                    TypedFunctionArg::Named { expr, .. } => expr.clone(),
+                                })
+                                .collect();
+                            let mut scalar_arg_values = Vec::with_capacity(typed_args.len());
+                            for arg in &typed_args {
+                                scalar_arg_values.push(eval_typed_expr(arg, &dummy_row, &qc)?);
+                            }
+                            if let Some(result) =
+                                crate::sql::executor::execute_cron_scalar_function(
+                                    &self.store(),
+                                    txn,
+                                    db_id,
+                                    qc.current_user.as_ref(),
+                                    qc.database_name.as_ref(),
+                                    crate::extensions::context::is_superuser(),
+                                    &func.name,
+                                    &scalar_arg_values,
+                                    self.tenant_keyspace(),
+                                )
+                                .await
+                            {
+                                vec![Row::new(vec![result?])]
+                            } else {
+                                let typed_expr = TypedExpr {
+                                    kind: TypedExprKind::FunctionCall {
+                                        func: func.clone(),
+                                        args: typed_args,
+                                        order_by: vec![],
+                                        filter: None,
+                                    },
+                                    data_type: func.return_type.clone(),
+                                };
+                                let val = eval_typed_expr(&typed_expr, &dummy_row, &qc)?;
+                                vec![Row::new(vec![val])]
+                            }
+                        }
+                    };
+
+                    build_ctx.table_schemas.insert(key.clone(), schema);
+                    build_ctx.preloaded_rows.insert(key, rows);
+                }
+                AnalyzedTableRefKind::Join { left, right, .. } => {
+                    self.preload_table_function_refs(
+                        left,
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        ctes,
+                        build_ctx,
+                    )
+                    .await?;
+                    self.preload_table_function_refs(
+                        right,
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        ctes,
+                        build_ctx,
+                    )
+                    .await?;
+                }
+                _ => {}
+            }
+            Ok(())
+        }) // end Box::pin
+    }
+
+    /// Apply row-level locks (FOR UPDATE/SHARE) to rows.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_row_locks(
+        &self,
+        rows: Vec<Row>,
+        locks: &[sqlparser::ast::LockClause],
+        analyzed: &AnalyzedQuery,
+        build_ctx: &BuildContext,
+        txn: &mut Transaction,
+        db_id: u64,
+        deferred_limit: &Option<(Option<TypedExpr>, Option<TypedExpr>)>,
+    ) -> Result<Vec<Row>> {
+        if locks.is_empty() {
+            return Ok(rows);
+        }
+
+        // Extract lock properties.
+        let has_skip_locked = locks
+            .iter()
+            .any(|l| l.lock_type == sqlparser::ast::LockType::Update)
+            && locks.iter().any(|l| {
+                l.nonblock
+                    .as_ref()
+                    .is_some_and(|nb| *nb == sqlparser::ast::NonBlock::SkipLocked)
+            });
+        let has_nowait = locks.iter().any(|l| {
+            l.nonblock
+                .as_ref()
+                .is_some_and(|nb| *nb == sqlparser::ast::NonBlock::Nowait)
+        });
+
+        // Find the table name for locking. Use the first base table in FROM.
+        let table_name = match &analyzed.body {
+            AnalyzedQueryBody::Select(select) => {
+                select.from.first().and_then(|tr| match &tr.kind {
+                    AnalyzedTableRefKind::Table { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        };
+
+        let Some(table_name) = table_name else {
+            return Ok(rows);
+        };
+
+        // Check that the table has a primary key (required for locking).
+        if let Some(schema) = build_ctx.table_schemas.get(&table_name) {
+            if schema.pk_indices.is_empty() {
+                return Err(anyhow!("FOR UPDATE/SHARE requires primary key"));
+            }
+        }
+
+        if has_skip_locked {
+            let limit = deferred_limit
+                .as_ref()
+                .and_then(|(l, _)| l.as_ref())
+                .map(eval_const_usize)
+                .transpose()?;
+            let offset = deferred_limit
+                .as_ref()
+                .and_then(|(_, o)| o.as_ref())
+                .map(eval_const_usize)
+                .transpose()?
+                .unwrap_or(0);
+            let max_locks = limit.map(|l| offset + l);
+            let locked_indices = self
+                .store()
+                .lock_rows_skip_locked(txn, db_id, &table_name, &rows, max_locks)
+                .await?;
+            let locked_rows: Vec<Row> = locked_indices.iter().map(|&i| rows[i].clone()).collect();
+            // Apply offset + limit to the locked subset.
+            let start = offset.min(locked_rows.len());
+            let end = limit.map_or(locked_rows.len(), |l| (start + l).min(locked_rows.len()));
+            Ok(locked_rows[start..end].to_vec())
+        } else {
+            // Apply deferred LIMIT/OFFSET before locking to avoid locking
+            // more rows than needed. Without this, `FOR UPDATE LIMIT 1` would
+            // lock ALL scanned rows, causing SKIP LOCKED in other sessions to
+            // find no unlockable rows.
+            let mut rows_to_lock = rows;
+            if let Some((ref limit_expr, ref offset_expr)) = deferred_limit {
+                let limit = limit_expr.as_ref().map(eval_const_usize).transpose()?;
+                let offset = offset_expr
+                    .as_ref()
+                    .map(eval_const_usize)
+                    .transpose()?
+                    .unwrap_or(0);
+                if limit.is_some() || offset > 0 {
+                    let start = offset.min(rows_to_lock.len());
+                    let end =
+                        limit.map_or(rows_to_lock.len(), |l| (start + l).min(rows_to_lock.len()));
+                    rows_to_lock = rows_to_lock[start..end].to_vec();
+                }
+            }
+            if has_nowait {
+                self.store()
+                    .lock_rows_nowait(txn, db_id, &table_name, &rows_to_lock)
+                    .await?;
+            } else {
+                self.store()
+                    .lock_rows(txn, db_id, &table_name, &rows_to_lock)
+                    .await?;
+            }
+            Ok(rows_to_lock)
+        }
+    }
+}
+
+/// Evaluate a constant TypedExpr to a usize (for LIMIT/OFFSET).
+fn eval_const_usize(expr: &TypedExpr) -> Result<usize> {
+    match &expr.kind {
+        TypedExprKind::Constant(Value::Int32(n)) => {
+            if *n < 0 {
+                Err(anyhow!("LIMIT/OFFSET must not be negative"))
+            } else {
+                Ok(*n as usize)
+            }
+        }
+        TypedExprKind::Constant(Value::Int64(n)) => {
+            if *n < 0 {
+                Err(anyhow!("LIMIT/OFFSET must not be negative"))
+            } else {
+                Ok(*n as usize)
+            }
+        }
+        TypedExprKind::Constant(Value::Null) => Ok(0),
+        _ => Err(anyhow!("LIMIT/OFFSET must be a constant integer")),
+    }
+}
+
+/// Extract the primary dependency (first ColumnRef argument) from an async
+/// expression. Typically the async expression is a catalog-dependent function
+/// call like `pg_get_indexdef(col_ref)` or `format_type(col_ref, const)`.
+fn extract_async_dependency(expr: &TypedExpr) -> Option<TypedExpr> {
+    match &expr.kind {
+        TypedExprKind::FunctionCall { args, .. } => {
+            // Return the first ColumnRef argument.
+            for arg in args {
+                if matches!(arg.kind, TypedExprKind::ColumnRef { .. }) {
+                    return Some(arg.clone());
+                }
+            }
+            // If no ColumnRef found, recurse into first arg.
+            args.first().and_then(extract_async_dependency)
+        }
+        _ => None,
+    }
+}
+
+/// Build a deferred async expression where ColumnRef arguments are remapped
+/// to reference the output column at `output_col_idx`. This allows the
+/// deferred expression to be evaluated against the output row (where the
+/// dependency value sits at position `output_col_idx`).
+fn build_deferred_async_expr(expr: &TypedExpr, output_col_idx: usize) -> TypedExpr {
+    match &expr.kind {
+        TypedExprKind::FunctionCall {
+            func,
+            args,
+            order_by,
+            filter,
+        } => {
+            let new_args: Vec<TypedExpr> = args
+                .iter()
+                .map(|arg| {
+                    if matches!(arg.kind, TypedExprKind::ColumnRef { .. }) {
+                        // Remap ColumnRef to output column index.
+                        TypedExpr {
+                            kind: TypedExprKind::ColumnRef {
+                                scope_depth: 0,
+                                column_index: output_col_idx,
+                                column_name: match &arg.kind {
+                                    TypedExprKind::ColumnRef { column_name, .. } => {
+                                        column_name.clone()
+                                    }
+                                    _ => unreachable!(),
+                                },
+                            },
+                            data_type: arg.data_type.clone(),
+                        }
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect();
+            TypedExpr {
+                kind: TypedExprKind::FunctionCall {
+                    func: func.clone(),
+                    args: new_args,
+                    order_by: order_by.clone(),
+                    filter: filter.clone(),
+                },
+                data_type: expr.data_type.clone(),
+            }
+        }
+        // For non-FunctionCall async expressions, return as-is (fallback).
+        _ => expr.clone(),
+    }
+}
+
+/// Collect all source columns from a SELECT's FROM clause table references.
+///
+/// Walks the FROM tree (handling joins, tables, functions) and collects
+/// `(column_name, data_type)` pairs in the same order the analyzer assigns
+/// column indices.
+fn collect_source_columns(select: &AnalyzedSelect) -> Vec<(String, DataType)> {
+    let mut cols = Vec::new();
+    for tr in &select.from {
+        collect_table_ref_columns(tr, &mut cols);
+    }
+    cols
+}
+
+fn collect_table_ref_columns(tr: &AnalyzedTableRef, out: &mut Vec<(String, DataType)>) {
+    match &tr.kind {
+        AnalyzedTableRefKind::Table { schema, .. } => {
+            for (name, dt, _nullable) in &schema.columns {
+                out.push((name.clone(), dt.clone()));
+            }
+        }
+        AnalyzedTableRefKind::Join { left, right, .. } => {
+            collect_table_ref_columns(left, out);
+            collect_table_ref_columns(right, out);
+        }
+        AnalyzedTableRefKind::Function { output_columns, .. } => {
+            for (name, dt) in output_columns {
+                out.push((name.clone(), dt.clone()));
+            }
+        }
+        AnalyzedTableRefKind::Subquery(subquery) => {
+            for (name, dt) in &subquery.output_schema {
+                out.push((name.clone(), dt.clone()));
+            }
+        }
+    }
+}
+
+/// Create a passthrough projection that emits all source columns as ColumnRef.
+fn create_passthrough_projection(
+    columns: &[(String, DataType)],
+) -> Vec<crate::sql::analyzer::types::AnalyzedProjection> {
+    columns
+        .iter()
+        .enumerate()
+        .map(
+            |(i, (name, dt))| crate::sql::analyzer::types::AnalyzedProjection {
+                expr: TypedExpr {
+                    kind: TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: i,
+                        column_name: name.clone(),
+                    },
+                    data_type: dt.clone(),
+                },
+                output_name: name.clone(),
+            },
+        )
+        .collect()
+}
+
+/// Build a TableSchema from column name/type pairs.
+fn build_schema_from_columns(name: &str, columns: &[(String, DataType)]) -> TableSchema {
+    TableSchema::new(
+        name.to_string(),
+        0,
+        columns
+            .iter()
+            .map(|(col_name, dt)| crate::types::ColumnDef {
+                name: col_name.clone(),
+                data_type: dt.clone(),
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            })
+            .collect(),
+        vec![],
+    )
+}
+
+/// Build a TableSchema from the analyzed query's output schema.
+fn build_output_schema(analyzed: &AnalyzedQuery) -> TableSchema {
+    build_schema_from_columns("__output", &analyzed.output_schema)
 }
 
 /// Sort projected rows by deferred ORDER BY expressions.

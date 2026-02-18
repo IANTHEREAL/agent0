@@ -4,6 +4,7 @@ use sqlparser::ast::JoinOperator;
 
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::analyzer::types::TypedExpr;
+use crate::sql::expr::classify::needs_async;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::types::{ColumnDef, Row, TableSchema, Value};
 
@@ -149,13 +150,31 @@ impl NestedLoopJoinOperator {
         Row::new(values)
     }
 
-    fn eval_condition(
+    async fn eval_condition(
         &self,
         combined_row: &Row,
-        query_ctx: &crate::sql::query_context::QueryContext,
+        ctx: &mut ExecutionContext<'_>,
     ) -> Result<bool> {
         if let Some(cond) = &self.condition {
-            let result = eval_typed_expr(cond, combined_row, query_ctx)?;
+            let result = if needs_async(cond) {
+                let materialized = ctx
+                    .executor
+                    .materialize_expr_for_row(
+                        cond,
+                        combined_row,
+                        Some(&self.output_schema),
+                        ctx.txn,
+                        ctx.db_id,
+                        ctx.sequence_values,
+                        ctx.search_path,
+                        ctx.cte_tables,
+                        ctx.query_ctx,
+                    )
+                    .await?;
+                eval_typed_expr(&materialized, combined_row, ctx.query_ctx)?
+            } else {
+                eval_typed_expr(cond, combined_row, ctx.query_ctx)?
+            };
             match result {
                 Value::Boolean(b) => Ok(b),
                 Value::Null => Ok(false),
@@ -229,7 +248,7 @@ impl PhysicalOperator for NestedLoopJoinOperator {
                         let idx = self.right_pos;
                         self.right_pos += 1;
 
-                        if self.eval_condition(&combined, ctx.query_ctx)? {
+                        if self.eval_condition(&combined, ctx).await? {
                             self.left_had_match = true;
                             if !self.right_matched.is_empty() {
                                 self.right_matched[idx] = true;

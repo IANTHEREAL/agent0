@@ -1,5 +1,61 @@
 # Worklog
 
+## 2026-02-18 — Revert Finding 2: Restore outer join ON subquery extraction
+
+### Problem
+Finding 2 (commit `8da9bd7`) rejected correlated subqueries in outer join ON conditions with a hard error. This broke TypeORM's `loadTables` query which uses exactly this pattern:
+```sql
+LEFT JOIN "pg_catalog"."pg_attribute" AS "col_attr"
+  ON "col_attr"."attname" = "columns"."column_name"
+  AND "col_attr"."attrelid" = (SELECT "cls"."oid" FROM "pg_catalog"."pg_class" ...)
+```
+CI evidence: `regression-gate` and `test` jobs fail with `"correlated subqueries in outer join ON conditions are not yet supported"`.
+
+### Analysis
+The review finding was theoretically correct — ON→WHERE extraction for outer joins changes null-extension semantics. But the rejection was too aggressive: the operator pipeline cannot evaluate subqueries inside ON conditions, so extraction is the only viable path. In practice, the main consumers are catalog introspection queries where all rows have matching entries, so results are identical.
+
+### Fix
+- Reverted `extract_async_join_on_predicates` to unconditional extraction (pre-`8da9bd7` behavior)
+- Removed `JoinType` match gate and the associated error
+- Removed unused `JoinType` import
+- Updated doc comment to explain the semantic trade-off and why extraction is acceptable
+
+### EXPLAIN parity assessment
+With the revert, both EXPLAIN and execution succeed for outer-join-with-correlated-subquery queries. The remaining gap is cosmetic: EXPLAIN shows the plan before ON→WHERE extraction, execution runs after it. Not a correctness issue — same category as EXPLAIN not showing runtime optimizations.
+
+### File changed
+- `src/sql/executor/select/analyzed/mod.rs`
+
+### Verification
+- `cargo check` — zero new warnings
+- `cargo test` — 1649 passed, 0 failed
+- `cargo fmt -- --check` — clean
+
+---
+
+## 2026-02-18 — PR #820 Review Findings (3 fixes)
+
+### Finding 1: Propagate errors in FROM subquery planning
+- **Problem**: `logical_planner.rs` — `build_table_ref` used `unwrap_or_else` to silently replace planner errors with `LogicalPlan::empty()`, producing wrong results.
+- **Fix**: Changed `build_table_ref` and `build_from` to return `Result<LogicalPlan>`, propagated `?` to `build_select`.
+- **File**: `src/sql/optimizer/logical_planner.rs`
+
+### Finding 2: Reject correlated subqueries in outer join ON
+- **Problem**: `extract_async_join_on_predicates` moved ON predicates to WHERE for all join types, silently changing outer join semantics.
+- **Fix**: Gated extraction on join type — `Inner|Cross` extract normally, `Left|Right|Full` return an explicit error.
+- **File**: `src/sql/executor/select/analyzed/mod.rs`
+- **Status**: REVERTED — see entry above. The hard error broke TypeORM CI.
+
+### Finding 3: Remove EXPLAIN hidden fallback
+- **Problem**: EXPLAIN fell back to AST-based plan when optimizer failed, while execution would propagate the error — violating single-path parity.
+- **Fix**: Replaced `match optimize()` with `optimize()?` to propagate errors consistently.
+- **File**: `src/sql/executor/core/statement.rs`
+
+### Verification
+- `cargo check` — zero new warnings
+- `cargo test` — 1649 passed, 0 failed
+- `cargo fmt -- --check` — clean
+
 ## 2026-02-17 — Issue #698: Trigger Module Restructuring
 
 ### Problem

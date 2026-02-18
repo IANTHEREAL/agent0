@@ -78,7 +78,10 @@ impl PhysicalPlanner {
         ctx: &'a PlanningContext,
     ) -> Option<&'a TableStatistics> {
         match &logical.node {
-            LogicalNode::Scan { table_name, .. } => ctx.get_stats(table_name),
+            LogicalNode::Scan { table_name, alias } => {
+                let key = super::schema_map_key(table_name, alias.as_deref());
+                ctx.get_stats(&key)
+            }
             // Aggregate output schema ≠ base table → block propagation.
             LogicalNode::Aggregate { .. } => None,
             // Transparent unary operators — recurse through.
@@ -167,8 +170,9 @@ impl PhysicalPlanner {
         match &logical.node {
             // ── Leaf nodes ──────────────────────────────
             LogicalNode::Scan { table_name, alias } => {
+                let key = super::schema_map_key(table_name, alias.as_deref());
                 let rows = ctx
-                    .get_stats(table_name)
+                    .get_stats(&key)
                     .map(|s| s.row_count)
                     .unwrap_or(DEFAULT_ESTIMATED_ROWS);
                 PhysicalPlan {
@@ -238,7 +242,8 @@ impl PhysicalPlanner {
                 // we have index metadata, try btree index selection.
                 // GIN is excluded — GIN queries stay on SeqScan (Option A).
                 let scan_node = if let PhysicalNode::SeqScan { table_name, alias } = &child.node {
-                    if let Some(schema) = ctx.get_schema(table_name) {
+                    let scan_key = super::schema_map_key(table_name, alias.as_deref());
+                    if let Some(schema) = ctx.get_schema(&scan_key) {
                         let access_path =
                             crate::sql::planner::choose_btree_access_path_for_typed_filter(
                                 schema,
@@ -994,7 +999,7 @@ mod tests {
             output_schema: vec![("id".to_string(), DataType::Int64)],
         };
 
-        let logical = LogicalPlanner::build(&query);
+        let logical = LogicalPlanner::build(&query).unwrap();
         let physical = PhysicalPlanner::plan(&logical, &ctx);
 
         // Scan should have 5000 rows (from stats)
@@ -1036,7 +1041,7 @@ mod tests {
             output_schema: vec![("id".to_string(), DataType::Int64)],
         };
 
-        let logical = LogicalPlanner::build(&query);
+        let logical = LogicalPlanner::build(&query).unwrap();
         let physical = PhysicalPlanner::plan(&logical, &PlanningContext::empty());
 
         assert!(matches!(physical.node, PhysicalNode::Project { .. }));
@@ -1080,7 +1085,7 @@ mod tests {
             output_schema: vec![("id".to_string(), DataType::Int64)],
         };
 
-        let logical = LogicalPlanner::build(&query);
+        let logical = LogicalPlanner::build(&query).unwrap();
         let physical = PhysicalPlanner::plan(&logical, &PlanningContext::empty());
 
         fn has_topn(plan: &PhysicalPlan) -> bool {
@@ -1150,7 +1155,7 @@ mod tests {
             ],
         };
 
-        let logical = LogicalPlanner::build(&query);
+        let logical = LogicalPlanner::build(&query).unwrap();
         let physical = PhysicalPlanner::plan(&logical, &PlanningContext::empty());
 
         assert!(matches!(physical.node, PhysicalNode::HashAggregate { .. }));

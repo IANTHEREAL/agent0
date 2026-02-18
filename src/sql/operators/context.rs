@@ -2,11 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tikv_client::Transaction;
 
+use crate::sql::executor::Executor;
 use crate::sql::query_context::QueryContext;
 use crate::storage::TikvStore;
 use crate::types::{Row, TableSchema};
 
 pub struct ExecutionContext<'a> {
+    pub executor: &'a Executor,
     pub txn: &'a mut Transaction,
     pub store: Arc<TikvStore>,
     pub db_id: u64,
@@ -23,6 +25,7 @@ static EMPTY_CTE_MAP: std::sync::LazyLock<HashMap<String, (TableSchema, Vec<Row>
 
 impl<'a> ExecutionContext<'a> {
     pub fn new(
+        executor: &'a Executor,
         txn: &'a mut Transaction,
         store: Arc<TikvStore>,
         db_id: u64,
@@ -31,6 +34,7 @@ impl<'a> ExecutionContext<'a> {
         query_ctx: &'a QueryContext,
     ) -> Self {
         Self {
+            executor,
             txn,
             store,
             db_id,
@@ -42,6 +46,7 @@ impl<'a> ExecutionContext<'a> {
     }
 
     pub fn with_ctes(
+        executor: &'a Executor,
         txn: &'a mut Transaction,
         store: Arc<TikvStore>,
         db_id: u64,
@@ -51,6 +56,7 @@ impl<'a> ExecutionContext<'a> {
         query_ctx: &'a QueryContext,
     ) -> Self {
         Self {
+            executor,
             txn,
             store,
             db_id,

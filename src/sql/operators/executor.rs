@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tikv_client::Transaction;
 
 use super::{BoxedOperator, ExecutionContext};
+use crate::sql::executor::Executor;
 use crate::sql::query_context::QueryContext;
 use crate::storage::TikvStore;
 use crate::types::Row;
@@ -15,6 +16,7 @@ fn build_query_ctx_from_task_locals() -> QueryContext {
 }
 
 pub async fn execute_operator_tree(
+    executor: &Executor,
     operator: &mut BoxedOperator,
     txn: &mut Transaction,
     store: Arc<TikvStore>,
@@ -23,7 +25,15 @@ pub async fn execute_operator_tree(
     sequence_values: &mut HashMap<String, i64>,
 ) -> Result<Vec<Row>> {
     let qc = build_query_ctx_from_task_locals();
-    let mut ctx = ExecutionContext::new(txn, store, db_id, search_path, sequence_values, &qc);
+    let mut ctx = ExecutionContext::new(
+        executor,
+        txn,
+        store,
+        db_id,
+        search_path,
+        sequence_values,
+        &qc,
+    );
 
     operator.open(&mut ctx).await?;
 
@@ -38,6 +48,7 @@ pub async fn execute_operator_tree(
 }
 
 pub async fn execute_operator_tree_with_ctes(
+    executor: &Executor,
     operator: &mut BoxedOperator,
     txn: &mut Transaction,
     store: Arc<TikvStore>,
@@ -48,6 +59,7 @@ pub async fn execute_operator_tree_with_ctes(
 ) -> Result<Vec<Row>> {
     let qc = build_query_ctx_from_task_locals();
     let mut ctx = ExecutionContext::with_ctes(
+        executor,
         txn,
         store,
         db_id,
