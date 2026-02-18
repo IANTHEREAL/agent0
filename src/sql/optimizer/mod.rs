@@ -19,7 +19,6 @@ pub mod window_rewrite;
 pub use build::BuildContext;
 pub use logical_planner::LogicalPlanner;
 pub use physical_planner::{PhysicalPlanner, PlanningContext};
-pub use statistics::{ColumnStatistics, TableStatistics};
 
 use crate::sql::analyzer::types::{
     AnalyzedQuery, AnalyzedQueryBody, AnalyzedTableRef, AnalyzedTableRefKind, TableRefSchema,
@@ -75,7 +74,14 @@ fn collect_join_tree_refs<'a>(
             collect_join_tree_refs(left, refs);
             collect_join_tree_refs(right, refs);
         }
-        _ => {}
+        AnalyzedTableRefKind::Subquery(subquery) => {
+            // Recurse into subquery body to collect inner table refs
+            // so their schemas get pre-loaded for the optimizer.
+            collect_body_refs(&subquery.body, refs);
+        }
+        AnalyzedTableRefKind::Function { .. } => {
+            // Table functions are pre-loaded separately by preload_table_functions.
+        }
     }
 }
 

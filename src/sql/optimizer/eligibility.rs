@@ -6,13 +6,14 @@
 //! ineligibility reasons are structural: aggregate ORDER BY/HAVING rewrite
 //! failures and window functions in DISTINCT ON.
 
+#[cfg(test)]
 use std::collections::HashSet;
 
+#[cfg(test)]
 use crate::sql::analyzer::types::{
-    AnalyzedDistinct, AnalyzedQuery, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef,
-    AnalyzedTableRefKind, JoinCondition,
+    AnalyzedDistinct, AnalyzedQuery, AnalyzedQueryBody, AnalyzedSelect,
 };
-use crate::sql::expr::classify::has_unresolved_subquery;
+#[cfg(test)]
 use crate::sql::optimizer::logical_planner::expr_has_aggregate;
 
 /// Check whether a query is eligible for the CBO optimizer pipeline.
@@ -27,11 +28,13 @@ use crate::sql::optimizer::logical_planner::expr_has_aggregate;
 /// - Aggregate ORDER BY / HAVING / DISTINCT ON expressions that cannot be
 ///   rewritten to post-aggregate column positions
 /// - Window functions in DISTINCT ON (PostgreSQL constraint)
+#[cfg(test)]
 pub fn is_optimizer_eligible(analyzed: &AnalyzedQuery) -> bool {
     is_eligible_inner(analyzed, &HashSet::new())
 }
 
 /// Inner eligibility check that threads CTE names from parent to child queries.
+#[cfg(test)]
 fn is_eligible_inner(analyzed: &AnalyzedQuery, inherited_cte_names: &HashSet<String>) -> bool {
     // Merge this query's CTE names with inherited ones (case-insensitive).
     let mut cte_names = inherited_cte_names.clone();
@@ -66,29 +69,6 @@ fn is_eligible_inner(analyzed: &AnalyzedQuery, inherited_cte_names: &HashSet<Str
         }
     }
 
-    // Reject queries with subquery-derived tables in FROM — the optimizer's
-    // collect_query_table_refs / logical planner don't handle these yet.
-    if has_subquery_from_leaf(select) {
-        return false;
-    }
-
-    // Reject self-joins (same table name appears more than once in FROM).
-    // The optimizer's prepare_optimizer_contexts stores schemas keyed by
-    // table name, so duplicate names overwrite each other and produce
-    // wrong column indices.
-    if has_duplicate_table_names(select) {
-        return false;
-    }
-
-    // Reject queries with unresolved subquery expressions in JOIN ON conditions.
-    // Non-correlated subqueries in WHERE/projection are handled by
-    // pre-materialization + post-processing, but JOIN ON subqueries (especially
-    // correlated ones) can't be pre-materialized and the operator tree can't
-    // evaluate them per-row.
-    if has_subquery_in_join_on(select) {
-        return false;
-    }
-
     // Reject aggregate queries whose ORDER BY / HAVING / DISTINCT ON cannot be rewritten
     // to post-aggregate column positions.  This is a compile-time feasibility
     // check so that optimize() never needs a runtime fallback path.
@@ -107,63 +87,7 @@ fn is_eligible_inner(analyzed: &AnalyzedQuery, inherited_cte_names: &HashSet<Str
     true
 }
 
-fn has_duplicate_table_names(select: &AnalyzedSelect) -> bool {
-    let mut names = HashSet::new();
-    for tr in &select.from {
-        if !collect_table_names_unique(tr, &mut names) {
-            return true;
-        }
-    }
-    false
-}
-
-fn collect_table_names_unique(tr: &AnalyzedTableRef, seen: &mut HashSet<String>) -> bool {
-    match &tr.kind {
-        AnalyzedTableRefKind::Table { name, .. } => seen.insert(name.to_lowercase()),
-        AnalyzedTableRefKind::Join { left, right, .. } => {
-            collect_table_names_unique(left, seen) && collect_table_names_unique(right, seen)
-        }
-        _ => true,
-    }
-}
-
-fn has_subquery_from_leaf(select: &AnalyzedSelect) -> bool {
-    select.from.iter().any(|tr| table_ref_has_subquery(tr))
-}
-
-fn table_ref_has_subquery(tr: &AnalyzedTableRef) -> bool {
-    match &tr.kind {
-        AnalyzedTableRefKind::Subquery(_) => true,
-        AnalyzedTableRefKind::Join { left, right, .. } => {
-            table_ref_has_subquery(left) || table_ref_has_subquery(right)
-        }
-        AnalyzedTableRefKind::Table { .. } | AnalyzedTableRefKind::Function { .. } => false,
-    }
-}
-
-fn has_subquery_in_join_on(select: &AnalyzedSelect) -> bool {
-    select.from.iter().any(|tr| join_on_has_subquery(tr))
-}
-
-fn join_on_has_subquery(tr: &AnalyzedTableRef) -> bool {
-    match &tr.kind {
-        AnalyzedTableRefKind::Join {
-            left,
-            right,
-            condition,
-            ..
-        } => {
-            if let JoinCondition::On(expr) = condition {
-                if has_unresolved_subquery(expr) {
-                    return true;
-                }
-            }
-            join_on_has_subquery(left) || join_on_has_subquery(right)
-        }
-        _ => false,
-    }
-}
-
+#[cfg(test)]
 fn can_rewrite_post_aggregate(select: &AnalyzedSelect, query: &AnalyzedQuery) -> bool {
     let group_by = &select.group_by;
     let group_by_count = group_by.len();

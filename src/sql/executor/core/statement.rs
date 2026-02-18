@@ -1129,67 +1129,48 @@ impl Executor {
                     // Same rewrite as execution path — invariant: EXPLAIN = execution.
                     let analyzed = crate::sql::rewriter::rewrite_query(analyzed);
 
-                    // When the optimizer GUC is on and the query is eligible,
-                    // use the shared optimize() entrypoint so EXPLAIN shows
-                    // the same plan that execution actually uses.
-                    if crate::sql::query_context::QueryContext::use_optimizer()
-                        && crate::sql::optimizer::eligibility::is_optimizer_eligible(&analyzed)
+                    // Always use the optimizer pipeline — single execution path.
+                    // Build PlanningContext with real table statistics and schemas,
+                    // identical to execution path.
+                    let mut planning_ctx = crate::sql::optimizer::PlanningContext::empty();
                     {
-                        // Build PlanningContext with real table statistics and schemas,
-                        // identical to execution path — uses get_or_load_stats
-                        // to warm cache from persisted TiKV stats on miss.
-                        //
-                        // Uses collect_query_table_refs to recursively walk the
-                        // query body, handling SetOperation branches uniformly.
-                        let mut planning_ctx = crate::sql::optimizer::PlanningContext::empty();
-                        {
-                            let table_refs =
-                                crate::sql::optimizer::collect_query_table_refs(&analyzed);
-                            // Collect CTE names so we skip store schema loading for
-                            // them — mirrors execution path (mod.rs:2724).
-                            let cte_names: HashSet<String> = analyzed
-                                .ctes
-                                .iter()
-                                .map(|c| c.name.to_lowercase())
-                                .collect();
-                            let mut stats_attempted = HashSet::new();
-                            for (name, schema, _alias) in &table_refs {
-                                let tid = schema.table_id;
-                                let stats = if stats_attempted.insert(tid) {
-                                    self.get_or_load_stats(txn, db_id, tid).await?
-                                } else {
-                                    self.stats_cache().get_full_stats(db_id, tid)
-                                };
-                                if let Some(stats) = stats {
-                                    planning_ctx.table_stats.insert(name.to_string(), stats);
-                                }
-                                // Load full table schema (with index metadata)
-                                // for access-path selection — mirrors execution path.
-                                // CTE schemas are not loaded here — they have no indexes.
-                                let cte_key = name.to_lowercase();
-                                if !cte_names.contains(&cte_key) {
-                                    if let Some(table_schema) =
-                                        self.store().get_schema(txn, db_id, name).await?
-                                    {
-                                        planning_ctx
-                                            .table_schemas
-                                            .insert(name.to_string(), table_schema);
-                                    }
+                        let table_refs =
+                            crate::sql::optimizer::collect_query_table_refs(&analyzed);
+                        let cte_names: HashSet<String> = analyzed
+                            .ctes
+                            .iter()
+                            .map(|c| c.name.to_lowercase())
+                            .collect();
+                        let mut stats_attempted = HashSet::new();
+                        for (name, schema, alias) in &table_refs {
+                            let ctx_key = alias.unwrap_or(name);
+                            let tid = schema.table_id;
+                            let stats = if stats_attempted.insert(tid) {
+                                self.get_or_load_stats(txn, db_id, tid).await?
+                            } else {
+                                self.stats_cache().get_full_stats(db_id, tid)
+                            };
+                            if let Some(stats) = stats {
+                                planning_ctx
+                                    .table_stats
+                                    .insert(ctx_key.to_string(), stats);
+                            }
+                            let cte_key = name.to_lowercase();
+                            if !cte_names.contains(&cte_key) {
+                                if let Some(table_schema) =
+                                    self.store().get_schema(txn, db_id, name).await?
+                                {
+                                    planning_ctx
+                                        .table_schemas
+                                        .insert(ctx_key.to_string(), table_schema);
                                 }
                             }
                         }
-                        {
-                            // Eligibility gate guarantees optimize() always succeeds.
-                            let physical =
-                                crate::sql::optimizer::optimize(&analyzed, &planning_ctx);
-                            explain::physical_plan_to_plan_node(&physical)
-                        }
-                    } else {
-                        explain::generate_plan_from_analyzed(
-                            &analyzed,
-                            &schema_lookup,
-                            &row_count_lookup,
-                        )
+                    }
+                    {
+                        let physical =
+                            crate::sql::optimizer::optimize(&analyzed, &planning_ctx);
+                        explain::physical_plan_to_plan_node(&physical)
                     }
                 }
                 Err(_) => {

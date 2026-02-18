@@ -78,7 +78,10 @@ impl PhysicalPlanner {
         ctx: &'a PlanningContext,
     ) -> Option<&'a TableStatistics> {
         match &logical.node {
-            LogicalNode::Scan { table_name, .. } => ctx.get_stats(table_name),
+            LogicalNode::Scan { table_name, alias } => {
+                let key = alias.as_deref().unwrap_or(table_name);
+                ctx.get_stats(key)
+            }
             // Aggregate output schema ≠ base table → block propagation.
             LogicalNode::Aggregate { .. } => None,
             // Transparent unary operators — recurse through.
@@ -167,8 +170,9 @@ impl PhysicalPlanner {
         match &logical.node {
             // ── Leaf nodes ──────────────────────────────
             LogicalNode::Scan { table_name, alias } => {
+                let key = alias.as_deref().unwrap_or(table_name);
                 let rows = ctx
-                    .get_stats(table_name)
+                    .get_stats(key)
                     .map(|s| s.row_count)
                     .unwrap_or(DEFAULT_ESTIMATED_ROWS);
                 PhysicalPlan {
@@ -238,7 +242,8 @@ impl PhysicalPlanner {
                 // we have index metadata, try btree index selection.
                 // GIN is excluded — GIN queries stay on SeqScan (Option A).
                 let scan_node = if let PhysicalNode::SeqScan { table_name, alias } = &child.node {
-                    if let Some(schema) = ctx.get_schema(table_name) {
+                    let scan_key = alias.as_deref().unwrap_or(table_name);
+                    if let Some(schema) = ctx.get_schema(scan_key) {
                         let access_path =
                             crate::sql::planner::choose_btree_access_path_for_typed_filter(
                                 schema,

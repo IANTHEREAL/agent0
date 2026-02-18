@@ -52,7 +52,6 @@ pub use filter::*;
 pub use hash_join::*;
 pub use join::*;
 pub use limit::*;
-pub use planner::*;
 pub use project::*;
 pub use scan::*;
 pub use set_operation::*;

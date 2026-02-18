@@ -71,16 +71,17 @@ impl PhysicalPlan {
         match &self.node {
             // ── Scan operators ──────────────────────────────────
             PhysicalNode::SeqScan { table_name, alias } => {
+                let key = alias.as_deref().unwrap_or(table_name);
                 let schema = ctx
                     .table_schemas
-                    .get(table_name)
-                    .ok_or_else(|| anyhow!("Table schema not found: {}", table_name))?;
+                    .get(key)
+                    .ok_or_else(|| anyhow!("Table schema not found: {}", key))?;
                 let mut schema = schema.clone();
                 if let Some(a) = alias {
                     schema.from_alias = Some(a.clone());
                 }
                 // Use preloaded rows for virtual catalog tables, CTEs, etc.
-                if let Some(rows) = ctx.preloaded_rows.get(table_name) {
+                if let Some(rows) = ctx.preloaded_rows.get(key) {
                     Ok(Box::new(TableScanOperator::new_with_rows(
                         schema,
                         rows.clone(),
@@ -95,10 +96,11 @@ impl PhysicalPlan {
                 alias,
                 scan_type,
             } => {
+                let key = alias.as_deref().unwrap_or(table_name);
                 let schema = ctx
                     .table_schemas
-                    .get(table_name)
-                    .ok_or_else(|| anyhow!("Table schema not found: {}", table_name))?;
+                    .get(key)
+                    .ok_or_else(|| anyhow!("Table schema not found: {}", key))?;
                 let mut schema = schema.clone();
                 if let Some(a) = alias {
                     schema.from_alias = Some(a.clone());
@@ -1196,7 +1198,8 @@ mod tests {
             schema: make_schema(&[("id", DataType::Int32), ("name", DataType::Text)]),
             cost: PhysicalCost::default(),
         };
-        let ctx = test_ctx();
+        // Key by alias "t" since alias-aware lookup uses alias as key.
+        let ctx = BuildContext::new().with_schema("t".to_string(), test_table_schema());
         let op = plan.build_operators(&ctx).unwrap();
         assert_eq!(op.schema().from_alias, Some("t".to_string()));
     }

@@ -123,3 +123,47 @@ All must hold: no outer CTEs, single FROM source that is Subquery, inner has no 
 - `cargo build` — compiles with no new warnings
 - `cargo test` — all 1463 tests pass (16 new rewriter unit tests)
 - Rewriter is transparent for non-flattenable queries (returns unchanged)
+
+---
+
+## Issue #819: Eliminate SELECT Dual-Path — Single CBO Architecture
+
+### Summary
+Removed the legacy SELECT execution fallback path, making the CBO optimizer the single execution path for all SELECT queries. Deleted ~1700+ lines of legacy code.
+
+### Changes
+
+**Step 1: Self-join keying** — `FROM t AS a JOIN t AS b` was broken because `BuildContext.table_schemas` was keyed by table name, causing overwrites. Fixed by keying all lookups (build.rs, physical_planner.rs, prepare_optimizer_contexts, EXPLAIN) by `alias.unwrap_or(table_name)`.
+
+**Step 2: Subquery FROM schema loading** — `collect_join_tree_refs` in optimizer/mod.rs now recurses into `AnalyzedTableRefKind::Subquery` to pre-load inner table schemas.
+
+**Step 3: JOIN ON subqueries** — Added `extract_async_join_on_predicates` to split correlated subqueries from JOIN ON conditions into post-join async WHERE filters. Reuses existing async WHERE post-processing pipeline.
+
+**Step 4: Remove routing gate + delete legacy** — `try_execute_analyzed` and `execute_subquery` now always call `execute_via_optimizer`. Deleted 7 legacy functions (~1700 lines): `execute_analyzed_query`, `execute_analyzed_pipeline`, `execute_analyzed_join`, `execute_analyzed_values`, `execute_analyzed_tableless`, `execute_analyzed_distinct_on`, `execute_analyzed_set_op`. Deleted `query_plan.rs` entirely.
+
+**Step 5: Unify EXPLAIN** — `execute_explain` now always uses the optimizer pipeline (removed `is_optimizer_eligible` routing check).
+
+**Step 6: GUC deprecation** — `SET tipg.use_optimizer = off` logs NOTICE and stays ON. `SHOW tipg.use_optimizer` always returns "on".
+
+**Step 7: Cleanup** — Removed unused imports, dead `rewrite::*` glob, `pub use planner::*`, `pub use statistics::*`. Gated test-only eligibility functions with `#[cfg(test)]`. Added `#[allow(dead_code)]` on legacy EXPLAIN helpers.
+
+### Files Modified
+| File | Action |
+|------|--------|
+| `src/sql/optimizer/build.rs` | Alias-aware schema/rows lookup in SeqScan/IndexScan + test fix |
+| `src/sql/optimizer/mod.rs` | Subquery FROM recursion in collect_join_tree_refs, removed unused re-exports |
+| `src/sql/optimizer/eligibility.rs` | Removed 3 gates, gated remaining code with `#[cfg(test)]` |
+| `src/sql/optimizer/physical_planner.rs` | Alias-aware stats/schema lookup |
+| `src/sql/executor/select/analyzed/mod.rs` | Single path, JOIN ON extraction, deleted ~1700 lines of legacy |
+| `src/sql/executor/select/analyzed/query_plan.rs` | **DELETED** |
+| `src/sql/executor/core/statement.rs` | Unified EXPLAIN (always optimizer) |
+| `src/sql/session.rs` | GUC deprecation notice |
+| `src/sql/query_context.rs` | `#[allow(dead_code)]` on unused `use_optimizer()` |
+| `src/sql/operators/mod.rs` | Removed unused `pub use planner::*` |
+| `src/sql/explain.rs` | `#[allow(dead_code)]` on legacy EXPLAIN helpers |
+
+### Verification
+- `cargo check` — zero new warnings (all pre-existing)
+- `cargo test` — all 1649 tests pass
+- Dead code grep: zero references to `execute_analyzed_query`, `plan_query`, `QueryPlan`
+- `use_optimizer` routing branches: zero remaining (only GUC infrastructure)
