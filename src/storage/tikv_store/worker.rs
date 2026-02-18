@@ -1,5 +1,5 @@
 use super::*;
-use crate::worker::types::{TaskQueueEntry, TaskRegistryEntry, WorkerClaim};
+use crate::worker::types::{TaskQueueEntry, TaskRegistryEntry, TaskType, WorkerClaim};
 
 impl TikvStore {
     // ========================================================================
@@ -176,6 +176,38 @@ impl TikvStore {
             }
         }
         Ok(matching_keys)
+    }
+
+    /// Scan all cron queue entries for a specific (keyspace, db_id).
+    /// Returns (raw_key, task_id) pairs for all matching cron entries.
+    pub async fn scan_cron_queue_entries_for_db(
+        &self,
+        txn: &mut Transaction,
+        keyspace: &str,
+        db_id: u64,
+    ) -> Result<Vec<(Vec<u8>, i64)>> {
+        let prefix = encode_worker_queue_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix.clone()..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        let mut results = Vec::new();
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let entry: TaskQueueEntry = bincode::deserialize(pair.value())
+                .context("Failed to deserialize worker queue entry")?;
+            if entry.keyspace == keyspace
+                && entry.db_id == db_id
+                && entry.task_type == TaskType::Cron
+            {
+                results.push((key.to_vec(), entry.task_id));
+            }
+        }
+        Ok(results)
     }
 
     // ========================================================================
