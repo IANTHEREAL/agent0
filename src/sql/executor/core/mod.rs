@@ -2,6 +2,7 @@
 
 mod alter;
 mod analyze;
+mod analyze_rewrite;
 pub(crate) mod catalog_prefetch;
 mod copy;
 mod dispatch;

@@ -309,8 +309,8 @@ pub fn analyze_predicates(expr: &Expr) -> Vec<PredicateInfo> {
 
 /// Choose the best access path for an optional AST filter expression.
 ///
-/// **Legacy:** Only used by the EXPLAIN AST fallback path (non-SELECT statements
-/// and analysis error recovery).  The primary path uses
+/// **Legacy:** Only used by the EXPLAIN AST path for non-SELECT statements.
+/// The primary path uses
 /// [`choose_best_access_path_for_typed_filter`] which operates on the Analyzer's
 /// TypedExpr IR.
 pub fn choose_best_access_path_for_filter(

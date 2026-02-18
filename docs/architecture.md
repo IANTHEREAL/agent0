@@ -504,6 +504,7 @@ AFTER triggers: deferred to commit (src/sql/trigger_worker.rs)
 | Privilege enforcement | SELECT privilege on every base table | `executor/core/statement.rs` |
 | 35+ catalog views | pg_catalog + information_schema compatibility | `catalog/` |
 | Full-text search | GIN indexes + Chinese tokenizer | `gin.rs`, `fts.rs` |
+| SQL Rewriter phase | Shared analyzed rewrite entry for execution/EXPLAIN, no SELECT/WITH runtime fallback | `executor/core/analyze_rewrite.rs`, `rewriter.rs`, `parser.rs` |
 
 ### In Progress
 
@@ -516,7 +517,6 @@ AFTER triggers: deferred to commit (src/sql/trigger_worker.rs)
 
 | Feature | Description | Issue |
 |---------|-------------|-------|
-| SQL Rewriter | Standard rewrite phase (subquery flattening, view merging) | #704 |
 | Parallel execution | Distributed query execution across TiKV regions | #708 |
 
 ---

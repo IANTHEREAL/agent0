@@ -390,7 +390,6 @@ pub enum TypedExprKind {
     },
 
     /// `expr op ANY/ALL (SELECT ...)`.
-    #[allow(dead_code)]
     AnyAll {
         expr: Box<TypedExpr>,
         op: BinaryOp,
