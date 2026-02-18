@@ -233,9 +233,7 @@ impl PhysicalPlan {
                     .table_schemas
                     .get(key)
                     .or_else(|| ctx.table_schemas.get(function_name.as_str()))
-                    .ok_or_else(|| {
-                        anyhow!("Table function schema not found: {}", function_name)
-                    })?;
+                    .ok_or_else(|| anyhow!("Table function schema not found: {}", function_name))?;
                 let rows = ctx
                     .preloaded_rows
                     .get(key)

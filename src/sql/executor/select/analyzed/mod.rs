@@ -163,9 +163,7 @@ impl Executor {
                     .await?
                 }
                 Err(_unsupported) => {
-                    return Err(anyhow!(
-                        "query not supported: could not plan execution"
-                    ));
+                    return Err(anyhow!("query not supported: could not plan execution"));
                 }
             }
         };
@@ -195,8 +193,16 @@ impl Executor {
         analyzed: &AnalyzedQuery,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
-        self.execute_via_optimizer(txn, db_id, sequence_values, search_path, analyzed, ctes, &[])
-            .await
+        self.execute_via_optimizer(
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            analyzed,
+            ctes,
+            &[],
+        )
+        .await
     }
 
     /// Execute a fully analyzed query, driven by the pre-computed `QueryPlan`.
@@ -2748,9 +2754,7 @@ impl Executor {
 
         // ── Step 2: Determine post-processing needs ──
         let has_async_where = match &analyzed.body {
-            AnalyzedQueryBody::Select(s) => {
-                s.where_clause.as_ref().is_some_and(|w| needs_async(w))
-            }
+            AnalyzedQueryBody::Select(s) => s.where_clause.as_ref().is_some_and(|w| needs_async(w)),
             _ => false,
         };
         let has_async_projection = match &analyzed.body {
@@ -2901,10 +2905,7 @@ impl Executor {
             rows = sort_projected_rows(rows, deferred_ob, &final_output_schema, limit, offset)?;
         } else if let Some((ref limit_expr, ref offset_expr)) = deferred_limit {
             // LIMIT/OFFSET deferred for locking but no deferred ORDER BY.
-            let limit = limit_expr
-                .as_ref()
-                .map(eval_const_usize)
-                .transpose()?;
+            let limit = limit_expr.as_ref().map(eval_const_usize).transpose()?;
             let offset = offset_expr
                 .as_ref()
                 .map(eval_const_usize)
@@ -3228,16 +3229,18 @@ impl Executor {
             let (mut virt_schema, virt_rows) = self
                 .get_table_data(txn, db_id, sequence_values, search_path, name, ctes)
                 .await?;
-            let short = virt_schema.name.rsplit('.').next().unwrap_or(&virt_schema.name);
+            let short = virt_schema
+                .name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&virt_schema.name);
             if !short.eq_ignore_ascii_case(display_alias) {
                 virt_schema.from_alias = Some(display_alias.to_string());
             }
             build_ctx
                 .table_schemas
                 .insert(name.to_string(), virt_schema);
-            build_ctx
-                .preloaded_rows
-                .insert(name.to_string(), virt_rows);
+            build_ctx.preloaded_rows.insert(name.to_string(), virt_rows);
         }
 
         // Also walk table functions in FROM and pre-execute them.
@@ -3268,47 +3271,47 @@ impl Executor {
         build_ctx: &'a mut BuildContext,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-        let body = &analyzed.body;
-        match body {
-            AnalyzedQueryBody::Select(select) => {
-                for tr in &select.from {
-                    self.preload_table_function_refs(
-                        tr,
+            let body = &analyzed.body;
+            match body {
+                AnalyzedQueryBody::Select(select) => {
+                    for tr in &select.from {
+                        self.preload_table_function_refs(
+                            tr,
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            ctes,
+                            build_ctx,
+                        )
+                        .await?;
+                    }
+                }
+                AnalyzedQueryBody::SetOperation { left, right, .. } => {
+                    self.preload_table_functions(
                         txn,
                         db_id,
                         sequence_values,
                         search_path,
+                        left,
+                        ctes,
+                        build_ctx,
+                    )
+                    .await?;
+                    self.preload_table_functions(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        right,
                         ctes,
                         build_ctx,
                     )
                     .await?;
                 }
+                AnalyzedQueryBody::Values(_) => {}
             }
-            AnalyzedQueryBody::SetOperation { left, right, .. } => {
-                self.preload_table_functions(
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    left,
-                    ctes,
-                    build_ctx,
-                )
-                .await?;
-                self.preload_table_functions(
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    right,
-                    ctes,
-                    build_ctx,
-                )
-                .await?;
-            }
-            AnalyzedQueryBody::Values(_) => {}
-        }
-        Ok(())
+            Ok(())
         }) // end Box::pin
     }
 
@@ -3325,91 +3328,87 @@ impl Executor {
         build_ctx: &'a mut BuildContext,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-        match &table_ref.kind {
-            AnalyzedTableRefKind::Function {
-                func,
-                args,
-                output_columns,
-            } => {
-                let key = table_ref
-                    .alias
-                    .as_deref()
-                    .unwrap_or(&func.name)
-                    .to_string();
+            match &table_ref.kind {
+                AnalyzedTableRefKind::Function {
+                    func,
+                    args,
+                    output_columns,
+                } => {
+                    let key = table_ref.alias.as_deref().unwrap_or(&func.name).to_string();
 
-                // Build schema from analyzer-resolved output columns.
-                let schema = TableSchema {
-                    name: key.clone(),
-                    table_id: 0,
-                    columns: output_columns
-                        .iter()
-                        .map(|(name, dt)| crate::types::ColumnDef {
-                            name: name.clone(),
-                            data_type: dt.clone(),
-                            nullable: true,
-                            primary_key: false,
-                            unique: false,
-                            is_serial: false,
-                            default_expr: None,
-                        })
-                        .collect(),
-                    version: 1,
-                    pk_constraint_name: None,
-                    pk_indices: vec![],
-                    indexes: vec![],
-                    check_constraints: vec![],
-                    foreign_keys: vec![],
-                    owner: String::new(),
-                    from_alias: table_ref.alias.clone(),
-                };
-
-                // Evaluate typed args to Values, then bridge to FunctionArg.
-                let qc = crate::sql::query_context::QueryContext::from_task_locals();
-                let dummy_row = Row::new(vec![]);
-                let mut bridge_args: Vec<FunctionArg> = Vec::with_capacity(args.len());
-                for tfa in args {
-                    let (name_opt, typed_expr) = match tfa {
-                        TypedFunctionArg::Positional(e) => (None, e),
-                        TypedFunctionArg::Named { name, expr } => (Some(name.clone()), expr),
+                    // Build schema from analyzer-resolved output columns.
+                    let schema = TableSchema {
+                        name: key.clone(),
+                        table_id: 0,
+                        columns: output_columns
+                            .iter()
+                            .map(|(name, dt)| crate::types::ColumnDef {
+                                name: name.clone(),
+                                data_type: dt.clone(),
+                                nullable: true,
+                                primary_key: false,
+                                unique: false,
+                                is_serial: false,
+                                default_expr: None,
+                            })
+                            .collect(),
+                        version: 1,
+                        pk_constraint_name: None,
+                        pk_indices: vec![],
+                        indexes: vec![],
+                        check_constraints: vec![],
+                        foreign_keys: vec![],
+                        owner: String::new(),
+                        from_alias: table_ref.alias.clone(),
                     };
-                    let val = eval_typed_expr(typed_expr, &dummy_row, &qc)?;
-                    let sql_expr = crate::sql::value_coercion::value_to_sql_expr(&val);
-                    let fa = match name_opt {
-                        None => FunctionArg::Unnamed(FunctionArgExpr::Expr(sql_expr)),
-                        Some(n) => FunctionArg::Named {
-                            name: sqlparser::ast::Ident::new(n),
-                            arg: FunctionArgExpr::Expr(sql_expr),
-                        },
-                    };
-                    bridge_args.push(fa);
-                }
 
-                let func_upper = func.name.to_uppercase();
+                    // Evaluate typed args to Values, then bridge to FunctionArg.
+                    let qc = crate::sql::query_context::QueryContext::from_task_locals();
+                    let dummy_row = Row::new(vec![]);
+                    let mut bridge_args: Vec<FunctionArg> = Vec::with_capacity(args.len());
+                    for tfa in args {
+                        let (name_opt, typed_expr) = match tfa {
+                            TypedFunctionArg::Positional(e) => (None, e),
+                            TypedFunctionArg::Named { name, expr } => (Some(name.clone()), expr),
+                        };
+                        let val = eval_typed_expr(typed_expr, &dummy_row, &qc)?;
+                        let sql_expr = crate::sql::value_coercion::value_to_sql_expr(&val);
+                        let fa = match name_opt {
+                            None => FunctionArg::Unnamed(FunctionArgExpr::Expr(sql_expr)),
+                            Some(n) => FunctionArg::Named {
+                                name: sqlparser::ast::Ident::new(n),
+                                arg: FunctionArgExpr::Expr(sql_expr),
+                            },
+                        };
+                        bridge_args.push(fa);
+                    }
 
-                let rows = if func_upper == "GENERATE_SERIES" {
-                    let (_, rows) = self
-                        .execute_generate_series(&bridge_args, &key, None, 0, None)
-                        .await?;
-                    rows
-                } else if func_upper == "_PGTIKV_SYS_RECORD_MIGRATION" {
-                    let (_, rows) = self.execute_record_migration(txn, &bridge_args).await?;
-                    rows
-                } else {
-                    // Try extension table function, user table function, or scalar-in-FROM.
-                    let obj_name =
-                        ObjectName(vec![sqlparser::ast::Ident::new(func.name.clone())]);
-                    if let Some(result) = self
-                        .try_execute_extension_table_function(
-                            txn,
-                            db_id,
-                            search_path,
-                            &obj_name,
-                            &bridge_args,
-                            None,
-                        )
-                        .await?
-                    {
-                        match result {
+                    let func_upper = func.name.to_uppercase();
+
+                    let rows = if func_upper == "GENERATE_SERIES" {
+                        let (_, rows) = self
+                            .execute_generate_series(&bridge_args, &key, None, 0, None)
+                            .await?;
+                        rows
+                    } else if func_upper == "_PGTIKV_SYS_RECORD_MIGRATION" {
+                        let (_, rows) = self.execute_record_migration(txn, &bridge_args).await?;
+                        rows
+                    } else {
+                        // Try extension table function, user table function, or scalar-in-FROM.
+                        let obj_name =
+                            ObjectName(vec![sqlparser::ast::Ident::new(func.name.clone())]);
+                        if let Some(result) = self
+                            .try_execute_extension_table_function(
+                                txn,
+                                db_id,
+                                search_path,
+                                &obj_name,
+                                &bridge_args,
+                                None,
+                            )
+                            .await?
+                        {
+                            match result {
                             crate::sql::executor::extensions::ExtensionTableFunctionResult::Batch(
                                 _,
                                 rows,
@@ -3422,90 +3421,91 @@ impl Executor {
                                 rt.run_operator_tree(&mut op, txn, sequence_values).await?
                             }
                         }
-                    } else if let Some((_, rows)) = self
-                        .try_execute_user_table_function(
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            &obj_name,
-                            &bridge_args,
-                            None,
-                        )
-                        .await?
-                    {
-                        rows
-                    } else {
-                        // Scalar-in-FROM: evaluate as function call.
-                        let typed_args: Vec<TypedExpr> = args
-                            .iter()
-                            .map(|a| match a {
-                                TypedFunctionArg::Positional(e) => e.clone(),
-                                TypedFunctionArg::Named { expr, .. } => expr.clone(),
-                            })
-                            .collect();
-                        let mut scalar_arg_values = Vec::with_capacity(typed_args.len());
-                        for arg in &typed_args {
-                            scalar_arg_values.push(eval_typed_expr(arg, &dummy_row, &qc)?);
-                        }
-                        if let Some(result) = crate::sql::executor::execute_cron_scalar_function(
-                            &self.store(),
-                            txn,
-                            db_id,
-                            qc.current_user.as_ref(),
-                            qc.database_name.as_ref(),
-                            crate::extensions::context::is_superuser(),
-                            &func.name,
-                            &scalar_arg_values,
-                            self.tenant_keyspace(),
-                        )
-                        .await
+                        } else if let Some((_, rows)) = self
+                            .try_execute_user_table_function(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                &obj_name,
+                                &bridge_args,
+                                None,
+                            )
+                            .await?
                         {
-                            vec![Row::new(vec![result?])]
+                            rows
                         } else {
-                            let typed_expr = TypedExpr {
-                                kind: TypedExprKind::FunctionCall {
-                                    func: func.clone(),
-                                    args: typed_args,
-                                    order_by: vec![],
-                                    filter: None,
-                                },
-                                data_type: func.return_type.clone(),
-                            };
-                            let val = eval_typed_expr(&typed_expr, &dummy_row, &qc)?;
-                            vec![Row::new(vec![val])]
+                            // Scalar-in-FROM: evaluate as function call.
+                            let typed_args: Vec<TypedExpr> = args
+                                .iter()
+                                .map(|a| match a {
+                                    TypedFunctionArg::Positional(e) => e.clone(),
+                                    TypedFunctionArg::Named { expr, .. } => expr.clone(),
+                                })
+                                .collect();
+                            let mut scalar_arg_values = Vec::with_capacity(typed_args.len());
+                            for arg in &typed_args {
+                                scalar_arg_values.push(eval_typed_expr(arg, &dummy_row, &qc)?);
+                            }
+                            if let Some(result) =
+                                crate::sql::executor::execute_cron_scalar_function(
+                                    &self.store(),
+                                    txn,
+                                    db_id,
+                                    qc.current_user.as_ref(),
+                                    qc.database_name.as_ref(),
+                                    crate::extensions::context::is_superuser(),
+                                    &func.name,
+                                    &scalar_arg_values,
+                                    self.tenant_keyspace(),
+                                )
+                                .await
+                            {
+                                vec![Row::new(vec![result?])]
+                            } else {
+                                let typed_expr = TypedExpr {
+                                    kind: TypedExprKind::FunctionCall {
+                                        func: func.clone(),
+                                        args: typed_args,
+                                        order_by: vec![],
+                                        filter: None,
+                                    },
+                                    data_type: func.return_type.clone(),
+                                };
+                                let val = eval_typed_expr(&typed_expr, &dummy_row, &qc)?;
+                                vec![Row::new(vec![val])]
+                            }
                         }
-                    }
-                };
+                    };
 
-                build_ctx.table_schemas.insert(key.clone(), schema);
-                build_ctx.preloaded_rows.insert(key, rows);
+                    build_ctx.table_schemas.insert(key.clone(), schema);
+                    build_ctx.preloaded_rows.insert(key, rows);
+                }
+                AnalyzedTableRefKind::Join { left, right, .. } => {
+                    self.preload_table_function_refs(
+                        left,
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        ctes,
+                        build_ctx,
+                    )
+                    .await?;
+                    self.preload_table_function_refs(
+                        right,
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        ctes,
+                        build_ctx,
+                    )
+                    .await?;
+                }
+                _ => {}
             }
-            AnalyzedTableRefKind::Join { left, right, .. } => {
-                self.preload_table_function_refs(
-                    left,
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    ctes,
-                    build_ctx,
-                )
-                .await?;
-                self.preload_table_function_refs(
-                    right,
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    ctes,
-                    build_ctx,
-                )
-                .await?;
-            }
-            _ => {}
-        }
-        Ok(())
+            Ok(())
         }) // end Box::pin
     }
 
@@ -3636,21 +3636,25 @@ fn collect_table_ref_columns(tr: &AnalyzedTableRef, out: &mut Vec<(String, DataT
 }
 
 /// Create a passthrough projection that emits all source columns as ColumnRef.
-fn create_passthrough_projection(columns: &[(String, DataType)]) -> Vec<crate::sql::analyzer::types::AnalyzedProjection> {
+fn create_passthrough_projection(
+    columns: &[(String, DataType)],
+) -> Vec<crate::sql::analyzer::types::AnalyzedProjection> {
     columns
         .iter()
         .enumerate()
-        .map(|(i, (name, dt))| crate::sql::analyzer::types::AnalyzedProjection {
-            expr: TypedExpr {
-                kind: TypedExprKind::ColumnRef {
-                    scope_depth: 0,
-                    column_index: i,
-                    column_name: name.clone(),
+        .map(
+            |(i, (name, dt))| crate::sql::analyzer::types::AnalyzedProjection {
+                expr: TypedExpr {
+                    kind: TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: i,
+                        column_name: name.clone(),
+                    },
+                    data_type: dt.clone(),
                 },
-                data_type: dt.clone(),
+                output_name: name.clone(),
             },
-            output_name: name.clone(),
-        })
+        )
         .collect()
 }
 
