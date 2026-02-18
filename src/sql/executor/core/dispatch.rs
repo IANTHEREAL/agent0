@@ -863,16 +863,14 @@ impl Executor {
                                                 stmt,
                                             )
                                             .await?;
-                                        let result = self
-                                            .execute_statement_on_txn(
-                                                txn,
-                                                db_id,
-                                                sequence_values,
-                                                search_path,
-                                                stmt,
-                                                current_role.as_deref(),
-                                            )
-                                            .await?;
+                                        let result = self.execute_statement_on_txn(
+                                            txn,
+                                            db_id,
+                                            sequence_values,
+                                            search_path,
+                                            stmt,
+                                            current_role.as_deref(),
+                                        ).await?;
                                         Ok::<(Vec<ExecuteResult>, ExecuteResult), anyhow::Error>((
                                             notices, result,
                                         ))
