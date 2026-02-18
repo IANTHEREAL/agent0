@@ -16,6 +16,7 @@ fi
 PG_PORT="${PG_PORT:-15433}"
 PG_USER="${PG_USER:-admin}"
 PG_PASSWORD="${PG_PASSWORD:-admin}"
+WORKER_SYSTEM_KEYSPACE="${PGTIKV_WORKER_SYSTEM_KEYSPACE:-_sys_worker}"
 
 PGTIKV_PID=""
 CLUSTER_STARTED=0
@@ -202,6 +203,91 @@ sock.close()
 PY
 }
 
+worker_is_enabled() {
+  local raw="${PGTIKV_WORKER_ENABLED:-1}"
+  case "${raw,,}" in
+    1|true|t|yes|y|on) return 0 ;;
+    0|false|f|no|n|off) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+ensure_pd_keyspace() {
+  local pd_endpoints="$1"
+  local keyspace="$2"
+  local pd_primary="${pd_endpoints%%,*}"
+
+  python3 - "$pd_primary" "$keyspace" <<'PY'
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+
+pd = sys.argv[1]
+keyspace = sys.argv[2]
+base = f"http://{pd}/pd/api/v2/keyspaces"
+headers = {"Content-Type": "application/json"}
+create_data = json.dumps({"name": keyspace}).encode("utf-8")
+
+
+def request(method: str, url: str, data=None):
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        body = resp.read().decode("utf-8", "replace")
+        return resp.status, body
+
+
+last_err = "unknown error"
+for _ in range(15):
+    try:
+        status, body = request("POST", base, create_data)
+        if status not in (200, 201, 409):
+            last_err = f"POST status={status}, body={body}"
+            time.sleep(1)
+            continue
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        if e.code == 409 or "already exists" in body.lower():
+            pass
+        elif e.code in (500, 503):
+            last_err = f"POST status={e.code}, body={body}"
+            time.sleep(1)
+            continue
+        else:
+            print(
+                f"ERROR: failed to create keyspace '{keyspace}' on PD {pd}: "
+                f"status={e.code}, body={body}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    except Exception as e:
+        last_err = f"POST error: {e}"
+        time.sleep(1)
+        continue
+
+    try:
+        status, body = request("GET", f"{base}/{keyspace}")
+        if status == 200:
+            print(f"Ensured system keyspace '{keyspace}' on PD {pd}")
+            sys.exit(0)
+        last_err = f"GET status={status}, body={body}"
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        last_err = f"GET status={e.code}, body={body}"
+    except Exception as e:
+        last_err = f"GET error: {e}"
+
+    time.sleep(1)
+
+print(
+    f"ERROR: unable to ensure keyspace '{keyspace}' on PD {pd} after retries: {last_err}",
+    file=sys.stderr,
+)
+sys.exit(1)
+PY
+}
+
 cleanup() {
   echo ""
   echo "=== Regression gate cleanup ==="
@@ -279,6 +365,13 @@ if [[ "$START_ENV" -eq 1 ]]; then
   CLUSTER_STARTED=1
   echo "Waiting for TiKV to be fully ready..."
   sleep 5
+
+  if worker_is_enabled; then
+    echo "Ensuring worker system keyspace '${WORKER_SYSTEM_KEYSPACE}'..."
+    ensure_pd_keyspace "$PD_ENDPOINTS" "$WORKER_SYSTEM_KEYSPACE"
+  else
+    echo "Worker disabled (PGTIKV_WORKER_ENABLED='${PGTIKV_WORKER_ENABLED:-unset}'); skipping system keyspace provisioning."
+  fi
 
   echo ""
   echo "[3/$TOTAL_STEPS] Building pg-tikv..."
