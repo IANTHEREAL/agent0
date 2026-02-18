@@ -31,6 +31,7 @@ use crate::types::{
     CheckConstraint, ColumnDef, DataType, ForeignKeyAction, ForeignKeyConstraint, IndexDef, Row,
     TableSchema, Value,
 };
+use crate::worker::types::{IndexState, TaskQueueEntry, TaskType, TASK_TYPE_BG_DDL};
 
 const DDL_SCAN_BATCH_SIZE: u32 = 1024;
 const DDL_BACKFILL_COMMIT_SIZE: usize = 5000;
@@ -693,6 +694,7 @@ pub async fn execute_create_table(
                 method: None,
                 predicate: None,
                 expressions: Vec::new(),
+                state: IndexState::Ready,
             });
             next_index_id += 1;
         }
@@ -720,6 +722,7 @@ pub async fn execute_create_table(
                         method: None,
                         predicate: None,
                         expressions: Vec::new(),
+                        state: IndexState::Ready,
                     });
                     next_index_id += 1;
                 }
@@ -1215,8 +1218,11 @@ pub async fn execute_create_index(
     columns: &[OrderByExpr],
     unique: bool,
     if_not_exists: bool,
+    concurrently: bool,
     predicate: Option<&Expr>,
     rows: Vec<Row>,
+    keyspace: &str,
+    username: &str,
 ) -> Result<ExecuteResult> {
     let idx_name_str = idx_name.to_string();
     let tbl_name = table_name;
@@ -1302,7 +1308,42 @@ pub async fn execute_create_index(
         method,
         predicate: predicate_str,
         expressions: idx_exprs,
+        state: if concurrently {
+            IndexState::Building
+        } else {
+            IndexState::Ready
+        },
     };
+
+    if concurrently {
+        schema.indexes.push(new_index);
+        store.update_schema(txn, db_id, schema.clone()).await?;
+
+        if let Some(system_store) = crate::worker::get_system_store() {
+            let entry = TaskQueueEntry::new(
+                keyspace.to_string(),
+                db_id,
+                index_id as i64,
+                TaskType::BgDdl,
+                format!("__backfill_index {} {}", tbl_name, idx_name_str),
+                username.to_string(),
+                128,
+            );
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let mut sys_txn = system_store.begin().await?;
+            system_store
+                .put_worker_queue_entry(&mut sys_txn, &entry, now_ms)
+                .await?;
+            system_store
+                .update_registry_task_types(&mut sys_txn, keyspace, db_id, TASK_TYPE_BG_DDL, 0)
+                .await?;
+            sys_txn.commit().await?;
+        }
+
+        return Ok(ExecuteResult::CreateIndex {
+            index_name: idx_name_str,
+        });
+    }
 
     let mut current_batch_writes = 0usize;
     let mut has_committed_batches = false;
@@ -1511,6 +1552,180 @@ pub async fn execute_create_index(
     Ok(ExecuteResult::CreateIndex {
         index_name: idx_name_str,
     })
+}
+
+pub async fn update_index_state(
+    store: &Arc<TikvStore>,
+    db_id: u64,
+    table_name: &str,
+    index_name: &str,
+    state: IndexState,
+) -> Result<()> {
+    let mut txn = store.begin().await?;
+    let result: Result<()> = async {
+        let mut schema = store
+            .get_schema(&mut txn, db_id, table_name)
+            .await?
+            .ok_or_else(|| SqlError::RelationNotFound(table_name.to_string()))?;
+        let idx = schema
+            .indexes
+            .iter_mut()
+            .find(|idx| idx.name == index_name)
+            .ok_or_else(|| anyhow!("Index '{}' not found on table '{}'", index_name, table_name))?;
+        idx.state = state;
+        store.update_schema(&mut txn, db_id, schema).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = result {
+        let _ = txn.rollback().await;
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+pub async fn backfill_index_by_name(
+    store: &Arc<TikvStore>,
+    db_id: u64,
+    table_name: &str,
+    index_name: &str,
+) -> Result<()> {
+    let mut txn = store.begin().await?;
+    let mut current_batch_writes = 0usize;
+    let mut has_committed_batches = false;
+
+    let result: Result<()> = async {
+        let schema = store
+            .get_schema(&mut txn, db_id, table_name)
+            .await?
+            .ok_or_else(|| SqlError::RelationNotFound(table_name.to_string()))?;
+        let index = schema
+            .indexes
+            .iter()
+            .find(|idx| idx.name == index_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("Index '{}' not found on table '{}'", index_name, table_name))?;
+
+        let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+        let data_key_prefix = start.clone();
+        let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
+            vec![DataType::Uuid]
+        } else {
+            schema
+                .pk_indices
+                .iter()
+                .map(|&idx| schema.columns[idx].data_type.clone())
+                .collect()
+        };
+
+        if index_helpers::is_index_materializable(&index) {
+            let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
+            while let Some(batch) = scanner.next_batch(&mut txn).await? {
+                for pair in batch {
+                    let key: &[u8] = pair.key().as_ref().into();
+                    let pk_values = if schema.pk_indices.is_empty() {
+                        let pk_bytes = key.strip_prefix(data_key_prefix.as_slice()).ok_or_else(|| {
+                            anyhow!(
+                                "corrupted row key while backfilling index '{}'",
+                                index_name
+                            )
+                        })?;
+                        crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?
+                    } else {
+                        let mut row = crate::storage::deserialize_row(pair.value())?;
+                        fill_row_defaults(&mut row, &schema)?;
+                        schema.get_pk_values(&row)
+                    };
+
+                    let mut row = crate::storage::deserialize_row(pair.value())?;
+                    fill_row_defaults(&mut row, &schema)?;
+                    if !index_helpers::eval_index_predicate(&index, &schema, &row)? {
+                        continue;
+                    }
+                    let idx_values =
+                        index_helpers::get_index_values_with_expressions(&index, &schema, &row)?;
+                    store
+                        .create_index_entry(
+                            &mut txn,
+                            db_id,
+                            schema.table_id,
+                            index.id,
+                            &idx_values,
+                            &pk_values,
+                            index.unique,
+                        )
+                        .await?;
+                    current_batch_writes += 1;
+                    maybe_rotate_backfill_txn(
+                        store,
+                        &mut txn,
+                        &mut current_batch_writes,
+                        &mut has_committed_batches,
+                    )
+                    .await?;
+                }
+            }
+        } else if supported_gin_index_column(&schema, &index).is_some() {
+            let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
+            while let Some(batch) = scanner.next_batch(&mut txn).await? {
+                for pair in batch {
+                    let key: &[u8] = pair.key().as_ref().into();
+                    let pk_values = if schema.pk_indices.is_empty() {
+                        let pk_bytes = key.strip_prefix(data_key_prefix.as_slice()).ok_or_else(|| {
+                            anyhow!(
+                                "corrupted row key while backfilling index '{}'",
+                                index_name
+                            )
+                        })?;
+                        crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?
+                    } else {
+                        let mut row = crate::storage::deserialize_row(pair.value())?;
+                        fill_row_defaults(&mut row, &schema)?;
+                        schema.get_pk_values(&row)
+                    };
+
+                    let mut row = crate::storage::deserialize_row(pair.value())?;
+                    fill_row_defaults(&mut row, &schema)?;
+                    let hashes = extract_gin_token_hashes_from_row(&schema, &index, &row)?;
+                    if hashes.is_empty() {
+                        continue;
+                    }
+                    store
+                        .create_gin_index_entries(
+                            &mut txn,
+                            db_id,
+                            schema.table_id,
+                            index.id,
+                            &hashes,
+                            &pk_values,
+                        )
+                        .await?;
+                    current_batch_writes += 1;
+                    maybe_rotate_backfill_txn(
+                        store,
+                        &mut txn,
+                        &mut current_batch_writes,
+                        &mut has_committed_batches,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        txn.commit().await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = result {
+        let _ = txn.rollback().await;
+        return Err(e);
+    }
+
+    Ok(())
 }
 
 /// Resolve raw `RelationDep`s into fully-qualified dependency names.
@@ -2304,6 +2519,7 @@ pub async fn execute_alter_table(
                     method: None,
                     predicate: None,
                     expressions: Vec::new(),
+                    state: IndexState::Ready,
                 };
 
                 let (start, end) =
@@ -3241,6 +3457,7 @@ mod tests {
             method: None,
             predicate: None,
             expressions: vec![],
+            state: IndexState::Ready,
         }
     }
 

@@ -154,6 +154,7 @@ impl Executor {
                 columns,
                 unique,
                 if_not_exists,
+                concurrently,
                 predicate,
                 ..
             } => {
@@ -188,7 +189,9 @@ impl Executor {
                     columns,
                     *unique,
                     *if_not_exists,
+                    *concurrently,
                     predicate.as_ref(),
+                    current_role.unwrap_or("postgres"),
                 )
                 .await
             }

@@ -1580,6 +1580,7 @@ mod tests {
                     method: None,
                     predicate: None,
                     expressions: Vec::new(),
+                    state: crate::worker::types::IndexState::Ready,
                 }],
                 check_constraints: vec![],
                 foreign_keys: vec![],

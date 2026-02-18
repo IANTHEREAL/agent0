@@ -2,6 +2,7 @@ use crate::extensions::context::{with_context_opts, ExtensionContextOpts};
 use crate::observability;
 use crate::pool::TikvClientPool;
 use crate::cron::types::{CronRun, CronRunStatus};
+use crate::sql::ddl;
 use crate::sql::parse_sql;
 use crate::sql::Executor;
 use crate::storage::TikvStore;
@@ -325,6 +326,12 @@ impl WorkerEngine {
     ) -> Result<usize> {
         let handle = pool.acquire(Some(entry.keyspace.clone())).await?;
         let store = handle.store().clone();
+
+        if entry.task_type == TaskType::BgDdl && entry.command.starts_with("__backfill_index ") {
+            Self::execute_bg_ddl_backfill(&store, entry).await?;
+            return Ok(1);
+        }
+
         let exec = Executor::new(
             store.clone(),
             entry.keyspace.clone(),
@@ -375,6 +382,58 @@ impl WorkerEngine {
         })
         .await
     }
+
+    async fn execute_bg_ddl_backfill(store: &Arc<TikvStore>, entry: &TaskQueueEntry) -> Result<()> {
+        let (table_name, index_name) = parse_backfill_index_command(&entry.command)?;
+
+        match ddl::backfill_index_by_name(store, entry.db_id, &table_name, &index_name).await {
+            Ok(()) => {
+                ddl::update_index_state(
+                    store,
+                    entry.db_id,
+                    &table_name,
+                    &index_name,
+                    IndexState::Ready,
+                )
+                .await?;
+                Ok(())
+            }
+            Err(e) => {
+                if let Err(mark_err) = ddl::update_index_state(
+                    store,
+                    entry.db_id,
+                    &table_name,
+                    &index_name,
+                    IndexState::Invalid,
+                )
+                .await
+                {
+                    warn!(
+                        "Failed to mark index invalid after backfill failure: table={} index={} error={}",
+                        table_name, index_name, mark_err
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+fn parse_backfill_index_command(command: &str) -> Result<(String, String)> {
+    let args = command
+        .strip_prefix("__backfill_index ")
+        .ok_or_else(|| anyhow!("invalid backfill command: {}", command))?;
+    let mut parts = args.split_whitespace();
+    let table_name = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing table name in backfill command"))?;
+    let index_name = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing index name in backfill command"))?;
+    if parts.next().is_some() {
+        return Err(anyhow!("invalid backfill command args: {}", command));
+    }
+    Ok((table_name.to_string(), index_name.to_string()))
 }
 
 fn now_ms() -> i64 {

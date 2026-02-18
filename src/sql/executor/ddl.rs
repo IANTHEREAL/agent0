@@ -180,7 +180,9 @@ impl Executor {
         columns: &[OrderByExpr],
         unique: bool,
         if_not_exists: bool,
+        concurrently: bool,
         predicate: Option<&Expr>,
+        username: &str,
     ) -> Result<ExecuteResult> {
         let resolved = names::resolve_existing_table_name(
             self.store().as_ref(),
@@ -225,8 +227,11 @@ impl Executor {
             columns,
             unique,
             if_not_exists,
+            concurrently,
             predicate,
             rows,
+            self.tenant_keyspace(),
+            username,
         )
         .await
     }

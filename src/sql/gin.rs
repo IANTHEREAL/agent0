@@ -557,6 +557,7 @@ mod tests {
             method: Some("gin".to_string()),
             predicate: None,
             expressions: vec![],
+            state: crate::worker::types::IndexState::Ready,
         };
         let row = Row::new(vec![Value::Jsonb(r#"{"a":1,"b":2}"#.to_string())]);
 
