@@ -1947,6 +1947,7 @@ impl Executor {
 }
 
 /// Evaluate a constant TypedExpr to a usize (for LIMIT/OFFSET).
+/// Handles plain constants and constant casts (e.g., `0::int8`).
 fn eval_const_usize(expr: &TypedExpr) -> Result<usize> {
     match &expr.kind {
         TypedExprKind::Constant(Value::Int32(n)) => {
@@ -1964,6 +1965,7 @@ fn eval_const_usize(expr: &TypedExpr) -> Result<usize> {
             }
         }
         TypedExprKind::Constant(Value::Null) => Ok(0),
+        TypedExprKind::Cast { expr: inner, .. } => eval_const_usize(inner),
         _ => Err(anyhow!("LIMIT/OFFSET must be a constant integer")),
     }
 }

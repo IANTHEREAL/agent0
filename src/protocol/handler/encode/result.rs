@@ -12,6 +12,13 @@ use std::sync::Arc;
 pub(in crate::protocol::handler) fn result_to_response(
     result: ExecuteResult,
 ) -> PgWireResult<Response<'static>> {
+    result_to_response_with_format(result, FieldFormat::Text)
+}
+
+pub(in crate::protocol::handler) fn result_to_response_with_format(
+    result: ExecuteResult,
+    result_format: FieldFormat,
+) -> PgWireResult<Response<'static>> {
     match result {
         ExecuteResult::Select {
             columns,
@@ -65,7 +72,7 @@ pub(in crate::protocol::handler) fn result_to_response(
                 .enumerate()
                 .map(|(i, name)| {
                     let pg_type = inferred_types.get(i).cloned().unwrap_or(Type::TEXT);
-                    FieldInfo::new(name.clone(), None, None, pg_type, FieldFormat::Text)
+                    FieldInfo::new(name.clone(), None, None, pg_type, result_format)
                 })
                 .collect();
 
@@ -83,7 +90,7 @@ pub(in crate::protocol::handler) fn result_to_response(
                 let mut encoder = DataRowEncoder::new(fields.clone());
                 for (i, value) in row.values.iter().enumerate() {
                     let col_type = internal_types.get(i);
-                    encode_value(&mut encoder, value, col_type, tz)?;
+                    encode_value(&mut encoder, value, col_type, tz, result_format)?;
                 }
                 data_rows.push(encoder.finish());
             }

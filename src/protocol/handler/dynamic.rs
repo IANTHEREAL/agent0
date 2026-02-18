@@ -17,7 +17,8 @@ use super::{
     client_allows_notice, count_placeholders_in_expr, extract_placeholder_index_from_expr,
     infer_result_fields_from_query_ast, infer_types_from_expr, parse_startup_options,
     resolve_copy_columns, resolve_table_for_insert, rollback_autocommit_or_mark_failed,
-    send_notices_and_get_last_response, stub_describe_field, CopyContext,
+    send_notices_and_get_last_response, send_notices_and_get_last_response_with_format,
+    stub_describe_field, CopyContext,
     PgServerParameterProvider, TipgQueryParser, CONNECTION_ID_COUNTER, METADATA_ACTUAL_USER,
     METADATA_AUTH_IS_SUPERUSER, METADATA_KEYSPACE,
 };
@@ -35,7 +36,8 @@ use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
-    CopyResponse, DescribePortalResponse, DescribeStatementResponse, FieldInfo, Response,
+    CopyResponse, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
+    Response,
 };
 use pgwire::api::stmt::StoredStatement;
 use pgwire::api::store::PortalStore;
@@ -1788,10 +1790,12 @@ impl ExtendedQueryHandler for DynamicPgHandler {
     {
         let executor = self.get_executor()?;
         let query = &portal.statement.statement;
-        debug!("Extended query: {}", query);
+
+        // Determine the result encoding format from the portal's Bind message.
+        // This ensures DataRow encoding matches what the client requested.
+        let result_field_format = portal.result_column_format.format_for(0);
 
         let final_query = substitute_parameters(query, portal)?;
-        debug!("Final query after substitution: {}", final_query);
 
         let mut session_guard = self.session.lock().await;
         let session = session_guard.as_mut().ok_or_else(|| {
@@ -1803,12 +1807,16 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         })?;
 
         match executor.execute(session, &final_query).await {
-            Ok(results) => Ok(send_notices_and_get_last_response(
-                client,
-                session.show_setting_value("client_min_messages"),
-                results,
-            )
-            .await?),
+            Ok(results) => {
+                let resp = send_notices_and_get_last_response_with_format(
+                    client,
+                    session.show_setting_value("client_min_messages"),
+                    results,
+                    result_field_format,
+                )
+                .await;
+                Ok(resp?)
+            }
             Err(e) => {
                 error!("Extended query execution error: {}", e);
                 Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -1909,6 +1917,23 @@ impl ExtendedQueryHandler for DynamicPgHandler {
     {
         let final_query = substitute_parameters(&portal.statement.statement, portal)?;
         let fields = self.infer_result_fields_from_query(&final_query).await;
+
+        // Per the PostgreSQL wire protocol, the RowDescription returned by
+        // Describe Portal must reflect the result format codes from Bind.
+        let fields: Vec<FieldInfo> = fields
+            .into_iter()
+            .enumerate()
+            .map(|(i, f)| {
+                FieldInfo::new(
+                    f.name().to_string(),
+                    f.table_id(),
+                    f.column_id(),
+                    f.datatype().clone(),
+                    portal.result_column_format.format_for(i),
+                )
+            })
+            .collect();
+
         Ok(DescribePortalResponse::new(fields))
     }
 }

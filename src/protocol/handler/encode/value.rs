@@ -8,6 +8,20 @@ pub(in crate::protocol::handler) fn encode_value(
     value: &Value,
     col_type: Option<&DataType>,
     tz: crate::types::timestamp::TimeZoneSpec,
+    format: FieldFormat,
+) -> PgWireResult<()> {
+    if format == FieldFormat::Binary {
+        return encode_value_binary(encoder, value, col_type, tz);
+    }
+    encode_value_text(encoder, value, col_type, tz)
+}
+
+/// Text-format encoding (original behavior).
+fn encode_value_text(
+    encoder: &mut DataRowEncoder,
+    value: &Value,
+    col_type: Option<&DataType>,
+    tz: crate::types::timestamp::TimeZoneSpec,
 ) -> PgWireResult<()> {
     match value {
         Value::Null => encoder.encode_field(&None::<String>),
@@ -59,24 +73,15 @@ pub(in crate::protocol::handler) fn encode_value(
         Value::Timestamp(ts) => {
             use chrono::{DateTime, Utc};
 
-            // Detect timestamp format:
-            // - Unix epoch milliseconds: typical values 1.0e12 to 2.5e12 (years 2001-2049)
-            // - PostgreSQL epoch microseconds: typical values 0 to 1.6e15 (years 2000-2050)
-            // If value is > 1e13 (year 2286 in Unix ms), assume it's PG epoch microseconds.
-            // PostgreSQL epoch is 2000-01-01 00:00:00 UTC = 946684800 seconds since Unix epoch.
             const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
-            const MAX_REASONABLE_UNIX_MS: i64 = 10_000_000_000_000; // year ~2286
+            const MAX_REASONABLE_UNIX_MS: i64 = 10_000_000_000_000;
 
-            // Only apply the legacy PG-epoch-micros heuristic for large *positive* values.
-            // Unix-epoch millis can be large in magnitude for pre-epoch timestamps (e.g. year 0001).
             let (seconds, micros) = if *ts > MAX_REASONABLE_UNIX_MS {
-                // Likely PostgreSQL epoch microseconds - convert to Unix seconds
                 let pg_micros = ts;
                 let unix_secs = pg_micros.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECS;
                 let micros = pg_micros.rem_euclid(1_000_000) as u32;
                 (unix_secs, micros)
             } else {
-                // Unix epoch milliseconds (our standard format)
                 let secs = ts.div_euclid(1000);
                 let millis = ts.rem_euclid(1000) as u32;
                 (secs, millis * 1000)
@@ -135,8 +140,6 @@ pub(in crate::protocol::handler) fn encode_value(
                     Value::Int64(i) => Some(i.to_string()),
                     Value::Float64(f) => Some(f.to_string()),
                     Value::Array(nested) => {
-                        // Nested arrays: build PostgreSQL text literal {el1,el2,...}
-                        // with NULL preserved for null elements.
                         let parts: Vec<String> = nested
                             .iter()
                             .map(|v| match value_to_option_string(v) {
@@ -161,7 +164,6 @@ pub(in crate::protocol::handler) fn encode_value(
                     serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
                     serde_json::Value::Number(n) => out.push_str(&n.to_string()),
                     serde_json::Value::String(s) => {
-                        // Delegate escaping to serde_json.
                         if let Ok(escaped) = serde_json::to_string(s) {
                             out.push_str(&escaped);
                         } else {
@@ -181,7 +183,6 @@ pub(in crate::protocol::handler) fn encode_value(
                     serde_json::Value::Object(obj) => {
                         use std::cmp::Ordering;
                         let mut items: Vec<(&String, &serde_json::Value)> = obj.iter().collect();
-                        // PostgreSQL jsonb key ordering: length first, then binary (byte) order.
                         items.sort_by(|(k1, _), (k2, _)| match k1.len().cmp(&k2.len()) {
                             Ordering::Equal => k1.cmp(k2),
                             other => other,
@@ -235,4 +236,222 @@ pub(in crate::protocol::handler) fn encode_value(
         Value::Numeric(d) => encoder.encode_field(&d.to_string()),
         Value::Tsvector(s) | Value::Tsquery(s) => encoder.encode_field(s),
     }
+}
+
+/// Binary-format encoding for the PostgreSQL wire protocol.
+/// Uses `encode_field_with_type_and_format` with explicit types to ensure
+/// correct binary serialization via postgres-types `ToSql` trait.
+fn encode_value_binary(
+    encoder: &mut DataRowEncoder,
+    value: &Value,
+    col_type: Option<&DataType>,
+    _tz: crate::types::timestamp::TimeZoneSpec,
+) -> PgWireResult<()> {
+    match value {
+        Value::Null => encoder.encode_field_with_type_and_format(
+            &None::<i32>,
+            &Type::INT4,
+            FieldFormat::Binary,
+        ),
+        Value::Boolean(b) => {
+            encoder.encode_field_with_type_and_format(b, &Type::BOOL, FieldFormat::Binary)
+        }
+        Value::Int32(i) => {
+            encoder.encode_field_with_type_and_format(i, &Type::INT4, FieldFormat::Binary)
+        }
+        Value::Int64(i) => {
+            if matches!(
+                col_type,
+                Some(DataType::Timestamp) | Some(DataType::TimestampTz)
+            ) {
+                let dt = int64_to_datetime(*i);
+                let is_timestamptz = matches!(col_type, Some(DataType::TimestampTz));
+                if is_timestamptz {
+                    encoder.encode_field_with_type_and_format(
+                        &dt,
+                        &Type::TIMESTAMPTZ,
+                        FieldFormat::Binary,
+                    )
+                } else {
+                    encoder.encode_field_with_type_and_format(
+                        &dt.naive_utc(),
+                        &Type::TIMESTAMP,
+                        FieldFormat::Binary,
+                    )
+                }
+            } else if matches!(col_type, Some(DataType::Int32)) {
+                encoder.encode_field_with_type_and_format(
+                    &(*i as i32),
+                    &Type::INT4,
+                    FieldFormat::Binary,
+                )
+            } else {
+                encoder.encode_field_with_type_and_format(i, &Type::INT8, FieldFormat::Binary)
+            }
+        }
+        Value::Float64(f) => {
+            encoder.encode_field_with_type_and_format(f, &Type::FLOAT8, FieldFormat::Binary)
+        }
+        Value::Text(s) => {
+            encoder.encode_field_with_type_and_format(s, &Type::TEXT, FieldFormat::Binary)
+        }
+        Value::Bytes(b) => {
+            encoder.encode_field_with_type_and_format(b, &Type::BYTEA, FieldFormat::Binary)
+        }
+        Value::Timestamp(ts) => {
+            let dt = int64_to_datetime(*ts);
+            let is_timestamptz = matches!(col_type, Some(DataType::TimestampTz));
+            if is_timestamptz {
+                encoder.encode_field_with_type_and_format(
+                    &dt,
+                    &Type::TIMESTAMPTZ,
+                    FieldFormat::Binary,
+                )
+            } else {
+                encoder.encode_field_with_type_and_format(
+                    &dt.naive_utc(),
+                    &Type::TIMESTAMP,
+                    FieldFormat::Binary,
+                )
+            }
+        }
+        Value::Uuid(bytes) => {
+            // UUID binary = 16 raw bytes; encode manually since uuid::Uuid
+            // doesn't implement postgres_types::ToSql without the feature.
+            encoder.encode_field_with_type_and_format(
+                &bytes.as_slice(),
+                &Type::UUID,
+                FieldFormat::Binary,
+            )
+        }
+        Value::Json(s) => {
+            // JSON binary in PostgreSQL = raw JSON text bytes (same as text)
+            encoder.encode_field_with_type_and_format(s, &Type::JSON, FieldFormat::Binary)
+        }
+        Value::Jsonb(s) => {
+            // JSONB binary = version byte (0x01) + JSON text bytes
+            use bytes::BufMut;
+            let json_bytes = s.as_bytes();
+            let mut buf = Vec::with_capacity(1 + json_bytes.len());
+            buf.put_u8(1); // JSONB version byte
+            buf.extend_from_slice(json_bytes);
+            encoder.encode_field_with_type_and_format(
+                &buf.as_slice(),
+                &Type::BYTEA,
+                FieldFormat::Binary,
+            )
+        }
+        Value::Date(days) => {
+            use chrono::NaiveDate;
+            let pg_epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+            let date = pg_epoch + chrono::Duration::days(*days as i64);
+            encoder.encode_field_with_type_and_format(&date, &Type::DATE, FieldFormat::Binary)
+        }
+        Value::Time(micros) => {
+            use chrono::NaiveTime;
+            let total_secs = (micros / 1_000_000) as u32;
+            let frac_micros = (micros % 1_000_000) as u32;
+            let h = total_secs / 3600;
+            let m = (total_secs % 3600) / 60;
+            let s = total_secs % 60;
+            if let Some(time) = NaiveTime::from_hms_micro_opt(h, m, s, frac_micros) {
+                encoder.encode_field_with_type_and_format(
+                    &time,
+                    &Type::TIME,
+                    FieldFormat::Binary,
+                )
+            } else {
+                encoder.encode_field_with_type_and_format(
+                    &"00:00:00",
+                    &Type::TEXT,
+                    FieldFormat::Text,
+                )
+            }
+        }
+        Value::Interval(iv) => {
+            // PostgreSQL binary interval: 8 bytes (microseconds) + 4 bytes (days) + 4 bytes (months)
+            use bytes::BufMut;
+            let microseconds = iv.millis * 1000; // convert millis to micros
+            let days = 0i32; // IntervalValue stores sub-month precision in millis
+            let mut buf = Vec::with_capacity(16);
+            buf.put_i64(microseconds);
+            buf.put_i32(days);
+            buf.put_i32(iv.months);
+            encoder.encode_field_with_type_and_format(
+                &buf.as_slice(),
+                &Type::BYTEA,
+                FieldFormat::Binary,
+            )
+        }
+        Value::Array(elems) => {
+            // Arrays: encode as text representation (PostgreSQL array text format)
+            // then send as TEXT to avoid complex binary array encoding.
+            fn value_to_option_string(v: &Value) -> Option<String> {
+                match v {
+                    Value::Null => None,
+                    Value::Text(t) => Some(t.clone()),
+                    Value::Boolean(b) => Some(if *b { "t" } else { "f" }.to_string()),
+                    Value::Int32(i) => Some(i.to_string()),
+                    Value::Int64(i) => Some(i.to_string()),
+                    Value::Float64(f) => Some(f.to_string()),
+                    Value::Array(nested) => {
+                        let parts: Vec<String> = nested
+                            .iter()
+                            .map(|v| match value_to_option_string(v) {
+                                Some(s) => s,
+                                None => "NULL".to_string(),
+                            })
+                            .collect();
+                        Some(format!("{{{}}}", parts.join(",")))
+                    }
+                    other => Some(other.to_string()),
+                }
+            }
+            let option_elems: Vec<Option<String>> =
+                elems.iter().map(value_to_option_string).collect();
+            encoder.encode_field_with_type_and_format(
+                &option_elems,
+                &Type::TEXT_ARRAY,
+                FieldFormat::Text,
+            )
+        }
+        Value::Numeric(d) => {
+            // rust_decimal::Decimal implements ToSql for Type::NUMERIC via db-postgres feature
+            encoder.encode_field_with_type_and_format(d, &Type::NUMERIC, FieldFormat::Binary)
+        }
+        Value::Vector(vec) => {
+            // pgvector binary: not standard, fall back to text
+            encoder.encode_field_with_type_and_format(
+                &crate::types::format_vector_pg_text(vec),
+                &Type::TEXT,
+                FieldFormat::Text,
+            )
+        }
+        Value::Tsvector(s) | Value::Tsquery(s) => {
+            // Full-text types: encode as text (binary tsvector/tsquery is complex)
+            encoder.encode_field_with_type_and_format(s, &Type::TEXT, FieldFormat::Text)
+        }
+    }
+}
+
+/// Convert an internal timestamp value (Unix ms or PG epoch micros) to DateTime<Utc>.
+fn int64_to_datetime(ts: i64) -> chrono::DateTime<chrono::Utc> {
+    use chrono::{DateTime, Utc};
+    const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
+    const MAX_REASONABLE_UNIX_MS: i64 = 10_000_000_000_000;
+
+    let (seconds, micros) = if ts > MAX_REASONABLE_UNIX_MS {
+        let unix_secs = ts.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECS;
+        let micros = ts.rem_euclid(1_000_000) as u32;
+        (unix_secs, micros)
+    } else {
+        let secs = ts.div_euclid(1000);
+        let millis = ts.rem_euclid(1000) as u32;
+        (secs, millis * 1000)
+    };
+
+    let nanos = micros * 1000;
+    DateTime::<Utc>::from_timestamp(seconds, nanos).unwrap_or_else(|| {
+        DateTime::<Utc>::from_timestamp(0, 0).unwrap()
+    })
 }

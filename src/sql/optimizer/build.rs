@@ -426,6 +426,7 @@ impl PhysicalPlan {
 // ── Helper functions ────────────────────────────────────────────
 
 /// Evaluate a TypedExpr that should be a non-negative constant integer (LIMIT/OFFSET).
+/// Handles plain constants and constant casts (e.g., `0::int8`).
 fn eval_const_usize(expr: &TypedExpr) -> Result<usize> {
     match &expr.kind {
         TypedExprKind::Constant(Value::Int32(n)) => {
@@ -442,6 +443,8 @@ fn eval_const_usize(expr: &TypedExpr) -> Result<usize> {
                 Ok(*n as usize)
             }
         }
+        // Handle constant casts: e.g., `1::int8` produces Cast(Constant(Int32(1)) → Int64)
+        TypedExprKind::Cast { expr: inner, .. } => eval_const_usize(inner),
         _ => Err(anyhow!(
             "Expected constant integer for LIMIT/OFFSET, got: {:?}",
             expr.kind

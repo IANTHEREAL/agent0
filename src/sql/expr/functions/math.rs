@@ -43,39 +43,26 @@ pub fn abs(args: Vec<Value>) -> Result<Value> {
 }
 
 pub fn ceil(args: Vec<Value>) -> Result<Value> {
-    use rust_decimal::prelude::ToPrimitive;
     match args.into_iter().next() {
         Some(Value::Float64(n)) => Ok(Value::Float64(n.ceil())),
         Some(Value::Int32(n)) => Ok(Value::Int32(n)),
         Some(Value::Int64(n)) => Ok(Value::Int64(n)),
-        Some(Value::Numeric(d)) => {
-            let f = d
-                .to_f64()
-                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
-            Ok(Value::Float64(f.ceil()))
-        }
+        Some(Value::Numeric(d)) => Ok(Value::Numeric(d.ceil())),
         _ => Ok(Value::Null),
     }
 }
 
 pub fn floor(args: Vec<Value>) -> Result<Value> {
-    use rust_decimal::prelude::ToPrimitive;
     match args.into_iter().next() {
         Some(Value::Float64(n)) => Ok(Value::Float64(n.floor())),
         Some(Value::Int32(n)) => Ok(Value::Int32(n)),
         Some(Value::Int64(n)) => Ok(Value::Int64(n)),
-        Some(Value::Numeric(d)) => {
-            let f = d
-                .to_f64()
-                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
-            Ok(Value::Float64(f.floor()))
-        }
+        Some(Value::Numeric(d)) => Ok(Value::Numeric(d.floor())),
         _ => Ok(Value::Null),
     }
 }
 
 pub fn round(args: Vec<Value>) -> Result<Value> {
-    use rust_decimal::prelude::ToPrimitive;
     let mut iter = args.into_iter();
     let val = iter.next();
     let precision = match iter.next() {
@@ -88,13 +75,7 @@ pub fn round(args: Vec<Value>) -> Result<Value> {
             let factor = 10_f64.powi(precision);
             Ok(Value::Float64((n * factor).round() / factor))
         }
-        Some(Value::Numeric(d)) => {
-            let n = d
-                .to_f64()
-                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
-            let factor = 10_f64.powi(precision);
-            Ok(Value::Float64((n * factor).round() / factor))
-        }
+        Some(Value::Numeric(d)) => Ok(Value::Numeric(d.round_dp(precision.max(0) as u32))),
         Some(Value::Int32(n)) => Ok(Value::Int32(n)),
         Some(Value::Int64(n)) => Ok(Value::Int64(n)),
         _ => Ok(Value::Null),
@@ -102,7 +83,6 @@ pub fn round(args: Vec<Value>) -> Result<Value> {
 }
 
 pub fn trunc(args: Vec<Value>) -> Result<Value> {
-    use rust_decimal::prelude::ToPrimitive;
     let mut iter = args.into_iter();
     let val = iter.next();
     let precision = match iter.next() {
@@ -115,13 +95,10 @@ pub fn trunc(args: Vec<Value>) -> Result<Value> {
             let factor = 10_f64.powi(precision);
             Ok(Value::Float64((n * factor).trunc() / factor))
         }
-        Some(Value::Numeric(d)) => {
-            let n = d
-                .to_f64()
-                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
-            let factor = 10_f64.powi(precision);
-            Ok(Value::Float64((n * factor).trunc() / factor))
-        }
+        Some(Value::Numeric(d)) => Ok(Value::Numeric(d.round_dp_with_strategy(
+            precision.max(0) as u32,
+            rust_decimal::RoundingStrategy::ToZero,
+        ))),
         Some(Value::Int32(n)) => Ok(Value::Int32(n)),
         Some(Value::Int64(n)) => Ok(Value::Int64(n)),
         _ => Ok(Value::Null),
@@ -379,6 +356,11 @@ mod tests {
             ceil(vec![Value::Float64(4.2)]).unwrap(),
             Value::Float64(5.0)
         );
+        // Numeric input → Numeric output (PostgreSQL semantics)
+        assert_eq!(
+            ceil(vec![Value::Numeric(Decimal::new(42, 1))]).unwrap(),
+            Value::Numeric(Decimal::new(5, 0))
+        );
     }
 
     #[test]
@@ -386,6 +368,11 @@ mod tests {
         assert_eq!(
             floor(vec![Value::Float64(4.8)]).unwrap(),
             Value::Float64(4.0)
+        );
+        // Numeric input → Numeric output (PostgreSQL semantics)
+        assert_eq!(
+            floor(vec![Value::Numeric(Decimal::new(48, 1))]).unwrap(),
+            Value::Numeric(Decimal::new(4, 0))
         );
     }
 

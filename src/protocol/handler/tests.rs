@@ -169,7 +169,7 @@ fn encode_value_to_string(value: &Value, col_type: Option<&DataType>) -> String 
     let fields = Arc::new(fields);
     let mut encoder = DataRowEncoder::new(fields);
     let tz = crate::types::timestamp::TimeZoneSpec::parse("UTC");
-    encode_value(&mut encoder, value, col_type, tz).unwrap();
+    encode_value(&mut encoder, value, col_type, tz, FieldFormat::Text).unwrap();
     let row = encoder.finish().unwrap();
 
     assert_eq!(row.field_count, 1);
@@ -1774,16 +1774,17 @@ fn test_substitute_parameters_date_binary_format_renders_date_literal() {
 
 #[test]
 fn test_substitute_parameters_unsupported_binary_type_returns_feature_not_supported() {
+    // Use a type that has no binary parameter decoding support (e.g., POINT)
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
         "SELECT $1".to_string(),
-        vec![Type::JSONB],
+        vec![Type::POINT],
     ));
     let mut portal: Portal<String> = Portal::default();
     portal.name = "portal".to_string();
     portal.statement = stmt;
     portal.parameter_format = Format::UnifiedBinary;
-    portal.parameters = vec![Some(Bytes::from_static(b"{"))];
+    portal.parameters = vec![Some(Bytes::from_static(b"\x00\x00"))];
     portal.result_column_format = Format::UnifiedText;
 
     let err = substitute_parameters("SELECT $1", &portal).unwrap_err();
@@ -1794,6 +1795,25 @@ fn test_substitute_parameters_unsupported_binary_type_returns_feature_not_suppor
         }
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+#[test]
+fn test_substitute_parameters_jsonb_binary_adds_cast() {
+    // JSONB binary: version byte (0x01) + JSON text
+    let stmt = Arc::new(StoredStatement::new(
+        "stmt".to_string(),
+        "SELECT $1".to_string(),
+        vec![Type::JSONB],
+    ));
+    let mut portal: Portal<String> = Portal::default();
+    portal.name = "portal".to_string();
+    portal.statement = stmt;
+    portal.parameter_format = Format::UnifiedBinary;
+    portal.parameters = vec![Some(Bytes::from_static(b"\x01{\"a\":1}"))];
+    portal.result_column_format = Format::UnifiedText;
+
+    let result = substitute_parameters("SELECT $1", &portal).unwrap();
+    assert_eq!(result, "SELECT '{\"a\":1}'::jsonb");
 }
 
 #[test]

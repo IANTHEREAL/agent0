@@ -42,7 +42,7 @@ mod tenant;
 mod type_infer;
 mod view_infer;
 
-use encode::{datatype_to_pgtype, result_to_response};
+use encode::{datatype_to_pgtype, result_to_response, result_to_response_with_format};
 
 // Re-export items moved to sub-modules so that `use super::*` in tests/dynamic still works.
 use type_infer::{infer_result_fields_from_query_ast, stub_describe_field};
@@ -388,6 +388,26 @@ where
     C::Error: Debug,
     PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
 {
+    send_notices_and_get_last_response_with_format(
+        client,
+        client_min_messages,
+        results,
+        pgwire::api::results::FieldFormat::Text,
+    )
+    .await
+}
+
+async fn send_notices_and_get_last_response_with_format<C>(
+    client: &mut C,
+    client_min_messages: Option<String>,
+    results: crate::sql::ExecuteResults,
+    result_format: pgwire::api::results::FieldFormat,
+) -> PgWireResult<Response<'static>>
+where
+    C: Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
     let allow_notice = client_allows_notice(client_min_messages);
     let mut last: Option<Response<'static>> = None;
     for result in results.into_vec() {
@@ -405,7 +425,7 @@ where
                 }
             }
             other => {
-                last = Some(result_to_response(other)?);
+                last = Some(result_to_response_with_format(other, result_format)?);
             }
         }
     }

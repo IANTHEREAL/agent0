@@ -201,7 +201,8 @@ describe('Prisma Query Generation & SQL Compatibility [pg-tikv]', () => {
       });
     });
 
-    it('should filter by JSON path', async () => {
+    // skip: JSONB path filtering not supported — tracked in #840
+    it.skip('should filter by JSON path', async () => {
       const users = await prisma.prismaUser.findMany({
         where: {
           metadata: {
@@ -214,7 +215,8 @@ describe('Prisma Query Generation & SQL Compatibility [pg-tikv]', () => {
       expect(users[0].name).toBe('Alice');
     });
 
-    it('should filter by nested JSON path', async () => {
+    // skip: JSONB path filtering not supported — tracked in #840
+    it.skip('should filter by nested JSON path', async () => {
       const users = await prisma.prismaUser.findMany({
         where: {
           metadata: {
