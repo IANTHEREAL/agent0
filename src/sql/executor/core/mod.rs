@@ -69,9 +69,8 @@ use crate::storage::{with_kv_read_stats, KvReadStatsSnapshot, TikvStore};
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    AlterIndexOperation, Expr, FunctionArg, FunctionArgExpr, Query, SelectItem,
-    SetExpr, Statement, TableFactor, TransactionAccessMode, TransactionIsolationLevel,
-    TransactionMode, Visit, Visitor,
+    AlterIndexOperation, Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr, Statement,
+    TableFactor, TransactionAccessMode, TransactionIsolationLevel, TransactionMode, Visit, Visitor,
 };
 
 use std::collections::{HashMap, HashSet};

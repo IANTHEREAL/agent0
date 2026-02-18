@@ -1949,3 +1949,34 @@ async fn infer_fs9_schema_non_superuser_is_fallback() {
 
     cleanup_dir(&dir);
 }
+
+#[test]
+fn test_deep_nested_subquery_parameter_scanning() {
+    // Regression guard: a deeply-nested subquery must not overflow the stack
+    // in count_sql_parameters or infer_parameter_types. Both are iterative
+    // scanners, but this test locks in the guarantee.
+    let depth = 50;
+    let mut sql = String::from("SELECT $1::int AS v");
+    for i in 1..=depth {
+        sql = format!("SELECT * FROM ({sql}) t{i}");
+    }
+
+    assert_eq!(count_sql_parameters(&sql), 1);
+    let types = infer_parameter_types(&sql, 1);
+    assert_eq!(types.len(), 1);
+    // $1 is not preceded by LIMIT/OFFSET/FETCH, so it defaults to TEXT.
+    assert_eq!(types[0], Type::TEXT);
+}
+
+#[test]
+fn test_replace_placeholders_deep_nesting() {
+    let depth = 50;
+    let mut sql = String::from("SELECT $1::int AS v");
+    for i in 1..=depth {
+        sql = format!("SELECT * FROM ({sql}) t{i}");
+    }
+
+    let replaced = replace_placeholders_for_inference(&sql);
+    assert!(!replaced.contains("$1"));
+    assert!(replaced.contains("1::int"));
+}

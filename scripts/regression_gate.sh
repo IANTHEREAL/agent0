@@ -362,9 +362,9 @@ echo "Manifest: $MANIFEST_PATH"
 echo "Report dir: $REPORT_DIR"
 echo ""
 
-TOTAL_STEPS=4
+TOTAL_STEPS=5
 if [[ "$SKIP_ORM" -eq 0 && "${#ORM_TESTS[@]}" -gt 0 ]]; then
-  TOTAL_STEPS=5
+  TOTAL_STEPS=6
 fi
 
 if [[ "$RUN_UNIT" -eq 1 ]]; then
@@ -448,7 +448,22 @@ else
   echo ""
 fi
 
-echo "[4/$TOTAL_STEPS] Running regression SQL cases (${#REGRESSION_TESTS[@]} files)..."
+# Extended protocol smoke test — catches do_describe_statement regressions early
+SMOKE_LOG="$REPORT_DIR/extended-smoke.log"
+echo "[4/$TOTAL_STEPS] Running extended protocol smoke test..."
+SMOKE_EXIT=0
+set +e
+python3 "$SCRIPT_DIR/extended_protocol_smoke.py" --dsn "$PG_DSN" 2>&1 | tee "$SMOKE_LOG"
+SMOKE_EXIT=${PIPESTATUS[0]}
+set -e
+echo ""
+if [[ "$SMOKE_EXIT" -ne 0 ]]; then
+  echo "❌ Extended protocol smoke FAILED (exit=$SMOKE_EXIT). Server is fundamentally broken — skipping remaining tests."
+  echo "   See: $SMOKE_LOG"
+  exit 1
+fi
+
+echo "[5/$TOTAL_STEPS] Running regression SQL cases (${#REGRESSION_TESTS[@]} files)..."
 args=(--dsn "$PG_DSN")
 if [[ "$VERBOSE" -eq 1 ]]; then
   args+=(--verbose)
@@ -479,7 +494,7 @@ if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
   exit 2
 fi
 
-echo "[5/$TOTAL_STEPS] Running ORM regression pack (${#ORM_TESTS[@]} item(s))..."
+echo "[6/$TOTAL_STEPS] Running ORM regression pack (${#ORM_TESTS[@]} item(s))..."
 ORM_FILTERS=()
 for item in "${ORM_TESTS[@]}"; do
   if [[ "$item" == orm-tests/* ]]; then
