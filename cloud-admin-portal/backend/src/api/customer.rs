@@ -625,47 +625,34 @@ pub async fn create_database(
         if let Err(e) = fs9.create_namespace(&tenant_id).await {
             tracing::warn!(tenant_id, error = %e, "Failed to create fs9 namespace (non-fatal)");
         } else {
-            // Create pagefs mount backed by TiKV
-            let pd_endpoints: Vec<String> = state
-                .config
-                .pd_endpoints
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect();
-            let ca_path = std::env::var("TIKV_CA_PATH").ok();
-            let cert_path = std::env::var("TIKV_CERT_PATH").ok();
-            let key_path = std::env::var("TIKV_KEY_PATH").ok();
-
-            if let Err(e) = fs9
-                .create_mount(
-                    &tenant_id,
-                    &pd_endpoints,
-                    &fs_keyspace,
-                    ca_path.as_deref(),
-                    cert_path.as_deref(),
-                    key_path.as_deref(),
-                )
-                .await
-            {
-                tracing::warn!(tenant_id, error = %e, "Failed to create fs9 mount (non-fatal)");
-            }
+            // Create a user in the namespace so a token can be issued.
+            // fs9-server auto-provisions the pagefs mount via default_pagefs config.
+            let fs9_user_id = match fs9.create_user(&tenant_id, &auth.customer_id).await {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::warn!(tenant_id, error = %e, "Failed to create fs9 user (non-fatal)");
+                    None
+                }
+            };
 
             // Generate and store fs9 token
-            match fs9.generate_token(&auth.customer_id, &tenant_id).await {
-                Ok(token) => {
-                    db::upsert_credential(
-                        &state.db,
-                        &tenant_id,
-                        "fs9_token",
-                        &auth.customer_id,
-                        &token,
-                        state.config.credential_key.as_deref(),
-                    )
-                    .await
-                    .ok();
-                }
-                Err(e) => {
-                    tracing::warn!(tenant_id, error = %e, "Failed to generate fs9 token (non-fatal)");
+            if let Some(user_id) = fs9_user_id {
+                match fs9.generate_token(&user_id).await {
+                    Ok(token) => {
+                        db::upsert_credential(
+                            &state.db,
+                            &tenant_id,
+                            "fs9_token",
+                            &auth.customer_id,
+                            &token,
+                            state.config.credential_key.as_deref(),
+                        )
+                        .await
+                        .ok();
+                    }
+                    Err(e) => {
+                        tracing::warn!(tenant_id, error = %e, "Failed to generate fs9 token (non-fatal)");
+                    }
                 }
             }
         }

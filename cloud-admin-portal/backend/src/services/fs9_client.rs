@@ -13,17 +13,19 @@ struct CreateNamespaceRequest {
 }
 
 #[derive(Serialize)]
-struct CreateMountRequest {
-    path: String,
-    provider: String,
-    config: serde_json::Value,
+struct CreateUserRequest {
+    username: String,
+    roles: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateUserResponse {
+    id: String,
 }
 
 #[derive(Serialize)]
 struct GenerateTokenRequest {
     user_id: String,
-    namespace: String,
-    roles: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -42,7 +44,7 @@ impl Fs9Client {
 
     /// Create an fs9 namespace for a tenant.
     pub async fn create_namespace(&self, name: &str) -> Result<(), String> {
-        let url = format!("{}/api/v1/namespaces", self.base_url);
+        let url = format!("{}/api/v1/admin/namespaces", self.base_url);
         let resp = self
             .client
             .post(&url)
@@ -65,75 +67,89 @@ impl Fs9Client {
         }
     }
 
-    /// Create a pagefs mount backed by TiKV for the given namespace.
-    pub async fn create_mount(
-        &self,
-        namespace: &str,
-        pd_endpoints: &[String],
-        keyspace: &str,
-        ca_path: Option<&str>,
-        cert_path: Option<&str>,
-        key_path: Option<&str>,
-    ) -> Result<(), String> {
-        let url = format!("{}/api/v1/namespaces/{}/mounts", self.base_url, namespace);
-
-        let mut tikv_config = serde_json::json!({
-            "type": "tikv",
-            "pd_endpoints": pd_endpoints,
-            "keyspace": keyspace,
-        });
-
-        if let Some(ca) = ca_path {
-            tikv_config["ca_path"] = serde_json::Value::String(ca.to_string());
-        }
-        if let Some(cert) = cert_path {
-            tikv_config["cert_path"] = serde_json::Value::String(cert.to_string());
-        }
-        if let Some(key) = key_path {
-            tikv_config["key_path"] = serde_json::Value::String(key.to_string());
-        }
-
-        let config = serde_json::json!({
-            "uid": 1000,
-            "gid": 1000,
-            "backend": tikv_config,
-        });
-
+    /// Create an admin user in the given namespace; returns the user's internal ID.
+    pub async fn create_user(&self, namespace: &str, username: &str) -> Result<String, String> {
+        let url = format!(
+            "{}/api/v1/admin/namespaces/{}/users",
+            self.base_url, namespace
+        );
         let resp = self
             .client
             .post(&url)
             .header("x-fs9-meta-key", &self.meta_key)
-            .json(&CreateMountRequest {
-                path: "/".to_string(),
-                provider: "pagefs".to_string(),
-                config,
+            .json(&CreateUserRequest {
+                username: username.to_string(),
+                roles: vec!["admin".to_string()],
             })
             .send()
             .await
-            .map_err(|e| format!("fs9 create_mount request failed: {e}"))?;
+            .map_err(|e| format!("fs9 create_user request failed: {e}"))?;
 
-        if resp.status().is_success() || resp.status().as_u16() == 409 {
-            Ok(())
+        if resp.status().is_success() {
+            let user_resp: CreateUserResponse = resp
+                .json()
+                .await
+                .map_err(|e| format!("fs9 create_user parse failed: {e}"))?;
+            Ok(user_resp.id)
+        } else if resp.status().as_u16() == 409 {
+            // User already exists — fetch the user list and return the matching id.
+            self.get_user_id(namespace, username).await
         } else {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             Err(format!(
-                "fs9 create_mount failed: status={status}, body={body}"
+                "fs9 create_user failed: status={status}, body={body}"
             ))
         }
     }
 
-    /// Generate a JWT token for accessing the filesystem namespace.
-    pub async fn generate_token(&self, user_id: &str, namespace: &str) -> Result<String, String> {
-        let url = format!("{}/api/v1/tokens/generate", self.base_url);
+    /// Fetch the internal user ID for an existing user in a namespace.
+    async fn get_user_id(&self, namespace: &str, username: &str) -> Result<String, String> {
+        let url = format!(
+            "{}/api/v1/admin/namespaces/{}/users",
+            self.base_url, namespace
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .header("x-fs9-meta-key", &self.meta_key)
+            .send()
+            .await
+            .map_err(|e| format!("fs9 get_users request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("fs9 get_users failed: status={status}, body={body}"));
+        }
+
+        #[derive(Deserialize)]
+        struct UserEntry {
+            id: String,
+            username: String,
+        }
+
+        let users: Vec<UserEntry> = resp
+            .json()
+            .await
+            .map_err(|e| format!("fs9 get_users parse failed: {e}"))?;
+
+        users
+            .into_iter()
+            .find(|u| u.username == username)
+            .map(|u| u.id)
+            .ok_or_else(|| format!("fs9 user '{username}' not found in namespace '{namespace}'"))
+    }
+
+    /// Generate a JWT token for the given user (by internal user_id).
+    pub async fn generate_token(&self, user_id: &str) -> Result<String, String> {
+        let url = format!("{}/api/v1/admin/tokens", self.base_url);
         let resp = self
             .client
             .post(&url)
             .header("x-fs9-meta-key", &self.meta_key)
             .json(&GenerateTokenRequest {
                 user_id: user_id.to_string(),
-                namespace: namespace.to_string(),
-                roles: vec!["admin".to_string()],
             })
             .send()
             .await

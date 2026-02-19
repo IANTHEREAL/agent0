@@ -22,6 +22,7 @@ pub struct Config {
     pub fs9_meta_url: Option<String>,
     pub fs9_meta_key: Option<String>,
     pub fs9_jwt_secret: Option<String>,
+    pub fs9_server_url: Option<String>,
 }
 
 impl Config {
@@ -85,6 +86,7 @@ impl Config {
             fs9_meta_url: env::var("FS9_META_URL").ok().filter(|v| !v.is_empty()),
             fs9_meta_key: env::var("FS9_META_KEY").ok().filter(|v| !v.is_empty()),
             fs9_jwt_secret: env::var("FS9_JWT_SECRET").ok().filter(|v| !v.is_empty()),
+            fs9_server_url: env::var("FS9_SERVER_URL").ok().filter(|v| !v.is_empty()),
         }
     }
 
