@@ -1,20 +1,16 @@
-/** A file or directory entry from fs9 readdir API */
-export interface Fs9FileInfo {
+/** A file or directory entry from fs9 readdir/stat API */
+export interface Fs9FileEntry {
   path: string;
-  type: 'file' | 'dir';
   size: number;
+  file_type: 'regular' | 'directory' | 'symlink';
   mode: number;
-  mtime: string;
-}
-
-/** Response from fs9 stat API */
-export interface Fs9StatResponse {
-  path: string;
-  is_dir: boolean;
-  is_file: boolean;
-  size: number;
-  mode: number;
+  uid: number;
+  gid: number;
+  atime: number;
   mtime: number;
+  ctime: number;
+  etag: string;
+  symlink_target?: string;
 }
 
 /** Options for fs9 list operation */

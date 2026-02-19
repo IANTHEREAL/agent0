@@ -1,9 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { createDb9Client } from '../client';
 import type { FetchFn } from '../http';
-import type { Fs9FileInfo, Fs9StatResponse } from '../fs-types';
-
-// ── Mock fetch helpers ──────────────────────────────────────────────
+import type { Fs9FileEntry } from '../fs-types';
 
 function capturingFetch(status: number, body?: unknown) {
   const calls: { url: string; init?: RequestInit }[] = [];
@@ -29,8 +27,6 @@ function capturingTextFetch(status: number, text: string) {
   return { fn, calls };
 }
 
-// ── Test helpers ────────────────────────────────────────────────────
-
 const BASE = 'http://test:8090/api';
 const TOKEN = 'test-token';
 
@@ -46,7 +42,20 @@ function expectAuth(calls: { url: string; init?: RequestInit }[]) {
   }
 }
 
-// ── Tests ───────────────────────────────────────────────────────────
+function mockEntry(overrides: Partial<Fs9FileEntry> & { path: string }): Fs9FileEntry {
+  return {
+    size: 0,
+    file_type: 'regular',
+    mode: 420,
+    uid: 0,
+    gid: 0,
+    atime: 0,
+    mtime: 0,
+    ctime: 0,
+    etag: '',
+    ...overrides,
+  };
+}
 
 describe('fs.list()', () => {
   it('sends GET request with correct URL and path parameter', async () => {
@@ -75,22 +84,10 @@ describe('fs.list()', () => {
     expectAuth(calls);
   });
 
-  it('returns typed Fs9FileInfo array from JSON response', async () => {
-    const mockFiles: Fs9FileInfo[] = [
-      {
-        path: '/uploads/file1.txt',
-        type: 'file',
-        size: 1024,
-        mode: 33188,
-        mtime: '2026-02-19T10:00:00Z',
-      },
-      {
-        path: '/uploads/subdir',
-        type: 'dir',
-        size: 4096,
-        mode: 16877,
-        mtime: '2026-02-19T09:00:00Z',
-      },
+  it('returns typed Fs9FileEntry array from JSON response', async () => {
+    const mockFiles: Fs9FileEntry[] = [
+      mockEntry({ path: '/uploads/file1.txt', size: 1024, file_type: 'regular', mode: 33188, mtime: 1771511901 }),
+      mockEntry({ path: '/uploads/subdir', size: 4096, file_type: 'directory', mode: 16877, mtime: 1771511800 }),
     ];
     const { fn, calls } = capturingFetch(200, mockFiles);
     const client = fsClient(fn);
@@ -99,8 +96,8 @@ describe('fs.list()', () => {
 
     expect(result).toEqual(mockFiles);
     expect(result).toHaveLength(2);
-    expect(result[0].type).toBe('file');
-    expect(result[1].type).toBe('dir');
+    expect(result[0].file_type).toBe('regular');
+    expect(result[1].file_type).toBe('directory');
     expectAuth(calls);
   });
 
@@ -230,15 +227,8 @@ describe('fs.write()', () => {
 
 describe('fs.stat()', () => {
   it('sends GET request to /stat endpoint', async () => {
-    const mockStat: Fs9StatResponse = {
-      path: '/uploads/file.txt',
-      is_dir: false,
-      is_file: true,
-      size: 1024,
-      mode: 33188,
-      mtime: 1645174800,
-    };
-    const { fn, calls } = capturingFetch(200, mockStat);
+    const mock = mockEntry({ path: '/uploads/file.txt', size: 1024, mode: 33188, mtime: 1645174800 });
+    const { fn, calls } = capturingFetch(200, mock);
     const client = fsClient(fn);
 
     await client.fs.stat('db1', '/uploads/file.txt');
@@ -251,43 +241,27 @@ describe('fs.stat()', () => {
     expectAuth(calls);
   });
 
-  it('returns typed Fs9StatResponse from JSON response', async () => {
-    const mockStat: Fs9StatResponse = {
-      path: '/uploads/file.txt',
-      is_dir: false,
-      is_file: true,
-      size: 2048,
-      mode: 33188,
-      mtime: 1645174800,
-    };
-    const { fn, calls } = capturingFetch(200, mockStat);
+  it('returns typed Fs9FileEntry from JSON response', async () => {
+    const mock = mockEntry({ path: '/uploads/file.txt', size: 2048, mode: 33188, mtime: 1645174800 });
+    const { fn, calls } = capturingFetch(200, mock);
     const client = fsClient(fn);
 
     const result = await client.fs.stat('db1', '/uploads/file.txt');
 
-    expect(result).toEqual(mockStat);
-    expect(result.is_file).toBe(true);
-    expect(result.is_dir).toBe(false);
+    expect(result).toEqual(mock);
+    expect(result.file_type).toBe('regular');
     expect(result.size).toBe(2048);
     expectAuth(calls);
   });
 
   it('returns stat for directory', async () => {
-    const mockStat: Fs9StatResponse = {
-      path: '/uploads',
-      is_dir: true,
-      is_file: false,
-      size: 4096,
-      mode: 16877,
-      mtime: 1645174800,
-    };
-    const { fn, calls } = capturingFetch(200, mockStat);
+    const mock = mockEntry({ path: '/uploads', file_type: 'directory', size: 4096, mode: 16877, mtime: 1645174800 });
+    const { fn, calls } = capturingFetch(200, mock);
     const client = fsClient(fn);
 
     const result = await client.fs.stat('db1', '/uploads');
 
-    expect(result.is_dir).toBe(true);
-    expect(result.is_file).toBe(false);
+    expect(result.file_type).toBe('directory');
     expectAuth(calls);
   });
 });
@@ -387,6 +361,129 @@ describe('fs – Error handling', () => {
   });
 });
 
+describe('fs.mkdir()', () => {
+  it('sends POST to /open with create+directory flags, then POST to /close', async () => {
+    let callCount = 0;
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const fn: FetchFn = async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      callCount++;
+      if (callCount === 1) {
+        // First call: /open
+        return new Response(JSON.stringify({ handle_id: '42', metadata: {} }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } else {
+        // Second call: /close
+        return new Response(null, {
+          status: 204,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    };
+    const client = fsClient(fn);
+
+    await client.fs.mkdir('db1', '/testdir');
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0].url).toContain('/open');
+    expect(calls[1].url).toContain('/close');
+    expectAuth(calls);
+  });
+
+  it('includes correct JSON body with path and flags in /open request', async () => {
+    let callCount = 0;
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const fn: FetchFn = async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      callCount++;
+      if (callCount === 1) {
+        return new Response(JSON.stringify({ handle_id: '42' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } else {
+        return new Response(null, { status: 204 });
+      }
+    };
+    const client = fsClient(fn);
+
+    await client.fs.mkdir('db1', '/testdir');
+
+    const openCall = calls[0];
+    expect(openCall.init?.body).toBe(
+      JSON.stringify({
+        path: '/testdir',
+        flags: { create: true, directory: true },
+      })
+    );
+    expect((openCall.init?.headers as Record<string, string>)['Content-Type']).toBe(
+      'application/json'
+    );
+  });
+
+  it('closes the handle after opening', async () => {
+    let callCount = 0;
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const fn: FetchFn = async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      callCount++;
+      if (callCount === 1) {
+        return new Response(JSON.stringify({ handle_id: '99' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } else {
+        return new Response(null, { status: 204 });
+      }
+    };
+    const client = fsClient(fn);
+
+    await client.fs.mkdir('db1', '/testdir');
+
+    const closeCall = calls[1];
+    expect(closeCall.init?.body).toBe(JSON.stringify({ handle_id: '99' }));
+    expect((closeCall.init?.headers as Record<string, string>)['Content-Type']).toBe(
+      'application/json'
+    );
+  });
+});
+
+describe('fs.remove()', () => {
+  it('sends DELETE request to /remove endpoint with path parameter', async () => {
+    const { fn, calls } = capturingFetch(204);
+    const client = fsClient(fn);
+
+    await client.fs.remove('db1', '/testfile.txt');
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain('/remove?path=%2Ftestfile.txt');
+    expect(calls[0].init?.method).toBe('DELETE');
+    expectAuth(calls);
+  });
+
+  it('works for files', async () => {
+    const { fn, calls } = capturingFetch(204);
+    const client = fsClient(fn);
+
+    await client.fs.remove('db1', '/myfile.txt');
+
+    expect(calls[0].url).toContain('/remove?path=%2Fmyfile.txt');
+    expect(calls[0].init?.method).toBe('DELETE');
+  });
+
+  it('works for directories', async () => {
+    const { fn, calls } = capturingFetch(204);
+    const client = fsClient(fn);
+
+    await client.fs.remove('db1', '/mydir');
+
+    expect(calls[0].url).toContain('/remove?path=%2Fmydir');
+    expect(calls[0].init?.method).toBe('DELETE');
+  });
+});
+
 describe('fs – Authentication', () => {
   it('includes Bearer token in Authorization header for list', async () => {
     const { fn, calls } = capturingFetch(200, []);
@@ -416,17 +513,42 @@ describe('fs – Authentication', () => {
   });
 
   it('includes Bearer token in Authorization header for stat', async () => {
-    const { fn, calls } = capturingFetch(200, {
-      path: '/path',
-      is_dir: false,
-      is_file: true,
-      size: 100,
-      mode: 33188,
-      mtime: 1645174800,
-    });
+    const mock = mockEntry({ path: '/path', size: 100, mode: 33188, mtime: 1645174800 });
+    const { fn, calls } = capturingFetch(200, mock);
     const client = fsClient(fn);
 
     await client.fs.stat('db1', '/path');
+
+    expectAuth(calls);
+  });
+
+  it('includes Bearer token in Authorization header for mkdir', async () => {
+    let callCount = 0;
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const fn: FetchFn = async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      callCount++;
+      if (callCount === 1) {
+        return new Response(JSON.stringify({ handle_id: '42' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } else {
+        return new Response(null, { status: 204 });
+      }
+    };
+    const client = fsClient(fn);
+
+    await client.fs.mkdir('db1', '/path');
+
+    expectAuth(calls);
+  });
+
+  it('includes Bearer token in Authorization header for remove', async () => {
+    const { fn, calls } = capturingFetch(204);
+    const client = fsClient(fn);
+
+    await client.fs.remove('db1', '/path');
 
     expectAuth(calls);
   });

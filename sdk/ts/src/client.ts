@@ -4,7 +4,7 @@ import {
   type CredentialStore,
 } from './credentials';
 import { Db9Error } from './errors';
-import type { Fs9FileInfo, Fs9StatResponse, Fs9ListOptions } from './fs-types';
+import type { Fs9FileEntry, Fs9ListOptions } from './fs-types';
 import type {
   RegisterRequest,
   CustomerResponse,
@@ -91,7 +91,8 @@ export function createDb9Client(options: Db9ClientOptions = {}) {
     method: string,
     dbId: string,
     fsPath: string,
-    body?: string
+    body?: string,
+    contentType?: string
   ): Promise<Response> {
     // Ensure token is loaded (lazy auth pattern)
     if (!token && !tokenLoaded) {
@@ -106,7 +107,7 @@ export function createDb9Client(options: Db9ClientOptions = {}) {
       headers['Authorization'] = `Bearer ${token}`;
     }
     if (body !== undefined) {
-      headers['Content-Type'] = 'text/plain';
+      headers['Content-Type'] = contentType || 'text/plain';
     }
 
     const init: RequestInit = { method, headers };
@@ -304,7 +305,7 @@ export function createDb9Client(options: Db9ClientOptions = {}) {
         dbId: string,
         path: string,
         options?: Fs9ListOptions
-      ): Promise<Fs9FileInfo[]> => {
+      ): Promise<Fs9FileEntry[]> => {
         const params = new URLSearchParams({ path });
         if (options?.recursive) params.set('recursive', 'true');
         const response = await fsRequest(
@@ -312,7 +313,7 @@ export function createDb9Client(options: Db9ClientOptions = {}) {
           dbId,
           `/readdir?${params.toString()}`
         );
-        return response.json() as Promise<Fs9FileInfo[]>;
+        return response.json() as Promise<Fs9FileEntry[]>;
       },
 
       read: async (dbId: string, path: string): Promise<string> => {
@@ -334,14 +335,41 @@ export function createDb9Client(options: Db9ClientOptions = {}) {
         await fsRequest('PUT', dbId, `/upload?${params.toString()}`, content);
       },
 
-      stat: async (dbId: string, path: string): Promise<Fs9StatResponse> => {
+      stat: async (dbId: string, path: string): Promise<Fs9FileEntry> => {
         const params = new URLSearchParams({ path });
         const response = await fsRequest(
           'GET',
           dbId,
           `/stat?${params.toString()}`
         );
-        return response.json() as Promise<Fs9StatResponse>;
+        return response.json() as Promise<Fs9FileEntry>;
+      },
+
+      mkdir: async (dbId: string, path: string): Promise<void> => {
+        // mkdir = open with create+directory flags, then close the handle
+        const openResp = await fsRequest(
+          'POST',
+          dbId,
+          '/open',
+          JSON.stringify({
+            path,
+            flags: { create: true, directory: true },
+          }),
+          'application/json'
+        );
+        const { handle_id } = (await openResp.json()) as { handle_id: string };
+        await fsRequest(
+          'POST',
+          dbId,
+          '/close',
+          JSON.stringify({ handle_id }),
+          'application/json'
+        );
+      },
+
+      remove: async (dbId: string, path: string): Promise<void> => {
+        const params = new URLSearchParams({ path });
+        await fsRequest('DELETE', dbId, `/remove?${params.toString()}`);
       },
     },
   };
