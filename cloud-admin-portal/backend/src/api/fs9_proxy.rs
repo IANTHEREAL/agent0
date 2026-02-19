@@ -11,8 +11,8 @@ use crate::AppState;
 ///
 /// Authenticates the customer, fetches the stored fs9 JWT for that database,
 /// and forwards the request to `{FS9_SERVER_URL}/{db_id}/{rest}`.
-/// The `db_id` is parsed from the URI path rather than using axum Path
-/// extraction, since this handler serves two routes with different arity.
+/// If the stored token is expired (fs9-server returns 401), automatically
+/// regenerates it via fs9-meta and retries once.
 pub async fn fs9_proxy(
     State(state): State<AppState>,
     auth: CustomerAuth,
@@ -65,7 +65,13 @@ pub async fn fs9_proxy(
     {
         Ok(Some(cred)) => cred.password_plain,
         Ok(None) => {
-            return (StatusCode::UNAUTHORIZED, "No fs9 token found for this database. Re-create the database or wait for provisioning.").into_response();
+            // No token stored — try to provision one now.
+            match refresh_fs9_token(&state, &tenant.id, &auth.customer_id).await {
+                Ok(token) => token,
+                Err(e) => {
+                    return (StatusCode::UNAUTHORIZED, format!("No fs9 token and auto-provision failed: {e}")).into_response();
+                }
+            }
         }
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -73,8 +79,6 @@ pub async fn fs9_proxy(
     };
 
     // Build the upstream URL.
-    // Incoming path:  /fs9/{db_id}[/rest][?query]
-    // Upstream path:  {fs9_url}/{db_id}[/rest][?query]
     let uri = req.uri();
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let prefix = format!("/fs9/{db_id}");
@@ -97,11 +101,49 @@ pub async fn fs9_proxy(
         }
     };
 
-    // Build the forwarded request, replacing Authorization with the fs9 token.
-    let mut fwd = state
-        .http_client
-        .request(method, &upstream_url)
-        .header("Authorization", format!("Bearer {fs9_token}"));
+    // Forward request with fs9 token.
+    let resp = forward_to_fs9(
+        &state.http_client, &method, &upstream_url, &headers, &body_bytes, &fs9_token,
+    ).await;
+
+    match resp {
+        Ok((status, resp_headers, resp_body)) => {
+            if status == StatusCode::UNAUTHORIZED {
+                // Token expired — refresh and retry once.
+                tracing::info!(db_id, "fs9 token expired, refreshing");
+                match refresh_fs9_token(&state, &tenant.id, &auth.customer_id).await {
+                    Ok(new_token) => {
+                        match forward_to_fs9(
+                            &state.http_client, &method, &upstream_url, &headers, &body_bytes, &new_token,
+                        ).await {
+                            Ok((status, headers, body)) => build_response(status, headers, body),
+                            Err(e) => (StatusCode::BAD_GATEWAY, format!("Upstream error on retry: {e}")).into_response(),
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(db_id, error = %e, "Failed to refresh fs9 token");
+                        build_response(status, resp_headers, resp_body)
+                    }
+                }
+            } else {
+                build_response(status, resp_headers, resp_body)
+            }
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")).into_response(),
+    }
+}
+
+async fn forward_to_fs9(
+    client: &reqwest::Client,
+    method: &axum::http::Method,
+    url: &str,
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+    token: &str,
+) -> Result<(StatusCode, reqwest::header::HeaderMap, bytes::Bytes), String> {
+    let mut fwd = client
+        .request(method.clone(), url)
+        .header("Authorization", format!("Bearer {token}"));
 
     for (key, value) in headers.iter() {
         let key_str = key.as_str();
@@ -109,29 +151,59 @@ pub async fn fs9_proxy(
             fwd = fwd.header(key, value);
         }
     }
-    fwd = fwd.body(body_bytes);
+    fwd = fwd.body(body.to_vec());
 
-    match fwd.send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            let resp_headers = resp.headers().clone();
-            let resp_body = match resp.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
-                }
-            };
+    let resp = fwd.send().await.map_err(|e| e.to_string())?;
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let resp_headers = resp.headers().clone();
+    let resp_body = resp.bytes().await.map_err(|e| e.to_string())?;
+    Ok((status, resp_headers, resp_body))
+}
 
-            let mut response = Response::new(Body::from(resp_body));
-            *response.status_mut() = status;
-            for (key, value) in resp_headers.iter() {
-                // Skip hop-by-hop headers that must not be forwarded.
-                if key.as_str() != "transfer-encoding" && key.as_str() != "connection" {
-                    response.headers_mut().insert(key, value.clone());
+fn build_response(
+    status: StatusCode,
+    resp_headers: reqwest::header::HeaderMap,
+    resp_body: bytes::Bytes,
+) -> Response {
+    let mut response = Response::new(Body::from(resp_body));
+    *response.status_mut() = status;
+    for (key, value) in resp_headers.iter() {
+        if key.as_str() != "transfer-encoding" && key.as_str() != "connection" {
+            if let Ok(name) = axum::http::HeaderName::from_bytes(key.as_str().as_bytes()) {
+                if let Ok(val) = axum::http::HeaderValue::from_bytes(value.as_bytes()) {
+                    response.headers_mut().insert(name, val);
                 }
             }
-            response
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")).into_response(),
     }
+    response
+}
+
+/// Regenerate the fs9 JWT token for a tenant via fs9-meta and store it.
+async fn refresh_fs9_token(
+    state: &AppState,
+    tenant_id: &str,
+    customer_id: &str,
+) -> Result<String, String> {
+    let fs9 = state.fs9_client.as_ref().ok_or("FS9 integration not configured")?;
+
+    // Ensure namespace + user exist (idempotent).
+    fs9.create_namespace(tenant_id).await?;
+    let user_id = fs9.create_user(tenant_id, "admin").await?;
+    let token = fs9.generate_token(&user_id).await?;
+
+    // Store the new token.
+    db::upsert_credential(
+        &state.db,
+        tenant_id,
+        "fs9_token",
+        customer_id,
+        &token,
+        state.config.credential_key.as_deref(),
+    )
+    .await
+    .map_err(|e| format!("Failed to store refreshed token: {e}"))?;
+
+    tracing::info!(tenant_id, "Refreshed fs9 token");
+    Ok(token)
 }

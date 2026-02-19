@@ -26,6 +26,8 @@ struct CreateUserResponse {
 #[derive(Serialize)]
 struct GenerateTokenRequest {
     user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl_seconds: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +144,7 @@ impl Fs9Client {
     }
 
     /// Generate a JWT token for the given user (by internal user_id).
+    /// Uses a 1-year TTL to avoid frequent token expiration.
     pub async fn generate_token(&self, user_id: &str) -> Result<String, String> {
         let url = format!("{}/api/v1/admin/tokens", self.base_url);
         let resp = self
@@ -150,6 +153,7 @@ impl Fs9Client {
             .header("x-fs9-meta-key", &self.meta_key)
             .json(&GenerateTokenRequest {
                 user_id: user_id.to_string(),
+                ttl_seconds: Some(365 * 24 * 3600), // 1 year
             })
             .send()
             .await
