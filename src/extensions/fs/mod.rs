@@ -888,7 +888,7 @@ mod tests {
         fs::write(dir.join("c.txt"), "delta\nepsilon\n").expect("write c.txt");
 
         let pattern = format!("{}/*.txt", dir.display());
-        let (schema, mut rx) = context::with_context(true, async {
+        let (schema, mut rx) = context::with_context(true, "", async {
             start_glob_stream("", &pattern, None, None, None, None)
                 .await
                 .expect("start glob stream")
@@ -919,7 +919,7 @@ mod tests {
         let pattern = format!("{}/*.txt", dir.display());
         let budget = "line1\nline2\nline3\n".len();
 
-        let (_schema, mut rx) = context::with_context(true, async {
+        let (_schema, mut rx) = context::with_context(true, "", async {
             start_glob_stream_with_budget("", &pattern, None, None, None, None, budget)
                 .await
                 .expect("start glob stream")
