@@ -1,0 +1,38 @@
+# pg-tikv (tipg) — native platform build for local e2e testing
+# Build context: tipg repo root (../../)
+FROM rust:1.88-bookworm AS builder
+
+RUN apt-get update && apt-get install -y \
+    cmake \
+    protobuf-compiler \
+    libssl-dev \
+    pkg-config \
+    clang \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG BUILD_GIT_HASH="dev"
+ARG BUILD_DATE="unknown"
+ENV BUILD_GIT_HASH=${BUILD_GIT_HASH}
+ENV BUILD_DATE=${BUILD_DATE}
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+COPY vendor/ vendor/
+COPY crates/ crates/
+
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/pg-tikv /usr/local/bin/pg-tikv
+
+EXPOSE 5433
+
+CMD ["pg-tikv"]

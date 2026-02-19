@@ -1,0 +1,52 @@
+# fs9-server — native platform build with pagefs TiKV backend
+# Reference copy — the canonical file used by docker-compose.yml is:
+#   ~/fs9/docker/Dockerfile.server-e2e
+# Build context when using directly: fs9 repo root (${FS9_REPO_PATH})
+FROM rust:1.85-bookworm AS builder
+
+RUN apt-get update && apt-get install -y \
+    cmake \
+    protobuf-compiler \
+    libssl-dev \
+    pkg-config \
+    clang \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy full workspace so all crate dependencies resolve correctly
+COPY . .
+
+# Build the HTTP server and all plugins.
+# pagefs is built with --features tikv to enable the TiKV storage backend.
+RUN cargo build --release -p fs9-server && \
+    cargo build --release -p fs9-plugin-pagefs --features tikv && \
+    cargo build --release -p fs9-plugin-kv && \
+    cargo build --release -p fs9-plugin-hellofs && \
+    cargo build --release -p fs9-plugin-streamfs && \
+    cargo build --release -p fs9-plugin-pubsubfs
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN mkdir /app/plugins
+
+COPY --from=builder /app/target/release/fs9-server /app/fs9-server
+COPY --from=builder /app/target/release/libfs9_plugin_pagefs.so /app/plugins/
+COPY --from=builder /app/target/release/libfs9_plugin_kv.so /app/plugins/
+COPY --from=builder /app/target/release/libfs9_plugin_hellofs.so /app/plugins/
+COPY --from=builder /app/target/release/libfs9_plugin_streamfs.so /app/plugins/
+COPY --from=builder /app/target/release/libfs9_plugin_pubsubfs.so /app/plugins/
+
+ENV FS9_PLUGIN_DIR=/app/plugins
+
+EXPOSE 9999
+
+CMD ["/app/fs9-server"]

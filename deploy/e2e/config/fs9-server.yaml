@@ -1,0 +1,34 @@
+server:
+  host: "0.0.0.0"
+  port: 9999
+
+  # fs9-meta for token validation
+  meta_url: "http://fs9-meta:9998"
+
+  # Auto-provision pagefs mounts backed by TiKV
+  default_pagefs:
+    pd_endpoints:
+      - "pd:2379"
+    keyspace_prefix: "tipg_fs_"
+
+  plugins:
+    directories:
+      - "/app/plugins"
+
+  request_timeout_secs: 30
+  max_concurrent_requests: 1000
+  max_body_size_bytes: 2097152       # 2 MB
+  max_write_size_bytes: 268435456    # 256 MB
+
+  rate_limit:
+    enabled: false
+
+  metrics:
+    enabled: true
+    path: "/metrics"
+
+  meta_resilience:
+    failure_threshold: 5
+    recovery_timeout_secs: 30
+    max_retry_attempts: 3
+    base_delay_ms: 100

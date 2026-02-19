@@ -1,0 +1,57 @@
+# cloud-admin-portal backend — native platform build for local e2e testing
+# Builds: pgtikv-admin (HTTP API server) + db9 (CLI) + sh9 (fs9 shell, from fs9 repo)
+#
+# Build contexts:
+#   default  — tipg repo root (../../)
+#   fs9      — fs9 repo (${FS9_REPO_PATH}, via additional_contexts in docker-compose)
+
+# ── Stage 1: build sh9 from fs9 repo ────────────────────────────────────────
+FROM rust:1.85-bookworm AS sh9-builder
+
+RUN apt-get update && apt-get install -y \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /fs9
+
+# 'fs9' is the additional_context pointing to the fs9 repo root
+COPY --from=fs9 . .
+
+RUN cargo build --release -p sh9
+
+# ── Stage 2: build pgtikv-admin + db9 from tipg repo ────────────────────────
+FROM rust:1.85-bookworm AS admin-builder
+
+RUN apt-get update && apt-get install -y \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG GIT_HASH="dev"
+ENV GIT_HASH=${GIT_HASH}
+
+WORKDIR /app
+
+COPY cloud-admin-portal/backend/Cargo.toml cloud-admin-portal/backend/Cargo.lock ./
+COPY cloud-admin-portal/backend/src/ src/
+
+RUN cargo build --release
+
+# ── Runtime image ────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=admin-builder /app/target/release/pgtikv-admin /usr/local/bin/pgtikv-admin
+COPY --from=admin-builder /app/target/release/pgtikv-ctl /usr/local/bin/pgtikv-ctl
+COPY --from=admin-builder /app/target/release/db9 /usr/local/bin/db9
+COPY --from=sh9-builder /fs9/target/release/sh9 /usr/local/bin/sh9
+
+EXPOSE 8090
+
+CMD ["pgtikv-admin"]
