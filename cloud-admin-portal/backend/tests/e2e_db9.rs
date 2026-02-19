@@ -511,7 +511,7 @@ fn config_dir_created_on_startup() {
     let home = TempHome::new();
     let _ = Command::new(env!("CARGO_BIN_EXE_db9"))
         .arg("--api-url")
-        .arg("http://127.0.0.1:1")  // invalid, will fail fast
+        .arg("http://127.0.0.1:1") // invalid, will fail fast
         .env("HOME", home.path())
         .env("DB9_API_URL", "http://127.0.0.1:1")
         .args(["db", "list"])
@@ -525,7 +525,7 @@ async fn history_file_persists_after_session() {
     let (addr, state) = start_server().await;
     let api_url = format!("http://{addr}");
     let home = TempHome::new();
-    
+
     let email = format!("e2e-hist-{}@test.com", uuid::Uuid::new_v4());
     let token = register_and_login(&state, &email, "TestPass123!").await;
     let customer_id = get_customer_id(&state, &token).await;
@@ -551,14 +551,23 @@ fn direct_mode_connection_refused() {
     let home = TempHome::new();
     // Write dummy credentials
     home.write_credentials("dummy-token");
-    
+
     // Try direct mode to a non-listening port — should get a connection error, not a panic
     let output = Command::new(env!("CARGO_BIN_EXE_db9"))
         .env("HOME", home.path())
-        .args(["db", "sql", "dummy-id", "--direct", "--dsn", "postgres://user:pass@127.0.0.1:19999/db", "-q", "SELECT 1"])
+        .args([
+            "db",
+            "sql",
+            "dummy-id",
+            "--direct",
+            "--dsn",
+            "postgres://user:pass@127.0.0.1:19999/db",
+            "-q",
+            "SELECT 1",
+        ])
         .output()
         .unwrap();
-    
+
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
@@ -566,7 +575,9 @@ fn direct_mode_connection_refused() {
     );
     // Should get a connection error, not a panic/crash
     assert!(
-        stderr.to_lowercase().contains("connection") || stderr.to_lowercase().contains("refused") || stderr.to_lowercase().contains("error"),
+        stderr.to_lowercase().contains("connection")
+            || stderr.to_lowercase().contains("refused")
+            || stderr.to_lowercase().contains("error"),
         "should mention connection error, got: {stderr}"
     );
 }
@@ -599,6 +610,9 @@ async fn sql_file_with_multiple_statements() {
         String::from_utf8_lossy(&output.stderr)
     );
     let lower = combined.to_lowercase();
-    assert!(!lower.contains("not logged in"), "should pass auth: {combined}");
+    assert!(
+        !lower.contains("not logged in"),
+        "should pass auth: {combined}"
+    );
     assert!(!lower.contains("not found"), "should find DB: {combined}");
 }

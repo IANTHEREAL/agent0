@@ -10,18 +10,16 @@ pub struct DirectExecutor {
 
 impl DirectExecutor {
     pub async fn connect(dsn: &str) -> Result<Self, String> {
-        let (client, connection) = tokio_postgres::connect(dsn, NoTls)
-            .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("authentication") {
-                    format!("Authentication failed: {msg}")
-                } else if msg.contains("Connection refused") || msg.contains("connect") {
-                    format!("Connection refused: {msg}\nHint: Is pg-tikv running?")
-                } else {
-                    format!("Connection failed: {msg}")
-                }
-            })?;
+        let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("authentication") {
+                format!("Authentication failed: {msg}")
+            } else if msg.contains("Connection refused") || msg.contains("connect") {
+                format!("Connection refused: {msg}\nHint: Is pg-tikv running?")
+            } else {
+                format!("Connection failed: {msg}")
+            }
+        })?;
 
         // tokio-postgres requires the connection future to be driven
         tokio::spawn(async move {
@@ -108,8 +106,7 @@ impl DirectExecutor {
             .map_err(|e| e.to_string())?;
         let mut sink = std::pin::pin!(sink);
 
-        let file =
-            std::fs::File::open(file_path).map_err(|e| format!("\\copy: {}", e))?;
+        let file = std::fs::File::open(file_path).map_err(|e| format!("\\copy: {}", e))?;
         let reader = std::io::BufReader::new(file);
         const CHUNK_SIZE: usize = 65536;
         let mut buf = Vec::with_capacity(CHUNK_SIZE);
@@ -144,10 +141,7 @@ impl DirectExecutor {
     ) -> Result<u64, String> {
         if let Some(parent) = std::path::Path::new(file_path).parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
-                return Err(format!(
-                    "\\copy: directory not found: {}",
-                    parent.display()
-                ));
+                return Err(format!("\\copy: directory not found: {}", parent.display()));
             }
         }
 
@@ -250,7 +244,10 @@ mod tests {
 
     #[test]
     fn test_infer_command_multi() {
-        assert_eq!(infer_command("INSERT INTO t VALUES (1); SELECT * FROM t;"), "SELECT");
+        assert_eq!(
+            infer_command("INSERT INTO t VALUES (1); SELECT * FROM t;"),
+            "SELECT"
+        );
     }
 
     #[test]
@@ -324,7 +321,10 @@ mod tests {
 
     #[test]
     fn test_infer_typed_value_large_int() {
-        assert_eq!(infer_typed_value("9999999999999"), Value::Number(9999999999999i64.into()));
+        assert_eq!(
+            infer_typed_value("9999999999999"),
+            Value::Number(9999999999999i64.into())
+        );
     }
 
     #[test]

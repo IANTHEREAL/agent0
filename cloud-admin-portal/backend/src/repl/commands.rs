@@ -728,7 +728,11 @@ async fn handle_connect(api: &ApiClient, new_id: &str) -> DispatchResult {
 
 fn handle_pager_command(repl_state: &mut ReplState, arg: &str) {
     if arg.is_empty() {
-        let status = if repl_state.pager_enabled { "on" } else { "off" };
+        let status = if repl_state.pager_enabled {
+            "on"
+        } else {
+            "off"
+        };
         let cmd = repl_state
             .pager_command
             .as_ref()
@@ -763,7 +767,10 @@ fn handle_expanded_command(repl_state: &mut ReplState, arg: &str) {
     } else if arg.eq_ignore_ascii_case("auto") {
         repl_state.expanded = ExpandedMode::Auto;
     } else {
-        eprintln!("Invalid expanded mode: {}. Use 'on', 'off', or 'auto'.", arg);
+        eprintln!(
+            "Invalid expanded mode: {}. Use 'on', 'off', or 'auto'.",
+            arg
+        );
         return;
     }
 
@@ -861,10 +868,7 @@ fn handle_pset_command(repl_state: &mut ReplState, arg: &str) {
                     eprintln!("Output format is json.");
                 }
                 _ => {
-                    eprintln!(
-                        "Invalid format: {}. Use table, csv, or json.",
-                        value
-                    );
+                    eprintln!("Invalid format: {}. Use table, csv, or json.", value);
                 }
             }
         }
@@ -887,10 +891,7 @@ fn handle_pset_command(repl_state: &mut ReplState, arg: &str) {
                     eprintln!("Line style is unicode.");
                 }
                 _ => {
-                    eprintln!(
-                        "Invalid linestyle: {}. Use ascii or unicode.",
-                        value
-                    );
+                    eprintln!("Invalid linestyle: {}. Use ascii or unicode.", value);
                 }
             }
         }
@@ -927,7 +928,9 @@ fn handle_save_favorite(repl_state: &mut ReplState, arg: &str) {
         match &repl_state.last_query {
             Some(q) => (name, q.clone()),
             None => {
-                eprintln!("ERROR: No last query to save. Provide query explicitly: \\fs <name> <query>");
+                eprintln!(
+                    "ERROR: No last query to save. Provide query explicitly: \\fs <name> <query>"
+                );
                 return;
             }
         }
@@ -987,7 +990,15 @@ fn handle_list_favorites(repl_state: &ReplState) {
         eprintln!("{:<w_name$}  {}", name, truncated);
     }
 
-    eprintln!("({} {})", favorites.len(), if favorites.len() == 1 { "favorite" } else { "favorites" });
+    eprintln!(
+        "({} {})",
+        favorites.len(),
+        if favorites.len() == 1 {
+            "favorite"
+        } else {
+            "favorites"
+        }
+    );
 }
 
 fn handle_highlight_command(arg: &str) -> DispatchResult {
@@ -1129,8 +1140,8 @@ fn repl_help() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::SqlExecutor;
+    use super::*;
 
     #[test]
     fn test_extract_table_names_normal() {
@@ -1192,7 +1203,10 @@ mod tests {
 
     #[test]
     fn test_format_bool_field_string() {
-        assert_eq!(format_bool_field(Some(&Value::String("custom".into()))), "custom");
+        assert_eq!(
+            format_bool_field(Some(&Value::String("custom".into()))),
+            "custom"
+        );
     }
 
     #[test]
@@ -1202,7 +1216,12 @@ mod tests {
 
     #[test]
     fn test_handle_expanded_toggle() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         assert_eq!(state.expanded, ExpandedMode::Off);
         handle_expanded_command(&mut state, "");
         assert_eq!(state.expanded, ExpandedMode::On);
@@ -1212,7 +1231,12 @@ mod tests {
 
     #[test]
     fn test_handle_expanded_explicit() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         handle_expanded_command(&mut state, "on");
         assert_eq!(state.expanded, ExpandedMode::On);
         handle_expanded_command(&mut state, "auto");
@@ -1223,14 +1247,24 @@ mod tests {
 
     #[test]
     fn test_handle_expanded_invalid() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         handle_expanded_command(&mut state, "invalid");
         assert_eq!(state.expanded, ExpandedMode::Off);
     }
 
     #[test]
     fn test_handle_pager_toggle() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         assert!(state.pager_enabled);
         handle_pager_command(&mut state, "off");
         assert!(!state.pager_enabled);
@@ -1241,7 +1275,12 @@ mod tests {
 
     #[test]
     fn test_handle_pager_custom_command() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         handle_pager_command(&mut state, "more");
         assert!(state.pager_enabled);
         assert_eq!(state.pager_command, Some("more".to_string()));
@@ -1281,14 +1320,24 @@ mod tests {
 
     #[test]
     fn test_handle_save_favorite_with_query() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         handle_save_favorite(&mut state, "myq SELECT 1");
         assert_eq!(state.favorites.get("myq"), Some("SELECT 1".to_string()));
     }
 
     #[test]
     fn test_handle_save_favorite_from_last_query() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         state.last_query = Some("SELECT 42".to_string());
         handle_save_favorite(&mut state, "last");
         assert_eq!(state.favorites.get("last"), Some("SELECT 42".to_string()));
@@ -1296,14 +1345,24 @@ mod tests {
 
     #[test]
     fn test_handle_save_favorite_no_last_query() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         handle_save_favorite(&mut state, "name_only");
         assert_eq!(state.favorites.get("name_only"), None);
     }
 
     #[test]
     fn test_handle_execute_favorite_found() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         state.favorites.add("run_me", "SELECT 99").unwrap();
         match handle_execute_favorite(&state, "run_me") {
             DispatchResult::ExecuteQuery(q) => assert_eq!(q, "SELECT 99"),
@@ -1313,7 +1372,12 @@ mod tests {
 
     #[test]
     fn test_handle_execute_favorite_not_found() {
-        let state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         match handle_execute_favorite(&state, "nonexistent") {
             DispatchResult::Continue => {}
             _ => panic!("Expected Continue for missing favorite"),
@@ -1322,7 +1386,12 @@ mod tests {
 
     #[test]
     fn test_handle_delete_favorite() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         state.favorites.add("del_me", "SELECT 1").unwrap();
         handle_delete_favorite(&mut state, "del_me");
         assert_eq!(state.favorites.get("del_me"), None);
@@ -1330,10 +1399,18 @@ mod tests {
 
     #[test]
     fn test_handle_output_redirect_set_and_reset() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         assert!(state.output_file.is_none());
         handle_output_redirect(&mut state, "/tmp/db9_test_output.txt");
-        assert_eq!(state.output_file, Some("/tmp/db9_test_output.txt".to_string()));
+        assert_eq!(
+            state.output_file,
+            Some("/tmp/db9_test_output.txt".to_string())
+        );
         handle_output_redirect(&mut state, "");
         assert!(state.output_file.is_none());
         let _ = std::fs::remove_file("/tmp/db9_test_output.txt");
@@ -1405,7 +1482,12 @@ mod tests {
 
     #[test]
     fn test_handle_pset_border_valid() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         assert_eq!(state.border, 1);
         handle_pset_command(&mut state, "border 0");
         assert_eq!(state.border, 0);
@@ -1417,7 +1499,12 @@ mod tests {
 
     #[test]
     fn test_handle_pset_border_invalid() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         handle_pset_command(&mut state, "border 5");
         assert_eq!(state.border, 1);
         handle_pset_command(&mut state, "border abc");
@@ -1426,7 +1513,12 @@ mod tests {
 
     #[test]
     fn test_handle_pset_null_custom() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         assert_eq!(state.null_display, "NULL");
         handle_pset_command(&mut state, "null (empty)");
         assert_eq!(state.null_display, "(empty)");
@@ -1436,7 +1528,12 @@ mod tests {
 
     #[test]
     fn test_handle_pset_format() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         assert!(state.format_override.is_none());
         handle_pset_command(&mut state, "format json");
         assert_eq!(state.format_override, Some(OutputFormat::Json));
@@ -1448,7 +1545,12 @@ mod tests {
 
     #[test]
     fn test_handle_pset_linestyle() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         assert_eq!(state.linestyle, LinestyleMode::Ascii);
         handle_pset_command(&mut state, "linestyle unicode");
         assert_eq!(state.linestyle, LinestyleMode::Unicode);
@@ -1458,7 +1560,12 @@ mod tests {
 
     #[test]
     fn test_handle_pset_unknown_option() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         let before_border = state.border;
         handle_pset_command(&mut state, "nosuchoption value");
         assert_eq!(state.border, before_border);
@@ -1466,7 +1573,12 @@ mod tests {
 
     #[test]
     fn test_handle_pset_expanded_delegates() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         assert_eq!(state.expanded, ExpandedMode::Off);
         handle_pset_command(&mut state, "expanded on");
         assert_eq!(state.expanded, ExpandedMode::On);
@@ -1476,7 +1588,12 @@ mod tests {
 
     #[test]
     fn test_handle_pset_pager_delegates() {
-        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let mut state = ReplState::new(
+            "id".into(),
+            "db".into(),
+            "http://x".into(),
+            SqlExecutor::Api,
+        );
         assert!(state.pager_enabled);
         handle_pset_command(&mut state, "pager off");
         assert!(!state.pager_enabled);
