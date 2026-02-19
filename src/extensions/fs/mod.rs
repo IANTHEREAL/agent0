@@ -375,7 +375,11 @@ pub(crate) async fn execute_fs9_events(
     let bk = backend::get_backend(tenant);
     let http_backend = match bk.as_any().downcast_ref::<backend::Fs9HttpBackend>() {
         Some(b) => b,
-        None => return Err(anyhow!("fs9_events: requires remote fs9-server (FS9_SERVER_URL)")),
+        None => {
+            return Err(anyhow!(
+                "fs9_events: requires remote fs9-server (FS9_SERVER_URL)"
+            ))
+        }
     };
 
     let mut url = format!(

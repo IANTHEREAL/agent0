@@ -156,12 +156,9 @@ fn fs9_size_remote(path: &str) -> Result<Value> {
 fn fs9_mtime_remote(path: &str) -> Result<Value> {
     let bk = get_remote_backend()?;
     let info = run_async(bk.stat(path))?;
-    let dt = DateTime::<Utc>::from(
-        std::time::UNIX_EPOCH + std::time::Duration::from_secs(info.mtime),
-    );
-    Ok(Value::Text(
-        dt.to_rfc3339_opts(SecondsFormat::Secs, true),
-    ))
+    let dt =
+        DateTime::<Utc>::from(std::time::UNIX_EPOCH + std::time::Duration::from_secs(info.mtime));
+    Ok(Value::Text(dt.to_rfc3339_opts(SecondsFormat::Secs, true)))
 }
 
 // ---------------------------------------------------------------------------
@@ -249,8 +246,11 @@ fn fs9_mtime_local(path: &str) -> Result<Value> {
 
 pub fn fs9_read(args: Vec<Value>) -> Result<Value> {
     ensure_permissions()?;
-    let path = match expect_text_arg("fs9_read", args.into_iter().next().unwrap_or(Value::Null), 1)?
-    {
+    let path = match expect_text_arg(
+        "fs9_read",
+        args.into_iter().next().unwrap_or(Value::Null),
+        1,
+    )? {
         Some(p) => p,
         None => return Ok(Value::Null),
     };
@@ -307,8 +307,11 @@ pub fn fs9_exists(args: Vec<Value>) -> Result<Value> {
 
 pub fn fs9_size(args: Vec<Value>) -> Result<Value> {
     ensure_permissions()?;
-    let path = match expect_text_arg("fs9_size", args.into_iter().next().unwrap_or(Value::Null), 1)?
-    {
+    let path = match expect_text_arg(
+        "fs9_size",
+        args.into_iter().next().unwrap_or(Value::Null),
+        1,
+    )? {
         Some(p) => p,
         None => return Ok(Value::Null),
     };
@@ -321,11 +324,14 @@ pub fn fs9_size(args: Vec<Value>) -> Result<Value> {
 
 pub fn fs9_mtime(args: Vec<Value>) -> Result<Value> {
     ensure_permissions()?;
-    let path =
-        match expect_text_arg("fs9_mtime", args.into_iter().next().unwrap_or(Value::Null), 1)? {
-            Some(p) => p,
-            None => return Ok(Value::Null),
-        };
+    let path = match expect_text_arg(
+        "fs9_mtime",
+        args.into_iter().next().unwrap_or(Value::Null),
+        1,
+    )? {
+        Some(p) => p,
+        None => return Ok(Value::Null),
+    };
     if backend::is_remote_configured() {
         fs9_mtime_remote(&path)
     } else {
