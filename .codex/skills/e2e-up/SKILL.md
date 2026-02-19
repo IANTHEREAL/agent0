@@ -363,6 +363,98 @@ db9 CLI ──── HTTP ──────► pgtikv-admin :8090
 
 ---
 
+### First Run: Expect Slow Context Transfer
+
+The Docker build sends the entire repo as build context. For fs9, this includes `target/` (~17GB) if no `.dockerignore` exists. **Always ensure `~/fs9/.dockerignore` contains at minimum:**
+
+```
+target/
+.git/
+```
+
+Without this, the `COPY . .` step in `Dockerfile.server-e2e` takes 2+ minutes just to transfer context. With `.dockerignore`, it drops to seconds.
+
+### Host Port Conflicts
+
+The e2e stack binds ports **5433** (pg-tikv), **8090** (pgtikv-admin), and **9999** (fs9-server) on the host. If you're running local dev instances of these services, Docker will fail with `address already in use`.
+
+**Before running `./setup.sh` or `docker compose up -d`:**
+
+```bash
+# Check for conflicts
+ss -tlnp | grep -E '5433|8090|9999'
+
+# Kill local processes if needed
+kill <pid>
+```
+
+The script may succeed partially (e.g., 6/7 services up) if only one port conflicts. Fix the conflict and run `docker compose up -d` again — it's idempotent.
+
+### Container Recreate Loses db9 Credentials
+
+db9 stores credentials at `/root/.db9/credentials` inside the pgtikv-admin container. When the container is recreated (e.g., after `docker compose build pgtikv-admin && docker compose up -d`), credentials are lost.
+
+**After rebuilding pgtikv-admin, always re-login:**
+
+```bash
+docker compose exec pgtikv-admin db9 --api-url http://localhost:8090/api login
+```
+
+User accounts persist (stored in postgres volume), so no need to re-register.
+
+### Missing `Dockerfile.server-e2e` in fs9
+
+The `docker-compose.yml` references `docker/Dockerfile.server-e2e` in the fs9 repo. This file may not exist in a fresh fs9 clone. The tipg repo ships a reference copy at `deploy/e2e/Dockerfile.fs9-server`.
+
+```bash
+# If fs9 is missing the Dockerfile:
+cp ~/lab/tipg/deploy/e2e/Dockerfile.fs9-server ~/fs9/docker/Dockerfile.server-e2e
+```
+
+### Docker Network DNS After Partial Restarts
+
+If a container is recreated after port conflicts (e.g., `pgtikv-admin` fails on first run, succeeds on retry), it may lose Docker DNS resolution to other containers (error: `failed to lookup address information: Temporary failure in name resolution`).
+
+**Fix: full restart to recreate the network cleanly:**
+
+```bash
+docker compose down && docker compose up -d
+```
+
+### Interactive db9 Commands in Docker
+
+`db9 register` and `db9 login` require interactive TTY input (email/password prompts). They won't work with `docker compose exec -T` (no TTY).
+
+**Use tmux or a separate terminal:**
+
+```bash
+# Interactive — works
+docker compose exec pgtikv-admin db9 --api-url http://localhost:8090/api register
+
+# Non-interactive — fails with "No such device or address"
+docker compose exec -T pgtikv-admin db9 --api-url http://localhost:8090/api register
+```
+
+For CI/scripting, use the HTTP API directly with `curl` (see Multi-Tenant Isolation Test section).
+
+### Rebuilding a Single Service (e.g., sh9 change)
+
+When you modify source in one crate (e.g., `sh9` in fs9 repo), you only need to rebuild the affected image:
+
+```bash
+# sh9 is bundled in pgtikv-admin
+docker compose build pgtikv-admin
+docker compose up -d pgtikv-admin
+
+# pg-tikv engine change
+docker compose build pg-tikv
+docker compose up -d pg-tikv
+```
+
+With `.dockerignore` in place, incremental rebuilds take ~30-60s (Docker layer cache reuses everything except the changed crate).
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -375,5 +467,9 @@ db9 CLI ──── HTTP ──────► pgtikv-admin :8090
 | `db sh` shows local files instead of pagefs | fs9 JWT expired or proxy not working | Check pgtikv-admin has `FS9_SERVER_URL` env; check fs9-server logs for "Mounted pagefs" |
 | `curl localhost:9998` returns 502 from host | Host HTTP proxy intercepting localhost traffic | Run from inside container: `docker compose exec -T pgtikv-admin bash -c "curl http://fs9-meta:9998/..."` |
 | Build fails with cargo error | Rust toolchain inside Docker too old | `docker buildx prune -f` then retry |
-| Port already in use | Previous stack still running | `docker compose down` first |
+| Port already in use | Local dev process occupying the port | `ss -tlnp \| grep <port>` then `kill <pid>` |
+| Build context transfer takes minutes | fs9 missing `.dockerignore`, sending `target/` dir | Add `.dockerignore` with `target/` and `.git/` to fs9 repo root |
+| pgtikv-admin DNS resolution failure | Container recreated outside clean network cycle | `docker compose down && docker compose up -d` |
+| `db9` says "Not logged in" after rebuild | Container recreation wiped `/root/.db9/credentials` | Re-run `docker compose exec pgtikv-admin db9 ... login` |
 | Volumes have stale data after code change | DB schema changed | `docker compose down -v && ./setup.sh` |
+| `Dockerfile.server-e2e` not found | fs9 repo missing the e2e Dockerfile | Copy from `deploy/e2e/Dockerfile.fs9-server` to `~/fs9/docker/Dockerfile.server-e2e` |

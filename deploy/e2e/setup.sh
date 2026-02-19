@@ -121,6 +121,76 @@ EOF
   ok ".env created (FS9_REPO_PATH=${fs9_path})"
 }
 
+# ── Pre-flight checks ────────────────────────────────────────────────────────
+preflight_checks() {
+  source .env 2>/dev/null || true
+  local fs9="${FS9_REPO_PATH:-}"
+
+  # 1. Ensure fs9 has .dockerignore (avoids sending target/ ~17GB as build context)
+  if [[ -n "$fs9" && -d "$fs9" && ! -f "$fs9/.dockerignore" ]]; then
+    info "Creating ${fs9}/.dockerignore (excludes target/ and .git/ from Docker context)"
+    cat > "$fs9/.dockerignore" <<'IGNORE'
+target/
+.git/
+*.swp
+*.swo
+IGNORE
+    ok ".dockerignore created — build context will be much smaller."
+  fi
+
+  # 2. Ensure Dockerfile.server-e2e exists in fs9 repo
+  if [[ -n "$fs9" && -d "$fs9" && ! -f "$fs9/docker/Dockerfile.server-e2e" ]]; then
+    if [[ -f "$SCRIPT_DIR/Dockerfile.fs9-server" ]]; then
+      info "Copying Dockerfile.fs9-server → ${fs9}/docker/Dockerfile.server-e2e"
+      mkdir -p "$fs9/docker"
+      cp "$SCRIPT_DIR/Dockerfile.fs9-server" "$fs9/docker/Dockerfile.server-e2e"
+      ok "Dockerfile.server-e2e installed."
+    else
+      warn "fs9/docker/Dockerfile.server-e2e not found and no reference copy available."
+      warn "The fs9-server build will fail. Copy a Dockerfile.server-e2e into ${fs9}/docker/."
+    fi
+  fi
+
+  # 3. Check for host port conflicts
+  local ports=(5433 8090 9999)
+  local names=("pg-tikv" "pgtikv-admin" "fs9-server")
+  local conflicts=()
+
+  for i in "${!ports[@]}"; do
+    local port="${ports[$i]}"
+    local svc="${names[$i]}"
+    local pid
+    pid=$(ss -tlnp 2>/dev/null | grep ":${port} " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+    if [[ -n "$pid" ]]; then
+      local pname
+      pname=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+      conflicts+=("  port ${port} (${svc}) ← pid ${pid} (${pname})")
+    fi
+  done
+
+  if [[ ${#conflicts[@]} -gt 0 ]]; then
+    warn "Host port conflicts detected:"
+    for c in "${conflicts[@]}"; do echo -e "  ${YELLOW}${c}${NC}"; done
+    printf "  Kill conflicting processes and continue? [Y/n] "
+    read -r answer
+    if [[ "${answer:-Y}" =~ ^[Yy]?$ ]]; then
+      for i in "${!ports[@]}"; do
+        local port="${ports[$i]}"
+        local pid
+        pid=$(ss -tlnp 2>/dev/null | grep ":${port} " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+        if [[ -n "$pid" ]]; then
+          info "  Killing pid ${pid} (port ${port})..."
+          kill "$pid" 2>/dev/null || true
+        fi
+      done
+      sleep 1
+      ok "Conflicting processes killed."
+    else
+      die "Aborting. Stop the conflicting services manually and re-run."
+    fi
+  fi
+}
+
 # ── Reset volumes ────────────────────────────────────────────────────────────
 reset_volumes() {
   warn "Resetting: stopping and removing all containers and volumes..."
@@ -429,6 +499,7 @@ main() {
   fi
 
   setup_env
+  preflight_checks
 
   if $RESET; then
     reset_volumes
