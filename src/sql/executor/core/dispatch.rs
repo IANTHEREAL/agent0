@@ -603,7 +603,7 @@ impl Executor {
                     timezone,
                     session_context::with_max_sort_bytes(
                         max_sort_bytes,
-                        crate::extensions::context::with_context(is_superuser, async {
+                        crate::extensions::context::with_context(is_superuser, self.tenant_keyspace(), async {
                         match stmt {
                             // Transaction Control
                             Statement::StartTransaction { modes, .. } => {

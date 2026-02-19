@@ -617,6 +617,7 @@ impl WorkerEngine {
         let ext_ctx = ExtensionContextOpts {
             is_superuser: true,
             allow_local_fs: false,
+            tenant_keyspace: entry.keyspace.clone(),
         };
 
         with_context_opts(ext_ctx, async {
