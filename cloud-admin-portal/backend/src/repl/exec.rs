@@ -122,7 +122,7 @@ fn detect_tx_state_change(data: &serde_json::Value, current_state: TxState) -> T
 
 fn print_error_with_hints(detail: &str) {
     eprintln!("\x1b[31mERROR:\x1b[0m {}", detail);
-    
+
     if detail.contains("relation") && detail.contains("does not exist") {
         eprintln!("Hint: Run \\dt to see available tables");
     } else if detail.contains("column") && detail.contains("does not exist") {

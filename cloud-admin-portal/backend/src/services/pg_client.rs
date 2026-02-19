@@ -266,12 +266,7 @@ impl PgClient {
         false
     }
 
-    pub async fn bootstrap_default_extensions(
-        &self,
-        keyspace: &str,
-        user: &str,
-        password: &str,
-    ) {
+    pub async fn bootstrap_default_extensions(&self, keyspace: &str, user: &str, password: &str) {
         const DEFAULT_EXTENSIONS: &[&str] = &["http", "fs9", "pg_cron"];
         let client = match self.connect(keyspace, user, password).await {
             Ok(c) => c,
@@ -402,7 +397,10 @@ impl PgClient {
         sql: &str,
     ) -> Result<String, String> {
         let client = self.connect(keyspace, user, password).await?;
-        let rows = client.simple_query(sql).await.map_err(|e| format_pg_error(&e))?;
+        let rows = client
+            .simple_query(sql)
+            .await
+            .map_err(|e| format_pg_error(&e))?;
         let mut output = String::new();
         for msg in rows {
             if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {

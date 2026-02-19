@@ -130,10 +130,7 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str, executor: Sql
             Some(&headers),
         )
         .await;
-    let db_name = db_info["name"]
-        .as_str()
-        .unwrap_or(id)
-        .to_string();
+    let db_name = db_info["name"].as_str().unwrap_or(id).to_string();
     let api_url = api.base_url().to_string();
     let is_direct = matches!(executor, SqlExecutor::Direct(_));
 
@@ -153,14 +150,21 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str, executor: Sql
         let prefix_len = prefix.len();
         (
             format!("{}{}", prefix, suffix),
-            format!("{}{}", " ".repeat(prefix_len.saturating_sub(1)), cont_suffix),
+            format!(
+                "{}{}",
+                " ".repeat(prefix_len.saturating_sub(1)),
+                cont_suffix
+            ),
         )
     };
 
     let (mut prompt_main, mut prompt_cont) = get_prompts(TxState::Idle, &db_name, is_direct);
 
     let mode_label = if is_direct { " (direct pgwire)" } else { "" };
-    eprintln!("db9 sql — connected to '{}' ({}){}", db_name, id, mode_label);
+    eprintln!(
+        "db9 sql — connected to '{}' ({}){}",
+        db_name, id, mode_label
+    );
     eprintln!("Type \\? for help, \\q to quit.\n");
 
     let handle = tokio::runtime::Handle::current();
@@ -211,7 +215,11 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str, executor: Sql
         rl.load_history(&history_path).ok();
 
         let mut buffer = String::new();
-        let mut show_timing = file_config.repl.as_ref().and_then(|r| r.timing).unwrap_or(true);
+        let mut show_timing = file_config
+            .repl
+            .as_ref()
+            .and_then(|r| r.timing)
+            .unwrap_or(true);
         let mut repl_state =
             ReplState::with_config(id.clone(), db_name.clone(), api_url, executor, &file_config);
 
@@ -362,7 +370,8 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str, executor: Sql
                             &sql,
                         ));
                         repl_state.tx_state = new_tx_state;
-                        (prompt_main, prompt_cont) = get_prompts(new_tx_state, &repl_state.db_name, is_direct);
+                        (prompt_main, prompt_cont) =
+                            get_prompts(new_tx_state, &repl_state.db_name, is_direct);
                         repl_state.last_query = Some(sql);
                     }
                     commands::DispatchResult::HighlightChanged(enabled) => {
@@ -390,7 +399,12 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str, executor: Sql
                                 eprintln!();
 
                                 let new_tx_state = handle.block_on(exec::repl_exec(
-                                    &api, &output, &repl_state.db_id, show_timing, &repl_state, &query,
+                                    &api,
+                                    &output,
+                                    &repl_state.db_id,
+                                    show_timing,
+                                    &repl_state,
+                                    &query,
                                 ));
                                 repl_state.tx_state = new_tx_state;
 
@@ -456,7 +470,12 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str, executor: Sql
                 }
 
                 let new_tx_state = handle.block_on(exec::repl_exec(
-                    &api, &output, &repl_state.db_id, show_timing, &repl_state, &sql,
+                    &api,
+                    &output,
+                    &repl_state.db_id,
+                    show_timing,
+                    &repl_state,
+                    &sql,
                 ));
 
                 if is_expanded_override {
@@ -464,7 +483,8 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str, executor: Sql
                 }
 
                 repl_state.tx_state = new_tx_state;
-                (prompt_main, prompt_cont) = get_prompts(new_tx_state, &repl_state.db_name, is_direct);
+                (prompt_main, prompt_cont) =
+                    get_prompts(new_tx_state, &repl_state.db_name, is_direct);
                 repl_state.last_query = Some(sql);
                 buffer.clear();
             }

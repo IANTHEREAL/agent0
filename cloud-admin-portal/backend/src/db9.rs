@@ -574,8 +574,19 @@ async fn main() {
         } => cmd_sh(&api, &cli.api_url, id.as_deref(), command.as_deref()).await,
         Commands::Completion { shell } => cmd_completion(shell),
         Commands::Db { ref action } => match action {
-            DbAction::Create { name, region, password } => {
-                cmd_db_create(&api, &cli.effective_output(), name, region.as_deref(), password.as_deref()).await
+            DbAction::Create {
+                name,
+                region,
+                password,
+            } => {
+                cmd_db_create(
+                    &api,
+                    &cli.effective_output(),
+                    name,
+                    region.as_deref(),
+                    password.as_deref(),
+                )
+                .await
             }
             DbAction::List => cmd_db_list(&api, &cli.effective_output()).await,
             DbAction::Status { id } => cmd_db_status(&api, &cli.effective_output(), id).await,
@@ -879,6 +890,11 @@ async fn cmd_login(api: &ApiClient, output: &OutputFormat) {
         process::exit(1);
     }
 
+    // Real login replaces any anonymous session — clear leftover flags.
+    if let Err(e) = clear_anonymous_credentials() {
+        eprintln!("Warning: failed to clear anonymous credentials: {e}");
+    }
+
     match output {
         OutputFormat::Json => {
             let safe = serde_json::json!({
@@ -896,7 +912,56 @@ async fn cmd_login(api: &ApiClient, output: &OutputFormat) {
 }
 
 async fn cmd_claim(api: &ApiClient, output: &OutputFormat) {
-    let token = require_token();
+    let token = match load_token() {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!("You're not logged in.");
+            eprint!("Would you like to [L]ogin or [R]egister? ");
+            io::stdout().flush().ok();
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer).ok();
+            match answer.trim().to_ascii_lowercase().as_str() {
+                "l" | "login" => cmd_login(api, output).await,
+                "r" | "register" => {
+                    cmd_register(api, output).await;
+                    println!();
+                    cmd_login(api, output).await;
+                }
+                _ => {
+                    eprintln!("Aborted. Run 'db9 login' or 'db9 register' first.");
+                    process::exit(1);
+                }
+            }
+            match load_token() {
+                Ok(t) => t,
+                Err(_) => {
+                    eprintln!("Login failed.");
+                    process::exit(1);
+                }
+            }
+        }
+    };
+
+    let is_anon = {
+        let cred_path = config_dir().join("credentials");
+        let content = std::fs::read_to_string(&cred_path).unwrap_or_default();
+        let parsed: toml::Table = content.parse().unwrap_or_default();
+        parsed
+            .get("is_anonymous")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+
+    if !is_anon {
+        match output {
+            OutputFormat::Json => {
+                print_json(&serde_json::json!({"status": "already_claimed"}));
+            }
+            _ => println!("Your account is already registered. Nothing to claim."),
+        }
+        return;
+    }
+
     let headers = make_auth_headers(&token);
     let email = prompt_email();
     let password = prompt_password("Password: ");
@@ -985,7 +1050,13 @@ async fn cmd_init(api: &ApiClient, output: &OutputFormat) {
     println!("\nYou're all set! Run 'db9 --help' to see all available commands.");
 }
 
-async fn cmd_db_create(api: &ApiClient, output: &OutputFormat, name: &str, region: Option<&str>, password: Option<&str>) {
+async fn cmd_db_create(
+    api: &ApiClient,
+    output: &OutputFormat,
+    name: &str,
+    region: Option<&str>,
+    password: Option<&str>,
+) {
     let token = match load_token() {
         Ok(t) => t,
         Err(_) => {
@@ -1424,7 +1495,16 @@ async fn cmd_db_inspect_schemas(api: &ApiClient, output: &OutputFormat, id: &str
 
     match output {
         OutputFormat::Json => print_json(&data),
-        _ => repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off, "NULL", 1, repl::LinestyleMode::Ascii),
+        _ => repl::output::print_sql_result(
+            &data,
+            output,
+            false,
+            &None,
+            ExpandedMode::Off,
+            "NULL",
+            1,
+            repl::LinestyleMode::Ascii,
+        ),
     }
 }
 
@@ -1438,7 +1518,16 @@ async fn cmd_db_inspect_tables(api: &ApiClient, output: &OutputFormat, id: &str)
 
     match output {
         OutputFormat::Json => print_json(&data),
-        _ => repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off, "NULL", 1, repl::LinestyleMode::Ascii),
+        _ => repl::output::print_sql_result(
+            &data,
+            output,
+            false,
+            &None,
+            ExpandedMode::Off,
+            "NULL",
+            1,
+            repl::LinestyleMode::Ascii,
+        ),
     }
 }
 
@@ -1452,7 +1541,16 @@ async fn cmd_db_inspect_indexes(api: &ApiClient, output: &OutputFormat, id: &str
 
     match output {
         OutputFormat::Json => print_json(&data),
-        _ => repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off, "NULL", 1, repl::LinestyleMode::Ascii),
+        _ => repl::output::print_sql_result(
+            &data,
+            output,
+            false,
+            &None,
+            ExpandedMode::Off,
+            "NULL",
+            1,
+            repl::LinestyleMode::Ascii,
+        ),
     }
 }
 
@@ -1664,9 +1762,16 @@ async fn cmd_db_sql(
         let executor = build_executor(api, id, true, dsn).await;
         if let repl::SqlExecutor::Direct(exec) = &executor {
             match exec.execute(&sql).await {
-                Ok(data) => {
-                    repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off, "NULL", 1, repl::LinestyleMode::Ascii)
-                }
+                Ok(data) => repl::output::print_sql_result(
+                    &data,
+                    output,
+                    false,
+                    &None,
+                    ExpandedMode::Off,
+                    "NULL",
+                    1,
+                    repl::LinestyleMode::Ascii,
+                ),
                 Err(e) => {
                     eprintln!("\x1b[31mERROR:\x1b[0m {e}");
                     process::exit(1);
@@ -1679,7 +1784,16 @@ async fn cmd_db_sql(
             eprintln!("\x1b[31mERROR:\x1b[0m {err}");
             process::exit(1);
         }
-        repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off, "NULL", 1, repl::LinestyleMode::Ascii);
+        repl::output::print_sql_result(
+            &data,
+            output,
+            false,
+            &None,
+            ExpandedMode::Off,
+            "NULL",
+            1,
+            repl::LinestyleMode::Ascii,
+        );
     }
 }
 
@@ -1933,7 +2047,10 @@ fn resolve_job_id_expr(job: &str) -> String {
     if job.parse::<i64>().is_ok() {
         job.to_string()
     } else {
-        format!("(SELECT jobid FROM cron.job WHERE jobname = '{}')", escape_sql(job))
+        format!(
+            "(SELECT jobid FROM cron.job WHERE jobname = '{}')",
+            escape_sql(job)
+        )
     }
 }
 
