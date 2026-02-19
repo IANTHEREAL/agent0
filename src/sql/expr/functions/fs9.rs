@@ -1,4 +1,4 @@
-use crate::extensions::fs::backend;
+use crate::extensions::fs::{backend, backend::FsBackend, glob};
 use crate::types::Value;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -162,10 +162,39 @@ fn fs9_mtime_remote(path: &str) -> Result<Value> {
     Ok(Value::Text(dt.to_rfc3339_opts(SecondsFormat::Secs, true)))
 }
 
-fn fs9_remove_remote(path: &str) -> Result<Value> {
+fn fs9_remove_remote(path: &str, recursive: bool) -> Result<Value> {
+    let tenant = crate::extensions::context::tenant_keyspace()
+        .ok_or_else(|| anyhow!("fs9: tenant keyspace not available in extension context"))?;
     let bk = get_remote_backend()?;
-    run_async(bk.remove(path))?;
-    Ok(Value::Boolean(true))
+
+    // Check if glob pattern
+    if glob::is_glob_pattern(path) {
+        let files = run_async(glob::expand_glob(
+            &*bk,
+            path,
+            crate::extensions::fs::MAX_FILES_PER_GLOB,
+            None,
+        ))?;
+        let mut count = 0i64;
+        for file in files {
+            if recursive {
+                count += run_async(bk.remove_recursive(&file))? as i64;
+            } else {
+                run_async(bk.remove(&file))?;
+                count += 1;
+            }
+        }
+        return Ok(Value::Int64(count));
+    }
+
+    // Single path
+    if recursive {
+        let count = run_async(bk.remove_recursive(path))?;
+        Ok(Value::Int64(count as i64))
+    } else {
+        run_async(bk.remove(path))?;
+        Ok(Value::Int64(1))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +276,30 @@ fn fs9_mtime_local(path: &str) -> Result<Value> {
     Ok(Value::Text(mtime))
 }
 
-fn fs9_remove_local(path: &str) -> Result<Value> {
+fn fs9_remove_local(path: &str, recursive: bool) -> Result<Value> {
+    let local_backend = backend::local_backend();
+
+    // Check if glob pattern
+    if glob::is_glob_pattern(path) {
+        let files = run_async(glob::expand_glob(
+            local_backend,
+            path,
+            crate::extensions::fs::MAX_FILES_PER_GLOB,
+            None,
+        ))?;
+        let mut count = 0i64;
+        for file in files {
+            if recursive {
+                count += run_async(local_backend.remove_recursive(&file))? as i64;
+            } else {
+                run_async(local_backend.remove(&file))?;
+                count += 1;
+            }
+        }
+        return Ok(Value::Int64(count));
+    }
+
+    // Single path
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -257,11 +309,17 @@ fn fs9_remove_local(path: &str) -> Result<Value> {
     };
 
     if metadata.is_dir() {
-        fs::remove_dir(path).map_err(|err| anyhow!("fs9_remove: {err}"))?;
+        if recursive {
+            let count = run_async(local_backend.remove_recursive(path))?;
+            Ok(Value::Int64(count as i64))
+        } else {
+            fs::remove_dir(path).map_err(|err| anyhow!("fs9_remove: {err}"))?;
+            Ok(Value::Int64(1))
+        }
     } else {
         fs::remove_file(path).map_err(|err| anyhow!("fs9_remove: {err}"))?;
+        Ok(Value::Int64(1))
     }
-    Ok(Value::Boolean(true))
 }
 
 // ---------------------------------------------------------------------------
@@ -365,18 +423,28 @@ pub fn fs9_mtime(args: Vec<Value>) -> Result<Value> {
 
 pub fn fs9_remove(args: Vec<Value>) -> Result<Value> {
     ensure_permissions()?;
-    let path = match expect_text_arg(
-        "fs9_remove",
-        args.into_iter().next().unwrap_or(Value::Null),
-        1,
-    )? {
+    let mut args_iter = args.into_iter();
+    let path = match expect_text_arg("fs9_remove", args_iter.next().unwrap_or(Value::Null), 1)? {
         Some(p) => p,
         None => return Ok(Value::Null),
     };
+
+    // Second argument: recursive (default false)
+    let recursive = match args_iter.next() {
+        Some(Value::Boolean(b)) => b,
+        Some(Value::Null) | None => false,
+        Some(other) => {
+            return Err(anyhow!(
+                "fs9_remove: argument 2 must be BOOLEAN, got {}",
+                other.type_display_name()
+            ))
+        }
+    };
+
     if backend::is_remote_configured() {
-        fs9_remove_remote(&path)
+        fs9_remove_remote(&path, recursive)
     } else {
-        fs9_remove_local(&path)
+        fs9_remove_local(&path, recursive)
     }
 }
 
@@ -567,7 +635,7 @@ mod tests {
             fs9_remove(vec![Value::Text(file.to_string_lossy().into_owned())]).expect("remove")
         })
         .await;
-        assert_eq!(result, Value::Boolean(true));
+        assert_eq!(result, Value::Int64(1));
 
         // Verify file no longer exists
         assert!(!file.exists());
@@ -592,7 +660,7 @@ mod tests {
                 .expect("remove dir")
         })
         .await;
-        assert_eq!(dir_result, Value::Boolean(true));
+        assert_eq!(dir_result, Value::Int64(1));
         assert!(!subdir.exists());
 
         // Null input should return null
@@ -601,6 +669,64 @@ mod tests {
         })
         .await;
         assert_eq!(null_value, Value::Null);
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fs9_remove_recursive() {
+        let dir = unique_base("remove-recursive");
+
+        // Create nested directory structure
+        let subdir = dir.join("subdir");
+        fs::create_dir_all(&subdir).expect("create subdir");
+        fs::write(dir.join("file1.txt"), b"1").expect("write file1");
+        fs::write(subdir.join("file2.txt"), b"2").expect("write file2");
+        fs::write(subdir.join("file3.txt"), b"3").expect("write file3");
+
+        // Non-recursive should fail on non-empty directory
+        let err = context::with_context(true, "", async {
+            fs9_remove(vec![Value::Text(dir.to_string_lossy().into_owned())])
+                .expect_err("non-recursive on non-empty dir should fail")
+        })
+        .await;
+        assert!(err.to_string().contains("fs9_remove"));
+
+        // Recursive should succeed
+        let result = context::with_context(true, "", async {
+            fs9_remove(vec![
+                Value::Text(dir.to_string_lossy().into_owned()),
+                Value::Boolean(true),
+            ])
+            .expect("recursive remove")
+        })
+        .await;
+        // Should return count of files removed (3 files)
+        assert!(matches!(result, Value::Int64(n) if n >= 3));
+        assert!(!dir.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fs9_remove_glob() {
+        let dir = unique_base("remove-glob");
+
+        // Create files
+        fs::write(dir.join("file1.txt"), b"1").expect("write file1");
+        fs::write(dir.join("file2.txt"), b"2").expect("write file2");
+        fs::write(dir.join("keep.csv"), b"keep").expect("write keep");
+
+        // Remove all .txt files using glob
+        let pattern = format!("{}/*.txt", dir.display());
+        let result = context::with_context(true, "", async {
+            fs9_remove(vec![Value::Text(pattern)]).expect("glob remove")
+        })
+        .await;
+        assert_eq!(result, Value::Int64(2));
+
+        // .txt files should be gone, .csv should remain
+        assert!(!dir.join("file1.txt").exists());
+        assert!(!dir.join("file2.txt").exists());
+        assert!(dir.join("keep.csv").exists());
 
         cleanup(&dir);
     }
