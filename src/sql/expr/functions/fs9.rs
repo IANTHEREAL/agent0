@@ -588,7 +588,8 @@ mod tests {
         let subdir = dir.join("empty_dir");
         fs::create_dir(&subdir).expect("create empty dir");
         let dir_result = context::with_context(true, "", async {
-            fs9_remove(vec![Value::Text(subdir.to_string_lossy().into_owned())]).expect("remove dir")
+            fs9_remove(vec![Value::Text(subdir.to_string_lossy().into_owned())])
+                .expect("remove dir")
         })
         .await;
         assert_eq!(dir_result, Value::Boolean(true));
