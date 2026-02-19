@@ -49,6 +49,15 @@ pub(crate) trait FsBackend: Send + Sync {
         max_bytes: usize,
     ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>>;
 
+    /// Remove a file or empty directory at the given path.
+    async fn remove(&self, path: &str) -> Result<()>;
+
+    /// Recursively remove a directory and all its contents.
+    async fn remove_recursive(&self, path: &str) -> Result<u64>;
+
+    /// Create a directory. If recursive is true, creates parent directories as needed.
+    async fn mkdir(&self, path: &str, recursive: bool) -> Result<()>;
+
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
@@ -205,9 +214,80 @@ impl FsBackend for LocalFsBackend {
         Ok(Box::new(BufReader::new(limited)))
     }
 
+    async fn remove(&self, path: &str) -> Result<()> {
+        let info = self.stat(path).await?;
+        if info.is_dir {
+            tokio::fs::remove_dir(path)
+                .await
+                .map_err(|err| anyhow!("fs9_remove: cannot remove directory '{path}': {err}"))?;
+        } else {
+            tokio::fs::remove_file(path)
+                .await
+                .map_err(|err| anyhow!("fs9_remove: cannot remove file '{path}': {err}"))?;
+        }
+        Ok(())
+    }
+
+    async fn remove_recursive(&self, path: &str) -> Result<u64> {
+        let info = self.stat(path).await?;
+        if !info.is_dir {
+            tokio::fs::remove_file(path)
+                .await
+                .map_err(|err| anyhow!("fs9_remove: cannot remove file '{path}': {err}"))?;
+            return Ok(1);
+        }
+
+        // Count files before removing
+        let count = count_files_recursive(path).await;
+        tokio::fs::remove_dir_all(path)
+            .await
+            .map_err(|err| anyhow!("fs9_remove: cannot remove directory '{path}': {err}"))?;
+        Ok(count)
+    }
+
+    async fn mkdir(&self, path: &str, recursive: bool) -> Result<()> {
+        if recursive {
+            tokio::fs::create_dir_all(path)
+                .await
+                .map_err(|err| anyhow!("fs9_mkdir: cannot create directory '{path}': {err}"))?;
+        } else {
+            tokio::fs::create_dir(path)
+                .await
+                .map_err(|err| anyhow!("fs9_mkdir: cannot create directory '{path}': {err}"))?;
+        }
+        Ok(())
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+async fn count_files_recursive(path: &str) -> u64 {
+    let mut count = 0u64;
+    let mut stack = vec![path.to_string()];
+
+    while let Some(current) = stack.pop() {
+        let mut rd = match tokio::fs::read_dir(&current).await {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let file_type = match entry.file_type().await {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+
+            if file_type.is_dir() {
+                stack.push(entry.path().to_string_lossy().to_string());
+            } else {
+                count += 1;
+            }
+        }
+    }
+
+    count
 }
 
 static BACKEND: OnceLock<LocalFsBackend> = OnceLock::new();
@@ -376,6 +456,47 @@ impl FsBackend for Fs9HttpBackend {
         // Download the entire file into memory (max 10MB) and wrap in a Cursor.
         let data = self.read_file(path, max_bytes).await?;
         Ok(Box::new(std::io::Cursor::new(data)))
+    }
+
+    async fn remove(&self, path: &str) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!("{}/api/v1/remove", self.base_url))
+            .bearer_auth(&self.token)
+            .query(&[("path", path)])
+            .send()
+            .await
+            .map_err(|e| anyhow!("fs9: cannot reach fs9-server: {e}"))?;
+        self.check_error(resp, path).await?;
+        Ok(())
+    }
+
+    async fn remove_recursive(&self, path: &str) -> Result<u64> {
+        let resp = self
+            .client
+            .delete(format!("{}/api/v1/remove", self.base_url))
+            .bearer_auth(&self.token)
+            .query(&[("path", path), ("recursive", "true")])
+            .send()
+            .await
+            .map_err(|e| anyhow!("fs9: cannot reach fs9-server: {e}"))?;
+        self.check_error(resp, path).await?;
+        // Remote doesn't return count, just return 1 for success
+        Ok(1)
+    }
+
+    async fn mkdir(&self, path: &str, recursive: bool) -> Result<()> {
+        let recursive_str = if recursive { "true" } else { "false" };
+        let resp = self
+            .client
+            .post(format!("{}/api/v1/mkdir", self.base_url))
+            .bearer_auth(&self.token)
+            .query(&[("path", path), ("recursive", recursive_str)])
+            .send()
+            .await
+            .map_err(|e| anyhow!("fs9: cannot reach fs9-server: {e}"))?;
+        self.check_error(resp, path).await?;
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
