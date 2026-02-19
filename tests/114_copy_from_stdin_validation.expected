@@ -23,13 +23,18 @@ count
 0
 (1 row)
 ERROR:  invalid input syntax for type integer: "abc"
+CONTEXT:  COPY t_copy_validate_type, line 1, column a: "abc"
 ERROR:  null value in column "b" of relation "t_copy_validate_notnull" violates not-null constraint
-DETAIL:  Failing row contains (1, NULL).
+DETAIL:  Failing row contains (1, null).
 ERROR:  new row for relation "t_copy_validate_check" violates check constraint "chk_positive"
 DETAIL:  Failing row contains (-1).
-ERROR:  insert or update on table "public.t_copy_validate_fk_child" violates foreign key constraint "fk_parent"
-DETAIL:  Key (pid)=(999) is not present in table "public.t_copy_validate_fk_parent".
+ERROR:  insert or update on table "t_copy_validate_fk_child" violates foreign key constraint "fk_parent"
+DETAIL:  Key (pid)=(999) is not present in table "t_copy_validate_fk_parent".
 ERROR:  invalid input syntax for type timestamp: "not-a-ts"
+CONTEXT:  COPY t_copy_validate_timestamp, line 1, column a: "not-a-ts"
 ERROR:  invalid input syntax for type time: "99:99"
+CONTEXT:  COPY t_copy_validate_time, line 1, column a: "99:99"
 ERROR:  invalid input syntax for type array: "not-an-array"
+CONTEXT:  COPY t_copy_validate_array, line 1, column a: "not-an-array"
 ERROR:  invalid input syntax for type vector: "not-a-vector"
+CONTEXT:  COPY t_copy_validate_vector, line 1, column a: "not-a-vector"

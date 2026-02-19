@@ -42,6 +42,35 @@ pub(crate) fn table_function_key(name: &ObjectName, args: &[FunctionArg]) -> Str
     format!("{}({})", full_name, rendered_args.join(","))
 }
 
+fn canonical_system_virtual_table_function(func_name: &str) -> Option<&'static str> {
+    match func_name.to_ascii_uppercase().as_str() {
+        "_PGTIKV_SYS_OBSERVABILITY" => Some("_PGTIKV_SYS_OBSERVABILITY"),
+        "_PGTIKV_SYS_QUERY_SAMPLES" => Some("_PGTIKV_SYS_QUERY_SAMPLES"),
+        "_PGTIKV_SYS_EXPORT_DDL" => Some("_PGTIKV_SYS_EXPORT_DDL"),
+        "_PGTIKV_SYS_MIGRATIONS" => Some("_PGTIKV_SYS_MIGRATIONS"),
+        "_PGTIKV_SYS_TRIGGER_QUEUE_STATS" => Some("_PGTIKV_SYS_TRIGGER_QUEUE_STATS"),
+        "_PGTIKV_SYS_TRIGGER_DLQ" => Some("_PGTIKV_SYS_TRIGGER_DLQ"),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_virtual_table_backed_system_function(name: &str) -> bool {
+    let base = name.rsplit('.').next().unwrap_or(name);
+    canonical_system_virtual_table_function(base).is_some()
+}
+
+pub(crate) fn infer_system_virtual_table_function_schema(
+    name: &ObjectName,
+    args: &[FunctionArg],
+) -> Option<TableSchema> {
+    if !args.is_empty() {
+        return None;
+    }
+    let base = name.0.last().map(names::normalize_ident)?;
+    let canonical = canonical_system_virtual_table_function(&base)?;
+    crate::sql::catalog::virtual_tables::virtual_table_schema(canonical)
+}
+
 pub(crate) async fn infer_extension_table_function_schema(
     search_path: &[String],
     schema_opt: Option<&str>,

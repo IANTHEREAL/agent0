@@ -10,8 +10,11 @@ use crate::sql::query_context::QueryContext;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, ColumnDef as SqlColumnDef, ColumnOption,
-    DataType as SqlDataType, Expr, GeneratedAs, ObjectName, OrderByExpr, Query, TableConstraint,
+    DataType as SqlDataType, Expr, GeneratedAs, ObjectName, OrderByExpr, Query, Statement,
+    TableConstraint,
 };
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
 use tikv_client::Transaction;
 
 use super::dml;
@@ -100,10 +103,9 @@ async fn resolve_column_data_type(
                             crate::types::UserTypeKind::Enum { .. } => {
                                 Ok((DataType::UserDefined(full_name), false))
                             }
-                            crate::types::UserTypeKind::Composite { .. } => Err(anyhow!(
-                                "composite type '{}' cannot be used as a column type",
-                                full_name
-                            )),
+                            crate::types::UserTypeKind::Composite { .. } => {
+                                Ok((DataType::UserDefined(full_name), false))
+                            }
                         },
                         None => Ok((sql_datatype_to_internal_strict(sql_type)?, false)),
                     }
@@ -242,28 +244,80 @@ fn assign_generated_check_constraint_names(
     used_names.extend(foreign_keys.iter().map(|fk| fk.name.clone()));
     used_names.extend(checks.iter().filter_map(|c| c.name.as_ref()).cloned());
 
-    for (ordinal, check) in checks.iter_mut().enumerate() {
+    for check in checks.iter_mut() {
         if check.name.is_some() {
             continue;
         }
 
-        let mut suffix = ordinal + 1;
-        loop {
-            let candidate = format!("{}_check{}", table, suffix);
-            suffix += 1;
-            if used_names.insert(candidate.clone()) {
-                check.name = Some(candidate);
-                break;
+        // PostgreSQL convention: {table}_{first_column}_check
+        // Extract the first identifier from the expression that looks like a column name.
+        let first_col = extract_first_column_from_check_expr(&check.expr);
+        let base = if let Some(col) = first_col {
+            format!("{}_{}_check", table, col)
+        } else {
+            format!("{}_check", table)
+        };
+
+        // Ensure uniqueness by appending a suffix if needed
+        if used_names.insert(base.clone()) {
+            check.name = Some(base);
+        } else {
+            let mut suffix = 1usize;
+            loop {
+                let candidate = format!("{}{}", base, suffix);
+                suffix += 1;
+                if used_names.insert(candidate.clone()) {
+                    check.name = Some(candidate);
+                    break;
+                }
             }
         }
     }
 }
 
-fn check_constraint_effective_name(table: &str, ordinal: usize, check: &CheckConstraint) -> String {
-    check
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("{}_check{}", table, ordinal + 1))
+/// Extract the first column-like identifier from a check constraint expression.
+/// E.g., `age > 0` → Some("age"), `salary >= 0` → Some("salary").
+fn extract_first_column_from_check_expr(expr: &str) -> Option<String> {
+    // Simple extraction: find the first identifier token (letters/underscores)
+    // that isn't a SQL keyword.
+    static KEYWORDS: &[&str] = &[
+        "and", "or", "not", "in", "is", "null", "true", "false", "between", "like", "ilike", "any",
+        "all", "exists", "case", "when", "then", "else", "end", "check",
+    ];
+    for word in expr.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        let w = word.trim();
+        if w.is_empty() || w.chars().next().map_or(true, |c| c.is_ascii_digit()) {
+            continue;
+        }
+        if KEYWORDS.contains(&w.to_lowercase().as_str()) {
+            continue;
+        }
+        // Skip common type names and string literals
+        if [
+            "text", "integer", "numeric", "varchar", "int", "bigint", "boolean",
+        ]
+        .contains(&w.to_lowercase().as_str())
+        {
+            continue;
+        }
+        return Some(w.to_lowercase());
+    }
+    None
+}
+
+fn check_constraint_effective_name(
+    table: &str,
+    _ordinal: usize,
+    check: &CheckConstraint,
+) -> String {
+    check.name.clone().unwrap_or_else(|| {
+        let first_col = extract_first_column_from_check_expr(&check.expr);
+        if let Some(col) = first_col {
+            format!("{}_{}_check", table, col)
+        } else {
+            format!("{}_check", table)
+        }
+    })
 }
 
 fn find_check_constraint_index(schema: &TableSchema, table: &str, name: &str) -> Option<usize> {
@@ -923,10 +977,11 @@ pub async fn create_table_from_query_result(
     }
 
     let table_id = store.next_table_id(txn, db_id).await?;
-    let pk_constraint_name = Some(format!(
-        "{}_pkey",
-        table_name.rsplit('.').next().unwrap_or(table_name)
-    ));
+    // CTAS uses an internal synthetic row-id PK for storage only; PostgreSQL
+    // does not expose/reserve a user-visible "<table>_pkey" constraint name.
+    // Use empty-name sentinel (not None) so legacy fallback checks do not
+    // synthesize "<table>_pkey" from pk_indices.
+    let pk_constraint_name = Some(String::new());
     let schema = TableSchema {
         name: table_name.to_string(),
         table_id,
@@ -942,20 +997,6 @@ pub async fn create_table_from_query_result(
     };
     store.create_table(txn, db_id, schema.clone()).await?;
     create_implicit_sequences_for_schema(store, txn, db_id, &schema).await?;
-
-    let table_schema_name = table_name.splitn(2, '.').next().unwrap_or("public");
-    if let Some(pk_name) = &schema.pk_constraint_name {
-        check_relation_name_available(
-            store,
-            txn,
-            db_id,
-            table_schema_name,
-            pk_name,
-            false,
-            Some(table_name),
-        )
-        .await?;
-    }
 
     let row_count = result_rows.len();
     for (i, row) in result_rows.into_iter().enumerate() {
@@ -1014,10 +1055,11 @@ pub async fn create_table_from_select_into(
     }));
 
     let table_id = store.next_table_id(txn, db_id).await?;
-    let pk_constraint_name = Some(format!(
-        "{}_pkey",
-        table_name.rsplit('.').next().unwrap_or(table_name)
-    ));
+    // SELECT INTO uses an internal synthetic row-id PK for storage only; it
+    // must not reserve a user-visible "<table>_pkey" relation name.
+    // Use empty-name sentinel (not None) so legacy fallback checks do not
+    // synthesize "<table>_pkey" from pk_indices.
+    let pk_constraint_name = Some(String::new());
     let schema = TableSchema {
         name: table_name.to_string(),
         table_id,
@@ -1033,20 +1075,6 @@ pub async fn create_table_from_select_into(
     };
     store.create_table(txn, db_id, schema.clone()).await?;
     create_implicit_sequences_for_schema(store, txn, db_id, &schema).await?;
-
-    let table_schema_name = table_name.splitn(2, '.').next().unwrap_or("public");
-    if let Some(pk_name) = &schema.pk_constraint_name {
-        check_relation_name_available(
-            store,
-            txn,
-            db_id,
-            table_schema_name,
-            pk_name,
-            false,
-            Some(table_name),
-        )
-        .await?;
-    }
 
     let row_count = result_rows.len();
     for (i, row) in result_rows.into_iter().enumerate() {
@@ -1292,6 +1320,45 @@ pub async fn execute_create_index(
             }
             _ => {
                 idx_exprs.push(expr.to_string());
+            }
+        }
+    }
+
+    // ── Operator class validation for GIN / GIST ────────────────────
+    // PostgreSQL requires a default operator class for the index method.
+    // For GIN: only array, jsonb, tsvector have defaults.
+    // For GIST: only geometric/range/tsvector/tsquery types have defaults
+    //           (most of which we don't support yet).
+    if let Some(ref m) = method {
+        let needs_opclass_check = matches!(m.as_str(), "gin" | "gist");
+        if needs_opclass_check {
+            for col_name in &idx_cols {
+                if let Some(idx) = schema.column_index(col_name) {
+                    let dt = &schema.columns[idx].data_type;
+                    let has_default_opclass = match m.as_str() {
+                        "gin" => matches!(
+                            dt,
+                            DataType::Array(_) | DataType::Jsonb | DataType::Tsvector
+                        ),
+                        "gist" => matches!(dt, DataType::Tsvector),
+                        _ => true,
+                    };
+                    if !has_default_opclass {
+                        return Err(anyhow!(
+                            "data type {} has no default operator class for access method \"{}\"\nHINT:  You must specify an operator class for the index or define a default operator class for the data type.",
+                            dt.to_string().to_lowercase(),
+                            m
+                        ));
+                    }
+                }
+            }
+            // Expression indexes on gin/gist: we can't easily infer the result
+            // type of arbitrary expressions, so reject them unless they're on
+            // known-good types (conservative approach matching PG behavior).
+            if !idx_exprs.is_empty() && idx_cols.is_empty() {
+                // For expression-only indexes we can't determine the type,
+                // so let them through (PG would also accept if the expression
+                // returns a type with a default opclass).
             }
         }
     }
@@ -2000,21 +2067,45 @@ pub async fn reconcile_index(
 /// - `Qualified { schema, name }` → `"{schema}.{name}"` directly.
 /// - `Unqualified { name }` → search each schema in `search_path` order,
 ///   checking tables, views, and materialized views.  First hit wins.
-///   Fallback: `"{view_schema}.{name}"`.
+///   If no hit exists, returns PostgreSQL-style "relation does not exist".
 async fn resolve_view_deps(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    view_schema: &str,
     search_path: &[String],
+    create_stmt_text: &str,
     raw_deps: std::collections::HashSet<super::binder::RelationDep>,
 ) -> Result<Vec<String>> {
     use super::binder::RelationDep;
+
+    fn missing_relation_err(relation: &str, create_stmt_text: &str) -> anyhow::Error {
+        let pos = create_stmt_text
+            .rfind(relation)
+            .unwrap_or(create_stmt_text.len().saturating_sub(1));
+        let caret = format!("{}^", " ".repeat("LINE 1: ".len() + pos));
+        anyhow!(
+            "relation \"{}\" does not exist\nLINE 1: {}\n{}",
+            relation,
+            create_stmt_text,
+            caret
+        )
+    }
+
     let mut resolved = Vec::with_capacity(raw_deps.len());
     for dep in raw_deps {
         match dep {
             RelationDep::Qualified { schema, name } => {
-                resolved.push(format!("{}.{}", schema, name));
+                let full = format!("{}.{}", schema, name);
+                if !(store.table_exists(txn, db_id, &full).await?
+                    || store.get_view(txn, db_id, &full).await?.is_some()
+                    || store
+                        .get_materialized_view(txn, db_id, &full)
+                        .await?
+                        .is_some())
+                {
+                    return Err(missing_relation_err(&full, create_stmt_text));
+                }
+                resolved.push(full);
             }
             RelationDep::Unqualified { name } => {
                 let mut found = false;
@@ -2033,7 +2124,7 @@ async fn resolve_view_deps(
                     }
                 }
                 if !found {
-                    resolved.push(format!("{}.{}", view_schema, name));
+                    return Err(missing_relation_err(&name, create_stmt_text));
                 }
             }
         }
@@ -2041,6 +2132,37 @@ async fn resolve_view_deps(
     resolved.sort();
     resolved.dedup();
     Ok(resolved)
+}
+
+async fn analyze_view_output_schema(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    query: &Query,
+) -> Result<Vec<(String, DataType)>> {
+    // Build a minimal catalog snapshot from resolved base-table dependencies.
+    // (Sufficient for CREATE OR REPLACE compatibility checks.)
+    let mut catalog = CatalogSnapshot::new(search_path.to_vec(), db_id);
+    let query_str = query.to_string();
+    let create_stmt_text = format!("CREATE VIEW _ddl_schema_check AS {};", query_str);
+    let deps = match super::binder::extract_dependencies(&query_str) {
+        Ok(raw) => {
+            resolve_view_deps(store, txn, db_id, search_path, &create_stmt_text, raw).await?
+        }
+        Err(_) => Vec::new(),
+    };
+    for dep in deps {
+        if let Some(schema) = store.get_schema(txn, db_id, &dep).await? {
+            let bare = dep.rsplit('.').next().unwrap_or(&dep).to_string();
+            let full = dep.clone();
+            catalog.add_table(&bare, full.clone(), schema.clone());
+            catalog.add_table(&full.clone(), full, schema);
+        }
+    }
+    let mut analyzer = Analyzer::new(&catalog);
+    let analyzed = analyzer.analyze_query(query).map_err(SqlError::from)?;
+    Ok(analyzed.output_schema)
 }
 
 pub async fn execute_create_view(
@@ -2059,10 +2181,59 @@ pub async fn execute_create_view(
     let view_name = resolved.full;
 
     let query_str = query.to_string();
+    let create_stmt_text = format!("CREATE VIEW {} AS {};", name, query_str);
+
+    // PostgreSQL parity: CREATE VIEW validates referenced relations up front.
     let deps = match super::binder::extract_dependencies(&query_str) {
-        Ok(raw) => resolve_view_deps(store, txn, db_id, &resolved.schema, search_path, raw).await?,
+        Ok(raw) => {
+            resolve_view_deps(store, txn, db_id, search_path, &create_stmt_text, raw).await?
+        }
         Err(_) => Vec::new(),
     };
+
+    // PostgreSQL parity: CREATE OR REPLACE VIEW may append columns only.
+    if or_replace {
+        if let Some(existing) = store.get_view(txn, db_id, &view_name).await? {
+            let new_output =
+                analyze_view_output_schema(store, txn, db_id, search_path, query).await?;
+
+            let dialect = PostgreSqlDialect {};
+            let old_stmts = Parser::parse_sql(&dialect, &existing.query)
+                .map_err(|e| anyhow!("failed to parse stored view '{}': {}", view_name, e))?;
+            let old_query = match old_stmts.as_slice() {
+                [Statement::Query(q)] => q.as_ref(),
+                _ => {
+                    return Err(anyhow!(
+                        "stored view '{}' does not contain a SELECT query",
+                        view_name
+                    ));
+                }
+            };
+            let old_output =
+                analyze_view_output_schema(store, txn, db_id, search_path, old_query).await?;
+
+            if new_output.len() < old_output.len() {
+                return Err(anyhow!("cannot drop columns from view"));
+            }
+            for (idx, (old_name, old_ty)) in old_output.iter().enumerate() {
+                let (new_name, new_ty) = &new_output[idx];
+                if old_name != new_name {
+                    return Err(anyhow!(
+                        "cannot change name of view column \"{}\" to \"{}\"",
+                        old_name,
+                        new_name
+                    ));
+                }
+                if old_ty != new_ty {
+                    return Err(anyhow!(
+                        "cannot change data type of view column \"{}\"",
+                        old_name
+                    ));
+                }
+            }
+        }
+    }
+
     store
         .create_view(txn, db_id, &view_name, &query_str, deps, or_replace)
         .await?;
@@ -2096,7 +2267,7 @@ pub async fn execute_drop_view(
                         continue;
                     }
                     if !if_exists {
-                        return Err(anyhow!("View '{}' does not exist", name));
+                        return Err(anyhow!("view \"{}\" does not exist", name));
                     }
                     continue;
                 }
@@ -2109,7 +2280,7 @@ pub async fn execute_drop_view(
         }
 
         if !store.drop_view(txn, db_id, &resolved.full).await? && !if_exists {
-            return Err(anyhow!("View '{}' does not exist", resolved.full));
+            return Err(anyhow!("view \"{}\" does not exist", resolved.full));
         }
         last = resolved.full;
     }
@@ -2157,8 +2328,11 @@ pub async fn execute_create_materialized_view(
     }
 
     let query_str = query.to_string();
+    let create_stmt_text = format!("CREATE MATERIALIZED VIEW {} AS {};", name, query_str);
     let deps = match super::binder::extract_dependencies(&query_str) {
-        Ok(raw) => resolve_view_deps(store, txn, db_id, &resolved.schema, search_path, raw).await?,
+        Ok(raw) => {
+            resolve_view_deps(store, txn, db_id, search_path, &create_stmt_text, raw).await?
+        }
         Err(_) => Vec::new(),
     };
     store
@@ -2980,13 +3154,24 @@ pub async fn execute_alter_table(
                 let check_name = if let Some(n) = name.as_ref() {
                     normalize_ident(n)
                 } else {
-                    let mut suffix = 1usize;
-                    loop {
-                        let candidate = format!("{}_check{}", table_object_name, suffix);
-                        if !constraint_name_exists(&schema, &table_object_name, &candidate) {
-                            break candidate;
+                    // PostgreSQL convention: {table}_{first_column}_check
+                    let first_col = extract_first_column_from_check_expr(&expr_str);
+                    let base = if let Some(col) = first_col {
+                        format!("{}_{}_check", table_object_name, col)
+                    } else {
+                        format!("{}_check", table_object_name)
+                    };
+                    if !constraint_name_exists(&schema, &table_object_name, &base) {
+                        base
+                    } else {
+                        let mut suffix = 1usize;
+                        loop {
+                            let candidate = format!("{}{}", base, suffix);
+                            if !constraint_name_exists(&schema, &table_object_name, &candidate) {
+                                break candidate;
+                            }
+                            suffix += 1;
                         }
-                        suffix += 1;
                     }
                 };
 
@@ -3385,36 +3570,11 @@ pub async fn execute_alter_table(
                 ));
             }
 
-            if let Some(idx) = schema
-                .indexes
-                .iter_mut()
-                .find(|idx| idx.name == old && idx.unique)
-            {
-                let table_schema_name = t.splitn(2, '.').next().unwrap_or("public");
-                check_relation_name_available(
-                    store,
-                    txn,
-                    db_id,
-                    table_schema_name,
-                    &new,
-                    false,
-                    None,
-                )
-                .await?;
-                let old_full = format!("{}.{}", table_schema_name, old);
-                idx.name = new;
-                schema.version += 1;
-                store.update_schema(txn, db_id, schema).await?;
-                store.release_relation_name(txn, db_id, &old_full).await?;
-                return Ok((
-                    ExecuteResult::AlterTable {
-                        table_name: result_table_name,
-                    },
-                    None,
-                ));
-            }
-
-            return Err(anyhow!("Constraint '{}' does not exist", old));
+            return Err(anyhow!(
+                "constraint \"{}\" for table \"{}\" does not exist",
+                old,
+                table_object_name
+            ));
         }
         AlterTableOperation::AlterColumn { column_name, op } => {
             let col_name = normalize_ident(column_name);

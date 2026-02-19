@@ -1,6 +1,11 @@
 use super::*;
 
 impl TikvStore {
+    #[inline]
+    fn index_key_has_null(values: &[Value]) -> bool {
+        values.iter().any(|v| matches!(v, Value::Null))
+    }
+
     /// Encode an index key into the fully-prefixed KV key.
     pub fn make_index_key(
         &self,
@@ -57,7 +62,8 @@ impl TikvStore {
         pk_values: &[Value],
         unique: bool,
     ) -> Result<()> {
-        if unique {
+        let enforce_unique_lookup = unique && !Self::index_key_has_null(values);
+        if enforce_unique_lookup {
             let idx_key = self.key(&encode_index_key_v2(
                 db_id, table_id, index_id, values, None,
             ));
@@ -67,6 +73,9 @@ impl TikvStore {
             let idx_val = encode_pk_values(pk_values);
             txn_put(txn, idx_key, idx_val).await?;
         } else {
+            // PostgreSQL unique indexes treat NULL values as distinct by default.
+            // For unique keys containing NULL, persist with PK-suffixed key shape
+            // (same as non-unique) so multiple NULL rows can coexist.
             let idx_key = self.key(&encode_index_key_v2(
                 db_id,
                 table_id,
@@ -90,7 +99,8 @@ impl TikvStore {
         pk_values: &[Value],
         unique: bool,
     ) -> Result<()> {
-        if unique {
+        let enforce_unique_lookup = unique && !Self::index_key_has_null(values);
+        if enforce_unique_lookup {
             let idx_key = self.key(&encode_index_key_v2(
                 db_id, table_id, index_id, values, None,
             ));
@@ -128,7 +138,8 @@ impl TikvStore {
             return Ok(Vec::new());
         }
 
-        if unique {
+        let enforce_unique_lookup = unique && !Self::index_key_has_null(values);
+        if enforce_unique_lookup {
             let idx_key = self.key(&encode_index_key_v2(
                 db_id, table_id, index_id, values, None,
             ));
@@ -209,8 +220,20 @@ impl TikvStore {
             let mut scanned_pairs = 0usize;
             for pair in pairs {
                 scanned_pairs += 1;
-                let pk_bytes: &[u8] = pair.value().as_ref();
-                let pk = decode_pk_from_index_suffix(pk_bytes, pk_types)?;
+                let pk = if pair.value().is_empty() {
+                    let full_key: &[u8] = pair.key().as_ref().into();
+                    self.decode_non_unique_pk_from_index_key(
+                        full_key,
+                        db_id,
+                        table_id,
+                        index_id,
+                        index_column_types,
+                        pk_types,
+                    )?
+                } else {
+                    let pk_bytes: &[u8] = pair.value().as_ref();
+                    decode_pk_from_index_suffix(pk_bytes, pk_types)?
+                };
                 pks.push(pk);
             }
             kv_stats::record_index_scan_pairs(scanned_pairs);
@@ -298,8 +321,20 @@ impl TikvStore {
             let mut scanned_pairs = 0usize;
             for pair in pairs {
                 scanned_pairs += 1;
-                let pk_bytes: &[u8] = pair.value().as_ref();
-                let pk = decode_pk_from_index_suffix(pk_bytes, pk_types)?;
+                let pk = if pair.value().is_empty() {
+                    let full_key: &[u8] = pair.key().as_ref().into();
+                    self.decode_non_unique_pk_from_index_key(
+                        full_key,
+                        db_id,
+                        table_id,
+                        index_id,
+                        index_column_types,
+                        pk_types,
+                    )?
+                } else {
+                    let pk_bytes: &[u8] = pair.value().as_ref();
+                    decode_pk_from_index_suffix(pk_bytes, pk_types)?
+                };
                 pks.push(pk);
             }
             kv_stats::record_index_scan_pairs(scanned_pairs);

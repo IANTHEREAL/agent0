@@ -204,6 +204,7 @@ fn test_sqlstate_for_executor_error() {
         (
             SqlError::ColumnNotFound {
                 column: "age".into(),
+                hint: None,
             },
             "42703",
         ),

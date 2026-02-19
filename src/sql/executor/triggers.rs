@@ -704,7 +704,8 @@ impl Executor {
                     .drop_function(txn, db_id, &func_full_name, cascade)
                     .await?;
                 if !dropped && !if_exists {
-                    return Err(anyhow!("Function '{}' does not exist", func_full_name));
+                    let bare = func_full_name.rsplit('.').next().unwrap_or(&func_full_name);
+                    return Err(anyhow!("function {}() does not exist", bare));
                 }
                 any_dropped |= dropped;
             }
@@ -769,8 +770,8 @@ impl Executor {
             let func_full_name = match func_resolved {
                 Some(resolved) => resolved.full,
                 None => {
-                    let resolved = names::resolve_ddl_object_name(&function, search_path)?;
-                    return Err(anyhow!("Function '{}' does not exist", resolved.full));
+                    let (_schema, bare_name) = names::split_object_name(&function)?;
+                    return Err(anyhow!("function {}() does not exist", bare_name));
                 }
             };
 

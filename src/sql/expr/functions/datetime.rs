@@ -1,6 +1,7 @@
 use crate::sql::error::SqlError;
 use crate::types::Value;
 use anyhow::{anyhow, Result};
+use chrono::Datelike;
 use std::collections::HashMap;
 
 use super::SqlFn;
@@ -10,6 +11,8 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("EXTRACT", eval_date_part); // EXTRACT is aliased to DATE_PART
     map.insert("DATE_TRUNC", eval_date_trunc);
     map.insert("DATE", eval_date);
+    map.insert("AGE", eval_age);
+    map.insert("TO_CHAR", eval_to_char);
 }
 
 /// DATE_PART(field, source) — extract a sub-field from a date/time value.
@@ -160,4 +163,129 @@ fn eval_date(args: Vec<Value>) -> Result<Value> {
         Some(Value::Null) | None => Ok(Value::Null),
         Some(other) => Err(anyhow!("DATE() cannot convert {:?} to date", other)),
     }
+}
+
+fn eval_to_char(args: Vec<Value>) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(anyhow!("TO_CHAR requires exactly 2 arguments"));
+    }
+
+    let value = &args[0];
+    let pattern = match &args[1] {
+        Value::Text(s) => s,
+        Value::Null => return Ok(Value::Null),
+        other => return Err(anyhow!("TO_CHAR format must be text, got {:?}", other)),
+    };
+
+    let dt = match value {
+        Value::Timestamp(ts) => chrono::DateTime::from_timestamp_millis(*ts)
+            .ok_or_else(|| anyhow!("invalid timestamp"))?
+            .naive_utc(),
+        Value::Date(days) => {
+            let ts = crate::types::date::date_days_to_timestamp_millis(*days)?;
+            chrono::DateTime::from_timestamp_millis(ts)
+                .ok_or_else(|| anyhow!("invalid date"))?
+                .naive_utc()
+        }
+        Value::Text(s) => match crate::sql::expr::parse_timestamp_string(s)? {
+            Value::Timestamp(ts) => chrono::DateTime::from_timestamp_millis(ts)
+                .ok_or_else(|| anyhow!("invalid timestamp"))?
+                .naive_utc(),
+            _ => return Err(anyhow!("TO_CHAR cannot convert text to timestamp")),
+        },
+        Value::Null => return Ok(Value::Null),
+        other => return Err(anyhow!("TO_CHAR cannot format {:?}", other)),
+    };
+
+    // Minimal PostgreSQL-compatible token subset used by integration tests.
+    let chrono_pattern = pattern
+        .replace("HH24", "%H")
+        .replace("YYYY", "%Y")
+        .replace("MM", "%m")
+        .replace("DD", "%d")
+        .replace("MI", "%M")
+        .replace("SS", "%S");
+
+    Ok(Value::Text(dt.format(&chrono_pattern).to_string()))
+}
+
+fn eval_age(args: Vec<Value>) -> Result<Value> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(anyhow!("AGE requires 1 or 2 arguments"));
+    }
+    if args.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+
+    let end_ts = value_to_naive_datetime(&args[0])?;
+    let start_ts = if args.len() == 2 {
+        value_to_naive_datetime(&args[1])?
+    } else {
+        chrono::Utc::now().naive_utc()
+    };
+
+    let (end_ts, start_ts, sign) = if end_ts >= start_ts {
+        (end_ts, start_ts, 1i32)
+    } else {
+        (start_ts, end_ts, -1i32)
+    };
+
+    let mut months = (end_ts.date().year() - start_ts.date().year()) * 12
+        + (end_ts.date().month() as i32 - start_ts.date().month() as i32);
+    if (end_ts.date().day(), end_ts.time()) < (start_ts.date().day(), start_ts.time()) {
+        months -= 1;
+    }
+
+    let anchor = add_months(start_ts, months)?;
+    let millis = (end_ts - anchor).num_milliseconds();
+
+    Ok(Value::Interval(crate::types::IntervalValue::new(
+        sign * months,
+        (sign as i64) * millis,
+    )))
+}
+
+fn value_to_naive_datetime(v: &Value) -> Result<chrono::NaiveDateTime> {
+    match v {
+        Value::Timestamp(ts) => chrono::DateTime::from_timestamp_millis(*ts)
+            .ok_or_else(|| anyhow!("invalid timestamp"))
+            .map(|dt| dt.naive_utc()),
+        Value::Date(days) => {
+            let ts = crate::types::date::date_days_to_timestamp_millis(*days)?;
+            chrono::DateTime::from_timestamp_millis(ts)
+                .ok_or_else(|| anyhow!("invalid date"))
+                .map(|dt| dt.naive_utc())
+        }
+        Value::Text(s) => match crate::sql::expr::parse_timestamp_string(s)? {
+            Value::Timestamp(ts) => chrono::DateTime::from_timestamp_millis(ts)
+                .ok_or_else(|| anyhow!("invalid timestamp"))
+                .map(|dt| dt.naive_utc()),
+            _ => Err(anyhow!("invalid timestamp text")),
+        },
+        Value::Null => Err(anyhow!("AGE cannot take NULL directly")),
+        other => Err(anyhow!("AGE cannot convert {:?} to timestamp", other)),
+    }
+}
+
+fn days_in_month(year: i32, month: u32) -> Result<u32> {
+    let first_of_next = if month == 12 {
+        chrono::NaiveDate::from_ymd_opt(year + 1, 1, 1)
+    } else {
+        chrono::NaiveDate::from_ymd_opt(year, month + 1, 1)
+    }
+    .ok_or_else(|| anyhow!("invalid year/month"))?;
+    let last_of_month = first_of_next - chrono::Duration::days(1);
+    Ok(last_of_month.day())
+}
+
+fn add_months(dt: chrono::NaiveDateTime, months: i32) -> Result<chrono::NaiveDateTime> {
+    let date = dt.date();
+    let total_months = date.year() * 12 + date.month0() as i32 + months;
+    let year = total_months.div_euclid(12);
+    let month0 = total_months.rem_euclid(12) as u32;
+    let month = month0 + 1;
+    let day = date.day().min(days_in_month(year, month)?);
+    let new_date =
+        chrono::NaiveDate::from_ymd_opt(year, month, day).ok_or_else(|| anyhow!("invalid date"))?;
+    Ok(new_date.and_time(dt.time()))
 }

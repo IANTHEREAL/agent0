@@ -162,6 +162,7 @@ async fn eval_join_filter(
                     .materialize_expr_for_row(
                         expr,
                         row,
+                        ctx.outer_row.as_ref(),
                         Some(output_schema),
                         ctx.txn,
                         ctx.db_id,

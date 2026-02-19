@@ -285,7 +285,7 @@ fn fold_subtree_if_safe(expr: TypedExpr, qctx: &QueryContext) -> TypedExpr {
     }
 }
 
-fn is_fold_candidate(expr: &TypedExpr) -> bool {
+pub(crate) fn is_fold_candidate(expr: &TypedExpr) -> bool {
     !expr_any(expr, &|node| match &node.kind {
         TypedExprKind::ColumnRef { .. }
         | TypedExprKind::AggregateCall { .. }
@@ -327,6 +327,7 @@ pub(crate) fn is_volatile_or_side_effecting_builtin(name: &str) -> bool {
         "NEXTVAL"
             | "CURRVAL"
             | "SETVAL"
+            | "PG_SLEEP"
             | "RANDOM"
             | "SETSEED"
             | "GEN_RANDOM_UUID"

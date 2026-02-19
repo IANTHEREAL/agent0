@@ -10,8 +10,11 @@ use anyhow::{anyhow, Result};
 /// The returned value is `local_minus_utc` (same sign convention as PostgreSQL):
 /// - `"Asia/Shanghai"` → `+8 * 3600`
 /// - `"America/New_York"` → `-5 * 3600` (MVP: fixed offset, DST not applied)
-/// - `"+08:00"` → `+8 * 3600`
-/// - `"-05:00"` → `-5 * 3600`
+///
+/// **POSIX convention for numeric offsets** (matching PostgreSQL behavior):
+/// Bare numeric offsets use POSIX convention where the sign is inverted from ISO 8601.
+/// - `"+08:00"` → `-8 * 3600` (POSIX +08 means west of UTC, i.e. UTC-8)
+/// - `"-05:00"` → `+5 * 3600` (POSIX -05 means east of UTC, i.e. UTC+5)
 pub(crate) fn parse_timezone_offset_seconds(zone: &str) -> Result<i32> {
     let zone = zone.trim();
     if zone.is_empty() {
@@ -103,7 +106,9 @@ fn parse_offset_string_seconds(s: &str) -> Option<i32> {
         return None;
     }
 
-    Some(sign * (hours * 3600 + mins * 60))
+    // Negate: PostgreSQL uses POSIX convention for bare numeric offsets,
+    // where the sign is inverted from ISO 8601.
+    Some(-sign * (hours * 3600 + mins * 60))
 }
 
 #[cfg(test)]
@@ -127,9 +132,10 @@ mod tests {
 
     #[test]
     fn test_parse_timezone_offset_seconds_numeric_offsets() {
-        assert_eq!(parse_timezone_offset_seconds("+08:00").unwrap(), 8 * 3600);
-        assert_eq!(parse_timezone_offset_seconds("-05:00").unwrap(), -5 * 3600);
-        assert_eq!(parse_timezone_offset_seconds("+8").unwrap(), 8 * 3600);
+        // POSIX convention: sign is inverted from ISO 8601
+        assert_eq!(parse_timezone_offset_seconds("+08:00").unwrap(), -8 * 3600);
+        assert_eq!(parse_timezone_offset_seconds("-05:00").unwrap(), 5 * 3600);
+        assert_eq!(parse_timezone_offset_seconds("+8").unwrap(), -8 * 3600);
         assert_eq!(parse_timezone_offset_seconds("-0").unwrap(), 0);
     }
 

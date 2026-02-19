@@ -3,6 +3,7 @@ use async_trait::async_trait;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
+use crate::sql::expr::classify::needs_async;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::query_context::QueryContext;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
@@ -252,11 +253,39 @@ impl ProjectOperator {
         }
     }
 
-    fn project_row(&self, input: &Row, query_ctx: &QueryContext) -> Result<Row> {
+    async fn eval_expr_in_ctx(
+        &self,
+        expr: &TypedExpr,
+        input: &Row,
+        ctx: &mut ExecutionContext<'_>,
+    ) -> Result<Value> {
+        if needs_async(expr) {
+            let materialized = ctx
+                .executor
+                .materialize_expr_for_row(
+                    expr,
+                    input,
+                    ctx.outer_row.as_ref(),
+                    Some(self.child.schema()),
+                    ctx.txn,
+                    ctx.db_id,
+                    ctx.sequence_values,
+                    ctx.search_path,
+                    ctx.cte_tables,
+                    ctx.query_ctx,
+                )
+                .await?;
+            eval_typed_expr(&materialized, input, ctx.query_ctx)
+        } else {
+            eval_typed_expr(expr, input, ctx.query_ctx)
+        }
+    }
+
+    async fn project_row(&self, input: &Row, ctx: &mut ExecutionContext<'_>) -> Result<Row> {
         let mut values = Vec::with_capacity(self.expressions.len());
 
         for expr in &self.expressions {
-            let value = eval_typed_expr(expr, input, query_ctx)?;
+            let value = self.eval_expr_in_ctx(expr, input, ctx).await?;
             values.push(value);
         }
 
@@ -264,18 +293,22 @@ impl ProjectOperator {
     }
 
     /// Project a row that contains SRFs, returning a vector of expanded rows.
-    fn project_row_with_srf(&self, input: &Row, query_ctx: &QueryContext) -> Result<Vec<Row>> {
+    async fn project_row_with_srf(
+        &self,
+        input: &Row,
+        ctx: &mut ExecutionContext<'_>,
+    ) -> Result<Vec<Row>> {
         // First, evaluate all expressions and collect SRF outputs.
         let mut base_values = Vec::with_capacity(self.expressions.len());
         let mut srf_outputs: Vec<(usize, Vec<Value>)> = Vec::new();
 
         for (i, expr) in self.expressions.iter().enumerate() {
             if let Some(&(_, kind)) = self.srf_indices.iter().find(|(idx, _)| *idx == i) {
-                let outputs = eval_srf(kind, expr, input, query_ctx)?;
+                let outputs = eval_srf(kind, expr, input, ctx.query_ctx)?;
                 srf_outputs.push((i, outputs));
                 base_values.push(Value::Null); // placeholder
             } else {
-                let value = eval_typed_expr(expr, input, query_ctx)?;
+                let value = self.eval_expr_in_ctx(expr, input, ctx).await?;
                 base_values.push(value);
             }
         }
@@ -335,7 +368,7 @@ impl PhysicalOperator for ProjectOperator {
         if self.srf_indices.is_empty() {
             // No SRFs — fast path, same as before.
             if let Some(row) = self.child.next(ctx).await? {
-                let projected = self.project_row(&row, ctx.query_ctx)?;
+                let projected = self.project_row(&row, ctx).await?;
                 Ok(Some(projected))
             } else {
                 Ok(None)
@@ -346,7 +379,7 @@ impl PhysicalOperator for ProjectOperator {
                 let Some(row) = self.child.next(ctx).await? else {
                     return Ok(None);
                 };
-                let mut expanded = self.project_row_with_srf(&row, ctx.query_ctx)?;
+                let mut expanded = self.project_row_with_srf(&row, ctx).await?;
                 if expanded.is_empty() {
                     continue; // SRFs returned empty, skip this input row.
                 }
@@ -390,6 +423,8 @@ impl PhysicalOperator for ProjectOperator {
 mod tests {
     use super::*;
     use crate::sql::analyzer::types::{BinaryOp as TypedBinaryOp, TypedExpr, TypedExprKind};
+    use crate::sql::expr::typed_eval::eval_typed_expr;
+    use crate::sql::query_context::QueryContext;
     use crate::types::ColumnDef;
 
     fn test_schema() -> TableSchema {
@@ -446,6 +481,16 @@ mod tests {
             },
             data_type,
         }
+    }
+
+    fn project_row_sync(project: &ProjectOperator, input: &Row) -> Row {
+        let query_ctx = QueryContext::from_task_locals();
+        let values = project
+            .expressions
+            .iter()
+            .map(|expr| eval_typed_expr(expr, input, &query_ctx).unwrap())
+            .collect();
+        Row::new(values)
     }
 
     #[test]
@@ -511,9 +556,7 @@ mod tests {
             Value::Text("Alice".to_string()),
             Value::Int32(30),
         ]);
-        let result = project
-            .project_row(&input, &QueryContext::from_task_locals())
-            .unwrap();
+        let result = project_row_sync(&project, &input);
 
         assert_eq!(result.values.len(), 1);
         assert_eq!(result.values[0], Value::Text("Alice".to_string()));
@@ -551,9 +594,7 @@ mod tests {
             Value::Text("Alice".to_string()),
             Value::Int32(30),
         ]);
-        let result = project
-            .project_row(&input, &QueryContext::from_task_locals())
-            .unwrap();
+        let result = project_row_sync(&project, &input);
 
         assert_eq!(result.values.len(), 1);
         assert_eq!(result.values[0], Value::Int32(15));
@@ -577,9 +618,7 @@ mod tests {
         let project = ProjectOperator::new(child, expressions, output_names, output_types);
 
         let input = Row::new(vec![Value::Int32(1), Value::Null, Value::Int32(30)]);
-        let result = project
-            .project_row(&input, &QueryContext::from_task_locals())
-            .unwrap();
+        let result = project_row_sync(&project, &input);
 
         assert_eq!(result.values.len(), 2);
         assert_eq!(result.values[0], Value::Int32(1));

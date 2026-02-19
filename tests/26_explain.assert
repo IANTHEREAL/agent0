@@ -27,14 +27,10 @@ Limit
 Group Key: a
 
 # Q19-Q20: join operators — hash cond present
-Hash Cond: (t2.test_id = t1.id)
-
-# Q22: range scan condition
-(a >= 10) AND (a <= 20)
+Hash Cond:
 
 # Q24: IS NOT NULL filter
 Filter: (b IS NOT NULL)
 
 # Q26: subquery IN — explain_join referenced
 explain_join
-

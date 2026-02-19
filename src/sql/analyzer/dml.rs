@@ -8,7 +8,7 @@ use sqlparser::ast::{self, Expr, Ident, ObjectName, OnInsert, Query, SelectItem,
 
 use crate::sql::names::{normalize_ident, split_object_name};
 use crate::sql::types::cast::CastContext;
-use crate::types::DataType;
+use crate::types::{DataType, Value};
 
 use super::error::AnalyzerError;
 use super::scope::Scope;
@@ -123,7 +123,7 @@ impl<'a> Analyzer<'a> {
         let analyzed_returning = if let Some(ret_items) = returning {
             self.scopes
                 .push(Scope::from_table_schema(&target_scope_name, &schema));
-            let (proj, _) = self.analyze_projection(ret_items)?;
+            let (proj, _) = self.analyze_projection(ret_items, None)?;
             self.scopes.pop();
             Some(proj)
         } else {
@@ -174,7 +174,7 @@ impl<'a> Analyzer<'a> {
 
                     let where_clause = if let Some(ref sel) = do_update.selection {
                         let analyzed = self.analyze_expr(sel)?;
-                        self.ensure_boolean_dml(&analyzed)?;
+                        let analyzed = self.ensure_boolean_dml(analyzed)?;
                         Some(analyzed)
                     } else {
                         None
@@ -295,7 +295,7 @@ impl<'a> Analyzer<'a> {
         // Analyze WHERE.
         let analyzed_where = if let Some(sel) = selection {
             let analyzed = self.analyze_expr(sel)?;
-            self.ensure_boolean_dml(&analyzed)?;
+            let analyzed = self.ensure_boolean_dml(analyzed)?;
             Some(analyzed)
         } else {
             None
@@ -303,7 +303,7 @@ impl<'a> Analyzer<'a> {
 
         // Analyze RETURNING.
         let analyzed_returning = if let Some(ret_items) = returning {
-            let (proj, _) = self.analyze_projection(ret_items)?;
+            let (proj, _) = self.analyze_projection(ret_items, None)?;
             Some(proj)
         } else {
             None
@@ -382,7 +382,7 @@ impl<'a> Analyzer<'a> {
         // Analyze WHERE.
         let analyzed_where = if let Some(sel) = selection {
             let analyzed = self.analyze_expr(sel)?;
-            self.ensure_boolean_dml(&analyzed)?;
+            let analyzed = self.ensure_boolean_dml(analyzed)?;
             Some(analyzed)
         } else {
             None
@@ -390,7 +390,7 @@ impl<'a> Analyzer<'a> {
 
         // Analyze RETURNING.
         let analyzed_returning = if let Some(ret_items) = returning {
-            let (proj, _) = self.analyze_projection(ret_items)?;
+            let (proj, _) = self.analyze_projection(ret_items, None)?;
             Some(proj)
         } else {
             None
@@ -447,7 +447,7 @@ impl<'a> Analyzer<'a> {
         schema
             .columns
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(col_name))
+            .position(|c| c.name == col_name)
             .ok_or_else(|| AnalyzerError::DmlColumnNotFound {
                 column: col_name.to_string(),
                 table: table_name.to_string(),
@@ -512,14 +512,28 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Validate that an expression has Boolean type (DML WHERE context).
-    fn ensure_boolean_dml(&self, expr: &TypedExpr) -> Result<(), AnalyzerError> {
-        if expr.data_type != DataType::Boolean {
-            Err(AnalyzerError::DmlWhereNotBoolean {
-                found: expr.data_type.clone(),
-            })
-        } else {
-            Ok(())
+    fn ensure_boolean_dml(&self, expr: TypedExpr) -> Result<TypedExpr, AnalyzerError> {
+        if expr.data_type == DataType::Boolean {
+            return Ok(expr);
         }
+
+        if expr.is_null_constant() {
+            return Ok(TypedExpr::null(DataType::Boolean));
+        }
+        if matches!(&expr.kind, TypedExprKind::Constant(Value::Text(_))) {
+            return Ok(TypedExpr::new(
+                TypedExprKind::Cast {
+                    expr: Box::new(expr),
+                    target_type: DataType::Boolean,
+                    cast_context: CastContext::Implicit,
+                },
+                DataType::Boolean,
+            ));
+        }
+
+        Err(AnalyzerError::DmlWhereNotBoolean {
+            found: expr.data_type,
+        })
     }
 }
 

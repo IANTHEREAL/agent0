@@ -39,7 +39,11 @@ impl ResolvedName {
 }
 
 pub(crate) fn default_schema(search_path: &[String]) -> &str {
-    search_path.first().map(|s| s.as_str()).unwrap_or("public")
+    search_path
+        .iter()
+        .map(|s| s.as_str())
+        .find(|s| !s.eq_ignore_ascii_case("$user"))
+        .unwrap_or("public")
 }
 
 pub(crate) fn validate_schema_ident(schema: &str) -> Result<()> {
@@ -109,10 +113,15 @@ pub(crate) fn resolve_ddl_object_name(
 }
 
 fn search_path_schemas<'a>(search_path: &'a [String]) -> Vec<&'a str> {
-    if search_path.is_empty() {
-        return vec!["public"];
+    let mut schemas: Vec<&str> = search_path
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| !s.eq_ignore_ascii_case("$user"))
+        .collect();
+    if schemas.is_empty() {
+        schemas.push("public");
     }
-    search_path.iter().map(|s| s.as_str()).collect()
+    schemas
 }
 
 pub(crate) async fn resolve_existing_table_name(
@@ -355,6 +364,14 @@ mod tests {
         let resolved =
             resolve_ddl_object_name(&name, &["app".to_string(), "public".to_string()]).unwrap();
         assert_eq!(resolved.full, "app.t");
+    }
+
+    #[test]
+    fn resolve_ddl_object_name_skips_user_placeholder_head() {
+        let name = ObjectName(vec![ident("t")]);
+        let resolved =
+            resolve_ddl_object_name(&name, &["$user".to_string(), "public".to_string()]).unwrap();
+        assert_eq!(resolved.full, "public.t");
     }
 
     #[test]

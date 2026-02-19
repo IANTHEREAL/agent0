@@ -26,6 +26,13 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("HAS_SCHEMA_PRIVILEGE", has_privilege);
     map.insert("HAS_TABLE_PRIVILEGE", has_privilege);
     map.insert("HAS_DATABASE_PRIVILEGE", has_privilege);
+    // Binary send functions (bytea serialization)
+    map.insert("INT4SEND", int4send);
+    map.insert("INT8SEND", int8send);
+    map.insert("UUID_SEND", uuid_send);
+    // Bit manipulation on bytea
+    map.insert("SET_BIT", set_bit_bytea);
+    map.insert("GET_BIT", get_bit_bytea);
 }
 
 fn pg_typeof_name(val: &Value) -> String {
@@ -105,26 +112,65 @@ pub fn format_type(args: Vec<Value>) -> Result<Value> {
         Value::Null => return Ok(Value::Null),
         _ => 0,
     };
-    let type_name = pg_types::format_type_name_for_oid(oid).unwrap_or("text");
-    Ok(Value::Text(type_name.to_string()))
+    let typmod = match iter.next() {
+        Some(Value::Int32(n)) => n as i64,
+        Some(Value::Int64(n)) => n,
+        _ => -1,
+    };
+    // Handle types that need typmod for canonical name
+    let formatted = match oid {
+        pg_types::OID_VARCHAR => {
+            if typmod > 0 {
+                format!("character varying({})", typmod - 4)
+            } else {
+                "character varying".to_string()
+            }
+        }
+        pg_types::OID_BPCHAR => {
+            if typmod > 0 {
+                format!("character({})", typmod - 4)
+            } else {
+                "character".to_string()
+            }
+        }
+        pg_types::OID_NUMERIC => {
+            if typmod > 0 {
+                let precision = ((typmod - 4) >> 16) & 0xffff;
+                let scale = (typmod - 4) & 0xffff;
+                format!("numeric({},{})", precision, scale)
+            } else {
+                "numeric".to_string()
+            }
+        }
+        _ => pg_types::format_type_name_for_oid(oid)
+            .unwrap_or("text")
+            .to_string(),
+    };
+    Ok(Value::Text(formatted))
 }
 
 pub fn pg_is_in_recovery(_args: Vec<Value>) -> Result<Value> {
     Ok(Value::Boolean(false))
 }
 
-pub fn pg_table_is_visible(_args: Vec<Value>) -> Result<Value> {
-    Ok(Value::Boolean(true))
+pub fn pg_table_is_visible(args: Vec<Value>) -> Result<Value> {
+    match args.into_iter().next() {
+        Some(Value::Null) | None => Ok(Value::Null),
+        Some(_) => Ok(Value::Boolean(true)),
+    }
 }
 
 /// Check if a type is visible in the current search_path.
 ///
 /// In pg-tikv, all types within the keyspace are visible, so this always
-/// returns true (similar to pg_table_is_visible).
+/// returns true for non-NULL inputs (similar to pg_table_is_visible).
 ///
 /// PostgreSQL signature: pg_type_is_visible(type_oid oid) → boolean
-pub fn pg_type_is_visible(_args: Vec<Value>) -> Result<Value> {
-    Ok(Value::Boolean(true))
+pub fn pg_type_is_visible(args: Vec<Value>) -> Result<Value> {
+    match args.into_iter().next() {
+        Some(Value::Null) | None => Ok(Value::Null),
+        Some(_) => Ok(Value::Boolean(true)),
+    }
 }
 
 pub fn clock_timestamp(_args: Vec<Value>) -> Result<Value> {
@@ -262,6 +308,132 @@ pub fn has_privilege(_args: Vec<Value>) -> Result<Value> {
     Ok(Value::Boolean(true))
 }
 
+/// int4send(integer) → bytea — 4-byte big-endian encoding
+pub fn int4send(args: Vec<Value>) -> Result<Value> {
+    let val = args.into_iter().next().unwrap_or(Value::Null);
+    match val {
+        Value::Null => Ok(Value::Null),
+        Value::Int32(n) => Ok(Value::Bytes(n.to_be_bytes().to_vec())),
+        Value::Int64(n) => Ok(Value::Bytes((n as i32).to_be_bytes().to_vec())),
+        other => {
+            let n: i32 = other
+                .to_string()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("function int4send(integer) does not exist"))?;
+            Ok(Value::Bytes(n.to_be_bytes().to_vec()))
+        }
+    }
+}
+
+/// int8send(bigint) → bytea — 8-byte big-endian encoding
+pub fn int8send(args: Vec<Value>) -> Result<Value> {
+    let val = args.into_iter().next().unwrap_or(Value::Null);
+    match val {
+        Value::Null => Ok(Value::Null),
+        Value::Int64(n) => Ok(Value::Bytes(n.to_be_bytes().to_vec())),
+        Value::Int32(n) => Ok(Value::Bytes((n as i64).to_be_bytes().to_vec())),
+        other => {
+            let n: i64 = other
+                .to_string()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("function int8send(bigint) does not exist"))?;
+            Ok(Value::Bytes(n.to_be_bytes().to_vec()))
+        }
+    }
+}
+
+/// uuid_send(uuid) → bytea — 16-byte binary representation
+pub fn uuid_send(args: Vec<Value>) -> Result<Value> {
+    let val = args.into_iter().next().unwrap_or(Value::Null);
+    match val {
+        Value::Null => Ok(Value::Null),
+        Value::Uuid(bytes) => Ok(Value::Bytes(bytes.to_vec())),
+        Value::Text(s) => {
+            let u: uuid::Uuid = s.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "{}",
+                    crate::sql::error::SqlError::InvalidInputSyntax {
+                        type_name: "uuid".into(),
+                        value: s,
+                    }
+                )
+            })?;
+            Ok(Value::Bytes(u.as_bytes().to_vec()))
+        }
+        _ => anyhow::bail!("function uuid_send(uuid) does not exist"),
+    }
+}
+
+/// set_bit(bytea, n, newvalue) → bytea
+///
+/// PostgreSQL bytea bit indexing: bit `n` maps to byte `n / 8`, and within
+/// that byte the bit position is `n % 8` (LSB-first: bit 0 = rightmost).
+pub fn set_bit_bytea(args: Vec<Value>) -> Result<Value> {
+    let mut iter = args.into_iter();
+    let bytes = match iter.next() {
+        Some(Value::Bytes(b)) => b,
+        Some(Value::Null) | None => return Ok(Value::Null),
+        _ => anyhow::bail!("function set_bit(bytea, integer, integer) does not exist"),
+    };
+    let bit_n = match iter.next() {
+        Some(Value::Int32(n)) => n as i64,
+        Some(Value::Int64(n)) => n,
+        _ => anyhow::bail!("function set_bit(bytea, integer, integer) does not exist"),
+    };
+    let new_val = match iter.next() {
+        Some(Value::Int32(n)) => n,
+        Some(Value::Int64(n)) => n as i32,
+        _ => anyhow::bail!("function set_bit(bytea, integer, integer) does not exist"),
+    };
+
+    if new_val != 0 && new_val != 1 {
+        anyhow::bail!("new bit must be 0 or 1");
+    }
+
+    let total_bits = bytes.len() as i64 * 8;
+    if bit_n < 0 || bit_n >= total_bits {
+        anyhow::bail!("index {} out of valid range, 0..{}", bit_n, total_bits - 1);
+    }
+
+    let mut result = bytes;
+    let byte_idx = (bit_n / 8) as usize;
+    let bit_idx = (bit_n % 8) as u32;
+    if new_val == 1 {
+        result[byte_idx] |= 1 << bit_idx;
+    } else {
+        result[byte_idx] &= !(1 << bit_idx);
+    }
+    Ok(Value::Bytes(result))
+}
+
+/// get_bit(bytea, n) → integer
+///
+/// PostgreSQL bytea bit indexing: bit `n` maps to byte `n / 8`, bit position
+/// `n % 8` within that byte (LSB-first: bit 0 = rightmost).
+pub fn get_bit_bytea(args: Vec<Value>) -> Result<Value> {
+    let mut iter = args.into_iter();
+    let bytes = match iter.next() {
+        Some(Value::Bytes(b)) => b,
+        Some(Value::Null) | None => return Ok(Value::Null),
+        _ => anyhow::bail!("function get_bit(bytea, integer) does not exist"),
+    };
+    let bit_n = match iter.next() {
+        Some(Value::Int32(n)) => n as i64,
+        Some(Value::Int64(n)) => n,
+        _ => anyhow::bail!("function get_bit(bytea, integer) does not exist"),
+    };
+
+    let total_bits = bytes.len() as i64 * 8;
+    if bit_n < 0 || bit_n >= total_bits {
+        anyhow::bail!("index {} out of valid range, 0..{}", bit_n, total_bits - 1);
+    }
+
+    let byte_idx = (bit_n / 8) as usize;
+    let bit_idx = (bit_n % 8) as u32;
+    let bit_val = (bytes[byte_idx] >> bit_idx) & 1;
+    Ok(Value::Int32(bit_val as i32))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::sql::expr::functions::string::{quote_ident, quote_literal, quote_nullable};
@@ -358,6 +530,16 @@ mod tests {
             format_type(vec![Value::Int32(1186)]).unwrap(),
             Value::Text("interval".into())
         );
+        // 2-arg form: VARCHAR with typmod
+        assert_eq!(
+            format_type(vec![Value::Int32(1043), Value::Int32(7)]).unwrap(),
+            Value::Text("character varying(3)".into())
+        );
+        // 2-arg form: VARCHAR without typmod
+        assert_eq!(
+            format_type(vec![Value::Int32(1043), Value::Int32(-1)]).unwrap(),
+            Value::Text("character varying".into())
+        );
     }
 
     #[test]
@@ -366,11 +548,8 @@ mod tests {
             pg_type_is_visible(vec![Value::Int32(12345)]).unwrap(),
             Value::Boolean(true)
         );
-        assert_eq!(
-            pg_type_is_visible(vec![Value::Null]).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(pg_type_is_visible(vec![]).unwrap(), Value::Boolean(true));
+        assert_eq!(pg_type_is_visible(vec![Value::Null]).unwrap(), Value::Null);
+        assert_eq!(pg_type_is_visible(vec![]).unwrap(), Value::Null);
     }
 
     #[test]
@@ -378,6 +557,66 @@ mod tests {
         assert_eq!(
             pg_table_is_visible(vec![Value::Int32(12345)]).unwrap(),
             Value::Boolean(true)
+        );
+        assert_eq!(pg_table_is_visible(vec![Value::Null]).unwrap(), Value::Null);
+        assert_eq!(pg_table_is_visible(vec![]).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_int4send() {
+        // int4send(16909060) → \x01020304 (big-endian)
+        assert_eq!(
+            int4send(vec![Value::Int32(16909060)]).unwrap(),
+            Value::Bytes(vec![0x01, 0x02, 0x03, 0x04])
+        );
+        assert_eq!(int4send(vec![Value::Null]).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_int8send() {
+        // int8send(72623859790382856) → \x0102030405060708 (big-endian)
+        assert_eq!(
+            int8send(vec![Value::Int64(72623859790382856)]).unwrap(),
+            Value::Bytes(vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])
+        );
+        assert_eq!(int8send(vec![Value::Null]).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_set_bit_bytea() {
+        // PG 17.7: set_bit('\x00'::bytea, 0, 1) → \x01 (bit 0 = LSB)
+        assert_eq!(
+            set_bit_bytea(vec![
+                Value::Bytes(vec![0x00]),
+                Value::Int32(0),
+                Value::Int32(1)
+            ])
+            .unwrap(),
+            Value::Bytes(vec![0x01])
+        );
+        // PG 17.7: set_bit('\x00'::bytea, 7, 1) → \x80 (bit 7 = MSB)
+        assert_eq!(
+            set_bit_bytea(vec![
+                Value::Bytes(vec![0x00]),
+                Value::Int32(7),
+                Value::Int32(1)
+            ])
+            .unwrap(),
+            Value::Bytes(vec![0x80])
+        );
+    }
+
+    #[test]
+    fn test_get_bit_bytea() {
+        // PG 17.7: get_bit('\x80'::bytea, 0) → 0 (bit 0 = LSB)
+        assert_eq!(
+            get_bit_bytea(vec![Value::Bytes(vec![0x80]), Value::Int32(0)]).unwrap(),
+            Value::Int32(0)
+        );
+        // PG 17.7: get_bit('\x80'::bytea, 7) → 1 (bit 7 = MSB)
+        assert_eq!(
+            get_bit_bytea(vec![Value::Bytes(vec![0x80]), Value::Int32(7)]).unwrap(),
+            Value::Int32(1)
         );
     }
 }

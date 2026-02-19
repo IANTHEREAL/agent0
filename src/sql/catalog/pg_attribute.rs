@@ -95,6 +95,16 @@ impl VirtualTable for PgAttribute {
                         (oid, typlen as i64)
                     };
 
+                    // Compute atttypmod from the column type (PG convention)
+                    let atttypmod: i64 = match &col.data_type {
+                        DataType::Varchar(n) => *n as i64 + 4,
+                        DataType::Numeric {
+                            precision: Some(p),
+                            scale: Some(s),
+                        } => ((*p as i64) << 16) | (*s as i64) + 4,
+                        _ => -1,
+                    };
+
                     rows.push(Row::new(vec![
                         int_val(base_table_oid),
                         text_val(&col.name),
@@ -105,7 +115,7 @@ impl VirtualTable for PgAttribute {
                         Value::Boolean(col.is_serial || col.default_expr.is_some()),
                         Value::Boolean(false),
                         Value::Boolean(true),
-                        int_val(-1),
+                        int_val(atttypmod),
                         text_val(""),
                         text_val(""),
                     ]));

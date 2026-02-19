@@ -66,20 +66,12 @@ impl Executor {
                 with_grant_option,
                 ..
             } => {
-                self.require_privilege(
-                    txn,
-                    current_role,
-                    Privilege::SuperUser,
-                    PrivilegeObject::Global,
-                    "privilege",
-                    "privilege".to_string(),
-                )
-                .await?;
                 rbac::execute_grant(
                     &self.store,
                     &self.auth_manager,
                     txn,
                     db_id,
+                    current_role,
                     privileges,
                     objects,
                     grantees,
@@ -93,20 +85,12 @@ impl Executor {
                 grantees,
                 ..
             } => {
-                self.require_privilege(
-                    txn,
-                    current_role,
-                    Privilege::SuperUser,
-                    PrivilegeObject::Global,
-                    "privilege",
-                    "privilege".to_string(),
-                )
-                .await?;
                 rbac::execute_revoke(
                     &self.store,
                     &self.auth_manager,
                     txn,
                     db_id,
+                    current_role,
                     privileges,
                     objects,
                     grantees,

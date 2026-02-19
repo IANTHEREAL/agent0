@@ -11,11 +11,11 @@ use sqlparser::ast::{
     self as ast, Expr, Query, Select, SelectItem, SetExpr, TableFactor, TableWithJoins,
 };
 
-use crate::sql::names::split_object_name;
+use crate::sql::names::{normalize_ident, split_object_name};
 use crate::sql::table_functions::table_function_key;
 use crate::sql::types::coercion::common_type;
 use crate::sql::types::CastContext;
-use crate::types::DataType;
+use crate::types::{ColumnDef, DataType, TableSchema, Value};
 use std::collections::HashSet;
 
 use super::error::AnalyzerError;
@@ -29,15 +29,33 @@ impl<'a> Analyzer<'a> {
     /// The Analyzer contract requires all boolean contexts to be validated at
     /// analysis time. This catches errors like `WHERE text_column` before any
     /// row is touched.
-    fn ensure_boolean(&self, expr: &TypedExpr, context: &str) -> Result<(), AnalyzerError> {
-        if expr.data_type != DataType::Boolean {
-            return Err(AnalyzerError::TypeMismatch {
-                expected: DataType::Boolean,
-                found: expr.data_type.clone(),
-                context: context.to_string(),
-            });
+    fn ensure_boolean(&self, expr: TypedExpr, context: &str) -> Result<TypedExpr, AnalyzerError> {
+        if expr.data_type == DataType::Boolean {
+            return Ok(expr);
         }
-        Ok(())
+
+        // PostgreSQL-style boolean context coercion:
+        // - NULL in predicate context is allowed (NULL::bool => unknown)
+        // - string literals are UNKNOWN and may be cast to bool ('true'/'false')
+        if expr.is_null_constant() {
+            return Ok(TypedExpr::null(DataType::Boolean));
+        }
+        if matches!(&expr.kind, TypedExprKind::Constant(Value::Text(_))) {
+            return Ok(TypedExpr::new(
+                TypedExprKind::Cast {
+                    expr: Box::new(expr),
+                    target_type: DataType::Boolean,
+                    cast_context: CastContext::Implicit,
+                },
+                DataType::Boolean,
+            ));
+        }
+
+        Err(AnalyzerError::TypeMismatch {
+            expected: DataType::Boolean,
+            found: expr.data_type,
+            context: context.to_string(),
+        })
     }
 
     /// Analyze a complete SQL query (top-level entry point).
@@ -47,6 +65,12 @@ impl<'a> Analyzer<'a> {
     pub fn analyze_query(&mut self, query: &Query) -> Result<AnalyzedQuery, AnalyzerError> {
         match &*query.body {
             SetExpr::Select(select) => {
+                // GROUPING SETS/CUBE/ROLLUP are rewritten into UNION ALL over
+                // simple GROUP BY arms so the analyzed pipeline remains single-path.
+                if let Some(rewritten) = self.maybe_rewrite_grouping_sets_query(query, select)? {
+                    return self.analyze_query(&rewritten);
+                }
+
                 // For a simple SELECT, use the combined path that handles
                 // CTEs + FROM + ORDER BY all within one scope.
                 self.analyze_select_complete(
@@ -149,6 +173,424 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn maybe_rewrite_grouping_sets_query(
+        &self,
+        query: &Query,
+        select: &Select,
+    ) -> Result<Option<Query>, AnalyzerError> {
+        let grouping_sets = match &select.group_by {
+            ast::GroupByExpr::Expressions(exprs) if exprs.len() == 1 => match &exprs[0] {
+                Expr::GroupingSets(sets) => sets.clone(),
+                Expr::Rollup(items) => Self::expand_rollup_sets(items),
+                Expr::Cube(items) => Self::expand_cube_sets(items),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+
+        let mut set_arms = Vec::with_capacity(grouping_sets.len());
+        for group_set in grouping_sets {
+            let grouped_keys = self.build_grouped_key_set(&group_set)?;
+            let projection = select
+                .projection
+                .iter()
+                .map(|item| self.rewrite_select_item_for_group_set(item, &grouped_keys))
+                .collect::<Result<Vec<_>, _>>()?;
+            let having = match &select.having {
+                Some(expr) => Some(self.rewrite_expr_for_group_set(expr, &grouped_keys)?),
+                None => None,
+            };
+
+            let mut arm = select.clone();
+            arm.projection = projection;
+            arm.having = having;
+            arm.group_by = ast::GroupByExpr::Expressions(group_set);
+            set_arms.push(SetExpr::Select(Box::new(arm)));
+        }
+
+        if set_arms.is_empty() {
+            return Ok(None);
+        }
+
+        let mut iter = set_arms.into_iter();
+        let first = iter.next().expect("set_arms is non-empty");
+        let body = iter.fold(first, |left, right| SetExpr::SetOperation {
+            op: ast::SetOperator::Union,
+            set_quantifier: ast::SetQuantifier::All,
+            left: Box::new(left),
+            right: Box::new(right),
+        });
+
+        Ok(Some(Query {
+            with: query.with.clone(),
+            body: Box::new(body),
+            order_by: query.order_by.clone(),
+            limit: query.limit.clone(),
+            limit_by: query.limit_by.clone(),
+            offset: query.offset.clone(),
+            fetch: query.fetch.clone(),
+            locks: query.locks.clone(),
+            for_clause: query.for_clause.clone(),
+        }))
+    }
+
+    fn expand_rollup_sets(items: &[Vec<Expr>]) -> Vec<Vec<Expr>> {
+        let mut sets = Vec::with_capacity(items.len() + 1);
+        for keep in (0..=items.len()).rev() {
+            let mut set = Vec::new();
+            for item in items.iter().take(keep) {
+                set.extend(item.clone());
+            }
+            sets.push(set);
+        }
+        sets
+    }
+
+    fn expand_cube_sets(items: &[Vec<Expr>]) -> Vec<Vec<Expr>> {
+        let total = 1usize << items.len();
+        let mut sets = Vec::with_capacity(total);
+        for mask in (0..total).rev() {
+            let mut set = Vec::new();
+            for (idx, item) in items.iter().enumerate() {
+                if mask & (1usize << idx) != 0 {
+                    set.extend(item.clone());
+                }
+            }
+            sets.push(set);
+        }
+        sets
+    }
+
+    fn build_grouped_key_set(&self, set: &[Expr]) -> Result<HashSet<String>, AnalyzerError> {
+        let mut keys = HashSet::new();
+        for expr in set {
+            let Some(expr_keys) = Self::column_expr_keys(expr) else {
+                return Err(AnalyzerError::Unsupported(
+                    "GROUPING SETS currently supports column references only".to_string(),
+                ));
+            };
+            keys.extend(expr_keys);
+        }
+        Ok(keys)
+    }
+
+    fn column_expr_keys(expr: &Expr) -> Option<Vec<String>> {
+        match expr {
+            Expr::Identifier(ident) => Some(vec![normalize_ident(ident)]),
+            Expr::CompoundIdentifier(parts) => {
+                if parts.is_empty() {
+                    return None;
+                }
+                let full = parts
+                    .iter()
+                    .map(normalize_ident)
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let short = normalize_ident(parts.last()?);
+                if full == short {
+                    Some(vec![short])
+                } else {
+                    Some(vec![full, short])
+                }
+            }
+            Expr::Nested(inner) => Self::column_expr_keys(inner),
+            _ => None,
+        }
+    }
+
+    fn expr_is_grouped_column(grouped_keys: &HashSet<String>, expr: &Expr) -> bool {
+        Self::column_expr_keys(expr)
+            .map(|keys| keys.into_iter().any(|k| grouped_keys.contains(&k)))
+            .unwrap_or(false)
+    }
+
+    fn default_alias_for_expr(expr: &Expr) -> Option<ast::Ident> {
+        match expr {
+            Expr::Identifier(ident) => Some(ident.clone()),
+            Expr::CompoundIdentifier(parts) => parts.last().cloned(),
+            _ => None,
+        }
+    }
+
+    fn rewrite_select_item_for_group_set(
+        &self,
+        item: &SelectItem,
+        grouped_keys: &HashSet<String>,
+    ) -> Result<SelectItem, AnalyzerError> {
+        match item {
+            SelectItem::UnnamedExpr(expr) => {
+                let rewritten = self.rewrite_expr_for_group_set(expr, grouped_keys)?;
+                if matches!(rewritten, Expr::Value(ast::Value::Null)) {
+                    if let Some(alias) = Self::default_alias_for_expr(expr) {
+                        return Ok(SelectItem::ExprWithAlias {
+                            expr: rewritten,
+                            alias,
+                        });
+                    }
+                }
+                Ok(SelectItem::UnnamedExpr(rewritten))
+            }
+            SelectItem::ExprWithAlias { expr, alias } => Ok(SelectItem::ExprWithAlias {
+                expr: self.rewrite_expr_for_group_set(expr, grouped_keys)?,
+                alias: alias.clone(),
+            }),
+            SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {
+                Err(AnalyzerError::Unsupported(
+                    "GROUPING SETS with wildcard projection is not yet supported".to_string(),
+                ))
+            }
+        }
+    }
+
+    fn rewrite_expr_for_group_set(
+        &self,
+        expr: &Expr,
+        grouped_keys: &HashSet<String>,
+    ) -> Result<Expr, AnalyzerError> {
+        match expr {
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                if Self::expr_is_grouped_column(grouped_keys, expr) {
+                    Ok(expr.clone())
+                } else {
+                    Ok(Expr::Value(ast::Value::Null))
+                }
+            }
+            Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
+                left: Box::new(self.rewrite_expr_for_group_set(left, grouped_keys)?),
+                op: op.clone(),
+                right: Box::new(self.rewrite_expr_for_group_set(right, grouped_keys)?),
+            }),
+            Expr::UnaryOp { op, expr } => Ok(Expr::UnaryOp {
+                op: op.clone(),
+                expr: Box::new(self.rewrite_expr_for_group_set(expr, grouped_keys)?),
+            }),
+            Expr::Nested(inner) => Ok(Expr::Nested(Box::new(
+                self.rewrite_expr_for_group_set(inner, grouped_keys)?,
+            ))),
+            Expr::IsFalse(inner) => Ok(Expr::IsFalse(Box::new(
+                self.rewrite_expr_for_group_set(inner, grouped_keys)?,
+            ))),
+            Expr::IsNotFalse(inner) => Ok(Expr::IsNotFalse(Box::new(
+                self.rewrite_expr_for_group_set(inner, grouped_keys)?,
+            ))),
+            Expr::IsTrue(inner) => Ok(Expr::IsTrue(Box::new(
+                self.rewrite_expr_for_group_set(inner, grouped_keys)?,
+            ))),
+            Expr::IsNotTrue(inner) => Ok(Expr::IsNotTrue(Box::new(
+                self.rewrite_expr_for_group_set(inner, grouped_keys)?,
+            ))),
+            Expr::IsNull(inner) => Ok(Expr::IsNull(Box::new(
+                self.rewrite_expr_for_group_set(inner, grouped_keys)?,
+            ))),
+            Expr::IsNotNull(inner) => Ok(Expr::IsNotNull(Box::new(
+                self.rewrite_expr_for_group_set(inner, grouped_keys)?,
+            ))),
+            Expr::IsUnknown(inner) => Ok(Expr::IsUnknown(Box::new(
+                self.rewrite_expr_for_group_set(inner, grouped_keys)?,
+            ))),
+            Expr::IsNotUnknown(inner) => Ok(Expr::IsNotUnknown(Box::new(
+                self.rewrite_expr_for_group_set(inner, grouped_keys)?,
+            ))),
+            Expr::IsDistinctFrom(left, right) => Ok(Expr::IsDistinctFrom(
+                Box::new(self.rewrite_expr_for_group_set(left, grouped_keys)?),
+                Box::new(self.rewrite_expr_for_group_set(right, grouped_keys)?),
+            )),
+            Expr::IsNotDistinctFrom(left, right) => Ok(Expr::IsNotDistinctFrom(
+                Box::new(self.rewrite_expr_for_group_set(left, grouped_keys)?),
+                Box::new(self.rewrite_expr_for_group_set(right, grouped_keys)?),
+            )),
+            Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => Ok(Expr::Between {
+                expr: Box::new(self.rewrite_expr_for_group_set(expr, grouped_keys)?),
+                negated: *negated,
+                low: Box::new(self.rewrite_expr_for_group_set(low, grouped_keys)?),
+                high: Box::new(self.rewrite_expr_for_group_set(high, grouped_keys)?),
+            }),
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => Ok(Expr::InList {
+                expr: Box::new(self.rewrite_expr_for_group_set(expr, grouped_keys)?),
+                list: list
+                    .iter()
+                    .map(|e| self.rewrite_expr_for_group_set(e, grouped_keys))
+                    .collect::<Result<Vec<_>, _>>()?,
+                negated: *negated,
+            }),
+            Expr::Like {
+                negated,
+                expr,
+                pattern,
+                escape_char,
+            } => Ok(Expr::Like {
+                negated: *negated,
+                expr: Box::new(self.rewrite_expr_for_group_set(expr, grouped_keys)?),
+                pattern: Box::new(self.rewrite_expr_for_group_set(pattern, grouped_keys)?),
+                escape_char: *escape_char,
+            }),
+            Expr::ILike {
+                negated,
+                expr,
+                pattern,
+                escape_char,
+            } => Ok(Expr::ILike {
+                negated: *negated,
+                expr: Box::new(self.rewrite_expr_for_group_set(expr, grouped_keys)?),
+                pattern: Box::new(self.rewrite_expr_for_group_set(pattern, grouped_keys)?),
+                escape_char: *escape_char,
+            }),
+            Expr::SimilarTo {
+                negated,
+                expr,
+                pattern,
+                escape_char,
+            } => Ok(Expr::SimilarTo {
+                negated: *negated,
+                expr: Box::new(self.rewrite_expr_for_group_set(expr, grouped_keys)?),
+                pattern: Box::new(self.rewrite_expr_for_group_set(pattern, grouped_keys)?),
+                escape_char: *escape_char,
+            }),
+            Expr::RLike {
+                negated,
+                expr,
+                pattern,
+                regexp,
+            } => Ok(Expr::RLike {
+                negated: *negated,
+                expr: Box::new(self.rewrite_expr_for_group_set(expr, grouped_keys)?),
+                pattern: Box::new(self.rewrite_expr_for_group_set(pattern, grouped_keys)?),
+                regexp: *regexp,
+            }),
+            Expr::AnyOp {
+                left,
+                compare_op,
+                right,
+            } => Ok(Expr::AnyOp {
+                left: Box::new(self.rewrite_expr_for_group_set(left, grouped_keys)?),
+                compare_op: compare_op.clone(),
+                right: Box::new(self.rewrite_expr_for_group_set(right, grouped_keys)?),
+            }),
+            Expr::AllOp {
+                left,
+                compare_op,
+                right,
+            } => Ok(Expr::AllOp {
+                left: Box::new(self.rewrite_expr_for_group_set(left, grouped_keys)?),
+                compare_op: compare_op.clone(),
+                right: Box::new(self.rewrite_expr_for_group_set(right, grouped_keys)?),
+            }),
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => Ok(Expr::Case {
+                operand: match operand {
+                    Some(e) => Some(Box::new(self.rewrite_expr_for_group_set(e, grouped_keys)?)),
+                    None => None,
+                },
+                conditions: conditions
+                    .iter()
+                    .map(|e| self.rewrite_expr_for_group_set(e, grouped_keys))
+                    .collect::<Result<Vec<_>, _>>()?,
+                results: results
+                    .iter()
+                    .map(|e| self.rewrite_expr_for_group_set(e, grouped_keys))
+                    .collect::<Result<Vec<_>, _>>()?,
+                else_result: match else_result {
+                    Some(e) => Some(Box::new(self.rewrite_expr_for_group_set(e, grouped_keys)?)),
+                    None => None,
+                },
+            }),
+            Expr::Cast {
+                expr,
+                data_type,
+                format,
+            } => Ok(Expr::Cast {
+                expr: Box::new(self.rewrite_expr_for_group_set(expr, grouped_keys)?),
+                data_type: data_type.clone(),
+                format: format.clone(),
+            }),
+            Expr::TryCast {
+                expr,
+                data_type,
+                format,
+            } => Ok(Expr::TryCast {
+                expr: Box::new(self.rewrite_expr_for_group_set(expr, grouped_keys)?),
+                data_type: data_type.clone(),
+                format: format.clone(),
+            }),
+            Expr::SafeCast {
+                expr,
+                data_type,
+                format,
+            } => Ok(Expr::SafeCast {
+                expr: Box::new(self.rewrite_expr_for_group_set(expr, grouped_keys)?),
+                data_type: data_type.clone(),
+                format: format.clone(),
+            }),
+            Expr::Function(func) => self.rewrite_function_for_group_set(func, grouped_keys),
+            _ => Ok(expr.clone()),
+        }
+    }
+
+    fn rewrite_function_for_group_set(
+        &self,
+        func: &ast::Function,
+        grouped_keys: &HashSet<String>,
+    ) -> Result<Expr, AnalyzerError> {
+        let func_name = func.name.0.last().map(normalize_ident).unwrap_or_default();
+
+        if func_name.eq_ignore_ascii_case("GROUPING") {
+            if func.args.is_empty() {
+                return Err(AnalyzerError::Unsupported(
+                    "GROUPING() requires at least one argument".to_string(),
+                ));
+            }
+            let mut mask = 0i32;
+            let arity = func.args.len();
+            for (idx, arg) in func.args.iter().enumerate() {
+                let expr = match arg {
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => e,
+                    ast::FunctionArg::Named {
+                        arg: ast::FunctionArgExpr::Expr(e),
+                        ..
+                    } => e,
+                    _ => {
+                        return Err(AnalyzerError::Unsupported(
+                            "GROUPING() arguments must be expressions".to_string(),
+                        ))
+                    }
+                };
+
+                let Some(arg_keys) = Self::column_expr_keys(expr) else {
+                    return Err(AnalyzerError::Unsupported(
+                        "GROUPING() arguments must be column references".to_string(),
+                    ));
+                };
+                let is_grouped = arg_keys.iter().any(|k| grouped_keys.contains(k));
+                if !is_grouped {
+                    let bit = (arity - idx - 1) as i32;
+                    mask |= 1 << bit;
+                }
+            }
+            return Ok(Expr::Value(ast::Value::Number(mask.to_string(), false)));
+        }
+
+        let mut cloned = func.clone();
+        if let Some(filter) = &func.filter {
+            cloned.filter = Some(Box::new(
+                self.rewrite_expr_for_group_set(filter, grouped_keys)?,
+            ));
+        }
+        Ok(Expr::Function(cloned))
+    }
+
     /// Analyze a SetExpr (used for set operations' left/right branches).
     ///
     /// Each branch manages its own scope lifecycle independently.
@@ -229,7 +671,7 @@ impl<'a> Analyzer<'a> {
         let filter = match &select.selection {
             Some(expr) => {
                 let analyzed = self.analyze_expr(expr)?;
-                self.ensure_boolean(&analyzed, "WHERE clause")?;
+                let analyzed = self.ensure_boolean(analyzed, "WHERE clause")?;
                 Some(analyzed)
             }
             None => None,
@@ -249,21 +691,31 @@ impl<'a> Analyzer<'a> {
         let having = match &select.having {
             Some(expr) => {
                 let analyzed = self.analyze_expr(expr)?;
-                self.ensure_boolean(&analyzed, "HAVING clause")?;
+                let analyzed = self.ensure_boolean(analyzed, "HAVING clause")?;
                 Some(analyzed)
             }
             None => None,
         };
 
         // 6. SELECT list (aggregates allowed)
-        let (projection, output_schema) = self.analyze_projection(&select.projection)?;
-        self.validate_grouping_semantics(&group_by, &projection, having.as_ref())?;
+        let wildcard_order = Self::build_wildcard_projection_order(select, &from);
+        let (projection, output_schema) =
+            self.analyze_projection(&select.projection, wildcard_order.as_deref())?;
 
         // 7. DISTINCT
         let distinct = self.analyze_distinct(&select.distinct)?;
 
         // 8. ORDER BY (can reference output aliases + FROM columns)
         let analyzed_order_by = self.analyze_order_by_exprs(order_by, &projection)?;
+
+        // Validate grouping semantics AFTER ORDER BY analysis so we can check
+        // ORDER BY expressions for ungrouped column references too.
+        self.validate_grouping_semantics(
+            &group_by,
+            &projection,
+            having.as_ref(),
+            &analyzed_order_by,
+        )?;
 
         // 9. LIMIT
         let analyzed_limit = match limit {
@@ -490,9 +942,14 @@ impl<'a> Analyzer<'a> {
             // right_index is LOCAL to the right operator; convert to GLOBAL scope index for hiding.
             if let JoinCondition::Using(ref cols) = condition {
                 for uc in cols {
-                    self.scopes
-                        .current_mut()
-                        .hide_using_column(right_start + uc.right_index);
+                    self.scopes.current_mut().register_using_column(
+                        &uc.name,
+                        left_start + uc.left_index,
+                        right_start + uc.right_index,
+                        uc.data_type.clone(),
+                        uc.left_type.clone(),
+                        uc.right_type.clone(),
+                    );
                 }
             }
 
@@ -524,12 +981,16 @@ impl<'a> Analyzer<'a> {
             } => {
                 // Table-valued function call in FROM.
 
-                let (_schema_opt, obj_name) = split_object_name(name)
+                let (schema_opt, obj_name) = split_object_name(name)
                     .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
                 let alias_str = alias
                     .as_ref()
-                    .map(|a| a.name.value.clone())
+                    .map(|a| normalize_ident(&a.name))
                     .unwrap_or_else(|| obj_name.clone());
+                let dispatch_name = match &schema_opt {
+                    Some(schema) => format!("{}.{}", schema, obj_name),
+                    None => obj_name.clone(),
+                };
 
                 // Analyze function arguments, preserving named parameters.
                 let mut typed_args = Vec::with_capacity(func_args.len());
@@ -667,7 +1128,7 @@ impl<'a> Analyzer<'a> {
                     .collect();
 
                 let func = ResolvedFunction {
-                    name: obj_name.to_ascii_uppercase(),
+                    name: dispatch_name,
                     kind: FunctionKind::Builtin,
                     return_type: DataType::Text,
                 };
@@ -704,7 +1165,7 @@ impl<'a> Analyzer<'a> {
                         let obj_name = ident.value.to_lowercase();
                         let alias_str = alias
                             .as_ref()
-                            .map(|a| a.name.value.clone())
+                            .map(|a| normalize_ident(&a.name))
                             .unwrap_or_else(|| obj_name.clone());
 
                         let mut output_cols: Vec<(String, DataType, bool)> =
@@ -757,7 +1218,7 @@ impl<'a> Analyzer<'a> {
                     .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
                 let alias_str = alias
                     .as_ref()
-                    .map(|a| a.name.value.clone())
+                    .map(|a| normalize_ident(&a.name))
                     .unwrap_or_else(|| obj_name.clone());
 
                 // Check CTE first (CTEs are always unqualified in PostgreSQL).
@@ -821,15 +1282,30 @@ impl<'a> Analyzer<'a> {
 
                 let alias_str = alias
                     .as_ref()
-                    .map(|a| a.name.value.clone())
+                    .map(|a| normalize_ident(&a.name))
                     .unwrap_or_else(|| "subquery".to_string());
 
                 // Add subquery output columns to current scope
-                let columns: Vec<(String, DataType, bool)> = analyzed
+                let mut columns: Vec<(String, DataType, bool)> = analyzed
                     .output_schema
                     .iter()
                     .map(|(name, dt)| (name.clone(), dt.clone(), true))
                     .collect();
+
+                if let Some(a) = alias {
+                    if !a.columns.is_empty() {
+                        if a.columns.len() != columns.len() {
+                            return Err(AnalyzerError::Unsupported(format!(
+                                "derived table alias column count mismatch: expected {}, got {}",
+                                columns.len(),
+                                a.columns.len()
+                            )));
+                        }
+                        for (i, ident) in a.columns.iter().enumerate() {
+                            columns[i].0 = normalize_ident(ident);
+                        }
+                    }
+                }
                 self.scopes.current_mut().add_table(&alias_str, &columns);
 
                 Ok(AnalyzedTableRef {
@@ -844,7 +1320,7 @@ impl<'a> Analyzer<'a> {
             } => {
                 let mut result = self.analyze_table_with_joins(table_with_joins)?;
                 if let Some(a) = alias {
-                    result.alias = Some(a.name.value.clone());
+                    result.alias = Some(normalize_ident(&a.name));
                 }
                 Ok(result)
             }
@@ -898,7 +1374,7 @@ impl<'a> Analyzer<'a> {
         match constraint {
             ast::JoinConstraint::On(expr) => {
                 let analyzed = self.analyze_expr(expr)?;
-                self.ensure_boolean(&analyzed, "JOIN ON clause")?;
+                let analyzed = self.ensure_boolean(analyzed, "JOIN ON clause")?;
                 Ok(JoinCondition::On(analyzed))
             }
             ast::JoinConstraint::Using(columns) => {
@@ -934,8 +1410,8 @@ impl<'a> Analyzer<'a> {
                     let unified_type = common_type(&left_col.data_type, &right_col.data_type)
                         .ok_or_else(|| AnalyzerError::OperatorTypeMismatch {
                             operator: "=".to_string(),
-                            left: left_col.data_type.clone(),
-                            right: right_col.data_type.clone(),
+                            left: left_col.data_type.to_string().to_lowercase(),
+                            right: right_col.data_type.to_string().to_lowercase(),
                         })?;
 
                     resolved.push(ResolvedUsingColumn {
@@ -975,8 +1451,8 @@ impl<'a> Analyzer<'a> {
                             common_type(&lc.data_type, &rc.data_type).ok_or_else(|| {
                                 AnalyzerError::OperatorTypeMismatch {
                                     operator: "=".to_string(),
-                                    left: lc.data_type.clone(),
-                                    right: rc.data_type.clone(),
+                                    left: lc.data_type.to_string().to_lowercase(),
+                                    right: rc.data_type.to_string().to_lowercase(),
                                 }
                             })?;
                         resolved.push(ResolvedUsingColumn {
@@ -1155,10 +1631,14 @@ impl<'a> Analyzer<'a> {
                     // Resolve alias references: GROUP BY alias → SELECT expr with that alias.
                     // PostgreSQL allows GROUP BY to reference SELECT output aliases.
                     if let Expr::Identifier(ident) = e {
-                        let name_lower = ident.value.to_lowercase();
+                        let lookup = normalize_ident(ident);
+                        let is_quoted = ident.quote_style.is_some();
                         for item in select_items {
                             if let SelectItem::ExprWithAlias { expr, alias } = item {
-                                if alias.value.to_lowercase() == name_lower {
+                                let alias_name = normalize_ident(alias);
+                                if (is_quoted && alias_name == lookup)
+                                    || (!is_quoted && alias_name.to_lowercase() == lookup)
+                                {
                                     return self.analyze_expr(expr);
                                 }
                             }
@@ -1179,6 +1659,7 @@ impl<'a> Analyzer<'a> {
         group_by: &[TypedExpr],
         projection: &[AnalyzedProjection],
         having: Option<&TypedExpr>,
+        order_by: &[TypedOrderByExpr],
     ) -> Result<(), AnalyzerError> {
         let has_projection_aggregate = projection
             .iter()
@@ -1203,11 +1684,24 @@ impl<'a> Analyzer<'a> {
             })
             .collect();
 
+        // PG qualifies ungrouped column names with their table alias.
+        let scope_cols = self.scopes.current().columns().to_vec();
+        let qualify = |name: String| -> String {
+            scope_cols
+                .iter()
+                .find(|c| c.column_name == name)
+                .and_then(|c| c.table_alias.as_ref())
+                .map(|t| format!("{}.{}", t, name))
+                .unwrap_or(name)
+        };
+
         for p in projection {
             if let Some(name) =
                 Self::find_ungrouped_column(&p.expr, &grouped_columns, &grouped_expr_keys, false)
             {
-                return Err(AnalyzerError::UngroupedColumn { name });
+                return Err(AnalyzerError::UngroupedColumn {
+                    name: qualify(name),
+                });
             }
         }
 
@@ -1218,7 +1712,19 @@ impl<'a> Analyzer<'a> {
                 &grouped_expr_keys,
                 false,
             ) {
-                return Err(AnalyzerError::UngroupedColumn { name });
+                return Err(AnalyzerError::UngroupedColumn {
+                    name: qualify(name),
+                });
+            }
+        }
+
+        for ob in order_by {
+            if let Some(name) =
+                Self::find_ungrouped_column(&ob.expr, &grouped_columns, &grouped_expr_keys, false)
+            {
+                return Err(AnalyzerError::UngroupedColumn {
+                    name: qualify(name),
+                });
             }
         }
 
@@ -1656,9 +2162,193 @@ impl<'a> Analyzer<'a> {
 
     // ── SELECT projection ───────────────────────────────────
 
+    fn build_wildcard_projection_order(
+        select: &Select,
+        from_refs: &[AnalyzedTableRef],
+    ) -> Option<Vec<(String, usize)>> {
+        let mut sources: Vec<TableSchema> = Vec::new();
+        for table_ref in from_refs {
+            Self::collect_wildcard_sources(table_ref, &mut sources);
+        }
+
+        let schema_refs: Vec<&TableSchema> = sources.iter().collect();
+        let plan = crate::sql::wildcard::build_join_wildcard_plan(select, &schema_refs)?;
+        if !plan.any_merge {
+            return None;
+        }
+
+        let mut source_offsets = Vec::with_capacity(sources.len());
+        let mut next_offset = 0usize;
+        for source in &sources {
+            source_offsets.push(next_offset);
+            next_offset = next_offset.saturating_add(source.columns.len());
+        }
+
+        let mut ordered = Vec::with_capacity(plan.columns.len());
+        for col in plan.columns {
+            let source_offset = *source_offsets.get(col.source_idx)?;
+            ordered.push((col.name, source_offset + col.col_idx));
+        }
+        Some(ordered)
+    }
+
+    fn collect_wildcard_sources(table_ref: &AnalyzedTableRef, out: &mut Vec<TableSchema>) {
+        match &table_ref.kind {
+            AnalyzedTableRefKind::Join { left, right, .. } => {
+                Self::collect_wildcard_sources(left, out);
+                Self::collect_wildcard_sources(right, out);
+            }
+            _ => out.push(Self::leaf_wildcard_source_schema(table_ref)),
+        }
+    }
+
+    fn leaf_wildcard_source_schema(table_ref: &AnalyzedTableRef) -> TableSchema {
+        match &table_ref.kind {
+            AnalyzedTableRefKind::Table { name, schema } => TableSchema {
+                name: name.clone(),
+                table_id: 0,
+                columns: schema
+                    .columns
+                    .iter()
+                    .map(|(col_name, data_type, nullable)| ColumnDef {
+                        name: col_name.clone(),
+                        data_type: data_type.clone(),
+                        nullable: *nullable,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    })
+                    .collect(),
+                version: 1,
+                pk_constraint_name: None,
+                pk_indices: vec![],
+                indexes: vec![],
+                check_constraints: vec![],
+                foreign_keys: vec![],
+                owner: String::new(),
+                from_alias: None,
+            },
+            AnalyzedTableRefKind::Subquery(query) => TableSchema {
+                name: "subquery".to_string(),
+                table_id: 0,
+                columns: query
+                    .output_schema
+                    .iter()
+                    .map(|(col_name, data_type)| ColumnDef {
+                        name: col_name.clone(),
+                        data_type: data_type.clone(),
+                        nullable: true,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    })
+                    .collect(),
+                version: 1,
+                pk_constraint_name: None,
+                pk_indices: vec![],
+                indexes: vec![],
+                check_constraints: vec![],
+                foreign_keys: vec![],
+                owner: String::new(),
+                from_alias: None,
+            },
+            AnalyzedTableRefKind::Function {
+                func,
+                output_columns,
+                ..
+            } => TableSchema {
+                name: func.name.clone(),
+                table_id: 0,
+                columns: output_columns
+                    .iter()
+                    .map(|(col_name, data_type)| ColumnDef {
+                        name: col_name.clone(),
+                        data_type: data_type.clone(),
+                        nullable: true,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    })
+                    .collect(),
+                version: 1,
+                pk_constraint_name: None,
+                pk_indices: vec![],
+                indexes: vec![],
+                check_constraints: vec![],
+                foreign_keys: vec![],
+                owner: String::new(),
+                from_alias: None,
+            },
+            AnalyzedTableRefKind::Join { .. } => unreachable!(),
+        }
+    }
+
+    fn cast_to_implicit(expr: TypedExpr, target_type: &DataType) -> TypedExpr {
+        if expr.data_type == *target_type {
+            expr
+        } else {
+            TypedExpr::new(
+                TypedExprKind::Cast {
+                    expr: Box::new(expr),
+                    target_type: target_type.clone(),
+                    cast_context: CastContext::Implicit,
+                },
+                target_type.clone(),
+            )
+        }
+    }
+
+    fn scope_column_projection(
+        scope: &Scope,
+        column_index: usize,
+    ) -> Option<(String, TypedExpr, DataType)> {
+        let col = scope.columns().get(column_index)?;
+        if let Some(merged) = scope.using_column_for_left(column_index) {
+            let left_expr = TypedExpr::new(
+                TypedExprKind::ColumnRef {
+                    scope_depth: 0,
+                    column_index: merged.left_index,
+                    column_name: merged.column_name.clone(),
+                },
+                merged.left_type.clone(),
+            );
+            let right_expr = TypedExpr::new(
+                TypedExprKind::ColumnRef {
+                    scope_depth: 0,
+                    column_index: merged.right_index,
+                    column_name: merged.column_name.clone(),
+                },
+                merged.right_type.clone(),
+            );
+
+            let expr = TypedExpr::new(
+                TypedExprKind::Coalesce(vec![
+                    Self::cast_to_implicit(left_expr, &merged.data_type),
+                    Self::cast_to_implicit(right_expr, &merged.data_type),
+                ]),
+                merged.data_type.clone(),
+            );
+            return Some((col.column_name.clone(), expr, merged.data_type.clone()));
+        }
+
+        let expr = TypedExpr::new(
+            TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: col.column_index,
+                column_name: col.column_name.clone(),
+            },
+            col.data_type.clone(),
+        );
+        Some((col.column_name.clone(), expr, col.data_type.clone()))
+    }
+
     pub(super) fn analyze_projection(
         &mut self,
         items: &[SelectItem],
+        wildcard_order: Option<&[(String, usize)]>,
     ) -> Result<(Vec<AnalyzedProjection>, Vec<(String, DataType)>), AnalyzerError> {
         let mut projection = Vec::new();
         let mut output_schema = Vec::new();
@@ -1687,24 +2377,35 @@ impl<'a> Analyzer<'a> {
 
                 SelectItem::Wildcard(_) => {
                     let scope = self.scopes.current();
+                    if let Some(order) = wildcard_order {
+                        for (name, column_index) in order {
+                            if let Some((_col_name, expr, data_type)) =
+                                Self::scope_column_projection(scope, *column_index)
+                            {
+                                output_schema.push((name.clone(), data_type.clone()));
+                                projection.push(AnalyzedProjection {
+                                    expr,
+                                    output_name: name.clone(),
+                                });
+                            }
+                        }
+                        continue;
+                    }
+
                     for col in scope.columns() {
                         // Skip USING join right-side duplicate columns.
                         if col.hidden {
                             continue;
                         }
-                        let expr = TypedExpr::new(
-                            TypedExprKind::ColumnRef {
-                                scope_depth: 0,
-                                column_index: col.column_index,
-                                column_name: col.column_name.clone(),
-                            },
-                            col.data_type.clone(),
-                        );
-                        output_schema.push((col.column_name.clone(), col.data_type.clone()));
-                        projection.push(AnalyzedProjection {
-                            expr,
-                            output_name: col.column_name.clone(),
-                        });
+                        if let Some((name, expr, data_type)) =
+                            Self::scope_column_projection(scope, col.column_index)
+                        {
+                            output_schema.push((name.clone(), data_type.clone()));
+                            projection.push(AnalyzedProjection {
+                                expr,
+                                output_name: name,
+                            });
+                        }
                     }
                 }
 
@@ -1717,11 +2418,10 @@ impl<'a> Analyzer<'a> {
                         .columns()
                         .iter()
                         .filter(|c| {
-                            !c.hidden
-                                && c.table_alias
-                                    .as_ref()
-                                    .map(|a| a.to_lowercase() == lower_table)
-                                    .unwrap_or(false)
+                            c.table_alias
+                                .as_ref()
+                                .map(|a| a.to_lowercase() == lower_table)
+                                .unwrap_or(false)
                         })
                         .collect();
 
@@ -1775,15 +2475,40 @@ impl<'a> Analyzer<'a> {
 
     /// Infer a column alias from an expression (for unaliased SELECT items).
     fn infer_column_alias(&self, expr: &Expr) -> String {
-        match expr {
-            Expr::Identifier(ident) => ident.value.clone(),
-            Expr::CompoundIdentifier(parts) => parts
-                .last()
-                .map(|i| i.value.clone())
-                .unwrap_or_else(|| "?column?".to_string()),
-            Expr::Function(func) => crate::sql::names::function_name_upper(func).to_lowercase(),
-            _ => "?column?".to_string(),
+        fn infer(expr: &Expr) -> Option<String> {
+            match expr {
+                Expr::Identifier(ident) => Some(ident.value.clone()),
+                Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.clone()),
+                Expr::Function(func) => {
+                    Some(crate::sql::names::function_name_upper(func).to_lowercase())
+                }
+                Expr::ArrayAgg(_) => Some("array_agg".to_string()),
+                Expr::ListAgg(_) => Some("listagg".to_string()),
+                Expr::Nested(inner) => infer(inner),
+                Expr::Array(_) | Expr::ArrayIndex { .. } => Some("array".to_string()),
+                Expr::ArraySubquery(_) => Some("array".to_string()),
+                Expr::Case {
+                    results,
+                    else_result,
+                    ..
+                } => {
+                    if let Some(inner) = else_result {
+                        if let Some(name) = infer(inner) {
+                            return Some(name);
+                        }
+                    }
+                    for result in results {
+                        if let Some(name) = infer(result) {
+                            return Some(name);
+                        }
+                    }
+                    Some("case".to_string())
+                }
+                _ => None,
+            }
         }
+
+        infer(expr).unwrap_or_else(|| "?column?".to_string())
     }
 
     // ── CTE analysis ────────────────────────────────────────

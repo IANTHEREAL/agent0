@@ -116,7 +116,7 @@ impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DataType::Boolean => write!(f, "BOOLEAN"),
-            DataType::Int32 => write!(f, "INT"),
+            DataType::Int32 => write!(f, "INTEGER"),
             DataType::Int64 => write!(f, "BIGINT"),
             DataType::Float64 => write!(f, "DOUBLE"),
             DataType::Text => write!(f, "TEXT"),

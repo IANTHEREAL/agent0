@@ -184,6 +184,7 @@ impl LogicalPlanner {
                 }
             }
 
+            let has_extra_agg = !extra_agg_projections.is_empty();
             let agg_projection = if has_win {
                 // Build a raw projection [group_by_cols..., agg_calls...] so the
                 // Aggregate outputs clean columns without a post-projection that
@@ -363,6 +364,30 @@ impl LogicalPlanner {
                             .collect::<Result<Vec<_>>>()?;
                         plan = plan.distinct_on(rewritten_on);
                     }
+                }
+
+                // If HAVING/ORDER BY introduced extra aggregate columns that are
+                // not in the user's SELECT, strip them with a final Project
+                // that references only the first N columns of the aggregate output.
+                if has_extra_agg {
+                    let select_col_count = select.projection.len();
+                    let strip_proj: Vec<AnalyzedProjection> = (0..select_col_count)
+                        .map(|i| {
+                            let col = &plan.schema.columns[i];
+                            AnalyzedProjection {
+                                output_name: col.0.clone(),
+                                expr: TypedExpr {
+                                    kind: TypedExprKind::ColumnRef {
+                                        scope_depth: 0,
+                                        column_index: i,
+                                        column_name: col.0.clone(),
+                                    },
+                                    data_type: col.1.clone(),
+                                },
+                            }
+                        })
+                        .collect();
+                    plan = plan.project(strip_proj, proj_schema.clone());
                 }
             }
         } else if has_win {
@@ -771,6 +796,33 @@ fn has_aggregates(projections: &[crate::sql::analyzer::types::AnalyzedProjection
 pub(crate) fn expr_has_aggregate(expr: &TypedExpr) -> bool {
     match &expr.kind {
         TypedExprKind::AggregateCall { .. } => true,
+        TypedExprKind::IsTest { expr, .. } => expr_has_aggregate(expr),
+        TypedExprKind::Between {
+            expr, low, high, ..
+        } => expr_has_aggregate(expr) || expr_has_aggregate(low) || expr_has_aggregate(high),
+        TypedExprKind::InList { expr, list, .. } => {
+            expr_has_aggregate(expr) || list.iter().any(expr_has_aggregate)
+        }
+        TypedExprKind::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_has_aggregate(expr)
+                || expr_has_aggregate(pattern)
+                || escape.as_ref().is_some_and(|e| expr_has_aggregate(e))
+        }
+        TypedExprKind::SimilarTo {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_has_aggregate(expr)
+                || expr_has_aggregate(pattern)
+                || escape.as_ref().is_some_and(|e| expr_has_aggregate(e))
+        }
         TypedExprKind::BinaryOp { left, right, .. } => {
             expr_has_aggregate(left) || expr_has_aggregate(right)
         }
@@ -789,6 +841,19 @@ pub(crate) fn expr_has_aggregate(expr: &TypedExpr) -> bool {
                 || else_result
                     .as_ref()
                     .map_or(false, |e| expr_has_aggregate(e))
+        }
+        TypedExprKind::AnyAll { expr, .. } => expr_has_aggregate(expr),
+        TypedExprKind::Coalesce(args) => args.iter().any(expr_has_aggregate),
+        TypedExprKind::NullIf(a, b) => expr_has_aggregate(a) || expr_has_aggregate(b),
+        TypedExprKind::MinMax { args, .. } => args.iter().any(expr_has_aggregate),
+        TypedExprKind::ArrayLiteral(items) | TypedExprKind::Row(items) => {
+            items.iter().any(expr_has_aggregate)
+        }
+        TypedExprKind::ArrayIndex { array, index } => {
+            expr_has_aggregate(array) || expr_has_aggregate(index)
+        }
+        TypedExprKind::JsonAccess { expr, path, .. } => {
+            expr_has_aggregate(expr) || expr_has_aggregate(path)
         }
         _ => false,
     }

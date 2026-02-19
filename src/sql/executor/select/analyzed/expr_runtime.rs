@@ -169,6 +169,7 @@ impl<'a> ExprRuntime<'a> {
                         .materialize_expr_for_row(
                             &expr,
                             row,
+                            None,
                             Some(schema),
                             txn,
                             self.db_id,
@@ -216,6 +217,7 @@ impl<'a> ExprRuntime<'a> {
             .materialize_expr_for_row(
                 expr,
                 row,
+                None,
                 Some(schema),
                 txn,
                 self.db_id,
@@ -250,6 +252,7 @@ impl<'a> ExprRuntime<'a> {
                 .materialize_expr_for_row(
                     pred,
                     &row,
+                    None,
                     Some(schema),
                     txn,
                     self.db_id,
@@ -297,6 +300,7 @@ impl<'a> ExprRuntime<'a> {
                             .materialize_expr_for_row(
                                 expr,
                                 row,
+                                None,
                                 Some(schema),
                                 txn,
                                 self.db_id,
@@ -482,6 +486,7 @@ pub(super) async fn execute_async_nested_loop_join(
             .materialize_expr_for_row(
                 on_expr,
                 combined,
+                None,
                 Some(schema),
                 txn,
                 db_id,

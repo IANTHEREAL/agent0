@@ -181,14 +181,23 @@ impl User {
             return true;
         }
 
-        for granted in &self.privileges {
-            if Self::privilege_matches(&granted.privilege, privilege)
-                && Self::object_matches(&granted.object, object)
-            {
-                return true;
-            }
+        self.privileges
+            .iter()
+            .any(|granted| Self::granted_matches(granted, privilege, object, false))
+    }
+
+    pub fn has_privilege_with_grant_option(
+        &self,
+        privilege: &Privilege,
+        object: &PrivilegeObject,
+    ) -> bool {
+        if self.is_superuser {
+            return true;
         }
-        false
+
+        self.privileges
+            .iter()
+            .any(|granted| Self::granted_matches(granted, privilege, object, true))
     }
 
     fn privilege_matches(granted: &Privilege, required: &Privilege) -> bool {
@@ -212,6 +221,19 @@ impl User {
             }
             _ => granted == required,
         }
+    }
+
+    fn granted_matches(
+        granted: &GrantedPrivilege,
+        required_privilege: &Privilege,
+        required_object: &PrivilegeObject,
+        require_grant_option: bool,
+    ) -> bool {
+        if require_grant_option && !granted.with_grant_option {
+            return false;
+        }
+        Self::privilege_matches(&granted.privilege, required_privilege)
+            && Self::object_matches(&granted.object, required_object)
     }
 }
 
@@ -450,6 +472,29 @@ impl AuthManager {
         privilege: &Privilege,
         object: &PrivilegeObject,
     ) -> Result<bool> {
+        self.check_privilege_internal(txn, username, privilege, object, false)
+            .await
+    }
+
+    pub async fn check_privilege_with_grant_option(
+        &self,
+        txn: &mut Transaction,
+        username: &str,
+        privilege: &Privilege,
+        object: &PrivilegeObject,
+    ) -> Result<bool> {
+        self.check_privilege_internal(txn, username, privilege, object, true)
+            .await
+    }
+
+    async fn check_privilege_internal(
+        &self,
+        txn: &mut Transaction,
+        username: &str,
+        privilege: &Privilege,
+        object: &PrivilegeObject,
+        require_grant_option: bool,
+    ) -> Result<bool> {
         let user = self
             .get_user(txn, username)
             .await?
@@ -465,7 +510,12 @@ impl AuthManager {
             _ => {}
         }
 
-        if user.has_privilege(privilege, object) {
+        let has_user_privilege = if require_grant_option {
+            user.has_privilege_with_grant_option(privilege, object)
+        } else {
+            user.has_privilege(privilege, object)
+        };
+        if has_user_privilege {
             return Ok(true);
         }
 
@@ -480,9 +530,7 @@ impl AuthManager {
                     _ => {}
                 }
                 for granted in &role.privileges {
-                    if User::privilege_matches(&granted.privilege, privilege)
-                        && User::object_matches(&granted.object, object)
-                    {
+                    if User::granted_matches(granted, privilege, object, require_grant_option) {
                         return Ok(true);
                     }
                 }

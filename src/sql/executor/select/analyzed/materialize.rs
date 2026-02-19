@@ -4,17 +4,18 @@
 //! consult catalogs/transactions. The analyzed executor resolves those nodes
 //! before evaluation via this module.
 
-use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
+use crate::sql::analyzer::types::{FunctionKind, TypedExpr, TypedExprKind};
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::query_context::QueryContext;
 use crate::types::{DataType, Row, TableSchema, Value};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tikv_client::Transaction;
 
 impl Executor {
@@ -28,6 +29,7 @@ impl Executor {
         &self,
         expr: &TypedExpr,
         row: &Row,
+        correlated_outer_row: Option<&Row>,
         schema: Option<&TableSchema>,
         txn: &mut Transaction,
         db_id: u64,
@@ -37,7 +39,8 @@ impl Executor {
         qctx: &QueryContext,
     ) -> Result<TypedExpr> {
         // 1) Substitute correlated outer refs (scope_depth > 0) to constants.
-        let substituted = super::subquery::substitute_outer_refs_in_expr(expr, row);
+        let outer_row = correlated_outer_row.unwrap_or(row);
+        let substituted = super::subquery::substitute_outer_refs_in_expr(expr, outer_row);
 
         // 2) Resolve any now-uncorrelated subqueries.
         let subqueries_materialized = self
@@ -52,8 +55,17 @@ impl Executor {
             .await?;
 
         // 3) Resolve catalog-dependent functions.
-        self.materialize_catalog_functions(&subqueries_materialized, row, schema, txn, db_id, qctx)
-            .await
+        self.materialize_catalog_functions(
+            &subqueries_materialized,
+            row,
+            schema,
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            qctx,
+        )
+        .await
     }
 
     fn materialize_catalog_functions<'a>(
@@ -63,6 +75,8 @@ impl Executor {
         schema: Option<&'a TableSchema>,
         txn: &'a mut Transaction,
         db_id: u64,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
         qctx: &'a QueryContext,
     ) -> Pin<Box<dyn Future<Output = Result<TypedExpr>> + Send + 'a>> {
         Box::pin(async move {
@@ -77,8 +91,17 @@ impl Executor {
                     let mut new_args = Vec::with_capacity(args.len());
                     for a in args {
                         new_args.push(
-                            self.materialize_catalog_functions(a, row, schema, txn, db_id, qctx)
-                                .await?,
+                            self.materialize_catalog_functions(
+                                a,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
+                            )
+                            .await?,
                         );
                     }
 
@@ -87,7 +110,14 @@ impl Executor {
                         new_order_by.push(crate::sql::analyzer::types::TypedOrderByExpr {
                             expr: self
                                 .materialize_catalog_functions(
-                                    &ob.expr, row, schema, txn, db_id, qctx,
+                                    &ob.expr,
+                                    row,
+                                    schema,
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    qctx,
                                 )
                                 .await?,
                             asc: ob.asc,
@@ -96,8 +126,17 @@ impl Executor {
                     }
                     let new_filter = match filter {
                         Some(f) => Some(Box::new(
-                            self.materialize_catalog_functions(f, row, schema, txn, db_id, qctx)
-                                .await?,
+                            self.materialize_catalog_functions(
+                                f,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
+                            )
+                            .await?,
                         )),
                         None => None,
                     };
@@ -107,6 +146,46 @@ impl Executor {
                             .eval_pg_get_indexdef(&new_args, row, schema, txn, db_id, qctx)
                             .await?;
                         return Ok(TypedExpr::new(TypedExprKind::Constant(val), DataType::Text));
+                    }
+
+                    if func.name.eq_ignore_ascii_case("PG_SLEEP") {
+                        let seconds = match new_args.first() {
+                            None => 0.0_f64,
+                            Some(arg) => match eval_typed_expr(arg, row, qctx)? {
+                                Value::Null => 0.0_f64,
+                                Value::Int32(v) => v as f64,
+                                Value::Int64(v) => v as f64,
+                                Value::Float64(v) => v,
+                                Value::Numeric(v) => {
+                                    let s = v.normalize().to_string();
+                                    s.parse::<f64>().map_err(|_| {
+                                        anyhow!("invalid argument for pg_sleep: {}", s)
+                                    })?
+                                }
+                                Value::Text(s) => s
+                                    .parse::<f64>()
+                                    .map_err(|_| anyhow!("invalid argument for pg_sleep: {}", s))?,
+                                other => {
+                                    return Err(anyhow!(
+                                        "pg_sleep requires a numeric argument, got: {:?}",
+                                        other
+                                    ));
+                                }
+                            },
+                        };
+                        if !seconds.is_finite() || seconds < 0.0 {
+                            return Err(anyhow!(
+                                "pg_sleep requires a non-negative finite duration, got: {}",
+                                seconds
+                            ));
+                        }
+                        tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
+                        return Ok(TypedExpr::new(
+                            // PostgreSQL renders `void` results as an empty field in psql.
+                            // Use empty text here so unaligned output matches that behavior.
+                            TypedExprKind::Constant(Value::Text(String::new())),
+                            expr.data_type.clone(),
+                        ));
                     }
 
                     if func.name.eq_ignore_ascii_case("PG_GET_CONSTRAINTDEF") {
@@ -184,6 +263,30 @@ impl Executor {
                         }
                     }
 
+                    if matches!(func.kind, FunctionKind::UserDefined { .. }) {
+                        let mut arg_values = Vec::with_capacity(new_args.len());
+                        for arg in &new_args {
+                            arg_values.push(eval_typed_expr(arg, row, qctx)?);
+                        }
+                        if let Some(result) = crate::sql::plpgsql::try_execute_user_function(
+                            &self.store(),
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            &func.name,
+                            arg_values,
+                        )
+                        .await?
+                        {
+                            return Ok(TypedExpr::new(
+                                TypedExprKind::Constant(result),
+                                expr.data_type.clone(),
+                            ));
+                        }
+                        return Err(anyhow!("Function '{}' does not exist", func.name));
+                    }
+
                     Ok(TypedExpr {
                         kind: TypedExprKind::FunctionCall {
                             func: func.clone(),
@@ -206,13 +309,29 @@ impl Executor {
                 TypedExprKind::BinaryOp { left, right, op } => Ok(TypedExpr {
                     kind: TypedExprKind::BinaryOp {
                         left: Box::new(
-                            self.materialize_catalog_functions(left, row, schema, txn, db_id, qctx)
-                                .await?,
+                            self.materialize_catalog_functions(
+                                left,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
+                            )
+                            .await?,
                         ),
                         op: op.clone(),
                         right: Box::new(
                             self.materialize_catalog_functions(
-                                right, row, schema, txn, db_id, qctx,
+                                right,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
                             )
                             .await?,
                         ),
@@ -224,7 +343,14 @@ impl Executor {
                         op: *op,
                         operand: Box::new(
                             self.materialize_catalog_functions(
-                                operand, row, schema, txn, db_id, qctx,
+                                operand,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
                             )
                             .await?,
                         ),
@@ -239,7 +365,14 @@ impl Executor {
                     kind: TypedExprKind::Cast {
                         expr: Box::new(
                             self.materialize_catalog_functions(
-                                inner, row, schema, txn, db_id, qctx,
+                                inner,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
                             )
                             .await?,
                         ),
@@ -256,7 +389,14 @@ impl Executor {
                     kind: TypedExprKind::IsTest {
                         expr: Box::new(
                             self.materialize_catalog_functions(
-                                inner, row, schema, txn, db_id, qctx,
+                                inner,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
                             )
                             .await?,
                         ),
@@ -274,17 +414,42 @@ impl Executor {
                     kind: TypedExprKind::Between {
                         expr: Box::new(
                             self.materialize_catalog_functions(
-                                inner, row, schema, txn, db_id, qctx,
+                                inner,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
                             )
                             .await?,
                         ),
                         low: Box::new(
-                            self.materialize_catalog_functions(low, row, schema, txn, db_id, qctx)
-                                .await?,
+                            self.materialize_catalog_functions(
+                                low,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
+                            )
+                            .await?,
                         ),
                         high: Box::new(
-                            self.materialize_catalog_functions(high, row, schema, txn, db_id, qctx)
-                                .await?,
+                            self.materialize_catalog_functions(
+                                high,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
+                            )
+                            .await?,
                         ),
                         negated: *negated,
                     },
@@ -296,13 +461,31 @@ impl Executor {
                     negated,
                 } => {
                     let inner = self
-                        .materialize_catalog_functions(inner, row, schema, txn, db_id, qctx)
+                        .materialize_catalog_functions(
+                            inner,
+                            row,
+                            schema,
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            qctx,
+                        )
                         .await?;
                     let mut new_list = Vec::with_capacity(list.len());
                     for item in list {
                         new_list.push(
-                            self.materialize_catalog_functions(item, row, schema, txn, db_id, qctx)
-                                .await?,
+                            self.materialize_catalog_functions(
+                                item,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
+                            )
+                            .await?,
                         );
                     }
                     Ok(TypedExpr {
@@ -324,20 +507,41 @@ impl Executor {
                     kind: TypedExprKind::Like {
                         expr: Box::new(
                             self.materialize_catalog_functions(
-                                inner, row, schema, txn, db_id, qctx,
+                                inner,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
                             )
                             .await?,
                         ),
                         pattern: Box::new(
                             self.materialize_catalog_functions(
-                                pattern, row, schema, txn, db_id, qctx,
+                                pattern,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
                             )
                             .await?,
                         ),
                         escape: match escape {
                             Some(e) => Some(Box::new(
                                 self.materialize_catalog_functions(
-                                    e, row, schema, txn, db_id, qctx,
+                                    e,
+                                    row,
+                                    schema,
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    qctx,
                                 )
                                 .await?,
                             )),
@@ -357,20 +561,41 @@ impl Executor {
                     kind: TypedExprKind::SimilarTo {
                         expr: Box::new(
                             self.materialize_catalog_functions(
-                                inner, row, schema, txn, db_id, qctx,
+                                inner,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
                             )
                             .await?,
                         ),
                         pattern: Box::new(
                             self.materialize_catalog_functions(
-                                pattern, row, schema, txn, db_id, qctx,
+                                pattern,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
                             )
                             .await?,
                         ),
                         escape: match escape {
                             Some(e) => Some(Box::new(
                                 self.materialize_catalog_functions(
-                                    e, row, schema, txn, db_id, qctx,
+                                    e,
+                                    row,
+                                    schema,
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    qctx,
                                 )
                                 .await?,
                             )),
@@ -387,24 +612,60 @@ impl Executor {
                 } => {
                     let operand = match operand {
                         Some(e) => Some(Box::new(
-                            self.materialize_catalog_functions(e, row, schema, txn, db_id, qctx)
-                                .await?,
+                            self.materialize_catalog_functions(
+                                e,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
+                            )
+                            .await?,
                         )),
                         None => None,
                     };
                     let mut new_when = Vec::with_capacity(when_clauses.len());
                     for (w, t) in when_clauses {
                         new_when.push((
-                            self.materialize_catalog_functions(w, row, schema, txn, db_id, qctx)
-                                .await?,
-                            self.materialize_catalog_functions(t, row, schema, txn, db_id, qctx)
-                                .await?,
+                            self.materialize_catalog_functions(
+                                w,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
+                            )
+                            .await?,
+                            self.materialize_catalog_functions(
+                                t,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
+                            )
+                            .await?,
                         ));
                     }
                     let else_result = match else_result {
                         Some(e) => Some(Box::new(
-                            self.materialize_catalog_functions(e, row, schema, txn, db_id, qctx)
-                                .await?,
+                            self.materialize_catalog_functions(
+                                e,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
+                            )
+                            .await?,
                         )),
                         None => None,
                     };
@@ -423,8 +684,17 @@ impl Executor {
                     let mut new_args = Vec::with_capacity(args.len());
                     for a in args {
                         new_args.push(
-                            self.materialize_catalog_functions(a, row, schema, txn, db_id, qctx)
-                                .await?,
+                            self.materialize_catalog_functions(
+                                a,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
+                            )
+                            .await?,
                         );
                     }
                     Ok(TypedExpr {
@@ -440,12 +710,30 @@ impl Executor {
                 TypedExprKind::NullIf(a, b) => Ok(TypedExpr {
                     kind: TypedExprKind::NullIf(
                         Box::new(
-                            self.materialize_catalog_functions(a, row, schema, txn, db_id, qctx)
-                                .await?,
+                            self.materialize_catalog_functions(
+                                a,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
+                            )
+                            .await?,
                         ),
                         Box::new(
-                            self.materialize_catalog_functions(b, row, schema, txn, db_id, qctx)
-                                .await?,
+                            self.materialize_catalog_functions(
+                                b,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
+                            )
+                            .await?,
                         ),
                     ),
                     data_type: expr.data_type.clone(),
@@ -458,13 +746,29 @@ impl Executor {
                     kind: TypedExprKind::JsonAccess {
                         expr: Box::new(
                             self.materialize_catalog_functions(
-                                inner, row, schema, txn, db_id, qctx,
+                                inner,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
                             )
                             .await?,
                         ),
                         path: Box::new(
-                            self.materialize_catalog_functions(path, row, schema, txn, db_id, qctx)
-                                .await?,
+                            self.materialize_catalog_functions(
+                                path,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
+                            )
+                            .await?,
                         ),
                         operator: *operator,
                     },
@@ -474,13 +778,27 @@ impl Executor {
                     kind: TypedExprKind::ArrayIndex {
                         array: Box::new(
                             self.materialize_catalog_functions(
-                                array, row, schema, txn, db_id, qctx,
+                                array,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
                             )
                             .await?,
                         ),
                         index: Box::new(
                             self.materialize_catalog_functions(
-                                index, row, schema, txn, db_id, qctx,
+                                index,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
                             )
                             .await?,
                         ),
@@ -570,6 +888,38 @@ impl Executor {
         let Some(oid) = value_to_i64(&oid_val) else {
             return Ok(Value::Text("text".to_string()));
         };
+
+        // Read typmod from second argument (default -1 when absent)
+        let typmod = args
+            .get(1)
+            .and_then(|a| eval_typed_expr(a, row, qctx).ok())
+            .and_then(|v| value_to_i64(&v))
+            .unwrap_or(-1);
+
+        // Handle types that need typmod for canonical name (PG format_type compat)
+        use crate::sql::pg_types;
+        match oid {
+            pg_types::OID_VARCHAR => {
+                return if typmod > 0 {
+                    Ok(Value::Text(format!("character varying({})", typmod - 4)))
+                } else {
+                    Ok(Value::Text("character varying".to_string()))
+                };
+            }
+            pg_types::OID_BPCHAR => {
+                return if typmod > 0 {
+                    Ok(Value::Text(format!("character({})", typmod - 4)))
+                } else {
+                    Ok(Value::Text("character".to_string()))
+                };
+            }
+            pg_types::OID_NUMERIC if typmod > 0 => {
+                let precision = ((typmod - 4) >> 16) & 0xffff;
+                let scale = (typmod - 4) & 0xffff;
+                return Ok(Value::Text(format!("numeric({},{})", precision, scale)));
+            }
+            _ => {}
+        }
 
         // Row-level compatibility: if typname column is visible, return it.
         if let Some(schema) = schema {

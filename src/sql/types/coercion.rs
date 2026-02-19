@@ -216,6 +216,13 @@ pub fn binary_op_result_type(op: &str, left: &DataType, right: &DataType) -> Opt
                 (DataType::Date, DataType::Date) if op == "Minus" || op == "-" => {
                     Some(DataType::Int32)
                 }
+                (DataType::Jsonb, DataType::Text)
+                | (DataType::Jsonb, DataType::Int32)
+                | (DataType::Jsonb, DataType::Int64)
+                    if op == "Minus" || op == "-" =>
+                {
+                    Some(DataType::Jsonb)
+                }
                 _ if is_numeric(left) && is_numeric(right) => common_type(left, right),
                 _ => None,
             }
@@ -249,6 +256,11 @@ pub fn binary_op_result_type(op: &str, left: &DataType, right: &DataType) -> Opt
         "LongArrow" | "->>" => Some(DataType::Text),
         "HashArrow" | "#>" => Some(DataType::Jsonb),
         "HashLongArrow" | "#>>" => Some(DataType::Text),
+        "HashMinus" | "#-" => match (left, right) {
+            (DataType::Jsonb, DataType::Array(_)) => Some(DataType::Jsonb),
+            (DataType::Jsonb, DataType::Text) => Some(DataType::Jsonb),
+            _ => None,
+        },
         "AtArrow" | "ArrowAt" | "@>" | "<@" | "?" | "?|" | "?&" => Some(DataType::Boolean),
 
         // Regex operators (PostgreSQL-specific, always return boolean)

@@ -35,7 +35,7 @@ impl<'a> Analyzer<'a> {
     pub fn analyze_expr(&mut self, expr: &Expr) -> Result<TypedExpr, AnalyzerError> {
         match expr {
             // ── Leaf nodes ──────────────────────────────────
-            Expr::Identifier(ident) => self.analyze_identifier(&ident.value),
+            Expr::Identifier(ident) => self.analyze_identifier(ident),
 
             Expr::CompoundIdentifier(parts) => self.analyze_compound_identifier(parts),
 
@@ -43,6 +43,18 @@ impl<'a> Analyzer<'a> {
 
             // ── Parenthesized expression ────────────────────
             Expr::Nested(inner) => self.analyze_expr(inner),
+
+            // ── Tuple / row constructor syntax ──────────────
+            Expr::Tuple(items) => {
+                let analyzed_items: Vec<TypedExpr> = items
+                    .iter()
+                    .map(|e| self.analyze_expr(e))
+                    .collect::<Result<_, _>>()?;
+                Ok(TypedExpr::new(
+                    TypedExprKind::Row(analyzed_items),
+                    DataType::UserDefined("record".to_string()),
+                ))
+            }
 
             // ── Binary operators ────────────────────────────
             Expr::BinaryOp { left, op, right } => self.analyze_binary_op(left, op, right),
@@ -299,8 +311,8 @@ impl<'a> Analyzer<'a> {
                         other => {
                             return Err(AnalyzerError::OperatorTypeMismatch {
                                 operator: "[]".to_string(),
-                                left: other.clone(),
-                                right: idx.data_type.clone(),
+                                left: other.to_string().to_lowercase(),
+                                right: idx.data_type.to_string().to_lowercase(),
                             });
                         }
                     };
@@ -321,6 +333,29 @@ impl<'a> Analyzer<'a> {
                 operator,
                 right,
             } => {
+                // Chained JSON access can arrive as:
+                //   JsonAccess(left, op, JsonAccess(path1, op2, path2))
+                // Reassociate to preserve JSON semantics:
+                //   JsonAccess(JsonAccess(left, op, path1), op2, path2)
+                if let Expr::JsonAccess {
+                    left: chained_left,
+                    operator: chained_op,
+                    right: chained_right,
+                } = right.as_ref()
+                {
+                    let left_json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: operator.clone(),
+                        right: chained_left.clone(),
+                    };
+                    let reassociated = Expr::JsonAccess {
+                        left: Box::new(left_json_access),
+                        operator: chained_op.clone(),
+                        right: chained_right.clone(),
+                    };
+                    return self.analyze_expr(&reassociated);
+                }
+
                 // sqlparser gives JSON operators lower precedence than comparison
                 // operators, so `metadata->>'level' = 'senior'` is parsed as:
                 //   JsonAccess(metadata, LongArrow, BinaryOp('level', Eq, 'senior'))
@@ -332,6 +367,24 @@ impl<'a> Analyzer<'a> {
                     right: bin_right,
                 } = right.as_ref()
                 {
+                    // Chained JSON access can arrive as:
+                    //   JsonAccess(left, op, BinaryOp(path1, json_op, path2))
+                    // Reassociate to preserve JSON access semantics:
+                    //   JsonAccess(JsonAccess(left, op, path1), json_op, path2)
+                    if let Some(chained_json_op) = Self::binary_op_to_json_access_op(bin_op) {
+                        let left_json_access = Expr::JsonAccess {
+                            left: left.clone(),
+                            operator: operator.clone(),
+                            right: bin_left.clone(),
+                        };
+                        let reassociated = Expr::JsonAccess {
+                            left: Box::new(left_json_access),
+                            operator: chained_json_op,
+                            right: bin_right.clone(),
+                        };
+                        return self.analyze_expr(&reassociated);
+                    }
+
                     let json_access = Expr::JsonAccess {
                         left: left.clone(),
                         operator: operator.clone(),
@@ -370,16 +423,46 @@ impl<'a> Analyzer<'a> {
                     ast::JsonOperator::Arrow
                     | ast::JsonOperator::LongArrow
                     | ast::JsonOperator::HashArrow
-                    | ast::JsonOperator::HashLongArrow => {
+                    | ast::JsonOperator::HashLongArrow
+                    | ast::JsonOperator::HashMinus => {
+                        // Validate left operand is JSON/JSONB (PG compat)
+                        match &l.data_type {
+                            DataType::Json | DataType::Jsonb => {}
+                            other => {
+                                let op_str = match operator {
+                                    ast::JsonOperator::Arrow => "->",
+                                    ast::JsonOperator::LongArrow => "->>",
+                                    ast::JsonOperator::HashArrow => "#>",
+                                    ast::JsonOperator::HashLongArrow => "#>>",
+                                    ast::JsonOperator::HashMinus => "#-",
+                                    _ => "json_op",
+                                };
+                                // PG reports bare string literals as type "unknown".
+                                let right_type =
+                                    if matches!(&r.kind, TypedExprKind::Constant(Value::Text(_))) {
+                                        "unknown".to_string()
+                                    } else {
+                                        r.data_type.to_string().to_lowercase()
+                                    };
+                                return Err(AnalyzerError::OperatorTypeMismatch {
+                                    operator: op_str.to_string(),
+                                    left: other.to_string().to_lowercase(),
+                                    right: right_type,
+                                });
+                            }
+                        }
                         let json_op = match operator {
                             ast::JsonOperator::Arrow => JsonAccessOp::Arrow,
                             ast::JsonOperator::LongArrow => JsonAccessOp::LongArrow,
                             ast::JsonOperator::HashArrow => JsonAccessOp::HashArrow,
                             ast::JsonOperator::HashLongArrow => JsonAccessOp::HashLongArrow,
+                            ast::JsonOperator::HashMinus => JsonAccessOp::HashMinus,
                             _ => unreachable!(),
                         };
                         let dt = match json_op {
-                            JsonAccessOp::Arrow | JsonAccessOp::HashArrow => DataType::Jsonb,
+                            JsonAccessOp::Arrow
+                            | JsonAccessOp::HashArrow
+                            | JsonAccessOp::HashMinus => DataType::Jsonb,
                             JsonAccessOp::LongArrow | JsonAccessOp::HashLongArrow => DataType::Text,
                         };
                         Ok(TypedExpr::new(
@@ -573,7 +656,7 @@ impl<'a> Analyzer<'a> {
 
                 // Optimize: `x = ANY(ARRAY[a, b, c])` → `x IN (a, b, c)`
                 if matches!(compare_op, BinaryOperator::Eq) {
-                    if let TypedExprKind::ArrayLiteral(elems) = right_expr.kind {
+                    if let Some(elems) = extract_array_literal_elems(&right_expr) {
                         let mut in_refs: Vec<&TypedExpr> = vec![&left_expr];
                         let elem_refs: Vec<&TypedExpr> = elems.iter().collect();
                         in_refs.extend(elem_refs);
@@ -596,7 +679,7 @@ impl<'a> Analyzer<'a> {
 
                 // Optimize: `x <> ANY(ARRAY[a, b, c])` → `x NOT IN (a, b, c)`
                 if matches!(compare_op, BinaryOperator::NotEq) {
-                    if let TypedExprKind::ArrayLiteral(elems) = right_expr.kind {
+                    if let Some(elems) = extract_array_literal_elems(&right_expr) {
                         let mut in_refs: Vec<&TypedExpr> = vec![&left_expr];
                         let elem_refs: Vec<&TypedExpr> = elems.iter().collect();
                         in_refs.extend(elem_refs);
@@ -661,7 +744,7 @@ impl<'a> Analyzer<'a> {
                 let right_expr = self.analyze_expr(right)?;
 
                 // `x = ALL(ARRAY[a, b, c])` → x = a AND x = b AND x = c
-                if let TypedExprKind::ArrayLiteral(elems) = right_expr.kind {
+                if let Some(elems) = extract_array_literal_elems(&right_expr) {
                     if elems.is_empty() {
                         // ALL of empty array is TRUE by SQL standard
                         return Ok(TypedExpr::new(
@@ -766,16 +849,76 @@ impl<'a> Analyzer<'a> {
 
     // ── Helper: identifier resolution ───────────────────────
 
-    fn analyze_identifier(&mut self, name: &str) -> Result<TypedExpr, AnalyzerError> {
-        let resolved = self.scopes.resolve_column(name)?;
-        Ok(TypedExpr::new(
-            TypedExprKind::ColumnRef {
-                scope_depth: resolved.scope_depth,
-                column_index: resolved.column_index,
-                column_name: resolved.column_name,
-            },
-            resolved.data_type,
-        ))
+    fn analyze_identifier(&mut self, ident: &ast::Ident) -> Result<TypedExpr, AnalyzerError> {
+        match self.scopes.resolve_column_ident(ident) {
+            Ok(resolved) => {
+                if let Some(merged) = resolved.merged_using.clone() {
+                    let mut left_expr = TypedExpr::new(
+                        TypedExprKind::ColumnRef {
+                            scope_depth: resolved.scope_depth,
+                            column_index: merged.left_index,
+                            column_name: merged.column_name.clone(),
+                        },
+                        merged.left_type.clone(),
+                    );
+                    let mut right_expr = TypedExpr::new(
+                        TypedExprKind::ColumnRef {
+                            scope_depth: resolved.scope_depth,
+                            column_index: merged.right_index,
+                            column_name: merged.column_name.clone(),
+                        },
+                        merged.right_type.clone(),
+                    );
+
+                    if left_expr.data_type != merged.data_type {
+                        left_expr = self.coerce_if_needed(left_expr, &merged.data_type);
+                    }
+                    if right_expr.data_type != merged.data_type {
+                        right_expr = self.coerce_if_needed(right_expr, &merged.data_type);
+                    }
+
+                    return Ok(TypedExpr::new(
+                        TypedExprKind::Coalesce(vec![left_expr, right_expr]),
+                        merged.data_type,
+                    ));
+                }
+
+                Ok(TypedExpr::new(
+                    TypedExprKind::ColumnRef {
+                        scope_depth: resolved.scope_depth,
+                        column_index: resolved.column_index,
+                        column_name: resolved.column_name,
+                    },
+                    resolved.data_type,
+                ))
+            }
+            Err(AnalyzerError::ColumnNotFound { .. }) => {
+                if let Some((scope_depth, cols)) = self.scopes.resolve_table_alias_columns(ident) {
+                    let row_items: Vec<TypedExpr> = cols
+                        .into_iter()
+                        .map(|c| {
+                            TypedExpr::new(
+                                TypedExprKind::ColumnRef {
+                                    scope_depth,
+                                    column_index: c.column_index,
+                                    column_name: c.column_name,
+                                },
+                                c.data_type,
+                            )
+                        })
+                        .collect();
+                    return Ok(TypedExpr::new(
+                        TypedExprKind::Row(row_items),
+                        DataType::UserDefined("record".to_string()),
+                    ));
+                }
+                Err(AnalyzerError::ColumnNotFound {
+                    name: ident.value.clone(),
+                    available: self.scopes.current().available_columns(),
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn analyze_compound_identifier(
@@ -792,7 +935,7 @@ impl<'a> Analyzer<'a> {
         if parts.len() == 2 {
             let resolved = self
                 .scopes
-                .resolve_qualified_column(&parts[0].value, &parts[1].value)?;
+                .resolve_qualified_column_idents(&parts[0], &parts[1])?;
             return Ok(TypedExpr::new(
                 TypedExprKind::ColumnRef {
                     scope_depth: resolved.scope_depth,
@@ -808,7 +951,7 @@ impl<'a> Analyzer<'a> {
             let n = parts.len();
             let resolved = self
                 .scopes
-                .resolve_qualified_column(&parts[n - 2].value, &parts[n - 1].value)?;
+                .resolve_qualified_column_idents(&parts[n - 2], &parts[n - 1])?;
             return Ok(TypedExpr::new(
                 TypedExprKind::ColumnRef {
                     scope_depth: resolved.scope_depth,
@@ -820,7 +963,7 @@ impl<'a> Analyzer<'a> {
         }
 
         // Single part (shouldn't reach here, but handle gracefully)
-        self.analyze_identifier(&parts[0].value)
+        self.analyze_identifier(&parts[0])
     }
 
     // ── Helper: value literal analysis ──────────────────────
@@ -887,6 +1030,11 @@ impl<'a> Analyzer<'a> {
             | ast::Value::DoubleQuotedString(s)
             | ast::Value::EscapedStringLiteral(s) => Ok(TypedExpr::new(
                 TypedExprKind::Constant(Value::Text(s.clone())),
+                DataType::Text,
+            )),
+
+            ast::Value::DollarQuotedString(dqs) => Ok(TypedExpr::new(
+                TypedExprKind::Constant(Value::Text(dqs.value.clone())),
                 DataType::Text,
             )),
 
@@ -988,8 +1136,8 @@ impl<'a> Analyzer<'a> {
             })
             .ok_or_else(|| AnalyzerError::OperatorTypeMismatch {
                 operator: op_display.clone(),
-                left: l.data_type.clone(),
-                right: r.data_type.clone(),
+                left: l.data_type.to_string().to_lowercase(),
+                right: r.data_type.to_string().to_lowercase(),
             })?;
 
         // Insert implicit casts when operand types differ and a target type exists.
@@ -1003,6 +1151,20 @@ impl<'a> Analyzer<'a> {
                 | BinaryOp::LtEq
                 | BinaryOp::Gt
                 | BinaryOp::GtEq => comparison_target_type(&l.data_type, &r.data_type),
+                // PostgreSQL jsonb subtraction is heterogeneous:
+                //   jsonb - text / int
+                // Do not force both sides to a common type (e.g. Text), which
+                // would break operator dispatch at runtime.
+                BinaryOp::Sub
+                    if matches!(
+                        (&l.data_type, &r.data_type),
+                        (DataType::Jsonb, DataType::Text)
+                            | (DataType::Jsonb, DataType::Int32)
+                            | (DataType::Jsonb, DataType::Int64)
+                    ) =>
+                {
+                    None
+                }
                 _ => common_type(&l.data_type, &r.data_type),
             };
 
@@ -1068,6 +1230,23 @@ impl<'a> Analyzer<'a> {
                 )));
             }
         })
+    }
+
+    fn binary_op_to_json_access_op(op: &ast::BinaryOperator) -> Option<ast::JsonOperator> {
+        match op {
+            ast::BinaryOperator::PGCustomBinaryOperator(parts) => {
+                let op_str: String = parts.iter().map(|p| p.as_str()).collect();
+                match op_str.as_str() {
+                    "->" => Some(ast::JsonOperator::Arrow),
+                    "->>" => Some(ast::JsonOperator::LongArrow),
+                    "#>" => Some(ast::JsonOperator::HashArrow),
+                    "#>>" => Some(ast::JsonOperator::HashLongArrow),
+                    "#-" => Some(ast::JsonOperator::HashMinus),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     // ── Helper: unary operators ─────────────────────────────
@@ -1167,16 +1346,26 @@ impl<'a> Analyzer<'a> {
         let mut when_clauses = Vec::with_capacity(conditions.len());
 
         for (cond, result) in conditions.iter().zip(results.iter()) {
-            let c = self.analyze_expr(cond)?;
+            let mut c = self.analyze_expr(cond)?;
             // For searched CASE (no operand), each WHEN condition must be boolean.
             // For simple CASE (with operand), conditions are values compared to
             // the operand, so any type is valid.
-            if analyzed_operand.is_none() && c.data_type != DataType::Boolean {
-                return Err(AnalyzerError::TypeMismatch {
-                    expected: DataType::Boolean,
-                    found: c.data_type.clone(),
-                    context: "CASE WHEN condition".to_string(),
-                });
+            if analyzed_operand.is_none() {
+                if c.is_null_constant() {
+                    c = TypedExpr::null(DataType::Boolean);
+                } else if matches!(c.kind, TypedExprKind::Constant(Value::Text(_))) {
+                    // PostgreSQL unknown-literal behavior in boolean context:
+                    // CASE WHEN 'true' THEN ... is allowed via implicit cast.
+                    c = self.coerce_if_needed(c, &DataType::Boolean);
+                }
+
+                if c.data_type != DataType::Boolean {
+                    return Err(AnalyzerError::TypeMismatch {
+                        expected: DataType::Boolean,
+                        found: c.data_type.clone(),
+                        context: "CASE WHEN condition".to_string(),
+                    });
+                }
             }
             let r = self.analyze_expr(result)?;
             when_clauses.push((c, r));
@@ -1195,8 +1384,8 @@ impl<'a> Analyzer<'a> {
                     comparison_target_type(&target, &when_expr.data_type).ok_or_else(|| {
                         AnalyzerError::OperatorTypeMismatch {
                             operator: "=".to_string(),
-                            left: target.clone(),
-                            right: when_expr.data_type.clone(),
+                            left: target.to_string().to_lowercase(),
+                            right: when_expr.data_type.to_string().to_lowercase(),
                         }
                     })?;
             }
@@ -1274,7 +1463,25 @@ impl<'a> Analyzer<'a> {
             "NULLIF" => return self.analyze_nullif(analyzed_args),
             "GREATEST" => return self.analyze_greatest_least(analyzed_args, true),
             "LEAST" => return self.analyze_greatest_least(analyzed_args, false),
+            // ROW(...) constructor is represented as a dedicated Typed IR node.
+            "ROW" => {
+                return Ok(TypedExpr::new(
+                    TypedExprKind::Row(analyzed_args),
+                    DataType::UserDefined("record".to_string()),
+                ))
+            }
             _ => {}
+        }
+
+        // PostgreSQL polymorphic resolution: TO_JSONB(unknown_literal) fails unless
+        // the literal is explicitly typed/cast.
+        if func_name == "TO_JSONB"
+            && args.len() == 1
+            && matches!(args[0], Expr::Value(ast::Value::SingleQuotedString(_)))
+        {
+            return Err(AnalyzerError::Unsupported(
+                "could not determine polymorphic type because input has type unknown".to_string(),
+            ));
         }
 
         // Analyze FILTER clause
@@ -1707,11 +1914,19 @@ impl<'a> Analyzer<'a> {
             .map(|ob| {
                 // PostgreSQL: ORDER BY can reference output aliases. Check first.
                 let expr = if let Expr::Identifier(ident) = &ob.expr {
-                    let name_lower = ident.value.to_lowercase();
-                    if let Some(proj) = projection
-                        .iter()
-                        .find(|p| p.output_name.to_lowercase() == name_lower)
-                    {
+                    let is_quoted = ident.quote_style.is_some();
+                    let id_norm = if is_quoted {
+                        ident.value.clone()
+                    } else {
+                        ident.value.to_lowercase()
+                    };
+                    if let Some(proj) = projection.iter().find(|p| {
+                        if is_quoted {
+                            p.output_name == id_norm
+                        } else {
+                            p.output_name.to_lowercase() == id_norm
+                        }
+                    }) {
                         proj.expr.clone()
                     } else {
                         self.analyze_expr(&ob.expr)?
@@ -1737,5 +1952,17 @@ impl<'a> Analyzer<'a> {
                 })
             })
             .collect()
+    }
+}
+
+/// Extract array literal elements from a typed expression.
+///
+/// Handles direct `ArrayLiteral` and cast-wrapped array literals
+/// (`CAST(ARRAY[...] AS type[])`, `ARRAY[...]::type[]`).
+fn extract_array_literal_elems(expr: &TypedExpr) -> Option<Vec<TypedExpr>> {
+    match &expr.kind {
+        TypedExprKind::ArrayLiteral(elems) => Some(elems.clone()),
+        TypedExprKind::Cast { expr: inner, .. } => extract_array_literal_elems(inner),
+        _ => None,
     }
 }

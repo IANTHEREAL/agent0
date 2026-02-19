@@ -59,7 +59,7 @@ impl VirtualTable for PgIndexes {
                         .filter_map(|idx| schema.columns.get(*idx).map(|c| c.name.clone()))
                         .collect();
                     let indexdef = format!(
-                        "CREATE UNIQUE INDEX {} ON {}.{} USING btree ({})",
+                        "create unique index {} on {}.{} using btree ({})",
                         pk_name,
                         table_schema,
                         table_name,

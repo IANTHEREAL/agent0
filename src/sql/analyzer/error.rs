@@ -38,10 +38,11 @@ pub enum AnalyzerError {
     },
 
     /// Operator type mismatch (no operator exists for the given operand types).
+    /// Fields carry lowercase PG-style type names (e.g. "text", "integer", "unknown").
     OperatorTypeMismatch {
         operator: String,
-        left: DataType,
-        right: DataType,
+        left: String,
+        right: String,
     },
 
     /// Type mismatch in context (e.g. WHERE clause is not boolean).
@@ -108,8 +109,26 @@ impl fmt::Display for AnalyzerError {
             Self::ColumnNotFound { name, available } => {
                 write!(f, "column \"{}\" does not exist", name)?;
                 if !available.is_empty() {
-                    let hint: Vec<_> = available.iter().take(5).map(String::as_str).collect();
-                    write!(f, "\nHINT: Perhaps you meant: {}", hint.join(", "))?;
+                    // Use edit-distance to find the closest match (PG-style hint).
+                    let best = available
+                        .iter()
+                        .filter_map(|candidate| {
+                            let col_part = candidate.rsplit('.').next().unwrap_or(candidate);
+                            let dist = strsim_damerau_levenshtein(
+                                &name.to_lowercase(),
+                                &col_part.to_lowercase(),
+                            );
+                            if dist <= 3 { Some((dist, candidate.as_str())) } else { None }
+                        })
+                        .min_by_key(|(d, _)| *d)
+                        .map(|(_, c)| c);
+                    if let Some(suggestion) = best {
+                        write!(
+                            f,
+                            "\nHINT:  Perhaps you meant to reference the column \"{}\".",
+                            suggestion
+                        )?;
+                    }
                 }
                 Ok(())
             }
@@ -159,7 +178,7 @@ impl fmt::Display for AnalyzerError {
                 right,
             } => write!(
                 f,
-                "operator does not exist: {} {} {}",
+                "operator does not exist: {} {} {}\nHINT:  No operator matches the given name and argument types. You might need to add explicit type casts.",
                 left, operator, right
             ),
             Self::TypeMismatch {
@@ -247,3 +266,36 @@ impl fmt::Display for AnalyzerError {
 }
 
 impl std::error::Error for AnalyzerError {}
+
+/// Simple Damerau-Levenshtein distance for column-name suggestions.
+fn strsim_damerau_levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let la = a.len();
+    let lb = b.len();
+    if la == 0 {
+        return lb;
+    }
+    if lb == 0 {
+        return la;
+    }
+    let mut d = vec![vec![0usize; lb + 1]; la + 1];
+    for i in 0..=la {
+        d[i][0] = i;
+    }
+    for j in 0..=lb {
+        d[0][j] = j;
+    }
+    for i in 1..=la {
+        for j in 1..=lb {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            d[i][j] = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d[i][j] = d[i][j].min(d[i - 2][j - 2] + cost);
+            }
+        }
+    }
+    d[la][lb]
+}

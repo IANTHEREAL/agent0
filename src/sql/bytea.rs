@@ -73,36 +73,34 @@ pub(crate) fn uuid_send(value: [u8; 16]) -> Vec<u8> {
 
 /// PostgreSQL `encode(data, 'escape')`: convert `BYTEA` to the legacy escape format.
 ///
-/// Behavior matches PostgreSQL:
-/// - Printable ASCII bytes (`0x20..=0x7e`) are emitted as-is, except `\\`.
-/// - `\\` is escaped as `\\\\`.
-/// - All other bytes are emitted as a backslash followed by a 3-digit octal code (`\\000`-`\\377`).
+/// Behavior matches PostgreSQL `encode(bytea, 'escape')`:
+/// - Only `\0` (null byte), `\\` (backslash), and high-bit bytes (`0x80..=0xff`)
+///   are escaped. Everything else (`0x01..=0x7f` except `\\`) is emitted as-is.
+///
+/// Note: this differs from `byteaout()` which also escapes control chars
+/// `0x01..=0x1f` and `0x7f`. The `encode(escape)` function is intentionally
+/// more permissive, matching PostgreSQL's `src/backend/utils/adt/encode.c`.
 pub(crate) fn encode_escape(bytes: &[u8]) -> String {
-    // Fast path: everything is printable ASCII and not a backslash.
-    if bytes
-        .iter()
-        .all(|&b| matches!(b, 0x20..=0x7e) && b != b'\\')
-    {
-        let mut out = Vec::with_capacity(bytes.len());
-        out.extend_from_slice(bytes);
-        // SAFETY: the allowed range is ASCII, which is valid UTF-8.
-        return unsafe { String::from_utf8_unchecked(out) };
+    // Fast path: no null bytes, no backslashes, no high-bit bytes.
+    if bytes.iter().all(|&b| b != 0x00 && b != b'\\' && b < 0x80) {
+        // SAFETY: bytes 0x01..=0x7f are valid UTF-8 (ASCII range).
+        return unsafe { String::from_utf8_unchecked(bytes.to_vec()) };
     }
 
     let mut out = Vec::with_capacity(bytes.len().saturating_mul(4));
     for &b in bytes {
         match b {
             b'\\' => out.extend_from_slice(b"\\\\"),
-            0x20..=0x7e => out.push(b),
-            _ => {
+            0x00 | 0x80..=0xff => {
                 out.push(b'\\');
                 out.push(b'0' + ((b >> 6) & 0x07));
                 out.push(b'0' + ((b >> 3) & 0x07));
                 out.push(b'0' + (b & 0x07));
             }
+            _ => out.push(b),
         }
     }
-    // SAFETY: output is ASCII (printable bytes, backslash, digits), which is valid UTF-8.
+    // SAFETY: output contains only 0x01..=0x7f bytes and ASCII digits/backslashes.
     unsafe { String::from_utf8_unchecked(out) }
 }
 
@@ -307,9 +305,13 @@ mod tests {
 
     #[test]
     fn escape_encode_matches_postgres_conventions() {
+        // PG encode(escape) only escapes \0, \\, and 0x80-0xff.
+        // Control chars 0x01-0x1f and 0x7f are passed through as-is.
         let bytes = vec![b'\\', 0, 0x1f, b' ', 0x7f, 0xff];
         let encoded = encode_escape(&bytes);
-        assert_eq!(encoded, r"\\\000\037 \177\377");
+        // Expected: \\ \000 <raw 0x1f> <space> <raw 0x7f> \377
+        assert_eq!(encoded, "\\\\\\000\x1f \x7f\\377");
+        assert_eq!(encoded.len(), 13);
     }
 
     #[test]

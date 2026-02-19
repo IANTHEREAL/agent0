@@ -10,6 +10,9 @@
 //! 3) SELECT privilege check
 //! 4) Analyzer
 //! 5) post-analysis rewriter
+//!
+//! Contract: this is the only semantic entrypoint. Callers must not implement
+//! runtime fallback to alternate planning/execution paths on analysis failure.
 
 use super::catalog_prefetch::build_catalog_snapshot;
 use super::view_rewrite::expand_views_in_query;
@@ -21,6 +24,8 @@ use crate::sql::error::SqlError;
 impl Executor {
     /// Canonical `SELECT/WITH` entry:
     /// raw query AST -> expanded AST + rewritten analyzed query.
+    ///
+    /// Errors are propagated directly to preserve single-path semantics.
     pub(crate) async fn analyze_then_rewrite_query(
         &self,
         txn: &mut Transaction,

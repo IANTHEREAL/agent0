@@ -139,15 +139,17 @@ pub fn access_method_name(method: Option<&str>) -> &str {
 pub fn format_index_columns(idx: &IndexDef) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.extend(idx.columns.iter().cloned());
-    parts.extend(idx.expressions.iter().map(|e| format!("({})", e)));
+    // PostgreSQL does not wrap expression-index entries in extra parens.
+    parts.extend(idx.expressions.iter().cloned());
     parts.join(", ")
 }
 
 pub fn format_indexdef(table_schema: &str, table_name: &str, idx: &IndexDef) -> String {
     let cols = format_index_columns(idx);
+    // PostgreSQL's pg_get_indexdef() outputs lowercase keywords.
     let mut indexdef = format!(
-        "CREATE {}INDEX {} ON {}.{} USING {} ({})",
-        if idx.unique { "UNIQUE " } else { "" },
+        "create {}index {} on {}.{} using {} ({})",
+        if idx.unique { "unique " } else { "" },
         idx.name,
         table_schema,
         table_name,
@@ -155,8 +157,10 @@ pub fn format_indexdef(table_schema: &str, table_name: &str, idx: &IndexDef) -> 
         cols
     );
     if let Some(pred) = idx.predicate.as_ref() {
-        indexdef.push_str(" WHERE ");
+        // PostgreSQL wraps the WHERE predicate in parentheses.
+        indexdef.push_str(" where (");
         indexdef.push_str(pred);
+        indexdef.push(')');
     }
     indexdef
 }

@@ -12,8 +12,10 @@ use anyhow::{anyhow, Result};
 
 use super::physical_plan::{PhysicalNode, PhysicalPlan};
 use crate::sql::analyzer::types::{
-    JoinCondition, JoinType, SetOpKind, TypedExpr, TypedExprKind, TypedOrderByExpr,
+    BinaryOp as TypedBinaryOp, JoinCondition, JoinType, SetOpKind, TypedExpr, TypedExprKind,
+    TypedOrderByExpr,
 };
+use crate::sql::expr::classify::has_correlated_ref;
 use crate::sql::expr::typed_eval::eval_const_usize;
 use crate::sql::operators::AggregateExpr;
 use crate::sql::operators::{
@@ -24,6 +26,7 @@ use crate::sql::operators::{
 };
 use crate::sql::operators::{InListScanOperator, IndexScanOperator, RangeIndexScanOperator};
 use crate::sql::planner::ScanType;
+use crate::sql::value_coercion::coerce_value_for_column;
 use crate::types::{DataType, Row, TableSchema, Value};
 
 /// Context needed to translate a [`PhysicalPlan`] into operator trees.
@@ -72,107 +75,14 @@ impl PhysicalPlan {
         match &self.node {
             // ── Scan operators ──────────────────────────────────
             PhysicalNode::SeqScan { table_name, alias } => {
-                let key = super::schema_map_key(table_name, alias.as_deref());
-                let schema = ctx
-                    .table_schemas
-                    .get(&key)
-                    .ok_or_else(|| anyhow!("Table schema not found: {}", key))?;
-                let mut schema = schema.clone();
-                if let Some(a) = alias {
-                    schema.from_alias = Some(a.clone());
-                }
-                // Use preloaded rows for virtual catalog tables, CTEs, etc.
-                if let Some(rows) = ctx.preloaded_rows.get(&key) {
-                    Ok(Box::new(TableScanOperator::new_with_rows(
-                        schema,
-                        rows.clone(),
-                    )))
-                } else {
-                    Ok(Box::new(TableScanOperator::new(schema)))
-                }
+                build_seq_scan_operator(ctx, table_name, alias.as_deref(), None)
             }
 
             PhysicalNode::IndexScan {
                 table_name,
                 alias,
                 scan_type,
-            } => {
-                let key = super::schema_map_key(table_name, alias.as_deref());
-                let schema = ctx
-                    .table_schemas
-                    .get(&key)
-                    .ok_or_else(|| anyhow!("Table schema not found: {}", key))?;
-                let mut schema = schema.clone();
-                if let Some(a) = alias {
-                    schema.from_alias = Some(a.clone());
-                }
-                match scan_type {
-                    ScanType::IndexScan {
-                        index_id,
-                        index_name,
-                        values,
-                        ..
-                    } => Ok(Box::new(IndexScanOperator::new_with_scan_limit(
-                        schema,
-                        *index_id,
-                        index_name.clone(),
-                        values.clone(),
-                        None,
-                    ))),
-                    ScanType::IndexRangeScan {
-                        index_id,
-                        index_name,
-                        prefix_values,
-                        ..
-                    } => Ok(Box::new(RangeIndexScanOperator::new(
-                        schema,
-                        *index_id,
-                        index_name.clone(),
-                        prefix_values.clone(),
-                        None,
-                        true,
-                        None,
-                        true,
-                    ))),
-                    ScanType::IndexBoundedRangeScan {
-                        index_id,
-                        index_name,
-                        prefix_values,
-                        range_start,
-                        start_inclusive,
-                        range_end,
-                        end_inclusive,
-                        ..
-                    } => Ok(Box::new(RangeIndexScanOperator::new(
-                        schema,
-                        *index_id,
-                        index_name.clone(),
-                        prefix_values.clone(),
-                        range_start.clone(),
-                        *start_inclusive,
-                        range_end.clone(),
-                        *end_inclusive,
-                    ))),
-                    ScanType::InListScan {
-                        index_id,
-                        index_name,
-                        column_values,
-                        ..
-                    } => Ok(Box::new(InListScanOperator::new(
-                        schema,
-                        *index_id,
-                        index_name.clone(),
-                        column_values.clone(),
-                    ))),
-                    // FullTableScan and GinIndexScan should not appear in PhysicalNode::IndexScan —
-                    // the physical planner only emits btree variants here.
-                    other => Err(anyhow!(
-                        "Unexpected ScanType {:?} in PhysicalNode::IndexScan for table '{}'",
-                        other,
-                        table_name
-                    )),
-                }
-            }
+            } => build_index_scan_operator(ctx, table_name, alias.as_deref(), scan_type, None),
 
             PhysicalNode::Empty => {
                 // No-input operator for SELECT without FROM.
@@ -314,7 +224,6 @@ impl PhysicalPlan {
                 offset,
                 input,
             } => {
-                let child = input.build_operators(ctx)?;
                 let limit_val = limit
                     .as_ref()
                     .map(|expr| eval_const_usize(expr, false))
@@ -324,6 +233,20 @@ impl PhysicalPlan {
                     .map(|expr| eval_const_usize(expr, false))
                     .transpose()?
                     .unwrap_or(0);
+                // Root fix for LIMIT pushdown on the analyzed/optimizer path:
+                // push scan limit only for LIMIT ... OFFSET 0 directly over a KV scan.
+                // This keeps semantics intact while preventing full index scans for
+                // simple top-N probes (e.g. tests/95_limit_pushdown.sql).
+                let child = if offset_val == 0 {
+                    if let Some(scan_limit) = limit_val {
+                        build_limit_child_with_scan_pushdown(input, ctx, scan_limit)?
+                            .unwrap_or(input.build_operators(ctx)?)
+                    } else {
+                        input.build_operators(ctx)?
+                    }
+                } else {
+                    input.build_operators(ctx)?
+                };
                 Ok(Box::new(LimitOperator::new(child, limit_val, offset_val)))
             }
 
@@ -359,12 +282,11 @@ impl PhysicalPlan {
                 let right_op = right.build_operators(ctx)?;
                 let op_join_type = convert_join_type(join_type);
                 let cond = extract_on_condition(condition);
-                Ok(Box::new(NestedLoopJoinOperator::new(
-                    left_op,
-                    right_op,
-                    op_join_type,
-                    cond,
-                )))
+                let right_depends_on_outer = plan_has_correlated_refs(right);
+                Ok(Box::new(
+                    NestedLoopJoinOperator::new(left_op, right_op, op_join_type, cond)
+                        .with_outer_dependency(right_depends_on_outer),
+                ))
             }
 
             PhysicalNode::HashJoin {
@@ -374,6 +296,11 @@ impl PhysicalPlan {
                 condition,
                 left_is_build,
             } => {
+                if plan_has_correlated_refs(right) {
+                    return Err(anyhow!(
+                        "HashJoin does not support correlated right input; planner should choose NestedLoopJoin"
+                    ));
+                }
                 let left_op = left.build_operators(ctx)?;
                 let right_op = right.build_operators(ctx)?;
                 let (left_key_indices, right_key_indices, filter) =
@@ -429,6 +356,287 @@ impl PhysicalPlan {
 
 // ── Helper functions ────────────────────────────────────────────
 
+fn build_seq_scan_operator(
+    ctx: &BuildContext,
+    table_name: &str,
+    alias: Option<&str>,
+    scan_limit: Option<usize>,
+) -> Result<BoxedOperator> {
+    let key = super::schema_map_key(table_name, alias);
+    let schema = ctx
+        .table_schemas
+        .get(&key)
+        .ok_or_else(|| anyhow!("Table schema not found: {}", key))?;
+    let mut schema = schema.clone();
+    if let Some(a) = alias {
+        schema.from_alias = Some(a.to_string());
+    }
+    // Use preloaded rows for virtual catalog tables, CTEs, etc.
+    if let Some(rows) = ctx.preloaded_rows.get(&key) {
+        Ok(Box::new(TableScanOperator::new_with_rows(
+            schema,
+            rows.clone(),
+        )))
+    } else {
+        Ok(Box::new(TableScanOperator::new_with_scan_limit(
+            schema, scan_limit,
+        )))
+    }
+}
+
+fn build_index_scan_operator(
+    ctx: &BuildContext,
+    table_name: &str,
+    alias: Option<&str>,
+    scan_type: &ScanType,
+    scan_limit: Option<usize>,
+) -> Result<BoxedOperator> {
+    let key = super::schema_map_key(table_name, alias);
+    let schema = ctx
+        .table_schemas
+        .get(&key)
+        .ok_or_else(|| anyhow!("Table schema not found: {}", key))?;
+    let mut schema = schema.clone();
+    if let Some(a) = alias {
+        schema.from_alias = Some(a.to_string());
+    }
+    match scan_type {
+        ScanType::IndexScan {
+            index_id,
+            index_name,
+            values,
+            ..
+        } => Ok(Box::new(IndexScanOperator::new_with_scan_limit(
+            schema,
+            *index_id,
+            index_name.clone(),
+            values.clone(),
+            scan_limit,
+        ))),
+        ScanType::IndexRangeScan {
+            index_id,
+            index_name,
+            prefix_values,
+            ..
+        } => Ok(Box::new(RangeIndexScanOperator::new(
+            schema,
+            *index_id,
+            index_name.clone(),
+            prefix_values.clone(),
+            None,
+            true,
+            None,
+            true,
+        ))),
+        ScanType::IndexBoundedRangeScan {
+            index_id,
+            index_name,
+            prefix_values,
+            range_start,
+            start_inclusive,
+            range_end,
+            end_inclusive,
+            ..
+        } => Ok(Box::new(RangeIndexScanOperator::new(
+            schema,
+            *index_id,
+            index_name.clone(),
+            prefix_values.clone(),
+            range_start.clone(),
+            *start_inclusive,
+            range_end.clone(),
+            *end_inclusive,
+        ))),
+        ScanType::InListScan {
+            index_id,
+            index_name,
+            column_values,
+            ..
+        } => Ok(Box::new(InListScanOperator::new(
+            schema,
+            *index_id,
+            index_name.clone(),
+            column_values.clone(),
+        ))),
+        // GIN execution operator is not implemented yet. Keep runtime semantics
+        // correct by scanning table rows and letting the parent Filter evaluate.
+        ScanType::GinIndexScan { .. } => Ok(Box::new(TableScanOperator::new(schema))),
+        // FullTableScan should not appear in PhysicalNode::IndexScan.
+        other => Err(anyhow!(
+            "Unexpected ScanType {:?} in PhysicalNode::IndexScan for table '{}'",
+            other,
+            table_name
+        )),
+    }
+}
+
+fn build_limit_child_with_scan_pushdown(
+    input: &PhysicalPlan,
+    ctx: &BuildContext,
+    scan_limit: usize,
+) -> Result<Option<BoxedOperator>> {
+    match &input.node {
+        PhysicalNode::SeqScan { table_name, alias } => Ok(Some(build_seq_scan_operator(
+            ctx,
+            table_name,
+            alias.as_deref(),
+            Some(scan_limit),
+        )?)),
+        PhysicalNode::IndexScan {
+            table_name,
+            alias,
+            scan_type,
+        } => Ok(Some(build_index_scan_operator(
+            ctx,
+            table_name,
+            alias.as_deref(),
+            scan_type,
+            Some(scan_limit),
+        )?)),
+        // Projection is row-preserving, so pushing LIMIT through Project is safe.
+        PhysicalNode::Project { projections, input } => {
+            let Some(child) = build_limit_child_with_scan_pushdown(input, ctx, scan_limit)? else {
+                return Ok(None);
+            };
+            let expressions: Vec<TypedExpr> = projections.iter().map(|p| p.expr.clone()).collect();
+            let output_names: Vec<String> =
+                projections.iter().map(|p| p.output_name.clone()).collect();
+            let output_types: Vec<DataType> = projections
+                .iter()
+                .map(|p| p.expr.data_type.clone())
+                .collect();
+            Ok(Some(Box::new(ProjectOperator::new(
+                child,
+                expressions,
+                output_names,
+                output_types,
+            ))))
+        }
+        PhysicalNode::Filter { predicate, input } => {
+            // Only push through Filter when the Filter is provably redundant with
+            // the chosen IndexScan lookup keys (exact equality match on the same
+            // leading index columns). Otherwise LIMIT pushdown can change results.
+            let PhysicalNode::IndexScan {
+                table_name,
+                alias,
+                scan_type:
+                    ScanType::IndexScan {
+                        index_id, values, ..
+                    },
+            } = &input.node
+            else {
+                return Ok(None);
+            };
+
+            let key = super::schema_map_key(table_name, alias.as_deref());
+            let Some(schema) = ctx.table_schemas.get(&key) else {
+                return Ok(None);
+            };
+            if !typed_filter_is_exact_index_lookup(predicate, schema, *index_id, values) {
+                return Ok(None);
+            }
+
+            Ok(Some(build_index_scan_operator(
+                ctx,
+                table_name,
+                alias.as_deref(),
+                match &input.node {
+                    PhysicalNode::IndexScan { scan_type, .. } => scan_type,
+                    _ => unreachable!(),
+                },
+                Some(scan_limit),
+            )?))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn collect_eq_predicates(expr: &TypedExpr, out: &mut HashMap<String, Value>) -> Option<()> {
+    match &expr.kind {
+        TypedExprKind::BinaryOp { left, op, right } => match op {
+            TypedBinaryOp::And => {
+                collect_eq_predicates(left, out)?;
+                collect_eq_predicates(right, out)?;
+                Some(())
+            }
+            TypedBinaryOp::Eq => {
+                let (col, val) = if let TypedExprKind::ColumnRef { column_name, .. } = &left.kind {
+                    if let TypedExprKind::Constant(v) = &right.kind {
+                        (column_name.to_lowercase(), v.clone())
+                    } else {
+                        return None;
+                    }
+                } else if let TypedExprKind::ColumnRef { column_name, .. } = &right.kind {
+                    if let TypedExprKind::Constant(v) = &left.kind {
+                        (column_name.to_lowercase(), v.clone())
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                };
+
+                if let Some(existing) = out.get(&col) {
+                    if existing != &val {
+                        return None;
+                    }
+                    return Some(());
+                }
+
+                out.insert(col, val);
+                Some(())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn typed_filter_is_exact_index_lookup(
+    filter: &TypedExpr,
+    schema: &TableSchema,
+    index_id: u64,
+    lookup_values: &[Value],
+) -> bool {
+    let Some(index) = schema.indexes.iter().find(|i| i.id == index_id) else {
+        return false;
+    };
+
+    if lookup_values.is_empty() || lookup_values.len() > index.columns.len() {
+        return false;
+    }
+
+    let mut predicates: HashMap<String, Value> = HashMap::new();
+    if collect_eq_predicates(filter, &mut predicates).is_none() {
+        return false;
+    }
+    if predicates.len() != lookup_values.len() {
+        return false;
+    }
+
+    for (i, col) in index.columns.iter().take(lookup_values.len()).enumerate() {
+        let key = col.to_lowercase();
+        let Some(pred_value) = predicates.get(&key) else {
+            return false;
+        };
+        let coerced = if let Some(col_def) = schema
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(col))
+        {
+            coerce_value_for_column(pred_value.clone(), col_def)
+                .unwrap_or_else(|_| pred_value.clone())
+        } else {
+            pred_value.clone()
+        };
+        if coerced != lookup_values[i] {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// Convert analyzer JoinType to operator JoinType.
 fn convert_join_type(jt: &JoinType) -> OpJoinType {
     match jt {
@@ -437,6 +645,106 @@ fn convert_join_type(jt: &JoinType) -> OpJoinType {
         JoinType::Right => OpJoinType::Right,
         JoinType::Full => OpJoinType::Full,
         JoinType::Cross => OpJoinType::Cross,
+    }
+}
+
+fn join_condition_has_correlated_ref(condition: &JoinCondition) -> bool {
+    match condition {
+        JoinCondition::On(expr) => has_correlated_ref(expr),
+        JoinCondition::Using(_) | JoinCondition::None => false,
+    }
+}
+
+fn plan_has_correlated_refs(plan: &PhysicalPlan) -> bool {
+    match &plan.node {
+        PhysicalNode::SeqScan { .. } | PhysicalNode::IndexScan { .. } | PhysicalNode::Empty => {
+            false
+        }
+        PhysicalNode::Values { rows } => rows.iter().flatten().any(has_correlated_ref),
+        PhysicalNode::TableFunction { args, .. } => args.iter().any(|arg| match arg {
+            crate::sql::analyzer::types::TypedFunctionArg::Positional(expr) => {
+                has_correlated_ref(expr)
+            }
+            crate::sql::analyzer::types::TypedFunctionArg::Named { expr, .. } => {
+                has_correlated_ref(expr)
+            }
+        }),
+        PhysicalNode::Filter { predicate, input } => {
+            has_correlated_ref(predicate) || plan_has_correlated_refs(input)
+        }
+        PhysicalNode::Project { projections, input } => {
+            projections.iter().any(|p| has_correlated_ref(&p.expr))
+                || plan_has_correlated_refs(input)
+        }
+        PhysicalNode::HashAggregate {
+            group_by,
+            projections,
+            input,
+        }
+        | PhysicalNode::StreamAggregate {
+            group_by,
+            projections,
+            input,
+        } => {
+            group_by.iter().any(has_correlated_ref)
+                || projections.iter().any(|p| has_correlated_ref(&p.expr))
+                || plan_has_correlated_refs(input)
+        }
+        PhysicalNode::Sort { order_by, input }
+        | PhysicalNode::TopNSort {
+            order_by, input, ..
+        } => {
+            order_by.iter().any(|o| has_correlated_ref(&o.expr)) || plan_has_correlated_refs(input)
+        }
+        PhysicalNode::Limit {
+            limit,
+            offset,
+            input,
+        } => {
+            limit.as_ref().is_some_and(has_correlated_ref)
+                || offset.as_ref().is_some_and(has_correlated_ref)
+                || plan_has_correlated_refs(input)
+        }
+        PhysicalNode::Distinct { input } => plan_has_correlated_refs(input),
+        PhysicalNode::DistinctOn { on_exprs, input } => {
+            on_exprs.iter().any(has_correlated_ref) || plan_has_correlated_refs(input)
+        }
+        PhysicalNode::Window {
+            window_functions,
+            input,
+        } => {
+            window_functions.iter().any(|wf| {
+                wf.arg_expr.as_ref().is_some_and(has_correlated_ref)
+                    || wf.partition_by.iter().any(has_correlated_ref)
+                    || wf.order_by.iter().any(|o| has_correlated_ref(&o.expr))
+                    || wf.offset_expr.as_ref().is_some_and(has_correlated_ref)
+                    || wf
+                        .default_value_expr
+                        .as_ref()
+                        .is_some_and(has_correlated_ref)
+                    || wf.filter_expr.as_ref().is_some_and(has_correlated_ref)
+            }) || plan_has_correlated_refs(input)
+        }
+        PhysicalNode::NestedLoopJoin {
+            left,
+            right,
+            condition,
+            ..
+        }
+        | PhysicalNode::HashJoin {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            join_condition_has_correlated_ref(condition)
+                || plan_has_correlated_refs(left)
+                || plan_has_correlated_refs(right)
+        }
+        PhysicalNode::SetOperation { left, right, .. } => {
+            plan_has_correlated_refs(left) || plan_has_correlated_refs(right)
+        }
+        PhysicalNode::Subquery { subplan, .. } => plan_has_correlated_refs(subplan),
     }
 }
 
@@ -672,6 +980,33 @@ fn build_hash_aggregate(
 fn contains_aggregate(expr: &TypedExpr) -> bool {
     match &expr.kind {
         TypedExprKind::AggregateCall { .. } => true,
+        TypedExprKind::IsTest { expr, .. } => contains_aggregate(expr),
+        TypedExprKind::Between {
+            expr, low, high, ..
+        } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
+        TypedExprKind::InList { expr, list, .. } => {
+            contains_aggregate(expr) || list.iter().any(contains_aggregate)
+        }
+        TypedExprKind::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            contains_aggregate(expr)
+                || contains_aggregate(pattern)
+                || escape.as_ref().is_some_and(|e| contains_aggregate(e))
+        }
+        TypedExprKind::SimilarTo {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            contains_aggregate(expr)
+                || contains_aggregate(pattern)
+                || escape.as_ref().is_some_and(|e| contains_aggregate(e))
+        }
         TypedExprKind::BinaryOp { left, right, .. } => {
             contains_aggregate(left) || contains_aggregate(right)
         }
@@ -691,9 +1026,19 @@ fn contains_aggregate(expr: &TypedExpr) -> bool {
                     .as_ref()
                     .map_or(false, |e| contains_aggregate(e))
         }
+        TypedExprKind::AnyAll { expr, .. } => contains_aggregate(expr),
         TypedExprKind::Coalesce(args) => args.iter().any(contains_aggregate),
         TypedExprKind::NullIf(a, b) => contains_aggregate(a) || contains_aggregate(b),
         TypedExprKind::MinMax { args, .. } => args.iter().any(contains_aggregate),
+        TypedExprKind::ArrayLiteral(items) | TypedExprKind::Row(items) => {
+            items.iter().any(contains_aggregate)
+        }
+        TypedExprKind::ArrayIndex { array, index } => {
+            contains_aggregate(array) || contains_aggregate(index)
+        }
+        TypedExprKind::JsonAccess { expr, path, .. } => {
+            contains_aggregate(expr) || contains_aggregate(path)
+        }
         _ => false,
     }
 }
@@ -761,6 +1106,136 @@ pub(crate) fn rewrite_post_aggregate_expr(
                 data_type: expr.data_type.clone(),
             })
         }
+        TypedExprKind::IsTest {
+            expr: inner,
+            test,
+            negated,
+        } => Ok(TypedExpr {
+            kind: TypedExprKind::IsTest {
+                expr: Box::new(rewrite_post_aggregate_expr(
+                    inner,
+                    group_by,
+                    group_by_count,
+                    aggregate_exprs,
+                )?),
+                test: *test,
+                negated: *negated,
+            },
+            data_type: expr.data_type.clone(),
+        }),
+        TypedExprKind::Between {
+            expr: inner,
+            low,
+            high,
+            negated,
+        } => Ok(TypedExpr {
+            kind: TypedExprKind::Between {
+                expr: Box::new(rewrite_post_aggregate_expr(
+                    inner,
+                    group_by,
+                    group_by_count,
+                    aggregate_exprs,
+                )?),
+                low: Box::new(rewrite_post_aggregate_expr(
+                    low,
+                    group_by,
+                    group_by_count,
+                    aggregate_exprs,
+                )?),
+                high: Box::new(rewrite_post_aggregate_expr(
+                    high,
+                    group_by,
+                    group_by_count,
+                    aggregate_exprs,
+                )?),
+                negated: *negated,
+            },
+            data_type: expr.data_type.clone(),
+        }),
+        TypedExprKind::InList {
+            expr: inner,
+            list,
+            negated,
+        } => Ok(TypedExpr {
+            kind: TypedExprKind::InList {
+                expr: Box::new(rewrite_post_aggregate_expr(
+                    inner,
+                    group_by,
+                    group_by_count,
+                    aggregate_exprs,
+                )?),
+                list: list
+                    .iter()
+                    .map(|e| {
+                        rewrite_post_aggregate_expr(e, group_by, group_by_count, aggregate_exprs)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                negated: *negated,
+            },
+            data_type: expr.data_type.clone(),
+        }),
+        TypedExprKind::Like {
+            expr: inner,
+            pattern,
+            escape,
+            case_insensitive,
+            negated,
+        } => Ok(TypedExpr {
+            kind: TypedExprKind::Like {
+                expr: Box::new(rewrite_post_aggregate_expr(
+                    inner,
+                    group_by,
+                    group_by_count,
+                    aggregate_exprs,
+                )?),
+                pattern: Box::new(rewrite_post_aggregate_expr(
+                    pattern,
+                    group_by,
+                    group_by_count,
+                    aggregate_exprs,
+                )?),
+                escape: escape
+                    .as_ref()
+                    .map(|e| {
+                        rewrite_post_aggregate_expr(e, group_by, group_by_count, aggregate_exprs)
+                            .map(Box::new)
+                    })
+                    .transpose()?,
+                case_insensitive: *case_insensitive,
+                negated: *negated,
+            },
+            data_type: expr.data_type.clone(),
+        }),
+        TypedExprKind::SimilarTo {
+            expr: inner,
+            pattern,
+            escape,
+            negated,
+        } => Ok(TypedExpr {
+            kind: TypedExprKind::SimilarTo {
+                expr: Box::new(rewrite_post_aggregate_expr(
+                    inner,
+                    group_by,
+                    group_by_count,
+                    aggregate_exprs,
+                )?),
+                pattern: Box::new(rewrite_post_aggregate_expr(
+                    pattern,
+                    group_by,
+                    group_by_count,
+                    aggregate_exprs,
+                )?),
+                escape: escape
+                    .as_ref()
+                    .map(|e| {
+                        rewrite_post_aggregate_expr(e, group_by, group_by_count, aggregate_exprs)
+                            .map(Box::new)
+                    })
+                    .transpose()?,
+                negated: *negated,
+            },
+            data_type: expr.data_type.clone(),
+        }),
         // Recurse into wrapping expressions.
         TypedExprKind::BinaryOp { left, op, right } => Ok(TypedExpr {
             kind: TypedExprKind::BinaryOp {
@@ -906,6 +1381,86 @@ pub(crate) fn rewrite_post_aggregate_expr(
                 data_type: expr.data_type.clone(),
             })
         }
+        TypedExprKind::AnyAll {
+            expr: inner,
+            op,
+            subquery,
+            is_all,
+        } => Ok(TypedExpr {
+            kind: TypedExprKind::AnyAll {
+                expr: Box::new(rewrite_post_aggregate_expr(
+                    inner,
+                    group_by,
+                    group_by_count,
+                    aggregate_exprs,
+                )?),
+                op: op.clone(),
+                subquery: subquery.clone(),
+                is_all: *is_all,
+            },
+            data_type: expr.data_type.clone(),
+        }),
+        TypedExprKind::ArrayLiteral(items) => Ok(TypedExpr {
+            kind: TypedExprKind::ArrayLiteral(
+                items
+                    .iter()
+                    .map(|e| {
+                        rewrite_post_aggregate_expr(e, group_by, group_by_count, aggregate_exprs)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            data_type: expr.data_type.clone(),
+        }),
+        TypedExprKind::Row(items) => Ok(TypedExpr {
+            kind: TypedExprKind::Row(
+                items
+                    .iter()
+                    .map(|e| {
+                        rewrite_post_aggregate_expr(e, group_by, group_by_count, aggregate_exprs)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            data_type: expr.data_type.clone(),
+        }),
+        TypedExprKind::ArrayIndex { array, index } => Ok(TypedExpr {
+            kind: TypedExprKind::ArrayIndex {
+                array: Box::new(rewrite_post_aggregate_expr(
+                    array,
+                    group_by,
+                    group_by_count,
+                    aggregate_exprs,
+                )?),
+                index: Box::new(rewrite_post_aggregate_expr(
+                    index,
+                    group_by,
+                    group_by_count,
+                    aggregate_exprs,
+                )?),
+            },
+            data_type: expr.data_type.clone(),
+        }),
+        TypedExprKind::JsonAccess {
+            expr: inner,
+            path,
+            operator,
+        } => Ok(TypedExpr {
+            kind: TypedExprKind::JsonAccess {
+                expr: Box::new(rewrite_post_aggregate_expr(
+                    inner,
+                    group_by,
+                    group_by_count,
+                    aggregate_exprs,
+                )?),
+                path: Box::new(rewrite_post_aggregate_expr(
+                    path,
+                    group_by,
+                    group_by_count,
+                    aggregate_exprs,
+                )?),
+                operator: *operator,
+            },
+            data_type: expr.data_type.clone(),
+        }),
         // WindowCall: preserve the wrapper but recurse into children (args,
         // partition_by, order_by) to rewrite any aggregate/group-by references.
         // This handles mixed expressions like `LAG(COUNT(*)) OVER (ORDER BY dept)`.
@@ -1032,6 +1587,46 @@ pub(crate) fn collect_agg_exprs_from(
                 agg_types.push(expr.data_type.clone());
             }
         }
+        TypedExprKind::IsTest { expr, .. } => {
+            collect_agg_exprs_from(expr, output_name, agg_exprs, agg_names, agg_types);
+        }
+        TypedExprKind::Between {
+            expr, low, high, ..
+        } => {
+            collect_agg_exprs_from(expr, output_name, agg_exprs, agg_names, agg_types);
+            collect_agg_exprs_from(low, output_name, agg_exprs, agg_names, agg_types);
+            collect_agg_exprs_from(high, output_name, agg_exprs, agg_names, agg_types);
+        }
+        TypedExprKind::InList { expr, list, .. } => {
+            collect_agg_exprs_from(expr, output_name, agg_exprs, agg_names, agg_types);
+            for item in list {
+                collect_agg_exprs_from(item, output_name, agg_exprs, agg_names, agg_types);
+            }
+        }
+        TypedExprKind::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_agg_exprs_from(expr, output_name, agg_exprs, agg_names, agg_types);
+            collect_agg_exprs_from(pattern, output_name, agg_exprs, agg_names, agg_types);
+            if let Some(e) = escape {
+                collect_agg_exprs_from(e, output_name, agg_exprs, agg_names, agg_types);
+            }
+        }
+        TypedExprKind::SimilarTo {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_agg_exprs_from(expr, output_name, agg_exprs, agg_names, agg_types);
+            collect_agg_exprs_from(pattern, output_name, agg_exprs, agg_names, agg_types);
+            if let Some(e) = escape {
+                collect_agg_exprs_from(e, output_name, agg_exprs, agg_names, agg_types);
+            }
+        }
         // Recurse into sub-expressions (e.g., CAST(COUNT(*) AS int))
         TypedExprKind::BinaryOp { left, right, .. } => {
             collect_agg_exprs_from(left, output_name, agg_exprs, agg_names, agg_types);
@@ -1077,6 +1672,22 @@ pub(crate) fn collect_agg_exprs_from(
             for arg in args {
                 collect_agg_exprs_from(arg, output_name, agg_exprs, agg_names, agg_types);
             }
+        }
+        TypedExprKind::AnyAll { expr, .. } => {
+            collect_agg_exprs_from(expr, output_name, agg_exprs, agg_names, agg_types);
+        }
+        TypedExprKind::ArrayLiteral(items) | TypedExprKind::Row(items) => {
+            for item in items {
+                collect_agg_exprs_from(item, output_name, agg_exprs, agg_names, agg_types);
+            }
+        }
+        TypedExprKind::ArrayIndex { array, index } => {
+            collect_agg_exprs_from(array, output_name, agg_exprs, agg_names, agg_types);
+            collect_agg_exprs_from(index, output_name, agg_exprs, agg_names, agg_types);
+        }
+        TypedExprKind::JsonAccess { expr, path, .. } => {
+            collect_agg_exprs_from(expr, output_name, agg_exprs, agg_names, agg_types);
+            collect_agg_exprs_from(path, output_name, agg_exprs, agg_names, agg_types);
         }
         // WindowCall: recurse into children to find aggregate sub-expressions.
         // Handles cases like `ROW_NUMBER() OVER (ORDER BY COUNT(*))` and

@@ -4,7 +4,7 @@
 
 use crate::sql::analyzer::{Analyzer, CatalogSnapshot};
 use crate::sql::names;
-use crate::sql::table_functions::table_function_key;
+use crate::sql::table_functions::{infer_system_virtual_table_function_schema, table_function_key};
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, Row, TableSchema, ViewDef};
 use anyhow::Result;
@@ -75,6 +75,18 @@ pub(crate) async fn build_catalog_snapshot_for_statement(
             snapshot.add_table(raw_name, raw_name.to_string(), virtual_schema);
         }
     }
+
+    // Prefetch scalar UDFs used in DML expressions (SET/WHERE/RETURNING/VALUES).
+    let scalar_function_names = extract_scalar_function_names_from_statement(stmt);
+    prefetch_scalar_functions(
+        store,
+        txn,
+        db_id,
+        search_path,
+        &scalar_function_names,
+        &mut snapshot,
+    )
+    .await?;
 
     // For INSERT ... SELECT, also build snapshot for the subquery.
     if let Statement::Insert {
@@ -190,6 +202,18 @@ async fn build_catalog_snapshot_inner(
     )
     .await?;
 
+    // 5. Prefetch scalar UDF metadata referenced by expressions.
+    let scalar_function_names = extract_scalar_function_names(query);
+    prefetch_scalar_functions(
+        store,
+        txn,
+        db_id,
+        search_path,
+        &scalar_function_names,
+        &mut snapshot,
+    )
+    .await?;
+
     Ok(snapshot)
 }
 
@@ -229,6 +253,7 @@ impl Visitor for TableNameCollector {
 #[derive(Debug, Clone)]
 struct TableFunctionCall {
     key: String,
+    name: ObjectName,
     name_parts: Vec<String>,
     args: Vec<sqlparser::ast::FunctionArg>,
 }
@@ -259,12 +284,80 @@ impl Visitor for TableFunctionCollector {
             let name_parts: Vec<String> = name.0.iter().map(names::normalize_ident).collect();
             self.calls.push(TableFunctionCall {
                 key,
+                name: name.clone(),
                 name_parts,
                 args: args.clone(),
             });
         }
         ControlFlow::Continue(())
     }
+}
+
+#[derive(Default)]
+struct ScalarFunctionCollector {
+    names: Vec<ObjectName>,
+    seen: HashSet<String>,
+}
+
+impl Visitor for ScalarFunctionCollector {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &sqlparser::ast::Expr) -> ControlFlow<()> {
+        if let sqlparser::ast::Expr::Function(func) = expr {
+            let key = func
+                .name
+                .0
+                .iter()
+                .map(names::normalize_ident)
+                .collect::<Vec<_>>()
+                .join(".");
+            if self.seen.insert(key) {
+                self.names.push(func.name.clone());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn extract_scalar_function_names(query: &Query) -> Vec<ObjectName> {
+    let mut collector = ScalarFunctionCollector::default();
+    let _ = query.visit(&mut collector);
+    collector.names
+}
+
+fn extract_scalar_function_names_from_statement(stmt: &Statement) -> Vec<ObjectName> {
+    let mut collector = ScalarFunctionCollector::default();
+    let _ = stmt.visit(&mut collector);
+    collector.names
+}
+
+async fn prefetch_scalar_functions(
+    store: &TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    function_names: &[ObjectName],
+    snapshot: &mut CatalogSnapshot,
+) -> Result<()> {
+    for func_name in function_names {
+        let Some((resolved_full, func_def)) =
+            try_resolve_function_def(store, txn, db_id, search_path, func_name).await?
+        else {
+            continue;
+        };
+
+        // Populate both qualified and bare aliases. The Analyzer currently
+        // resolves function identifiers as unqualified names.
+        snapshot.add_function(&resolved_full, func_def.clone());
+        let bare_name = resolved_full
+            .rsplit('.')
+            .next()
+            .unwrap_or(&resolved_full)
+            .to_string();
+        snapshot.add_function(&bare_name, func_def);
+    }
+
+    Ok(())
 }
 
 async fn prefetch_table_function_schemas(
@@ -319,6 +412,11 @@ async fn prefetch_table_function_schemas(
             continue;
         }
 
+        if let Some(schema) = infer_system_virtual_table_function_schema(&call.name, &call.args) {
+            snapshot.add_table_function(&call.key, schema);
+            continue;
+        }
+
         // Determine schema/function name.
         let (schema_opt, func_name) = match call.name_parts.as_slice() {
             [name] => (None, name.as_str()),
@@ -333,100 +431,110 @@ async fn prefetch_table_function_schemas(
                 .any(|s| s.eq_ignore_ascii_case(EXTENSIONS_SCHEMA)),
         };
 
-        if !is_extensions_schema {
-            continue;
-        }
-
-        // Only prefetch schemas for known extension table functions.
         let func_lower = func_name.to_ascii_lowercase();
 
-        if let Some(schema) = http::table_function_schema(&func_lower) {
-            snapshot.add_table_function(&call.key, schema);
-            continue;
-        }
-
-        if func_lower == "fs9" {
-            // Require fs9 extension installed+enabled to expose schema.
-            let installed = store.get_extension(txn, db_id, "fs9").await?;
-            let Some(installed) = installed else {
-                continue;
-            };
-            if !installed.enabled {
+        if is_extensions_schema {
+            // Prefetch schemas for known extension table functions.
+            if let Some(schema) = http::table_function_schema(&func_lower) {
+                snapshot.add_table_function(&call.key, schema);
                 continue;
             }
 
-            // Parse args (constants only).
-            let path = match call.args.first() {
-                Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => expr_to_text(e),
-                _ => None,
-            };
-            let Some(path) = path else {
-                continue;
-            };
-
-            let mut format: Option<String> = None;
-            let mut delimiter: Option<char> = None;
-            let mut header: Option<bool> = None;
-            let mut recursive: Option<bool> = None;
-            let mut exclude: Option<String> = None;
-
-            for arg in call.args.iter().skip(1) {
-                let FunctionArg::Named {
-                    name,
-                    arg: FunctionArgExpr::Expr(e),
-                    ..
-                } = arg
-                else {
+            if func_lower == "fs9" {
+                // Require fs9 extension installed+enabled to expose schema.
+                let installed = store.get_extension(txn, db_id, "fs9").await?;
+                let Some(installed) = installed else {
                     continue;
                 };
-                let param = names::normalize_ident(name).to_ascii_lowercase();
-                match param.as_str() {
-                    "format" => {
-                        format = expr_to_text(e);
-                    }
-                    "delimiter" => {
-                        delimiter = expr_to_char(e);
-                    }
-                    "header" => {
-                        header = expr_to_bool(e);
-                    }
-                    "recursive" => {
-                        recursive = expr_to_bool(e);
-                    }
-                    "exclude" => {
-                        exclude = expr_to_text(e);
-                    }
-                    _ => {}
+                if !installed.enabled {
+                    continue;
                 }
+
+                // Parse args (constants only).
+                let path = match call.args.first() {
+                    Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => expr_to_text(e),
+                    _ => None,
+                };
+                let Some(path) = path else {
+                    continue;
+                };
+
+                let mut format: Option<String> = None;
+                let mut delimiter: Option<char> = None;
+                let mut header: Option<bool> = None;
+                let mut recursive: Option<bool> = None;
+                let mut exclude: Option<String> = None;
+
+                for arg in call.args.iter().skip(1) {
+                    let FunctionArg::Named {
+                        name,
+                        arg: FunctionArgExpr::Expr(e),
+                        ..
+                    } = arg
+                    else {
+                        continue;
+                    };
+                    let param = names::normalize_ident(name).to_ascii_lowercase();
+                    match param.as_str() {
+                        "format" => {
+                            format = expr_to_text(e);
+                        }
+                        "delimiter" => {
+                            delimiter = expr_to_char(e);
+                        }
+                        "header" => {
+                            header = expr_to_bool(e);
+                        }
+                        "recursive" => {
+                            recursive = expr_to_bool(e);
+                        }
+                        "exclude" => {
+                            exclude = expr_to_text(e);
+                        }
+                        _ => {}
+                    }
+                }
+
+                let has_glob = path.contains('*') || path.contains('?') || path.contains('[');
+                let mode = if has_glob {
+                    fs::Fs9Mode::Glob {
+                        pattern: path,
+                        format,
+                        delimiter,
+                        header,
+                        exclude,
+                    }
+                } else if recursive == Some(true) {
+                    fs::Fs9Mode::Directory {
+                        path,
+                        recursive: true,
+                        exclude,
+                    }
+                } else {
+                    fs::Fs9Mode::File {
+                        path,
+                        format,
+                        delimiter,
+                        header,
+                    }
+                };
+
+                let schema = fs::infer_table_function_schema(tenant_keyspace, &mode).await?;
+                snapshot.add_table_function(&call.key, schema);
+                continue;
             }
+        }
 
-            let has_glob = path.contains('*') || path.contains('?') || path.contains('[');
-            let mode = if has_glob {
-                fs::Fs9Mode::Glob {
-                    pattern: path,
-                    format,
-                    delimiter,
-                    header,
-                    exclude,
-                }
-            } else if recursive == Some(true) {
-                fs::Fs9Mode::Directory {
-                    path,
-                    recursive: true,
-                    exclude,
-                }
-            } else {
-                fs::Fs9Mode::File {
-                    path,
-                    format,
-                    delimiter,
-                    header,
-                }
-            };
-
-            let schema = fs::infer_table_function_schema(tenant_keyspace, &mode).await?;
-            snapshot.add_table_function(&call.key, schema);
+        // User-defined table functions: support RETURNS SETOF <table>.
+        let Some((_resolved_full, func_def)) =
+            try_resolve_function_def(store, txn, db_id, search_path, &call.name).await?
+        else {
             continue;
+        };
+        if let Some(schema) =
+            infer_setof_table_schema(store, txn, db_id, search_path, &func_def.return_type).await?
+        {
+            snapshot.add_table_function(&call.key, schema);
         }
 
         if func_lower == "fs9_events" {
@@ -445,6 +553,51 @@ async fn prefetch_table_function_schemas(
     }
 
     Ok(())
+}
+
+async fn try_resolve_function_def(
+    store: &TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    name: &ObjectName,
+) -> Result<Option<(String, crate::types::FunctionDef)>> {
+    let resolved =
+        match names::resolve_existing_function_name(store, txn, db_id, name, search_path).await {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+    let Some(resolved) = resolved else {
+        return Ok(None);
+    };
+
+    let Some(func_def) = store.get_function(txn, db_id, &resolved.full).await? else {
+        return Ok(None);
+    };
+
+    Ok(Some((resolved.full, func_def)))
+}
+
+async fn infer_setof_table_schema(
+    store: &TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    return_type: &str,
+) -> Result<Option<TableSchema>> {
+    let ret_lower = return_type.to_lowercase();
+    let Some(target) = ret_lower.strip_prefix("setof").map(str::trim) else {
+        return Ok(None);
+    };
+
+    if target.is_empty() || target == "record" {
+        return Ok(None);
+    }
+
+    let schema = try_resolve_table(store, txn, db_id, search_path, target)
+        .await?
+        .map(|(_, _, schema)| schema);
+    Ok(schema)
 }
 
 /// Try to resolve a view name through the search path.
@@ -833,5 +986,45 @@ mod tests {
             "INSERT with CAST target not found in {:?}",
             names
         );
+    }
+
+    #[test]
+    fn test_extract_scalar_functions_from_query() {
+        let query = parse_query(
+            "SELECT basic_add(id, 1), upper(name) FROM users WHERE is_large(id) AND upper(name) <> ''",
+        );
+        let names = extract_scalar_function_names(&query);
+        let keys: HashSet<String> = names
+            .iter()
+            .map(|name| {
+                name.0
+                    .iter()
+                    .map(crate::sql::names::normalize_ident)
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+            .collect();
+        assert!(keys.contains("basic_add"));
+        assert!(keys.contains("upper"));
+        assert!(keys.contains("is_large"));
+        assert_eq!(keys.iter().filter(|k| k.as_str() == "upper").count(), 1);
+    }
+
+    #[test]
+    fn test_extract_scalar_functions_from_statement() {
+        let stmt = parse_stmt("UPDATE t SET v = my_udf(v) WHERE is_large(v)");
+        let names = extract_scalar_function_names_from_statement(&stmt);
+        let keys: HashSet<String> = names
+            .iter()
+            .map(|name| {
+                name.0
+                    .iter()
+                    .map(crate::sql::names::normalize_ident)
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+            .collect();
+        assert!(keys.contains("my_udf"));
+        assert!(keys.contains("is_large"));
     }
 }

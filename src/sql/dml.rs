@@ -79,12 +79,7 @@ pub async fn build_enum_label_cache(
             crate::types::UserTypeKind::Enum { labels } => {
                 cache.insert(udt_name.to_string(), labels.into_iter().collect());
             }
-            crate::types::UserTypeKind::Composite { .. } => {
-                return Err(anyhow!(
-                    "composite type '{}' cannot be used as a column type",
-                    udt_name
-                ));
-            }
+            crate::types::UserTypeKind::Composite { .. } => {}
         }
     }
 
@@ -109,16 +104,19 @@ fn validate_enum_values(schema: &TableSchema, row: &Row, cache: &EnumLabelCache)
             continue;
         }
 
-        let labels = cache
-            .get(udt_name)
-            .ok_or_else(|| anyhow!("Type '{}' does not exist", udt_name))?;
+        // Non-enum UDTs (e.g. composite types) do not participate in enum-label
+        // validation on write.
+        let Some(labels) = cache.get(udt_name) else {
+            continue;
+        };
 
+        let bare_type = udt_name.rsplit('.').next().unwrap_or(udt_name);
         match value {
             Value::Text(s) => {
                 if !labels.contains(s) {
                     return Err(anyhow!(
                         "invalid input value for enum {}: \"{}\"",
-                        udt_name,
+                        bare_type,
                         s
                     ));
                 }
@@ -126,7 +124,7 @@ fn validate_enum_values(schema: &TableSchema, row: &Row, cache: &EnumLabelCache)
             other => {
                 return Err(anyhow!(
                     "invalid input value for enum {}: {}",
-                    udt_name,
+                    bare_type,
                     other
                 ));
             }
@@ -1051,22 +1049,33 @@ pub async fn execute_update_row(
                 )
                 .await;
             if let Err(e) = create_result {
-                if index.unique
-                    && matches!(index.state, IndexState::WriteOnly | IndexState::Ready)
-                    && is_unique_duplicate_error(&e)
-                {
-                    match resolve_unique_index_conflict(
-                        store, txn, db_id, schema, index, &new_idx, &new_pks,
-                    )
-                    .await?
+                if is_unique_duplicate_error(&e) {
+                    if index.unique
+                        && matches!(index.state, IndexState::WriteOnly | IndexState::Ready)
                     {
-                        UniqueConflictResolution::Idempotent
-                        | UniqueConflictResolution::StaleReplaced => {}
-                        UniqueConflictResolution::RealConflict => return Err(e),
+                        match resolve_unique_index_conflict(
+                            store, txn, db_id, schema, index, &new_idx, &new_pks,
+                        )
+                        .await?
+                        {
+                            UniqueConflictResolution::Idempotent
+                            | UniqueConflictResolution::StaleReplaced => continue,
+                            UniqueConflictResolution::RealConflict => {}
+                        }
                     }
-                } else {
-                    return Err(e);
+
+                    let cols = index.columns.join(", ");
+                    let vals: Vec<String> = new_idx.iter().map(|v| format!("{}", v)).collect();
+                    return Err(SqlError::UniqueViolation {
+                        constraint: index.name.clone(),
+                        message: format!(
+                            "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
+                            index.name, cols, vals.join(", ")
+                        ),
+                    }
+                    .into());
                 }
+                return Err(e);
             }
         }
     }
@@ -1256,6 +1265,15 @@ pub async fn fill_missing_columns(
     Ok(())
 }
 
+/// Format a value for DETAIL messages matching PostgreSQL convention
+/// (lowercase "null" instead of uppercase "NULL").
+fn format_value_for_detail(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        _ => format!("{}", v),
+    }
+}
+
 pub fn coerce_row_values(schema: &TableSchema, row_vals: &mut Vec<Value>) -> Result<()> {
     for (i, c) in schema.columns.iter().enumerate() {
         let coerced = coerce_value_for_column(row_vals[i].clone(), c)?;
@@ -1263,7 +1281,7 @@ pub fn coerce_row_values(schema: &TableSchema, row_vals: &mut Vec<Value>) -> Res
             let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
             let row_str = row_vals
                 .iter()
-                .map(|v| format!("{}", v))
+                .map(|v| format_value_for_detail(v))
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(SqlError::NotNullViolation {
@@ -1410,7 +1428,7 @@ mod tests {
         let err = validate_enum_values(&schema, &row, &cache).unwrap_err();
         assert!(err
             .to_string()
-            .contains("invalid input value for enum public.role"));
+            .contains("invalid input value for enum role"));
     }
 
     #[test]
@@ -1421,7 +1439,7 @@ mod tests {
         let err = validate_enum_values(&schema, &row, &cache).unwrap_err();
         assert!(err
             .to_string()
-            .contains("invalid input value for enum public.role"));
+            .contains("invalid input value for enum role"));
     }
 
     #[test]
@@ -1432,6 +1450,6 @@ mod tests {
         let err = validate_enum_values(&schema, &row, &cache).unwrap_err();
         assert!(err
             .to_string()
-            .contains("invalid input value for enum public.role"));
+            .contains("invalid input value for enum role"));
     }
 }

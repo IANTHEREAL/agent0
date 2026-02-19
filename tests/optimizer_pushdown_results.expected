@@ -6,11 +6,11 @@ id|x|y
 (1 row)
 id|y
 2|200
-3|300
+3|NULL
 (2 rows)
 id|y
 2|200
-3|300
+3|NULL
 (2 rows)
 id|y
 2|200

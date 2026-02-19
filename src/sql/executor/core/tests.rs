@@ -1,8 +1,9 @@
 use super::{
     cast_current_setting_value, get_skip_reason, get_unsupported_reason,
-    is_current_setting_function, is_set_config_function, parse_search_path_guc_value,
-    set_variable_value_to_string, split_sql_statements, starts_with_ignore_ascii_case,
-    try_parse_const_bool, try_parse_const_text, unwrap_top_level_cast,
+    is_current_setting_function, is_set_config_function, normalize_search_path_entries,
+    parse_search_path_guc_value, set_variable_value_to_string, split_sql_statements,
+    starts_with_ignore_ascii_case, try_parse_const_bool, try_parse_const_text,
+    unwrap_top_level_cast,
 };
 use crate::types::Value;
 use sqlparser::ast::{
@@ -199,6 +200,30 @@ fn test_parse_search_path_guc_value() {
             "foo".to_string()
         ]
     );
+}
+
+#[test]
+fn test_normalize_search_path_entries_preserves_user_placeholder() {
+    let normalized = normalize_search_path_entries(vec![
+        "public".to_string(),
+        "$user".to_string(),
+        "myschema".to_string(),
+    ])
+    .unwrap();
+    assert_eq!(
+        normalized,
+        vec![
+            "public".to_string(),
+            "$user".to_string(),
+            "myschema".to_string()
+        ]
+    );
+}
+
+#[test]
+fn test_normalize_search_path_entries_default_keyword() {
+    let normalized = normalize_search_path_entries(vec!["default".to_string()]).unwrap();
+    assert_eq!(normalized, vec!["$user".to_string(), "public".to_string()]);
 }
 
 #[test]

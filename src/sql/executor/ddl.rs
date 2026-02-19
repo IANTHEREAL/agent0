@@ -289,7 +289,7 @@ impl Executor {
                 if if_exists {
                     continue;
                 }
-                return Err(SqlError::RelationNotFound(idx_name.to_string()).into());
+                return Err(anyhow!("index \"{}\" does not exist", idx_name));
             };
 
             let mut schema = self

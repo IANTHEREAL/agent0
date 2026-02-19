@@ -6,6 +6,11 @@ use sqlparser::ast::Statement;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
+/// Normalize PostgreSQL's `EXPLAIN (...)` option list into sqlparser-rs'
+/// keyword-form `EXPLAIN ANALYZE VERBOSE ...`.
+///
+/// Classification: parse-normalization shim.
+/// Exit condition: remove when sqlparser-rs supports parenthetical EXPLAIN options.
 fn preprocess_explain(sql: &str) -> Option<String> {
     let trimmed = sql.trim();
     let upper = trimmed.to_uppercase();
@@ -50,6 +55,9 @@ fn is_sequence_option_keyword(token_upper: &str) -> bool {
 ///
 /// To keep compatibility without expanding sqlparser-rs, we normalize common
 /// `CREATE SEQUENCE` option orderings into the expected order.
+///
+/// Classification: parse-normalization shim.
+/// Exit condition: remove when sqlparser-rs supports PostgreSQL option ordering.
 fn reorder_single_create_sequence(stmt: &str) -> Option<String> {
     let trimmed = stmt.trim();
     if trimmed.is_empty() {
@@ -242,6 +250,10 @@ fn reorder_single_create_sequence(stmt: &str) -> Option<String> {
     }
 }
 
+/// Apply CREATE SEQUENCE option-order normalization to all statements in SQL text.
+///
+/// Classification: parse-normalization shim.
+/// Exit condition: remove when sqlparser-rs supports PostgreSQL option ordering.
 fn preprocess_create_sequence(sql: &str) -> Option<String> {
     if !sql.to_uppercase().contains("CREATE SEQUENCE") {
         return None;
@@ -266,6 +278,11 @@ fn preprocess_create_sequence(sql: &str) -> Option<String> {
     }
 }
 
+/// Remove PostgreSQL CTE materialization hints (`AS MATERIALIZED` /
+/// `AS NOT MATERIALIZED`) that sqlparser-rs cannot parse.
+///
+/// Classification: parse-normalization shim.
+/// Exit condition: remove when sqlparser-rs supports CTE materialization hints.
 fn preprocess_cte_materialized(sql: &str) -> Option<String> {
     let re_not = Regex::new(r"(?i)\bAS\s+NOT\s+MATERIALIZED\s*\(").ok()?;
     let re_yes = Regex::new(r"(?i)\bAS\s+MATERIALIZED\s*\(").ok()?;
@@ -277,6 +294,41 @@ fn preprocess_cte_materialized(sql: &str) -> Option<String> {
     Some(out.into_owned())
 }
 
+/// SQL preprocessor shim registry (all parse-time compatibility only).
+///
+/// Shim inventory:
+/// - `preprocess_explain`
+///   What: `EXPLAIN (ANALYZE, VERBOSE)` -> keyword form.
+///   Why: sqlparser-rs parse limitation.
+///   Exit condition: parenthetical EXPLAIN options supported.
+/// - `preprocess_create_sequence`
+///   What: normalize `CREATE SEQUENCE` option order.
+///   Why: sqlparser-rs expects fixed option order.
+///   Exit condition: arbitrary PostgreSQL option order supported.
+/// - `preprocess_cte_materialized`
+///   What: strip `[NOT] MATERIALIZED` CTE hints.
+///   Why: sqlparser-rs parse limitation.
+///   Exit condition: CTE materialization hints supported.
+/// - `preprocess_reset_role` / `rewrite_reset_role`
+///   What: `RESET ROLE` -> `SET ROLE NONE`.
+///   Why: sqlparser-rs lacks RESET ROLE support.
+///   Exit condition: RESET ROLE statement support added.
+/// - `rewrite_all_any_subquery_parse_compat`
+///   What: `ANY/ALL(SELECT ...)` -> `ANY/ALL(ARRAY(SELECT ...))`.
+///   Why: sqlparser-rs can't parse direct subquery form.
+///   Exit condition: direct `ANY/ALL(SELECT ...)` parse support.
+/// - `rewrite_jsonb_exists_ops`
+///   What: `?`, `?|`, `?&` operators -> function calls.
+///   Why: sqlparser-rs operator parse gap for these PostgreSQL operators.
+///   Exit condition: parser supports these operators without conflicting with placeholders.
+/// - `rewrite_vector_distance_ops`
+///   What: `<->`, `<#>`, `<=>` -> function calls.
+///   Why: sqlparser-rs does not parse extension custom operators.
+///   Exit condition: parser supports custom operators.
+/// - `rewrite_at_time_zone_placeholders`
+///   What: `AT TIME ZONE $n` -> `AT TIME ZONE 'UTC'` (parse-time only).
+///   Why: sqlparser-rs expects string literal in this position.
+///   Exit condition: expression/placeholder support after `AT TIME ZONE`.
 fn preprocess_sql(sql: &str) -> String {
     let mut result = sql.to_string();
 
@@ -313,6 +365,10 @@ fn preprocess_sql(sql: &str) -> String {
     result
 }
 
+/// Convert standalone `RESET ROLE` to its equivalent `SET ROLE NONE`.
+///
+/// Classification: parse-compatibility shim.
+/// Exit condition: remove when sqlparser-rs supports `RESET ROLE`.
 fn preprocess_reset_role(sql: &str) -> Option<String> {
     let trimmed = sql.trim();
     let trimmed = trimmed.trim_end_matches(';').trim();
@@ -731,6 +787,9 @@ fn skip_ws_comments_backward(tokens: &[Token], mut idx: usize, start: usize) -> 
 /// sqlparser-rs doesn't parse the direct PostgreSQL subquery form, but it does
 /// parse `ANY/ALL (ARRAY(SELECT ...))`. We only wrap the subquery shape here;
 /// semantic handling remains in Analyzer/Rewriter on typed IR.
+///
+/// Classification: parse-compatibility shim.
+/// Exit condition: remove when sqlparser-rs supports direct `ANY/ALL(SELECT ...)`.
 fn rewrite_all_any_subquery_parse_compat(sql: &str) -> String {
     let mut current = sql.to_string();
     loop {
@@ -836,6 +895,10 @@ fn extract_subquery(sql: &str, start: usize) -> Option<(String, usize)> {
     None
 }
 
+/// Rewrite JSONB existence operators (`?`, `?|`, `?&`) into internal function calls.
+///
+/// Classification: parse-compatibility shim.
+/// Exit condition: remove when sqlparser-rs can parse these operators in PostgreSQL mode.
 fn rewrite_jsonb_exists_ops(sql: &str) -> String {
     let tokens = tokenize_sql_for_rewrite(sql);
     if tokens.is_empty() {
@@ -907,6 +970,10 @@ fn is_ident_char(b: u8) -> bool {
     matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
 }
 
+/// Rewrite vector distance operators (`<->`, `<#>`, `<=>`) into function calls.
+///
+/// Classification: parse-compatibility shim.
+/// Exit condition: remove when sqlparser-rs supports extension custom operators.
 fn rewrite_vector_distance_ops(sql: &str) -> String {
     let tokens = tokenize_sql_for_rewrite(sql);
     if tokens.is_empty() {
@@ -973,6 +1040,10 @@ fn rewrite_vector_distance_ops(sql: &str) -> String {
     out
 }
 
+/// Rewrite `AT TIME ZONE $n` placeholders to a literal for parse-time validation.
+///
+/// Classification: parse-compatibility shim.
+/// Exit condition: remove when sqlparser-rs accepts expression/placeholder form.
 fn rewrite_at_time_zone_placeholders(sql: &str) -> String {
     let tokens = tokenize_sql_for_rewrite(sql);
     if tokens.is_empty() {
@@ -1047,6 +1118,10 @@ fn rewrite_at_time_zone_placeholders(sql: &str) -> String {
     out
 }
 
+/// Rewrite standalone `RESET ROLE` statements to `SET ROLE NONE`.
+///
+/// Classification: parse-compatibility shim.
+/// Exit condition: remove when sqlparser-rs supports `RESET ROLE`.
 fn rewrite_reset_role(sql: &str) -> String {
     let tokens = tokenize_sql_for_rewrite(sql);
     if tokens.is_empty() {
@@ -1301,6 +1376,28 @@ mod tests {
     fn test_parse_create_table() {
         let stmts = parse_sql("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)").unwrap();
         assert_eq!(stmts.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_create_schema_named_authorization() {
+        let stmts = parse_sql("CREATE SCHEMA s1 AUTHORIZATION owner1").unwrap();
+        assert_eq!(stmts.len(), 1);
+        match &stmts[0] {
+            Statement::CreateSchema {
+                schema_name,
+                if_not_exists,
+            } => {
+                assert!(!*if_not_exists);
+                match schema_name {
+                    sqlparser::ast::SchemaName::NamedAuthorization(name, owner) => {
+                        assert_eq!(name.to_string(), "s1");
+                        assert_eq!(owner.value, "owner1");
+                    }
+                    other => panic!("expected named authorization, got {:?}", other),
+                }
+            }
+            other => panic!("expected CREATE SCHEMA, got {:?}", other),
+        }
     }
 
     #[test]

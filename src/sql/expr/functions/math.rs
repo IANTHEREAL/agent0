@@ -5,6 +5,36 @@ use std::collections::HashMap;
 
 use super::SqlFn;
 
+/// Round a Decimal to `n` significant digits (matching PostgreSQL's numeric
+/// precision for transcendental functions like ln, exp, sqrt).
+fn round_to_significant_digits(d: Decimal, n: u32) -> Decimal {
+    if d.is_zero() {
+        return d;
+    }
+    let abs_str = d.abs().to_string();
+    // Count leading zeros (non-significant digits) in decimal part
+    let dot_pos = abs_str.find('.');
+    let significant_int_digits = match dot_pos {
+        Some(pos) => {
+            let int_part = &abs_str[..pos];
+            if int_part == "0" {
+                // Value < 1: count leading zeros after decimal point
+                let leading_zeros =
+                    abs_str[pos + 1..].chars().take_while(|c| *c == '0').count() as u32;
+                // dp = n + leading_zeros (all significant digits are after the zeros)
+                return d.round_dp_with_strategy(
+                    n + leading_zeros,
+                    RoundingStrategy::MidpointNearestEven,
+                );
+            }
+            int_part.len() as u32
+        }
+        None => abs_str.len() as u32,
+    };
+    let dp = n.saturating_sub(significant_int_digits);
+    d.round_dp_with_strategy(dp, RoundingStrategy::MidpointNearestEven)
+}
+
 pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("ABS", abs);
     map.insert("CEIL", ceil);
@@ -155,16 +185,16 @@ pub fn trunc(args: Vec<Value>) -> Result<Value> {
 }
 
 pub fn sqrt(args: Vec<Value>) -> Result<Value> {
-    use rust_decimal::prelude::ToPrimitive;
+    use rust_decimal::MathematicalOps;
     match args.into_iter().next() {
         Some(Value::Float64(n)) => Ok(Value::Float64(n.sqrt())),
         Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).sqrt())),
         Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).sqrt())),
         Some(Value::Numeric(d)) => {
-            let n = d
-                .to_f64()
-                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
-            Ok(Value::Float64(n.sqrt()))
+            let result = d
+                .sqrt()
+                .ok_or_else(|| anyhow!("cannot take square root of a negative number"))?;
+            Ok(Value::Numeric(round_to_significant_digits(result, 16)))
         }
         _ => Ok(Value::Null),
     }
@@ -172,15 +202,24 @@ pub fn sqrt(args: Vec<Value>) -> Result<Value> {
 
 pub fn cbrt(args: Vec<Value>) -> Result<Value> {
     use rust_decimal::prelude::ToPrimitive;
+    fn pg_like_cbrt(n: f64) -> f64 {
+        if n == 0.0 {
+            0.0
+        } else {
+            // Match PostgreSQL float8 cbrt behavior on modern libm:
+            // preserve sign and compute cube root via exp(ln(x)/3).
+            n.signum() * ((n.abs().ln() / 3.0).exp())
+        }
+    }
     match args.into_iter().next() {
-        Some(Value::Float64(n)) => Ok(Value::Float64(n.cbrt())),
-        Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).cbrt())),
-        Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).cbrt())),
+        Some(Value::Float64(n)) => Ok(Value::Float64(pg_like_cbrt(n))),
+        Some(Value::Int32(n)) => Ok(Value::Float64(pg_like_cbrt(n as f64))),
+        Some(Value::Int64(n)) => Ok(Value::Float64(pg_like_cbrt(n as f64))),
         Some(Value::Numeric(d)) => {
             let n = d
                 .to_f64()
                 .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
-            Ok(Value::Float64(n.cbrt()))
+            Ok(Value::Float64(pg_like_cbrt(n)))
         }
         _ => Ok(Value::Null),
     }
@@ -211,48 +250,48 @@ pub fn power(args: Vec<Value>) -> Result<Value> {
 }
 
 pub fn exp(args: Vec<Value>) -> Result<Value> {
-    use rust_decimal::prelude::ToPrimitive;
+    use rust_decimal::MathematicalOps;
     match args.into_iter().next() {
         Some(Value::Float64(n)) => Ok(Value::Float64(n.exp())),
         Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).exp())),
         Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).exp())),
         Some(Value::Numeric(d)) => {
-            let n = d
-                .to_f64()
-                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
-            Ok(Value::Float64(n.exp()))
+            let result = d.exp();
+            Ok(Value::Numeric(round_to_significant_digits(result, 16)))
         }
         _ => Ok(Value::Null),
     }
 }
 
 pub fn ln(args: Vec<Value>) -> Result<Value> {
-    use rust_decimal::prelude::ToPrimitive;
+    use rust_decimal::MathematicalOps;
     match args.into_iter().next() {
         Some(Value::Float64(n)) => Ok(Value::Float64(n.ln())),
         Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).ln())),
         Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).ln())),
         Some(Value::Numeric(d)) => {
-            let n = d
-                .to_f64()
-                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
-            Ok(Value::Float64(n.ln()))
+            let result = d.ln();
+            Ok(Value::Numeric(round_to_significant_digits(result, 16)))
         }
         _ => Ok(Value::Null),
     }
 }
 
 pub fn log10(args: Vec<Value>) -> Result<Value> {
-    use rust_decimal::prelude::ToPrimitive;
+    use rust_decimal::Decimal;
+    use rust_decimal::MathematicalOps;
     match args.into_iter().next() {
         Some(Value::Float64(n)) => Ok(Value::Float64(n.log10())),
         Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).log10())),
         Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).log10())),
         Some(Value::Numeric(d)) => {
-            let n = d
-                .to_f64()
-                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
-            Ok(Value::Float64(n.log10()))
+            // log10(x) = ln(x) / ln(10)
+            let ln_val = d.ln();
+            let ln_10 = Decimal::TEN.ln();
+            Ok(Value::Numeric(round_to_significant_digits(
+                ln_val / ln_10,
+                16,
+            )))
         }
         _ => Ok(Value::Null),
     }

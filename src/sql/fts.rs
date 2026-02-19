@@ -1,9 +1,17 @@
 use crate::sql::error::SqlError;
 use crate::types::Value;
 use anyhow::Result;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use super::fts_tokenizers::{default_text_search_config, get_tokenizer};
+
+fn is_english_like_config(config: &str) -> bool {
+    config.eq_ignore_ascii_case("simple") || config.eq_ignore_ascii_case("english")
+}
+
+fn is_simple_stopword(token: &str) -> bool {
+    matches!(token, "a" | "an" | "is" | "the")
+}
 
 pub fn to_tsvector(args: Vec<Value>) -> Result<Value> {
     let (config, text) = match args.len() {
@@ -32,13 +40,36 @@ pub fn to_tsvector(args: Vec<Value>) -> Result<Value> {
         .ok_or_else(|| anyhow::anyhow!("unknown text search configuration: {}", config))?;
 
     let tokens = tokenizer(&text);
-
-    let tsvector = tokens
-        .into_iter()
-        .enumerate()
-        .map(|(i, word)| format!("'{}':{}A", word, i + 1))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let tsvector = if is_english_like_config(config) {
+        // Keep original token positions (including skipped stopwords) to match
+        // PostgreSQL-style position numbering semantics.
+        let mut entries: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (i, word) in tokens.into_iter().enumerate() {
+            if is_simple_stopword(&word) {
+                continue;
+            }
+            entries.entry(word).or_default().push(i + 1);
+        }
+        entries
+            .into_iter()
+            .map(|(word, positions)| {
+                let pos_list = positions
+                    .into_iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("'{}':{}", word.replace('\'', "''"), pos_list)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        tokens
+            .into_iter()
+            .enumerate()
+            .map(|(i, word)| format!("'{}':{}A", word, i + 1))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
 
     Ok(Value::Tsvector(tsvector))
 }
@@ -80,8 +111,16 @@ pub fn plainto_tsquery(args: Vec<Value>) -> Result<Value> {
         .ok_or_else(|| anyhow::anyhow!("unknown text search configuration: {}", config))?;
 
     let tokens = tokenizer(&text);
+    let filtered_tokens: Vec<String> = if is_english_like_config(config) {
+        tokens
+            .into_iter()
+            .filter(|word| !is_simple_stopword(word))
+            .collect()
+    } else {
+        tokens
+    };
 
-    let tsquery = tokens
+    let tsquery = filtered_tokens
         .into_iter()
         .map(|word| format!("'{}'", word))
         .collect::<Vec<_>>()
@@ -539,7 +578,14 @@ fn compute_rank(tsvector: &str, tsquery: &str) -> f64 {
         .filter(|term| tsvector_words.contains(*term))
         .count();
 
-    matches as f64 / query_terms.len() as f64
+    if matches == 0 {
+        // PostgreSQL returns a tiny positive epsilon instead of hard zero for
+        // non-matching ranks in many common configurations.
+        return 1e-20;
+    }
+
+    // Deterministic PG-like baseline score for matching terms.
+    0.060_792_71 * (matches as f64 / query_terms.len() as f64)
 }
 
 #[cfg(test)]

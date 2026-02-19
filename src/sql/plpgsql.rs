@@ -691,6 +691,11 @@ fn substitute_variables(ctx: &PlpgsqlContext, s: &str) -> String {
         let value_str = match value {
             Value::Null => "NULL".to_string(),
             Value::Text(t) => quoting::quote_literal(t),
+            // Wrap negative numbers in parens to prevent "--5" becoming a SQL comment
+            Value::Int32(i) if *i < 0 => format!("({})", i),
+            Value::Int64(i) if *i < 0 => format!("({})", i),
+            Value::Float64(f) if *f < 0.0 => format!("({})", f),
+            Value::Numeric(d) if d.is_sign_negative() => format!("({})", d),
             v => v.to_string(),
         };
         result = replace_identifier(&result, name, &value_str);

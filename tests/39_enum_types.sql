@@ -1,6 +1,7 @@
 -- Enum type creation and use
 DROP TABLE IF EXISTS udt_enum_test;
 DROP TYPE IF EXISTS role;
+DROP TABLE IF EXISTS udt_comp_test;
 DROP TYPE IF EXISTS comp;
 
 CREATE TYPE role AS ENUM ('USER', 'ADMIN');
@@ -47,4 +48,5 @@ CREATE TYPE comp AS (a INT, b TEXT);
 SELECT typname, typtype FROM pg_catalog.pg_type WHERE typname = 'comp';
 CREATE TABLE udt_comp_test (id INT PRIMARY KEY, c comp);
 DROP TYPE comp;
-
+DROP TABLE IF EXISTS udt_comp_test;
+DROP TYPE IF EXISTS comp;

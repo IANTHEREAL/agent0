@@ -1,9 +1,9 @@
 //! Tableless `set_config()` / `current_setting()` fast paths
 
 use super::{
-    normalize_ident, parse_search_path_guc_value, try_parse_const_bool, try_parse_const_text,
-    DataType, ExecuteResult, Expr, FunctionArg, FunctionArgExpr, Query, Row, SelectItem, Session,
-    SetExpr, Value,
+    normalize_ident, normalize_search_path_entries, parse_search_path_guc_value,
+    try_parse_const_bool, try_parse_const_text, DataType, ExecuteResult, Expr, FunctionArg,
+    FunctionArgExpr, Query, Row, SelectItem, Session, SetExpr, Value,
 };
 use crate::session_context;
 use crate::sql::error::SqlError;
@@ -171,40 +171,31 @@ pub(super) fn try_execute_set_config_select(
 
     let var_name = var_name.to_lowercase();
     if var_name == "search_path" {
-        let prev = session
+        let parsed = parse_search_path_guc_value(&new_value);
+        let new_search_path = normalize_search_path_entries(parsed)?;
+        session.set_search_path(new_search_path);
+        let current = session
             .show_setting_value("search_path")
             .unwrap_or_else(|| "public".to_string());
-
-        let mut new_search_path = parse_search_path_guc_value(&new_value);
-        new_search_path.retain(|s| !s.is_empty() && s != "$user");
-        if new_search_path.len() == 1 && new_search_path[0] == "default" {
-            new_search_path = vec!["public".to_string()];
-        }
-        for schema in &new_search_path {
-            if schema.contains('.') {
-                return Err(anyhow!("schema name '{}' must not contain '.'", schema));
-            }
-        }
-        if new_search_path.is_empty() {
-            new_search_path.push("public".to_string());
-        }
-        session.set_search_path(new_search_path);
 
         return Ok(Some(ExecuteResult::Select {
             columns: vec![alias.unwrap_or_else(|| "set_config".to_string())],
             column_types: Some(vec![DataType::Text]),
-            rows: vec![Row::new(vec![Value::Text(prev)])],
+            // PostgreSQL set_config() returns the newly set value.
+            rows: vec![Row::new(vec![Value::Text(current)])],
             timezone: session_context::current_timezone(),
         }));
     }
 
-    let prev = session.show_setting_value(&var_name);
     if session.set_known_setting(&var_name, new_value)? {
-        let prev = prev.unwrap_or_else(|| "0".to_string());
+        let current = session
+            .show_setting_value(&var_name)
+            .unwrap_or_else(|| "".to_string());
         return Ok(Some(ExecuteResult::Select {
             columns: vec![alias.unwrap_or_else(|| "set_config".to_string())],
             column_types: Some(vec![DataType::Text]),
-            rows: vec![Row::new(vec![Value::Text(prev)])],
+            // PostgreSQL set_config() returns the newly set value.
+            rows: vec![Row::new(vec![Value::Text(current)])],
             timezone: session_context::current_timezone(),
         }));
     }

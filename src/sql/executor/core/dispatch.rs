@@ -599,11 +599,17 @@ impl Executor {
                         .unwrap_or_else(|| "UTC".to_string()),
                 );
                 let max_sort_bytes = session.max_sort_bytes();
+                let search_path_vec = Arc::new(session.search_path().to_vec());
                 let stmt_exec: Result<Vec<ExecuteResult>> = session_context::with_timezone(
                     timezone,
                     session_context::with_max_sort_bytes(
                         max_sort_bytes,
-                        crate::extensions::context::with_context(is_superuser, self.tenant_keyspace(), async {
+                        session_context::with_search_path(
+                            search_path_vec,
+                            crate::extensions::context::with_context(
+                                is_superuser,
+                                self.tenant_keyspace(),
+                                async {
                         match stmt {
                             // Transaction Control
                             Statement::StartTransaction { modes, .. } => {
@@ -755,24 +761,8 @@ impl Executor {
                                             }
                                         }
                                     }
-
-                                    new_search_path.retain(|s| !s.is_empty() && s != "$user");
-                                    if new_search_path.len() == 1
-                                        && new_search_path[0] == "default"
-                                    {
-                                        new_search_path = vec!["public".to_string()];
-                                    }
-                                    for schema in &new_search_path {
-                                        if schema.contains('.') {
-                                            return Err(anyhow!(
-                                                "schema name '{}' must not contain '.'",
-                                                schema
-                                            ));
-                                        }
-                                    }
-                                    if new_search_path.is_empty() {
-                                        new_search_path.push("public".to_string());
-                                    }
+                                    let new_search_path =
+                                        normalize_search_path_entries(new_search_path)?;
                                     session.set_search_path(new_search_path);
                                 } else {
                                     let value = set_variable_value_to_string(value)?;
@@ -940,6 +930,7 @@ impl Executor {
                             }
                         }
                     }),
+                    ),
                     ),
                 )
                 .await;

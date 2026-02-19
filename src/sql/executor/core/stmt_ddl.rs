@@ -1,7 +1,7 @@
 //! DDL statement sub-dispatcher
 
 use super::*;
-use crate::auth::{Privilege, PrivilegeObject};
+use crate::auth::{GrantedPrivilege, Privilege, PrivilegeObject};
 use crate::sql::error::SqlError;
 use sqlparser::ast::{ObjectType, ReferentialAction, SchemaName};
 
@@ -373,23 +373,35 @@ impl Executor {
                     "schema".to_string(),
                 )
                 .await?;
-                let schema_obj = match schema_name {
-                    SchemaName::Simple(name) => name,
-                    SchemaName::NamedAuthorization(name, _) => name,
-                    SchemaName::UnnamedAuthorization(_) => {
-                        return Err(SqlError::Unsupported(
-                            "Unsupported CREATE SCHEMA syntax".into(),
-                        )
-                        .into());
+                let (schema, owner) = match schema_name {
+                    SchemaName::Simple(name) => {
+                        let (schema_prefix, schema) = names::split_object_name(name)?;
+                        if schema_prefix.is_some() {
+                            return Err(anyhow!("Invalid schema name '{}'", name));
+                        }
+                        (schema, current_role.unwrap_or("postgres").to_string())
+                    }
+                    SchemaName::NamedAuthorization(name, auth_role) => {
+                        let (schema_prefix, schema) = names::split_object_name(name)?;
+                        if schema_prefix.is_some() {
+                            return Err(anyhow!("Invalid schema name '{}'", name));
+                        }
+                        (schema, names::normalize_ident(auth_role))
+                    }
+                    SchemaName::UnnamedAuthorization(auth_role) => {
+                        let owner = names::normalize_ident(auth_role);
+                        (owner.clone(), owner)
                     }
                 };
-                let (schema_prefix, schema) = names::split_object_name(schema_obj)?;
-                if schema_prefix.is_some() {
-                    return Err(anyhow!("Invalid schema name '{}'", schema_obj));
-                }
-                self.store
+
+                let created = self
+                    .store
                     .create_schema(txn, db_id, &schema, *if_not_exists)
                     .await?;
+                if created {
+                    self.grant_schema_owner_privileges(txn, &owner, &schema)
+                        .await?;
+                }
                 Ok(ExecuteResult::CommandComplete {
                     tag: "CREATE SCHEMA",
                 })
@@ -560,6 +572,40 @@ impl Executor {
         }
     }
 
+    async fn grant_schema_owner_privileges(
+        &self,
+        txn: &mut Transaction,
+        owner: &str,
+        schema: &str,
+    ) -> Result<()> {
+        let object = PrivilegeObject::Schema(schema.to_string());
+        let privileges = [Privilege::Usage, Privilege::CreateTable];
+
+        if let Some(mut user) = self.auth_manager.get_user(txn, owner).await? {
+            for privilege in &privileges {
+                user.grant_privilege(privilege.clone(), object.clone(), true);
+            }
+            self.auth_manager.update_user(txn, user).await?;
+            return Ok(());
+        }
+
+        if let Some(mut role) = self.auth_manager.get_role(txn, owner).await? {
+            for privilege in &privileges {
+                role.privileges
+                    .retain(|p| !(p.privilege == *privilege && p.object == object));
+                role.privileges.push(GrantedPrivilege {
+                    privilege: privilege.clone(),
+                    object: object.clone(),
+                    with_grant_option: true,
+                });
+            }
+            self.auth_manager.update_role(txn, role).await?;
+            return Ok(());
+        }
+
+        Err(anyhow!("Role or user '{}' does not exist", owner))
+    }
+
     async fn execute_drop_schema(
         &self,
         txn: &mut Transaction,
@@ -645,7 +691,7 @@ impl Executor {
         }
 
         let table_name =
-            found_table.ok_or_else(|| anyhow!("index \"{}\" does not exist", idx_name))?;
+            found_table.ok_or_else(|| anyhow!("relation \"{}\" does not exist", idx_name))?;
 
         // Schema-wide namespace uniqueness check for the new name.
         let owning_schema = table_name.splitn(2, '.').next().unwrap_or("public");

@@ -40,13 +40,12 @@ fn init_tokenizers() -> HashMap<String, TokenizerFn> {
 ///
 /// Splits on non-alphanumeric characters and filters out:
 /// - Empty strings
-/// - Single-character tokens
 ///
 /// All tokens are converted to lowercase.
 fn tokenize_simple(text: &str) -> Vec<String> {
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty() && s.len() > 1)
+        .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect()
 }
@@ -95,14 +94,13 @@ mod tests {
     #[test]
     fn test_english_tokenizer() {
         let tokens = tokenize_simple("Hello, World! This is a test.");
-        assert_eq!(tokens, vec!["hello", "world", "this", "is", "test"]);
+        assert_eq!(tokens, vec!["hello", "world", "this", "is", "a", "test"]);
     }
 
     #[test]
-    fn test_english_tokenizer_filters_single_chars() {
+    fn test_english_tokenizer_keeps_single_chars() {
         let tokens = tokenize_simple("I am a student");
-        // "I", "a" are filtered out (single chars)
-        assert_eq!(tokens, vec!["am", "student"]);
+        assert_eq!(tokens, vec!["i", "am", "a", "student"]);
     }
 
     #[test]

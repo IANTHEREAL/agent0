@@ -18,6 +18,7 @@ pub struct ExecutionContext<'a> {
     pub sequence_values: &'a mut HashMap<String, i64>,
     pub cte_tables: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     pub query_ctx: &'a QueryContext,
+    pub outer_row: Option<Row>,
 }
 
 static EMPTY_CTE_MAP: std::sync::LazyLock<HashMap<String, (TableSchema, Vec<Row>)>> =
@@ -42,6 +43,7 @@ impl<'a> ExecutionContext<'a> {
             sequence_values,
             cte_tables: &EMPTY_CTE_MAP,
             query_ctx,
+            outer_row: None,
         }
     }
 
@@ -64,6 +66,7 @@ impl<'a> ExecutionContext<'a> {
             sequence_values,
             cte_tables,
             query_ctx,
+            outer_row: None,
         }
     }
 }

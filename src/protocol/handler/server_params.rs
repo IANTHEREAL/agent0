@@ -127,7 +127,7 @@ mod tests {
         );
         assert_eq!(
             params.get("search_path").map(String::as_str),
-            Some("public, extensions")
+            Some("\"$user\", public")
         );
 
         assert_eq!(

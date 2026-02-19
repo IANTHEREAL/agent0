@@ -5,8 +5,13 @@ use super::super::ExecuteResult;
 use super::core::Executor;
 use crate::types::{ColumnDef, DataType, Row, TableSchema};
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{Ident, Query, SetExpr, SetOperator, SetQuantifier, TableFactor};
+use sqlparser::ast::{
+    Ident, Query, SetExpr, SetOperator, SetQuantifier, TableFactor, Visit, Visitor,
+};
 use std::collections::HashMap;
+use std::future::Future;
+use std::ops::ControlFlow;
+use std::pin::Pin;
 use tikv_client::Transaction;
 
 impl Executor {
@@ -128,6 +133,41 @@ impl Executor {
             current_role,
         )
         .await
+    }
+
+    /// Build CTE runtime context for nested WITH queries contained inside `query`.
+    ///
+    /// This excludes the root query's own WITH clause (callers typically materialize
+    /// root WITH separately) and only processes nested Query nodes. The merged map
+    /// is additive over `base_ctes`, preserving outer-scope CTE visibility.
+    pub(crate) fn build_nested_with_cte_context_with_base<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        db_id: u64,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        query: &'a Query,
+        base_ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+        current_role: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<HashMap<String, (TableSchema, Vec<Row>)>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut ctes = base_ctes.clone();
+            for nested_query in collect_nested_with_queries(query) {
+                ctes = self
+                    .build_cte_context_with_base(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        &nested_query,
+                        &ctes,
+                        current_role,
+                    )
+                    .await?;
+            }
+            Ok(ctes)
+        })
     }
 
     pub(crate) async fn execute_recursive_cte(
@@ -294,11 +334,18 @@ impl Executor {
 
 /// Check if a CTE is recursive (references itself in the UNION)
 pub(crate) fn cte_is_recursive(query: &Query, cte_name: &str) -> bool {
-    if let SetExpr::SetOperation { left, right, .. } = &*query.body {
-        set_expr_references_table(right, cte_name) || set_expr_references_table(left, cte_name)
-    } else {
-        false
+    fn check(expr: &SetExpr, cte_name: &str) -> bool {
+        match expr {
+            SetExpr::SetOperation { left, right, .. } => {
+                set_expr_references_table(left, cte_name)
+                    || set_expr_references_table(right, cte_name)
+            }
+            SetExpr::Query(q) => check(&q.body, cte_name),
+            _ => false,
+        }
     }
+
+    check(&query.body, cte_name)
 }
 
 /// Check if a SetExpr references a specific table
@@ -337,4 +384,34 @@ pub(crate) fn table_factor_references(factor: &TableFactor, table_name: &str) ->
         }
         _ => false,
     }
+}
+
+/// Collect nested Query nodes (excluding root) that contain a WITH clause.
+fn collect_nested_with_queries(query: &Query) -> Vec<Query> {
+    struct NestedWithCollector {
+        seen_root: bool,
+        queries: Vec<Query>,
+    }
+
+    impl Visitor for NestedWithCollector {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            if self.seen_root {
+                if q.with.is_some() {
+                    self.queries.push(q.clone());
+                }
+            } else {
+                self.seen_root = true;
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut collector = NestedWithCollector {
+        seen_root: false,
+        queries: Vec::new(),
+    };
+    let _ = query.visit(&mut collector);
+    collector.queries
 }

@@ -1,6 +1,7 @@
 //! `SET` / GUC parsing helpers
 
 use super::{Expr, Result, SqlError};
+use anyhow::anyhow;
 
 pub(super) fn set_variable_value_to_string(value: &[Expr]) -> Result<String> {
     if value.len() != 1 {
@@ -71,6 +72,26 @@ pub(super) fn parse_search_path_guc_value(s: &str) -> Vec<String> {
         out.push(schema);
     }
     out
+}
+
+pub(super) fn default_search_path_entries() -> Vec<String> {
+    vec!["$user".to_string(), "public".to_string()]
+}
+
+pub(super) fn normalize_search_path_entries(mut entries: Vec<String>) -> Result<Vec<String>> {
+    entries.retain(|s| !s.is_empty());
+    if entries.len() == 1 && entries[0].eq_ignore_ascii_case("default") {
+        return Ok(default_search_path_entries());
+    }
+    for schema in &entries {
+        if schema.contains('.') {
+            return Err(anyhow!("schema name '{}' must not contain '.'", schema));
+        }
+    }
+    if entries.is_empty() {
+        entries.push("public".to_string());
+    }
+    Ok(entries)
 }
 
 pub(super) fn try_parse_const_text(expr: &Expr) -> Option<String> {

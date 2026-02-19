@@ -60,6 +60,8 @@ pub struct NestedLoopJoinOperator {
     right_matched: Vec<bool>,
     /// Current execution phase.
     phase: NLJPhase,
+    /// Whether right side must be re-executed per left row (LATERAL/correlated).
+    right_depends_on_outer: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -137,7 +139,27 @@ impl NestedLoopJoinOperator {
             left_had_match: false,
             right_matched: Vec::new(),
             phase: NLJPhase::NotOpened,
+            right_depends_on_outer: false,
         }
+    }
+
+    #[allow(dead_code)] // planner wiring: correlated/LATERAL subquery joins
+    pub fn new_with_outer_dependency(
+        left: BoxedOperator,
+        right: BoxedOperator,
+        join_type: JoinType,
+        condition: Option<TypedExpr>,
+        right_depends_on_outer: bool,
+    ) -> Self {
+        let mut op = Self::new(left, right, join_type, condition);
+        op.right_depends_on_outer = right_depends_on_outer;
+        op
+    }
+
+    #[allow(dead_code)] // planner wiring: correlated/LATERAL subquery joins
+    pub fn with_outer_dependency(mut self, right_depends_on_outer: bool) -> Self {
+        self.right_depends_on_outer = right_depends_on_outer;
+        self
     }
 
     fn make_null_values(count: usize) -> Vec<Value> {
@@ -162,6 +184,7 @@ impl NestedLoopJoinOperator {
                     .materialize_expr_for_row(
                         cond,
                         combined_row,
+                        ctx.outer_row.as_ref(),
                         Some(&self.output_schema),
                         ctx.txn,
                         ctx.db_id,
@@ -184,6 +207,20 @@ impl NestedLoopJoinOperator {
             Ok(true)
         }
     }
+
+    async fn reload_right_rows_for_left(
+        &mut self,
+        left_row: &Row,
+        ctx: &mut ExecutionContext<'_>,
+    ) -> Result<()> {
+        let saved_outer = ctx.outer_row.clone();
+        ctx.outer_row = Some(left_row.clone());
+        self.right.open(ctx).await?;
+        self.right_rows = collect_all(self.right.as_mut(), ctx).await?;
+        self.right.close(ctx).await?;
+        ctx.outer_row = saved_outer;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -194,14 +231,24 @@ impl PhysicalOperator for NestedLoopJoinOperator {
 
     async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
         self.left.open(ctx).await?;
-        self.right.open(ctx).await?;
+        if self.right_depends_on_outer {
+            if matches!(self.join_type, JoinType::Right | JoinType::Full) {
+                return Err(anyhow!(
+                    "RIGHT/FULL JOIN with correlated lateral subquery is not supported"
+                ));
+            }
+            self.right_rows.clear();
+            self.right_matched.clear();
+        } else {
+            self.right.open(ctx).await?;
 
-        // Materialize only the right (inner) side.
-        self.right_rows = collect_all(self.right.as_mut(), ctx).await?;
+            // Materialize only the right (inner) side.
+            self.right_rows = collect_all(self.right.as_mut(), ctx).await?;
 
-        // For RIGHT/FULL joins, track which right rows have been matched.
-        if matches!(self.join_type, JoinType::Right | JoinType::Full) {
-            self.right_matched = vec![false; self.right_rows.len()];
+            // For RIGHT/FULL joins, track which right rows have been matched.
+            if matches!(self.join_type, JoinType::Right | JoinType::Full) {
+                self.right_matched = vec![false; self.right_rows.len()];
+            }
         }
 
         self.current_left_row = None;
@@ -221,6 +268,9 @@ impl PhysicalOperator for NestedLoopJoinOperator {
                     if self.current_left_row.is_none() {
                         match self.left.next(ctx).await? {
                             Some(row) => {
+                                if self.right_depends_on_outer {
+                                    self.reload_right_rows_for_left(&row, ctx).await?;
+                                }
                                 self.current_left_row = Some(row);
                                 self.right_pos = 0;
                                 self.left_had_match = false;

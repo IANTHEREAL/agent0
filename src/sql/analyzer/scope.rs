@@ -10,6 +10,7 @@ use crate::types::DataType;
 use std::collections::HashMap;
 
 use super::error::AnalyzerError;
+use sqlparser::ast::Ident;
 
 /// A column visible in the current scope.
 #[derive(Debug, Clone)]
@@ -30,6 +31,21 @@ pub struct ScopeColumn {
     pub hidden: bool,
 }
 
+/// Metadata for an unqualified column merged by JOIN ... USING / NATURAL JOIN.
+///
+/// The merged output column is represented as `COALESCE(left_col, right_col)` for
+/// unqualified references (`SELECT id` / `SELECT *`), while qualified references
+/// (`left.id`, `right.id`) still target the physical side-specific columns.
+#[derive(Debug, Clone)]
+pub struct UsingMergedColumn {
+    pub column_name: String,
+    pub left_index: usize,
+    pub right_index: usize,
+    pub data_type: DataType,
+    pub left_type: DataType,
+    pub right_type: DataType,
+}
+
 /// Result of resolving a column reference.
 #[derive(Debug, Clone)]
 pub struct ResolvedColumnRef {
@@ -41,6 +57,8 @@ pub struct ResolvedColumnRef {
     pub column_name: String,
     /// Resolved data type.
     pub data_type: DataType,
+    /// JOIN ... USING / NATURAL merged-column metadata for unqualified refs.
+    pub merged_using: Option<UsingMergedColumn>,
 }
 
 /// A single scope frame in the scope stack.
@@ -59,6 +77,9 @@ pub struct Scope {
     /// Index from (lowercase_table_alias, lowercase_column_name) → position.
     qualified_index: HashMap<(String, String), usize>,
 
+    /// Metadata for merged USING/NATURAL columns keyed by left-side column index.
+    using_merged_by_left: HashMap<usize, UsingMergedColumn>,
+
     /// CTE schemas visible from this scope (name → output columns).
     cte_schemas: HashMap<String, Vec<(String, DataType)>>,
 
@@ -70,12 +91,21 @@ pub struct Scope {
 }
 
 impl Scope {
+    fn ident_matches_name(name: &str, ident: &Ident) -> bool {
+        if ident.quote_style.is_some() {
+            name == ident.value
+        } else {
+            name == ident.value.to_lowercase()
+        }
+    }
+
     /// Create an empty scope.
     pub fn new() -> Self {
         Self {
             columns: Vec::new(),
             column_index: HashMap::new(),
             qualified_index: HashMap::new(),
+            using_merged_by_left: HashMap::new(),
             cte_schemas: HashMap::new(),
             allow_aggregates: false,
             allow_windows: false,
@@ -191,12 +221,119 @@ impl Scope {
         }
     }
 
+    /// Resolve an unqualified column and return merged USING metadata when present.
+    pub fn resolve_unqualified_with_merge(
+        &self,
+        name: &str,
+    ) -> Result<Option<ResolvedColumnRef>, AnalyzerError> {
+        let lower = name.to_lowercase();
+        match self.column_index.get(&lower) {
+            None => Ok(None),
+            Some(positions) if positions.len() > 1 => {
+                let tables: Vec<String> = positions
+                    .iter()
+                    .filter_map(|&pos| self.columns[pos].table_alias.clone())
+                    .collect();
+                Err(AnalyzerError::AmbiguousColumn {
+                    name: name.to_string(),
+                    tables,
+                })
+            }
+            Some(positions) => {
+                let pos = positions[0];
+                let col = &self.columns[pos];
+                Ok(Some(ResolvedColumnRef {
+                    scope_depth: 0,
+                    column_index: col.column_index,
+                    column_name: col.column_name.clone(),
+                    data_type: self
+                        .using_merged_by_left
+                        .get(&col.column_index)
+                        .map(|m| m.data_type.clone())
+                        .unwrap_or_else(|| col.data_type.clone()),
+                    merged_using: self.using_merged_by_left.get(&col.column_index).cloned(),
+                }))
+            }
+        }
+    }
+
+    /// Resolve an unqualified column with SQL identifier semantics.
+    ///
+    /// Quoted identifiers are exact-match; unquoted identifiers are normalized
+    /// to lowercase before matching.
+    pub fn resolve_unqualified_with_ident(
+        &self,
+        ident: &Ident,
+    ) -> Result<Option<ResolvedColumnRef>, AnalyzerError> {
+        let positions: Vec<usize> = self
+            .columns
+            .iter()
+            // Hidden columns (right-side USING/NATURAL duplicates) are excluded
+            // from unqualified resolution, matching PostgreSQL merged-column
+            // semantics while preserving qualified access.
+            .filter(|c| !c.hidden && Self::ident_matches_name(&c.column_name, ident))
+            .map(|c| c.column_index)
+            .collect();
+
+        match positions.as_slice() {
+            [] => Ok(None),
+            [only] => {
+                let col = &self.columns[*only];
+                Ok(Some(ResolvedColumnRef {
+                    scope_depth: 0,
+                    column_index: col.column_index,
+                    column_name: col.column_name.clone(),
+                    data_type: self
+                        .using_merged_by_left
+                        .get(&col.column_index)
+                        .map(|m| m.data_type.clone())
+                        .unwrap_or_else(|| col.data_type.clone()),
+                    merged_using: self.using_merged_by_left.get(&col.column_index).cloned(),
+                }))
+            }
+            _ => {
+                let tables: Vec<String> = positions
+                    .iter()
+                    .filter_map(|&pos| self.columns[pos].table_alias.clone())
+                    .collect();
+                Err(AnalyzerError::AmbiguousColumn {
+                    name: ident.value.clone(),
+                    tables,
+                })
+            }
+        }
+    }
+
     /// Resolve a qualified column reference (`table.column`).
     pub fn resolve_qualified(&self, table: &str, column: &str) -> Option<&ScopeColumn> {
         let key = (table.to_lowercase(), column.to_lowercase());
         self.qualified_index
             .get(&key)
             .map(|&pos| &self.columns[pos])
+    }
+
+    /// Resolve a qualified column with SQL identifier semantics.
+    pub fn resolve_qualified_idents(&self, table: &Ident, column: &Ident) -> Option<&ScopeColumn> {
+        self.columns.iter().find(|c| {
+            c.table_alias
+                .as_ref()
+                .map(|a| Self::ident_matches_name(a, table))
+                .unwrap_or(false)
+                && Self::ident_matches_name(&c.column_name, column)
+        })
+    }
+
+    /// Return all columns for a table alias identified by SQL identifier rules.
+    pub fn columns_for_table_alias_ident(&self, table: &Ident) -> Vec<&ScopeColumn> {
+        self.columns
+            .iter()
+            .filter(|c| {
+                c.table_alias
+                    .as_ref()
+                    .map(|a| Self::ident_matches_name(a, table))
+                    .unwrap_or(false)
+            })
+            .collect()
     }
 
     /// Return all column names visible in this scope (for error hints).
@@ -233,6 +370,38 @@ impl Scope {
                 positions.retain(|&pos| pos != index);
             }
         }
+    }
+
+    /// Register a USING/NATURAL merged column.
+    ///
+    /// - Hides the right-side duplicate from unqualified `SELECT *`
+    /// - Keeps both sides addressable through qualified refs
+    /// - Records metadata so unqualified refs can be analyzed as COALESCE(left, right)
+    pub fn register_using_column(
+        &mut self,
+        name: &str,
+        left_index: usize,
+        right_index: usize,
+        data_type: DataType,
+        left_type: DataType,
+        right_type: DataType,
+    ) {
+        self.hide_using_column(right_index);
+        self.using_merged_by_left.insert(
+            left_index,
+            UsingMergedColumn {
+                column_name: name.to_string(),
+                left_index,
+                right_index,
+                data_type,
+                left_type,
+                right_type,
+            },
+        );
+    }
+
+    pub fn using_column_for_left(&self, left_index: usize) -> Option<&UsingMergedColumn> {
+        self.using_merged_by_left.get(&left_index)
     }
 }
 
@@ -276,13 +445,15 @@ impl ScopeStack {
     /// For correlated subqueries, depth > 0 means "outer reference".
     pub fn resolve_column(&self, name: &str) -> Result<ResolvedColumnRef, AnalyzerError> {
         for (i, scope) in self.scopes.iter().rev().enumerate() {
-            match scope.resolve_unqualified(name)? {
-                Some(col) => {
+            match scope.resolve_unqualified_with_merge(name)? {
+                Some(mut resolved) => {
+                    resolved.scope_depth = i as u32;
                     return Ok(ResolvedColumnRef {
-                        scope_depth: i as u32,
-                        column_index: col.column_index,
-                        column_name: col.column_name.clone(),
-                        data_type: col.data_type.clone(),
+                        scope_depth: resolved.scope_depth,
+                        column_index: resolved.column_index,
+                        column_name: resolved.column_name,
+                        data_type: resolved.data_type,
+                        merged_using: resolved.merged_using,
                     });
                 }
                 None => continue,
@@ -302,6 +473,36 @@ impl ScopeStack {
         })
     }
 
+    /// Resolve a column reference with SQL identifier semantics.
+    pub fn resolve_column_ident(&self, ident: &Ident) -> Result<ResolvedColumnRef, AnalyzerError> {
+        for (i, scope) in self.scopes.iter().rev().enumerate() {
+            match scope.resolve_unqualified_with_ident(ident)? {
+                Some(mut resolved) => {
+                    resolved.scope_depth = i as u32;
+                    return Ok(ResolvedColumnRef {
+                        scope_depth: resolved.scope_depth,
+                        column_index: resolved.column_index,
+                        column_name: resolved.column_name,
+                        data_type: resolved.data_type,
+                        merged_using: resolved.merged_using,
+                    });
+                }
+                None => continue,
+            }
+        }
+
+        let available = if let Some(scope) = self.scopes.last() {
+            scope.available_columns()
+        } else {
+            vec![]
+        };
+
+        Err(AnalyzerError::ColumnNotFound {
+            name: ident.value.clone(),
+            available,
+        })
+    }
+
     /// Resolve a qualified column reference (`table.column`).
     pub fn resolve_qualified_column(
         &self,
@@ -315,6 +516,7 @@ impl ScopeStack {
                     column_index: col.column_index,
                     column_name: col.column_name.clone(),
                     data_type: col.data_type.clone(),
+                    merged_using: None,
                 });
             }
         }
@@ -329,6 +531,46 @@ impl ScopeStack {
             name: format!("{}.{}", table, column),
             available,
         })
+    }
+
+    pub fn resolve_qualified_column_idents(
+        &self,
+        table: &Ident,
+        column: &Ident,
+    ) -> Result<ResolvedColumnRef, AnalyzerError> {
+        for (i, scope) in self.scopes.iter().rev().enumerate() {
+            if let Some(col) = scope.resolve_qualified_idents(table, column) {
+                return Ok(ResolvedColumnRef {
+                    scope_depth: i as u32,
+                    column_index: col.column_index,
+                    column_name: col.column_name.clone(),
+                    data_type: col.data_type.clone(),
+                    merged_using: None,
+                });
+            }
+        }
+
+        let available = if let Some(scope) = self.scopes.last() {
+            scope.available_columns()
+        } else {
+            vec![]
+        };
+
+        Err(AnalyzerError::ColumnNotFound {
+            name: format!("{}.{}", table.value, column.value),
+            available,
+        })
+    }
+
+    /// Resolve table alias (row variable) columns by SQL identifier semantics.
+    pub fn resolve_table_alias_columns(&self, table: &Ident) -> Option<(u32, Vec<ScopeColumn>)> {
+        for (i, scope) in self.scopes.iter().rev().enumerate() {
+            let cols = scope.columns_for_table_alias_ident(table);
+            if !cols.is_empty() {
+                return Some((i as u32, cols.into_iter().cloned().collect()));
+            }
+        }
+        None
     }
 
     /// Look up a CTE by name in any scope (innermost first).
@@ -373,7 +615,7 @@ mod tests {
     #[test]
     fn case_insensitive_resolution() {
         let mut scope = Scope::new();
-        scope.add_table("t", &[int_col("Age")]);
+        scope.add_table("t", &[int_col("age")]);
 
         assert!(scope.resolve_unqualified("age").unwrap().is_some());
         assert!(scope.resolve_unqualified("AGE").unwrap().is_some());
@@ -469,5 +711,33 @@ mod tests {
         assert_eq!(cols[0], ("a".to_string(), DataType::Int32));
 
         assert!(stack.resolve_cte("nonexistent").is_none());
+    }
+
+    #[test]
+    fn using_hidden_column_not_ambiguous_for_ident_resolution() {
+        use sqlparser::ast::Ident;
+
+        let mut scope = Scope::new();
+        scope.add_table("l", &[int_col("id"), text_col("x")]);
+        scope.add_table("r", &[int_col("id"), text_col("y")]);
+
+        // Simulate JOIN ... USING(id): hide right duplicate and register merge.
+        scope.register_using_column(
+            "id",
+            0,
+            2,
+            DataType::Int32,
+            DataType::Int32,
+            DataType::Int32,
+        );
+
+        let resolved = scope
+            .resolve_unqualified_with_ident(&Ident::new("id"))
+            .expect("resolution should not error")
+            .expect("id should resolve");
+
+        assert_eq!(resolved.column_index, 0);
+        assert!(resolved.merged_using.is_some());
+        assert_eq!(resolved.data_type, DataType::Int32);
     }
 }

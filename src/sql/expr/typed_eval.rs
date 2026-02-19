@@ -14,6 +14,7 @@
 use crate::sql::analyzer::types::*;
 use crate::sql::error::SqlError;
 use crate::sql::expr::operators::{compare_values, eval_binary_op};
+use crate::sql::expr::typed_fold::is_fold_candidate;
 use crate::sql::query_context::QueryContext;
 use crate::sql::types::cast;
 use crate::types::{Row, Value};
@@ -60,6 +61,29 @@ pub(crate) fn eval_const_usize(expr: &TypedExpr, null_as_zero: bool) -> Result<u
         }
         TypedExprKind::Constant(Value::Null) if null_as_zero => Ok(0),
         TypedExprKind::Cast { expr: inner, .. } => eval_const_usize(inner, null_as_zero),
+        TypedExprKind::MinMax { args, is_greatest } => {
+            let mut best: Option<usize> = None;
+            for arg in args {
+                let val = eval_const_usize(arg, false)?;
+                best = Some(match best {
+                    None => val,
+                    Some(cur) => {
+                        if *is_greatest {
+                            cur.max(val)
+                        } else {
+                            cur.min(val)
+                        }
+                    }
+                });
+            }
+            match best {
+                Some(v) => Ok(v),
+                None if null_as_zero => Ok(0),
+                None => Err(anyhow!(
+                    "Expected constant integer for LIMIT/OFFSET, got: NULL"
+                )),
+            }
+        }
         _ if null_as_zero => Err(anyhow!("LIMIT/OFFSET must be a constant integer")),
         _ => Err(anyhow!(
             "Expected constant integer for LIMIT/OFFSET, got: {:?}",
@@ -268,6 +292,24 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
         }
 
         TypedExprKind::Coalesce(exprs) => {
+            // PostgreSQL folds row-independent constant arguments in COALESCE
+            // before execution. This can raise errors (e.g. `1/0`) even if
+            // short-circuiting would skip the branch at runtime, unless a
+            // preceding argument is a known non-NULL constant.
+            let mut has_proven_non_null_constant = false;
+            for e in exprs {
+                if has_proven_non_null_constant {
+                    break;
+                }
+                if !is_fold_candidate(e) {
+                    continue;
+                }
+                let v = eval_typed_expr(e, row, qctx)?;
+                if v != Value::Null {
+                    has_proven_non_null_constant = true;
+                }
+            }
+
             for e in exprs {
                 let val = eval_typed_expr(e, row, qctx)?;
                 if val != Value::Null {
@@ -322,6 +364,28 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
             // TIMEZONE needs the input TypedExpr data_type to decide direction.
             if func.name.eq_ignore_ascii_case("TIMEZONE") && args.len() == 2 {
                 return eval_timezone(&args[0], &args[1], row, qctx);
+            }
+
+            // Preserve ROW(...) structural semantics for JSON conversion helpers.
+            if args.len() == 1
+                && (func.name.eq_ignore_ascii_case("TO_JSONB")
+                    || func.name.eq_ignore_ascii_case("ROW_TO_JSON"))
+                && matches!(args[0].kind, TypedExprKind::Row(_))
+            {
+                if let TypedExprKind::Row(items) = &args[0].kind {
+                    let mut obj = serde_json::Map::new();
+                    for (i, item) in items.iter().enumerate() {
+                        let v = eval_typed_expr(item, row, qctx)?;
+                        obj.insert(
+                            format!("f{}", i + 1),
+                            crate::sql::expr::functions::json::value_to_json(&v),
+                        );
+                    }
+                    if func.name.eq_ignore_ascii_case("TO_JSONB") {
+                        return Ok(Value::Jsonb(serde_json::Value::Object(obj).to_string()));
+                    }
+                    return Ok(Value::Json(serde_json::Value::Object(obj).to_string()));
+                }
             }
 
             let arg_vals: Vec<Value> = args
@@ -763,7 +827,11 @@ fn eval_function_call(name: &str, args: Vec<Value>, qctx: &QueryContext) -> Resu
         "CURRENT_DATABASE" => {
             return Ok(Value::Text(qctx.database_name.as_ref().to_string()));
         }
-        "CURRENT_SCHEMA" => return Ok(Value::Text("public".to_string())),
+        "CURRENT_SCHEMA" => {
+            return Ok(Value::Text(
+                crate::session_context::current_search_path_first_schema(),
+            ))
+        }
         "CURRENT_USER" | "SESSION_USER" | "USER" => {
             return Ok(Value::Text(qctx.current_user.as_ref().to_string()));
         }
@@ -854,6 +922,7 @@ fn to_sqlparser_json_op(op: &JsonAccessOp) -> sqlparser::ast::JsonOperator {
         JsonAccessOp::LongArrow => sqlparser::ast::JsonOperator::LongArrow,
         JsonAccessOp::HashArrow => sqlparser::ast::JsonOperator::HashArrow,
         JsonAccessOp::HashLongArrow => sqlparser::ast::JsonOperator::HashLongArrow,
+        JsonAccessOp::HashMinus => sqlparser::ast::JsonOperator::HashMinus,
     }
 }
 
@@ -2245,7 +2314,7 @@ mod tests {
         );
         let result = eval_typed_expr(&func, &row, &qctx).unwrap();
         match result {
-            Value::Text(s) => assert!(s.contains("db9")),
+            Value::Text(s) => assert!(s.contains("pg-tikv")),
             _ => panic!("expected text"),
         }
     }
@@ -2824,7 +2893,8 @@ mod tests {
     fn test_at_time_zone_offset() {
         let row = empty_row();
         let qctx = test_qctx();
-        // TIMESTAMP AT TIME ZONE '+08:00' → interpret as +8h local, convert to UTC
+        // PostgreSQL uses POSIX sign convention for numeric offsets:
+        // '+08:00' means UTC-8, so TIMESTAMP AT TIME ZONE '+08:00' adds 8h.
         let expr = TypedExpr::new(
             TypedExprKind::FunctionCall {
                 func: ResolvedFunction {
@@ -2845,8 +2915,7 @@ mod tests {
             DataType::Timestamp,
         );
         let result = eval_typed_expr(&expr, &row, &qctx).unwrap();
-        // TIMESTAMP AT TIME ZONE '+08:00' subtracts 8h offset
-        assert_eq!(result, Value::Timestamp(1_700_000_000_000 - 8 * 3_600_000));
+        assert_eq!(result, Value::Timestamp(1_700_000_000_000 + 8 * 3_600_000));
     }
 
     // ── Cast edge cases ───────────────────────────────────

@@ -42,6 +42,7 @@ mkdir -p "$REPORT_DIR"
 # Timing
 START_TIME=$(date +%s)
 PGTIKV_PID=""
+ORM_DATABASE=""
 
 # Test results
 INTEGRATION_EXIT=0
@@ -52,6 +53,13 @@ ORM_OUTPUT=""
 cleanup() {
     echo ""
     echo "=== Cleaning up ==="
+    if [ -n "$ORM_DATABASE" ] && [ -n "$PGTIKV_PID" ] && kill -0 "$PGTIKV_PID" 2>/dev/null; then
+        echo "Dropping isolated ORM database '$ORM_DATABASE'..."
+        PGPASSWORD="$PG_PASSWORD" psql -X -q \
+            -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -d postgres \
+            -v ON_ERROR_STOP=1 \
+            -c "DROP DATABASE IF EXISTS \"$ORM_DATABASE\"" 2>/dev/null || true
+    fi
     if [ -n "$PGTIKV_PID" ] && kill -0 "$PGTIKV_PID" 2>/dev/null; then
         echo "Stopping pg-tikv (PID: $PGTIKV_PID)..."
         kill "$PGTIKV_PID" 2>/dev/null || true
@@ -112,6 +120,7 @@ cat >> "$REPORT_FILE" << EOF
 | PD Endpoint | 127.0.0.1:$PD_PORT |
 | pg-tikv Port | $PG_PORT |
 | User | $PG_USER |
+| ORM Database | isolated (auto-created per run) |
 | Prisma | $([ "$INCLUDE_PRISMA" -eq 1 ] && echo "enabled" || echo "skipped") |
 
 EOF
@@ -196,6 +205,15 @@ $INTEGRATION_OUTPUT
 EOF
 
 echo "[5/5] Running ORM tests..."
+ORM_DATABASE="orm_tests_${REPORT_TIMESTAMP//-/_}"
+echo "Preparing isolated ORM database '$ORM_DATABASE'..."
+PGPASSWORD="$PG_PASSWORD" psql -X -q \
+    -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -d postgres \
+    -v ON_ERROR_STOP=1 \
+    -c "DROP DATABASE IF EXISTS \"$ORM_DATABASE\"" \
+    -c "CREATE DATABASE \"$ORM_DATABASE\""
+ORM_DSN="postgres://$PG_USER:$PG_PASSWORD@127.0.0.1:$PG_PORT/$ORM_DATABASE"
+
 cd "$SCRIPT_DIR/orm-tests"
 if [ ! -d "node_modules" ]; then
     echo "Installing dependencies..."
@@ -222,7 +240,7 @@ else
 fi
 
 ORM_START=$(date +%s)
-ORM_OUTPUT=$(PG_DSN="$PG_DSN" timeout 300 npm test -- "${ORM_SUITES[@]}" 2>&1) || ORM_EXIT=$?
+ORM_OUTPUT=$(PG_DSN="$ORM_DSN" timeout 300 npm test -- "${ORM_SUITES[@]}" 2>&1) || ORM_EXIT=$?
 ORM_END=$(date +%s)
 ORM_TIME=$((ORM_END - ORM_START))
 echo "$ORM_OUTPUT"

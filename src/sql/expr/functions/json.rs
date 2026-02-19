@@ -10,7 +10,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("JSONB_TYPEOF", jsonb_typeof);
     map.insert("JSON_TYPEOF", jsonb_typeof);
     map.insert("JSONB_BUILD_OBJECT", jsonb_build_object);
-    map.insert("JSON_BUILD_OBJECT", jsonb_build_object);
+    map.insert("JSON_BUILD_OBJECT", json_build_object);
     map.insert("JSONB_BUILD_ARRAY", jsonb_build_array);
     map.insert("JSON_BUILD_ARRAY", jsonb_build_array);
     map.insert("JSONB_EXISTS", jsonb_exists);
@@ -24,6 +24,8 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("JSON_EXTRACT_PATH_TEXT", jsonb_extract_path_text);
     map.insert("JSONB_PRETTY", jsonb_pretty);
     map.insert("TO_JSON", to_json);
+    map.insert("TO_JSONB", to_jsonb);
+    map.insert("ROW_TO_JSON", row_to_json);
     map.insert("JSONB_SET", jsonb_set);
     map.insert("JSON_SET", jsonb_set);
     map.insert("JSONB_ARRAY_ELEMENTS", jsonb_array_elements);
@@ -36,7 +38,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("JSON_EACH_TEXT", jsonb_each_text);
 }
 
-fn value_to_json(val: &Value) -> serde_json::Value {
+pub(crate) fn value_to_json(val: &Value) -> serde_json::Value {
     match val {
         Value::Null => serde_json::Value::Null,
         Value::Boolean(b) => serde_json::Value::Bool(*b),
@@ -130,6 +132,29 @@ pub fn jsonb_build_object(args: Vec<Value>) -> Result<Value> {
         obj.insert(key_str, json_val);
     }
     Ok(Value::Jsonb(serde_json::Value::Object(obj).to_string()))
+}
+
+/// PostgreSQL `json_build_object` uses `" : "` separator (space before and after colon),
+/// which differs from `jsonb_build_object`'s compact `": "` format.
+pub fn json_build_object(args: Vec<Value>) -> Result<Value> {
+    let mut obj = serde_json::Map::new();
+    let mut iter = args.into_iter();
+    while let Some(key) = iter.next() {
+        let key_str = match key {
+            Value::Text(s) => s,
+            Value::Null => "null".to_string(),
+            v => v.to_string(),
+        };
+        let val = iter.next().unwrap_or(Value::Null);
+        let json_val = value_to_json(&val);
+        obj.insert(key_str, json_val);
+    }
+    // PostgreSQL json type uses " : " separator
+    let pairs: Vec<String> = obj
+        .iter()
+        .map(|(k, v)| format!("{} : {}", serde_json::Value::String(k.clone()), v))
+        .collect();
+    Ok(Value::Json(format!("{{{}}}", pairs.join(", "))))
 }
 
 pub fn jsonb_build_array(args: Vec<Value>) -> Result<Value> {
@@ -338,6 +363,29 @@ pub fn to_json(args: Vec<Value>) -> Result<Value> {
     let val = args.into_iter().next().unwrap_or(Value::Null);
     let json_val = value_to_json(&val);
     Ok(Value::Json(json_val.to_string()))
+}
+
+pub fn to_jsonb(args: Vec<Value>) -> Result<Value> {
+    let val = args.into_iter().next().unwrap_or(Value::Null);
+    let json_val = value_to_json(&val);
+    Ok(Value::Jsonb(json_val.to_string()))
+}
+
+pub fn row_to_json(args: Vec<Value>) -> Result<Value> {
+    let Some(val) = args.into_iter().next() else {
+        return Ok(Value::Null);
+    };
+    match val {
+        Value::Null => Ok(Value::Null),
+        Value::Array(arr) => {
+            let mut obj = serde_json::Map::new();
+            for (i, v) in arr.iter().enumerate() {
+                obj.insert(format!("f{}", i + 1), value_to_json(v));
+            }
+            Ok(Value::Json(serde_json::Value::Object(obj).to_string()))
+        }
+        other => Ok(Value::Json(value_to_json(&other).to_string())),
+    }
 }
 
 pub fn jsonb_set(args: Vec<Value>) -> Result<Value> {

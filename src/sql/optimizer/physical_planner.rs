@@ -239,15 +239,16 @@ impl PhysicalPlanner {
                 };
 
                 // Access-path selection: when Filter sits above SeqScan and
-                // we have index metadata, try btree index selection.
-                // GIN is excluded — GIN queries stay on SeqScan (Option A).
+                // we have index metadata, choose the best typed access path.
+                // This includes GIN path selection in the optimizer plan.
                 let scan_node = if let PhysicalNode::SeqScan { table_name, alias } = &child.node {
                     let scan_key = super::schema_map_key(table_name, alias.as_deref());
                     if let Some(schema) = ctx.get_schema(&scan_key) {
                         let access_path =
-                            crate::sql::planner::choose_btree_access_path_for_typed_filter(
+                            crate::sql::planner::choose_best_access_path_for_typed_filter(
+                                0,
                                 schema,
-                                predicate,
+                                Some(predicate),
                                 child.cost.rows,
                             );
                         match &access_path.scan_type {

@@ -175,83 +175,78 @@ impl TikvStore {
             return Err(anyhow!("Schema '{}' does not exist", schema));
         }
 
-        let mut table_prefix = encode_schema_prefix_v2(db_id);
-        table_prefix.extend_from_slice(schema.as_bytes());
-        table_prefix.push(b'.');
-        if self.prefix_has_any(txn, table_prefix).await? {
-            return Err(anyhow!(
-                "cannot drop schema '{}': schema is not empty",
-                schema
-            ));
+        // Check for dependent objects — match PostgreSQL error format
+        let schema_prefix = format!("{}.", schema);
+        let mut deps: Vec<String> = Vec::new();
+
+        // Tables (use schema-qualified name like PG: "table app.users depends on schema app")
+        for table in self.list_tables(txn, db_id).await? {
+            if table.starts_with(&schema_prefix) {
+                deps.push(format!("table {} depends on schema {}", table, schema));
+            }
+        }
+        // Views
+        for view in self.list_views(txn, db_id).await? {
+            if view.schema == schema {
+                deps.push(format!("view {} depends on schema {}", view.name, schema));
+            }
+        }
+        // Materialized views
+        for mv in self.list_materialized_views(txn, db_id).await? {
+            if mv.schema == schema {
+                deps.push(format!(
+                    "materialized view {} depends on schema {}",
+                    mv.name, schema
+                ));
+            }
+        }
+        // Functions
+        for func in self.list_functions(txn, db_id).await? {
+            if func.schema == schema {
+                deps.push(format!(
+                    "function {}() depends on schema {}",
+                    func.name, schema
+                ));
+            }
+        }
+        // Procedures
+        for proc_name in self.list_procedures(txn, db_id).await? {
+            if proc_name.starts_with(&schema_prefix) {
+                let name = proc_name.strip_prefix(&schema_prefix).unwrap_or(&proc_name);
+                deps.push(format!("procedure {}() depends on schema {}", name, schema));
+            }
+        }
+        // Sequences
+        for seq in self.list_sequences(txn, db_id).await? {
+            if seq.schema == schema {
+                deps.push(format!(
+                    "sequence {}.{} depends on schema {}",
+                    schema, seq.name, schema
+                ));
+            }
+        }
+        // Types
+        for udt in self.list_types(txn, db_id).await? {
+            let udt_schema = udt
+                .name
+                .rsplit_once('.')
+                .map(|(s, _)| s)
+                .unwrap_or("public");
+            if udt_schema == schema {
+                let bare_name = udt
+                    .name
+                    .rsplit_once('.')
+                    .map(|(_, n)| n)
+                    .unwrap_or(&udt.name);
+                deps.push(format!("type {} depends on schema {}", bare_name, schema));
+            }
         }
 
-        let mut view_prefix = encode_view_prefix_v2(db_id);
-        view_prefix.extend_from_slice(schema.as_bytes());
-        view_prefix.push(b'.');
-        if self.prefix_has_any(txn, view_prefix).await? {
+        if !deps.is_empty() {
+            let detail = deps.join("\n");
             return Err(anyhow!(
-                "cannot drop schema '{}': schema is not empty",
-                schema
-            ));
-        }
-
-        let mut matview_prefix = encode_matview_prefix_v2(db_id);
-        matview_prefix.extend_from_slice(schema.as_bytes());
-        matview_prefix.push(b'.');
-        if self.prefix_has_any(txn, matview_prefix).await? {
-            return Err(anyhow!(
-                "cannot drop schema '{}': schema is not empty",
-                schema
-            ));
-        }
-
-        let mut procedure_prefix = encode_procedure_prefix_v2(db_id);
-        procedure_prefix.extend_from_slice(schema.as_bytes());
-        procedure_prefix.push(b'.');
-        if self.prefix_has_any(txn, procedure_prefix).await? {
-            return Err(anyhow!(
-                "cannot drop schema '{}': schema is not empty",
-                schema
-            ));
-        }
-
-        let mut function_prefix = encode_function_prefix_v2(db_id);
-        function_prefix.extend_from_slice(schema.as_bytes());
-        function_prefix.push(b'.');
-        if self.prefix_has_any(txn, function_prefix).await? {
-            return Err(anyhow!(
-                "cannot drop schema '{}': schema is not empty",
-                schema
-            ));
-        }
-
-        let mut trigger_prefix = encode_trigger_prefix_v2(db_id);
-        trigger_prefix.extend_from_slice(schema.as_bytes());
-        trigger_prefix.push(b'.');
-        if self.prefix_has_any(txn, trigger_prefix).await? {
-            return Err(anyhow!(
-                "cannot drop schema '{}': schema is not empty",
-                schema
-            ));
-        }
-
-        let mut type_prefix = encode_type_prefix_v2(db_id);
-        type_prefix.extend_from_slice(schema.as_bytes());
-        type_prefix.push(b'.');
-        if self.prefix_has_any(txn, type_prefix).await? {
-            return Err(anyhow!(
-                "cannot drop schema '{}': schema is not empty",
-                schema
-            ));
-        }
-
-        let mut sequence_prefix = encode_sequence_def_prefix_v2(db_id);
-        sequence_prefix.extend_from_slice(schema.as_bytes());
-        sequence_prefix.push(b'.');
-        if self.prefix_has_any(txn, sequence_prefix).await? {
-            return Err(anyhow!(
-                "cannot drop schema '{}': schema is not empty",
-                schema
+                "cannot drop schema {} because other objects depend on it\nDETAIL:  {}\nHINT:  Use DROP ... CASCADE to drop the dependent objects too.",
+                schema, detail
             ));
         }
 

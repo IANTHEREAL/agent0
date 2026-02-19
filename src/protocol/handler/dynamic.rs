@@ -25,6 +25,7 @@ use crate::auth::{AuthManager, Privilege};
 use crate::config;
 use crate::observability;
 use crate::pool::{TenantHandle, TikvClientPool};
+use crate::sql::error::SqlError;
 use crate::sql::{ExecuteResult, Executor, Session};
 use crate::storage::TikvStore;
 use crate::types::{DataType, TableSchema, Value};
@@ -882,6 +883,93 @@ impl DynamicPgHandler {
     }
 }
 
+fn copy_display_table_name(resolved_table: &str) -> &str {
+    resolved_table.rsplit('.').next().unwrap_or(resolved_table)
+}
+
+fn copy_missing_data_error(
+    resolved_table: &str,
+    column_name: &str,
+    line_no: usize,
+    raw_line: &str,
+) -> PgWireError {
+    let table = copy_display_table_name(resolved_table);
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_string(),
+        "22P04".to_string(),
+        format!(
+            "missing data for column \"{}\"\nCONTEXT:  COPY {}, line {}: \"{}\"",
+            column_name, table, line_no, raw_line
+        ),
+    )))
+}
+
+fn copy_value_parse_error(
+    resolved_table: &str,
+    line_no: usize,
+    column_name: &str,
+    raw_value: &str,
+    err: &anyhow::Error,
+) -> PgWireError {
+    let table = copy_display_table_name(resolved_table);
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_string(),
+        sqlstate_for_executor_error(err).to_string(),
+        format!(
+            "{}\nCONTEXT:  COPY {}, line {}, column {}: \"{}\"",
+            err, table, line_no, column_name, raw_value
+        ),
+    )))
+}
+
+fn parse_copy_text_line(
+    executor: &Executor,
+    resolved_table: &str,
+    columns: &[String],
+    column_types: &[Option<DataType>],
+    line_no: usize,
+    line_bytes: &[u8],
+) -> PgWireResult<Vec<(String, Value)>> {
+    let line = String::from_utf8_lossy(line_bytes);
+    let values: Vec<&str> = line.split('\t').collect();
+
+    if values.len() > columns.len() {
+        return Err(copy_row_column_mismatch_error(values.len(), columns.len()));
+    }
+
+    let mut col_values: Vec<(String, Value)> = Vec::with_capacity(columns.len());
+    for (idx, (col_name, col_type)) in columns.iter().zip(column_types.iter()).enumerate() {
+        let Some(val) = values.get(idx).copied() else {
+            return Err(copy_missing_data_error(
+                resolved_table,
+                col_name,
+                line_no,
+                line.as_ref(),
+            ));
+        };
+
+        let value = if val == "\\N" {
+            Value::Null
+        } else if let Some(dt) = col_type.as_ref() {
+            executor
+                .parse_value_for_copy(val, dt)
+                .map_err(|e| copy_value_parse_error(resolved_table, line_no, col_name, val, &e))?
+        } else {
+            Value::Text(val.to_string())
+        };
+        col_values.push((col_name.clone(), value));
+    }
+
+    Ok(col_values)
+}
+
+fn should_add_copy_insert_context(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<SqlError>(),
+        Some(SqlError::UniqueViolation { .. })
+    )
+}
+
 #[async_trait]
 impl StartupHandler for DynamicPgHandler {
     async fn on_startup<C>(
@@ -1367,7 +1455,7 @@ impl CopyHandler for DynamicPgHandler {
             let table_name = ctx.table_name.clone();
             let started_txn = ctx.started_txn;
 
-            let parse_res = (|| -> PgWireResult<Vec<Vec<(String, Value)>>> {
+            let parse_res = (|| -> PgWireResult<Vec<(usize, Vec<(String, Value)>)>> {
                 if ctx.reached_end_marker {
                     return Ok(Vec::new());
                 }
@@ -1377,7 +1465,8 @@ impl CopyHandler for DynamicPgHandler {
                     return Ok(Vec::new());
                 }
 
-                let mut rows_to_insert: Vec<Vec<(String, Value)>> = Vec::with_capacity(lines.len());
+                let mut rows_to_insert: Vec<(usize, Vec<(String, Value)>)> =
+                    Vec::with_capacity(lines.len());
                 for line_bytes in lines {
                     if ctx.reached_end_marker {
                         break;
@@ -1388,40 +1477,19 @@ impl CopyHandler for DynamicPgHandler {
                         break;
                     }
 
-                    let line = String::from_utf8_lossy(&line_bytes);
-                    let values: Vec<&str> = line.split('\t').collect();
-
-                    if values.len() != ctx.columns.len() {
-                        return Err(copy_row_column_mismatch_error(
-                            values.len(),
-                            ctx.columns.len(),
-                        ));
-                    }
-
-                    let mut col_values: Vec<(String, Value)> =
-                        Vec::with_capacity(ctx.columns.len());
-                    for ((col_name, col_type), val) in ctx
-                        .columns
-                        .iter()
-                        .zip(ctx.column_types.iter())
-                        .zip(values.iter())
-                    {
-                        let value = if *val == "\\N" {
-                            Value::Null
-                        } else if let Some(dt) = col_type.as_ref() {
-                            executor.parse_value_for_copy(val, dt).map_err(|e| {
-                                PgWireError::UserError(Box::new(ErrorInfo::new(
-                                    "ERROR".to_string(),
-                                    "22P02".to_string(),
-                                    e.to_string(),
-                                )))
-                            })?
-                        } else {
-                            Value::Text(val.to_string())
-                        };
-                        col_values.push((col_name.clone(), value));
-                    }
-                    rows_to_insert.push(col_values);
+                    let line_no = ctx
+                        .row_count
+                        .saturating_add(rows_to_insert.len())
+                        .saturating_add(1);
+                    let col_values = parse_copy_text_line(
+                        executor,
+                        &ctx.table_name,
+                        &ctx.columns,
+                        &ctx.column_types,
+                        line_no,
+                        &line_bytes,
+                    )?;
+                    rows_to_insert.push((line_no, col_values));
                 }
 
                 Ok(rows_to_insert)
@@ -1466,16 +1534,22 @@ impl CopyHandler for DynamicPgHandler {
 
             let savepoints = session.savepoints();
             crate::txn::with_savepoints(savepoints, async {
-                for col_values in rows_to_insert {
+                for (line_no, col_values) in rows_to_insert {
                     executor
                         .execute_copy_insert(session, &table_name, col_values)
                         .await
                         .map_err(|e| {
                             error!("COPY insert error: {}", e);
+                            let table = copy_display_table_name(&table_name);
+                            let message = if should_add_copy_insert_context(&e) {
+                                format!("{}\nCONTEXT:  COPY {}, line {}", e, table, line_no)
+                            } else {
+                                e.to_string()
+                            };
                             PgWireError::UserError(Box::new(ErrorInfo::new(
                                 "ERROR".to_string(),
-                                "XX000".to_string(),
-                                e.to_string(),
+                                sqlstate_for_executor_error(&e).to_string(),
+                                message,
                             )))
                         })?;
                 }
@@ -1539,40 +1613,21 @@ impl CopyHandler for DynamicPgHandler {
                 if final_line_bytes.as_slice() == b"\\." {
                     ctx.reached_end_marker = true;
                 } else if !ctx.reached_end_marker {
-                    let line = String::from_utf8_lossy(&final_line_bytes);
-                    let values: Vec<&str> = line.split('\t').collect();
-
-                    if values.len() != ctx.columns.len() {
-                        rollback_autocommit_or_mark_failed(session, ctx.started_txn).await;
-                        return Err(copy_row_column_mismatch_error(
-                            values.len(),
-                            ctx.columns.len(),
-                        ));
-                    }
-
-                    let mut col_values: Vec<(String, Value)> =
-                        Vec::with_capacity(ctx.columns.len());
-                    for ((col_name, col_type), val) in ctx
-                        .columns
-                        .iter()
-                        .zip(ctx.column_types.iter())
-                        .zip(values.iter())
-                    {
-                        let value = if *val == "\\N" {
-                            Value::Null
-                        } else if let Some(dt) = col_type.as_ref() {
-                            executor.parse_value_for_copy(val, dt).map_err(|e| {
-                                PgWireError::UserError(Box::new(ErrorInfo::new(
-                                    "ERROR".to_string(),
-                                    "22P02".to_string(),
-                                    e.to_string(),
-                                )))
-                            })?
-                        } else {
-                            Value::Text(val.to_string())
-                        };
-                        col_values.push((col_name.clone(), value));
-                    }
+                    let line_no = ctx.row_count.saturating_add(1);
+                    let col_values = match parse_copy_text_line(
+                        executor,
+                        &ctx.table_name,
+                        &ctx.columns,
+                        &ctx.column_types,
+                        line_no,
+                        &final_line_bytes,
+                    ) {
+                        Ok(values) => values,
+                        Err(e) => {
+                            rollback_autocommit_or_mark_failed(session, ctx.started_txn).await;
+                            return Err(e);
+                        }
+                    };
 
                     let savepoints = session.savepoints();
                     let insert_res = crate::txn::with_savepoints(savepoints, async {
@@ -1581,10 +1636,16 @@ impl CopyHandler for DynamicPgHandler {
                             .await
                             .map_err(|e| {
                                 error!("COPY insert error: {}", e);
+                                let table = copy_display_table_name(&ctx.table_name);
+                                let message = if should_add_copy_insert_context(&e) {
+                                    format!("{}\nCONTEXT:  COPY {}, line {}", e, table, line_no)
+                                } else {
+                                    e.to_string()
+                                };
                                 PgWireError::UserError(Box::new(ErrorInfo::new(
                                     "ERROR".to_string(),
-                                    "XX000".to_string(),
-                                    e.to_string(),
+                                    sqlstate_for_executor_error(&e).to_string(),
+                                    message,
                                 )))
                             })
                     })

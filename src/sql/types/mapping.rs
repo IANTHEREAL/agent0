@@ -197,6 +197,23 @@ fn convert_custom_type(
     let type_name = last_ident.value.to_uppercase();
 
     match type_name.as_str() {
+        "BOOL" | "BOOLEAN" => Ok(DataType::Boolean),
+        "INT" | "INTEGER" | "INT4" | "SMALLINT" | "INT2" => Ok(DataType::Int32),
+        "BIGINT" | "INT8" => Ok(DataType::Int64),
+        "REAL" | "FLOAT4" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" | "FLOAT" => {
+            Ok(DataType::Float64)
+        }
+        "TEXT" | "VARCHAR" | "CHARACTER VARYING" | "CHAR" | "CHARACTER" => Ok(DataType::Text),
+        "NUMERIC" | "DECIMAL" => Ok(DataType::Numeric {
+            precision: None,
+            scale: None,
+        }),
+        "DATE" => Ok(DataType::Date),
+        "TIME" => Ok(DataType::Time),
+        "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => Ok(DataType::Timestamp),
+        "TIMESTAMP WITH TIME ZONE" => Ok(DataType::TimestampTz),
+        "INTERVAL" => Ok(DataType::Interval),
+        "UUID" => Ok(DataType::Uuid),
         "SERIAL" => Ok(DataType::Int32),
         "BIGSERIAL" => Ok(DataType::Int64),
         "BYTEA" => Ok(DataType::Bytes),

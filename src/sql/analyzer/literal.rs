@@ -81,34 +81,11 @@ impl<'a> Analyzer<'a> {
         value: &str,
         target_type: &DataType,
     ) -> Result<Value, AnalyzerError> {
-        // Try timezone-aware formats first (RFC3339, offset suffixes).
-        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
-            return Ok(Value::Timestamp(dt.timestamp_millis()));
-        }
-        let tz_formats = [
-            "%Y-%m-%d %H:%M:%S%.f%:z",
-            "%Y-%m-%d %H:%M:%S%:z",
-            "%Y-%m-%dT%H:%M:%S%.f%:z",
-            "%Y-%m-%dT%H:%M:%S%:z",
-        ];
-        for fmt in &tz_formats {
-            if let Ok(dt) = chrono::DateTime::parse_from_str(value, fmt) {
-                return Ok(Value::Timestamp(dt.timestamp_millis()));
-            }
-        }
-
-        // Fall back to naive (no timezone) formats.
-        let ts = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
-            .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f"))
-            .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S"))
-            .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f"))
-            .map_err(|e| AnalyzerError::InvalidLiteral {
-                value: value.to_string(),
-                target_type: target_type.clone(),
-                parse_error: e.to_string(),
-            })?;
-        let millis = ts.and_utc().timestamp_millis();
-        Ok(Value::Timestamp(millis))
+        crate::sql::expr::parse_timestamp_string(value).map_err(|e| AnalyzerError::InvalidLiteral {
+            value: value.to_string(),
+            target_type: target_type.clone(),
+            parse_error: e.to_string(),
+        })
     }
 
     /// Parse an interval expression (wraps parse_interval_str).

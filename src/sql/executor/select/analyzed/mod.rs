@@ -14,7 +14,9 @@ use crate::sql::analyzer::types::{
 use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::typed_eval::{eval_const_usize, eval_typed_expr};
+use crate::sql::names;
 use crate::sql::sequences::resolve_sequence_full_name_from_value;
+use crate::sql::table_functions::is_virtual_table_backed_system_function;
 use crate::sql::types::coercion::comparison_target_type;
 use crate::sql::types::CastContext;
 use crate::sql::ExecuteResult;
@@ -22,7 +24,7 @@ use crate::types::{DataType, Row, TableSchema, Value};
 
 use crate::sql::optimizer::{BuildContext, PlanningContext};
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{FunctionArg, FunctionArgExpr, ObjectName, Query, SetExpr};
+use sqlparser::ast::{FunctionArg, FunctionArgExpr, Query, SetExpr};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -50,8 +52,38 @@ impl Executor {
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
         current_role: Option<&str>,
     ) -> Result<ExecuteResult> {
+        // Pre-expand views once to discover nested WITH scopes introduced by
+        // view expansion (e.g. FROM (WITH ... SELECT ...) AS v) and materialize
+        // those CTEs before analysis.
+        let preexpanded_query = crate::sql::executor::core::view_rewrite::expand_views_in_query(
+            self.store().as_ref(),
+            txn,
+            db_id,
+            search_path,
+            query,
+        )
+        .await?;
+        let prepared_ctes = self
+            .build_nested_with_cte_context_with_base(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                &preexpanded_query,
+                ctes,
+                current_role,
+            )
+            .await?;
+
         let (expanded_query, analyzed) = self
-            .analyze_then_rewrite_query(txn, db_id, search_path, query, ctes, current_role)
+            .analyze_then_rewrite_query(
+                txn,
+                db_id,
+                search_path,
+                query,
+                &prepared_ctes,
+                current_role,
+            )
             .await?;
 
         // ── Pre-materialize async expressions ──────────────────────
@@ -65,7 +97,7 @@ impl Executor {
             db_id,
             sequence_values,
             search_path,
-            ctes,
+            &prepared_ctes,
         )
         .await?;
 
@@ -77,7 +109,7 @@ impl Executor {
                 sequence_values,
                 search_path,
                 &analyzed,
-                ctes,
+                &prepared_ctes,
                 &expanded_query.locks,
             )
             .await?;
@@ -966,10 +998,6 @@ impl Executor {
         .await?;
 
         // ── Step 2: Determine post-processing needs ──
-        let has_async_where = match &analyzed.body {
-            AnalyzedQueryBody::Select(s) => s.where_clause.as_ref().is_some_and(|w| needs_async(w)),
-            _ => false,
-        };
         let mut has_async_projection = match &analyzed.body {
             AnalyzedQueryBody::Select(s) => s.projection.iter().any(|p| needs_async(&p.expr)),
             _ => false,
@@ -1020,7 +1048,7 @@ impl Executor {
             has_async_projection = false;
         }
 
-        let needs_passthrough = has_async_projection || has_locks || has_async_where;
+        let needs_passthrough = has_async_projection || has_locks;
 
         // Save the final output schema before any modifications.
         let final_output_schema = analyzed.output_schema.clone();
@@ -1031,7 +1059,6 @@ impl Executor {
         // handle the real projection in post-processing.
         let mut original_proj_exprs: Option<Vec<TypedExpr>> = None;
         let mut base_schema: Option<TableSchema> = None;
-        let mut async_where_pred: Option<TypedExpr> = None;
         let mut deferred_order_by: Option<Vec<TypedOrderByExpr>> = None;
         let mut deferred_limit: Option<(Option<TypedExpr>, Option<TypedExpr>)> = None;
 
@@ -1055,16 +1082,6 @@ impl Executor {
             let offset = analyzed.offset.take();
             if limit.is_some() || offset.is_some() {
                 deferred_limit = Some((limit, offset));
-            }
-        }
-
-        if has_async_where {
-            if let AnalyzedQueryBody::Select(ref mut select) = analyzed.body {
-                if let Some(w) = select.where_clause.take() {
-                    let (sync_part, async_part) = split_where_for_async(&w);
-                    select.where_clause = sync_part;
-                    async_where_pred = async_part;
-                }
             }
         }
 
@@ -1113,18 +1130,7 @@ impl Executor {
 
         // ── Step 8: Post-processing ──
 
-        // 8a: Async WHERE filter (correlated subqueries, catalog functions).
-        if let Some(ref async_pred) = async_where_pred {
-            let schema = base_schema
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| build_output_schema(&analyzed));
-            rows = rt
-                .filter_async(rows, Some(async_pred), &schema, txn, sequence_values)
-                .await?;
-        }
-
-        // 8b: FOR UPDATE/SHARE locking (before projection, raw rows have PK).
+        // 8a: FOR UPDATE/SHARE locking (before projection, raw rows have PK).
         if has_locks {
             rows = self
                 .apply_row_locks(
@@ -1139,7 +1145,7 @@ impl Executor {
                 .await?;
         }
 
-        // 8c: Apply original projection (async expressions + all expressions when passthrough).
+        // 8b: Apply original projection (async expressions + all expressions when passthrough).
         if let Some(ref proj_exprs) = original_proj_exprs {
             let schema = base_schema
                 .as_ref()
@@ -1150,7 +1156,7 @@ impl Executor {
                 .await?;
         }
 
-        // 8c2: Deferred async projection for GROUP BY queries.
+        // 8c: Deferred async projection for GROUP BY queries.
         // Each deferred entry has (output_col_idx, async_expr_with_output_col_ref).
         // The output row already contains the dependency value at col_idx;
         // we evaluate the async function with that value and replace the column.
@@ -1163,6 +1169,7 @@ impl Executor {
                         .materialize_expr_for_row(
                             async_expr,
                             row,
+                            None,
                             Some(&schema),
                             txn,
                             db_id,
@@ -1463,6 +1470,52 @@ impl Executor {
         })
     }
 
+    /// Pre-load KV-backed table schemas and statistics into [`PlanningContext`].
+    ///
+    /// This intentionally skips:
+    /// - runtime CTE bindings (`ctes`)
+    /// - WITH-local CTE names from the analyzed query body
+    /// - virtual catalog tables (resolved at build/runtime only)
+    pub(crate) async fn prepare_planning_context(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        analyzed: &AnalyzedQuery,
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+        planning_ctx: &mut PlanningContext,
+    ) -> Result<()> {
+        let table_refs = crate::sql::optimizer::collect_query_table_refs(analyzed);
+        let analyzed_cte_names: std::collections::HashSet<String> = analyzed
+            .ctes
+            .iter()
+            .map(|c| c.name.to_lowercase())
+            .collect();
+
+        let mut stats_attempted = std::collections::HashSet::new();
+        for (name, _schema, alias) in &table_refs {
+            let cte_key = name.to_lowercase();
+            if ctes.contains_key(&cte_key) || analyzed_cte_names.contains(&cte_key) {
+                continue;
+            }
+
+            if let Some(table_schema) = self.store().get_schema(txn, db_id, name).await? {
+                let ctx_key = crate::sql::optimizer::schema_map_key(name, *alias);
+                let tid = table_schema.table_id;
+                let stats = if stats_attempted.insert(tid) {
+                    self.get_or_load_stats(txn, db_id, tid).await?
+                } else {
+                    self.stats_cache().get_full_stats(db_id, tid)
+                };
+                if let Some(stats) = stats {
+                    planning_ctx.table_stats.insert(ctx_key.clone(), stats);
+                }
+                planning_ctx.table_schemas.insert(ctx_key, table_schema);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Pre-load table schemas, statistics, virtual table data, and table function
     /// results into the PlanningContext and BuildContext.
     #[allow(clippy::too_many_arguments)]
@@ -1477,10 +1530,12 @@ impl Executor {
         planning_ctx: &mut PlanningContext,
         build_ctx: &mut BuildContext,
     ) -> Result<()> {
+        self.prepare_planning_context(txn, db_id, analyzed, ctes, planning_ctx)
+            .await?;
+
         // Walk the query body to collect all table references.
         let table_refs = crate::sql::optimizer::collect_query_table_refs(analyzed);
 
-        let mut stats_attempted = std::collections::HashSet::new();
         for (name, _schema, alias) in &table_refs {
             // Use scope-safe composite key: "table_name\0alias" to prevent
             // collisions when the same alias appears in different scopes
@@ -1499,21 +1554,16 @@ impl Executor {
             }
 
             // Try KV table (regular user table).
-            if let Some(table_schema) = self.store().get_schema(txn, db_id, name).await? {
-                // Load statistics for cost-based optimization.
-                let tid = table_schema.table_id;
-                let stats = if stats_attempted.insert(tid) {
-                    self.get_or_load_stats(txn, db_id, tid).await?
-                } else {
-                    self.stats_cache().get_full_stats(db_id, tid)
-                };
-                if let Some(stats) = stats {
-                    planning_ctx.table_stats.insert(ctx_key.clone(), stats);
+            if let Some(table_schema) = planning_ctx.table_schemas.get(&ctx_key).cloned() {
+                let mut s = table_schema;
+                let short = s.name.rsplit('.').next().unwrap_or(&s.name);
+                if !short.eq_ignore_ascii_case(alias_display) {
+                    s.from_alias = Some(alias_display.to_string());
                 }
-                planning_ctx
-                    .table_schemas
-                    .insert(ctx_key.clone(), table_schema.clone());
-
+                build_ctx.table_schemas.insert(ctx_key, s);
+                continue;
+            }
+            if let Some(table_schema) = self.store().get_schema(txn, db_id, name).await? {
                 let mut s = table_schema;
                 let short = s.name.rsplit('.').next().unwrap_or(&s.name);
                 if !short.eq_ignore_ascii_case(alias_display) {
@@ -1690,10 +1740,23 @@ impl Executor {
                     } else if func_upper == "_PGTIKV_SYS_RECORD_MIGRATION" {
                         let (_, rows) = self.execute_record_migration(txn, &bridge_args).await?;
                         rows
+                    } else if bridge_args.is_empty()
+                        && is_virtual_table_backed_system_function(&func.name)
+                    {
+                        let (_, rows) = self
+                            .get_table_data(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                &func.name,
+                                ctes,
+                            )
+                            .await?;
+                        rows
                     } else {
                         // Try extension table function, user table function, or scalar-in-FROM.
-                        let obj_name =
-                            ObjectName(vec![sqlparser::ast::Ident::new(func.name.clone())]);
+                        let obj_name = names::object_name_from_str(&func.name)?;
                         if let Some(result) = self
                             .try_execute_extension_table_function(
                                 txn,
@@ -1795,6 +1858,18 @@ impl Executor {
                         db_id,
                         sequence_values,
                         search_path,
+                        ctes,
+                        build_ctx,
+                    )
+                    .await?;
+                }
+                AnalyzedTableRefKind::Subquery(subquery) => {
+                    self.preload_table_functions(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        subquery,
                         ctes,
                         build_ctx,
                     )

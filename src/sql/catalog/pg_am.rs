@@ -34,6 +34,7 @@ impl VirtualTable for PgAm {
 
     async fn scan(&self, _ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {
         Ok(vec![
+            Row::new(vec![int_val(2), text_val("heap")]),
             Row::new(vec![int_val(403), text_val("btree")]),
             Row::new(vec![int_val(405), text_val("hash")]),
             Row::new(vec![int_val(783), text_val("gist")]),

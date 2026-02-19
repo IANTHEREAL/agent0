@@ -19,7 +19,6 @@ use crate::sql::dml::ConflictBehavior;
 use crate::sql::expr::static_eval::needs_async_materialization;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::expr::typed_fold::fold_typed_expr;
-use crate::sql::expr::typed_rewrite::materialize_sequences_in_typed_expr;
 use crate::sql::query_context::QueryContext;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
@@ -51,6 +50,7 @@ impl Executor {
 
         let qctx = QueryContext::from_task_locals();
         let folded_where = del.where_clause.as_ref().map(|e| fold_typed_expr(e, &qctx));
+        let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         let rows = self.scan_and_fill(txn, db_id, t, &schema).await?;
         let mut cnt = 0;
         let mut ret_rows = Vec::new();
@@ -77,7 +77,19 @@ impl Executor {
                     let mut matched = false;
                     for using_row in using_rows {
                         let combined = combine_rows(r, using_row);
-                        let val = eval_typed_expr(where_expr, &combined, &qctx)?;
+                        let val = self
+                            .eval_typed_expr_maybe_async(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                where_expr,
+                                &combined,
+                                None,
+                                &empty_ctes,
+                                &qctx,
+                            )
+                            .await?;
                         if typed_value_to_bool(val)? {
                             matched = true;
                             break;
@@ -85,7 +97,19 @@ impl Executor {
                     }
                     matched
                 } else {
-                    let val = eval_typed_expr(where_expr, r, &qctx)?;
+                    let val = self
+                        .eval_typed_expr_maybe_async(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            where_expr,
+                            r,
+                            Some(&schema),
+                            &empty_ctes,
+                            &qctx,
+                        )
+                        .await?;
                     typed_value_to_bool(val)?
                 }
             } else {
@@ -181,6 +205,7 @@ impl Executor {
 
         let qctx = QueryContext::from_task_locals();
         let folded_where = upd.where_clause.as_ref().map(|e| fold_typed_expr(e, &qctx));
+        let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         let compiled_checks = check_constraints::compile_check_constraints(&schema, &qctx)?;
         let rows = self.scan_and_fill(txn, db_id, t, &schema).await?;
         let mut cnt = 0;
@@ -213,7 +238,19 @@ impl Executor {
                     let mut matched_from = None;
                     for from_row in from_rows {
                         let combined = combine_rows(r, from_row);
-                        let val = eval_typed_expr(where_expr, &combined, &qctx)?;
+                        let val = self
+                            .eval_typed_expr_maybe_async(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                where_expr,
+                                &combined,
+                                None,
+                                &empty_ctes,
+                                &qctx,
+                            )
+                            .await?;
                         if typed_value_to_bool(val)? {
                             matched_from = Some(combined);
                             break;
@@ -230,7 +267,19 @@ impl Executor {
             } else {
                 // No FROM clause — simple WHERE check.
                 if let Some(ref where_expr) = folded_where {
-                    let val = eval_typed_expr(where_expr, r, &qctx)?;
+                    let val = self
+                        .eval_typed_expr_maybe_async(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            where_expr,
+                            r,
+                            Some(&schema),
+                            &empty_ctes,
+                            &qctx,
+                        )
+                        .await?;
                     if !typed_value_to_bool(val)? {
                         continue;
                     }
@@ -388,6 +437,7 @@ impl Executor {
         .await?;
 
         let qctx = QueryContext::from_task_locals();
+        let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         let folded_on_conflict_where = match &ins.on_conflict {
             Some(AnalyzedOnConflict::DoUpdate { where_clause, .. }) => {
                 where_clause.as_ref().map(|e| fold_typed_expr(e, &qctx))
@@ -421,23 +471,19 @@ impl Executor {
                             vals.push(Value::Null);
                             default_positions.push(i);
                         } else {
-                            // Materialize sequence calls before sync eval.
-                            let materialized = if needs_async_materialization(&folded_expr) {
-                                let store = self.store();
-                                materialize_sequences_in_typed_expr(
-                                    &store,
+                            let val = self
+                                .eval_typed_expr_maybe_async(
                                     txn,
                                     db_id,
                                     sequence_values,
                                     search_path,
                                     &folded_expr,
+                                    &empty_row,
+                                    None,
+                                    &empty_ctes,
                                     &qctx,
                                 )
-                                .await?
-                            } else {
-                                folded_expr
-                            };
-                            let val = eval_typed_expr(&materialized, &empty_row, &qctx)?;
+                                .await?;
                             vals.push(val);
                         }
                     }
@@ -600,7 +646,19 @@ impl Executor {
 
                                 // Check WHERE if present.
                                 if let Some(ref where_expr) = folded_on_conflict_where {
-                                    let val = eval_typed_expr(where_expr, &combined, &qctx)?;
+                                    let val = self
+                                        .eval_typed_expr_maybe_async(
+                                            txn,
+                                            db_id,
+                                            sequence_values,
+                                            search_path,
+                                            where_expr,
+                                            &combined,
+                                            Some(&schema),
+                                            &empty_ctes,
+                                            &qctx,
+                                        )
+                                        .await?;
                                     if !typed_value_to_bool(val)? {
                                         continue;
                                     }
@@ -819,22 +877,54 @@ impl Executor {
             .await;
         }
 
-        let materialized = if needs_async_materialization(&folded_expr) {
-            let store = self.store();
-            materialize_sequences_in_typed_expr(
-                &store,
-                txn,
-                db_id,
-                sequence_values,
-                search_path,
-                &folded_expr,
-                qctx,
-            )
-            .await?
+        let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
+        self.eval_typed_expr_maybe_async(
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            &folded_expr,
+            eval_row,
+            Some(schema),
+            &empty_ctes,
+            qctx,
+        )
+        .await
+    }
+
+    /// Evaluate typed expression in DML path, materializing async constructs
+    /// (subqueries, sequence/cat funcs) on the current row when needed.
+    async fn eval_typed_expr_maybe_async(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
+        expr: &TypedExpr,
+        eval_row: &Row,
+        schema: Option<&TableSchema>,
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+        qctx: &QueryContext,
+    ) -> Result<Value> {
+        if needs_async_materialization(expr) {
+            let materialized = self
+                .materialize_expr_for_row(
+                    expr,
+                    eval_row,
+                    None,
+                    schema,
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    ctes,
+                    qctx,
+                )
+                .await?;
+            eval_typed_expr(&materialized, eval_row, qctx)
         } else {
-            folded_expr
-        };
-        eval_typed_expr(&materialized, eval_row, qctx)
+            eval_typed_expr(expr, eval_row, qctx)
+        }
     }
 
     /// Best-effort, non-blocking enqueue of auto-ANALYZE when modification

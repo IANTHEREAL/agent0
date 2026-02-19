@@ -8,6 +8,13 @@ use crate::sql::analyzer::AnalyzerError;
 use crate::sql::types::TypeError;
 use crate::types::DataType;
 
+fn column_not_found_display(column: &str, hint: &Option<String>) -> String {
+    match hint {
+        Some(h) => format!("column \"{}\" does not exist\n{}", column, h),
+        None => format!("column \"{}\" does not exist", column),
+    }
+}
+
 /// Structured SQL error with SQLSTATE code support.
 /// Structured SQL error with SQLSTATE code support.
 ///
@@ -31,8 +38,11 @@ pub enum SqlError {
     #[error("relation \"{0}\" does not exist")]
     RelationNotFound(String),
 
-    #[error("column \"{column}\" does not exist")]
-    ColumnNotFound { column: String },
+    #[error("{}", column_not_found_display(.column, .hint))]
+    ColumnNotFound {
+        column: String,
+        hint: Option<String>,
+    },
 
     #[error("column reference \"{0}\" is ambiguous")]
     AmbiguousColumn(String),
@@ -72,7 +82,7 @@ pub enum SqlError {
     StringDataRightTruncation { max_length: u64 },
 
     // Runtime errors
-    #[error("Division by zero")]
+    #[error("division by zero")]
     DivisionByZero,
 
     #[error("canceling statement due to statement timeout")]
@@ -142,7 +152,15 @@ impl SqlError {
 impl From<AnalyzerError> for SqlError {
     fn from(e: AnalyzerError) -> Self {
         match e {
-            AnalyzerError::ColumnNotFound { name, .. } => SqlError::ColumnNotFound { column: name },
+            AnalyzerError::ColumnNotFound { ref name, .. } => {
+                // Preserve the full Display output which includes the HINT line.
+                let full = e.to_string();
+                let hint = full.find("\nHINT:").map(|pos| full[pos + 1..].to_string());
+                SqlError::ColumnNotFound {
+                    column: name.clone(),
+                    hint,
+                }
+            }
             AnalyzerError::AmbiguousColumn { name, .. } => SqlError::AmbiguousColumn(name),
             AnalyzerError::TableNotFound(name) => SqlError::RelationNotFound(name),
             AnalyzerError::FunctionNotFound { name, arg_types } => {
@@ -155,7 +173,9 @@ impl From<AnalyzerError> for SqlError {
                 type_name: target_type.to_string(),
                 value,
             },
-            AnalyzerError::DmlColumnNotFound { column, .. } => SqlError::ColumnNotFound { column },
+            AnalyzerError::DmlColumnNotFound { column, .. } => {
+                SqlError::ColumnNotFound { column, hint: None }
+            }
             AnalyzerError::Unsupported(msg) => SqlError::Unsupported(msg),
             other => SqlError::Internal(anyhow::anyhow!("{}", other)),
         }
@@ -165,7 +185,10 @@ impl From<AnalyzerError> for SqlError {
 impl From<TypeError> for SqlError {
     fn from(e: TypeError) -> Self {
         match e {
-            TypeError::ColumnNotFound { name, .. } => SqlError::ColumnNotFound { column: name },
+            TypeError::ColumnNotFound { name, .. } => SqlError::ColumnNotFound {
+                column: name,
+                hint: None,
+            },
             TypeError::AmbiguousColumn { name, .. } => SqlError::AmbiguousColumn(name),
             TypeError::UnknownFunction(name) => SqlError::FunctionNotFound(name),
             other => SqlError::Internal(anyhow::anyhow!("{}", other)),
@@ -190,7 +213,11 @@ mod tests {
         );
         assert_eq!(SqlError::RelationNotFound("t".into()).sqlstate(), "42P01");
         assert_eq!(
-            SqlError::ColumnNotFound { column: "c".into() }.sqlstate(),
+            SqlError::ColumnNotFound {
+                column: "c".into(),
+                hint: None
+            }
+            .sqlstate(),
             "42703"
         );
         assert_eq!(SqlError::AmbiguousColumn("c".into()).sqlstate(), "42702");
@@ -272,7 +299,8 @@ mod tests {
         );
         assert_eq!(
             SqlError::ColumnNotFound {
-                column: "age".into()
+                column: "age".into(),
+                hint: None,
             }
             .to_string(),
             "column \"age\" does not exist"
@@ -289,7 +317,7 @@ mod tests {
             .to_string(),
             "invalid input syntax for type integer: \"abc\""
         );
-        assert_eq!(SqlError::DivisionByZero.to_string(), "Division by zero");
+        assert_eq!(SqlError::DivisionByZero.to_string(), "division by zero");
         assert_eq!(
             SqlError::DuplicateRelation("my_idx".into()).to_string(),
             "relation \"my_idx\" already exists"

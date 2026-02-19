@@ -176,7 +176,7 @@ SELECT LEAST(1, 3, 2) AS least_test;
 SELECT PG_TYPEOF(123) AS pg_typeof_int_test;
 SELECT PG_TYPEOF('hello'::text) AS pg_typeof_text_test;
 SELECT PG_TYPEOF(TRUE) AS pg_typeof_bool_test;
-SELECT VERSION() LIKE '%pg-tikv%' AS version_test;
+SELECT VERSION() LIKE 'PostgreSQL%' AS version_test;
 SELECT CURRENT_DATABASE() IS NOT NULL AS current_database_test;
 SELECT CURRENT_SCHEMA() AS current_schema_test;
 SELECT CURRENT_USER IS NOT NULL AS current_user_test;

@@ -397,7 +397,7 @@ pub(crate) async fn execute_table_function(
     if !context::is_superuser() {
         return Err(SqlError::PermissionDenied {
             object_type: "extension".into(),
-            object_name: "http".into(),
+            object_name: "\"http\"".into(),
         }
         .into());
     }

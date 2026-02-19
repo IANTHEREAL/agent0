@@ -123,6 +123,11 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
         }
 
         // ===== To Text / Name =====
+        (Value::Timestamp(ts), DataType::Text | DataType::Name) => {
+            let formatted = crate::types::timestamp::format_timestamp_millis(ts, false)
+                .unwrap_or_else(|_| ts.to_string());
+            Ok(Value::Text(formatted))
+        }
         (v, DataType::Text | DataType::Name) => Ok(Value::Text(v.to_string())),
 
         // ===== To Boolean =====
@@ -331,7 +336,7 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
         (Value::Timestamp(ts), DataType::Timestamp | DataType::TimestampTz) => {
             Ok(Value::Timestamp(ts))
         }
-        (Value::Date(days), DataType::Timestamp) => {
+        (Value::Date(days), DataType::Timestamp | DataType::TimestampTz) => {
             crate::types::date::date_days_to_timestamp_millis(days).map(Value::Timestamp)
         }
         (Value::Text(s), DataType::Time) => {
@@ -506,23 +511,21 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                     value: trimmed.to_string(),
                 })
             })?;
+            if vec.is_empty() {
+                return Err(anyhow!("vector must have at least 1 dimension"));
+            }
             // dim == 0 means "any dimension" (bare `vector` without modifier).
             if *dim > 0 && vec.len() != *dim as usize {
-                return Err(anyhow!(
-                    "vector has wrong dimensions: expected {}, got {}",
-                    dim,
-                    vec.len()
-                ));
+                return Err(anyhow!("expected {} dimensions, not {}", dim, vec.len()));
             }
             Ok(Value::Vector(vec))
         }
         (Value::Vector(vec), DataType::Vector(dim)) => {
+            if vec.is_empty() {
+                return Err(anyhow!("vector must have at least 1 dimension"));
+            }
             if *dim > 0 && vec.len() != *dim as usize {
-                return Err(anyhow!(
-                    "vector has wrong dimensions: expected {}, got {}",
-                    dim,
-                    vec.len()
-                ));
+                return Err(anyhow!("expected {} dimensions, not {}", dim, vec.len()));
             }
             Ok(Value::Vector(vec))
         }

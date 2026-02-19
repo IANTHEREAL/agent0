@@ -611,11 +611,11 @@ fn register_builtin_functions(r: &mut FunctionRegistry) {
     // Date/time functions
     r.register(
         "NOW",
-        FunctionSignature::fixed(DataType::TimestampTz).with_args(0, Some(0)),
+        FunctionSignature::fixed(DataType::TimestampTz).with_args(0, Some(1)),
     );
     r.register(
         "CURRENT_TIMESTAMP",
-        FunctionSignature::fixed(DataType::TimestampTz).with_args(0, Some(0)),
+        FunctionSignature::fixed(DataType::TimestampTz).with_args(0, Some(1)),
     );
     r.register(
         "CURRENT_DATE",
@@ -703,11 +703,11 @@ fn register_builtin_functions(r: &mut FunctionRegistry) {
     );
     r.register(
         "STATEMENT_TIMESTAMP",
-        FunctionSignature::fixed(DataType::TimestampTz).with_args(0, Some(0)),
+        FunctionSignature::fixed(DataType::TimestampTz).with_args(0, Some(1)),
     );
     r.register(
         "TRANSACTION_TIMESTAMP",
-        FunctionSignature::fixed(DataType::TimestampTz).with_args(0, Some(0)),
+        FunctionSignature::fixed(DataType::TimestampTz).with_args(0, Some(1)),
     );
     r.register(
         "TIMEOFDAY",

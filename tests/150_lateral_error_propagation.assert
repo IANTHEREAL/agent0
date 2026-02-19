@@ -1,4 +1,3 @@
-column reference "id" is ambiguous
-Filter predicate must evaluate to boolean
-Column 'missing_col' not found
-
+ambiguous
+WHERE
+missing_col

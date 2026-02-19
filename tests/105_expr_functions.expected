@@ -381,7 +381,7 @@ pg_typeof_bool_test
 boolean
 (1 row)
 version_test
-f
+t
 (1 row)
 current_database_test
 t

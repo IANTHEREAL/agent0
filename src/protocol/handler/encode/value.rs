@@ -3,6 +3,27 @@ use pgwire::api::results::{DataRowEncoder, FieldFormat};
 use pgwire::api::Type;
 use pgwire::error::{PgWireError, PgWireResult};
 
+fn format_float8_pg_text(v: f64) -> String {
+    if v.is_nan() {
+        return "NaN".to_string();
+    }
+    if v.is_infinite() {
+        return if v.is_sign_negative() {
+            "-Infinity".to_string()
+        } else {
+            "Infinity".to_string()
+        };
+    }
+
+    let abs = v.abs();
+    if abs != 0.0 && (abs < 1e-6 || abs >= 1e15) {
+        // PostgreSQL-style scientific notation for very small/large magnitudes.
+        return format!("{:e}", v);
+    }
+
+    v.to_string()
+}
+
 pub(in crate::protocol::handler) fn encode_value(
     encoder: &mut DataRowEncoder,
     value: &Value,
@@ -39,7 +60,7 @@ fn encode_value_text(
                 encoder.encode_field(i)
             }
         }
-        Value::Float64(f) => encoder.encode_field(f),
+        Value::Float64(f) => encoder.encode_field(&format_float8_pg_text(*f)),
         Value::Text(s) => encoder.encode_field(s),
         Value::Bytes(b) => encoder.encode_field(&format!("\\x{}", hex::encode(b))),
         Value::Timestamp(ts) => encode_timestamp_text(encoder, *ts, col_type, tz),
@@ -49,6 +70,43 @@ fn encode_value_text(
             encoder.encode_field(&uuid.to_string())
         }
         Value::Array(elems) => {
+            if matches!(col_type, Some(DataType::UserDefined(s)) if s.eq_ignore_ascii_case("record"))
+            {
+                fn format_record_field(v: &Value) -> String {
+                    match v {
+                        Value::Null => String::new(),
+                        Value::Text(s) => {
+                            let needs_quotes = s.is_empty()
+                                || s.eq_ignore_ascii_case("null")
+                                || s.chars().any(|ch| {
+                                    matches!(ch, ',' | '(' | ')' | '"' | '\\') || ch.is_whitespace()
+                                });
+                            if needs_quotes {
+                                let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+                                format!("\"{}\"", escaped)
+                            } else {
+                                s.clone()
+                            }
+                        }
+                        Value::Array(nested) => {
+                            let parts: Vec<String> = nested
+                                .iter()
+                                .map(|e| match e {
+                                    Value::Null => "NULL".to_string(),
+                                    Value::Text(t) => t.clone(),
+                                    other => other.to_string(),
+                                })
+                                .collect();
+                            format!("{{{}}}", parts.join(","))
+                        }
+                        other => other.to_string(),
+                    }
+                }
+
+                let fields: Vec<String> = elems.iter().map(format_record_field).collect();
+                let composite = format!("({})", fields.join(","));
+                return encoder.encode_field(&composite);
+            }
             // int2vector: encode as space-separated text "1 2 3"
             if matches!(col_type, Some(DataType::UserDefined(s)) if s == "int2vector") {
                 let mut parts = Vec::with_capacity(elems.len());
@@ -78,7 +136,7 @@ fn encode_value_text(
                     Value::Boolean(b) => Some(if *b { "t" } else { "f" }.to_string()),
                     Value::Int32(i) => Some(i.to_string()),
                     Value::Int64(i) => Some(i.to_string()),
-                    Value::Float64(f) => Some(f.to_string()),
+                    Value::Float64(f) => Some(format_float8_pg_text(*f)),
                     Value::Array(nested) => {
                         let parts: Vec<String> = nested
                             .iter()
@@ -332,7 +390,7 @@ fn encode_value_binary(
                     Value::Boolean(b) => Some(if *b { "t" } else { "f" }.to_string()),
                     Value::Int32(i) => Some(i.to_string()),
                     Value::Int64(i) => Some(i.to_string()),
-                    Value::Float64(f) => Some(f.to_string()),
+                    Value::Float64(f) => Some(format_float8_pg_text(*f)),
                     Value::Array(nested) => {
                         let parts: Vec<String> = nested
                             .iter()

@@ -225,6 +225,7 @@ impl fmt::Display for TypedExpr {
                     JsonAccessOp::LongArrow => "->>",
                     JsonAccessOp::HashArrow => "#>",
                     JsonAccessOp::HashLongArrow => "#>>",
+                    JsonAccessOp::HashMinus => "#-",
                 };
                 write!(f, "({} {} {})", expr, op_str, path)
             }
@@ -593,6 +594,8 @@ pub enum JsonAccessOp {
     HashArrow,
     /// `#>>` returns text.
     HashLongArrow,
+    /// `#-` deletes path and returns JSON.
+    HashMinus,
 }
 
 // ── Resolved function ───────────────────────────────────────

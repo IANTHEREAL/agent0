@@ -1546,18 +1546,35 @@ fn collect_gin_predicates_typed(expr: &super::analyzer::types::TypedExpr) -> Vec
                 predicates
             }
             TypedBinaryOp::TsMatch | TypedBinaryOp::JsonContains | TypedBinaryOp::ArrayContains => {
-                // left should be a column ref, right should be a constant
-                match (&left.kind, &right.kind) {
-                    (
-                        TypedExprKind::ColumnRef { column_name, .. },
-                        TypedExprKind::Constant(pattern),
-                    ) => vec![(column_name.to_lowercase(), pattern.clone())],
+                // Left should be a column ref; right can be a folded constant
+                // expression (e.g. plainto_tsquery('foo')).
+                match &left.kind {
+                    TypedExprKind::ColumnRef { column_name, .. } => {
+                        if let Some(pattern) = eval_const_typed_expr(right) {
+                            vec![(column_name.to_lowercase(), pattern)]
+                        } else {
+                            Vec::new()
+                        }
+                    }
                     _ => Vec::new(),
                 }
             }
             _ => Vec::new(),
         },
         _ => Vec::new(),
+    }
+}
+
+fn eval_const_typed_expr(expr: &super::analyzer::types::TypedExpr) -> Option<Value> {
+    use super::analyzer::types::TypedExprKind;
+
+    match &expr.kind {
+        TypedExprKind::Constant(v) => Some(v.clone()),
+        _ => {
+            let qctx = crate::sql::query_context::QueryContext::from_task_locals();
+            let row = crate::types::Row::new(vec![]);
+            crate::sql::expr::typed_eval::eval_typed_expr(expr, &row, &qctx).ok()
+        }
     }
 }
 

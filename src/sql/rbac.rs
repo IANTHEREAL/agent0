@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tikv_client::Transaction;
 
 use crate::auth::{AuthManager, GrantedPrivilege, Privilege, PrivilegeObject, User};
+use crate::sql::error::SqlError;
 use crate::storage::TikvStore;
 
 use super::ExecuteResult;
@@ -351,11 +352,105 @@ async fn expand_privilege_objects(
     }
 }
 
+fn expand_privileges_for_authorization(privs: &[Privilege]) -> Vec<Privilege> {
+    let mut out = Vec::new();
+    for privilege in privs {
+        if *privilege == Privilege::All {
+            out.extend(Privilege::expand_all());
+        } else {
+            out.push(privilege.clone());
+        }
+    }
+    out
+}
+
+async fn has_grant_authority_for_object(
+    store: &Arc<TikvStore>,
+    auth_manager: &AuthManager,
+    txn: &mut Transaction,
+    db_id: u64,
+    grantor: &str,
+    privilege: &Privilege,
+    object: &PrivilegeObject,
+) -> Result<bool> {
+    if auth_manager
+        .check_privilege(
+            txn,
+            grantor,
+            &Privilege::SuperUser,
+            &PrivilegeObject::Global,
+        )
+        .await?
+    {
+        return Ok(true);
+    }
+
+    if auth_manager
+        .check_privilege_with_grant_option(txn, grantor, privilege, object)
+        .await?
+    {
+        return Ok(true);
+    }
+
+    if let PrivilegeObject::Table { schema, name } = object {
+        let full_name = format!("{}.{}", schema, name);
+        if let Some(table_schema) = store.get_schema(txn, db_id, &full_name).await? {
+            if table_schema.owner == grantor {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+async fn ensure_grant_authority(
+    store: &Arc<TikvStore>,
+    auth_manager: &AuthManager,
+    txn: &mut Transaction,
+    db_id: u64,
+    current_role: Option<&str>,
+    privileges: &[Privilege],
+    objects: &[PrivilegeObject],
+) -> Result<()> {
+    let Some(grantor) = current_role else {
+        return Ok(());
+    };
+
+    let expanded_privileges = expand_privileges_for_authorization(privileges);
+    for privilege in &expanded_privileges {
+        for object in objects {
+            if has_grant_authority_for_object(
+                store,
+                auth_manager,
+                txn,
+                db_id,
+                grantor,
+                privilege,
+                object,
+            )
+            .await?
+            {
+                continue;
+            }
+
+            return Err(SqlError::PermissionDenied {
+                object_type: "privilege".to_string(),
+                object_name: "privilege".to_string(),
+            }
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn execute_grant(
     store: &Arc<TikvStore>,
     auth_manager: &AuthManager,
     txn: &mut Transaction,
     db_id: u64,
+    current_role: Option<&str>,
     privileges: &Privileges,
     objects: &GrantObjects,
     grantees: &[Ident],
@@ -363,6 +458,16 @@ pub async fn execute_grant(
 ) -> Result<ExecuteResult> {
     let privs = parse_privileges(privileges);
     let objects = expand_privilege_objects(store, txn, db_id, objects).await?;
+    ensure_grant_authority(
+        store,
+        auth_manager,
+        txn,
+        db_id,
+        current_role,
+        &privs,
+        &objects,
+    )
+    .await?;
 
     for grantee in grantees {
         let username = grantee.value.clone();
@@ -399,12 +504,23 @@ pub async fn execute_revoke(
     auth_manager: &AuthManager,
     txn: &mut Transaction,
     db_id: u64,
+    current_role: Option<&str>,
     privileges: &Privileges,
     objects: &GrantObjects,
     grantees: &[Ident],
 ) -> Result<ExecuteResult> {
     let privs = parse_privileges(privileges);
     let mut expanded_objects = expand_privilege_objects(store, txn, db_id, objects).await?;
+    ensure_grant_authority(
+        store,
+        auth_manager,
+        txn,
+        db_id,
+        current_role,
+        &privs,
+        &expanded_objects,
+    )
+    .await?;
     if let GrantObjects::AllTablesInSchema { schemas } = objects {
         for schema_name in schemas {
             let (_schema_prefix, schema) = super::names::split_object_name(schema_name)?;

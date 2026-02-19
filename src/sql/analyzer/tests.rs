@@ -44,6 +44,14 @@ fn parse_query(sql: &str) -> sqlparser::ast::Query {
     }
 }
 
+fn text_literal_value(expr: &TypedExpr) -> Option<&str> {
+    match &expr.kind {
+        TypedExprKind::Constant(crate::types::Value::Text(s)) => Some(s.as_str()),
+        TypedExprKind::Cast { expr, .. } => text_literal_value(expr),
+        _ => None,
+    }
+}
+
 fn test_catalog() -> MockCatalog {
     MockCatalog::builder()
         .table(
@@ -245,6 +253,56 @@ fn analyze_string_concat() {
 fn analyze_logical() {
     let expr = analyze_expr_with_users("age > 18 AND active").unwrap();
     assert_eq!(expr.data_type, DataType::Boolean);
+}
+
+#[test]
+fn analyze_json_access_chain_reassociates_to_json_access_nodes() {
+    let expr = analyze_expr_with_users("'{\"a\": {\"b\": 2}}'::jsonb -> 'a' -> 'b'").unwrap();
+    assert_eq!(expr.data_type, DataType::Jsonb);
+
+    let (outer_expr, outer_path, outer_op) = match &expr.kind {
+        TypedExprKind::JsonAccess {
+            expr,
+            path,
+            operator,
+        } => (expr, path, operator),
+        other => panic!("expected outer JsonAccess, got {:?}", other),
+    };
+    assert_eq!(*outer_op, JsonAccessOp::Arrow);
+    assert_eq!(text_literal_value(outer_path), Some("b"));
+
+    let (inner_path, inner_op) = match &outer_expr.kind {
+        TypedExprKind::JsonAccess { path, operator, .. } => (path, operator),
+        other => panic!("expected inner JsonAccess, got {:?}", other),
+    };
+    assert_eq!(*inner_op, JsonAccessOp::Arrow);
+    assert_eq!(text_literal_value(inner_path), Some("a"));
+}
+
+#[test]
+fn analyze_json_access_comparison_precedence_stays_binary_comparison() {
+    let expr =
+        analyze_expr_with_users("'{\"level\":\"senior\"}'::jsonb ->> 'level' = 'senior'").unwrap();
+    assert_eq!(expr.data_type, DataType::Boolean);
+
+    let (left, op, right) = match &expr.kind {
+        TypedExprKind::BinaryOp { left, op, right } => (left, op, right),
+        other => panic!("expected BinaryOp, got {:?}", other),
+    };
+    assert_eq!(*op, BinaryOp::Eq);
+
+    match &left.kind {
+        TypedExprKind::JsonAccess { path, operator, .. } => {
+            assert_eq!(*operator, JsonAccessOp::LongArrow);
+            assert_eq!(text_literal_value(path), Some("level"));
+        }
+        other => panic!("expected JsonAccess on comparison left, got {:?}", other),
+    }
+
+    assert!(matches!(
+        right.kind,
+        TypedExprKind::Constant(crate::types::Value::Text(ref s)) if s == "senior"
+    ));
 }
 
 // ── Unary operators ─────────────────────────────────────────
@@ -661,7 +719,7 @@ fn analyze_group_by_rejects_ungrouped_select_column() {
     let mut analyzer = Analyzer::new(&catalog);
     let query = parse_query("SELECT age, name FROM users GROUP BY age");
     let err = analyzer.analyze_query(&query).unwrap_err();
-    assert!(matches!(err, AnalyzerError::UngroupedColumn { ref name } if name == "name"));
+    assert!(matches!(err, AnalyzerError::UngroupedColumn { ref name } if name == "users.name"));
 }
 
 #[test]
@@ -680,7 +738,7 @@ fn analyze_aggregate_without_group_by_rejects_plain_column() {
     let mut analyzer = Analyzer::new(&catalog);
     let query = parse_query("SELECT age, COUNT(id) FROM users");
     let err = analyzer.analyze_query(&query).unwrap_err();
-    assert!(matches!(err, AnalyzerError::UngroupedColumn { ref name } if name == "age"));
+    assert!(matches!(err, AnalyzerError::UngroupedColumn { ref name } if name == "users.age"));
 }
 
 #[test]
@@ -963,8 +1021,8 @@ fn analyze_arithmetic_rejects_explicit_text_literal_plus_int() {
     let err = analyze_expr_with_users("'100'::text + 50").unwrap_err();
     assert!(matches!(
         err,
-        AnalyzerError::OperatorTypeMismatch { ref operator, left: DataType::Text, right: DataType::Int32 }
-            if operator == "+"
+        AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
+            if operator == "+" && left == "text" && right == "integer"
     ));
 }
 
@@ -973,8 +1031,8 @@ fn analyze_arithmetic_rejects_text_column_plus_int() {
     let err = analyze_expr_with_users("name + 50").unwrap_err();
     assert!(matches!(
         err,
-        AnalyzerError::OperatorTypeMismatch { ref operator, left: DataType::Text, right: DataType::Int32 }
-            if operator == "+"
+        AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
+            if operator == "+" && left == "text" && right == "integer"
     ));
 }
 
@@ -1459,6 +1517,30 @@ fn analyze_insert_values() {
             }
             assert!(ins.on_conflict.is_none());
             assert!(ins.returning.is_none());
+        }
+        _ => panic!("expected AnalyzedStatement::Insert"),
+    }
+}
+
+#[test]
+fn analyze_insert_values_preserves_quoted_target_columns() {
+    let catalog = MockCatalog::builder()
+        .table(
+            "t_case_cols",
+            vec![
+                ("x", DataType::Int32, false),
+                ("y", DataType::Int32, true),
+                ("Y", DataType::Int32, true),
+            ],
+        )
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("INSERT INTO t_case_cols (x, y, \"Y\") VALUES (1, 10, 20)");
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+
+    match result {
+        AnalyzedStatement::Insert(ins) => {
+            assert_eq!(ins.target_columns, vec![0, 1, 2]);
         }
         _ => panic!("expected AnalyzedStatement::Insert"),
     }

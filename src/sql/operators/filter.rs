@@ -3,6 +3,7 @@ use async_trait::async_trait;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::analyzer::types::TypedExpr;
+use crate::sql::expr::classify::needs_async;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::query_context::QueryContext;
 use crate::types::{Row, TableSchema, Value};
@@ -31,6 +32,39 @@ impl FilterOperator {
             _ => Err(anyhow!("Filter predicate must evaluate to boolean")),
         }
     }
+
+    async fn evaluate_predicate_in_ctx(
+        &self,
+        row: &Row,
+        ctx: &mut ExecutionContext<'_>,
+    ) -> Result<bool> {
+        let result = if needs_async(&self.predicate) {
+            let materialized = ctx
+                .executor
+                .materialize_expr_for_row(
+                    &self.predicate,
+                    row,
+                    ctx.outer_row.as_ref(),
+                    Some(self.child.schema()),
+                    ctx.txn,
+                    ctx.db_id,
+                    ctx.sequence_values,
+                    ctx.search_path,
+                    ctx.cte_tables,
+                    ctx.query_ctx,
+                )
+                .await?;
+            eval_typed_expr(&materialized, row, ctx.query_ctx)?
+        } else {
+            eval_typed_expr(&self.predicate, row, ctx.query_ctx)?
+        };
+
+        match result {
+            Value::Boolean(b) => Ok(b),
+            Value::Null => Ok(false),
+            _ => Err(anyhow!("Filter predicate must evaluate to boolean")),
+        }
+    }
 }
 
 #[async_trait]
@@ -51,7 +85,7 @@ impl PhysicalOperator for FilterOperator {
         }
 
         while let Some(row) = self.child.next(ctx).await? {
-            if self.evaluate_predicate(&row, ctx.query_ctx)? {
+            if self.evaluate_predicate_in_ctx(&row, ctx).await? {
                 return Ok(Some(row));
             }
         }

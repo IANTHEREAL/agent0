@@ -25,8 +25,8 @@ pub(crate) mod view_rewrite;
 mod tests;
 
 use guc::{
-    parse_search_path_guc_value, set_variable_value_to_string, try_parse_const_bool,
-    try_parse_const_text,
+    normalize_search_path_entries, parse_search_path_guc_value, set_variable_value_to_string,
+    try_parse_const_bool, try_parse_const_text,
 };
 use misc::{
     get_skip_reason, get_unsupported_reason, split_sql_statements, starts_with_ignore_ascii_case,

@@ -198,6 +198,7 @@ impl Executor {
                     if schema.column_index(&column_name).is_none() {
                         return Err(SqlError::ColumnNotFound {
                             column: column_name.clone(),
+                            hint: None,
                         }
                         .into());
                     }
@@ -301,6 +302,7 @@ impl Executor {
                     if schema.column_index(&column).is_none() {
                         return Err(SqlError::ColumnNotFound {
                             column: column.clone(),
+                            hint: None,
                         }
                         .into());
                     }

@@ -72,9 +72,47 @@ pub(crate) struct SessionSettings {
 }
 
 impl SessionSettings {
+    fn default_search_path() -> Vec<String> {
+        vec!["$user".to_string(), "public".to_string()]
+    }
+
+    fn quote_search_path_schema(schema: &str) -> String {
+        if schema == "$user" {
+            return "\"$user\"".to_string();
+        }
+        let simple_ident = schema.chars().enumerate().all(|(i, c)| {
+            if i == 0 {
+                c.is_ascii_lowercase() || c == '_'
+            } else {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'
+            }
+        });
+        if simple_ident {
+            schema.to_string()
+        } else {
+            format!("\"{}\"", schema.replace('"', "\"\""))
+        }
+    }
+
+    fn format_search_path_show(search_path: &[String]) -> String {
+        search_path
+            .iter()
+            .map(|s| Self::quote_search_path_schema(s))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn format_timeout_show(ms: u64) -> String {
+        if ms == 0 {
+            "0".to_string()
+        } else {
+            format!("{}ms", ms)
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
-            search_path: vec!["public".to_string(), "extensions".to_string()],
+            search_path: Self::default_search_path(),
             max_sort_bytes: DEFAULT_MAX_SORT_BYTES,
             use_optimizer: true,
             ..Default::default()
@@ -303,9 +341,7 @@ impl SessionSettings {
     /// Reset a single session setting to its default value.
     pub(crate) fn reset_setting(&mut self, name: &str) {
         match name {
-            "search_path" => {
-                self.search_path = vec!["public".to_string(), "extensions".to_string()]
-            }
+            "search_path" => self.search_path = Self::default_search_path(),
             "statement_timeout" => self.statement_timeout_ms = 0,
             "lock_timeout" => self.lock_timeout_ms = 0,
             "idle_in_transaction_session_timeout" => {
@@ -345,15 +381,15 @@ impl SessionSettings {
             "server_version" => Some("16.0".to_string()),
             "server_version_num" => Some("160000".to_string()),
             "server_encoding" => Some("UTF8".to_string()),
-            "search_path" => Some(self.search_path.join(", ")),
+            "search_path" => Some(Self::format_search_path_show(&self.search_path)),
             "datestyle" => Some("ISO, MDY".to_string()),
             "integer_datetimes" => Some("on".to_string()),
             "intervalstyle" => Some("postgres".to_string()),
-            "statement_timeout" => Some(self.statement_timeout_ms.to_string()),
-            "lock_timeout" => Some(self.lock_timeout_ms.to_string()),
-            "idle_in_transaction_session_timeout" => {
-                Some(self.idle_in_transaction_session_timeout_ms.to_string())
-            }
+            "statement_timeout" => Some(Self::format_timeout_show(self.statement_timeout_ms)),
+            "lock_timeout" => Some(Self::format_timeout_show(self.lock_timeout_ms)),
+            "idle_in_transaction_session_timeout" => Some(Self::format_timeout_show(
+                self.idle_in_transaction_session_timeout_ms,
+            )),
             "pgtikv.max_sort_bytes" => Some(self.max_sort_bytes.to_string()),
             "tipg.use_optimizer" => Some("on".to_string()),
             "timezone" => Some(self.timezone.as_deref().unwrap_or("UTC").to_string()),
@@ -829,7 +865,7 @@ mod tests {
         assert_eq!(settings.show_value("application_name").as_deref(), Some(""));
         assert_eq!(
             settings.show_value("search_path").as_deref(),
-            Some("public, extensions")
+            Some("\"$user\", public")
         );
         assert_eq!(
             settings.show_value("statement_timeout").as_deref(),
@@ -924,7 +960,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             settings.show_value("statement_timeout").as_deref(),
-            Some("20")
+            Some("20ms")
         );
 
         settings
@@ -932,7 +968,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             settings.show_value("statement_timeout").as_deref(),
-            Some("1000")
+            Some("1000ms")
         );
 
         assert!(settings
@@ -1131,7 +1167,7 @@ mod tests {
 
         assert_eq!(
             settings.show_value("statement_timeout").as_deref(),
-            Some("5000")
+            Some("5000ms")
         );
         assert_eq!(
             settings.show_value("timezone").as_deref(),
@@ -1180,7 +1216,7 @@ mod tests {
         assert_eq!(settings.show_value("application_name").as_deref(), Some(""));
         assert_eq!(
             settings.show_value("search_path").as_deref(),
-            Some("public, extensions")
+            Some("\"$user\", public")
         );
     }
 

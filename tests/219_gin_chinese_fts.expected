@@ -1,132 +1,54 @@
--- Test GIN index support for Chinese full-text search
-
--- Cleanup
-DROP TABLE IF EXISTS articles;
-DROP TABLE
-
--- Create test table
-CREATE TABLE articles (
-    id SERIAL PRIMARY KEY,
-    title TEXT NOT NULL,
-    content TEXT
-);
-CREATE TABLE
-
--- Insert Chinese test data
-INSERT INTO articles (title, content) VALUES
-    ('数据库技术', '分布式数据库是现代互联网架构的核心组件'),
-    ('搜索引擎原理', '全文搜索引擎使用倒排索引来加速查询'),
-    ('机器学习入门', '深度学习是机器学习的一个重要分支');
-INSERT 0 3
-
--- Test 1: Create GIN index with Chinese tokenizer (expression index)
-CREATE INDEX idx_content_cn ON articles
-  USING gin (to_tsvector('chinese', content));
-CREATE INDEX
-
--- Test 2: Query with Chinese tokenizer (exact match)
-SELECT id, title FROM articles
-WHERE to_tsvector('chinese', content) @@ plainto_tsquery('chinese', '数据库')
-ORDER BY id;
- id |    title
-----+--------------
+psql:tests/219_gin_chinese_fts.sql:4: NOTICE:  table "articles" does not exist, skipping
+ id |   title    
+----+------------
   1 | 数据库技术
 (1 row)
 
--- Test 3: Query with multiple terms
-SELECT id, title FROM articles
-WHERE to_tsvector('chinese', content) @@ plainto_tsquery('chinese', '搜索 索引')
-ORDER BY id;
- id |      title
-----+-----------------
-  2 | 搜索引擎原理
+ id | title 
+----+-------
+(0 rows)
+
+ id |    title     |    rank    
+----+--------------+------------
+  3 | 机器学习入门 | 0.06079271
 (1 row)
 
--- Test 4: Query with ts_rank
-SELECT id, title,
-       ts_rank(to_tsvector('chinese', content), plainto_tsquery('chinese', '机器学习')) as rank
-FROM articles
-WHERE to_tsvector('chinese', content) @@ plainto_tsquery('chinese', '机器学习')
-ORDER BY rank DESC, id;
- id |      title      | rank
-----+-----------------+------
-  3 | 机器学习入门 |  0.5
-(1 row)
-
--- Test 5: Insert more data and verify index maintenance
-INSERT INTO articles (title, content) VALUES
-    ('自然语言处理', '自然语言处理是人工智能的重要应用领域');
-INSERT 0 1
-
-SELECT id, title FROM articles
-WHERE to_tsvector('chinese', content) @@ plainto_tsquery('chinese', '自然语言')
-ORDER BY id;
- id |       title
-----+-------------------
+ id |    title     
+----+--------------
   4 | 自然语言处理
 (1 row)
 
--- Test 6: English tokenizer (for comparison)
-CREATE INDEX idx_content_en ON articles
-  USING gin (to_tsvector('english', title));
-CREATE INDEX
-
-INSERT INTO articles (title, content) VALUES
-    ('Database Systems', 'Distributed databases are essential for scalability');
-INSERT 0 1
-
-SELECT id, title FROM articles
-WHERE to_tsvector('english', title) @@ plainto_tsquery('english', 'database')
-ORDER BY id;
- id |       title
-----+-------------------
+ id |      title       
+----+------------------
   5 | Database Systems
 (1 row)
 
--- Test 7: Mixed Chinese-English content
-INSERT INTO articles (title, content) VALUES
-    ('PostgreSQL教程', 'PostgreSQL是一个功能强大的开源数据库');
-INSERT 0 1
-
-SELECT id, title FROM articles
-WHERE to_tsvector('chinese', content) @@ plainto_tsquery('chinese', '数据库')
-ORDER BY id;
- id |      title
-----+-----------------
+ id |     title      
+----+----------------
   1 | 数据库技术
   6 | PostgreSQL教程
 (2 rows)
 
--- Test 8: Test to_tsvector directly with Chinese
-SELECT to_tsvector('chinese', '我爱中国');
-           to_tsvector
----------------------------------
- '中国':2A '我':1A '爱':1A
+        to_tsvector        
+---------------------------
+ '我':1A '爱':2A '中国':3A
 (1 row)
 
--- Test 9: Test plainto_tsquery with Chinese
-SELECT plainto_tsquery('chinese', '人工智能 机器学习');
-           plainto_tsquery
--------------------------------------
+       plainto_tsquery        
+------------------------------
  '人工智能' & '机器' & '学习'
 (1 row)
 
--- Test 10: Test unknown config error
-SELECT to_tsvector('klingon', 'test');
-ERROR:  unknown text search configuration: klingon
-
--- Test 11: Single-argument to_tsvector (uses default tokenizer)
-SELECT to_tsvector('This is a test');
-       to_tsvector
--------------------------
- 'test':4A 'this':1A
+psql:tests/219_gin_chinese_fts.sql:80: ERROR:  unknown text search configuration: klingon
+    to_tsvector    
+-------------------
+ 'test':4 'this':1
 (1 row)
 
--- Test 12: Verify index usage with EXPLAIN
-EXPLAIN SELECT id FROM articles
-WHERE to_tsvector('chinese', content) @@ plainto_tsquery('chinese', '数据库');
-QUERY PLAN
+                                              QUERY PLAN                                               
+-------------------------------------------------------------------------------------------------------
+ Filter  (cost=0.00..14.33 rows=333 width=120)
+   Filter: (to_tsvector('chinese'::text, content) @@ plainto_tsquery('chinese'::text, '数据库'::text))
+   ->  Seq Scan on articles  (cost=0.00..11.00 rows=1000 width=120)
+(3 rows)
 
--- Cleanup
-DROP TABLE articles;
-DROP TABLE

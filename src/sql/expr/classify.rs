@@ -11,12 +11,19 @@ use crate::sql::analyzer::types::{FunctionKind, TypedExpr, TypedExprKind};
 use crate::sql::expr::typed_fold::is_volatile_or_side_effecting_builtin;
 use crate::sql::expr::typed_visit::expr_any;
 
+fn is_async_materialized_builtin(name: &str) -> bool {
+    // These builtins require async execution and must be materialized by the executor.
+    name.eq_ignore_ascii_case("PG_SLEEP")
+}
+
 /// Check if a TypedExpr needs async (per-row) materialization.
 ///
 /// Returns `true` if the expression contains subquery nodes or catalog-dependent
 /// functions that can't be evaluated by the pure typed evaluator.
 pub(crate) fn needs_async(expr: &TypedExpr) -> bool {
-    has_unresolved_subquery(expr) || has_catalog_dependent_function(expr)
+    has_unresolved_subquery(expr)
+        || has_catalog_dependent_function(expr)
+        || has_correlated_ref(expr)
 }
 
 /// Check if a TypedExpr tree contains any non-materialized subquery node.
@@ -93,7 +100,13 @@ pub(crate) fn has_catalog_dependent_function(expr: &TypedExpr) -> bool {
             order_by,
             filter,
         } => {
+            if matches!(func.kind, FunctionKind::UserDefined { .. }) {
+                return true;
+            }
             let name = func.name.as_str();
+            if is_async_materialized_builtin(name) {
+                return true;
+            }
             if name.eq_ignore_ascii_case("PG_GET_INDEXDEF")
                 || name.eq_ignore_ascii_case("PG_GET_CONSTRAINTDEF")
                 || name.eq_ignore_ascii_case("FORMAT_TYPE")
@@ -121,7 +134,13 @@ pub(crate) fn has_catalog_dependent_function(expr: &TypedExpr) -> bool {
             filter,
             ..
         } => {
+            if matches!(func.kind, FunctionKind::UserDefined { .. }) {
+                return true;
+            }
             let name = func.name.as_str();
+            if is_async_materialized_builtin(name) {
+                return true;
+            }
             if name.eq_ignore_ascii_case("PG_GET_INDEXDEF")
                 || name.eq_ignore_ascii_case("PG_GET_CONSTRAINTDEF")
                 || name.eq_ignore_ascii_case("FORMAT_TYPE")
@@ -149,7 +168,13 @@ pub(crate) fn has_catalog_dependent_function(expr: &TypedExpr) -> bool {
             order_by,
             ..
         } => {
+            if matches!(func.kind, FunctionKind::UserDefined { .. }) {
+                return true;
+            }
             let name = func.name.as_str();
+            if is_async_materialized_builtin(name) {
+                return true;
+            }
             if name.eq_ignore_ascii_case("PG_GET_INDEXDEF")
                 || name.eq_ignore_ascii_case("PG_GET_CONSTRAINTDEF")
                 || name.eq_ignore_ascii_case("FORMAT_TYPE")

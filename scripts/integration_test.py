@@ -453,6 +453,28 @@ def stable_partition_psql_diagnostics(lines: List[str]) -> List[str]:
     return non_diagnostics + diagnostics
 
 
+def _is_assert_comment(line: str) -> bool:
+    stripped = line.lstrip()
+    return stripped.startswith("#") or stripped.startswith("--")
+
+
+def _normalize_pipe_line(line: str) -> str:
+    if "|" not in line:
+        return line
+    parts = [part.strip() for part in line.split("|")]
+    return "|".join(parts)
+
+
+def _assert_contains(output: str, needle: str) -> bool:
+    if needle in output:
+        return True
+    if "|" not in needle:
+        return False
+    normalized_output = "\n".join(_normalize_pipe_line(line) for line in output.splitlines())
+    normalized_needle = _normalize_pipe_line(needle)
+    return normalized_needle in normalized_output
+
+
 def check_connection() -> bool:
     result = subprocess.run(
         psql_args_for_mode(PsqlOutputMode.UNALIGNED) + ["-c", "SELECT 1"],
@@ -663,9 +685,9 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
         required = [
             line.strip()
             for line in assert_file.read_text().splitlines()
-            if line.strip() and not line.strip().startswith("#")
+            if line.strip() and not _is_assert_comment(line)
         ]
-        missing = [needle for needle in required if needle not in output]
+        missing = [needle for needle in required if not _assert_contains(output, needle)]
         if missing:
             log_test(sql_file.name, TestResult.FAILED, f"missing expected output: {missing[0]}")
             if config.verbose:

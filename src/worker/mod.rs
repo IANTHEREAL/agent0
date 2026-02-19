@@ -8,7 +8,9 @@ use crate::storage::TikvStore;
 use anyhow::{Context, Result};
 use config::WorkerConfig;
 use std::sync::{Arc, OnceLock};
-use tracing::info;
+use std::time::Duration;
+use tokio::time::sleep;
+use tracing::{info, warn};
 
 static SYSTEM_STORE: OnceLock<Arc<TikvStore>> = OnceLock::new();
 static WORKER_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
@@ -33,9 +35,101 @@ pub fn wake_worker() {
     }
 }
 
+/// Ensure the system keyspace exists in PD before initializing worker store.
+///
+/// This keeps worker metadata isolated (`_sys_worker`) while removing the need
+/// for manual keyspace pre-provisioning in local/dev and CI-like environments.
+/// In TLS mode, skip HTTP provisioning and rely on existing pre-created keyspace.
+async fn ensure_system_keyspace(pd_endpoints: &[String], keyspace: &str) -> Result<()> {
+    if std::env::var("TIKV_CA_PATH").is_ok() {
+        info!(
+            "Skipping system keyspace ensure in TLS mode; expecting '{}' to be pre-created",
+            keyspace
+        );
+        return Ok(());
+    }
+
+    let pd_primary = pd_endpoints
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no PD endpoint configured"))?;
+    let base = format!("http://{}/pd/api/v2/keyspaces", pd_primary);
+    let keyspace_url = format!("{}/{}", base, keyspace);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("failed to build PD HTTP client")?;
+
+    let mut last_err = String::new();
+    for _ in 0..15 {
+        // Idempotent create. Some PD versions return 500 with "keyspace already exists"
+        // instead of 409, so we always verify with a follow-up GET before retrying.
+        let post_resp = client
+            .post(&base)
+            .json(&serde_json::json!({ "name": keyspace }))
+            .send()
+            .await;
+
+        match post_resp {
+            Ok(resp) => {
+                let status = resp.status();
+                if !(status.is_success() || status.as_u16() == 409) {
+                    let body = resp.text().await.unwrap_or_default();
+                    if status.as_u16() == 500 || status.as_u16() == 503 {
+                        last_err = format!("POST status={}, body={}", status, body);
+                        // Fall through to GET existence check for idempotent success.
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "failed to create system keyspace '{}': status={}, body={}",
+                            keyspace,
+                            status,
+                            body
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                last_err = format!("POST error: {}", e);
+                sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        }
+
+        match client.get(&keyspace_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                info!(
+                    "Ensured worker system keyspace '{}' on PD {}",
+                    keyspace, pd_primary
+                );
+                return Ok(());
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                last_err = format!("GET status={}, body={}", status, body);
+            }
+            Err(e) => {
+                last_err = format!("GET error: {}", e);
+            }
+        }
+
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    Err(anyhow::anyhow!(
+        "unable to ensure system keyspace '{}' on PD {} after retries: {}",
+        keyspace,
+        pd_primary,
+        last_err
+    ))
+}
+
 /// Initialize the system store for the unified worker engine.
-/// The system keyspace must be pre-created in PD by the backend before pg-tikv starts.
-/// No fallback keyspace is allowed, so worker metadata remains isolated.
+///
+/// Attempts to ensure the system keyspace exists in PD (best-effort) and then
+/// initializes the isolated system store. No fallback keyspace is allowed, so
+/// worker metadata remains isolated.
+///
 /// Returns None if worker is disabled via config.
 pub async fn init_system_store(
     pd_endpoints: Vec<String>,
@@ -50,6 +144,13 @@ pub async fn init_system_store(
         "Initializing system store for keyspace: {}",
         config.system_keyspace
     );
+
+    if let Err(e) = ensure_system_keyspace(&pd_endpoints, &config.system_keyspace).await {
+        warn!(
+            "Failed to ensure worker system keyspace '{}': {}. Proceeding with direct init.",
+            config.system_keyspace, e
+        );
+    }
 
     let store = TikvStore::new_system(pd_endpoints, &config.system_keyspace)
         .await

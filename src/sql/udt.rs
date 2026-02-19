@@ -126,9 +126,11 @@ pub async fn drop_types(
                     .iter()
                     .find(|c| matches!(&c.data_type, crate::types::DataType::UserDefined(t) if t == full_name))
                 {
+                    let bare_type = full_name.rsplit('.').next().unwrap_or(full_name);
+                    let bare_table = table_name.rsplit('.').next().unwrap_or(table_name);
                     return Err(anyhow!(
-                        "cannot drop type {} because column {}.{} depends on it",
-                        full_name, table_name, col.name
+                        "cannot drop type {} because other objects depend on it\nDETAIL:  column {} of table {} depends on type {}\nHINT:  Use DROP ... CASCADE to drop the dependent objects too.",
+                        bare_type, col.name, bare_table, bare_type
                     ));
                 }
             }

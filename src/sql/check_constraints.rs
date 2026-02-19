@@ -56,7 +56,10 @@ pub fn validate_compiled_check_constraints(
                 let row_str = row
                     .values
                     .iter()
-                    .map(|v| format!("{}", v))
+                    .map(|v| match v {
+                        Value::Null => "null".to_string(),
+                        _ => format!("{}", v),
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Err(SqlError::CheckViolation {
