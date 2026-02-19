@@ -360,13 +360,13 @@ fs9-meta   → PostgreSQL (metadata store)
 To minimize total deploy time:
 
 ```
-Time ──────────────────────────────────────────────────►
+Time ──────────────────────────────────────────────────────────────────────────────────────►
 
- ┌─ Trigger CLI CI ──────────── Wait for CI ── Download artifacts ─┐
+ ┌─ Trigger CLI CI ──────────── Wait for CI ── Download artifacts ──┐
  │                                                                  │
- ├─ Build pg-tikv image ──────┐                                     ├─ Build landing image
+ ├─ Build pg-tikv image ───────┐                                    ├─ Build landing image
  │                             ├─ Restart pg-tikv + backend         │
- └─ Build backend image ──────┘                                     └─ Restart landing
+ └─ Build backend image ───────┘                                    └─ Restart landing
 ```
 
 - **Parallel group**: CLI CI trigger + pg-tikv build + backend build
