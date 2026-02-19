@@ -97,6 +97,21 @@ enum Commands {
     },
     /// Guided setup: register, login, and create your first database
     Init,
+    /// Filesystem operations (fs9/sh9)
+    Fs {
+        #[command(subcommand)]
+        action: FsAction,
+    },
+    /// Generate shell completion scripts
+    Completion {
+        /// Shell to generate for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum FsAction {
     /// Launch interactive filesystem shell for a database
     Sh {
         /// Database ID (omit to auto-select or choose interactively)
@@ -105,11 +120,19 @@ enum Commands {
         #[arg(short = 'c')]
         command: Option<String>,
     },
-    /// Generate shell completion scripts
-    Completion {
-        /// Shell to generate for
-        #[arg(value_enum)]
-        shell: clap_complete::Shell,
+    /// Show filesystem audit event log
+    Events {
+        /// Database ID (omit to auto-select or choose interactively)
+        id: Option<String>,
+        /// Maximum number of events to show
+        #[arg(short = 'n', long, default_value_t = 50)]
+        limit: usize,
+        /// Filter by path prefix
+        #[arg(short, long)]
+        path: Option<String>,
+        /// Filter by event type (create, delete, mkdir, rename, truncate, chmod, upload)
+        #[arg(short = 't', long = "type")]
+        event_type: Option<String>,
     },
 }
 
@@ -568,10 +591,29 @@ async fn main() {
         Commands::Claim => cmd_claim(&api, &cli.effective_output()).await,
         Commands::Logout => cmd_logout(),
         Commands::Init => cmd_init(&api, &cli.effective_output()).await,
-        Commands::Sh {
-            ref id,
-            ref command,
-        } => cmd_sh(&api, &cli.api_url, id.as_deref(), command.as_deref()).await,
+        Commands::Fs { ref action } => match action {
+            FsAction::Sh {
+                ref id,
+                ref command,
+            } => cmd_sh(&api, &cli.api_url, id.as_deref(), command.as_deref()).await,
+            FsAction::Events {
+                ref id,
+                limit,
+                ref path,
+                ref event_type,
+            } => {
+                cmd_fs_events(
+                    &api,
+                    &cli.api_url,
+                    &cli.effective_output(),
+                    id.as_deref(),
+                    *limit,
+                    path.as_deref(),
+                    event_type.as_deref(),
+                )
+                .await
+            }
+        },
         Commands::Completion { shell } => cmd_completion(shell),
         Commands::Db { ref action } => match action {
             DbAction::Create {
@@ -738,71 +780,75 @@ fn cmd_completion(shell: clap_complete::Shell) {
     clap_complete::generate(shell, &mut cmd, "db9", &mut io::stdout());
 }
 
+async fn resolve_db_id(api: &ApiClient, id: Option<&str>, headers: &HashMap<String, String>) -> String {
+    if let Some(id) = id {
+        return id.to_string();
+    }
+
+    let data = api
+        .request("GET", "/customer/databases", None, Some(headers))
+        .await;
+    let databases = data.as_array().cloned().unwrap_or_default();
+
+    match databases.len() {
+        0 => {
+            eprintln!("No databases found. Create one with 'db9 db create --name <name>'.");
+            process::exit(1);
+        }
+        1 => {
+            let id = databases[0]["id"].as_str().unwrap_or_else(|| {
+                eprintln!("Failed to read database ID.");
+                process::exit(1);
+            });
+            let name = databases[0]["name"].as_str().unwrap_or("(unnamed)");
+            eprintln!("Using database: {} ({})", name, id);
+            id.to_string()
+        }
+        _ => {
+            eprintln!("Select a database:");
+            for (i, db) in databases.iter().enumerate() {
+                let id = db["id"].as_str().unwrap_or("?");
+                let name = db["name"].as_str().unwrap_or("(unnamed)");
+                let state = db["state"].as_str().unwrap_or("?");
+                eprintln!("  [{}] {} ({}) - {}", i + 1, name, id, state);
+            }
+            eprint!("Enter number: ");
+            io::stderr().flush().ok();
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).unwrap_or_else(|e| {
+                eprintln!("Failed to read input: {e}");
+                process::exit(1);
+            });
+            let choice: usize = input.trim().parse().unwrap_or_else(|_| {
+                eprintln!("Invalid selection.");
+                process::exit(1);
+            });
+            if choice < 1 || choice > databases.len() {
+                eprintln!("Selection out of range.");
+                process::exit(1);
+            }
+            let db = &databases[choice - 1];
+            db["id"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    eprintln!("Failed to read database ID.");
+                    process::exit(1);
+                })
+                .to_string()
+        }
+    }
+}
+
+fn derive_fs9_url(api_url: &str, db_id: &str) -> String {
+    let base_url = api_url.strip_suffix("/api").unwrap_or(api_url);
+    format!("{base_url}/fs9/{db_id}")
+}
+
 async fn cmd_sh(api: &ApiClient, api_url: &str, id: Option<&str>, command: Option<&str>) {
     let token = require_token();
     let headers = make_auth_headers(&token);
-
-    // Resolve database ID
-    let db_id = if let Some(id) = id {
-        id.to_string()
-    } else {
-        let data = api
-            .request("GET", "/customer/databases", None, Some(&headers))
-            .await;
-        let databases = data.as_array().cloned().unwrap_or_default();
-
-        match databases.len() {
-            0 => {
-                eprintln!("No databases found. Create one with 'db9 db create --name <name>'.");
-                process::exit(1);
-            }
-            1 => {
-                let id = databases[0]["id"].as_str().unwrap_or_else(|| {
-                    eprintln!("Failed to read database ID.");
-                    process::exit(1);
-                });
-                let name = databases[0]["name"].as_str().unwrap_or("(unnamed)");
-                eprintln!("Using database: {} ({})", name, id);
-                id.to_string()
-            }
-            _ => {
-                eprintln!("Select a database:");
-                for (i, db) in databases.iter().enumerate() {
-                    let id = db["id"].as_str().unwrap_or("?");
-                    let name = db["name"].as_str().unwrap_or("(unnamed)");
-                    let state = db["state"].as_str().unwrap_or("?");
-                    eprintln!("  [{}] {} ({}) - {}", i + 1, name, id, state);
-                }
-                eprint!("Enter number: ");
-                io::stderr().flush().ok();
-                let mut input = String::new();
-                io::stdin().read_line(&mut input).unwrap_or_else(|e| {
-                    eprintln!("Failed to read input: {e}");
-                    process::exit(1);
-                });
-                let choice: usize = input.trim().parse().unwrap_or_else(|_| {
-                    eprintln!("Invalid selection.");
-                    process::exit(1);
-                });
-                if choice < 1 || choice > databases.len() {
-                    eprintln!("Selection out of range.");
-                    process::exit(1);
-                }
-                let db = &databases[choice - 1];
-                db["id"]
-                    .as_str()
-                    .unwrap_or_else(|| {
-                        eprintln!("Failed to read database ID.");
-                        process::exit(1);
-                    })
-                    .to_string()
-            }
-        }
-    };
-
-    // Derive fs9 URL: strip /api suffix, append /fs9/<db_id>
-    let base_url = api_url.strip_suffix("/api").unwrap_or(api_url);
-    let fs9_url = format!("{base_url}/fs9/{db_id}");
+    let db_id = resolve_db_id(api, id, &headers).await;
+    let fs9_url = derive_fs9_url(api_url, &db_id);
 
     // Build sh9 command
     let mut cmd = std::process::Command::new("sh9");
@@ -840,6 +886,89 @@ async fn cmd_sh(api: &ApiClient, api_url: &str, id: Option<&str>, command: Optio
         });
         if !status.success() {
             process::exit(status.code().unwrap_or(1));
+        }
+    }
+}
+
+async fn cmd_fs_events(
+    api: &ApiClient,
+    api_url: &str,
+    output: &OutputFormat,
+    id: Option<&str>,
+    limit: usize,
+    path: Option<&str>,
+    event_type: Option<&str>,
+) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+    let db_id = resolve_db_id(api, id, &headers).await;
+    let fs9_url = derive_fs9_url(api_url, &db_id);
+
+    let mut url = format!("{fs9_url}/api/v1/events?limit={limit}");
+    if let Some(p) = path {
+        url.push_str(&format!("&path={p}"));
+    }
+    if let Some(t) = event_type {
+        url.push_str(&format!("&type={t}"));
+    }
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to create HTTP client: {e}");
+            process::exit(1);
+        });
+
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to connect to fs9: {e}");
+            process::exit(1);
+        });
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        eprintln!("Error {status}: {body}");
+        process::exit(1);
+    }
+
+    let events: Vec<Value> = resp.json().await.unwrap_or_else(|e| {
+        eprintln!("Failed to parse response: {e}");
+        process::exit(1);
+    });
+
+    match output {
+        OutputFormat::Json => print_json(&Value::Array(events)),
+        OutputFormat::Csv => {
+            print_csv(
+                &events,
+                &[
+                    ("TIMESTAMP", "timestamp", 12),
+                    ("TYPE", "event_type", 10),
+                    ("PATH", "path", 30),
+                    ("COUNT", "count", 5),
+                ],
+            );
+        }
+        OutputFormat::Table => {
+            if events.is_empty() {
+                println!("No events found.");
+                return;
+            }
+            print_table(
+                &events,
+                &[
+                    ("TIMESTAMP", "timestamp", 12),
+                    ("TYPE", "event_type", 10),
+                    ("PATH", "path", 30),
+                    ("COUNT", "count", 5),
+                ],
+            );
         }
     }
 }
