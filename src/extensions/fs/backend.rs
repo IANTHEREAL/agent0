@@ -55,6 +55,9 @@ pub(crate) trait FsBackend: Send + Sync {
     /// Recursively remove a directory and all its contents.
     async fn remove_recursive(&self, path: &str) -> Result<u64>;
 
+    /// Create a directory. If recursive is true, creates parent directories as needed.
+    async fn mkdir(&self, path: &str, recursive: bool) -> Result<()>;
+
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
@@ -240,6 +243,19 @@ impl FsBackend for LocalFsBackend {
             .await
             .map_err(|err| anyhow!("fs9_remove: cannot remove directory '{path}': {err}"))?;
         Ok(count)
+    }
+
+    async fn mkdir(&self, path: &str, recursive: bool) -> Result<()> {
+        if recursive {
+            tokio::fs::create_dir_all(path)
+                .await
+                .map_err(|err| anyhow!("fs9_mkdir: cannot create directory '{path}': {err}"))?;
+        } else {
+            tokio::fs::create_dir(path)
+                .await
+                .map_err(|err| anyhow!("fs9_mkdir: cannot create directory '{path}': {err}"))?;
+        }
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -467,6 +483,20 @@ impl FsBackend for Fs9HttpBackend {
         self.check_error(resp, path).await?;
         // Remote doesn't return count, just return 1 for success
         Ok(1)
+    }
+
+    async fn mkdir(&self, path: &str, recursive: bool) -> Result<()> {
+        let recursive_str = if recursive { "true" } else { "false" };
+        let resp = self
+            .client
+            .post(format!("{}/api/v1/mkdir", self.base_url))
+            .bearer_auth(&self.token)
+            .query(&[("path", path), ("recursive", recursive_str)])
+            .send()
+            .await
+            .map_err(|e| anyhow!("fs9: cannot reach fs9-server: {e}"))?;
+        self.check_error(resp, path).await?;
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

@@ -56,6 +56,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("FS9_SIZE", fs9_size);
     map.insert("FS9_MTIME", fs9_mtime);
     map.insert("FS9_REMOVE", fs9_remove);
+    map.insert("FS9_MKDIR", fs9_mkdir);
 }
 
 /// Check permissions. In remote mode, only superuser is required (remote backend
@@ -197,6 +198,12 @@ fn fs9_remove_remote(path: &str, recursive: bool) -> Result<Value> {
     }
 }
 
+fn fs9_mkdir_remote(path: &str, recursive: bool) -> Result<Value> {
+    let bk = get_remote_backend()?;
+    run_async(bk.mkdir(path, recursive))?;
+    Ok(Value::Boolean(true))
+}
+
 // ---------------------------------------------------------------------------
 // Local-mode implementations (original behaviour)
 // ---------------------------------------------------------------------------
@@ -322,6 +329,15 @@ fn fs9_remove_local(path: &str, recursive: bool) -> Result<Value> {
     }
 }
 
+fn fs9_mkdir_local(path: &str, recursive: bool) -> Result<Value> {
+    if recursive {
+        fs::create_dir_all(path).map_err(|err| anyhow!("fs9_mkdir: {err}"))?;
+    } else {
+        fs::create_dir(path).map_err(|err| anyhow!("fs9_mkdir: {err}"))?;
+    }
+    Ok(Value::Boolean(true))
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points — dispatch to remote or local
 // ---------------------------------------------------------------------------
@@ -445,6 +461,33 @@ pub fn fs9_remove(args: Vec<Value>) -> Result<Value> {
         fs9_remove_remote(&path, recursive)
     } else {
         fs9_remove_local(&path, recursive)
+    }
+}
+
+pub fn fs9_mkdir(args: Vec<Value>) -> Result<Value> {
+    ensure_permissions()?;
+    let mut args_iter = args.into_iter();
+    let path = match expect_text_arg("fs9_mkdir", args_iter.next().unwrap_or(Value::Null), 1)? {
+        Some(p) => p,
+        None => return Ok(Value::Null),
+    };
+
+    // Second argument: recursive (default false)
+    let recursive = match args_iter.next() {
+        Some(Value::Boolean(b)) => b,
+        Some(Value::Null) | None => false,
+        Some(other) => {
+            return Err(anyhow!(
+                "fs9_mkdir: argument 2 must be BOOLEAN, got {}",
+                other.type_display_name()
+            ))
+        }
+    };
+
+    if backend::is_remote_configured() {
+        fs9_mkdir_remote(&path, recursive)
+    } else {
+        fs9_mkdir_local(&path, recursive)
     }
 }
 
@@ -727,6 +770,50 @@ mod tests {
         assert!(!dir.join("file1.txt").exists());
         assert!(!dir.join("file2.txt").exists());
         assert!(dir.join("keep.csv").exists());
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_fs9_mkdir() {
+        let dir = unique_base("mkdir");
+
+        // Create single directory
+        let subdir = dir.join("newdir");
+        let result = context::with_context(true, "", async {
+            fs9_mkdir(vec![Value::Text(subdir.to_string_lossy().into_owned())]).expect("mkdir")
+        })
+        .await;
+        assert_eq!(result, Value::Boolean(true));
+        assert!(subdir.exists() && subdir.is_dir());
+
+        // Non-recursive should fail for nested path
+        let nested = dir.join("a/b/c");
+        let err = context::with_context(true, "", async {
+            fs9_mkdir(vec![Value::Text(nested.to_string_lossy().into_owned())])
+                .expect_err("non-recursive nested should fail")
+        })
+        .await;
+        assert!(err.to_string().contains("fs9_mkdir"));
+
+        // Recursive should succeed for nested path
+        let result = context::with_context(true, "", async {
+            fs9_mkdir(vec![
+                Value::Text(nested.to_string_lossy().into_owned()),
+                Value::Boolean(true),
+            ])
+            .expect("recursive mkdir")
+        })
+        .await;
+        assert_eq!(result, Value::Boolean(true));
+        assert!(nested.exists() && nested.is_dir());
+
+        // Null input should return null
+        let null_value = context::with_context(true, "", async {
+            fs9_mkdir(vec![Value::Null]).expect("null input")
+        })
+        .await;
+        assert_eq!(null_value, Value::Null);
 
         cleanup(&dir);
     }
