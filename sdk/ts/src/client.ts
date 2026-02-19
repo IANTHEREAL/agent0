@@ -3,6 +3,8 @@ import {
   defaultCredentialStore,
   type CredentialStore,
 } from './credentials';
+import { Db9Error } from './errors';
+import type { Fs9FileInfo, Fs9StatResponse, Fs9ListOptions } from './fs-types';
 import type {
   RegisterRequest,
   CustomerResponse,
@@ -45,6 +47,7 @@ export function createDb9Client(options: Db9ClientOptions = {}) {
   let token = options.token;
   let tokenLoaded = !!token;
   const store = options.credentialStore ?? defaultCredentialStore();
+  const fetchFn = options.fetch ?? globalThis.fetch;
 
   // Public HTTP client — no Authorization header
   const publicClient = createHttpClient({
@@ -76,6 +79,46 @@ export function createDb9Client(options: Db9ClientOptions = {}) {
       fetch: options.fetch,
       headers: { Authorization: `Bearer ${token}` },
     });
+  }
+
+  // ── fs9 helpers ──────────────────────────────────────────────
+  function deriveFs9Url(dbId: string): string {
+    const origin = baseUrl.replace(/\/api\/?$/, '');
+    return `${origin}/fs9/${dbId}`;
+  }
+
+  async function fsRequest(
+    method: string,
+    dbId: string,
+    fsPath: string,
+    body?: string
+  ): Promise<Response> {
+    // Ensure token is loaded (lazy auth pattern)
+    if (!token && !tokenLoaded) {
+      await getAuthClient();
+    }
+
+    const fs9Url = deriveFs9Url(dbId);
+    const url = `${fs9Url}/api/v1${fsPath}`;
+
+    const headers: Record<string, string> = {};
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+    if (body !== undefined) {
+      headers['Content-Type'] = 'text/plain';
+    }
+
+    const init: RequestInit = { method, headers };
+    if (body !== undefined) {
+      init.body = body;
+    }
+
+    const response = await fetchFn(url, init);
+    if (!response.ok) {
+      throw await Db9Error.fromResponse(response);
+    }
+    return response;
   }
 
   return {
@@ -253,6 +296,52 @@ export function createDb9Client(options: Db9ClientOptions = {}) {
             `/customer/databases/${databaseId}/users/${username}`
           );
         },
+      },
+    },
+
+    fs: {
+      list: async (
+        dbId: string,
+        path: string,
+        options?: Fs9ListOptions
+      ): Promise<Fs9FileInfo[]> => {
+        const params = new URLSearchParams({ path });
+        if (options?.recursive) params.set('recursive', 'true');
+        const response = await fsRequest(
+          'GET',
+          dbId,
+          `/readdir?${params.toString()}`
+        );
+        return response.json() as Promise<Fs9FileInfo[]>;
+      },
+
+      read: async (dbId: string, path: string): Promise<string> => {
+        const params = new URLSearchParams({ path });
+        const response = await fsRequest(
+          'GET',
+          dbId,
+          `/download?${params.toString()}`
+        );
+        return response.text();
+      },
+
+      write: async (
+        dbId: string,
+        path: string,
+        content: string
+      ): Promise<void> => {
+        const params = new URLSearchParams({ path });
+        await fsRequest('PUT', dbId, `/upload?${params.toString()}`, content);
+      },
+
+      stat: async (dbId: string, path: string): Promise<Fs9StatResponse> => {
+        const params = new URLSearchParams({ path });
+        const response = await fsRequest(
+          'GET',
+          dbId,
+          `/stat?${params.toString()}`
+        );
+        return response.json() as Promise<Fs9StatResponse>;
       },
     },
   };
