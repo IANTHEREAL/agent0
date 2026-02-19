@@ -49,6 +49,9 @@ pub(crate) trait FsBackend: Send + Sync {
         max_bytes: usize,
     ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>>;
 
+    /// Remove a file or empty directory at the given path.
+    async fn remove(&self, path: &str) -> Result<()>;
+
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
@@ -203,6 +206,20 @@ impl FsBackend for LocalFsBackend {
             .map_err(|err| anyhow!("fs9: cannot read file '{path}': {err}"))?;
         let limited = file.take(max_bytes as u64);
         Ok(Box::new(BufReader::new(limited)))
+    }
+
+    async fn remove(&self, path: &str) -> Result<()> {
+        let info = self.stat(path).await?;
+        if info.is_dir {
+            tokio::fs::remove_dir(path)
+                .await
+                .map_err(|err| anyhow!("fs9_remove: cannot remove directory '{path}': {err}"))?;
+        } else {
+            tokio::fs::remove_file(path)
+                .await
+                .map_err(|err| anyhow!("fs9_remove: cannot remove file '{path}': {err}"))?;
+        }
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -376,6 +393,19 @@ impl FsBackend for Fs9HttpBackend {
         // Download the entire file into memory (max 10MB) and wrap in a Cursor.
         let data = self.read_file(path, max_bytes).await?;
         Ok(Box::new(std::io::Cursor::new(data)))
+    }
+
+    async fn remove(&self, path: &str) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!("{}/api/v1/remove", self.base_url))
+            .bearer_auth(&self.token)
+            .query(&[("path", path)])
+            .send()
+            .await
+            .map_err(|e| anyhow!("fs9: cannot reach fs9-server: {e}"))?;
+        self.check_error(resp, path).await?;
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

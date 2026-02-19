@@ -55,6 +55,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("FS9_EXISTS", fs9_exists);
     map.insert("FS9_SIZE", fs9_size);
     map.insert("FS9_MTIME", fs9_mtime);
+    map.insert("FS9_REMOVE", fs9_remove);
 }
 
 /// Check permissions. In remote mode, only superuser is required (remote backend
@@ -161,6 +162,12 @@ fn fs9_mtime_remote(path: &str) -> Result<Value> {
     Ok(Value::Text(dt.to_rfc3339_opts(SecondsFormat::Secs, true)))
 }
 
+fn fs9_remove_remote(path: &str) -> Result<Value> {
+    let bk = get_remote_backend()?;
+    run_async(bk.remove(path))?;
+    Ok(Value::Boolean(true))
+}
+
 // ---------------------------------------------------------------------------
 // Local-mode implementations (original behaviour)
 // ---------------------------------------------------------------------------
@@ -238,6 +245,23 @@ fn fs9_mtime_local(path: &str) -> Result<Value> {
         .map_err(|err| anyhow!("fs9_mtime: {err}"))?;
     let mtime = DateTime::<Utc>::from(modified).to_rfc3339_opts(SecondsFormat::Secs, true);
     Ok(Value::Text(mtime))
+}
+
+fn fs9_remove_local(path: &str) -> Result<Value> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!("fs9_remove: file not found: {path}"));
+        }
+        Err(err) => return Err(anyhow!("fs9_remove: {err}")),
+    };
+
+    if metadata.is_dir() {
+        fs::remove_dir(path).map_err(|err| anyhow!("fs9_remove: {err}"))?;
+    } else {
+        fs::remove_file(path).map_err(|err| anyhow!("fs9_remove: {err}"))?;
+    }
+    Ok(Value::Boolean(true))
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +360,23 @@ pub fn fs9_mtime(args: Vec<Value>) -> Result<Value> {
         fs9_mtime_remote(&path)
     } else {
         fs9_mtime_local(&path)
+    }
+}
+
+pub fn fs9_remove(args: Vec<Value>) -> Result<Value> {
+    ensure_permissions()?;
+    let path = match expect_text_arg(
+        "fs9_remove",
+        args.into_iter().next().unwrap_or(Value::Null),
+        1,
+    )? {
+        Some(p) => p,
+        None => return Ok(Value::Null),
+    };
+    if backend::is_remote_configured() {
+        fs9_remove_remote(&path)
+    } else {
+        fs9_remove_local(&path)
     }
 }
 
@@ -508,6 +549,57 @@ mod tests {
         assert!(missing_err
             .to_string()
             .contains("fs9_mtime: file not found"));
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_fs9_remove() {
+        let dir = unique_base("remove");
+        let file = dir.join("to_delete.txt");
+        fs::write(&file, b"delete me").expect("write test file");
+
+        // Verify file exists
+        assert!(file.exists());
+
+        // Remove the file
+        let result = context::with_context(true, "", async {
+            fs9_remove(vec![Value::Text(file.to_string_lossy().into_owned())]).expect("remove")
+        })
+        .await;
+        assert_eq!(result, Value::Boolean(true));
+
+        // Verify file no longer exists
+        assert!(!file.exists());
+
+        // Removing missing file should error
+        let missing_err = context::with_context(true, "", async {
+            fs9_remove(vec![Value::Text(
+                dir.join("missing.txt").to_string_lossy().into_owned(),
+            )])
+            .expect_err("missing should fail")
+        })
+        .await;
+        assert!(missing_err
+            .to_string()
+            .contains("fs9_remove: file not found"));
+
+        // Test removing empty directory
+        let subdir = dir.join("empty_dir");
+        fs::create_dir(&subdir).expect("create empty dir");
+        let dir_result = context::with_context(true, "", async {
+            fs9_remove(vec![Value::Text(subdir.to_string_lossy().into_owned())]).expect("remove dir")
+        })
+        .await;
+        assert_eq!(dir_result, Value::Boolean(true));
+        assert!(!subdir.exists());
+
+        // Null input should return null
+        let null_value = context::with_context(true, "", async {
+            fs9_remove(vec![Value::Null]).expect("null input")
+        })
+        .await;
+        assert_eq!(null_value, Value::Null);
 
         cleanup(&dir);
     }
