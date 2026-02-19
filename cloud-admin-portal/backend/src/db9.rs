@@ -127,6 +127,9 @@ enum FsAction {
         /// Maximum number of events to show
         #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
+        /// Skip first N events
+        #[arg(short = 'o', long, default_value_t = 0)]
+        offset: usize,
         /// Filter by path prefix
         #[arg(short, long)]
         path: Option<String>,
@@ -599,6 +602,7 @@ async fn main() {
             FsAction::Events {
                 ref id,
                 limit,
+                offset,
                 ref path,
                 ref event_type,
             } => {
@@ -608,6 +612,7 @@ async fn main() {
                     &cli.effective_output(),
                     id.as_deref(),
                     *limit,
+                    *offset,
                     path.as_deref(),
                     event_type.as_deref(),
                 )
@@ -896,6 +901,7 @@ async fn cmd_fs_events(
     output: &OutputFormat,
     id: Option<&str>,
     limit: usize,
+    offset: usize,
     path: Option<&str>,
     event_type: Option<&str>,
 ) {
@@ -904,7 +910,7 @@ async fn cmd_fs_events(
     let db_id = resolve_db_id(api, id, &headers).await;
     let fs9_url = derive_fs9_url(api_url, &db_id);
 
-    let mut url = format!("{fs9_url}/api/v1/events?limit={limit}");
+    let mut url = format!("{fs9_url}/api/v1/events?limit={limit}&offset={offset}");
     if let Some(p) = path {
         url.push_str(&format!("&path={p}"));
     }

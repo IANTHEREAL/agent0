@@ -428,6 +428,20 @@ async fn prefetch_table_function_schemas(
             snapshot.add_table_function(&call.key, schema);
             continue;
         }
+
+        if func_lower == "fs9_events" {
+            let installed = store.get_extension(txn, db_id, "fs9").await?;
+            let Some(installed) = installed else {
+                continue;
+            };
+            if !installed.enabled {
+                continue;
+            }
+            if let Some(schema) = fs::table_function_schema("fs9_events") {
+                snapshot.add_table_function(&call.key, schema);
+            }
+            continue;
+        }
     }
 
     Ok(())

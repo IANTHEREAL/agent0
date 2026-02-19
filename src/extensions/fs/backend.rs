@@ -48,6 +48,8 @@ pub(crate) trait FsBackend: Send + Sync {
         path: &str,
         max_bytes: usize,
     ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>>;
+
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 pub(crate) struct LocalFsBackend;
@@ -201,6 +203,10 @@ impl FsBackend for LocalFsBackend {
             .map_err(|err| anyhow!("fs9: cannot read file '{path}': {err}"))?;
         let limited = file.take(max_bytes as u64);
         Ok(Box::new(BufReader::new(limited)))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -370,6 +376,24 @@ impl FsBackend for Fs9HttpBackend {
         // Download the entire file into memory (max 10MB) and wrap in a Cursor.
         let data = self.read_file(path, max_bytes).await?;
         Ok(Box::new(std::io::Cursor::new(data)))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl Fs9HttpBackend {
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub(crate) fn client(&self) -> &reqwest::Client {
+        &self.client
     }
 }
 

@@ -81,10 +81,64 @@ fn fs9_file_schema(name: &str) -> TableSchema {
     }
 }
 
+fn fs9_events_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "fs9_events".to_string(),
+        columns: vec![
+            ColumnDef {
+                name: "timestamp".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            },
+            ColumnDef {
+                name: "event_type".to_string(),
+                data_type: DataType::Text,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            },
+            ColumnDef {
+                name: "path".to_string(),
+                data_type: DataType::Text,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            },
+            ColumnDef {
+                name: "count".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            },
+        ],
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![],
+        version: 1,
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
+        from_alias: None,
+    }
+}
+
 pub(crate) fn table_function_schema(func_name: &str) -> Option<TableSchema> {
     let name = func_name.trim().to_ascii_lowercase();
     match name.as_str() {
         "fs9" => Some(fs9_file_schema(&name)),
+        "fs9_events" => Some(fs9_events_schema()),
         _ => None,
     }
 }
@@ -307,6 +361,76 @@ pub(crate) async fn execute_table_function(
             Ok((schema, all_rows))
         }
     }
+}
+
+pub(crate) async fn execute_fs9_events(
+    tenant: &str,
+    limit: usize,
+    offset: usize,
+    path_filter: Option<&str>,
+    type_filter: Option<&str>,
+) -> Result<(TableSchema, Vec<Row>)> {
+    use crate::types::Value;
+
+    let bk = backend::get_backend(tenant);
+    let http_backend = match bk.as_any().downcast_ref::<backend::Fs9HttpBackend>() {
+        Some(b) => b,
+        None => return Err(anyhow!("fs9_events: requires remote fs9-server (FS9_SERVER_URL)")),
+    };
+
+    let mut url = format!(
+        "{}/api/v1/events?limit={}&offset={}",
+        http_backend.base_url(),
+        limit,
+        offset,
+    );
+    if let Some(p) = path_filter {
+        url.push_str(&format!("&path={p}"));
+    }
+    if let Some(t) = type_filter {
+        url.push_str(&format!("&type={t}"));
+    }
+
+    let resp = http_backend
+        .client()
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", http_backend.token()))
+        .send()
+        .await
+        .map_err(|e| anyhow!("fs9_events: cannot reach fs9-server: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("fs9_events: remote error ({status}): {body}"));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct EventRow {
+        timestamp: u64,
+        event_type: String,
+        path: String,
+        count: u64,
+    }
+
+    let events: Vec<EventRow> = resp
+        .json()
+        .await
+        .map_err(|e| anyhow!("fs9_events: invalid response: {e}"))?;
+
+    let rows: Vec<Row> = events
+        .into_iter()
+        .map(|e| Row {
+            values: vec![
+                Value::Int64(e.timestamp as i64),
+                Value::Text(e.event_type),
+                Value::Text(e.path),
+                Value::Int64(e.count as i64),
+            ],
+        })
+        .collect();
+
+    Ok((fs9_events_schema(), rows))
 }
 
 pub(crate) async fn start_file_stream(

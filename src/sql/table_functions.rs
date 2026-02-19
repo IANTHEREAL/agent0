@@ -67,6 +67,10 @@ pub(crate) async fn infer_extension_table_function_schema(
         return infer_fs9_table_function_schema(args, is_superuser).await;
     }
 
+    if func_name.eq_ignore_ascii_case("fs9_events") {
+        return crate::extensions::fs::table_function_schema("fs9_events");
+    }
+
     crate::extensions::fs::table_function_schema(func_name)
 }
 
