@@ -474,13 +474,13 @@
   <main>
     <div class="container">
       <section class="docs-top">
-        <span class="docs-kicker">TypeScript SDK v0.3.0</span>
+        <span class="docs-kicker">TypeScript SDK v0.4.1</span>
         <h1>Complete <code>get-db9</code> API Documentation</h1>
         <p class="lead">Reference for every public export: installation, one-liner provisioning, full client surface, auth lifecycle, credential stores, error model, and all exported TypeScript interfaces.</p>
       </section>
 
       <div class="docs-layout">
-        <button type="button" class="sidebar-toggle" id="sidebar-toggle">Menu <span class="mono">(16 sections)</span></button>
+        <button type="button" class="sidebar-toggle" id="sidebar-toggle">Menu <span class="mono">(17 sections)</span></button>
 
         <aside class="docs-sidebar" id="docs-sidebar">
           <div class="sidebar-title">On This Page</div>
@@ -499,7 +499,8 @@
           <a href="#auth-flow">13. Authentication Flow</a>
           <a href="#credential-storage">14. Credential Storage</a>
           <a href="#error-handling">15. Error Handling</a>
-          <a href="#typescript-types">16. TypeScript Types Reference</a>
+          <a href="#filesystem">16. Filesystem (<code>client.fs</code>)</a>
+          <a href="#typescript-types">17. TypeScript Types Reference</a>
         </aside>
 
         <article class="docs-main" id="docs-main">
@@ -964,8 +965,77 @@ try {
             </div>
           </section>
 
-          <section class="doc-section" id="typescript-types">
+          <section class="doc-section" id="filesystem">
             <span class="badge">Section 16</span>
+            <h2>Filesystem (<code>client.fs</code>)</h2>
+            <p class="section-note">Cloud filesystem operations for reading, writing, and managing files attached to each database. Built for RAG pipelines, document ingestion, and agent workflows.</p>
+
+            <ul class="method-list">
+              <li><code>list(dbId, path, options?): Promise&lt;Fs9FileEntry[]&gt;</code> — List directory contents</li>
+              <li><code>read(dbId, path): Promise&lt;string&gt;</code> — Read file content as text</li>
+              <li><code>write(dbId, path, content): Promise&lt;void&gt;</code> — Write text content to a file</li>
+              <li><code>stat(dbId, path): Promise&lt;Fs9FileEntry&gt;</code> — Get file metadata</li>
+              <li><code>mkdir(dbId, path): Promise&lt;void&gt;</code> — Create a directory</li>
+              <li><code>remove(dbId, path): Promise&lt;void&gt;</code> — Delete a file or directory</li>
+            </ul>
+
+            <div class="code-block" data-lang="typescript">
+              <div class="code-head"><span class="code-lang">typescript</span><button type="button" class="copy-btn">Copy</button></div>
+              <pre><code>import { createDb9Client } from 'get-db9/client';
+
+const client = createDb9Client();
+const dbId = 'my-database-id';
+
+// Create directory and write a file
+await client.fs.mkdir(dbId, '/data');
+await client.fs.write(dbId, '/data/hello.txt', 'Hello from db9!');
+
+// Read file content
+const content = await client.fs.read(dbId, '/data/hello.txt');
+
+// List directory
+const files = await client.fs.list(dbId, '/data/');
+for (const file of files) {
+  console.log(file.path, file.file_type, file.size);
+}
+
+// Stat a file
+const info = await client.fs.stat(dbId, '/data/hello.txt');
+console.log(info.file_type, info.size, info.mtime);
+
+// Cleanup
+await client.fs.remove(dbId, '/data/hello.txt');
+await client.fs.remove(dbId, '/data');</code></pre>
+            </div>
+
+            <div class="api-subtitle" style="color: var(--text-muted); font-size: 11px; letter-spacing: 1px; text-transform: uppercase; font-weight: 700; margin-bottom: 10px;">Fs9FileEntry</div>
+            <table>
+              <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+              <tbody>
+                <tr><td><code>path</code></td><td><code>string</code></td><td>Full file path.</td></tr>
+                <tr><td><code>size</code></td><td><code>number</code></td><td>File size in bytes.</td></tr>
+                <tr><td><code>file_type</code></td><td><code>'regular' | 'directory' | 'symlink'</code></td><td>Entry type.</td></tr>
+                <tr><td><code>mode</code></td><td><code>number</code></td><td>Unix file mode.</td></tr>
+                <tr><td><code>uid</code></td><td><code>number</code></td><td>Owner user ID.</td></tr>
+                <tr><td><code>gid</code></td><td><code>number</code></td><td>Owner group ID.</td></tr>
+                <tr><td><code>atime</code></td><td><code>number</code></td><td>Last access (Unix timestamp).</td></tr>
+                <tr><td><code>mtime</code></td><td><code>number</code></td><td>Last modified (Unix timestamp).</td></tr>
+                <tr><td><code>ctime</code></td><td><code>number</code></td><td>Status change (Unix timestamp).</td></tr>
+                <tr><td><code>etag</code></td><td><code>string</code></td><td>Content hash for caching.</td></tr>
+              </tbody>
+            </table>
+
+            <div class="api-subtitle" style="color: var(--text-muted); font-size: 11px; letter-spacing: 1px; text-transform: uppercase; font-weight: 700; margin: 18px 0 10px;">Fs9ListOptions</div>
+            <table>
+              <thead><tr><th>Option</th><th>Type</th><th>Description</th></tr></thead>
+              <tbody>
+                <tr><td><code>recursive</code></td><td><code>boolean</code></td><td>List entries recursively (default: <code>false</code>).</td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="doc-section" id="typescript-types">
+            <span class="badge">Section 17</span>
             <h2>TypeScript Types Reference (All Public Interfaces)</h2>
             <p class="section-note">The package re-exports all interfaces from <code>./types</code> in addition to <code>InstantDatabaseOptions</code>, <code>InstantDatabaseResult</code>, <code>Db9ClientOptions</code>, and credential/http types.</p>
 
@@ -973,6 +1043,7 @@ try {
               <div class="type-card"><h3>Common</h3><p><code>Endpoint</code>, <code>MessageResponse</code>, <code>HealthResponse</code>, <code>ColumnInfo</code>, <code>SqlResult</code>, <code>TenantState</code></p></div>
               <div class="type-card"><h3>Customer Requests</h3><p><code>RegisterRequest</code>, <code>LoginRequest</code>, <code>CreateDatabaseRequest</code>, <code>SqlExecuteRequest</code>, <code>DumpRequest</code>, <code>MigrationApplyRequest</code>, <code>BranchRequest</code>, <code>ClaimRequest</code>, <code>AnonymousRefreshRequest</code>, <code>CreateUserRequest</code></p></div>
               <div class="type-card"><h3>Customer Responses</h3><p><code>CustomerResponse</code>, <code>LoginResponse</code>, <code>AnonymousRegisterResponse</code>, <code>AnonymousRefreshResponse</code>, <code>AnonymousSecretResponse</code>, <code>ClaimResponse</code>, <code>DatabaseResponse</code>, <code>CustomerPasswordResetResponse</code>, <code>TokenResponse</code>, <code>DumpResponse</code>, <code>SchemaResponse</code>, <code>TableMetadata</code>, <code>ColumnMetadata</code>, <code>ViewMetadata</code>, <code>MigrationApplyResponse</code>, <code>MigrationMetadata</code>, <code>UserResponse</code>, <code>TenantObservabilityResponse</code>, <code>ObservabilitySummary</code>, <code>QuerySample</code></p></div>
+              <div class="type-card"><h3>Filesystem</h3><p><code>Fs9FileEntry</code>, <code>Fs9ListOptions</code></p></div>
               <div class="type-card"><h3>Credential &amp; HTTP</h3><p><code>Credentials</code>, <code>CredentialStore</code>, <code>FetchFn</code>, <code>HttpClient</code>, <code>HttpClientOptions</code>, <code>InstantDatabaseOptions</code>, <code>InstantDatabaseResult</code>, <code>Db9ClientOptions</code>, <code>Db9Client</code>, <code>Endpoint</code></p></div>
             </div>
 

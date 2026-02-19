@@ -665,9 +665,10 @@
             <span class="dot"></span>
             <span class="editor-title">TypeScript SDK Examples</span>
           </div>
-          <div class="editor-tabs" data-tab-group="editor">
+           <div class="editor-tabs" data-tab-group="editor">
              <button type="button" class="editor-tab active" data-tab="sdk">SDK</button>
              <button type="button" class="editor-tab" data-tab="client">Client API</button>
+             <button type="button" class="editor-tab" data-tab="fs">Filesystem</button>
            </div>
 
           <div class="editor-panel active" data-panel="sdk">
@@ -692,6 +693,23 @@ console.<span class="fn">log</span>(db.<span class="prop">connectionString</span
  <span class="kw">const</span> result = <span class="kw">await</span> client.<span class="prop">databases</span>.<span class="fn">sql</span>(db.<span class="prop">id</span>, <span class="str">'SELECT * FROM users'</span>);
  console.<span class="fn">log</span>(result.<span class="prop">columns</span>, result.<span class="prop">rows</span>);</pre>
            </div>
+
+           <div class="editor-panel" data-panel="fs">
+             <div class="code-file">filesystem-example.ts</div>
+             <pre><span class="kw">import</span> { <span class="fn">createDb9Client</span> } <span class="kw">from</span> <span class="str">'get-db9/client'</span>;
+
+<span class="kw">const</span> client = <span class="fn">createDb9Client</span>();
+<span class="kw">const</span> dbId = <span class="str">'my-database-id'</span>;
+
+<span class="kw">await</span> client.<span class="prop">fs</span>.<span class="fn">mkdir</span>(dbId, <span class="str">'/data'</span>);
+<span class="kw">await</span> client.<span class="prop">fs</span>.<span class="fn">write</span>(dbId, <span class="str">'/data/hello.txt'</span>, <span class="str">'Hello from db9!'</span>);
+
+<span class="kw">const</span> content = <span class="kw">await</span> client.<span class="prop">fs</span>.<span class="fn">read</span>(dbId, <span class="str">'/data/hello.txt'</span>);
+<span class="kw">const</span> files = <span class="kw">await</span> client.<span class="prop">fs</span>.<span class="fn">list</span>(dbId, <span class="str">'/data/'</span>);
+<span class="kw">const</span> info = <span class="kw">await</span> client.<span class="prop">fs</span>.<span class="fn">stat</span>(dbId, <span class="str">'/data/hello.txt'</span>);
+
+<span class="kw">await</span> client.<span class="prop">fs</span>.<span class="fn">remove</span>(dbId, <span class="str">'/data/hello.txt'</span>);</pre>
+           </div>
         </div>
       </div>
     </div>
@@ -710,9 +728,13 @@ console.<span class="fn">log</span>(db.<span class="prop">connectionString</span
             <span class="api-badge high">HIGH-LEVEL</span>
           </button>
           <button type="button" class="api-nav-btn" data-tab="client-api">
-             <span class="api-name">createDb9Client</span>
-             <span class="api-badge customer">CLIENT</span>
-           </button>
+              <span class="api-name">createDb9Client</span>
+              <span class="api-badge customer">CLIENT</span>
+            </button>
+          <button type="button" class="api-nav-btn" data-tab="fs-api">
+            <span class="api-name">client.fs</span>
+            <span class="api-badge customer">FILESYSTEM</span>
+          </button>
         </aside>
 
         <div class="api-content">
@@ -745,27 +767,68 @@ console.<span class="fn">log</span>(db.<span class="prop">databaseId</span>, db.
           </article>
 
            <article class="api-panel" data-panel="client-api">
-             <h3><code>createDb9Client(options?)</code></h3>
-             <p>Typed Client API with auth, database, SQL, schema, dump, migration, branch, and user operations. Auto-registers anonymously when no token provided.</p>
-             <div class="api-subtitle">Example</div>
-             <div class="api-code">
-               <pre><span class="kw">import</span> { <span class="fn">createDb9Client</span> } <span class="kw">from</span> <span class="str">'get-db9/client'</span>;
+              <h3><code>createDb9Client(options?)</code></h3>
+              <p>Typed Client API with auth, database, SQL, schema, dump, migration, branch, and user operations. Auto-registers anonymously when no token provided.</p>
+              <div class="api-subtitle">Example</div>
+              <div class="api-code">
+                <pre><span class="kw">import</span> { <span class="fn">createDb9Client</span> } <span class="kw">from</span> <span class="str">'get-db9/client'</span>;
  
  <span class="kw">const</span> client = <span class="fn">createDb9Client</span>();
  <span class="kw">const</span> db = <span class="kw">await</span> client.<span class="prop">databases</span>.<span class="fn">create</span>({ <span class="prop">name</span>: <span class="str">'myapp'</span> });
  <span class="kw">const</span> result = <span class="kw">await</span> client.<span class="prop">databases</span>.<span class="fn">sql</span>(db.<span class="prop">id</span>, <span class="str">'SELECT * FROM users'</span>);</pre>
-             </div>
-             <div class="api-subtitle">Parameters</div>
-             <table>
-               <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
-               <tbody>
-                 <tr><td><code>baseUrl</code></td><td><code>string</code></td><td>Client API endpoint (default production URL).</td></tr>
-                 <tr><td><code>token</code></td><td><code>string</code></td><td>Optional bearer token. If omitted, auto-registers anonymously.</td></tr>
-                 <tr><td><code>fetch</code></td><td><code>FetchFn</code></td><td>Custom fetch implementation.</td></tr>
-                 <tr><td><code>credentialStore</code></td><td><code>CredentialStore</code></td><td>Optional lazy token loader when no token passed.</td></tr>
-               </tbody>
-             </table>
-           </article>
+              </div>
+              <div class="api-subtitle">Parameters</div>
+              <table>
+                <thead><tr><th>Name</th><th>Type</th><th>Description</th></tr></thead>
+                <tbody>
+                  <tr><td><code>baseUrl</code></td><td><code>string</code></td><td>Client API endpoint (default production URL).</td></tr>
+                  <tr><td><code>token</code></td><td><code>string</code></td><td>Optional bearer token. If omitted, auto-registers anonymously.</td></tr>
+                  <tr><td><code>fetch</code></td><td><code>FetchFn</code></td><td>Custom fetch implementation.</td></tr>
+                  <tr><td><code>credentialStore</code></td><td><code>CredentialStore</code></td><td>Optional lazy token loader when no token passed.</td></tr>
+                </tbody>
+              </table>
+            </article>
+
+          <article class="api-panel" data-panel="fs-api">
+            <h3><code>client.fs</code></h3>
+            <p>Cloud filesystem operations for reading, writing, and managing files attached to each database. Built for RAG pipelines, file ingestion, and agent workflows.</p>
+            <div class="api-subtitle">Methods</div>
+            <table>
+              <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+              <tbody>
+                <tr><td><code>list(dbId, path, options?)</code></td><td><code>Promise&lt;Fs9FileEntry[]&gt;</code></td><td>List directory contents.</td></tr>
+                <tr><td><code>read(dbId, path)</code></td><td><code>Promise&lt;string&gt;</code></td><td>Read file content as text.</td></tr>
+                <tr><td><code>write(dbId, path, content)</code></td><td><code>Promise&lt;void&gt;</code></td><td>Write text content to a file.</td></tr>
+                <tr><td><code>stat(dbId, path)</code></td><td><code>Promise&lt;Fs9FileEntry&gt;</code></td><td>Get file metadata (size, type, timestamps).</td></tr>
+                <tr><td><code>mkdir(dbId, path)</code></td><td><code>Promise&lt;void&gt;</code></td><td>Create a directory.</td></tr>
+                <tr><td><code>remove(dbId, path)</code></td><td><code>Promise&lt;void&gt;</code></td><td>Delete a file or directory.</td></tr>
+              </tbody>
+            </table>
+            <div class="api-subtitle">Example</div>
+            <div class="api-code">
+              <pre><span class="kw">const</span> client = <span class="fn">createDb9Client</span>();
+
+<span class="kw">await</span> client.<span class="prop">fs</span>.<span class="fn">mkdir</span>(dbId, <span class="str">'/data'</span>);
+<span class="kw">await</span> client.<span class="prop">fs</span>.<span class="fn">write</span>(dbId, <span class="str">'/data/doc.txt'</span>, <span class="str">'Hello!'</span>);
+
+<span class="kw">const</span> content = <span class="kw">await</span> client.<span class="prop">fs</span>.<span class="fn">read</span>(dbId, <span class="str">'/data/doc.txt'</span>);
+<span class="kw">const</span> files = <span class="kw">await</span> client.<span class="prop">fs</span>.<span class="fn">list</span>(dbId, <span class="str">'/data/'</span>);
+<span class="kw">const</span> info = <span class="kw">await</span> client.<span class="prop">fs</span>.<span class="fn">stat</span>(dbId, <span class="str">'/data/doc.txt'</span>);
+
+<span class="kw">await</span> client.<span class="prop">fs</span>.<span class="fn">remove</span>(dbId, <span class="str">'/data/doc.txt'</span>);</pre>
+            </div>
+            <div class="api-subtitle">Fs9FileEntry</div>
+            <table>
+              <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+              <tbody>
+                <tr><td><code>path</code></td><td><code>string</code></td><td>Full file path.</td></tr>
+                <tr><td><code>size</code></td><td><code>number</code></td><td>File size in bytes.</td></tr>
+                <tr><td><code>file_type</code></td><td><code>'regular' | 'directory' | 'symlink'</code></td><td>Entry type.</td></tr>
+                <tr><td><code>mtime</code></td><td><code>number</code></td><td>Last modified (Unix timestamp).</td></tr>
+                <tr><td><code>etag</code></td><td><code>string</code></td><td>Content hash for caching.</td></tr>
+              </tbody>
+            </table>
+          </article>
         </div>
       </div>
     </div>
@@ -806,6 +869,11 @@ console.<span class="fn">log</span>(db.<span class="prop">databaseId</span>, db.
           <div class="feature-icon">&#127793;</div>
           <h3>Database seeding</h3>
           <p>Seed tables and fixtures at creation time with SQL strings or files.</p>
+        </div>
+        <div class="feature">
+          <div class="feature-icon">&#128193;</div>
+          <h3>Cloud filesystem</h3>
+          <p>Read, write, list, and manage files per database with <code>client.fs</code>.</p>
         </div>
       </div>
     </div>
