@@ -175,8 +175,8 @@ enum DbAction {
     },
     /// Execute SQL query against a database
     Sql {
-        /// Database ID
-        id: String,
+        /// Database ID (omit to auto-select or choose interactively)
+        id: Option<String>,
         /// SQL query string
         #[arg(long, short)]
         query: Option<String>,
@@ -675,7 +675,7 @@ async fn main() {
                 cmd_db_sql(
                     &api,
                     &cli.effective_output(),
-                    id,
+                    id.as_deref(),
                     query.as_deref(),
                     file.as_deref(),
                     *direct,
@@ -1862,12 +1862,16 @@ async fn build_executor(
 async fn cmd_db_sql(
     api: &ApiClient,
     output: &OutputFormat,
-    id: &str,
+    id: Option<&str>,
     query: Option<&str>,
     file: Option<&str>,
     direct: bool,
     dsn: Option<&str>,
 ) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+    let id_owned = resolve_db_id(api, id, &headers).await;
+    let id = id_owned.as_str();
     let sql = if let Some(q) = query {
         q.to_string()
     } else if let Some(f) = file {
