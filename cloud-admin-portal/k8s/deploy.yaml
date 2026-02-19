@@ -77,6 +77,8 @@ spec:
             secretKeyRef:
               name: fs9-secret
               key: FS9_JWT_SECRET
+        - name: FS9_SERVER_URL
+          value: "http://fs9-server:9999"
         - name: RUST_LOG
           value: "info"
         volumeMounts:
@@ -409,7 +411,7 @@ spec:
   - port: 9999
     targetPort: 9999
 ---
-# Ingress for fs9 - /fs9 path with rewrite
+# Ingress for fs9 - /fs9 routed through backend reverse-proxy (auth + token swap)
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -417,7 +419,6 @@ metadata:
   namespace: cloud-admin-portal
   annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
-    nginx.ingress.kubernetes.io/rewrite-target: /$2
     nginx.ingress.kubernetes.io/proxy-body-size: "256m"
 spec:
   ingressClassName: nginx
@@ -429,13 +430,13 @@ spec:
   - host: db9.shared.aws.tidbcloud.com
     http:
       paths:
-      - path: /fs9(/|$)(.*)
-        pathType: ImplementationSpecific
+      - path: /fs9
+        pathType: Prefix
         backend:
           service:
-            name: fs9-server
+            name: cloud-admin-backend
             port:
-              number: 9999
+              number: 8090
 ---
 # Ingress - HTTPS with Let's Encrypt cert
 apiVersion: networking.k8s.io/v1

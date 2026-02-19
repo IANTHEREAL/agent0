@@ -13,11 +13,14 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
     CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
 
+ARG BUILD_GIT_HASH=unknown
+
 WORKDIR /app
 
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src/ src/
 
+ENV BUILD_GIT_HASH=${BUILD_GIT_HASH}
 RUN cargo build --release --target aarch64-unknown-linux-gnu
 
 FROM --platform=linux/arm64 debian:bookworm-slim

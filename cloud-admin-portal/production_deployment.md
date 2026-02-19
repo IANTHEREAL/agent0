@@ -3,38 +3,37 @@
 ## Architecture Overview
 
 ```
-                     ┌─────────────────────────────────────┐
-                     │         EKS Cluster (arm64)         │
-                     │                                     │
-  HTTPS (443)        │  ┌───────────┐     ┌─────────────┐  │
-  ──────────────────►│  │  Ingress  │────►│   Landing   │  │
-  db9.example.com    │  │  (nginx)  │     │   (nginx)   │  │
-                     │  │           │     └─────────────┘  │
-                     │  │  /api ────│───►┌──────────────┐  │
-                     │  │           │    │   Backend    │  │
-                     │  │  /sdk ────│───►│  (Rust/axum) │  │
-                     │  │  /fs9 ────│─┐  └──────┬───────┘  │
-                     │  └───────────┘ │         │          │
-                     │                │  ┌──────▼───────┐  │
-                     │                │  │  PostgreSQL  │  │
-                     │                │  │  (metadata)  │  │
-                     │                │  └──────────────┘  │
-                     │                │                    │
-  TCP (5433)         │  ┌─────────┐   │  ┌───────────────┐ │
-  ──────────────────►│  │  NLB    │───│─►│   pg-tikv     │ │
-  pg.example.com     │  └─────────┘   │  │  (SQL engine) │ │
-                     │                │  └──────┬────────┘ │
-                     │                │         │          │
-                     │                │  ┌──────▼────────┐ │
-                     │  ┌──────────┐  │  │    TiKV       │ │
-                     │  │ fs9-meta │  │  │  (storage)    │ │
-                     │  └────┬─────┘  │  └───────────────┘ │
-                     │       │        │                    │
-                     │  ┌────▼─────┐  │                    │
-                     │  │fs9-server│◄─┘                    │
-                     │  └──────────┘                       │
-                     └─────────────────────────────────────┘
+                     ┌──────────────────────────────────────────┐
+                     │           EKS Cluster (arm64)            │
+                     │                                          │
+  HTTPS (443)        │  ┌───────────┐       ┌─────────────┐    │
+  ──────────────────►│  │  Ingress  │──────►│   Landing   │    │
+  db9.example.com    │  │  (nginx)  │       │   (nginx)   │    │
+                     │  │           │       └─────────────┘    │
+                     │  │  /api ────│──┐                        │
+                     │  │  /fs9 ────│──┼──►┌──────────────┐    │
+                     │  │  /sdk ────│──┘   │   Backend    │    │
+                     │  └───────────┘      │  (Rust/axum) │    │
+                     │                     └──┬───────┬───┘    │
+                     │                        │       │        │
+                     │                 ┌──────▼──┐  ┌─▼──────┐ │
+                     │                 │PostgreSQL│  │fs9-    │ │
+                     │                 │(metadata)│  │server  │ │
+                     │                 └─────────┘  └──┬─────┘ │
+                     │                                 │       │
+  TCP (5433)         │  ┌─────────┐    ┌───────────┐   │       │
+  ──────────────────►│  │  NLB    │───►│  pg-tikv  │   │       │
+  pg.example.com     │  └─────────┘    │(SQL engine)│   │       │
+                     │                 └─────┬─────┘   │       │
+                     │                       │         │       │
+                     │                 ┌─────▼─────────▼──┐    │
+                     │  ┌──────────┐   │      TiKV        │    │
+                     │  │ fs9-meta │   │    (storage)      │    │
+                     │  └──────────┘   └──────────────────┘    │
+                     └──────────────────────────────────────────┘
 ```
+
+**Note**: `/fs9` requests are routed through the backend, which authenticates the customer, swaps their API token for the stored fs9 JWT, and proxies to fs9-server internally. fs9-server is not directly exposed externally.
 
 ### Components
 
@@ -321,12 +320,45 @@ pg-tikv embeds version info at build time:
 
 ---
 
+## Backend Configuration
+
+### Environment Variables
+
+| Variable | Purpose | Required |
+|----------|---------|----------|
+| `FS9_META_URL` | fs9-meta endpoint (e.g. `http://fs9-meta:9998`) | Yes (for fs9 integration) |
+| `FS9_META_KEY` | Admin key for fs9-meta API (from `fs9-secret`) | Yes (for fs9 integration) |
+| `FS9_JWT_SECRET` | JWT signing secret (from `fs9-secret`) | Yes (for fs9 integration) |
+| `FS9_SERVER_URL` | fs9-server endpoint for reverse proxy (e.g. `http://fs9-server:9999`) | Yes (for `/fs9` proxy) |
+| `BUILD_GIT_HASH` | Git hash embedded at build time (via `--build-arg`) | Yes (Docker build) |
+
+### fs9 Reverse Proxy
+
+The backend provides an authenticated reverse proxy at `/fs9/:db_id/*`:
+1. Authenticates the customer via API token
+2. Verifies ownership of the database
+3. Swaps the customer's API token for the stored fs9 JWT
+4. Proxies the request to `FS9_SERVER_URL/{db_id}/*`
+
+This means `/fs9` traffic goes through the backend, and fs9-server is **not directly exposed externally**. The Ingress routes `/fs9` to the backend, not to fs9-server.
+
+### fs9 Provisioning Flow (on `db9 db create`)
+
+1. `create_namespace(tenant_id)` → `POST /api/v1/admin/namespaces`
+2. `create_user(namespace, "admin")` → `POST /api/v1/admin/namespaces/{ns}/users` (409 = idempotent)
+3. `generate_token(user_id)` → `POST /api/v1/admin/tokens`
+4. Store JWT as `fs9_token` credential for the tenant
+
+---
+
 ## fs9 Configuration
 
 ### Service Dependencies
 
 ```
-fs9-server → fs9-meta (mount configs)
+backend    → fs9-meta (namespace/user/token management via admin API)
+backend    → fs9-server (reverse proxy for /fs9/:db_id requests)
+fs9-server → fs9-meta (namespace lookup for auth)
 fs9-server → TiKV (pagefs storage, mTLS)
 fs9-server → backend (db9 token validation)
 fs9-meta   → PostgreSQL (metadata store)
@@ -334,11 +366,21 @@ fs9-meta   → PostgreSQL (metadata store)
 
 ### Key Points
 
-- pagefs plugin connects to TiKV for persistent storage (one keyspace per tenant)
-- Auto-provisioning: when a db9-authenticated request arrives for an unknown tenant, fs9-server auto-creates namespace + pagefs mount
+- pagefs plugin connects to TiKV for persistent storage (one keyspace per tenant, prefix `tipg_fs_`)
+- Auto-provisioning: when a db9-authenticated request arrives for an unknown tenant, fs9-server auto-creates namespace in fs9-meta and mounts pagefs directly in-process (no mounts API in fs9-meta)
+- fs9-meta admin API uses `/api/v1/admin/` prefix (not `/api/v1/`)
 - pg-tikv's fs9 SQL extension connects to fs9-server via HTTP with short-lived JWT tokens
 - Cross-namespace communication: pg-tikv (in `tipg`) → fs9-server (in `cloud-admin-portal`) via `fs9-server.cloud-admin-portal.svc.cluster.local:9999`
 - `fs9-secret` must exist in both namespaces
+
+### Ingress Routing
+
+```
+/api/*   → cloud-admin-backend:8090  (API)
+/fs9/*   → cloud-admin-backend:8090  (fs9 reverse proxy → fs9-server:9999 internal)
+/sdk     → cloud-admin-landing:80    (SDK docs)
+/*       → cloud-admin-landing:80    (landing page)
+```
 
 ---
 
