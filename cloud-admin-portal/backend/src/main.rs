@@ -210,6 +210,10 @@ async fn main() {
             axum::routing::any(api::fs9_proxy::fs9_proxy),
         )
         .route(
+            "/fs9/:db_id/",
+            axum::routing::any(api::fs9_proxy::fs9_proxy),
+        )
+        .route(
             "/fs9/:db_id/*rest",
             axum::routing::any(api::fs9_proxy::fs9_proxy),
         )

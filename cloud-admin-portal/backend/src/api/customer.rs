@@ -637,7 +637,7 @@ pub async fn create_database(
 
             // Generate and store fs9 token
             if let Some(user_id) = fs9_user_id {
-                match fs9.generate_token(&user_id).await {
+                match fs9.generate_token(&user_id, &tenant_id).await {
                     Ok(token) => {
                         db::upsert_credential(
                             &state.db,

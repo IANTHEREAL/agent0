@@ -190,7 +190,7 @@ async fn refresh_fs9_token(
     // Ensure namespace + user exist (idempotent).
     fs9.create_namespace(tenant_id).await?;
     let user_id = fs9.create_user(tenant_id, "admin").await?;
-    let token = fs9.generate_token(&user_id).await?;
+    let token = fs9.generate_token(&user_id, tenant_id).await?;
 
     // Store the new token.
     db::upsert_credential(

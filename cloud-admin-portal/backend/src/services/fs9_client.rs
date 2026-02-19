@@ -15,17 +15,19 @@ struct CreateNamespaceRequest {
 #[derive(Serialize)]
 struct CreateUserRequest {
     username: String,
-    roles: Vec<String>,
 }
 
 #[derive(Deserialize)]
-struct CreateUserResponse {
+struct UserResponse {
     id: String,
+    username: String,
 }
 
 #[derive(Serialize)]
 struct GenerateTokenRequest {
     user_id: String,
+    namespace: String,
+    roles: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ttl_seconds: Option<u64>,
 }
@@ -46,7 +48,7 @@ impl Fs9Client {
 
     /// Create an fs9 namespace for a tenant.
     pub async fn create_namespace(&self, name: &str) -> Result<(), String> {
-        let url = format!("{}/api/v1/admin/namespaces", self.base_url);
+        let url = format!("{}/api/v1/namespaces", self.base_url);
         let resp = self
             .client
             .post(&url)
@@ -69,33 +71,30 @@ impl Fs9Client {
         }
     }
 
-    /// Create an admin user in the given namespace; returns the user's internal ID.
-    pub async fn create_user(&self, namespace: &str, username: &str) -> Result<String, String> {
-        let url = format!(
-            "{}/api/v1/admin/namespaces/{}/users",
-            self.base_url, namespace
-        );
+    /// Create a user (global, not per-namespace); returns the user's internal ID.
+    /// If user already exists (409), fetches and returns the existing ID.
+    pub async fn create_user(&self, _namespace: &str, username: &str) -> Result<String, String> {
+        let url = format!("{}/api/v1/users", self.base_url);
         let resp = self
             .client
             .post(&url)
             .header("x-fs9-meta-key", &self.meta_key)
             .json(&CreateUserRequest {
                 username: username.to_string(),
-                roles: vec!["admin".to_string()],
             })
             .send()
             .await
             .map_err(|e| format!("fs9 create_user request failed: {e}"))?;
 
         if resp.status().is_success() {
-            let user_resp: CreateUserResponse = resp
+            let user: UserResponse = resp
                 .json()
                 .await
                 .map_err(|e| format!("fs9 create_user parse failed: {e}"))?;
-            Ok(user_resp.id)
+            Ok(user.id)
         } else if resp.status().as_u16() == 409 {
-            // User already exists — fetch the user list and return the matching id.
-            self.get_user_id(namespace, username).await
+            // User already exists — look up by username.
+            self.get_user_id(username).await
         } else {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -105,54 +104,44 @@ impl Fs9Client {
         }
     }
 
-    /// Fetch the internal user ID for an existing user in a namespace.
-    async fn get_user_id(&self, namespace: &str, username: &str) -> Result<String, String> {
-        let url = format!(
-            "{}/api/v1/admin/namespaces/{}/users",
-            self.base_url, namespace
-        );
+    /// Fetch the internal user ID for an existing user by username.
+    async fn get_user_id(&self, username: &str) -> Result<String, String> {
+        let url = format!("{}/api/v1/users/by-name/{}", self.base_url, username);
         let resp = self
             .client
             .get(&url)
             .header("x-fs9-meta-key", &self.meta_key)
             .send()
             .await
-            .map_err(|e| format!("fs9 get_users request failed: {e}"))?;
+            .map_err(|e| format!("fs9 get_user request failed: {e}"))?;
 
-        if !resp.status().is_success() {
+        if resp.status().is_success() {
+            let user: UserResponse = resp
+                .json()
+                .await
+                .map_err(|e| format!("fs9 get_user parse failed: {e}"))?;
+            Ok(user.id)
+        } else {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("fs9 get_users failed: status={status}, body={body}"));
+            Err(format!(
+                "fs9 get_user failed: status={status}, body={body}"
+            ))
         }
-
-        #[derive(Deserialize)]
-        struct UserEntry {
-            id: String,
-            username: String,
-        }
-
-        let users: Vec<UserEntry> = resp
-            .json()
-            .await
-            .map_err(|e| format!("fs9 get_users parse failed: {e}"))?;
-
-        users
-            .into_iter()
-            .find(|u| u.username == username)
-            .map(|u| u.id)
-            .ok_or_else(|| format!("fs9 user '{username}' not found in namespace '{namespace}'"))
     }
 
-    /// Generate a JWT token for the given user (by internal user_id).
+    /// Generate a JWT token for the given user in a namespace.
     /// Uses a 1-year TTL to avoid frequent token expiration.
-    pub async fn generate_token(&self, user_id: &str) -> Result<String, String> {
-        let url = format!("{}/api/v1/admin/tokens", self.base_url);
+    pub async fn generate_token(&self, user_id: &str, namespace: &str) -> Result<String, String> {
+        let url = format!("{}/api/v1/tokens/generate", self.base_url);
         let resp = self
             .client
             .post(&url)
             .header("x-fs9-meta-key", &self.meta_key)
             .json(&GenerateTokenRequest {
                 user_id: user_id.to_string(),
+                namespace: namespace.to_string(),
+                roles: vec!["admin".to_string()],
                 ttl_seconds: Some(365 * 24 * 3600), // 1 year
             })
             .send()
