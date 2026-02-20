@@ -28,8 +28,7 @@ fn get_or_compile_regex(pattern: &str) -> Result<regex::Regex> {
     if let Some(re) = REGEX_CACHE.get(pattern) {
         return Ok(re.clone());
     }
-    let re =
-        regex::Regex::new(pattern).map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
+    let re = regex::Regex::new(pattern).map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
     // Soft cap: skip insert when full. Under concurrency, len() is approximate
     // so the cache may transiently exceed MAX_REGEX_CACHE_SIZE — acceptable
     // since it's a memory budget hint, not a hard invariant.
