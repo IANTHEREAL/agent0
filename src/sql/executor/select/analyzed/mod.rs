@@ -1716,6 +1716,7 @@ impl Executor {
 
                     build_ctx.table_schemas.insert(key.clone(), schema);
                     if has_correlated_args {
+                        build_ctx.correlated_table_functions.insert(key.clone());
                         return Ok(());
                     }
 

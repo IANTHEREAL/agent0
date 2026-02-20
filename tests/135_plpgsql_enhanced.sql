@@ -109,6 +109,63 @@ $$ LANGUAGE plpgsql;
 
 SELECT process_batch();
 
+-- EXIT short-circuit: statements after EXIT must NOT execute
+CREATE FUNCTION test_exit_shortcircuit() RETURNS integer AS $$
+DECLARE
+    i integer;
+    total integer := 0;
+BEGIN
+    FOR i IN 1..10 LOOP
+        IF i > 3 THEN
+            EXIT;
+            total := total + 1000;
+        END IF;
+        total := total + i;
+    END LOOP;
+    RETURN total;
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT test_exit_shortcircuit();
+
+-- FOR loop body with SQL containing FOR UPDATE must parse correctly
+CREATE FUNCTION test_for_update_compat() RETURNS integer AS $$
+DECLARE
+    rec RECORD;
+    cnt integer := 0;
+BEGIN
+    FOR rec IN SELECT id FROM plpgsql_test_data ORDER BY id LIMIT 2
+    LOOP
+        cnt := cnt + 1;
+    END LOOP;
+    RETURN cnt;
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT test_for_update_compat();
+
+CREATE FUNCTION test_strict_no_rows() RETURNS integer AS $$
+DECLARE
+    v integer;
+BEGIN
+    SELECT value INTO STRICT v FROM plpgsql_test_data WHERE id = -999;
+    RETURN v;
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT test_strict_no_rows();
+
+CREATE FUNCTION test_strict_many_rows() RETURNS integer AS $$
+DECLARE
+    v integer;
+BEGIN
+    SELECT value INTO STRICT v FROM plpgsql_test_data;
+    RETURN v;
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT test_strict_many_rows();
+
 DROP FUNCTION insert_and_count;
 DROP FUNCTION do_perform;
 DROP FUNCTION get_max_value;
@@ -117,4 +174,8 @@ DROP FUNCTION sum_all_values;
 DROP FUNCTION sum_range;
 DROP FUNCTION find_first_over;
 DROP FUNCTION process_batch;
+DROP FUNCTION test_exit_shortcircuit;
+DROP FUNCTION test_for_update_compat;
+DROP FUNCTION test_strict_no_rows;
+DROP FUNCTION test_strict_many_rows;
 DROP TABLE plpgsql_test_data;

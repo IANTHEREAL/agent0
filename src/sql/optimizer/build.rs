@@ -6,7 +6,7 @@
 //! The [`BuildContext`] carries pre-resolved table schemas so that operator
 //! construction is a pure, synchronous tree walk (no async catalog lookups).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Result};
 
@@ -43,6 +43,7 @@ pub struct BuildContext {
     /// Pre-loaded row data for tables that don't live in KV storage
     /// (virtual catalog tables, table functions, CTEs with materialized data).
     pub preloaded_rows: HashMap<String, Vec<Row>>,
+    pub correlated_table_functions: HashSet<String>,
 }
 
 impl BuildContext {
@@ -50,6 +51,7 @@ impl BuildContext {
         Self {
             table_schemas: HashMap::new(),
             preloaded_rows: HashMap::new(),
+            correlated_table_functions: HashSet::new(),
         }
     }
 
@@ -147,6 +149,17 @@ impl PhysicalPlan {
                     .get(key)
                     .or_else(|| ctx.table_schemas.get(function_name.as_str()))
                     .ok_or_else(|| anyhow!("Table function schema not found: {}", function_name))?;
+                if ctx.correlated_table_functions.contains(key)
+                    || ctx
+                        .correlated_table_functions
+                        .contains(function_name.as_str())
+                {
+                    return Err(anyhow!(
+                        "table function {}() has correlated arguments referencing an outer query; \
+                         LATERAL table functions are not yet supported",
+                        function_name
+                    ));
+                }
                 let rows = ctx
                     .preloaded_rows
                     .get(key)

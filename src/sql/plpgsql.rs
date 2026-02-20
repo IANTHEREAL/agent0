@@ -164,6 +164,7 @@ enum PlpgsqlStatement {
     SelectInto {
         variables: Vec<String>,
         query: String,
+        strict: bool,
     },
     ForQuery {
         variable: String,
@@ -226,19 +227,19 @@ fn find_matching_end(s: &str) -> Option<usize> {
                 continue;
             }
         }
-        if i + 3 <= bytes.len() && &s_upper[i..i + 3] == "FOR" {
-            if (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
-                && (i + 3 == bytes.len() || !bytes[i + 3].is_ascii_alphanumeric())
-            {
-                depth += 1;
-                i += 3;
-                continue;
-            }
-        }
         if i + 8 <= bytes.len() && &s_upper[i..i + 8] == "END LOOP" {
             if i == 0 || !bytes[i - 1].is_ascii_alphanumeric() {
                 depth -= 1;
                 i += 8;
+                continue;
+            }
+        }
+        if i + 4 <= bytes.len() && &s_upper[i..i + 4] == "LOOP" {
+            if (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+                && (i + 4 == bytes.len() || !bytes[i + 4].is_ascii_alphanumeric())
+            {
+                depth += 1;
+                i += 4;
                 continue;
             }
         }
@@ -446,7 +447,8 @@ fn parse_select_into_statement(
         s[into_pos + 4..].trim()
     };
 
-    if var_part.to_uppercase().starts_with("STRICT") {
+    let strict = var_part.to_uppercase().starts_with("STRICT");
+    if strict {
         var_part = var_part[6..].trim();
     }
 
@@ -461,14 +463,17 @@ fn parse_select_into_statement(
                 return Err(anyhow!("SELECT INTO requires a SELECT expression"));
             }
             let query = if remaining_proj.is_empty() {
-                // SELECT INTO var FROM table  (no extra projection, select all)
                 format!("SELECT * {}", s[from_pos.unwrap()..].trim())
             } else if let Some(fp) = from_pos {
                 format!("SELECT {} {}", remaining_proj, s[fp..].trim())
             } else {
                 format!("SELECT {}", remaining_proj)
             };
-            return Ok(Some(PlpgsqlStatement::SelectInto { variables, query }));
+            return Ok(Some(PlpgsqlStatement::SelectInto {
+                variables,
+                query,
+                strict,
+            }));
         }
     }
 
@@ -492,7 +497,11 @@ fn parse_select_into_statement(
         format!("SELECT {}", projection)
     };
 
-    Ok(Some(PlpgsqlStatement::SelectInto { variables, query }))
+    Ok(Some(PlpgsqlStatement::SelectInto {
+        variables,
+        query,
+        strict,
+    }))
 }
 
 fn split_into_targets(text: &str, declared_vars: &HashSet<String>) -> (Vec<String>, String) {
@@ -995,10 +1004,31 @@ fn execute_statements<'a>(
 
                 PlpgsqlStatement::Sql(sql) => {
                     let expanded = substitute_variables(ctx, sql);
-                    if let Some(exec) = executor {
-                        let stmts = parse_sql(&expanded)?;
-                        for stmt in stmts {
-                            exec.execute_statement_on_txn(
+                    let exec = executor
+                        .ok_or_else(|| anyhow!("SQL statement requires execution context"))?;
+                    let stmts = parse_sql(&expanded)?;
+                    for stmt in stmts {
+                        exec.execute_statement_on_txn(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            &stmt,
+                            None,
+                        )
+                        .await?;
+                    }
+                }
+
+                PlpgsqlStatement::Perform(query) => {
+                    let expanded = substitute_variables(ctx, query);
+                    let select_sql = format!("SELECT {}", expanded);
+                    let exec =
+                        executor.ok_or_else(|| anyhow!("PERFORM requires execution context"))?;
+                    let stmts = parse_sql(&select_sql)?;
+                    for stmt in stmts {
+                        let _ = exec
+                            .execute_statement_on_txn(
                                 txn,
                                 db_id,
                                 sequence_values,
@@ -1007,31 +1037,14 @@ fn execute_statements<'a>(
                                 None,
                             )
                             .await?;
-                        }
                     }
                 }
 
-                PlpgsqlStatement::Perform(query) => {
-                    let expanded = substitute_variables(ctx, query);
-                    let select_sql = format!("SELECT {}", expanded);
-                    if let Some(exec) = executor {
-                        let stmts = parse_sql(&select_sql)?;
-                        for stmt in stmts {
-                            let _ = exec
-                                .execute_statement_on_txn(
-                                    txn,
-                                    db_id,
-                                    sequence_values,
-                                    search_path,
-                                    &stmt,
-                                    None,
-                                )
-                                .await?;
-                        }
-                    }
-                }
-
-                PlpgsqlStatement::SelectInto { variables, query } => {
+                PlpgsqlStatement::SelectInto {
+                    variables,
+                    query,
+                    strict,
+                } => {
                     let expanded = substitute_variables(ctx, query);
                     if let Some(exec) = executor {
                         let stmts = parse_sql(&expanded)?;
@@ -1047,6 +1060,13 @@ fn execute_statements<'a>(
                                 )
                                 .await?;
                             if let ExecuteResult::Select { rows, .. } = result {
+                                let row_count = rows.len();
+                                if *strict && row_count == 0 {
+                                    return Err(anyhow!("query returned no rows"));
+                                }
+                                if *strict && row_count > 1 {
+                                    return Err(anyhow!("query returned more than one row"));
+                                }
                                 if let Some(row) = rows.into_iter().next() {
                                     for (i, var_name) in variables.iter().enumerate() {
                                         let val = row.values.get(i).cloned().unwrap_or(Value::Null);
@@ -1228,9 +1248,16 @@ fn execute_statements<'a>(
                     }
                 }
 
-                PlpgsqlStatement::Exit => set_exit_signal(ctx),
+                PlpgsqlStatement::Exit => {
+                    set_exit_signal(ctx);
+                    return Ok(Value::Null);
+                }
 
                 PlpgsqlStatement::Null => {}
+            }
+
+            if has_exit_signal(ctx) {
+                return Ok(Value::Null);
             }
         }
         Ok(Value::Null)
@@ -1368,6 +1395,12 @@ const EXIT_SIGNAL_VAR: &str = "__tipg_plpgsql_exit_signal__";
 
 fn set_exit_signal(ctx: &mut PlpgsqlContext) {
     ctx.set_var(EXIT_SIGNAL_VAR, Value::Boolean(true));
+}
+
+fn has_exit_signal(ctx: &PlpgsqlContext) -> bool {
+    ctx.variables
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case(EXIT_SIGNAL_VAR) && matches!(v, Value::Boolean(true)))
 }
 
 fn consume_exit_signal(ctx: &mut PlpgsqlContext) -> bool {
