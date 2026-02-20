@@ -23,11 +23,7 @@ use std::task::{Context, Poll};
 
 use super::encode::encode_value;
 use super::errors::sqlstate_for_executor_error;
-use super::params::{
-    count_sql_parameters, find_keyword_outside_strings, infer_parameter_types,
-    replace_placeholders_for_inference, substitute_parameters,
-    substitute_placeholders_outside_strings_and_dollar,
-};
+use super::params::{count_sql_parameters, decode_parameters};
 use super::portal::{
     max_suspended_portal_buffer_rows, max_suspended_portals, on_execute_with_tx_status_fix,
     update_tx_status_after_execution, SuspendedPortalState,
@@ -44,6 +40,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
+
+/// Test-local struct mirroring the deleted type_infer::SourceSchema.
+/// Only used by wildcard tests; production code uses `&[&TableSchema]`.
+struct SourceSchema {
+    alias: String,
+    schema: TableSchema,
+}
 
 #[derive(Default)]
 struct RecordingSink {
@@ -1275,74 +1278,6 @@ fn test_parse_copy_command_many_columns() {
 }
 
 #[test]
-fn test_replace_placeholders_basic() {
-    assert_eq!(
-        replace_placeholders_for_inference("SELECT * FROM users WHERE id = $1"),
-        "SELECT * FROM users WHERE id = 1"
-    );
-    assert_eq!(
-        replace_placeholders_for_inference("SELECT * FROM users WHERE id = $1 AND name = $2"),
-        "SELECT * FROM users WHERE id = 1 AND name = 1"
-    );
-}
-
-#[test]
-fn test_replace_placeholders_preserves_string_literals() {
-    assert_eq!(
-        replace_placeholders_for_inference(
-            "SELECT * FROM users WHERE email = '$100bill@example.com'"
-        ),
-        "SELECT * FROM users WHERE email = '$100bill@example.com'"
-    );
-    assert_eq!(
-        replace_placeholders_for_inference("SELECT '${10}' AS template"),
-        "SELECT '${10}' AS template"
-    );
-    assert_eq!(
-        replace_placeholders_for_inference(
-            "SELECT * FROM t WHERE a = $1 AND b = 'contains $2 inside'"
-        ),
-        "SELECT * FROM t WHERE a = 1 AND b = 'contains $2 inside'"
-    );
-}
-
-#[test]
-fn test_replace_placeholders_preserves_double_quoted_identifiers() {
-    assert_eq!(
-        replace_placeholders_for_inference(r#"SELECT * FROM "table$1" WHERE id = $1"#),
-        r#"SELECT * FROM "table$1" WHERE id = 1"#
-    );
-}
-
-#[test]
-fn test_replace_placeholders_handles_escaped_single_quotes() {
-    assert_eq!(
-        replace_placeholders_for_inference("SELECT 'it''s $1' AS msg, $1 AS v"),
-        "SELECT 'it''s $1' AS msg, 1 AS v"
-    );
-}
-
-#[test]
-fn test_replace_placeholders_preserves_dollar_quoted_strings() {
-    assert_eq!(
-        replace_placeholders_for_inference("SELECT $$ $1 $$ AS body, $1 AS v"),
-        "SELECT $$ $1 $$ AS body, 1 AS v"
-    );
-    assert_eq!(
-        replace_placeholders_for_inference("SELECT $tag$ $1 $tag$ AS body, $1 AS v"),
-        "SELECT $tag$ $1 $tag$ AS body, 1 AS v"
-    );
-}
-
-#[test]
-fn test_replace_placeholders_high_numbers() {
-    assert_eq!(
-        replace_placeholders_for_inference("SELECT $1, $10, $100, $999"),
-        "SELECT 1, 1, 1, 1"
-    );
-}
-
-#[test]
 fn test_count_sql_parameters_ignores_dollar_quoted_strings() {
     assert_eq!(count_sql_parameters("SELECT $$ $99 $$, $1;"), 1);
     assert_eq!(count_sql_parameters("SELECT $tag$ $2 $tag$, $1;"), 1);
@@ -1361,84 +1296,6 @@ fn test_count_sql_parameters_ignores_comments_and_identifier_tokens() {
     assert_eq!(
         count_sql_parameters("SELECT /* outer /* $10 */ inner */ $1;"),
         1
-    );
-}
-
-#[test]
-fn test_find_keyword_outside_strings_ignores_dollar_quoted_strings() {
-    let query = "INSERT INTO t VALUES (1) $$ RETURNING $$ RETURNING id";
-    let pos = find_keyword_outside_strings(query, "RETURNING").unwrap();
-    assert_eq!(pos, query.rfind("RETURNING").unwrap());
-
-    let query = "SELECT $tag$RETURNING$tag$ RETURNING";
-    let pos = find_keyword_outside_strings(query, "RETURNING").unwrap();
-    assert_eq!(pos, query.rfind("RETURNING").unwrap());
-
-    let query = "SELECT RETURNINGX RETURNING";
-    let pos = find_keyword_outside_strings(query, "RETURNING").unwrap();
-    assert_eq!(pos, query.rfind("RETURNING").unwrap());
-}
-
-#[test]
-fn test_substitute_placeholders_preserves_dollar_quoted_strings() {
-    let values = vec!["111".to_string()];
-    assert_eq!(
-        substitute_placeholders_outside_strings_and_dollar(
-            "SELECT $$ $1 $$ AS body, $1 AS v",
-            &values
-        ),
-        "SELECT $$ $1 $$ AS body, 111 AS v"
-    );
-
-    assert_eq!(
-        substitute_placeholders_outside_strings_and_dollar("SELECT 'it''s $1' AS msg, $1", &values),
-        "SELECT 'it''s $1' AS msg, 111"
-    );
-}
-
-#[test]
-fn test_substitute_placeholders_handles_multi_digit_numbers() {
-    let values = (1..=10).map(|i| i.to_string()).collect::<Vec<_>>();
-    assert_eq!(
-        substitute_placeholders_outside_strings_and_dollar("SELECT $10, $1", &values),
-        "SELECT 10, 1"
-    );
-
-    assert_eq!(
-        substitute_placeholders_outside_strings_and_dollar("SELECT '${10}', $1", &values),
-        "SELECT '${10}', 1"
-    );
-
-    assert_eq!(
-        substitute_placeholders_outside_strings_and_dollar("SELECT $$ $10 $$, $10", &values),
-        "SELECT $$ $10 $$, 10"
-    );
-}
-
-#[test]
-fn test_substitute_placeholders_ignores_comments_and_identifier_tokens() {
-    let values = vec!["42".to_string()];
-    assert_eq!(
-        substitute_placeholders_outside_strings_and_dollar("SELECT 1 /* $1 */ , $1;", &values),
-        "SELECT 1 /* $1 */ , 42;"
-    );
-    assert_eq!(
-        substitute_placeholders_outside_strings_and_dollar("SELECT 1 -- $1\n, $1;", &values),
-        "SELECT 1 -- $1\n, 42;"
-    );
-    assert_eq!(
-        substitute_placeholders_outside_strings_and_dollar(
-            "SELECT a$1 FROM t WHERE id = $1;",
-            &values
-        ),
-        "SELECT a$1 FROM t WHERE id = 42;"
-    );
-    assert_eq!(
-        substitute_placeholders_outside_strings_and_dollar(
-            "SELECT /* outer /* $1 */ inner */ $1;",
-            &values
-        ),
-        "SELECT /* outer /* $1 */ inner */ 42;"
     );
 }
 
@@ -1618,77 +1475,7 @@ async fn test_extended_query_notice_respects_client_min_messages() {
     assert!(client.messages.is_empty());
 }
 
-#[test]
-fn test_infer_parameter_types_limit() {
-    let types = infer_parameter_types("SELECT * FROM users LIMIT $1", 1);
-    assert_eq!(types, vec![Type::INT8]);
-}
-
-#[test]
-fn test_infer_parameter_types_offset() {
-    let types = infer_parameter_types("SELECT * FROM users OFFSET $1", 1);
-    assert_eq!(types, vec![Type::INT8]);
-}
-
-#[test]
-fn test_infer_parameter_types_limit_offset() {
-    let types = infer_parameter_types("SELECT * FROM users LIMIT $1 OFFSET $2", 2);
-    assert_eq!(types, vec![Type::INT8, Type::INT8]);
-}
-
-#[test]
-fn test_infer_parameter_types_fetch() {
-    let types = infer_parameter_types("SELECT * FROM users FETCH FIRST $1 ROWS ONLY", 1);
-    assert_eq!(types, vec![Type::INT8]);
-
-    let types = infer_parameter_types("SELECT * FROM users FETCH NEXT $1 ROWS ONLY", 1);
-    assert_eq!(types, vec![Type::INT8]);
-}
-
-#[test]
-fn test_infer_parameter_types_where_clause_defaults_to_text() {
-    let types = infer_parameter_types("SELECT * FROM users WHERE id = $1", 1);
-    assert_eq!(types, vec![Type::TEXT]);
-}
-
-#[test]
-fn test_infer_parameter_types_mixed() {
-    let types = infer_parameter_types("SELECT * FROM users WHERE id = $1 LIMIT $2 OFFSET $3", 3);
-    assert_eq!(types, vec![Type::TEXT, Type::INT8, Type::INT8]);
-}
-
-#[test]
-fn test_infer_parameter_types_preserves_string_literals() {
-    let types = infer_parameter_types("SELECT 'LIMIT $1' FROM users LIMIT $1", 1);
-    assert_eq!(types, vec![Type::INT8]);
-}
-
-#[test]
-fn test_infer_parameter_types_preserves_dollar_quoted() {
-    let types = infer_parameter_types("SELECT $$ LIMIT $1 $$ FROM users LIMIT $1", 1);
-    assert_eq!(types, vec![Type::INT8]);
-}
-
-#[test]
-fn test_infer_parameter_types_case_insensitive() {
-    let types = infer_parameter_types("SELECT * FROM users limit $1", 1);
-    assert_eq!(types, vec![Type::INT8]);
-
-    let types = infer_parameter_types("SELECT * FROM users Offset $1", 1);
-    assert_eq!(types, vec![Type::INT8]);
-}
-
-#[test]
-fn test_infer_parameter_types_no_params() {
-    let types = infer_parameter_types("SELECT * FROM users", 0);
-    assert!(types.is_empty());
-}
-
-#[test]
-fn test_infer_parameter_types_non_ascii_does_not_panic() {
-    let types = infer_parameter_types("SELECT 'ııı' FROM users LIMIT $1", 1);
-    assert_eq!(types, vec![Type::INT8]);
-}
+// ── decode_parameters tests (converted from substitute_parameters) ──────────
 
 /// Helper to create a test PreparedStatement from a SQL string.
 fn test_prepared_stmt(sql: &str) -> PreparedStatement {
@@ -1701,7 +1488,7 @@ fn test_prepared_stmt(sql: &str) -> PreparedStatement {
 }
 
 #[test]
-fn test_substitute_parameters_text_always_quoted() {
+fn test_decode_parameters_text_always_text_value() {
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
         test_prepared_stmt("SELECT $1::text"),
@@ -1714,14 +1501,13 @@ fn test_substitute_parameters_text_always_quoted() {
     portal.parameters = vec![Some(Bytes::from_static(b"001"))];
     portal.result_column_format = Format::UnifiedText;
 
-    assert_eq!(
-        substitute_parameters("SELECT $1::text", &portal).unwrap(),
-        "SELECT '001'::text"
-    );
+    let values = decode_parameters(&portal).unwrap();
+    assert_eq!(values, vec![Some(Value::Text("001".to_string()))]);
 }
 
 #[test]
-fn test_substitute_parameters_unknown_text_format_always_quoted() {
+fn test_decode_parameters_unknown_text_format_text_value() {
+    // Empty parameter_types defaults to TEXT in decode_parameters
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
         test_prepared_stmt("SELECT $1::text"),
@@ -1734,18 +1520,17 @@ fn test_substitute_parameters_unknown_text_format_always_quoted() {
     portal.parameters = vec![Some(Bytes::from_static(b"001"))];
     portal.result_column_format = Format::UnifiedText;
 
-    assert_eq!(
-        substitute_parameters("SELECT $1::text", &portal).unwrap(),
-        "SELECT '001'::text"
-    );
+    let values = decode_parameters(&portal).unwrap();
+    assert_eq!(values, vec![Some(Value::Text("001".to_string()))]);
 }
 
 #[test]
-fn test_substitute_parameters_unknown_binary_int8_with_nul_renders_number() {
+fn test_decode_parameters_int8_binary_decodes_correctly() {
+    // Explicit INT8 type — intent is "binary int8 decoding works"
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
         test_prepared_stmt("SELECT $1"),
-        vec![],
+        vec![Type::INT8],
     ));
     let mut portal: Portal<PreparedStatement> = Portal::default();
     portal.name = "portal".to_string();
@@ -1754,14 +1539,12 @@ fn test_substitute_parameters_unknown_binary_int8_with_nul_renders_number() {
     portal.parameters = vec![Some(Bytes::copy_from_slice(&1i64.to_be_bytes()))];
     portal.result_column_format = Format::UnifiedText;
 
-    assert_eq!(
-        substitute_parameters("SELECT $1", &portal).unwrap(),
-        "SELECT 1"
-    );
+    let values = decode_parameters(&portal).unwrap();
+    assert_eq!(values, vec![Some(Value::Int64(1))]);
 }
 
 #[test]
-fn test_substitute_parameters_escapes_single_quotes() {
+fn test_decode_parameters_escapes_single_quotes_in_text() {
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
         test_prepared_stmt("SELECT $1"),
@@ -1774,14 +1557,12 @@ fn test_substitute_parameters_escapes_single_quotes() {
     portal.parameters = vec![Some(Bytes::from_static(b"O'Reilly"))];
     portal.result_column_format = Format::UnifiedText;
 
-    assert_eq!(
-        substitute_parameters("SELECT $1", &portal).unwrap(),
-        "SELECT 'O''Reilly'"
-    );
+    let values = decode_parameters(&portal).unwrap();
+    assert_eq!(values, vec![Some(Value::Text("O'Reilly".to_string()))]);
 }
 
 #[test]
-fn test_substitute_parameters_int4_text_format_renders_number() {
+fn test_decode_parameters_int4_text_format_renders_int32() {
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
         test_prepared_stmt("SELECT $1"),
@@ -1794,14 +1575,12 @@ fn test_substitute_parameters_int4_text_format_renders_number() {
     portal.parameters = vec![Some(Bytes::from_static(b"42"))];
     portal.result_column_format = Format::UnifiedText;
 
-    assert_eq!(
-        substitute_parameters("SELECT $1", &portal).unwrap(),
-        "SELECT 42"
-    );
+    let values = decode_parameters(&portal).unwrap();
+    assert_eq!(values, vec![Some(Value::Int32(42))]);
 }
 
 #[test]
-fn test_substitute_parameters_int4_text_format_invalid_errors() {
+fn test_decode_parameters_int4_text_format_invalid_errors() {
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
         test_prepared_stmt("SELECT $1"),
@@ -1814,11 +1593,11 @@ fn test_substitute_parameters_int4_text_format_invalid_errors() {
     portal.parameters = vec![Some(Bytes::from_static(b"not-a-number"))];
     portal.result_column_format = Format::UnifiedText;
 
-    assert!(substitute_parameters("SELECT $1", &portal).is_err());
+    assert!(decode_parameters(&portal).is_err());
 }
 
 #[test]
-fn test_substitute_parameters_uuid_binary_format_renders_uuid_literal() {
+fn test_decode_parameters_uuid_binary_format() {
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
         test_prepared_stmt("SELECT $1"),
@@ -1832,14 +1611,12 @@ fn test_substitute_parameters_uuid_binary_format_renders_uuid_literal() {
     portal.parameters = vec![Some(Bytes::copy_from_slice(uuid.as_bytes()))];
     portal.result_column_format = Format::UnifiedText;
 
-    assert_eq!(
-        substitute_parameters("SELECT $1", &portal).unwrap(),
-        "SELECT '550e8400-e29b-41d4-a716-446655440000'::uuid"
-    );
+    let values = decode_parameters(&portal).unwrap();
+    assert_eq!(values, vec![Some(Value::Uuid(*uuid.as_bytes()))]);
 }
 
 #[test]
-fn test_substitute_parameters_date_binary_format_renders_date_literal() {
+fn test_decode_parameters_date_binary_format() {
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
         test_prepared_stmt("SELECT $1"),
@@ -1853,14 +1630,13 @@ fn test_substitute_parameters_date_binary_format_renders_date_literal() {
     portal.parameters = vec![Some(Bytes::copy_from_slice(&1i32.to_be_bytes()))];
     portal.result_column_format = Format::UnifiedText;
 
-    assert_eq!(
-        substitute_parameters("SELECT $1", &portal).unwrap(),
-        "SELECT '2000-01-02'::date"
-    );
+    let values = decode_parameters(&portal).unwrap();
+    // 1 day after 2000-01-01 = day 10958 since Unix epoch (10957 + 1)
+    assert_eq!(values, vec![Some(Value::Date(10958))]);
 }
 
 #[test]
-fn test_substitute_parameters_unsupported_binary_type_returns_feature_not_supported() {
+fn test_decode_parameters_unsupported_binary_type_returns_feature_not_supported() {
     // Use a type that has no binary parameter decoding support (e.g., POINT)
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
@@ -1874,7 +1650,7 @@ fn test_substitute_parameters_unsupported_binary_type_returns_feature_not_suppor
     portal.parameters = vec![Some(Bytes::from_static(b"\x00\x00"))];
     portal.result_column_format = Format::UnifiedText;
 
-    let err = substitute_parameters("SELECT $1", &portal).unwrap_err();
+    let err = decode_parameters(&portal).unwrap_err();
     match err {
         PgWireError::UserError(info) => {
             assert_eq!(info.code, "0A000");
@@ -1885,7 +1661,7 @@ fn test_substitute_parameters_unsupported_binary_type_returns_feature_not_suppor
 }
 
 #[test]
-fn test_substitute_parameters_jsonb_binary_adds_cast() {
+fn test_decode_parameters_jsonb_binary() {
     // JSONB binary: version byte (0x01) + JSON text
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
@@ -1899,12 +1675,12 @@ fn test_substitute_parameters_jsonb_binary_adds_cast() {
     portal.parameters = vec![Some(Bytes::from_static(b"\x01{\"a\":1}"))];
     portal.result_column_format = Format::UnifiedText;
 
-    let result = substitute_parameters("SELECT $1", &portal).unwrap();
-    assert_eq!(result, "SELECT '{\"a\":1}'::jsonb");
+    let values = decode_parameters(&portal).unwrap();
+    assert_eq!(values, vec![Some(Value::Jsonb("{\"a\":1}".to_string()))]);
 }
 
 #[test]
-fn test_substitute_parameters_jsonb_binary_invalid_version_errors() {
+fn test_decode_parameters_jsonb_binary_invalid_version_errors() {
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
         test_prepared_stmt("SELECT $1"),
@@ -1917,7 +1693,7 @@ fn test_substitute_parameters_jsonb_binary_invalid_version_errors() {
     portal.parameters = vec![Some(Bytes::from_static(b"\x02{\"a\":1}"))];
     portal.result_column_format = Format::UnifiedText;
 
-    let err = substitute_parameters("SELECT $1", &portal).unwrap_err();
+    let err = decode_parameters(&portal).unwrap_err();
     match err {
         PgWireError::UserError(info) => {
             assert_eq!(info.code, "22P02");
@@ -1928,6 +1704,8 @@ fn test_substitute_parameters_jsonb_binary_invalid_version_errors() {
         other => panic!("unexpected error: {other:?}"),
     }
 }
+
+// ── Encode value tests ──────────────────────────────────────────────────────
 
 #[test]
 fn test_encode_value_timestamp_negative_millis() {
@@ -2023,6 +1801,8 @@ fn test_encode_value_int64_as_timestamp_negative_millis() {
     );
 }
 
+// ── fs9 infer tests (import directly from crate::sql::table_functions) ──────
+
 #[tokio::test]
 async fn infer_fs9_schema_directory_mode() {
     let dir = unique_fs9_infer_base("dir");
@@ -2032,7 +1812,7 @@ async fn infer_fs9_schema_directory_mode() {
     let sql = format!("SELECT * FROM extensions.fs9('{path}')");
     let args = extract_fs9_args(&sql);
 
-    let schema = infer_fs9_table_function_schema(&args, true)
+    let schema = crate::sql::table_functions::infer_fs9_table_function_schema(&args, true)
         .await
         .expect("schema");
     let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -2050,7 +1830,7 @@ async fn infer_fs9_schema_directory_via_stat() {
     let sql = format!("SELECT * FROM extensions.fs9('{path}')");
     let args = extract_fs9_args(&sql);
 
-    let schema = infer_fs9_table_function_schema(&args, true)
+    let schema = crate::sql::table_functions::infer_fs9_table_function_schema(&args, true)
         .await
         .expect("schema");
     let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -2069,7 +1849,7 @@ async fn infer_fs9_schema_csv_headers() {
     let sql = format!("SELECT * FROM extensions.fs9('{path}')");
     let args = extract_fs9_args(&sql);
 
-    let schema = infer_fs9_table_function_schema(&args, true)
+    let schema = crate::sql::table_functions::infer_fs9_table_function_schema(&args, true)
         .await
         .expect("schema");
     let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -2090,7 +1870,7 @@ async fn infer_fs9_schema_jsonl_is_jsonb() {
     let sql = format!("SELECT * FROM extensions.fs9('{path}')");
     let args = extract_fs9_args(&sql);
 
-    let schema = infer_fs9_table_function_schema(&args, true)
+    let schema = crate::sql::table_functions::infer_fs9_table_function_schema(&args, true)
         .await
         .expect("schema");
     let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -2110,7 +1890,7 @@ async fn infer_fs9_schema_glob_uses_first_match() {
     let sql = format!("SELECT * FROM extensions.fs9('{pattern}')");
     let args = extract_fs9_args(&sql);
 
-    let schema = infer_fs9_table_function_schema(&args, true)
+    let schema = crate::sql::table_functions::infer_fs9_table_function_schema(&args, true)
         .await
         .expect("schema");
     let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -2129,7 +1909,7 @@ async fn infer_fs9_schema_non_superuser_is_fallback() {
     let sql = format!("SELECT * FROM extensions.fs9('{path}')");
     let args = extract_fs9_args(&sql);
 
-    let schema = infer_fs9_table_function_schema(&args, false)
+    let schema = crate::sql::table_functions::infer_fs9_table_function_schema(&args, false)
         .await
         .expect("schema");
     let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -2139,11 +1919,13 @@ async fn infer_fs9_schema_non_superuser_is_fallback() {
     cleanup_dir(&dir);
 }
 
+// ── Deep nesting guard for count_sql_parameters ─────────────────────────────
+
 #[test]
 fn test_deep_nested_subquery_parameter_scanning() {
     // Regression guard: a deeply-nested subquery must not overflow the stack
-    // in count_sql_parameters or infer_parameter_types. Both are iterative
-    // scanners, but this test locks in the guarantee.
+    // in count_sql_parameters. It is an iterative scanner, but this test
+    // locks in the guarantee.
     let depth = 50;
     let mut sql = String::from("SELECT $1::int AS v");
     for i in 1..=depth {
@@ -2151,21 +1933,146 @@ fn test_deep_nested_subquery_parameter_scanning() {
     }
 
     assert_eq!(count_sql_parameters(&sql), 1);
-    let types = infer_parameter_types(&sql, 1);
-    assert_eq!(types.len(), 1);
-    // $1 is not preceded by LIMIT/OFFSET/FETCH, so it defaults to TEXT.
-    assert_eq!(types[0], Type::TEXT);
+}
+
+// ── Regression tests: on_parse invariants ───────────────────────────────────
+
+#[test]
+fn test_is_data_statement_identifies_select() {
+    use super::dynamic::is_data_statement;
+    assert!(is_data_statement("SELECT 1"));
+    assert!(is_data_statement("  SELECT\n1"));
+    assert!(is_data_statement(
+        "WITH cte AS (SELECT 1) SELECT * FROM cte"
+    ));
+    assert!(is_data_statement("(SELECT 1)"));
 }
 
 #[test]
-fn test_replace_placeholders_deep_nesting() {
-    let depth = 50;
-    let mut sql = String::from("SELECT $1::int AS v");
-    for i in 1..=depth {
-        sql = format!("SELECT * FROM ({sql}) t{i}");
-    }
+fn test_is_data_statement_identifies_dml() {
+    use super::dynamic::is_data_statement;
+    assert!(is_data_statement("INSERT INTO t VALUES (1)"));
+    assert!(is_data_statement("UPDATE t SET x = 1"));
+    assert!(is_data_statement("DELETE FROM t WHERE id = 1"));
+}
 
-    let replaced = replace_placeholders_for_inference(&sql);
-    assert!(!replaced.contains("$1"));
-    assert!(replaced.contains("1::int"));
+#[test]
+fn test_is_data_statement_rejects_utility() {
+    use super::dynamic::is_data_statement;
+    assert!(!is_data_statement("CREATE TABLE t (id INT)"));
+    assert!(!is_data_statement("SET search_path TO public"));
+    assert!(!is_data_statement("SHOW server_version"));
+    assert!(!is_data_statement("DROP TABLE IF EXISTS t"));
+    assert!(!is_data_statement("EXPLAIN SELECT 1"));
+}
+
+#[test]
+fn test_is_data_statement_returns_false_for_unparseable() {
+    use super::dynamic::is_data_statement;
+    assert!(!is_data_statement("SELCT 1"));
+    assert!(!is_data_statement(""));
+}
+
+#[test]
+fn test_reject_unanalyzed_data_statement_returns_xx000() {
+    use super::dynamic::reject_unanalyzed_if_needed;
+    let err = reject_unanalyzed_if_needed("SELECT 1", 0, "test reason");
+    assert!(err.is_some());
+    match err.unwrap() {
+        PgWireError::UserError(info) => {
+            assert_eq!(info.code, "XX000");
+            assert!(info.message.contains("cannot describe data statement"));
+            assert!(info.message.contains("test reason"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn test_reject_unanalyzed_data_statement_with_params_still_xx000() {
+    // Per feedback #1: data statement check takes priority over param check
+    use super::dynamic::reject_unanalyzed_if_needed;
+    let err = reject_unanalyzed_if_needed("SELECT $1", 1, "infra failure");
+    assert!(err.is_some());
+    match err.unwrap() {
+        PgWireError::UserError(info) => {
+            assert_eq!(info.code, "XX000");
+            assert!(info.message.contains("cannot describe data statement"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn test_reject_unanalyzed_utility_with_params_returns_42p02() {
+    use super::dynamic::reject_unanalyzed_if_needed;
+    let err = reject_unanalyzed_if_needed("SET search_path TO $1", 1, "test reason");
+    assert!(err.is_some());
+    match err.unwrap() {
+        PgWireError::UserError(info) => {
+            assert_eq!(info.code, "42P02");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn test_reject_unanalyzed_utility_no_params_returns_none() {
+    use super::dynamic::reject_unanalyzed_if_needed;
+    assert!(reject_unanalyzed_if_needed("SET search_path TO public", 0, "test").is_none());
+    assert!(reject_unanalyzed_if_needed("SHOW server_version", 0, "test").is_none());
+    assert!(reject_unanalyzed_if_needed("CREATE TABLE t (id INT)", 0, "test").is_none());
+}
+
+// ── Regression tests: static utility Describe ───────────────────────────────
+
+#[test]
+fn test_utility_describe_show_variable() {
+    use super::dynamic::utility_describe_fields;
+    let fields = utility_describe_fields("SHOW server_version");
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].name(), "server_version");
+    assert_eq!(fields[0].datatype(), &Type::TEXT);
+}
+
+#[test]
+fn test_utility_describe_show_search_path() {
+    use super::dynamic::utility_describe_fields;
+    let fields = utility_describe_fields("SHOW search_path");
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].name(), "search_path");
+    assert_eq!(fields[0].datatype(), &Type::TEXT);
+}
+
+#[test]
+fn test_utility_describe_show_tables() {
+    use super::dynamic::utility_describe_fields;
+    let fields = utility_describe_fields("SHOW TABLES");
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].name(), "table_name");
+    assert_eq!(fields[0].datatype(), &Type::TEXT);
+}
+
+#[test]
+fn test_utility_describe_explain() {
+    use super::dynamic::utility_describe_fields;
+    let fields = utility_describe_fields("EXPLAIN SELECT 1");
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].name(), "QUERY PLAN");
+    assert_eq!(fields[0].datatype(), &Type::TEXT);
+}
+
+#[test]
+fn test_utility_describe_ddl_returns_empty() {
+    use super::dynamic::utility_describe_fields;
+    assert!(utility_describe_fields("CREATE TABLE t (id INT)").is_empty());
+    assert!(utility_describe_fields("SET search_path TO public").is_empty());
+    assert!(utility_describe_fields("DROP TABLE IF EXISTS t").is_empty());
+}
+
+#[test]
+fn test_utility_describe_unparseable_returns_empty() {
+    use super::dynamic::utility_describe_fields;
+    assert!(utility_describe_fields("SELCT 1").is_empty());
+    assert!(utility_describe_fields("").is_empty());
 }

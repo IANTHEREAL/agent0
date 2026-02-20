@@ -1,19 +1,20 @@
 # Protocol Module
 
-PostgreSQL wire protocol via pgwire. ~2300 lines.
+PostgreSQL wire protocol via pgwire.
 
 ## Files
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `handler.rs` | 2250 | pgwire handlers, type mapping |
-| `mod.rs` | 50 | Exports |
+| `handler/dynamic.rs` | ~2000 | pgwire handlers, type mapping, on_parse analysis |
+| `handler/mod.rs` | ~280 | Exports, utility functions |
+| `handler/params/` | | Parameter counting + decoding |
+| `handler/encode/` | | Value encoding, type mapping |
 
 ## Handlers
 
 - `DynamicPgHandler` - Production handler (per-connection TiKV client)
 - `DynamicHandlerFactory` - Creates handlers with keyspace from username
-- `PgHandler` - Legacy static handler (deprecated, kept for compatibility)
 
 ## Protocol Flows
 
@@ -24,29 +25,37 @@ Query("SELECT ...") → do_query() → executor.execute() → result_to_response
 
 **Extended Query (ORMs):**
 ```
-Parse → Bind → Describe → Execute
-                  ↓
-        infer_result_fields_from_query() → PostgreSQL OIDs
+Parse → Analyze → Bind → Describe → Execute
+                           ↓
+             AnalyzedQuery output_schema → PostgreSQL OIDs
 ```
+
+For data statements (SELECT/INSERT/UPDATE/DELETE), `on_parse` runs the Analyzer
+to produce typed IR with `output_schema`. Describe reads this schema directly.
+
+For utility statements (DDL/SET/SHOW), `on_parse` keeps `RawSqlUtility` and
+Describe uses `utility_describe_fields()` for static schema mapping.
 
 ## Where to Look
 
 | Task | Location |
 |------|----------|
-| Add PostgreSQL type | `datatype_to_pgtype()` |
-| Fix type OID | `infer_result_fields_from_query()` |
-| Change value encoding | `encode_value()` |
-| Fix RETURNING types | `find_keyword_outside_strings()` |
+| Add PostgreSQL type | `encode/types.rs` → `datatype_to_pgtype()` |
+| Fix type OID | Analyzer `output_schema` (analyzer/query.rs) |
+| Change value encoding | `encode/result.rs` → `encode_value()` |
+| Fix parameter decoding | `params/decode.rs` → `decode_parameters()` |
 
 ## Key Functions
 
 ```
-find_keyword_outside_strings()    # Find keyword not in string literals
-infer_result_fields_from_query()  # Column type inference for Describe
-substitute_parameters()           # Replace $1, $2 with values
-result_to_response()              # ExecuteResult → pgwire Response
-datatype_to_pgtype()              # Internal type → pg Type
-parse_tenant_username()           # "tenant.user" → (keyspace, user)
+count_sql_parameters()       # Count $N placeholders in SQL
+decode_parameters()          # Wire bytes → Value (Bind phase)
+utility_describe_fields()    # Static Describe for SHOW/EXPLAIN
+is_data_statement()          # AST-based SELECT/DML classification
+reject_unanalyzed_if_needed()# Guard: reject unanalyzed data SQL
+result_to_response()         # ExecuteResult → pgwire Response
+datatype_to_pgtype()         # Internal type → pg Type
+parse_tenant_username()      # "tenant.user" → (keyspace, user)
 ```
 
 ## PostgreSQL Type OIDs
@@ -72,9 +81,8 @@ Username format: `tenant.user` or `tenant:user`
 ## Common Issues
 
 **Wrong OIDs (integers as strings):**
-- Check `infer_result_fields_from_query()`
+- Check Analyzer `output_schema` for correct DataType
 - Check `column_types` in executor result
 
-**RETURNING parse errors:**
-- Use `find_keyword_outside_strings()` for keyword search
-- Handle quoted table names
+**Describe returns empty for SHOW/EXPLAIN:**
+- Check `utility_describe_fields()` in dynamic.rs

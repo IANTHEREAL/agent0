@@ -13,11 +13,10 @@ use super::prepared::{PreparedExec, PreparedStatement};
 use super::query_parser::strip_leading_whitespace_and_comments;
 use super::tenant::parse_tenant_username;
 use super::{
-    client_allows_notice, infer_result_fields_from_query_ast, parse_startup_options,
-    resolve_copy_columns, rollback_autocommit_or_mark_failed,
-    send_notices_and_get_last_response_with_format, stub_describe_field, CopyContext,
-    PgServerParameterProvider, TipgQueryParser, CONNECTION_ID_COUNTER, METADATA_ACTUAL_USER,
-    METADATA_AUTH_IS_SUPERUSER, METADATA_KEYSPACE,
+    client_allows_notice, parse_startup_options, resolve_copy_columns,
+    rollback_autocommit_or_mark_failed, send_notices_and_get_last_response_with_format,
+    CopyContext, PgServerParameterProvider, TipgQueryParser, CONNECTION_ID_COUNTER,
+    METADATA_ACTUAL_USER, METADATA_AUTH_IS_SUPERUSER, METADATA_KEYSPACE,
 };
 use crate::auth::{AuthManager, Privilege};
 use crate::config;
@@ -36,7 +35,8 @@ use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
-    CopyResponse, DescribePortalResponse, DescribeStatementResponse, FieldInfo, Response,
+    CopyResponse, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
+    Response,
 };
 use pgwire::api::stmt::StoredStatement;
 use pgwire::api::store::PortalStore;
@@ -58,6 +58,105 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
 use tracing::{debug, error, info, warn};
+
+/// Returns true for SELECT/INSERT/UPDATE/DELETE — statements that require
+/// Analyzer output for correct Describe schema.  Uses parse_sql for
+/// precise AST classification (handles SELECT\n, WITH\t, etc.).
+pub(super) fn is_data_statement(sql: &str) -> bool {
+    match crate::sql::parse_sql(sql) {
+        Ok(stmts) if !stmts.is_empty() => matches!(
+            &stmts[0],
+            Statement::Query(_)
+                | Statement::Insert { .. }
+                | Statement::Update { .. }
+                | Statement::Delete { .. }
+        ),
+        _ => false, // unparseable → accepted by should_accept_sql_without_sqlparser → utility
+    }
+}
+
+/// Reject RawSqlUtility that should have been analyzed.
+/// Check order: data statement first (XX000 with infra failure reason),
+/// then param_count > 0 (42P02 for utility + params).
+pub(super) fn reject_unanalyzed_if_needed(
+    sql: &str,
+    param_count: usize,
+    reason: &str,
+) -> Option<PgWireError> {
+    if is_data_statement(sql) {
+        Some(PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "XX000".to_string(),
+            format!("cannot describe data statement: {}", reason),
+        ))))
+    } else if param_count > 0 {
+        let err: anyhow::Error = SqlError::InvalidParameterUsage {
+            index: 1,
+            context: "utility statements do not support parameters".into(),
+        }
+        .into();
+        Some(PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            sqlstate_for_executor_error(&err).to_string(),
+            err.to_string(),
+        ))))
+    } else {
+        None // genuine utility, no params — safe as RawSqlUtility
+    }
+}
+
+/// Static Describe schema for known row-producing utility statements.
+/// Uses AST classification — no heuristic inference.
+pub(super) fn utility_describe_fields(sql: &str) -> Vec<FieldInfo> {
+    let stmts = match crate::sql::parse_sql(sql) {
+        Ok(s) if !s.is_empty() => s,
+        _ => return vec![],
+    };
+    match &stmts[0] {
+        Statement::ShowVariable { variable } => {
+            // Mirror execution: dispatch.rs normalizes idents (quoted preserved,
+            // unquoted lowercased), joins with ".", then lowercases the result.
+            let name = variable
+                .iter()
+                .map(|i| {
+                    if i.quote_style.is_some() {
+                        i.value.clone()
+                    } else {
+                        i.value.to_lowercase()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(".")
+                .to_lowercase();
+            vec![FieldInfo::new(
+                name,
+                None,
+                None,
+                Type::TEXT,
+                FieldFormat::Text,
+            )]
+        }
+        Statement::ShowTables { .. } => {
+            vec![FieldInfo::new(
+                "table_name".to_string(),
+                None,
+                None,
+                Type::TEXT,
+                FieldFormat::Text,
+            )]
+        }
+        Statement::Explain { .. } => {
+            vec![FieldInfo::new(
+                "QUERY PLAN".to_string(),
+                None,
+                None,
+                Type::TEXT,
+                FieldFormat::Text,
+            )]
+        }
+        _ => vec![], // DDL/SET/etc — no rows
+    }
+}
 
 pub struct DynamicPgHandler {
     client_pool: Option<Arc<TikvClientPool>>,
@@ -94,30 +193,6 @@ impl DynamicPgHandler {
             connection_id: CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             server_config,
         }
-    }
-
-    async fn infer_result_fields_from_query(&self, query: &str) -> Vec<FieldInfo> {
-        // Get the executor if initialized
-        let executor = match self.executor.get() {
-            Some(exec) => exec,
-            None => {
-                // Executor not initialized yet, return stub
-                return stub_describe_field();
-            }
-        };
-
-        // Get session lock
-        let mut session_guard = self.session.lock().await;
-
-        // Check if session exists
-        if session_guard.is_none() {
-            // No session yet, return stub
-            return stub_describe_field();
-        }
-
-        let store = executor.store();
-        let session = session_guard.as_mut().unwrap();
-        infer_result_fields_from_query_ast(&store, session, query).await
     }
 
     async fn init_executor(
@@ -1532,7 +1607,14 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                         session.search_path().to_vec(),
                     ),
                     None => {
-                        // No session yet — keep RawSqlUtility
+                        // No session yet — reject data/parameterized SQL
+                        if let Some(err) = reject_unanalyzed_if_needed(
+                            &stored.statement.sql,
+                            param_count,
+                            "session not available",
+                        ) {
+                            return Err(err);
+                        }
                         client.portal_store().put_statement(Arc::new(stored))?;
                         client
                             .send(PgWireBackendMessage::ParseComplete(
@@ -1614,8 +1696,8 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                                 }
                             }
                         }
-                        Err(e) if param_count > 0 => {
-                            // Can't type params without analysis — surface error
+                        Err(e) if param_count > 0 || is_data_statement(&stored.statement.sql) => {
+                            // Data statements and parameterized statements must be analyzed.
                             let _ = txn.rollback().await;
                             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                                 "ERROR".to_string(),
@@ -1624,14 +1706,34 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                             ))));
                         }
                         Err(_) => {
-                            // Non-analyzable, no params — keep RawSqlUtility
+                            // Utility, no params — keep RawSqlUtility
                         }
                     }
                     let _ = txn.rollback().await; // read-only, discard
                 }
-                Err(_) => {
-                    // Can't begin txn — keep RawSqlUtility
+                Err(e) => {
+                    // Can't begin txn — reject data/parameterized SQL
+                    if let Some(err) = reject_unanalyzed_if_needed(
+                        &stored.statement.sql,
+                        param_count,
+                        &format!("failed to begin catalog transaction: {}", e),
+                    ) {
+                        return Err(err);
+                    }
+                    // Utility, no params — keep RawSqlUtility
                 }
+            }
+        }
+
+        // Belt-and-suspenders: catch any future code path that produces
+        // unanalyzed data SQL or parameterized utility SQL.
+        if matches!(stored.statement.exec, PreparedExec::RawSqlUtility) {
+            if let Some(err) = reject_unanalyzed_if_needed(
+                &stored.statement.sql,
+                param_count,
+                "analysis was not performed",
+            ) {
+                return Err(err);
             }
         }
 
@@ -1900,18 +2002,16 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                         None,
                         None,
                         datatype_to_pgtype(Some(dt)),
-                        pgwire::api::results::FieldFormat::Text,
+                        FieldFormat::Text,
                     )
                 })
                 .collect();
             return Ok(DescribeStatementResponse::new(param_types, fields));
         }
 
-        // Raw SQL utility path: Parse-time analysis intentionally did not produce
-        // typed IR, so Describe is best-effort schema inference over the original SQL.
-        // Parameter types remain whatever Parse provided (normally empty for utilities).
+        // RawSqlUtility: use static utility schema (no heuristic inference).
         let param_types = stmt.parameter_types.clone();
-        let fields = self.infer_result_fields_from_query(&prepared.sql).await;
+        let fields = utility_describe_fields(&prepared.sql);
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -1941,10 +2041,8 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             return Ok(DescribePortalResponse::new(fields));
         }
 
-        // Fallback for RawSqlUtility: no params (Fix 4 rejects params at Parse)
-        let final_query = prepared.sql.clone();
-        let fields = self.infer_result_fields_from_query(&final_query).await;
-
+        // RawSqlUtility: use static utility schema
+        let fields = utility_describe_fields(&prepared.sql);
         let fields: Vec<FieldInfo> = fields
             .into_iter()
             .enumerate()

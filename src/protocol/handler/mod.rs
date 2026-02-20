@@ -27,8 +27,6 @@ use sqlparser::ast::{
 use std::collections::HashMap;
 #[allow(unused_imports)]
 use std::sync::Arc;
-#[allow(unused_imports)]
-use tikv_client::Transaction;
 
 mod copy;
 mod dynamic;
@@ -38,22 +36,11 @@ mod params;
 mod portal;
 mod prepared;
 mod query_parser;
-mod schema_resolve;
 mod server_params;
 mod tenant;
-mod type_infer;
-mod view_infer;
 
 #[allow(unused_imports)] // re-exported for tests (via `use super::*`)
 use encode::{datatype_to_pgtype, result_to_response, result_to_response_with_format};
-
-// Re-export items moved to sub-modules so that `use super::*` in tests/dynamic still works.
-use type_infer::{infer_result_fields_from_query_ast, stub_describe_field};
-// Re-export SourceSchema for tests (used via `use super::*`).
-#[cfg(test)]
-pub(self) use type_infer::infer_fs9_table_function_schema;
-#[allow(unused_imports)] // used by dynamic.rs via `use super::*`
-pub(self) use type_infer::SourceSchema;
 
 pub use dynamic::DynamicHandlerFactory;
 #[allow(unused_imports)]
