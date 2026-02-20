@@ -415,6 +415,23 @@ pub struct ClaimResponse {
     pub claimed: bool,
 }
 
+#[derive(Deserialize)]
+pub struct CreateTokenRequest {
+    /// Optional name for the token (default: "api-key")
+    pub name: Option<String>,
+    /// Optional expiration in days (default: 365)
+    pub expires_in_days: Option<u32>,
+}
+
+#[derive(Serialize)]
+pub struct CreateTokenResponse {
+    pub id: String,
+    pub name: String,
+    pub token: String,
+    pub expires_at: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Serialize)]
 pub struct DatabaseResponse {
     pub id: String,

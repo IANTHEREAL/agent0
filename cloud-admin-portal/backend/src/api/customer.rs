@@ -28,7 +28,7 @@ pub fn router() -> Router<AppState> {
         .route("/login", post(login))
         .route("/claim", post(claim_account))
         .route("/me", get(me))
-        .route("/tokens", get(list_tokens))
+        .route("/tokens", get(list_tokens).post(create_token))
         .route("/tokens/:token_id", delete(revoke_token))
         .route("/databases", post(create_database).get(list_databases))
         .route(
@@ -516,6 +516,63 @@ pub async fn list_tokens(
         })
         .collect();
     Ok(Json(responses))
+}
+
+// ── POST /tokens ─────────────────────────────────────────────────
+
+pub async fn create_token(
+    State(state): State<AppState>,
+    auth: CustomerAuth,
+    Json(req): Json<CreateTokenRequest>,
+) -> Result<(StatusCode, Json<CreateTokenResponse>), AppError> {
+    use rand::RngCore;
+
+    let name = req.name.unwrap_or_else(|| "api-key".to_string());
+    let expires_in_days = req.expires_in_days.unwrap_or(365);
+
+    // Generate token
+    let mut token_bytes = [0u8; 64];
+    rand::thread_rng().fill_bytes(&mut token_bytes);
+    let token = token_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    // Hash for storage
+    let hash_bytes = Sha256::digest(token.as_bytes());
+    let token_hash = hash_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    // Calculate expiration
+    let now = chrono::Utc::now();
+    let expires_at = now + chrono::Duration::days(expires_in_days as i64);
+    let expires_at_str = expires_at.to_rfc3339();
+    let created_at_str = now.to_rfc3339();
+
+    let token_id = uuid::Uuid::new_v4().to_string();
+
+    db::create_customer_token(
+        &state.db,
+        &token_id,
+        &auth.customer_id,
+        &token_hash,
+        &name,
+        &expires_at_str,
+    )
+    .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateTokenResponse {
+            id: token_id,
+            name,
+            token,
+            expires_at: Some(expires_at_str),
+            created_at: created_at_str,
+        }),
+    ))
 }
 
 // ── DELETE /tokens/:token_id ─────────────────────────────────────
