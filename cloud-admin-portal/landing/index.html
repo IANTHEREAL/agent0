@@ -640,6 +640,11 @@
           <h3>Dump &amp; seed</h3>
           <p>Export schemas and data as SQL. Seed databases from files for reproducible environments.</p>
         </div>
+        <div class="feature">
+          <div class="feature-icon">&#128193;</div>
+          <h3>Cloud filesystem</h3>
+          <p>Read, write, and manage files per database via the SDK or interactive shell. Built for RAG pipelines and file-driven workflows.</p>
+        </div>
       </div>
     </div>
   </section>
@@ -682,6 +687,14 @@
         <div class="cmd-card">
           <code>db9 db connect &lt;id&gt;</code>
           <p>Get connection string for psql</p>
+        </div>
+        <div class="cmd-card">
+          <code>db9 fs sh &lt;id&gt;</code>
+          <p>Interactive filesystem shell</p>
+        </div>
+        <div class="cmd-card">
+          <code>db9 fs cp local.txt &lt;id&gt;:/data/</code>
+          <p>Upload files to cloud filesystem</p>
         </div>
       </div>
     </div>
