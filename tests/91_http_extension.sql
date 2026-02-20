@@ -58,3 +58,68 @@ SELECT (SELECT status FROM extensions.http_get('https://httpbin.org/get')) AS su
 SELECT 
     (SELECT status FROM extensions.http_get('https://httpbin.org/status/200')) AS status_200,
     (SELECT status FROM extensions.http_get('https://httpbin.org/status/201')) AS status_201;
+
+-- Custom headers: pgsql-http array format
+SELECT status,
+       content::jsonb -> 'headers' ->> 'X-Test-Header' AS test_header
+FROM extensions.http_get(
+    'https://httpbin.org/get',
+    '[{"field":"X-Test-Header","value":"hello-from-pgtikv"}]'
+);
+
+-- Custom headers: object shorthand format
+SELECT status,
+       content::jsonb -> 'headers' ->> 'Authorization' AS auth_header
+FROM extensions.http_get(
+    'https://httpbin.org/get',
+    '{"Authorization":"Bearer test-token-123"}'
+);
+
+-- Custom headers on http_post
+SELECT status,
+       content::jsonb -> 'headers' ->> 'X-Api-Key' AS api_key
+FROM extensions.http_post(
+    'https://httpbin.org/post',
+    '{"data":"test"}',
+    'application/json',
+    '{"X-Api-Key":"sk-test-key"}'
+);
+
+-- Custom headers on http_put
+SELECT status,
+       content::jsonb -> 'headers' ->> 'X-Put-Header' AS put_header
+FROM extensions.http_put(
+    'https://httpbin.org/put',
+    '{"data":"update"}',
+    'application/json',
+    '[{"field":"X-Put-Header","value":"put-value"}]'
+);
+
+-- Custom headers on http_delete
+SELECT status,
+       content::jsonb -> 'headers' ->> 'X-Delete-Token' AS del_token
+FROM extensions.http_delete(
+    'https://httpbin.org/delete',
+    '{"X-Delete-Token":"del-123"}'
+);
+
+-- Universal http() function: GET
+SELECT status,
+       content::jsonb -> 'headers' ->> 'X-Universal' AS universal_hdr
+FROM extensions.http(
+    'GET',
+    'https://httpbin.org/get',
+    '{"X-Universal":"works"}'
+);
+
+-- Universal http() function: POST with body
+SELECT status,
+       content::jsonb -> 'json' ->> 'msg' AS msg,
+       content::jsonb -> 'headers' ->> 'X-Custom' AS custom_hdr
+FROM extensions.http(
+    'POST',
+    'https://httpbin.org/post',
+    '{"X-Custom":"via-universal"}',
+    'application/json',
+    '{"msg":"universal-post"}'
+);

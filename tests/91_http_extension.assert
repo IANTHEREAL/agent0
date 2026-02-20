@@ -26,3 +26,17 @@ subquery_status
 200
 status_200|status_201
 200|201
+status|test_header
+200|hello-from-pgtikv
+status|auth_header
+200|Bearer test-token-123
+status|api_key
+200|sk-test-key
+status|put_header
+200|put-value
+status|del_token
+200|del-123
+status|universal_hdr
+200|works
+status|msg|custom_hdr
+200|universal-post|via-universal

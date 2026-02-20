@@ -164,33 +164,57 @@ impl Executor {
             }
         }
 
+        fn extract_optional_headers(args: &[FunctionArg], idx: usize) -> Result<Option<String>> {
+            if idx >= args.len() {
+                return Ok(None);
+            }
+            let val = eval_const_ast_expr(extract_expr_arg(&args[idx])?)?;
+            match val {
+                Value::Null => Ok(None),
+                Value::Text(s) | Value::Jsonb(s) => Ok(Some(s)),
+                other => Err(anyhow!(
+                    "http: headers must be JSONB, got {}",
+                    other.data_type().unwrap_or(crate::types::DataType::Text)
+                )),
+            }
+        }
+
         let func_upper = func_name.to_ascii_uppercase();
         let http_call = match func_upper.as_str() {
             "HTTP_GET" => {
-                if args.len() != 1 {
-                    return Err(anyhow!("http_get(url text) requires 1 argument"));
+                if args.is_empty() || args.len() > 2 {
+                    return Err(anyhow!(
+                        "http_get(url text [, headers jsonb]) requires 1-2 arguments"
+                    ));
                 }
                 let url = expect_text(eval_const_ast_expr(extract_expr_arg(&args[0])?)?, "url")?;
-                Some(HttpTableFunctionCall::Get { url })
+                let headers = extract_optional_headers(args, 1)?;
+                Some(HttpTableFunctionCall::Get { url, headers })
             }
             "HTTP_HEAD" => {
-                if args.len() != 1 {
-                    return Err(anyhow!("http_head(url text) requires 1 argument"));
+                if args.is_empty() || args.len() > 2 {
+                    return Err(anyhow!(
+                        "http_head(url text [, headers jsonb]) requires 1-2 arguments"
+                    ));
                 }
                 let url = expect_text(eval_const_ast_expr(extract_expr_arg(&args[0])?)?, "url")?;
-                Some(HttpTableFunctionCall::Head { url })
+                let headers = extract_optional_headers(args, 1)?;
+                Some(HttpTableFunctionCall::Head { url, headers })
             }
             "HTTP_DELETE" => {
-                if args.len() != 1 {
-                    return Err(anyhow!("http_delete(url text) requires 1 argument"));
+                if args.is_empty() || args.len() > 2 {
+                    return Err(anyhow!(
+                        "http_delete(url text [, headers jsonb]) requires 1-2 arguments"
+                    ));
                 }
                 let url = expect_text(eval_const_ast_expr(extract_expr_arg(&args[0])?)?, "url")?;
-                Some(HttpTableFunctionCall::Delete { url })
+                let headers = extract_optional_headers(args, 1)?;
+                Some(HttpTableFunctionCall::Delete { url, headers })
             }
             "HTTP_POST" => {
-                if args.len() != 3 {
+                if args.len() < 3 || args.len() > 4 {
                     return Err(anyhow!(
-                        "http_post(url text, body text, content_type text) requires 3 arguments"
+                        "http_post(url text, body text, content_type text [, headers jsonb]) requires 3-4 arguments"
                     ));
                 }
                 let url = expect_text(eval_const_ast_expr(extract_expr_arg(&args[0])?)?, "url")?;
@@ -199,16 +223,18 @@ impl Executor {
                     eval_const_ast_expr(extract_expr_arg(&args[2])?)?,
                     "content_type",
                 )?;
+                let headers = extract_optional_headers(args, 3)?;
                 Some(HttpTableFunctionCall::Post {
                     url,
                     body,
                     content_type,
+                    headers,
                 })
             }
             "HTTP_PUT" => {
-                if args.len() != 3 {
+                if args.len() < 3 || args.len() > 4 {
                     return Err(anyhow!(
-                        "http_put(url text, body text, content_type text) requires 3 arguments"
+                        "http_put(url text, body text, content_type text [, headers jsonb]) requires 3-4 arguments"
                     ));
                 }
                 let url = expect_text(eval_const_ast_expr(extract_expr_arg(&args[0])?)?, "url")?;
@@ -217,10 +243,59 @@ impl Executor {
                     eval_const_ast_expr(extract_expr_arg(&args[2])?)?,
                     "content_type",
                 )?;
+                let headers = extract_optional_headers(args, 3)?;
                 Some(HttpTableFunctionCall::Put {
                     url,
                     body,
                     content_type,
+                    headers,
+                })
+            }
+            "HTTP" => {
+                // http(method, uri [, headers jsonb [, content_type text [, content text]]])
+                if args.len() < 2 || args.len() > 5 {
+                    return Err(anyhow!(
+                        "http(method text, uri text [, headers jsonb [, content_type text [, content text]]]) requires 2-5 arguments"
+                    ));
+                }
+                let method =
+                    expect_text(eval_const_ast_expr(extract_expr_arg(&args[0])?)?, "method")?;
+                let url = expect_text(eval_const_ast_expr(extract_expr_arg(&args[1])?)?, "uri")?;
+                let headers = extract_optional_headers(args, 2)?;
+                let content_type = if args.len() > 3 {
+                    match eval_const_ast_expr(extract_expr_arg(&args[3])?)? {
+                        Value::Null => None,
+                        Value::Text(s) => Some(s),
+                        other => {
+                            return Err(anyhow!(
+                                "http: content_type must be TEXT, got {}",
+                                other.data_type().unwrap_or(crate::types::DataType::Text)
+                            ))
+                        }
+                    }
+                } else {
+                    None
+                };
+                let body = if args.len() > 4 {
+                    match eval_const_ast_expr(extract_expr_arg(&args[4])?)? {
+                        Value::Null => None,
+                        Value::Text(s) => Some(s),
+                        other => {
+                            return Err(anyhow!(
+                                "http: content must be TEXT, got {}",
+                                other.data_type().unwrap_or(crate::types::DataType::Text)
+                            ))
+                        }
+                    }
+                } else {
+                    None
+                };
+                Some(HttpTableFunctionCall::Universal {
+                    method,
+                    url,
+                    headers,
+                    content_type,
+                    body,
                 })
             }
             _ => None,
