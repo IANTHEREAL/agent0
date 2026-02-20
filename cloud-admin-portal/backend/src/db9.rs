@@ -141,6 +141,22 @@ enum FsAction {
         #[arg(short = 't', long = "type")]
         event_type: Option<String>,
     },
+    /// Copy files between local filesystem and fs9
+    Cp {
+        /// Database ID (omit to auto-select or choose interactively)
+        #[arg(long)]
+        id: Option<String>,
+        /// Source path (local path or fs9:/remote/path)
+        source: String,
+        /// Destination path (local path or fs9:/remote/path)
+        destination: String,
+        /// Copy directories recursively
+        #[arg(short)]
+        r: bool,
+        /// Verbose output — print each file as copied
+        #[arg(short)]
+        v: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -594,7 +610,9 @@ async fn main() {
 
     match cli.command {
         Commands::Register => cmd_register(&api, &cli.effective_output()).await,
-        Commands::Login { ref api_key } => cmd_login(&api, &cli.effective_output(), api_key.clone()).await,
+        Commands::Login { ref api_key } => {
+            cmd_login(&api, &cli.effective_output(), api_key.clone()).await
+        }
         Commands::Claim => cmd_claim(&api, &cli.effective_output()).await,
         Commands::Logout => cmd_logout(),
         Commands::Init => cmd_init(&api, &cli.effective_output()).await,
@@ -619,6 +637,24 @@ async fn main() {
                     *offset,
                     path.as_deref(),
                     event_type.as_deref(),
+                )
+                .await
+            }
+            FsAction::Cp {
+                ref id,
+                ref source,
+                ref destination,
+                r,
+                v,
+            } => {
+                cmd_fs_cp(
+                    &api,
+                    &cli.api_url,
+                    id.as_deref(),
+                    source,
+                    destination,
+                    *r,
+                    *v,
                 )
                 .await
             }
@@ -789,7 +825,11 @@ fn cmd_completion(shell: clap_complete::Shell) {
     clap_complete::generate(shell, &mut cmd, "db9", &mut io::stdout());
 }
 
-async fn resolve_db_id(api: &ApiClient, id: Option<&str>, headers: &HashMap<String, String>) -> String {
+async fn resolve_db_id(
+    api: &ApiClient,
+    id: Option<&str>,
+    headers: &HashMap<String, String>,
+) -> String {
     if let Some(id) = id {
         return id.to_string();
     }
@@ -851,6 +891,632 @@ async fn resolve_db_id(api: &ApiClient, id: Option<&str>, headers: &HashMap<Stri
 fn derive_fs9_url(api_url: &str, db_id: &str) -> String {
     let base_url = api_url.strip_suffix("/api").unwrap_or(api_url);
     format!("{base_url}/fs9/{db_id}")
+}
+
+fn is_fs9_path(path: &str) -> bool {
+    path.starts_with("fs9:")
+}
+
+fn parse_fs9_path(path: &str) -> String {
+    let stripped = if path.starts_with("fs9://") {
+        &path[6..]
+    } else if path.starts_with("fs9:") {
+        &path[4..]
+    } else {
+        return path.to_string();
+    };
+    if stripped.is_empty() {
+        "/".to_string()
+    } else if stripped.starts_with('/') {
+        stripped.to_string()
+    } else {
+        format!("/{stripped}")
+    }
+}
+
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+async fn cmd_fs_cp(
+    api: &ApiClient,
+    api_url: &str,
+    id: Option<&str>,
+    source: &str,
+    destination: &str,
+    recursive: bool,
+    verbose: bool,
+) {
+    let src_is_fs9 = is_fs9_path(source);
+    let dst_is_fs9 = is_fs9_path(destination);
+
+    if src_is_fs9 && dst_is_fs9 {
+        eprintln!("error: remote-to-remote copy not supported");
+        process::exit(1);
+    }
+    if !src_is_fs9 && !dst_is_fs9 {
+        eprintln!("error: one of source or destination must be an fs9: path");
+        process::exit(1);
+    }
+
+    // Validate local source path eagerly before any network calls
+    if !src_is_fs9 {
+        let p = std::path::Path::new(source);
+        if !p.exists() {
+            eprintln!("error: '{}' does not exist", source);
+            process::exit(1);
+        }
+        if p.is_dir() && !recursive {
+            eprintln!("error: '{}' is a directory (not copied); use -r", source);
+            process::exit(1);
+        }
+    }
+
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+    let db_id = resolve_db_id(api, id, &headers).await;
+    let fs9_url = derive_fs9_url(api_url, &db_id);
+    let client = reqwest::Client::new();
+
+    if dst_is_fs9 {
+        let remote_dest = parse_fs9_path(destination);
+        upload_path(
+            &client,
+            &fs9_url,
+            &token,
+            source,
+            &remote_dest,
+            recursive,
+            verbose,
+        )
+        .await;
+    } else {
+        let remote_src = parse_fs9_path(source);
+        download_path(
+            &client,
+            &fs9_url,
+            &token,
+            &remote_src,
+            destination,
+            recursive,
+            verbose,
+        )
+        .await;
+    }
+}
+
+async fn upload_path(
+    client: &reqwest::Client,
+    fs9_url: &str,
+    token: &str,
+    local_path: &str,
+    remote_path: &str,
+    recursive: bool,
+    verbose: bool,
+) {
+    let path = std::path::Path::new(local_path);
+
+    if !path.exists() {
+        eprintln!("error: '{}' does not exist", local_path);
+        process::exit(1);
+    }
+
+    if path.is_dir() && !recursive {
+        eprintln!(
+            "error: '{}' is a directory (not copied); use -r",
+            local_path
+        );
+        process::exit(1);
+    }
+
+    let final_remote = resolve_upload_dest(client, fs9_url, token, local_path, remote_path).await;
+
+    if path.is_file() {
+        let skipped =
+            upload_single_file(client, fs9_url, token, path, &final_remote, verbose).await;
+        if skipped {
+            process::exit(1);
+        }
+    } else if path.is_dir() {
+        let mut copied = 0u64;
+        let mut skipped = 0u64;
+        upload_dir_recursive(
+            client,
+            fs9_url,
+            token,
+            path,
+            &final_remote,
+            verbose,
+            &mut copied,
+            &mut skipped,
+        )
+        .await;
+        if verbose || skipped > 0 {
+            eprintln!("{copied} file(s) copied, {skipped} skipped");
+        }
+        if skipped > 0 {
+            process::exit(1);
+        }
+    }
+}
+
+async fn resolve_upload_dest(
+    client: &reqwest::Client,
+    fs9_url: &str,
+    token: &str,
+    local_path: &str,
+    remote_path: &str,
+) -> String {
+    match fs9_stat(client, fs9_url, token, remote_path).await {
+        Ok((true, _)) => {
+            let basename = std::path::Path::new(local_path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
+            let dest = remote_path.trim_end_matches('/');
+            format!("{dest}/{basename}")
+        }
+        _ => remote_path.to_string(),
+    }
+}
+
+async fn upload_single_file(
+    client: &reqwest::Client,
+    fs9_url: &str,
+    token: &str,
+    local_path: &std::path::Path,
+    remote_path: &str,
+    verbose: bool,
+) -> bool {
+    let metadata = std::fs::metadata(local_path).unwrap_or_else(|e| {
+        eprintln!("error: cannot read '{}': {e}", local_path.display());
+        process::exit(1);
+    });
+
+    if metadata.len() > MAX_FILE_SIZE {
+        eprintln!(
+            "warning: '{}' exceeds 10MB limit ({} bytes), skipping",
+            local_path.display(),
+            metadata.len()
+        );
+        return true;
+    }
+
+    let content = std::fs::read(local_path).unwrap_or_else(|e| {
+        eprintln!("error: cannot read '{}': {e}", local_path.display());
+        process::exit(1);
+    });
+
+    if let Some(parent) = std::path::Path::new(remote_path).parent() {
+        let parent_str = parent.to_string_lossy();
+        if parent_str != "/" && !parent_str.is_empty() {
+            if let Err(e) = fs9_mkdir(client, fs9_url, token, &parent_str).await {
+                eprintln!("warning: mkdir '{}': {e}", parent_str);
+            }
+        }
+    }
+
+    match fs9_upload(client, fs9_url, token, remote_path, content).await {
+        Ok(_) => {
+            if verbose {
+                println!("'{}' -> 'fs9:{}'", local_path.display(), remote_path);
+            }
+            false
+        }
+        Err(e) => {
+            eprintln!(
+                "error: upload '{}' -> '{}': {e}",
+                local_path.display(),
+                remote_path
+            );
+            process::exit(1);
+        }
+    }
+}
+
+async fn upload_dir_recursive(
+    client: &reqwest::Client,
+    fs9_url: &str,
+    token: &str,
+    local_dir: &std::path::Path,
+    remote_dir: &str,
+    verbose: bool,
+    copied: &mut u64,
+    skipped: &mut u64,
+) {
+    if let Err(e) = fs9_mkdir(client, fs9_url, token, remote_dir).await {
+        eprintln!("warning: mkdir '{}': {e}", remote_dir);
+    }
+
+    let entries = std::fs::read_dir(local_dir).unwrap_or_else(|e| {
+        eprintln!(
+            "error: cannot read directory '{}': {e}",
+            local_dir.display()
+        );
+        process::exit(1);
+    });
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("warning: read entry: {e}");
+                *skipped += 1;
+                continue;
+            }
+        };
+
+        let local_child = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let remote_child = format!("{}/{}", remote_dir.trim_end_matches('/'), name);
+
+        if local_child.is_dir() {
+            Box::pin(upload_dir_recursive(
+                client,
+                fs9_url,
+                token,
+                &local_child,
+                &remote_child,
+                verbose,
+                copied,
+                skipped,
+            ))
+            .await;
+        } else if local_child.is_file() {
+            let metadata = match std::fs::metadata(&local_child) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("warning: cannot stat '{}': {e}", local_child.display());
+                    *skipped += 1;
+                    continue;
+                }
+            };
+
+            if metadata.len() > MAX_FILE_SIZE {
+                eprintln!(
+                    "warning: '{}' exceeds 10MB limit ({} bytes), skipping",
+                    local_child.display(),
+                    metadata.len()
+                );
+                *skipped += 1;
+                continue;
+            }
+
+            let content = match std::fs::read(&local_child) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("warning: cannot read '{}': {e}", local_child.display());
+                    *skipped += 1;
+                    continue;
+                }
+            };
+
+            match fs9_upload(client, fs9_url, token, &remote_child, content).await {
+                Ok(_) => {
+                    if verbose {
+                        println!("'{}' -> 'fs9:{}'", local_child.display(), remote_child);
+                    }
+                    *copied += 1;
+                }
+                Err(e) => {
+                    eprintln!("warning: upload '{}': {e}", local_child.display());
+                    *skipped += 1;
+                }
+            }
+        }
+    }
+}
+
+async fn download_path(
+    client: &reqwest::Client,
+    fs9_url: &str,
+    token: &str,
+    remote_path: &str,
+    local_path: &str,
+    recursive: bool,
+    verbose: bool,
+) {
+    let (is_dir, _size) = match fs9_stat(client, fs9_url, token, remote_path).await {
+        Ok(stat) => stat,
+        Err(e) => {
+            eprintln!("error: cannot stat 'fs9:{}': {e}", remote_path);
+            process::exit(1);
+        }
+    };
+
+    if is_dir && !recursive {
+        eprintln!(
+            "error: 'fs9:{}' is a directory (not copied); use -r",
+            remote_path
+        );
+        process::exit(1);
+    }
+
+    let dest = std::path::Path::new(local_path);
+    let final_local = if dest.is_dir() {
+        let basename = std::path::Path::new(remote_path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        dest.join(basename)
+    } else {
+        dest.to_path_buf()
+    };
+
+    if !is_dir {
+        download_single_file(client, fs9_url, token, remote_path, &final_local, verbose).await;
+    } else {
+        let mut copied = 0u64;
+        let mut skipped = 0u64;
+        download_dir_recursive(
+            client,
+            fs9_url,
+            token,
+            remote_path,
+            &final_local,
+            verbose,
+            &mut copied,
+            &mut skipped,
+        )
+        .await;
+        if verbose || skipped > 0 {
+            eprintln!("{copied} file(s) copied, {skipped} skipped");
+        }
+        if skipped > 0 {
+            process::exit(1);
+        }
+    }
+}
+
+async fn download_single_file(
+    client: &reqwest::Client,
+    fs9_url: &str,
+    token: &str,
+    remote_path: &str,
+    local_path: &std::path::Path,
+    verbose: bool,
+) {
+    let content = match fs9_download(client, fs9_url, token, remote_path).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: download 'fs9:{}': {e}", remote_path);
+            process::exit(1);
+        }
+    };
+
+    if let Some(parent) = local_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent).unwrap_or_else(|e| {
+                eprintln!("error: cannot create directory '{}': {e}", parent.display());
+                process::exit(1);
+            });
+        }
+    }
+
+    std::fs::write(local_path, &content).unwrap_or_else(|e| {
+        eprintln!("error: cannot write '{}': {e}", local_path.display());
+        process::exit(1);
+    });
+
+    if verbose {
+        println!("'fs9:{}' -> '{}'", remote_path, local_path.display());
+    }
+}
+
+async fn download_dir_recursive(
+    client: &reqwest::Client,
+    fs9_url: &str,
+    token: &str,
+    remote_dir: &str,
+    local_dir: &std::path::Path,
+    verbose: bool,
+    copied: &mut u64,
+    skipped: &mut u64,
+) {
+    if let Err(e) = std::fs::create_dir_all(local_dir) {
+        eprintln!(
+            "error: cannot create directory '{}': {e}",
+            local_dir.display()
+        );
+        process::exit(1);
+    }
+
+    let entries = match fs9_readdir(client, fs9_url, token, remote_dir).await {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error: readdir 'fs9:{}': {e}", remote_dir);
+            process::exit(1);
+        }
+    };
+
+    for (entry_path, is_dir, _size) in entries {
+        let name = std::path::Path::new(&entry_path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let local_child = local_dir.join(&name);
+        let remote_child = format!("{}/{}", remote_dir.trim_end_matches('/'), name);
+
+        if is_dir {
+            Box::pin(download_dir_recursive(
+                client,
+                fs9_url,
+                token,
+                &remote_child,
+                &local_child,
+                verbose,
+                copied,
+                skipped,
+            ))
+            .await;
+        } else {
+            match fs9_download(client, fs9_url, token, &remote_child).await {
+                Ok(content) => match std::fs::write(&local_child, &content) {
+                    Ok(_) => {
+                        if verbose {
+                            println!("'fs9:{}' -> '{}'", remote_child, local_child.display());
+                        }
+                        *copied += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("warning: write '{}': {e}", local_child.display());
+                        *skipped += 1;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("warning: download '{}': {e}", remote_child);
+                    *skipped += 1;
+                }
+            }
+        }
+    }
+}
+
+async fn fs9_upload(
+    client: &reqwest::Client,
+    fs9_url: &str,
+    token: &str,
+    remote_path: &str,
+    content: Vec<u8>,
+) -> Result<usize, String> {
+    let len = content.len();
+    let url = format!("{fs9_url}/api/v1/upload");
+    let resp = client
+        .put(&url)
+        .query(&[("path", remote_path)])
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/octet-stream")
+        .body(content)
+        .send()
+        .await
+        .map_err(|e| format!("fs9 upload failed: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("fs9 upload error ({status}): {body}"));
+    }
+    Ok(len)
+}
+
+async fn fs9_download(
+    client: &reqwest::Client,
+    fs9_url: &str,
+    token: &str,
+    remote_path: &str,
+) -> Result<Vec<u8>, String> {
+    let url = format!("{fs9_url}/api/v1/download");
+    let resp = client
+        .get(&url)
+        .query(&[("path", remote_path)])
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| format!("fs9 download failed: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("fs9 download error ({status}): {body}"));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("fs9 download read error: {e}"))
+}
+
+async fn fs9_mkdir(
+    client: &reqwest::Client,
+    fs9_url: &str,
+    token: &str,
+    remote_path: &str,
+) -> Result<(), String> {
+    let url = format!("{fs9_url}/api/v1/mkdir");
+    let resp = client
+        .post(&url)
+        .query(&[("path", remote_path), ("recursive", "true")])
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| format!("fs9 mkdir failed: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("fs9 mkdir error ({status}): {body}"));
+    }
+    Ok(())
+}
+
+async fn fs9_stat(
+    client: &reqwest::Client,
+    fs9_url: &str,
+    token: &str,
+    remote_path: &str,
+) -> Result<(bool, u64), String> {
+    let url = format!("{fs9_url}/api/v1/stat");
+    let resp = client
+        .get(&url)
+        .query(&[("path", remote_path)])
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| format!("fs9 stat failed: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("fs9 stat error ({status}): {body}"));
+    }
+    let json: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("fs9 stat parse error: {e}"))?;
+    let is_dir = json
+        .get("file_type")
+        .and_then(|v| v.as_str())
+        .map(|t| t == "directory")
+        .unwrap_or(false);
+    let size = json.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    Ok((is_dir, size))
+}
+
+async fn fs9_readdir(
+    client: &reqwest::Client,
+    fs9_url: &str,
+    token: &str,
+    remote_path: &str,
+) -> Result<Vec<(String, bool, u64)>, String> {
+    let url = format!("{fs9_url}/api/v1/readdir");
+    let resp = client
+        .get(&url)
+        .query(&[("path", remote_path)])
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| format!("fs9 readdir failed: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("fs9 readdir error ({status}): {body}"));
+    }
+    let json: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("fs9 readdir parse error: {e}"))?;
+    let entries = json.as_array().ok_or("fs9 readdir: expected JSON array")?;
+    let mut result = Vec::new();
+    for entry in entries {
+        let path = entry
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let is_dir = entry
+            .get("file_type")
+            .and_then(|v| v.as_str())
+            .map(|t| t == "directory")
+            .unwrap_or(false);
+        let size = entry.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+        result.push((path, is_dir, size));
+    }
+    Ok(result)
 }
 
 async fn cmd_sh(api: &ApiClient, api_url: &str, id: Option<&str>, command: Option<&str>) {
@@ -1041,7 +1707,10 @@ async fn cmd_login(api: &ApiClient, output: &OutputFormat, api_key: Option<Strin
                 print_json(&safe);
             }
             _ => {
-                println!("Login successful! Logged in as: {}", result["email"].as_str().unwrap_or("unknown"));
+                println!(
+                    "Login successful! Logged in as: {}",
+                    result["email"].as_str().unwrap_or("unknown")
+                );
             }
         }
         return;
@@ -3178,5 +3847,45 @@ mod tests {
         let parsed: toml::Table = content.parse().unwrap();
         assert_eq!(parsed.get("token").and_then(|v| v.as_str()), Some("abc123"));
         assert!(parsed.get("is_anonymous").is_none());
+    }
+
+    #[test]
+    fn test_is_fs9_path() {
+        assert!(is_fs9_path("fs9:/data/file.txt"));
+        assert!(is_fs9_path("fs9://data/file.txt"));
+        assert!(is_fs9_path("fs9:/"));
+        assert!(is_fs9_path("fs9://"));
+        assert!(!is_fs9_path("/local/file.txt"));
+        assert!(!is_fs9_path("./relative"));
+        assert!(!is_fs9_path("relative/path"));
+        assert!(!is_fs9_path(""));
+    }
+
+    #[test]
+    fn test_parse_fs9_path_single_colon() {
+        assert_eq!(parse_fs9_path("fs9:/data/file.txt"), "/data/file.txt");
+        assert_eq!(parse_fs9_path("fs9:/"), "/");
+        assert_eq!(parse_fs9_path("fs9:/data/"), "/data/");
+    }
+
+    #[test]
+    fn test_parse_fs9_path_double_slash() {
+        assert_eq!(parse_fs9_path("fs9://data/file.txt"), "/data/file.txt");
+        assert_eq!(parse_fs9_path("fs9://"), "/");
+        assert_eq!(parse_fs9_path("fs9://data/"), "/data/");
+    }
+
+    #[test]
+    fn test_parse_fs9_path_non_fs9() {
+        assert_eq!(parse_fs9_path("/local/file"), "/local/file");
+        assert_eq!(parse_fs9_path("./relative"), "./relative");
+    }
+
+    #[test]
+    fn test_copy_direction_detection() {
+        assert!(!is_fs9_path("./local") && is_fs9_path("fs9:/remote"));
+        assert!(is_fs9_path("fs9:/remote") && !is_fs9_path("./local"));
+        assert!(is_fs9_path("fs9:/a") && is_fs9_path("fs9:/b"));
+        assert!(!is_fs9_path("/a") && !is_fs9_path("/b"));
     }
 }
