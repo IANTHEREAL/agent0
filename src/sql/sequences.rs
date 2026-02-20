@@ -875,6 +875,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                             search_path,
                             &func_name_str,
                             arg_values,
+                            None,
                         )
                         .await
                         {

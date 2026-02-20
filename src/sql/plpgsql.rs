@@ -5,7 +5,7 @@
 use crate::storage::TikvStore;
 use crate::types::{DataType, FunctionDef, Value};
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,6 +15,8 @@ use super::names;
 use super::parse_sql;
 use super::quoting;
 use super::sequences;
+use super::ExecuteResult;
+use super::Executor;
 
 pub struct PlpgsqlContext {
     pub variables: HashMap<String, Value>,
@@ -158,16 +160,36 @@ enum PlpgsqlStatement {
     RaiseNotice(String),
     RaiseException(String),
     Sql(String),
+    Perform(String),
+    SelectInto {
+        variables: Vec<String>,
+        query: String,
+    },
+    ForQuery {
+        variable: String,
+        query: String,
+        body: Vec<PlpgsqlStatement>,
+    },
+    ForRange {
+        variable: String,
+        start_expr: String,
+        end_expr: String,
+        step_expr: Option<String>,
+        reverse: bool,
+        body: Vec<PlpgsqlStatement>,
+    },
+    Exit,
     Null,
 }
 
 pub fn validate_plpgsql_body(body: &str) -> Result<()> {
     let _ = parse_declare_block(body)?;
-    let _ = parse_begin_block(body)?;
+    let empty_vars = HashSet::new();
+    let _ = parse_begin_block(body, &empty_vars)?;
     Ok(())
 }
 
-fn parse_begin_block(body: &str) -> Result<Vec<PlpgsqlStatement>> {
+fn parse_begin_block(body: &str, declared_vars: &HashSet<String>) -> Result<Vec<PlpgsqlStatement>> {
     let body_upper = body.to_uppercase();
     let begin_pos = body_upper
         .find("BEGIN")
@@ -176,7 +198,7 @@ fn parse_begin_block(body: &str) -> Result<Vec<PlpgsqlStatement>> {
         .ok_or_else(|| anyhow!("Missing END for BEGIN block"))?;
 
     let block_content = &body[begin_pos + 5..begin_pos + end_pos];
-    parse_statements(block_content)
+    parse_statements(block_content, declared_vars)
 }
 
 fn find_matching_end(s: &str) -> Option<usize> {
@@ -201,6 +223,22 @@ fn find_matching_end(s: &str) -> Option<usize> {
             {
                 depth += 1;
                 i += 2;
+                continue;
+            }
+        }
+        if i + 3 <= bytes.len() && &s_upper[i..i + 3] == "FOR" {
+            if (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+                && (i + 3 == bytes.len() || !bytes[i + 3].is_ascii_alphanumeric())
+            {
+                depth += 1;
+                i += 3;
+                continue;
+            }
+        }
+        if i + 8 <= bytes.len() && &s_upper[i..i + 8] == "END LOOP" {
+            if i == 0 || !bytes[i - 1].is_ascii_alphanumeric() {
+                depth -= 1;
+                i += 8;
                 continue;
             }
         }
@@ -233,7 +271,10 @@ fn find_matching_end(s: &str) -> Option<usize> {
     None
 }
 
-fn parse_statements(content: &str) -> Result<Vec<PlpgsqlStatement>> {
+fn parse_statements(
+    content: &str,
+    declared_vars: &HashSet<String>,
+) -> Result<Vec<PlpgsqlStatement>> {
     let mut statements = Vec::new();
     let content = content.trim();
 
@@ -247,7 +288,7 @@ fn parse_statements(content: &str) -> Result<Vec<PlpgsqlStatement>> {
 
         let remaining_upper = remaining.to_uppercase();
         if remaining_upper.starts_with("IF ") || remaining_upper.starts_with("IF\n") {
-            let (if_stmt, rest) = parse_if_statement(remaining)?;
+            let (if_stmt, rest) = parse_if_statement(remaining, declared_vars)?;
             statements.push(if_stmt);
             remaining = rest;
             continue;
@@ -255,20 +296,27 @@ fn parse_statements(content: &str) -> Result<Vec<PlpgsqlStatement>> {
 
         if remaining_upper.starts_with("ELSIF ") || remaining_upper.starts_with("ELSIF\n") {
             let synthetic_if = format!("IF{} END IF", &remaining[5..]);
-            let (if_stmt, _rest) = parse_if_statement(&synthetic_if)?;
+            let (if_stmt, _rest) = parse_if_statement(&synthetic_if, declared_vars)?;
             statements.push(if_stmt);
             break;
+        }
+
+        if remaining_upper.starts_with("FOR ") || remaining_upper.starts_with("FOR\n") {
+            let (for_stmt, rest) = parse_for_statement(remaining, declared_vars)?;
+            statements.push(for_stmt);
+            remaining = rest;
+            continue;
         }
 
         if let Some(semi_pos) = find_statement_end(remaining) {
             let stmt_str = remaining[..semi_pos].trim();
             if !stmt_str.is_empty() {
-                statements.push(parse_single_statement(stmt_str)?);
+                statements.push(parse_single_statement(stmt_str, declared_vars)?);
             }
             remaining = &remaining[semi_pos + 1..];
         } else {
             if !remaining.is_empty() {
-                statements.push(parse_single_statement(remaining)?);
+                statements.push(parse_single_statement(remaining, declared_vars)?);
             }
             break;
         }
@@ -303,7 +351,7 @@ fn find_statement_end(s: &str) -> Option<usize> {
     None
 }
 
-fn parse_single_statement(s: &str) -> Result<PlpgsqlStatement> {
+fn parse_single_statement(s: &str, declared_vars: &HashSet<String>) -> Result<PlpgsqlStatement> {
     let s = s.trim();
     let s_upper = s.to_uppercase();
 
@@ -334,6 +382,32 @@ fn parse_single_statement(s: &str) -> Result<PlpgsqlStatement> {
         return Ok(PlpgsqlStatement::RaiseException(rest.to_string()));
     }
 
+    if s_upper == "EXIT" || s_upper.starts_with("EXIT ") {
+        return Ok(PlpgsqlStatement::Exit);
+    }
+
+    if s_upper.starts_with("PERFORM ") {
+        let query = s[8..].trim();
+        return Ok(PlpgsqlStatement::Perform(query.to_string()));
+    }
+
+    if s_upper.starts_with("SELECT ") {
+        if let Some(stmt) = parse_select_into_statement(s, declared_vars)? {
+            return Ok(stmt);
+        }
+    }
+
+    if s_upper.starts_with("INSERT ")
+        || s_upper.starts_with("UPDATE ")
+        || s_upper.starts_with("DELETE ")
+        || s_upper.starts_with("CREATE ")
+        || s_upper.starts_with("DROP ")
+        || s_upper.starts_with("ALTER ")
+        || s_upper.starts_with("TRUNCATE ")
+    {
+        return Ok(PlpgsqlStatement::Sql(s.to_string()));
+    }
+
     if let Some(assign_pos) = s.find(":=") {
         let var_name = s[..assign_pos].trim().to_string();
         let expr = s[assign_pos + 2..].trim().to_string();
@@ -343,7 +417,251 @@ fn parse_single_statement(s: &str) -> Result<PlpgsqlStatement> {
     Ok(PlpgsqlStatement::Sql(s.to_string()))
 }
 
-fn parse_if_statement(s: &str) -> Result<(PlpgsqlStatement, &str)> {
+fn parse_select_into_statement(
+    s: &str,
+    declared_vars: &HashSet<String>,
+) -> Result<Option<PlpgsqlStatement>> {
+    let upper = s.to_uppercase();
+    let Some(select_pos) = upper.find("SELECT") else {
+        return Ok(None);
+    };
+    let Some(into_pos) = upper.find("INTO") else {
+        return Ok(None);
+    };
+    if into_pos <= select_pos {
+        return Ok(None);
+    }
+
+    let from_pos = upper.find("FROM");
+    if let Some(fp) = from_pos {
+        if into_pos >= fp {
+            return Ok(None);
+        }
+    }
+
+    let mut projection = s[select_pos + 6..into_pos].trim().to_string();
+    let mut var_part = if let Some(fp) = from_pos {
+        s[into_pos + 4..fp].trim()
+    } else {
+        s[into_pos + 4..].trim()
+    };
+
+    if var_part.to_uppercase().starts_with("STRICT") {
+        var_part = var_part[6..].trim();
+    }
+
+    // Form 2: SELECT INTO var1[, var2, ...] expr1[, expr2, ...] FROM ...
+    // When projection is empty (INTO immediately after SELECT), use declared
+    // variable names to split `var_part` into target variables vs. projection.
+    if projection.is_empty() && !declared_vars.is_empty() {
+        let (vars, remaining_proj) = split_into_targets(var_part, declared_vars);
+        if !vars.is_empty() {
+            let variables = vars;
+            if remaining_proj.is_empty() && from_pos.is_none() {
+                return Err(anyhow!("SELECT INTO requires a SELECT expression"));
+            }
+            let query = if remaining_proj.is_empty() {
+                // SELECT INTO var FROM table  (no extra projection, select all)
+                format!("SELECT * {}", s[from_pos.unwrap()..].trim())
+            } else if let Some(fp) = from_pos {
+                format!("SELECT {} {}", remaining_proj, s[fp..].trim())
+            } else {
+                format!("SELECT {}", remaining_proj)
+            };
+            return Ok(Some(PlpgsqlStatement::SelectInto { variables, query }));
+        }
+    }
+
+    if projection.is_empty() {
+        return Ok(None);
+    }
+
+    let variables: Vec<String> = var_part
+        .split(',')
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+
+    if variables.is_empty() {
+        return Ok(None);
+    }
+
+    let query = if let Some(fp) = from_pos {
+        format!("SELECT {} {}", projection, s[fp..].trim())
+    } else {
+        format!("SELECT {}", projection)
+    };
+
+    Ok(Some(PlpgsqlStatement::SelectInto { variables, query }))
+}
+
+fn split_into_targets(text: &str, declared_vars: &HashSet<String>) -> (Vec<String>, String) {
+    let mut vars = Vec::new();
+    let mut pos = 0;
+    let bytes = text.as_bytes();
+    let len = text.len();
+
+    loop {
+        while pos < len && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= len {
+            break;
+        }
+
+        let word_start = pos;
+        while pos < len && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
+            pos += 1;
+        }
+        let word = &text[word_start..pos];
+
+        if word.is_empty() || !declared_vars.contains(&word.to_lowercase()) {
+            pos = word_start;
+            break;
+        }
+
+        vars.push(word.to_string());
+
+        while pos < len && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos < len && bytes[pos] == b',' {
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+
+    let remaining = text[pos..].trim().to_string();
+    (vars, remaining)
+}
+
+fn parse_for_statement<'a>(
+    s: &'a str,
+    declared_vars: &HashSet<String>,
+) -> Result<(PlpgsqlStatement, &'a str)> {
+    let s_upper = s.to_uppercase();
+    let bytes = s_upper.as_bytes();
+
+    let mut loop_pos = None;
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        if &s_upper[i..i + 4] == "LOOP"
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            && (i + 4 == bytes.len() || !bytes[i + 4].is_ascii_alphanumeric())
+        {
+            loop_pos = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let loop_pos = loop_pos.ok_or_else(|| anyhow!("FOR without LOOP"))?;
+
+    let header_raw = s[3..loop_pos].trim();
+    let header_norm: String = header_raw
+        .chars()
+        .map(|c| {
+            if c == '\n' || c == '\r' || c == '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let in_pos = header_norm
+        .to_uppercase()
+        .find(" IN ")
+        .ok_or_else(|| anyhow!("FOR without IN"))?;
+    let variable = header_norm[..in_pos].trim().to_string();
+    let mut in_expr = header_norm[in_pos + 4..].trim().to_string();
+
+    let mut reverse = false;
+    if in_expr.to_uppercase().starts_with("REVERSE ") {
+        reverse = true;
+        in_expr = in_expr[8..].trim().to_string();
+    }
+
+    let mut depth = 1;
+    let mut end_loop_pos = None;
+    i = loop_pos + 4;
+    while i < bytes.len() {
+        if i + 8 <= bytes.len() && &s_upper[i..i + 8] == "END LOOP" {
+            if i == 0 || !bytes[i - 1].is_ascii_alphanumeric() {
+                depth -= 1;
+                if depth == 0 {
+                    end_loop_pos = Some(i);
+                    break;
+                }
+                i += 8;
+                continue;
+            }
+        }
+
+        if i + 4 <= bytes.len() && &s_upper[i..i + 4] == "LOOP" {
+            if (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+                && (i + 4 == bytes.len() || !bytes[i + 4].is_ascii_alphanumeric())
+            {
+                depth += 1;
+                i += 4;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    let end_loop_pos = end_loop_pos.ok_or_else(|| anyhow!("FOR without END LOOP"))?;
+    let body_str = s[loop_pos + 4..end_loop_pos].trim();
+    let body = parse_statements(body_str, declared_vars)?;
+
+    let rest_start = end_loop_pos + 8;
+    let rest = s[rest_start..].trim_start();
+    let rest = if let Some(stripped) = rest.strip_prefix(';') {
+        stripped
+    } else {
+        rest
+    };
+
+    if let Some(range_pos) = in_expr.find("..") {
+        let start_expr = in_expr[..range_pos].trim().to_string();
+        let end_and_by = in_expr[range_pos + 2..].trim();
+        let end_and_by_upper = end_and_by.to_uppercase();
+        let (end_expr, step_expr) = if let Some(by_pos) = end_and_by_upper.find(" BY ") {
+            (
+                end_and_by[..by_pos].trim().to_string(),
+                Some(end_and_by[by_pos + 4..].trim().to_string()),
+            )
+        } else {
+            (end_and_by.to_string(), None)
+        };
+
+        return Ok((
+            PlpgsqlStatement::ForRange {
+                variable,
+                start_expr,
+                end_expr,
+                step_expr,
+                reverse,
+                body,
+            },
+            rest,
+        ));
+    }
+
+    Ok((
+        PlpgsqlStatement::ForQuery {
+            variable,
+            query: in_expr,
+            body,
+        },
+        rest,
+    ))
+}
+
+fn parse_if_statement<'a>(
+    s: &'a str,
+    declared_vars: &HashSet<String>,
+) -> Result<(PlpgsqlStatement, &'a str)> {
     let s_upper = s.to_uppercase();
 
     let then_pos = s_upper
@@ -356,11 +674,11 @@ fn parse_if_statement(s: &str) -> Result<(PlpgsqlStatement, &str)> {
 
     let (then_block, else_block, rest) = find_if_blocks(after_then)?;
 
-    let then_stmts = parse_statements(then_block)?;
+    let then_stmts = parse_statements(then_block, declared_vars)?;
     let else_stmts = if else_block.is_empty() {
         Vec::new()
     } else {
-        parse_statements(else_block)?
+        parse_statements(else_block, declared_vars)?
     };
 
     Ok((
@@ -464,6 +782,7 @@ pub fn execute_plpgsql_function<'a>(
     search_path: &'a [String],
     func_def: &'a FunctionDef,
     args: Vec<Value>,
+    executor: Option<&'a Executor>,
 ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
     Box::pin(async move {
         let mut ctx = PlpgsqlContext::new();
@@ -509,7 +828,12 @@ pub fn execute_plpgsql_function<'a>(
             ctx.variables.insert(name, value);
         }
 
-        let statements = parse_begin_block(body)?;
+        let declared_vars: HashSet<String> = ctx
+            .variable_types
+            .keys()
+            .map(|k| k.to_lowercase())
+            .collect();
+        let statements = parse_begin_block(body, &declared_vars)?;
         execute_statements(
             store,
             txn,
@@ -518,6 +842,7 @@ pub fn execute_plpgsql_function<'a>(
             search_path,
             &mut ctx,
             &statements,
+            executor,
         )
         .await
     })
@@ -565,6 +890,7 @@ fn execute_statements<'a>(
     search_path: &'a [String],
     ctx: &'a mut PlpgsqlContext,
     statements: &'a [PlpgsqlStatement],
+    executor: Option<&'a Executor>,
 ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
     Box::pin(async move {
         for stmt in statements {
@@ -627,6 +953,7 @@ fn execute_statements<'a>(
                             search_path,
                             ctx,
                             then_stmts,
+                            executor,
                         )
                         .await?;
                         if !matches!(result, Value::Null)
@@ -645,6 +972,7 @@ fn execute_statements<'a>(
                             search_path,
                             ctx,
                             else_stmts,
+                            executor,
                         )
                         .await?;
                         if !matches!(result, Value::Null)
@@ -665,7 +993,242 @@ fn execute_statements<'a>(
                     return Err(anyhow!("{}", format_raise_message(ctx, msg)));
                 }
 
-                PlpgsqlStatement::Sql(_sql) => {}
+                PlpgsqlStatement::Sql(sql) => {
+                    let expanded = substitute_variables(ctx, sql);
+                    if let Some(exec) = executor {
+                        let stmts = parse_sql(&expanded)?;
+                        for stmt in stmts {
+                            exec.execute_statement_on_txn(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                &stmt,
+                                None,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+
+                PlpgsqlStatement::Perform(query) => {
+                    let expanded = substitute_variables(ctx, query);
+                    let select_sql = format!("SELECT {}", expanded);
+                    if let Some(exec) = executor {
+                        let stmts = parse_sql(&select_sql)?;
+                        for stmt in stmts {
+                            let _ = exec
+                                .execute_statement_on_txn(
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    &stmt,
+                                    None,
+                                )
+                                .await?;
+                        }
+                    }
+                }
+
+                PlpgsqlStatement::SelectInto { variables, query } => {
+                    let expanded = substitute_variables(ctx, query);
+                    if let Some(exec) = executor {
+                        let stmts = parse_sql(&expanded)?;
+                        if let Some(stmt) = stmts.into_iter().next() {
+                            let result = exec
+                                .execute_statement_on_txn(
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    &stmt,
+                                    None,
+                                )
+                                .await?;
+                            if let ExecuteResult::Select { rows, .. } = result {
+                                if let Some(row) = rows.into_iter().next() {
+                                    for (i, var_name) in variables.iter().enumerate() {
+                                        let val = row.values.get(i).cloned().unwrap_or(Value::Null);
+                                        ctx.set_var(var_name, val);
+                                    }
+                                } else {
+                                    for var_name in variables {
+                                        ctx.set_var(var_name, Value::Null);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        return Err(anyhow!("SELECT INTO requires SQL execution context"));
+                    }
+                }
+
+                PlpgsqlStatement::ForQuery {
+                    variable,
+                    query,
+                    body,
+                } => {
+                    let expanded = substitute_variables(ctx, query);
+                    if let Some(exec) = executor {
+                        let stmts = parse_sql(&expanded)?;
+                        if let Some(stmt) = stmts.into_iter().next() {
+                            let result = exec
+                                .execute_statement_on_txn(
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    &stmt,
+                                    None,
+                                )
+                                .await?;
+                            if let ExecuteResult::Select { columns, rows, .. } = result {
+                                for row in rows {
+                                    for (i, col) in columns.iter().enumerate() {
+                                        let val = row.values.get(i).cloned().unwrap_or(Value::Null);
+                                        let field_name = format!("{}.{}", variable, col);
+                                        ctx.set_var(&field_name, val);
+                                    }
+
+                                    let body_result = execute_statements(
+                                        store,
+                                        txn,
+                                        db_id,
+                                        sequence_values,
+                                        search_path,
+                                        ctx,
+                                        body,
+                                        executor,
+                                    )
+                                    .await?;
+
+                                    if consume_exit_signal(ctx) {
+                                        break;
+                                    }
+
+                                    if !matches!(body_result, Value::Null)
+                                        || body
+                                            .iter()
+                                            .any(|s| matches!(s, PlpgsqlStatement::Return(_)))
+                                    {
+                                        return Ok(body_result);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        return Err(anyhow!("FOR loop requires SQL execution context"));
+                    }
+                }
+
+                PlpgsqlStatement::ForRange {
+                    variable,
+                    start_expr,
+                    end_expr,
+                    step_expr,
+                    reverse,
+                    body,
+                } => {
+                    let start_val = evaluate_expression(
+                        store,
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        ctx,
+                        start_expr,
+                    )
+                    .await?;
+                    let end_val = evaluate_expression(
+                        store,
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        ctx,
+                        end_expr,
+                    )
+                    .await?;
+
+                    let start = match start_val {
+                        Value::Int32(n) => n as i64,
+                        Value::Int64(n) => n,
+                        _ => return Err(anyhow!("FOR loop bounds must be integers")),
+                    };
+                    let end = match end_val {
+                        Value::Int32(n) => n as i64,
+                        Value::Int64(n) => n,
+                        _ => return Err(anyhow!("FOR loop bounds must be integers")),
+                    };
+                    let step = if let Some(step_str) = step_expr {
+                        let step_val = evaluate_expression(
+                            store,
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            ctx,
+                            step_str,
+                        )
+                        .await?;
+                        match step_val {
+                            Value::Int32(n) => n as i64,
+                            Value::Int64(n) => n,
+                            _ => return Err(anyhow!("FOR loop step must be integer")),
+                        }
+                    } else {
+                        1i64
+                    };
+
+                    if step == 0 {
+                        return Err(anyhow!("FOR loop step cannot be zero"));
+                    }
+
+                    let mut i = start;
+                    loop {
+                        if !*reverse {
+                            if i > end {
+                                break;
+                            }
+                        } else if i < end {
+                            break;
+                        }
+
+                        ctx.set_var(variable, Value::Int64(i));
+                        let body_result = execute_statements(
+                            store,
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            ctx,
+                            body,
+                            executor,
+                        )
+                        .await?;
+
+                        if consume_exit_signal(ctx) {
+                            break;
+                        }
+
+                        if !matches!(body_result, Value::Null)
+                            || body
+                                .iter()
+                                .any(|s| matches!(s, PlpgsqlStatement::Return(_)))
+                        {
+                            return Ok(body_result);
+                        }
+
+                        if *reverse {
+                            i -= step;
+                        } else {
+                            i += step;
+                        }
+                    }
+                }
+
+                PlpgsqlStatement::Exit => set_exit_signal(ctx),
 
                 PlpgsqlStatement::Null => {}
             }
@@ -687,7 +1250,9 @@ fn format_raise_message(_ctx: &PlpgsqlContext, msg: &str) -> String {
 
 fn substitute_variables(ctx: &PlpgsqlContext, s: &str) -> String {
     let mut result = s.to_string();
-    for (name, value) in &ctx.variables {
+    let mut vars: Vec<(&String, &Value)> = ctx.variables.iter().collect();
+    vars.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()));
+    for (name, value) in vars {
         let value_str = match value {
             Value::Null => "NULL".to_string(),
             Value::Text(t) => quoting::quote_literal(t),
@@ -741,9 +1306,10 @@ pub(crate) fn replace_identifier(s: &str, name: &str, replacement: &str) -> Stri
         if i + name_bytes.len() <= bytes.len()
             && bytes[i..i + name_bytes.len()].eq_ignore_ascii_case(name_bytes)
         {
-            let before_ok = i == 0 || !is_ident_char(bytes[i - 1]);
-            let after_ok =
-                i + name_bytes.len() == bytes.len() || !is_ident_char(bytes[i + name_bytes.len()]);
+            let before_ok = i == 0 || (!is_ident_char(bytes[i - 1]) && bytes[i - 1] != b'.');
+            let after_ok = i + name_bytes.len() == bytes.len()
+                || (!is_ident_char(bytes[i + name_bytes.len()])
+                    && bytes[i + name_bytes.len()] != b'.');
 
             if before_ok && after_ok {
                 result.extend_from_slice(replacement.as_bytes());
@@ -798,6 +1364,28 @@ async fn evaluate_expression(
     parse_literal_value(&expanded, &DataType::Text)
 }
 
+const EXIT_SIGNAL_VAR: &str = "__tipg_plpgsql_exit_signal__";
+
+fn set_exit_signal(ctx: &mut PlpgsqlContext) {
+    ctx.set_var(EXIT_SIGNAL_VAR, Value::Boolean(true));
+}
+
+fn consume_exit_signal(ctx: &mut PlpgsqlContext) -> bool {
+    let mut found_key: Option<String> = None;
+    let mut signaled = false;
+    for (k, v) in &ctx.variables {
+        if k.eq_ignore_ascii_case(EXIT_SIGNAL_VAR) {
+            found_key = Some(k.clone());
+            signaled = matches!(v, Value::Boolean(true));
+            break;
+        }
+    }
+    if let Some(key) = found_key {
+        ctx.variables.remove(&key);
+    }
+    signaled
+}
+
 pub async fn try_execute_user_function(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -806,6 +1394,7 @@ pub async fn try_execute_user_function(
     search_path: &[String],
     func_name: &str,
     args: Vec<Value>,
+    executor: Option<&'_ Executor>,
 ) -> Result<Option<Value>> {
     let func_obj = names::object_name_from_str(func_name)?;
     let resolved =
@@ -826,6 +1415,7 @@ pub async fn try_execute_user_function(
                         search_path,
                         &full,
                         args,
+                        executor,
                     )
                     .await
                     .map(Some);
@@ -843,6 +1433,7 @@ pub async fn try_execute_user_function(
         search_path,
         &full_name,
         args,
+        executor,
     )
     .await
     .map(Some)
@@ -856,6 +1447,7 @@ async fn execute_user_function_by_name(
     search_path: &[String],
     full_name: &str,
     args: Vec<Value>,
+    executor: Option<&'_ Executor>,
 ) -> Result<Value> {
     let func_def = store
         .get_function(txn, db_id, full_name)
@@ -891,6 +1483,7 @@ async fn execute_user_function_by_name(
         search_path,
         &func_def,
         args,
+        executor,
     )
     .await
 }

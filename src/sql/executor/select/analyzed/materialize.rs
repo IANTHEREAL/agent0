@@ -276,6 +276,7 @@ impl Executor {
                             search_path,
                             &func.name,
                             arg_values,
+                            Some(self),
                         )
                         .await?
                         {

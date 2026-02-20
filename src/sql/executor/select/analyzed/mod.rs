@@ -1683,6 +1683,11 @@ impl Executor {
                 } => {
                     let key = table_ref.alias.as_deref().unwrap_or(&func.name).to_string();
 
+                    let has_correlated_args = args.iter().any(|arg| match arg {
+                        TypedFunctionArg::Positional(expr) => has_outer_ref(expr),
+                        TypedFunctionArg::Named { expr, .. } => has_outer_ref(expr),
+                    });
+
                     // Build schema from analyzer-resolved output columns.
                     let schema = TableSchema {
                         name: key.clone(),
@@ -1708,6 +1713,11 @@ impl Executor {
                         owner: String::new(),
                         from_alias: table_ref.alias.clone(),
                     };
+
+                    build_ctx.table_schemas.insert(key.clone(), schema);
+                    if has_correlated_args {
+                        return Ok(());
+                    }
 
                     // Evaluate typed args to Values, then bridge to FunctionArg.
                     let qc = crate::sql::query_context::QueryContext::from_task_locals();
@@ -1838,7 +1848,6 @@ impl Executor {
                         }
                     };
 
-                    build_ctx.table_schemas.insert(key.clone(), schema);
                     build_ctx.preloaded_rows.insert(key, rows);
                 }
                 AnalyzedTableRefKind::Join { left, right, .. } => {

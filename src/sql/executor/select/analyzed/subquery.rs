@@ -2,7 +2,7 @@
 
 use crate::sql::analyzer::types::{
     AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind, BinaryOp,
-    JoinCondition, TypedExpr, TypedExprKind, TypedOrderByExpr,
+    JoinCondition, TypedExpr, TypedExprKind, TypedFunctionArg, TypedOrderByExpr,
 };
 use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::expr::classify::has_unresolved_subquery;
@@ -53,6 +53,11 @@ pub(super) fn is_correlated_query(query: &AnalyzedQuery) -> bool {
 /// Check if a table reference (or its nested joins) contains outer references.
 fn table_ref_has_outer_ref(table_ref: &AnalyzedTableRef) -> bool {
     match &table_ref.kind {
+        AnalyzedTableRefKind::Subquery(query) => is_correlated_query(query),
+        AnalyzedTableRefKind::Function { args, .. } => args.iter().any(|arg| match arg {
+            TypedFunctionArg::Positional(expr) => has_outer_ref(expr),
+            TypedFunctionArg::Named { expr, .. } => has_outer_ref(expr),
+        }),
         AnalyzedTableRefKind::Join {
             left,
             right,
@@ -222,6 +227,32 @@ fn substitute_outer_refs_in_table_ref(
     outer_row: &Row,
 ) -> AnalyzedTableRef {
     let kind = match &table_ref.kind {
+        AnalyzedTableRefKind::Subquery(query) => AnalyzedTableRefKind::Subquery(Box::new(
+            substitute_outer_refs_in_query(query, outer_row),
+        )),
+        AnalyzedTableRefKind::Function {
+            func,
+            args,
+            output_columns,
+        } => {
+            let args = args
+                .iter()
+                .map(|arg| match arg {
+                    TypedFunctionArg::Positional(expr) => {
+                        TypedFunctionArg::Positional(substitute_outer_refs_in_expr(expr, outer_row))
+                    }
+                    TypedFunctionArg::Named { name, expr } => TypedFunctionArg::Named {
+                        name: name.clone(),
+                        expr: substitute_outer_refs_in_expr(expr, outer_row),
+                    },
+                })
+                .collect();
+            AnalyzedTableRefKind::Function {
+                func: func.clone(),
+                args,
+                output_columns: output_columns.clone(),
+            }
+        }
         AnalyzedTableRefKind::Join {
             join_type,
             left,
@@ -620,7 +651,8 @@ fn combine_and(parts: Vec<&TypedExpr>) -> Option<TypedExpr> {
 mod tests {
     use super::*;
     use crate::sql::analyzer::types::{
-        AnalyzedDistinct, AnalyzedProjection, AnalyzedQueryBody, BinaryOp,
+        AnalyzedDistinct, AnalyzedProjection, AnalyzedQueryBody, AnalyzedTableRef,
+        AnalyzedTableRefKind, BinaryOp, FunctionKind, ResolvedFunction, TypedFunctionArg,
     };
 
     fn int_const(v: i32) -> TypedExpr {
@@ -699,5 +731,114 @@ mod tests {
         };
 
         assert!(is_correlated_query(&query));
+    }
+
+    #[test]
+    fn is_correlated_query_detects_outer_ref_in_table_function_args() {
+        let query = AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection: vec![AnalyzedProjection {
+                    expr: int_const(1),
+                    output_name: "?column?".to_string(),
+                }],
+                from: vec![AnalyzedTableRef {
+                    kind: AnalyzedTableRefKind::Function {
+                        func: ResolvedFunction {
+                            name: "generate_series".to_string(),
+                            kind: FunctionKind::Builtin,
+                            return_type: DataType::Int32,
+                        },
+                        args: vec![
+                            TypedFunctionArg::Positional(int_const(1)),
+                            TypedFunctionArg::Positional(TypedExpr::new(
+                                TypedExprKind::ColumnRef {
+                                    scope_depth: 1,
+                                    column_index: 0,
+                                    column_name: "outer_n".to_string(),
+                                },
+                                DataType::Int32,
+                            )),
+                        ],
+                        output_columns: vec![("generate_series".to_string(), DataType::Int32)],
+                    },
+                    alias: Some("gs".to_string()),
+                }],
+                where_clause: None,
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("?column?".to_string(), DataType::Int32)],
+        };
+
+        assert!(is_correlated_query(&query));
+    }
+
+    #[test]
+    fn substitute_outer_refs_in_query_rewrites_table_function_args() {
+        let query = AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection: vec![AnalyzedProjection {
+                    expr: int_const(1),
+                    output_name: "?column?".to_string(),
+                }],
+                from: vec![AnalyzedTableRef {
+                    kind: AnalyzedTableRefKind::Function {
+                        func: ResolvedFunction {
+                            name: "generate_series".to_string(),
+                            kind: FunctionKind::Builtin,
+                            return_type: DataType::Int32,
+                        },
+                        args: vec![
+                            TypedFunctionArg::Positional(int_const(1)),
+                            TypedFunctionArg::Positional(TypedExpr::new(
+                                TypedExprKind::ColumnRef {
+                                    scope_depth: 1,
+                                    column_index: 1,
+                                    column_name: "outer_n".to_string(),
+                                },
+                                DataType::Int32,
+                            )),
+                        ],
+                        output_columns: vec![("generate_series".to_string(), DataType::Int32)],
+                    },
+                    alias: Some("gs".to_string()),
+                }],
+                where_clause: None,
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("?column?".to_string(), DataType::Int32)],
+        };
+        let outer_row = Row::new(vec![Value::Int32(7), Value::Int32(5)]);
+
+        let substituted = substitute_outer_refs_in_query(&query, &outer_row);
+        let AnalyzedQueryBody::Select(select) = substituted.body else {
+            panic!("expected select body");
+        };
+        let Some(AnalyzedTableRef {
+            kind: AnalyzedTableRefKind::Function { args, .. },
+            ..
+        }) = select.from.first()
+        else {
+            panic!("expected function table ref");
+        };
+
+        let TypedFunctionArg::Positional(expr) = &args[1] else {
+            panic!("expected positional argument");
+        };
+        assert!(matches!(
+            expr.kind,
+            TypedExprKind::Constant(Value::Int32(5))
+        ));
     }
 }
