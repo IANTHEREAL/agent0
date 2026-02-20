@@ -70,7 +70,11 @@ enum Commands {
     /// Register a new account
     Register,
     /// Login to your account
-    Login,
+    Login {
+        /// Use API key directly instead of email/password
+        #[arg(long)]
+        api_key: Option<String>,
+    },
     /// Claim anonymous account with email and password
     Claim,
     /// Logout (remove stored credentials)
@@ -590,7 +594,7 @@ async fn main() {
 
     match cli.command {
         Commands::Register => cmd_register(&api, &cli.effective_output()).await,
-        Commands::Login => cmd_login(&api, &cli.effective_output()).await,
+        Commands::Login { ref api_key } => cmd_login(&api, &cli.effective_output(), api_key.clone()).await,
         Commands::Claim => cmd_claim(&api, &cli.effective_output()).await,
         Commands::Logout => cmd_logout(),
         Commands::Init => cmd_init(&api, &cli.effective_output()).await,
@@ -1003,7 +1007,47 @@ async fn cmd_register(api: &ApiClient, output: &OutputFormat) {
     }
 }
 
-async fn cmd_login(api: &ApiClient, output: &OutputFormat) {
+async fn cmd_login(api: &ApiClient, output: &OutputFormat, api_key: Option<String>) {
+    // If --api-key is provided, save it directly and verify
+    if let Some(key) = api_key {
+        if let Err(e) = save_token(&key) {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+
+        // Verify the token works by creating a new client with it and calling /customer/me
+        let verify_api = ApiClient::new(api.base_url(), Some(&key));
+        let result = verify_api.request("GET", "/customer/me", None, None).await;
+
+        if result.get("error").is_some() || result.get("id").is_none() {
+            // Token invalid, remove it
+            let cred_path = config_dir().join("credentials");
+            let _ = std::fs::remove_file(&cred_path);
+            eprintln!("Invalid API key");
+            process::exit(1);
+        }
+
+        // Clear any anonymous credentials
+        if let Err(e) = clear_anonymous_credentials() {
+            eprintln!("Warning: failed to clear anonymous credentials: {e}");
+        }
+
+        match output {
+            OutputFormat::Json => {
+                let safe = serde_json::json!({
+                    "status": "ok",
+                    "email": result.get("email"),
+                });
+                print_json(&safe);
+            }
+            _ => {
+                println!("Login successful! Logged in as: {}", result["email"].as_str().unwrap_or("unknown"));
+            }
+        }
+        return;
+    }
+
+    // Interactive login with email/password
     let email = prompt_email();
     let password = prompt_password("Password: ");
 
@@ -1056,11 +1100,11 @@ async fn cmd_claim(api: &ApiClient, output: &OutputFormat) {
             let mut answer = String::new();
             io::stdin().read_line(&mut answer).ok();
             match answer.trim().to_ascii_lowercase().as_str() {
-                "l" | "login" => cmd_login(api, output).await,
+                "l" | "login" => cmd_login(api, output, None).await,
                 "r" | "register" => {
                     cmd_register(api, output).await;
                     println!();
-                    cmd_login(api, output).await;
+                    cmd_login(api, output, None).await;
                 }
                 _ => {
                     eprintln!("Aborted. Run 'db9 login' or 'db9 register' first.");
@@ -1155,12 +1199,12 @@ async fn cmd_init(api: &ApiClient, output: &OutputFormat) {
 
         if has_account {
             println!("\n--- Login ---");
-            cmd_login(api, output).await;
+            cmd_login(api, output, None).await;
         } else {
             println!("\n--- Register ---");
             cmd_register(api, output).await;
             println!("\n--- Login ---");
-            cmd_login(api, output).await;
+            cmd_login(api, output, None).await;
         }
     }
 
