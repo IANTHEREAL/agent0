@@ -12,9 +12,32 @@
 use crate::sql::error::SqlError;
 use crate::types::Value;
 use anyhow::{anyhow, Result};
+use dashmap::DashMap;
 use sqlparser::ast::BinaryOperator;
 
 use super::numeric;
+
+/// Process-wide cache for compiled regexes used by `~`, `~*`, `!~`, `!~*` operators.
+/// Bounded: new entries are skipped (not cached) when the map is full.
+const MAX_REGEX_CACHE_SIZE: usize = 256;
+
+static REGEX_CACHE: std::sync::LazyLock<DashMap<String, regex::Regex>> =
+    std::sync::LazyLock::new(DashMap::new);
+
+fn get_or_compile_regex(pattern: &str) -> Result<regex::Regex> {
+    if let Some(re) = REGEX_CACHE.get(pattern) {
+        return Ok(re.clone());
+    }
+    let re =
+        regex::Regex::new(pattern).map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
+    // Soft cap: skip insert when full. Under concurrency, len() is approximate
+    // so the cache may transiently exceed MAX_REGEX_CACHE_SIZE — acceptable
+    // since it's a memory budget hint, not a hard invariant.
+    if REGEX_CACHE.len() < MAX_REGEX_CACHE_SIZE {
+        REGEX_CACHE.insert(pattern.to_string(), re.clone());
+    }
+    Ok(re)
+}
 
 /// Sort with fallible comparison. Propagates the first comparison error.
 /// After the first error, remaining comparisons short-circuit to Equal
@@ -45,52 +68,45 @@ pub fn sort_by_fallible<T>(
     }
 }
 
+/// Returns true for SQL strict operators where any NULL input produces NULL output.
+fn is_strict_op(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Gt
+            | BinaryOperator::Lt
+            | BinaryOperator::GtEq
+            | BinaryOperator::LtEq
+            | BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo
+            | BinaryOperator::PGRegexMatch
+            | BinaryOperator::PGRegexIMatch
+            | BinaryOperator::PGRegexNotMatch
+            | BinaryOperator::PGRegexNotIMatch
+    )
+}
+
 /// Evaluate a binary operator on two values.
 pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<Value> {
+    // SQL strict operators: any NULL input produces NULL output.
+    // Excludes: And/Or (three-valued logic), StringConcat (array overloads are non-strict),
+    // PGOverlap/@@/? (handled inline or delegated).
+    if is_strict_op(op) && (matches!(left, Value::Null) || matches!(right, Value::Null)) {
+        return Ok(Value::Null);
+    }
+
     match op {
-        // Comparison - SQL three-valued logic: comparison with NULL returns NULL
-        BinaryOperator::Eq => {
-            if matches!(left, Value::Null) || matches!(right, Value::Null) {
-                Ok(Value::Null)
-            } else {
-                Ok(Value::Boolean(compare_values(&left, &right)? == 0))
-            }
-        }
-        BinaryOperator::NotEq => {
-            if matches!(left, Value::Null) || matches!(right, Value::Null) {
-                Ok(Value::Null)
-            } else {
-                Ok(Value::Boolean(compare_values(&left, &right)? != 0))
-            }
-        }
-        BinaryOperator::Gt => {
-            if matches!(left, Value::Null) || matches!(right, Value::Null) {
-                Ok(Value::Null)
-            } else {
-                Ok(Value::Boolean(compare_values(&left, &right)? > 0))
-            }
-        }
-        BinaryOperator::Lt => {
-            if matches!(left, Value::Null) || matches!(right, Value::Null) {
-                Ok(Value::Null)
-            } else {
-                Ok(Value::Boolean(compare_values(&left, &right)? < 0))
-            }
-        }
-        BinaryOperator::GtEq => {
-            if matches!(left, Value::Null) || matches!(right, Value::Null) {
-                Ok(Value::Null)
-            } else {
-                Ok(Value::Boolean(compare_values(&left, &right)? >= 0))
-            }
-        }
-        BinaryOperator::LtEq => {
-            if matches!(left, Value::Null) || matches!(right, Value::Null) {
-                Ok(Value::Null)
-            } else {
-                Ok(Value::Boolean(compare_values(&left, &right)? <= 0))
-            }
-        }
+        // Comparison (NULL already handled above)
+        BinaryOperator::Eq => Ok(Value::Boolean(compare_values(&left, &right)? == 0)),
+        BinaryOperator::NotEq => Ok(Value::Boolean(compare_values(&left, &right)? != 0)),
+        BinaryOperator::Gt => Ok(Value::Boolean(compare_values(&left, &right)? > 0)),
+        BinaryOperator::Lt => Ok(Value::Boolean(compare_values(&left, &right)? < 0)),
+        BinaryOperator::GtEq => Ok(Value::Boolean(compare_values(&left, &right)? >= 0)),
+        BinaryOperator::LtEq => Ok(Value::Boolean(compare_values(&left, &right)? <= 0)),
 
         // Logical
         // SQL three-valued logic for boolean operators
@@ -114,43 +130,12 @@ pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<
             _ => Err(anyhow!("OR requires boolean operands")),
         },
 
-        // Arithmetic
-        // PostgreSQL arithmetic operators are strict: NULL in => NULL out.
-        BinaryOperator::Plus => {
-            if left == Value::Null || right == Value::Null {
-                Ok(Value::Null)
-            } else {
-                add_values(left, right)
-            }
-        }
-        BinaryOperator::Minus => {
-            if left == Value::Null || right == Value::Null {
-                Ok(Value::Null)
-            } else {
-                sub_values(left, right)
-            }
-        }
-        BinaryOperator::Multiply => {
-            if left == Value::Null || right == Value::Null {
-                Ok(Value::Null)
-            } else {
-                mul_values(left, right)
-            }
-        }
-        BinaryOperator::Divide => {
-            if left == Value::Null || right == Value::Null {
-                Ok(Value::Null)
-            } else {
-                div_values(left, right)
-            }
-        }
-        BinaryOperator::Modulo => {
-            if left == Value::Null || right == Value::Null {
-                Ok(Value::Null)
-            } else {
-                mod_values(left, right)
-            }
-        }
+        // Arithmetic (NULL already handled above)
+        BinaryOperator::Plus => add_values(left, right),
+        BinaryOperator::Minus => sub_values(left, right),
+        BinaryOperator::Multiply => mul_values(left, right),
+        BinaryOperator::Divide => div_values(left, right),
+        BinaryOperator::Modulo => mod_values(left, right),
 
         BinaryOperator::StringConcat => match (&left, &right) {
             (Value::Tsvector(_), _) | (_, Value::Tsvector(_)) => {
@@ -221,74 +206,57 @@ pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<
             _ => Err(anyhow!("&& operator requires array operands")),
         },
 
+        // Regex operators (NULL already handled above; compiled regex is cached)
         BinaryOperator::PGRegexMatch => {
             let text = match &left {
                 Value::Text(s) => s.clone(),
-                Value::Null => return Ok(Value::Null),
                 v => v.to_string(),
             };
             let pattern = match &right {
                 Value::Text(s) => s.clone(),
-                Value::Null => return Ok(Value::Null),
                 v => v.to_string(),
             };
-            match regex::Regex::new(&pattern) {
-                Ok(re) => Ok(Value::Boolean(re.is_match(&text))),
-                Err(e) => Err(anyhow!("Invalid regex pattern: {}", e)),
-            }
+            let re = get_or_compile_regex(&pattern)?;
+            Ok(Value::Boolean(re.is_match(&text)))
         }
 
         BinaryOperator::PGRegexIMatch => {
             let text = match &left {
                 Value::Text(s) => s.clone(),
-                Value::Null => return Ok(Value::Null),
                 v => v.to_string(),
             };
             let pattern = match &right {
                 Value::Text(s) => s.clone(),
-                Value::Null => return Ok(Value::Null),
                 v => v.to_string(),
             };
-            let case_insensitive_pattern = format!("(?i){}", pattern);
-            match regex::Regex::new(&case_insensitive_pattern) {
-                Ok(re) => Ok(Value::Boolean(re.is_match(&text))),
-                Err(e) => Err(anyhow!("Invalid regex pattern: {}", e)),
-            }
+            let re = get_or_compile_regex(&format!("(?i){}", pattern))?;
+            Ok(Value::Boolean(re.is_match(&text)))
         }
 
         BinaryOperator::PGRegexNotMatch => {
             let text = match &left {
                 Value::Text(s) => s.clone(),
-                Value::Null => return Ok(Value::Null),
                 v => v.to_string(),
             };
             let pattern = match &right {
                 Value::Text(s) => s.clone(),
-                Value::Null => return Ok(Value::Null),
                 v => v.to_string(),
             };
-            match regex::Regex::new(&pattern) {
-                Ok(re) => Ok(Value::Boolean(!re.is_match(&text))),
-                Err(e) => Err(anyhow!("Invalid regex pattern: {}", e)),
-            }
+            let re = get_or_compile_regex(&pattern)?;
+            Ok(Value::Boolean(!re.is_match(&text)))
         }
 
         BinaryOperator::PGRegexNotIMatch => {
             let text = match &left {
                 Value::Text(s) => s.clone(),
-                Value::Null => return Ok(Value::Null),
                 v => v.to_string(),
             };
             let pattern = match &right {
                 Value::Text(s) => s.clone(),
-                Value::Null => return Ok(Value::Null),
                 v => v.to_string(),
             };
-            let case_insensitive_pattern = format!("(?i){}", pattern);
-            match regex::Regex::new(&case_insensitive_pattern) {
-                Ok(re) => Ok(Value::Boolean(!re.is_match(&text))),
-                Err(e) => Err(anyhow!("Invalid regex pattern: {}", e)),
-            }
+            let re = get_or_compile_regex(&format!("(?i){}", pattern))?;
+            Ok(Value::Boolean(!re.is_match(&text)))
         }
 
         // PostgreSQL JSONB existence operator: `jsonb ? text`

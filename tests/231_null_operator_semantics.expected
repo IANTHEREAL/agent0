@@ -1,0 +1,54 @@
+regex_null_left
+NULL
+(1 row)
+regex_null_right
+NULL
+(1 row)
+regex_not_null_left
+NULL
+(1 row)
+regex_ci_null_left
+NULL
+(1 row)
+regex_nci_null_left
+NULL
+(1 row)
+concat_null_right
+NULL
+(1 row)
+concat_null_left
+NULL
+(1 row)
+plus_null
+NULL
+(1 row)
+minus_null
+NULL
+(1 row)
+mul_null
+NULL
+(1 row)
+div_null
+NULL
+(1 row)
+mod_null
+NULL
+(1 row)
+eq_null
+NULL
+(1 row)
+neq_null
+NULL
+(1 row)
+gt_null
+NULL
+(1 row)
+lt_null
+NULL
+(1 row)
+gte_null
+NULL
+(1 row)
+lte_null
+NULL
+(1 row)
