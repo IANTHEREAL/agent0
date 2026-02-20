@@ -45,6 +45,14 @@ pub enum AnalyzerError {
         right: String,
     },
 
+    /// Operator resolution is ambiguous (multiple candidates match).
+    /// Fields carry lowercase PG-style type names (typically "unknown").
+    AmbiguousOperator {
+        operator: String,
+        left: String,
+        right: String,
+    },
+
     /// Type mismatch in context (e.g. WHERE clause is not boolean).
     TypeMismatch {
         expected: DataType,
@@ -192,6 +200,15 @@ impl fmt::Display for AnalyzerError {
             } => write!(
                 f,
                 "operator does not exist: {} {} {}\nHINT:  No operator matches the given name and argument types. You might need to add explicit type casts.",
+                left, operator, right
+            ),
+            Self::AmbiguousOperator {
+                operator,
+                left,
+                right,
+            } => write!(
+                f,
+                "operator is not unique: {} {} {}\nHINT:  Could not choose a best candidate operator. You might need to add explicit type casts.",
                 left, operator, right
             ),
             Self::TypeMismatch {

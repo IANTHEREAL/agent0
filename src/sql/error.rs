@@ -168,6 +168,9 @@ pub enum SqlError {
     #[error("{message}")]
     OperatorResolution { message: String },
 
+    #[error("{message}")]
+    AmbiguousOperator { message: String },
+
     // Structure errors (42601 without "syntax error: " prefix)
     #[error("{0}")]
     SqlStructure(String),
@@ -241,6 +244,7 @@ impl SqlError {
             Self::GroupingError { .. } => "42803",
             Self::WindowFunctionError { .. } => "42P20",
             Self::OperatorResolution { .. } => "42883",
+            Self::AmbiguousOperator { .. } => "42725",
             Self::SqlStructure(_) => "42601",
             Self::InvalidCatalogName(_) => "3D000",
             Self::SequenceLimitExceeded { .. } => "2200H",
@@ -302,6 +306,9 @@ impl From<AnalyzerError> for SqlError {
             }
             AnalyzerError::Unsupported(msg) => SqlError::Unsupported(msg),
             AnalyzerError::OperatorTypeMismatch { .. } => SqlError::OperatorResolution {
+                message: e.to_string(),
+            },
+            AnalyzerError::AmbiguousOperator { .. } => SqlError::AmbiguousOperator {
                 message: e.to_string(),
             },
             AnalyzerError::ArgumentCountMismatch { .. } => SqlError::OperatorResolution {
@@ -529,6 +536,13 @@ mod tests {
             .sqlstate(),
             "42883"
         );
+        assert_eq!(
+            SqlError::AmbiguousOperator {
+                message: "operator is not unique: unknown + unknown".into()
+            }
+            .sqlstate(),
+            "42725"
+        );
         assert_eq!(SqlError::SqlStructure("struct".into()).sqlstate(), "42601");
         assert_eq!(
             SqlError::InvalidCatalogName("db".into()).sqlstate(),
@@ -597,6 +611,13 @@ mod tests {
             }
             .to_string(),
             "operator does not exist: int + text"
+        );
+        assert_eq!(
+            SqlError::AmbiguousOperator {
+                message: "operator is not unique: unknown + unknown".into()
+            }
+            .to_string(),
+            "operator is not unique: unknown + unknown"
         );
         assert_eq!(
             SqlError::SqlStructure("each UNION query must have the same number of columns".into())
@@ -740,6 +761,15 @@ mod tests {
         };
         let sql: SqlError = ae.into();
         assert_eq!(sql.sqlstate(), "42883");
+
+        // AmbiguousOperator → 42725
+        let ae = AnalyzerError::AmbiguousOperator {
+            operator: "+".into(),
+            left: "unknown".into(),
+            right: "unknown".into(),
+        };
+        let sql: SqlError = ae.into();
+        assert_eq!(sql.sqlstate(), "42725");
 
         // TypeMismatch → 42804
         let ae = AnalyzerError::TypeMismatch {

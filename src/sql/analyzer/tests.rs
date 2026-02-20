@@ -1037,6 +1037,19 @@ fn analyze_arithmetic_rejects_text_column_plus_int() {
 }
 
 #[test]
+fn analyze_arithmetic_rejects_text_column_plus_text_column() {
+    let err = analyze_expr_with_users("name + name").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
+            if operator == "+" && left == "text" && right == "text"
+    ));
+
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
+#[test]
 fn analyze_no_cast_when_types_match() {
     // age (Int32) + 1 (Int32) → no cast needed
     let expr = analyze_expr_with_users("age + 1").unwrap();
@@ -1947,6 +1960,37 @@ fn analyze_select_with_parameter() {
 }
 
 #[test]
+fn analyze_unknown_plus_unknown_reports_ambiguous_operator() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 + $1");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+    assert!(sql.to_string().contains("operator is not unique"));
+}
+
+#[test]
+fn analyze_unknown_plus_int_infers_integer_and_succeeds() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 + 1");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Int32]);
+}
+
+#[test]
+fn analyze_unknown_concat_unknown_resolves_to_text() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 || $2");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text, DataType::Text]);
+}
+
+#[test]
 fn analyze_insert_with_parameters() {
     // INSERT INTO users (id, name) VALUES ($1, $2) → params typed from columns
     let catalog = test_catalog();
@@ -2046,6 +2090,17 @@ fn analyze_unresolved_parameter_in_projection_defaults_to_text() {
 }
 
 #[test]
+fn analyze_pg_typeof_unknown_param_returns_42p18_on_finalize() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT pg_typeof($1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let err = analyzer.finalize_param_types().unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42P18");
+}
+
+#[test]
 fn analyze_parameter_with_client_oid() {
     // Client provides INT4 OID → respected even without contextual typing
     let catalog = test_catalog();
@@ -2086,6 +2141,16 @@ fn analyze_parameter_explicit_cast() {
             ));
         }
     }
+}
+
+#[test]
+fn analyze_parameter_explicit_cast_binary_op_is_not_ambiguous() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1::int + $2::int");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Int32, DataType::Int32]);
 }
 
 #[test]

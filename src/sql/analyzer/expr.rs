@@ -1198,6 +1198,37 @@ impl<'a> Analyzer<'a> {
             }
         }
 
+        let left_unresolved_param = match &l.kind {
+            TypedExprKind::Parameter { index } if self.is_unresolved_param(&l) => Some(*index),
+            _ => None,
+        };
+        let right_unresolved_param = match &r.kind {
+            TypedExprKind::Parameter { index } if self.is_unresolved_param(&r) => Some(*index),
+            _ => None,
+        };
+        if let (Some(left_index), Some(right_index)) =
+            (left_unresolved_param, right_unresolved_param)
+        {
+            if Self::resolves_unknown_pair_to_text(&typed_op) {
+                self.resolve_param_type(left_index, &DataType::Text)?;
+                self.resolve_param_type(right_index, &DataType::Text)?;
+                l = TypedExpr::new(
+                    TypedExprKind::Parameter { index: left_index },
+                    DataType::Text,
+                );
+                r = TypedExpr::new(
+                    TypedExprKind::Parameter { index: right_index },
+                    DataType::Text,
+                );
+            } else if Self::is_ambiguous_unknown_pair_op(&typed_op) {
+                return Err(AnalyzerError::AmbiguousOperator {
+                    operator: typed_op.to_string(),
+                    left: "unknown".to_string(),
+                    right: "unknown".to_string(),
+                });
+            }
+        }
+
         // PostgreSQL UNKNOWN literal rule (partial):
         //
         // String literals are untyped (UNKNOWN) in PostgreSQL and can be coerced
@@ -1293,6 +1324,35 @@ impl<'a> Analyzer<'a> {
             },
             result_type,
         ))
+    }
+
+    fn resolves_unknown_pair_to_text(op: &BinaryOp) -> bool {
+        matches!(
+            op,
+            BinaryOp::Concat
+                | BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq
+        )
+    }
+
+    fn is_ambiguous_unknown_pair_op(op: &BinaryOp) -> bool {
+        matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::BitwiseAnd
+                | BinaryOp::BitwiseOr
+                | BinaryOp::BitwiseXor
+                | BinaryOp::ShiftLeft
+                | BinaryOp::ShiftRight
+        )
     }
 
     fn convert_binary_op(&self, op: &ast::BinaryOperator) -> Result<BinaryOp, AnalyzerError> {

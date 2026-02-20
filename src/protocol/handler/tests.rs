@@ -1,4 +1,6 @@
 use super::*;
+use crate::sql::analyzer::catalog::MockCatalog;
+use crate::sql::analyzer::{Analyzer, Catalog};
 use crate::sql::error::SqlError;
 use crate::types::{Row, Value};
 use async_trait::async_trait;
@@ -184,6 +186,24 @@ fn encode_value_to_string(value: &Value, col_type: Option<&DataType>) -> String 
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
+fn parse_single_statement(sql: &str) -> sqlparser::ast::Statement {
+    let mut stmts = crate::sql::parse_sql(sql).expect("SQL parse");
+    assert_eq!(stmts.len(), 1, "expected one statement");
+    stmts.remove(0)
+}
+
+fn analyze_statement_with_params(
+    catalog: &dyn Catalog,
+    sql: &str,
+    param_count: usize,
+    client_oids: &[Option<DataType>],
+) -> Result<Vec<DataType>, SqlError> {
+    let stmt = parse_single_statement(sql);
+    let mut analyzer = Analyzer::new_with_params(catalog, param_count, client_oids);
+    analyzer.analyze_statement(&stmt).map_err(SqlError::from)?;
+    analyzer.finalize_param_types().map_err(SqlError::from)
+}
+
 #[test]
 fn test_sqlstate_for_executor_error() {
     // SqlError::InFailedTransaction → 25P02
@@ -255,6 +275,12 @@ fn test_sqlstate_for_executor_error() {
             SqlError::StringDataRightTruncation { max_length: 10u64 },
             "22001",
         ),
+        (
+            SqlError::AmbiguousOperator {
+                message: "operator is not unique: unknown + unknown".into(),
+            },
+            "42725",
+        ),
     ];
 
     for (sql_err, expected_code) in cases {
@@ -266,6 +292,61 @@ fn test_sqlstate_for_executor_error() {
             expected_code
         );
     }
+}
+
+#[test]
+fn prepared_unknown_plus_unknown_returns_42725() {
+    let catalog = MockCatalog::empty();
+    let stmt = parse_single_statement("SELECT $1 + $1");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+    assert!(sql.to_string().contains("operator is not unique"));
+}
+
+#[test]
+fn prepared_unknown_plus_int_succeeds() {
+    let catalog = MockCatalog::empty();
+    let types = analyze_statement_with_params(&catalog, "SELECT $1 + 1", 1, &[None]).unwrap();
+    assert_eq!(types, vec![DataType::Int32]);
+}
+
+#[test]
+fn prepared_unknown_concat_unknown_resolves_text() {
+    let catalog = MockCatalog::empty();
+    let types =
+        analyze_statement_with_params(&catalog, "SELECT $1 || $2", 2, &[None, None]).unwrap();
+    assert_eq!(types, vec![DataType::Text, DataType::Text]);
+}
+
+#[test]
+fn prepared_pg_typeof_unknown_returns_42p18() {
+    let catalog = MockCatalog::empty();
+    let err =
+        analyze_statement_with_params(&catalog, "SELECT pg_typeof($1)", 1, &[None]).unwrap_err();
+    assert_eq!(err.sqlstate(), "42P18");
+}
+
+#[test]
+fn prepared_explicit_cast_plus_succeeds() {
+    let catalog = MockCatalog::empty();
+    let types =
+        analyze_statement_with_params(&catalog, "SELECT $1::int + $2::int", 2, &[None, None])
+            .unwrap();
+    assert_eq!(types, vec![DataType::Int32, DataType::Int32]);
+}
+
+#[test]
+fn prepared_text_column_plus_text_column_stays_42883() {
+    let catalog = MockCatalog::builder()
+        .table("t", vec![("name", DataType::Text, true)])
+        .build();
+    let stmt = parse_single_statement("SELECT name + name FROM t");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
 }
 
 #[test]
