@@ -1,0 +1,11 @@
+-- Test 2: SET to 2s
+2000ms
+
+-- Test 3: SET to 30s
+30000ms
+
+-- Test 4: Raw ms
+5000ms
+
+-- Test 5: Disabled
+ 0

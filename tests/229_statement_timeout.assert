@@ -1,0 +1,14 @@
+-- Test 1: SET and SHOW - value displayed as milliseconds
+5000ms
+
+-- Test 2: 30 seconds
+30000ms
+
+-- Test 3: Raw ms value
+2000ms
+
+-- Test 4: Disabled (0)
+ 0
+
+-- Test 8: Connection still works after timeout
+ 1
