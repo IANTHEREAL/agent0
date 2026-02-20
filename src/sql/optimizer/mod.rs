@@ -7,6 +7,7 @@
 pub mod build;
 pub mod eligibility;
 pub mod join_keys;
+pub mod join_reorder;
 pub mod logical_plan;
 pub mod logical_planner;
 pub mod physical_plan;
@@ -117,8 +118,8 @@ pub fn optimize(
 ) -> anyhow::Result<PhysicalPlan> {
     // Step 1: AnalyzedQuery → LogicalPlan
     let logical = LogicalPlanner::build(analyzed)?;
-    // Step 2: Apply rewrite rules (predicate pushdown, etc.)
-    let optimized = rewrite::apply_rewrites(logical);
+    // Step 2: Apply rewrite rules (predicate pushdown, join reorder, etc.)
+    let optimized = rewrite::apply_rewrites(logical, Some(planning_ctx));
     // Step 3: LogicalPlan → PhysicalPlan (cost-based)
     Ok(PhysicalPlanner::plan(&optimized, planning_ctx))
 }

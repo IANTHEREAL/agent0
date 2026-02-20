@@ -29,13 +29,24 @@ trait LogicalRewriteRule {
 /// Apply all rewrite rules to a logical plan.
 ///
 /// Called from `optimize()` between logical planning and physical planning.
-pub fn apply_rewrites(plan: LogicalPlan) -> LogicalPlan {
-    let rules: Vec<Box<dyn LogicalRewriteRule>> =
-        vec![Box::new(PredicatePushdown), Box::new(CrossJoinElimination)];
-    let mut current = plan;
-    for rule in &rules {
-        current = rule.rewrite(current);
+/// When `planning_ctx` is provided, join reordering is enabled using table
+/// statistics for cost-based decisions.
+pub fn apply_rewrites(
+    plan: LogicalPlan,
+    planning_ctx: Option<&super::physical_planner::PlanningContext>,
+) -> LogicalPlan {
+    // Phase 1: Predicate pushdown + cross-join elimination
+    let mut current = PredicatePushdown.rewrite(plan);
+    current = CrossJoinElimination.rewrite(current);
+
+    // Phase 2: Join reordering (requires PlanningContext for cost estimation)
+    if let Some(ctx) = planning_ctx {
+        current = super::join_reorder::reorder_joins(current, ctx);
+        // Second pushdown pass: re-push single-table filters that may now be
+        // pushable after join tree restructuring
+        current = PredicatePushdown.rewrite(current);
     }
+
     current
 }
 
@@ -673,7 +684,7 @@ fn rebuild_filter_join(
 // ── Helpers (private to this module) ───────────────────────────
 
 /// Split an expression on AND into a flat list of conjuncts.
-fn split_conjunction(expr: TypedExpr) -> Vec<TypedExpr> {
+pub(super) fn split_conjunction(expr: TypedExpr) -> Vec<TypedExpr> {
     match expr.kind {
         TypedExprKind::BinaryOp {
             left,
@@ -691,7 +702,7 @@ fn split_conjunction(expr: TypedExpr) -> Vec<TypedExpr> {
 /// Recombine a list of conjuncts into a single AND expression.
 ///
 /// Panics if the list is empty.
-fn conjuncts_to_predicate(mut conjuncts: Vec<TypedExpr>) -> TypedExpr {
+pub(super) fn conjuncts_to_predicate(mut conjuncts: Vec<TypedExpr>) -> TypedExpr {
     assert!(!conjuncts.is_empty(), "conjuncts must be non-empty");
     let mut result = conjuncts.pop().unwrap();
     while let Some(next) = conjuncts.pop() {
@@ -701,7 +712,7 @@ fn conjuncts_to_predicate(mut conjuncts: Vec<TypedExpr>) -> TypedExpr {
 }
 
 /// Create an AND binary op node.
-fn and_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+pub(super) fn and_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
     TypedExpr {
         kind: TypedExprKind::BinaryOp {
             left: Box::new(left),
@@ -716,7 +727,7 @@ fn and_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
 ///
 /// Uses explicit recursive walk (not `expr_any`) because `expr_any` takes `&Fn`
 /// which doesn't support the mutable `HashSet` capture needed for collection.
-fn collect_column_indices(expr: &TypedExpr) -> HashSet<usize> {
+pub(super) fn collect_column_indices(expr: &TypedExpr) -> HashSet<usize> {
     let mut indices = HashSet::new();
     collect_column_indices_inner(expr, &mut indices);
     indices
@@ -1757,7 +1768,7 @@ mod tests {
             eq_expr(col_ref(0, "a"), col_ref(2, "c")),
         );
         let plan = join.filter(pred);
-        let result = apply_rewrites(plan);
+        let result = apply_rewrites(plan, None);
 
         // After pushdown: Filter(a.col0=b.col2, Cross(Filter(a=1, A), B))
         // After elim: Inner(ON a.col0=b.col2, Filter(a=1, A), B)
