@@ -117,6 +117,7 @@ pub(in crate::protocol::handler) fn count_sql_parameters(sql: &str) -> usize {
     max_param
 }
 
+#[cfg(test)]
 pub(in crate::protocol::handler) fn infer_parameter_types(
     sql: &str,
     param_count: usize,
@@ -249,7 +250,7 @@ pub(super) fn is_ident_char_or_dollar(b: u8) -> bool {
     is_ident_char(b) || b == b'$'
 }
 
-#[allow(dead_code)] // called from parser.rs, but transitively dead in production
+#[cfg(test)]
 pub(in crate::protocol::handler) fn find_keyword_outside_strings(
     query: &str,
     keyword: &str,
@@ -349,6 +350,7 @@ pub(in crate::protocol::handler) fn find_keyword_outside_strings(
     None
 }
 
+#[cfg(test)]
 #[cfg(test)]
 pub(in crate::protocol::handler) fn replace_placeholders_for_inference(query: &str) -> String {
     let mut result = String::with_capacity(query.len());

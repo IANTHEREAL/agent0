@@ -6,11 +6,11 @@ use pgwire::api::results::Response;
 // Re-exported for tests (via `use super::*`)
 #[allow(unused_imports)]
 use pgwire::api::results::{FieldFormat, FieldInfo};
+#[allow(unused_imports)] // re-exported for tests (via `use super::*`)
 use pgwire::api::Type;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::response::NoticeResponse;
 use pgwire::messages::PgWireBackendMessage;
-use sqlparser::ast::Expr;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::atomic::AtomicI32;
@@ -36,6 +36,7 @@ mod encode;
 mod errors;
 mod params;
 mod portal;
+mod prepared;
 mod query_parser;
 mod schema_resolve;
 mod server_params;
@@ -43,6 +44,7 @@ mod tenant;
 mod type_infer;
 mod view_infer;
 
+#[allow(unused_imports)] // re-exported for tests (via `use super::*`)
 use encode::{datatype_to_pgtype, result_to_response, result_to_response_with_format};
 
 // Re-export items moved to sub-modules so that `use super::*` in tests/dynamic still works.
@@ -78,24 +80,6 @@ async fn rollback_autocommit_or_mark_failed(session: &mut Session, started_txn: 
 }
 
 pub type CopyContext = copy::CopyContext;
-
-fn resolve_table_for_insert(table_name: &str, search_path: &[String]) -> String {
-    // Strip quotes from table name (GORM uses quoted identifiers)
-    let strip_quotes = |s: &str| -> String { s.trim_matches('"').to_string() };
-
-    if table_name.contains('.') {
-        // Split on . and strip quotes from each part
-        let parts: Vec<&str> = table_name.splitn(2, '.').collect();
-        if parts.len() == 2 {
-            format!("{}.{}", strip_quotes(parts[0]), strip_quotes(parts[1]))
-        } else {
-            strip_quotes(table_name)
-        }
-    } else {
-        let schema = search_path.first().map(|s| s.as_str()).unwrap_or("public");
-        format!("{}.{}", schema, strip_quotes(table_name))
-    }
-}
 
 fn normalize_copy_ident(token: &str) -> String {
     let token = token.trim();
@@ -151,143 +135,6 @@ fn resolve_copy_columns(
     }
 
     Ok((resolved_columns, column_types))
-}
-
-fn count_placeholders_in_expr(expr: &Expr) -> usize {
-    match expr {
-        Expr::Value(sqlparser::ast::Value::Placeholder(p)) => {
-            if p.starts_with('$') && p[1..].chars().all(|c| c.is_ascii_digit()) {
-                1
-            } else {
-                0
-            }
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            count_placeholders_in_expr(left) + count_placeholders_in_expr(right)
-        }
-        Expr::UnaryOp { expr, .. } => count_placeholders_in_expr(expr),
-        Expr::Nested(inner) => count_placeholders_in_expr(inner),
-        Expr::Function(f) => f.args.iter().fold(0, |acc, arg| {
-            acc + match arg {
-                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
-                    count_placeholders_in_expr(e)
-                }
-                sqlparser::ast::FunctionArg::Named {
-                    arg: sqlparser::ast::FunctionArgExpr::Expr(e),
-                    ..
-                } => count_placeholders_in_expr(e),
-                _ => 0,
-            }
-        }),
-        Expr::Cast { expr, .. } => count_placeholders_in_expr(expr),
-        _ => 0,
-    }
-}
-
-fn infer_types_from_expr(
-    expr: &Expr,
-    col_types: &std::collections::HashMap<String, DataType>,
-    types: &mut Vec<Type>,
-) {
-    match expr {
-        Expr::BinaryOp { left, op, right } => match op {
-            sqlparser::ast::BinaryOperator::Eq
-            | sqlparser::ast::BinaryOperator::NotEq
-            | sqlparser::ast::BinaryOperator::Lt
-            | sqlparser::ast::BinaryOperator::LtEq
-            | sqlparser::ast::BinaryOperator::Gt
-            | sqlparser::ast::BinaryOperator::GtEq => {
-                if let (
-                    Expr::Identifier(ident),
-                    Expr::Value(sqlparser::ast::Value::Placeholder(p)),
-                ) = (left.as_ref(), right.as_ref())
-                {
-                    if let Some(idx) = extract_placeholder_index(p) {
-                        let col_name = ident.value.to_lowercase();
-                        if let Some(col_type) = col_types.get(&col_name) {
-                            if idx < types.len() {
-                                types[idx] = datatype_to_pgtype(Some(col_type));
-                            }
-                        }
-                    }
-                } else if let (
-                    Expr::Value(sqlparser::ast::Value::Placeholder(p)),
-                    Expr::Identifier(ident),
-                ) = (left.as_ref(), right.as_ref())
-                {
-                    if let Some(idx) = extract_placeholder_index(p) {
-                        let col_name = ident.value.to_lowercase();
-                        if let Some(col_type) = col_types.get(&col_name) {
-                            if idx < types.len() {
-                                types[idx] = datatype_to_pgtype(Some(col_type));
-                            }
-                        }
-                    }
-                } else if let (
-                    Expr::CompoundIdentifier(parts),
-                    Expr::Value(sqlparser::ast::Value::Placeholder(p)),
-                ) = (left.as_ref(), right.as_ref())
-                {
-                    if let Some(idx) = extract_placeholder_index(p) {
-                        if let Some(last) = parts.last() {
-                            let col_name = last.value.to_lowercase();
-                            if let Some(col_type) = col_types.get(&col_name) {
-                                if idx < types.len() {
-                                    types[idx] = datatype_to_pgtype(Some(col_type));
-                                }
-                            }
-                        }
-                    }
-                }
-                infer_types_from_expr(left, col_types, types);
-                infer_types_from_expr(right, col_types, types);
-            }
-            sqlparser::ast::BinaryOperator::And | sqlparser::ast::BinaryOperator::Or => {
-                infer_types_from_expr(left, col_types, types);
-                infer_types_from_expr(right, col_types, types);
-            }
-            _ => {}
-        },
-        Expr::Nested(inner) => infer_types_from_expr(inner, col_types, types),
-        Expr::InList {
-            expr: left_expr,
-            list,
-            ..
-        } => {
-            if let Expr::Identifier(ident) = left_expr.as_ref() {
-                let col_name = ident.value.to_lowercase();
-                if let Some(col_type) = col_types.get(&col_name) {
-                    for item in list {
-                        if let Expr::Value(sqlparser::ast::Value::Placeholder(p)) = item {
-                            if let Some(idx) = extract_placeholder_index(p) {
-                                if idx < types.len() {
-                                    types[idx] = datatype_to_pgtype(Some(col_type));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn extract_placeholder_index(p: &str) -> Option<usize> {
-    if p.starts_with('$') && p[1..].chars().all(|c| c.is_ascii_digit()) {
-        p[1..].parse::<usize>().ok().map(|n| n - 1)
-    } else {
-        None
-    }
-}
-
-fn extract_placeholder_index_from_expr(expr: &sqlparser::ast::Expr) -> Option<usize> {
-    match expr {
-        sqlparser::ast::Expr::Value(sqlparser::ast::Value::Placeholder(p)) => {
-            extract_placeholder_index(p)
-        }
-        _ => None,
-    }
 }
 
 fn parse_startup_options(options: &str) -> Vec<(String, String)> {

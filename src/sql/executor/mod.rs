@@ -3,7 +3,7 @@
 //! This module contains the main executor and all execution-related submodules.
 
 mod bg_sql;
-mod core;
+pub(crate) mod core;
 mod cron;
 mod cte;
 mod database;

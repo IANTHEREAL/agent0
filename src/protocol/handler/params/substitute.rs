@@ -1,3 +1,4 @@
+use super::super::prepared::PreparedStatement;
 use super::scan::is_ident_char_or_dollar;
 use crate::sql::quoting;
 use pgwire::api::portal::Portal;
@@ -150,30 +151,9 @@ pub(in crate::protocol::handler) fn substitute_placeholders_outside_strings_and_
     String::from_utf8(out).unwrap_or_else(|_| query.to_string())
 }
 
-pub(in crate::protocol::handler) fn dummy_sql_expr_for_param_type(param_type: &Type) -> String {
-    match param_type {
-        t if *t == Type::BOOL => "NULL::bool".to_string(),
-        t if *t == Type::INT2 => "NULL::int2".to_string(),
-        t if *t == Type::INT4 => "NULL::int4".to_string(),
-        t if *t == Type::INT8 => "NULL::int8".to_string(),
-        t if *t == Type::FLOAT4 => "NULL::float4".to_string(),
-        t if *t == Type::FLOAT8 => "NULL::float8".to_string(),
-        t if *t == Type::TEXT || *t == Type::VARCHAR => "NULL::text".to_string(),
-        t if *t == Type::TIMESTAMP => "NULL::timestamp".to_string(),
-        t if *t == Type::TIMESTAMPTZ => "NULL::timestamptz".to_string(),
-        t if *t == Type::UUID => "NULL::uuid".to_string(),
-        t if *t == Type::DATE => "NULL::date".to_string(),
-        t if *t == Type::BYTEA => "NULL::bytea".to_string(),
-        t if *t == Type::JSON => "NULL::json".to_string(),
-        t if *t == Type::JSONB => "NULL::jsonb".to_string(),
-        t if *t == Type::NUMERIC => "NULL::numeric".to_string(),
-        _ => "NULL".to_string(),
-    }
-}
-
 pub(in crate::protocol::handler) fn substitute_parameters(
     query: &str,
-    portal: &Portal<String>,
+    portal: &Portal<PreparedStatement>,
 ) -> PgWireResult<String> {
     let mut values: Vec<String> = Vec::with_capacity(portal.parameter_len());
 

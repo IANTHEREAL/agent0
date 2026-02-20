@@ -1419,8 +1419,23 @@ impl<'a> Analyzer<'a> {
         case_insensitive: bool,
         negated: bool,
     ) -> Result<TypedExpr, AnalyzerError> {
-        let e = self.analyze_expr(expr)?;
-        let p = self.analyze_expr(pattern)?;
+        let mut e = self.analyze_expr(expr)?;
+        if let TypedExprKind::Parameter { index } = &e.kind {
+            let was_unresolved = self.is_unresolved_param(&e);
+            self.resolve_param_type(*index, &DataType::Text)?;
+            if was_unresolved {
+                e = TypedExpr::new(TypedExprKind::Parameter { index: *index }, DataType::Text);
+            }
+        }
+
+        let mut p = self.analyze_expr(pattern)?;
+        if let TypedExprKind::Parameter { index } = &p.kind {
+            let was_unresolved = self.is_unresolved_param(&p);
+            self.resolve_param_type(*index, &DataType::Text)?;
+            if was_unresolved {
+                p = TypedExpr::new(TypedExprKind::Parameter { index: *index }, DataType::Text);
+            }
+        }
         let esc = escape.map(|c| {
             Box::new(TypedExpr::new(
                 TypedExprKind::Constant(Value::Text(c.to_string())),
@@ -1575,6 +1590,7 @@ impl<'a> Analyzer<'a> {
             .iter()
             .map(|a| self.analyze_expr(a))
             .collect::<Result<_, _>>()?;
+        let analyzed_args = self.apply_function_arg_context(func_name.as_str(), analyzed_args)?;
 
         let arg_types: Vec<DataType> = analyzed_args.iter().map(|a| a.data_type.clone()).collect();
 
@@ -1797,6 +1813,44 @@ impl<'a> Analyzer<'a> {
             }
         }
         Ok(exprs)
+    }
+
+    fn apply_function_arg_context(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        match func_name {
+            // Vector distance functions require vector arguments. This provides
+            // parameter typing context for $N placeholders in extended protocol.
+            "COSINE_DISTANCE" | "L2_DISTANCE" | "INNER_PRODUCT" => {
+                self.coerce_args_to_vector(args, 2)
+            }
+            "VECTOR_DIMS" | "VECTOR_NORM" => self.coerce_args_to_vector(args, 1),
+            _ => Ok(args),
+        }
+    }
+
+    fn coerce_args_to_vector(
+        &mut self,
+        args: Vec<TypedExpr>,
+        expected_arity: usize,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.len() != expected_arity {
+            return Ok(args);
+        }
+
+        let target = args
+            .iter()
+            .find_map(|arg| match &arg.data_type {
+                DataType::Vector(dim) => Some(DataType::Vector(*dim)),
+                _ => None,
+            })
+            .unwrap_or(DataType::Vector(0));
+
+        args.into_iter()
+            .map(|arg| self.coerce_if_needed(arg, &target))
+            .collect()
     }
 
     /// Create a resolved scalar FunctionCall from a function name and analyzed args.

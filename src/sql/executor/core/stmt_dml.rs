@@ -7,6 +7,24 @@ use crate::sql::analyzer::types::AnalyzedStatement;
 use crate::sql::analyzer::Analyzer;
 use crate::sql::error::SqlError;
 
+/// Create an Analyzer that is aware of extended-query parameters when present.
+/// Checks QUERY_PARAMS task-local; if non-empty, creates a param-aware Analyzer
+/// so $N placeholders resolve to TypedExprKind::Parameter nodes.
+fn make_analyzer<'a>(catalog: &'a crate::sql::analyzer::catalog::CatalogSnapshot) -> Analyzer<'a> {
+    let query_params = crate::sql::query_context::QueryContext::current_query_params();
+    if !query_params.is_empty() {
+        let param_types = crate::sql::query_context::QueryContext::current_query_param_types();
+        let client_oids = if param_types.len() == query_params.len() {
+            param_types
+        } else {
+            vec![None; query_params.len()]
+        };
+        Analyzer::new_with_params(catalog, query_params.len(), &client_oids)
+    } else {
+        Analyzer::new(catalog)
+    }
+}
+
 impl Executor {
     pub(super) async fn execute_dml_statement(
         &self,
@@ -30,7 +48,7 @@ impl Executor {
                     stmt,
                 )
                 .await?;
-                let mut analyzer = Analyzer::new(&catalog);
+                let mut analyzer = make_analyzer(&catalog);
                 let analyzed = analyzer.analyze_statement(stmt).map_err(SqlError::from)?;
                 match analyzed {
                     AnalyzedStatement::Insert(ins) => {
@@ -69,7 +87,7 @@ impl Executor {
                     stmt,
                 )
                 .await?;
-                let mut analyzer = Analyzer::new(&catalog);
+                let mut analyzer = make_analyzer(&catalog);
                 let analyzed = analyzer.analyze_statement(stmt).map_err(SqlError::from)?;
                 match analyzed {
                     AnalyzedStatement::Delete(del) => {
@@ -96,7 +114,7 @@ impl Executor {
                     stmt,
                 )
                 .await?;
-                let mut analyzer = Analyzer::new(&catalog);
+                let mut analyzer = make_analyzer(&catalog);
                 let analyzed = analyzer.analyze_statement(stmt).map_err(SqlError::from)?;
                 match analyzed {
                     AnalyzedStatement::Update(upd) => {

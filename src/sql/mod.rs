@@ -15,7 +15,7 @@ pub(crate) mod ddl;
 pub mod ddl_export;
 mod dml;
 pub mod error;
-mod executor;
+pub(crate) mod executor;
 mod explain;
 pub mod expr;
 pub(crate) mod fts;
@@ -61,7 +61,7 @@ mod session;
 pub use session::*;
 mod aggregate;
 pub use aggregate::*;
-mod value_coercion;
+pub(crate) mod value_coercion;
 mod value_key;
 
 pub(crate) use information_schema::get_information_schema_schema;

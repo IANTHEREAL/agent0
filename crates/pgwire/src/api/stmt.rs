@@ -189,7 +189,7 @@ pub struct StoredStatement<S> {
 }
 
 impl<S> StoredStatement<S> {
-    pub(crate) async fn parse<Q>(parse: &Parse, parser: Q) -> PgWireResult<StoredStatement<S>>
+    pub async fn parse<Q>(parse: &Parse, parser: Q) -> PgWireResult<StoredStatement<S>>
     where
         Q: QueryParser<Statement = S>,
     {

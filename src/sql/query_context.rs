@@ -15,6 +15,7 @@ tokio::task_local! {
     static CURRENT_USER_NAME: Arc<str>;
     static CURRENT_TIMEZONE: Arc<str>;
     static QUERY_PARAMS: Vec<Option<Value>>;
+    static QUERY_PARAM_TYPES: Vec<Option<crate::types::DataType>>;
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +36,10 @@ pub struct QueryContext {
     /// Bound parameter values from extended protocol (Execute).
     /// `None` entries represent SQL NULL. Empty vec for simple-query path.
     pub params: Vec<Option<Value>>,
+    /// Finalized parameter types from Parse-time analysis.
+    /// Threaded to execute-time Analyzer so re-analysis uses the same type hints.
+    /// Empty vec for simple-query path or when no types were finalized.
+    pub param_types: Vec<Option<crate::types::DataType>>,
 }
 
 impl QueryContext {
@@ -54,6 +59,7 @@ impl QueryContext {
             transaction_timestamp_ms,
             timezone,
             params: vec![],
+            param_types: vec![],
         }
     }
 
@@ -75,6 +81,12 @@ impl QueryContext {
 
     pub(crate) fn current_query_params() -> Vec<Option<Value>> {
         QUERY_PARAMS.try_with(|p| p.clone()).unwrap_or_default()
+    }
+
+    pub(crate) fn current_query_param_types() -> Vec<Option<crate::types::DataType>> {
+        QUERY_PARAM_TYPES
+            .try_with(|t| t.clone())
+            .unwrap_or_default()
     }
 
     /// Build a QueryContext from task-local storage.
@@ -131,6 +143,7 @@ impl QueryContext {
             ),
         );
         qctx.params = params;
+        qctx.param_types = Self::current_query_param_types();
         qctx
     }
 
@@ -196,12 +209,15 @@ where
         qctx.database_name.clone(),
         qctx.current_user.clone(),
         qctx.timezone.clone(),
-        QUERY_PARAMS.scope(
-            qctx.params.clone(),
-            crate::sql::statement_time::with_timestamps(
-                qctx.statement_timestamp_ms,
-                qctx.transaction_timestamp_ms,
-                fut,
+        QUERY_PARAM_TYPES.scope(
+            qctx.param_types.clone(),
+            QUERY_PARAMS.scope(
+                qctx.params.clone(),
+                crate::sql::statement_time::with_timestamps(
+                    qctx.statement_timestamp_ms,
+                    qctx.transaction_timestamp_ms,
+                    fut,
+                ),
             ),
         ),
     )

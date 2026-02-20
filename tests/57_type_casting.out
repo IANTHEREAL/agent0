@@ -57,7 +57,9 @@ bool_to_int
 false_to_int
 0
 (1 row)
-psql:tests/57_type_casting.sql:36: ERROR:  operator does not exist: TEXT + INT
+implicit_text_to_int
+150
+(1 row)
 implicit_int_to_float
 15.5
 (1 row)

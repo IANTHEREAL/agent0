@@ -11,6 +11,7 @@ use sqlparser::ast::{
     self as ast, Expr, Query, Select, SelectItem, SetExpr, TableFactor, TableWithJoins,
 };
 
+use crate::sql::expr::typed_visit::expr_any;
 use crate::sql::names::{normalize_ident, split_object_name};
 use crate::sql::table_functions::table_function_key;
 use crate::sql::types::coercion::common_type;
@@ -153,14 +154,8 @@ impl<'a> Analyzer<'a> {
                 }
 
                 let analyzed_order_by = self.analyze_order_by_exprs(&query.order_by, &[])?;
-                let analyzed_limit = match &query.limit {
-                    Some(limit) => Some(self.analyze_expr(limit)?),
-                    None => None,
-                };
-                let analyzed_offset = match &query.offset {
-                    Some(offset) => Some(self.analyze_expr(&offset.value)?),
-                    None => None,
-                };
+                let analyzed_limit = self.analyze_limit_expr(&query.limit)?;
+                let analyzed_offset = self.analyze_offset_expr(&query.offset)?;
 
                 self.scopes.pop();
 
@@ -732,43 +727,9 @@ impl<'a> Analyzer<'a> {
             &analyzed_order_by,
         )?;
 
-        // 9. LIMIT — resolve params to Int64
-        let analyzed_limit = match limit {
-            Some(l) => {
-                let mut expr = self.analyze_expr(l)?;
-                if let TypedExprKind::Parameter { index } = &expr.kind {
-                    let was_unresolved = self.is_unresolved_param(&expr);
-                    self.resolve_param_type(*index, &DataType::Int64)?;
-                    if was_unresolved {
-                        expr = TypedExpr::new(
-                            TypedExprKind::Parameter { index: *index },
-                            DataType::Int64,
-                        );
-                    }
-                }
-                Some(expr)
-            }
-            None => None,
-        };
-
-        // 10. OFFSET — resolve params to Int64
-        let analyzed_offset = match offset {
-            Some(o) => {
-                let mut expr = self.analyze_expr(&o.value)?;
-                if let TypedExprKind::Parameter { index } = &expr.kind {
-                    let was_unresolved = self.is_unresolved_param(&expr);
-                    self.resolve_param_type(*index, &DataType::Int64)?;
-                    if was_unresolved {
-                        expr = TypedExpr::new(
-                            TypedExprKind::Parameter { index: *index },
-                            DataType::Int64,
-                        );
-                    }
-                }
-                Some(expr)
-            }
-            None => None,
-        };
+        // 9/10. LIMIT/OFFSET — resolve params to Int64
+        let analyzed_limit = self.analyze_limit_expr(limit)?;
+        let analyzed_offset = self.analyze_offset_expr(offset)?;
 
         // 11. Correlated subqueries in JOIN context are handled by the executor
         // via execute_async_nested_loop_join (per-row materialization fallback).
@@ -842,14 +803,8 @@ impl<'a> Analyzer<'a> {
             .collect();
 
         let analyzed_order_by = self.analyze_order_by_exprs(order_by, &projection)?;
-        let analyzed_limit = match limit {
-            Some(l) => Some(self.analyze_expr(l)?),
-            None => None,
-        };
-        let analyzed_offset = match offset {
-            Some(o) => Some(self.analyze_expr(&o.value)?),
-            None => None,
-        };
+        let analyzed_limit = self.analyze_limit_expr(limit)?;
+        let analyzed_offset = self.analyze_offset_expr(offset)?;
 
         self.scopes.pop();
 
@@ -866,6 +821,85 @@ impl<'a> Analyzer<'a> {
     /// Analyze a VALUES branch (used inside set operations).
     fn analyze_values(&mut self, values: &ast::Values) -> Result<AnalyzedQuery, AnalyzerError> {
         self.analyze_values_complete(values, None, &[], &None, &None)
+    }
+
+    fn analyze_limit_expr(
+        &mut self,
+        limit: &Option<ast::Expr>,
+    ) -> Result<Option<TypedExpr>, AnalyzerError> {
+        match limit {
+            Some(expr) => {
+                let analyzed = self.analyze_expr(expr)?;
+                let analyzed = self.resolve_limit_offset_param_type(analyzed)?;
+                self.validate_limit_offset_expr(&analyzed, "LIMIT")?;
+                Ok(Some(analyzed))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn analyze_offset_expr(
+        &mut self,
+        offset: &Option<ast::Offset>,
+    ) -> Result<Option<TypedExpr>, AnalyzerError> {
+        match offset {
+            Some(offset) => {
+                let analyzed = self.analyze_expr(&offset.value)?;
+                let analyzed = self.resolve_limit_offset_param_type(analyzed)?;
+                self.validate_limit_offset_expr(&analyzed, "OFFSET")?;
+                Ok(Some(analyzed))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn validate_limit_offset_expr(
+        &self,
+        expr: &TypedExpr,
+        clause: &str,
+    ) -> Result<(), AnalyzerError> {
+        // PostgreSQL semantics: LIMIT/OFFSET cannot depend on row variables.
+        // Parameters are allowed and resolved separately.
+        let has_row_variable = expr_any(expr, &|node| {
+            matches!(node.kind, TypedExprKind::ColumnRef { scope_depth: 0, .. })
+        });
+        if has_row_variable {
+            return Err(AnalyzerError::Unsupported(format!(
+                "argument of {} must not contain variables",
+                clause
+            )));
+        }
+        Ok(())
+    }
+
+    fn resolve_projection_param_type(
+        &mut self,
+        mut expr: TypedExpr,
+    ) -> Result<TypedExpr, AnalyzerError> {
+        // In a SELECT target list, an otherwise-unresolved parameter behaves like
+        // PostgreSQL's unknown literal in output context and defaults to text.
+        if let TypedExprKind::Parameter { index } = &expr.kind {
+            let was_unresolved = self.is_unresolved_param(&expr);
+            self.resolve_param_type(*index, &DataType::Text)?;
+            if was_unresolved {
+                expr = TypedExpr::new(TypedExprKind::Parameter { index: *index }, DataType::Text);
+            }
+        }
+        Ok(expr)
+    }
+
+    fn resolve_limit_offset_param_type(
+        &mut self,
+        mut expr: TypedExpr,
+    ) -> Result<TypedExpr, AnalyzerError> {
+        if let TypedExprKind::Parameter { index } = &expr.kind {
+            let was_unresolved = self.is_unresolved_param(&expr);
+            self.resolve_param_type(*index, &DataType::Int64)?;
+            if was_unresolved {
+                expr = TypedExpr::new(TypedExprKind::Parameter { index: *index }, DataType::Int64);
+            }
+        }
+        Ok(expr)
     }
 
     /// Analyze VALUES rows and unify each column's type across all rows.
@@ -2400,6 +2434,7 @@ impl<'a> Analyzer<'a> {
             match item {
                 SelectItem::UnnamedExpr(expr) => {
                     let analyzed = self.analyze_expr(expr)?;
+                    let analyzed = self.resolve_projection_param_type(analyzed)?;
                     let name = self.infer_column_alias(expr);
                     output_schema.push((name.clone(), analyzed.data_type.clone()));
                     projection.push(AnalyzedProjection {
@@ -2410,6 +2445,7 @@ impl<'a> Analyzer<'a> {
 
                 SelectItem::ExprWithAlias { expr, alias } => {
                     let analyzed = self.analyze_expr(expr)?;
+                    let analyzed = self.resolve_projection_param_type(analyzed)?;
                     let name = alias.value.clone();
                     output_schema.push((name.clone(), analyzed.data_type.clone()));
                     projection.push(AnalyzedProjection {

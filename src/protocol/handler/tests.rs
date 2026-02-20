@@ -32,6 +32,7 @@ use super::portal::{
     max_suspended_portal_buffer_rows, max_suspended_portals, on_execute_with_tx_status_fix,
     update_tx_status_after_execution, SuspendedPortalState,
 };
+use super::prepared::{PreparedExec, PreparedStatement};
 use super::tenant::parse_tenant_username;
 use futures::stream;
 use futures::StreamExt;
@@ -1689,14 +1690,24 @@ fn test_infer_parameter_types_non_ascii_does_not_panic() {
     assert_eq!(types, vec![Type::INT8]);
 }
 
+/// Helper to create a test PreparedStatement from a SQL string.
+fn test_prepared_stmt(sql: &str) -> PreparedStatement {
+    PreparedStatement {
+        sql: sql.to_string(),
+        exec: PreparedExec::RawSqlUtility,
+        output_schema: vec![],
+        param_data_types: vec![],
+    }
+}
+
 #[test]
 fn test_substitute_parameters_text_always_quoted() {
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
-        "SELECT $1::text".to_string(),
+        test_prepared_stmt("SELECT $1::text"),
         vec![Type::TEXT],
     ));
-    let mut portal: Portal<String> = Portal::default();
+    let mut portal: Portal<PreparedStatement> = Portal::default();
     portal.name = "portal".to_string();
     portal.statement = stmt;
     portal.parameter_format = Format::UnifiedText;
@@ -1713,10 +1724,10 @@ fn test_substitute_parameters_text_always_quoted() {
 fn test_substitute_parameters_unknown_text_format_always_quoted() {
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
-        "SELECT $1::text".to_string(),
+        test_prepared_stmt("SELECT $1::text"),
         vec![],
     ));
-    let mut portal: Portal<String> = Portal::default();
+    let mut portal: Portal<PreparedStatement> = Portal::default();
     portal.name = "portal".to_string();
     portal.statement = stmt;
     portal.parameter_format = Format::UnifiedText;
@@ -1733,10 +1744,10 @@ fn test_substitute_parameters_unknown_text_format_always_quoted() {
 fn test_substitute_parameters_unknown_binary_int8_with_nul_renders_number() {
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
-        "SELECT $1".to_string(),
+        test_prepared_stmt("SELECT $1"),
         vec![],
     ));
-    let mut portal: Portal<String> = Portal::default();
+    let mut portal: Portal<PreparedStatement> = Portal::default();
     portal.name = "portal".to_string();
     portal.statement = stmt;
     portal.parameter_format = Format::UnifiedBinary;
@@ -1753,10 +1764,10 @@ fn test_substitute_parameters_unknown_binary_int8_with_nul_renders_number() {
 fn test_substitute_parameters_escapes_single_quotes() {
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
-        "SELECT $1".to_string(),
+        test_prepared_stmt("SELECT $1"),
         vec![Type::TEXT],
     ));
-    let mut portal: Portal<String> = Portal::default();
+    let mut portal: Portal<PreparedStatement> = Portal::default();
     portal.name = "portal".to_string();
     portal.statement = stmt;
     portal.parameter_format = Format::UnifiedText;
@@ -1773,10 +1784,10 @@ fn test_substitute_parameters_escapes_single_quotes() {
 fn test_substitute_parameters_int4_text_format_renders_number() {
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
-        "SELECT $1".to_string(),
+        test_prepared_stmt("SELECT $1"),
         vec![Type::INT4],
     ));
-    let mut portal: Portal<String> = Portal::default();
+    let mut portal: Portal<PreparedStatement> = Portal::default();
     portal.name = "portal".to_string();
     portal.statement = stmt;
     portal.parameter_format = Format::UnifiedText;
@@ -1793,10 +1804,10 @@ fn test_substitute_parameters_int4_text_format_renders_number() {
 fn test_substitute_parameters_int4_text_format_invalid_errors() {
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
-        "SELECT $1".to_string(),
+        test_prepared_stmt("SELECT $1"),
         vec![Type::INT4],
     ));
-    let mut portal: Portal<String> = Portal::default();
+    let mut portal: Portal<PreparedStatement> = Portal::default();
     portal.name = "portal".to_string();
     portal.statement = stmt;
     portal.parameter_format = Format::UnifiedText;
@@ -1810,11 +1821,11 @@ fn test_substitute_parameters_int4_text_format_invalid_errors() {
 fn test_substitute_parameters_uuid_binary_format_renders_uuid_literal() {
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
-        "SELECT $1".to_string(),
+        test_prepared_stmt("SELECT $1"),
         vec![Type::UUID],
     ));
     let uuid = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid uuid");
-    let mut portal: Portal<String> = Portal::default();
+    let mut portal: Portal<PreparedStatement> = Portal::default();
     portal.name = "portal".to_string();
     portal.statement = stmt;
     portal.parameter_format = Format::UnifiedBinary;
@@ -1831,10 +1842,10 @@ fn test_substitute_parameters_uuid_binary_format_renders_uuid_literal() {
 fn test_substitute_parameters_date_binary_format_renders_date_literal() {
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
-        "SELECT $1".to_string(),
+        test_prepared_stmt("SELECT $1"),
         vec![Type::DATE],
     ));
-    let mut portal: Portal<String> = Portal::default();
+    let mut portal: Portal<PreparedStatement> = Portal::default();
     portal.name = "portal".to_string();
     portal.statement = stmt;
     portal.parameter_format = Format::UnifiedBinary;
@@ -1853,10 +1864,10 @@ fn test_substitute_parameters_unsupported_binary_type_returns_feature_not_suppor
     // Use a type that has no binary parameter decoding support (e.g., POINT)
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
-        "SELECT $1".to_string(),
+        test_prepared_stmt("SELECT $1"),
         vec![Type::POINT],
     ));
-    let mut portal: Portal<String> = Portal::default();
+    let mut portal: Portal<PreparedStatement> = Portal::default();
     portal.name = "portal".to_string();
     portal.statement = stmt;
     portal.parameter_format = Format::UnifiedBinary;
@@ -1878,10 +1889,10 @@ fn test_substitute_parameters_jsonb_binary_adds_cast() {
     // JSONB binary: version byte (0x01) + JSON text
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
-        "SELECT $1".to_string(),
+        test_prepared_stmt("SELECT $1"),
         vec![Type::JSONB],
     ));
-    let mut portal: Portal<String> = Portal::default();
+    let mut portal: Portal<PreparedStatement> = Portal::default();
     portal.name = "portal".to_string();
     portal.statement = stmt;
     portal.parameter_format = Format::UnifiedBinary;
@@ -1896,10 +1907,10 @@ fn test_substitute_parameters_jsonb_binary_adds_cast() {
 fn test_substitute_parameters_jsonb_binary_invalid_version_errors() {
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
-        "SELECT $1".to_string(),
+        test_prepared_stmt("SELECT $1"),
         vec![Type::JSONB],
     ));
-    let mut portal: Portal<String> = Portal::default();
+    let mut portal: Portal<PreparedStatement> = Portal::default();
     portal.name = "portal".to_string();
     portal.statement = stmt;
     portal.parameter_format = Format::UnifiedBinary;

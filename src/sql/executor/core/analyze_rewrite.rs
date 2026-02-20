@@ -56,7 +56,21 @@ impl Executor {
             }
         }
 
-        let mut analyzer = Analyzer::new(&catalog);
+        // Check if extended-query parameters are active (QUERY_PARAMS task-local).
+        // When present, create a param-aware Analyzer so $N placeholders resolve
+        // to TypedExprKind::Parameter nodes instead of failing.
+        let query_params = crate::sql::query_context::QueryContext::current_query_params();
+        let mut analyzer = if !query_params.is_empty() {
+            let param_types = crate::sql::query_context::QueryContext::current_query_param_types();
+            let client_oids = if param_types.len() == query_params.len() {
+                param_types
+            } else {
+                vec![None; query_params.len()]
+            };
+            Analyzer::new_with_params(&catalog, query_params.len(), &client_oids)
+        } else {
+            Analyzer::new(&catalog)
+        };
         let analyzed = stacker::maybe_grow(128 * 1024 * 1024, 256 * 1024 * 1024, || {
             analyzer.analyze_query(&expanded_query)
         })

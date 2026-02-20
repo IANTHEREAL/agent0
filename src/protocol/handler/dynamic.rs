@@ -1,22 +1,20 @@
 use super::copy::copy_row_column_mismatch_error;
+use super::encode::pgtype_to_datatype;
 use super::encode::{datatype_to_pgtype, effective_result_format, result_to_response};
 use super::errors::{
     ambiguous_column_error_with_position, in_failed_sql_transaction_pgwire_error,
     sqlstate_for_executor_error,
 };
-use super::params::{
-    count_sql_parameters, dummy_sql_expr_for_param_type, infer_parameter_types,
-    substitute_parameters, substitute_placeholders_outside_strings_and_dollar,
-};
+use super::params::{count_sql_parameters, decode_parameters};
 use super::portal::{
     on_execute_with_tx_status_fix, on_query_with_tx_status_fix, SuspendedPortalState,
 };
+use super::prepared::{PreparedExec, PreparedStatement};
 use super::query_parser::strip_leading_whitespace_and_comments;
 use super::tenant::parse_tenant_username;
 use super::{
-    client_allows_notice, count_placeholders_in_expr, extract_placeholder_index_from_expr,
-    infer_result_fields_from_query_ast, infer_types_from_expr, parse_startup_options,
-    resolve_copy_columns, resolve_table_for_insert, rollback_autocommit_or_mark_failed,
+    client_allows_notice, infer_result_fields_from_query_ast, parse_startup_options,
+    resolve_copy_columns, rollback_autocommit_or_mark_failed,
     send_notices_and_get_last_response_with_format, stub_describe_field, CopyContext,
     PgServerParameterProvider, TipgQueryParser, CONNECTION_ID_COUNTER, METADATA_ACTUAL_USER,
     METADATA_AUTH_IS_SUPERUSER, METADATA_KEYSPACE,
@@ -27,6 +25,7 @@ use crate::config::SharedServerConfig;
 use crate::observability;
 use crate::pool::{TenantHandle, TikvClientPool};
 use crate::sql::error::SqlError;
+use crate::sql::executor::core::prepared_analysis::PreparedAnalysis;
 use crate::sql::{ExecuteResult, Executor, Session};
 use crate::storage::TikvStore;
 use crate::types::{DataType, TableSchema, Value};
@@ -50,7 +49,7 @@ use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::response::{CommandComplete, NoticeResponse};
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
-use sqlparser::ast::{CopySource, CopyTarget, Expr, Ident, Statement};
+use sqlparser::ast::{CopySource, CopyTarget, Ident, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
@@ -95,295 +94,6 @@ impl DynamicPgHandler {
             connection_id: CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             server_config,
         }
-    }
-
-    async fn infer_insert_parameter_types(
-        &self,
-        sql: &str,
-        param_count: usize,
-    ) -> Option<Vec<Type>> {
-        if param_count == 0 {
-            return Some(vec![]);
-        }
-
-        let parsed = crate::sql::parse_sql(sql).ok()?;
-        let stmt = parsed.into_iter().next()?;
-
-        let (table_name, columns, values_list): (String, Vec<String>, Vec<Vec<Expr>>) = match stmt {
-            Statement::Insert {
-                table_name,
-                columns,
-                source,
-                ..
-            } => {
-                let table_name_str = table_name.to_string();
-                let columns: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
-                let values = match source.as_ref() {
-                    Some(src) => src,
-                    None => return None,
-                };
-                if let sqlparser::ast::SetExpr::Values(v) = values.body.as_ref() {
-                    (table_name_str, columns, v.rows.clone())
-                } else {
-                    return None;
-                }
-            }
-            _ => return None,
-        };
-
-        info!(
-            "infer_insert_parameter_types: table={}, columns={:?}, param_count={}",
-            table_name, columns, param_count
-        );
-
-        let executor = self.executor.get()?;
-        let store = executor.store();
-
-        let mut session_guard = self.session.lock().await;
-        let session = session_guard.as_mut()?;
-        let mut txn = store.begin().await.ok()?;
-
-        let search_path = session.search_path();
-        let resolved_table = resolve_table_for_insert(&table_name, search_path);
-
-        info!(
-            "infer_insert_parameter_types: resolved_table={}",
-            resolved_table
-        );
-
-        let schema = store
-            .get_schema(&mut txn, session.current_database_id(), &resolved_table)
-            .await
-            .ok()??;
-        let _ = txn.rollback().await;
-
-        info!(
-            "infer_insert_parameter_types: got schema with {} columns",
-            schema.columns.len()
-        );
-
-        let col_types: std::collections::HashMap<String, DataType> = schema
-            .columns
-            .iter()
-            .map(|c| (c.name.to_lowercase(), c.data_type.clone()))
-            .collect();
-
-        let column_order: Vec<String> = if !columns.is_empty() {
-            columns.iter().map(|c: &String| c.to_lowercase()).collect()
-        } else {
-            schema
-                .columns
-                .iter()
-                .map(|c| c.name.to_lowercase())
-                .collect()
-        };
-
-        let mut types = vec![Type::TEXT; param_count];
-        let mut param_idx = 0usize;
-
-        // Iterate ALL rows in the VALUES clause — batch INSERTs repeat
-        // the column pattern for each row (e.g. 3 rows × 6 cols = 18 params).
-        for row in &values_list {
-            for (col_idx, expr) in row.iter().enumerate() {
-                let col_name = column_order.get(col_idx)?;
-                let col_type = col_types.get(col_name);
-
-                let placeholders = count_placeholders_in_expr(expr);
-                for _ in 0..placeholders {
-                    if param_idx < param_count {
-                        types[param_idx] = datatype_to_pgtype(col_type);
-                        param_idx += 1;
-                    }
-                }
-            }
-        }
-
-        Some(types)
-    }
-
-    async fn infer_update_parameter_types(
-        &self,
-        sql: &str,
-        param_count: usize,
-    ) -> Option<Vec<Type>> {
-        if param_count == 0 {
-            return Some(vec![]);
-        }
-
-        let parsed = crate::sql::parse_sql(sql).ok()?;
-        let stmt = parsed.into_iter().next()?;
-
-        let (table_name, assignments) = match stmt {
-            Statement::Update {
-                table, assignments, ..
-            } => {
-                let table_name = match &table.relation {
-                    sqlparser::ast::TableFactor::Table { name, .. } => name.to_string(),
-                    _ => return None,
-                };
-                (table_name, assignments)
-            }
-            _ => return None,
-        };
-
-        info!(
-            "infer_update_parameter_types: table={}, assignments={}, param_count={}",
-            table_name,
-            assignments.len(),
-            param_count
-        );
-
-        let executor = self.executor.get()?;
-        let store = executor.store();
-
-        let mut session_guard = self.session.lock().await;
-        let session = session_guard.as_mut()?;
-        let mut txn = store.begin().await.ok()?;
-
-        let search_path = session.search_path();
-        let resolved_table = resolve_table_for_insert(&table_name, search_path);
-
-        info!(
-            "infer_update_parameter_types: resolved_table={}",
-            resolved_table
-        );
-
-        let schema = store
-            .get_schema(&mut txn, session.current_database_id(), &resolved_table)
-            .await
-            .ok()??;
-        let _ = txn.rollback().await;
-
-        info!(
-            "infer_update_parameter_types: got schema with {} columns",
-            schema.columns.len()
-        );
-
-        let col_types: std::collections::HashMap<String, DataType> = schema
-            .columns
-            .iter()
-            .map(|c| (c.name.to_lowercase(), c.data_type.clone()))
-            .collect();
-
-        let mut types = vec![Type::TEXT; param_count];
-        let mut param_idx = 0usize;
-
-        for assignment in &assignments {
-            let col_names: Vec<String> = assignment
-                .id
-                .iter()
-                .map(|ident| ident.value.to_lowercase())
-                .collect();
-
-            if let Some(col_name) = col_names.last() {
-                let col_type = col_types.get(col_name);
-                let placeholders = count_placeholders_in_expr(&assignment.value);
-
-                for _ in 0..placeholders {
-                    if param_idx < param_count {
-                        types[param_idx] = datatype_to_pgtype(col_type);
-                        param_idx += 1;
-                    }
-                }
-            }
-        }
-
-        info!(
-            "infer_update_parameter_types: inferred {} types, remaining {} as TEXT",
-            param_idx,
-            param_count - param_idx
-        );
-
-        Some(types)
-    }
-
-    async fn infer_select_parameter_types(
-        &self,
-        sql: &str,
-        param_count: usize,
-    ) -> Option<Vec<Type>> {
-        if param_count == 0 {
-            return Some(vec![]);
-        }
-
-        let parsed = crate::sql::parse_sql(sql).ok()?;
-        let stmt = parsed.into_iter().next()?;
-
-        let (table_name, selection, limit_expr, offset_expr) = match stmt {
-            Statement::Query(query) => {
-                if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
-                    let table_name = select.from.first().and_then(|f| match &f.relation {
-                        sqlparser::ast::TableFactor::Table { name, .. } => Some(name.to_string()),
-                        _ => None,
-                    })?;
-                    (
-                        table_name,
-                        select.selection.clone(),
-                        query.limit.clone(),
-                        query.offset.clone(),
-                    )
-                } else {
-                    return None;
-                }
-            }
-            _ => return None,
-        };
-
-        info!(
-            "infer_select_parameter_types: table={}, param_count={}",
-            table_name, param_count
-        );
-
-        let executor = self.executor.get()?;
-        let store = executor.store();
-
-        let mut session_guard = self.session.lock().await;
-        let session = session_guard.as_mut()?;
-        let mut txn = store.begin().await.ok()?;
-
-        let search_path = session.search_path();
-        let resolved_table = resolve_table_for_insert(&table_name, search_path);
-
-        let schema = store
-            .get_schema(&mut txn, session.current_database_id(), &resolved_table)
-            .await
-            .ok()??;
-        let _ = txn.rollback().await;
-
-        let col_types: std::collections::HashMap<String, DataType> = schema
-            .columns
-            .iter()
-            .map(|c| (c.name.to_lowercase(), c.data_type.clone()))
-            .collect();
-
-        let mut types = vec![Type::TEXT; param_count];
-
-        // Infer types from WHERE clause
-        if let Some(ref sel) = selection {
-            infer_types_from_expr(sel, &col_types, &mut types);
-        }
-
-        // LIMIT placeholder should be INT8
-        if let Some(ref limit) = limit_expr {
-            if let Some(idx) = extract_placeholder_index_from_expr(limit) {
-                if idx < types.len() {
-                    types[idx] = Type::INT8;
-                }
-            }
-        }
-
-        // OFFSET placeholder should be INT8
-        if let Some(ref offset) = offset_expr {
-            if let Some(idx) = extract_placeholder_index_from_expr(&offset.value) {
-                if idx < types.len() {
-                    types[idx] = Type::INT8;
-                }
-            }
-        }
-
-        info!("infer_select_parameter_types: inferred types={:?}", types);
-
-        Some(types)
     }
 
     async fn infer_result_fields_from_query(&self, query: &str) -> Vec<FieldInfo> {
@@ -897,6 +607,22 @@ impl DynamicPgHandler {
             }
         }
     }
+}
+
+/// Merge finalized analyzer types into wire types.
+/// Client-specified non-UNKNOWN OIDs win (preserves INT2/FLOAT4 fidelity).
+/// UNKNOWN slots filled from inferred DataType → Type.
+fn merge_parameter_types(client_types: &[Type], finalized: &[DataType]) -> Vec<Type> {
+    let mut result = Vec::with_capacity(finalized.len());
+    for i in 0..finalized.len() {
+        let client = client_types.get(i).cloned().unwrap_or(Type::UNKNOWN);
+        if client != Type::UNKNOWN {
+            result.push(client); // preserve client INT2/FLOAT4
+        } else {
+            result.push(datatype_to_pgtype(Some(&finalized[i])));
+        }
+    }
+    result
 }
 
 fn copy_display_table_name(resolved_table: &str) -> &str {
@@ -1755,11 +1481,168 @@ impl CopyHandler for DynamicPgHandler {
 
 #[async_trait]
 impl ExtendedQueryHandler for DynamicPgHandler {
-    type Statement = String;
+    type Statement = PreparedStatement;
     type QueryParser = TipgQueryParser;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
         self.query_parser.clone()
+    }
+
+    async fn on_parse<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::extendedquery::Parse,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        // 1. Parse via QueryParser (preserves multi-statement rejection guard)
+        let parser = self.query_parser();
+        let mut stored = StoredStatement::parse(&message, parser).await?;
+
+        // 2. Count $N placeholders in the SQL
+        let param_count = count_sql_parameters(&stored.statement.sql);
+
+        // 3. Map client OIDs to Option<DataType> for Analyzer
+        let client_oids: Vec<Option<DataType>> = stored
+            .parameter_types
+            .iter()
+            .map(|t| {
+                if *t == Type::UNKNOWN {
+                    None
+                } else {
+                    pgtype_to_datatype(t)
+                }
+            })
+            .collect();
+
+        // 4. Analyze for frozen execution IR
+        if let Some(executor) = self.executor.get() {
+            let store = executor.store();
+
+            // Brief session lock to read db_id + search_path
+            let (db_id, search_path) = {
+                let session_guard = self.session.lock().await;
+                match session_guard.as_ref() {
+                    Some(session) => (
+                        session.current_database_id(),
+                        session.search_path().to_vec(),
+                    ),
+                    None => {
+                        // No session yet — keep RawSqlUtility
+                        client.portal_store().put_statement(Arc::new(stored))?;
+                        client
+                            .send(PgWireBackendMessage::ParseComplete(
+                                pgwire::messages::extendedquery::ParseComplete::new(),
+                            ))
+                            .await?;
+                        return Ok(());
+                    }
+                }
+            };
+
+            // Temporary read-only transaction for catalog access
+            match store.begin().await {
+                Ok(mut txn) => {
+                    match executor
+                        .analyze_for_prepared(
+                            &mut txn,
+                            db_id,
+                            &search_path,
+                            &stored.statement.sql,
+                            param_count,
+                            &client_oids,
+                        )
+                        .await
+                    {
+                        Ok(analysis) => {
+                            match analysis {
+                                PreparedAnalysis::Query {
+                                    analyzed,
+                                    locks,
+                                    select_into,
+                                    output_schema,
+                                    param_types,
+                                    base_table_names,
+                                } => {
+                                    let required_privileges = base_table_names
+                                        .into_iter()
+                                        .map(|t| (t, Privilege::Select))
+                                        .collect();
+                                    stored.parameter_types = merge_parameter_types(
+                                        &stored.parameter_types,
+                                        &param_types,
+                                    );
+                                    stored.statement = PreparedStatement {
+                                        sql: stored.statement.sql,
+                                        exec: PreparedExec::AnalyzedQuery {
+                                            analyzed,
+                                            locks,
+                                            select_into,
+                                            required_privileges,
+                                        },
+                                        output_schema,
+                                        param_data_types: param_types,
+                                    };
+                                }
+                                PreparedAnalysis::Dml {
+                                    analyzed,
+                                    output_schema,
+                                    param_types,
+                                } => {
+                                    let required_privileges =
+                                        PreparedStatement::compute_privileges(&analyzed, &[]);
+                                    stored.parameter_types = merge_parameter_types(
+                                        &stored.parameter_types,
+                                        &param_types,
+                                    );
+                                    stored.statement = PreparedStatement {
+                                        sql: stored.statement.sql,
+                                        exec: PreparedExec::AnalyzedDml {
+                                            analyzed,
+                                            required_privileges,
+                                        },
+                                        output_schema,
+                                        param_data_types: param_types,
+                                    };
+                                }
+                                PreparedAnalysis::Utility => {
+                                    // Keep RawSqlUtility
+                                }
+                            }
+                        }
+                        Err(e) if param_count > 0 => {
+                            // Can't type params without analysis — surface error
+                            let _ = txn.rollback().await;
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                sqlstate_for_executor_error(&e).to_string(),
+                                e.to_string(),
+                            ))));
+                        }
+                        Err(_) => {
+                            // Non-analyzable, no params — keep RawSqlUtility
+                        }
+                    }
+                    let _ = txn.rollback().await; // read-only, discard
+                }
+                Err(_) => {
+                    // Can't begin txn — keep RawSqlUtility
+                }
+            }
+        }
+
+        // 5. Store immutable
+        client.portal_store().put_statement(Arc::new(stored))?;
+        client
+            .send(PgWireBackendMessage::ParseComplete(
+                pgwire::messages::extendedquery::ParseComplete::new(),
+            ))
+            .await?;
+        Ok(())
     }
 
     async fn on_execute<C>(
@@ -1801,35 +1684,20 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             .as_deref()
             .unwrap_or(pgwire::api::DEFAULT_NAME);
 
-        if let Some(mut statement) = client.portal_store().get_statement(statement_name) {
-            // Some clients (e.g. pgx/GORM) omit parameter type OIDs in Parse and expect the server
-            // to infer types. Ensure the portal references a statement with inferred types so that
-            // binary parameters are decoded correctly during execution.
-            let param_count = message.parameters.len();
-            let needs_inference = param_count > 0
-                && (statement.parameter_types.len() < param_count
-                    || statement
-                        .parameter_types
-                        .iter()
-                        .take(param_count)
-                        .any(|t| *t == Type::UNKNOWN));
-
-            if needs_inference {
-                if let Ok(describe_response) =
-                    self.do_describe_statement(client, statement.as_ref()).await
-                {
-                    if describe_response.parameters.len() >= param_count
-                        && describe_response.parameters != statement.parameter_types
-                    {
-                        let updated = Arc::new(StoredStatement::new(
-                            statement.id.clone(),
-                            statement.statement.clone(),
-                            describe_response.parameters,
-                        ));
-                        client.portal_store().put_statement(updated.clone())?;
-                        statement = updated;
-                    }
-                }
+        if let Some(statement) = client.portal_store().get_statement(statement_name) {
+            // Validate parameter count: on_parse already finalized types,
+            // so Bind just checks that the client supplies the right number.
+            let expected = statement.parameter_types.len();
+            let provided = message.parameters.len();
+            if provided != expected {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "08P01".to_string(),
+                    format!(
+                        "bind message supplies {} parameters, but prepared statement requires {}",
+                        provided, expected
+                    ),
+                ))));
             }
 
             let portal = Portal::try_new(&message, statement)?;
@@ -1877,6 +1745,44 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         Ok(())
     }
 
+    /// Override default `on_describe` to prevent the pgwire default from writing
+    /// inferred parameter types back into the stored statement. The statement is
+    /// immutable after Parse — Describe must be read-only.
+    async fn on_describe<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::extendedquery::Describe,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let name = message.name.as_deref().unwrap_or(pgwire::api::DEFAULT_NAME);
+        match message.target_type {
+            pgwire::messages::extendedquery::TARGET_TYPE_BYTE_STATEMENT => {
+                if let Some(stmt) = client.portal_store().get_statement(name) {
+                    let resp = self.do_describe_statement(client, &stmt).await?;
+                    // NO write-back — statement is immutable after Parse
+                    pgwire::api::query::send_describe_response(client, &resp).await?;
+                } else {
+                    return Err(PgWireError::StatementNotFound(name.to_owned()));
+                }
+            }
+            pgwire::messages::extendedquery::TARGET_TYPE_BYTE_PORTAL => {
+                if let Some(portal) = client.portal_store().get_portal(name) {
+                    let resp = self.do_describe_portal(client, &portal).await?;
+                    pgwire::api::query::send_describe_response(client, &resp).await?;
+                } else {
+                    return Err(PgWireError::PortalNotFound(name.to_owned()));
+                }
+            }
+            _ => return Err(PgWireError::InvalidTargetType(message.target_type)),
+        }
+        Ok(())
+    }
+
     async fn do_query<'a, 'b: 'a, C>(
         &'b self,
         client: &mut C,
@@ -1889,12 +1795,30 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let executor = self.get_executor()?;
-        let query = &portal.statement.statement;
+        let prepared = &portal.statement.statement;
 
-        debug!("Extended query: {}", query);
+        debug!("Extended query: {}", prepared.sql);
 
-        let final_query = substitute_parameters(query, portal)?;
-        debug!("Final query after substitution: {}", final_query);
+        // Determine execution SQL and parameter handling based on analysis state.
+        let (exec_sql, params) = match &prepared.exec {
+            PreparedExec::RawSqlUtility => {
+                // DDL/utility: Fix 4 rejects params at Parse time, so no
+                // substitution needed — execute original SQL directly.
+                debug_assert!(
+                    portal.statement.parameter_types.is_empty(),
+                    "RawSqlUtility should never have parameters after Fix 4"
+                );
+                (prepared.sql.clone(), vec![])
+            }
+            _ => {
+                // Analyzed statement: decode parameters into Values.
+                // The original SQL (with $1, $2, ...) is passed to the executor;
+                // the Analyzer creates Parameter IR nodes, and the typed evaluator
+                // reads values from the QUERY_PARAMS task-local.
+                let decoded = decode_parameters(portal)?;
+                (prepared.sql.clone(), decoded)
+            }
+        };
 
         let mut session_guard = self.session.lock().await;
         let session = session_guard.as_mut().ok_or_else(|| {
@@ -1914,7 +1838,24 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             ))));
         }
 
-        match executor.execute(session, &final_query).await {
+        // Set decoded parameters on the session so they flow into
+        // QUERY_PARAMS via QueryContext.
+        if !params.is_empty() {
+            session.set_pending_params(params);
+        }
+
+        // Thread Parse-time finalized types to execute-time Analyzer via
+        // QUERY_PARAM_TYPES task-local so re-analysis uses the same type hints.
+        if !prepared.param_data_types.is_empty() {
+            let param_types: Vec<Option<DataType>> = prepared
+                .param_data_types
+                .iter()
+                .map(|dt| Some(dt.clone()))
+                .collect();
+            session.set_pending_param_types(param_types);
+        }
+
+        match executor.execute(session, &exec_sql).await {
             Ok(results) => {
                 session.record_command_complete();
                 let resp = send_notices_and_get_last_response_with_format(
@@ -1945,74 +1886,32 @@ impl ExtendedQueryHandler for DynamicPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let param_count = count_sql_parameters(&stmt.statement);
-        let mut param_types: Vec<Type> = stmt.parameter_types.clone();
+        let prepared = &stmt.statement;
 
-        info!(
-            "do_describe_statement: sql={}, param_count={}, initial_types={:?}",
-            stmt.statement.chars().take(100).collect::<String>(),
-            param_count,
-            param_types
-        );
-
-        if param_types.len() < param_count || param_types.iter().any(|t| *t == Type::UNKNOWN) {
-            let inferred = if let Some(insert_types) = self
-                .infer_insert_parameter_types(&stmt.statement, param_count)
-                .await
-            {
-                info!(
-                    "do_describe_statement: inferred INSERT types={:?}",
-                    insert_types
-                );
-                insert_types
-            } else if let Some(update_types) = self
-                .infer_update_parameter_types(&stmt.statement, param_count)
-                .await
-            {
-                info!(
-                    "do_describe_statement: inferred UPDATE types={:?}",
-                    update_types
-                );
-                update_types
-            } else if let Some(select_types) = self
-                .infer_select_parameter_types(&stmt.statement, param_count)
-                .await
-            {
-                info!(
-                    "do_describe_statement: inferred SELECT types={:?}",
-                    select_types
-                );
-                select_types
-            } else {
-                let fallback = infer_parameter_types(&stmt.statement, param_count);
-                info!("do_describe_statement: fallback types={:?}", fallback);
-                fallback
-            };
-            for i in param_types.len()..param_count {
-                param_types.push(inferred[i].clone());
-            }
-            for i in 0..param_types.len().min(inferred.len()) {
-                if param_types[i] == Type::UNKNOWN && inferred[i] != Type::UNKNOWN {
-                    param_types[i] = inferred[i].clone();
-                }
-            }
+        // If on_parse produced analyzed IR, use the stored schema directly.
+        if !matches!(prepared.exec, PreparedExec::RawSqlUtility) {
+            let param_types = stmt.parameter_types.clone();
+            let fields: Vec<FieldInfo> = prepared
+                .output_schema
+                .iter()
+                .map(|(name, dt)| {
+                    FieldInfo::new(
+                        name.to_string(),
+                        None,
+                        None,
+                        datatype_to_pgtype(Some(dt)),
+                        pgwire::api::results::FieldFormat::Text,
+                    )
+                })
+                .collect();
+            return Ok(DescribeStatementResponse::new(param_types, fields));
         }
 
-        info!("do_describe_statement: final_types={:?}", param_types);
-
-        let query_for_inference = if param_count == 0 {
-            stmt.statement.clone()
-        } else {
-            let mut values: Vec<String> = Vec::with_capacity(param_count);
-            for i in 0..param_count {
-                let t = param_types.get(i).cloned().unwrap_or(Type::UNKNOWN);
-                values.push(dummy_sql_expr_for_param_type(&t));
-            }
-            substitute_placeholders_outside_strings_and_dollar(&stmt.statement, &values)
-        };
-        let fields = self
-            .infer_result_fields_from_query(&query_for_inference)
-            .await;
+        // Raw SQL utility path: Parse-time analysis intentionally did not produce
+        // typed IR, so Describe is best-effort schema inference over the original SQL.
+        // Parameter types remain whatever Parse provided (normally empty for utilities).
+        let param_types = stmt.parameter_types.clone();
+        let fields = self.infer_result_fields_from_query(&prepared.sql).await;
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -2024,11 +1923,28 @@ impl ExtendedQueryHandler for DynamicPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let final_query = substitute_parameters(&portal.statement.statement, portal)?;
+        let prepared = &portal.statement.statement;
+
+        // If on_parse produced analyzed IR, use the stored schema directly.
+        if !matches!(prepared.exec, PreparedExec::RawSqlUtility) {
+            let fields: Vec<FieldInfo> = prepared
+                .output_schema
+                .iter()
+                .enumerate()
+                .map(|(i, (name, dt))| {
+                    let pg_type = datatype_to_pgtype(Some(dt));
+                    let requested = portal.result_column_format.format_for(i);
+                    let format = effective_result_format(&pg_type, requested);
+                    FieldInfo::new(name.to_string(), None, None, pg_type, format)
+                })
+                .collect();
+            return Ok(DescribePortalResponse::new(fields));
+        }
+
+        // Fallback for RawSqlUtility: no params (Fix 4 rejects params at Parse)
+        let final_query = prepared.sql.clone();
         let fields = self.infer_result_fields_from_query(&final_query).await;
 
-        // Per the PostgreSQL wire protocol, the RowDescription returned by
-        // Describe Portal must reflect the result format codes from Bind.
         let fields: Vec<FieldInfo> = fields
             .into_iter()
             .enumerate()

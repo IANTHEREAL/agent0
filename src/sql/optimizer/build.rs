@@ -237,21 +237,20 @@ impl PhysicalPlan {
                 offset,
                 input,
             } => {
-                let limit_val = limit
+                // LIMIT/OFFSET semantics are runtime-evaluable (parameters allowed).
+                // Constant extraction is optimization-only.
+                let limit_const = limit
                     .as_ref()
-                    .map(|expr| eval_const_usize(expr, false))
-                    .transpose()?;
-                let offset_val = offset
+                    .and_then(|expr| eval_const_usize(expr, false).ok());
+                let offset_const = offset
                     .as_ref()
-                    .map(|expr| eval_const_usize(expr, false))
-                    .transpose()?
-                    .unwrap_or(0);
+                    .and_then(|expr| eval_const_usize(expr, false).ok());
                 // Root fix for LIMIT pushdown on the analyzed/optimizer path:
                 // push scan limit only for LIMIT ... OFFSET 0 directly over a KV scan.
                 // This keeps semantics intact while preventing full index scans for
                 // simple top-N probes (e.g. tests/95_limit_pushdown.sql).
-                let child = if offset_val == 0 {
-                    if let Some(scan_limit) = limit_val {
+                let child = if offset.is_none() || matches!(offset_const, Some(0)) {
+                    if let Some(scan_limit) = limit_const {
                         build_limit_child_with_scan_pushdown(input, ctx, scan_limit)?
                             .unwrap_or(input.build_operators(ctx)?)
                     } else {
@@ -260,7 +259,11 @@ impl PhysicalPlan {
                 } else {
                     input.build_operators(ctx)?
                 };
-                Ok(Box::new(LimitOperator::new(child, limit_val, offset_val)))
+                Ok(Box::new(LimitOperator::new_with_exprs(
+                    child,
+                    limit.clone(),
+                    offset.clone(),
+                )))
             }
 
             PhysicalNode::Distinct { input } => {
@@ -1923,6 +1926,36 @@ mod tests {
                     data_type: DataType::Int64,
                 }),
                 input: Box::new(sorted),
+            },
+            schema: make_schema(&[("id", DataType::Int32), ("name", DataType::Text)]),
+            cost: PhysicalCost::default(),
+        };
+        let ctx = test_ctx();
+        let op = plan.build_operators(&ctx).unwrap();
+        assert_eq!(op.name(), "Limit");
+    }
+
+    #[test]
+    fn test_parameterized_limit_builds_without_constant_folding() {
+        let scan = PhysicalPlan {
+            node: PhysicalNode::SeqScan {
+                table_name: "test_table".to_string(),
+                alias: None,
+            },
+            schema: make_schema(&[("id", DataType::Int32), ("name", DataType::Text)]),
+            cost: PhysicalCost::default(),
+        };
+        let plan = PhysicalPlan {
+            node: PhysicalNode::Limit {
+                limit: Some(TypedExpr {
+                    kind: TypedExprKind::Parameter { index: 0 },
+                    data_type: DataType::Int64,
+                }),
+                offset: Some(TypedExpr {
+                    kind: TypedExprKind::Parameter { index: 1 },
+                    data_type: DataType::Int64,
+                }),
+                input: Box::new(scan),
             },
             schema: make_schema(&[("id", DataType::Int32), ("name", DataType::Text)]),
             cost: PhysicalCost::default(),

@@ -1969,17 +1969,80 @@ fn analyze_parameter_limit() {
 }
 
 #[test]
-fn analyze_unresolved_parameter_error() {
-    // SELECT $1 with no OID → 42P18 from finalize_param_types
+fn analyze_limit_rejects_row_variable() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT * FROM users LIMIT id");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    assert!(
+        matches!(err, AnalyzerError::Unsupported(msg) if msg.contains("argument of LIMIT must not contain variables"))
+    );
+}
+
+#[test]
+fn analyze_offset_rejects_row_variable() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT * FROM users OFFSET id");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    assert!(
+        matches!(err, AnalyzerError::Unsupported(msg) if msg.contains("argument of OFFSET must not contain variables"))
+    );
+}
+
+#[test]
+fn analyze_parameter_limit_in_set_operation() {
+    // UNION ... LIMIT $1 → param typed as Int64 on set-op query body path
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT id FROM users UNION ALL SELECT id FROM users LIMIT $1");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Int64]);
+}
+
+#[test]
+fn analyze_parameter_limit_offset_in_values_query() {
+    // VALUES ... LIMIT/OFFSET params typed as Int64 on VALUES query body path
+    let catalog = test_catalog();
+    let stmt = parse_statement("VALUES (1), (2) LIMIT $1 OFFSET $2");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Int64, DataType::Int64]);
+}
+
+#[test]
+fn analyze_parameter_like_typed_as_text() {
+    // WHERE name LIKE $1 → param typed as Text from LIKE context
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT * FROM users WHERE name LIKE $1");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text]);
+}
+
+#[test]
+fn analyze_parameter_ilike_typed_as_text() {
+    // WHERE name ILIKE $1 → param typed as Text from ILIKE context
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT * FROM users WHERE name ILIKE $1");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text]);
+}
+
+#[test]
+fn analyze_unresolved_parameter_in_projection_defaults_to_text() {
+    // SELECT target-list context resolves unknown parameter to Text.
     let catalog = test_catalog();
     let stmt = parse_statement("SELECT $1");
     let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
     analyzer.analyze_statement(&stmt).unwrap();
-    let err = analyzer.finalize_param_types().unwrap_err();
-    assert!(matches!(
-        err,
-        AnalyzerError::IndeterminateParameterType { index: 1 }
-    ));
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text]);
 }
 
 #[test]
@@ -1991,6 +2054,17 @@ fn analyze_parameter_with_client_oid() {
     analyzer.analyze_statement(&stmt).unwrap();
     let types = analyzer.finalize_param_types().unwrap();
     assert_eq!(types, vec![DataType::Int32]);
+}
+
+#[test]
+fn analyze_parameter_in_vector_function() {
+    // cosine_distance(vector, $1) resolves $1 to vector from function context.
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT cosine_distance('[1,2,3]'::vector, $1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Vector(0)]);
 }
 
 #[test]

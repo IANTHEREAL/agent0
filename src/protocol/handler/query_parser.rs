@@ -1,4 +1,5 @@
 use super::errors::syntax_error_pgwire_error;
+use super::prepared::{PreparedExec, PreparedStatement};
 use async_trait::async_trait;
 use pgwire::api::Type;
 use pgwire::error::PgWireResult;
@@ -14,16 +15,28 @@ impl TipgQueryParser {
 
 #[async_trait]
 impl pgwire::api::stmt::QueryParser for TipgQueryParser {
-    type Statement = String;
+    type Statement = PreparedStatement;
 
     async fn parse_sql(&self, sql: &str, _types: &[Type]) -> PgWireResult<Self::Statement> {
         // Match libpq behavior for empty queries (handled later by executor/protocol).
         if sql.trim().is_empty() {
-            return Ok(sql.to_owned());
+            return Ok(PreparedStatement {
+                sql: sql.to_owned(),
+                exec: PreparedExec::RawSqlUtility,
+                output_schema: vec![],
+                param_data_types: vec![],
+            });
         }
 
         let parse_err = match crate::sql::parse_sql(sql) {
-            Ok(_) => return Ok(sql.to_owned()),
+            Ok(_) => {
+                return Ok(PreparedStatement {
+                    sql: sql.to_owned(),
+                    exec: PreparedExec::RawSqlUtility,
+                    output_schema: vec![],
+                    param_data_types: vec![],
+                })
+            }
             Err(e) => e,
         };
 
@@ -33,7 +46,12 @@ impl pgwire::api::stmt::QueryParser for TipgQueryParser {
 
         let sql_upper = sql_no_comments.trim_start().to_ascii_uppercase();
         if crate::sql::raw_sql::should_accept_sql_without_sqlparser(&sql_upper) {
-            return Ok(sql.to_owned());
+            return Ok(PreparedStatement {
+                sql: sql.to_owned(),
+                exec: PreparedExec::RawSqlUtility,
+                output_schema: vec![],
+                param_data_types: vec![],
+            });
         }
 
         Err(syntax_error_pgwire_error(parse_err.to_string()))

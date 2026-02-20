@@ -9,6 +9,7 @@ mod dispatch;
 mod guc;
 mod misc;
 mod observability;
+pub(crate) mod prepared_analysis;
 mod query_exec;
 mod retry;
 mod scan;

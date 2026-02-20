@@ -516,6 +516,14 @@ pub struct Session {
     last_command_complete_at: Option<Instant>,
     /// Shared server-level configuration (for ALTER SYSTEM SET).
     server_config: Option<SharedServerConfig>,
+    /// Pending parameter values from extended-query Bind for the next Execute.
+    /// Set by the protocol handler before calling `execute()`, consumed by
+    /// `query_context_for_statement()` so they flow into `QUERY_PARAMS`.
+    pending_params: Vec<Option<crate::types::Value>>,
+    /// Pending parameter types from Parse-time analysis for the next Execute.
+    /// Set by the protocol handler, consumed by `query_context_for_statement()`
+    /// so they flow into `QUERY_PARAM_TYPES`.
+    pending_param_types: Vec<Option<crate::types::DataType>>,
 }
 
 impl Session {
@@ -549,6 +557,8 @@ impl Session {
             transaction_timestamp_ms: None,
             last_command_complete_at: None,
             server_config: None,
+            pending_params: vec![],
+            pending_param_types: vec![],
         }
     }
 
@@ -584,6 +594,8 @@ impl Session {
             transaction_timestamp_ms: None,
             last_command_complete_at: None,
             server_config: None,
+            pending_params: vec![],
+            pending_param_types: vec![],
         }
     }
 
@@ -633,18 +645,43 @@ impl Session {
     }
 
     pub(crate) fn query_context_for_statement(
-        &self,
+        &mut self,
         statement_timestamp_ms: i64,
         transaction_timestamp_ms: i64,
     ) -> QueryContext {
-        QueryContext::new(
+        let mut qctx = QueryContext::new(
             self.connection_id(),
             self.current_database_name_arc(),
             self.current_user_arc(),
             statement_timestamp_ms,
             transaction_timestamp_ms,
             self.timezone_arc(),
-        )
+        );
+        // Drain pending params (set by extended-query Execute) into the context.
+        // This ensures QUERY_PARAMS task-local is populated for this statement.
+        if !self.pending_params.is_empty() {
+            qctx.params = std::mem::take(&mut self.pending_params);
+        }
+        // Drain pending param types (set by extended-query Execute) into the context.
+        // This ensures QUERY_PARAM_TYPES task-local is populated for this statement.
+        if !self.pending_param_types.is_empty() {
+            qctx.param_types = std::mem::take(&mut self.pending_param_types);
+        }
+        qctx
+    }
+
+    /// Set parameter values for the next statement execution.
+    /// Called by the protocol handler after decoding Bind parameters.
+    /// Consumed (drained) by `query_context_for_statement()`.
+    pub fn set_pending_params(&mut self, params: Vec<Option<crate::types::Value>>) {
+        self.pending_params = params;
+    }
+
+    /// Set parameter types for the next statement execution.
+    /// Called by the protocol handler to thread Parse-time types to Execute-time Analyzer.
+    /// Consumed (drained) by `query_context_for_statement()`.
+    pub fn set_pending_param_types(&mut self, types: Vec<Option<crate::types::DataType>>) {
+        self.pending_param_types = types;
     }
 
     /// Check if currently in a transaction block
