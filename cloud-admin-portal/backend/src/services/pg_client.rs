@@ -39,75 +39,111 @@ fn escape_connstr_value(s: &str) -> String {
 }
 
 fn split_sql_statements(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
     let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut chars = sql.chars().peekable();
     let mut in_single = false;
     let mut in_double = false;
     let mut in_line_comment = false;
     let mut in_block_comment = false;
+    let mut dollar_delim: Option<Vec<u8>> = None;
+    let mut start = 0usize;
+    let mut i = 0usize;
 
-    while let Some(ch) = chars.next() {
+    while i < bytes.len() {
+        if let Some(ref delim) = dollar_delim {
+            let dlen = delim.len();
+            if i + dlen <= bytes.len() && bytes[i..i + dlen] == *delim.as_slice() {
+                dollar_delim = None;
+                i += dlen;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
         if in_line_comment {
-            current.push(ch);
-            if ch == '\n' {
+            if bytes[i] == b'\n' {
                 in_line_comment = false;
             }
+            i += 1;
             continue;
         }
 
         if in_block_comment {
-            current.push(ch);
-            if ch == '*' && chars.peek() == Some(&'/') {
-                current.push('/');
-                chars.next();
+            if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
                 in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
             }
+            continue;
+        }
+
+        let b = bytes[i];
+
+        if !in_single && !in_double {
+            if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+            if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+        }
+
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            i += 1;
             continue;
         }
 
         if !in_single && !in_double {
-            if ch == '-' && chars.peek() == Some(&'-') {
-                current.push(ch);
-                current.push('-');
-                chars.next();
-                in_line_comment = true;
+            if b == b'$' {
+                let prev_ok =
+                    i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                if prev_ok {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+                        dollar_delim = Some(b"$$".to_vec());
+                        i += 2;
+                        continue;
+                    }
+                    let mut j = i + 1;
+                    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                    {
+                        j += 1;
+                    }
+                    if j > i + 1 && j < bytes.len() && bytes[j] == b'$' {
+                        dollar_delim = Some(bytes[i..=j].to_vec());
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+
+            if b == b';' {
+                let stmt = sql[start..i].trim();
+                if !stmt.is_empty() {
+                    statements.push(stmt.to_string());
+                }
+                start = i + 1;
+                i += 1;
                 continue;
             }
-            if ch == '/' && chars.peek() == Some(&'*') {
-                current.push(ch);
-                current.push('*');
-                chars.next();
-                in_block_comment = true;
-                continue;
-            }
         }
 
-        if ch == '\'' && !in_double {
-            in_single = !in_single;
-            current.push(ch);
-            continue;
-        }
-
-        if ch == '"' && !in_single {
-            in_double = !in_double;
-            current.push(ch);
-            continue;
-        }
-
-        if ch == ';' && !in_single && !in_double {
-            let stmt = current.trim();
-            if !stmt.is_empty() {
-                statements.push(stmt.to_string());
-            }
-            current.clear();
-            continue;
-        }
-
-        current.push(ch);
+        i += 1;
     }
 
-    let stmt = current.trim();
+    let stmt = sql[start..].trim();
     if !stmt.is_empty() {
         statements.push(stmt.to_string());
     }
