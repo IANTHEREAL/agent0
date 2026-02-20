@@ -20,7 +20,8 @@ where
         | TypedExprKind::ScalarSubquery(_)
         | TypedExprKind::ArraySubquery(_)
         | TypedExprKind::Exists { .. }
-        | TypedExprKind::Default => false,
+        | TypedExprKind::Default
+        | TypedExprKind::Parameter { .. } => false,
         TypedExprKind::BinaryOp { left, right, .. } => {
             expr_any(left, predicate) || expr_any(right, predicate)
         }

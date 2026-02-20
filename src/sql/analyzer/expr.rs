@@ -69,6 +69,17 @@ impl<'a> Analyzer<'a> {
                 let inner = self.analyze_expr(expr)?;
                 let target = sql_datatype_to_internal(data_type)
                     .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                // Explicit cast resolves parameter type: `$1::int4`
+                if let TypedExprKind::Parameter { index } = &inner.kind {
+                    let was_unresolved = self.is_unresolved_param(&inner);
+                    self.resolve_param_type(*index, &target)?;
+                    if was_unresolved {
+                        return Ok(TypedExpr::new(
+                            TypedExprKind::Parameter { index: *index },
+                            target,
+                        ));
+                    }
+                }
                 Ok(TypedExpr::new(
                     TypedExprKind::Cast {
                         expr: Box::new(inner),
@@ -109,9 +120,9 @@ impl<'a> Analyzer<'a> {
                 let hi = self.analyze_expr(high)?;
                 // All three operands must be type-compatible (PostgreSQL semantics).
                 let common = self.unify_expr_types(&[&e, &lo, &hi], "BETWEEN")?;
-                let e = self.coerce_if_needed(e, &common);
-                let lo = self.coerce_if_needed(lo, &common);
-                let hi = self.coerce_if_needed(hi, &common);
+                let e = self.coerce_if_needed(e, &common)?;
+                let lo = self.coerce_if_needed(lo, &common)?;
+                let hi = self.coerce_if_needed(hi, &common)?;
                 Ok(TypedExpr::new(
                     TypedExprKind::Between {
                         expr: Box::new(e),
@@ -138,11 +149,11 @@ impl<'a> Analyzer<'a> {
                 let mut in_refs: Vec<&TypedExpr> = vec![&e];
                 in_refs.extend(analyzed_list.iter());
                 let common = self.unify_expr_types(&in_refs, "IN list")?;
-                let e = self.coerce_if_needed(e, &common);
+                let e = self.coerce_if_needed(e, &common)?;
                 let analyzed_list = analyzed_list
                     .into_iter()
                     .map(|item| self.coerce_if_needed(item, &common))
-                    .collect();
+                    .collect::<Result<_, _>>()?;
                 Ok(TypedExpr::new(
                     TypedExprKind::InList {
                         expr: Box::new(e),
@@ -290,7 +301,7 @@ impl<'a> Analyzer<'a> {
                 let elems = elems
                     .into_iter()
                     .map(|e| self.coerce_if_needed(e, &elem_type))
-                    .collect();
+                    .collect::<Result<_, _>>()?;
 
                 Ok(TypedExpr::new(
                     TypedExprKind::ArrayLiteral(elems),
@@ -661,11 +672,11 @@ impl<'a> Analyzer<'a> {
                         let elem_refs: Vec<&TypedExpr> = elems.iter().collect();
                         in_refs.extend(elem_refs);
                         let common = self.unify_expr_types(&in_refs, "ANY")?;
-                        let left_coerced = self.coerce_if_needed(left_expr, &common);
+                        let left_coerced = self.coerce_if_needed(left_expr, &common)?;
                         let list = elems
                             .into_iter()
                             .map(|e| self.coerce_if_needed(e, &common))
-                            .collect();
+                            .collect::<Result<_, _>>()?;
                         return Ok(TypedExpr::new(
                             TypedExprKind::InList {
                                 expr: Box::new(left_coerced),
@@ -684,11 +695,11 @@ impl<'a> Analyzer<'a> {
                         let elem_refs: Vec<&TypedExpr> = elems.iter().collect();
                         in_refs.extend(elem_refs);
                         let common = self.unify_expr_types(&in_refs, "ANY")?;
-                        let left_coerced = self.coerce_if_needed(left_expr, &common);
+                        let left_coerced = self.coerce_if_needed(left_expr, &common)?;
                         let list = elems
                             .into_iter()
                             .map(|e| self.coerce_if_needed(e, &common))
-                            .collect();
+                            .collect::<Result<_, _>>()?;
                         return Ok(TypedExpr::new(
                             TypedExprKind::InList {
                                 expr: Box::new(left_coerced),
@@ -816,7 +827,7 @@ impl<'a> Analyzer<'a> {
             left_expr = TypedExpr::null(right_type.clone());
         } else if left_expr.data_type != right_type {
             if let Some(target) = comparison_target_type(&left_expr.data_type, &right_type) {
-                left_expr = self.coerce_if_needed(left_expr, &target);
+                left_expr = self.coerce_if_needed(left_expr, &target)?;
             }
         }
 
@@ -871,10 +882,10 @@ impl<'a> Analyzer<'a> {
                     );
 
                     if left_expr.data_type != merged.data_type {
-                        left_expr = self.coerce_if_needed(left_expr, &merged.data_type);
+                        left_expr = self.coerce_if_needed(left_expr, &merged.data_type)?;
                     }
                     if right_expr.data_type != merged.data_type {
-                        right_expr = self.coerce_if_needed(right_expr, &merged.data_type);
+                        right_expr = self.coerce_if_needed(right_expr, &merged.data_type)?;
                     }
 
                     return Ok(TypedExpr::new(
@@ -1061,11 +1072,57 @@ impl<'a> Analyzer<'a> {
                 ))
             }
 
+            ast::Value::Placeholder(s) => {
+                let index = Self::parse_placeholder_index(s)?;
+                if index >= self.param_types.len() {
+                    return Err(AnalyzerError::InvalidParameterUsage {
+                        index: index + 1,
+                        context: format!(
+                            "parameter index exceeds placeholder count ({})",
+                            self.param_types.len()
+                        ),
+                    });
+                }
+
+                // Determine type: client OID > previously inferred > Text seed.
+                // Text seed is intentional — is_unresolved_param() checks
+                // inferred_params, not the data_type on the node, so Text
+                // never skews type resolution.
+                let data_type = if let Some(Some(dt)) = self.param_types.get(index) {
+                    dt.clone()
+                } else if let Some(Some(dt)) = self.inferred_params.get(index) {
+                    dt.clone()
+                } else {
+                    DataType::Text // Seed only; filtered out by unify_expr_types
+                };
+
+                Ok(TypedExpr::new(
+                    TypedExprKind::Parameter { index },
+                    data_type,
+                ))
+            }
+
             other => Err(AnalyzerError::Unsupported(format!(
                 "value literal type: {:?}",
                 other,
             ))),
         }
+    }
+
+    /// Parse `$N` placeholder string to 0-indexed parameter index.
+    /// Rejects `$0` (PG parameters are 1-based).
+    pub(super) fn parse_placeholder_index(s: &str) -> Result<usize, AnalyzerError> {
+        let n = s
+            .strip_prefix('$')
+            .and_then(|n| n.parse::<usize>().ok())
+            .ok_or_else(|| AnalyzerError::Unsupported(format!("invalid placeholder: {}", s)))?;
+        if n == 0 {
+            return Err(AnalyzerError::InvalidParameterUsage {
+                index: 0,
+                context: "parameters are numbered from $1".to_string(),
+            });
+        }
+        Ok(n - 1) // 0-indexed internally
     }
 
     // ── Helper: binary operators ────────────────────────────
@@ -1085,6 +1142,60 @@ impl<'a> Analyzer<'a> {
             l = TypedExpr::null(r.data_type.clone());
         } else if r.is_null_constant() && !l.is_null_constant() {
             r = TypedExpr::null(l.data_type.clone());
+        }
+
+        // Contextual parameter typing (mirrors NULL typing above).
+        // Resolve parameter from the concrete type on the other side.
+        // Always call resolve_param_type for conflict detection, even for
+        // already-resolved params (enables InconsistentParameterTypes).
+        if let TypedExprKind::Parameter { index } = &l.kind {
+            if !r.is_null_constant() && !matches!(&r.kind, TypedExprKind::Parameter { .. }) {
+                let was_unresolved = self.is_unresolved_param(&l);
+                self.resolve_param_type(*index, &r.data_type)?;
+                if was_unresolved {
+                    l = TypedExpr::new(
+                        TypedExprKind::Parameter { index: *index },
+                        r.data_type.clone(),
+                    );
+                }
+            }
+        }
+        if let TypedExprKind::Parameter { index } = &r.kind {
+            if !l.is_null_constant() && !matches!(&l.kind, TypedExprKind::Parameter { .. }) {
+                let was_unresolved = self.is_unresolved_param(&r);
+                self.resolve_param_type(*index, &l.data_type)?;
+                if was_unresolved {
+                    r = TypedExpr::new(
+                        TypedExprKind::Parameter { index: *index },
+                        l.data_type.clone(),
+                    );
+                }
+            }
+        }
+
+        // AND/OR: both sides must be boolean — resolve params (including
+        // already-resolved ones for conflict detection)
+        if matches!(typed_op, BinaryOp::And | BinaryOp::Or) {
+            if let TypedExprKind::Parameter { index } = &l.kind {
+                let was_unresolved = self.is_unresolved_param(&l);
+                self.resolve_param_type(*index, &DataType::Boolean)?;
+                if was_unresolved {
+                    l = TypedExpr::new(
+                        TypedExprKind::Parameter { index: *index },
+                        DataType::Boolean,
+                    );
+                }
+            }
+            if let TypedExprKind::Parameter { index } = &r.kind {
+                let was_unresolved = self.is_unresolved_param(&r);
+                self.resolve_param_type(*index, &DataType::Boolean)?;
+                if was_unresolved {
+                    r = TypedExpr::new(
+                        TypedExprKind::Parameter { index: *index },
+                        DataType::Boolean,
+                    );
+                }
+            }
         }
 
         // PostgreSQL UNKNOWN literal rule (partial):
@@ -1110,11 +1221,11 @@ impl<'a> Analyzer<'a> {
         ) {
             if is_numeric(&r.data_type) && matches!(l.kind, TypedExprKind::Constant(Value::Text(_)))
             {
-                l = self.coerce_if_needed(l, &r.data_type);
+                l = self.coerce_if_needed(l, &r.data_type)?;
             } else if is_numeric(&l.data_type)
                 && matches!(r.kind, TypedExprKind::Constant(Value::Text(_)))
             {
-                r = self.coerce_if_needed(r, &l.data_type);
+                r = self.coerce_if_needed(r, &l.data_type)?;
             }
         }
 
@@ -1169,8 +1280,8 @@ impl<'a> Analyzer<'a> {
             };
 
             if let Some(target) = target_type {
-                l = self.coerce_if_needed(l, &target);
-                r = self.coerce_if_needed(r, &target);
+                l = self.coerce_if_needed(l, &target)?;
+                r = self.coerce_if_needed(r, &target)?;
             }
         }
 
@@ -1353,10 +1464,20 @@ impl<'a> Analyzer<'a> {
             if analyzed_operand.is_none() {
                 if c.is_null_constant() {
                     c = TypedExpr::null(DataType::Boolean);
+                } else if let TypedExprKind::Parameter { index } = &c.kind {
+                    // Parameter in searched CASE WHEN → resolve to Boolean
+                    let was_unresolved = self.is_unresolved_param(&c);
+                    self.resolve_param_type(*index, &DataType::Boolean)?;
+                    if was_unresolved {
+                        c = TypedExpr::new(
+                            TypedExprKind::Parameter { index: *index },
+                            DataType::Boolean,
+                        );
+                    }
                 } else if matches!(c.kind, TypedExprKind::Constant(Value::Text(_))) {
                     // PostgreSQL unknown-literal behavior in boolean context:
                     // CASE WHEN 'true' THEN ... is allowed via implicit cast.
-                    c = self.coerce_if_needed(c, &DataType::Boolean);
+                    c = self.coerce_if_needed(c, &DataType::Boolean)?;
                 }
 
                 if c.data_type != DataType::Boolean {
@@ -1390,11 +1511,11 @@ impl<'a> Analyzer<'a> {
                     })?;
             }
 
-            analyzed_operand = Some(Box::new(self.coerce_if_needed(*op, &target)));
+            analyzed_operand = Some(Box::new(self.coerce_if_needed(*op, &target)?));
             when_clauses = when_clauses
                 .into_iter()
-                .map(|(cond, result)| (self.coerce_if_needed(cond, &target), result))
-                .collect();
+                .map(|(cond, result)| Ok((self.coerce_if_needed(cond, &target)?, result)))
+                .collect::<Result<_, AnalyzerError>>()?;
         }
 
         let analyzed_else = match else_result {
@@ -1413,10 +1534,12 @@ impl<'a> Analyzer<'a> {
         // Insert implicit casts on result expressions to match the unified type.
         let when_clauses = when_clauses
             .into_iter()
-            .map(|(cond, result)| (cond, self.coerce_if_needed(result, &result_type)))
-            .collect();
-        let analyzed_else =
-            analyzed_else.map(|e| Box::new(self.coerce_if_needed(*e, &result_type)));
+            .map(|(cond, result)| Ok((cond, self.coerce_if_needed(result, &result_type)?)))
+            .collect::<Result<_, AnalyzerError>>()?;
+        let analyzed_else = match analyzed_else {
+            Some(e) => Some(Box::new(self.coerce_if_needed(*e, &result_type)?)),
+            None => None,
+        };
 
         Ok(TypedExpr::new(
             TypedExprKind::Case {
@@ -1716,7 +1839,7 @@ impl<'a> Analyzer<'a> {
     // These produce dedicated IR variants instead of FunctionCall,
     // because they have short-circuit or comparison semantics.
 
-    fn analyze_coalesce(&self, args: Vec<TypedExpr>) -> Result<TypedExpr, AnalyzerError> {
+    fn analyze_coalesce(&mut self, args: Vec<TypedExpr>) -> Result<TypedExpr, AnalyzerError> {
         if args.is_empty() {
             return Err(AnalyzerError::ArgumentCountMismatch {
                 function: "COALESCE".to_string(),
@@ -1730,11 +1853,11 @@ impl<'a> Analyzer<'a> {
         let args = args
             .into_iter()
             .map(|a| self.coerce_if_needed(a, &unified))
-            .collect();
+            .collect::<Result<_, _>>()?;
         Ok(TypedExpr::new(TypedExprKind::Coalesce(args), unified))
     }
 
-    fn analyze_nullif(&self, args: Vec<TypedExpr>) -> Result<TypedExpr, AnalyzerError> {
+    fn analyze_nullif(&mut self, args: Vec<TypedExpr>) -> Result<TypedExpr, AnalyzerError> {
         if args.len() != 2 {
             return Err(AnalyzerError::ArgumentCountMismatch {
                 function: "NULLIF".to_string(),
@@ -1754,7 +1877,7 @@ impl<'a> Analyzer<'a> {
     }
 
     fn analyze_greatest_least(
-        &self,
+        &mut self,
         args: Vec<TypedExpr>,
         is_greatest: bool,
     ) -> Result<TypedExpr, AnalyzerError> {
@@ -1772,7 +1895,7 @@ impl<'a> Analyzer<'a> {
         let args = args
             .into_iter()
             .map(|a| self.coerce_if_needed(a, &unified))
-            .collect();
+            .collect::<Result<_, _>>()?;
         Ok(TypedExpr::new(
             TypedExprKind::MinMax { args, is_greatest },
             unified,
@@ -1849,6 +1972,58 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    // ── Helper: parameter typing ────────────────────────────
+
+    /// True if expr is a Parameter not yet resolved from context or client OID.
+    pub(super) fn is_unresolved_param(&self, expr: &TypedExpr) -> bool {
+        if let TypedExprKind::Parameter { index } = &expr.kind {
+            self.param_types.get(*index).map_or(true, |v| v.is_none())
+                && self
+                    .inferred_params
+                    .get(*index)
+                    .map_or(true, |v| v.is_none())
+        } else {
+            false
+        }
+    }
+
+    /// Record inferred type for parameter. If already inferred, check compatibility.
+    pub(super) fn resolve_param_type(
+        &mut self,
+        index: usize,
+        data_type: &DataType,
+    ) -> Result<(), AnalyzerError> {
+        // Client-specified OID makes the parameter type authoritative.
+        // Do not run inference/conflict logic in this case; normal operator
+        // type checks handle incompatible contexts.
+        if self
+            .param_types
+            .get(index)
+            .and_then(|t| t.as_ref())
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        if let Some(existing) = self.inferred_params.get(index).cloned().flatten() {
+            if existing != *data_type {
+                if common_type(&existing, data_type).is_none() {
+                    return Err(AnalyzerError::InconsistentParameterTypes {
+                        index: index + 1,
+                        first: existing,
+                        second: data_type.clone(),
+                    });
+                }
+                // Keep the first inferred type stable. Widening here can
+                // desynchronize already-built TypedExpr::Parameter node types
+                // from finalize_param_types() output.
+            }
+        } else if let Some(slot) = self.inferred_params.get_mut(index) {
+            *slot = Some(data_type.clone());
+        }
+        Ok(())
+    }
+
     // ── Helper: implicit cast insertion ─────────────────────
 
     /// Wrap an expression in an implicit Cast if its type differs from the target.
@@ -1857,46 +2032,74 @@ impl<'a> Analyzer<'a> {
     /// types in the IR — the evaluator never needs runtime coercion.
     ///
     /// NULL constants are retyped directly (no Cast node needed).
-    fn coerce_if_needed(&self, expr: TypedExpr, target: &DataType) -> TypedExpr {
+    /// Unresolved parameters are re-typed (no Cast node) and their inferred type
+    /// is recorded for `finalize_param_types()`.
+    fn coerce_if_needed(
+        &mut self,
+        expr: TypedExpr,
+        target: &DataType,
+    ) -> Result<TypedExpr, AnalyzerError> {
+        // Snapshot before resolve_param_type mutates inferred_params
+        let was_unresolved = self.is_unresolved_param(&expr);
+
+        // For any parameter, always register type for conflict detection.
+        // This ensures InconsistentParameterTypes fires when the same $N
+        // appears in incompatible type contexts (e.g. WHERE id=$1 AND flag=$1).
+        if let TypedExprKind::Parameter { index } = &expr.kind {
+            self.resolve_param_type(*index, target)?;
+        }
+
         if expr.data_type == *target {
-            expr
+            Ok(expr)
         } else if expr.is_null_constant() {
             // NULL constants can be retyped directly — no Cast node needed.
-            TypedExpr::null(target.clone())
+            Ok(TypedExpr::null(target.clone()))
+        } else if was_unresolved {
+            // Unresolved parameter — re-type without Cast
+            if let TypedExprKind::Parameter { index } = &expr.kind {
+                Ok(TypedExpr::new(
+                    TypedExprKind::Parameter { index: *index },
+                    target.clone(),
+                ))
+            } else {
+                unreachable!()
+            }
         } else {
-            TypedExpr::new(
+            Ok(TypedExpr::new(
                 TypedExprKind::Cast {
                     expr: Box::new(expr),
                     target_type: target.clone(),
                     cast_context: CastContext::Implicit,
                 },
                 target.clone(),
-            )
+            ))
         }
     }
 
-    /// Unify types across a list of expressions, treating NULL constants as
-    /// wildcards (they adopt the unified type of the non-NULL expressions).
+    /// Unify types across a list of expressions, treating NULL constants and
+    /// unresolved parameters as wildcards (they adopt the unified type of the
+    /// concrete expressions).
     ///
-    /// If all expressions are NULL, defaults to Text (PostgreSQL semantics).
-    /// Takes references to avoid cloning entire expressions just for type inspection.
+    /// If all expressions are NULL/unresolved params, defaults to Text
+    /// (PostgreSQL semantics). `finalize_param_types()` catches truly
+    /// unresolved parameters later.
     fn unify_expr_types(
         &self,
         exprs: &[&TypedExpr],
         context: &str,
     ) -> Result<DataType, AnalyzerError> {
-        let non_null_types: Vec<DataType> = exprs
+        let concrete_types: Vec<DataType> = exprs
             .iter()
-            .filter(|e| !e.is_null_constant())
+            .filter(|e| !e.is_null_constant() && !self.is_unresolved_param(e))
             .map(|e| e.data_type.clone())
             .collect();
 
-        if non_null_types.is_empty() {
-            // All NULLs → default to Text (PostgreSQL: standalone NULL is text)
+        if concrete_types.is_empty() {
+            // All NULLs and/or unresolved params → Text fallback
             return Ok(DataType::Text);
         }
 
-        unify_types(&non_null_types).ok_or_else(|| AnalyzerError::TypesCannotBeMatched {
+        unify_types(&concrete_types).ok_or_else(|| AnalyzerError::TypesCannotBeMatched {
             types: exprs.iter().map(|e| e.data_type.clone()).collect(),
             context: context.to_string(),
         })

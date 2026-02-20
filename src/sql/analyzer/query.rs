@@ -29,7 +29,11 @@ impl<'a> Analyzer<'a> {
     /// The Analyzer contract requires all boolean contexts to be validated at
     /// analysis time. This catches errors like `WHERE text_column` before any
     /// row is touched.
-    fn ensure_boolean(&self, expr: TypedExpr, context: &str) -> Result<TypedExpr, AnalyzerError> {
+    fn ensure_boolean(
+        &mut self,
+        expr: TypedExpr,
+        context: &str,
+    ) -> Result<TypedExpr, AnalyzerError> {
         if expr.data_type == DataType::Boolean {
             return Ok(expr);
         }
@@ -37,8 +41,19 @@ impl<'a> Analyzer<'a> {
         // PostgreSQL-style boolean context coercion:
         // - NULL in predicate context is allowed (NULL::bool => unknown)
         // - string literals are UNKNOWN and may be cast to bool ('true'/'false')
+        // - unresolved parameters resolve to Boolean
         if expr.is_null_constant() {
             return Ok(TypedExpr::null(DataType::Boolean));
+        }
+        if let TypedExprKind::Parameter { index } = &expr.kind {
+            let was_unresolved = self.is_unresolved_param(&expr);
+            self.resolve_param_type(*index, &DataType::Boolean)?;
+            if was_unresolved {
+                return Ok(TypedExpr::new(
+                    TypedExprKind::Parameter { index: *index },
+                    DataType::Boolean,
+                ));
+            }
         }
         if matches!(&expr.kind, TypedExprKind::Constant(Value::Text(_))) {
             return Ok(TypedExpr::new(
@@ -717,15 +732,41 @@ impl<'a> Analyzer<'a> {
             &analyzed_order_by,
         )?;
 
-        // 9. LIMIT
+        // 9. LIMIT — resolve params to Int64
         let analyzed_limit = match limit {
-            Some(l) => Some(self.analyze_expr(l)?),
+            Some(l) => {
+                let mut expr = self.analyze_expr(l)?;
+                if let TypedExprKind::Parameter { index } = &expr.kind {
+                    let was_unresolved = self.is_unresolved_param(&expr);
+                    self.resolve_param_type(*index, &DataType::Int64)?;
+                    if was_unresolved {
+                        expr = TypedExpr::new(
+                            TypedExprKind::Parameter { index: *index },
+                            DataType::Int64,
+                        );
+                    }
+                }
+                Some(expr)
+            }
             None => None,
         };
 
-        // 10. OFFSET
+        // 10. OFFSET — resolve params to Int64
         let analyzed_offset = match offset {
-            Some(o) => Some(self.analyze_expr(&o.value)?),
+            Some(o) => {
+                let mut expr = self.analyze_expr(&o.value)?;
+                if let TypedExprKind::Parameter { index } = &expr.kind {
+                    let was_unresolved = self.is_unresolved_param(&expr);
+                    self.resolve_param_type(*index, &DataType::Int64)?;
+                    if was_unresolved {
+                        expr = TypedExpr::new(
+                            TypedExprKind::Parameter { index: *index },
+                            DataType::Int64,
+                        );
+                    }
+                }
+                Some(expr)
+            }
             None => None,
         };
 
@@ -1839,7 +1880,8 @@ impl<'a> Analyzer<'a> {
             | TypedExprKind::ScalarSubquery(_)
             | TypedExprKind::ArraySubquery(_)
             | TypedExprKind::Exists { .. }
-            | TypedExprKind::Default => false,
+            | TypedExprKind::Default
+            | TypedExprKind::Parameter { .. } => false,
         }
     }
 
@@ -2140,7 +2182,8 @@ impl<'a> Analyzer<'a> {
             | TypedExprKind::ScalarSubquery(_)
             | TypedExprKind::ArraySubquery(_)
             | TypedExprKind::Exists { .. }
-            | TypedExprKind::Default => None,
+            | TypedExprKind::Default
+            | TypedExprKind::Parameter { .. } => None,
         }
     }
 

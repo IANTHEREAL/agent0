@@ -62,7 +62,8 @@ fn push_expr_children<'a>(expr: &'a TypedExpr, stack: &mut Vec<&'a TypedExpr>) {
         | TypedExprKind::ScalarSubquery(_)
         | TypedExprKind::ArraySubquery(_)
         | TypedExprKind::Exists { .. }
-        | TypedExprKind::Default => {}
+        | TypedExprKind::Default
+        | TypedExprKind::Parameter { .. } => {}
 
         TypedExprKind::BinaryOp { left, right, .. } => {
             stack.push(left);

@@ -234,6 +234,7 @@ pub fn fold_typed_expr(expr: &TypedExpr, qctx: &QueryContext) -> TypedExpr {
             TypedExprKind::Row(args.iter().map(|e| fold_typed_expr(e, qctx)).collect())
         }
         TypedExprKind::Default => TypedExprKind::Default,
+        TypedExprKind::Parameter { index } => TypedExprKind::Parameter { index: *index },
     };
 
     let rebuilt = TypedExpr {
@@ -295,7 +296,8 @@ pub(crate) fn is_fold_candidate(expr: &TypedExpr) -> bool {
         | TypedExprKind::InSubquery { .. }
         | TypedExprKind::AnyAll { .. }
         | TypedExprKind::ArraySubquery(_)
-        | TypedExprKind::Default => true,
+        | TypedExprKind::Default
+        | TypedExprKind::Parameter { .. } => true,
         TypedExprKind::FunctionCall {
             func,
             order_by,

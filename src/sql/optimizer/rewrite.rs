@@ -733,7 +733,7 @@ fn collect_column_indices_inner(expr: &TypedExpr, indices: &mut HashSet<usize>) 
                 indices.insert(*column_index);
             }
         }
-        TypedExprKind::Constant(_) | TypedExprKind::Default => {}
+        TypedExprKind::Constant(_) | TypedExprKind::Default | TypedExprKind::Parameter { .. } => {}
         TypedExprKind::BinaryOp { left, right, .. } => {
             collect_column_indices_inner(left, indices);
             collect_column_indices_inner(right, indices);

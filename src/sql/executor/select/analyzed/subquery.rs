@@ -126,7 +126,8 @@ pub(super) fn has_outer_ref(expr: &TypedExpr) -> bool {
         | TypedExprKind::ScalarSubquery(_)
         | TypedExprKind::ArraySubquery(_)
         | TypedExprKind::Exists { .. }
-        | TypedExprKind::Default => false,
+        | TypedExprKind::Default
+        | TypedExprKind::Parameter { .. } => false,
     }
 }
 

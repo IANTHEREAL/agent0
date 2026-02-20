@@ -98,6 +98,20 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
         TypedExprKind::Constant(v) => Ok(v.clone()),
         TypedExprKind::Default => Ok(Value::Null),
 
+        TypedExprKind::Parameter { index } => {
+            match qctx.params.get(*index) {
+                Some(Some(v)) => Ok(v.clone()),
+                Some(None) => Ok(Value::Null), // Bound NULL
+                None => Err(anyhow!(
+                    "parameter ${} not bound (bind message supplies {} parameters, \
+                     but prepared statement requires at least {})",
+                    index + 1,
+                    qctx.params.len(),
+                    index + 1,
+                )),
+            }
+        }
+
         TypedExprKind::ColumnRef {
             column_index,
             scope_depth,

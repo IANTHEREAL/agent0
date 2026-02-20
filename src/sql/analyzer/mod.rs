@@ -43,6 +43,8 @@ pub use scope::Scope;
 pub use scope::ScopeStack;
 pub use types::*;
 
+use crate::types::DataType;
+
 /// The Analyzer: transforms raw SQL AST into Typed IR.
 ///
 /// Maintains a scope stack for column resolution across nested queries.
@@ -51,6 +53,12 @@ pub use types::*;
 pub struct Analyzer<'a> {
     pub(crate) catalog: &'a dyn Catalog,
     pub(crate) scopes: ScopeStack,
+    /// Client-provided OIDs mapped to DataType. `None` = OID 0 (infer).
+    /// Length = number of placeholders found in SQL.
+    pub(crate) param_types: Vec<Option<DataType>>,
+    /// Inferred types from context, per parameter index.
+    /// Populated during analysis. `None` = not yet resolved.
+    pub(crate) inferred_params: Vec<Option<DataType>>,
 }
 
 impl<'a> Analyzer<'a> {
@@ -61,7 +69,50 @@ impl<'a> Analyzer<'a> {
         Self {
             catalog,
             scopes: ScopeStack::new(),
+            param_types: vec![],
+            inferred_params: vec![],
         }
+    }
+
+    /// Create a new Analyzer with parameter context for prepared statements.
+    ///
+    /// `param_count`: number of `$N` placeholders found in the SQL text.
+    /// `client_oids`: OIDs from the Parse message (mapped to DataType).
+    pub fn new_with_params(
+        catalog: &'a dyn Catalog,
+        param_count: usize,
+        client_oids: &[Option<DataType>],
+    ) -> Self {
+        let mut param_types = vec![None; param_count];
+        for (i, oid) in client_oids.iter().enumerate() {
+            if i < param_count {
+                param_types[i] = oid.clone();
+            }
+        }
+        Self {
+            catalog,
+            scopes: ScopeStack::new(),
+            param_types,
+            inferred_params: vec![None; param_count],
+        }
+    }
+
+    /// Finalize parameter types after analysis.
+    ///
+    /// Returns resolved types for all parameters, or 42P18 if any
+    /// parameter could not be resolved from context or client OIDs.
+    pub fn finalize_param_types(&self) -> Result<Vec<DataType>, AnalyzerError> {
+        let mut result = Vec::with_capacity(self.param_types.len());
+        for i in 0..self.param_types.len() {
+            let dt = self.param_types[i]
+                .clone()
+                .or_else(|| self.inferred_params[i].clone());
+            match dt {
+                Some(dt) => result.push(dt),
+                None => return Err(AnalyzerError::IndeterminateParameterType { index: i + 1 }),
+            }
+        }
+        Ok(result)
     }
 
     /// Analyze a complete SQL statement (DML or query).

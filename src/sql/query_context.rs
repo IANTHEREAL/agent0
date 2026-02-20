@@ -7,11 +7,14 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use crate::types::Value;
+
 tokio::task_local! {
     static CONNECTION_ID: i32;
     static CURRENT_DATABASE_NAME: Arc<str>;
     static CURRENT_USER_NAME: Arc<str>;
     static CURRENT_TIMEZONE: Arc<str>;
+    static QUERY_PARAMS: Vec<Option<Value>>;
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +32,9 @@ pub struct QueryContext {
     pub transaction_timestamp_ms: i64,
     #[allow(dead_code)] // set during init; read path uses session_context fallback
     pub timezone: Arc<str>,
+    /// Bound parameter values from extended protocol (Execute).
+    /// `None` entries represent SQL NULL. Empty vec for simple-query path.
+    pub params: Vec<Option<Value>>,
 }
 
 impl QueryContext {
@@ -47,6 +53,7 @@ impl QueryContext {
             statement_timestamp_ms,
             transaction_timestamp_ms,
             timezone,
+            params: vec![],
         }
     }
 
@@ -66,6 +73,10 @@ impl QueryContext {
         CURRENT_TIMEZONE.try_with(|tz| tz.clone()).ok()
     }
 
+    pub(crate) fn current_query_params() -> Vec<Option<Value>> {
+        QUERY_PARAMS.try_with(|p| p.clone()).unwrap_or_default()
+    }
+
     /// Build a QueryContext from task-local storage.
     ///
     /// Use this for code paths that don't receive an explicit QueryContext
@@ -82,6 +93,7 @@ impl QueryContext {
         let db_name = Self::current_database_name();
         let user_name = Self::current_user_name();
         let timezone = Self::current_timezone();
+        let params = Self::current_query_params();
 
         #[cfg(test)]
         if stmt_ts.is_none()
@@ -98,7 +110,7 @@ impl QueryContext {
              execute through Executor::execute or wrap with statement_time::with_timestamps",
         );
         let txn_ts = transaction_timestamp_millis().unwrap_or(stmt_ts);
-        Self::new(
+        let mut qctx = Self::new(
             conn_id.expect(
                 "QueryContext::from_task_locals called without connection_id; \
                  execute through Executor::execute or wrap with query_context::with_query_context",
@@ -117,7 +129,9 @@ impl QueryContext {
                 "QueryContext::from_task_locals called without timezone; \
                  execute through Executor::execute or wrap with query_context::with_query_context",
             ),
-        )
+        );
+        qctx.params = params;
+        qctx
     }
 
     #[cfg(test)]
@@ -182,10 +196,13 @@ where
         qctx.database_name.clone(),
         qctx.current_user.clone(),
         qctx.timezone.clone(),
-        crate::sql::statement_time::with_timestamps(
-            qctx.statement_timestamp_ms,
-            qctx.transaction_timestamp_ms,
-            fut,
+        QUERY_PARAMS.scope(
+            qctx.params.clone(),
+            crate::sql::statement_time::with_timestamps(
+                qctx.statement_timestamp_ms,
+                qctx.transaction_timestamp_ms,
+                fut,
+            ),
         ),
     )
     .await

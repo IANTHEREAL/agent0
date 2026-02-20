@@ -37,6 +37,11 @@ impl TypedExpr {
     pub fn is_null_constant(&self) -> bool {
         matches!(self.kind, TypedExprKind::Constant(Value::Null))
     }
+
+    /// Returns true if this expression is a `$N` parameter placeholder.
+    pub fn is_parameter(&self) -> bool {
+        matches!(self.kind, TypedExprKind::Parameter { .. })
+    }
 }
 
 impl fmt::Display for TypedExpr {
@@ -234,6 +239,7 @@ impl fmt::Display for TypedExpr {
                 write!(f, "ROW({})", items.join(", "))
             }
             TypedExprKind::Default => write!(f, "DEFAULT"),
+            TypedExprKind::Parameter { index } => write!(f, "${}", index + 1),
         }
     }
 }
@@ -428,6 +434,11 @@ pub enum TypedExprKind {
     /// DEFAULT keyword in INSERT VALUES — placeholder for executor to fill
     /// with the column's default value or serial sequence.
     Default,
+
+    // ── Prepared statement parameter ────────────────────
+    /// `$N` placeholder from extended protocol. 0-indexed internally.
+    /// Type is resolved at analysis time from context / client OIDs.
+    Parameter { index: usize },
 }
 
 // ── Binary operators ────────────────────────────────────────

@@ -44,7 +44,8 @@ impl<'a> SequenceMaterializeCtx<'a> {
                 | TypedExprKind::ScalarSubquery(_)
                 | TypedExprKind::ArraySubquery(_)
                 | TypedExprKind::Exists { .. }
-                | TypedExprKind::Default => return Ok(expr.clone()),
+                | TypedExprKind::Default
+                | TypedExprKind::Parameter { .. } => return Ok(expr.clone()),
                 TypedExprKind::FunctionCall {
                     func,
                     args,

@@ -108,6 +108,20 @@ pub enum SqlError {
     #[error("relation \"{0}\" already exists")]
     DuplicateRelation(String),
 
+    // Parameter errors
+    #[error("could not determine data type of parameter ${index}")]
+    IndeterminateParameterType { index: usize },
+
+    #[error("inconsistent types deduced for parameter ${index}: {first} vs {second}")]
+    InconsistentParameterTypes {
+        index: usize,
+        first: DataType,
+        second: DataType,
+    },
+
+    #[error("there is no parameter ${index}")]
+    InvalidParameterUsage { index: usize, context: String },
+
     // Unsupported features
     #[error("{0}")]
     Unsupported(String),
@@ -142,6 +156,9 @@ impl SqlError {
             Self::InFailedTransaction => "25P02",
             Self::PermissionDenied { .. } => "42501",
             Self::DuplicateRelation(_) => "42P07",
+            Self::IndeterminateParameterType { .. } => "42P18",
+            Self::InconsistentParameterTypes { .. } => "42P18",
+            Self::InvalidParameterUsage { .. } => "42P02",
             Self::Unsupported(_) => "0A000",
             Self::Internal(_) => "XX000",
         }
@@ -179,6 +196,21 @@ impl From<AnalyzerError> for SqlError {
             },
             AnalyzerError::DmlColumnNotFound { column, .. } => {
                 SqlError::ColumnNotFound { column, hint: None }
+            }
+            AnalyzerError::IndeterminateParameterType { index } => {
+                SqlError::IndeterminateParameterType { index }
+            }
+            AnalyzerError::InconsistentParameterTypes {
+                index,
+                first,
+                second,
+            } => SqlError::InconsistentParameterTypes {
+                index,
+                first,
+                second,
+            },
+            AnalyzerError::InvalidParameterUsage { index, context } => {
+                SqlError::InvalidParameterUsage { index, context }
             }
             AnalyzerError::Unsupported(msg) => SqlError::Unsupported(msg),
             other => SqlError::Internal(anyhow::anyhow!("{}", other)),
@@ -289,6 +321,27 @@ mod tests {
         assert_eq!(
             SqlError::DuplicateRelation("idx".into()).sqlstate(),
             "42P07"
+        );
+        assert_eq!(
+            SqlError::IndeterminateParameterType { index: 1 }.sqlstate(),
+            "42P18"
+        );
+        assert_eq!(
+            SqlError::InconsistentParameterTypes {
+                index: 1,
+                first: DataType::Int32,
+                second: DataType::Boolean,
+            }
+            .sqlstate(),
+            "42P18"
+        );
+        assert_eq!(
+            SqlError::InvalidParameterUsage {
+                index: 0,
+                context: "test".into()
+            }
+            .sqlstate(),
+            "42P02"
         );
         assert_eq!(SqlError::Unsupported("x".into()).sqlstate(), "0A000");
         let internal = SqlError::Internal(anyhow::anyhow!("boom"));

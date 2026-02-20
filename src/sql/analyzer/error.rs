@@ -96,6 +96,19 @@ pub enum AnalyzerError {
     /// DML: WHERE clause in DML is not boolean.
     DmlWhereNotBoolean { found: DataType },
 
+    /// Could not determine data type of parameter (SQLSTATE 42P18).
+    IndeterminateParameterType { index: usize },
+
+    /// Parameter referenced in inconsistent type contexts.
+    InconsistentParameterTypes {
+        index: usize,
+        first: DataType,
+        second: DataType,
+    },
+
+    /// Parameter in non-parameterizable statement context (SQLSTATE 42P02).
+    InvalidParameterUsage { index: usize, context: String },
+
     /// Unsupported SQL feature.
     Unsupported(String),
 
@@ -258,6 +271,21 @@ impl fmt::Display for AnalyzerError {
                     "argument of WHERE must be type boolean, not type {}",
                     found,
                 )
+            }
+            Self::IndeterminateParameterType { index } => {
+                write!(f, "could not determine data type of parameter ${}", index)
+            }
+            Self::InconsistentParameterTypes {
+                index,
+                first,
+                second,
+            } => write!(
+                f,
+                "inconsistent types deduced for parameter ${}: {} vs {}",
+                index, first, second,
+            ),
+            Self::InvalidParameterUsage { index, context } => {
+                write!(f, "there is no parameter ${}: {}", index, context)
             }
             Self::Unsupported(msg) => write!(f, "{}", msg),
             Self::Internal(msg) => write!(f, "internal error: {}", msg),

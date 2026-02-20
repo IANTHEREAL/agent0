@@ -1931,3 +1931,228 @@ fn conflict_behavior_from_analyzed_on_conflict() {
     };
     assert_eq!(behavior, ConflictBehavior::DoNothing);
 }
+
+// ── Parameter analysis tests ─────────────────────────────────
+
+#[test]
+fn analyze_select_with_parameter() {
+    // WHERE id = $1 → param typed as Int32 from column
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT * FROM users WHERE id = $1");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Int32]);
+    assert!(matches!(result, AnalyzedStatement::Query(_)));
+}
+
+#[test]
+fn analyze_insert_with_parameters() {
+    // INSERT INTO users (id, name) VALUES ($1, $2) → params typed from columns
+    let catalog = test_catalog();
+    let stmt = parse_statement("INSERT INTO users (id, name) VALUES ($1, $2)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Int32, DataType::Text]);
+}
+
+#[test]
+fn analyze_parameter_limit() {
+    // LIMIT $1 → param typed as Int64
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT * FROM users LIMIT $1");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Int64]);
+}
+
+#[test]
+fn analyze_unresolved_parameter_error() {
+    // SELECT $1 with no OID → 42P18 from finalize_param_types
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let err = analyzer.finalize_param_types().unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::IndeterminateParameterType { index: 1 }
+    ));
+}
+
+#[test]
+fn analyze_parameter_with_client_oid() {
+    // Client provides INT4 OID → respected even without contextual typing
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[Some(DataType::Int32)]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Int32]);
+}
+
+#[test]
+fn analyze_parameter_explicit_cast() {
+    // $1::int4 → param typed as Int4
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1::int4");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Int32]);
+    // The result should be a Parameter node (not Cast), since we resolve
+    // the param type directly from the explicit cast target.
+    if let AnalyzedStatement::Query(q) = result {
+        if let AnalyzedQueryBody::Select(s) = &q.body {
+            assert!(matches!(
+                s.projection[0].expr.kind,
+                TypedExprKind::Parameter { index: 0 }
+            ));
+        }
+    }
+}
+
+#[test]
+fn analyze_parameter_in_list() {
+    // WHERE id IN ($1, $2) → params typed from column
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT * FROM users WHERE id IN ($1, $2)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Int32, DataType::Int32]);
+}
+
+#[test]
+fn analyze_parameter_coalesce() {
+    // COALESCE($1, 42) → param typed as Int32
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT COALESCE($1, 42)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Int32]);
+}
+
+#[test]
+fn analyze_parameter_between() {
+    // WHERE id BETWEEN $1 AND $2 → params typed from column
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT * FROM users WHERE id BETWEEN $1 AND $2");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Int32, DataType::Int32]);
+}
+
+#[test]
+fn analyze_parameter_zero_rejected() {
+    // $0 is not a valid parameter index — test the helper directly
+    let err = Analyzer::parse_placeholder_index("$0").unwrap_err();
+    assert!(err.to_string().contains("$0"));
+    // Ensure $1 still works
+    assert_eq!(Analyzer::parse_placeholder_index("$1").unwrap(), 0);
+}
+
+#[test]
+fn analyze_parameter_boolean_where() {
+    // WHERE $1 → param typed as Boolean from ensure_boolean
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT * FROM users WHERE $1");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Boolean]);
+}
+
+#[test]
+fn analyze_parameter_case_when_boolean() {
+    // Regression: CASE WHEN $1 THEN ... → param typed as Boolean
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT CASE WHEN $1 THEN 1 ELSE 0 END FROM users");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Boolean]);
+}
+
+#[test]
+fn analyze_parameter_inconsistent_types_detected() {
+    // Regression: same $1 in incompatible contexts → InconsistentParameterTypes
+    // id is Int32, active is Boolean — common_type(Int32, Boolean) = None
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT * FROM users WHERE id = $1 AND active = $1");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    assert!(
+        err.to_string().contains("inconsistent types"),
+        "expected InconsistentParameterTypes, got: {}",
+        err,
+    );
+}
+
+#[test]
+fn analyze_parameter_zero_sqlstate() {
+    // Regression: $0 should produce InvalidParameterUsage (42P02), not Unsupported
+    let err = Analyzer::parse_placeholder_index("$0").unwrap_err();
+    assert!(
+        matches!(err, AnalyzerError::InvalidParameterUsage { index: 0, .. }),
+        "expected InvalidParameterUsage, got: {:?}",
+        err,
+    );
+}
+
+#[test]
+fn analyze_parameter_error_sqlstate_mapping() {
+    // Regression: parameter errors map to correct SQLSTATEs via SqlError
+    use crate::sql::error::SqlError;
+
+    // IndeterminateParameterType → 42P18
+    let ae = AnalyzerError::IndeterminateParameterType { index: 1 };
+    let sql: SqlError = ae.into();
+    assert_eq!(sql.sqlstate(), "42P18");
+
+    // InconsistentParameterTypes → 42P18
+    let ae = AnalyzerError::InconsistentParameterTypes {
+        index: 1,
+        first: DataType::Int32,
+        second: DataType::Boolean,
+    };
+    let sql: SqlError = ae.into();
+    assert_eq!(sql.sqlstate(), "42P18");
+
+    // InvalidParameterUsage → 42P02
+    let ae = AnalyzerError::InvalidParameterUsage {
+        index: 0,
+        context: "test".into(),
+    };
+    let sql: SqlError = ae.into();
+    assert_eq!(sql.sqlstate(), "42P02");
+}
+
+#[test]
+fn analyze_parameter_keeps_first_inferred_type_across_compatible_contexts() {
+    // Regression: avoid widening inferred param type, which can desync
+    // TypedExpr parameter node types from finalize_param_types().
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT * FROM users WHERE id = $1 LIMIT $1");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Int32]);
+}
+
+#[test]
+fn analyze_parameter_with_client_oid_does_not_use_inference_conflict_path() {
+    // Regression: client-typed params should bypass inference-conflict paths.
+    // Keep predicates type-compatible (both Int32) so this test does not
+    // depend on operator permissiveness outside parameter inference logic.
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT * FROM users WHERE id = $1 AND age = $1");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[Some(DataType::Int32)]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Int32]);
+}

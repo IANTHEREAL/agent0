@@ -508,17 +508,38 @@ impl<'a> Analyzer<'a> {
         }
 
         let analyzed = self.analyze_expr(expr)?;
+        // Resolve parameters from target column type (always call for conflict detection)
+        if let TypedExprKind::Parameter { index } = &analyzed.kind {
+            let was_unresolved = self.is_unresolved_param(&analyzed);
+            self.resolve_param_type(*index, &col.data_type)?;
+            if was_unresolved {
+                return Ok(TypedExpr::new(
+                    TypedExprKind::Parameter { index: *index },
+                    col.data_type.clone(),
+                ));
+            }
+        }
         self.coerce_assignment(analyzed, &col.data_type, &col.name)
     }
 
     /// Validate that an expression has Boolean type (DML WHERE context).
-    fn ensure_boolean_dml(&self, expr: TypedExpr) -> Result<TypedExpr, AnalyzerError> {
+    fn ensure_boolean_dml(&mut self, expr: TypedExpr) -> Result<TypedExpr, AnalyzerError> {
         if expr.data_type == DataType::Boolean {
             return Ok(expr);
         }
 
         if expr.is_null_constant() {
             return Ok(TypedExpr::null(DataType::Boolean));
+        }
+        if let TypedExprKind::Parameter { index } = &expr.kind {
+            let was_unresolved = self.is_unresolved_param(&expr);
+            self.resolve_param_type(*index, &DataType::Boolean)?;
+            if was_unresolved {
+                return Ok(TypedExpr::new(
+                    TypedExprKind::Parameter { index: *index },
+                    DataType::Boolean,
+                ));
+            }
         }
         if matches!(&expr.kind, TypedExprKind::Constant(Value::Text(_))) {
             return Ok(TypedExpr::new(

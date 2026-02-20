@@ -460,7 +460,8 @@ fn remap_column_refs(expr: TypedExpr, column_map: &[usize], base_names: &[String
         // Leaves — return as-is
         TypedExprKind::Constant(_)
         | TypedExprKind::ColumnRef { .. } // scope_depth > 0
-        | TypedExprKind::Default => kind,
+        | TypedExprKind::Default
+        | TypedExprKind::Parameter { .. } => kind,
 
         // Subquery boundaries — do NOT descend
         TypedExprKind::ScalarSubquery(_)
