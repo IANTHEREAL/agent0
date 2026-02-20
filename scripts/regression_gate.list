@@ -52,6 +52,7 @@ tests/188_worker_refresh_mv.sql
 tests/189_worker_auto_analyze.sql
 tests/229_statement_timeout.sql
 tests/230_idle_in_transaction_timeout.sql
+tests/232_statement_timeout_guc_regression.sql
 
 [orm]
 orm-tests/pg-client/

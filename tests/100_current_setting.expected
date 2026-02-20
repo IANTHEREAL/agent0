@@ -1,9 +1,6 @@
 search_path
 "$user", public
 (1 row)
-statement_timeout
-0
-(1 row)
 missing_ok
 NULL
 (1 row)

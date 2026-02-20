@@ -1214,7 +1214,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
                 table_name, columns
             );
 
-            let (resolved_table, resolved_columns, column_types, col_count, started_txn) = {
+            let (resolved_table, resolved_columns, column_types, col_count, started_txn, qctx) = {
                 let mut session_guard = self.session.lock().await;
                 let session = session_guard.as_mut().ok_or_else(|| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -1238,6 +1238,13 @@ impl SimpleQueryHandler for DynamicPgHandler {
                         )))
                     })?;
                 }
+
+                let statement_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
+                let qctx = session.query_context_for_statement(statement_ts, transaction_ts);
 
                 let db_id = session.current_database_id();
                 let search_path: Vec<String> = session.search_path().to_vec();
@@ -1381,6 +1388,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
                     column_types,
                     col_count,
                     started_txn,
+                    qctx,
                 )
             };
 
@@ -1389,6 +1397,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
                 table_name: resolved_table,
                 columns: resolved_columns,
                 column_types,
+                query_context: qctx,
                 line_buffer: Vec::new(),
                 row_count: 0,
                 started_txn,
@@ -1472,7 +1481,7 @@ impl CopyHandler for DynamicPgHandler {
     {
         let executor = self.get_executor()?;
 
-        let (parse_res, table_name, started_txn) = {
+        let (parse_res, table_name, started_txn, qctx) = {
             let mut ctx_guard = self.copy_context.lock().await;
             let Some(ctx) = ctx_guard.as_mut() else {
                 return Ok(());
@@ -1480,6 +1489,7 @@ impl CopyHandler for DynamicPgHandler {
 
             let table_name = ctx.table_name.clone();
             let started_txn = ctx.started_txn;
+            let qctx = ctx.query_context.clone();
 
             let parse_res = (|| -> PgWireResult<Vec<(usize, Vec<(String, Value)>)>> {
                 if ctx.reached_end_marker {
@@ -1521,7 +1531,7 @@ impl CopyHandler for DynamicPgHandler {
                 Ok(rows_to_insert)
             })();
 
-            (parse_res, table_name, started_txn)
+            (parse_res, table_name, started_txn, qctx)
         };
 
         let rows_to_insert = match parse_res {
@@ -1544,49 +1554,50 @@ impl CopyHandler for DynamicPgHandler {
             return Ok(());
         }
 
-        let insert_res: PgWireResult<()> = async {
-            let mut session_guard = self.session.lock().await;
-            let session = session_guard.as_mut().ok_or_else(|| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "XX000".to_string(),
-                    "Session not initialized".to_string(),
-                )))
-            })?;
+        let insert_res: PgWireResult<()> =
+            crate::sql::query_context::with_scoped_query_context(&qctx, async {
+                let mut session_guard = self.session.lock().await;
+                let session = session_guard.as_mut().ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "XX000".to_string(),
+                        "Session not initialized".to_string(),
+                    )))
+                })?;
 
-            if session.is_transaction_failed() {
-                return Err(in_failed_sql_transaction_pgwire_error());
-            }
-
-            let savepoints = session.savepoints();
-            crate::txn::with_savepoints(savepoints, async {
-                for (line_no, col_values) in rows_to_insert {
-                    executor
-                        .execute_copy_insert(session, &table_name, col_values)
-                        .await
-                        .map_err(|e| {
-                            error!("COPY insert error: {}", e);
-                            let table = copy_display_table_name(&table_name);
-                            let message = if should_add_copy_insert_context(&e) {
-                                format!("{}\nCONTEXT:  COPY {}, line {}", e, table, line_no)
-                            } else {
-                                e.to_string()
-                            };
-                            PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".to_string(),
-                                sqlstate_for_executor_error(&e).to_string(),
-                                message,
-                            )))
-                        })?;
+                if session.is_transaction_failed() {
+                    return Err(in_failed_sql_transaction_pgwire_error());
                 }
 
-                Ok::<(), PgWireError>(())
-            })
-            .await?;
+                let savepoints = session.savepoints();
+                crate::txn::with_savepoints(savepoints, async {
+                    for (line_no, col_values) in rows_to_insert {
+                        executor
+                            .execute_copy_insert(session, &table_name, col_values)
+                            .await
+                            .map_err(|e| {
+                                error!("COPY insert error: {}", e);
+                                let table = copy_display_table_name(&table_name);
+                                let message = if should_add_copy_insert_context(&e) {
+                                    format!("{}\nCONTEXT:  COPY {}, line {}", e, table, line_no)
+                                } else {
+                                    e.to_string()
+                                };
+                                PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    sqlstate_for_executor_error(&e).to_string(),
+                                    message,
+                                )))
+                            })?;
+                    }
 
-            Ok(())
-        }
-        .await;
+                    Ok::<(), PgWireError>(())
+                })
+                .await?;
+
+                Ok(())
+            })
+            .await;
 
         if let Err(e) = insert_res {
             let mut session_guard = self.session.lock().await;
@@ -1621,82 +1632,86 @@ impl CopyHandler for DynamicPgHandler {
 
         let row_count = if let Some(mut ctx) = ctx_opt {
             let executor = self.get_executor()?;
+            let qctx = ctx.query_context.clone();
 
-            let mut session_guard = self.session.lock().await;
-            let session = session_guard.as_mut().ok_or_else(|| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "XX000".to_string(),
-                    "Session not initialized".to_string(),
-                )))
-            })?;
-
-            if session.is_transaction_failed() {
-                return Err(in_failed_sql_transaction_pgwire_error());
-            }
-
-            if let Some(final_line_bytes) = ctx.drain_final_line() {
-                if final_line_bytes.as_slice() == b"\\." {
-                    ctx.reached_end_marker = true;
-                } else if !ctx.reached_end_marker {
-                    let line_no = ctx.row_count.saturating_add(1);
-                    let col_values = match parse_copy_text_line(
-                        executor,
-                        &ctx.table_name,
-                        &ctx.columns,
-                        &ctx.column_types,
-                        line_no,
-                        &final_line_bytes,
-                    ) {
-                        Ok(values) => values,
-                        Err(e) => {
-                            rollback_autocommit_or_mark_failed(session, ctx.started_txn).await;
-                            return Err(e);
-                        }
-                    };
-
-                    let savepoints = session.savepoints();
-                    let insert_res = crate::txn::with_savepoints(savepoints, async {
-                        executor
-                            .execute_copy_insert(session, &ctx.table_name, col_values)
-                            .await
-                            .map_err(|e| {
-                                error!("COPY insert error: {}", e);
-                                let table = copy_display_table_name(&ctx.table_name);
-                                let message = if should_add_copy_insert_context(&e) {
-                                    format!("{}\nCONTEXT:  COPY {}, line {}", e, table, line_no)
-                                } else {
-                                    e.to_string()
-                                };
-                                PgWireError::UserError(Box::new(ErrorInfo::new(
-                                    "ERROR".to_string(),
-                                    sqlstate_for_executor_error(&e).to_string(),
-                                    message,
-                                )))
-                            })
-                    })
-                    .await;
-
-                    if let Err(e) = insert_res {
-                        rollback_autocommit_or_mark_failed(session, ctx.started_txn).await;
-                        return Err(e);
-                    }
-
-                    ctx.row_count = ctx.row_count.saturating_add(1);
-                }
-            }
-
-            if ctx.started_txn {
-                session.commit().await.map_err(|e| {
+            crate::sql::query_context::with_scoped_query_context(&qctx, async {
+                let mut session_guard = self.session.lock().await;
+                let session = session_guard.as_mut().ok_or_else(|| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".to_string(),
                         "XX000".to_string(),
-                        e.to_string(),
+                        "Session not initialized".to_string(),
                     )))
                 })?;
-            }
 
-            ctx.row_count
+                if session.is_transaction_failed() {
+                    return Err(in_failed_sql_transaction_pgwire_error());
+                }
+
+                if let Some(final_line_bytes) = ctx.drain_final_line() {
+                    if final_line_bytes.as_slice() == b"\\." {
+                        ctx.reached_end_marker = true;
+                    } else if !ctx.reached_end_marker {
+                        let line_no = ctx.row_count.saturating_add(1);
+                        let col_values = match parse_copy_text_line(
+                            executor,
+                            &ctx.table_name,
+                            &ctx.columns,
+                            &ctx.column_types,
+                            line_no,
+                            &final_line_bytes,
+                        ) {
+                            Ok(values) => values,
+                            Err(e) => {
+                                rollback_autocommit_or_mark_failed(session, ctx.started_txn).await;
+                                return Err(e);
+                            }
+                        };
+
+                        let savepoints = session.savepoints();
+                        let insert_res = crate::txn::with_savepoints(savepoints, async {
+                            executor
+                                .execute_copy_insert(session, &ctx.table_name, col_values)
+                                .await
+                                .map_err(|e| {
+                                    error!("COPY insert error: {}", e);
+                                    let table = copy_display_table_name(&ctx.table_name);
+                                    let message = if should_add_copy_insert_context(&e) {
+                                        format!("{}\nCONTEXT:  COPY {}, line {}", e, table, line_no)
+                                    } else {
+                                        e.to_string()
+                                    };
+                                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                                        "ERROR".to_string(),
+                                        sqlstate_for_executor_error(&e).to_string(),
+                                        message,
+                                    )))
+                                })
+                        })
+                        .await;
+
+                        if let Err(e) = insert_res {
+                            rollback_autocommit_or_mark_failed(session, ctx.started_txn).await;
+                            return Err(e);
+                        }
+
+                        ctx.row_count = ctx.row_count.saturating_add(1);
+                    }
+                }
+
+                if ctx.started_txn {
+                    session.commit().await.map_err(|e| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_string(),
+                            "XX000".to_string(),
+                            e.to_string(),
+                        )))
+                    })?;
+                }
+
+                Ok::<usize, PgWireError>(ctx.row_count)
+            })
+            .await?
         } else {
             0
         };

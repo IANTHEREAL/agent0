@@ -1,3 +1,4 @@
+use crate::sql::query_context::QueryContext;
 use crate::types::DataType;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
@@ -31,6 +32,7 @@ pub struct CopyContext {
     pub table_name: String,
     pub columns: Vec<String>,
     pub column_types: Vec<Option<DataType>>,
+    pub query_context: QueryContext,
     pub line_buffer: Vec<u8>,
     pub row_count: usize,
     pub started_txn: bool,

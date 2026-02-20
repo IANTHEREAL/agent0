@@ -20,6 +20,8 @@ WORKER_SYSTEM_KEYSPACE="${PGTIKV_WORKER_SYSTEM_KEYSPACE:-_sys_worker}"
 
 PGTIKV_PID=""
 CLUSTER_STARTED=0
+ORM_DATABASE=""
+ORM_DSN=""
 
 RUN_UNIT=1
 START_ENV=1
@@ -65,6 +67,40 @@ trim_manifest_line() {
   s="${s#"${s%%[![:space:]]*}"}"
   s="${s%"${s##*[![:space:]]}"}"
   printf '%s\n' "$s"
+}
+
+build_dsn_with_database() {
+  local dsn="$1"
+  local database="$2"
+  python3 - "$dsn" "$database" <<'PY'
+import sys
+from urllib.parse import quote, urlsplit, urlunsplit
+
+dsn = sys.argv[1]
+database = sys.argv[2]
+
+parts = urlsplit(dsn)
+if not parts.scheme or not parts.netloc:
+    raise SystemExit(1)
+
+new_path = "/" + quote(database, safe="")
+print(urlunsplit((parts.scheme, parts.netloc, new_path, parts.query, parts.fragment)))
+PY
+}
+
+dsn_database_name() {
+  local dsn="$1"
+  python3 - "$dsn" <<'PY'
+import sys
+from urllib.parse import unquote, urlsplit
+
+dsn = sys.argv[1]
+parts = urlsplit(dsn)
+path = parts.path or ""
+if path.startswith("/"):
+    path = path[1:]
+print(unquote(path))
+PY
 }
 
 parse_manifest() {
@@ -313,9 +349,53 @@ verify_worker_startup() {
   return 1
 }
 
+manifest_requires_live_worker() {
+  local test_file
+  for test_file in "${REGRESSION_TESTS[@]}"; do
+    case "$test_file" in
+      tests/187_worker_cic.sql|tests/188_worker_refresh_mv.sql|tests/186_worker_bg_sql.sql)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+verify_worker_runtime_with_dsn() {
+  local dsn="$1"
+
+  local task_id
+  task_id="$(psql "$dsn" -Atqc "SELECT pg_background_launch('SELECT 1')" 2>/dev/null || true)"
+  if [[ -z "$task_id" || ! "$task_id" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: failed to launch worker runtime probe via pg_background_launch()." >&2
+    echo "       External DSN is reachable, but worker functions are not operational." >&2
+    return 1
+  fi
+
+  local result=""
+  local i
+  for i in $(seq 1 30); do
+    result="$(psql "$dsn" -Atqc "SELECT pg_background_result($task_id)" 2>/dev/null || true)"
+    if [[ "$result" == "OK" || "$result" == ERROR:* ]]; then
+      echo "Worker runtime probe verified (task_id=$task_id, result=$result)."
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  echo "ERROR: worker runtime probe did not complete in time (task_id=$task_id, last_result='${result:-<empty>}')." >&2
+  echo "       Background worker appears unavailable; worker SQL cases would be unreliable." >&2
+  return 1
+}
+
 cleanup() {
   echo ""
   echo "=== Regression gate cleanup ==="
+
+  if [[ -n "$ORM_DATABASE" && -n "${PG_DSN:-}" ]]; then
+    psql "$PG_DSN" -v ON_ERROR_STOP=0 \
+      -c "DROP DATABASE IF EXISTS \"$ORM_DATABASE\"" >/dev/null 2>&1 || true
+  fi
 
   if [[ -n "$PGTIKV_PID" ]] && kill -0 "$PGTIKV_PID" 2>/dev/null; then
     echo "Stopping pg-tikv (PID: $PGTIKV_PID)..."
@@ -356,8 +436,17 @@ if [[ -z "${PG_DSN:-}" ]]; then
   PG_DSN="postgres://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:${PG_PORT}/postgres"
 fi
 
+REGRESSION_DSN="$PG_DSN"
+DSN_DB_NAME="$(dsn_database_name "$PG_DSN" || true)"
+if [[ -n "$DSN_DB_NAME" && "$DSN_DB_NAME" != "postgres" ]]; then
+  REGRESSION_DSN="$(build_dsn_with_database "$PG_DSN" "postgres")"
+fi
+
 echo "=== pg-tikv Regression Gate ==="
 echo "PG_DSN: $PG_DSN"
+if [[ "$REGRESSION_DSN" != "$PG_DSN" ]]; then
+  echo "Regression SQL DSN: $REGRESSION_DSN"
+fi
 echo "Manifest: $MANIFEST_PATH"
 echo "Report dir: $REPORT_DIR"
 echo ""
@@ -445,6 +534,10 @@ if [[ "$START_ENV" -eq 1 ]]; then
   echo ""
 else
   echo "[2/$TOTAL_STEPS] Skipping TiKV/pg-tikv startup (--no-env/--dsn)"
+  if manifest_requires_live_worker; then
+    echo "Verifying worker runtime on external DSN..."
+    verify_worker_runtime_with_dsn "$PG_DSN"
+  fi
   echo ""
 fi
 
@@ -464,7 +557,7 @@ if [[ "$SMOKE_EXIT" -ne 0 ]]; then
 fi
 
 echo "[5/$TOTAL_STEPS] Running regression SQL cases (${#REGRESSION_TESTS[@]} files)..."
-args=(--dsn "$PG_DSN")
+args=(--dsn "$REGRESSION_DSN")
 if [[ "$VERBOSE" -eq 1 ]]; then
   args+=(--verbose)
 fi
@@ -504,6 +597,21 @@ for item in "${ORM_TESTS[@]}"; do
   fi
 done
 
+ORM_DATABASE="orm_regression_${REPORT_TS//[-]/_}"
+ORM_DSN="$(build_dsn_with_database "$PG_DSN" "$ORM_DATABASE")"
+if [[ -z "$ORM_DSN" ]]; then
+  echo "ERROR: failed to derive ORM DSN from PG_DSN: $PG_DSN" >&2
+  exit 2
+fi
+
+if ! psql "$PG_DSN" -v ON_ERROR_STOP=1 \
+  -c "DROP DATABASE IF EXISTS \"$ORM_DATABASE\"" \
+  -c "CREATE DATABASE \"$ORM_DATABASE\"" >/dev/null; then
+  echo "ERROR: failed to create isolated ORM database '$ORM_DATABASE'." >&2
+  echo "       Ensure the PG_DSN user has CREATEDB privilege." >&2
+  exit 2
+fi
+
 ORM_EXIT=0
 set +e
 (
@@ -511,7 +619,7 @@ set +e
   if [[ ! -d node_modules ]]; then
     npm ci
   fi
-  PG_DSN="$PG_DSN" npm test -- "${ORM_FILTERS[@]}"
+  PG_DSN="$ORM_DSN" npm test -- "${ORM_FILTERS[@]}"
 ) 2>&1 | tee "$ORM_LOG"
 ORM_EXIT=${PIPESTATUS[0]}
 set -e

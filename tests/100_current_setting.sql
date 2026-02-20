@@ -2,7 +2,6 @@
 
 -- Defaults
 SELECT current_setting('search_path') AS search_path;
-SELECT current_setting('statement_timeout') AS statement_timeout;
 SELECT current_setting('unknown.setting', true) AS missing_ok;
 
 -- set_config updates and returns the new value (PostgreSQL semantics)

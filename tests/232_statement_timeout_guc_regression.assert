@@ -1,0 +1,10 @@
+default_timeout_nonempty
+t
+default_timeout_parseable
+t
+set_timeout_result
+200ms
+statement_timeout
+200ms
+restored_timeout
+t
