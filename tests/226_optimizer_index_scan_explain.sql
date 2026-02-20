@@ -1,5 +1,6 @@
--- Test: Optimizer path index scan EXPLAIN verification
--- Verifies that the CBO physical planner selects IndexScan for btree-indexed queries.
+-- Test: Single-path optimizer index scan EXPLAIN verification.
+-- tipg.use_optimizer toggles are compatibility no-ops; this suite validates
+-- planner behavior and compatibility readback plumbing.
 
 DROP TABLE IF EXISTS ois_test;
 CREATE TABLE ois_test (
@@ -37,7 +38,7 @@ SELECT * FROM ois_test WHERE name = 'Alice' ORDER BY id;
 -- Test 6: Result correctness with optimizer ON (range scan)
 SELECT * FROM ois_test WHERE age > 25 ORDER BY id;
 
--- Test 7: Optimizer OFF baseline — same queries should work
+-- Test 7: compatibility toggle OFF (no-op) — same queries should work
 SET tipg.use_optimizer = off;
 SELECT * FROM ois_test WHERE name = 'Alice' ORDER BY id;
 SELECT * FROM ois_test WHERE age > 25 ORDER BY id;

@@ -1,5 +1,5 @@
--- Optimizer predicate pushdown: result equivalence tests.
--- Verifies optimizer on vs off produce identical rows.
+-- Optimizer predicate pushdown: compatibility-GUC no-op checks.
+-- `tipg.use_optimizer` toggles are accepted for compatibility; execution stays single-path.
 -- All queries use ORDER BY for deterministic output.
 
 CREATE TABLE opt_a (id INT PRIMARY KEY, x INT);

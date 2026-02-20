@@ -44,7 +44,7 @@ pub(crate) async fn expand_views_in_query(
     search_path: &[String],
     query: &Query,
 ) -> Result<Query> {
-    let mut rewritten = query.clone();
+    let mut rewritten = crate::sql::stack_safety::with_grown_stack(|| query.clone());
     let mut stack: Vec<String> = Vec::new();
     let mut stack_set: HashSet<String> = HashSet::new();
     let visible_ctes: HashSet<String> = HashSet::new();
@@ -612,6 +612,12 @@ fn expand_views_in_expr<'a>(
     stack_set: &'a mut HashSet<String>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
+        // Fast path: this subtree cannot contain subqueries, so no view
+        // expansion work is needed.
+        if !expr_requires_view_expansion(expr) {
+            return Ok(());
+        }
+
         match expr {
             // ── Subquery-bearing nodes ────────────────────
             Expr::Subquery(q) | Expr::ArraySubquery(q) => {
@@ -1200,4 +1206,157 @@ fn expand_views_in_expr<'a>(
 
         Ok(())
     })
+}
+
+fn expr_requires_view_expansion(expr: &Expr) -> bool {
+    let mut stack = vec![expr];
+
+    while let Some(node) = stack.pop() {
+        match node {
+            Expr::Subquery(_) | Expr::ArraySubquery(_) | Expr::Exists { .. } => return true,
+            Expr::InSubquery { .. } | Expr::AnyOp { .. } | Expr::AllOp { .. } => return true,
+
+            Expr::Nested(e)
+            | Expr::Cast { expr: e, .. }
+            | Expr::IsNull(e)
+            | Expr::IsNotNull(e)
+            | Expr::IsTrue(e)
+            | Expr::IsNotTrue(e)
+            | Expr::IsFalse(e)
+            | Expr::IsNotFalse(e)
+            | Expr::IsUnknown(e)
+            | Expr::IsNotUnknown(e)
+            | Expr::UnaryOp { expr: e, .. } => stack.push(e.as_ref()),
+
+            Expr::BinaryOp { left, right, .. } => {
+                stack.push(left.as_ref());
+                stack.push(right.as_ref());
+            }
+
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                stack.push(expr.as_ref());
+                stack.push(low.as_ref());
+                stack.push(high.as_ref());
+            }
+
+            Expr::InList { expr, list, .. } => {
+                stack.push(expr.as_ref());
+                stack.extend(list.iter());
+            }
+
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => {
+                if let Some(op) = operand.as_ref() {
+                    stack.push(op.as_ref());
+                }
+                stack.extend(conditions.iter());
+                stack.extend(results.iter());
+                if let Some(el) = else_result.as_ref() {
+                    stack.push(el.as_ref());
+                }
+            }
+
+            Expr::Function(func) => {
+                for arg in &func.args {
+                    match arg {
+                        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => stack.push(e),
+                        ast::FunctionArg::Named { arg, .. } => {
+                            if let ast::FunctionArgExpr::Expr(e) = arg {
+                                stack.push(e);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(filter) = func.filter.as_ref() {
+                    stack.push(filter.as_ref());
+                }
+                stack.extend(func.order_by.iter().map(|ob| &ob.expr));
+                if let Some(over) = func.over.as_ref() {
+                    match over {
+                        ast::WindowType::WindowSpec(spec) => {
+                            stack.extend(spec.partition_by.iter());
+                            stack.extend(spec.order_by.iter().map(|ob| &ob.expr));
+                        }
+                        ast::WindowType::NamedWindow(_) => {}
+                    }
+                }
+            }
+
+            Expr::Array(arr) => {
+                stack.extend(arr.elem.iter());
+            }
+
+            Expr::ArrayIndex { obj, indexes } => {
+                stack.push(obj.as_ref());
+                stack.extend(indexes.iter());
+            }
+
+            Expr::JsonAccess { left, right, .. } => {
+                stack.push(left.as_ref());
+                stack.push(right.as_ref());
+            }
+
+            Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                stack.push(expr.as_ref());
+                if let Some(e) = substring_from.as_ref() {
+                    stack.push(e.as_ref());
+                }
+                if let Some(e) = substring_for.as_ref() {
+                    stack.push(e.as_ref());
+                }
+            }
+
+            Expr::Trim {
+                expr, trim_what, ..
+            } => {
+                stack.push(expr.as_ref());
+                if let Some(e) = trim_what.as_ref() {
+                    stack.push(e.as_ref());
+                }
+            }
+
+            Expr::Position { expr, r#in } => {
+                stack.push(expr.as_ref());
+                stack.push(r#in.as_ref());
+            }
+
+            Expr::Extract { expr, .. } | Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => {
+                stack.push(expr.as_ref());
+            }
+
+            Expr::Overlay {
+                expr,
+                overlay_what,
+                overlay_from,
+                overlay_for,
+            } => {
+                stack.push(expr.as_ref());
+                stack.push(overlay_what.as_ref());
+                stack.push(overlay_from.as_ref());
+                if let Some(e) = overlay_for.as_ref() {
+                    stack.push(e.as_ref());
+                }
+            }
+
+            Expr::AtTimeZone { timestamp, .. } => {
+                stack.push(timestamp.as_ref());
+            }
+
+            _ => {}
+        }
+    }
+
+    false
 }

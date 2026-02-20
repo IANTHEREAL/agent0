@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::analyzer::{Analyzer, CatalogSnapshot, Scope};
@@ -42,6 +42,18 @@ use crate::worker::types::{IndexState, TaskQueueEntry, TaskType, TASK_TYPE_BG_DD
 
 const DDL_SCAN_BATCH_SIZE: u32 = 1024;
 const DDL_BACKFILL_COMMIT_SIZE: usize = 5000;
+const LEGACY_RELNAME_CONFLICT_SCAN_SUNSET_DATE: &str = "2026-12-31";
+
+fn warn_legacy_relname_conflict_scan_once() {
+    static WARN_ONCE: Once = Once::new();
+    WARN_ONCE.call_once(|| {
+        tracing::warn!(
+            sunset_date = LEGACY_RELNAME_CONFLICT_SCAN_SUNSET_DATE,
+            issue = "#775",
+            "legacy relation-name conflict scan is active for pre-sys_relname_ clusters; remove after all clusters are migrated"
+        );
+    });
+}
 
 fn analyze_row_level_expr(
     expr: &Expr,
@@ -1201,6 +1213,9 @@ pub async fn check_relation_name_available(
     // 5. Legacy-safe: scan all table schemas in this namespace for
     //    indexes / PK constraints with the same name.  Covers data
     //    created before sys_relname_ enforcement (issue #775).
+    //    Sunset policy: remove after 2026-12-31 once all clusters have
+    //    completed migration and reservation backfill.
+    warn_legacy_relname_conflict_scan_once();
     let schema_prefix = format!("{}.", schema_name);
     let mut table_schemas: Vec<(String, TableSchema)> = Vec::new();
     for table_name in store.list_tables(txn, db_id).await? {
@@ -2146,12 +2161,9 @@ async fn analyze_view_output_schema(
     let mut catalog = CatalogSnapshot::new(search_path.to_vec(), db_id);
     let query_str = query.to_string();
     let create_stmt_text = format!("CREATE VIEW _ddl_schema_check AS {};", query_str);
-    let deps = match super::binder::extract_dependencies(&query_str) {
-        Ok(raw) => {
-            resolve_view_deps(store, txn, db_id, search_path, &create_stmt_text, raw).await?
-        }
-        Err(_) => Vec::new(),
-    };
+    let raw_deps = super::binder::extract_dependencies_from_query(query);
+    let deps =
+        resolve_view_deps(store, txn, db_id, search_path, &create_stmt_text, raw_deps).await?;
     for dep in deps {
         if let Some(schema) = store.get_schema(txn, db_id, &dep).await? {
             let bare = dep.rsplit('.').next().unwrap_or(&dep).to_string();
@@ -2184,12 +2196,9 @@ pub async fn execute_create_view(
     let create_stmt_text = format!("CREATE VIEW {} AS {};", name, query_str);
 
     // PostgreSQL parity: CREATE VIEW validates referenced relations up front.
-    let deps = match super::binder::extract_dependencies(&query_str) {
-        Ok(raw) => {
-            resolve_view_deps(store, txn, db_id, search_path, &create_stmt_text, raw).await?
-        }
-        Err(_) => Vec::new(),
-    };
+    let raw_deps = super::binder::extract_dependencies_from_query(query);
+    let deps =
+        resolve_view_deps(store, txn, db_id, search_path, &create_stmt_text, raw_deps).await?;
 
     // PostgreSQL parity: CREATE OR REPLACE VIEW may append columns only.
     if or_replace {
@@ -2233,7 +2242,6 @@ pub async fn execute_create_view(
             }
         }
     }
-
     store
         .create_view(txn, db_id, &view_name, &query_str, deps, or_replace)
         .await?;
@@ -2329,12 +2337,9 @@ pub async fn execute_create_materialized_view(
 
     let query_str = query.to_string();
     let create_stmt_text = format!("CREATE MATERIALIZED VIEW {} AS {};", name, query_str);
-    let deps = match super::binder::extract_dependencies(&query_str) {
-        Ok(raw) => {
-            resolve_view_deps(store, txn, db_id, search_path, &create_stmt_text, raw).await?
-        }
-        Err(_) => Vec::new(),
-    };
+    let raw_deps = super::binder::extract_dependencies_from_query(query);
+    let deps =
+        resolve_view_deps(store, txn, db_id, search_path, &create_stmt_text, raw_deps).await?;
     store
         .create_materialized_view(txn, db_id, &view_name, &query_str, deps)
         .await?;

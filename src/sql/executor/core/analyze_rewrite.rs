@@ -23,7 +23,7 @@ use crate::sql::error::SqlError;
 
 impl Executor {
     /// Canonical `SELECT/WITH` entry:
-    /// raw query AST -> expanded AST + rewritten analyzed query.
+    /// raw query AST -> rewritten analyzed query.
     ///
     /// Errors are propagated directly to preserve single-path semantics.
     pub(crate) async fn analyze_then_rewrite_query(
@@ -34,7 +34,7 @@ impl Executor {
         query: &Query,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
         current_role: Option<&str>,
-    ) -> Result<(Query, AnalyzedQuery)> {
+    ) -> Result<AnalyzedQuery> {
         let expanded_query =
             expand_views_in_query(self.store().as_ref(), txn, db_id, search_path, query).await?;
 
@@ -57,10 +57,15 @@ impl Executor {
         }
 
         let mut analyzer = Analyzer::new(&catalog);
-        let analyzed = analyzer
-            .analyze_query(&expanded_query)
-            .map_err(SqlError::from)?;
-        let rewritten = crate::sql::rewriter::rewrite_query(analyzed);
-        Ok((expanded_query, rewritten))
+        let analyzed = stacker::maybe_grow(128 * 1024 * 1024, 256 * 1024 * 1024, || {
+            analyzer.analyze_query(&expanded_query)
+        })
+        .map_err(SqlError::from)?;
+        let rewritten = stacker::maybe_grow(128 * 1024 * 1024, 256 * 1024 * 1024, || {
+            crate::sql::rewriter::rewrite_query(analyzed)
+        });
+        // Drop deep expanded AST on a grown stack before returning.
+        crate::sql::stack_safety::drop_on_grown_stack(expanded_query);
+        Ok(rewritten)
     }
 }

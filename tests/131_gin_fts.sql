@@ -43,9 +43,8 @@ SELECT id, title FROM fts_articles
 WHERE search_vector @@ plainto_tsquery('nonexistent') 
 ORDER BY id;
 
--- Test 5: Verify index is used (via EXPLAIN)
--- GIN index selection is not yet supported in the CBO optimizer path;
--- force legacy planner so EXPLAIN shows the GIN index name.
+-- Test 5: Verify index is used (via EXPLAIN).
+-- tipg.use_optimizer toggles are compatibility no-ops; engine remains single-path.
 SET tipg.use_optimizer = off;
 EXPLAIN SELECT id FROM fts_articles WHERE search_vector @@ plainto_tsquery('postgresql');
 SET tipg.use_optimizer = on;

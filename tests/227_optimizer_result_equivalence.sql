@@ -1,5 +1,6 @@
--- Test: Optimizer ON/OFF result equivalence for various query shapes
--- Verifies that the CBO path produces identical results to the legacy path.
+-- Test: tipg.use_optimizer compatibility GUC is accepted as a no-op.
+-- The engine is single-path (optimizer always on); toggles below validate
+-- compatibility plumbing/readback behavior without implying dual execution.
 
 DROP TABLE IF EXISTS ore_test;
 CREATE TABLE ore_test (
@@ -19,52 +20,52 @@ ANALYZE ore_test;
 
 -- ─── Aggregation ─────────────────────────────────────
 
--- Test 1: GROUP BY + COUNT (optimizer OFF)
+-- Test 1: GROUP BY + COUNT (compat toggle OFF => no-op)
 SET tipg.use_optimizer = off;
 SELECT category, COUNT(*) AS cnt FROM ore_test GROUP BY category ORDER BY category;
 
--- Test 2: GROUP BY + COUNT (optimizer ON)
+-- Test 2: GROUP BY + COUNT (compat toggle ON)
 SET tipg.use_optimizer = on;
 SELECT category, COUNT(*) AS cnt FROM ore_test GROUP BY category ORDER BY category;
 
--- Test 3: GROUP BY + SUM (optimizer OFF)
+-- Test 3: GROUP BY + SUM (compat toggle OFF => no-op)
 SET tipg.use_optimizer = off;
 SELECT category, SUM(value) AS total FROM ore_test GROUP BY category ORDER BY category;
 
--- Test 4: GROUP BY + SUM (optimizer ON)
+-- Test 4: GROUP BY + SUM (compat toggle ON)
 SET tipg.use_optimizer = on;
 SELECT category, SUM(value) AS total FROM ore_test GROUP BY category ORDER BY category;
 
 -- ─── DISTINCT ────────────────────────────────────────
 
--- Test 5: DISTINCT (optimizer OFF)
+-- Test 5: DISTINCT (compat toggle OFF => no-op)
 SET tipg.use_optimizer = off;
 SELECT DISTINCT category FROM ore_test ORDER BY category;
 
--- Test 6: DISTINCT (optimizer ON)
+-- Test 6: DISTINCT (compat toggle ON)
 SET tipg.use_optimizer = on;
 SELECT DISTINCT category FROM ore_test ORDER BY category;
 
 -- ─── ORDER BY + LIMIT ────────────────────────────────
 
--- Test 7: ORDER BY + LIMIT (optimizer OFF)
+-- Test 7: ORDER BY + LIMIT (compat toggle OFF => no-op)
 SET tipg.use_optimizer = off;
 SELECT * FROM ore_test ORDER BY value DESC LIMIT 3;
 
--- Test 8: ORDER BY + LIMIT (optimizer ON)
+-- Test 8: ORDER BY + LIMIT (compat toggle ON)
 SET tipg.use_optimizer = on;
 SELECT * FROM ore_test ORDER BY value DESC LIMIT 3;
 
 -- ─── CTE ─────────────────────────────────────────────
 
--- Test 9: CTE (optimizer OFF)
+-- Test 9: CTE (compat toggle OFF => no-op)
 SET tipg.use_optimizer = off;
 WITH top_cats AS (
     SELECT category, SUM(value) AS total FROM ore_test GROUP BY category
 )
 SELECT * FROM top_cats ORDER BY category;
 
--- Test 10: CTE (optimizer ON)
+-- Test 10: CTE (compat toggle ON)
 SET tipg.use_optimizer = on;
 WITH top_cats AS (
     SELECT category, SUM(value) AS total FROM ore_test GROUP BY category
@@ -73,11 +74,11 @@ SELECT * FROM top_cats ORDER BY category;
 
 -- ─── Subquery in WHERE ───────────────────────────────
 
--- Test 11: Subquery (optimizer OFF)
+-- Test 11: Subquery (compat toggle OFF => no-op)
 SET tipg.use_optimizer = off;
 SELECT * FROM ore_test WHERE value > (SELECT AVG(value) FROM ore_test) ORDER BY id;
 
--- Test 12: Subquery (optimizer ON)
+-- Test 12: Subquery (compat toggle ON)
 SET tipg.use_optimizer = on;
 SELECT * FROM ore_test WHERE value > (SELECT AVG(value) FROM ore_test) ORDER BY id;
 

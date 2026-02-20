@@ -1,11 +1,48 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLUSTER_NAME="test-$(date +%s)"
+PG_HOST=${PG_HOST:-127.0.0.1}
+PG_PORT_IS_EXPLICIT=0
+if [[ -n "${PG_PORT+x}" ]]; then
+    PG_PORT_IS_EXPLICIT=1
+fi
 PG_PORT=${PG_PORT:-15433}
 PG_USER=${PG_USER:-admin}
 PG_PASSWORD=${PG_PASSWORD:-admin}
+
+is_port_free() {
+    python3 - "$1" "$2" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    sock.bind((host, port))
+except OSError:
+    sys.exit(1)
+finally:
+    sock.close()
+sys.exit(0)
+PY
+}
+
+pick_free_port() {
+    python3 - "$1" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.bind((host, 0))
+print(sock.getsockname()[1])
+sock.close()
+PY
+}
 
 # ORM selection — normalize env var to 0/1
 _raw_prisma=${WITH_PRISMA:-0}
@@ -56,7 +93,7 @@ cleanup() {
     if [ -n "$ORM_DATABASE" ] && [ -n "$PGTIKV_PID" ] && kill -0 "$PGTIKV_PID" 2>/dev/null; then
         echo "Dropping isolated ORM database '$ORM_DATABASE'..."
         PGPASSWORD="$PG_PASSWORD" psql -X -q \
-            -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -d postgres \
+            -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d postgres \
             -v ON_ERROR_STOP=1 \
             -c "DROP DATABASE IF EXISTS \"$ORM_DATABASE\"" 2>/dev/null || true
     fi
@@ -111,6 +148,15 @@ echo "Waiting for TiKV to be fully ready..."
 sleep 5
 echo ""
 
+if [[ "$PG_PORT_IS_EXPLICIT" -eq 0 ]]; then
+    PG_PORT="$(pick_free_port "$PG_HOST")"
+    echo "Selected free pg-tikv port: $PG_PORT"
+elif ! is_port_free "$PG_HOST" "$PG_PORT"; then
+    echo "ERROR: requested PG_PORT=$PG_PORT is already in use"
+    echo "### Error: requested PG_PORT=$PG_PORT is already in use" >> "$REPORT_FILE"
+    exit 1
+fi
+
 cat >> "$REPORT_FILE" << EOF
 ### Environment
 
@@ -118,6 +164,7 @@ cat >> "$REPORT_FILE" << EOF
 |-----------|-------|
 | TiKV Cluster | $CLUSTER_NAME |
 | PD Endpoint | 127.0.0.1:$PD_PORT |
+| pg-tikv Host | $PG_HOST |
 | pg-tikv Port | $PG_PORT |
 | User | $PG_USER |
 | ORM Database | isolated (auto-created per run) |
@@ -141,6 +188,7 @@ echo "" >> "$REPORT_FILE"
 
 echo "[3/5] Starting pg-tikv on port $PG_PORT..."
 PD_ENDPOINTS="127.0.0.1:$PD_PORT" \
+PG_LISTEN_ADDR="$PG_HOST" \
 PG_PORT="$PG_PORT" \
 PGTIKV_BOOTSTRAP_ADMIN_USER="$PG_USER" \
 PGTIKV_BOOTSTRAP_ADMIN_PASSWORD="$PG_PASSWORD" \
@@ -149,26 +197,33 @@ PGTIKV_INSECURE=1 \
 PGTIKV_PID=$!
 
 for i in $(seq 1 30); do
-    if pg_isready -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -q 2>/dev/null; then
-        break
-    fi
     if ! kill -0 "$PGTIKV_PID" 2>/dev/null; then
         echo "ERROR: pg-tikv failed to start"
         cat /tmp/pgtikv-test.log
         echo "### Error: pg-tikv failed to start" >> "$REPORT_FILE"
         exit 1
     fi
+    if pg_isready -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -q 2>/dev/null; then
+        break
+    fi
     sleep 1
 done
 
-if ! pg_isready -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -q 2>/dev/null; then
+if ! kill -0 "$PGTIKV_PID" 2>/dev/null; then
+    echo "ERROR: pg-tikv exited before readiness"
+    cat /tmp/pgtikv-test.log
+    echo "### Error: pg-tikv exited before readiness" >> "$REPORT_FILE"
+    exit 1
+fi
+
+if ! pg_isready -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -q 2>/dev/null; then
     echo "ERROR: pg-tikv not ready after 30s"
     cat /tmp/pgtikv-test.log
     echo "### Error: pg-tikv not ready after 30s" >> "$REPORT_FILE"
     exit 1
 fi
 
-PG_DSN="postgres://$PG_USER:$PG_PASSWORD@127.0.0.1:$PG_PORT/postgres"
+PG_DSN="postgres://$PG_USER:$PG_PASSWORD@$PG_HOST:$PG_PORT/postgres"
 echo "pg-tikv ready (PID: $PGTIKV_PID)"
 echo "PG_DSN: $PG_DSN"
 echo ""
@@ -208,11 +263,11 @@ echo "[5/5] Running ORM tests..."
 ORM_DATABASE="orm_tests_${REPORT_TIMESTAMP//-/_}"
 echo "Preparing isolated ORM database '$ORM_DATABASE'..."
 PGPASSWORD="$PG_PASSWORD" psql -X -q \
-    -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -d postgres \
+    -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d postgres \
     -v ON_ERROR_STOP=1 \
     -c "DROP DATABASE IF EXISTS \"$ORM_DATABASE\"" \
     -c "CREATE DATABASE \"$ORM_DATABASE\""
-ORM_DSN="postgres://$PG_USER:$PG_PASSWORD@127.0.0.1:$PG_PORT/$ORM_DATABASE"
+ORM_DSN="postgres://$PG_USER:$PG_PASSWORD@$PG_HOST:$PG_PORT/$ORM_DATABASE"
 
 cd "$SCRIPT_DIR/orm-tests"
 if [ ! -d "node_modules" ]; then

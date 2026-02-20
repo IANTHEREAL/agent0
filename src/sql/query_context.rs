@@ -2,7 +2,7 @@
 //!
 //! Replaces: `CONNECTION_ID`, `CURRENT_DATABASE_NAME`,
 //! `STATEMENT_TIMESTAMP_MILLIS` (statement_time.rs), `TIMEZONE` (session_context.rs).
-//! Legacy paths still read task-locals; eval functions fall back when QueryContext is absent.
+//! Legacy paths still read task-locals; eval functions require explicit context threading.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -11,7 +11,7 @@ tokio::task_local! {
     static CONNECTION_ID: i32;
     static CURRENT_DATABASE_NAME: Arc<str>;
     static CURRENT_USER_NAME: Arc<str>;
-    static USE_OPTIMIZER: bool;
+    static CURRENT_TIMEZONE: Arc<str>;
 }
 
 #[derive(Debug, Clone)]
@@ -62,11 +62,8 @@ impl QueryContext {
         CURRENT_USER_NAME.try_with(|name| name.clone()).ok()
     }
 
-    /// Whether the CBO optimizer pipeline is enabled for this statement.
-    /// Note: always ON in single-path architecture; retained for GUC infrastructure.
-    #[allow(dead_code)]
-    pub(crate) fn use_optimizer() -> bool {
-        USE_OPTIMIZER.try_with(|v| *v).unwrap_or(false)
+    pub(crate) fn current_timezone() -> Option<Arc<str>> {
+        CURRENT_TIMEZONE.try_with(|tz| tz.clone()).ok()
     }
 
     /// Build a QueryContext from task-local storage.
@@ -77,18 +74,61 @@ impl QueryContext {
     /// returned context is correct.
     pub fn from_task_locals() -> Self {
         use crate::sql::statement_time::{
-            statement_timestamp_millis_or_now, transaction_timestamp_millis,
+            statement_timestamp_millis, transaction_timestamp_millis,
         };
 
-        let stmt_ts = statement_timestamp_millis_or_now();
+        let stmt_ts = statement_timestamp_millis();
+        let conn_id = Self::current_connection_id();
+        let db_name = Self::current_database_name();
+        let user_name = Self::current_user_name();
+        let timezone = Self::current_timezone();
+
+        #[cfg(test)]
+        if stmt_ts.is_none()
+            || conn_id.is_none()
+            || db_name.is_none()
+            || user_name.is_none()
+            || timezone.is_none()
+        {
+            return Self::for_tests();
+        }
+
+        let stmt_ts = stmt_ts.expect(
+            "QueryContext::from_task_locals called without statement timestamp; \
+             execute through Executor::execute or wrap with statement_time::with_timestamps",
+        );
         let txn_ts = transaction_timestamp_millis().unwrap_or(stmt_ts);
         Self::new(
-            Self::current_connection_id().unwrap_or(0),
-            Self::current_database_name().unwrap_or_else(|| Arc::from("postgres")),
-            Self::current_user_name().unwrap_or_else(|| Arc::from("postgres")),
+            conn_id.expect(
+                "QueryContext::from_task_locals called without connection_id; \
+                 execute through Executor::execute or wrap with query_context::with_query_context",
+            ),
+            db_name.expect(
+                "QueryContext::from_task_locals called without database_name; \
+                 execute through Executor::execute or wrap with query_context::with_query_context",
+            ),
+            user_name.expect(
+                "QueryContext::from_task_locals called without current_user; \
+                 execute through Executor::execute or wrap with query_context::with_query_context",
+            ),
             stmt_ts,
             txn_ts,
-            crate::session_context::current_timezone(),
+            timezone.expect(
+                "QueryContext::from_task_locals called without timezone; \
+                 execute through Executor::execute or wrap with query_context::with_query_context",
+            ),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self::new(
+            0,
+            Arc::from("postgres"),
+            Arc::from("postgres"),
+            1_700_000_000_000,
+            1_700_000_000_000,
+            Arc::from("UTC"),
         )
     }
 }
@@ -97,7 +137,7 @@ pub(crate) async fn with_query_context<R, Fut>(
     connection_id: i32,
     database_name: Arc<str>,
     current_user: Arc<str>,
-    use_optimizer: bool,
+    timezone: Arc<str>,
     fut: Fut,
 ) -> R
 where
@@ -111,7 +151,7 @@ where
                 connection_id,
                 CURRENT_DATABASE_NAME.scope(
                     database_name,
-                    CURRENT_USER_NAME.scope(current_user, USE_OPTIMIZER.scope(use_optimizer, fut)),
+                    CURRENT_USER_NAME.scope(current_user, CURRENT_TIMEZONE.scope(timezone, fut)),
                 ),
             )
             .await
@@ -124,11 +164,31 @@ where
                 connection_id,
                 CURRENT_DATABASE_NAME.scope(
                     database_name,
-                    CURRENT_USER_NAME.scope(current_user, USE_OPTIMIZER.scope(use_optimizer, fut)),
+                    CURRENT_USER_NAME.scope(current_user, CURRENT_TIMEZONE.scope(timezone, fut)),
                 ),
             )
             .await
     }
+}
+
+/// Scope all query task-locals (identity + statement/transaction timestamps)
+/// from an explicit `QueryContext`.
+pub(crate) async fn with_scoped_query_context<R, Fut>(qctx: &QueryContext, fut: Fut) -> R
+where
+    Fut: Future<Output = R>,
+{
+    with_query_context(
+        qctx.connection_id,
+        qctx.database_name.clone(),
+        qctx.current_user.clone(),
+        qctx.timezone.clone(),
+        crate::sql::statement_time::with_timestamps(
+            qctx.statement_timestamp_ms,
+            qctx.transaction_timestamp_ms,
+            fut,
+        ),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -160,8 +220,12 @@ mod tests {
             77,
             Arc::from("tenant_db"),
             Arc::from("testuser"),
-            false,
-            async { QueryContext::from_task_locals() },
+            Arc::from("UTC"),
+            crate::sql::statement_time::with_timestamps(
+                1_700_000_123_000,
+                1_700_000_122_000,
+                async { QueryContext::from_task_locals() },
+            ),
         )
         .await;
         assert_eq!(ctx.connection_id, 77);

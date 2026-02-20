@@ -185,7 +185,7 @@ src/sql/
 
 1. **Single-path SELECT**: All SELECTs flow through Analyzer -> TypedExpr. No legacy fallback.
 2. **TypedExpr carries type**: Every `TypedExpr` node has a resolved `DataType`. All column refs -> positional indices. No unresolved names escape the Analyzer.
-3. **Optimizer is default ON**: CBO pipeline gated by `tipg.use_optimizer` GUC (default ON). Covers single-table, multi-table joins, set operations, CTEs, window functions, and DISTINCT ON. Safety valve: `SET tipg.use_optimizer = off`.
+3. **Optimizer is single-path ON**: CBO pipeline is always on for execution. `tipg.use_optimizer` is retained only as compatibility/readback GUC (accepted as no-op).
 4. **Volcano iterator model**: Operators implement `open() -> next() -> close()` lifecycle for streaming execution.
 5. **EXPLAIN matches execution for SELECT/WITH**: both paths share analyze+rewrite entry before optimizer planning.
 6. **Type coercion dual rules**: `common_type()` (Text wins for mixed types) vs `comparison_target_type()` (non-Text wins for comparisons). Both intentional, both in `coercion.rs`.

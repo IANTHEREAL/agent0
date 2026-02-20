@@ -164,6 +164,7 @@ impl Binder {
 // ── Public API ─────────────────────────────────────────────────────────
 
 /// Extract all relation dependencies from SQL, with correct CTE scoping.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn extract_dependencies(sql: &str) -> Result<HashSet<RelationDep>> {
     let dialect = PostgreSqlDialect {};
     let stmts = Parser::parse_sql(&dialect, sql)?;
@@ -172,4 +173,16 @@ pub(crate) fn extract_dependencies(sql: &str) -> Result<HashSet<RelationDep>> {
         binder.walk_statement(stmt);
     }
     Ok(binder.deps)
+}
+
+/// Extract all relation dependencies from an already parsed query AST.
+///
+/// Used by CREATE VIEW / CREATE MATERIALIZED VIEW DDL to avoid SQL
+/// round-tripping and parser fallback behavior.
+pub(crate) fn extract_dependencies_from_query(
+    query: &sqlparser::ast::Query,
+) -> HashSet<RelationDep> {
+    let mut binder = Binder::new();
+    binder.walk_query(query);
+    binder.deps
 }

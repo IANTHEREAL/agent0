@@ -26,7 +26,7 @@ impl Binder {
 
     /// Walk a Query node. This is the scope boundary: each Query gets its
     /// own BindScope frame for CTE name resolution.
-    fn walk_query(&mut self, query: &Query) {
+    pub(super) fn walk_query(&mut self, query: &Query) {
         self.push_scope();
 
         // Process CTEs in declaration order (sequential visibility).

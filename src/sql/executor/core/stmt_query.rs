@@ -124,7 +124,7 @@ impl Executor {
         // directly instead of trying an alternate planner path.
         let plan = if let Statement::Query(query) = statement {
             let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
-            let (_expanded, analyzed) = self
+            let analyzed = self
                 .analyze_then_rewrite_query(
                     txn,
                     db_id,

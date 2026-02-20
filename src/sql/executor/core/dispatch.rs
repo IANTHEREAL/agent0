@@ -70,26 +70,18 @@ impl Executor {
         // For explicit transactions, use the stored transaction start time;
         // for implicit (autocommit), the transaction timestamp equals the statement timestamp.
         let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
+        let qctx = session.query_context_for_statement(statement_ts, transaction_ts);
         let savepoints = session.savepoints();
-        let connection_id = session.connection_id();
-        let database_name = session.current_database_name_arc();
-        let current_user: Arc<str> = Arc::from(session.current_user().unwrap_or("postgres"));
-        let use_optimizer = session.use_optimizer();
-        crate::sql::query_context::with_query_context(
-            connection_id,
-            database_name,
-            current_user,
-            use_optimizer,
-            statement_time::with_timestamps(
-                statement_ts,
-                transaction_ts,
-                crate::txn::with_savepoints(savepoints, async {
+        crate::sql::query_context::with_scoped_query_context(
+            &qctx,
+            crate::txn::with_savepoints(savepoints, async {
                 let sql_stripped = strip_leading_sql_comments(sql);
                 let sql_trimmed = sql_stripped.trim_start();
                 let is_observability_user =
                     session.current_user() == Some(OBSERVABILITY_USER) && !session.is_superuser();
                 let starts_with = |prefix: &str| starts_with_ignore_ascii_case(sql_trimmed, prefix);
                 let sql_upper = sql_trimmed.trim().to_ascii_uppercase();
+                let sql_for_observability = sql_trimmed.to_string();
                 let raw_kind = crate::sql::raw_sql::classify(&sql_upper);
 
                 if session.is_transaction_failed()
@@ -1002,15 +994,21 @@ impl Executor {
 
                 if !is_observability_query {
                     self.observability
-                        .record_statement(start.elapsed(), stmt_exec.is_ok(), || stmt.to_string());
+                        .record_statement(start.elapsed(), stmt_exec.is_ok(), || {
+                            sql_for_observability.clone()
+                        });
                 }
 
                 results.extend(stmt_exec?);
             }
 
+            // Parser ASTs for large statements (e.g. deep OR chains) can be
+            // deeply recursive; drop them on a grown stack to avoid worker
+            // stack overflow after successful execution.
+            crate::sql::stack_safety::drop_on_grown_stack(statements);
+
             Ok(ExecuteResults(results))
                 }),
-            ),
         )
         .await
     }

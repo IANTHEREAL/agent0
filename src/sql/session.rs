@@ -3,6 +3,7 @@
 use crate::config::SharedServerConfig;
 use crate::observability::TenantObservability;
 use crate::sql::error::SqlError;
+use crate::sql::query_context::QueryContext;
 use crate::storage::TikvStore;
 use crate::txn::SavepointState;
 use anyhow::{anyhow, Result};
@@ -64,10 +65,6 @@ pub(crate) struct SessionSettings {
     transaction_isolation: Option<String>,
     default_transaction_read_only: Option<String>,
 
-    /// Always true — the CBO optimizer pipeline is the single execution path.
-    /// `SET tipg.use_optimizer = off` is accepted but logs a NOTICE and stays ON.
-    use_optimizer: bool,
-
     /// Generic storage for GUC parameters that tipg does not actively use but
     /// drivers expect to SET/SHOW without error (e.g. `extra_float_digits`,
     /// `DateStyle`, `work_mem`). Values are stored as-is for `SHOW` readback.
@@ -128,7 +125,6 @@ impl SessionSettings {
             default_statement_timeout_ms,
             idle_in_transaction_session_timeout_ms: default_idle_in_txn_timeout_ms,
             default_idle_in_transaction_session_timeout_ms: default_idle_in_txn_timeout_ms,
-            use_optimizer: true,
             ..Default::default()
         }
     }
@@ -264,7 +260,6 @@ impl SessionSettings {
                             "NOTICE: optimizer cannot be disabled; \
                              tipg.use_optimizer setting ignored"
                         );
-                        // Keep use_optimizer = true — single execution path.
                     }
                     _ => {
                         return Err(anyhow!(
@@ -370,7 +365,7 @@ impl SessionSettings {
             "pgtikv.max_sort_bytes" | "tipg.max_sort_bytes" => {
                 self.max_sort_bytes = DEFAULT_MAX_SORT_BYTES
             }
-            "tipg.use_optimizer" => self.use_optimizer = true,
+            "tipg.use_optimizer" => {}
             "timezone" => self.timezone = None,
             "application_name" => self.application_name = None,
             "client_encoding" => self.client_encoding = None,
@@ -492,10 +487,6 @@ impl SessionSettings {
 
     pub(crate) fn max_sort_bytes(&self) -> usize {
         self.max_sort_bytes
-    }
-
-    pub(crate) fn use_optimizer(&self) -> bool {
-        self.use_optimizer
     }
 }
 
@@ -628,6 +619,32 @@ impl Session {
 
     pub(crate) fn current_database_name_arc(&self) -> Arc<str> {
         self.current_database_name.clone()
+    }
+
+    pub(crate) fn current_user_arc(&self) -> Arc<str> {
+        Arc::from(self.current_user().unwrap_or("postgres"))
+    }
+
+    pub(crate) fn timezone_arc(&self) -> Arc<str> {
+        Arc::from(
+            self.show_setting_value("timezone")
+                .unwrap_or_else(|| "UTC".to_string()),
+        )
+    }
+
+    pub(crate) fn query_context_for_statement(
+        &self,
+        statement_timestamp_ms: i64,
+        transaction_timestamp_ms: i64,
+    ) -> QueryContext {
+        QueryContext::new(
+            self.connection_id(),
+            self.current_database_name_arc(),
+            self.current_user_arc(),
+            statement_timestamp_ms,
+            transaction_timestamp_ms,
+            self.timezone_arc(),
+        )
     }
 
     /// Check if currently in a transaction block
@@ -767,10 +784,6 @@ impl Session {
 
     pub(crate) fn max_sort_bytes(&self) -> usize {
         self.settings.max_sort_bytes()
-    }
-
-    pub(crate) fn use_optimizer(&self) -> bool {
-        self.settings.use_optimizer()
     }
 
     pub async fn create_savepoint(&mut self, name: String) -> Result<()> {

@@ -42,6 +42,7 @@ mod result;
 pub(crate) mod rewriter;
 mod role_settings;
 mod sequences;
+pub(crate) mod stack_safety;
 mod statement_time;
 pub mod stats;
 pub(crate) mod table_functions;

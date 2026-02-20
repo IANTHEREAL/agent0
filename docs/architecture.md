@@ -141,16 +141,14 @@ Client SQL string
 └──────────────────────────────────────────────────────────────┘
     │
     ▼
-┌─ Optimizer Gate ─────────────────────────────────────────────┐
-│  IF tipg.use_optimizer = ON AND is_optimizer_eligible():      │
-│  │  ├─ LogicalPlanner: AnalyzedQuery → LogicalPlan           │
-│  │  ├─ Load table statistics from TableStatsCache             │
-│  │  ├─ PhysicalPlanner: LogicalPlan → PhysicalPlan           │
-│  │  │   (selectivity estimation, cardinality propagation)     │
-│  │  ├─ build.rs: PhysicalPlan → BoxedOperator                │
-│  │  └─ Execute operator tree → results                       │
-│  ELSE:                                                        │
-│  │  └─ Analyzed execution path (production default)           │
+┌─ Optimizer Pipeline (Always On) ─────────────────────────────┐
+│  ├─ LogicalPlanner: AnalyzedQuery → LogicalPlan              │
+│  ├─ Load table statistics from TableStatsCache               │
+│  ├─ PhysicalPlanner: LogicalPlan → PhysicalPlan              │
+│  │   (selectivity estimation, cardinality propagation)       │
+│  ├─ build.rs: PhysicalPlan → BoxedOperator                   │
+│  └─ Execute operator tree → results                          │
+│  NOTE: tipg.use_optimizer is compatibility/readback only.    │
 └──────────────────────────────────────────────────────────────┘
     │
     ▼
@@ -251,7 +249,7 @@ EXPLAIN query
 
 **Purpose**: Cost-based query optimization. Transforms `AnalyzedQuery` into an optimized physical plan.
 
-**Current status**: Default ON. Covers single-table, multi-table joins, set operations (UNION/INTERSECT/EXCEPT), CTEs, window functions, and DISTINCT ON. Includes selectivity estimation and index selection. Safety valve: `SET tipg.use_optimizer = off`.
+**Current status**: Always ON single path. Covers single-table, multi-table joins, set operations (UNION/INTERSECT/EXCEPT), CTEs, window functions, and DISTINCT ON. Includes selectivity estimation and index selection. `tipg.use_optimizer` remains compatibility/readback only.
 
 ```
 AnalyzedQuery

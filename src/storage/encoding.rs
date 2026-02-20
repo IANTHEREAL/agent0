@@ -18,6 +18,7 @@ use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{Context, Result};
 use memcomparable::Deserializer;
 use rust_decimal::Decimal;
+use std::sync::Once;
 
 /// System key prefixes
 const SYS_NEXT_TABLE_ID: &[u8] = b"_sys_next_table_id";
@@ -78,6 +79,18 @@ const TABLE_GIN_MARKER: &[u8] = b"gin_";
 //   ... gin_{hash}[SEP]{pk...}
 // We use 0x00 for the scan start and 0x01 for the scan end (exclusive).
 const GIN_PK_SEP_START: u8 = 0x00;
+const LEGACY_SCHEMA_DESERIALIZATION_SUNSET_DATE: &str = "2026-12-31";
+
+fn warn_legacy_schema_deserialization_once() {
+    static WARN_ONCE: Once = Once::new();
+    WARN_ONCE.call_once(|| {
+        tracing::warn!(
+            sunset_date = LEGACY_SCHEMA_DESERIALIZATION_SUNSET_DATE,
+            commit = "ce73a8a",
+            "legacy schema deserialization fallback is active; remove after all persisted schemas include IndexDef.state"
+        );
+    });
+}
 
 /// Encode the system key for next table ID
 pub fn encode_next_table_id_key() -> Vec<u8> {
@@ -1137,6 +1150,8 @@ pub fn deserialize_schema(data: &[u8]) -> Result<TableSchema> {
     }
 
     // Fallback: deserialize with legacy IndexDef (no `state` field), then upgrade.
+    // Sunset policy: remove after 2026-12-31 once all keyspaces are migrated.
+    warn_legacy_schema_deserialization_once();
     let legacy: TableSchemaLegacy = bincode::deserialize(payload)
         .context("Failed to deserialize schema (tried both current and legacy formats)")?;
     Ok(legacy.into())

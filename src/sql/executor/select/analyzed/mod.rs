@@ -9,10 +9,11 @@
 use crate::sql::analyzer::types::{
     AnalyzedDistinct, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind,
     BinaryOp as TypedBinaryOp, JoinCondition, TypedExpr, TypedExprKind, TypedFunctionArg,
-    TypedOrderByExpr,
+    TypedOrderByExpr, WindowFrame, WindowFrameBound,
 };
 use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::executor::core::Executor;
+use crate::sql::expr::classify::needs_pre_materialization;
 use crate::sql::expr::typed_eval::{eval_const_usize, eval_typed_expr};
 use crate::sql::names;
 use crate::sql::sequences::resolve_sequence_full_name_from_value;
@@ -55,27 +56,33 @@ impl Executor {
         // Pre-expand views once to discover nested WITH scopes introduced by
         // view expansion (e.g. FROM (WITH ... SELECT ...) AS v) and materialize
         // those CTEs before analysis.
-        let preexpanded_query = crate::sql::executor::core::view_rewrite::expand_views_in_query(
-            self.store().as_ref(),
-            txn,
-            db_id,
-            search_path,
-            query,
-        )
-        .await?;
-        let prepared_ctes = self
-            .build_nested_with_cte_context_with_base(
-                txn,
-                db_id,
-                sequence_values,
-                search_path,
-                &preexpanded_query,
-                ctes,
-                current_role,
-            )
-            .await?;
+        let prepared_ctes = {
+            let preexpanded_query =
+                crate::sql::executor::core::view_rewrite::expand_views_in_query(
+                    self.store().as_ref(),
+                    txn,
+                    db_id,
+                    search_path,
+                    query,
+                )
+                .await?;
+            let prepared = self
+                .build_nested_with_cte_context_with_base(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    &preexpanded_query,
+                    ctes,
+                    current_role,
+                )
+                .await?;
+            // Drop deep rewritten AST on a grown stack as soon as it is no longer needed.
+            crate::sql::stack_safety::drop_on_grown_stack(preexpanded_query);
+            prepared
+        };
 
-        let (expanded_query, analyzed) = self
+        let analyzed = self
             .analyze_then_rewrite_query(
                 txn,
                 db_id,
@@ -86,20 +93,10 @@ impl Executor {
             )
             .await?;
 
-        // ── Pre-materialize async expressions ──────────────────────
-        // Resolve non-correlated subqueries → constants BEFORE the optimizer
-        // eligibility check. After this, most async expressions become literals
-        // and the query becomes optimizer-eligible.
-        let mut analyzed = analyzed;
-        self.pre_materialize_query_body(
-            &mut analyzed,
-            txn,
-            db_id,
-            sequence_values,
-            search_path,
-            &prepared_ctes,
-        )
-        .await?;
+        let select_into_target = match &*query.body {
+            SetExpr::Select(select) => select.into.as_ref().map(|into| into.name.clone()),
+            _ => None,
+        };
 
         // ── Single execution path: CBO optimizer pipeline ──────────
         let result = self
@@ -108,19 +105,17 @@ impl Executor {
                 db_id,
                 sequence_values,
                 search_path,
-                &analyzed,
+                analyzed,
                 &prepared_ctes,
-                &expanded_query.locks,
+                &query.locks,
             )
             .await?;
 
         // SELECT INTO post-processing: create table from result.
-        if let SetExpr::Select(select) = &*expanded_query.body {
-            if let Some(ref into) = select.into {
-                return self
-                    .create_table_from_result(txn, db_id, search_path, &into.name, result)
-                    .await;
-            }
+        if let Some(target_name) = select_into_target {
+            return self
+                .create_table_from_result(txn, db_id, search_path, &target_name, result)
+                .await;
         }
 
         Ok(result)
@@ -144,7 +139,7 @@ impl Executor {
             db_id,
             sequence_values,
             search_path,
-            analyzed,
+            analyzed.clone(),
             ctes,
             &[],
         )
@@ -152,6 +147,111 @@ impl Executor {
     }
 
     // ── Subquery pre-materialization ────────────────────────────
+
+    fn maybe_pre_materialize_expr<'a>(
+        &'a self,
+        expr: &'a TypedExpr,
+        txn: &'a mut Transaction,
+        db_id: u64,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> Pin<Box<dyn Future<Output = Result<TypedExpr>> + Send + 'a>> {
+        Box::pin(async move {
+            if !needs_pre_materialization(expr) {
+                return Ok(expr.clone());
+            }
+            self.pre_materialize_async_exprs(expr, txn, db_id, sequence_values, search_path, ctes)
+                .await
+        })
+    }
+
+    fn pre_materialize_window_frame_bound<'a>(
+        &'a self,
+        bound: &'a WindowFrameBound,
+        txn: &'a mut Transaction,
+        db_id: u64,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> Pin<Box<dyn Future<Output = Result<WindowFrameBound>> + Send + 'a>> {
+        Box::pin(async move {
+            match bound {
+                WindowFrameBound::CurrentRow => Ok(WindowFrameBound::CurrentRow),
+                WindowFrameBound::Preceding(Some(expr)) => {
+                    Ok(WindowFrameBound::Preceding(Some(Box::new(
+                        self.maybe_pre_materialize_expr(
+                            expr,
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            ctes,
+                        )
+                        .await?,
+                    ))))
+                }
+                WindowFrameBound::Following(Some(expr)) => {
+                    Ok(WindowFrameBound::Following(Some(Box::new(
+                        self.maybe_pre_materialize_expr(
+                            expr,
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            ctes,
+                        )
+                        .await?,
+                    ))))
+                }
+                WindowFrameBound::Preceding(None) => Ok(WindowFrameBound::Preceding(None)),
+                WindowFrameBound::Following(None) => Ok(WindowFrameBound::Following(None)),
+            }
+        })
+    }
+
+    fn pre_materialize_window_frame<'a>(
+        &'a self,
+        frame: &'a WindowFrame,
+        txn: &'a mut Transaction,
+        db_id: u64,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> Pin<Box<dyn Future<Output = Result<WindowFrame>> + Send + 'a>> {
+        Box::pin(async move {
+            let start = self
+                .pre_materialize_window_frame_bound(
+                    &frame.start,
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    ctes,
+                )
+                .await?;
+            let end = if let Some(bound) = &frame.end {
+                Some(
+                    self.pre_materialize_window_frame_bound(
+                        bound,
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        ctes,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            Ok(WindowFrame {
+                units: frame.units,
+                start,
+                end,
+            })
+        })
+    }
 
     /// Pre-materialize all uncorrelated subqueries in a TypedExpr tree.
     ///
@@ -173,6 +273,9 @@ impl Executor {
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Pin<Box<dyn Future<Output = Result<TypedExpr>> + Send + 'a>> {
         Box::pin(async move {
+            if !needs_pre_materialization(expr) {
+                return Ok(expr.clone());
+            }
             match &expr.kind {
                 TypedExprKind::InSubquery {
                     expr: inner_expr,
@@ -185,7 +288,7 @@ impl Executor {
                     }
                     // Recurse into the LHS expression first.
                     let rewritten_expr = self
-                        .pre_materialize_async_exprs(
+                        .maybe_pre_materialize_expr(
                             inner_expr,
                             txn,
                             db_id,
@@ -286,7 +389,7 @@ impl Executor {
                     }
                     // Recurse into the LHS expression.
                     let rewritten_expr = self
-                        .pre_materialize_async_exprs(
+                        .maybe_pre_materialize_expr(
                             inner_expr,
                             txn,
                             db_id,
@@ -395,7 +498,7 @@ impl Executor {
                 // Recurse into children for non-subquery nodes.
                 TypedExprKind::BinaryOp { left, right, op } => {
                     let l = self
-                        .pre_materialize_async_exprs(
+                        .maybe_pre_materialize_expr(
                             left,
                             txn,
                             db_id,
@@ -405,7 +508,7 @@ impl Executor {
                         )
                         .await?;
                     let r = self
-                        .pre_materialize_async_exprs(
+                        .maybe_pre_materialize_expr(
                             right,
                             txn,
                             db_id,
@@ -426,7 +529,7 @@ impl Executor {
 
                 TypedExprKind::UnaryOp { op, operand } => {
                     let inner = self
-                        .pre_materialize_async_exprs(
+                        .maybe_pre_materialize_expr(
                             operand,
                             txn,
                             db_id,
@@ -450,7 +553,7 @@ impl Executor {
                     cast_context,
                 } => {
                     let rewritten = self
-                        .pre_materialize_async_exprs(
+                        .maybe_pre_materialize_expr(
                             inner,
                             txn,
                             db_id,
@@ -475,7 +578,7 @@ impl Executor {
                     negated,
                 } => {
                     let rewritten = self
-                        .pre_materialize_async_exprs(
+                        .maybe_pre_materialize_expr(
                             inner,
                             txn,
                             db_id,
@@ -501,7 +604,7 @@ impl Executor {
                     negated,
                 } => {
                     let e = self
-                        .pre_materialize_async_exprs(
+                        .maybe_pre_materialize_expr(
                             inner,
                             txn,
                             db_id,
@@ -511,7 +614,7 @@ impl Executor {
                         )
                         .await?;
                     let l = self
-                        .pre_materialize_async_exprs(
+                        .maybe_pre_materialize_expr(
                             low,
                             txn,
                             db_id,
@@ -521,7 +624,7 @@ impl Executor {
                         )
                         .await?;
                     let h = self
-                        .pre_materialize_async_exprs(
+                        .maybe_pre_materialize_expr(
                             high,
                             txn,
                             db_id,
@@ -547,7 +650,7 @@ impl Executor {
                     negated,
                 } => {
                     let e = self
-                        .pre_materialize_async_exprs(
+                        .maybe_pre_materialize_expr(
                             inner,
                             txn,
                             db_id,
@@ -559,7 +662,7 @@ impl Executor {
                     let mut new_list = Vec::with_capacity(list.len());
                     for item in list {
                         new_list.push(
-                            self.pre_materialize_async_exprs(
+                            self.maybe_pre_materialize_expr(
                                 item,
                                 txn,
                                 db_id,
@@ -587,7 +690,7 @@ impl Executor {
                 } => {
                     let new_operand = if let Some(ref op) = operand {
                         Some(Box::new(
-                            self.pre_materialize_async_exprs(
+                            self.maybe_pre_materialize_expr(
                                 op,
                                 txn,
                                 db_id,
@@ -603,7 +706,7 @@ impl Executor {
                     let mut new_whens = Vec::with_capacity(when_clauses.len());
                     for (w, t) in when_clauses {
                         let nw = self
-                            .pre_materialize_async_exprs(
+                            .maybe_pre_materialize_expr(
                                 w,
                                 txn,
                                 db_id,
@@ -613,7 +716,7 @@ impl Executor {
                             )
                             .await?;
                         let nt = self
-                            .pre_materialize_async_exprs(
+                            .maybe_pre_materialize_expr(
                                 t,
                                 txn,
                                 db_id,
@@ -626,7 +729,7 @@ impl Executor {
                     }
                     let new_else = if let Some(ref e) = else_result {
                         Some(Box::new(
-                            self.pre_materialize_async_exprs(
+                            self.maybe_pre_materialize_expr(
                                 e,
                                 txn,
                                 db_id,
@@ -653,7 +756,7 @@ impl Executor {
                     let mut new_args = Vec::with_capacity(args.len());
                     for a in args {
                         new_args.push(
-                            self.pre_materialize_async_exprs(
+                            self.maybe_pre_materialize_expr(
                                 a,
                                 txn,
                                 db_id,
@@ -672,7 +775,7 @@ impl Executor {
 
                 TypedExprKind::NullIf(a, b) => {
                     let na = self
-                        .pre_materialize_async_exprs(
+                        .maybe_pre_materialize_expr(
                             a,
                             txn,
                             db_id,
@@ -682,7 +785,7 @@ impl Executor {
                         )
                         .await?;
                     let nb = self
-                        .pre_materialize_async_exprs(
+                        .maybe_pre_materialize_expr(
                             b,
                             txn,
                             db_id,
@@ -837,7 +940,7 @@ impl Executor {
                     let mut new_args = Vec::with_capacity(args.len());
                     for a in args {
                         new_args.push(
-                            self.pre_materialize_async_exprs(
+                            self.maybe_pre_materialize_expr(
                                 a,
                                 txn,
                                 db_id,
@@ -850,7 +953,7 @@ impl Executor {
                     }
                     let new_filter = if let Some(ref f) = filter {
                         Some(Box::new(
-                            self.pre_materialize_async_exprs(
+                            self.maybe_pre_materialize_expr(
                                 f,
                                 txn,
                                 db_id,
@@ -882,7 +985,7 @@ impl Executor {
                     case_insensitive,
                 } => {
                     let e = self
-                        .pre_materialize_async_exprs(
+                        .maybe_pre_materialize_expr(
                             inner,
                             txn,
                             db_id,
@@ -892,7 +995,7 @@ impl Executor {
                         )
                         .await?;
                     let p = self
-                        .pre_materialize_async_exprs(
+                        .maybe_pre_materialize_expr(
                             pattern,
                             txn,
                             db_id,
@@ -905,7 +1008,21 @@ impl Executor {
                         kind: TypedExprKind::Like {
                             expr: Box::new(e),
                             pattern: Box::new(p),
-                            escape: escape.clone(),
+                            escape: if let Some(esc) = escape {
+                                Some(Box::new(
+                                    self.maybe_pre_materialize_expr(
+                                        esc,
+                                        txn,
+                                        db_id,
+                                        sequence_values,
+                                        search_path,
+                                        ctes,
+                                    )
+                                    .await?,
+                                ))
+                            } else {
+                                None
+                            },
                             negated: *negated,
                             case_insensitive: *case_insensitive,
                         },
@@ -920,7 +1037,7 @@ impl Executor {
                     negated,
                 } => {
                     let e = self
-                        .pre_materialize_async_exprs(
+                        .maybe_pre_materialize_expr(
                             inner,
                             txn,
                             db_id,
@@ -930,7 +1047,7 @@ impl Executor {
                         )
                         .await?;
                     let p = self
-                        .pre_materialize_async_exprs(
+                        .maybe_pre_materialize_expr(
                             pattern,
                             txn,
                             db_id,
@@ -943,14 +1060,303 @@ impl Executor {
                         kind: TypedExprKind::SimilarTo {
                             expr: Box::new(e),
                             pattern: Box::new(p),
-                            escape: escape.clone(),
+                            escape: if let Some(esc) = escape {
+                                Some(Box::new(
+                                    self.maybe_pre_materialize_expr(
+                                        esc,
+                                        txn,
+                                        db_id,
+                                        sequence_values,
+                                        search_path,
+                                        ctes,
+                                    )
+                                    .await?,
+                                ))
+                            } else {
+                                None
+                            },
                             negated: *negated,
                         },
                         data_type: expr.data_type.clone(),
                     })
                 }
 
-                // Leaf nodes (Constant, ColumnRef, etc.) — return as-is.
+                TypedExprKind::AggregateCall {
+                    func,
+                    args,
+                    distinct,
+                    order_by,
+                    filter,
+                } => {
+                    let mut new_args = Vec::with_capacity(args.len());
+                    for arg in args {
+                        new_args.push(
+                            self.maybe_pre_materialize_expr(
+                                arg,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                ctes,
+                            )
+                            .await?,
+                        );
+                    }
+                    let mut new_order_by = Vec::with_capacity(order_by.len());
+                    for ob in order_by {
+                        new_order_by.push(TypedOrderByExpr {
+                            expr: self
+                                .maybe_pre_materialize_expr(
+                                    &ob.expr,
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    ctes,
+                                )
+                                .await?,
+                            asc: ob.asc,
+                            nulls_first: ob.nulls_first,
+                        });
+                    }
+                    let new_filter = if let Some(f) = filter {
+                        Some(Box::new(
+                            self.maybe_pre_materialize_expr(
+                                f,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                ctes,
+                            )
+                            .await?,
+                        ))
+                    } else {
+                        None
+                    };
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::AggregateCall {
+                            func: func.clone(),
+                            args: new_args,
+                            distinct: *distinct,
+                            order_by: new_order_by,
+                            filter: new_filter,
+                        },
+                        data_type: expr.data_type.clone(),
+                    })
+                }
+
+                TypedExprKind::WindowCall {
+                    func,
+                    args,
+                    partition_by,
+                    order_by,
+                    window_frame,
+                } => {
+                    let mut new_args = Vec::with_capacity(args.len());
+                    for arg in args {
+                        new_args.push(
+                            self.maybe_pre_materialize_expr(
+                                arg,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                ctes,
+                            )
+                            .await?,
+                        );
+                    }
+                    let mut new_partition_by = Vec::with_capacity(partition_by.len());
+                    for part in partition_by {
+                        new_partition_by.push(
+                            self.maybe_pre_materialize_expr(
+                                part,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                ctes,
+                            )
+                            .await?,
+                        );
+                    }
+                    let mut new_order_by = Vec::with_capacity(order_by.len());
+                    for ob in order_by {
+                        new_order_by.push(TypedOrderByExpr {
+                            expr: self
+                                .maybe_pre_materialize_expr(
+                                    &ob.expr,
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    ctes,
+                                )
+                                .await?,
+                            asc: ob.asc,
+                            nulls_first: ob.nulls_first,
+                        });
+                    }
+                    let new_window_frame = if let Some(frame) = window_frame {
+                        Some(
+                            self.pre_materialize_window_frame(
+                                frame,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                ctes,
+                            )
+                            .await?,
+                        )
+                    } else {
+                        None
+                    };
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::WindowCall {
+                            func: func.clone(),
+                            args: new_args,
+                            partition_by: new_partition_by,
+                            order_by: new_order_by,
+                            window_frame: new_window_frame,
+                        },
+                        data_type: expr.data_type.clone(),
+                    })
+                }
+
+                TypedExprKind::MinMax { args, is_greatest } => {
+                    let mut new_args = Vec::with_capacity(args.len());
+                    for arg in args {
+                        new_args.push(
+                            self.maybe_pre_materialize_expr(
+                                arg,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                ctes,
+                            )
+                            .await?,
+                        );
+                    }
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::MinMax {
+                            args: new_args,
+                            is_greatest: *is_greatest,
+                        },
+                        data_type: expr.data_type.clone(),
+                    })
+                }
+
+                TypedExprKind::ArrayLiteral(items) => {
+                    let mut new_items = Vec::with_capacity(items.len());
+                    for item in items {
+                        new_items.push(
+                            self.maybe_pre_materialize_expr(
+                                item,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                ctes,
+                            )
+                            .await?,
+                        );
+                    }
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::ArrayLiteral(new_items),
+                        data_type: expr.data_type.clone(),
+                    })
+                }
+
+                TypedExprKind::ArrayIndex { array, index } => {
+                    let new_array = self
+                        .maybe_pre_materialize_expr(
+                            array,
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            ctes,
+                        )
+                        .await?;
+                    let new_index = self
+                        .maybe_pre_materialize_expr(
+                            index,
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            ctes,
+                        )
+                        .await?;
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::ArrayIndex {
+                            array: Box::new(new_array),
+                            index: Box::new(new_index),
+                        },
+                        data_type: expr.data_type.clone(),
+                    })
+                }
+
+                TypedExprKind::JsonAccess {
+                    expr: inner,
+                    path,
+                    operator,
+                } => {
+                    let new_inner = self
+                        .maybe_pre_materialize_expr(
+                            inner,
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            ctes,
+                        )
+                        .await?;
+                    let new_path = self
+                        .maybe_pre_materialize_expr(
+                            path,
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            ctes,
+                        )
+                        .await?;
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::JsonAccess {
+                            expr: Box::new(new_inner),
+                            path: Box::new(new_path),
+                            operator: *operator,
+                        },
+                        data_type: expr.data_type.clone(),
+                    })
+                }
+
+                TypedExprKind::Row(items) => {
+                    let mut new_items = Vec::with_capacity(items.len());
+                    for item in items {
+                        new_items.push(
+                            self.maybe_pre_materialize_expr(
+                                item,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                ctes,
+                            )
+                            .await?,
+                        );
+                    }
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::Row(new_items),
+                        data_type: expr.data_type.clone(),
+                    })
+                }
+
+                // Leaf nodes (Constant, ColumnRef, etc.).
                 _ => Ok(expr.clone()),
             }
         }) // end Box::pin
@@ -971,7 +1377,7 @@ impl Executor {
         db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
-        analyzed: &AnalyzedQuery,
+        mut analyzed: AnalyzedQuery,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
         locks: &[sqlparser::ast::LockClause],
     ) -> Result<ExecuteResult> {
@@ -986,7 +1392,6 @@ impl Executor {
         // Resolves IN subquery → InList, EXISTS → bool, ScalarSubquery → constant,
         // ANY/ALL → expanded comparisons, ArraySubquery → array literal.
         // Correlated subqueries (scope_depth > 0) are left as-is.
-        let mut analyzed = analyzed.clone();
         self.pre_materialize_query_body(
             &mut analyzed,
             txn,
@@ -1118,10 +1523,13 @@ impl Executor {
         .await?;
 
         // ── Step 5: AnalyzedQuery → PhysicalPlan ──
-        let physical = crate::sql::optimizer::optimize(&analyzed, &planning_ctx)?;
+        let physical = crate::sql::stack_safety::with_grown_stack(|| {
+            crate::sql::optimizer::optimize(&analyzed, &planning_ctx)
+        })?;
 
         // ── Step 6: PhysicalPlan → BoxedOperator ──
-        let mut operator = physical.build_operators(&build_ctx)?;
+        let mut operator =
+            crate::sql::stack_safety::with_grown_stack(|| physical.build_operators(&build_ctx))?;
 
         // ── Step 7: Execute operator tree ──
         let mut rows = rt
@@ -1259,66 +1667,57 @@ impl Executor {
                 AnalyzedQueryBody::Select(ref mut select) => {
                     // Projection.
                     for proj in &mut select.projection {
-                        proj.expr = self
-                            .pre_materialize_async_exprs(
-                                &proj.expr,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?;
+                        if needs_pre_materialization(&proj.expr) {
+                            proj.expr = self
+                                .pre_materialize_async_exprs(
+                                    &proj.expr,
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    ctes,
+                                )
+                                .await?;
+                        }
                     }
                     // WHERE.
                     if let Some(ref w) = select.where_clause {
-                        let new_w = self
-                            .pre_materialize_async_exprs(
-                                w,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?;
-                        select.where_clause = Some(new_w);
+                        if needs_pre_materialization(w) {
+                            let new_w = self
+                                .pre_materialize_async_exprs(
+                                    w,
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    ctes,
+                                )
+                                .await?;
+                            select.where_clause = Some(new_w);
+                        }
                     }
                     // HAVING.
                     if let Some(ref h) = select.having {
-                        let new_h = self
-                            .pre_materialize_async_exprs(
-                                h,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?;
-                        select.having = Some(new_h);
+                        if needs_pre_materialization(h) {
+                            let new_h = self
+                                .pre_materialize_async_exprs(
+                                    h,
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    ctes,
+                                )
+                                .await?;
+                            select.having = Some(new_h);
+                        }
                     }
                     // GROUP BY.
                     let group_exprs: Vec<TypedExpr> = select.group_by.clone();
                     for (i, expr) in group_exprs.iter().enumerate() {
-                        select.group_by[i] = self
-                            .pre_materialize_async_exprs(
-                                expr,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?;
-                    }
-                    // DISTINCT ON.
-                    if let AnalyzedDistinct::DistinctOn(ref on_exprs) = select.distinct {
-                        let cloned: Vec<TypedExpr> = on_exprs.clone();
-                        let mut new_on = Vec::with_capacity(cloned.len());
-                        for expr in &cloned {
-                            new_on.push(
-                                self.pre_materialize_async_exprs(
+                        if needs_pre_materialization(expr) {
+                            select.group_by[i] = self
+                                .pre_materialize_async_exprs(
                                     expr,
                                     txn,
                                     db_id,
@@ -1326,8 +1725,29 @@ impl Executor {
                                     search_path,
                                     ctes,
                                 )
-                                .await?,
-                            );
+                                .await?;
+                        }
+                    }
+                    // DISTINCT ON.
+                    if let AnalyzedDistinct::DistinctOn(ref on_exprs) = select.distinct {
+                        let cloned: Vec<TypedExpr> = on_exprs.clone();
+                        let mut new_on = Vec::with_capacity(cloned.len());
+                        for expr in &cloned {
+                            if needs_pre_materialization(expr) {
+                                new_on.push(
+                                    self.pre_materialize_async_exprs(
+                                        expr,
+                                        txn,
+                                        db_id,
+                                        sequence_values,
+                                        search_path,
+                                        ctes,
+                                    )
+                                    .await?,
+                                );
+                            } else {
+                                new_on.push(expr.clone());
+                            }
                         }
                         select.distinct = AnalyzedDistinct::DistinctOn(new_on);
                     }
@@ -1371,16 +1791,18 @@ impl Executor {
                 AnalyzedQueryBody::Values(ref mut rows) => {
                     for row in rows {
                         for expr in row {
-                            *expr = self
-                                .pre_materialize_async_exprs(
-                                    expr,
-                                    txn,
-                                    db_id,
-                                    sequence_values,
-                                    search_path,
-                                    ctes,
-                                )
-                                .await?;
+                            if needs_pre_materialization(expr) {
+                                *expr = self
+                                    .pre_materialize_async_exprs(
+                                        expr,
+                                        txn,
+                                        db_id,
+                                        sequence_values,
+                                        search_path,
+                                        ctes,
+                                    )
+                                    .await?;
+                            }
                         }
                     }
                 }
@@ -1389,16 +1811,18 @@ impl Executor {
             // ORDER BY.
             let order_by_clone: Vec<TypedOrderByExpr> = analyzed.order_by.clone();
             for (i, ob) in order_by_clone.iter().enumerate() {
-                analyzed.order_by[i].expr = self
-                    .pre_materialize_async_exprs(
-                        &ob.expr,
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        ctes,
-                    )
-                    .await?;
+                if needs_pre_materialization(&ob.expr) {
+                    analyzed.order_by[i].expr = self
+                        .pre_materialize_async_exprs(
+                            &ob.expr,
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            ctes,
+                        )
+                        .await?;
+                }
             }
 
             Ok(())
@@ -1447,17 +1871,21 @@ impl Executor {
                     .await?;
                     let new_cond = match condition {
                         JoinCondition::On(ref expr) => {
-                            let new_expr = self
-                                .pre_materialize_async_exprs(
-                                    expr,
-                                    txn,
-                                    db_id,
-                                    sequence_values,
-                                    search_path,
-                                    ctes,
-                                )
-                                .await?;
-                            Some(JoinCondition::On(new_expr))
+                            if needs_pre_materialization(expr) {
+                                let new_expr = self
+                                    .pre_materialize_async_exprs(
+                                        expr,
+                                        txn,
+                                        db_id,
+                                        sequence_values,
+                                        search_path,
+                                        ctes,
+                                    )
+                                    .await?;
+                                Some(JoinCondition::On(new_expr))
+                            } else {
+                                None
+                            }
                         }
                         _ => None,
                     };
