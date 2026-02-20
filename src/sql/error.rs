@@ -88,6 +88,9 @@ pub enum SqlError {
     #[error("canceling statement due to statement timeout")]
     StatementTimeout,
 
+    #[error("terminating connection due to idle-in-transaction timeout")]
+    IdleInTransactionTimeout,
+
     #[error("could not obtain lock on row in relation \"{relation}\"")]
     LockNotAvailable { relation: String },
 
@@ -134,6 +137,7 @@ impl SqlError {
             Self::StringDataRightTruncation { .. } => "22001",
             Self::DivisionByZero => "22012",
             Self::StatementTimeout => "57014",
+            Self::IdleInTransactionTimeout => "25P03",
             Self::LockNotAvailable { .. } => "55P03",
             Self::InFailedTransaction => "25P02",
             Self::PermissionDenied { .. } => "42501",
