@@ -35,24 +35,38 @@ const MAX_REQUEST_BYTES: usize = 256 * 1024;
 const MAX_REDIRECTS: usize = 3;
 
 pub(crate) enum HttpTableFunctionCall {
+    /// http(method, uri, headers_jsonb, content_type, content) — universal function
+    /// Headers format: JSON array of {"field":"...", "value":"..."} objects (pgsql-http compatible)
+    Universal {
+        method: String,
+        url: String,
+        headers: Option<String>,
+        content_type: Option<String>,
+        body: Option<String>,
+    },
     Get {
         url: String,
+        headers: Option<String>,
     },
     Head {
         url: String,
+        headers: Option<String>,
     },
     Delete {
         url: String,
+        headers: Option<String>,
     },
     Post {
         url: String,
         body: String,
         content_type: String,
+        headers: Option<String>,
     },
     Put {
         url: String,
         body: String,
         content_type: String,
+        headers: Option<String>,
     },
 }
 
@@ -149,7 +163,7 @@ fn http_response_schema(name: &str) -> TableSchema {
 pub(crate) fn table_function_schema(func_name: &str) -> Option<TableSchema> {
     let name = func_name.trim().to_ascii_lowercase();
     match name.as_str() {
-        "http_get" | "http_head" | "http_delete" | "http_post" | "http_put" => {
+        "http" | "http_get" | "http_head" | "http_delete" | "http_post" | "http_put" => {
             Some(http_response_schema(&name))
         }
         _ => None,
@@ -320,15 +334,70 @@ async fn read_response(
     Ok((status, content_type, headers_json, content))
 }
 
+fn parse_custom_headers(
+    headers_json: &str,
+) -> Result<Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>> {
+    let parsed: serde_json::Value = serde_json::from_str(headers_json)
+        .map_err(|e| anyhow!("http: invalid headers JSON: {}", e))?;
+    match &parsed {
+        serde_json::Value::Array(arr) => {
+            let mut result = Vec::with_capacity(arr.len());
+            for item in arr {
+                let obj = item.as_object().ok_or_else(|| {
+                    anyhow!("http: each header must be an object with \"field\" and \"value\"")
+                })?;
+                let field = obj
+                    .get("field")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("http: header missing \"field\""))?;
+                let value = obj
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("http: header missing \"value\""))?;
+                let header_name = reqwest::header::HeaderName::from_bytes(field.as_bytes())
+                    .map_err(|_| anyhow!("http: invalid header name: {}", field))?;
+                let header_value = reqwest::header::HeaderValue::from_str(value)
+                    .map_err(|_| anyhow!("http: invalid header value for {}", field))?;
+                result.push((header_name, header_value));
+            }
+            Ok(result)
+        }
+        serde_json::Value::Object(obj) => {
+            let mut result = Vec::with_capacity(obj.len());
+            for (key, value) in obj {
+                let header_name = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                    .map_err(|_| anyhow!("http: invalid header name: {}", key))?;
+                let val_str = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let header_value = reqwest::header::HeaderValue::from_str(&val_str)
+                    .map_err(|_| anyhow!("http: invalid header value for {}", key))?;
+                result.push((header_name, header_value));
+            }
+            Ok(result)
+        }
+        _ => Err(anyhow!(
+            "http: headers must be a JSON array of {{\"field\":...,\"value\":...}} or a JSON object"
+        )),
+    }
+}
+
 async fn execute_request(
     tenant: &str,
     mut method: Method,
     mut url: Url,
     mut body: Option<bytes::Bytes>,
     mut content_type: Option<String>,
+    custom_headers: Option<&str>,
     follow_redirects: bool,
 ) -> Result<(i32, Option<String>, String, String)> {
     context::try_consume_http_request(MAX_REQUESTS_PER_STATEMENT)?;
+
+    let parsed_headers = match custom_headers {
+        Some(h) => Some(parse_custom_headers(h)?),
+        None => None,
+    };
 
     let semaphore = limiters().semaphore(tenant);
     let _permit = semaphore
@@ -342,6 +411,11 @@ async fn execute_request(
         let mut req = client().request(method.clone(), url.clone());
         if let Some(ref ct) = content_type {
             req = req.header(CONTENT_TYPE, ct);
+        }
+        if let Some(ref hdrs) = parsed_headers {
+            for (name, value) in hdrs {
+                req = req.header(name.clone(), value.clone());
+            }
         }
         if let Some(ref b) = body {
             if b.len() > MAX_REQUEST_BYTES {
@@ -402,42 +476,92 @@ pub(crate) async fn execute_table_function(
         .into());
     }
 
-    let (schema_name, method, url, body, content_type, follow_redirects) = match call {
-        HttpTableFunctionCall::Get { url } => ("http_get", Method::GET, url, None, None, true),
-        HttpTableFunctionCall::Head { url } => ("http_head", Method::HEAD, url, None, None, false),
-        HttpTableFunctionCall::Delete { url } => {
-            ("http_delete", Method::DELETE, url, None, None, true)
-        }
-        HttpTableFunctionCall::Post {
-            url,
-            body,
-            content_type,
-        } => (
-            "http_post",
-            Method::POST,
-            url,
-            Some(bytes::Bytes::from(body.into_bytes())),
-            Some(content_type),
-            true,
-        ),
-        HttpTableFunctionCall::Put {
-            url,
-            body,
-            content_type,
-        } => (
-            "http_put",
-            Method::PUT,
-            url,
-            Some(bytes::Bytes::from(body.into_bytes())),
-            Some(content_type),
-            true,
-        ),
-    };
+    let (schema_name, method, url, body, content_type, custom_headers, follow_redirects) =
+        match call {
+            HttpTableFunctionCall::Get { url, headers } => {
+                ("http_get", Method::GET, url, None, None, headers, true)
+            }
+            HttpTableFunctionCall::Head { url, headers } => {
+                ("http_head", Method::HEAD, url, None, None, headers, false)
+            }
+            HttpTableFunctionCall::Delete { url, headers } => (
+                "http_delete",
+                Method::DELETE,
+                url,
+                None,
+                None,
+                headers,
+                true,
+            ),
+            HttpTableFunctionCall::Post {
+                url,
+                body,
+                content_type,
+                headers,
+            } => (
+                "http_post",
+                Method::POST,
+                url,
+                Some(bytes::Bytes::from(body.into_bytes())),
+                Some(content_type),
+                headers,
+                true,
+            ),
+            HttpTableFunctionCall::Put {
+                url,
+                body,
+                content_type,
+                headers,
+            } => (
+                "http_put",
+                Method::PUT,
+                url,
+                Some(bytes::Bytes::from(body.into_bytes())),
+                Some(content_type),
+                headers,
+                true,
+            ),
+            HttpTableFunctionCall::Universal {
+                method,
+                url,
+                headers,
+                content_type,
+                body,
+            } => {
+                let m = match method.to_ascii_uppercase().as_str() {
+                    "GET" => Method::GET,
+                    "POST" => Method::POST,
+                    "PUT" => Method::PUT,
+                    "DELETE" => Method::DELETE,
+                    "HEAD" => Method::HEAD,
+                    "PATCH" => Method::PATCH,
+                    _ => return Err(anyhow!("http: unsupported method: {}", method)),
+                };
+                let follow = !matches!(m, Method::HEAD);
+                (
+                    "http",
+                    m,
+                    url,
+                    body.map(|b| bytes::Bytes::from(b.into_bytes())),
+                    content_type,
+                    headers,
+                    follow,
+                )
+            }
+        };
 
     let url = Url::parse(&url).map_err(|e| anyhow!("http: invalid url: {}", e))?;
 
-    let (status, content_type_out, headers_json, content) =
-        execute_request(tenant, method, url, body, content_type, follow_redirects).await?;
+    let (status, content_type_out, headers_json, content) = execute_request(
+        tenant,
+        method,
+        url,
+        body,
+        content_type,
+        custom_headers.as_deref(),
+        follow_redirects,
+    )
+    .await?;
 
     let schema = http_response_schema(schema_name);
     let row = Row::new(vec![
@@ -523,5 +647,60 @@ mod tests {
     async fn test_validate_url_http_allowed_in_insecure_mode() {
         let url = Url::parse("http://example.com:8080/api").unwrap();
         assert!(validate_url_with_policy(&url, true).await.is_ok());
+    }
+
+    #[test]
+    fn test_parse_custom_headers_array_format() {
+        let json = r#"[{"field":"Authorization","value":"Bearer sk-test"},{"field":"X-Custom","value":"foo"}]"#;
+        let headers = parse_custom_headers(json).unwrap();
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].0.as_str(), "authorization");
+        assert_eq!(headers[0].1.to_str().unwrap(), "Bearer sk-test");
+        assert_eq!(headers[1].0.as_str(), "x-custom");
+        assert_eq!(headers[1].1.to_str().unwrap(), "foo");
+    }
+
+    #[test]
+    fn test_parse_custom_headers_object_format() {
+        let json = r#"{"Authorization":"Bearer sk-test","X-Custom":"bar"}"#;
+        let headers = parse_custom_headers(json).unwrap();
+        assert_eq!(headers.len(), 2);
+        let names: Vec<&str> = headers.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"authorization"));
+        assert!(names.contains(&"x-custom"));
+    }
+
+    #[test]
+    fn test_parse_custom_headers_empty_array() {
+        let headers = parse_custom_headers("[]").unwrap();
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn test_parse_custom_headers_empty_object() {
+        let headers = parse_custom_headers("{}").unwrap();
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn test_parse_custom_headers_invalid_json() {
+        assert!(parse_custom_headers("not json").is_err());
+    }
+
+    #[test]
+    fn test_parse_custom_headers_missing_field() {
+        let json = r#"[{"value":"Bearer sk-test"}]"#;
+        assert!(parse_custom_headers(json).is_err());
+    }
+
+    #[test]
+    fn test_parse_custom_headers_missing_value() {
+        let json = r#"[{"field":"Authorization"}]"#;
+        assert!(parse_custom_headers(json).is_err());
+    }
+
+    #[test]
+    fn test_parse_custom_headers_scalar_rejected() {
+        assert!(parse_custom_headers(r#""just a string""#).is_err());
     }
 }
