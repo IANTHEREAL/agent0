@@ -15,6 +15,7 @@ mod types;
 mod worker;
 
 use anyhow::Result;
+use crate::config::ServerConfig;
 use pgwire::tokio::process_socket;
 use pool::TikvClientPool;
 use protocol::DynamicHandlerFactory;
@@ -134,6 +135,15 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     let require_tls = config::env_bool("PG_REQUIRE_TLS");
     let dev_mode = config::env_bool("PGTIKV_DEV");
     let insecure_mode = config::env_bool("PGTIKV_INSECURE");
+    let server_config = ServerConfig::from_env().shared();
+    info!(
+        "Statement timeout default: {}ms, idle-in-transaction timeout default: {}ms",
+        server_config.read().unwrap().statement_timeout_ms,
+        server_config
+            .read()
+            .unwrap()
+            .idle_in_transaction_session_timeout_ms
+    );
 
     let tls_cert = cli_args.tls_cert.or_else(|| env::var("PG_TLS_CERT").ok());
     let tls_key = cli_args.tls_key.or_else(|| env::var("PG_TLS_KEY").ok());
@@ -289,7 +299,11 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
         let client_pool = client_pool.clone();
         let default_keyspace = default_keyspace.clone();
 
-        let factory = DynamicHandlerFactory::new_with_pool(client_pool, default_keyspace);
+        let factory = DynamicHandlerFactory::new_with_pool(
+            client_pool,
+            default_keyspace,
+            server_config.clone(),
+        );
 
         tokio::spawn(async move {
             if let Err(e) = process_socket(socket, tls_acceptor, factory).await {

@@ -423,6 +423,67 @@ impl Executor {
                 }
             }
 
+                if sql_upper.starts_with("ALTER SYSTEM SET ") {
+                    if !session.is_superuser() {
+                        return Err(SqlError::PermissionDenied {
+                            object_type: "system".to_string(),
+                            object_name: "ALTER SYSTEM SET".to_string(),
+                        }
+                        .into());
+                    }
+
+                    let rest = sql_trimmed.get(17..).unwrap_or("").trim();
+                    let rest_clean = rest.trim_end_matches(';').trim();
+                    let (name, raw_value) = if let Some(pos) = rest_clean.find('=') {
+                        (&rest_clean[..pos], &rest_clean[pos + 1..])
+                    } else {
+                        let rest_upper = rest_clean.to_ascii_uppercase();
+                        if let Some(pos) = rest_upper.find(" TO ") {
+                            (&rest_clean[..pos], &rest_clean[pos + 4..])
+                        } else {
+                            return Err(anyhow!("syntax error in ALTER SYSTEM SET").into());
+                        }
+                    };
+
+                    let name_lower = name.trim().to_lowercase();
+                    let value_clean = raw_value
+                        .trim()
+                        .trim_matches('\'')
+                        .trim_matches('"')
+                        .trim();
+
+                    match name_lower.as_str() {
+                        "statement_timeout" | "idle_in_transaction_session_timeout" => {}
+                        _ => {
+                            return Err(anyhow!(
+                                "ALTER SYSTEM SET is only supported for statement_timeout and idle_in_transaction_session_timeout"
+                            )
+                            .into());
+                        }
+                    }
+
+                    let ms = crate::sql::session::SessionSettings::parse_timeout_value(value_clean)?;
+
+                    let server_config = session
+                        .server_config()
+                        .ok_or_else(|| anyhow!("server configuration not available"))?;
+
+                    {
+                        let mut cfg = server_config.write().unwrap();
+                        match name_lower.as_str() {
+                            "statement_timeout" => cfg.statement_timeout_ms = ms,
+                            "idle_in_transaction_session_timeout" => {
+                                cfg.idle_in_transaction_session_timeout_ms = ms
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+
+                    return Ok(ExecuteResults::single(ExecuteResult::CommandComplete {
+                        tag: "ALTER SYSTEM",
+                    }));
+                }
+
                 // RESET <guc> / RESET ALL — handled directly from raw SQL, bypassing
                 // sqlparser entirely. This avoids sentinel-value collisions that arise
                 // from rewriting RESET to SET.

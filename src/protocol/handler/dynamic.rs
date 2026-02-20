@@ -23,6 +23,7 @@ use super::{
 };
 use crate::auth::{AuthManager, Privilege};
 use crate::config;
+use crate::config::SharedServerConfig;
 use crate::observability;
 use crate::pool::{TenantHandle, TikvClientPool};
 use crate::sql::error::SqlError;
@@ -71,12 +72,14 @@ pub struct DynamicPgHandler {
     suspended_portals: Mutex<HashMap<String, SuspendedPortalState>>,
     query_parser: Arc<TipgQueryParser>,
     connection_id: i32,
+    server_config: SharedServerConfig,
 }
 
 impl DynamicPgHandler {
     pub fn new_with_pool(
         client_pool: Arc<TikvClientPool>,
         default_keyspace: Option<String>,
+        server_config: SharedServerConfig,
     ) -> Self {
         Self {
             client_pool: Some(client_pool),
@@ -90,6 +93,7 @@ impl DynamicPgHandler {
             suspended_portals: Mutex::new(HashMap::new()),
             query_parser: Arc::new(TipgQueryParser::new()),
             connection_id: CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            server_config,
         }
     }
 
@@ -471,6 +475,13 @@ impl DynamicPgHandler {
             database_name
         };
         let database_name = database_name.to_ascii_lowercase();
+        let (default_stmt_timeout, default_idle_txn_timeout) = {
+            let cfg = self.server_config.read().unwrap();
+            (
+                cfg.statement_timeout_ms,
+                cfg.idle_in_transaction_session_timeout_ms,
+            )
+        };
 
         let mut db_txn = store
             .begin()
@@ -493,7 +504,7 @@ impl DynamicPgHandler {
         };
         db_txn.rollback().await.ok();
 
-        let session = match username {
+        let mut session = match username {
             Some(user) => Session::new_with_user_and_database(
                 store,
                 tenant_obs,
@@ -502,6 +513,8 @@ impl DynamicPgHandler {
                 self.connection_id,
                 database_id,
                 database_name,
+                default_stmt_timeout,
+                default_idle_txn_timeout,
             ),
             None => Session::new_with_database(
                 store,
@@ -509,8 +522,11 @@ impl DynamicPgHandler {
                 self.connection_id,
                 database_id,
                 database_name,
+                default_stmt_timeout,
+                default_idle_txn_timeout,
             ),
         };
+        session.set_server_config(self.server_config.clone());
 
         let _ = self.executor.set(executor);
 
@@ -1396,8 +1412,18 @@ impl SimpleQueryHandler for DynamicPgHandler {
             )))
         })?;
 
+        if let Err(e) = session.check_idle_in_transaction_timeout() {
+            let _ = session.rollback().await;
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                e.sqlstate().to_string(),
+                e.to_string(),
+            ))));
+        }
+
         match executor.execute(session, query).await {
             Ok(results) => {
+                session.record_command_complete();
                 let mut responses: Vec<Response<'a>> = Vec::new();
                 for result in results.into_vec() {
                     if let ExecuteResult::Notice { message } = result {
@@ -1864,8 +1890,18 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             )))
         })?;
 
+        if let Err(e) = session.check_idle_in_transaction_timeout() {
+            let _ = session.rollback().await;
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                e.sqlstate().to_string(),
+                e.to_string(),
+            ))));
+        }
+
         match executor.execute(session, &final_query).await {
             Ok(results) => {
+                session.record_command_complete();
                 let resp = send_notices_and_get_last_response_with_format(
                     client,
                     session.show_setting_value("client_min_messages"),
@@ -2006,11 +2042,13 @@ impl DynamicHandlerFactory {
     pub fn new_with_pool(
         client_pool: Arc<TikvClientPool>,
         default_keyspace: Option<String>,
+        server_config: SharedServerConfig,
     ) -> Self {
         Self {
             handler: Arc::new(DynamicPgHandler::new_with_pool(
                 client_pool,
                 default_keyspace,
+                server_config,
             )),
         }
     }
