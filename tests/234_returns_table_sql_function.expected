@@ -1,0 +1,16 @@
+item_name|has_rank
+PostgreSQL Book|t
+(1 row)
+item_name
+Rust Cookbook
+(1 row)
+item_name
+(0 rows)
+category|item_count
+books|3
+electronics|1
+(2 rows)
+item_name|is_close
+PostgreSQL Book|t
+TiKV Deep Dive|t
+(2 rows)

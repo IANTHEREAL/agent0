@@ -66,7 +66,7 @@ impl Executor {
                 .ok_or_else(|| anyhow!("Function '{}' does not exist", full_name))?;
 
             let ret_lower = func_def.return_type.to_lowercase();
-            if !ret_lower.starts_with("setof ") {
+            if !ret_lower.starts_with("setof ") && !is_returns_table(&ret_lower) {
                 return Ok(None);
             }
 
@@ -138,7 +138,7 @@ async fn execute_sql_table_function(
     let lang = func_def.language.to_lowercase();
     if lang != "sql" {
         return Err(anyhow!(
-            "SETOF table functions only support LANGUAGE SQL, got '{}'",
+            "table functions only support LANGUAGE SQL, got '{}'",
             func_def.language
         ));
     }
@@ -153,7 +153,7 @@ async fn execute_sql_table_function(
 
     let stmt = last_select.ok_or_else(|| {
         anyhow!(
-            "SETOF function '{}' body contains no SELECT statement",
+            "table function '{}' body contains no SELECT statement",
             func_def.name
         )
     })?;
@@ -170,17 +170,20 @@ async fn execute_sql_table_function(
             ..
         } => {
             let ret_lower = func_def.return_type.to_lowercase();
-            let target_table = ret_lower
-                .strip_prefix("setof ")
-                .unwrap_or("")
-                .trim()
-                .to_string();
-
-            let schema = build_output_schema(&target_table, &columns, &column_types);
+            let schema = if let Some(declared_cols) = parse_returns_table_columns(&ret_lower) {
+                build_returns_table_schema(&declared_cols)
+            } else {
+                let target_table = ret_lower
+                    .strip_prefix("setof ")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                build_output_schema(&target_table, &columns, &column_types)
+            };
             Ok((schema, rows))
         }
         _ => Err(anyhow!(
-            "SETOF function '{}' body did not produce a SELECT result",
+            "table function '{}' body did not produce a SELECT result",
             func_def.name
         )),
     }
@@ -269,6 +272,94 @@ fn looks_like_type(s: &str) -> bool {
             | "tsquery"
             | "setof"
     )
+}
+
+fn is_returns_table(ret_lower: &str) -> bool {
+    ret_lower.starts_with("table(") || ret_lower.starts_with("table (")
+}
+
+fn parse_returns_table_columns(ret_lower: &str) -> Option<Vec<(String, crate::types::DataType)>> {
+    use crate::types::DataType;
+
+    let inner = ret_lower
+        .strip_prefix("table")
+        .and_then(|s| s.trim().strip_prefix('('))
+        .and_then(|s| s.strip_suffix(')'))?;
+
+    let mut cols = Vec::new();
+    for part in inner.split(',') {
+        let tokens: Vec<&str> = part.trim().split_whitespace().collect();
+        if tokens.len() < 2 {
+            return None;
+        }
+        let col_name = tokens[0].to_string();
+        let type_str = tokens[1..].join(" ").to_uppercase();
+        let dt = match type_str.as_str() {
+            "BOOL" | "BOOLEAN" => DataType::Boolean,
+            "INT" | "INTEGER" | "INT4" | "SMALLINT" | "INT2" => DataType::Int32,
+            "BIGINT" | "INT8" => DataType::Int64,
+            "REAL" | "FLOAT4" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" | "FLOAT" => {
+                DataType::Float64
+            }
+            "TEXT" | "VARCHAR" | "CHARACTER VARYING" | "CHAR" | "CHARACTER" => DataType::Text,
+            "NUMERIC" | "DECIMAL" => DataType::Numeric {
+                precision: None,
+                scale: None,
+            },
+            "DATE" => DataType::Date,
+            "TIME" => DataType::Time,
+            "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => DataType::Timestamp,
+            "TIMESTAMP WITH TIME ZONE" | "TIMESTAMPTZ" => DataType::TimestampTz,
+            "INTERVAL" => DataType::Interval,
+            "UUID" => DataType::Uuid,
+            "BYTEA" => DataType::Bytes,
+            "JSON" => DataType::Json,
+            "JSONB" => DataType::Jsonb,
+            "TSVECTOR" => DataType::Tsvector,
+            "TSQUERY" => DataType::Tsquery,
+            s if s.starts_with("VECTOR") => {
+                let dim = s
+                    .strip_prefix("VECTOR")
+                    .and_then(|r| r.trim().strip_prefix('('))
+                    .and_then(|r| r.strip_suffix(')'))
+                    .and_then(|r| r.trim().parse::<u32>().ok())
+                    .unwrap_or(0);
+                DataType::Vector(dim)
+            }
+            _ => DataType::Text,
+        };
+        cols.push((col_name, dt));
+    }
+    if cols.is_empty() {
+        None
+    } else {
+        Some(cols)
+    }
+}
+
+fn build_returns_table_schema(declared_cols: &[(String, crate::types::DataType)]) -> TableSchema {
+    use crate::types::ColumnDef;
+
+    let cols: Vec<ColumnDef> = declared_cols
+        .iter()
+        .map(|(name, dt)| ColumnDef {
+            name: name.clone(),
+            data_type: dt.clone(),
+            nullable: true,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+        })
+        .collect();
+
+    TableSchema {
+        table_id: 0,
+        name: String::new(),
+        columns: cols,
+        indexes: vec![],
+        ..Default::default()
+    }
 }
 
 fn build_output_schema(
