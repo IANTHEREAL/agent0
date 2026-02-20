@@ -185,6 +185,29 @@ impl CatalogSnapshot {
         result
     }
 
+    /// Return deduplicated `(qualified_name, schema_version)` for all real
+    /// (non-virtual) base tables in the snapshot.
+    pub fn base_table_versions(&self) -> Vec<(String, u64)> {
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        for (qualified_name, schema) in self.tables.values() {
+            // Skip entries explicitly marked as non-base (CTEs, virtual tables).
+            if self.non_base_names.contains(qualified_name.as_str()) {
+                continue;
+            }
+            // Skip schema-prefixed virtual catalog tables.
+            if qualified_name.starts_with("information_schema.")
+                || qualified_name.starts_with("pg_catalog.")
+            {
+                continue;
+            }
+            if seen.insert(qualified_name.as_str()) {
+                result.push((qualified_name.clone(), schema.version));
+            }
+        }
+        result
+    }
+
     /// Merge tables from another snapshot into this one (for DML + subquery).
     pub fn merge_from(&mut self, other: &CatalogSnapshot) {
         for (key, (qualified, schema)) in &other.tables {

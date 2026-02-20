@@ -55,6 +55,8 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
@@ -1633,6 +1635,8 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                                     output_schema,
                                     param_types,
                                     base_table_names,
+                                    table_versions,
+                                    has_recursive_cte,
                                 } => {
                                     let required_privileges = base_table_names
                                         .into_iter()
@@ -1649,15 +1653,18 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                                             locks,
                                             select_into,
                                             required_privileges,
+                                            has_recursive_cte,
                                         },
                                         output_schema,
                                         param_data_types: param_types,
+                                        table_versions,
                                     };
                                 }
                                 PreparedAnalysis::Dml {
                                     analyzed,
                                     output_schema,
                                     param_types,
+                                    table_versions,
                                 } => {
                                     let required_privileges =
                                         PreparedStatement::compute_privileges(&analyzed, &[]);
@@ -1673,6 +1680,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                                         },
                                         output_schema,
                                         param_data_types: param_types,
+                                        table_versions,
                                     };
                                 }
                                 PreparedAnalysis::Utility => {
@@ -1885,27 +1893,6 @@ impl ExtendedQueryHandler for DynamicPgHandler {
 
         debug!("Extended query: {}", prepared.sql);
 
-        // Determine execution SQL and parameter handling based on analysis state.
-        let (exec_sql, params) = match &prepared.exec {
-            PreparedExec::RawSqlUtility => {
-                // DDL/utility: Fix 4 rejects params at Parse time, so no
-                // substitution needed — execute original SQL directly.
-                debug_assert!(
-                    portal.statement.parameter_types.is_empty(),
-                    "RawSqlUtility should never have parameters after Fix 4"
-                );
-                (prepared.sql.clone(), vec![])
-            }
-            _ => {
-                // Analyzed statement: decode parameters into Values.
-                // The original SQL (with $1, $2, ...) is passed to the executor;
-                // the Analyzer creates Parameter IR nodes, and the typed evaluator
-                // reads values from the QUERY_PARAMS task-local.
-                let decoded = decode_parameters(portal)?;
-                (prepared.sql.clone(), decoded)
-            }
-        };
-
         let mut session_guard = self.session.lock().await;
         let session = session_guard.as_mut().ok_or_else(|| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -1924,24 +1911,31 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             ))));
         }
 
-        // Set decoded parameters on the session so they flow into
-        // QUERY_PARAMS via QueryContext.
-        if !params.is_empty() {
-            session.set_pending_params(params);
-        }
+        let exec_future: Pin<
+            Box<dyn Future<Output = Result<crate::sql::ExecuteResults, anyhow::Error>> + Send + '_>,
+        > = match &prepared.exec {
+            PreparedExec::RawSqlUtility => {
+                debug_assert!(
+                    portal.statement.parameter_types.is_empty(),
+                    "RawSqlUtility should never have parameters after Parse"
+                );
+                Box::pin(executor.execute(session, &prepared.sql))
+            }
+            PreparedExec::AnalyzedQuery { .. } | PreparedExec::AnalyzedDml { .. } => {
+                let params = decode_parameters(portal)?;
+                Box::pin(executor.execute_prepared(
+                    session,
+                    &prepared.sql,
+                    &prepared.exec,
+                    params,
+                    &prepared.param_data_types,
+                    &prepared.table_versions,
+                ))
+            }
+        };
+        let exec_results = exec_future.await;
 
-        // Thread Parse-time finalized types to execute-time Analyzer via
-        // QUERY_PARAM_TYPES task-local so re-analysis uses the same type hints.
-        if !prepared.param_data_types.is_empty() {
-            let param_types: Vec<Option<DataType>> = prepared
-                .param_data_types
-                .iter()
-                .map(|dt| Some(dt.clone()))
-                .collect();
-            session.set_pending_param_types(param_types);
-        }
-
-        match executor.execute(session, &exec_sql).await {
+        match exec_results {
             Ok(results) => {
                 session.record_command_complete();
                 let resp = send_notices_and_get_last_response_with_format(

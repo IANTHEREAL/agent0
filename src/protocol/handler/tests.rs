@@ -449,6 +449,85 @@ impl Sink<PgWireBackendMessage> for TestClient {
 }
 
 #[derive(Debug)]
+struct TestPreparedClient {
+    inner: DefaultClient<PreparedStatement>,
+    sent: Vec<PgWireBackendMessage>,
+}
+
+impl TestPreparedClient {
+    fn new() -> Self {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        Self {
+            inner: DefaultClient::new(addr, false),
+            sent: Vec::new(),
+        }
+    }
+}
+
+impl ClientInfo for TestPreparedClient {
+    fn socket_addr(&self) -> SocketAddr {
+        self.inner.socket_addr
+    }
+
+    fn is_secure(&self) -> bool {
+        self.inner.is_secure
+    }
+
+    fn state(&self) -> PgWireConnectionState {
+        self.inner.state
+    }
+
+    fn set_state(&mut self, new_state: PgWireConnectionState) {
+        self.inner.state = new_state;
+    }
+
+    fn transaction_status(&self) -> TransactionStatus {
+        self.inner.transaction_status
+    }
+
+    fn set_transaction_status(&mut self, new_status: TransactionStatus) {
+        self.inner.transaction_status = new_status;
+    }
+
+    fn metadata(&self) -> &HashMap<String, String> {
+        &self.inner.metadata
+    }
+
+    fn metadata_mut(&mut self) -> &mut HashMap<String, String> {
+        &mut self.inner.metadata
+    }
+}
+
+impl ClientPortalStore for TestPreparedClient {
+    type PortalStore = pgwire::api::store::MemPortalStore<PreparedStatement>;
+
+    fn portal_store(&self) -> &Self::PortalStore {
+        &self.inner.portal_store
+    }
+}
+
+impl Sink<PgWireBackendMessage> for TestPreparedClient {
+    type Error = PgWireError;
+
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: PgWireBackendMessage) -> Result<(), Self::Error> {
+        self.get_mut().sent.push(item);
+        Ok(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[derive(Debug)]
 struct StubExtendedQueryHandler {
     query_parser: Arc<NoopQueryParser>,
     rows: usize,
@@ -1473,7 +1552,127 @@ fn test_prepared_stmt(sql: &str) -> PreparedStatement {
         exec: PreparedExec::RawSqlUtility,
         output_schema: vec![],
         param_data_types: vec![],
+        table_versions: vec![],
     }
+}
+
+#[tokio::test]
+async fn extended_query_bind_parameter_count_mismatch_returns_08p01() {
+    let handler = test_dynamic_handler();
+    let mut client = TestPreparedClient::new();
+    let stmt = Arc::new(StoredStatement::new(
+        "stmt".to_string(),
+        test_prepared_stmt_analyzed(
+            "SELECT $1::int, $2::int",
+            vec![],
+            vec![DataType::Int32, DataType::Int32],
+        ),
+        vec![Type::INT4, Type::INT4],
+    ));
+    client
+        .portal_store()
+        .put_statement(stmt)
+        .expect("store statement");
+
+    let bind = pgwire::messages::extendedquery::Bind::new(
+        Some("portal".to_string()),
+        Some("stmt".to_string()),
+        vec![],
+        vec![Some(Bytes::from_static(b"1"))],
+        vec![],
+    );
+    let err = handler
+        .on_bind(&mut client, bind)
+        .await
+        .expect_err("bind should fail");
+    match err {
+        PgWireError::UserError(info) => {
+            assert_eq!(info.code, "08P01");
+            assert!(info.message.contains("bind message supplies 1 parameters"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+fn test_prepared_stmt_analyzed(
+    sql: &str,
+    output_schema: Vec<(String, DataType)>,
+    param_data_types: Vec<DataType>,
+) -> PreparedStatement {
+    let analyzed = crate::sql::analyzer::types::AnalyzedQuery {
+        ctes: vec![],
+        body: crate::sql::analyzer::types::AnalyzedQueryBody::Values(vec![vec![]]),
+        order_by: vec![],
+        limit: None,
+        offset: None,
+        output_schema: output_schema.clone(),
+    };
+    PreparedStatement {
+        sql: sql.to_string(),
+        exec: PreparedExec::AnalyzedQuery {
+            analyzed,
+            locks: vec![],
+            select_into: None,
+            required_privileges: vec![],
+            has_recursive_cte: false,
+        },
+        output_schema,
+        param_data_types,
+        table_versions: vec![],
+    }
+}
+
+fn test_dynamic_handler() -> DynamicPgHandler {
+    let pool = Arc::new(crate::pool::TikvClientPool::new(vec![]));
+    let server_config = crate::config::ServerConfig::default().shared();
+    DynamicPgHandler::new_with_pool(pool, None, server_config)
+}
+
+fn extract_query_schema(resp: Response<'static>) -> Vec<(String, Type)> {
+    let Response::Query(query) = resp else {
+        panic!("expected query response");
+    };
+    query
+        .row_schema()
+        .iter()
+        .map(|f| (f.name().to_string(), f.datatype().clone()))
+        .collect()
+}
+
+async fn assert_describe_execute_metadata_agreement(
+    sql: &str,
+    output_schema: Vec<(String, DataType)>,
+    param_types: Vec<Type>,
+) {
+    let handler = test_dynamic_handler();
+    let mut client = TestPreparedClient::new();
+    let prepared = test_prepared_stmt_analyzed(sql, output_schema.clone(), vec![]);
+    let stored = StoredStatement::new("stmt".to_string(), prepared, param_types);
+
+    let describe = handler
+        .do_describe_statement(&mut client, &stored)
+        .await
+        .expect("describe statement");
+    let describe_fields: Vec<(String, Type)> = describe
+        .fields
+        .iter()
+        .map(|f| (f.name().to_string(), f.datatype().clone()))
+        .collect();
+
+    let exec_columns: Vec<String> = output_schema.iter().map(|(n, _)| n.clone()).collect();
+    let exec_types: Vec<DataType> = output_schema.iter().map(|(_, t)| t.clone()).collect();
+    let execute_resp = result_to_response_with_format(
+        ExecuteResult::Select {
+            columns: exec_columns,
+            column_types: Some(exec_types),
+            rows: vec![],
+            timezone: Arc::<str>::from("UTC"),
+        },
+        &Format::UnifiedText,
+    )
+    .expect("encode execute response");
+    let execute_fields = extract_query_schema(execute_resp);
+    assert_eq!(describe_fields, execute_fields);
 }
 
 #[test]
@@ -1582,7 +1781,47 @@ fn test_decode_parameters_int4_text_format_invalid_errors() {
     portal.parameters = vec![Some(Bytes::from_static(b"not-a-number"))];
     portal.result_column_format = Format::UnifiedText;
 
-    assert!(decode_parameters(&portal).is_err());
+    let err = decode_parameters(&portal).unwrap_err();
+    match err {
+        PgWireError::UserError(info) => {
+            assert_eq!(info.code, "22P02");
+            assert!(info.message.contains("invalid input syntax"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn describe_execute_metadata_agreement_for_select() {
+    assert_describe_execute_metadata_agreement(
+        "SELECT id, name FROM t WHERE id = $1",
+        vec![
+            ("id".to_string(), DataType::Int32),
+            ("name".to_string(), DataType::Text),
+        ],
+        vec![Type::INT4],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn describe_execute_metadata_agreement_for_insert_returning() {
+    assert_describe_execute_metadata_agreement(
+        "INSERT INTO t VALUES ($1, $2) RETURNING id",
+        vec![("id".to_string(), DataType::Int32)],
+        vec![Type::INT4, Type::TEXT],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn describe_execute_metadata_agreement_for_update_returning() {
+    assert_describe_execute_metadata_agreement(
+        "UPDATE t SET name = $1 RETURNING name",
+        vec![("name".to_string(), DataType::Text)],
+        vec![Type::TEXT],
+    )
+    .await;
 }
 
 #[test]

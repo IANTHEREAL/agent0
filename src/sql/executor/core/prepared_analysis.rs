@@ -24,12 +24,15 @@ pub enum PreparedAnalysis {
         output_schema: Vec<(String, DataType)>,
         param_types: Vec<DataType>,
         base_table_names: Vec<String>,
+        table_versions: Vec<(String, u64)>,
+        has_recursive_cte: bool,
     },
     /// INSERT / UPDATE / DELETE — analyzed DML IR.
     Dml {
         analyzed: AnalyzedStatement,
         output_schema: Vec<(String, DataType)>,
         param_types: Vec<DataType>,
+        table_versions: Vec<(String, u64)>,
     },
     /// DDL / utility / non-analyzable statement.
     Utility,
@@ -116,6 +119,7 @@ impl Executor {
                     .into_iter()
                     .map(|s| s.to_string())
                     .collect();
+                let table_versions = catalog.base_table_versions();
 
                 // 8. Extract locks + SELECT INTO from original AST
                 let locks = query.locks.clone();
@@ -123,6 +127,7 @@ impl Executor {
                     SetExpr::Select(s) => s.into.clone(),
                     _ => None,
                 };
+                let has_recursive_cte = query_contains_recursive_cte(&expanded);
 
                 crate::sql::stack_safety::drop_on_grown_stack(expanded);
 
@@ -133,6 +138,8 @@ impl Executor {
                     output_schema,
                     param_types,
                     base_table_names,
+                    table_versions,
+                    has_recursive_cte,
                 })
             }
 
@@ -158,11 +165,13 @@ impl Executor {
                     AnalyzedStatement::Update(u) => returning_schema(&u.returning),
                     AnalyzedStatement::Delete(d) => returning_schema(&d.returning),
                 };
+                let table_versions = catalog.base_table_versions();
 
                 Ok(PreparedAnalysis::Dml {
                     analyzed: analyzed_stmt,
                     output_schema,
                     param_types,
+                    table_versions,
                 })
             }
 
@@ -346,4 +355,74 @@ fn recursive_seed_query(query: &Query, cte_name: &str) -> Result<Query> {
         limit_by: vec![],
         for_clause: None,
     })
+}
+
+fn query_contains_recursive_cte(query: &Query) -> bool {
+    struct RecursiveCteDetector {
+        has_recursive_cte: bool,
+    }
+
+    impl Visitor for RecursiveCteDetector {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<Self::Break> {
+            if let Some(with) = &q.with {
+                for cte in &with.cte_tables {
+                    let cte_name = cte.alias.name.value.to_lowercase();
+                    if with.recursive
+                        && crate::sql::executor::cte::cte_is_recursive(&cte.query, &cte_name)
+                    {
+                        self.has_recursive_cte = true;
+                        return ControlFlow::Break(());
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut detector = RecursiveCteDetector {
+        has_recursive_cte: false,
+    };
+    let _ = query.visit(&mut detector);
+    detector.has_recursive_cte
+}
+
+#[cfg(test)]
+mod tests {
+    use super::query_contains_recursive_cte;
+    use crate::sql::parse_sql;
+    use sqlparser::ast::Statement;
+
+    fn parse_query(sql: &str) -> sqlparser::ast::Query {
+        let mut stmts = parse_sql(sql).expect("parse sql");
+        let stmt = stmts.remove(0);
+        let Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+        *query
+    }
+
+    #[test]
+    fn detects_recursive_cte_in_root_query() {
+        let query = parse_query(
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+             SELECT * FROM t",
+        );
+        assert!(query_contains_recursive_cte(&query));
+    }
+
+    #[test]
+    fn ignores_non_recursive_cte() {
+        let query = parse_query("WITH t AS (SELECT 1) SELECT * FROM t");
+        assert!(!query_contains_recursive_cte(&query));
+    }
+
+    #[test]
+    fn detects_recursive_cte_in_nested_query() {
+        let query = parse_query(
+            "SELECT * FROM (WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 2) SELECT * FROM t) s",
+        );
+        assert!(query_contains_recursive_cte(&query));
+    }
 }

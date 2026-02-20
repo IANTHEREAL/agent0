@@ -15,7 +15,7 @@ use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::error::SqlError;
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::classify::needs_pre_materialization;
-use crate::sql::expr::traverse::{map_children_async, AsyncExprTransform};
+use crate::sql::expr::traverse::{for_each_child, map_children_async, AsyncExprTransform};
 use crate::sql::expr::typed_eval::{eval_const_usize, eval_typed_expr};
 use crate::sql::names;
 use crate::sql::sequences::resolve_sequence_full_name_from_value;
@@ -148,6 +148,143 @@ impl Executor {
         .await
     }
 
+    /// Materialize WITH CTEs from analyzed IR into runtime CTE bindings.
+    ///
+    /// This is used by prepared execution where we no longer have the original
+    /// SQL AST but still need deterministic CTE materialization.
+    pub(crate) fn build_cte_context_from_analyzed_with_base<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        db_id: u64,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        analyzed: &'a AnalyzedQuery,
+        base_ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> Pin<Box<dyn Future<Output = Result<HashMap<String, (TableSchema, Vec<Row>)>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut ctes: HashMap<String, (TableSchema, Vec<Row>)> = base_ctes.clone();
+            for cte in &analyzed.ctes {
+                let cte_scope = self
+                    .build_cte_context_from_analyzed_with_base(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        &cte.query,
+                        &ctes,
+                    )
+                    .await?;
+                let cte_result = self
+                    .execute_subquery(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        &cte.query,
+                        &cte_scope,
+                    )
+                    .await?;
+                match cte_result {
+                    ExecuteResult::Select {
+                        columns,
+                        column_types,
+                        rows,
+                        timezone: _,
+                    } => {
+                        let col_names: Vec<String> = if cte.columns.is_empty() {
+                            columns
+                        } else {
+                            cte.columns.iter().map(|(n, _)| n.clone()).collect()
+                        };
+                        let inferred_types: Vec<DataType> = if let Some(types) = column_types {
+                            types
+                        } else {
+                            crate::types::infer_column_types_from_rows(&rows, col_names.len())
+                        };
+                        let schema = TableSchema {
+                            table_id: 0,
+                            name: cte.name.clone(),
+                            columns: col_names
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, n)| crate::types::ColumnDef {
+                                    name: n.clone(),
+                                    // Index guard: unreachable when types and columns are aligned.
+                                    data_type: inferred_types
+                                        .get(idx)
+                                        .cloned()
+                                        .unwrap_or(DataType::Text),
+                                    nullable: true,
+                                    primary_key: false,
+                                    unique: false,
+                                    is_serial: false,
+                                    default_expr: None,
+                                })
+                                .collect(),
+                            pk_constraint_name: None,
+                            pk_indices: vec![],
+                            indexes: vec![],
+                            version: 1,
+                            check_constraints: vec![],
+                            foreign_keys: vec![],
+                            owner: String::new(),
+                            from_alias: None,
+                        };
+                        ctes.insert(cte.name.to_lowercase(), (schema, rows));
+                    }
+                    _ => return Err(anyhow!("CTE must be a SELECT query")),
+                }
+            }
+            ctes = self
+                .build_nested_ctes_from_analyzed_query_with_base(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    analyzed,
+                    &ctes,
+                )
+                .await?;
+            Ok(ctes)
+        })
+    }
+
+    /// Materialize CTE runtime bindings for nested (non-root) analyzed queries.
+    ///
+    /// Traverses subqueries in FROM/join trees, typed expressions, set-operation
+    /// branches, and query-level ORDER BY/LIMIT/OFFSET.
+    fn build_nested_ctes_from_analyzed_query_with_base<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        db_id: u64,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        analyzed: &'a AnalyzedQuery,
+        base_ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> Pin<Box<dyn Future<Output = Result<HashMap<String, (TableSchema, Vec<Row>)>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut ctes = base_ctes.clone();
+            let nested_queries = collect_immediate_nested_analyzed_queries(analyzed);
+
+            for nested_query in nested_queries {
+                ctes = self
+                    .build_cte_context_from_analyzed_with_base(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        nested_query,
+                        &ctes,
+                    )
+                    .await?;
+            }
+
+            Ok(ctes)
+        })
+    }
+
     // ── Subquery pre-materialization ────────────────────────────
 
     /// Pre-materialize all uncorrelated subqueries in a TypedExpr tree.
@@ -195,7 +332,7 @@ impl Executor {
     /// CTEs, VALUES, tableless SELECT, table functions, virtual catalog tables,
     /// subqueries, correlated subqueries, catalog-dependent functions,
     /// FOR UPDATE/SHARE row locking, and DISTINCT/DISTINCT ON.
-    async fn execute_via_optimizer(
+    pub(crate) async fn execute_via_optimizer(
         &self,
         txn: &mut Transaction,
         db_id: u64,
@@ -1885,6 +2022,133 @@ fn sort_projected_rows(
     Ok(rows[start..end].to_vec())
 }
 
+/// Collect immediate nested analyzed queries (excluding descendants).
+///
+/// This provides one-level query children only. The caller performs DFS by
+/// recursively materializing each child query, guaranteeing each subtree is
+/// visited exactly once.
+fn collect_immediate_nested_analyzed_queries<'a>(
+    query: &'a AnalyzedQuery,
+) -> Vec<&'a AnalyzedQuery> {
+    let mut out = Vec::new();
+    collect_immediate_from_query_body(&query.body, &mut out);
+    for ob in &query.order_by {
+        collect_immediate_from_typed_expr(&ob.expr, &mut out);
+    }
+    if let Some(limit) = &query.limit {
+        collect_immediate_from_typed_expr(limit, &mut out);
+    }
+    if let Some(offset) = &query.offset {
+        collect_immediate_from_typed_expr(offset, &mut out);
+    }
+    out
+}
+
+fn collect_immediate_from_query_body<'a>(
+    body: &'a AnalyzedQueryBody,
+    out: &mut Vec<&'a AnalyzedQuery>,
+) {
+    match body {
+        AnalyzedQueryBody::Select(select) => {
+            for table_ref in &select.from {
+                collect_immediate_from_table_ref(table_ref, out);
+            }
+            if let Some(where_clause) = &select.where_clause {
+                collect_immediate_from_typed_expr(where_clause, out);
+            }
+            for proj in &select.projection {
+                collect_immediate_from_typed_expr(&proj.expr, out);
+            }
+            for group_expr in &select.group_by {
+                collect_immediate_from_typed_expr(group_expr, out);
+            }
+            if let Some(having) = &select.having {
+                collect_immediate_from_typed_expr(having, out);
+            }
+            if let AnalyzedDistinct::DistinctOn(exprs) = &select.distinct {
+                for expr in exprs {
+                    collect_immediate_from_typed_expr(expr, out);
+                }
+            }
+        }
+        AnalyzedQueryBody::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    collect_immediate_from_typed_expr(expr, out);
+                }
+            }
+        }
+        AnalyzedQueryBody::SetOperation { left, right, .. } => {
+            out.push(left);
+            out.push(right);
+        }
+    }
+}
+
+fn collect_immediate_from_table_ref<'a>(
+    table_ref: &'a AnalyzedTableRef,
+    out: &mut Vec<&'a AnalyzedQuery>,
+) {
+    match &table_ref.kind {
+        AnalyzedTableRefKind::Table { .. } => {}
+        AnalyzedTableRefKind::Subquery(subquery) => {
+            out.push(subquery);
+        }
+        AnalyzedTableRefKind::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            collect_immediate_from_table_ref(left, out);
+            collect_immediate_from_table_ref(right, out);
+            if let JoinCondition::On(expr) = condition {
+                collect_immediate_from_typed_expr(expr, out);
+            }
+        }
+        AnalyzedTableRefKind::Function { args, .. } => {
+            for arg in args {
+                match arg {
+                    TypedFunctionArg::Positional(expr) => {
+                        collect_immediate_from_typed_expr(expr, out)
+                    }
+                    TypedFunctionArg::Named { expr, .. } => {
+                        collect_immediate_from_typed_expr(expr, out)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_immediate_from_typed_expr<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a AnalyzedQuery>) {
+    match &expr.kind {
+        TypedExprKind::ScalarSubquery(subquery)
+        | TypedExprKind::ArraySubquery(subquery)
+        | TypedExprKind::Exists { subquery, .. } => {
+            out.push(subquery);
+        }
+        TypedExprKind::InSubquery {
+            expr: lhs,
+            subquery,
+            ..
+        }
+        | TypedExprKind::AnyAll {
+            expr: lhs,
+            subquery,
+            ..
+        } => {
+            collect_immediate_from_typed_expr(lhs, out);
+            out.push(subquery);
+        }
+        _ => {
+            for_each_child(expr, &mut |child| {
+                collect_immediate_from_typed_expr(child, out)
+            });
+        }
+    }
+}
+
 /// Build a typed RHS constant for `AnyAll` comparisons.
 ///
 /// Runtime comparison rejects cross-type values, so we must preserve the
@@ -1945,6 +2209,38 @@ mod tests {
         )
     }
 
+    fn const_int(v: i32) -> TypedExpr {
+        TypedExpr::new(TypedExprKind::Constant(Value::Int32(v)), DataType::Int32)
+    }
+
+    fn values_query() -> AnalyzedQuery {
+        AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Values(vec![vec![const_int(1)]]),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("v".to_string(), DataType::Int32)],
+        }
+    }
+
+    fn query_with_cte(name: &str) -> AnalyzedQuery {
+        let cte = crate::sql::analyzer::types::AnalyzedCte {
+            name: name.to_string(),
+            query: values_query(),
+            columns: vec![("v".to_string(), DataType::Int32)],
+            materialized: None,
+        };
+        AnalyzedQuery {
+            ctes: vec![cte],
+            body: AnalyzedQueryBody::Values(vec![vec![const_int(2)]]),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("v".to_string(), DataType::Int32)],
+        }
+    }
+
     #[test]
     fn any_all_rhs_uses_implicit_cast_when_comparison_type_differs() {
         let rhs = build_any_all_rhs_constant_expr(
@@ -1987,5 +2283,132 @@ mod tests {
 
         let result = eval_typed_expr(&expr, &Row::new(vec![]), &test_qctx()).unwrap();
         assert_eq!(result, Value::Boolean(true));
+    }
+
+    #[test]
+    fn collect_immediate_nested_queries_finds_table_and_expr_subqueries() {
+        let from_subquery = query_with_cte("from_cte");
+        let expr_subquery = query_with_cte("expr_cte");
+        let root = AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection: vec![crate::sql::analyzer::types::AnalyzedProjection {
+                    expr: TypedExpr::new(
+                        TypedExprKind::ScalarSubquery(Box::new(expr_subquery)),
+                        DataType::Int32,
+                    ),
+                    output_name: "x".to_string(),
+                }],
+                from: vec![AnalyzedTableRef {
+                    kind: AnalyzedTableRefKind::Subquery(Box::new(from_subquery)),
+                    alias: Some("sq".to_string()),
+                }],
+                where_clause: None,
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("x".to_string(), DataType::Int32)],
+        };
+
+        let nested = collect_immediate_nested_analyzed_queries(&root);
+        let cte_names: Vec<String> = nested
+            .iter()
+            .map(|q| q.ctes.first().map(|c| c.name.clone()).unwrap_or_default())
+            .collect();
+        assert_eq!(
+            cte_names,
+            vec!["from_cte".to_string(), "expr_cte".to_string()]
+        );
+    }
+
+    #[test]
+    fn collect_immediate_nested_queries_finds_set_operation_branches() {
+        let left = query_with_cte("left_cte");
+        let right = query_with_cte("right_cte");
+        let root = AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::SetOperation {
+                op: crate::sql::analyzer::types::SetOpKind::Union,
+                all: true,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("v".to_string(), DataType::Int32)],
+        };
+
+        let nested = collect_immediate_nested_analyzed_queries(&root);
+        let cte_names: Vec<String> = nested
+            .iter()
+            .map(|q| q.ctes.first().map(|c| c.name.clone()).unwrap_or_default())
+            .collect();
+        assert_eq!(
+            cte_names,
+            vec!["left_cte".to_string(), "right_cte".to_string()]
+        );
+    }
+
+    #[test]
+    fn collect_immediate_nested_queries_excludes_descendants() {
+        let grandchild = query_with_cte("grandchild_cte");
+        let child = AnalyzedQuery {
+            ctes: vec![crate::sql::analyzer::types::AnalyzedCte {
+                name: "child_cte".to_string(),
+                query: values_query(),
+                columns: vec![("v".to_string(), DataType::Int32)],
+                materialized: None,
+            }],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection: vec![crate::sql::analyzer::types::AnalyzedProjection {
+                    expr: TypedExpr::new(
+                        TypedExprKind::ScalarSubquery(Box::new(grandchild)),
+                        DataType::Int32,
+                    ),
+                    output_name: "v".to_string(),
+                }],
+                from: vec![],
+                where_clause: None,
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("v".to_string(), DataType::Int32)],
+        };
+        let root = AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection: vec![],
+                from: vec![AnalyzedTableRef {
+                    kind: AnalyzedTableRefKind::Subquery(Box::new(child)),
+                    alias: Some("child".to_string()),
+                }],
+                where_clause: None,
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![],
+        };
+
+        let nested = collect_immediate_nested_analyzed_queries(&root);
+        assert_eq!(nested.len(), 1);
+        let first_name = nested[0]
+            .ctes
+            .first()
+            .map(|c| c.name.as_str())
+            .unwrap_or_default();
+        assert_eq!(first_name, "child_cte");
     }
 }
