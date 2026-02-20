@@ -257,8 +257,11 @@ enum CronAction {
     Create {
         /// Cron schedule expression (e.g., '*/5 * * * *')
         schedule: String,
-        /// SQL command to execute
-        command: String,
+        /// SQL command to execute (provide this or --file, not both)
+        command: Option<String>,
+        /// Read SQL command from a .sql file
+        #[arg(short, long, conflicts_with = "command")]
+        file: Option<String>,
         /// Optional job name (enables upsert semantics)
         #[arg(long)]
         name: Option<String>,
@@ -765,14 +768,16 @@ async fn main() {
                 CronAction::Create {
                     schedule,
                     command,
+                    file,
                     name,
                 } => {
+                    let sql_command = resolve_cron_command(command.as_deref(), file.as_deref());
                     cmd_cron_create(
                         &api,
                         &cli.effective_output(),
                         id,
                         schedule,
-                        command,
+                        &sql_command,
                         name.as_deref(),
                     )
                     .await
@@ -2934,6 +2939,29 @@ async fn cmd_cron_list(api: &ApiClient, output: &OutputFormat, id: &str) {
             1,
             repl::LinestyleMode::Ascii,
         ),
+    }
+}
+
+fn resolve_cron_command(command: Option<&str>, file: Option<&str>) -> String {
+    match (command, file) {
+        (Some(cmd), None) => cmd.to_string(),
+        (None, Some(path)) => {
+            let content = std::fs::read_to_string(path).unwrap_or_else(|e| {
+                eprintln!("error: cannot read '{}': {e}", path);
+                process::exit(1);
+            });
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                eprintln!("error: '{}' is empty", path);
+                process::exit(1);
+            }
+            trimmed.to_string()
+        }
+        (None, None) => {
+            eprintln!("error: provide a SQL command or --file");
+            process::exit(1);
+        }
+        (Some(_), Some(_)) => unreachable!(),
     }
 }
 
