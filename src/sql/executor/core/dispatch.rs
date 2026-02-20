@@ -50,6 +50,12 @@ enum PreparedTxnResult {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedObservabilityMode {
+    Normal,
+    Observability,
+}
+
 impl Executor {
     /// Execute a SQL statement string using the provided session.
     ///
@@ -168,30 +174,37 @@ impl Executor {
 
                 let observability_policy =
                     self.enforce_observability_prepared_policy(session, sql_trimmed, exec);
-                let is_observability_query =
-                    observability_policy.as_ref().copied().unwrap_or(false);
 
                 let start = Instant::now();
-                let exec_result = match observability_policy {
-                    Ok(is_observability_query) => {
-                        self.execute_prepared_with_runtime_context(
-                            session,
-                            sql,
-                            exec,
-                            table_versions,
-                            qctx.as_ref(),
-                            is_observability_query,
+                let (exec_result, should_record_statement) = match observability_policy {
+                    Ok(mode) => {
+                        let is_observability_query =
+                            matches!(mode, PreparedObservabilityMode::Observability);
+                        (
+                            self.execute_prepared_with_runtime_context(
+                                session,
+                                sql,
+                                exec,
+                                table_versions,
+                                qctx.as_ref(),
+                                is_observability_query,
+                            )
+                            .await,
+                            matches!(mode, PreparedObservabilityMode::Normal),
                         )
-                        .await
                     }
-                    Err(err) => Err(err),
+                    Err(err) => {
+                        // Keep parity with execute_single: denied observability
+                        // statements are rejected before per-statement recording.
+                        (Err(err), false)
+                    }
                 };
 
                 if exec_result.is_err() && session.is_in_transaction() {
                     session.mark_transaction_failed();
                 }
 
-                if !is_observability_query {
+                if should_record_statement {
                     self.observability.record_statement(
                         start.elapsed(),
                         exec_result.is_ok(),
@@ -409,11 +422,11 @@ impl Executor {
         session: &mut Session,
         sql_trimmed: &str,
         exec: &PreparedExec,
-    ) -> Result<bool> {
+    ) -> Result<PreparedObservabilityMode> {
         let is_observability_user =
             session.current_user() == Some(OBSERVABILITY_USER) && !session.is_superuser();
         if !is_observability_user {
-            return Ok(false);
+            return Ok(PreparedObservabilityMode::Normal);
         }
 
         // Prepared analyzed path only handles SELECT/DML. For observability users,
@@ -454,7 +467,7 @@ impl Executor {
             .into());
         }
 
-        Ok(true)
+        Ok(PreparedObservabilityMode::Observability)
     }
 
     async fn execute_prepared_text_fallback(
