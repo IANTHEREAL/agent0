@@ -880,168 +880,24 @@ pub fn reindex_join_condition(condition: &JoinCondition, offset: usize) -> JoinC
 
 /// Recursively clone a TypedExpr, subtracting `offset` from all
 /// `ColumnRef.column_index` where `scope_depth == 0` (current-scope refs only).
+///
+/// Uses [`crate::sql::expr::traverse::map_children`] for canonical child recursion.
+/// Previously skipped variants (WindowCall, SimilarTo, Row, ArrayLiteral) are now
+/// correctly reindexed — this is a correctness fix, not a regression.
 pub fn reindex_typed_expr(expr: &TypedExpr, offset: usize) -> TypedExpr {
+    use crate::sql::expr::traverse::map_children;
+
     let kind = match &expr.kind {
         TypedExprKind::ColumnRef {
             scope_depth,
             column_index,
             column_name,
-        } => {
-            if *scope_depth == 0 {
-                TypedExprKind::ColumnRef {
-                    scope_depth: 0,
-                    column_index: column_index.saturating_sub(offset),
-                    column_name: column_name.clone(),
-                }
-            } else {
-                expr.kind.clone()
-            }
-        }
-        TypedExprKind::BinaryOp { left, right, op } => TypedExprKind::BinaryOp {
-            left: Box::new(reindex_typed_expr(left, offset)),
-            op: op.clone(),
-            right: Box::new(reindex_typed_expr(right, offset)),
+        } if *scope_depth == 0 => TypedExprKind::ColumnRef {
+            scope_depth: 0,
+            column_index: column_index.saturating_sub(offset),
+            column_name: column_name.clone(),
         },
-        TypedExprKind::UnaryOp { operand, op } => TypedExprKind::UnaryOp {
-            operand: Box::new(reindex_typed_expr(operand, offset)),
-            op: *op,
-        },
-        TypedExprKind::Cast {
-            expr: inner,
-            target_type,
-            cast_context,
-        } => TypedExprKind::Cast {
-            expr: Box::new(reindex_typed_expr(inner, offset)),
-            target_type: target_type.clone(),
-            cast_context: *cast_context,
-        },
-        TypedExprKind::IsTest {
-            expr: inner,
-            test,
-            negated,
-        } => TypedExprKind::IsTest {
-            expr: Box::new(reindex_typed_expr(inner, offset)),
-            test: *test,
-            negated: *negated,
-        },
-        TypedExprKind::Between {
-            expr: inner,
-            low,
-            high,
-            negated,
-        } => TypedExprKind::Between {
-            expr: Box::new(reindex_typed_expr(inner, offset)),
-            low: Box::new(reindex_typed_expr(low, offset)),
-            high: Box::new(reindex_typed_expr(high, offset)),
-            negated: *negated,
-        },
-        TypedExprKind::InList {
-            expr: inner,
-            list,
-            negated,
-        } => TypedExprKind::InList {
-            expr: Box::new(reindex_typed_expr(inner, offset)),
-            list: list.iter().map(|e| reindex_typed_expr(e, offset)).collect(),
-            negated: *negated,
-        },
-        TypedExprKind::Like {
-            expr: inner,
-            pattern,
-            escape,
-            case_insensitive,
-            negated,
-        } => TypedExprKind::Like {
-            expr: Box::new(reindex_typed_expr(inner, offset)),
-            pattern: Box::new(reindex_typed_expr(pattern, offset)),
-            escape: escape
-                .as_ref()
-                .map(|e| Box::new(reindex_typed_expr(e, offset))),
-            case_insensitive: *case_insensitive,
-            negated: *negated,
-        },
-        TypedExprKind::SimilarTo {
-            expr: inner,
-            pattern,
-            escape,
-            negated,
-        } => TypedExprKind::SimilarTo {
-            expr: Box::new(reindex_typed_expr(inner, offset)),
-            pattern: Box::new(reindex_typed_expr(pattern, offset)),
-            escape: escape
-                .as_ref()
-                .map(|e| Box::new(reindex_typed_expr(e, offset))),
-            negated: *negated,
-        },
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => TypedExprKind::Case {
-            operand: operand
-                .as_ref()
-                .map(|e| Box::new(reindex_typed_expr(e, offset))),
-            when_clauses: when_clauses
-                .iter()
-                .map(|(w, t)| (reindex_typed_expr(w, offset), reindex_typed_expr(t, offset)))
-                .collect(),
-            else_result: else_result
-                .as_ref()
-                .map(|e| Box::new(reindex_typed_expr(e, offset))),
-        },
-        TypedExprKind::Coalesce(args) => {
-            TypedExprKind::Coalesce(args.iter().map(|a| reindex_typed_expr(a, offset)).collect())
-        }
-        TypedExprKind::NullIf(a, b) => TypedExprKind::NullIf(
-            Box::new(reindex_typed_expr(a, offset)),
-            Box::new(reindex_typed_expr(b, offset)),
-        ),
-        TypedExprKind::MinMax { args, is_greatest } => TypedExprKind::MinMax {
-            args: args.iter().map(|a| reindex_typed_expr(a, offset)).collect(),
-            is_greatest: *is_greatest,
-        },
-        TypedExprKind::FunctionCall {
-            func,
-            args,
-            order_by,
-            filter,
-        } => TypedExprKind::FunctionCall {
-            func: func.clone(),
-            args: args.iter().map(|a| reindex_typed_expr(a, offset)).collect(),
-            order_by: order_by.clone(),
-            filter: filter
-                .as_ref()
-                .map(|f| Box::new(reindex_typed_expr(f, offset))),
-        },
-        TypedExprKind::AggregateCall {
-            func,
-            args,
-            distinct,
-            order_by,
-            filter,
-        } => TypedExprKind::AggregateCall {
-            func: func.clone(),
-            args: args.iter().map(|a| reindex_typed_expr(a, offset)).collect(),
-            distinct: *distinct,
-            order_by: order_by.clone(),
-            filter: filter
-                .as_ref()
-                .map(|f| Box::new(reindex_typed_expr(f, offset))),
-        },
-        TypedExprKind::ArrayIndex { array, index } => TypedExprKind::ArrayIndex {
-            array: Box::new(reindex_typed_expr(array, offset)),
-            index: Box::new(reindex_typed_expr(index, offset)),
-        },
-        TypedExprKind::JsonAccess {
-            expr: inner,
-            path,
-            operator,
-        } => TypedExprKind::JsonAccess {
-            expr: Box::new(reindex_typed_expr(inner, offset)),
-            path: Box::new(reindex_typed_expr(path, offset)),
-            operator: *operator,
-        },
-        // Leaf/opaque nodes: subqueries, constants, etc. — no reindexing needed.
-        _ => expr.kind.clone(),
+        _ => map_children(expr, &mut |child| reindex_typed_expr(child, offset)),
     };
     TypedExpr {
         kind,

@@ -4,98 +4,21 @@
 //! sync-safe subtrees and avoids folding function/subquery nodes directly.
 
 use crate::sql::analyzer::types::{
-    FunctionKind, ResolvedFunction, TypedExpr, TypedExprKind, TypedOrderByExpr, WindowFrame,
-    WindowFrameBound,
+    FunctionKind, ResolvedFunction, TypedExpr, TypedExprKind, TypedOrderByExpr,
 };
+use crate::sql::expr::traverse::map_children;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::expr::typed_visit::expr_any;
 use crate::sql::query_context::QueryContext;
 use crate::types::{Row, Value};
 
 /// Fold row-independent constant subtrees inside a typed expression.
+///
+/// Uses [`map_children`] for canonical child recursion. The `Case` variant
+/// retains custom dead-branch-elimination logic.
 pub fn fold_typed_expr(expr: &TypedExpr, qctx: &QueryContext) -> TypedExpr {
     let kind = match &expr.kind {
-        TypedExprKind::Constant(v) => TypedExprKind::Constant(v.clone()),
-        TypedExprKind::ColumnRef {
-            scope_depth,
-            column_index,
-            column_name,
-        } => TypedExprKind::ColumnRef {
-            scope_depth: *scope_depth,
-            column_index: *column_index,
-            column_name: column_name.clone(),
-        },
-        TypedExprKind::BinaryOp { left, op, right } => TypedExprKind::BinaryOp {
-            left: Box::new(fold_typed_expr(left, qctx)),
-            op: op.clone(),
-            right: Box::new(fold_typed_expr(right, qctx)),
-        },
-        TypedExprKind::UnaryOp { op, operand } => TypedExprKind::UnaryOp {
-            op: *op,
-            operand: Box::new(fold_typed_expr(operand, qctx)),
-        },
-        TypedExprKind::Cast {
-            expr: inner,
-            target_type,
-            cast_context,
-        } => TypedExprKind::Cast {
-            expr: Box::new(fold_typed_expr(inner, qctx)),
-            target_type: target_type.clone(),
-            cast_context: *cast_context,
-        },
-        TypedExprKind::IsTest {
-            expr: inner,
-            test,
-            negated,
-        } => TypedExprKind::IsTest {
-            expr: Box::new(fold_typed_expr(inner, qctx)),
-            test: *test,
-            negated: *negated,
-        },
-        TypedExprKind::Between {
-            expr: inner,
-            low,
-            high,
-            negated,
-        } => TypedExprKind::Between {
-            expr: Box::new(fold_typed_expr(inner, qctx)),
-            low: Box::new(fold_typed_expr(low, qctx)),
-            high: Box::new(fold_typed_expr(high, qctx)),
-            negated: *negated,
-        },
-        TypedExprKind::InList {
-            expr: inner,
-            list,
-            negated,
-        } => TypedExprKind::InList {
-            expr: Box::new(fold_typed_expr(inner, qctx)),
-            list: list.iter().map(|e| fold_typed_expr(e, qctx)).collect(),
-            negated: *negated,
-        },
-        TypedExprKind::Like {
-            expr: inner,
-            pattern,
-            escape,
-            case_insensitive,
-            negated,
-        } => TypedExprKind::Like {
-            expr: Box::new(fold_typed_expr(inner, qctx)),
-            pattern: Box::new(fold_typed_expr(pattern, qctx)),
-            escape: escape.as_ref().map(|e| Box::new(fold_typed_expr(e, qctx))),
-            case_insensitive: *case_insensitive,
-            negated: *negated,
-        },
-        TypedExprKind::SimilarTo {
-            expr: inner,
-            pattern,
-            escape,
-            negated,
-        } => TypedExprKind::SimilarTo {
-            expr: Box::new(fold_typed_expr(inner, qctx)),
-            pattern: Box::new(fold_typed_expr(pattern, qctx)),
-            escape: escape.as_ref().map(|e| Box::new(fold_typed_expr(e, qctx))),
-            negated: *negated,
-        },
+        // Case: custom dead-branch elimination (preserves existing semantics)
         TypedExprKind::Case {
             operand,
             when_clauses,
@@ -137,104 +60,8 @@ pub fn fold_typed_expr(expr: &TypedExpr, qctx: &QueryContext) -> TypedExpr {
                 else_result: folded_else,
             }
         }
-        TypedExprKind::Coalesce(args) => {
-            TypedExprKind::Coalesce(args.iter().map(|e| fold_typed_expr(e, qctx)).collect())
-        }
-        TypedExprKind::NullIf(a, b) => TypedExprKind::NullIf(
-            Box::new(fold_typed_expr(a, qctx)),
-            Box::new(fold_typed_expr(b, qctx)),
-        ),
-        TypedExprKind::MinMax { args, is_greatest } => TypedExprKind::MinMax {
-            args: args.iter().map(|e| fold_typed_expr(e, qctx)).collect(),
-            is_greatest: *is_greatest,
-        },
-        TypedExprKind::FunctionCall {
-            func,
-            args,
-            order_by,
-            filter,
-        } => TypedExprKind::FunctionCall {
-            func: func.clone(),
-            args: args.iter().map(|e| fold_typed_expr(e, qctx)).collect(),
-            order_by: fold_order_by(order_by, qctx),
-            filter: filter.as_ref().map(|f| Box::new(fold_typed_expr(f, qctx))),
-        },
-        TypedExprKind::AggregateCall {
-            func,
-            args,
-            distinct,
-            order_by,
-            filter,
-        } => TypedExprKind::AggregateCall {
-            func: func.clone(),
-            args: args.iter().map(|e| fold_typed_expr(e, qctx)).collect(),
-            distinct: *distinct,
-            order_by: fold_order_by(order_by, qctx),
-            filter: filter.as_ref().map(|f| Box::new(fold_typed_expr(f, qctx))),
-        },
-        TypedExprKind::WindowCall {
-            func,
-            args,
-            partition_by,
-            order_by,
-            window_frame,
-        } => TypedExprKind::WindowCall {
-            func: func.clone(),
-            args: args.iter().map(|e| fold_typed_expr(e, qctx)).collect(),
-            partition_by: partition_by
-                .iter()
-                .map(|e| fold_typed_expr(e, qctx))
-                .collect(),
-            order_by: fold_order_by(order_by, qctx),
-            window_frame: fold_window_frame(window_frame, qctx),
-        },
-        TypedExprKind::ScalarSubquery(q) => TypedExprKind::ScalarSubquery(q.clone()),
-        TypedExprKind::Exists { subquery, negated } => TypedExprKind::Exists {
-            subquery: subquery.clone(),
-            negated: *negated,
-        },
-        TypedExprKind::InSubquery {
-            expr: inner,
-            subquery,
-            negated,
-        } => TypedExprKind::InSubquery {
-            expr: Box::new(fold_typed_expr(inner, qctx)),
-            subquery: subquery.clone(),
-            negated: *negated,
-        },
-        TypedExprKind::AnyAll {
-            expr: inner,
-            op,
-            subquery,
-            is_all,
-        } => TypedExprKind::AnyAll {
-            expr: Box::new(fold_typed_expr(inner, qctx)),
-            op: op.clone(),
-            subquery: subquery.clone(),
-            is_all: *is_all,
-        },
-        TypedExprKind::ArraySubquery(q) => TypedExprKind::ArraySubquery(q.clone()),
-        TypedExprKind::ArrayLiteral(args) => {
-            TypedExprKind::ArrayLiteral(args.iter().map(|e| fold_typed_expr(e, qctx)).collect())
-        }
-        TypedExprKind::ArrayIndex { array, index } => TypedExprKind::ArrayIndex {
-            array: Box::new(fold_typed_expr(array, qctx)),
-            index: Box::new(fold_typed_expr(index, qctx)),
-        },
-        TypedExprKind::JsonAccess {
-            expr: inner,
-            path,
-            operator,
-        } => TypedExprKind::JsonAccess {
-            expr: Box::new(fold_typed_expr(inner, qctx)),
-            path: Box::new(fold_typed_expr(path, qctx)),
-            operator: *operator,
-        },
-        TypedExprKind::Row(args) => {
-            TypedExprKind::Row(args.iter().map(|e| fold_typed_expr(e, qctx)).collect())
-        }
-        TypedExprKind::Default => TypedExprKind::Default,
-        TypedExprKind::Parameter { index } => TypedExprKind::Parameter { index: *index },
+        // Everything else: canonical child recursion
+        _ => map_children(expr, &mut |child| fold_typed_expr(child, qctx)),
     };
 
     let rebuilt = TypedExpr {
@@ -242,37 +69,6 @@ pub fn fold_typed_expr(expr: &TypedExpr, qctx: &QueryContext) -> TypedExpr {
         data_type: expr.data_type.clone(),
     };
     fold_subtree_if_safe(rebuilt, qctx)
-}
-
-fn fold_order_by(order_by: &[TypedOrderByExpr], qctx: &QueryContext) -> Vec<TypedOrderByExpr> {
-    order_by
-        .iter()
-        .map(|ob| TypedOrderByExpr {
-            expr: fold_typed_expr(&ob.expr, qctx),
-            asc: ob.asc,
-            nulls_first: ob.nulls_first,
-        })
-        .collect()
-}
-
-fn fold_window_frame(frame: &Option<WindowFrame>, qctx: &QueryContext) -> Option<WindowFrame> {
-    frame.as_ref().map(|f| WindowFrame {
-        units: f.units,
-        start: fold_window_frame_bound(&f.start, qctx),
-        end: f.end.as_ref().map(|b| fold_window_frame_bound(b, qctx)),
-    })
-}
-
-fn fold_window_frame_bound(bound: &WindowFrameBound, qctx: &QueryContext) -> WindowFrameBound {
-    match bound {
-        WindowFrameBound::CurrentRow => WindowFrameBound::CurrentRow,
-        WindowFrameBound::Preceding(v) => {
-            WindowFrameBound::Preceding(v.as_ref().map(|e| Box::new(fold_typed_expr(e, qctx))))
-        }
-        WindowFrameBound::Following(v) => {
-            WindowFrameBound::Following(v.as_ref().map(|e| Box::new(fold_typed_expr(e, qctx))))
-        }
-    }
 }
 
 fn fold_subtree_if_safe(expr: TypedExpr, qctx: &QueryContext) -> TypedExpr {

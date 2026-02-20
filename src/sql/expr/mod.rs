@@ -7,6 +7,7 @@ pub mod functions;
 mod numeric;
 pub(crate) mod operators;
 pub mod static_eval;
+pub(crate) mod traverse;
 pub mod typed_eval;
 pub mod typed_fold;
 pub mod typed_rewrite;

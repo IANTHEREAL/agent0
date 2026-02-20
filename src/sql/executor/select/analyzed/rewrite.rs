@@ -49,38 +49,9 @@ pub(super) fn has_aggregates(select: &AnalyzedSelect) -> bool {
 
 /// Check if a TypedExpr tree contains an AggregateCall.
 pub(super) fn contains_aggregate(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        TypedExprKind::AggregateCall { .. } => true,
-        TypedExprKind::BinaryOp { left, right, .. } => {
-            contains_aggregate(left) || contains_aggregate(right)
-        }
-        TypedExprKind::UnaryOp { operand, .. } => contains_aggregate(operand),
-        TypedExprKind::Cast { expr, .. } => contains_aggregate(expr),
-        TypedExprKind::IsTest { expr, .. } => contains_aggregate(expr),
-        TypedExprKind::Between {
-            expr, low, high, ..
-        } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
-        TypedExprKind::InList { expr, list, .. } => {
-            contains_aggregate(expr) || list.iter().any(contains_aggregate)
-        }
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            operand.as_ref().is_some_and(|e| contains_aggregate(e))
-                || when_clauses
-                    .iter()
-                    .any(|(w, t)| contains_aggregate(w) || contains_aggregate(t))
-                || else_result.as_ref().is_some_and(|e| contains_aggregate(e))
-        }
-        TypedExprKind::Coalesce(args) | TypedExprKind::MinMax { args, .. } => {
-            args.iter().any(contains_aggregate)
-        }
-        TypedExprKind::NullIf(a, b) => contains_aggregate(a) || contains_aggregate(b),
-        TypedExprKind::FunctionCall { args, .. } => args.iter().any(contains_aggregate),
-        _ => false,
-    }
+    crate::sql::expr::traverse::visit_any(expr, |e| {
+        matches!(e.kind, TypedExprKind::AggregateCall { .. })
+    })
 }
 
 /// Aggregate analysis info for building the post-aggregate pipeline.
@@ -157,123 +128,51 @@ pub(super) fn build_aggregate_analysis(
 /// Recursively collect AggregateCall nodes from a TypedExpr, deduplicating
 /// by display key. Does NOT recurse into AggregateCall children (they are
 /// input-level expressions evaluated by the aggregate operator itself).
+///
+/// Uses [`crate::sql::expr::traverse::for_each_child`] for canonical child
+/// enumeration, but handles AggregateCall explicitly to stop recursion there.
 pub(super) fn collect_aggregates_from_expr(expr: &TypedExpr, analysis: &mut AggregateAnalysis) {
-    match &expr.kind {
-        TypedExprKind::AggregateCall {
-            func,
-            args,
-            distinct,
-            order_by,
-            filter,
-        } => {
-            let key = agg_display_key(func, args, *distinct, filter);
-            if !analysis.agg_key_to_index.contains_key(&key) {
-                let idx = analysis.aggregate_exprs.len();
-                let agg_expr = AggregateExpr {
-                    func_name: func.name.to_uppercase(),
-                    arg: args.first().cloned(),
-                    distinct: *distinct,
-                    delimiter: if func.name.eq_ignore_ascii_case("STRING_AGG") {
-                        args.get(1).and_then(|e| match &e.kind {
-                            TypedExprKind::Constant(Value::Text(s)) => Some(s.clone()),
-                            _ => None,
-                        })
-                    } else {
-                        None
-                    },
-                    filter: filter.as_ref().map(|f| *f.clone()),
-                    order_by: order_by.clone(),
-                };
-                analysis
-                    .aggregate_names
-                    .push(format!("{}_{}", func.name.to_lowercase(), idx));
-                analysis.aggregate_types.push(expr.data_type.clone());
-                analysis.aggregate_exprs.push(agg_expr);
-                analysis.agg_key_to_index.insert(key, idx);
-            }
-            // Don't recurse — aggregate args are evaluated against pre-aggregate rows.
+    if let TypedExprKind::AggregateCall {
+        func,
+        args,
+        distinct,
+        order_by,
+        filter,
+    } = &expr.kind
+    {
+        let key = agg_display_key(func, args, *distinct, filter);
+        if !analysis.agg_key_to_index.contains_key(&key) {
+            let idx = analysis.aggregate_exprs.len();
+            let agg_expr = AggregateExpr {
+                func_name: func.name.to_uppercase(),
+                arg: args.first().cloned(),
+                distinct: *distinct,
+                delimiter: if func.name.eq_ignore_ascii_case("STRING_AGG") {
+                    args.get(1).and_then(|e| match &e.kind {
+                        TypedExprKind::Constant(Value::Text(s)) => Some(s.clone()),
+                        _ => None,
+                    })
+                } else {
+                    None
+                },
+                filter: filter.as_ref().map(|f| *f.clone()),
+                order_by: order_by.clone(),
+            };
+            analysis
+                .aggregate_names
+                .push(format!("{}_{}", func.name.to_lowercase(), idx));
+            analysis.aggregate_types.push(expr.data_type.clone());
+            analysis.aggregate_exprs.push(agg_expr);
+            analysis.agg_key_to_index.insert(key, idx);
         }
-
-        // Recurse into children to find nested aggregates (e.g. COUNT(*) + 1).
-        TypedExprKind::BinaryOp { left, right, .. } => {
-            collect_aggregates_from_expr(left, analysis);
-            collect_aggregates_from_expr(right, analysis);
-        }
-        TypedExprKind::UnaryOp { operand, .. } | TypedExprKind::Cast { expr: operand, .. } => {
-            collect_aggregates_from_expr(operand, analysis);
-        }
-        TypedExprKind::IsTest { expr, .. } => {
-            collect_aggregates_from_expr(expr, analysis);
-        }
-        TypedExprKind::Between {
-            expr, low, high, ..
-        } => {
-            collect_aggregates_from_expr(expr, analysis);
-            collect_aggregates_from_expr(low, analysis);
-            collect_aggregates_from_expr(high, analysis);
-        }
-        TypedExprKind::InList { expr, list, .. } => {
-            collect_aggregates_from_expr(expr, analysis);
-            for item in list {
-                collect_aggregates_from_expr(item, analysis);
-            }
-        }
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            if let Some(op) = operand {
-                collect_aggregates_from_expr(op, analysis);
-            }
-            for (w, t) in when_clauses {
-                collect_aggregates_from_expr(w, analysis);
-                collect_aggregates_from_expr(t, analysis);
-            }
-            if let Some(el) = else_result {
-                collect_aggregates_from_expr(el, analysis);
-            }
-        }
-        TypedExprKind::Coalesce(args)
-        | TypedExprKind::MinMax { args, .. }
-        | TypedExprKind::ArrayLiteral(args)
-        | TypedExprKind::Row(args) => {
-            for arg in args {
-                collect_aggregates_from_expr(arg, analysis);
-            }
-        }
-        TypedExprKind::NullIf(a, b) => {
-            collect_aggregates_from_expr(a, analysis);
-            collect_aggregates_from_expr(b, analysis);
-        }
-        TypedExprKind::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_aggregates_from_expr(arg, analysis);
-            }
-        }
-        TypedExprKind::Like { expr, pattern, .. }
-        | TypedExprKind::SimilarTo { expr, pattern, .. } => {
-            collect_aggregates_from_expr(expr, analysis);
-            collect_aggregates_from_expr(pattern, analysis);
-        }
-        TypedExprKind::ArrayIndex { array, index } => {
-            collect_aggregates_from_expr(array, analysis);
-            collect_aggregates_from_expr(index, analysis);
-        }
-        TypedExprKind::JsonAccess { expr, .. } => {
-            collect_aggregates_from_expr(expr, analysis);
-        }
-        // Leaf nodes and opaque nodes.
-        TypedExprKind::Constant(_)
-        | TypedExprKind::ColumnRef { .. }
-        | TypedExprKind::WindowCall { .. }
-        | TypedExprKind::ScalarSubquery(_)
-        | TypedExprKind::ArraySubquery(_)
-        | TypedExprKind::Exists { .. }
-        | TypedExprKind::InSubquery { .. }
-        | TypedExprKind::AnyAll { .. }
-        | TypedExprKind::Default => {}
+        // Don't recurse — aggregate args are evaluated against pre-aggregate rows.
+        return;
     }
+
+    // Recurse into children to find nested aggregates (e.g. COUNT(*) + 1).
+    crate::sql::expr::traverse::for_each_child(expr, &mut |child| {
+        collect_aggregates_from_expr(child, analysis);
+    });
 }
 
 /// Build a display key for an AggregateCall for deduplication.

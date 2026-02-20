@@ -8,64 +8,9 @@ use crate::sql::operators::WindowFunctionExpr;
 
 /// Check if a TypedExpr tree contains a WindowCall.
 pub fn contains_window(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        TypedExprKind::WindowCall { .. } => true,
-        TypedExprKind::BinaryOp { left, right, .. } => {
-            contains_window(left) || contains_window(right)
-        }
-        TypedExprKind::UnaryOp { operand, .. } | TypedExprKind::Cast { expr: operand, .. } => {
-            contains_window(operand)
-        }
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            operand.as_ref().is_some_and(|e| contains_window(e))
-                || when_clauses
-                    .iter()
-                    .any(|(w, t)| contains_window(w) || contains_window(t))
-                || else_result.as_ref().is_some_and(|e| contains_window(e))
-        }
-        TypedExprKind::Coalesce(args) | TypedExprKind::MinMax { args, .. } => {
-            args.iter().any(contains_window)
-        }
-        TypedExprKind::NullIf(a, b) => contains_window(a) || contains_window(b),
-        TypedExprKind::FunctionCall { args, .. } => args.iter().any(contains_window),
-        TypedExprKind::IsTest { expr, .. } => contains_window(expr),
-        TypedExprKind::Between {
-            expr, low, high, ..
-        } => contains_window(expr) || contains_window(low) || contains_window(high),
-        TypedExprKind::InList { expr, list, .. } => {
-            contains_window(expr) || list.iter().any(contains_window)
-        }
-        TypedExprKind::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        }
-        | TypedExprKind::SimilarTo {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            contains_window(expr)
-                || contains_window(pattern)
-                || escape.as_ref().is_some_and(|e| contains_window(e))
-        }
-        TypedExprKind::ArrayLiteral(elems) | TypedExprKind::Row(elems) => {
-            elems.iter().any(contains_window)
-        }
-        TypedExprKind::ArrayIndex { array, index } => {
-            contains_window(array) || contains_window(index)
-        }
-        TypedExprKind::JsonAccess { expr, path, .. } => {
-            contains_window(expr) || contains_window(path)
-        }
-        _ => false,
-    }
+    crate::sql::expr::traverse::visit_any(expr, |e| {
+        matches!(e.kind, TypedExprKind::WindowCall { .. })
+    })
 }
 
 /// Recursively collect WindowCall nodes from a TypedExpr tree.

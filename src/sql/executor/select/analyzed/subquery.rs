@@ -6,57 +6,119 @@ use crate::sql::analyzer::types::{
 };
 use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::expr::classify::has_unresolved_subquery;
+use crate::sql::expr::traverse::{map_children, visit_any};
 use crate::types::{DataType, Row, Value};
 
 /// Check if an AnalyzedQuery references outer scope columns (correlated).
 ///
 /// A correlated subquery has at least one `ColumnRef` with `scope_depth > 0`
-/// somewhere in its WHERE, projection, or other clauses.
+/// somewhere in its WHERE, projection, or other clauses. Also detects
+/// transitively-correlated nested subqueries (e.g., a scalar subquery inside
+/// the WHERE clause that itself references the outer scope).
 pub(super) fn is_correlated_query(query: &AnalyzedQuery) -> bool {
-    let body_has_outer_ref = match &query.body {
+    query_has_outer_ref_beyond(query, 0)
+}
+
+/// Check if a TypedExpr has any outer reference (`scope_depth > 0`), including
+/// transitively inside nested subquery expressions.
+///
+/// Uses [`visit_any`] for canonical traversal. When a subquery expression node
+/// is encountered, descends into its `AnalyzedQuery` payload with an incremented
+/// depth threshold to detect transitively-outer references (e.g., `scope_depth=2`
+/// inside a nested subquery means the ref points beyond the current query).
+pub(super) fn has_outer_ref(expr: &TypedExpr) -> bool {
+    has_outer_ref_beyond(expr, 0)
+}
+
+/// Check if an expression has ColumnRefs with `scope_depth > min_depth`.
+///
+/// For nested expression-level subqueries, increments `min_depth` by 1 to
+/// account for the additional scope boundary. A `scope_depth` of `min_depth + 1`
+/// inside a nested subquery points to the current query's scope (not beyond),
+/// so only `scope_depth > min_depth + 1` indicates a transitively-outer ref.
+fn has_outer_ref_beyond(expr: &TypedExpr, min_depth: u32) -> bool {
+    visit_any(expr, |e| match &e.kind {
+        TypedExprKind::ColumnRef { scope_depth, .. } => *scope_depth > min_depth,
+        TypedExprKind::ScalarSubquery(q) | TypedExprKind::ArraySubquery(q) => {
+            query_has_outer_ref_beyond(q, min_depth + 1)
+        }
+        TypedExprKind::Exists { subquery, .. }
+        | TypedExprKind::InSubquery { subquery, .. }
+        | TypedExprKind::AnyAll { subquery, .. } => {
+            query_has_outer_ref_beyond(subquery, min_depth + 1)
+        }
+        _ => false,
+    })
+}
+
+/// Check if a query has any ColumnRef with `scope_depth > min_depth`,
+/// including transitively inside nested subquery expressions.
+fn query_has_outer_ref_beyond(query: &AnalyzedQuery, min_depth: u32) -> bool {
+    let body_has = match &query.body {
         AnalyzedQueryBody::Select(select) => {
-            // Check FROM clause (JOIN ON conditions may contain outer refs).
-            if select.from.iter().any(table_ref_has_outer_ref) {
+            if select
+                .from
+                .iter()
+                .any(|tr| table_ref_has_outer_ref_beyond(tr, min_depth))
+            {
                 return true;
             }
-            // Check WHERE.
             if let Some(ref w) = select.where_clause {
-                if has_outer_ref(w) {
+                if has_outer_ref_beyond(w, min_depth) {
                     return true;
                 }
             }
-            // Check projection.
-            if select.projection.iter().any(|p| has_outer_ref(&p.expr)) {
+            if select
+                .projection
+                .iter()
+                .any(|p| has_outer_ref_beyond(&p.expr, min_depth))
+            {
                 return true;
             }
-            // Check GROUP BY.
-            if select.group_by.iter().any(has_outer_ref) {
+            if select
+                .group_by
+                .iter()
+                .any(|e| has_outer_ref_beyond(e, min_depth))
+            {
                 return true;
             }
-            // Check HAVING.
             if let Some(ref h) = select.having {
-                if has_outer_ref(h) {
+                if has_outer_ref_beyond(h, min_depth) {
                     return true;
                 }
             }
             false
         }
-        AnalyzedQueryBody::Values(rows) => rows.iter().flatten().any(has_outer_ref),
+        AnalyzedQueryBody::Values(rows) => rows
+            .iter()
+            .flatten()
+            .any(|e| has_outer_ref_beyond(e, min_depth)),
         AnalyzedQueryBody::SetOperation { left, right, .. } => {
-            is_correlated_query(left) || is_correlated_query(right)
+            query_has_outer_ref_beyond(left, min_depth)
+                || query_has_outer_ref_beyond(right, min_depth)
         }
     };
 
-    body_has_outer_ref || query.order_by.iter().any(|o| has_outer_ref(&o.expr))
+    body_has
+        || query
+            .order_by
+            .iter()
+            .any(|o| has_outer_ref_beyond(&o.expr, min_depth))
 }
 
-/// Check if a table reference (or its nested joins) contains outer references.
-fn table_ref_has_outer_ref(table_ref: &AnalyzedTableRef) -> bool {
+/// Check if a table reference (or its nested joins) contains outer references
+/// with `scope_depth > min_depth`.
+fn table_ref_has_outer_ref_beyond(table_ref: &AnalyzedTableRef, min_depth: u32) -> bool {
     match &table_ref.kind {
-        AnalyzedTableRefKind::Subquery(query) => is_correlated_query(query),
+        AnalyzedTableRefKind::Subquery(query) => {
+            // A derived-table subquery introduces a scope boundary, same as
+            // expression-level subqueries. scope_depth == min_depth + 1 inside
+            // the subquery refers to the enclosing query's scope (not beyond).
+            query_has_outer_ref_beyond(query, min_depth + 1)
+        }
         AnalyzedTableRefKind::Function { args, .. } => args.iter().any(|arg| match arg {
-            TypedFunctionArg::Positional(expr) => has_outer_ref(expr),
-            TypedFunctionArg::Named { expr, .. } => has_outer_ref(expr),
+            TypedFunctionArg::Positional(expr) => has_outer_ref_beyond(expr, min_depth),
+            TypedFunctionArg::Named { expr, .. } => has_outer_ref_beyond(expr, min_depth),
         }),
         AnalyzedTableRefKind::Join {
             left,
@@ -64,75 +126,11 @@ fn table_ref_has_outer_ref(table_ref: &AnalyzedTableRef) -> bool {
             condition,
             ..
         } => {
-            table_ref_has_outer_ref(left)
-                || table_ref_has_outer_ref(right)
-                || matches!(condition, JoinCondition::On(expr) if has_outer_ref(expr))
+            table_ref_has_outer_ref_beyond(left, min_depth)
+                || table_ref_has_outer_ref_beyond(right, min_depth)
+                || matches!(condition, JoinCondition::On(expr) if has_outer_ref_beyond(expr, min_depth))
         }
         _ => false,
-    }
-}
-
-/// Check if a TypedExpr has any ColumnRef with scope_depth > 0 (outer reference).
-pub(super) fn has_outer_ref(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        TypedExprKind::ColumnRef { scope_depth, .. } => *scope_depth > 0,
-        TypedExprKind::BinaryOp { left, right, .. } => has_outer_ref(left) || has_outer_ref(right),
-        TypedExprKind::UnaryOp { operand, .. }
-        | TypedExprKind::Cast { expr: operand, .. }
-        | TypedExprKind::IsTest { expr: operand, .. } => has_outer_ref(operand),
-        TypedExprKind::Between {
-            expr, low, high, ..
-        } => has_outer_ref(expr) || has_outer_ref(low) || has_outer_ref(high),
-        TypedExprKind::InList { expr, list, .. } => {
-            has_outer_ref(expr) || list.iter().any(has_outer_ref)
-        }
-        TypedExprKind::Like { expr, pattern, .. }
-        | TypedExprKind::SimilarTo { expr, pattern, .. } => {
-            has_outer_ref(expr) || has_outer_ref(pattern)
-        }
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            operand.as_ref().is_some_and(|e| has_outer_ref(e))
-                || when_clauses
-                    .iter()
-                    .any(|(w, t)| has_outer_ref(w) || has_outer_ref(t))
-                || else_result.as_ref().is_some_and(|e| has_outer_ref(e))
-        }
-        TypedExprKind::Coalesce(args)
-        | TypedExprKind::MinMax { args, .. }
-        | TypedExprKind::ArrayLiteral(args)
-        | TypedExprKind::Row(args) => args.iter().any(has_outer_ref),
-        TypedExprKind::NullIf(a, b) => has_outer_ref(a) || has_outer_ref(b),
-        TypedExprKind::FunctionCall { args, filter, .. } => {
-            args.iter().any(has_outer_ref) || filter.as_ref().is_some_and(|f| has_outer_ref(f))
-        }
-        TypedExprKind::AggregateCall { args, filter, .. } => {
-            args.iter().any(has_outer_ref) || filter.as_ref().is_some_and(|f| has_outer_ref(f))
-        }
-        TypedExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            args.iter().any(has_outer_ref)
-                || partition_by.iter().any(has_outer_ref)
-                || order_by.iter().any(|o| has_outer_ref(&o.expr))
-        }
-        TypedExprKind::InSubquery { expr, .. } | TypedExprKind::AnyAll { expr, .. } => {
-            has_outer_ref(expr)
-        }
-        TypedExprKind::ArrayIndex { array, index } => has_outer_ref(array) || has_outer_ref(index),
-        TypedExprKind::JsonAccess { expr, .. } => has_outer_ref(expr),
-        TypedExprKind::Constant(_)
-        | TypedExprKind::ScalarSubquery(_)
-        | TypedExprKind::ArraySubquery(_)
-        | TypedExprKind::Exists { .. }
-        | TypedExprKind::Default
-        | TypedExprKind::Parameter { .. } => false,
     }
 }
 
@@ -282,8 +280,17 @@ fn substitute_outer_refs_in_table_ref(
 
 /// Substitute outer column references (scope_depth > 0) in a TypedExpr tree
 /// with constant values from the outer row.
+///
+/// Uses [`map_children`] for canonical child recursion on non-subquery composite
+/// variants. Subquery variants are handled explicitly because they must call
+/// [`substitute_outer_refs_in_query`] to descend into `AnalyzedQuery` payloads.
+///
+/// **Fixes vs previous manual walker**: the old catch-all `_ => expr.clone()`
+/// skipped recursion into SimilarTo, WindowCall, MinMax, Row, and ArrayLiteral.
+/// Outer refs inside those variants are now correctly substituted.
 pub(super) fn substitute_outer_refs_in_expr(expr: &TypedExpr, outer_row: &Row) -> TypedExpr {
-    match &expr.kind {
+    let kind = match &expr.kind {
+        // ColumnRef: custom substitution logic
         TypedExprKind::ColumnRef {
             column_index,
             scope_depth,
@@ -296,55 +303,49 @@ pub(super) fn substitute_outer_refs_in_expr(expr: &TypedExpr, outer_row: &Row) -
                     .get(*column_index)
                     .cloned()
                     .unwrap_or(Value::Null);
-                TypedExpr::new(TypedExprKind::Constant(val), expr.data_type.clone())
+                return TypedExpr::new(TypedExprKind::Constant(val), expr.data_type.clone());
             } else if *scope_depth > 1 {
                 // Deeper nesting → decrement scope_depth.
-                TypedExpr::new(
+                return TypedExpr::new(
                     TypedExprKind::ColumnRef {
                         column_index: *column_index,
                         scope_depth: scope_depth - 1,
                         column_name: column_name.clone(),
                     },
                     expr.data_type.clone(),
-                )
+                );
             } else {
-                expr.clone()
+                return expr.clone();
             }
         }
+
+        // 5 subquery variants: MUST keep explicit — they call substitute_outer_refs_in_query()
+        // to descend into AnalyzedQuery payloads (map_children cannot do this).
         TypedExprKind::ScalarSubquery(subquery) => {
             if is_correlated_query(subquery) {
                 let substituted = substitute_outer_refs_in_query(subquery, outer_row);
-                TypedExpr::new(
-                    TypedExprKind::ScalarSubquery(Box::new(substituted)),
-                    expr.data_type.clone(),
-                )
+                TypedExprKind::ScalarSubquery(Box::new(substituted))
             } else {
-                expr.clone()
+                return expr.clone();
             }
         }
         TypedExprKind::ArraySubquery(subquery) => {
             if is_correlated_query(subquery) {
                 let substituted = substitute_outer_refs_in_query(subquery, outer_row);
-                TypedExpr::new(
-                    TypedExprKind::ArraySubquery(Box::new(substituted)),
-                    expr.data_type.clone(),
-                )
+                TypedExprKind::ArraySubquery(Box::new(substituted))
             } else {
-                expr.clone()
+                return expr.clone();
             }
         }
         TypedExprKind::Exists { subquery, negated } => {
             if is_correlated_query(subquery) {
                 let substituted = substitute_outer_refs_in_query(subquery, outer_row);
-                TypedExpr::new(
-                    TypedExprKind::Exists {
-                        subquery: Box::new(substituted),
-                        negated: *negated,
-                    },
-                    expr.data_type.clone(),
-                )
+                TypedExprKind::Exists {
+                    subquery: Box::new(substituted),
+                    negated: *negated,
+                }
             } else {
-                expr.clone()
+                return expr.clone();
             }
         }
         TypedExprKind::InSubquery {
@@ -355,23 +356,17 @@ pub(super) fn substitute_outer_refs_in_expr(expr: &TypedExpr, outer_row: &Row) -
             let inner_sub = substitute_outer_refs_in_expr(inner, outer_row);
             if is_correlated_query(subquery) {
                 let sub = substitute_outer_refs_in_query(subquery, outer_row);
-                TypedExpr::new(
-                    TypedExprKind::InSubquery {
-                        expr: Box::new(inner_sub),
-                        subquery: Box::new(sub),
-                        negated: *negated,
-                    },
-                    expr.data_type.clone(),
-                )
+                TypedExprKind::InSubquery {
+                    expr: Box::new(inner_sub),
+                    subquery: Box::new(sub),
+                    negated: *negated,
+                }
             } else {
-                TypedExpr::new(
-                    TypedExprKind::InSubquery {
-                        expr: Box::new(inner_sub),
-                        subquery: subquery.clone(),
-                        negated: *negated,
-                    },
-                    expr.data_type.clone(),
-                )
+                TypedExprKind::InSubquery {
+                    expr: Box::new(inner_sub),
+                    subquery: subquery.clone(),
+                    negated: *negated,
+                }
             }
         }
         TypedExprKind::AnyAll {
@@ -383,216 +378,30 @@ pub(super) fn substitute_outer_refs_in_expr(expr: &TypedExpr, outer_row: &Row) -
             let inner_sub = substitute_outer_refs_in_expr(inner, outer_row);
             if is_correlated_query(subquery) {
                 let sub = substitute_outer_refs_in_query(subquery, outer_row);
-                TypedExpr::new(
-                    TypedExprKind::AnyAll {
-                        expr: Box::new(inner_sub),
-                        op: op.clone(),
-                        subquery: Box::new(sub),
-                        is_all: *is_all,
-                    },
-                    expr.data_type.clone(),
-                )
+                TypedExprKind::AnyAll {
+                    expr: Box::new(inner_sub),
+                    op: op.clone(),
+                    subquery: Box::new(sub),
+                    is_all: *is_all,
+                }
             } else {
-                TypedExpr::new(
-                    TypedExprKind::AnyAll {
-                        expr: Box::new(inner_sub),
-                        op: op.clone(),
-                        subquery: subquery.clone(),
-                        is_all: *is_all,
-                    },
-                    expr.data_type.clone(),
-                )
+                TypedExprKind::AnyAll {
+                    expr: Box::new(inner_sub),
+                    op: op.clone(),
+                    subquery: subquery.clone(),
+                    is_all: *is_all,
+                }
             }
         }
-        // Recurse into composite nodes.
-        TypedExprKind::BinaryOp { left, right, op } => TypedExpr::new(
-            TypedExprKind::BinaryOp {
-                left: Box::new(substitute_outer_refs_in_expr(left, outer_row)),
-                op: op.clone(),
-                right: Box::new(substitute_outer_refs_in_expr(right, outer_row)),
-            },
-            expr.data_type.clone(),
-        ),
-        TypedExprKind::UnaryOp { operand, op } => TypedExpr::new(
-            TypedExprKind::UnaryOp {
-                operand: Box::new(substitute_outer_refs_in_expr(operand, outer_row)),
-                op: op.clone(),
-            },
-            expr.data_type.clone(),
-        ),
-        TypedExprKind::Cast {
-            expr: inner,
-            target_type,
-            cast_context,
-        } => TypedExpr::new(
-            TypedExprKind::Cast {
-                expr: Box::new(substitute_outer_refs_in_expr(inner, outer_row)),
-                target_type: target_type.clone(),
-                cast_context: cast_context.clone(),
-            },
-            expr.data_type.clone(),
-        ),
-        TypedExprKind::FunctionCall {
-            func,
-            args,
-            order_by,
-            filter,
-        } => TypedExpr::new(
-            TypedExprKind::FunctionCall {
-                func: func.clone(),
-                args: args
-                    .iter()
-                    .map(|a| substitute_outer_refs_in_expr(a, outer_row))
-                    .collect(),
-                order_by: order_by.clone(),
-                filter: filter
-                    .as_ref()
-                    .map(|f| Box::new(substitute_outer_refs_in_expr(f, outer_row))),
-            },
-            expr.data_type.clone(),
-        ),
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => TypedExpr::new(
-            TypedExprKind::Case {
-                operand: operand
-                    .as_ref()
-                    .map(|e| Box::new(substitute_outer_refs_in_expr(e, outer_row))),
-                when_clauses: when_clauses
-                    .iter()
-                    .map(|(w, t)| {
-                        (
-                            substitute_outer_refs_in_expr(w, outer_row),
-                            substitute_outer_refs_in_expr(t, outer_row),
-                        )
-                    })
-                    .collect(),
-                else_result: else_result
-                    .as_ref()
-                    .map(|e| Box::new(substitute_outer_refs_in_expr(e, outer_row))),
-            },
-            expr.data_type.clone(),
-        ),
-        TypedExprKind::IsTest {
-            expr: inner,
-            test,
-            negated,
-        } => TypedExpr::new(
-            TypedExprKind::IsTest {
-                expr: Box::new(substitute_outer_refs_in_expr(inner, outer_row)),
-                test: test.clone(),
-                negated: *negated,
-            },
-            expr.data_type.clone(),
-        ),
-        TypedExprKind::Like {
-            expr: inner,
-            pattern,
-            escape,
-            case_insensitive,
-            negated,
-        } => TypedExpr::new(
-            TypedExprKind::Like {
-                expr: Box::new(substitute_outer_refs_in_expr(inner, outer_row)),
-                pattern: Box::new(substitute_outer_refs_in_expr(pattern, outer_row)),
-                escape: escape
-                    .as_ref()
-                    .map(|e| Box::new(substitute_outer_refs_in_expr(e, outer_row))),
-                case_insensitive: *case_insensitive,
-                negated: *negated,
-            },
-            expr.data_type.clone(),
-        ),
-        TypedExprKind::Coalesce(args) => TypedExpr::new(
-            TypedExprKind::Coalesce(
-                args.iter()
-                    .map(|a| substitute_outer_refs_in_expr(a, outer_row))
-                    .collect(),
-            ),
-            expr.data_type.clone(),
-        ),
-        TypedExprKind::NullIf(a, b) => TypedExpr::new(
-            TypedExprKind::NullIf(
-                Box::new(substitute_outer_refs_in_expr(a, outer_row)),
-                Box::new(substitute_outer_refs_in_expr(b, outer_row)),
-            ),
-            expr.data_type.clone(),
-        ),
-        TypedExprKind::Between {
-            expr: inner,
-            low,
-            high,
-            negated,
-        } => TypedExpr::new(
-            TypedExprKind::Between {
-                expr: Box::new(substitute_outer_refs_in_expr(inner, outer_row)),
-                low: Box::new(substitute_outer_refs_in_expr(low, outer_row)),
-                high: Box::new(substitute_outer_refs_in_expr(high, outer_row)),
-                negated: *negated,
-            },
-            expr.data_type.clone(),
-        ),
-        TypedExprKind::InList {
-            expr: inner,
-            list,
-            negated,
-        } => TypedExpr::new(
-            TypedExprKind::InList {
-                expr: Box::new(substitute_outer_refs_in_expr(inner, outer_row)),
-                list: list
-                    .iter()
-                    .map(|l| substitute_outer_refs_in_expr(l, outer_row))
-                    .collect(),
-                negated: *negated,
-            },
-            expr.data_type.clone(),
-        ),
-        TypedExprKind::AggregateCall {
-            func,
-            args,
-            distinct,
-            order_by,
-            filter,
-        } => TypedExpr::new(
-            TypedExprKind::AggregateCall {
-                func: func.clone(),
-                args: args
-                    .iter()
-                    .map(|a| substitute_outer_refs_in_expr(a, outer_row))
-                    .collect(),
-                distinct: *distinct,
-                order_by: order_by.clone(),
-                filter: filter
-                    .as_ref()
-                    .map(|f| Box::new(substitute_outer_refs_in_expr(f, outer_row))),
-            },
-            expr.data_type.clone(),
-        ),
-        TypedExprKind::JsonAccess {
-            expr: inner,
-            path,
-            operator,
-        } => TypedExpr::new(
-            TypedExprKind::JsonAccess {
-                expr: Box::new(substitute_outer_refs_in_expr(inner, outer_row)),
-                path: Box::new(substitute_outer_refs_in_expr(path, outer_row)),
-                operator: operator.clone(),
-            },
-            expr.data_type.clone(),
-        ),
-        TypedExprKind::ArrayIndex { array, index } => TypedExpr::new(
-            TypedExprKind::ArrayIndex {
-                array: Box::new(substitute_outer_refs_in_expr(array, outer_row)),
-                index: Box::new(substitute_outer_refs_in_expr(index, outer_row)),
-            },
-            expr.data_type.clone(),
-        ),
-        // Leaf nodes that don't contain column refs.
-        TypedExprKind::Constant(_) => expr.clone(),
-        // Anything else: clone as-is (SimilarTo, WindowCall, MinMax, Row, ArrayLiteral).
-        _ => expr.clone(),
+
+        // Everything else: canonical child recursion via map_children
+        _ => map_children(expr, &mut |child| {
+            substitute_outer_refs_in_expr(child, outer_row)
+        }),
+    };
+    TypedExpr {
+        kind,
+        data_type: expr.data_type.clone(),
     }
 }
 
@@ -841,5 +650,275 @@ mod tests {
             expr.kind,
             TypedExprKind::Constant(Value::Int32(5))
         ));
+    }
+
+    // ── Semantic change regression tests ──────────────────────────
+
+    #[test]
+    fn has_outer_ref_detects_outer_ref_in_like_escape() {
+        // Previously missed: escape field in Like was not traversed
+        let expr = TypedExpr::new(
+            TypedExprKind::Like {
+                expr: Box::new(int_const(1)),
+                pattern: Box::new(int_const(2)),
+                escape: Some(Box::new(TypedExpr::new(
+                    TypedExprKind::ColumnRef {
+                        scope_depth: 1,
+                        column_index: 0,
+                        column_name: "esc_col".to_string(),
+                    },
+                    DataType::Text,
+                ))),
+                case_insensitive: false,
+                negated: false,
+            },
+            DataType::Boolean,
+        );
+        assert!(has_outer_ref(&expr));
+    }
+
+    #[test]
+    fn has_outer_ref_detects_outer_ref_in_function_order_by() {
+        // Previously missed: order_by exprs in FunctionCall
+        let expr = TypedExpr::new(
+            TypedExprKind::FunctionCall {
+                func: ResolvedFunction {
+                    name: "array_agg".to_string(),
+                    kind: FunctionKind::Builtin,
+                    return_type: DataType::Int32,
+                },
+                args: vec![int_const(1)],
+                order_by: vec![TypedOrderByExpr {
+                    expr: TypedExpr::new(
+                        TypedExprKind::ColumnRef {
+                            scope_depth: 1,
+                            column_index: 0,
+                            column_name: "sort_col".to_string(),
+                        },
+                        DataType::Int32,
+                    ),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                filter: None,
+            },
+            DataType::Int32,
+        );
+        assert!(has_outer_ref(&expr));
+    }
+
+    #[test]
+    fn has_outer_ref_detects_outer_ref_in_json_path() {
+        // Previously missed: path field in JsonAccess
+        let expr = TypedExpr::new(
+            TypedExprKind::JsonAccess {
+                expr: Box::new(int_const(1)),
+                path: Box::new(TypedExpr::new(
+                    TypedExprKind::ColumnRef {
+                        scope_depth: 1,
+                        column_index: 0,
+                        column_name: "path_col".to_string(),
+                    },
+                    DataType::Text,
+                )),
+                operator: crate::sql::analyzer::types::JsonAccessOp::Arrow,
+            },
+            DataType::Text,
+        );
+        assert!(has_outer_ref(&expr));
+    }
+
+    #[test]
+    fn substitute_outer_refs_recurses_into_similar_to() {
+        // Previously the catch-all `_ => expr.clone()` skipped SimilarTo
+        let expr = TypedExpr::new(
+            TypedExprKind::SimilarTo {
+                expr: Box::new(TypedExpr::new(
+                    TypedExprKind::ColumnRef {
+                        scope_depth: 1,
+                        column_index: 0,
+                        column_name: "outer_col".to_string(),
+                    },
+                    DataType::Text,
+                )),
+                pattern: Box::new(int_const(1)),
+                escape: None,
+                negated: false,
+            },
+            DataType::Boolean,
+        );
+        let outer_row = Row::new(vec![Value::Text("hello".to_string())]);
+        let result = substitute_outer_refs_in_expr(&expr, &outer_row);
+        if let TypedExprKind::SimilarTo { expr: inner, .. } = &result.kind {
+            assert!(matches!(
+                inner.kind,
+                TypedExprKind::Constant(Value::Text(_))
+            ));
+        } else {
+            panic!("expected SimilarTo, got {:?}", result.kind);
+        }
+    }
+
+    #[test]
+    fn substitute_outer_refs_recurses_into_min_max() {
+        // Previously the catch-all `_ => expr.clone()` skipped MinMax
+        let expr = TypedExpr::new(
+            TypedExprKind::MinMax {
+                args: vec![
+                    TypedExpr::new(
+                        TypedExprKind::ColumnRef {
+                            scope_depth: 1,
+                            column_index: 0,
+                            column_name: "a".to_string(),
+                        },
+                        DataType::Int32,
+                    ),
+                    int_const(5),
+                ],
+                is_greatest: true,
+            },
+            DataType::Int32,
+        );
+        let outer_row = Row::new(vec![Value::Int32(10)]);
+        let result = substitute_outer_refs_in_expr(&expr, &outer_row);
+        if let TypedExprKind::MinMax { args, .. } = &result.kind {
+            assert!(matches!(
+                args[0].kind,
+                TypedExprKind::Constant(Value::Int32(10))
+            ));
+        } else {
+            panic!("expected MinMax, got {:?}", result.kind);
+        }
+    }
+
+    /// Regression test for derived-subquery scope boundary.
+    ///
+    /// A FROM subquery (derived table) with scope_depth=1 refs points to its
+    /// enclosing query's scope — NOT beyond. The enclosing query itself should
+    /// NOT be classified as correlated just because its FROM subquery references
+    /// the enclosing scope.
+    ///
+    /// Example: `SELECT * FROM (SELECT t1.x FROM t2) AS sub`
+    ///   - Inside the derived subquery, `t1.x` has scope_depth=1 (one scope up)
+    ///   - This makes the derived subquery correlated with its parent
+    ///   - But the parent query is NOT correlated with any outer scope
+    #[test]
+    fn derived_subquery_scope_depth_1_does_not_make_parent_correlated() {
+        // Build: SELECT 1 FROM (SELECT outer_col FROM t2) AS sub
+        // where outer_col has scope_depth=1 inside the derived subquery
+        let derived_subquery = AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection: vec![AnalyzedProjection {
+                    expr: TypedExpr::new(
+                        TypedExprKind::ColumnRef {
+                            scope_depth: 1, // references enclosing query's scope
+                            column_index: 0,
+                            column_name: "outer_col".to_string(),
+                        },
+                        DataType::Int32,
+                    ),
+                    output_name: "outer_col".to_string(),
+                }],
+                from: vec![],
+                where_clause: None,
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("outer_col".to_string(), DataType::Int32)],
+        };
+
+        let parent_query = AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection: vec![AnalyzedProjection {
+                    expr: int_const(1),
+                    output_name: "?column?".to_string(),
+                }],
+                from: vec![AnalyzedTableRef {
+                    kind: AnalyzedTableRefKind::Subquery(Box::new(derived_subquery)),
+                    alias: Some("sub".to_string()),
+                }],
+                where_clause: None,
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("?column?".to_string(), DataType::Int32)],
+        };
+
+        // The parent query should NOT be classified as correlated — the derived
+        // subquery's scope_depth=1 ref points to the parent's own scope, not beyond.
+        assert!(
+            !is_correlated_query(&parent_query),
+            "parent query should not be correlated: derived subquery's scope_depth=1 \
+             refs point to the parent scope, not beyond"
+        );
+    }
+
+    /// Derived subquery with scope_depth=2 DOES make the parent correlated
+    /// (the ref points beyond the parent to a grandparent scope).
+    #[test]
+    fn derived_subquery_scope_depth_2_makes_parent_correlated() {
+        let derived_subquery = AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection: vec![AnalyzedProjection {
+                    expr: TypedExpr::new(
+                        TypedExprKind::ColumnRef {
+                            scope_depth: 2, // references grandparent scope (beyond parent)
+                            column_index: 0,
+                            column_name: "grandparent_col".to_string(),
+                        },
+                        DataType::Int32,
+                    ),
+                    output_name: "gp".to_string(),
+                }],
+                from: vec![],
+                where_clause: None,
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("gp".to_string(), DataType::Int32)],
+        };
+
+        let parent_query = AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection: vec![AnalyzedProjection {
+                    expr: int_const(1),
+                    output_name: "?column?".to_string(),
+                }],
+                from: vec![AnalyzedTableRef {
+                    kind: AnalyzedTableRefKind::Subquery(Box::new(derived_subquery)),
+                    alias: Some("sub".to_string()),
+                }],
+                where_clause: None,
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("?column?".to_string(), DataType::Int32)],
+        };
+
+        assert!(
+            is_correlated_query(&parent_query),
+            "parent query should be correlated: derived subquery's scope_depth=2 \
+             ref points beyond the parent scope"
+        );
     }
 }

@@ -9,12 +9,13 @@
 use crate::sql::analyzer::types::{
     AnalyzedDistinct, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind,
     BinaryOp as TypedBinaryOp, JoinCondition, TypedExpr, TypedExprKind, TypedFunctionArg,
-    TypedOrderByExpr, WindowFrame, WindowFrameBound,
+    TypedOrderByExpr,
 };
 use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::error::SqlError;
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::classify::needs_pre_materialization;
+use crate::sql::expr::traverse::{map_children_async, AsyncExprTransform};
 use crate::sql::expr::typed_eval::{eval_const_usize, eval_typed_expr};
 use crate::sql::names;
 use crate::sql::sequences::resolve_sequence_full_name_from_value;
@@ -149,111 +150,6 @@ impl Executor {
 
     // ── Subquery pre-materialization ────────────────────────────
 
-    fn maybe_pre_materialize_expr<'a>(
-        &'a self,
-        expr: &'a TypedExpr,
-        txn: &'a mut Transaction,
-        db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
-        search_path: &'a [String],
-        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
-    ) -> Pin<Box<dyn Future<Output = Result<TypedExpr>> + Send + 'a>> {
-        Box::pin(async move {
-            if !needs_pre_materialization(expr) {
-                return Ok(expr.clone());
-            }
-            self.pre_materialize_async_exprs(expr, txn, db_id, sequence_values, search_path, ctes)
-                .await
-        })
-    }
-
-    fn pre_materialize_window_frame_bound<'a>(
-        &'a self,
-        bound: &'a WindowFrameBound,
-        txn: &'a mut Transaction,
-        db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
-        search_path: &'a [String],
-        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
-    ) -> Pin<Box<dyn Future<Output = Result<WindowFrameBound>> + Send + 'a>> {
-        Box::pin(async move {
-            match bound {
-                WindowFrameBound::CurrentRow => Ok(WindowFrameBound::CurrentRow),
-                WindowFrameBound::Preceding(Some(expr)) => {
-                    Ok(WindowFrameBound::Preceding(Some(Box::new(
-                        self.maybe_pre_materialize_expr(
-                            expr,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?,
-                    ))))
-                }
-                WindowFrameBound::Following(Some(expr)) => {
-                    Ok(WindowFrameBound::Following(Some(Box::new(
-                        self.maybe_pre_materialize_expr(
-                            expr,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?,
-                    ))))
-                }
-                WindowFrameBound::Preceding(None) => Ok(WindowFrameBound::Preceding(None)),
-                WindowFrameBound::Following(None) => Ok(WindowFrameBound::Following(None)),
-            }
-        })
-    }
-
-    fn pre_materialize_window_frame<'a>(
-        &'a self,
-        frame: &'a WindowFrame,
-        txn: &'a mut Transaction,
-        db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
-        search_path: &'a [String],
-        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
-    ) -> Pin<Box<dyn Future<Output = Result<WindowFrame>> + Send + 'a>> {
-        Box::pin(async move {
-            let start = self
-                .pre_materialize_window_frame_bound(
-                    &frame.start,
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    ctes,
-                )
-                .await?;
-            let end = if let Some(bound) = &frame.end {
-                Some(
-                    self.pre_materialize_window_frame_bound(
-                        bound,
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        ctes,
-                    )
-                    .await?,
-                )
-            } else {
-                None
-            };
-            Ok(WindowFrame {
-                units: frame.units,
-                start,
-                end,
-            })
-        })
-    }
-
     /// Pre-materialize all uncorrelated subqueries in a TypedExpr tree.
     ///
     /// Walks the tree and replaces:
@@ -264,6 +160,10 @@ impl Executor {
     ///
     /// Only processes uncorrelated subqueries (no outer column references).
     /// Correlated subqueries are left as-is for per-row materialization.
+    ///
+    /// Uses [`AsyncExprTransform`] via [`PreMaterializeTransform`] for canonical
+    /// child recursion. Custom arms handle 5 subquery variants + sequence functions;
+    /// all other variants delegate to [`map_children_async`].
     fn pre_materialize_async_exprs<'a>(
         &'a self,
         expr: &'a TypedExpr,
@@ -274,1093 +174,16 @@ impl Executor {
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Pin<Box<dyn Future<Output = Result<TypedExpr>> + Send + 'a>> {
         Box::pin(async move {
-            if !needs_pre_materialization(expr) {
-                return Ok(expr.clone());
-            }
-            match &expr.kind {
-                TypedExprKind::InSubquery {
-                    expr: inner_expr,
-                    subquery,
-                    negated,
-                } => {
-                    if is_correlated_query(subquery) {
-                        // Leave correlated IN-subquery as-is for per-row evaluation.
-                        return Ok(expr.clone());
-                    }
-                    // Recurse into the LHS expression first.
-                    let rewritten_expr = self
-                        .maybe_pre_materialize_expr(
-                            inner_expr,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-
-                    // Execute the subquery to get result rows.
-                    let result = self
-                        .execute_subquery(txn, db_id, sequence_values, search_path, subquery, ctes)
-                        .await?;
-                    let rows = match result {
-                        ExecuteResult::Select { rows, .. } => rows,
-                        _ => return Err(anyhow!("Expected SELECT from IN subquery")),
-                    };
-
-                    // Extract first column of each row as constant values.
-                    let list: Vec<TypedExpr> = rows
-                        .into_iter()
-                        .filter_map(|r| r.values.into_iter().next())
-                        .map(|v| TypedExpr {
-                            data_type: rewritten_expr.data_type.clone(),
-                            kind: TypedExprKind::Constant(v),
-                        })
-                        .collect();
-
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::InList {
-                            expr: Box::new(rewritten_expr),
-                            list,
-                            negated: *negated,
-                        },
-                        data_type: DataType::Boolean,
-                    })
-                }
-
-                TypedExprKind::Exists { subquery, negated } => {
-                    if is_correlated_query(subquery) {
-                        // Leave correlated EXISTS as-is for per-row evaluation.
-                        return Ok(expr.clone());
-                    }
-                    // Execute the subquery — we only need to know if it returns any rows.
-                    let result = self
-                        .execute_subquery(txn, db_id, sequence_values, search_path, subquery, ctes)
-                        .await?;
-                    let has_rows = match result {
-                        ExecuteResult::Select { rows, .. } => !rows.is_empty(),
-                        _ => false,
-                    };
-                    let val = if *negated { !has_rows } else { has_rows };
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::Constant(Value::Boolean(val)),
-                        data_type: DataType::Boolean,
-                    })
-                }
-
-                TypedExprKind::ScalarSubquery(subquery) => {
-                    if is_correlated_query(subquery) {
-                        // Leave correlated subqueries as-is for per-row evaluation.
-                        return Ok(expr.clone());
-                    }
-                    // Execute the subquery — expect 0 or 1 rows, first column.
-                    let result = self
-                        .execute_subquery(txn, db_id, sequence_values, search_path, subquery, ctes)
-                        .await?;
-                    let value = match result {
-                        ExecuteResult::Select { rows, .. } => {
-                            if rows.is_empty() {
-                                Value::Null
-                            } else if rows.len() == 1 {
-                                rows.into_iter()
-                                    .next()
-                                    .and_then(|r| r.values.into_iter().next())
-                                    .unwrap_or(Value::Null)
-                            } else {
-                                return Err(anyhow!("Scalar subquery returned more than one row"));
-                            }
-                        }
-                        _ => Value::Null,
-                    };
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::Constant(value),
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::AnyAll {
-                    expr: inner_expr,
-                    op,
-                    subquery,
-                    is_all,
-                } => {
-                    if is_correlated_query(subquery) {
-                        // Leave correlated ANY/ALL as-is for per-row evaluation.
-                        return Ok(expr.clone());
-                    }
-                    // Recurse into the LHS expression.
-                    let rewritten_expr = self
-                        .maybe_pre_materialize_expr(
-                            inner_expr,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-
-                    // Execute subquery → get values → build array.
-                    let result = self
-                        .execute_subquery(txn, db_id, sequence_values, search_path, subquery, ctes)
-                        .await?;
-                    let rows = match result {
-                        ExecuteResult::Select { rows, .. } => rows,
-                        _ => return Err(anyhow!("Expected SELECT from ANY/ALL subquery")),
-                    };
-
-                    let rhs_declared_type = subquery
-                        .output_schema
-                        .first()
-                        .map(|(_, dt)| dt.clone())
-                        .ok_or_else(|| anyhow!("ANY/ALL subquery has empty output schema"))?;
-
-                    let values: Vec<TypedExpr> = rows
-                        .into_iter()
-                        .filter_map(|r| r.values.into_iter().next())
-                        .map(|v| {
-                            build_any_all_rhs_constant_expr(
-                                &rewritten_expr.data_type,
-                                &rhs_declared_type,
-                                v,
-                            )
-                        })
-                        .collect();
-
-                    // ANY: true if `expr op value` for ANY value in the list.
-                    // ALL: true if `expr op value` for ALL values in the list.
-                    // For empty list: ANY → false, ALL → true.
-                    if values.is_empty() {
-                        return Ok(TypedExpr {
-                            kind: TypedExprKind::Constant(Value::Boolean(*is_all)),
-                            data_type: DataType::Boolean,
-                        });
-                    }
-
-                    let comparisons: Vec<TypedExpr> = values
-                        .into_iter()
-                        .map(|v| TypedExpr {
-                            kind: TypedExprKind::BinaryOp {
-                                left: Box::new(rewritten_expr.clone()),
-                                op: op.clone(),
-                                right: Box::new(v),
-                            },
-                            data_type: DataType::Boolean,
-                        })
-                        .collect();
-
-                    // ANY → OR chain, ALL → AND chain.
-                    let chain_op = if *is_all {
-                        TypedBinaryOp::And
-                    } else {
-                        TypedBinaryOp::Or
-                    };
-
-                    let combined = comparisons
-                        .into_iter()
-                        .reduce(|a, b| TypedExpr {
-                            kind: TypedExprKind::BinaryOp {
-                                left: Box::new(a),
-                                op: chain_op.clone(),
-                                right: Box::new(b),
-                            },
-                            data_type: DataType::Boolean,
-                        })
-                        .unwrap(); // values is non-empty, so this is safe.
-
-                    Ok(combined)
-                }
-
-                TypedExprKind::ArraySubquery(subquery) => {
-                    if is_correlated_query(subquery) {
-                        // Leave correlated ArraySubquery as-is for per-row evaluation.
-                        return Ok(expr.clone());
-                    }
-                    // Execute subquery → collect first column values into array.
-                    let result = self
-                        .execute_subquery(txn, db_id, sequence_values, search_path, subquery, ctes)
-                        .await?;
-                    let rows = match result {
-                        ExecuteResult::Select { rows, .. } => rows,
-                        _ => return Err(anyhow!("Expected SELECT from ARRAY(subquery)")),
-                    };
-
-                    let values: Vec<Value> = rows
-                        .into_iter()
-                        .filter_map(|r| r.values.into_iter().next())
-                        .collect();
-
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::Constant(Value::Array(values)),
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                // Recurse into children for non-subquery nodes.
-                TypedExprKind::BinaryOp { left, right, op } => {
-                    let l = self
-                        .maybe_pre_materialize_expr(
-                            left,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    let r = self
-                        .maybe_pre_materialize_expr(
-                            right,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::BinaryOp {
-                            left: Box::new(l),
-                            op: op.clone(),
-                            right: Box::new(r),
-                        },
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::UnaryOp { op, operand } => {
-                    let inner = self
-                        .maybe_pre_materialize_expr(
-                            operand,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::UnaryOp {
-                            op: *op,
-                            operand: Box::new(inner),
-                        },
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::Cast {
-                    expr: inner,
-                    target_type,
-                    cast_context,
-                } => {
-                    let rewritten = self
-                        .maybe_pre_materialize_expr(
-                            inner,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::Cast {
-                            expr: Box::new(rewritten),
-                            target_type: target_type.clone(),
-                            cast_context: cast_context.clone(),
-                        },
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::IsTest {
-                    expr: inner,
-                    test,
-                    negated,
-                } => {
-                    let rewritten = self
-                        .maybe_pre_materialize_expr(
-                            inner,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::IsTest {
-                            expr: Box::new(rewritten),
-                            test: *test,
-                            negated: *negated,
-                        },
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::Between {
-                    expr: inner,
-                    low,
-                    high,
-                    negated,
-                } => {
-                    let e = self
-                        .maybe_pre_materialize_expr(
-                            inner,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    let l = self
-                        .maybe_pre_materialize_expr(
-                            low,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    let h = self
-                        .maybe_pre_materialize_expr(
-                            high,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::Between {
-                            expr: Box::new(e),
-                            low: Box::new(l),
-                            high: Box::new(h),
-                            negated: *negated,
-                        },
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::InList {
-                    expr: inner,
-                    list,
-                    negated,
-                } => {
-                    let e = self
-                        .maybe_pre_materialize_expr(
-                            inner,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    let mut new_list = Vec::with_capacity(list.len());
-                    for item in list {
-                        new_list.push(
-                            self.maybe_pre_materialize_expr(
-                                item,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?,
-                        );
-                    }
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::InList {
-                            expr: Box::new(e),
-                            list: new_list,
-                            negated: *negated,
-                        },
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::Case {
-                    operand,
-                    when_clauses,
-                    else_result,
-                } => {
-                    let new_operand = if let Some(ref op) = operand {
-                        Some(Box::new(
-                            self.maybe_pre_materialize_expr(
-                                op,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?,
-                        ))
-                    } else {
-                        None
-                    };
-                    let mut new_whens = Vec::with_capacity(when_clauses.len());
-                    for (w, t) in when_clauses {
-                        let nw = self
-                            .maybe_pre_materialize_expr(
-                                w,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?;
-                        let nt = self
-                            .maybe_pre_materialize_expr(
-                                t,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?;
-                        new_whens.push((nw, nt));
-                    }
-                    let new_else = if let Some(ref e) = else_result {
-                        Some(Box::new(
-                            self.maybe_pre_materialize_expr(
-                                e,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?,
-                        ))
-                    } else {
-                        None
-                    };
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::Case {
-                            operand: new_operand,
-                            when_clauses: new_whens,
-                            else_result: new_else,
-                        },
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::Coalesce(args) => {
-                    let mut new_args = Vec::with_capacity(args.len());
-                    for a in args {
-                        new_args.push(
-                            self.maybe_pre_materialize_expr(
-                                a,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?,
-                        );
-                    }
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::Coalesce(new_args),
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::NullIf(a, b) => {
-                    let na = self
-                        .maybe_pre_materialize_expr(
-                            a,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    let nb = self
-                        .maybe_pre_materialize_expr(
-                            b,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::NullIf(Box::new(na), Box::new(nb)),
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::FunctionCall {
-                    func,
-                    args,
-                    order_by,
-                    filter,
-                } => {
-                    let name_upper = func.name.to_ascii_uppercase();
-                    let store = self.store();
-                    let qctx = crate::sql::query_context::QueryContext::from_task_locals();
-
-                    // Sequence functions: execute and replace with Constant.
-                    match name_upper.as_str() {
-                        "NEXTVAL" => {
-                            let arg_val = eval_typed_expr(
-                                args.first()
-                                    .ok_or_else(|| anyhow!("nextval requires 1 argument"))?,
-                                &Row::new(vec![]),
-                                &qctx,
-                            )?;
-                            let full_name = resolve_sequence_full_name_from_value(
-                                &store,
-                                txn,
-                                db_id,
-                                search_path,
-                                arg_val,
-                            )
-                            .await?;
-                            let val = store.nextval_sequence(txn, db_id, &full_name).await?;
-                            sequence_values.insert(full_name, val);
-                            return Ok(TypedExpr {
-                                kind: TypedExprKind::Constant(Value::Int64(val)),
-                                data_type: DataType::Int64,
-                            });
-                        }
-                        "CURRVAL" => {
-                            let arg_val = eval_typed_expr(
-                                args.first()
-                                    .ok_or_else(|| anyhow!("currval requires 1 argument"))?,
-                                &Row::new(vec![]),
-                                &qctx,
-                            )?;
-                            let full_name = resolve_sequence_full_name_from_value(
-                                &store,
-                                txn,
-                                db_id,
-                                search_path,
-                                arg_val,
-                            )
-                            .await?;
-                            if store.get_sequence(txn, db_id, &full_name).await?.is_none() {
-                                return Err(SqlError::RelationNotFound(full_name.clone()).into());
-                            }
-                            let val = sequence_values.get(&full_name).copied().ok_or_else(|| {
-                            anyhow!("currval of sequence \"{}\" is not yet defined in this session", full_name)
-                        })?;
-                            return Ok(TypedExpr {
-                                kind: TypedExprKind::Constant(Value::Int64(val)),
-                                data_type: DataType::Int64,
-                            });
-                        }
-                        "SETVAL" => {
-                            let arg0 = eval_typed_expr(
-                                args.first().ok_or_else(|| {
-                                    anyhow!("setval requires at least 2 arguments")
-                                })?,
-                                &Row::new(vec![]),
-                                &qctx,
-                            )?;
-                            let arg1 = eval_typed_expr(
-                                args.get(1).ok_or_else(|| {
-                                    anyhow!("setval requires at least 2 arguments")
-                                })?,
-                                &Row::new(vec![]),
-                                &qctx,
-                            )?;
-                            let full_name = resolve_sequence_full_name_from_value(
-                                &store,
-                                txn,
-                                db_id,
-                                search_path,
-                                arg0,
-                            )
-                            .await?;
-                            let value_i64 = match arg1 {
-                                Value::Int32(n) => n as i64,
-                                Value::Int64(n) => n,
-                                Value::Float64(n) => n as i64,
-                                Value::Text(s) => s.trim().parse::<i64>().map_err(|_| {
-                                    anyhow!("setval: value must be integer, got {}", s)
-                                })?,
-                                other => {
-                                    return Err(anyhow!(
-                                        "setval: value must be integer, got {}",
-                                        other
-                                    ))
-                                }
-                            };
-                            let is_called = if let Some(arg2) = args.get(2) {
-                                match eval_typed_expr(arg2, &Row::new(vec![]), &qctx)? {
-                                    Value::Boolean(b) => b,
-                                    Value::Text(s) => matches!(
-                                        s.to_lowercase().as_str(),
-                                        "true" | "t" | "1" | "yes" | "y"
-                                    ),
-                                    other => {
-                                        return Err(anyhow!(
-                                            "setval: is_called must be boolean, got {}",
-                                            other
-                                        ))
-                                    }
-                                }
-                            } else {
-                                true
-                            };
-                            let res = store
-                                .setval_sequence(txn, db_id, &full_name, value_i64, is_called)
-                                .await?;
-                            return Ok(TypedExpr {
-                                kind: TypedExprKind::Constant(Value::Int64(res)),
-                                data_type: DataType::Int64,
-                            });
-                        }
-                        "LASTVAL" => {
-                            // LASTVAL returns the value most recently obtained by nextval.
-                            let val =
-                                sequence_values.values().last().copied().ok_or_else(|| {
-                                    anyhow!("lastval is not yet defined in this session")
-                                })?;
-                            return Ok(TypedExpr {
-                                kind: TypedExprKind::Constant(Value::Int64(val)),
-                                data_type: DataType::Int64,
-                            });
-                        }
-                        _ => {}
-                    }
-
-                    // Non-sequence function: recurse into args/filter.
-                    let mut new_args = Vec::with_capacity(args.len());
-                    for a in args {
-                        new_args.push(
-                            self.maybe_pre_materialize_expr(
-                                a,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?,
-                        );
-                    }
-                    let new_filter = if let Some(ref f) = filter {
-                        Some(Box::new(
-                            self.maybe_pre_materialize_expr(
-                                f,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?,
-                        ))
-                    } else {
-                        None
-                    };
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::FunctionCall {
-                            func: func.clone(),
-                            args: new_args,
-                            order_by: order_by.clone(),
-                            filter: new_filter,
-                        },
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::Like {
-                    expr: inner,
-                    pattern,
-                    escape,
-                    negated,
-                    case_insensitive,
-                } => {
-                    let e = self
-                        .maybe_pre_materialize_expr(
-                            inner,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    let p = self
-                        .maybe_pre_materialize_expr(
-                            pattern,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::Like {
-                            expr: Box::new(e),
-                            pattern: Box::new(p),
-                            escape: if let Some(esc) = escape {
-                                Some(Box::new(
-                                    self.maybe_pre_materialize_expr(
-                                        esc,
-                                        txn,
-                                        db_id,
-                                        sequence_values,
-                                        search_path,
-                                        ctes,
-                                    )
-                                    .await?,
-                                ))
-                            } else {
-                                None
-                            },
-                            negated: *negated,
-                            case_insensitive: *case_insensitive,
-                        },
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::SimilarTo {
-                    expr: inner,
-                    pattern,
-                    escape,
-                    negated,
-                } => {
-                    let e = self
-                        .maybe_pre_materialize_expr(
-                            inner,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    let p = self
-                        .maybe_pre_materialize_expr(
-                            pattern,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::SimilarTo {
-                            expr: Box::new(e),
-                            pattern: Box::new(p),
-                            escape: if let Some(esc) = escape {
-                                Some(Box::new(
-                                    self.maybe_pre_materialize_expr(
-                                        esc,
-                                        txn,
-                                        db_id,
-                                        sequence_values,
-                                        search_path,
-                                        ctes,
-                                    )
-                                    .await?,
-                                ))
-                            } else {
-                                None
-                            },
-                            negated: *negated,
-                        },
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::AggregateCall {
-                    func,
-                    args,
-                    distinct,
-                    order_by,
-                    filter,
-                } => {
-                    let mut new_args = Vec::with_capacity(args.len());
-                    for arg in args {
-                        new_args.push(
-                            self.maybe_pre_materialize_expr(
-                                arg,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?,
-                        );
-                    }
-                    let mut new_order_by = Vec::with_capacity(order_by.len());
-                    for ob in order_by {
-                        new_order_by.push(TypedOrderByExpr {
-                            expr: self
-                                .maybe_pre_materialize_expr(
-                                    &ob.expr,
-                                    txn,
-                                    db_id,
-                                    sequence_values,
-                                    search_path,
-                                    ctes,
-                                )
-                                .await?,
-                            asc: ob.asc,
-                            nulls_first: ob.nulls_first,
-                        });
-                    }
-                    let new_filter = if let Some(f) = filter {
-                        Some(Box::new(
-                            self.maybe_pre_materialize_expr(
-                                f,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?,
-                        ))
-                    } else {
-                        None
-                    };
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::AggregateCall {
-                            func: func.clone(),
-                            args: new_args,
-                            distinct: *distinct,
-                            order_by: new_order_by,
-                            filter: new_filter,
-                        },
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::WindowCall {
-                    func,
-                    args,
-                    partition_by,
-                    order_by,
-                    window_frame,
-                } => {
-                    let mut new_args = Vec::with_capacity(args.len());
-                    for arg in args {
-                        new_args.push(
-                            self.maybe_pre_materialize_expr(
-                                arg,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?,
-                        );
-                    }
-                    let mut new_partition_by = Vec::with_capacity(partition_by.len());
-                    for part in partition_by {
-                        new_partition_by.push(
-                            self.maybe_pre_materialize_expr(
-                                part,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?,
-                        );
-                    }
-                    let mut new_order_by = Vec::with_capacity(order_by.len());
-                    for ob in order_by {
-                        new_order_by.push(TypedOrderByExpr {
-                            expr: self
-                                .maybe_pre_materialize_expr(
-                                    &ob.expr,
-                                    txn,
-                                    db_id,
-                                    sequence_values,
-                                    search_path,
-                                    ctes,
-                                )
-                                .await?,
-                            asc: ob.asc,
-                            nulls_first: ob.nulls_first,
-                        });
-                    }
-                    let new_window_frame = if let Some(frame) = window_frame {
-                        Some(
-                            self.pre_materialize_window_frame(
-                                frame,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?,
-                        )
-                    } else {
-                        None
-                    };
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::WindowCall {
-                            func: func.clone(),
-                            args: new_args,
-                            partition_by: new_partition_by,
-                            order_by: new_order_by,
-                            window_frame: new_window_frame,
-                        },
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::MinMax { args, is_greatest } => {
-                    let mut new_args = Vec::with_capacity(args.len());
-                    for arg in args {
-                        new_args.push(
-                            self.maybe_pre_materialize_expr(
-                                arg,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?,
-                        );
-                    }
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::MinMax {
-                            args: new_args,
-                            is_greatest: *is_greatest,
-                        },
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::ArrayLiteral(items) => {
-                    let mut new_items = Vec::with_capacity(items.len());
-                    for item in items {
-                        new_items.push(
-                            self.maybe_pre_materialize_expr(
-                                item,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?,
-                        );
-                    }
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::ArrayLiteral(new_items),
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::ArrayIndex { array, index } => {
-                    let new_array = self
-                        .maybe_pre_materialize_expr(
-                            array,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    let new_index = self
-                        .maybe_pre_materialize_expr(
-                            index,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::ArrayIndex {
-                            array: Box::new(new_array),
-                            index: Box::new(new_index),
-                        },
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::JsonAccess {
-                    expr: inner,
-                    path,
-                    operator,
-                } => {
-                    let new_inner = self
-                        .maybe_pre_materialize_expr(
-                            inner,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    let new_path = self
-                        .maybe_pre_materialize_expr(
-                            path,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            ctes,
-                        )
-                        .await?;
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::JsonAccess {
-                            expr: Box::new(new_inner),
-                            path: Box::new(new_path),
-                            operator: *operator,
-                        },
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                TypedExprKind::Row(items) => {
-                    let mut new_items = Vec::with_capacity(items.len());
-                    for item in items {
-                        new_items.push(
-                            self.maybe_pre_materialize_expr(
-                                item,
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                ctes,
-                            )
-                            .await?,
-                        );
-                    }
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::Row(new_items),
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-
-                // Leaf nodes (Constant, ColumnRef, etc.).
-                _ => Ok(expr.clone()),
-            }
-        }) // end Box::pin
+            let mut transform = PreMaterializeTransform {
+                executor: self,
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                ctes,
+            };
+            transform.transform_expr(expr).await
+        })
     }
 
     /// Execute a query through the CBO optimizer pipeline.
@@ -2429,6 +1252,415 @@ impl Executor {
             }
             Ok(rows_to_lock)
         }
+    }
+}
+
+// ── PreMaterializeTransform ─────────────────────────────────
+//
+// Bundles mutable state for pre-materialization into an AsyncExprTransform.
+// Custom arms handle 5 subquery variants + sequence FunctionCall;
+// all other composite variants delegate to map_children_async.
+
+struct PreMaterializeTransform<'a> {
+    executor: &'a Executor,
+    txn: &'a mut Transaction,
+    db_id: u64,
+    sequence_values: &'a mut HashMap<String, i64>,
+    search_path: &'a [String],
+    ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+}
+
+impl AsyncExprTransform for PreMaterializeTransform<'_> {
+    fn transform_expr<'a>(
+        &'a mut self,
+        expr: &'a TypedExpr,
+    ) -> Pin<Box<dyn Future<Output = Result<TypedExpr>> + Send + 'a>> {
+        Box::pin(async move {
+            if !needs_pre_materialization(expr) {
+                return Ok(expr.clone());
+            }
+            match &expr.kind {
+                TypedExprKind::InSubquery {
+                    expr: inner_expr,
+                    subquery,
+                    negated,
+                } => {
+                    if is_correlated_query(subquery) {
+                        return Ok(expr.clone());
+                    }
+                    let rewritten_expr = self.transform_expr(inner_expr).await?;
+                    let result = self
+                        .executor
+                        .execute_subquery(
+                            &mut *self.txn,
+                            self.db_id,
+                            &mut *self.sequence_values,
+                            self.search_path,
+                            subquery,
+                            self.ctes,
+                        )
+                        .await?;
+                    let rows = match result {
+                        ExecuteResult::Select { rows, .. } => rows,
+                        _ => return Err(anyhow!("Expected SELECT from IN subquery")),
+                    };
+                    let list: Vec<TypedExpr> = rows
+                        .into_iter()
+                        .filter_map(|r| r.values.into_iter().next())
+                        .map(|v| TypedExpr {
+                            data_type: rewritten_expr.data_type.clone(),
+                            kind: TypedExprKind::Constant(v),
+                        })
+                        .collect();
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::InList {
+                            expr: Box::new(rewritten_expr),
+                            list,
+                            negated: *negated,
+                        },
+                        data_type: DataType::Boolean,
+                    })
+                }
+
+                TypedExprKind::Exists { subquery, negated } => {
+                    if is_correlated_query(subquery) {
+                        return Ok(expr.clone());
+                    }
+                    let result = self
+                        .executor
+                        .execute_subquery(
+                            &mut *self.txn,
+                            self.db_id,
+                            &mut *self.sequence_values,
+                            self.search_path,
+                            subquery,
+                            self.ctes,
+                        )
+                        .await?;
+                    let has_rows = match result {
+                        ExecuteResult::Select { rows, .. } => !rows.is_empty(),
+                        _ => false,
+                    };
+                    let val = if *negated { !has_rows } else { has_rows };
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::Constant(Value::Boolean(val)),
+                        data_type: DataType::Boolean,
+                    })
+                }
+
+                TypedExprKind::ScalarSubquery(subquery) => {
+                    if is_correlated_query(subquery) {
+                        return Ok(expr.clone());
+                    }
+                    let result = self
+                        .executor
+                        .execute_subquery(
+                            &mut *self.txn,
+                            self.db_id,
+                            &mut *self.sequence_values,
+                            self.search_path,
+                            subquery,
+                            self.ctes,
+                        )
+                        .await?;
+                    let value = match result {
+                        ExecuteResult::Select { rows, .. } => {
+                            if rows.is_empty() {
+                                Value::Null
+                            } else if rows.len() == 1 {
+                                rows.into_iter()
+                                    .next()
+                                    .and_then(|r| r.values.into_iter().next())
+                                    .unwrap_or(Value::Null)
+                            } else {
+                                return Err(anyhow!("Scalar subquery returned more than one row"));
+                            }
+                        }
+                        _ => Value::Null,
+                    };
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::Constant(value),
+                        data_type: expr.data_type.clone(),
+                    })
+                }
+
+                TypedExprKind::AnyAll {
+                    expr: inner_expr,
+                    op,
+                    subquery,
+                    is_all,
+                } => {
+                    if is_correlated_query(subquery) {
+                        return Ok(expr.clone());
+                    }
+                    let rewritten_expr = self.transform_expr(inner_expr).await?;
+                    let result = self
+                        .executor
+                        .execute_subquery(
+                            &mut *self.txn,
+                            self.db_id,
+                            &mut *self.sequence_values,
+                            self.search_path,
+                            subquery,
+                            self.ctes,
+                        )
+                        .await?;
+                    let rows = match result {
+                        ExecuteResult::Select { rows, .. } => rows,
+                        _ => return Err(anyhow!("Expected SELECT from ANY/ALL subquery")),
+                    };
+                    let rhs_declared_type = subquery
+                        .output_schema
+                        .first()
+                        .map(|(_, dt)| dt.clone())
+                        .ok_or_else(|| anyhow!("ANY/ALL subquery has empty output schema"))?;
+                    let values: Vec<TypedExpr> = rows
+                        .into_iter()
+                        .filter_map(|r| r.values.into_iter().next())
+                        .map(|v| {
+                            build_any_all_rhs_constant_expr(
+                                &rewritten_expr.data_type,
+                                &rhs_declared_type,
+                                v,
+                            )
+                        })
+                        .collect();
+                    if values.is_empty() {
+                        return Ok(TypedExpr {
+                            kind: TypedExprKind::Constant(Value::Boolean(*is_all)),
+                            data_type: DataType::Boolean,
+                        });
+                    }
+                    let comparisons: Vec<TypedExpr> = values
+                        .into_iter()
+                        .map(|v| TypedExpr {
+                            kind: TypedExprKind::BinaryOp {
+                                left: Box::new(rewritten_expr.clone()),
+                                op: op.clone(),
+                                right: Box::new(v),
+                            },
+                            data_type: DataType::Boolean,
+                        })
+                        .collect();
+                    let chain_op = if *is_all {
+                        TypedBinaryOp::And
+                    } else {
+                        TypedBinaryOp::Or
+                    };
+                    let combined = comparisons
+                        .into_iter()
+                        .reduce(|a, b| TypedExpr {
+                            kind: TypedExprKind::BinaryOp {
+                                left: Box::new(a),
+                                op: chain_op.clone(),
+                                right: Box::new(b),
+                            },
+                            data_type: DataType::Boolean,
+                        })
+                        .unwrap();
+                    Ok(combined)
+                }
+
+                TypedExprKind::ArraySubquery(subquery) => {
+                    if is_correlated_query(subquery) {
+                        return Ok(expr.clone());
+                    }
+                    let result = self
+                        .executor
+                        .execute_subquery(
+                            &mut *self.txn,
+                            self.db_id,
+                            &mut *self.sequence_values,
+                            self.search_path,
+                            subquery,
+                            self.ctes,
+                        )
+                        .await?;
+                    let rows = match result {
+                        ExecuteResult::Select { rows, .. } => rows,
+                        _ => return Err(anyhow!("Expected SELECT from ARRAY(subquery)")),
+                    };
+                    let values: Vec<Value> = rows
+                        .into_iter()
+                        .filter_map(|r| r.values.into_iter().next())
+                        .collect();
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::Constant(Value::Array(values)),
+                        data_type: expr.data_type.clone(),
+                    })
+                }
+
+                // Sequence functions: execute and replace with Constant.
+                TypedExprKind::FunctionCall { func, args, .. } => {
+                    let name_upper = func.name.to_ascii_uppercase();
+                    let store = self.executor.store();
+                    let qctx = crate::sql::query_context::QueryContext::from_task_locals();
+
+                    match name_upper.as_str() {
+                        "NEXTVAL" => {
+                            let arg_val = eval_typed_expr(
+                                args.first()
+                                    .ok_or_else(|| anyhow!("nextval requires 1 argument"))?,
+                                &Row::new(vec![]),
+                                &qctx,
+                            )?;
+                            let full_name = resolve_sequence_full_name_from_value(
+                                &store,
+                                &mut *self.txn,
+                                self.db_id,
+                                self.search_path,
+                                arg_val,
+                            )
+                            .await?;
+                            let val = store
+                                .nextval_sequence(&mut *self.txn, self.db_id, &full_name)
+                                .await?;
+                            self.sequence_values.insert(full_name, val);
+                            Ok(TypedExpr {
+                                kind: TypedExprKind::Constant(Value::Int64(val)),
+                                data_type: DataType::Int64,
+                            })
+                        }
+                        "CURRVAL" => {
+                            let arg_val = eval_typed_expr(
+                                args.first()
+                                    .ok_or_else(|| anyhow!("currval requires 1 argument"))?,
+                                &Row::new(vec![]),
+                                &qctx,
+                            )?;
+                            let full_name = resolve_sequence_full_name_from_value(
+                                &store,
+                                &mut *self.txn,
+                                self.db_id,
+                                self.search_path,
+                                arg_val,
+                            )
+                            .await?;
+                            if store
+                                .get_sequence(&mut *self.txn, self.db_id, &full_name)
+                                .await?
+                                .is_none()
+                            {
+                                return Err(SqlError::RelationNotFound(full_name.clone()).into());
+                            }
+                            let val = self
+                                .sequence_values
+                                .get(&full_name)
+                                .copied()
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "currval of sequence \"{}\" is not yet defined in this session",
+                                        full_name
+                                    )
+                                })?;
+                            Ok(TypedExpr {
+                                kind: TypedExprKind::Constant(Value::Int64(val)),
+                                data_type: DataType::Int64,
+                            })
+                        }
+                        "SETVAL" => {
+                            let arg0 = eval_typed_expr(
+                                args.first().ok_or_else(|| {
+                                    anyhow!("setval requires at least 2 arguments")
+                                })?,
+                                &Row::new(vec![]),
+                                &qctx,
+                            )?;
+                            let arg1 = eval_typed_expr(
+                                args.get(1).ok_or_else(|| {
+                                    anyhow!("setval requires at least 2 arguments")
+                                })?,
+                                &Row::new(vec![]),
+                                &qctx,
+                            )?;
+                            let full_name = resolve_sequence_full_name_from_value(
+                                &store,
+                                &mut *self.txn,
+                                self.db_id,
+                                self.search_path,
+                                arg0,
+                            )
+                            .await?;
+                            let value_i64 = match arg1 {
+                                Value::Int32(n) => n as i64,
+                                Value::Int64(n) => n,
+                                Value::Float64(n) => n as i64,
+                                Value::Text(s) => s.trim().parse::<i64>().map_err(|_| {
+                                    anyhow!("setval: value must be integer, got {}", s)
+                                })?,
+                                other => {
+                                    return Err(anyhow!(
+                                        "setval: value must be integer, got {}",
+                                        other
+                                    ))
+                                }
+                            };
+                            let is_called = if let Some(arg2) = args.get(2) {
+                                match eval_typed_expr(arg2, &Row::new(vec![]), &qctx)? {
+                                    Value::Boolean(b) => b,
+                                    Value::Text(s) => matches!(
+                                        s.to_lowercase().as_str(),
+                                        "true" | "t" | "1" | "yes" | "y"
+                                    ),
+                                    other => {
+                                        return Err(anyhow!(
+                                            "setval: is_called must be boolean, got {}",
+                                            other
+                                        ))
+                                    }
+                                }
+                            } else {
+                                true
+                            };
+                            let res = store
+                                .setval_sequence(
+                                    &mut *self.txn,
+                                    self.db_id,
+                                    &full_name,
+                                    value_i64,
+                                    is_called,
+                                )
+                                .await?;
+                            Ok(TypedExpr {
+                                kind: TypedExprKind::Constant(Value::Int64(res)),
+                                data_type: DataType::Int64,
+                            })
+                        }
+                        "LASTVAL" => {
+                            let val =
+                                self.sequence_values
+                                    .values()
+                                    .last()
+                                    .copied()
+                                    .ok_or_else(|| {
+                                        anyhow!("lastval is not yet defined in this session")
+                                    })?;
+                            Ok(TypedExpr {
+                                kind: TypedExprKind::Constant(Value::Int64(val)),
+                                data_type: DataType::Int64,
+                            })
+                        }
+                        // Non-sequence function: canonical async child recursion.
+                        _ => {
+                            let kind = map_children_async(expr, self).await?;
+                            Ok(TypedExpr {
+                                kind,
+                                data_type: expr.data_type.clone(),
+                            })
+                        }
+                    }
+                }
+
+                // All other composite variants: canonical async child recursion.
+                _ => {
+                    let kind = map_children_async(expr, self).await?;
+                    Ok(TypedExpr {
+                        kind,
+                        data_type: expr.data_type.clone(),
+                    })
+                }
+            }
+        })
     }
 }
 

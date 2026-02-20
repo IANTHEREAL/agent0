@@ -723,133 +723,19 @@ fn collect_column_indices(expr: &TypedExpr) -> HashSet<usize> {
 }
 
 fn collect_column_indices_inner(expr: &TypedExpr, indices: &mut HashSet<usize>) {
-    match &expr.kind {
-        TypedExprKind::ColumnRef {
-            scope_depth,
-            column_index,
-            ..
-        } => {
-            if *scope_depth == 0 {
-                indices.insert(*column_index);
-            }
-        }
-        TypedExprKind::Constant(_) | TypedExprKind::Default | TypedExprKind::Parameter { .. } => {}
-        TypedExprKind::BinaryOp { left, right, .. } => {
-            collect_column_indices_inner(left, indices);
-            collect_column_indices_inner(right, indices);
-        }
-        TypedExprKind::UnaryOp { operand, .. } => {
-            collect_column_indices_inner(operand, indices);
-        }
-        TypedExprKind::Cast { expr, .. } | TypedExprKind::IsTest { expr, .. } => {
-            collect_column_indices_inner(expr, indices);
-        }
-        TypedExprKind::Between {
-            expr, low, high, ..
-        } => {
-            collect_column_indices_inner(expr, indices);
-            collect_column_indices_inner(low, indices);
-            collect_column_indices_inner(high, indices);
-        }
-        TypedExprKind::InList { expr, list, .. } => {
-            collect_column_indices_inner(expr, indices);
-            for item in list {
-                collect_column_indices_inner(item, indices);
-            }
-        }
-        TypedExprKind::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        }
-        | TypedExprKind::SimilarTo {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            collect_column_indices_inner(expr, indices);
-            collect_column_indices_inner(pattern, indices);
-            if let Some(esc) = escape {
-                collect_column_indices_inner(esc, indices);
-            }
-        }
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            if let Some(op) = operand {
-                collect_column_indices_inner(op, indices);
-            }
-            for (w, t) in when_clauses {
-                collect_column_indices_inner(w, indices);
-                collect_column_indices_inner(t, indices);
-            }
-            if let Some(e) = else_result {
-                collect_column_indices_inner(e, indices);
-            }
-        }
-        TypedExprKind::Coalesce(args)
-        | TypedExprKind::MinMax { args, .. }
-        | TypedExprKind::ArrayLiteral(args)
-        | TypedExprKind::Row(args) => {
-            for arg in args {
-                collect_column_indices_inner(arg, indices);
-            }
-        }
-        TypedExprKind::NullIf(a, b) => {
-            collect_column_indices_inner(a, indices);
-            collect_column_indices_inner(b, indices);
-        }
-        TypedExprKind::FunctionCall { args, filter, .. } => {
-            for arg in args {
-                collect_column_indices_inner(arg, indices);
-            }
-            if let Some(f) = filter {
-                collect_column_indices_inner(f, indices);
-            }
-        }
-        TypedExprKind::AggregateCall { args, filter, .. } => {
-            for arg in args {
-                collect_column_indices_inner(arg, indices);
-            }
-            if let Some(f) = filter {
-                collect_column_indices_inner(f, indices);
-            }
-        }
-        TypedExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            for arg in args {
-                collect_column_indices_inner(arg, indices);
-            }
-            for pb in partition_by {
-                collect_column_indices_inner(pb, indices);
-            }
-            for ob in order_by {
-                collect_column_indices_inner(&ob.expr, indices);
-            }
-        }
-        TypedExprKind::ArrayIndex { array, index } => {
-            collect_column_indices_inner(array, indices);
-            collect_column_indices_inner(index, indices);
-        }
-        TypedExprKind::JsonAccess { expr, path, .. } => {
-            collect_column_indices_inner(expr, indices);
-            collect_column_indices_inner(path, indices);
-        }
-        // Subquery nodes — don't descend into subqueries (different scope)
-        TypedExprKind::ScalarSubquery(_)
-        | TypedExprKind::Exists { .. }
-        | TypedExprKind::InSubquery { .. }
-        | TypedExprKind::AnyAll { .. }
-        | TypedExprKind::ArraySubquery(_) => {}
+    // ColumnRef at scope_depth 0: collect it
+    if let TypedExprKind::ColumnRef {
+        scope_depth: 0,
+        column_index,
+        ..
+    } = &expr.kind
+    {
+        indices.insert(*column_index);
     }
+    // Recurse into children (for_each_child treats subqueries as opaque — correct)
+    crate::sql::expr::traverse::for_each_child(expr, &mut |child| {
+        collect_column_indices_inner(child, indices);
+    });
 }
 
 // ── Unit tests ─────────────────────────────────────────────────
