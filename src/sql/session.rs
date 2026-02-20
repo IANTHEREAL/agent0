@@ -1,5 +1,6 @@
 //! Session management for transactions
 
+use crate::config::SharedServerConfig;
 use crate::observability::TenantObservability;
 use crate::sql::error::SqlError;
 use crate::storage::TikvStore;
@@ -8,7 +9,6 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use crate::config::SharedServerConfig;
 use tikv_client::Transaction;
 
 pub(crate) const DEFAULT_MAX_SORT_BYTES: usize = 256 * 1024 * 1024;
@@ -364,7 +364,8 @@ impl SessionSettings {
             "statement_timeout" => self.statement_timeout_ms = self.default_statement_timeout_ms,
             "lock_timeout" => self.lock_timeout_ms = 0,
             "idle_in_transaction_session_timeout" => {
-                self.idle_in_transaction_session_timeout_ms = self.default_idle_in_transaction_session_timeout_ms
+                self.idle_in_transaction_session_timeout_ms =
+                    self.default_idle_in_transaction_session_timeout_ms
             }
             "pgtikv.max_sort_bytes" | "tipg.max_sort_bytes" => {
                 self.max_sort_bytes = DEFAULT_MAX_SORT_BYTES
@@ -483,7 +484,9 @@ impl SessionSettings {
         if self.idle_in_transaction_session_timeout_ms == 0 {
             None
         } else {
-            Some(Duration::from_millis(self.idle_in_transaction_session_timeout_ms))
+            Some(Duration::from_millis(
+                self.idle_in_transaction_session_timeout_ms,
+            ))
         }
     }
 
@@ -935,15 +938,15 @@ mod tests {
 
         assert_eq!(settings.statement_timeout_ms, 1_500);
         assert_eq!(settings.default_statement_timeout_ms, 1_500);
-        assert_eq!(
-            settings.idle_in_transaction_session_timeout_ms,
-            2_500
-        );
+        assert_eq!(settings.idle_in_transaction_session_timeout_ms, 2_500);
         assert_eq!(
             settings.default_idle_in_transaction_session_timeout_ms,
             2_500
         );
-        assert_eq!(settings.statement_timeout(), Some(Duration::from_millis(1_500)));
+        assert_eq!(
+            settings.statement_timeout(),
+            Some(Duration::from_millis(1_500))
+        );
         assert_eq!(
             settings
                 .show_value("idle_in_transaction_session_timeout")
@@ -1397,7 +1400,9 @@ mod tests {
 
         // Verify initial value
         assert_eq!(
-            settings.show_value("idle_in_transaction_session_timeout").as_deref(),
+            settings
+                .show_value("idle_in_transaction_session_timeout")
+                .as_deref(),
             Some("3000ms")
         );
 
@@ -1406,14 +1411,18 @@ mod tests {
             .set_known_setting("idle_in_transaction_session_timeout", "10000".to_string())
             .unwrap();
         assert_eq!(
-            settings.show_value("idle_in_transaction_session_timeout").as_deref(),
+            settings
+                .show_value("idle_in_transaction_session_timeout")
+                .as_deref(),
             Some("10000ms")
         );
 
         // RESET should restore to server default (3000), not 0
         settings.reset_setting("idle_in_transaction_session_timeout");
         assert_eq!(
-            settings.show_value("idle_in_transaction_session_timeout").as_deref(),
+            settings
+                .show_value("idle_in_transaction_session_timeout")
+                .as_deref(),
             Some("3000ms")
         );
     }
@@ -1435,7 +1444,9 @@ mod tests {
             Some("20000ms")
         );
         assert_eq!(
-            settings.show_value("idle_in_transaction_session_timeout").as_deref(),
+            settings
+                .show_value("idle_in_transaction_session_timeout")
+                .as_deref(),
             Some("15000ms")
         );
 
@@ -1446,7 +1457,9 @@ mod tests {
             Some("5000ms")
         );
         assert_eq!(
-            settings.show_value("idle_in_transaction_session_timeout").as_deref(),
+            settings
+                .show_value("idle_in_transaction_session_timeout")
+                .as_deref(),
             Some("3000ms")
         );
     }
@@ -1474,8 +1487,14 @@ mod tests {
         assert_eq!(SessionSettings::parse_timeout_value("1s").unwrap(), 1_000);
         assert_eq!(SessionSettings::parse_timeout_value("5s").unwrap(), 5_000);
         assert_eq!(SessionSettings::parse_timeout_value("100ms").unwrap(), 100);
-        assert_eq!(SessionSettings::parse_timeout_value("1min").unwrap(), 60_000);
-        assert_eq!(SessionSettings::parse_timeout_value("2h").unwrap(), 7_200_000);
+        assert_eq!(
+            SessionSettings::parse_timeout_value("1min").unwrap(),
+            60_000
+        );
+        assert_eq!(
+            SessionSettings::parse_timeout_value("2h").unwrap(),
+            7_200_000
+        );
 
         // Invalid
         assert!(SessionSettings::parse_timeout_value("-1").is_err());

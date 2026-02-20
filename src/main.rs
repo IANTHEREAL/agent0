@@ -14,8 +14,8 @@ mod txn;
 mod types;
 mod worker;
 
-use anyhow::Result;
 use crate::config::ServerConfig;
+use anyhow::Result;
 use pgwire::tokio::process_socket;
 use pool::TikvClientPool;
 use protocol::DynamicHandlerFactory;

@@ -605,7 +605,9 @@ impl WorkerEngine {
 
         // Worker statement timeout: wraps each individual statement, not the entire task.
         let stmt_timeout = if config.statement_timeout_ms > 0 {
-            Some(std::time::Duration::from_millis(config.statement_timeout_ms))
+            Some(std::time::Duration::from_millis(
+                config.statement_timeout_ms,
+            ))
         } else {
             None
         };
