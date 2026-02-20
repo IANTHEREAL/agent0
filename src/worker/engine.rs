@@ -1,3 +1,4 @@
+use crate::cron::process_list::{get_process_list, RunningCronJob};
 use crate::cron::types::{CronRun, CronRunStatus};
 use crate::extensions::context::{with_context_opts, ExtensionContextOpts};
 use crate::observability;
@@ -408,11 +409,40 @@ impl WorkerEngine {
 
         let exec_result = if entry.task_type == TaskType::Cron && cron_run.is_none() {
             Ok(0usize)
+        } else if let Some((_, cron_db_id, ref run, _, max_runtime_ms)) = cron_run {
+            let cancel_signal = get_process_list().register(RunningCronJob {
+                run_id: run.run_id,
+                job_id: entry.task_id,
+                keyspace: entry.keyspace.clone(),
+                db_id: cron_db_id,
+                username: entry.username.clone(),
+                command: entry.command.clone(),
+                started_at: now_ms(),
+            });
+
+            let timeout_ms = max_runtime_ms.unwrap_or(config.cron_job_timeout_ms);
+            let timeout_dur = if timeout_ms > 0 {
+                Some(Duration::from_millis(timeout_ms))
+            } else {
+                None
+            };
+
+            let task_fut = Self::execute_task(pool, config, &entry, Some(cancel_signal));
+            let result = match timeout_dur {
+                Some(dur) => match tokio::time::timeout(dur, task_fut).await {
+                    Ok(r) => r,
+                    Err(_) => Err(anyhow!("cron job timed out after {}ms", timeout_ms)),
+                },
+                None => task_fut.await,
+            };
+
+            get_process_list().deregister(run.run_id);
+            result
         } else {
-            Self::execute_task(pool, config, &entry).await
+            Self::execute_task(pool, config, &entry, None).await
         };
 
-        if let Some((store, db_id, mut run, started_at)) = cron_run {
+        if let Some((store, db_id, mut run, started_at, _max_runtime_ms)) = cron_run {
             let (status, message) = match &exec_result {
                 Ok(completed_commands) => (
                     CronRunStatus::Succeeded,
@@ -499,7 +529,7 @@ impl WorkerEngine {
         pool: &Arc<TikvClientPool>,
         entry: &TaskQueueEntry,
         scheduled_minute: i64,
-    ) -> Result<Option<(Arc<TikvStore>, u64, CronRun, i64)>> {
+    ) -> Result<Option<(Arc<TikvStore>, u64, CronRun, i64, Option<u64>)>> {
         let handle = pool.acquire(Some(entry.keyspace.clone())).await?;
         let store = handle.store().clone();
         let mut txn = store.begin().await?;
@@ -522,6 +552,11 @@ impl WorkerEngine {
                 .map(|db| db.name)
                 .unwrap_or_else(|| "postgres".to_string());
 
+            let max_runtime_ms = store
+                .get_cron_job(&mut txn, entry.db_id, entry.task_id)
+                .await?
+                .and_then(|j| j.max_runtime_ms);
+
             let run_id = store.next_cron_run_id(entry.db_id).await?;
             let started_at = now_ms();
             let run = CronRun {
@@ -537,7 +572,7 @@ impl WorkerEngine {
                 end_time: None,
             };
             store.put_cron_run(&mut txn, entry.db_id, &run).await?;
-            Ok(Some((store, entry.db_id, run, started_at)))
+            Ok(Some((store, entry.db_id, run, started_at, max_runtime_ms)))
         }
         .await;
 
@@ -592,6 +627,7 @@ impl WorkerEngine {
         pool: &Arc<TikvClientPool>,
         config: &WorkerConfig,
         entry: &TaskQueueEntry,
+        cancel_signal: Option<Arc<Notify>>,
     ) -> Result<usize> {
         let handle = pool.acquire(Some(entry.keyspace.clone())).await?;
         let store = handle.store().clone();
@@ -603,8 +639,8 @@ impl WorkerEngine {
             return Ok(1);
         }
 
-        // Worker statement timeout: wraps each individual statement, not the entire task.
-        let stmt_timeout = if config.statement_timeout_ms > 0 {
+        let is_cron = entry.task_type == TaskType::Cron;
+        let stmt_timeout = if !is_cron && config.statement_timeout_ms > 0 {
             Some(std::time::Duration::from_millis(
                 config.statement_timeout_ms,
             ))
@@ -645,14 +681,23 @@ impl WorkerEngine {
                         stmt,
                         None,
                     );
-                    let res = match stmt_timeout {
-                        Some(t) => match tokio::time::timeout(t, fut).await {
-                            Ok(res) => res,
-                            Err(_) => Err(anyhow::anyhow!(
-                                "canceling statement due to statement timeout"
-                            )),
+                    let res = match (&stmt_timeout, &cancel_signal) {
+                        (Some(t), Some(sig)) => tokio::select! {
+                            r = tokio::time::timeout(*t, fut) => match r {
+                                Ok(res) => res,
+                                Err(_) => Err(anyhow::anyhow!("canceling statement due to statement timeout")),
+                            },
+                            _ = sig.notified() => Err(anyhow::anyhow!("cancelled by administrator")),
                         },
-                        None => fut.await,
+                        (Some(t), None) => match tokio::time::timeout(*t, fut).await {
+                            Ok(res) => res,
+                            Err(_) => Err(anyhow::anyhow!("canceling statement due to statement timeout")),
+                        },
+                        (None, Some(sig)) => tokio::select! {
+                            r = fut => r,
+                            _ = sig.notified() => Err(anyhow::anyhow!("cancelled by administrator")),
+                        },
+                        (None, None) => fut.await,
                     };
                     let _ = res?;
                 }

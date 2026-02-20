@@ -3,6 +3,7 @@ mod columns;
 mod constraint_column_usage;
 mod cron_job;
 mod cron_job_run_details;
+mod cron_running_jobs;
 pub(crate) mod helpers;
 mod key_column_usage;
 mod pg_am;
@@ -111,6 +112,7 @@ impl CatalogRegistry {
         registry.register(Box::new(tables::Tables));
         registry.register(Box::new(cron_job::CronJobTable));
         registry.register(Box::new(cron_job_run_details::CronJobRunDetailsTable));
+        registry.register(Box::new(cron_running_jobs::CronRunningJobsTable));
         registry
     }
 

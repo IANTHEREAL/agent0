@@ -73,6 +73,7 @@ pub(crate) async fn execute_cron_scalar_function(
             )
             .await,
         ),
+        "cancel" => Some(execute_cancel(is_superuser, args).await),
         "schedule_in_database" => Some(Err(anyhow!("cron.schedule_in_database is not supported"))),
         _ => None,
     }
@@ -144,6 +145,7 @@ async fn execute_schedule(
         username: current_user.to_string(),
         active: true,
         jobname,
+        max_runtime_ms: None,
     };
     store.put_cron_job(txn, db_id, &job).await?;
     enqueue_cron_to_worker(keyspace, db_id, &job).await;
@@ -225,9 +227,9 @@ async fn execute_alter_job(
         return Err(anyhow!("extension pg_cron is disabled"));
     }
 
-    if args.is_empty() || args.len() > 6 {
+    if args.is_empty() || args.len() > 7 {
         return Err(anyhow!(
-            "cron.alter_job() requires 1 to 6 arguments, got {}",
+            "cron.alter_job() requires 1 to 7 arguments, got {}",
             args.len()
         ));
     }
@@ -304,6 +306,13 @@ async fn execute_alter_job(
                 _ => return Err(anyhow!("cron.alter_job: active must be boolean")),
             };
             job.active = active;
+        }
+    }
+
+    if let Some(val) = args.get(6) {
+        if !matches!(val, Value::Null) {
+            let max_runtime_ms = parse_runtime_text(val)?;
+            job.max_runtime_ms = max_runtime_ms;
         }
     }
 
@@ -400,6 +409,94 @@ fn extract_text(value: &Value, arg_name: &str) -> Result<String> {
     }
 }
 
+async fn execute_cancel(is_superuser: bool, args: &[Value]) -> Result<Value> {
+    if !is_superuser {
+        return Err(anyhow!("cron.cancel: must be superuser"));
+    }
+    if args.len() != 1 {
+        return Err(anyhow!(
+            "cron.cancel() requires exactly 1 argument (job_id), got {}",
+            args.len()
+        ));
+    }
+    let job_id = match &args[0] {
+        Value::Int64(id) => *id,
+        Value::Int32(id) => *id as i64,
+        _ => return Err(anyhow!("cron.cancel: argument must be bigint (job_id)")),
+    };
+
+    let found = crate::cron::process_list::get_process_list().cancel_by_job_id(job_id);
+    if found {
+        Ok(Value::Boolean(true))
+    } else {
+        Ok(Value::Boolean(false))
+    }
+}
+
+fn parse_runtime_text(val: &Value) -> Result<Option<u64>> {
+    match val {
+        Value::Null => Ok(None),
+        Value::Int64(0) | Value::Int32(0) => Ok(Some(0)),
+        Value::Int64(ms) => {
+            if *ms < 0 {
+                Err(anyhow!("cron.alter_job: max_runtime must be non-negative"))
+            } else {
+                Ok(Some(*ms as u64))
+            }
+        }
+        Value::Int32(ms) => {
+            if *ms < 0 {
+                Err(anyhow!("cron.alter_job: max_runtime must be non-negative"))
+            } else {
+                Ok(Some(*ms as u64))
+            }
+        }
+        Value::Text(s) => {
+            let s = s.trim().to_lowercase();
+            if s == "0" {
+                return Ok(Some(0));
+            }
+            if let Some(num) = s.strip_suffix("ms") {
+                return num
+                    .trim()
+                    .parse::<u64>()
+                    .map(Some)
+                    .map_err(|_| anyhow!("cron.alter_job: invalid max_runtime '{}'", s));
+            }
+            if let Some(num) = s.strip_suffix("min") {
+                return num
+                    .trim()
+                    .parse::<u64>()
+                    .map(|n| Some(n * 60_000))
+                    .map_err(|_| anyhow!("cron.alter_job: invalid max_runtime '{}'", s));
+            }
+            if let Some(num) = s.strip_suffix('h') {
+                return num
+                    .trim()
+                    .parse::<u64>()
+                    .map(|n| Some(n * 3_600_000))
+                    .map_err(|_| anyhow!("cron.alter_job: invalid max_runtime '{}'", s));
+            }
+            if let Some(num) = s.strip_suffix('s') {
+                return num
+                    .trim()
+                    .parse::<u64>()
+                    .map(|n| Some(n * 1_000))
+                    .map_err(|_| anyhow!("cron.alter_job: invalid max_runtime '{}'", s));
+            }
+            s.parse::<u64>().map(Some).map_err(|_| {
+                anyhow!(
+                    "cron.alter_job: invalid max_runtime '{}'. Use format: 30min, 2h, 60s, 5000ms, or integer milliseconds",
+                    s
+                )
+            })
+        }
+        _ => Err(anyhow!(
+            "cron.alter_job: max_runtime must be text or integer"
+        )),
+    }
+}
+
 pub(crate) fn try_execute_cron_scalar_function(
     func_name: &str,
     _args: &[Value],
@@ -419,6 +516,9 @@ pub(crate) fn try_execute_cron_scalar_function(
         ))),
         "alter_job" => Some(Err(anyhow!(
             "cron.alter_job must be evaluated during execution"
+        ))),
+        "cancel" => Some(Err(anyhow!(
+            "cron.cancel must be evaluated during execution"
         ))),
         "schedule_in_database" => Some(Err(anyhow!("cron.schedule_in_database is not supported"))),
         _ => None,
@@ -510,5 +610,43 @@ mod tests {
     fn alter_job_not_recognized_for_other_schemas() {
         assert!(try_execute_cron_scalar_function("public.alter_job", &[]).is_none());
         assert!(try_execute_cron_scalar_function("extensions.alter_job", &[]).is_none());
+    }
+
+    #[test]
+    fn parse_runtime_text_units() {
+        assert_eq!(
+            parse_runtime_text(&Value::Text("30min".into())).unwrap(),
+            Some(1_800_000)
+        );
+        assert_eq!(
+            parse_runtime_text(&Value::Text("2h".into())).unwrap(),
+            Some(7_200_000)
+        );
+        assert_eq!(
+            parse_runtime_text(&Value::Text("60s".into())).unwrap(),
+            Some(60_000)
+        );
+        assert_eq!(
+            parse_runtime_text(&Value::Text("5000ms".into())).unwrap(),
+            Some(5_000)
+        );
+        assert_eq!(
+            parse_runtime_text(&Value::Text("5000".into())).unwrap(),
+            Some(5_000)
+        );
+        assert_eq!(parse_runtime_text(&Value::Int64(0)).unwrap(), Some(0));
+        assert_eq!(parse_runtime_text(&Value::Null).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_runtime_text_invalid() {
+        assert!(parse_runtime_text(&Value::Text("abc".into())).is_err());
+        assert!(parse_runtime_text(&Value::Int64(-1)).is_err());
+    }
+
+    #[test]
+    fn cancel_dispatch_recognized() {
+        assert!(try_execute_cron_scalar_function("cron.cancel", &[]).is_some());
+        assert!(try_execute_cron_scalar_function("CRON.CANCEL", &[]).is_some());
     }
 }

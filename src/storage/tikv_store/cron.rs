@@ -1,5 +1,16 @@
 use super::*;
-use crate::cron::types::{CronJob, CronRun};
+use crate::cron::types::{CronJob, CronJobLegacy, CronRun};
+
+fn deserialize_cron_job(data: &[u8]) -> anyhow::Result<CronJob> {
+    match bincode::deserialize::<CronJob>(data) {
+        Ok(job) => Ok(job),
+        Err(_) => {
+            let legacy: CronJobLegacy = bincode::deserialize(data)
+                .context("Failed to deserialize cron job (legacy fallback)")?;
+            Ok(legacy.into())
+        }
+    }
+}
 
 impl TikvStore {
     pub async fn put_cron_job(
@@ -22,9 +33,7 @@ impl TikvStore {
     ) -> Result<Option<CronJob>> {
         let key = self.key(&encode_cron_job_key_v2(db_id, job_id));
         match txn.get(key).await? {
-            Some(data) => Ok(Some(
-                bincode::deserialize(&data).context("Failed to deserialize cron job")?,
-            )),
+            Some(data) => Ok(Some(deserialize_cron_job(&data)?)),
             None => Ok(None),
         }
     }
@@ -42,8 +51,7 @@ impl TikvStore {
             if !key.starts_with(&prefix) {
                 continue;
             }
-            let job: CronJob =
-                bincode::deserialize(pair.value()).context("Failed to deserialize cron job")?;
+            let job: CronJob = deserialize_cron_job(pair.value())?;
             jobs.push(job);
         }
         Ok(jobs)

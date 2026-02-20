@@ -30,6 +30,7 @@ impl VirtualTable for CronJobTable {
                 text_col("username"),
                 bool_col("active"),
                 text_col("jobname"),
+                text_col("max_runtime"),
             ],
             version: 1,
             pk_constraint_name: None,
@@ -78,10 +79,21 @@ impl VirtualTable for CronJobTable {
                         .as_deref()
                         .map(text_val)
                         .unwrap_or_else(null_val),
+                    text_val(&format_runtime_ms(job.max_runtime_ms)),
                 ])
             })
             .collect();
 
         Ok(rows)
+    }
+}
+
+fn format_runtime_ms(ms: Option<u64>) -> String {
+    match ms {
+        None | Some(0) => "default".to_string(),
+        Some(ms) if ms >= 3_600_000 && ms % 3_600_000 == 0 => format!("{}h", ms / 3_600_000),
+        Some(ms) if ms >= 60_000 && ms % 60_000 == 0 => format!("{}min", ms / 60_000),
+        Some(ms) if ms >= 1_000 && ms % 1_000 == 0 => format!("{}s", ms / 1_000),
+        Some(ms) => format!("{}ms", ms),
     }
 }
