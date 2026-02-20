@@ -590,16 +590,25 @@ impl WorkerEngine {
 
     async fn execute_task(
         pool: &Arc<TikvClientPool>,
-        _config: &WorkerConfig,
+        config: &WorkerConfig,
         entry: &TaskQueueEntry,
     ) -> Result<usize> {
         let handle = pool.acquire(Some(entry.keyspace.clone())).await?;
         let store = handle.store().clone();
 
+        // BgDdl tasks (e.g. CREATE INDEX CONCURRENTLY backfill) are exempt from
+        // statement_timeout — they legitimately run for extended periods.
         if entry.task_type == TaskType::BgDdl && entry.command.starts_with("__backfill_index ") {
             Self::execute_bg_ddl_backfill(&store, entry).await?;
             return Ok(1);
         }
+
+        // Worker statement timeout: wraps each individual statement, not the entire task.
+        let stmt_timeout = if config.statement_timeout_ms > 0 {
+            Some(std::time::Duration::from_millis(config.statement_timeout_ms))
+        } else {
+            None
+        };
 
         let exec = Executor::new(
             store.clone(),
@@ -626,16 +635,24 @@ impl WorkerEngine {
             let result = async {
                 let statements = parse_sql(&entry.command)?;
                 for stmt in &statements {
-                    let _ = exec
-                        .execute_statement_on_txn(
-                            &mut txn,
-                            entry.db_id,
-                            &mut sequence_values,
-                            &search_path,
-                            stmt,
-                            None,
-                        )
-                        .await?;
+                    let fut = exec.execute_statement_on_txn(
+                        &mut txn,
+                        entry.db_id,
+                        &mut sequence_values,
+                        &search_path,
+                        stmt,
+                        None,
+                    );
+                    let res = match stmt_timeout {
+                        Some(t) => match tokio::time::timeout(t, fut).await {
+                            Ok(res) => res,
+                            Err(_) => Err(anyhow::anyhow!(
+                                "canceling statement due to statement timeout"
+                            )),
+                        },
+                        None => fut.await,
+                    };
+                    let _ = res?;
                 }
                 txn.commit().await?;
                 Ok(statements.len())
