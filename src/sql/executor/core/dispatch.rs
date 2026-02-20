@@ -157,17 +157,19 @@ impl Executor {
 
                 if session.is_transaction_failed() && !sql_trimmed.trim().is_empty() {
                     if !is_observability_user {
-                        self.observability
-                            .record_statement(Duration::from_millis(0), false, || {
-                                sql_trimmed.to_string()
-                            });
+                        self.observability.record_statement(
+                            Duration::from_millis(0),
+                            false,
+                            || sql_trimmed.to_string(),
+                        );
                     }
                     return Err(SqlError::InFailedTransaction.into());
                 }
 
                 let observability_policy =
                     self.enforce_observability_prepared_policy(session, sql_trimmed, exec);
-                let is_observability_query = observability_policy.as_ref().copied().unwrap_or(false);
+                let is_observability_query =
+                    observability_policy.as_ref().copied().unwrap_or(false);
 
                 let start = Instant::now();
                 let exec_result = match observability_policy {
@@ -190,10 +192,11 @@ impl Executor {
                 }
 
                 if !is_observability_query {
-                    self.observability
-                        .record_statement(start.elapsed(), exec_result.is_ok(), || {
-                            sql_for_observability.clone()
-                        });
+                    self.observability.record_statement(
+                        start.elapsed(),
+                        exec_result.is_ok(),
+                        || sql_for_observability.clone(),
+                    );
                 }
 
                 exec_result
@@ -312,12 +315,15 @@ impl Executor {
                             current_version = ?current,
                             "prepared schema drift detected; falling back to SQL parse/analyze"
                         );
-                        return self.execute_prepared_text_fallback(session, sql, qctx).await;
+                        return self
+                            .execute_prepared_text_fallback(session, sql, qctx)
+                            .await;
                     }
                     Err(err) => {
                         session.rollback().await?;
                         self.clear_trigger_activations();
-                        let should_retry = attempt + 1 < max_attempts && is_retryable_tikv_error(&err);
+                        let should_retry =
+                            attempt + 1 < max_attempts && is_retryable_tikv_error(&err);
                         if should_retry {
                             // Exponential backoff with jitter to reduce contention.
                             let base_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
@@ -343,7 +349,8 @@ impl Executor {
                             current_version = ?current,
                             "prepared schema drift detected; falling back to SQL parse/analyze"
                         );
-                        self.execute_prepared_text_fallback(session, sql, qctx).await
+                        self.execute_prepared_text_fallback(session, sql, qctx)
+                            .await
                     }
                 };
             }
@@ -365,8 +372,9 @@ impl Executor {
             let (txn, sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
-            if let Some((table_name, expected, current)) =
-                self.first_schema_drift_on_txn(txn, db_id, table_versions).await?
+            if let Some((table_name, expected, current)) = self
+                .first_schema_drift_on_txn(txn, db_id, table_versions)
+                .await?
             {
                 return Ok::<PreparedTxnResult, anyhow::Error>(PreparedTxnResult::SchemaDrift {
                     table_name,

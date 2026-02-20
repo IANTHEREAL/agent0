@@ -1912,9 +1912,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         }
 
         let exec_future: Pin<
-            Box<
-                dyn Future<Output = Result<crate::sql::ExecuteResults, anyhow::Error>> + Send + '_,
-            >,
+            Box<dyn Future<Output = Result<crate::sql::ExecuteResults, anyhow::Error>> + Send + '_>,
         > = match &prepared.exec {
             PreparedExec::RawSqlUtility => {
                 debug_assert!(
