@@ -1,4 +1,5 @@
 use super::*;
+use crate::sql::error::SqlError;
 
 impl TikvStore {
     pub async fn list_procedures(&self, txn: &mut Transaction, db_id: u64) -> Result<Vec<String>> {
@@ -57,7 +58,7 @@ impl TikvStore {
             if if_not_exists {
                 return Ok(false);
             }
-            return Err(anyhow!("Schema '{}' already exists", schema));
+            return Err(SqlError::DuplicateSchema(schema.to_string()).into());
         }
 
         let key = self.key(&encode_schema_def_key_v2(db_id, schema));
@@ -65,7 +66,7 @@ impl TikvStore {
             if if_not_exists {
                 return Ok(false);
             }
-            return Err(anyhow!("Schema '{}' already exists", schema));
+            return Err(SqlError::DuplicateSchema(schema.to_string()).into());
         }
         let oid = self.next_schema_oid(txn, db_id).await?;
         txn_put(txn, key, oid.to_be_bytes().to_vec()).await?;
@@ -164,7 +165,10 @@ impl TikvStore {
             return Err(anyhow!("schema name '{}' must not contain '.'", schema));
         }
         if Self::is_builtin_schema(schema) {
-            return Err(anyhow!("cannot drop schema '{}'", schema));
+            return Err(SqlError::DependentObjectsStillExist {
+                message: format!("cannot drop schema '{}'", schema),
+            }
+            .into());
         }
 
         let key = self.key(&encode_schema_def_key_v2(db_id, schema));
@@ -172,7 +176,7 @@ impl TikvStore {
             if if_exists {
                 return Ok(false);
             }
-            return Err(anyhow!("Schema '{}' does not exist", schema));
+            return Err(SqlError::InvalidSchemaName(schema.to_string()).into());
         }
 
         // Check for dependent objects — match PostgreSQL error format
@@ -244,10 +248,13 @@ impl TikvStore {
 
         if !deps.is_empty() {
             let detail = deps.join("\n");
-            return Err(anyhow!(
-                "cannot drop schema {} because other objects depend on it\nDETAIL:  {}\nHINT:  Use DROP ... CASCADE to drop the dependent objects too.",
-                schema, detail
-            ));
+            return Err(SqlError::DependentObjectsStillExist {
+                message: format!(
+                    "cannot drop schema {} because other objects depend on it\nDETAIL:  {}\nHINT:  Use DROP ... CASCADE to drop the dependent objects too.",
+                    schema, detail
+                ),
+            }
+            .into());
         }
 
         txn_delete(txn, key).await?;
@@ -268,7 +275,10 @@ impl TikvStore {
             return Err(anyhow!("schema name '{}' must not contain '.'", schema));
         }
         if Self::is_builtin_schema(schema) {
-            return Err(anyhow!("cannot drop schema '{}'", schema));
+            return Err(SqlError::DependentObjectsStillExist {
+                message: format!("cannot drop schema '{}'", schema),
+            }
+            .into());
         }
 
         let key = self.key(&encode_schema_def_key_v2(db_id, schema));
@@ -276,7 +286,7 @@ impl TikvStore {
             if if_exists {
                 return Ok(false);
             }
-            return Err(anyhow!("Schema '{}' does not exist", schema));
+            return Err(SqlError::InvalidSchemaName(schema.to_string()).into());
         }
 
         let schema_prefix = format!("{}.", schema);

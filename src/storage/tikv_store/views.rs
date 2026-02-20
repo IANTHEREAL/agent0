@@ -1,4 +1,5 @@
 use super::*;
+use crate::sql::error::SqlError;
 
 impl TikvStore {
     pub async fn create_view(
@@ -13,7 +14,7 @@ impl TikvStore {
         let key = self.key(&encode_view_key_v2(db_id, name));
         if txn.get(key.clone()).await?.is_some() {
             if !or_replace {
-                return Err(anyhow!("View '{}' already exists", name));
+                return Err(SqlError::DuplicateRelation(name.to_string()).into());
             }
 
             let mut def = self
@@ -100,7 +101,7 @@ impl TikvStore {
     ) -> Result<()> {
         let key = self.key(&encode_matview_key_v2(db_id, name));
         if txn.get(key.clone()).await?.is_some() {
-            return Err(anyhow!("Materialized view '{}' already exists", name));
+            return Err(SqlError::DuplicateRelation(name.to_string()).into());
         }
         let (schema, mv_name) = name.split_once('.').unwrap_or(("public", name));
         let def = MatViewDef {

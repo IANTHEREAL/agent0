@@ -1,5 +1,5 @@
 use super::*;
-use crate::sql::InFailedSqlTransaction;
+use crate::sql::error::SqlError;
 use crate::types::{Row, Value};
 use async_trait::async_trait;
 use bytes::Buf;
@@ -186,10 +186,8 @@ fn encode_value_to_string(value: &Value, col_type: Option<&DataType>) -> String 
 
 #[test]
 fn test_sqlstate_for_executor_error() {
-    use crate::sql::error::SqlError;
-
-    // InFailedSqlTransaction → 25P02
-    let failed = anyhow::Error::new(InFailedSqlTransaction);
+    // SqlError::InFailedTransaction → 25P02
+    let failed: anyhow::Error = SqlError::InFailedTransaction.into();
     assert_eq!(sqlstate_for_executor_error(&failed), "25P02");
 
     // Untyped anyhow → XX000
@@ -1077,15 +1075,6 @@ fn test_parse_tenant_username_whitespace() {
     let (ks, user) = parse_tenant_username("tenant. user");
     assert_eq!(ks, Some("tipg_tenant_tenant".to_string()));
     assert_eq!(user, " user");
-}
-
-#[test]
-fn test_auth_bootstrap_transport_errors_do_not_authenticate() {
-    let err = anyhow::anyhow!("gRPC transport error: connection reset");
-    assert!(DynamicPgHandler::ensure_auth_bootstrapped(Err(err)).is_err());
-
-    let err = anyhow::anyhow!("transport error");
-    assert!(DynamicPgHandler::ensure_auth_bootstrapped(Err(err)).is_err());
 }
 
 #[test]

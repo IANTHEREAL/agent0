@@ -1,4 +1,5 @@
 use crate::config;
+use crate::sql::error::SqlError;
 use crate::txn::{txn_delete, txn_put};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -304,19 +305,22 @@ impl AuthManager {
             .unwrap_or_else(|| DEFAULT_ADMIN_USER.to_string());
         let bootstrap_password =
             config::env_string("PGTIKV_BOOTSTRAP_ADMIN_PASSWORD").ok_or_else(|| {
-                anyhow!(
-                    "No superuser exists yet. Set PGTIKV_BOOTSTRAP_ADMIN_PASSWORD to bootstrap the initial superuser (optionally PGTIKV_BOOTSTRAP_ADMIN_USER), or set PGTIKV_DEV=1 for local development."
-                )
+                SqlError::InvalidAuthorizationSpecification {
+                    message: "No superuser exists yet. Set PGTIKV_BOOTSTRAP_ADMIN_PASSWORD to bootstrap the initial superuser (optionally PGTIKV_BOOTSTRAP_ADMIN_USER), or set PGTIKV_DEV=1 for local development.".into(),
+                }
             })?;
 
         if let Some(existing) = self.get_user(txn, &bootstrap_user).await? {
             if existing.is_superuser {
                 return Ok(());
             }
-            return Err(anyhow!(
-                "Bootstrap user '{}' already exists but is not a superuser",
-                bootstrap_user
-            ));
+            return Err(SqlError::InvalidAuthorizationSpecification {
+                message: format!(
+                    "Bootstrap user '{}' already exists but is not a superuser",
+                    bootstrap_user
+                ),
+            }
+            .into());
         }
 
         let admin = User::new_superuser(&bootstrap_user, &bootstrap_password);
@@ -384,7 +388,10 @@ impl AuthManager {
         match self.get_user(txn, username).await? {
             Some(user) => {
                 if !user.can_login {
-                    return Err(anyhow!("User '{}' is not permitted to log in", username));
+                    return Err(SqlError::InvalidAuthorizationSpecification {
+                        message: format!("role \"{}\" is not permitted to log in", username),
+                    }
+                    .into());
                 }
                 if user.verify_password(password) {
                     Ok(Some(user))

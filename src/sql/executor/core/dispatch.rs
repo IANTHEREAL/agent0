@@ -97,7 +97,7 @@ impl Executor {
                             || sql_trimmed.to_string(),
                         );
                     }
-                    return Err(anyhow::Error::new(InFailedSqlTransaction));
+                    return Err(SqlError::InFailedTransaction.into());
                 }
 
                 if !is_observability_user {

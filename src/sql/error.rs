@@ -38,6 +38,9 @@ pub enum SqlError {
     #[error("relation \"{0}\" does not exist")]
     RelationNotFound(String),
 
+    #[error("sequence \"{0}\" does not exist")]
+    SequenceNotFound(String),
+
     #[error("{}", column_not_found_display(.column, .hint))]
     ColumnNotFound {
         column: String,
@@ -122,6 +125,72 @@ pub enum SqlError {
     #[error("there is no parameter ${index}")]
     InvalidParameterUsage { index: usize, context: String },
 
+    // Foreign key violations
+    #[error("{message}")]
+    ForeignKeyViolation { constraint: String, message: String },
+
+    // Schema errors
+    #[error("schema \"{0}\" does not exist")]
+    InvalidSchemaName(String),
+
+    #[error("schema \"{0}\" already exists")]
+    DuplicateSchema(String),
+
+    // Object errors
+    #[error("{0}")]
+    UndefinedObject(String),
+
+    #[error("{0}")]
+    DuplicateObject(String),
+
+    // Parameter value errors
+    #[error("{message}")]
+    InvalidParameterValue { message: String },
+
+    // Dependency errors
+    #[error("{message}")]
+    DependentObjectsStillExist { message: String },
+
+    // Transaction state errors
+    #[error("{message}")]
+    NoActiveTransaction { message: String },
+
+    // Type/grouping/window errors
+    #[error("{message}")]
+    DataTypeMismatch { message: String },
+
+    #[error("{message}")]
+    GroupingError { message: String },
+
+    #[error("{message}")]
+    WindowFunctionError { message: String },
+
+    #[error("{message}")]
+    OperatorResolution { message: String },
+
+    // Structure errors (42601 without "syntax error: " prefix)
+    #[error("{0}")]
+    SqlStructure(String),
+
+    // Catalog errors
+    #[error("{0}")]
+    InvalidCatalogName(String),
+
+    // Sequence errors
+    #[error("{message}")]
+    SequenceLimitExceeded { message: String },
+
+    // PL/pgSQL STRICT errors
+    #[error("query returned no rows")]
+    NoDataFound,
+
+    #[error("query returned more than one row")]
+    TooManyRows,
+
+    // Auth errors
+    #[error("{message}")]
+    InvalidAuthorizationSpecification { message: String },
+
     // Unsupported features
     #[error("{0}")]
     Unsupported(String),
@@ -139,6 +208,7 @@ impl SqlError {
             Self::TsquerySyntax { .. } => "42601",
             Self::TsqueryNoOperand { .. } => "42601",
             Self::RelationNotFound(_) => "42P01",
+            Self::SequenceNotFound(_) => "42P01",
             Self::ColumnNotFound { .. } => "42703",
             Self::AmbiguousColumn(_) => "42702",
             Self::FunctionNotFound(_) => "42883",
@@ -159,6 +229,24 @@ impl SqlError {
             Self::IndeterminateParameterType { .. } => "42P18",
             Self::InconsistentParameterTypes { .. } => "42P18",
             Self::InvalidParameterUsage { .. } => "42P02",
+            Self::ForeignKeyViolation { .. } => "23503",
+            Self::InvalidSchemaName(_) => "3F000",
+            Self::DuplicateSchema(_) => "42P06",
+            Self::UndefinedObject(_) => "42704",
+            Self::DuplicateObject(_) => "42710",
+            Self::InvalidParameterValue { .. } => "22023",
+            Self::DependentObjectsStillExist { .. } => "2BP01",
+            Self::NoActiveTransaction { .. } => "25P01",
+            Self::DataTypeMismatch { .. } => "42804",
+            Self::GroupingError { .. } => "42803",
+            Self::WindowFunctionError { .. } => "42P20",
+            Self::OperatorResolution { .. } => "42883",
+            Self::SqlStructure(_) => "42601",
+            Self::InvalidCatalogName(_) => "3D000",
+            Self::SequenceLimitExceeded { .. } => "2200H",
+            Self::NoDataFound => "P0002",
+            Self::TooManyRows => "P0003",
+            Self::InvalidAuthorizationSpecification { .. } => "28000",
             Self::Unsupported(_) => "0A000",
             Self::Internal(_) => "XX000",
         }
@@ -213,6 +301,42 @@ impl From<AnalyzerError> for SqlError {
                 SqlError::InvalidParameterUsage { index, context }
             }
             AnalyzerError::Unsupported(msg) => SqlError::Unsupported(msg),
+            AnalyzerError::OperatorTypeMismatch { .. } => SqlError::OperatorResolution {
+                message: e.to_string(),
+            },
+            AnalyzerError::ArgumentCountMismatch { .. } => SqlError::OperatorResolution {
+                message: e.to_string(),
+            },
+            AnalyzerError::TypeMismatch { .. } => SqlError::DataTypeMismatch {
+                message: e.to_string(),
+            },
+            AnalyzerError::TypesCannotBeMatched { .. } => SqlError::DataTypeMismatch {
+                message: e.to_string(),
+            },
+            AnalyzerError::UngroupedColumn { .. } => SqlError::GroupingError {
+                message: e.to_string(),
+            },
+            AnalyzerError::AggregateNotAllowed { .. } => SqlError::GroupingError {
+                message: e.to_string(),
+            },
+            AnalyzerError::WindowNotAllowed { .. } => SqlError::WindowFunctionError {
+                message: e.to_string(),
+            },
+            AnalyzerError::ScalarSubqueryMultipleColumns { .. } => {
+                SqlError::SqlStructure(e.to_string())
+            }
+            AnalyzerError::SetOperationColumnMismatch { .. } => {
+                SqlError::SqlStructure(e.to_string())
+            }
+            AnalyzerError::InsertColumnCountMismatch { .. } => {
+                SqlError::SqlStructure(e.to_string())
+            }
+            AnalyzerError::AssignmentTypeMismatch { .. } => SqlError::DataTypeMismatch {
+                message: e.to_string(),
+            },
+            AnalyzerError::DmlWhereNotBoolean { .. } => SqlError::DataTypeMismatch {
+                message: e.to_string(),
+            },
             other => SqlError::Internal(anyhow::anyhow!("{}", other)),
         }
     }
@@ -248,6 +372,7 @@ mod tests {
             "42601"
         );
         assert_eq!(SqlError::RelationNotFound("t".into()).sqlstate(), "42P01");
+        assert_eq!(SqlError::SequenceNotFound("s".into()).sqlstate(), "42P01");
         assert_eq!(
             SqlError::ColumnNotFound {
                 column: "c".into(),
@@ -343,6 +468,88 @@ mod tests {
             .sqlstate(),
             "42P02"
         );
+        assert_eq!(
+            SqlError::ForeignKeyViolation {
+                constraint: "fk".into(),
+                message: "msg".into()
+            }
+            .sqlstate(),
+            "23503"
+        );
+        assert_eq!(SqlError::InvalidSchemaName("s".into()).sqlstate(), "3F000");
+        assert_eq!(SqlError::DuplicateSchema("s".into()).sqlstate(), "42P06");
+        assert_eq!(SqlError::UndefinedObject("o".into()).sqlstate(), "42704");
+        assert_eq!(SqlError::DuplicateObject("o".into()).sqlstate(), "42710");
+        assert_eq!(
+            SqlError::InvalidParameterValue {
+                message: "bad".into()
+            }
+            .sqlstate(),
+            "22023"
+        );
+        assert_eq!(
+            SqlError::DependentObjectsStillExist {
+                message: "dep".into()
+            }
+            .sqlstate(),
+            "2BP01"
+        );
+        assert_eq!(
+            SqlError::NoActiveTransaction {
+                message: "no txn".into()
+            }
+            .sqlstate(),
+            "25P01"
+        );
+        assert_eq!(
+            SqlError::DataTypeMismatch {
+                message: "mismatch".into()
+            }
+            .sqlstate(),
+            "42804"
+        );
+        assert_eq!(
+            SqlError::GroupingError {
+                message: "group".into()
+            }
+            .sqlstate(),
+            "42803"
+        );
+        assert_eq!(
+            SqlError::WindowFunctionError {
+                message: "win".into()
+            }
+            .sqlstate(),
+            "42P20"
+        );
+        assert_eq!(
+            SqlError::OperatorResolution {
+                message: "op".into()
+            }
+            .sqlstate(),
+            "42883"
+        );
+        assert_eq!(SqlError::SqlStructure("struct".into()).sqlstate(), "42601");
+        assert_eq!(
+            SqlError::InvalidCatalogName("db".into()).sqlstate(),
+            "3D000"
+        );
+        assert_eq!(
+            SqlError::SequenceLimitExceeded {
+                message: "limit".into()
+            }
+            .sqlstate(),
+            "2200H"
+        );
+        assert_eq!(SqlError::NoDataFound.sqlstate(), "P0002");
+        assert_eq!(SqlError::TooManyRows.sqlstate(), "P0003");
+        assert_eq!(
+            SqlError::InvalidAuthorizationSpecification {
+                message: "auth".into()
+            }
+            .sqlstate(),
+            "28000"
+        );
         assert_eq!(SqlError::Unsupported("x".into()).sqlstate(), "0A000");
         let internal = SqlError::Internal(anyhow::anyhow!("boom"));
         assert_eq!(internal.sqlstate(), "XX000");
@@ -353,6 +560,10 @@ mod tests {
         assert_eq!(
             SqlError::RelationNotFound("users".into()).to_string(),
             "relation \"users\" does not exist"
+        );
+        assert_eq!(
+            SqlError::SequenceNotFound("my_seq".into()).to_string(),
+            "sequence \"my_seq\" does not exist"
         );
         assert_eq!(
             SqlError::ColumnNotFound {
@@ -379,6 +590,32 @@ mod tests {
             SqlError::DuplicateRelation("my_idx".into()).to_string(),
             "relation \"my_idx\" already exists"
         );
+        // New variants: message passthrough (no prefixes)
+        assert_eq!(
+            SqlError::OperatorResolution {
+                message: "operator does not exist: int + text".into()
+            }
+            .to_string(),
+            "operator does not exist: int + text"
+        );
+        assert_eq!(
+            SqlError::SqlStructure("each UNION query must have the same number of columns".into())
+                .to_string(),
+            "each UNION query must have the same number of columns"
+        );
+        assert_eq!(
+            SqlError::InvalidSchemaName("myschema".into()).to_string(),
+            "schema \"myschema\" does not exist"
+        );
+        assert_eq!(
+            SqlError::DuplicateSchema("myschema".into()).to_string(),
+            "schema \"myschema\" already exists"
+        );
+        assert_eq!(SqlError::NoDataFound.to_string(), "query returned no rows");
+        assert_eq!(
+            SqlError::TooManyRows.to_string(),
+            "query returned more than one row"
+        );
     }
 
     #[test]
@@ -387,6 +624,38 @@ mod tests {
         let anyhow_err: anyhow::Error = sql_err.into();
         let recovered = anyhow_err.downcast_ref::<SqlError>().unwrap();
         assert_eq!(recovered.sqlstate(), "22012");
+    }
+
+    #[test]
+    fn test_anyhow_bridge_roundtrip_new_variants() {
+        // ForeignKeyViolation
+        let sql_err = SqlError::ForeignKeyViolation {
+            constraint: "fk_test".into(),
+            message: "violates fk".into(),
+        };
+        let anyhow_err: anyhow::Error = sql_err.into();
+        let recovered = anyhow_err.downcast_ref::<SqlError>().unwrap();
+        assert_eq!(recovered.sqlstate(), "23503");
+
+        // InvalidSchemaName
+        let sql_err = SqlError::InvalidSchemaName("test".into());
+        let anyhow_err: anyhow::Error = sql_err.into();
+        let recovered = anyhow_err.downcast_ref::<SqlError>().unwrap();
+        assert_eq!(recovered.sqlstate(), "3F000");
+
+        // NoDataFound
+        let sql_err = SqlError::NoDataFound;
+        let anyhow_err: anyhow::Error = sql_err.into();
+        let recovered = anyhow_err.downcast_ref::<SqlError>().unwrap();
+        assert_eq!(recovered.sqlstate(), "P0002");
+
+        // InvalidAuthorizationSpecification
+        let sql_err = SqlError::InvalidAuthorizationSpecification {
+            message: "auth fail".into(),
+        };
+        let anyhow_err: anyhow::Error = sql_err.into();
+        let recovered = anyhow_err.downcast_ref::<SqlError>().unwrap();
+        assert_eq!(recovered.sqlstate(), "28000");
     }
 
     #[test]
@@ -458,9 +727,40 @@ mod tests {
         let sql: SqlError = ae.into();
         assert_eq!(sql.sqlstate(), "0A000");
 
-        // Unmapped variant → XX000
+        // UngroupedColumn → 42803 (was XX000 before error unification)
         let ae = AnalyzerError::UngroupedColumn { name: "x".into() };
         let sql: SqlError = ae.into();
-        assert_eq!(sql.sqlstate(), "XX000");
+        assert_eq!(sql.sqlstate(), "42803");
+
+        // OperatorTypeMismatch → 42883
+        let ae = AnalyzerError::OperatorTypeMismatch {
+            operator: "+".into(),
+            left: "integer".into(),
+            right: "text".into(),
+        };
+        let sql: SqlError = ae.into();
+        assert_eq!(sql.sqlstate(), "42883");
+
+        // TypeMismatch → 42804
+        let ae = AnalyzerError::TypeMismatch {
+            expected: DataType::Boolean,
+            found: DataType::Int32,
+            context: "WHERE clause".into(),
+        };
+        let sql: SqlError = ae.into();
+        assert_eq!(sql.sqlstate(), "42804");
+
+        // SetOperationColumnMismatch → 42601
+        let ae = AnalyzerError::SetOperationColumnMismatch { left: 2, right: 3 };
+        let sql: SqlError = ae.into();
+        assert_eq!(sql.sqlstate(), "42601");
+
+        // WindowNotAllowed → 42P20
+        let ae = AnalyzerError::WindowNotAllowed {
+            function: "row_number".into(),
+            context: "WHERE clause".into(),
+        };
+        let sql: SqlError = ae.into();
+        assert_eq!(sql.sqlstate(), "42P20");
     }
 }

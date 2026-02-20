@@ -511,13 +511,13 @@ pub(crate) async fn execute_drop_sequence(
                 .await?;
         let Some(resolved) = resolved else {
             if !if_exists {
-                return Err(anyhow!("Sequence '{}' does not exist", name));
+                return Err(SqlError::SequenceNotFound(name.to_string()).into());
             }
             continue;
         };
         let existed = store.drop_sequence(txn, db_id, &resolved.full).await?;
         if !existed && !if_exists {
-            return Err(anyhow!("Sequence '{}' does not exist", resolved.full));
+            return Err(SqlError::SequenceNotFound(resolved.full.clone()).into());
         }
     }
     Ok(ExecuteResult::CommandComplete {
@@ -728,7 +728,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         )
                         .await?;
                         if store.get_sequence(txn, db_id, &full_name).await?.is_none() {
-                            return Err(anyhow!("Sequence '{}' does not exist", full_name));
+                            return Err(SqlError::RelationNotFound(full_name.clone()).into());
                         }
                         let val =
                             last_sequence_values

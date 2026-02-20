@@ -330,8 +330,8 @@ pub async fn execute_insert_row(
             Ok(InsertRowResult::Inserted(row))
         }
         Err(e)
-            if e.to_string()
-                .contains("duplicate key value violates unique constraint") =>
+            if e.downcast_ref::<SqlError>()
+                .is_some_and(|se| matches!(se, SqlError::UniqueViolation { .. })) =>
         {
             if schema.pk_indices.is_empty() {
                 return Err(e);
@@ -687,16 +687,20 @@ async fn cascade_delete_recursive(
                                 pk_values.iter().map(|v| format!("{}", v)).collect();
                             let short_table = short_relation_name(table_name);
                             let short_other_table = short_relation_name(other_table);
-                            return Err(anyhow!(
-                                "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"\n\
-                                 DETAIL:  Key ({})=({}) is still referenced from table \"{}\".",
-                                short_table,
-                                fk.name,
-                                short_other_table,
-                                cols,
-                                pk_val_strs.join(", "),
-                                short_other_table
-                            ));
+                            return Err(SqlError::ForeignKeyViolation {
+                                constraint: fk.name.clone(),
+                                message: format!(
+                                    "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"\n\
+                                     DETAIL:  Key ({})=({}) is still referenced from table \"{}\".",
+                                    short_table,
+                                    fk.name,
+                                    short_other_table,
+                                    cols,
+                                    pk_val_strs.join(", "),
+                                    short_other_table
+                                ),
+                            }
+                            .into());
                         }
                         ForeignKeyAction::SetDefault => {
                             let mut new_values = other_row.values.clone();
@@ -859,16 +863,20 @@ pub async fn handle_foreign_key_on_update(
                                 old_pk_values.iter().map(|v| format!("{}", v)).collect();
                             let short_table = short_relation_name(table_name);
                             let short_other_table = short_relation_name(other_table);
-                            return Err(anyhow!(
-                                "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"\n\
-                                 DETAIL:  Key ({})=({}) is still referenced from table \"{}\".",
-                                short_table,
-                                fk.name,
-                                short_other_table,
-                                cols,
-                                pk_val_strs.join(", "),
-                                short_other_table
-                            ));
+                            return Err(SqlError::ForeignKeyViolation {
+                                constraint: fk.name.clone(),
+                                message: format!(
+                                    "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"\n\
+                                     DETAIL:  Key ({})=({}) is still referenced from table \"{}\".",
+                                    short_table,
+                                    fk.name,
+                                    short_other_table,
+                                    cols,
+                                    pk_val_strs.join(", "),
+                                    short_other_table
+                                ),
+                            }
+                            .into());
                         }
                     }
                 }
@@ -1357,15 +1365,19 @@ pub async fn validate_foreign_keys(
             let vals: Vec<String> = fk_values.iter().map(|v| format!("{}", v)).collect();
             let short_table = short_relation_name(&schema.name);
             let short_ref_table = short_relation_name(&fk.ref_table);
-            return Err(anyhow!(
-                "insert or update on table \"{}\" violates foreign key constraint \"{}\"\n\
-                 DETAIL:  Key ({})=({}) is not present in table \"{}\".",
-                short_table,
-                fk.name,
-                cols,
-                vals.join(", "),
-                short_ref_table
-            ));
+            return Err(SqlError::ForeignKeyViolation {
+                constraint: fk.name.clone(),
+                message: format!(
+                    "insert or update on table \"{}\" violates foreign key constraint \"{}\"\n\
+                     DETAIL:  Key ({})=({}) is not present in table \"{}\".",
+                    short_table,
+                    fk.name,
+                    cols,
+                    vals.join(", "),
+                    short_ref_table
+                ),
+            }
+            .into());
         }
     }
     Ok(())

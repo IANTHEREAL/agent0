@@ -78,7 +78,9 @@ pub async fn execute_alter_role(
     let mut user = auth_manager
         .get_user(txn, &role_name)
         .await?
-        .ok_or_else(|| anyhow!("Role '{}' does not exist", role_name))?;
+        .ok_or_else(|| {
+            SqlError::UndefinedObject(format!("role \"{}\" does not exist", role_name))
+        })?;
 
     match operation {
         AlterRoleOperation::RenameRole {
@@ -121,17 +123,19 @@ pub async fn execute_alter_role(
             let database_oid = if let Some(db_name) = in_database {
                 let (schema_opt, db_name) = super::names::split_object_name(db_name)?;
                 if schema_opt.is_some() {
-                    return Err(anyhow!("invalid database name '{}'", db_name));
+                    return Err(SqlError::SqlStructure(format!(
+                        "invalid database name '{}'",
+                        db_name
+                    ))
+                    .into());
                 }
 
-                let db_id = store
-                    .get_database_id(txn, &db_name)
-                    .await?
-                    .ok_or_else(|| anyhow!("database \"{}\" does not exist", db_name))?;
-                let def = store
-                    .get_database_by_id(txn, db_id)
-                    .await?
-                    .ok_or_else(|| anyhow!("database \"{}\" does not exist", db_name))?;
+                let db_id = store.get_database_id(txn, &db_name).await?.ok_or_else(|| {
+                    SqlError::InvalidCatalogName(format!("database \"{}\" does not exist", db_name))
+                })?;
+                let def = store.get_database_by_id(txn, db_id).await?.ok_or_else(|| {
+                    SqlError::InvalidCatalogName(format!("database \"{}\" does not exist", db_name))
+                })?;
                 def.oid
             } else {
                 0
@@ -187,17 +191,19 @@ pub async fn execute_alter_role(
             let database_oid = if let Some(db_name) = in_database {
                 let (schema_opt, db_name) = super::names::split_object_name(db_name)?;
                 if schema_opt.is_some() {
-                    return Err(anyhow!("invalid database name '{}'", db_name));
+                    return Err(SqlError::SqlStructure(format!(
+                        "invalid database name '{}'",
+                        db_name
+                    ))
+                    .into());
                 }
 
-                let db_id = store
-                    .get_database_id(txn, &db_name)
-                    .await?
-                    .ok_or_else(|| anyhow!("database \"{}\" does not exist", db_name))?;
-                let def = store
-                    .get_database_by_id(txn, db_id)
-                    .await?
-                    .ok_or_else(|| anyhow!("database \"{}\" does not exist", db_name))?;
+                let db_id = store.get_database_id(txn, &db_name).await?.ok_or_else(|| {
+                    SqlError::InvalidCatalogName(format!("database \"{}\" does not exist", db_name))
+                })?;
+                let def = store.get_database_by_id(txn, db_id).await?.ok_or_else(|| {
+                    SqlError::InvalidCatalogName(format!("database \"{}\" does not exist", db_name))
+                })?;
                 def.oid
             } else {
                 0
@@ -256,13 +262,21 @@ pub async fn execute_drop_role(
 
         let dropped = auth_manager.drop_user(txn, &role_name).await?;
         if !dropped && !if_exists {
-            return Err(anyhow!("Role '{}' does not exist", role_name));
+            return Err(SqlError::UndefinedObject(format!(
+                "role \"{}\" does not exist",
+                role_name
+            ))
+            .into());
         }
 
         if !dropped {
             let role_dropped = auth_manager.drop_role(txn, &role_name).await?;
             if !role_dropped && !if_exists {
-                return Err(anyhow!("Role '{}' does not exist", role_name));
+                return Err(SqlError::UndefinedObject(format!(
+                    "role \"{}\" does not exist",
+                    role_name
+                ))
+                .into());
             }
         }
 
@@ -492,7 +506,9 @@ pub async fn execute_grant(
             }
             auth_manager.update_role(txn, role).await?;
         } else {
-            return Err(anyhow!("Role or user '{}' does not exist", username));
+            return Err(
+                SqlError::UndefinedObject(format!("role \"{}\" does not exist", username)).into(),
+            );
         }
     }
 
@@ -544,7 +560,9 @@ pub async fn execute_revoke(
             });
             auth_manager.update_role(txn, role).await?;
         } else {
-            return Err(anyhow!("Role or user '{}' does not exist", username));
+            return Err(
+                SqlError::UndefinedObject(format!("role \"{}\" does not exist", username)).into(),
+            );
         }
     }
 

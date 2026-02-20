@@ -2,6 +2,7 @@
 //!
 //! Supports: DECLARE, BEGIN/END, RETURN, IF/THEN/ELSIF/ELSE/END IF, RAISE, assignment (:=)
 
+use crate::sql::error::SqlError;
 use crate::storage::TikvStore;
 use crate::types::{DataType, FunctionDef, Value};
 use anyhow::{anyhow, Result};
@@ -1062,10 +1063,10 @@ fn execute_statements<'a>(
                             if let ExecuteResult::Select { rows, .. } = result {
                                 let row_count = rows.len();
                                 if *strict && row_count == 0 {
-                                    return Err(anyhow!("query returned no rows"));
+                                    return Err(SqlError::NoDataFound.into());
                                 }
                                 if *strict && row_count > 1 {
-                                    return Err(anyhow!("query returned more than one row"));
+                                    return Err(SqlError::TooManyRows.into());
                                 }
                                 if let Some(row) = rows.into_iter().next() {
                                     for (i, var_name) in variables.iter().enumerate() {

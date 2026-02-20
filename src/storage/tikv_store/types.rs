@@ -1,4 +1,5 @@
 use super::*;
+use crate::sql::error::SqlError;
 
 impl TikvStore {
     pub async fn create_type(
@@ -10,7 +11,9 @@ impl TikvStore {
         let full_name = format!("{}.{}", def.schema, def.name);
         let key = self.key(&encode_type_key_v2(db_id, &full_name));
         if txn.get(key.clone()).await?.is_some() {
-            return Err(anyhow!("Type '{}' already exists", full_name));
+            return Err(
+                SqlError::DuplicateObject(format!("Type '{}' already exists", full_name)).into(),
+            );
         }
         let data = bincode::serialize(&def).context("Failed to serialize type definition")?;
         txn_put(txn, key, data).await?;

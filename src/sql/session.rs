@@ -14,20 +14,6 @@ use tikv_client::Transaction;
 
 pub(crate) const DEFAULT_MAX_SORT_BYTES: usize = 256 * 1024 * 1024;
 
-#[derive(Debug)]
-pub struct InFailedSqlTransaction;
-
-impl std::fmt::Display for InFailedSqlTransaction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "current transaction is aborted, commands ignored until end of transaction block"
-        )
-    }
-}
-
-impl std::error::Error for InFailedSqlTransaction {}
-
 pub enum TransactionState {
     Idle,
     Active(Transaction),
@@ -152,16 +138,24 @@ impl SessionSettings {
             i += 1;
         }
         if i == 0 {
-            return Err(anyhow!("invalid timeout value '{}'", value));
+            return Err(SqlError::InvalidParameterValue {
+                message: format!("invalid timeout value '{}'", value),
+            }
+            .into());
         }
         let (num_part, unit_part) = s.split_at(i);
         let unit = unit_part.trim();
 
         let num: f64 = num_part
             .parse()
-            .map_err(|_| anyhow!("invalid timeout value '{}'", value))?;
+            .map_err(|_| SqlError::InvalidParameterValue {
+                message: format!("invalid timeout value '{}'", value),
+            })?;
         if !num.is_finite() || num < 0.0 {
-            return Err(anyhow!("invalid timeout value '{}'", value));
+            return Err(SqlError::InvalidParameterValue {
+                message: format!("invalid timeout value '{}'", value),
+            }
+            .into());
         }
         if num == 0.0 {
             return Ok(0);
@@ -178,12 +172,18 @@ impl SessionSettings {
         } else if unit.eq_ignore_ascii_case("h") {
             3_600_000.0
         } else {
-            return Err(anyhow!("invalid timeout unit '{}'", unit));
+            return Err(SqlError::InvalidParameterValue {
+                message: format!("invalid timeout unit '{}'", unit),
+            }
+            .into());
         };
 
         let ms = (num * multiplier).ceil();
         if ms > u64::MAX as f64 {
-            return Err(anyhow!("timeout value out of range '{}'", value));
+            return Err(SqlError::InvalidParameterValue {
+                message: format!("timeout value out of range '{}'", value),
+            }
+            .into());
         }
         Ok(ms as u64)
     }
@@ -196,7 +196,10 @@ impl SessionSettings {
     fn parse_byte_size(value: &str) -> Result<usize> {
         let s = value.trim();
         if s.is_empty() {
-            return Err(anyhow!("invalid byte size value '{}'", value));
+            return Err(SqlError::InvalidParameterValue {
+                message: format!("invalid byte size value '{}'", value),
+            }
+            .into());
         }
 
         let bytes = s.as_bytes();
@@ -206,13 +209,18 @@ impl SessionSettings {
         }
 
         if i == 0 {
-            return Err(anyhow!("invalid byte size value '{}'", value));
+            return Err(SqlError::InvalidParameterValue {
+                message: format!("invalid byte size value '{}'", value),
+            }
+            .into());
         }
 
         let (num_part, unit_part) = s.split_at(i);
         let num: u128 = num_part
             .parse()
-            .map_err(|_| anyhow!("invalid byte size value '{}'", value))?;
+            .map_err(|_| SqlError::InvalidParameterValue {
+                message: format!("invalid byte size value '{}'", value),
+            })?;
         let unit = unit_part.trim();
 
         let multiplier: u128 = if unit.is_empty() {
@@ -224,14 +232,22 @@ impl SessionSettings {
         } else if unit.eq_ignore_ascii_case("gb") {
             1024 * 1024 * 1024
         } else {
-            return Err(anyhow!("invalid byte size unit '{}'", unit));
+            return Err(SqlError::InvalidParameterValue {
+                message: format!("invalid byte size unit '{}'", unit),
+            }
+            .into());
         };
 
         let total = num
             .checked_mul(multiplier)
-            .ok_or_else(|| anyhow!("byte size value out of range '{}'", value))?;
+            .ok_or_else(|| SqlError::InvalidParameterValue {
+                message: format!("byte size value out of range '{}'", value),
+            })?;
         if total > usize::MAX as u128 {
-            return Err(anyhow!("byte size value out of range '{}'", value));
+            return Err(SqlError::InvalidParameterValue {
+                message: format!("byte size value out of range '{}'", value),
+            }
+            .into());
         }
 
         Ok(total as usize)
@@ -262,9 +278,11 @@ impl SessionSettings {
                         );
                     }
                     _ => {
-                        return Err(anyhow!(
-                            "parameter \"tipg.use_optimizer\" requires a Boolean value"
-                        ))
+                        return Err(SqlError::InvalidParameterValue {
+                            message: "parameter \"tipg.use_optimizer\" requires a Boolean value"
+                                .into(),
+                        }
+                        .into())
                     }
                 }
             }
@@ -280,10 +298,11 @@ impl SessionSettings {
                     // and store the canonical Postgres spelling.
                     self.client_encoding = Some("UTF8".to_string());
                 } else {
-                    return Err(anyhow!(
+                    return Err(SqlError::Unsupported(format!(
                         "unsupported client_encoding '{}'; only UTF8 is supported",
                         value
-                    ));
+                    ))
+                    .into());
                 }
             }
             "standard_conforming_strings" => self.standard_conforming_strings = Some(value),
@@ -318,10 +337,13 @@ impl SessionSettings {
                         .into());
                     }
                     _ => {
-                        return Err(anyhow!(
-                            "invalid value for parameter \"transaction_isolation\": \"{}\"",
-                            value
-                        ));
+                        return Err(SqlError::InvalidParameterValue {
+                            message: format!(
+                                "invalid value for parameter \"transaction_isolation\": \"{}\"",
+                                value
+                            ),
+                        }
+                        .into());
                     }
                 }
             }
@@ -335,9 +357,12 @@ impl SessionSettings {
                         self.default_transaction_read_only = Some("off".to_string());
                     }
                     _ => {
-                        return Err(anyhow!(
-                            "parameter \"default_transaction_read_only\" requires a Boolean value"
-                        ));
+                        return Err(SqlError::InvalidParameterValue {
+                            message:
+                                "parameter \"default_transaction_read_only\" requires a Boolean value"
+                                    .into(),
+                        }
+                        .into());
                     }
                 }
             }
@@ -825,31 +850,36 @@ impl Session {
 
     pub async fn create_savepoint(&mut self, name: String) -> Result<()> {
         if !self.is_in_transaction() {
-            return Err(anyhow!("SAVEPOINT can only be used in transaction blocks"));
+            return Err(SqlError::NoActiveTransaction {
+                message: "SAVEPOINT can only be used in transaction blocks".into(),
+            }
+            .into());
         }
         if self.is_transaction_failed() {
-            return Err(anyhow::Error::new(InFailedSqlTransaction));
+            return Err(SqlError::InFailedTransaction.into());
         }
         self.savepoints.create(name).await
     }
 
     pub async fn release_savepoint(&mut self, name: &str) -> Result<()> {
         if !self.is_in_transaction() {
-            return Err(anyhow!(
-                "RELEASE SAVEPOINT can only be used in transaction blocks"
-            ));
+            return Err(SqlError::NoActiveTransaction {
+                message: "RELEASE SAVEPOINT can only be used in transaction blocks".into(),
+            }
+            .into());
         }
         if self.is_transaction_failed() {
-            return Err(anyhow::Error::new(InFailedSqlTransaction));
+            return Err(SqlError::InFailedTransaction.into());
         }
         self.savepoints.release(name).await
     }
 
     pub async fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
         if !self.is_in_transaction() {
-            return Err(anyhow!(
-                "ROLLBACK TO SAVEPOINT can only be used in transaction blocks"
-            ));
+            return Err(SqlError::NoActiveTransaction {
+                message: "ROLLBACK TO SAVEPOINT can only be used in transaction blocks".into(),
+            }
+            .into());
         }
 
         let mut prepared = self.savepoints.prepare_rollback_to(name).await?;
@@ -979,7 +1009,7 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::{InFailedSqlTransaction, SessionSettings};
+    use super::SessionSettings;
     use std::time::Duration;
 
     #[test]
@@ -1407,8 +1437,9 @@ mod tests {
 
     #[test]
     fn test_in_failed_sql_transaction_message() {
+        use crate::sql::error::SqlError;
         assert_eq!(
-            InFailedSqlTransaction.to_string(),
+            SqlError::InFailedTransaction.to_string(),
             "current transaction is aborted, commands ignored until end of transaction block"
         );
     }

@@ -55,7 +55,11 @@ impl Executor {
                     .await?
                     .is_some();
             if !role_exists {
-                return Err(anyhow!("role \"{}\" does not exist", target_role));
+                return Err(SqlError::UndefinedObject(format!(
+                    "role \"{}\" does not exist",
+                    target_role
+                ))
+                .into());
             }
 
             if current_user != target_role {
@@ -88,7 +92,7 @@ impl Executor {
                 Some(schemas) => {
                     for schema in schemas {
                         if !self.store().schema_exists(txn, db_id, schema).await? {
-                            return Err(anyhow!("schema '{}' does not exist", schema));
+                            return Err(SqlError::InvalidSchemaName(schema.clone()).into());
                         }
                     }
                     schemas.iter().cloned().map(Some).collect()
@@ -106,7 +110,11 @@ impl Executor {
                         let exists = self.auth_manager().get_user(txn, grantee).await?.is_some()
                             || self.auth_manager().get_role(txn, grantee).await?.is_some();
                         if !exists {
-                            return Err(anyhow!("role \"{}\" does not exist", grantee));
+                            return Err(SqlError::UndefinedObject(format!(
+                                "role \"{}\" does not exist",
+                                grantee
+                            ))
+                            .into());
                         }
                     }
 

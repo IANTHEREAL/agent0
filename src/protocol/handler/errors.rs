@@ -1,4 +1,4 @@
-use crate::sql::InFailedSqlTransaction;
+use crate::sql::error::SqlError;
 use pgwire::error::{ErrorInfo, PgWireError};
 
 fn is_ident_char(b: u8) -> bool {
@@ -6,13 +6,9 @@ fn is_ident_char(b: u8) -> bool {
 }
 
 pub(super) fn sqlstate_for_executor_error(err: &anyhow::Error) -> &'static str {
-    if let Some(sql_err) = err.downcast_ref::<crate::sql::error::SqlError>() {
-        return sql_err.sqlstate();
-    }
-    if err.is::<InFailedSqlTransaction>() {
-        return "25P02";
-    }
-    "XX000"
+    err.downcast_ref::<SqlError>()
+        .map(|e| e.sqlstate())
+        .unwrap_or("XX000")
 }
 
 fn find_unqualified_identifier_position(query: &str, ident: &str) -> Option<usize> {
@@ -65,7 +61,7 @@ pub(super) fn in_failed_sql_transaction_pgwire_error() -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "ERROR".to_string(),
         "25P02".to_string(),
-        InFailedSqlTransaction.to_string(),
+        SqlError::InFailedTransaction.to_string(),
     )))
 }
 

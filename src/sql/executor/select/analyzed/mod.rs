@@ -12,6 +12,7 @@ use crate::sql::analyzer::types::{
     TypedOrderByExpr, WindowFrame, WindowFrameBound,
 };
 use crate::sql::analyzer::AnalyzedQuery;
+use crate::sql::error::SqlError;
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::classify::needs_pre_materialization;
 use crate::sql::expr::typed_eval::{eval_const_usize, eval_typed_expr};
@@ -850,7 +851,7 @@ impl Executor {
                             )
                             .await?;
                             if store.get_sequence(txn, db_id, &full_name).await?.is_none() {
-                                return Err(anyhow!("Sequence '{}' does not exist", full_name));
+                                return Err(SqlError::RelationNotFound(full_name.clone()).into());
                             }
                             let val = sequence_values.get(&full_name).copied().ok_or_else(|| {
                             anyhow!("currval of sequence \"{}\" is not yet defined in this session", full_name)

@@ -1,4 +1,5 @@
 use super::*;
+use crate::sql::error::SqlError;
 
 pub(super) fn nextval_standalone(
     full_name: &str,
@@ -26,21 +27,25 @@ pub(super) fn nextval_standalone(
         if is_cycled {
             min_value
         } else {
-            return Err(anyhow!(
-                "nextval: reached maximum value of sequence \"{}\" ({})",
-                full_name,
-                max_value
-            ));
+            return Err(SqlError::SequenceLimitExceeded {
+                message: format!(
+                    "nextval: reached maximum value of sequence \"{}\" ({})",
+                    full_name, max_value
+                ),
+            }
+            .into());
         }
     } else if candidate < min_value {
         if is_cycled {
             max_value
         } else {
-            return Err(anyhow!(
-                "nextval: reached minimum value of sequence \"{}\" ({})",
-                full_name,
-                min_value
-            ));
+            return Err(SqlError::SequenceLimitExceeded {
+                message: format!(
+                    "nextval: reached minimum value of sequence \"{}\" ({})",
+                    full_name, min_value
+                ),
+            }
+            .into());
         }
     } else {
         candidate
@@ -59,11 +64,13 @@ pub(super) fn setval_standalone(
     is_called: bool,
 ) -> Result<i64> {
     if value < min_value || value > max_value {
-        return Err(anyhow!(
-            "setval: value {} is out of bounds for sequence \"{}\"",
-            value,
-            full_name
-        ));
+        return Err(SqlError::NumericValueOutOfRange {
+            message: format!(
+                "setval: value {} is out of bounds for sequence \"{}\"",
+                value, full_name
+            ),
+        }
+        .into());
     }
 
     state.last_value = value;
@@ -142,7 +149,7 @@ impl TikvStore {
         let full_name = def.full_name();
         let key = self.key(&encode_sequence_def_key_v2(db_id, &full_name));
         if txn.get(key.clone()).await?.is_some() {
-            return Err(anyhow!("Sequence '{}' already exists", full_name));
+            return Err(SqlError::DuplicateRelation(full_name.to_string()).into());
         }
         let data = bincode::serialize(&def).context("Failed to serialize sequence definition")?;
         txn_put(txn, key, data).await?;
@@ -450,7 +457,7 @@ impl TikvStore {
         let mut def = self
             .get_sequence(txn, db_id, full_name)
             .await?
-            .ok_or_else(|| anyhow!("Sequence '{}' does not exist", full_name))?;
+            .ok_or_else(|| SqlError::RelationNotFound(full_name.to_string()))?;
 
         self.maybe_migrate_implicit_sequence_to_standalone(txn, db_id, &mut def)
             .await?;
@@ -499,7 +506,7 @@ impl TikvStore {
         let mut def = self
             .get_sequence(txn, db_id, full_name)
             .await?
-            .ok_or_else(|| anyhow!("Sequence '{}' does not exist", full_name))?;
+            .ok_or_else(|| SqlError::RelationNotFound(full_name.to_string()))?;
 
         self.maybe_migrate_implicit_sequence_to_standalone(txn, db_id, &mut def)
             .await?;
@@ -507,29 +514,34 @@ impl TikvStore {
         match &def.backing {
             SequenceBacking::TableId(table_id) => {
                 if value < 1 {
-                    return Err(anyhow!(
-                        "setval: value {} is out of bounds for sequence \"{}\"",
-                        value,
-                        full_name
-                    ));
+                    return Err(SqlError::NumericValueOutOfRange {
+                        message: format!(
+                            "setval: value {} is out of bounds for sequence \"{}\"",
+                            value, full_name
+                        ),
+                    }
+                    .into());
                 }
-                let value_u64: u64 = value.try_into().map_err(|_| {
-                    anyhow!(
-                        "setval: value {} is too large for sequence \"{}\"",
-                        value,
-                        full_name
-                    )
-                })?;
+                let value_u64: u64 =
+                    value
+                        .try_into()
+                        .map_err(|_| SqlError::NumericValueOutOfRange {
+                            message: format!(
+                                "setval: value {} is too large for sequence \"{}\"",
+                                value, full_name
+                            ),
+                        })?;
                 let stored = if is_called {
                     value_u64
                 } else {
-                    value_u64.checked_sub(1).ok_or_else(|| {
-                        anyhow!(
-                            "setval: value {} is out of bounds for sequence \"{}\"",
-                            value,
-                            full_name
-                        )
-                    })?
+                    value_u64
+                        .checked_sub(1)
+                        .ok_or_else(|| SqlError::NumericValueOutOfRange {
+                            message: format!(
+                                "setval: value {} is out of bounds for sequence \"{}\"",
+                                value, full_name
+                            ),
+                        })?
                 };
                 self.set_sequence_value(txn, db_id, *table_id, stored)
                     .await?;

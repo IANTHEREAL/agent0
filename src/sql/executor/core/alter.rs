@@ -72,14 +72,14 @@ impl Executor {
                                 tag: "ALTER SEQUENCE",
                             });
                         }
-                        None => return Err(anyhow!("Sequence '{}' does not exist", name)),
+                        None => return Err(SqlError::RelationNotFound(name.to_string()).into()),
                     };
 
                     let mut seq = self
                         .store
                         .get_sequence(txn, db_id, &resolved.full)
                         .await?
-                        .ok_or_else(|| anyhow!("Sequence '{}' does not exist", resolved.full))?;
+                        .ok_or_else(|| SqlError::RelationNotFound(resolved.full.clone()))?;
                     seq.owner = new_owner;
                     self.store.update_sequence_def(txn, db_id, &seq).await?;
                     Ok(ExecuteResult::AlterSequence {
@@ -168,14 +168,14 @@ impl Executor {
                         tag: "ALTER SEQUENCE",
                     });
                 }
-                None => return Err(anyhow!("Sequence '{}' does not exist", sequence_name)),
+                None => return Err(SqlError::RelationNotFound(sequence_name.to_string()).into()),
             };
 
             let mut seq = self
                 .store
                 .get_sequence(txn, db_id, &resolved.full)
                 .await?
-                .ok_or_else(|| anyhow!("Sequence '{}' does not exist", resolved.full))?;
+                .ok_or_else(|| SqlError::RelationNotFound(resolved.full.clone()))?;
 
             seq.owned_by = match owned_by {
                 None => None,

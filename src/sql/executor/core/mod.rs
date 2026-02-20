@@ -60,7 +60,7 @@ use super::super::stats::TableStatsCache;
 use super::super::triggers::TriggerBodyCache;
 use super::super::udt;
 use super::super::value_coercion::parse_value_for_copy;
-use super::super::{parse_sql, ExecuteResult, ExecuteResults, InFailedSqlTransaction, Session};
+use super::super::{parse_sql, ExecuteResult, ExecuteResults, Session};
 use super::triggers::strip_leading_sql_comments;
 use crate::auth::AuthManager;
 use crate::observability::TenantObservability;

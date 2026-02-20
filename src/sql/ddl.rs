@@ -3130,15 +3130,19 @@ pub async fn execute_alter_table(
                             let cols = fk_cols.join(", ");
                             let vals: Vec<String> =
                                 fk_values.iter().map(|v| format!("{}", v)).collect();
-                            return Err(anyhow!(
-                                "insert or update on table \"{}\" violates foreign key constraint \"{}\"\n\
-                                 DETAIL:  Key ({})=({}) is not present in table \"{}\".",
-                                schema.name,
-                                fk_name,
-                                cols,
-                                vals.join(", "),
-                                ref_table
-                            ));
+                            return Err(SqlError::ForeignKeyViolation {
+                                constraint: fk_name.clone(),
+                                message: format!(
+                                    "insert or update on table \"{}\" violates foreign key constraint \"{}\"\n\
+                                     DETAIL:  Key ({})=({}) is not present in table \"{}\".",
+                                    schema.name,
+                                    fk_name,
+                                    cols,
+                                    vals.join(", "),
+                                    ref_table
+                                ),
+                            }
+                            .into());
                         }
                     }
                 }

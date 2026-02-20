@@ -28,6 +28,7 @@ use crate::sql::executor::core::prepared_analysis::PreparedAnalysis;
 use crate::sql::{ExecuteResult, Executor, Session};
 use crate::storage::TikvStore;
 use crate::types::{DataType, TableSchema, Value};
+use anyhow::Context as _;
 use async_trait::async_trait;
 use futures::{Sink, SinkExt};
 use pgwire::api::auth::StartupHandler;
@@ -599,18 +600,12 @@ impl DynamicPgHandler {
         Ok(vec![])
     }
 
-    pub(super) fn ensure_auth_bootstrapped(
-        bootstrap_result: Result<(), anyhow::Error>,
-    ) -> Result<(), String> {
-        bootstrap_result.map_err(|e| format!("Failed to bootstrap auth: {}", e))
-    }
-
     async fn authenticate_user(
         &self,
         keyspace: &Option<String>,
         username: &str,
         password: &str,
-    ) -> Result<(bool, bool), String> {
+    ) -> Result<(bool, bool), anyhow::Error> {
         let effective_keyspace = keyspace
             .clone()
             .or_else(|| self.default_keyspace.clone())
@@ -647,29 +642,23 @@ impl DynamicPgHandler {
         let auth_manager = AuthManager::new();
 
         // Try bootstrap. Any failure must deny authentication.
-        let bootstrap_result = async {
-            let mut txn = store.begin().await?;
-            auth_manager.bootstrap(&mut txn).await?;
-            txn.commit().await?;
-            Ok::<(), anyhow::Error>(())
+        {
+            let mut txn = store.begin().await.context("Failed to bootstrap auth")?;
+            auth_manager
+                .bootstrap(&mut txn)
+                .await
+                .context("Failed to bootstrap auth")?;
+            txn.commit().await.context("Failed to bootstrap auth")?;
         }
-        .await;
 
-        Self::ensure_auth_bootstrapped(bootstrap_result)?;
-
-        let mut txn = store
-            .begin()
-            .await
-            .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+        let mut txn = store.begin().await.context("Failed to begin transaction")?;
 
         match auth_manager
             .authenticate(&mut txn, username, password)
             .await
         {
             Ok(Some(user)) => {
-                txn.commit()
-                    .await
-                    .map_err(|e| format!("Failed to commit: {}", e))?;
+                txn.commit().await.context("Failed to commit")?;
                 Ok((true, user.is_superuser))
             }
             Ok(None) => {
@@ -678,7 +667,7 @@ impl DynamicPgHandler {
             }
             Err(e) => {
                 txn.rollback().await.ok();
-                Err(format!("Authentication error: {}", e))
+                Err(e.context("Authentication error"))
             }
         }
     }
@@ -948,14 +937,9 @@ impl StartupHandler for DynamicPgHandler {
                         }
                     }
                     Err(e) => {
-                        let sqlstate = if e.contains("PGTIKV_BOOTSTRAP_ADMIN_PASSWORD")
-                            || e.contains("bootstrap")
-                        {
-                            "28000"
-                        } else {
-                            "XX000"
-                        };
-                        let error_info = ErrorInfo::new("FATAL".to_owned(), sqlstate.to_owned(), e);
+                        let sqlstate = sqlstate_for_executor_error(&e);
+                        let error_info =
+                            ErrorInfo::new("FATAL".to_owned(), sqlstate.to_owned(), e.to_string());
                         return Err(PgWireError::UserError(Box::new(error_info)));
                     }
                 }
