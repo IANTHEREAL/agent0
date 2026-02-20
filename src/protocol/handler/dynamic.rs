@@ -55,6 +55,8 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
@@ -1909,28 +1911,31 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             ))));
         }
 
-        let exec_results = match &prepared.exec {
+        let exec_future: Pin<
+            Box<
+                dyn Future<Output = Result<crate::sql::ExecuteResults, anyhow::Error>> + Send + '_,
+            >,
+        > = match &prepared.exec {
             PreparedExec::RawSqlUtility => {
                 debug_assert!(
                     portal.statement.parameter_types.is_empty(),
                     "RawSqlUtility should never have parameters after Parse"
                 );
-                executor.execute(session, &prepared.sql).await
+                Box::pin(executor.execute(session, &prepared.sql))
             }
             PreparedExec::AnalyzedQuery { .. } | PreparedExec::AnalyzedDml { .. } => {
                 let params = decode_parameters(portal)?;
-                executor
-                    .execute_prepared(
-                        session,
-                        &prepared.sql,
-                        &prepared.exec,
-                        params,
-                        &prepared.param_data_types,
-                        &prepared.table_versions,
-                    )
-                    .await
+                Box::pin(executor.execute_prepared(
+                    session,
+                    &prepared.sql,
+                    &prepared.exec,
+                    params,
+                    &prepared.param_data_types,
+                    &prepared.table_versions,
+                ))
             }
         };
+        let exec_results = exec_future.await;
 
         match exec_results {
             Ok(results) => {
