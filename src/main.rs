@@ -30,6 +30,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 const DEFAULT_PG_PORT: u16 = 5433;
 const DEFAULT_PD_ENDPOINTS: &str = "127.0.0.1:2379";
 const DEFAULT_PG_LISTEN_ADDR: &str = "127.0.0.1";
+const DEFAULT_TOKIO_STACK_MB: usize = 8;
 
 /// Lightweight PD health check — just verifies PD is reachable without
 /// creating any TiKV client or keyspace connection.
@@ -92,11 +93,14 @@ fn main() -> Result<()> {
         }
     };
 
+    // Some analyzed-path queries (notably catalog-heavy scalar-subquery shapes)
+    // can create deep async call chains in a single worker poll cycle.
+    // Keep a safer default stack budget while allowing operators to tune it.
     let stack_mb: usize = env::var("PGTIKV_TOKIO_STACK_MB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&mb| mb > 0)
-        .unwrap_or(4);
+        .unwrap_or(DEFAULT_TOKIO_STACK_MB);
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(stack_mb * 1024 * 1024)

@@ -487,6 +487,16 @@ AFTER triggers: deferred to commit (src/sql/trigger_worker.rs)
     → Background tokio task processes queue
 ```
 
+### 7.4 Runtime Stack Budget
+
+`pg-tikv` runs on Tokio multi-thread workers. Certain valid SQL shapes (for example, scalar subqueries over `pg_catalog` views) can produce deep async call chains during analyzed-path execution.
+
+Runtime contract:
+- `PGTIKV_TOKIO_STACK_MB` configures Tokio worker thread stack size.
+- Default is `8` MiB (`src/main.rs`).
+- The setting is operational only: it does not change SQL semantics or planner/executor logic.
+- Increase this value (`16`/`32`) for workloads with unusually deep nested query trees or heavy catalog introspection.
+
 ---
 
 ## 8. Current State & Roadmap

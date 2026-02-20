@@ -11,6 +11,8 @@ use super::*;
 use crate::sql::analyzer::types::{AnalyzedQuery, AnalyzedStatement};
 use crate::sql::analyzer::Analyzer;
 use crate::sql::error::SqlError;
+use crate::types::ColumnDef;
+use sqlparser::ast::SetOperator;
 
 /// Result of analyzing a SQL statement for prepared execution.
 pub enum PreparedAnalysis {
@@ -67,7 +69,22 @@ impl Executor {
                     expand_views_in_query(self.store().as_ref(), txn, db_id, search_path, query)
                         .await?;
 
-                // 2. Catalog snapshot (empty CTEs at Parse time)
+                // 2. Build CTE schema context for analysis.
+                // For WITH RECURSIVE, infer the self-reference schema from the
+                // non-recursive arm so Parse-time analysis can resolve recursive
+                // table references without executing the CTE.
+                let analysis_ctes = self
+                    .build_prepared_cte_schemas(
+                        txn,
+                        db_id,
+                        search_path,
+                        &expanded,
+                        param_count,
+                        client_oids,
+                    )
+                    .await?;
+
+                // 3. Catalog snapshot with inferred CTE schemas.
                 let catalog = build_catalog_snapshot(
                     self.store().as_ref(),
                     txn,
@@ -75,27 +92,27 @@ impl Executor {
                     search_path,
                     self.tenant_keyspace(),
                     &expanded,
-                    &HashMap::new(),
+                    &analysis_ctes,
                 )
                 .await?;
 
-                // 3. Analyzer with parameter context
+                // 4. Analyzer with parameter context
                 let mut analyzer = Analyzer::new_with_params(&catalog, param_count, client_oids);
                 let analyzed = stacker::maybe_grow(128 * 1024 * 1024, 256 * 1024 * 1024, || {
                     analyzer.analyze_query(&expanded)
                 })
                 .map_err(SqlError::from)?;
 
-                // 4. Rewriter
+                // 5. Rewriter
                 let rewritten = stacker::maybe_grow(128 * 1024 * 1024, 256 * 1024 * 1024, || {
                     crate::sql::rewriter::rewrite_query(analyzed)
                 });
 
-                // 5. Finalize parameter types
+                // 6. Finalize parameter types
                 let param_types = analyzer.finalize_param_types().map_err(SqlError::from)?;
                 let output_schema = rewritten.output_schema.clone();
 
-                // 6. Collect base table names for RBAC
+                // 7. Collect base table names for RBAC
                 let base_table_names = catalog
                     .base_table_full_names()
                     .into_iter()
@@ -103,7 +120,7 @@ impl Executor {
                     .collect();
                 let table_versions = catalog.base_table_versions();
 
-                // 7. Extract locks + SELECT INTO from original AST
+                // 8. Extract locks + SELECT INTO from original AST
                 let locks = query.locks.clone();
                 let select_into = match &*query.body {
                     SetExpr::Select(s) => s.into.clone(),
@@ -168,6 +185,78 @@ impl Executor {
             }
         }
     }
+
+    async fn build_prepared_cte_schemas(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        search_path: &[String],
+        query: &Query,
+        param_count: usize,
+        client_oids: &[Option<DataType>],
+    ) -> Result<HashMap<String, (TableSchema, Vec<Row>)>> {
+        let mut ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
+        let Some(with) = &query.with else {
+            return Ok(ctes);
+        };
+
+        for cte in &with.cte_tables {
+            let cte_name = cte.alias.name.value.to_lowercase();
+            let schema_query = if with.recursive
+                && crate::sql::executor::cte::cte_is_recursive(&cte.query, &cte_name)
+            {
+                recursive_seed_query(&cte.query, &cte_name)?
+            } else {
+                cte.query.as_ref().clone()
+            };
+            let output_schema = self
+                .analyze_query_output_schema(
+                    txn,
+                    db_id,
+                    search_path,
+                    &schema_query,
+                    &ctes,
+                    param_count,
+                    client_oids,
+                )
+                .await?;
+            let table_schema = cte_table_schema(&cte_name, &cte.alias.columns, &output_schema);
+            ctes.insert(cte_name, (table_schema, vec![]));
+        }
+
+        Ok(ctes)
+    }
+
+    async fn analyze_query_output_schema(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        search_path: &[String],
+        query: &Query,
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+        param_count: usize,
+        client_oids: &[Option<DataType>],
+    ) -> Result<Vec<(String, DataType)>> {
+        let expanded =
+            expand_views_in_query(self.store().as_ref(), txn, db_id, search_path, query).await?;
+        let catalog = build_catalog_snapshot(
+            self.store().as_ref(),
+            txn,
+            db_id,
+            search_path,
+            self.tenant_keyspace(),
+            &expanded,
+            ctes,
+        )
+        .await?;
+        let mut analyzer = Analyzer::new_with_params(&catalog, param_count, client_oids);
+        let analyzed = stacker::maybe_grow(128 * 1024 * 1024, 256 * 1024 * 1024, || {
+            analyzer.analyze_query(&expanded)
+        })
+        .map_err(SqlError::from)?;
+        crate::sql::stack_safety::drop_on_grown_stack(expanded);
+        Ok(analyzed.output_schema)
+    }
 }
 
 fn returning_schema(
@@ -180,4 +269,87 @@ fn returning_schema(
             .collect(),
         None => vec![],
     }
+}
+
+fn cte_table_schema(
+    cte_name: &str,
+    alias_columns: &[sqlparser::ast::Ident],
+    output_schema: &[(String, DataType)],
+) -> TableSchema {
+    let columns: Vec<(String, DataType)> = if alias_columns.is_empty() {
+        output_schema.to_vec()
+    } else {
+        alias_columns
+            .iter()
+            .zip(output_schema.iter())
+            .map(|(alias_col, (_, dt))| (alias_col.value.clone(), dt.clone()))
+            .collect()
+    };
+
+    TableSchema {
+        table_id: 0,
+        name: cte_name.to_string(),
+        columns: columns
+            .into_iter()
+            .map(|(name, data_type)| ColumnDef {
+                name,
+                data_type,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            })
+            .collect(),
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![],
+        version: 1,
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
+        from_alias: None,
+    }
+}
+
+fn recursive_seed_query(query: &Query, cte_name: &str) -> Result<Query> {
+    let (left, right) = match &*query.body {
+        SetExpr::SetOperation {
+            op: SetOperator::Union,
+            left,
+            right,
+            ..
+        } => (left.as_ref(), right.as_ref()),
+        _ => {
+            return Err(SqlError::Unsupported(
+                "recursive CTE must use UNION or UNION ALL".to_string(),
+            )
+            .into())
+        }
+    };
+
+    let left_refs_self = crate::sql::executor::cte::set_expr_references_table(left, cte_name);
+    let right_refs_self = crate::sql::executor::cte::set_expr_references_table(right, cte_name);
+    let base_expr = match (left_refs_self, right_refs_self) {
+        (false, true) => left.clone(),
+        (true, false) => right.clone(),
+        _ => {
+            return Err(SqlError::Unsupported(
+                "recursive CTE must have one non-recursive UNION arm".to_string(),
+            )
+            .into())
+        }
+    };
+
+    Ok(Query {
+        with: None,
+        body: Box::new(base_expr),
+        order_by: vec![],
+        limit: None,
+        offset: None,
+        fetch: None,
+        locks: vec![],
+        limit_by: vec![],
+        for_clause: None,
+    })
 }

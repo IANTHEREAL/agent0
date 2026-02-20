@@ -232,10 +232,12 @@ pg_restore -h 127.0.0.1 -p 5433 -d postgres --no-owner --no-privileges ./backup/
 |---------------------|---------|-------------|
 | `PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD endpoints |
 | `PG_PORT` | `5433` | PostgreSQL protocol port |
-| `PGTIKV_TOKIO_STACK_MB` | `4` | Tokio worker thread stack size (MB) |
+| `PGTIKV_TOKIO_STACK_MB` | `8` | Tokio worker thread stack size (MB) |
 | `PG_KEYSPACE` | `default` | Default TiKV keyspace for multi-tenancy |
 | `PG_TLS_CERT` | (empty) | Path to TLS certificate file |
 | `PG_TLS_KEY` | (empty) | Path to TLS private key file |
+
+`PGTIKV_TOKIO_STACK_MB` controls worker thread stack size for the async runtime. The default `8` MiB is chosen to safely handle deep analyzed-path subquery execution (especially catalog-heavy queries) without stack overflows. Increase it (for example to `16` or `32`) if your workload includes unusually deep nested query shapes.
 
 **Authentication**: Password authentication is always enabled via AuthManager. Each tenant has its own users stored in TiKV. Default admin user is created on bootstrap with password "admin".
 
