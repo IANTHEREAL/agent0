@@ -148,6 +148,98 @@ impl Executor {
         .await
     }
 
+    /// Materialize WITH CTEs from analyzed IR into runtime CTE bindings.
+    ///
+    /// This is used by prepared execution where we no longer have the original
+    /// SQL AST but still need deterministic CTE materialization.
+    pub(crate) fn build_cte_context_from_analyzed_with_base<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        db_id: u64,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        analyzed: &'a AnalyzedQuery,
+        base_ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> Pin<Box<dyn Future<Output = Result<HashMap<String, (TableSchema, Vec<Row>)>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut ctes: HashMap<String, (TableSchema, Vec<Row>)> = base_ctes.clone();
+            for cte in &analyzed.ctes {
+                let cte_scope = self
+                    .build_cte_context_from_analyzed_with_base(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        &cte.query,
+                        &ctes,
+                    )
+                    .await?;
+                let cte_result = self
+                    .execute_subquery(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        &cte.query,
+                        &cte_scope,
+                    )
+                    .await?;
+                match cte_result {
+                    ExecuteResult::Select {
+                        columns,
+                        column_types,
+                        rows,
+                        timezone: _,
+                    } => {
+                        let col_names: Vec<String> = if cte.columns.is_empty() {
+                            columns
+                        } else {
+                            cte.columns.iter().map(|(n, _)| n.clone()).collect()
+                        };
+                        let inferred_types: Vec<DataType> = if let Some(types) = column_types {
+                            types
+                        } else {
+                            crate::types::infer_column_types_from_rows(&rows, col_names.len())
+                        };
+                        let schema = TableSchema {
+                            table_id: 0,
+                            name: cte.name.clone(),
+                            columns: col_names
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, n)| crate::types::ColumnDef {
+                                    name: n.clone(),
+                                    // Index guard: unreachable when types and columns are aligned.
+                                    data_type: inferred_types
+                                        .get(idx)
+                                        .cloned()
+                                        .unwrap_or(DataType::Text),
+                                    nullable: true,
+                                    primary_key: false,
+                                    unique: false,
+                                    is_serial: false,
+                                    default_expr: None,
+                                })
+                                .collect(),
+                            pk_constraint_name: None,
+                            pk_indices: vec![],
+                            indexes: vec![],
+                            version: 1,
+                            check_constraints: vec![],
+                            foreign_keys: vec![],
+                            owner: String::new(),
+                            from_alias: None,
+                        };
+                        ctes.insert(cte.name.to_lowercase(), (schema, rows));
+                    }
+                    _ => return Err(anyhow!("CTE must be a SELECT query")),
+                }
+            }
+            Ok(ctes)
+        })
+    }
+
     // ── Subquery pre-materialization ────────────────────────────
 
     /// Pre-materialize all uncorrelated subqueries in a TypedExpr tree.
@@ -195,7 +287,7 @@ impl Executor {
     /// CTEs, VALUES, tableless SELECT, table functions, virtual catalog tables,
     /// subqueries, correlated subqueries, catalog-dependent functions,
     /// FOR UPDATE/SHARE row locking, and DISTINCT/DISTINCT ON.
-    async fn execute_via_optimizer(
+    pub(crate) async fn execute_via_optimizer(
         &self,
         txn: &mut Transaction,
         db_id: u64,

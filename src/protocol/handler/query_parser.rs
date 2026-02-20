@@ -25,6 +25,7 @@ impl pgwire::api::stmt::QueryParser for TipgQueryParser {
                 exec: PreparedExec::RawSqlUtility,
                 output_schema: vec![],
                 param_data_types: vec![],
+                table_versions: vec![],
             });
         }
 
@@ -35,6 +36,7 @@ impl pgwire::api::stmt::QueryParser for TipgQueryParser {
                     exec: PreparedExec::RawSqlUtility,
                     output_schema: vec![],
                     param_data_types: vec![],
+                    table_versions: vec![],
                 })
             }
             Err(e) => e,
@@ -51,6 +53,7 @@ impl pgwire::api::stmt::QueryParser for TipgQueryParser {
                 exec: PreparedExec::RawSqlUtility,
                 output_schema: vec![],
                 param_data_types: vec![],
+                table_versions: vec![],
             });
         }
 

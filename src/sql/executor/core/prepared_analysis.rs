@@ -22,12 +22,14 @@ pub enum PreparedAnalysis {
         output_schema: Vec<(String, DataType)>,
         param_types: Vec<DataType>,
         base_table_names: Vec<String>,
+        table_versions: Vec<(String, u64)>,
     },
     /// INSERT / UPDATE / DELETE — analyzed DML IR.
     Dml {
         analyzed: AnalyzedStatement,
         output_schema: Vec<(String, DataType)>,
         param_types: Vec<DataType>,
+        table_versions: Vec<(String, u64)>,
     },
     /// DDL / utility / non-analyzable statement.
     Utility,
@@ -99,6 +101,7 @@ impl Executor {
                     .into_iter()
                     .map(|s| s.to_string())
                     .collect();
+                let table_versions = catalog.base_table_versions();
 
                 // 7. Extract locks + SELECT INTO from original AST
                 let locks = query.locks.clone();
@@ -116,6 +119,7 @@ impl Executor {
                     output_schema,
                     param_types,
                     base_table_names,
+                    table_versions,
                 })
             }
 
@@ -141,11 +145,13 @@ impl Executor {
                     AnalyzedStatement::Update(u) => returning_schema(&u.returning),
                     AnalyzedStatement::Delete(d) => returning_schema(&d.returning),
                 };
+                let table_versions = catalog.base_table_versions();
 
                 Ok(PreparedAnalysis::Dml {
                     analyzed: analyzed_stmt,
                     output_schema,
                     param_types,
+                    table_versions,
                 })
             }
 

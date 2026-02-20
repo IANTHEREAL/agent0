@@ -37,7 +37,7 @@ pub enum PreparedExec {
 /// Both Describe and Execute read from this — single semantic source (§3.1).
 #[derive(Debug, Clone, Default)]
 pub struct PreparedStatement {
-    /// Original SQL text (diagnostics/display only; never re-parsed at Execute).
+    /// Original SQL text (diagnostics/display, schema-drift fallback execution).
     pub sql: String,
     /// Execution plan: analyzed IR or raw-SQL fallback.
     pub exec: PreparedExec,
@@ -46,6 +46,9 @@ pub struct PreparedStatement {
     /// Finalized parameter types from Parse-time analysis.
     /// Threaded to execute-time Analyzer so re-analysis uses the same types.
     pub param_data_types: Vec<DataType>,
+    /// Parse-time base-table schema versions used for drift detection.
+    /// `(table_full_name, schema_version)`.
+    pub table_versions: Vec<(String, u64)>,
 }
 
 impl PreparedStatement {

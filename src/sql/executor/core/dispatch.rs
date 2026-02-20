@@ -1,6 +1,8 @@
 //! Simple-query dispatch
 
 use super::*;
+use crate::protocol::PreparedExec;
+use tracing::warn;
 
 /// Validate and apply transaction modes (isolation level, access mode) from
 /// `BEGIN ISOLATION LEVEL ...` or `START TRANSACTION ...` statements.
@@ -63,6 +65,339 @@ impl Executor {
             results.append(&mut statement_results);
         }
         Ok(ExecuteResults(results))
+    }
+
+    /// Execute a prepared analyzed statement without re-parsing SQL text.
+    ///
+    /// For schema drift (table version mismatch), this falls back to the
+    /// text-based execution path (`execute`) so Parse+Analyze run again.
+    pub async fn execute_prepared(
+        &self,
+        session: &mut Session,
+        sql: &str,
+        exec: &PreparedExec,
+        params: Vec<Option<Value>>,
+        param_data_types: &[DataType],
+        table_versions: &[(String, u64)],
+    ) -> Result<ExecuteResults> {
+        if matches!(exec, PreparedExec::RawSqlUtility) {
+            if !params.is_empty() {
+                session.set_pending_params(params);
+            }
+            if !param_data_types.is_empty() {
+                let param_types = param_data_types
+                    .iter()
+                    .cloned()
+                    .map(Some)
+                    .collect::<Vec<_>>();
+                session.set_pending_param_types(param_types);
+            }
+            return self.execute(session, sql).await;
+        }
+
+        #[derive(Debug)]
+        enum PreparedTxnResult {
+            Executed(ExecuteResult),
+            SchemaDrift {
+                table_name: String,
+                expected: u64,
+                current: Option<u64>,
+            },
+        }
+
+        let fallback_params = params.clone();
+        let fallback_param_types: Vec<Option<DataType>> =
+            param_data_types.iter().cloned().map(Some).collect();
+
+        if !params.is_empty() {
+            session.set_pending_params(params);
+        }
+        if !param_data_types.is_empty() {
+            session.set_pending_param_types(fallback_param_types.clone());
+        }
+
+        let statement_ts = statement_time::now_timestamp_millis();
+        let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
+        let qctx = session.query_context_for_statement(statement_ts, transaction_ts);
+        let savepoints = session.savepoints();
+        crate::sql::query_context::with_scoped_query_context(
+            &qctx,
+            crate::txn::with_savepoints(savepoints, async {
+                let sql_stripped = strip_leading_sql_comments(sql);
+                let sql_trimmed = sql_stripped.trim_start();
+                let sql_for_observability = sql_trimmed.to_string();
+                let is_observability_user =
+                    session.current_user() == Some(OBSERVABILITY_USER) && !session.is_superuser();
+
+                if session.is_transaction_failed() && !sql_trimmed.trim().is_empty() {
+                    if !is_observability_user {
+                        self.observability.record_statement(
+                            Duration::from_millis(0),
+                            false,
+                            || sql_trimmed.to_string(),
+                        );
+                    }
+                    return Err(SqlError::InFailedTransaction.into());
+                }
+
+                let start = Instant::now();
+                let exec_result: Result<ExecuteResults> = async {
+                    let is_autocommit = !session.is_in_transaction();
+                    let db_id = session.current_database_id();
+                    let max_attempts = if is_autocommit { 10usize } else { 1usize };
+
+                    for attempt in 0..max_attempts {
+                        if is_autocommit {
+                            session.begin().await?;
+                        }
+
+                        let timeout = session.statement_timeout();
+                        let current_role = session.current_user().map(|u| u.to_string());
+                        let fut = async {
+                            let (txn, sequence_values, search_path) = session
+                                .get_mut_txn_sequence_values_and_search_path()
+                                .expect("Transaction must be active");
+                            if let Some((table_name, expected, current)) = self
+                                .first_schema_drift_on_txn(txn, db_id, table_versions)
+                                .await?
+                            {
+                                return Ok::<PreparedTxnResult, anyhow::Error>(
+                                    PreparedTxnResult::SchemaDrift {
+                                        table_name,
+                                        expected,
+                                        current,
+                                    },
+                                );
+                            }
+                            let result = self
+                                .execute_prepared_on_txn(
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    exec,
+                                    current_role.as_deref(),
+                                )
+                                .await?;
+                            Ok::<PreparedTxnResult, anyhow::Error>(
+                                PreparedTxnResult::Executed(result),
+                            )
+                        };
+
+                        let res = match timeout {
+                            Some(timeout) => match tokio::time::timeout(timeout, fut).await {
+                                Ok(res) => res,
+                                Err(_) => Err(anyhow::Error::new(StatementTimeoutError)),
+                            },
+                            None => fut.await,
+                        };
+
+                        if is_autocommit {
+                            match res {
+                                Ok(PreparedTxnResult::Executed(result)) => {
+                                    session.commit().await?;
+                                    self.flush_trigger_activations();
+                                    return Ok(ExecuteResults::single(result));
+                                }
+                                Ok(PreparedTxnResult::SchemaDrift {
+                                    table_name,
+                                    expected,
+                                    current,
+                                }) => {
+                                    session.rollback().await?;
+                                    self.clear_trigger_activations();
+                                    warn!(
+                                        table = %table_name,
+                                        expected_version = expected,
+                                        current_version = ?current,
+                                        "prepared schema drift detected; falling back to SQL parse/analyze"
+                                    );
+                                    if !fallback_params.is_empty() {
+                                        session.set_pending_params(fallback_params.clone());
+                                    }
+                                    if !fallback_param_types.is_empty() {
+                                        session.set_pending_param_types(fallback_param_types.clone());
+                                    }
+                                    return self.execute(session, sql).await;
+                                }
+                                Err(err) => {
+                                    session.rollback().await?;
+                                    self.clear_trigger_activations();
+                                    let should_retry =
+                                        attempt + 1 < max_attempts && is_retryable_tikv_error(&err);
+                                    if should_retry {
+                                        // Exponential backoff with jitter to reduce contention.
+                                        let base_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
+                                        let jitter_ms = rand::random::<u64>() % (base_ms + 1);
+                                        let backoff_ms = base_ms + jitter_ms;
+                                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                        continue;
+                                    }
+                                    return Err(err);
+                                }
+                            }
+                        } else {
+                            return match res? {
+                                PreparedTxnResult::Executed(result) => {
+                                    Ok(ExecuteResults::single(result))
+                                }
+                                PreparedTxnResult::SchemaDrift {
+                                    table_name,
+                                    expected,
+                                    current,
+                                } => {
+                                    warn!(
+                                        table = %table_name,
+                                        expected_version = expected,
+                                        current_version = ?current,
+                                        "prepared schema drift detected; falling back to SQL parse/analyze"
+                                    );
+                                    if !fallback_params.is_empty() {
+                                        session.set_pending_params(fallback_params.clone());
+                                    }
+                                    if !fallback_param_types.is_empty() {
+                                        session.set_pending_param_types(fallback_param_types.clone());
+                                    }
+                                    self.execute(session, sql).await
+                                }
+                            };
+                        }
+                    }
+
+                    unreachable!("retry loop must return")
+                }
+                .await;
+
+                if exec_result.is_err() && session.is_in_transaction() {
+                    session.mark_transaction_failed();
+                }
+
+                if !is_observability_user {
+                    self.observability.record_statement(
+                        start.elapsed(),
+                        exec_result.is_ok(),
+                        || sql_for_observability.clone(),
+                    );
+                }
+
+                exec_result
+            }),
+        )
+        .await
+    }
+
+    async fn execute_prepared_on_txn(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
+        exec: &PreparedExec,
+        current_role: Option<&str>,
+    ) -> Result<ExecuteResult> {
+        match exec {
+            PreparedExec::AnalyzedQuery {
+                analyzed,
+                locks,
+                select_into,
+                required_privileges,
+            } => {
+                for (table_name, privilege) in required_privileges {
+                    self.require_table_privilege(
+                        txn,
+                        current_role,
+                        (*privilege).clone(),
+                        table_name,
+                    )
+                    .await?;
+                }
+
+                let prepared_ctes = self
+                    .build_cte_context_from_analyzed_with_base(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        analyzed,
+                        &HashMap::new(),
+                    )
+                    .await?;
+
+                let result = self
+                    .execute_via_optimizer(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        analyzed.clone(),
+                        &prepared_ctes,
+                        locks,
+                    )
+                    .await?;
+
+                if let Some(target_name) = select_into.as_ref().map(|into| into.name.clone()) {
+                    return self
+                        .create_table_from_result(txn, db_id, search_path, &target_name, result)
+                        .await;
+                }
+
+                Ok(result)
+            }
+            PreparedExec::AnalyzedDml {
+                analyzed,
+                required_privileges,
+            } => {
+                for (table_name, privilege) in required_privileges {
+                    self.require_table_privilege(
+                        txn,
+                        current_role,
+                        (*privilege).clone(),
+                        table_name,
+                    )
+                    .await?;
+                }
+                match analyzed {
+                    crate::sql::analyzer::types::AnalyzedStatement::Insert(ins) => {
+                        self.execute_analyzed_insert(txn, db_id, sequence_values, search_path, &ins)
+                            .await
+                    }
+                    crate::sql::analyzer::types::AnalyzedStatement::Update(upd) => {
+                        self.execute_analyzed_update(txn, db_id, sequence_values, search_path, &upd)
+                            .await
+                    }
+                    crate::sql::analyzer::types::AnalyzedStatement::Delete(del) => {
+                        self.execute_analyzed_delete(txn, db_id, sequence_values, search_path, &del)
+                            .await
+                    }
+                    crate::sql::analyzer::types::AnalyzedStatement::Query(_) => {
+                        Err(anyhow!("prepared DML execution received query variant"))
+                    }
+                }
+            }
+            PreparedExec::RawSqlUtility => {
+                unreachable!("RawSqlUtility should not be routed to execute_prepared_on_txn")
+            }
+        }
+    }
+
+    async fn first_schema_drift_on_txn(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_versions: &[(String, u64)],
+    ) -> Result<Option<(String, u64, Option<u64>)>> {
+        for (table_name, expected_version) in table_versions {
+            let current_schema = self.store().get_schema(txn, db_id, table_name).await?;
+            let current_version = current_schema.map(|s| s.version);
+            if current_version != Some(*expected_version) {
+                return Ok(Some((
+                    table_name.clone(),
+                    *expected_version,
+                    current_version,
+                )));
+            }
+        }
+        Ok(None)
     }
 
     async fn execute_single(&self, session: &mut Session, sql: &str) -> Result<ExecuteResults> {
