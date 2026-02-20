@@ -1,5 +1,6 @@
 //! Session management for transactions
 
+use crate::config::SharedServerConfig;
 use crate::observability::TenantObservability;
 use crate::sql::error::SqlError;
 use crate::storage::TikvStore;
@@ -7,7 +8,7 @@ use crate::txn::SavepointState;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tikv_client::Transaction;
 
 pub(crate) const DEFAULT_MAX_SORT_BYTES: usize = 256 * 1024 * 1024;
@@ -46,8 +47,10 @@ pub(crate) struct SessionSettings {
 
     // pg_dump startup variables we keep for readback (`SHOW`) and later timeout enforcement.
     statement_timeout_ms: u64,
+    default_statement_timeout_ms: u64,
     lock_timeout_ms: u64,
     idle_in_transaction_session_timeout_ms: u64,
+    default_idle_in_transaction_session_timeout_ms: u64,
     timezone: Option<String>,
     application_name: Option<String>,
     client_encoding: Option<String>,
@@ -111,9 +114,20 @@ impl SessionSettings {
     }
 
     pub(crate) fn new() -> Self {
+        Self::new_with_defaults(0, 0)
+    }
+
+    pub(crate) fn new_with_defaults(
+        default_statement_timeout_ms: u64,
+        default_idle_in_txn_timeout_ms: u64,
+    ) -> Self {
         Self {
             search_path: Self::default_search_path(),
             max_sort_bytes: DEFAULT_MAX_SORT_BYTES,
+            statement_timeout_ms: default_statement_timeout_ms,
+            default_statement_timeout_ms,
+            idle_in_transaction_session_timeout_ms: default_idle_in_txn_timeout_ms,
+            default_idle_in_transaction_session_timeout_ms: default_idle_in_txn_timeout_ms,
             use_optimizer: true,
             ..Default::default()
         }
@@ -176,6 +190,11 @@ impl SessionSettings {
             return Err(anyhow!("timeout value out of range '{}'", value));
         }
         Ok(ms as u64)
+    }
+
+    /// Public wrapper for timeout value parsing. Used by ALTER SYSTEM SET handler.
+    pub(crate) fn parse_timeout_value(value: &str) -> Result<u64> {
+        Self::parse_timeout_millis(value)
     }
 
     fn parse_byte_size(value: &str) -> Result<usize> {
@@ -342,10 +361,11 @@ impl SessionSettings {
     pub(crate) fn reset_setting(&mut self, name: &str) {
         match name {
             "search_path" => self.search_path = Self::default_search_path(),
-            "statement_timeout" => self.statement_timeout_ms = 0,
+            "statement_timeout" => self.statement_timeout_ms = self.default_statement_timeout_ms,
             "lock_timeout" => self.lock_timeout_ms = 0,
             "idle_in_transaction_session_timeout" => {
-                self.idle_in_transaction_session_timeout_ms = 0
+                self.idle_in_transaction_session_timeout_ms =
+                    self.default_idle_in_transaction_session_timeout_ms
             }
             "pgtikv.max_sort_bytes" | "tipg.max_sort_bytes" => {
                 self.max_sort_bytes = DEFAULT_MAX_SORT_BYTES
@@ -371,7 +391,10 @@ impl SessionSettings {
 
     /// Reset all session settings to their defaults.
     pub(crate) fn reset_all_settings(&mut self) {
-        *self = Self::new();
+        *self = Self::new_with_defaults(
+            self.default_statement_timeout_ms,
+            self.default_idle_in_transaction_session_timeout_ms,
+        );
     }
 
     /// Get a session setting value in a Postgres-like string form, for `SHOW`.
@@ -457,6 +480,16 @@ impl SessionSettings {
         }
     }
 
+    pub(crate) fn idle_in_transaction_session_timeout(&self) -> Option<Duration> {
+        if self.idle_in_transaction_session_timeout_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(
+                self.idle_in_transaction_session_timeout_ms,
+            ))
+        }
+    }
+
     pub(crate) fn max_sort_bytes(&self) -> usize {
         self.max_sort_bytes
     }
@@ -486,6 +519,12 @@ pub struct Session {
     /// Timestamp (epoch millis) when the current explicit transaction started.
     /// None when not in an explicit transaction block.
     transaction_timestamp_ms: Option<i64>,
+    /// Timestamp of the last command completion while in a transaction block.
+    /// Used for `idle_in_transaction_session_timeout` enforcement.
+    /// Set by `record_command_complete()`, cleared on commit/rollback.
+    last_command_complete_at: Option<Instant>,
+    /// Shared server-level configuration (for ALTER SYSTEM SET).
+    server_config: Option<SharedServerConfig>,
 }
 
 impl Session {
@@ -496,6 +535,8 @@ impl Session {
         connection_id: i32,
         database_id: u64,
         database_name: String,
+        default_statement_timeout_ms: u64,
+        default_idle_in_txn_timeout_ms: u64,
     ) -> Self {
         Self {
             store,
@@ -503,7 +544,10 @@ impl Session {
             state: TransactionState::Idle,
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: HashMap::new(),
-            settings: SessionSettings::new(),
+            settings: SessionSettings::new_with_defaults(
+                default_statement_timeout_ms,
+                default_idle_in_txn_timeout_ms,
+            ),
             session_user: None,
             session_user_is_superuser: false,
             current_user: None,
@@ -512,6 +556,8 @@ impl Session {
             current_database_name: Arc::from(database_name),
             connection_id,
             transaction_timestamp_ms: None,
+            last_command_complete_at: None,
+            server_config: None,
         }
     }
 
@@ -524,6 +570,8 @@ impl Session {
         connection_id: i32,
         database_id: u64,
         database_name: String,
+        default_statement_timeout_ms: u64,
+        default_idle_in_txn_timeout_ms: u64,
     ) -> Self {
         Self {
             store,
@@ -531,7 +579,10 @@ impl Session {
             state: TransactionState::Idle,
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: HashMap::new(),
-            settings: SessionSettings::new(),
+            settings: SessionSettings::new_with_defaults(
+                default_statement_timeout_ms,
+                default_idle_in_txn_timeout_ms,
+            ),
             session_user: Some(username.clone()),
             session_user_is_superuser: is_superuser,
             current_user: Some(username),
@@ -540,6 +591,8 @@ impl Session {
             current_database_name: Arc::from(database_name),
             connection_id,
             transaction_timestamp_ms: None,
+            last_command_complete_at: None,
+            server_config: None,
         }
     }
 
@@ -601,6 +654,51 @@ impl Session {
             TransactionState::Failed(txn) => self.state = TransactionState::Active(txn),
             other => self.state = other,
         }
+    }
+
+    /// Record that a command has completed. If we're in a transaction,
+    /// this starts the idle-in-transaction timer.
+    pub fn record_command_complete(&mut self) {
+        if self.is_in_transaction() {
+            self.last_command_complete_at = Some(Instant::now());
+        } else {
+            self.last_command_complete_at = None;
+        }
+    }
+
+    /// Check if the session has been idle in a transaction for too long.
+    /// Returns `Err(SqlError::IdleInTransactionTimeout)` if the timeout has been exceeded.
+    pub fn check_idle_in_transaction_timeout(&self) -> std::result::Result<(), SqlError> {
+        let timeout = self.settings.idle_in_transaction_session_timeout();
+        let timeout = match timeout {
+            Some(t) => t,
+            None => return Ok(()), // disabled (0)
+        };
+
+        if !self.is_in_transaction() {
+            return Ok(());
+        }
+
+        let last_complete = match self.last_command_complete_at {
+            Some(t) => t,
+            None => return Ok(()), // no previous command completed yet
+        };
+
+        if last_complete.elapsed() > timeout {
+            Err(SqlError::IdleInTransactionTimeout)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Set the shared server configuration reference.
+    pub fn set_server_config(&mut self, config: SharedServerConfig) {
+        self.server_config = Some(config);
+    }
+
+    /// Get the shared server configuration reference.
+    pub fn server_config(&self) -> Option<&SharedServerConfig> {
+        self.server_config.as_ref()
     }
 
     pub(crate) fn savepoints(&self) -> Arc<SavepointState> {
@@ -832,6 +930,30 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::{InFailedSqlTransaction, SessionSettings};
+    use std::time::Duration;
+
+    #[test]
+    fn test_session_settings_new_with_defaults() {
+        let settings = SessionSettings::new_with_defaults(1_500, 2_500);
+
+        assert_eq!(settings.statement_timeout_ms, 1_500);
+        assert_eq!(settings.default_statement_timeout_ms, 1_500);
+        assert_eq!(settings.idle_in_transaction_session_timeout_ms, 2_500);
+        assert_eq!(
+            settings.default_idle_in_transaction_session_timeout_ms,
+            2_500
+        );
+        assert_eq!(
+            settings.statement_timeout(),
+            Some(Duration::from_millis(1_500))
+        );
+        assert_eq!(
+            settings
+                .show_value("idle_in_transaction_session_timeout")
+                .as_deref(),
+            Some("2500ms")
+        );
+    }
 
     #[test]
     fn test_session_settings_defaults_and_overrides() {
@@ -1239,5 +1361,144 @@ mod tests {
             InFailedSqlTransaction.to_string(),
             "current transaction is aborted, commands ignored until end of transaction block"
         );
+    }
+
+    #[test]
+    fn test_reset_statement_timeout_restores_server_default() {
+        let mut settings = SessionSettings::new_with_defaults(5_000, 3_000);
+
+        // Verify initial value is the server default
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("5000ms")
+        );
+
+        // Change it
+        settings
+            .set_known_setting("statement_timeout", "10000".to_string())
+            .unwrap();
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("10000ms")
+        );
+
+        // RESET should restore to server default (5000), not 0
+        settings.reset_setting("statement_timeout");
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("5000ms")
+        );
+        assert_eq!(
+            settings.statement_timeout(),
+            Some(Duration::from_millis(5_000))
+        );
+    }
+
+    #[test]
+    fn test_reset_idle_in_transaction_timeout_restores_server_default() {
+        let mut settings = SessionSettings::new_with_defaults(5_000, 3_000);
+
+        // Verify initial value
+        assert_eq!(
+            settings
+                .show_value("idle_in_transaction_session_timeout")
+                .as_deref(),
+            Some("3000ms")
+        );
+
+        // Change it
+        settings
+            .set_known_setting("idle_in_transaction_session_timeout", "10000".to_string())
+            .unwrap();
+        assert_eq!(
+            settings
+                .show_value("idle_in_transaction_session_timeout")
+                .as_deref(),
+            Some("10000ms")
+        );
+
+        // RESET should restore to server default (3000), not 0
+        settings.reset_setting("idle_in_transaction_session_timeout");
+        assert_eq!(
+            settings
+                .show_value("idle_in_transaction_session_timeout")
+                .as_deref(),
+            Some("3000ms")
+        );
+    }
+
+    #[test]
+    fn test_reset_all_restores_server_defaults() {
+        let mut settings = SessionSettings::new_with_defaults(5_000, 3_000);
+
+        // Change both timeouts
+        settings
+            .set_known_setting("statement_timeout", "20000".to_string())
+            .unwrap();
+        settings
+            .set_known_setting("idle_in_transaction_session_timeout", "15000".to_string())
+            .unwrap();
+
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("20000ms")
+        );
+        assert_eq!(
+            settings
+                .show_value("idle_in_transaction_session_timeout")
+                .as_deref(),
+            Some("15000ms")
+        );
+
+        // RESET ALL should restore both to server defaults
+        settings.reset_all_settings();
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("5000ms")
+        );
+        assert_eq!(
+            settings
+                .show_value("idle_in_transaction_session_timeout")
+                .as_deref(),
+            Some("3000ms")
+        );
+    }
+
+    #[test]
+    fn test_statement_timeout_getter_with_nonzero_default() {
+        let settings = SessionSettings::new_with_defaults(5_000, 0);
+        assert_eq!(
+            settings.statement_timeout(),
+            Some(Duration::from_millis(5_000))
+        );
+
+        // Zero default means no timeout
+        let settings_zero = SessionSettings::new_with_defaults(0, 0);
+        assert_eq!(settings_zero.statement_timeout(), None);
+    }
+
+    #[test]
+    fn test_parse_timeout_value() {
+        // Pure numeric (milliseconds)
+        assert_eq!(SessionSettings::parse_timeout_value("5000").unwrap(), 5_000);
+        assert_eq!(SessionSettings::parse_timeout_value("0").unwrap(), 0);
+
+        // With suffix
+        assert_eq!(SessionSettings::parse_timeout_value("1s").unwrap(), 1_000);
+        assert_eq!(SessionSettings::parse_timeout_value("5s").unwrap(), 5_000);
+        assert_eq!(SessionSettings::parse_timeout_value("100ms").unwrap(), 100);
+        assert_eq!(
+            SessionSettings::parse_timeout_value("1min").unwrap(),
+            60_000
+        );
+        assert_eq!(
+            SessionSettings::parse_timeout_value("2h").unwrap(),
+            7_200_000
+        );
+
+        // Invalid
+        assert!(SessionSettings::parse_timeout_value("-1").is_err());
+        assert!(SessionSettings::parse_timeout_value("abc").is_err());
+        assert!(SessionSettings::parse_timeout_value("1unknown").is_err());
     }
 }
