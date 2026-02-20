@@ -1614,6 +1614,7 @@ fn test_prepared_stmt_analyzed(
             locks: vec![],
             select_into: None,
             required_privileges: vec![],
+            has_recursive_cte: false,
         },
         output_schema,
         param_data_types,

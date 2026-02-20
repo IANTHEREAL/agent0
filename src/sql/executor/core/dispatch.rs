@@ -1,7 +1,7 @@
 //! Simple-query dispatch
 
+use super::prepared_stmt::PreparedExec;
 use super::*;
-use crate::protocol::PreparedExec;
 use tracing::warn;
 
 /// Validate and apply transaction modes (isolation level, access mode) from
@@ -81,16 +81,25 @@ impl Executor {
         table_versions: &[(String, u64)],
     ) -> Result<ExecuteResults> {
         if matches!(exec, PreparedExec::RawSqlUtility) {
+            unreachable!("RawSqlUtility should not be routed to execute_prepared")
+        }
+
+        // Recursive CTE execution over analyzed prepared IR is not implemented yet.
+        // Preserve correctness by falling back to the normal text execution path.
+        if matches!(
+            exec,
+            PreparedExec::AnalyzedQuery {
+                has_recursive_cte: true,
+                ..
+            }
+        ) {
+            warn!("prepared recursive CTE detected; falling back to SQL parse/analyze");
             if !params.is_empty() {
                 session.set_pending_params(params);
             }
             if !param_data_types.is_empty() {
-                let param_types = param_data_types
-                    .iter()
-                    .cloned()
-                    .map(Some)
-                    .collect::<Vec<_>>();
-                session.set_pending_param_types(param_types);
+                session
+                    .set_pending_param_types(param_data_types.iter().cloned().map(Some).collect());
             }
             return self.execute(session, sql).await;
         }
@@ -105,185 +114,316 @@ impl Executor {
             },
         }
 
-        let fallback_params = params.clone();
-        let fallback_param_types: Vec<Option<DataType>> =
-            param_data_types.iter().cloned().map(Some).collect();
-
-        if !params.is_empty() {
-            session.set_pending_params(params);
-        }
-        if !param_data_types.is_empty() {
-            session.set_pending_param_types(fallback_param_types.clone());
-        }
-
         let statement_ts = statement_time::now_timestamp_millis();
         let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
-        let qctx = session.query_context_for_statement(statement_ts, transaction_ts);
+        let mut qctx = session.query_context_for_statement(statement_ts, transaction_ts);
+        qctx.params = params;
+        if !param_data_types.is_empty() {
+            qctx.param_types = param_data_types.iter().cloned().map(Some).collect();
+        }
+        let qctx = Arc::new(qctx);
+        let qctx_for_fallback = Arc::clone(&qctx);
         let savepoints = session.savepoints();
+        let is_superuser = session.is_superuser();
+        let timezone = Arc::from(
+            session
+                .show_setting_value("timezone")
+                .unwrap_or_else(|| "UTC".to_string()),
+        );
+        let max_sort_bytes = session.max_sort_bytes();
+        let search_path_vec = Arc::new(session.search_path().to_vec());
+
         crate::sql::query_context::with_scoped_query_context(
-            &qctx,
-            crate::txn::with_savepoints(savepoints, async {
-                let sql_stripped = strip_leading_sql_comments(sql);
-                let sql_trimmed = sql_stripped.trim_start();
-                let sql_for_observability = sql_trimmed.to_string();
-                let is_observability_user =
-                    session.current_user() == Some(OBSERVABILITY_USER) && !session.is_superuser();
+            qctx.as_ref(),
+            crate::txn::with_savepoints(
+                savepoints,
+                session_context::with_timezone(
+                    timezone,
+                    session_context::with_max_sort_bytes(
+                        max_sort_bytes,
+                        session_context::with_search_path(
+                            search_path_vec,
+                            crate::extensions::context::with_context(
+                                is_superuser,
+                                self.tenant_keyspace(),
+                                async move {
+                                    let sql_stripped = strip_leading_sql_comments(sql);
+                                    let sql_trimmed = sql_stripped.trim_start();
+                                    let sql_for_observability = sql_trimmed.to_string();
+                                    let is_observability_user = session.current_user()
+                                        == Some(OBSERVABILITY_USER)
+                                        && !session.is_superuser();
 
-                if session.is_transaction_failed() && !sql_trimmed.trim().is_empty() {
-                    if !is_observability_user {
-                        self.observability.record_statement(
-                            Duration::from_millis(0),
-                            false,
-                            || sql_trimmed.to_string(),
-                        );
-                    }
-                    return Err(SqlError::InFailedTransaction.into());
-                }
-
-                let start = Instant::now();
-                let exec_result: Result<ExecuteResults> = async {
-                    let is_autocommit = !session.is_in_transaction();
-                    let db_id = session.current_database_id();
-                    let max_attempts = if is_autocommit { 10usize } else { 1usize };
-
-                    for attempt in 0..max_attempts {
-                        if is_autocommit {
-                            session.begin().await?;
-                        }
-
-                        let timeout = session.statement_timeout();
-                        let current_role = session.current_user().map(|u| u.to_string());
-                        let fut = async {
-                            let (txn, sequence_values, search_path) = session
-                                .get_mut_txn_sequence_values_and_search_path()
-                                .expect("Transaction must be active");
-                            if let Some((table_name, expected, current)) = self
-                                .first_schema_drift_on_txn(txn, db_id, table_versions)
-                                .await?
-                            {
-                                return Ok::<PreparedTxnResult, anyhow::Error>(
-                                    PreparedTxnResult::SchemaDrift {
-                                        table_name,
-                                        expected,
-                                        current,
-                                    },
-                                );
-                            }
-                            let result = self
-                                .execute_prepared_on_txn(
-                                    txn,
-                                    db_id,
-                                    sequence_values,
-                                    search_path,
-                                    exec,
-                                    current_role.as_deref(),
-                                )
-                                .await?;
-                            Ok::<PreparedTxnResult, anyhow::Error>(
-                                PreparedTxnResult::Executed(result),
-                            )
-                        };
-
-                        let res = match timeout {
-                            Some(timeout) => match tokio::time::timeout(timeout, fut).await {
-                                Ok(res) => res,
-                                Err(_) => Err(anyhow::Error::new(StatementTimeoutError)),
-                            },
-                            None => fut.await,
-                        };
-
-                        if is_autocommit {
-                            match res {
-                                Ok(PreparedTxnResult::Executed(result)) => {
-                                    session.commit().await?;
-                                    self.flush_trigger_activations();
-                                    return Ok(ExecuteResults::single(result));
-                                }
-                                Ok(PreparedTxnResult::SchemaDrift {
-                                    table_name,
-                                    expected,
-                                    current,
-                                }) => {
-                                    session.rollback().await?;
-                                    self.clear_trigger_activations();
-                                    warn!(
-                                        table = %table_name,
-                                        expected_version = expected,
-                                        current_version = ?current,
-                                        "prepared schema drift detected; falling back to SQL parse/analyze"
-                                    );
-                                    if !fallback_params.is_empty() {
-                                        session.set_pending_params(fallback_params.clone());
+                                    if session.is_transaction_failed() && !sql_trimmed.trim().is_empty()
+                                    {
+                                        if !is_observability_user {
+                                            self.observability.record_statement(
+                                                Duration::from_millis(0),
+                                                false,
+                                                || sql_trimmed.to_string(),
+                                            );
+                                        }
+                                        return Err(SqlError::InFailedTransaction.into());
                                     }
-                                    if !fallback_param_types.is_empty() {
-                                        session.set_pending_param_types(fallback_param_types.clone());
-                                    }
-                                    return self.execute(session, sql).await;
-                                }
-                                Err(err) => {
-                                    session.rollback().await?;
-                                    self.clear_trigger_activations();
-                                    let should_retry =
-                                        attempt + 1 < max_attempts && is_retryable_tikv_error(&err);
-                                    if should_retry {
-                                        // Exponential backoff with jitter to reduce contention.
-                                        let base_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
-                                        let jitter_ms = rand::random::<u64>() % (base_ms + 1);
-                                        let backoff_ms = base_ms + jitter_ms;
-                                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                                        continue;
-                                    }
-                                    return Err(err);
-                                }
-                            }
-                        } else {
-                            return match res? {
-                                PreparedTxnResult::Executed(result) => {
-                                    Ok(ExecuteResults::single(result))
-                                }
-                                PreparedTxnResult::SchemaDrift {
-                                    table_name,
-                                    expected,
-                                    current,
-                                } => {
-                                    warn!(
-                                        table = %table_name,
-                                        expected_version = expected,
-                                        current_version = ?current,
-                                        "prepared schema drift detected; falling back to SQL parse/analyze"
-                                    );
-                                    if !fallback_params.is_empty() {
-                                        session.set_pending_params(fallback_params.clone());
-                                    }
-                                    if !fallback_param_types.is_empty() {
-                                        session.set_pending_param_types(fallback_param_types.clone());
-                                    }
-                                    self.execute(session, sql).await
-                                }
-                            };
-                        }
-                    }
 
-                    unreachable!("retry loop must return")
-                }
-                .await;
+                                    let observability_policy = self
+                                        .enforce_observability_prepared_policy(
+                                            session, sql_trimmed, exec,
+                                        );
+                                    let is_observability_query =
+                                        observability_policy.as_ref().copied().unwrap_or(false);
 
-                if exec_result.is_err() && session.is_in_transaction() {
-                    session.mark_transaction_failed();
-                }
+                                    let start = Instant::now();
+                                    let exec_result: Result<ExecuteResults> = async {
+                                        let is_observability_query = observability_policy?;
+                                        let is_autocommit = !session.is_in_transaction();
+                                        let db_id = session.current_database_id();
+                                        let max_attempts = if is_autocommit { 10usize } else { 1usize };
 
-                if !is_observability_user {
-                    self.observability.record_statement(
-                        start.elapsed(),
-                        exec_result.is_ok(),
-                        || sql_for_observability.clone(),
-                    );
-                }
+                                        for attempt in 0..max_attempts {
+                                            if is_autocommit {
+                                                session.begin().await?;
+                                            }
 
-                exec_result
-            }),
+                                            let timeout = session.statement_timeout();
+                                            let current_role = session.current_user().map(|u| u.to_string());
+                                            let fut = async {
+                                                let (txn, sequence_values, search_path) = session
+                                                    .get_mut_txn_sequence_values_and_search_path()
+                                                    .expect("Transaction must be active");
+                                                if let Some((table_name, expected, current)) = self
+                                                    .first_schema_drift_on_txn(
+                                                        txn,
+                                                        db_id,
+                                                        table_versions,
+                                                    )
+                                                    .await?
+                                                {
+                                                    return Ok::<PreparedTxnResult, anyhow::Error>(
+                                                        PreparedTxnResult::SchemaDrift {
+                                                            table_name,
+                                                            expected,
+                                                            current,
+                                                        },
+                                                    );
+                                                }
+                                                let result = self
+                                                    .execute_prepared_on_txn(
+                                                        txn,
+                                                        db_id,
+                                                        sequence_values,
+                                                        search_path,
+                                                        exec,
+                                                        current_role.as_deref(),
+                                                    )
+                                                    .await?;
+                                                Ok::<PreparedTxnResult, anyhow::Error>(
+                                                    PreparedTxnResult::Executed(result),
+                                                )
+                                            };
+
+                                            let res = match timeout {
+                                                Some(timeout) => {
+                                                    match tokio::time::timeout(timeout, fut).await {
+                                                        Ok(res) => res,
+                                                        Err(_) => {
+                                                            Err(anyhow::Error::new(
+                                                                StatementTimeoutError,
+                                                            ))
+                                                        }
+                                                    }
+                                                }
+                                                None => fut.await,
+                                            };
+
+                                            if res
+                                                .as_ref()
+                                                .err()
+                                                .is_some_and(|e| e.is::<StatementTimeoutError>())
+                                                && !is_autocommit
+                                            {
+                                                // Keep non-autocommit timeout behavior aligned with
+                                                // execute_single: abort explicit transaction to avoid
+                                                // unknown partial state.
+                                                session.rollback().await?;
+                                                self.clear_trigger_activations();
+                                            }
+
+                                            if is_autocommit {
+                                                match res {
+                                                    Ok(PreparedTxnResult::Executed(result)) => {
+                                                        if is_observability_query {
+                                                            session.rollback().await?;
+                                                            self.clear_trigger_activations();
+                                                        } else {
+                                                            session.commit().await?;
+                                                            self.flush_trigger_activations();
+                                                        }
+                                                        return Ok(ExecuteResults::single(result));
+                                                    }
+                                                    Ok(PreparedTxnResult::SchemaDrift {
+                                                        table_name,
+                                                        expected,
+                                                        current,
+                                                    }) => {
+                                                        session.rollback().await?;
+                                                        self.clear_trigger_activations();
+                                                        warn!(
+                                                            table = %table_name,
+                                                            expected_version = expected,
+                                                            current_version = ?current,
+                                                            "prepared schema drift detected; falling back to SQL parse/analyze"
+                                                        );
+                                                        return self
+                                                            .execute_prepared_text_fallback(
+                                                                session,
+                                                                sql,
+                                                                qctx_for_fallback.as_ref(),
+                                                            )
+                                                            .await;
+                                                    }
+                                                    Err(err) => {
+                                                        session.rollback().await?;
+                                                        self.clear_trigger_activations();
+                                                        let should_retry = attempt + 1 < max_attempts
+                                                            && is_retryable_tikv_error(&err);
+                                                        if should_retry {
+                                                            // Exponential backoff with jitter to reduce contention.
+                                                            let base_ms = 5u64
+                                                                .saturating_mul(1u64
+                                                                    << attempt.min(6));
+                                                            let jitter_ms =
+                                                                rand::random::<u64>() % (base_ms + 1);
+                                                            let backoff_ms = base_ms + jitter_ms;
+                                                            tokio::time::sleep(
+                                                                Duration::from_millis(backoff_ms),
+                                                            )
+                                                            .await;
+                                                            continue;
+                                                        }
+                                                        return Err(err);
+                                                    }
+                                                }
+                                            } else {
+                                                return match res? {
+                                                    PreparedTxnResult::Executed(result) => {
+                                                        Ok(ExecuteResults::single(result))
+                                                    }
+                                                    PreparedTxnResult::SchemaDrift {
+                                                        table_name,
+                                                        expected,
+                                                        current,
+                                                    } => {
+                                                        warn!(
+                                                            table = %table_name,
+                                                            expected_version = expected,
+                                                            current_version = ?current,
+                                                            "prepared schema drift detected; falling back to SQL parse/analyze"
+                                                        );
+                                                        self.execute_prepared_text_fallback(
+                                                            session,
+                                                            sql,
+                                                            qctx_for_fallback.as_ref(),
+                                                        )
+                                                        .await
+                                                    }
+                                                };
+                                            }
+                                        }
+
+                                        unreachable!("retry loop must return")
+                                    }
+                                    .await;
+
+                                    if exec_result.is_err() && session.is_in_transaction() {
+                                        session.mark_transaction_failed();
+                                    }
+
+                                    if !is_observability_query {
+                                        self.observability.record_statement(
+                                            start.elapsed(),
+                                            exec_result.is_ok(),
+                                            || sql_for_observability.clone(),
+                                        );
+                                    }
+
+                                    exec_result
+                                },
+                            ),
+                        ),
+                    ),
+                ),
+            ),
         )
         .await
+    }
+
+    fn enforce_observability_prepared_policy(
+        &self,
+        session: &mut Session,
+        sql_trimmed: &str,
+        exec: &PreparedExec,
+    ) -> Result<bool> {
+        let is_observability_user =
+            session.current_user() == Some(OBSERVABILITY_USER) && !session.is_superuser();
+        if !is_observability_user {
+            return Ok(false);
+        }
+
+        // Prepared analyzed path only handles SELECT/DML. For observability users,
+        // keep the same policy as execute_single: only allow system/tableless SELECT.
+        if !matches!(exec, PreparedExec::AnalyzedQuery { .. }) {
+            if session.is_in_transaction() {
+                session.mark_transaction_failed();
+            }
+            return Err(SqlError::PermissionDenied {
+                object_type: "role".into(),
+                object_name: OBSERVABILITY_USER.to_string(),
+            }
+            .into());
+        }
+
+        let statements = parse_sql(sql_trimmed)?;
+        let Some(stmt) = statements.first() else {
+            if session.is_in_transaction() {
+                session.mark_transaction_failed();
+            }
+            return Err(SqlError::PermissionDenied {
+                object_type: "role".into(),
+                object_name: OBSERVABILITY_USER.to_string(),
+            }
+            .into());
+        };
+
+        let is_observability_query =
+            is_observability_system_query(stmt) || is_observability_tableless_query(stmt);
+        if !is_observability_query {
+            if session.is_in_transaction() {
+                session.mark_transaction_failed();
+            }
+            return Err(SqlError::PermissionDenied {
+                object_type: "role".into(),
+                object_name: OBSERVABILITY_USER.to_string(),
+            }
+            .into());
+        }
+
+        Ok(true)
+    }
+
+    async fn execute_prepared_text_fallback(
+        &self,
+        session: &mut Session,
+        sql: &str,
+        qctx: &crate::sql::query_context::QueryContext,
+    ) -> Result<ExecuteResults> {
+        if !qctx.params.is_empty() {
+            session.set_pending_params(qctx.params.clone());
+        }
+        if !qctx.param_types.is_empty() {
+            session.set_pending_param_types(qctx.param_types.clone());
+        }
+        self.execute(session, sql).await
     }
 
     async fn execute_prepared_on_txn(
@@ -301,6 +441,7 @@ impl Executor {
                 locks,
                 select_into,
                 required_privileges,
+                ..
             } => {
                 for (table_name, privilege) in required_privileges {
                     self.require_table_privilege(

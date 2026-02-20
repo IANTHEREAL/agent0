@@ -1634,6 +1634,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                                     param_types,
                                     base_table_names,
                                     table_versions,
+                                    has_recursive_cte,
                                 } => {
                                     let required_privileges = base_table_names
                                         .into_iter()
@@ -1650,6 +1651,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                                             locks,
                                             select_into,
                                             required_privileges,
+                                            has_recursive_cte,
                                         },
                                         output_schema,
                                         param_data_types: param_types,
