@@ -40,5 +40,28 @@ describe('pg client - Extended Protocol Transaction Control', () => {
       client.release();
     }
   });
-});
 
+  it('supports recursive CTE via named prepared statement', async () => {
+    const client = await pool.connect();
+    try {
+      const sql = `
+        WITH RECURSIVE numbers AS (
+          SELECT 1 AS n
+          UNION ALL
+          SELECT n + 1 FROM numbers WHERE n < 5
+        )
+        SELECT * FROM numbers ORDER BY n
+      `;
+
+      const result = await client.query<{ n: number }>({
+        name: `recursive_cte_stmt_${Date.now()}`,
+        text: sql,
+        values: [],
+      });
+
+      expect(result.rows.map((r) => r.n)).toEqual([1, 2, 3, 4, 5]);
+    } finally {
+      client.release();
+    }
+  });
+});

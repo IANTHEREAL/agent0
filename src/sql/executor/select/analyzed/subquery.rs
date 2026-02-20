@@ -133,7 +133,6 @@ fn table_ref_has_outer_ref_beyond(table_ref: &AnalyzedTableRef, min_depth: u32) 
         _ => false,
     }
 }
-
 // ── Correlated subquery substitution ─────────────────────────
 
 /// Substitute outer column references in an AnalyzedQuery with constant
@@ -575,6 +574,150 @@ mod tests {
                     alias: Some("gs".to_string()),
                 }],
                 where_clause: None,
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("?column?".to_string(), DataType::Int32)],
+        };
+
+        assert!(is_correlated_query(&query));
+    }
+
+    fn correlated_values_query() -> AnalyzedQuery {
+        AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection: vec![AnalyzedProjection {
+                    expr: TypedExpr::new(
+                        TypedExprKind::ColumnRef {
+                            scope_depth: 1,
+                            column_index: 0,
+                            column_name: "outer_x".to_string(),
+                        },
+                        DataType::Int32,
+                    ),
+                    output_name: "outer_x".to_string(),
+                }],
+                from: vec![],
+                where_clause: None,
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("outer_x".to_string(), DataType::Int32)],
+        }
+    }
+
+    #[test]
+    fn is_correlated_query_detects_scalar_subquery_correlation() {
+        assert!(is_correlated_query(&correlated_values_query()));
+    }
+
+    #[test]
+    fn is_correlated_query_does_not_treat_nested_correlation_as_outer_ref() {
+        let expr = TypedExpr::new(
+            TypedExprKind::ScalarSubquery(Box::new(correlated_values_query())),
+            DataType::Int32,
+        );
+        let where_expr = TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(expr),
+                op: BinaryOp::Eq,
+                right: Box::new(int_const(1)),
+            },
+            DataType::Boolean,
+        );
+
+        let query = AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection: vec![AnalyzedProjection {
+                    expr: int_const(1),
+                    output_name: "?column?".to_string(),
+                }],
+                from: vec![],
+                where_clause: Some(where_expr),
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("?column?".to_string(), DataType::Int32)],
+        };
+
+        assert!(!is_correlated_query(&query));
+    }
+
+    #[test]
+    fn is_correlated_query_detects_nested_ref_beyond_current_scope() {
+        let nested = AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection: vec![AnalyzedProjection {
+                    expr: TypedExpr::new(
+                        TypedExprKind::ColumnRef {
+                            scope_depth: 2,
+                            column_index: 0,
+                            column_name: "grand_outer".to_string(),
+                        },
+                        DataType::Int32,
+                    ),
+                    output_name: "grand_outer".to_string(),
+                }],
+                from: vec![],
+                where_clause: None,
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("grand_outer".to_string(), DataType::Int32)],
+        };
+
+        let expr = TypedExpr::new(
+            TypedExprKind::ScalarSubquery(Box::new(nested)),
+            DataType::Int32,
+        );
+
+        let where_expr = TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(TypedExpr::new(
+                    TypedExprKind::Constant(Value::Boolean(false)),
+                    DataType::Boolean,
+                )),
+                op: BinaryOp::Or,
+                right: Box::new(TypedExpr::new(
+                    TypedExprKind::BinaryOp {
+                        left: Box::new(expr),
+                        op: BinaryOp::Eq,
+                        right: Box::new(int_const(1)),
+                    },
+                    DataType::Boolean,
+                )),
+            },
+            DataType::Boolean,
+        );
+
+        let query = AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection: vec![AnalyzedProjection {
+                    expr: int_const(1),
+                    output_name: "?column?".to_string(),
+                }],
+                from: vec![],
+                where_clause: Some(where_expr),
                 group_by: vec![],
                 having: None,
                 distinct: AnalyzedDistinct::All,
