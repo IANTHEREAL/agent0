@@ -1,4 +1,4 @@
-use super::helpers::{int_col, null_val, text_col, text_val};
+use super::helpers::{format_epoch_ms, int_col, null_val, text_col, text_val};
 use super::{ScanContext, VirtualTable};
 use crate::types::{Row, TableSchema, Value};
 use anyhow::Result;
@@ -94,14 +94,5 @@ impl VirtualTable for CronJobRunDetailsTable {
             .collect();
 
         Ok(rows)
-    }
-}
-
-fn format_epoch_ms(epoch_ms: i64) -> String {
-    let secs = epoch_ms / 1000;
-    let nanos = ((epoch_ms % 1000) * 1_000_000) as u32;
-    match chrono::DateTime::from_timestamp(secs, nanos) {
-        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S%.3f+00").to_string(),
-        None => epoch_ms.to_string(),
     }
 }
