@@ -3,6 +3,7 @@ use std::env;
 const DEFAULT_POLL_MS: u64 = 60_000;
 const DEFAULT_MAX_CONCURRENT_JOBS: usize = 32;
 const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 300_000;
+const DEFAULT_CRON_JOB_TIMEOUT_MS: u64 = 1_800_000;
 const DEFAULT_ORPHAN_TIMEOUT_SEC: u64 = 300;
 const DEFAULT_GC_BATCH_SIZE: usize = 100;
 const DEFAULT_AUTO_ANALYZE_THRESHOLD: u64 = 50;
@@ -15,6 +16,7 @@ pub struct WorkerConfig {
     pub max_concurrent_jobs: usize,
     pub worker_id: String,
     pub statement_timeout_ms: u64,
+    pub cron_job_timeout_ms: u64,
     pub orphan_timeout_sec: u64,
     pub gc_batch_size: usize,
     pub auto_analyze_enabled: bool,
@@ -34,6 +36,7 @@ impl Default for WorkerConfig {
             max_concurrent_jobs: DEFAULT_MAX_CONCURRENT_JOBS,
             worker_id,
             statement_timeout_ms: DEFAULT_STATEMENT_TIMEOUT_MS,
+            cron_job_timeout_ms: DEFAULT_CRON_JOB_TIMEOUT_MS,
             orphan_timeout_sec: DEFAULT_ORPHAN_TIMEOUT_SEC,
             gc_batch_size: DEFAULT_GC_BATCH_SIZE,
             auto_analyze_enabled: true,
@@ -82,6 +85,13 @@ impl WorkerConfig {
                 .ok()
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.statement_timeout_ms);
+        }
+        if let Ok(v) = env::var("PGTIKV_CRON_JOB_TIMEOUT_MS") {
+            cfg.cron_job_timeout_ms = v
+                .parse::<u64>()
+                .ok()
+                .filter(|n| *n > 0)
+                .unwrap_or(cfg.cron_job_timeout_ms);
         }
         if let Ok(v) = env::var("PGTIKV_WORKER_ORPHAN_TIMEOUT_SEC") {
             cfg.orphan_timeout_sec = v
@@ -135,6 +145,7 @@ mod tests {
             "PGTIKV_WORKER_MAX_CONCURRENT_JOBS",
             "PGTIKV_WORKER_ID",
             "PGTIKV_WORKER_STATEMENT_TIMEOUT_MS",
+            "PGTIKV_CRON_JOB_TIMEOUT_MS",
             "PGTIKV_WORKER_ORPHAN_TIMEOUT_SEC",
             "PGTIKV_WORKER_GC_BATCH_SIZE",
             "PGTIKV_AUTO_ANALYZE_ENABLED",
@@ -148,7 +159,9 @@ mod tests {
             .collect();
 
         for key in &keys {
-            env::remove_var(key);
+            unsafe {
+                env::remove_var(key);
+            }
         }
 
         let cfg = WorkerConfig::from_env();
@@ -157,6 +170,7 @@ mod tests {
         assert_eq!(cfg.max_concurrent_jobs, DEFAULT_MAX_CONCURRENT_JOBS);
         assert!(cfg.worker_id.contains(':'));
         assert_eq!(cfg.statement_timeout_ms, DEFAULT_STATEMENT_TIMEOUT_MS);
+        assert_eq!(cfg.cron_job_timeout_ms, DEFAULT_CRON_JOB_TIMEOUT_MS);
         assert_eq!(cfg.orphan_timeout_sec, DEFAULT_ORPHAN_TIMEOUT_SEC);
         assert_eq!(cfg.gc_batch_size, DEFAULT_GC_BATCH_SIZE);
         assert!(cfg.auto_analyze_enabled);
@@ -165,8 +179,8 @@ mod tests {
 
         for (key, value) in saved {
             match value {
-                Some(v) => env::set_var(key, v),
-                None => env::remove_var(key),
+                Some(v) => unsafe { env::set_var(key, v) },
+                None => unsafe { env::remove_var(key) },
             }
         }
     }
@@ -205,6 +219,7 @@ mod tests {
         assert_eq!(cfg.poll_ms, 60_000);
         assert_eq!(cfg.max_concurrent_jobs, 32);
         assert_eq!(cfg.statement_timeout_ms, 300_000);
+        assert_eq!(cfg.cron_job_timeout_ms, 1_800_000);
         assert_eq!(cfg.orphan_timeout_sec, 300);
         assert_eq!(cfg.gc_batch_size, 100);
         assert!(cfg.auto_analyze_enabled);
