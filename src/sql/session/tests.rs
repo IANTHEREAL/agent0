@@ -697,6 +697,149 @@ mod tests {
         );
     }
 
+    // ── SHOW ALL tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_known_gucs_sorted() {
+        use crate::sql::session::settings::KNOWN_GUCS;
+        let names: Vec<&str> = KNOWN_GUCS.iter().map(|g| g.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names, sorted,
+            "KNOWN_GUCS must be sorted alphabetically by name"
+        );
+    }
+
+    #[test]
+    fn test_show_all_sorted_no_duplicates() {
+        let settings = SessionSettings::new();
+        let all = settings.show_all();
+
+        // No duplicates (HashSet comparison — works regardless of ordering)
+        let names: Vec<&str> = all.iter().map(|(n, _, _)| n.as_str()).collect();
+        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "show_all() must have no duplicate names"
+        );
+
+        // Alphabetically sorted
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "show_all() must be sorted alphabetically");
+
+        // Key GUCs present
+        let name_set: std::collections::HashSet<&str> = names.iter().copied().collect();
+        for key in &[
+            "server_version",
+            "timezone",
+            "search_path",
+            "extra_float_digits",
+            "statement_timeout",
+            "transaction_isolation",
+        ] {
+            assert!(
+                name_set.contains(key),
+                "show_all() missing key GUC: {}",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_show_all_includes_extra_settings() {
+        let mut settings = SessionSettings::new();
+        settings
+            .set_known_setting("my_custom_guc", "val".to_string())
+            .unwrap();
+        let all = settings.show_all();
+        let found = all
+            .iter()
+            .any(|(n, v, _)| n == "my_custom_guc" && v == "val");
+        assert!(found, "show_all() must include user-SET extra_settings");
+    }
+
+    #[test]
+    fn test_show_all_includes_local_overrides() {
+        let mut settings = SessionSettings::new();
+        settings
+            .set_local_override("statement_timeout", "5000".to_string())
+            .unwrap();
+        let all = settings.show_all();
+        let found = all.iter().find(|(n, _, _)| n == "statement_timeout");
+        assert_eq!(
+            found.map(|(_, v, _)| v.as_str()),
+            Some("5000ms"),
+            "show_all() must reflect local override value"
+        );
+    }
+
+    #[test]
+    fn test_show_all_local_only_key_appears() {
+        let mut settings = SessionSettings::new();
+        settings
+            .set_local_override("my_local_guc", "localval".to_string())
+            .unwrap();
+        let all = settings.show_all();
+        let found = all
+            .iter()
+            .any(|(n, v, _)| n == "my_local_guc" && v == "localval");
+        assert!(found, "show_all() must include local-only override keys");
+    }
+
+    #[test]
+    fn test_show_all_settings_forces_session_pseudo_gucs() {
+        use crate::sql::session::force_insert_setting;
+
+        // Simulate show_all_settings() contract: even when extra_settings
+        // contains stale/user-set values for is_superuser or
+        // session_authorization, force_insert_setting must overwrite them.
+        let mut settings = SessionSettings::new();
+        settings
+            .set_known_setting("is_superuser", "bogus".to_string())
+            .unwrap();
+        settings
+            .set_known_setting("session_authorization", "evil_user".to_string())
+            .unwrap();
+
+        let mut all = settings.show_all();
+
+        // Before force-replace: stale values present
+        let is_su = all.iter().find(|(n, _, _)| n == "is_superuser");
+        assert_eq!(is_su.map(|(_, v, _)| v.as_str()), Some("bogus"));
+
+        // Apply force-replace (mirrors Session::show_all_settings logic)
+        force_insert_setting(&mut all, "is_superuser", "off".to_string());
+        force_insert_setting(&mut all, "session_authorization", "real_user".to_string());
+
+        // After: authoritative values win
+        let is_su = all.iter().find(|(n, _, _)| n == "is_superuser");
+        assert_eq!(is_su.map(|(_, v, _)| v.as_str()), Some("off"));
+        let sa = all.iter().find(|(n, _, _)| n == "session_authorization");
+        assert_eq!(sa.map(|(_, v, _)| v.as_str()), Some("real_user"));
+
+        // Vec remains sorted after force-inserts
+        let names: Vec<&str> = all.iter().map(|(n, _, _)| n.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "force_insert must preserve sort order");
+    }
+
+    #[test]
+    fn test_show_value_covers_all_known_gucs() {
+        use crate::sql::session::settings::KNOWN_GUCS;
+        let settings = SessionSettings::new();
+        for guc in KNOWN_GUCS {
+            assert!(
+                settings.show_value(guc.name).is_some(),
+                "show_value({:?}) returned None — add a typed-field match arm or static_default for this GUC",
+                guc.name
+            );
+        }
+    }
+
     #[test]
     fn test_reset_all_clears_local_overrides_but_preserves_savepoint_snapshots() {
         let mut settings = SessionSettings::new();

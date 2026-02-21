@@ -2517,3 +2517,26 @@ fn test_utility_describe_unparseable_returns_empty() {
     assert!(utility_describe_fields("SELCT 1").is_empty());
     assert!(utility_describe_fields("").is_empty());
 }
+
+#[test]
+fn test_utility_describe_show_all() {
+    use super::dynamic::utility_describe_fields;
+    let fields = utility_describe_fields("SHOW ALL");
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0].name(), "name");
+    assert_eq!(fields[0].datatype(), &Type::TEXT);
+    assert_eq!(fields[1].name(), "setting");
+    assert_eq!(fields[1].datatype(), &Type::TEXT);
+    assert_eq!(fields[2].name(), "description");
+    assert_eq!(fields[2].datatype(), &Type::TEXT);
+}
+
+#[test]
+fn test_utility_describe_show_all_case_insensitive() {
+    use super::dynamic::utility_describe_fields;
+    let fields = utility_describe_fields("SHOW all");
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0].name(), "name");
+    assert_eq!(fields[1].name(), "setting");
+    assert_eq!(fields[2].name(), "description");
+}

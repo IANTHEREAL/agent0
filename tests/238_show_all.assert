@@ -1,0 +1,4 @@
+server_version
+timezone
+search_path
+transaction_isolation

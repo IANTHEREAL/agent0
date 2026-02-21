@@ -67,6 +67,19 @@ pub struct Session {
     pending_param_types: Vec<Option<crate::types::DataType>>,
 }
 
+/// Force-insert or overwrite a setting in a sorted `(name, value, description)` vec.
+/// Used by `show_all_settings()` to replace pseudo-GUCs with authoritative values.
+pub(super) fn force_insert_setting(
+    v: &mut Vec<(String, String, String)>,
+    name: &str,
+    value: String,
+) {
+    match v.binary_search_by(|(n, _, _)| n.as_str().cmp(name)) {
+        Ok(idx) => v[idx].1 = value,
+        Err(idx) => v.insert(idx, (name.to_string(), value, String::new())),
+    }
+}
+
 impl Session {
     /// Create a session for the given database.
     pub fn new_with_database(
@@ -389,6 +402,31 @@ impl Session {
             ),
             _ => self.settings.show_value(name),
         }
+    }
+
+    /// Collect all settings for `SHOW ALL`.
+    /// Returns Vec<(name, setting, description)> sorted alphabetically.
+    /// Session-level pseudo-GUCs (`is_superuser`, `session_authorization`) are
+    /// force-replaced with authoritative Session values.
+    pub(crate) fn show_all_settings(&self) -> Vec<(String, String, String)> {
+        let mut all = self.settings.show_all();
+
+        force_insert_setting(
+            &mut all,
+            "is_superuser",
+            if self.is_superuser { "on" } else { "off" }.to_string(),
+        );
+        force_insert_setting(
+            &mut all,
+            "session_authorization",
+            self.session_user
+                .as_deref()
+                .or(self.current_user.as_deref())
+                .unwrap_or("postgres")
+                .to_string(),
+        );
+
+        all
     }
 
     pub(crate) fn statement_timeout(&self) -> Option<Duration> {

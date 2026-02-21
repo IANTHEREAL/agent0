@@ -6,10 +6,246 @@
 
 use crate::sql::error::SqlError;
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use super::DEFAULT_MAX_SORT_BYTES;
+
+/// Metadata for a single known GUC parameter.
+pub(crate) struct GucMeta {
+    pub(crate) name: &'static str,
+    immutable: bool,
+    description: &'static str,
+    /// Static default for GUCs handled in the default_value fallback path.
+    /// `None` for GUCs whose value is computed from typed struct fields in show_value().
+    static_default: Option<&'static str>,
+}
+
+/// Single source of truth for all known GUC parameters. MUST be sorted alphabetically by name.
+pub(crate) const KNOWN_GUCS: &[GucMeta] = &[
+    GucMeta {
+        name: "application_name",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "bytea_output",
+        immutable: false,
+        description: "",
+        static_default: Some("hex"),
+    },
+    GucMeta {
+        name: "check_function_bodies",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "client_encoding",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "client_min_messages",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "datestyle",
+        immutable: true,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "default_table_access_method",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "default_tablespace",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "default_text_search_config",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "default_transaction_isolation",
+        immutable: true,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "default_transaction_read_only",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "extra_float_digits",
+        immutable: false,
+        description: "",
+        static_default: Some("1"),
+    },
+    GucMeta {
+        name: "idle_in_transaction_session_timeout",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "in_hot_standby",
+        immutable: false,
+        description: "",
+        static_default: Some("off"),
+    },
+    GucMeta {
+        name: "integer_datetimes",
+        immutable: true,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "intervalstyle",
+        immutable: true,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "lc_messages",
+        immutable: false,
+        description: "",
+        static_default: Some("C"),
+    },
+    GucMeta {
+        name: "lc_monetary",
+        immutable: false,
+        description: "",
+        static_default: Some("C"),
+    },
+    GucMeta {
+        name: "lc_numeric",
+        immutable: false,
+        description: "",
+        static_default: Some("C"),
+    },
+    GucMeta {
+        name: "lc_time",
+        immutable: false,
+        description: "",
+        static_default: Some("C"),
+    },
+    GucMeta {
+        name: "lock_timeout",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "max_identifier_length",
+        immutable: false,
+        description: "",
+        static_default: Some("63"),
+    },
+    GucMeta {
+        name: "max_index_keys",
+        immutable: false,
+        description: "",
+        static_default: Some("32"),
+    },
+    GucMeta {
+        name: "password_encryption",
+        immutable: false,
+        description: "",
+        static_default: Some("scram-sha-256"),
+    },
+    GucMeta {
+        name: "pgtikv.max_sort_bytes",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "row_security",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "search_path",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "server_encoding",
+        immutable: true,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "server_version",
+        immutable: true,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "server_version_num",
+        immutable: true,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "standard_conforming_strings",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "statement_timeout",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "timezone",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "tipg.use_optimizer",
+        immutable: true,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "transaction_isolation",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "work_mem",
+        immutable: false,
+        description: "",
+        static_default: Some("4MB"),
+    },
+    GucMeta {
+        name: "xmloption",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+];
 
 #[derive(Clone, Debug, Default)]
 struct SettingsSavepoint {
@@ -110,17 +346,7 @@ impl SessionSettings {
     }
 
     fn is_immutable_setting(name: &str) -> bool {
-        matches!(
-            name,
-            "server_version"
-                | "server_version_num"
-                | "server_encoding"
-                | "datestyle"
-                | "integer_datetimes"
-                | "intervalstyle"
-                | "tipg.use_optimizer"
-                | "default_transaction_isolation"
-        )
+        KNOWN_GUCS.iter().any(|g| g.name == name && g.immutable)
     }
 
     pub(crate) fn new() -> Self {
@@ -532,6 +758,19 @@ impl SessionSettings {
             }
         }
 
+        // ── Structural reverse guard ──
+        // If the name is not in KNOWN_GUCS and not in dynamic maps, return None early.
+        // This is a best-effort runtime guard: any typed-field match arm below for an
+        // unregistered name would be unreachable dead code, nudging developers to add
+        // new GUCs to KNOWN_GUCS first.
+        let is_registered = KNOWN_GUCS.iter().any(|g| g.name == canonical);
+        if !is_registered
+            && !self.extra_settings.contains_key(canonical)
+            && !self.local_overrides.contains_key(canonical)
+        {
+            return None;
+        }
+
         match canonical {
             // These are used heavily by drivers for feature detection.
             "server_version" => Some("16.0".to_string()),
@@ -603,34 +842,49 @@ impl SessionSettings {
                     .unwrap_or("off")
                     .to_string(),
             ),
-            _ => self
-                .extra_settings
-                .get(canonical)
-                .cloned()
-                .or_else(|| Self::default_value(canonical).map(String::from)),
+            _ => self.extra_settings.get(canonical).cloned().or_else(|| {
+                // default_text_search_config uses a runtime OnceLock fn, not a const.
+                if canonical == "default_text_search_config" {
+                    return Some(
+                        crate::sql::fts_tokenizers::default_text_search_config().to_string(),
+                    );
+                }
+                KNOWN_GUCS
+                    .iter()
+                    .find(|g| g.name == canonical)
+                    .and_then(|g| g.static_default)
+                    .map(String::from)
+            }),
         }
     }
 
-    /// PostgreSQL-compatible defaults for common GUC parameters that tipg does
-    /// not actively track but drivers/ORMs expect to SHOW without error.
-    fn default_value(name: &str) -> Option<&'static str> {
-        match name {
-            "extra_float_digits" => Some("1"),
-            "bytea_output" => Some("hex"),
-            "lc_messages" => Some("C"),
-            "lc_monetary" => Some("C"),
-            "lc_numeric" => Some("C"),
-            "lc_time" => Some("C"),
-            "max_identifier_length" => Some("63"),
-            "max_index_keys" => Some("32"),
-            "work_mem" => Some("4MB"),
-            "default_text_search_config" => {
-                Some(crate::sql::fts_tokenizers::default_text_search_config())
+    /// Collect all settings for SHOW ALL.
+    /// Returns Vec<(name, value, description)> sorted alphabetically by name.
+    pub(crate) fn show_all(&self) -> Vec<(String, String, String)> {
+        let mut result = BTreeMap::new();
+
+        // 1. All registered GUCs (respects local_override > typed field > default precedence)
+        for guc in KNOWN_GUCS {
+            if let Some(value) = self.show_value(guc.name) {
+                result.insert(guc.name.to_string(), (value, guc.description.to_string()));
             }
-            "in_hot_standby" => Some("off"),
-            "password_encryption" => Some("scram-sha-256"),
-            _ => None,
         }
+
+        // 2. User-SET extra_settings not in registry
+        for (name, _) in &self.extra_settings {
+            result
+                .entry(name.clone())
+                .or_insert_with(|| (self.show_value(name).unwrap_or_default(), String::new()));
+        }
+
+        // 3. Local overrides not already covered
+        for (name, _) in &self.local_overrides {
+            result
+                .entry(name.clone())
+                .or_insert_with(|| (self.show_value(name).unwrap_or_default(), String::new()));
+        }
+
+        result.into_iter().map(|(n, (v, d))| (n, v, d)).collect()
     }
 
     pub(crate) fn statement_timeout(&self) -> Option<Duration> {

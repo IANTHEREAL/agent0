@@ -114,13 +114,40 @@ pub(in crate::protocol::handler) fn utility_describe_fields(sql: &str) -> Vec<Fi
                 .collect::<Vec<_>>()
                 .join(".")
                 .to_lowercase();
-            vec![FieldInfo::new(
-                name,
-                None,
-                None,
-                Type::TEXT,
-                FieldFormat::Text,
-            )]
+
+            if name == "all" {
+                vec![
+                    FieldInfo::new(
+                        "name".to_string(),
+                        None,
+                        None,
+                        Type::TEXT,
+                        FieldFormat::Text,
+                    ),
+                    FieldInfo::new(
+                        "setting".to_string(),
+                        None,
+                        None,
+                        Type::TEXT,
+                        FieldFormat::Text,
+                    ),
+                    FieldInfo::new(
+                        "description".to_string(),
+                        None,
+                        None,
+                        Type::TEXT,
+                        FieldFormat::Text,
+                    ),
+                ]
+            } else {
+                vec![FieldInfo::new(
+                    name,
+                    None,
+                    None,
+                    Type::TEXT,
+                    FieldFormat::Text,
+                )]
+            }
         }
         Statement::ShowTables { .. } => {
             vec![FieldInfo::new(

@@ -11,6 +11,32 @@ use utils::{
 
 use super::*;
 
+/// Build a `SHOW ALL` result set: three columns (name, setting, description),
+/// sorted alphabetically by name.
+fn build_show_all_result(session: &Session, timezone: Arc<str>) -> ExecuteResult {
+    let all_settings = session.show_all_settings();
+    let rows = all_settings
+        .into_iter()
+        .map(|(name, setting, description)| {
+            Row::new(vec![
+                Value::Text(name),
+                Value::Text(setting),
+                Value::Text(description),
+            ])
+        })
+        .collect();
+    ExecuteResult::Select {
+        columns: vec![
+            "name".to_string(),
+            "setting".to_string(),
+            "description".to_string(),
+        ],
+        column_types: Some(vec![DataType::Text, DataType::Text, DataType::Text]),
+        rows,
+        timezone,
+    }
+}
+
 impl Executor {
     /// Execute a SQL statement string using the provided session.
     ///
@@ -570,6 +596,17 @@ impl Executor {
                                 .collect::<Vec<_>>()
                                 .join(".")
                                 .to_lowercase();
+
+                            if var_name == "all" {
+                                let tz = Arc::from(
+                                    session
+                                        .show_setting_value("timezone")
+                                        .unwrap_or_else(|| "UTC".into()),
+                                );
+                                results.push(build_show_all_result(session, tz));
+                                continue;
+                            }
+
                             let value = match session.show_setting_value(&var_name) {
                                 Some(value) => value,
                                 None => {
@@ -876,6 +913,14 @@ impl Executor {
                                     .collect::<Vec<_>>()
                                     .join(".")
                                     .to_lowercase();
+
+                                if var_name == "all" {
+                                    return Ok(vec![build_show_all_result(
+                                        session,
+                                        session_context::current_timezone(),
+                                    )]);
+                                }
+
                                 let value = session.show_setting_value(&var_name).ok_or_else(|| {
                                     anyhow!("unrecognized configuration parameter \"{}\"", var_name)
                                 })?;
