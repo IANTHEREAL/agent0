@@ -58,6 +58,8 @@ pub use delete::execute_delete_row;
 pub use foreign_keys::{
     handle_foreign_key_on_delete, handle_foreign_key_on_update, validate_foreign_keys,
 };
-pub(crate) use foreign_keys::{pk_to_hash_key, resolve_fk_ref_lookup, FkRefLookup};
+pub(crate) use foreign_keys::{
+    pk_to_hash_key, resolve_fk_ref_lookup, FkDeleteContext, FkRefLookup,
+};
 pub use insert::{build_enum_label_cache, execute_insert_row};
 pub use update::{execute_update_row, execute_update_row_by_pk};

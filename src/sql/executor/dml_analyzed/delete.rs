@@ -130,6 +130,14 @@ impl Executor {
             .map(|r| pk_to_hash_key(&schema.get_pk_values(r)))
             .collect();
 
+        // Build FK context once for the entire statement.
+        // Skip expensive metadata/data loads when no rows match DELETE.
+        let mut fk_ctx = if rows_to_delete.is_empty() {
+            dml::FkDeleteContext::default()
+        } else {
+            dml::FkDeleteContext::build(&self.store(), txn, db_id).await?
+        };
+
         // ── Phase 2: execute deletions ───────────────────────────
         for r in &rows_to_delete {
             // Evaluate RETURNING before delete (row still exists).
@@ -138,8 +146,17 @@ impl Executor {
                 ret_rows.push(ret_row);
             }
 
-            dml::execute_delete_row(&self.store(), txn, db_id, t, &schema, r, &stmt_deleting_pks)
-                .await?;
+            dml::execute_delete_row(
+                &self.store(),
+                txn,
+                db_id,
+                t,
+                &schema,
+                r,
+                &stmt_deleting_pks,
+                &mut fk_ctx,
+            )
+            .await?;
 
             trigger_worker::enqueue_after_triggers(
                 txn,

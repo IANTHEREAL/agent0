@@ -364,6 +364,7 @@ impl Executor {
                                         &existing_row,
                                         updated_row,
                                         &enum_cache,
+                                        None,
                                     )
                                     .await?
                                 };

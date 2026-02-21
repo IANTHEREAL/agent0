@@ -199,6 +199,7 @@ impl Executor {
                 r,
                 new_row,
                 &enum_cache,
+                None,
             )
             .await?;
 
