@@ -586,6 +586,11 @@ async fn infer_setof_table_schema(
     return_type: &str,
 ) -> Result<Option<TableSchema>> {
     let ret_lower = return_type.to_lowercase();
+
+    if let Some(schema) = infer_returns_table_schema(&ret_lower) {
+        return Ok(Some(schema));
+    }
+
     let Some(target) = ret_lower.strip_prefix("setof").map(str::trim) else {
         return Ok(None);
     };
@@ -598,6 +603,80 @@ async fn infer_setof_table_schema(
         .await?
         .map(|(_, _, schema)| schema);
     Ok(schema)
+}
+
+fn infer_returns_table_schema(ret_lower: &str) -> Option<TableSchema> {
+    use crate::types::{ColumnDef, DataType};
+
+    let inner = ret_lower
+        .strip_prefix("table")
+        .and_then(|s| s.trim().strip_prefix('('))
+        .and_then(|s| s.strip_suffix(')'))?;
+
+    let mut cols = Vec::new();
+    for part in inner.split(',') {
+        let tokens: Vec<&str> = part.trim().split_whitespace().collect();
+        if tokens.len() < 2 {
+            return None;
+        }
+        let col_name = tokens[0].to_string();
+        let type_str = tokens[1..].join(" ").to_uppercase();
+        let dt = match type_str.as_str() {
+            "BOOL" | "BOOLEAN" => DataType::Boolean,
+            "INT" | "INTEGER" | "INT4" | "SMALLINT" | "INT2" => DataType::Int32,
+            "BIGINT" | "INT8" => DataType::Int64,
+            "REAL" | "FLOAT4" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" | "FLOAT" => {
+                DataType::Float64
+            }
+            "TEXT" | "VARCHAR" | "CHARACTER VARYING" | "CHAR" | "CHARACTER" => DataType::Text,
+            "NUMERIC" | "DECIMAL" => DataType::Numeric {
+                precision: None,
+                scale: None,
+            },
+            "DATE" => DataType::Date,
+            "TIME" => DataType::Time,
+            "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => DataType::Timestamp,
+            "TIMESTAMP WITH TIME ZONE" | "TIMESTAMPTZ" => DataType::TimestampTz,
+            "INTERVAL" => DataType::Interval,
+            "UUID" => DataType::Uuid,
+            "BYTEA" => DataType::Bytes,
+            "JSON" => DataType::Json,
+            "JSONB" => DataType::Jsonb,
+            "TSVECTOR" => DataType::Tsvector,
+            "TSQUERY" => DataType::Tsquery,
+            s if s.starts_with("VECTOR") => {
+                let dim = s
+                    .strip_prefix("VECTOR")
+                    .and_then(|r| r.trim().strip_prefix('('))
+                    .and_then(|r| r.strip_suffix(')'))
+                    .and_then(|r| r.trim().parse::<u32>().ok())
+                    .unwrap_or(0);
+                DataType::Vector(dim)
+            }
+            _ => DataType::Text,
+        };
+        cols.push(ColumnDef {
+            name: col_name,
+            data_type: dt,
+            nullable: true,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+        });
+    }
+
+    if cols.is_empty() {
+        return None;
+    }
+
+    Some(TableSchema {
+        table_id: 0,
+        name: String::new(),
+        columns: cols,
+        indexes: vec![],
+        ..Default::default()
+    })
 }
 
 /// Try to resolve a view name through the search path.
