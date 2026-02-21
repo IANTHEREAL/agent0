@@ -26,7 +26,7 @@ fn allow_insecure_http() -> bool {
     })
 }
 
-const MAX_REQUESTS_PER_STATEMENT: u32 = 5;
+const MAX_REQUESTS_PER_STATEMENT: u32 = 100;
 const MAX_INFLIGHT_REQUESTS_PER_TENANT_PER_NODE: usize = 20;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1000);
 const TIMEOUT: Duration = Duration::from_millis(5000);
