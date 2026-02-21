@@ -557,6 +557,8 @@ db9 db cron <id> enable my_job                                  # Enable (by nam
 db9 db cron <id> disable 1                                      # Disable (by name or ID)
 db9 db cron <id> history --job my_job --limit 50                # Execution history
 db9 db cron <id> delete my_job                                  # Delete (by name or ID)
+db9 db cron <id> status                                         # Overview of all jobs
+db9 db cron <id> status my_job                                  # Detailed status of specific job
 ```
 
 ### Examples
