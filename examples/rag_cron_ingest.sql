@@ -235,9 +235,9 @@ WHERE jobname = 'rag_ingest';
 --   SELECT * FROM rag_ingest_status;
 --
 -- Check cron execution history:
---   SELECT runid, job_id, status, return_message, start_time, end_time
+--   SELECT runid, jobid, status, return_message, start_time, end_time
 --   FROM cron.job_run_details
---   WHERE job_id = (SELECT jobid FROM cron.job WHERE jobname = 'rag_ingest')
+--   WHERE jobid = (SELECT jobid FROM cron.job WHERE jobname = 'rag_ingest')
 --   ORDER BY runid DESC LIMIT 10;
 --
 -- Search documents (FTS):

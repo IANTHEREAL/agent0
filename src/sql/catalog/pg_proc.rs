@@ -80,6 +80,8 @@ impl VirtualTable for PgProc {
                     (1103_i64, "http_put"),
                     (1104_i64, "http_delete"),
                     (1105_i64, "http_head"),
+                    (1106_i64, "http"),
+                    (1107_i64, "http_patch"),
                 ] {
                     rows.push(Row::new(vec![
                         int_val(oid),
