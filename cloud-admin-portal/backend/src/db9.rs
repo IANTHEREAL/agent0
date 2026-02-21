@@ -1050,6 +1050,17 @@ async fn resolve_upload_dest(
     local_path: &str,
     remote_path: &str,
 ) -> String {
+    // Trailing `/` signals directory intent — always append basename,
+    // regardless of whether the directory exists yet.
+    if remote_path.ends_with('/') {
+        let basename = std::path::Path::new(local_path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let dest = remote_path.trim_end_matches('/');
+        return format!("{dest}/{basename}");
+    }
+
     match fs9_stat(client, fs9_url, token, remote_path).await {
         Ok((true, _)) => {
             let basename = std::path::Path::new(local_path)
