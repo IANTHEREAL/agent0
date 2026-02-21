@@ -154,7 +154,9 @@ fn decode_binary(bytes: &[u8], pg_type: &Type, index: usize) -> PgWireResult<Val
                 )));
             };
             let s = std::str::from_utf8(json_bytes).map_err(|e| err(e.to_string()))?;
-            Ok(Value::Jsonb(s.to_string()))
+            let parsed: serde_json::Value =
+                serde_json::from_str(s).map_err(|e| err(e.to_string()))?;
+            Ok(Value::Jsonb(parsed.to_string()))
         }
         t if *t == Type::NUMERIC => {
             // PostgreSQL NUMERIC binary is complex (ndigits, weight, sign, dscale, digits).

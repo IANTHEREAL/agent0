@@ -1,6 +1,6 @@
 //! Foreign key constraint validation and cascade operations (DELETE/UPDATE).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -8,6 +8,7 @@ use anyhow::Result;
 use tikv_client::Transaction;
 
 use crate::sql::error::SqlError;
+use crate::sql::expr::compare_values;
 use crate::sql::projection::eval_default_expr;
 use crate::storage::TikvStore;
 use crate::types::{DataType, ForeignKeyConstraint, Row, TableSchema, Value};
@@ -18,6 +19,19 @@ use super::update::execute_update_row;
 
 fn short_relation_name(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
+}
+
+/// Deterministic string key from a PK value vector for HashSet membership.
+pub(crate) fn pk_to_hash_key(pk: &[Value]) -> String {
+    use std::fmt::Write;
+    let mut key = String::new();
+    for (i, v) in pk.iter().enumerate() {
+        if i > 0 {
+            key.push('\x00');
+        }
+        let _ = write!(key, "{:?}", v);
+    }
+    key
 }
 
 /// Extract referenced-column values from a parent row for a given FK.
@@ -182,6 +196,24 @@ pub async fn validate_foreign_keys(
             })?;
 
         let lookup = resolve_fk_ref_lookup(&fk.ref_columns, &ref_schema)?;
+
+        // Self-referencing FK: if the row's FK column values match its own
+        // referenced column values, the constraint is trivially satisfied once
+        // the row is written.  Skip the storage lookup.
+        // (PostgreSQL validates at statement end where the row is visible.)
+        // Use compare_values() for PG-like equality semantics (e.g. NaN = NaN).
+        if fk.ref_table == schema.name {
+            let self_ref_vals = get_ref_values(fk, &ref_schema, row)?;
+            if fk_values.len() == self_ref_vals.len()
+                && fk_values
+                    .iter()
+                    .zip(&self_ref_vals)
+                    .all(|(a, b)| compare_values(a, b).map_or(false, |c| c == 0))
+            {
+                continue;
+            }
+        }
+
         let parent_exists = match lookup {
             FkRefLookup::Pk => {
                 let ref_rows = store
@@ -242,6 +274,7 @@ pub async fn handle_foreign_key_on_delete(
     table_name: &str,
     schema: &TableSchema,
     row: &Row,
+    stmt_deleting_pks: &HashSet<String>,
 ) -> Result<()> {
     let table_names = store.list_tables(txn, db_id).await?;
     let mut table_rows: HashMap<String, Vec<Row>> = HashMap::new();
@@ -257,8 +290,8 @@ pub async fn handle_foreign_key_on_delete(
     }
 
     let mut deleted_pks: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
-    // Pre-seed with the initial row being deleted to prevent cyclic self-cascades
-    // from re-visiting it.
+    // Pre-seed with the current row being deleted to prevent cyclic
+    // self-cascades from re-visiting it.
     deleted_pks
         .entry(table_name.to_string())
         .or_default()
@@ -274,6 +307,8 @@ pub async fn handle_foreign_key_on_delete(
         &table_rows,
         &table_schemas,
         &mut deleted_pks,
+        stmt_deleting_pks,
+        table_name,
     ))
     .await
 }
@@ -288,6 +323,8 @@ async fn cascade_delete_recursive(
     table_rows: &HashMap<String, Vec<Row>>,
     table_schemas: &HashMap<String, TableSchema>,
     deleted_pks: &mut HashMap<String, Vec<Vec<Value>>>,
+    stmt_deleting_pks: &HashSet<String>,
+    stmt_target_table: &str,
 ) -> Result<()> {
     use crate::types::ForeignKeyAction;
 
@@ -315,6 +352,16 @@ async fn cascade_delete_recursive(
             for other_row in &all_rows {
                 let other_pk = other_schema.get_pk_values(other_row);
                 if deleted_in_table.contains(&other_pk) {
+                    continue;
+                }
+
+                // Statement-level deferral: skip referencing rows that are
+                // also being deleted by the same DELETE statement.  Gives
+                // correct PostgreSQL semantics for both NO ACTION and RESTRICT.
+                // O(1) lookup via pre-built HashSet<String>.
+                if other_table.as_str() == stmt_target_table
+                    && stmt_deleting_pks.contains(&pk_to_hash_key(&other_pk))
+                {
                     continue;
                 }
 
@@ -416,6 +463,8 @@ async fn cascade_delete_recursive(
                     table_rows,
                     table_schemas,
                     deleted_pks,
+                    stmt_deleting_pks,
+                    stmt_target_table,
                 ))
                 .await?;
 

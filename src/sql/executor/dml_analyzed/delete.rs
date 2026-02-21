@@ -10,11 +10,12 @@ use super::{
     cross_product_rows, eval_returning_typed, typed_value_to_bool,
 };
 use crate::sql::analyzer::types::AnalyzedDelete;
+use crate::sql::dml::pk_to_hash_key;
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
 use crate::types::{Row, TableSchema};
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tikv_client::Transaction;
 
 impl Executor {
@@ -63,6 +64,8 @@ impl Executor {
             None
         };
 
+        // ── Phase 1: collect rows to delete ────────────────────────
+        let mut rows_to_delete: Vec<&Row> = Vec::new();
         for r in &rows {
             let should_delete = if let Some(ref where_expr) = folded_where {
                 if let Some(ref using_rows) = using_combined_rows {
@@ -112,17 +115,31 @@ impl Executor {
                 }
             };
 
-            if !should_delete {
-                continue;
+            if should_delete {
+                rows_to_delete.push(r);
             }
+        }
 
+        // Compute all PKs being deleted by this statement upfront as a
+        // HashSet for O(1) membership checks.  Passed to FK handlers so
+        // that both NO ACTION and RESTRICT get correct PostgreSQL
+        // statement-level semantics: referencing rows that are also being
+        // deleted in the same statement are not considered violations.
+        let stmt_deleting_pks: HashSet<String> = rows_to_delete
+            .iter()
+            .map(|r| pk_to_hash_key(&schema.get_pk_values(r)))
+            .collect();
+
+        // ── Phase 2: execute deletions ───────────────────────────
+        for r in &rows_to_delete {
             // Evaluate RETURNING before delete (row still exists).
             if let Some(ref returning) = del.returning {
                 let ret_row = eval_returning_typed(returning, r, &qctx)?;
                 ret_rows.push(ret_row);
             }
 
-            dml::execute_delete_row(&self.store(), txn, db_id, t, &schema, r).await?;
+            dml::execute_delete_row(&self.store(), txn, db_id, t, &schema, r, &stmt_deleting_pks)
+                .await?;
 
             trigger_worker::enqueue_after_triggers(
                 txn,

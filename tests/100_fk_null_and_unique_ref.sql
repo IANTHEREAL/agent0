@@ -1,5 +1,7 @@
 -- FK NULL semantics (MATCH SIMPLE) + referenced-key validation coverage
 
+DROP TABLE IF EXISTS fk_self_restrict_all CASCADE;
+DROP TABLE IF EXISTS fk_self_noaction_all CASCADE;
 DROP TABLE IF EXISTS fk_child_cascade CASCADE;
 DROP TABLE IF EXISTS fk_child_restrict CASCADE;
 DROP TABLE IF EXISTS fk_parent_del CASCADE;
@@ -19,6 +21,11 @@ DROP TABLE IF EXISTS fk_child_pk CASCADE;
 DROP TABLE IF EXISTS fk_parent_pk CASCADE;
 DROP TABLE IF EXISTS fk_child_cmp CASCADE;
 DROP TABLE IF EXISTS fk_parent_cmp CASCADE;
+DROP TABLE IF EXISTS fk_self_insert_pk CASCADE;
+DROP TABLE IF EXISTS fk_self_insert_unique CASCADE;
+DROP TABLE IF EXISTS fk_self_update_pk CASCADE;
+DROP TABLE IF EXISTS fk_self_composite CASCADE;
+DROP TABLE IF EXISTS fk_self_insert_other CASCADE;
 DROP TABLE IF EXISTS fk_self_unique CASCADE;
 DROP TABLE IF EXISTS fk_self_restrict CASCADE;
 DROP TABLE IF EXISTS fk_self_del_cascade CASCADE;
@@ -315,3 +322,89 @@ UPDATE fk_self_cycle SET ref_id = 2 WHERE id = 1;
 UPDATE fk_self_cycle SET ref_id = 1 WHERE id = 2;
 DELETE FROM fk_self_cycle WHERE id = 1;  -- cascades: both rows deleted
 SELECT id, ref_id FROM fk_self_cycle ORDER BY id;
+
+-- 18) Self-referencing INSERT via PK
+CREATE TABLE fk_self_insert_pk (
+    id INT PRIMARY KEY,
+    parent_id INT REFERENCES fk_self_insert_pk(id)
+);
+INSERT INTO fk_self_insert_pk VALUES (1, 1);   -- self-ref, OK
+INSERT INTO fk_self_insert_pk VALUES (2, 99);  -- non-existent, ERROR
+SELECT id, parent_id FROM fk_self_insert_pk ORDER BY id;
+
+-- 19) Self-referencing INSERT via UNIQUE column
+CREATE TABLE fk_self_insert_unique (
+    id INT PRIMARY KEY,
+    code TEXT UNIQUE,
+    ref_code TEXT REFERENCES fk_self_insert_unique(code)
+);
+INSERT INTO fk_self_insert_unique VALUES (1, 'A', 'A');  -- self-ref via UNIQUE, OK
+INSERT INTO fk_self_insert_unique VALUES (2, 'B', 'Z');  -- non-existent, ERROR
+SELECT id, code, ref_code FROM fk_self_insert_unique ORDER BY id;
+
+-- 20) UPDATE changing PK + FK to self-reference
+CREATE TABLE fk_self_update_pk (
+    id INT PRIMARY KEY,
+    parent_id INT REFERENCES fk_self_update_pk(id)
+);
+INSERT INTO fk_self_update_pk VALUES (1, NULL);
+UPDATE fk_self_update_pk SET id = 2, parent_id = 2 WHERE id = 1;  -- self-ref, OK
+SELECT id, parent_id FROM fk_self_update_pk ORDER BY id;
+
+-- 21) Negative UPDATE: non-self same-table reference must fail
+INSERT INTO fk_self_update_pk VALUES (3, NULL);
+UPDATE fk_self_update_pk SET id = 4, parent_id = 2 WHERE id = 3;  -- refs id=2 (exists), OK
+UPDATE fk_self_update_pk SET id = 5, parent_id = 99 WHERE id = 4; -- refs id=99 (missing), ERROR
+SELECT id, parent_id FROM fk_self_update_pk ORDER BY id;
+
+-- 22) Composite FK self-reference
+CREATE TABLE fk_self_composite (
+    a INT, b INT,
+    ref_a INT, ref_b INT,
+    PRIMARY KEY (a, b),
+    FOREIGN KEY (ref_a, ref_b) REFERENCES fk_self_composite(a, b)
+);
+INSERT INTO fk_self_composite VALUES (1, 1, 1, 1);  -- self-ref, OK
+INSERT INTO fk_self_composite VALUES (2, 2, 9, 9);  -- non-existent, ERROR
+SELECT a, b, ref_a, ref_b FROM fk_self_composite ORDER BY a, b;
+
+-- 23) Non-self INSERT still fails correctly
+CREATE TABLE fk_self_insert_other (
+    id INT PRIMARY KEY,
+    parent_id INT REFERENCES fk_self_insert_other(id)
+);
+INSERT INTO fk_self_insert_other VALUES (1, NULL);
+INSERT INTO fk_self_insert_other VALUES (2, 1);   -- refs existing row, OK
+INSERT INTO fk_self_insert_other VALUES (3, 5);   -- refs non-existent, ERROR
+SELECT id, parent_id FROM fk_self_insert_other ORDER BY id;
+
+-- 24) Statement-level NO ACTION: DELETE all rows from self-ref table succeeds
+DROP TABLE IF EXISTS fk_self_noaction_all CASCADE;
+CREATE TABLE fk_self_noaction_all (
+    id INT PRIMARY KEY,
+    parent_id INT REFERENCES fk_self_noaction_all(id)
+);
+INSERT INTO fk_self_noaction_all VALUES (1, NULL), (2, 1), (3, 2);
+DELETE FROM fk_self_noaction_all;
+SELECT id, parent_id FROM fk_self_noaction_all ORDER BY id;
+
+-- 25) Statement-level NO ACTION: partial delete leaving dangling ref fails
+INSERT INTO fk_self_noaction_all VALUES (1, NULL), (2, 1), (3, 2);
+DELETE FROM fk_self_noaction_all WHERE id IN (1, 3);
+SELECT id, parent_id FROM fk_self_noaction_all ORDER BY id;
+
+-- 26) Statement-level NO ACTION: delete subset where all refs within deleted set
+DELETE FROM fk_self_noaction_all;
+INSERT INTO fk_self_noaction_all VALUES (1, NULL), (2, 1), (3, NULL);
+DELETE FROM fk_self_noaction_all WHERE id IN (1, 2);
+SELECT id, parent_id FROM fk_self_noaction_all ORDER BY id;
+
+-- 27) Statement-level RESTRICT: DELETE all rows from self-ref table succeeds (PG parity)
+DROP TABLE IF EXISTS fk_self_restrict_all CASCADE;
+CREATE TABLE fk_self_restrict_all (
+    id INT PRIMARY KEY,
+    parent_id INT REFERENCES fk_self_restrict_all(id) ON DELETE RESTRICT
+);
+INSERT INTO fk_self_restrict_all VALUES (1, NULL), (2, 1), (3, 2);
+DELETE FROM fk_self_restrict_all;
+SELECT id, parent_id FROM fk_self_restrict_all ORDER BY id;

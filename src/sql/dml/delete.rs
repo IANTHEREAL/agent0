@@ -1,5 +1,6 @@
 //! DELETE row execution: storage entry cleanup and index removal.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -20,8 +21,18 @@ pub async fn execute_delete_row(
     table_name: &str,
     schema: &TableSchema,
     row: &Row,
+    stmt_deleting_pks: &HashSet<String>,
 ) -> Result<()> {
-    handle_foreign_key_on_delete(store, txn, db_id, table_name, schema, row).await?;
+    handle_foreign_key_on_delete(
+        store,
+        txn,
+        db_id,
+        table_name,
+        schema,
+        row,
+        stmt_deleting_pks,
+    )
+    .await?;
 
     delete_row_storage_entries(store, txn, db_id, table_name, schema, row).await
 }

@@ -2146,6 +2146,86 @@ fn test_decode_parameters_jsonb_binary_invalid_version_errors() {
     }
 }
 
+#[test]
+fn test_decode_parameters_jsonb_binary_invalid_json_errors() {
+    let stmt = Arc::new(StoredStatement::new(
+        "stmt".to_string(),
+        test_prepared_stmt("SELECT $1"),
+        vec![Type::JSONB],
+    ));
+    let mut portal: Portal<PreparedStatement> = Portal::default();
+    portal.name = "portal".to_string();
+    portal.statement = stmt;
+    portal.parameter_format = Format::UnifiedBinary;
+    // Version byte 0x01 + invalid JSON content
+    portal.parameters = vec![Some(Bytes::from_static(b"\x01not json at all"))];
+    portal.result_column_format = Format::UnifiedText;
+
+    let err = decode_parameters(&portal).unwrap_err();
+    match err {
+        PgWireError::UserError(info) => {
+            assert_eq!(info.code, "22P02");
+            assert!(info.message.contains("invalid input syntax"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn test_decode_parameters_jsonb_binary_canonicalizes() {
+    let stmt = Arc::new(StoredStatement::new(
+        "stmt".to_string(),
+        test_prepared_stmt("SELECT $1"),
+        vec![Type::JSONB],
+    ));
+    let mut portal: Portal<PreparedStatement> = Portal::default();
+    portal.name = "portal".to_string();
+    portal.statement = stmt;
+    portal.parameter_format = Format::UnifiedBinary;
+    // Version byte 0x01 + non-canonical JSON (extra whitespace)
+    portal.parameters = vec![Some(Bytes::from_static(b"\x01{ \"b\" : 1 , \"a\" : 2 }"))];
+    portal.result_column_format = Format::UnifiedText;
+
+    let values = decode_parameters(&portal).unwrap();
+    // serde_json roundtrip normalizes whitespace; key order depends on serde_json internals
+    match &values[0] {
+        Some(Value::Jsonb(s)) => {
+            let reparsed: serde_json::Value = serde_json::from_str(s).unwrap();
+            assert_eq!(reparsed["a"], serde_json::json!(2));
+            assert_eq!(reparsed["b"], serde_json::json!(1));
+            // Verify whitespace is stripped (no spaces around colons/commas)
+            assert!(!s.contains(" : "));
+            assert!(!s.contains(" , "));
+        }
+        other => panic!("expected Jsonb value, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_decode_parameters_jsonb_binary_empty_after_version_byte() {
+    let stmt = Arc::new(StoredStatement::new(
+        "stmt".to_string(),
+        test_prepared_stmt("SELECT $1"),
+        vec![Type::JSONB],
+    ));
+    let mut portal: Portal<PreparedStatement> = Portal::default();
+    portal.name = "portal".to_string();
+    portal.statement = stmt;
+    portal.parameter_format = Format::UnifiedBinary;
+    // Version byte 0x01 + empty JSON body
+    portal.parameters = vec![Some(Bytes::from_static(b"\x01"))];
+    portal.result_column_format = Format::UnifiedText;
+
+    let err = decode_parameters(&portal).unwrap_err();
+    match err {
+        PgWireError::UserError(info) => {
+            assert_eq!(info.code, "22P02");
+            assert!(info.message.contains("invalid input syntax"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
 // ── Encode value tests ──────────────────────────────────────────────────────
 
 #[test]

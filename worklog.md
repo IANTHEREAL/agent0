@@ -1,5 +1,54 @@
 # Worklog
 
+## 2026-02-21: Statement-Level FK NO ACTION/RESTRICT Deferral for DELETE
+
+### Problem
+pg-tikv treated `NO ACTION` (default FK action) and `RESTRICT` identically — both checked per-row during deletion and failed immediately if any referencing row existed. PostgreSQL differentiates: both are checked at statement end for non-deferrable constraints, meaning `DELETE FROM self_ref_table` (all rows) succeeds when all referencing rows are also deleted by the same statement. This caused 179 ORM test failures across 5 `advanced.test.ts` suites where `beforeEach` cleanup ran `DELETE FROM adv_employees` on a table with self-referential `manager_id` FK.
+
+### Solution: Two-Phase DELETE with HashSet Statement-Level Check
+1. **Two-phase DELETE** in `executor/dml_analyzed/delete.rs`: Phase 1 collects all rows matching WHERE, computes `stmt_deleting_pks` as a `HashSet<String>` (PKs serialized via `pk_to_hash_key` for O(1) lookup). Phase 2 executes deletions with the set threaded through.
+2. **Separate statement-level check** in `cascade_delete_recursive`: `stmt_deleting_pks` is passed as an immutable `&HashSet<String>` alongside the existing mutable `deleted_pks`. The row loop checks `stmt_deleting_pks.contains()` (O(1)) to skip referencing rows being deleted by the same statement. `deleted_pks` retains its original per-row seeding for cascade cycle prevention.
+3. This handles both NO ACTION and RESTRICT correctly — no match-arm splitting needed.
+
+### Key Design Decision
+User correction: PostgreSQL 17.7 validates that RESTRICT also allows bulk self-ref delete when all referencing rows are in the same statement. The statement-level HashSet check handles both uniformly.
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `src/sql/executor/dml_analyzed/delete.rs` | Two-phase restructure: collect → compute PK HashSet → execute |
+| `src/sql/dml/delete.rs` | Add `stmt_deleting_pks: &HashSet<String>` param to `execute_delete_row` |
+| `src/sql/dml/foreign_keys.rs` | Add `pk_to_hash_key` helper; thread `stmt_deleting_pks` + `stmt_target_table` through cascade chain; O(1) skip check in row loop |
+| `tests/100_fk_null_and_unique_ref.sql` | 4 new test cases (tests 24-27) |
+| `tests/100_fk_null_and_unique_ref.expected` | Expected output validated against PG 17.7 |
+
+### Verification
+- `cargo build` — clean compile
+- `cargo test` — all 1924 tests pass
+- All `.expected` output validated against PostgreSQL 17.7 via `sudo -u postgres psql`
+
+---
+
+## 2026-02-21: Issue #951 — JSONB Binary Parameter Validation
+
+### Problem
+The binary JSONB parameter decode path (`src/protocol/handler/params/decode.rs:143-158`) accepted any UTF-8 bytes after stripping the version byte, without validating that the content is valid JSON. For example, `\x01not json at all` was silently accepted as `Value::Jsonb("not json at all")`. The text JSONB decode path already validated via `serde_json::from_str()`.
+
+### Solution
+Added `serde_json::from_str()` validation + `parsed.to_string()` canonicalization to the binary JSONB decode path, mirroring the text path exactly. Invalid JSON now returns SQLSTATE `22P02` via the existing `invalid_param()` error wrapper.
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `src/protocol/handler/params/decode.rs` | Add serde_json parse + roundtrip (2 lines added) |
+| `src/protocol/handler/tests.rs` | Add 3 tests: invalid JSON rejection, canonicalization, empty body after version byte |
+
+### Verification
+- `cargo build` — clean compile
+- `cargo test test_decode_parameters_jsonb_binary` — all 5 tests pass (2 existing + 3 new)
+
+---
+
 ## 2026-02-21: Issue #281 — JSON/JSONB Canonicalization
 
 ### Problem
