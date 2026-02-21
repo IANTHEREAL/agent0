@@ -3,6 +3,9 @@
 
 use super::super::prepared_stmt::PreparedExec;
 use super::super::*;
+use super::utils::{
+    apply_statement_timeout, autocommit_backoff, wrap_with_runtime_context, RuntimeSettings,
+};
 use std::future::Future;
 use std::pin::Pin;
 use tracing::warn;
@@ -166,14 +169,7 @@ impl Executor {
         qctx: &'a crate::sql::query_context::QueryContext,
         is_observability_query: bool,
     ) -> Pin<Box<dyn Future<Output = Result<ExecuteResults>> + Send + 'a>> {
-        let is_superuser = session.is_superuser();
-        let timezone = Arc::from(
-            session
-                .show_setting_value("timezone")
-                .unwrap_or_else(|| "UTC".to_string()),
-        );
-        let max_sort_bytes = session.max_sort_bytes();
-        let search_path_vec = Arc::new(session.search_path().to_vec());
+        let rt_settings = RuntimeSettings::from_session(session);
 
         let execute_future: Pin<Box<dyn Future<Output = Result<ExecuteResults>> + Send + 'a>> =
             Box::pin(self.execute_prepared_autocommit(
@@ -185,20 +181,7 @@ impl Executor {
                 is_observability_query,
             ));
 
-        Box::pin(session_context::with_timezone(
-            timezone,
-            session_context::with_max_sort_bytes(
-                max_sort_bytes,
-                session_context::with_search_path(
-                    search_path_vec,
-                    crate::extensions::context::with_context(
-                        is_superuser,
-                        self.tenant_keyspace(),
-                        execute_future,
-                    ),
-                ),
-            ),
-        ))
+        wrap_with_runtime_context(&rt_settings, self.tenant_keyspace(), execute_future)
     }
 
     async fn execute_prepared_autocommit(
@@ -277,11 +260,7 @@ impl Executor {
                         let should_retry =
                             attempt + 1 < max_attempts && is_retryable_tikv_error(&err);
                         if should_retry {
-                            // Exponential backoff with jitter to reduce contention.
-                            let base_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
-                            let jitter_ms = rand::random::<u64>() % (base_ms + 1);
-                            let backoff_ms = base_ms + jitter_ms;
-                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            autocommit_backoff(attempt).await;
                             continue;
                         }
                         return Err(err);
@@ -347,13 +326,7 @@ impl Executor {
             Ok::<PreparedTxnResult, anyhow::Error>(PreparedTxnResult::Executed(result))
         };
 
-        match timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, fut).await {
-                Ok(res) => res,
-                Err(_) => Err(anyhow::Error::new(StatementTimeoutError)),
-            },
-            None => fut.await,
-        }
+        apply_statement_timeout(timeout, fut).await
     }
 
     fn enforce_observability_prepared_policy(
@@ -468,7 +441,7 @@ impl Executor {
                         db_id,
                         sequence_values,
                         search_path,
-                        analyzed.clone(),
+                        std::borrow::Cow::Borrowed(analyzed),
                         &prepared_ctes,
                         locks,
                     )

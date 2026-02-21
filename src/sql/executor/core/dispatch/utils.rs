@@ -1,7 +1,9 @@
-//! Transaction mode validation, schema drift detection, and notice collection
-//! helpers for the statement dispatch layer.
+//! Transaction mode validation, schema drift detection, notice collection,
+//! and shared runtime helpers for the statement dispatch layer.
 
 use super::super::*;
+use std::future::Future;
+use std::pin::Pin;
 
 /// Validate and apply transaction modes (isolation level, access mode) from
 /// `BEGIN ISOLATION LEVEL ...` or `START TRANSACTION ...` statements.
@@ -107,4 +109,84 @@ impl Executor {
             _ => Ok(Vec::new()),
         }
     }
+}
+
+// ── Shared runtime helpers ────────────────────────────────────
+
+/// Session settings snapshot used to set up per-statement task-local context.
+///
+/// Both the simple-query and prepared dispatch paths extract the same four
+/// settings before entering the runtime context nesting. This struct avoids
+/// repeating that extraction logic.
+pub(in crate::sql::executor::core) struct RuntimeSettings {
+    pub is_superuser: bool,
+    pub timezone: Arc<str>,
+    pub max_sort_bytes: usize,
+    pub search_path: Arc<Vec<String>>,
+}
+
+impl RuntimeSettings {
+    pub fn from_session(session: &Session) -> Self {
+        Self {
+            is_superuser: session.is_superuser(),
+            timezone: Arc::from(
+                session
+                    .show_setting_value("timezone")
+                    .unwrap_or_else(|| "UTC".to_string()),
+            ),
+            max_sort_bytes: session.max_sort_bytes(),
+            search_path: Arc::new(session.search_path().to_vec()),
+        }
+    }
+}
+
+/// Wrap a future in the per-statement task-local runtime context layers:
+/// timezone → max_sort_bytes → search_path → extension context.
+///
+/// Returns a boxed future — transparent passthrough (`T`, not `Result<T>`).
+pub(in crate::sql::executor::core) fn wrap_with_runtime_context<'a, T: Send + 'a>(
+    settings: &RuntimeSettings,
+    tenant_keyspace: &'a str,
+    fut: impl Future<Output = T> + Send + 'a,
+) -> Pin<Box<dyn Future<Output = T> + Send + 'a>> {
+    let tz = settings.timezone.clone();
+    let msb = settings.max_sort_bytes;
+    let sp = settings.search_path.clone();
+    let su = settings.is_superuser;
+    Box::pin(session_context::with_timezone(
+        tz,
+        session_context::with_max_sort_bytes(
+            msb,
+            session_context::with_search_path(
+                sp,
+                crate::extensions::context::with_context(su, tenant_keyspace, fut),
+            ),
+        ),
+    ))
+}
+
+/// Apply an optional statement timeout to a future.
+///
+/// If `timeout` is `Some`, wraps the future with `tokio::time::timeout` and
+/// converts the elapsed error into `StatementTimeoutError`. If `None`,
+/// runs the future directly.
+pub(in crate::sql::executor::core) async fn apply_statement_timeout<T>(
+    timeout: Option<Duration>,
+    fut: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, fut).await {
+            Ok(res) => res,
+            Err(_) => Err(anyhow::Error::new(StatementTimeoutError)),
+        },
+        None => fut.await,
+    }
+}
+
+/// Exponential backoff with jitter for autocommit retry loops.
+pub(in crate::sql::executor::core) async fn autocommit_backoff(attempt: usize) {
+    let base_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
+    let jitter_ms = rand::random::<u64>() % (base_ms + 1);
+    let backoff_ms = base_ms + jitter_ms;
+    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
 }

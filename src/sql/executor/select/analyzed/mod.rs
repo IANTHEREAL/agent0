@@ -6,15 +6,20 @@
 //!
 //! Handles FOR UPDATE/SHARE row locking and SELECT INTO natively.
 
-use crate::sql::analyzer::types::{AnalyzedQueryBody, TypedExpr, TypedExprKind, TypedOrderByExpr};
+use crate::sql::analyzer::types::{
+    AnalyzedDistinct, AnalyzedQueryBody, AnalyzedTableRef, AnalyzedTableRefKind, JoinCondition,
+    TypedExpr, TypedExprKind, TypedOrderByExpr,
+};
 use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::executor::core::Executor;
+use crate::sql::expr::classify::needs_pre_materialization;
 use crate::sql::expr::typed_eval::eval_const_usize;
 use crate::sql::ExecuteResult;
 use crate::types::{DataType, Row, TableSchema};
 
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Query, SetExpr};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -102,7 +107,7 @@ impl Executor {
                     db_id,
                     sequence_values,
                     search_path,
-                    analyzed,
+                    Cow::Owned(analyzed),
                     &prepared_ctes,
                     &query.locks,
                 )
@@ -142,7 +147,7 @@ impl Executor {
                 db_id,
                 sequence_values,
                 search_path,
-                analyzed.clone(),
+                Cow::Borrowed(analyzed),
                 ctes,
                 &[],
             )
@@ -307,7 +312,7 @@ impl Executor {
         db_id: u64,
         sequence_values: &'a mut HashMap<String, i64>,
         search_path: &'a [String],
-        mut analyzed: AnalyzedQuery,
+        analyzed: Cow<'a, AnalyzedQuery>,
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
         locks: &'a [sqlparser::ast::LockClause],
     ) -> Pin<Box<dyn Future<Output = Result<ExecuteResult>> + Send + 'a>> {
@@ -323,15 +328,37 @@ impl Executor {
             // Resolves IN subquery → InList, EXISTS → bool, ScalarSubquery → constant,
             // ANY/ALL → expanded comparisons, ArraySubquery → array literal.
             // Correlated subqueries (scope_depth > 0) are left as-is.
-            self.pre_materialize_query_body(
-                &mut analyzed,
-                txn,
-                db_id,
-                sequence_values,
-                search_path,
-                ctes,
-            )
-            .await?;
+            //
+            // For Cow::Owned (normal SELECT): to_mut() is free — no clone.
+            // For Cow::Borrowed (prepared/subquery): only clone when the query
+            // actually contains expressions that need pre-materialization.
+            let mut analyzed = analyzed;
+            match &mut analyzed {
+                Cow::Owned(ref mut owned) => {
+                    self.pre_materialize_query_body(
+                        owned,
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        ctes,
+                    )
+                    .await?;
+                }
+                Cow::Borrowed(_) => {
+                    if query_needs_pre_materialization(&analyzed) {
+                        self.pre_materialize_query_body(
+                            analyzed.to_mut(),
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            ctes,
+                        )
+                        .await?;
+                    }
+                }
+            }
 
             // ── Step 2: Determine post-processing needs ──
             let mut has_async_projection = match &analyzed.body {
@@ -354,7 +381,7 @@ impl Executor {
             // (output_col_index, deferred_async_expr_with_output_col_ref)
             let mut deferred_async_cols: Vec<(usize, TypedExpr)> = Vec::new();
             if has_group_by && has_async_projection {
-                if let AnalyzedQueryBody::Select(ref mut select) = analyzed.body {
+                if let AnalyzedQueryBody::Select(ref mut select) = analyzed.to_mut().body {
                     for (i, proj) in select.projection.iter_mut().enumerate() {
                         if needs_async(&proj.expr) {
                             // Build a deferred expression that references output col `i`
@@ -399,7 +426,8 @@ impl Executor {
             let mut deferred_limit: Option<(Option<TypedExpr>, Option<TypedExpr>)> = None;
 
             if needs_passthrough {
-                if let AnalyzedQueryBody::Select(ref mut select) = analyzed.body {
+                let a = analyzed.to_mut();
+                if let AnalyzedQueryBody::Select(ref mut select) = a.body {
                     // Save original projection.
                     original_proj_exprs =
                         Some(select.projection.iter().map(|p| p.expr.clone()).collect());
@@ -410,12 +438,12 @@ impl Executor {
 
                     // Replace projection with passthrough.
                     select.projection = create_passthrough_projection(&source_cols);
-                    analyzed.output_schema = source_cols;
+                    a.output_schema = source_cols;
                 }
 
                 // Defer LIMIT/OFFSET for locking (scan all, lock, then paginate).
-                let limit = analyzed.limit.take();
-                let offset = analyzed.offset.take();
+                let limit = a.limit.take();
+                let offset = a.offset.take();
                 if limit.is_some() || offset.is_some() {
                     deferred_limit = Some((limit, offset));
                 }
@@ -426,12 +454,13 @@ impl Executor {
             // null-extension semantics remain join-local and deterministic.
 
             if has_async_order_by {
-                deferred_order_by = Some(analyzed.order_by.clone());
-                analyzed.order_by.clear();
+                let a = analyzed.to_mut();
+                deferred_order_by = Some(a.order_by.clone());
+                a.order_by.clear();
                 // Also defer LIMIT/OFFSET (ORDER BY must happen before LIMIT).
                 if deferred_limit.is_none() {
-                    let limit = analyzed.limit.take();
-                    let offset = analyzed.offset.take();
+                    let limit = a.limit.take();
+                    let offset = a.offset.take();
                     if limit.is_some() || offset.is_some() {
                         deferred_limit = Some((limit, offset));
                     }
@@ -585,6 +614,72 @@ impl Executor {
     }
 }
 
+/// Check if any expression in the analyzed query needs pre-materialization.
+///
+/// This mirrors the scope of `pre_materialize_query_body` (pipeline.rs) to
+/// determine whether a `Cow::Borrowed` query must be cloned. For `Cow::Owned`
+/// callers this check is unnecessary (to_mut() on Owned is free).
+fn query_needs_pre_materialization(analyzed: &AnalyzedQuery) -> bool {
+    if analyzed
+        .order_by
+        .iter()
+        .any(|ob| needs_pre_materialization(&ob.expr))
+    {
+        return true;
+    }
+    match &analyzed.body {
+        AnalyzedQueryBody::Select(select) => {
+            select
+                .projection
+                .iter()
+                .any(|p| needs_pre_materialization(&p.expr))
+                || select
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(|w| needs_pre_materialization(w))
+                || select
+                    .having
+                    .as_ref()
+                    .is_some_and(|h| needs_pre_materialization(h))
+                || select
+                    .group_by
+                    .iter()
+                    .any(|e| needs_pre_materialization(e))
+                || matches!(
+                    &select.distinct,
+                    AnalyzedDistinct::DistinctOn(exprs) if exprs.iter().any(|e| needs_pre_materialization(e))
+                )
+                || select
+                    .from
+                    .iter()
+                    .any(table_ref_needs_pre_materialization)
+        }
+        AnalyzedQueryBody::SetOperation { left, right, .. } => {
+            query_needs_pre_materialization(left) || query_needs_pre_materialization(right)
+        }
+        AnalyzedQueryBody::Values(rows) => rows
+            .iter()
+            .any(|row| row.iter().any(|e| needs_pre_materialization(e))),
+    }
+}
+
+/// Check if a table ref tree contains JOIN ON conditions that need pre-materialization.
+fn table_ref_needs_pre_materialization(tr: &AnalyzedTableRef) -> bool {
+    match &tr.kind {
+        AnalyzedTableRefKind::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            table_ref_needs_pre_materialization(left)
+                || table_ref_needs_pre_materialization(right)
+                || matches!(condition, JoinCondition::On(expr) if needs_pre_materialization(expr))
+        }
+        _ => false,
+    }
+}
+
 /// Compile-time guards for #907: these three functions MUST return
 /// `Pin<Box<dyn Future<...>>>`, not opaque `impl Future` (from `async fn`).
 /// Reverting any of them to `async fn` makes this a type error at `cargo build`.
@@ -600,7 +695,7 @@ mod _stack_overflow_signature_guards_907 {
     ) {
         let ctes = HashMap::new();
         let _: Pin<Box<dyn Future<Output = Result<ExecuteResult>> + Send + '_>> =
-            e.execute_via_optimizer(txn, 0, seq, &[], analyzed, &ctes, &[]);
+            e.execute_via_optimizer(txn, 0, seq, &[], Cow::Owned(analyzed), &ctes, &[]);
     }
 
     fn _guard_execute_subquery(

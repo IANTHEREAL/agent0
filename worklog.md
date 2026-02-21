@@ -1,5 +1,30 @@
 # Worklog
 
+## 2026-02-21: Issue #906 Follow-ups (3 Commits)
+
+### Commit 1: refactor(executor): extract shared runtime helpers from dispatch paths
+- Added 4 helpers to `dispatch/utils.rs`: `RuntimeSettings`, `wrap_with_runtime_context`, `apply_statement_timeout`, `autocommit_backoff`
+- Updated `dispatch/prepared.rs` and `dispatch/mod.rs` to use helpers (~-40 lines dedup)
+- No behavior change, pure internal cleanup
+
+### Commit 2: perf(executor): use Cow<AnalyzedQuery> to avoid clone for simple prepared queries
+- Changed `execute_via_optimizer` to take `Cow<'a, AnalyzedQuery>` instead of `mut AnalyzedQuery`
+- Added `query_needs_pre_materialization` guard to skip cloning for Cow::Borrowed when no mutation needed
+- Updated 3 call sites: `try_execute_analyzed` (Cow::Owned), `execute_subquery` (Cow::Borrowed), `prepared.rs` (Cow::Borrowed)
+- Simple prepared SELECT and subqueries: **0 clones** (was 1 deep clone each)
+
+### Commit 3: test(prepared): add extended-protocol schema-drift and metadata e2e tests
+- New file: `orm-tests/pg-client/prepared-metadata.test.ts` (~210 lines, 7 test cases)
+- Tests: column metadata OIDs, re-execute with different params, multi-param types, INSERT RETURNING metadata
+- Schema drift tests: ADD COLUMN, DROP referenced column, DROP TABLE after prepare
+
+### Verification
+- `cargo check` — clean compile
+- `cargo clippy` — no new warnings
+- `cargo test` — all 1839 tests pass
+
+---
+
 ## 2026-02-21: Structural Fix for Extended-Protocol Worker Stack Overflow (#907)
 
 ### Problem

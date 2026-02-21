@@ -4,7 +4,10 @@
 mod prepared;
 mod utils;
 
-use utils::validate_transaction_modes;
+use utils::{
+    autocommit_backoff, apply_statement_timeout, validate_transaction_modes, wrap_with_runtime_context,
+    RuntimeSettings,
+};
 
 use super::*;
 
@@ -617,24 +620,11 @@ impl Executor {
                     }
                 }
                 let start = Instant::now();
-                let is_superuser = session.is_superuser();
-                let timezone = Arc::from(
-                    session
-                        .show_setting_value("timezone")
-                        .unwrap_or_else(|| "UTC".to_string()),
-                );
-                let max_sort_bytes = session.max_sort_bytes();
-                let search_path_vec = Arc::new(session.search_path().to_vec());
-                let stmt_exec: Result<Vec<ExecuteResult>> = session_context::with_timezone(
-                    timezone,
-                    session_context::with_max_sort_bytes(
-                        max_sort_bytes,
-                        session_context::with_search_path(
-                            search_path_vec,
-                            crate::extensions::context::with_context(
-                                is_superuser,
-                                self.tenant_keyspace(),
-                                async {
+                let rt_settings = RuntimeSettings::from_session(session);
+                let stmt_exec: Result<Vec<ExecuteResult>> = wrap_with_runtime_context(
+                    &rt_settings,
+                    self.tenant_keyspace(),
+                    async {
                         match stmt {
                             // Transaction Control
                             Statement::StartTransaction { modes, .. } => {
@@ -891,13 +881,7 @@ impl Executor {
                                         ))
                                     };
 
-                                    let res = match timeout {
-                                        Some(timeout) => match tokio::time::timeout(timeout, fut).await {
-                                            Ok(res) => res,
-                                            Err(_) => Err(anyhow::Error::new(StatementTimeoutError)),
-                                        },
-                                        None => fut.await,
-                                    };
+                                    let res = apply_statement_timeout(timeout, fut).await;
 
                                     if res
                                         .as_ref()
@@ -932,12 +916,7 @@ impl Executor {
                                                 let should_retry = attempt + 1 < max_attempts
                                                     && is_retryable_tikv_error(&err);
                                                 if should_retry {
-                                                    // Exponential backoff with jitter to reduce contention
-                                                    let base_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
-                                                    let jitter_ms = rand::random::<u64>() % (base_ms + 1);
-                                                    let backoff_ms = base_ms + jitter_ms;
-                                                    tokio::time::sleep(Duration::from_millis(backoff_ms))
-                                                        .await;
+                                                    autocommit_backoff(attempt).await;
                                                     continue;
                                                 }
                                                 return Err(err);
@@ -954,10 +933,7 @@ impl Executor {
                                 unreachable!("retry loop must return")
                             }
                         }
-                    }),
-                    ),
-                    ),
-                )
+                    })
                 .await;
 
                 if stmt_exec.is_err() && session.is_in_transaction() {
