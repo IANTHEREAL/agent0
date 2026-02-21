@@ -2169,6 +2169,148 @@ fn analyze_unknown_concat_unknown_resolves_to_text() {
     assert_eq!(types, vec![DataType::Text, DataType::Text]);
 }
 
+// ── Extended 42725 coverage (#911) ──
+
+#[test]
+fn analyze_unknown_minus_unknown_reports_42725() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 - $2");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_unknown_mul_unknown_reports_42725() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 * $2");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_unknown_div_unknown_reports_42725() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 / $2");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_unknown_mod_unknown_reports_42725() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 % $2");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_unknown_exp_unknown_reports_42725() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 ^ $2");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_unknown_bitand_unknown_reports_42725() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 & $2");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_unknown_bitor_unknown_reports_42725() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 | $2");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_unknown_shl_unknown_reports_42725() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 << $2");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_unknown_shr_unknown_reports_42725() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 >> $2");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_param_exp_literal_reports_42725() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 ^ '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_literal_concat_literal_resolves_to_text() {
+    let catalog = test_catalog();
+    let query = parse_query("SELECT 'hello' || 'world'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+    let result = analyzer.analyze_query(&query).unwrap();
+    assert_eq!(result.output_schema.len(), 1);
+    assert_eq!(result.output_schema[0].1, DataType::Text);
+}
+
+#[test]
+fn analyze_int_plus_int_succeeds() {
+    let catalog = test_catalog();
+    let query = parse_query("SELECT 1 + 2");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+    let result = analyzer.analyze_query(&query).unwrap();
+    assert_eq!(result.output_schema.len(), 1);
+    assert_eq!(result.output_schema[0].1, DataType::Int32);
+}
+
+#[test]
+fn analyze_explicit_cast_params_succeed() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1::int + $2::int");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 2, &[None, None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Int32, DataType::Int32]);
+}
+
+#[test]
+fn analyze_text_column_plus_text_column_stays_42883() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT name + name FROM users");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
 #[test]
 fn analyze_insert_with_parameters() {
     // INSERT INTO users (id, name) VALUES ($1, $2) → params typed from columns

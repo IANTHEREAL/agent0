@@ -402,6 +402,75 @@ fn prepared_param_plus_null_returns_42725() {
     assert_eq!(sql.sqlstate(), "42725");
 }
 
+// ── Extended 42725 SqlError conversion coverage (#911) ──
+
+#[test]
+fn prepared_unknown_minus_unknown_returns_42725() {
+    let catalog = MockCatalog::empty();
+    let err =
+        analyze_statement_with_params(&catalog, "SELECT $1 - $2", 2, &[None, None]).unwrap_err();
+    assert_eq!(err.sqlstate(), "42725");
+}
+
+#[test]
+fn prepared_unknown_bitand_unknown_returns_42725() {
+    let catalog = MockCatalog::empty();
+    let err =
+        analyze_statement_with_params(&catalog, "SELECT $1 & $2", 2, &[None, None]).unwrap_err();
+    assert_eq!(err.sqlstate(), "42725");
+}
+
+#[test]
+fn prepared_unknown_shl_unknown_returns_42725() {
+    let catalog = MockCatalog::empty();
+    let err =
+        analyze_statement_with_params(&catalog, "SELECT $1 << $2", 2, &[None, None]).unwrap_err();
+    assert_eq!(err.sqlstate(), "42725");
+}
+
+#[test]
+fn prepared_unknown_exp_unknown_returns_42725() {
+    let catalog = MockCatalog::empty();
+    let err =
+        analyze_statement_with_params(&catalog, "SELECT $1 ^ $2", 2, &[None, None]).unwrap_err();
+    assert_eq!(err.sqlstate(), "42725");
+}
+
+#[test]
+fn prepared_param_bitand_literal_returns_42725() {
+    let catalog = MockCatalog::empty();
+    let stmt = parse_single_statement("SELECT $1 & '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn prepared_param_exp_literal_returns_42725() {
+    let catalog = MockCatalog::empty();
+    let stmt = parse_single_statement("SELECT $1 ^ '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn prepared_int_plus_int_succeeds() {
+    let catalog = MockCatalog::empty();
+    let types = analyze_statement_with_params(&catalog, "SELECT 1 + 2", 0, &[]).unwrap();
+    assert_eq!(types, vec![]);
+}
+
+#[test]
+fn prepared_literal_concat_literal_succeeds() {
+    let catalog = MockCatalog::empty();
+    let types =
+        analyze_statement_with_params(&catalog, "SELECT 'hello' || 'world'", 0, &[]).unwrap();
+    assert_eq!(types, vec![]);
+}
+
 #[test]
 fn test_update_tx_status_after_execution_clears_error_on_rollback_to_savepoint() {
     let status = TransactionStatus::Error;

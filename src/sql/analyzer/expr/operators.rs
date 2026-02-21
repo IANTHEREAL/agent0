@@ -252,6 +252,7 @@ impl<'a> Analyzer<'a> {
                 | BinaryOp::BitwiseXor
                 | BinaryOp::ShiftLeft
                 | BinaryOp::ShiftRight
+                | BinaryOp::Exp
         )
     }
 
