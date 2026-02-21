@@ -1,0 +1,621 @@
+//! Physical planner: `LogicalPlan → PhysicalPlan`.
+//!
+//! Two-tier estimation:
+//! - **No stats** (table never ANALYZEd): exact legacy heuristics — `rows/3` for
+//!   filter, `rows/10` for aggregate, `DEFAULT_ESTIMATED_ROWS` for scan.
+//! - **Stats available**: selectivity estimation via `selectivity.rs`, histogram-
+//!   based range estimates, and n_distinct-based GROUP BY estimates.
+//!
+//! | Logical       | Physical        | Rule                    |
+//! |---------------|-----------------|-------------------------|
+//! | Scan          | SeqScan         | Always (index in Ph. 2) |
+//! | Join          | HashJoin/NLJ    | HashJoin if equi-keys   |
+//! | Aggregate     | HashAggregate   | Always                  |
+//! | Sort + Limit  | TopNSort        | When limit+offset < 1K  |
+
+use super::logical_plan::{LogicalNode, LogicalPlan};
+use super::physical_plan::{PhysicalCost, PhysicalNode, PhysicalPlan};
+use super::statistics::TableStatistics;
+use super::{join_keys, selectivity};
+use crate::sql::analyzer::types::{JoinCondition, JoinType, TypedExprKind};
+use crate::types::TableSchema;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+const DEFAULT_ESTIMATED_ROWS: usize = 1000;
+const TOPN_THRESHOLD: usize = 1000;
+const DEFAULT_JOIN_SEL: f64 = 0.1;
+
+/// Context for physical planning, carrying table statistics and schemas.
+///
+/// Built by the executor before calling `PhysicalPlanner::plan()`.
+/// When no statistics are available (empty context), the planner
+/// falls back to exact legacy heuristics.
+///
+/// `table_schemas` carries full [`TableSchema`] (including index metadata)
+/// for access-path selection. Pre-loaded by the executor and shared with
+/// [`BuildContext`](super::BuildContext) to eliminate redundant catalog reads.
+pub struct PlanningContext {
+    pub table_stats: HashMap<String, Arc<TableStatistics>>,
+    pub table_schemas: HashMap<String, TableSchema>,
+}
+
+impl PlanningContext {
+    /// Create an empty context (no statistics or schemas — legacy behavior).
+    pub fn empty() -> Self {
+        Self {
+            table_stats: HashMap::new(),
+            table_schemas: HashMap::new(),
+        }
+    }
+
+    /// Look up table statistics by name.
+    pub fn get_stats(&self, table_name: &str) -> Option<&TableStatistics> {
+        self.table_stats.get(table_name).map(|arc| arc.as_ref())
+    }
+
+    /// Look up table schema by name.
+    pub fn get_schema(&self, table_name: &str) -> Option<&TableSchema> {
+        self.table_schemas.get(table_name)
+    }
+}
+
+/// Converts a [`LogicalPlan`] into a [`PhysicalPlan`].
+pub struct PhysicalPlanner;
+
+impl PhysicalPlanner {
+    /// Plan a logical plan into a physical plan.
+    pub fn plan(logical: &LogicalPlan, ctx: &PlanningContext) -> PhysicalPlan {
+        Self::plan_node(logical, ctx)
+    }
+
+    /// Walk a logical subtree to find base-table stats.
+    ///
+    /// Returns `None` if no Scan is reachable, or if an Aggregate blocks
+    /// propagation (prevents HAVING filters from inheriting base-table stats).
+    fn resolve_stats<'a>(
+        logical: &LogicalPlan,
+        ctx: &'a PlanningContext,
+    ) -> Option<&'a TableStatistics> {
+        match &logical.node {
+            LogicalNode::Scan { table_name, alias } => {
+                let key = super::schema_map_key(table_name, alias.as_deref());
+                ctx.get_stats(&key)
+            }
+            // Aggregate output schema ≠ base table → block propagation.
+            LogicalNode::Aggregate { .. } => None,
+            // Transparent unary operators — recurse through.
+            LogicalNode::Filter { input, .. }
+            | LogicalNode::Project { input, .. }
+            | LogicalNode::Sort { input, .. }
+            | LogicalNode::Limit { input, .. }
+            | LogicalNode::Distinct { input }
+            | LogicalNode::DistinctOn { input, .. }
+            | LogicalNode::Window { input, .. } => Self::resolve_stats(input, ctx),
+            // Multi-input / opaque → no stats.
+            _ => None,
+        }
+    }
+
+    /// Estimate join output rows.
+    ///
+    /// Strategy:
+    /// 1. Equi-joins with stats on BOTH sides: 1/max(NDV_left, NDV_right) per key pair.
+    ///    Column lookup uses `selectivity::get_column_stats` (case-insensitive, ambiguity-safe).
+    /// 2. Equi-joins without stats on one/both sides: DEFAULT_JOIN_SEL.
+    /// 3. Non-equi / cross joins: Cartesian product (selectivity = 1.0).
+    /// 4. Clamp to join-type semantic lower bound.
+    fn estimate_join_rows(
+        left_logical: &LogicalPlan,
+        right_logical: &LogicalPlan,
+        left_rows: usize,
+        right_rows: usize,
+        join_type: &JoinType,
+        condition: &JoinCondition,
+        ctx: &PlanningContext,
+    ) -> usize {
+        let left_width = left_logical.schema.columns.len();
+
+        let selectivity = if let Some((left_keys, right_keys)) =
+            join_keys::try_extract_equi_keys(condition, left_width)
+        {
+            let left_stats = Self::resolve_stats(left_logical, ctx);
+            let right_stats = Self::resolve_stats(right_logical, ctx);
+
+            match (left_stats, right_stats) {
+                (Some(ls), Some(rs)) => {
+                    let mut sel = 1.0;
+                    for (&lk, &rk) in left_keys.iter().zip(right_keys.iter()) {
+                        let left_col_name =
+                            left_logical.schema.columns.get(lk).map(|(n, _)| n.as_str());
+                        let right_col_name = right_logical
+                            .schema
+                            .columns
+                            .get(rk)
+                            .map(|(n, _)| n.as_str());
+
+                        let left_ndv = left_col_name
+                            .and_then(|n| selectivity::get_column_stats(ls, n))
+                            .map(|c| selectivity::n_distinct_raw(c, ls.row_count));
+                        let right_ndv = right_col_name
+                            .and_then(|n| selectivity::get_column_stats(rs, n))
+                            .map(|c| selectivity::n_distinct_raw(c, rs.row_count));
+
+                        sel *= match (left_ndv, right_ndv) {
+                            (Some(l), Some(r)) => 1.0 / l.max(r).max(1.0),
+                            _ => DEFAULT_JOIN_SEL,
+                        };
+                    }
+                    sel
+                }
+                _ => DEFAULT_JOIN_SEL,
+            }
+        } else {
+            1.0 // Non-equi or cross — Cartesian
+        };
+
+        let inner_est = ((left_rows as f64) * (right_rows as f64) * selectivity).ceil() as usize;
+
+        let min_rows = match join_type {
+            JoinType::Left => left_rows,
+            JoinType::Right => right_rows,
+            JoinType::Full => left_rows.max(right_rows),
+            _ => 0, // Inner, Cross: no structural minimum
+        };
+
+        inner_est.max(min_rows).max(1)
+    }
+
+    fn plan_node(logical: &LogicalPlan, ctx: &PlanningContext) -> PhysicalPlan {
+        match &logical.node {
+            // ── Leaf nodes ──────────────────────────────
+            LogicalNode::Scan { table_name, alias } => {
+                let key = super::schema_map_key(table_name, alias.as_deref());
+                let rows = ctx
+                    .get_stats(&key)
+                    .map(|s| s.row_count)
+                    .unwrap_or(DEFAULT_ESTIMATED_ROWS);
+                PhysicalPlan {
+                    node: PhysicalNode::SeqScan {
+                        table_name: table_name.clone(),
+                        alias: alias.clone(),
+                    },
+                    schema: logical.schema.clone(),
+                    cost: PhysicalCost {
+                        startup: 0.0,
+                        total: rows as f64 * 0.01 + 1.0,
+                        rows,
+                    },
+                }
+            }
+
+            LogicalNode::Empty => PhysicalPlan {
+                node: PhysicalNode::Empty,
+                schema: logical.schema.clone(),
+                cost: PhysicalCost {
+                    startup: 0.0,
+                    total: 0.01,
+                    rows: 1,
+                },
+            },
+
+            LogicalNode::Values { rows } => PhysicalPlan {
+                node: PhysicalNode::Values { rows: rows.clone() },
+                schema: logical.schema.clone(),
+                cost: PhysicalCost {
+                    startup: 0.0,
+                    total: rows.len() as f64 * 0.01,
+                    rows: rows.len(),
+                },
+            },
+
+            LogicalNode::TableFunction {
+                function_name,
+                args,
+                alias,
+            } => PhysicalPlan {
+                node: PhysicalNode::TableFunction {
+                    function_name: function_name.clone(),
+                    args: args.clone(),
+                    alias: alias.clone(),
+                },
+                schema: logical.schema.clone(),
+                cost: PhysicalCost {
+                    startup: 0.0,
+                    total: 11.0,
+                    rows: DEFAULT_ESTIMATED_ROWS,
+                },
+            },
+
+            // ── Unary operators ─────────────────────────
+            LogicalNode::Filter { predicate, input } => {
+                let child = Self::plan_node(input, ctx);
+                let child_stats = Self::resolve_stats(input, ctx);
+                let rows = if let Some(stats) = child_stats {
+                    let sel = selectivity::estimate_selectivity(predicate, stats);
+                    (child.cost.rows as f64 * sel).ceil() as usize
+                } else {
+                    (child.cost.rows / 3).max(1) // exact legacy
+                };
+
+                // Access-path selection: when Filter sits above SeqScan and
+                // we have index metadata, choose the best typed access path.
+                // This includes GIN path selection in the optimizer plan.
+                let scan_node = if let PhysicalNode::SeqScan { table_name, alias } = &child.node {
+                    let scan_key = super::schema_map_key(table_name, alias.as_deref());
+                    if let Some(schema) = ctx.get_schema(&scan_key) {
+                        let access_path =
+                            crate::sql::planner::choose_best_access_path_for_typed_filter(
+                                0,
+                                schema,
+                                Some(predicate),
+                                child.cost.rows,
+                            );
+                        match &access_path.scan_type {
+                            crate::sql::planner::ScanType::FullTableScan => None,
+                            _ => {
+                                let index_cost = PhysicalCost {
+                                    startup: 0.0,
+                                    total: access_path.cost,
+                                    rows: child.cost.rows,
+                                };
+                                Some(PhysicalPlan {
+                                    node: PhysicalNode::IndexScan {
+                                        table_name: table_name.clone(),
+                                        alias: alias.clone(),
+                                        scan_type: access_path.scan_type,
+                                    },
+                                    schema: child.schema.clone(),
+                                    cost: index_cost,
+                                })
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let effective_child = scan_node.unwrap_or(child);
+                let cost = PhysicalCost {
+                    startup: effective_child.cost.startup,
+                    total: effective_child.cost.total + rows as f64 * 0.01,
+                    rows,
+                };
+                PhysicalPlan {
+                    node: PhysicalNode::Filter {
+                        predicate: predicate.clone(),
+                        input: Box::new(effective_child),
+                    },
+                    schema: logical.schema.clone(),
+                    cost,
+                }
+            }
+
+            LogicalNode::Project { projections, input } => {
+                let child = Self::plan_node(input, ctx);
+                let cost = PhysicalCost {
+                    startup: child.cost.startup,
+                    total: child.cost.total + child.cost.rows as f64 * 0.001,
+                    rows: child.cost.rows,
+                };
+                PhysicalPlan {
+                    node: PhysicalNode::Project {
+                        projections: projections.clone(),
+                        input: Box::new(child),
+                    },
+                    schema: logical.schema.clone(),
+                    cost,
+                }
+            }
+
+            LogicalNode::Aggregate {
+                group_by,
+                projections,
+                input,
+            } => {
+                let child = Self::plan_node(input, ctx);
+                let child_stats = Self::resolve_stats(input, ctx);
+                let agg_rows = if group_by.is_empty() {
+                    1
+                } else if let Some(stats) = child_stats {
+                    selectivity::estimate_group_by_rows(group_by, stats, child.cost.rows)
+                } else {
+                    (child.cost.rows / 10).max(1) // exact legacy
+                };
+                let cost = PhysicalCost {
+                    startup: child.cost.total,
+                    total: child.cost.total + agg_rows as f64 * 0.1,
+                    rows: agg_rows,
+                };
+                PhysicalPlan {
+                    node: PhysicalNode::HashAggregate {
+                        group_by: group_by.clone(),
+                        projections: projections.clone(),
+                        input: Box::new(child),
+                    },
+                    schema: logical.schema.clone(),
+                    cost,
+                }
+            }
+
+            LogicalNode::Sort { order_by, input } => {
+                let child = Self::plan_node(input, ctx);
+                let sort_cost = child.cost.total
+                    + (child.cost.rows as f64 * (child.cost.rows as f64).log2().max(1.0));
+                let cost = PhysicalCost {
+                    startup: sort_cost,
+                    total: sort_cost,
+                    rows: child.cost.rows,
+                };
+                PhysicalPlan {
+                    node: PhysicalNode::Sort {
+                        order_by: order_by.clone(),
+                        input: Box::new(child),
+                    },
+                    schema: logical.schema.clone(),
+                    cost,
+                }
+            }
+
+            LogicalNode::Limit {
+                limit,
+                offset,
+                input,
+            } => {
+                let child = Self::plan_node(input, ctx);
+
+                // Check for TopN optimization: Sort + Limit with small limit.
+                // After the plan restructuring, the shape for non-aggregate
+                // queries is Limit → Project → Sort, so we look through a
+                // single Project node when the direct child is not a Sort.
+                let (sort_order_by, sort_input, project_wrapper) = match &child.node {
+                    PhysicalNode::Sort {
+                        order_by,
+                        input: si,
+                    } => (Some(order_by), Some(si), None),
+                    PhysicalNode::Project {
+                        projections,
+                        input: proj_input,
+                    } => {
+                        if let PhysicalNode::Sort {
+                            order_by,
+                            input: si,
+                        } = &proj_input.node
+                        {
+                            (Some(order_by), Some(si), Some(projections))
+                        } else {
+                            (None, None, None)
+                        }
+                    }
+                    _ => (None, None, None),
+                };
+
+                if let (Some(limit_expr), Some(order_by), Some(sort_input)) =
+                    (limit, sort_order_by, sort_input)
+                {
+                    if let Some(limit_val) = extract_constant_usize(limit_expr) {
+                        let offset_val = offset
+                            .as_ref()
+                            .and_then(extract_constant_usize)
+                            .unwrap_or(0);
+                        if limit_val + offset_val < TOPN_THRESHOLD {
+                            let effective_limit = limit_val + offset_val;
+                            let topn_cost = PhysicalCost {
+                                startup: sort_input.cost.startup,
+                                total: sort_input.cost.total + effective_limit as f64 * 0.01,
+                                rows: limit_val,
+                            };
+                            let topn_plan = PhysicalPlan {
+                                node: PhysicalNode::TopNSort {
+                                    order_by: order_by.clone(),
+                                    limit: effective_limit,
+                                    input: sort_input.clone(),
+                                },
+                                schema: sort_input.schema.clone(),
+                                cost: topn_cost.clone(),
+                            };
+                            // Re-wrap in Project if we looked through one.
+                            let limit_child = if let Some(projections) = project_wrapper {
+                                PhysicalPlan {
+                                    node: PhysicalNode::Project {
+                                        projections: projections.clone(),
+                                        input: Box::new(topn_plan),
+                                    },
+                                    schema: child.schema.clone(),
+                                    cost: topn_cost.clone(),
+                                }
+                            } else {
+                                topn_plan
+                            };
+                            return PhysicalPlan {
+                                node: PhysicalNode::Limit {
+                                    limit: limit.clone(),
+                                    offset: offset.clone(),
+                                    input: Box::new(limit_child),
+                                },
+                                schema: logical.schema.clone(),
+                                cost: topn_cost,
+                            };
+                        }
+                    }
+                }
+
+                let limited_rows = if let Some(limit_expr) = limit {
+                    extract_constant_usize(limit_expr)
+                        .map(|l| l.min(child.cost.rows))
+                        .unwrap_or(child.cost.rows)
+                } else {
+                    child.cost.rows
+                };
+                let cost = PhysicalCost {
+                    startup: child.cost.startup,
+                    total: child.cost.startup + limited_rows as f64 * 0.01,
+                    rows: limited_rows,
+                };
+                PhysicalPlan {
+                    node: PhysicalNode::Limit {
+                        limit: limit.clone(),
+                        offset: offset.clone(),
+                        input: Box::new(child),
+                    },
+                    schema: logical.schema.clone(),
+                    cost,
+                }
+            }
+
+            LogicalNode::Distinct { input } => {
+                let child = Self::plan_node(input, ctx);
+                let cost = PhysicalCost {
+                    startup: child.cost.total,
+                    total: child.cost.total + child.cost.rows as f64 * 0.01,
+                    rows: (child.cost.rows / 2).max(1),
+                };
+                PhysicalPlan {
+                    node: PhysicalNode::Distinct {
+                        input: Box::new(child),
+                    },
+                    schema: logical.schema.clone(),
+                    cost,
+                }
+            }
+
+            LogicalNode::DistinctOn { on_exprs, input } => {
+                let child = Self::plan_node(input, ctx);
+                let cost = PhysicalCost {
+                    startup: child.cost.total,
+                    total: child.cost.total + child.cost.rows as f64 * 0.01,
+                    rows: (child.cost.rows / 2).max(1),
+                };
+                PhysicalPlan {
+                    node: PhysicalNode::DistinctOn {
+                        on_exprs: on_exprs.clone(),
+                        input: Box::new(child),
+                    },
+                    schema: logical.schema.clone(),
+                    cost,
+                }
+            }
+
+            LogicalNode::Window {
+                window_functions,
+                input,
+                ..
+            } => {
+                let child = Self::plan_node(input, ctx);
+                let cost = child.cost.clone();
+                PhysicalPlan {
+                    node: PhysicalNode::Window {
+                        window_functions: window_functions.clone(),
+                        input: Box::new(child),
+                    },
+                    schema: logical.schema.clone(),
+                    cost,
+                }
+            }
+
+            // ── Binary operators ────────────────────────
+            LogicalNode::Join {
+                left,
+                right,
+                join_type,
+                condition,
+            } => {
+                let left_phys = Self::plan_node(left, ctx);
+                let right_phys = Self::plan_node(right, ctx);
+                let left_rows = left_phys.cost.rows;
+                let right_rows = right_phys.cost.rows;
+                let left_width = left.schema.columns.len();
+
+                let total_rows = Self::estimate_join_rows(
+                    left, right, left_rows, right_rows, join_type, condition, ctx,
+                );
+                let total_cost =
+                    left_phys.cost.total + right_phys.cost.total + total_rows as f64 * 0.01;
+                let cost = PhysicalCost {
+                    startup: 0.0,
+                    total: total_cost,
+                    rows: total_rows,
+                };
+
+                // Algorithm selection: HashJoin for pure equi-joins, NLJ otherwise.
+                // Mixed ON (equi + residual) → NLJ for now (limitation L1).
+                let node = if join_keys::try_extract_equi_keys(condition, left_width).is_some() {
+                    let left_is_build = left_rows <= right_rows;
+                    PhysicalNode::HashJoin {
+                        left: Box::new(left_phys),
+                        right: Box::new(right_phys),
+                        join_type: *join_type,
+                        condition: condition.clone(),
+                        left_is_build,
+                    }
+                } else {
+                    PhysicalNode::NestedLoopJoin {
+                        left: Box::new(left_phys),
+                        right: Box::new(right_phys),
+                        join_type: *join_type,
+                        condition: condition.clone(),
+                    }
+                };
+
+                PhysicalPlan {
+                    node,
+                    schema: logical.schema.clone(),
+                    cost,
+                }
+            }
+
+            LogicalNode::SetOperation {
+                op,
+                all,
+                left,
+                right,
+            } => {
+                let left_phys = Self::plan_node(left, ctx);
+                let right_phys = Self::plan_node(right, ctx);
+                let rows = left_phys.cost.rows + right_phys.cost.rows;
+                let cost = PhysicalCost {
+                    startup: 0.0,
+                    total: left_phys.cost.total + right_phys.cost.total + rows as f64 * 0.01,
+                    rows,
+                };
+                PhysicalPlan {
+                    node: PhysicalNode::SetOperation {
+                        op: *op,
+                        all: *all,
+                        left: Box::new(left_phys),
+                        right: Box::new(right_phys),
+                    },
+                    schema: logical.schema.clone(),
+                    cost,
+                }
+            }
+
+            LogicalNode::Subquery { subplan, alias } => {
+                let child = Self::plan_node(subplan, ctx);
+                let cost = child.cost.clone();
+                PhysicalPlan {
+                    node: PhysicalNode::Subquery {
+                        subplan: Box::new(child),
+                        alias: alias.clone(),
+                    },
+                    schema: logical.schema.clone(),
+                    cost,
+                }
+            }
+        }
+    }
+}
+
+/// Extract a constant integer value from a TypedExpr.
+fn extract_constant_usize(expr: &crate::sql::analyzer::types::TypedExpr) -> Option<usize> {
+    match &expr.kind {
+        TypedExprKind::Constant(crate::types::Value::Int32(v)) => Some(*v as usize),
+        TypedExprKind::Constant(crate::types::Value::Int64(v)) => Some(*v as usize),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests;

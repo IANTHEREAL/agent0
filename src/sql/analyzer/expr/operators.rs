@@ -1,0 +1,469 @@
+//! Binary operator, unary operator, IS test, LIKE, and ANY/ALL analysis.
+//!
+//! Contains `analyze_binary_op`, `analyze_unary_op`, `analyze_is_test`,
+//! `analyze_like`, `analyze_any_all_subquery`, `any_all_compare_op`,
+//! and related helpers.
+
+use sqlparser::ast::{self as ast, BinaryOperator, Expr, UnaryOperator};
+
+use crate::sql::types::coercion::{
+    binary_op_result_type, common_type, comparison_target_type, is_numeric,
+};
+use crate::types::{DataType, Value};
+
+use crate::sql::analyzer::error::AnalyzerError;
+use crate::sql::analyzer::types::*;
+use crate::sql::analyzer::Analyzer;
+
+impl<'a> Analyzer<'a> {
+    // -- Helper: binary operators --
+
+    pub(super) fn analyze_binary_op(
+        &mut self,
+        left: &Expr,
+        op: &ast::BinaryOperator,
+        right: &Expr,
+    ) -> Result<TypedExpr, AnalyzerError> {
+        let mut l = self.analyze_expr(left)?;
+        let mut r = self.analyze_expr(right)?;
+        let typed_op = self.convert_binary_op(op)?;
+
+        // Contextual NULL typing: if one side is NULL, adopt the other's type
+        if l.is_null_constant() && !r.is_null_constant() {
+            l = TypedExpr::null(r.data_type.clone());
+        } else if r.is_null_constant() && !l.is_null_constant() {
+            r = TypedExpr::null(l.data_type.clone());
+        }
+
+        // Contextual parameter typing (mirrors NULL typing above).
+        // Resolve parameter from the concrete type on the other side.
+        // Always call resolve_param_type for conflict detection, even for
+        // already-resolved params (enables InconsistentParameterTypes).
+        if let TypedExprKind::Parameter { index } = &l.kind {
+            if !r.is_null_constant() && !matches!(&r.kind, TypedExprKind::Parameter { .. }) {
+                let was_unresolved = self.is_unresolved_param(&l);
+                self.resolve_param_type(*index, &r.data_type)?;
+                if was_unresolved {
+                    l = TypedExpr::new(
+                        TypedExprKind::Parameter { index: *index },
+                        r.data_type.clone(),
+                    );
+                }
+            }
+        }
+        if let TypedExprKind::Parameter { index } = &r.kind {
+            if !l.is_null_constant() && !matches!(&l.kind, TypedExprKind::Parameter { .. }) {
+                let was_unresolved = self.is_unresolved_param(&r);
+                self.resolve_param_type(*index, &l.data_type)?;
+                if was_unresolved {
+                    r = TypedExpr::new(
+                        TypedExprKind::Parameter { index: *index },
+                        l.data_type.clone(),
+                    );
+                }
+            }
+        }
+
+        // AND/OR: both sides must be boolean -- resolve params (including
+        // already-resolved ones for conflict detection)
+        if matches!(typed_op, BinaryOp::And | BinaryOp::Or) {
+            if let TypedExprKind::Parameter { index } = &l.kind {
+                let was_unresolved = self.is_unresolved_param(&l);
+                self.resolve_param_type(*index, &DataType::Boolean)?;
+                if was_unresolved {
+                    l = TypedExpr::new(
+                        TypedExprKind::Parameter { index: *index },
+                        DataType::Boolean,
+                    );
+                }
+            }
+            if let TypedExprKind::Parameter { index } = &r.kind {
+                let was_unresolved = self.is_unresolved_param(&r);
+                self.resolve_param_type(*index, &DataType::Boolean)?;
+                if was_unresolved {
+                    r = TypedExpr::new(
+                        TypedExprKind::Parameter { index: *index },
+                        DataType::Boolean,
+                    );
+                }
+            }
+        }
+
+        let left_unresolved_param = match &l.kind {
+            TypedExprKind::Parameter { index } if self.is_unresolved_param(&l) => Some(*index),
+            _ => None,
+        };
+        let right_unresolved_param = match &r.kind {
+            TypedExprKind::Parameter { index } if self.is_unresolved_param(&r) => Some(*index),
+            _ => None,
+        };
+        if let (Some(left_index), Some(right_index)) =
+            (left_unresolved_param, right_unresolved_param)
+        {
+            if Self::resolves_unknown_pair_to_text(&typed_op) {
+                self.resolve_param_type(left_index, &DataType::Text)?;
+                self.resolve_param_type(right_index, &DataType::Text)?;
+                l = TypedExpr::new(
+                    TypedExprKind::Parameter { index: left_index },
+                    DataType::Text,
+                );
+                r = TypedExpr::new(
+                    TypedExprKind::Parameter { index: right_index },
+                    DataType::Text,
+                );
+            } else if Self::is_ambiguous_unknown_pair_op(&typed_op) {
+                return Err(AnalyzerError::AmbiguousOperator {
+                    operator: typed_op.to_string(),
+                    left: "unknown".to_string(),
+                    right: "unknown".to_string(),
+                });
+            }
+        }
+
+        // PostgreSQL UNKNOWN literal rule (partial):
+        //
+        // String literals are untyped (UNKNOWN) in PostgreSQL and can be coerced
+        // to match a numeric operator context. In tipg, string literals are
+        // initially typed as TEXT, which would otherwise reject `TEXT + INT`.
+        //
+        // We only apply this for *literal* text constants (not TEXT columns, and
+        // not explicitly typed TEXT via `::text`), matching the desired contract:
+        //
+        //   SELECT '100' + 50  -> OK (coerce literal to INT)
+        //   SELECT '100'::text + 50 -> ERROR
+        //   SELECT text_col + 50 -> ERROR
+        if matches!(
+            typed_op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::Exp
+        ) {
+            if is_numeric(&r.data_type) && matches!(l.kind, TypedExprKind::Constant(Value::Text(_)))
+            {
+                l = self.coerce_if_needed(l, &r.data_type)?;
+            } else if is_numeric(&l.data_type)
+                && matches!(r.kind, TypedExprKind::Constant(Value::Text(_)))
+            {
+                r = self.coerce_if_needed(r, &l.data_type)?;
+            }
+        }
+
+        // Use our BinaryOp Display impl (outputs "+", "-", "=", etc.)
+        // which maps directly to the operator symbols in binary_op_result_type.
+        let op_display = typed_op.to_string();
+        let result_type = binary_op_result_type(&op_display, &l.data_type, &r.data_type)
+            .or_else(|| {
+                // Bitwise operators return the common numeric type
+                match &typed_op {
+                    BinaryOp::BitwiseAnd
+                    | BinaryOp::BitwiseOr
+                    | BinaryOp::BitwiseXor
+                    | BinaryOp::ShiftLeft
+                    | BinaryOp::ShiftRight => common_type(&l.data_type, &r.data_type),
+                    BinaryOp::Custom(_) => common_type(&l.data_type, &r.data_type),
+                    _ => None,
+                }
+            })
+            .ok_or_else(|| AnalyzerError::OperatorTypeMismatch {
+                operator: op_display.clone(),
+                left: l.data_type.to_string().to_lowercase(),
+                right: r.data_type.to_string().to_lowercase(),
+            })?;
+
+        // Insert implicit casts when operand types differ and a target type exists.
+        // Comparisons use comparison_target_type (non-Text side wins) while
+        // arithmetic/other operators continue to use common_type.
+        if l.data_type != r.data_type {
+            let target_type = match typed_op {
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq => comparison_target_type(&l.data_type, &r.data_type),
+                // PostgreSQL jsonb subtraction is heterogeneous:
+                //   jsonb - text / int
+                // Do not force both sides to a common type (e.g. Text), which
+                // would break operator dispatch at runtime.
+                BinaryOp::Sub
+                    if matches!(
+                        (&l.data_type, &r.data_type),
+                        (DataType::Jsonb, DataType::Text)
+                            | (DataType::Jsonb, DataType::Int32)
+                            | (DataType::Jsonb, DataType::Int64)
+                    ) =>
+                {
+                    None
+                }
+                _ => common_type(&l.data_type, &r.data_type),
+            };
+
+            if let Some(target) = target_type {
+                l = self.coerce_if_needed(l, &target)?;
+                r = self.coerce_if_needed(r, &target)?;
+            }
+        }
+
+        Ok(TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(l),
+                op: typed_op,
+                right: Box::new(r),
+            },
+            result_type,
+        ))
+    }
+
+    fn resolves_unknown_pair_to_text(op: &BinaryOp) -> bool {
+        matches!(
+            op,
+            BinaryOp::Concat
+                | BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq
+        )
+    }
+
+    fn is_ambiguous_unknown_pair_op(op: &BinaryOp) -> bool {
+        matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::BitwiseAnd
+                | BinaryOp::BitwiseOr
+                | BinaryOp::BitwiseXor
+                | BinaryOp::ShiftLeft
+                | BinaryOp::ShiftRight
+        )
+    }
+
+    pub(super) fn convert_binary_op(
+        &self,
+        op: &ast::BinaryOperator,
+    ) -> Result<BinaryOp, AnalyzerError> {
+        use ast::BinaryOperator as SqlOp;
+        Ok(match op {
+            SqlOp::Plus => BinaryOp::Add,
+            SqlOp::Minus => BinaryOp::Sub,
+            SqlOp::Multiply => BinaryOp::Mul,
+            SqlOp::Divide => BinaryOp::Div,
+            SqlOp::Modulo => BinaryOp::Mod,
+            SqlOp::Eq => BinaryOp::Eq,
+            SqlOp::NotEq => BinaryOp::NotEq,
+            SqlOp::Lt => BinaryOp::Lt,
+            SqlOp::LtEq => BinaryOp::LtEq,
+            SqlOp::Gt => BinaryOp::Gt,
+            SqlOp::GtEq => BinaryOp::GtEq,
+            SqlOp::And => BinaryOp::And,
+            SqlOp::Or => BinaryOp::Or,
+            SqlOp::StringConcat => BinaryOp::Concat,
+            SqlOp::BitwiseAnd => BinaryOp::BitwiseAnd,
+            SqlOp::BitwiseOr => BinaryOp::BitwiseOr,
+            SqlOp::BitwiseXor => BinaryOp::BitwiseXor,
+            SqlOp::PGBitwiseShiftLeft => BinaryOp::ShiftLeft,
+            SqlOp::PGBitwiseShiftRight => BinaryOp::ShiftRight,
+            SqlOp::PGRegexMatch => BinaryOp::RegexMatch,
+            SqlOp::PGRegexIMatch => BinaryOp::RegexIMatch,
+            SqlOp::PGRegexNotMatch => BinaryOp::RegexNotMatch,
+            SqlOp::PGRegexNotIMatch => BinaryOp::RegexNotIMatch,
+            SqlOp::PGOverlap => BinaryOp::ArrayOverlap,
+            SqlOp::PGExp => BinaryOp::Exp,
+            SqlOp::PGCustomBinaryOperator(parts) => {
+                let op_str: String = parts.iter().map(|p| p.as_str()).collect();
+                match op_str.as_str() {
+                    "?|" => BinaryOp::JsonExistsAny,
+                    "?&" => BinaryOp::JsonExistsAll,
+                    "@@" => BinaryOp::TsMatch,
+                    "@>" => BinaryOp::ArrayContains,
+                    "<@" => BinaryOp::ArrayContainedBy,
+                    other => BinaryOp::Custom(other.to_string()),
+                }
+            }
+            other => {
+                return Err(AnalyzerError::Unsupported(format!(
+                    "binary operator {:?}",
+                    other
+                )));
+            }
+        })
+    }
+
+    pub(super) fn binary_op_to_json_access_op(
+        op: &ast::BinaryOperator,
+    ) -> Option<ast::JsonOperator> {
+        match op {
+            ast::BinaryOperator::PGCustomBinaryOperator(parts) => {
+                let op_str: String = parts.iter().map(|p| p.as_str()).collect();
+                match op_str.as_str() {
+                    "->" => Some(ast::JsonOperator::Arrow),
+                    "->>" => Some(ast::JsonOperator::LongArrow),
+                    "#>" => Some(ast::JsonOperator::HashArrow),
+                    "#>>" => Some(ast::JsonOperator::HashLongArrow),
+                    "#-" => Some(ast::JsonOperator::HashMinus),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    // -- Helper: unary operators --
+
+    pub(super) fn analyze_unary_op(
+        &mut self,
+        op: &UnaryOperator,
+        expr: &Expr,
+    ) -> Result<TypedExpr, AnalyzerError> {
+        let operand = self.analyze_expr(expr)?;
+        let (typed_op, result_type) = match op {
+            UnaryOperator::Not => (UnaryOp::Not, DataType::Boolean),
+            UnaryOperator::Plus => (UnaryOp::Plus, operand.data_type.clone()),
+            UnaryOperator::Minus => (UnaryOp::Minus, operand.data_type.clone()),
+            UnaryOperator::PGBitwiseNot => (UnaryOp::BitwiseNot, operand.data_type.clone()),
+            _ => {
+                return Err(AnalyzerError::Unsupported(format!(
+                    "unary operator {:?}",
+                    op,
+                )));
+            }
+        };
+
+        Ok(TypedExpr::new(
+            TypedExprKind::UnaryOp {
+                op: typed_op,
+                operand: Box::new(operand),
+            },
+            result_type,
+        ))
+    }
+
+    // -- Helper: IS tests --
+
+    pub(super) fn analyze_is_test(
+        &mut self,
+        expr: &Expr,
+        test: IsTestKind,
+        negated: bool,
+    ) -> Result<TypedExpr, AnalyzerError> {
+        let inner = self.analyze_expr(expr)?;
+        Ok(TypedExpr::new(
+            TypedExprKind::IsTest {
+                expr: Box::new(inner),
+                test,
+                negated,
+            },
+            DataType::Boolean,
+        ))
+    }
+
+    // -- Helper: LIKE --
+
+    pub(super) fn analyze_like(
+        &mut self,
+        expr: &Expr,
+        pattern: &Expr,
+        escape: &Option<char>,
+        case_insensitive: bool,
+        negated: bool,
+    ) -> Result<TypedExpr, AnalyzerError> {
+        let mut e = self.analyze_expr(expr)?;
+        if let TypedExprKind::Parameter { index } = &e.kind {
+            let was_unresolved = self.is_unresolved_param(&e);
+            self.resolve_param_type(*index, &DataType::Text)?;
+            if was_unresolved {
+                e = TypedExpr::new(TypedExprKind::Parameter { index: *index }, DataType::Text);
+            }
+        }
+
+        let mut p = self.analyze_expr(pattern)?;
+        if let TypedExprKind::Parameter { index } = &p.kind {
+            let was_unresolved = self.is_unresolved_param(&p);
+            self.resolve_param_type(*index, &DataType::Text)?;
+            if was_unresolved {
+                p = TypedExpr::new(TypedExprKind::Parameter { index: *index }, DataType::Text);
+            }
+        }
+        let esc = escape.map(|c| {
+            Box::new(TypedExpr::new(
+                TypedExprKind::Constant(Value::Text(c.to_string())),
+                DataType::Text,
+            ))
+        });
+
+        Ok(TypedExpr::new(
+            TypedExprKind::Like {
+                expr: Box::new(e),
+                pattern: Box::new(p),
+                escape: esc,
+                case_insensitive,
+                negated,
+            },
+            DataType::Boolean,
+        ))
+    }
+
+    // -- Helper: ANY/ALL subquery --
+
+    pub(super) fn analyze_any_all_subquery(
+        &mut self,
+        left: &Expr,
+        compare_op: &BinaryOperator,
+        subquery: &ast::Query,
+        is_all: bool,
+    ) -> Result<TypedExpr, AnalyzerError> {
+        let mut left_expr = self.analyze_expr(left)?;
+        let analyzed = self.analyze_query(subquery)?;
+        if analyzed.output_schema.len() != 1 {
+            return Err(AnalyzerError::ScalarSubqueryMultipleColumns {
+                got: analyzed.output_schema.len(),
+            });
+        }
+
+        let right_type = analyzed.output_schema[0].1.clone();
+        if left_expr.is_null_constant() {
+            left_expr = TypedExpr::null(right_type.clone());
+        } else if left_expr.data_type != right_type {
+            if let Some(target) = comparison_target_type(&left_expr.data_type, &right_type) {
+                left_expr = self.coerce_if_needed(left_expr, &target)?;
+            }
+        }
+
+        let op = self.any_all_compare_op(compare_op)?;
+        Ok(TypedExpr::new(
+            TypedExprKind::AnyAll {
+                expr: Box::new(left_expr),
+                op,
+                subquery: Box::new(analyzed),
+                is_all,
+            },
+            DataType::Boolean,
+        ))
+    }
+
+    pub(super) fn any_all_compare_op(
+        &self,
+        compare_op: &BinaryOperator,
+    ) -> Result<BinaryOp, AnalyzerError> {
+        match compare_op {
+            BinaryOperator::Eq => Ok(BinaryOp::Eq),
+            BinaryOperator::NotEq => Ok(BinaryOp::NotEq),
+            BinaryOperator::Lt => Ok(BinaryOp::Lt),
+            BinaryOperator::LtEq => Ok(BinaryOp::LtEq),
+            BinaryOperator::Gt => Ok(BinaryOp::Gt),
+            BinaryOperator::GtEq => Ok(BinaryOp::GtEq),
+            other => Err(AnalyzerError::Unsupported(format!(
+                "ANY/ALL with operator: {:?}",
+                other,
+            ))),
+        }
+    }
+}

@@ -73,7 +73,7 @@ modules:
     code_entrypoints:
       - path: src/sql/parser/mod.rs
         symbols: [parse_sql]
-      - path: src/sql/planner.rs
+      - path: src/sql/planner/mod.rs
         symbols: [choose_join_algorithm]
       - path: src/sql/executor/core/mod.rs
         symbols: [Executor]

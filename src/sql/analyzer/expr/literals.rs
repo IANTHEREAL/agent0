@@ -1,0 +1,288 @@
+//! Literal and identifier analysis for the expression analyzer.
+//!
+//! Contains `analyze_identifier`, `analyze_compound_identifier`,
+//! `analyze_value`, and `parse_placeholder_index`.
+
+use rust_decimal::Decimal;
+use sqlparser::ast;
+use std::str::FromStr;
+
+use crate::types::{DataType, Value};
+
+use crate::sql::analyzer::error::AnalyzerError;
+use crate::sql::analyzer::types::*;
+use crate::sql::analyzer::Analyzer;
+
+impl<'a> Analyzer<'a> {
+    // -- Helper: identifier resolution --
+
+    pub(super) fn analyze_identifier(
+        &mut self,
+        ident: &ast::Ident,
+    ) -> Result<TypedExpr, AnalyzerError> {
+        match self.scopes.resolve_column_ident(ident) {
+            Ok(resolved) => {
+                if let Some(merged) = resolved.merged_using.clone() {
+                    let mut left_expr = TypedExpr::new(
+                        TypedExprKind::ColumnRef {
+                            scope_depth: resolved.scope_depth,
+                            column_index: merged.left_index,
+                            column_name: merged.column_name.clone(),
+                        },
+                        merged.left_type.clone(),
+                    );
+                    let mut right_expr = TypedExpr::new(
+                        TypedExprKind::ColumnRef {
+                            scope_depth: resolved.scope_depth,
+                            column_index: merged.right_index,
+                            column_name: merged.column_name.clone(),
+                        },
+                        merged.right_type.clone(),
+                    );
+
+                    if left_expr.data_type != merged.data_type {
+                        left_expr = self.coerce_if_needed(left_expr, &merged.data_type)?;
+                    }
+                    if right_expr.data_type != merged.data_type {
+                        right_expr = self.coerce_if_needed(right_expr, &merged.data_type)?;
+                    }
+
+                    return Ok(TypedExpr::new(
+                        TypedExprKind::Coalesce(vec![left_expr, right_expr]),
+                        merged.data_type,
+                    ));
+                }
+
+                Ok(TypedExpr::new(
+                    TypedExprKind::ColumnRef {
+                        scope_depth: resolved.scope_depth,
+                        column_index: resolved.column_index,
+                        column_name: resolved.column_name,
+                    },
+                    resolved.data_type,
+                ))
+            }
+            Err(AnalyzerError::ColumnNotFound { .. }) => {
+                if let Some((scope_depth, cols)) = self.scopes.resolve_table_alias_columns(ident) {
+                    let row_items: Vec<TypedExpr> = cols
+                        .into_iter()
+                        .map(|c| {
+                            TypedExpr::new(
+                                TypedExprKind::ColumnRef {
+                                    scope_depth,
+                                    column_index: c.column_index,
+                                    column_name: c.column_name,
+                                },
+                                c.data_type,
+                            )
+                        })
+                        .collect();
+                    return Ok(TypedExpr::new(
+                        TypedExprKind::Row(row_items),
+                        DataType::UserDefined("record".to_string()),
+                    ));
+                }
+                Err(AnalyzerError::ColumnNotFound {
+                    name: ident.value.clone(),
+                    available: self.scopes.current().available_columns(),
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub(super) fn analyze_compound_identifier(
+        &mut self,
+        parts: &[ast::Ident],
+    ) -> Result<TypedExpr, AnalyzerError> {
+        if parts.is_empty() {
+            return Err(AnalyzerError::Internal(
+                "empty compound identifier".to_string(),
+            ));
+        }
+
+        // Two-part: table.column
+        if parts.len() == 2 {
+            let resolved = self
+                .scopes
+                .resolve_qualified_column_idents(&parts[0], &parts[1])?;
+            return Ok(TypedExpr::new(
+                TypedExprKind::ColumnRef {
+                    scope_depth: resolved.scope_depth,
+                    column_index: resolved.column_index,
+                    column_name: resolved.column_name,
+                },
+                resolved.data_type,
+            ));
+        }
+
+        // Three-part: schema.table.column -- use last two parts
+        if parts.len() >= 3 {
+            let n = parts.len();
+            let resolved = self
+                .scopes
+                .resolve_qualified_column_idents(&parts[n - 2], &parts[n - 1])?;
+            return Ok(TypedExpr::new(
+                TypedExprKind::ColumnRef {
+                    scope_depth: resolved.scope_depth,
+                    column_index: resolved.column_index,
+                    column_name: resolved.column_name,
+                },
+                resolved.data_type,
+            ));
+        }
+
+        // Single part (shouldn't reach here, but handle gracefully)
+        self.analyze_identifier(&parts[0])
+    }
+
+    // -- Helper: value literal analysis --
+
+    pub(super) fn analyze_value(&self, val: &ast::Value) -> Result<TypedExpr, AnalyzerError> {
+        match val {
+            ast::Value::Number(n, _) => {
+                if n.contains(['e', 'E']) {
+                    let f: f64 = n.parse().map_err(|_| AnalyzerError::InvalidLiteral {
+                        value: n.clone(),
+                        target_type: DataType::Float64,
+                        parse_error: "invalid float".to_string(),
+                    })?;
+                    Ok(TypedExpr::new(
+                        TypedExprKind::Constant(Value::Float64(f)),
+                        DataType::Float64,
+                    ))
+                } else if n.contains('.') {
+                    let d = Decimal::from_str(n).map_err(|e| AnalyzerError::InvalidLiteral {
+                        value: n.clone(),
+                        target_type: DataType::Numeric {
+                            precision: None,
+                            scale: None,
+                        },
+                        parse_error: e.to_string(),
+                    })?;
+                    Ok(TypedExpr::new(
+                        TypedExprKind::Constant(Value::Numeric(d)),
+                        DataType::Numeric {
+                            precision: None,
+                            scale: None,
+                        },
+                    ))
+                } else if let Ok(i) = n.parse::<i32>() {
+                    Ok(TypedExpr::new(
+                        TypedExprKind::Constant(Value::Int32(i)),
+                        DataType::Int32,
+                    ))
+                } else if let Ok(i) = n.parse::<i64>() {
+                    Ok(TypedExpr::new(
+                        TypedExprKind::Constant(Value::Int64(i)),
+                        DataType::Int64,
+                    ))
+                } else {
+                    let d = Decimal::from_str(n).map_err(|e| AnalyzerError::InvalidLiteral {
+                        value: n.clone(),
+                        target_type: DataType::Numeric {
+                            precision: None,
+                            scale: None,
+                        },
+                        parse_error: e.to_string(),
+                    })?;
+                    Ok(TypedExpr::new(
+                        TypedExprKind::Constant(Value::Numeric(d)),
+                        DataType::Numeric {
+                            precision: None,
+                            scale: None,
+                        },
+                    ))
+                }
+            }
+
+            ast::Value::SingleQuotedString(s)
+            | ast::Value::DoubleQuotedString(s)
+            | ast::Value::EscapedStringLiteral(s) => Ok(TypedExpr::new(
+                TypedExprKind::Constant(Value::Text(s.clone())),
+                DataType::Text,
+            )),
+
+            ast::Value::DollarQuotedString(dqs) => Ok(TypedExpr::new(
+                TypedExprKind::Constant(Value::Text(dqs.value.clone())),
+                DataType::Text,
+            )),
+
+            ast::Value::Boolean(b) => Ok(TypedExpr::new(
+                TypedExprKind::Constant(Value::Boolean(*b)),
+                DataType::Boolean,
+            )),
+
+            ast::Value::Null => {
+                // Untyped NULL -- default type is Text (PostgreSQL semantics).
+                // The Analyzer may override via contextual coercion in binary ops.
+                Ok(TypedExpr::null(DataType::Text))
+            }
+
+            ast::Value::HexStringLiteral(s) => {
+                let bytes = hex::decode(s).map_err(|e| AnalyzerError::InvalidLiteral {
+                    value: s.clone(),
+                    target_type: DataType::Bytes,
+                    parse_error: e.to_string(),
+                })?;
+                Ok(TypedExpr::new(
+                    TypedExprKind::Constant(Value::Bytes(bytes)),
+                    DataType::Bytes,
+                ))
+            }
+
+            ast::Value::Placeholder(s) => {
+                let index = Self::parse_placeholder_index(s)?;
+                if index >= self.param_types.len() {
+                    return Err(AnalyzerError::InvalidParameterUsage {
+                        index: index + 1,
+                        context: format!(
+                            "parameter index exceeds placeholder count ({})",
+                            self.param_types.len()
+                        ),
+                    });
+                }
+
+                // Determine type: client OID > previously inferred > Text seed.
+                // Text seed is intentional -- is_unresolved_param() checks
+                // inferred_params, not the data_type on the node, so Text
+                // never skews type resolution.
+                let data_type = if let Some(Some(dt)) = self.param_types.get(index) {
+                    dt.clone()
+                } else if let Some(Some(dt)) = self.inferred_params.get(index) {
+                    dt.clone()
+                } else {
+                    DataType::Text // Seed only; filtered out by unify_expr_types
+                };
+
+                Ok(TypedExpr::new(
+                    TypedExprKind::Parameter { index },
+                    data_type,
+                ))
+            }
+
+            other => Err(AnalyzerError::Unsupported(format!(
+                "value literal type: {:?}",
+                other,
+            ))),
+        }
+    }
+
+    /// Parse `$N` placeholder string to 0-indexed parameter index.
+    /// Rejects `$0` (PG parameters are 1-based).
+    pub(in crate::sql::analyzer) fn parse_placeholder_index(
+        s: &str,
+    ) -> Result<usize, AnalyzerError> {
+        let n = s
+            .strip_prefix('$')
+            .and_then(|n| n.parse::<usize>().ok())
+            .ok_or_else(|| AnalyzerError::Unsupported(format!("invalid placeholder: {}", s)))?;
+        if n == 0 {
+            return Err(AnalyzerError::InvalidParameterUsage {
+                index: 0,
+                context: "parameters are numbered from $1".to_string(),
+            });
+        }
+        Ok(n - 1) // 0-indexed internally
+    }
+}
