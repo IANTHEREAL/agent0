@@ -574,7 +574,9 @@ pub(super) fn coerce_value_for_type_change(val: Value, target_col: &ColumnDef) -
 
     match (val, new_type) {
         (Value::Json(s), DataType::Text) => Ok(Value::Text(s)),
-        (Value::Jsonb(s), DataType::Text) => Ok(Value::Text(s)),
+        (Value::Jsonb(s), DataType::Text) => {
+            Ok(Value::Text(crate::sql::jsonb::format_jsonb_pg_str(&s)))
+        }
         (Value::Uuid(bytes), DataType::Text) => {
             Ok(Value::Text(uuid::Uuid::from_bytes(bytes).to_string()))
         }

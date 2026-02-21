@@ -128,6 +128,9 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 .unwrap_or_else(|_| ts.to_string());
             Ok(Value::Text(formatted))
         }
+        (Value::Jsonb(s), DataType::Text | DataType::Name) => {
+            Ok(Value::Text(crate::sql::jsonb::format_jsonb_pg_str(&s)))
+        }
         (v, DataType::Text | DataType::Name) => Ok(Value::Text(v.to_string())),
 
         // ===== To Boolean =====
@@ -390,7 +393,9 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 })?;
             Ok(Value::Jsonb(parsed.to_string()))
         }
-        (Value::Jsonb(s), DataType::Json) => Ok(Value::Json(s)),
+        (Value::Jsonb(s), DataType::Json) => {
+            Ok(Value::Json(crate::sql::jsonb::format_jsonb_pg_str(&s)))
+        }
         (Value::Jsonb(s), DataType::Jsonb) => Ok(Value::Jsonb(s)),
         // Explicit: any value → JSON via to_string (existing behavior from cast_value_to_type)
         (v, DataType::Json) if context == CastContext::Explicit => {

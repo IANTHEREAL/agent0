@@ -195,7 +195,11 @@ fn encode_value_raw(value: &Value, buf: &mut Vec<u8>) {
         Value::Null => {} // handled by caller
         Value::Boolean(b) => buf.push(if *b { b't' } else { b'f' }),
         Value::Text(s) => buf.extend_from_slice(s.as_bytes()),
-        Value::Json(s) | Value::Jsonb(s) => buf.extend_from_slice(s.as_bytes()),
+        Value::Json(s) => buf.extend_from_slice(s.as_bytes()),
+        Value::Jsonb(s) => {
+            let canonical = crate::sql::jsonb::format_jsonb_pg_str(s);
+            buf.extend_from_slice(canonical.as_bytes());
+        }
         Value::Tsvector(s) | Value::Tsquery(s) => buf.extend_from_slice(s.as_bytes()),
         Value::Bytes(b) => {
             // CSV uses single-backslash hex (no text-mode double escaping).
@@ -307,8 +311,12 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>, delimiter: u8) {
         Value::Vector(vec) => {
             buf.extend_from_slice(crate::types::format_vector_pg_text(vec).as_bytes());
         }
-        Value::Json(s) | Value::Jsonb(s) => {
+        Value::Json(s) => {
             escape_text(s.as_bytes(), buf, delimiter);
+        }
+        Value::Jsonb(s) => {
+            let canonical = crate::sql::jsonb::format_jsonb_pg_str(s);
+            escape_text(canonical.as_bytes(), buf, delimiter);
         }
         Value::Numeric(d) => {
             buf.extend_from_slice(d.to_string().as_bytes());
@@ -833,6 +841,49 @@ mod tests {
         let mut buf = Vec::new();
         encode_row_with_options(&[Value::Text("a\"b,c".to_string())], &mut buf, &opts);
         assert_eq!(buf, b"\"a\"\"b,c\"\n");
+    }
+
+    #[test]
+    fn test_jsonb_copy_text_canonical() {
+        let mut buf = Vec::new();
+        encode_row_with_options(
+            &[Value::Jsonb(r#"{"b":1,"a":2}"#.to_string())],
+            &mut buf,
+            &CopyOptions::default(),
+        );
+        assert_eq!(buf, b"{\"a\": 2, \"b\": 1}\n");
+    }
+
+    #[test]
+    fn test_jsonb_copy_csv_canonical() {
+        let opts = CopyOptions {
+            format: CopyFormat::Csv,
+            delimiter: b',',
+            null_string: String::new(),
+            header: false,
+            quote: b'"',
+            escape: b'"',
+        };
+        let mut buf = Vec::new();
+        encode_row_with_options(
+            &[Value::Jsonb(r#"{"b":1,"a":2}"#.to_string())],
+            &mut buf,
+            &opts,
+        );
+        // CSV quotes the value because it contains commas
+        assert_eq!(buf, b"\"{\"\"a\"\": 2, \"\"b\"\": 1}\"\n");
+    }
+
+    #[test]
+    fn test_json_copy_text_preserved() {
+        let mut buf = Vec::new();
+        encode_row_with_options(
+            &[Value::Json(r#"{"b":1,"a":2}"#.to_string())],
+            &mut buf,
+            &CopyOptions::default(),
+        );
+        // JSON preserves original format (no canonicalization)
+        assert_eq!(buf, b"{\"b\":1,\"a\":2}\n");
     }
 
     #[test]

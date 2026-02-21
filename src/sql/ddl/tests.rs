@@ -229,3 +229,36 @@ fn set_data_type_stats_invalidation_matches_type_change() {
         &DataType::Int64
     ));
 }
+
+#[test]
+fn coerce_jsonb_to_text_produces_canonical_output() {
+    let col = crate::types::ColumnDef {
+        name: "data".to_string(),
+        data_type: DataType::Text,
+        nullable: true,
+        primary_key: false,
+        unique: false,
+        is_serial: false,
+        default_expr: None,
+    };
+    let result =
+        coerce_value_for_type_change(Value::Jsonb(r#"{"b":1,"a":2}"#.to_string()), &col).unwrap();
+    assert_eq!(result, Value::Text(r#"{"a": 2, "b": 1}"#.to_string()));
+}
+
+#[test]
+fn coerce_json_to_text_preserves_raw_format() {
+    let col = crate::types::ColumnDef {
+        name: "data".to_string(),
+        data_type: DataType::Text,
+        nullable: true,
+        primary_key: false,
+        unique: false,
+        is_serial: false,
+        default_expr: None,
+    };
+    let result =
+        coerce_value_for_type_change(Value::Json(r#"{"b":1,"a":2}"#.to_string()), &col).unwrap();
+    // JSON preserves the original string verbatim
+    assert_eq!(result, Value::Text(r#"{"b":1,"a":2}"#.to_string()));
+}

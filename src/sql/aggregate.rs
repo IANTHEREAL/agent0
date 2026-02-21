@@ -46,6 +46,9 @@ pub enum Aggregator {
     JsonAgg {
         values: Vec<Value>,
     },
+    JsonbAgg {
+        values: Vec<Value>,
+    },
 }
 
 impl Aggregator {
@@ -73,7 +76,8 @@ impl Aggregator {
             "ARRAY_AGG" => Ok(Aggregator::ArrayAgg { values: Vec::new() }),
             "BOOL_AND" | "EVERY" => Ok(Aggregator::BoolAnd(None)),
             "BOOL_OR" => Ok(Aggregator::BoolOr(None)),
-            "JSON_AGG" | "JSONB_AGG" => Ok(Aggregator::JsonAgg { values: Vec::new() }),
+            "JSON_AGG" => Ok(Aggregator::JsonAgg { values: Vec::new() }),
+            "JSONB_AGG" => Ok(Aggregator::JsonbAgg { values: Vec::new() }),
             _ => Err(
                 SqlError::Unsupported(format!("Unsupported aggregate function: {}", kind)).into(),
             ),
@@ -206,6 +210,9 @@ impl Aggregator {
             Aggregator::JsonAgg { values } => {
                 values.push(val.clone());
             }
+            Aggregator::JsonbAgg { values } => {
+                values.push(val.clone());
+            }
         }
         Ok(())
     }
@@ -250,8 +257,20 @@ impl Aggregator {
                 if values.is_empty() {
                     Value::Null
                 } else {
-                    let items: Vec<String> = values.iter().map(value_to_json_str).collect();
+                    // json_agg returns Value::Json which bypasses JSONB output-boundary
+                    // canonicalization, so JSONB elements must be canonicalized here.
+                    let items: Vec<String> =
+                        values.iter().map(value_to_json_str_canonical).collect();
                     Value::Json(format!("[{}]", items.join(",")))
+                }
+            }
+            Aggregator::JsonbAgg { values } => {
+                if values.is_empty() {
+                    Value::Null
+                } else {
+                    let items: Vec<String> = values.iter().map(value_to_json_str).collect();
+                    // Compact format — output boundary will canonicalize
+                    Value::Jsonb(format!("[{}]", items.join(",")))
                 }
             }
         }
@@ -259,7 +278,12 @@ impl Aggregator {
 }
 
 /// Convert a Value to its JSON representation string.
-fn value_to_json_str(v: &Value) -> String {
+///
+/// When `canonicalize_jsonb` is true, `Value::Jsonb` elements at any depth are
+/// formatted using PostgreSQL JSONB canonical output (length-first key order,
+/// spaced separators). This is needed for JSON_AGG, whose `Value::Json` result
+/// bypasses the JSONB output-boundary formatting layer.
+fn value_to_json_str_inner(v: &Value, canonicalize_jsonb: bool) -> String {
     match v {
         Value::Null => "null".to_string(),
         Value::Boolean(b) => b.to_string(),
@@ -283,11 +307,21 @@ fn value_to_json_str(v: &Value) -> String {
             format!("\"{}\"", escaped)
         }
         Value::Json(j) => j.clone(),
+        Value::Jsonb(j) => {
+            if canonicalize_jsonb {
+                crate::sql::jsonb::format_jsonb_pg_str(j)
+            } else {
+                j.clone()
+            }
+        }
         Value::Bytes(b) => {
             format!("\"\\\\x{}\"", hex::encode(b))
         }
         Value::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(value_to_json_str).collect();
+            let items: Vec<String> = arr
+                .iter()
+                .map(|v| value_to_json_str_inner(v, canonicalize_jsonb))
+                .collect();
             format!("[{}]", items.join(","))
         }
         _ => {
@@ -301,6 +335,14 @@ fn value_to_json_str(v: &Value) -> String {
             format!("\"{}\"", escaped)
         }
     }
+}
+
+fn value_to_json_str(v: &Value) -> String {
+    value_to_json_str_inner(v, false)
+}
+
+fn value_to_json_str_canonical(v: &Value) -> String {
+    value_to_json_str_inner(v, true)
 }
 
 fn add_values(left: &Value, right: &Value) -> Result<Value> {
@@ -707,6 +749,77 @@ mod tests {
     fn test_array_agg_empty() {
         let agg = Aggregator::new("ARRAY_AGG", None).unwrap();
         assert_eq!(agg.result(), Value::Null);
+    }
+
+    #[test]
+    fn test_jsonb_agg_returns_jsonb_type() {
+        let mut agg = Aggregator::new("JSONB_AGG", None).unwrap();
+        agg.update(&Value::Int32(1)).unwrap();
+        agg.update(&Value::Int32(2)).unwrap();
+        agg.update(&Value::Int32(3)).unwrap();
+        match agg.result() {
+            Value::Jsonb(s) => assert_eq!(s, "[1,2,3]"),
+            other => panic!("expected Value::Jsonb, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_jsonb_agg_with_jsonb_inputs() {
+        let mut agg = Aggregator::new("JSONB_AGG", None).unwrap();
+        agg.update(&Value::Jsonb(r#"{"a":1}"#.to_string())).unwrap();
+        agg.update(&Value::Jsonb(r#"{"b":2}"#.to_string())).unwrap();
+        match agg.result() {
+            Value::Jsonb(s) => assert_eq!(s, r#"[{"a":1},{"b":2}]"#),
+            other => panic!("expected Value::Jsonb, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_jsonb_agg_empty() {
+        let agg = Aggregator::new("JSONB_AGG", None).unwrap();
+        assert_eq!(agg.result(), Value::Null);
+    }
+
+    #[test]
+    fn test_json_agg_returns_json_type() {
+        let mut agg = Aggregator::new("JSON_AGG", None).unwrap();
+        agg.update(&Value::Int32(1)).unwrap();
+        agg.update(&Value::Int32(2)).unwrap();
+        match agg.result() {
+            Value::Json(s) => assert_eq!(s, "[1,2]"),
+            other => panic!("expected Value::Json, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_json_agg_with_jsonb_inputs_canonical() {
+        // json_agg(jsonb_col) must canonicalize JSONB elements inside the JSON array,
+        // because the result is Value::Json which bypasses JSONB output-boundary formatting.
+        // PG 17.7: SELECT json_agg(v) FROM (VALUES ('{"color":"w","size":"M"}'::jsonb)) t(v);
+        //       => [{"size": "M", "color": "w"}]
+        let mut agg = Aggregator::new("JSON_AGG", None).unwrap();
+        agg.update(&Value::Jsonb(r#"{"color":"w","size":"M"}"#.to_string()))
+            .unwrap();
+        match agg.result() {
+            Value::Json(s) => assert_eq!(s, r#"[{"size": "M", "color": "w"}]"#),
+            other => panic!("expected Value::Json, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_json_agg_with_nested_jsonb_array_canonical() {
+        // json_agg(jsonb[]) must canonicalize JSONB elements at any nesting depth.
+        // PG 17.7: SELECT json_agg(arr) FROM (SELECT ARRAY['{"color":"w","size":"M"}'::jsonb]) t(arr);
+        //       => [[{"size": "M", "color": "w"}]]
+        let mut agg = Aggregator::new("JSON_AGG", None).unwrap();
+        agg.update(&Value::Array(vec![Value::Jsonb(
+            r#"{"color":"w","size":"M"}"#.to_string(),
+        )]))
+        .unwrap();
+        match agg.result() {
+            Value::Json(s) => assert_eq!(s, r#"[[{"size": "M", "color": "w"}]]"#),
+            other => panic!("expected Value::Json, got {:?}", other),
+        }
     }
 
     fn parse_first_projection_function(sql: &str) -> sqlparser::ast::Function {

@@ -1,5 +1,34 @@
 # Worklog
 
+## 2026-02-21: Issue #281 — JSON/JSONB Canonicalization
+
+### Problem
+TiPG's JSONB output was missing PostgreSQL's canonical formatting (spaces after `:` and `,`). The wire text encoder (`write_jsonb_pg()`) in `encode/value.rs` correctly handled formatting, but multiple other output paths (binary wire, COPY, cast to text/json, ALTER TYPE) bypassed it and emitted raw compact stored strings. Additionally, `JSONB_AGG` returned `Value::Json` instead of `Value::Jsonb`.
+
+### Solution: Output-Boundary Canonicalization
+Extracted the existing `write_jsonb_pg()` logic into a reusable `format_jsonb_pg_str()` helper in `src/sql/jsonb.rs`, then applied it at ALL output boundaries:
+
+1. **`src/sql/jsonb.rs`** — Added `format_jsonb_pg()`, `format_jsonb_pg_str()`, `write_jsonb_pg()` + 8 unit tests
+2. **`src/sql/mod.rs`** — Changed `mod jsonb` → `pub(crate) mod jsonb` for cross-module access
+3. **`src/protocol/handler/encode/value.rs`** — Text: replaced inline formatter with shared helper. Binary: canonicalize before sending.
+4. **`src/protocol/copy_format.rs`** — Split `Value::Json | Value::Jsonb` in both text and CSV paths
+5. **`src/sql/types/cast/mod.rs`** — Added JSONB→text cast, fixed JSONB→JSON cast
+6. **`src/sql/ddl/mod.rs`** — Fixed ALTER TYPE JSONB→text coercion path
+7. **`src/sql/aggregate.rs`** — Added `JsonbAgg` variant, fixed `value_to_json_str` for `Value::Jsonb`
+
+### What Did NOT Change
+- Internal stored format: `Value::Jsonb(String)` still holds compact `serde_json::to_string()` output
+- Hash/equality/group-by paths: unchanged (use raw stored string)
+- JSON type: fully preserved as-is
+- `Display for Value`: NOT changed (avoids cross-layer coupling)
+
+### Verification
+- `cargo build` — clean compile
+- `cargo test` — all 1917 tests pass (0 failures)
+- 17 new regression tests added across 4 files
+
+---
+
 ## 2026-02-21: Issue #906 Follow-ups (3 Commits)
 
 ### Commit 1: refactor(executor): extract shared runtime helpers from dispatch paths

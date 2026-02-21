@@ -24,7 +24,7 @@ mod gin;
 pub(crate) mod index_consistency;
 mod index_helpers;
 mod information_schema;
-mod jsonb;
+pub(crate) mod jsonb;
 mod names;
 pub mod operators;
 pub mod optimizer;

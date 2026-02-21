@@ -155,64 +155,7 @@ fn encode_value_text(
             encoder.encode_field(&option_elems)
         }
         Value::Json(s) => encoder.encode_field(s),
-        Value::Jsonb(s) => {
-            fn write_jsonb_pg(out: &mut String, val: &serde_json::Value) {
-                match val {
-                    serde_json::Value::Null => out.push_str("null"),
-                    serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-                    serde_json::Value::Number(n) => out.push_str(&n.to_string()),
-                    serde_json::Value::String(s) => {
-                        if let Ok(escaped) = serde_json::to_string(s) {
-                            out.push_str(&escaped);
-                        } else {
-                            out.push_str("\"\"");
-                        }
-                    }
-                    serde_json::Value::Array(arr) => {
-                        out.push('[');
-                        for (idx, item) in arr.iter().enumerate() {
-                            if idx > 0 {
-                                out.push_str(", ");
-                            }
-                            write_jsonb_pg(out, item);
-                        }
-                        out.push(']');
-                    }
-                    serde_json::Value::Object(obj) => {
-                        use std::cmp::Ordering;
-                        let mut items: Vec<(&String, &serde_json::Value)> = obj.iter().collect();
-                        items.sort_by(|(k1, _), (k2, _)| match k1.len().cmp(&k2.len()) {
-                            Ordering::Equal => k1.cmp(k2),
-                            other => other,
-                        });
-
-                        out.push('{');
-                        for (idx, (k, v)) in items.into_iter().enumerate() {
-                            if idx > 0 {
-                                out.push_str(", ");
-                            }
-                            if let Ok(key) = serde_json::to_string(k) {
-                                out.push_str(&key);
-                            } else {
-                                out.push_str("\"\"");
-                            }
-                            out.push_str(": ");
-                            write_jsonb_pg(out, v);
-                        }
-                        out.push('}');
-                    }
-                }
-            }
-
-            match serde_json::from_str::<serde_json::Value>(s) {
-                Ok(val) => {
-                    let mut formatted = String::new();
-                    write_jsonb_pg(&mut formatted, &val);
-                    encoder.encode_field(&formatted)
-                }
-                Err(_) => encoder.encode_field(s),
-            }
-        }
+        Value::Jsonb(s) => encoder.encode_field(&crate::sql::jsonb::format_jsonb_pg_str(s)),
         Value::Vector(vec) => encoder.encode_field(&crate::types::format_vector_pg_text(vec)),
         Value::Time(micros) => {
             let total_secs = micros / 1_000_000;
@@ -327,9 +270,10 @@ fn encode_value_binary(
             encoder.encode_field_with_type_and_format(s, &Type::JSON, FieldFormat::Binary)
         }
         Value::Jsonb(s) => {
-            // JSONB binary = version byte (0x01) + JSON text bytes
+            // JSONB binary = version byte (0x01) + canonical JSON text bytes
             use bytes::BufMut;
-            let json_bytes = s.as_bytes();
+            let canonical = crate::sql::jsonb::format_jsonb_pg_str(s);
+            let json_bytes = canonical.as_bytes();
             let mut buf = Vec::with_capacity(1 + json_bytes.len());
             buf.put_u8(1); // JSONB version byte
             buf.extend_from_slice(json_bytes);

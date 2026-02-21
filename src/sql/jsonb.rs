@@ -5,6 +5,77 @@
 
 use serde_json::{Number as JsonNumber, Value as JsonValue};
 
+// ── PostgreSQL JSONB canonical text formatting ──────────────────────────────
+
+/// Format a `serde_json::Value` as PostgreSQL JSONB text output.
+///
+/// PostgreSQL JSONB output contract:
+/// - Object keys sorted by length first, then lexicographically within equal lengths
+/// - Separators: ": " (colon-space) and ", " (comma-space)
+/// - Standard JSON string escaping
+pub(crate) fn format_jsonb_pg(val: &JsonValue) -> String {
+    let mut out = String::new();
+    write_jsonb_pg(&mut out, val);
+    out
+}
+
+/// Parse raw JSON string and format as PostgreSQL JSONB text.
+/// Returns original string on parse failure (defensive).
+pub(crate) fn format_jsonb_pg_str(raw: &str) -> String {
+    match serde_json::from_str::<JsonValue>(raw) {
+        Ok(val) => format_jsonb_pg(&val),
+        Err(_) => raw.to_string(),
+    }
+}
+
+fn write_jsonb_pg(out: &mut String, val: &JsonValue) {
+    match val {
+        JsonValue::Null => out.push_str("null"),
+        JsonValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        JsonValue::Number(n) => out.push_str(&n.to_string()),
+        JsonValue::String(s) => {
+            if let Ok(escaped) = serde_json::to_string(s) {
+                out.push_str(&escaped);
+            } else {
+                out.push_str("\"\"");
+            }
+        }
+        JsonValue::Array(arr) => {
+            out.push('[');
+            for (idx, item) in arr.iter().enumerate() {
+                if idx > 0 {
+                    out.push_str(", ");
+                }
+                write_jsonb_pg(out, item);
+            }
+            out.push(']');
+        }
+        JsonValue::Object(obj) => {
+            use std::cmp::Ordering;
+            let mut items: Vec<(&String, &JsonValue)> = obj.iter().collect();
+            items.sort_by(|(k1, _), (k2, _)| match k1.len().cmp(&k2.len()) {
+                Ordering::Equal => k1.cmp(k2),
+                other => other,
+            });
+
+            out.push('{');
+            for (idx, (k, v)) in items.into_iter().enumerate() {
+                if idx > 0 {
+                    out.push_str(", ");
+                }
+                if let Ok(key) = serde_json::to_string(k) {
+                    out.push_str(&key);
+                } else {
+                    out.push_str("\"\"");
+                }
+                out.push_str(": ");
+                write_jsonb_pg(out, v);
+            }
+            out.push('}');
+        }
+    }
+}
+
 /// Returns `true` if `container` JSONB contains `containee` JSONB (`@>` semantics).
 ///
 /// Semantics:
@@ -192,5 +263,69 @@ mod tests {
         assert!(exists_any(&obj, ["a", "c"].into_iter()));
         assert!(exists_all(&obj, ["a", "b"].into_iter()));
         assert!(!exists_all(&obj, ["a", "c"].into_iter()));
+    }
+
+    // ── format_jsonb_pg tests ───────────────────────────────────────────────
+
+    #[test]
+    fn format_length_first_sort() {
+        // "size" (4) before "color" (5)
+        assert_eq!(
+            format_jsonb_pg_str(r#"{"color":"w","size":"M"}"#),
+            r#"{"size": "M", "color": "w"}"#
+        );
+    }
+
+    #[test]
+    fn format_equal_length_lexical() {
+        assert_eq!(
+            format_jsonb_pg_str(r#"{"bb":1,"aa":2}"#),
+            r#"{"aa": 2, "bb": 1}"#
+        );
+    }
+
+    #[test]
+    fn format_spaced_separators() {
+        assert_eq!(format_jsonb_pg_str(r#"{"a":1}"#), r#"{"a": 1}"#);
+    }
+
+    #[test]
+    fn format_array() {
+        assert_eq!(format_jsonb_pg_str(r#"[1,2,3]"#), r#"[1, 2, 3]"#);
+    }
+
+    #[test]
+    fn format_nested_objects() {
+        assert_eq!(
+            format_jsonb_pg_str(r#"{"b":{"d":1,"c":2},"a":3}"#),
+            r#"{"a": 3, "b": {"c": 2, "d": 1}}"#
+        );
+    }
+
+    #[test]
+    fn format_scalars() {
+        assert_eq!(format_jsonb_pg_str("null"), "null");
+        assert_eq!(format_jsonb_pg_str("true"), "true");
+        assert_eq!(format_jsonb_pg_str("false"), "false");
+        assert_eq!(format_jsonb_pg_str("42"), "42");
+        assert_eq!(format_jsonb_pg_str(r#""hello""#), r#""hello""#);
+    }
+
+    #[test]
+    fn format_string_escaping() {
+        assert_eq!(format_jsonb_pg_str(r#"{"k":"a\"b"}"#), r#"{"k": "a\"b"}"#);
+    }
+
+    #[test]
+    fn format_idempotent() {
+        let input = r#"{"color":"white","size":"M"}"#;
+        let once = format_jsonb_pg_str(input);
+        let twice = format_jsonb_pg_str(&once);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn format_invalid_json_passthrough() {
+        assert_eq!(format_jsonb_pg_str("not json"), "not json");
     }
 }

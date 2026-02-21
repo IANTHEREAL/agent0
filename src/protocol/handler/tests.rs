@@ -2540,3 +2540,49 @@ fn test_utility_describe_show_all_case_insensitive() {
     assert_eq!(fields[1].name(), "setting");
     assert_eq!(fields[2].name(), "description");
 }
+
+// ── JSONB canonicalization regression tests ──────────────────────────────────
+
+#[test]
+fn test_encode_jsonb_text_canonical() {
+    // Compact stored format should produce canonical output with spaces
+    assert_eq!(
+        encode_value_to_string(
+            &Value::Jsonb(r#"{"b":1,"a":2}"#.to_string()),
+            Some(&DataType::Jsonb)
+        ),
+        r#"{"a": 2, "b": 1}"#
+    );
+}
+
+#[test]
+fn test_encode_jsonb_binary_canonical() {
+    use crate::types::DataType;
+    use pgwire::api::results::FieldInfo;
+    let fields = Arc::new(vec![FieldInfo::new(
+        "j".to_string(),
+        None,
+        None,
+        Type::JSONB,
+        FieldFormat::Binary,
+    )]);
+    let mut encoder = DataRowEncoder::new(fields);
+    let tz = crate::types::timestamp::TimeZoneSpec::parse("UTC");
+    encode_value(
+        &mut encoder,
+        &Value::Jsonb(r#"{"b":1,"a":2}"#.to_string()),
+        Some(&DataType::Jsonb),
+        tz,
+        FieldFormat::Binary,
+    )
+    .unwrap();
+    let row = encoder.finish().unwrap();
+    let mut data = row.data;
+    let len = data.get_i32();
+    assert!(len > 0);
+    let bytes = data.copy_to_bytes(len as usize);
+    // First byte is JSONB version byte (0x01), rest is canonical text
+    assert_eq!(bytes[0], 0x01);
+    let json_text = std::str::from_utf8(&bytes[1..]).unwrap();
+    assert_eq!(json_text, r#"{"a": 2, "b": 1}"#);
+}

@@ -468,3 +468,27 @@ fn varchar_explicit_truncates_silently() {
     );
     assert_eq!(result.unwrap(), Value::Text("hel".into()));
 }
+
+// ---- JSONB → Text canonicalization ----
+#[test]
+fn jsonb_to_text_canonical() {
+    let result = cast(
+        Value::Jsonb(r#"{"b":1,"a":2}"#.into()),
+        &DataType::Text,
+        CastContext::Explicit,
+    )
+    .unwrap();
+    assert_eq!(result, Value::Text(r#"{"a": 2, "b": 1}"#.into()));
+}
+
+// ---- JSONB → JSON canonicalization ----
+#[test]
+fn jsonb_to_json_canonical() {
+    let result = cast(
+        Value::Jsonb(r#"{"b":1,"a":2}"#.into()),
+        &DataType::Json,
+        CastContext::Explicit,
+    )
+    .unwrap();
+    assert_eq!(result, Value::Json(r#"{"a": 2, "b": 1}"#.into()));
+}
