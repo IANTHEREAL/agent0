@@ -250,7 +250,7 @@ impl Aggregator {
                 if values.is_empty() {
                     Value::Null
                 } else {
-                    let items: Vec<String> = values.iter().map(|v| value_to_json_str(v)).collect();
+                    let items: Vec<String> = values.iter().map(value_to_json_str).collect();
                     Value::Json(format!("[{}]", items.join(",")))
                 }
             }
@@ -266,9 +266,7 @@ fn value_to_json_str(v: &Value) -> String {
         Value::Int32(i) => i.to_string(),
         Value::Int64(i) => i.to_string(),
         Value::Float64(f) => {
-            if f.is_nan() {
-                "null".to_string()
-            } else if f.is_infinite() {
+            if f.is_nan() || f.is_infinite() {
                 "null".to_string()
             } else {
                 f.to_string()
@@ -289,7 +287,7 @@ fn value_to_json_str(v: &Value) -> String {
             format!("\"\\\\x{}\"", hex::encode(b))
         }
         Value::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(|v| value_to_json_str(v)).collect();
+            let items: Vec<String> = arr.iter().map(value_to_json_str).collect();
             format!("[{}]", items.join(","))
         }
         _ => {
