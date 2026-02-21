@@ -1,0 +1,547 @@
+//! Schema, view, function, trigger, cron, worker, and comment system key construction.
+//!
+//! All database-scoped metadata keys are built on top of `encode_database_data_prefix()`.
+//! Worker system keys are global (not per-database).
+
+use memcomparable::Deserializer;
+
+use super::{encode_database_data_prefix, SYS_MIGRATION_PREFIX};
+
+// Database-scoped metadata prefixes (used only in this module).
+const DB_SYS_NEXT_TABLE_ID: &[u8] = b"sys_next_table_id";
+const DB_SYS_NEXT_TYPE_OID: &[u8] = b"sys_next_type_oid";
+const DB_SYS_NEXT_SCHEMA_OID: &[u8] = b"sys_next_schema_oid";
+const DB_SYS_NEXT_SEQUENCE_OID: &[u8] = b"sys_next_sequence_oid";
+const DB_SYS_NEXT_FUNCTION_OID: &[u8] = b"sys_next_function_oid";
+const DB_SYS_NEXT_TRIGGER_OID: &[u8] = b"sys_next_trigger_oid";
+const DB_SYS_NEXT_VIEW_OID: &[u8] = b"sys_next_view_oid";
+const DB_SYS_SCHEMA_PREFIX: &[u8] = b"sys_schema_";
+const DB_SYS_SCHEMADEF_PREFIX: &[u8] = b"sys_schemadef_";
+const DB_SYS_VIEW_PREFIX: &[u8] = b"sys_view_";
+const DB_SYS_MATVIEW_PREFIX: &[u8] = b"sys_matview_";
+const DB_SYS_PROCEDURE_PREFIX: &[u8] = b"sys_proc_";
+const DB_SYS_FUNCTION_PREFIX: &[u8] = b"sys_func_";
+const DB_SYS_TRIGGER_PREFIX: &[u8] = b"sys_trigger_";
+const DB_SYS_TYPE_PREFIX: &[u8] = b"sys_type_";
+const DB_SYS_SEQUENCEDEF_PREFIX: &[u8] = b"sys_seqdef_";
+const DB_SYS_EXTENSION_PREFIX: &[u8] = b"sys_ext_";
+const DB_SYS_EXTENSIONCFG_PREFIX: &[u8] = b"sys_extcfg_";
+const DB_SYS_COMMENT_PREFIX: &[u8] = b"sys_comment_";
+const DB_SYS_RELNAME_PREFIX: &[u8] = b"sys_relname_";
+const DB_SYS_SEQ_PREFIX: &[u8] = b"sys_seq_";
+const DB_SYS_STATS_PREFIX: &[u8] = b"sys_stats_";
+const DB_SYS_CRON_JOB_PREFIX_V2: &[u8] = b"sys_cron_job_";
+const DB_SYS_CRON_RUN_PREFIX_V2: &[u8] = b"sys_cron_run_";
+const DB_SYS_CRON_SEQ_PREFIX_V2: &[u8] = b"sys_next_cron_job_id";
+const DB_SYS_CRON_RUN_SEQ_PREFIX_V2: &[u8] = b"sys_next_cron_run_id";
+const DB_SYS_CRON_ENABLED_PREFIX_V2: &[u8] = b"sys_cron_enabled";
+const DB_SYS_CRON_CLAIM_PREFIX_V2: &[u8] = b"sys_cron_claim_";
+
+// Worker system prefixes (global, not per-database)
+pub(super) const WORKER_REGISTRY_PREFIX: &[u8] = b"_worker_registry_";
+pub(super) const WORKER_QUEUE_PREFIX: &[u8] = b"_worker_queue_";
+pub(super) const WORKER_CLAIM_PREFIX: &[u8] = b"_worker_claim_";
+pub(super) const WORKER_BG_RESULT_PREFIX: &[u8] = b"_worker_bg_result_";
+
+// ============================================================================
+// Migration keys
+// ============================================================================
+
+pub fn encode_migration_key(name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(SYS_MIGRATION_PREFIX.len() + name.len());
+    key.extend_from_slice(SYS_MIGRATION_PREFIX);
+    key.extend_from_slice(name.as_bytes());
+    key
+}
+
+pub fn encode_migration_prefix() -> Vec<u8> {
+    SYS_MIGRATION_PREFIX.to_vec()
+}
+
+// ============================================================================
+// Database-scoped OID allocators
+// ============================================================================
+
+pub fn encode_next_table_id_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_NEXT_TABLE_ID);
+    key
+}
+
+pub fn encode_next_type_oid_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_NEXT_TYPE_OID);
+    key
+}
+
+pub fn encode_next_schema_oid_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_NEXT_SCHEMA_OID);
+    key
+}
+
+pub fn encode_next_sequence_oid_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_NEXT_SEQUENCE_OID);
+    key
+}
+
+pub fn encode_next_function_oid_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_NEXT_FUNCTION_OID);
+    key
+}
+
+pub fn encode_next_trigger_oid_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_NEXT_TRIGGER_OID);
+    key
+}
+
+pub fn encode_next_view_oid_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_NEXT_VIEW_OID);
+    key
+}
+
+// ============================================================================
+// Schema / table metadata keys
+// ============================================================================
+
+pub fn encode_schema_key_v2(db_id: u64, table_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_SCHEMA_PREFIX);
+    key.extend_from_slice(table_name.as_bytes());
+    key
+}
+
+pub fn encode_schema_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_SCHEMA_PREFIX);
+    key
+}
+
+pub fn encode_schema_def_key_v2(db_id: u64, schema_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_SCHEMADEF_PREFIX);
+    key.extend_from_slice(schema_name.as_bytes());
+    key
+}
+
+pub fn encode_schema_def_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_SCHEMADEF_PREFIX);
+    key
+}
+
+// ============================================================================
+// Type / sequence / stats / relname keys
+// ============================================================================
+
+pub fn encode_type_key_v2(db_id: u64, full_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_TYPE_PREFIX);
+    key.extend_from_slice(full_name.as_bytes());
+    key
+}
+
+pub fn encode_type_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_TYPE_PREFIX);
+    key
+}
+
+pub fn encode_sequence_def_key_v2(db_id: u64, full_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_SEQUENCEDEF_PREFIX);
+    key.extend_from_slice(full_name.as_bytes());
+    key
+}
+
+pub fn encode_sequence_def_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_SEQUENCEDEF_PREFIX);
+    key
+}
+
+pub fn encode_sequence_value_key_v2(db_id: u64, sequence_oid: u32) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_SEQ_PREFIX);
+    key.extend_from_slice(&sequence_oid.to_be_bytes());
+    key
+}
+
+pub fn encode_table_sequence_value_key_v2(db_id: u64, table_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_SEQ_PREFIX);
+    key.extend_from_slice(&table_id.to_be_bytes());
+    key
+}
+
+/// Encode the key for persisted table statistics (storage format v2, database-scoped).
+///
+/// Key format: `d_{db_id:8bytes}_sys_stats_{table_id:8bytes}`
+pub fn encode_stats_key_v2(db_id: u64, table_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_STATS_PREFIX);
+    key.extend_from_slice(&table_id.to_be_bytes());
+    key
+}
+
+/// Encode a relation-name reservation key (storage format v2, database-scoped).
+///
+/// Used to enforce schema-wide index name uniqueness via TiKV write-write
+/// conflict detection. The value stored is a single-byte tag (e.g. `b'I'`
+/// for index).
+pub fn encode_relname_key_v2(db_id: u64, full_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_RELNAME_PREFIX);
+    key.extend_from_slice(full_name.as_bytes());
+    key
+}
+
+// ============================================================================
+// Extension keys
+// ============================================================================
+
+pub fn encode_extension_key_v2(db_id: u64, ext_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_EXTENSION_PREFIX);
+    key.extend_from_slice(ext_name.as_bytes());
+    key
+}
+
+pub fn encode_extension_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_EXTENSION_PREFIX);
+    key
+}
+
+pub fn encode_extension_config_key_v2(db_id: u64, ext_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_EXTENSIONCFG_PREFIX);
+    key.extend_from_slice(ext_name.as_bytes());
+    key
+}
+
+// ============================================================================
+// Cron system keys
+// ============================================================================
+
+pub fn encode_cron_job_key_v2(db_id: u64, job_id: i64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_JOB_PREFIX_V2);
+    key.extend_from_slice(&job_id.to_be_bytes());
+    key
+}
+
+pub fn encode_cron_job_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_JOB_PREFIX_V2);
+    key
+}
+
+pub fn encode_cron_run_key_v2(db_id: u64, run_id: i64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_RUN_PREFIX_V2);
+    key.extend_from_slice(&run_id.to_be_bytes());
+    key
+}
+
+pub fn encode_cron_run_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_RUN_PREFIX_V2);
+    key
+}
+
+pub fn encode_cron_claim_key_v2(db_id: u64, job_id: i64, scheduled_min: i64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_CLAIM_PREFIX_V2);
+    key.extend_from_slice(&job_id.to_be_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&scheduled_min.to_be_bytes());
+    key
+}
+
+pub fn encode_cron_claim_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_CLAIM_PREFIX_V2);
+    key
+}
+
+pub fn encode_next_cron_job_id_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_SEQ_PREFIX_V2);
+    key
+}
+
+pub fn encode_next_cron_run_id_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_RUN_SEQ_PREFIX_V2);
+    key
+}
+
+pub fn encode_cron_enabled_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_ENABLED_PREFIX_V2);
+    key
+}
+
+// ============================================================================
+// Worker System Keys (Global, not per-database)
+// ============================================================================
+
+/// Encode a worker registry key (global).
+///
+/// Format: `_worker_registry_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}`
+pub fn encode_worker_registry_key(keyspace: &str, db_id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(WORKER_REGISTRY_PREFIX.len() + 2 + keyspace.len() + 1 + 8);
+    key.extend_from_slice(WORKER_REGISTRY_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key
+}
+
+/// Encode the prefix for all worker registry keys (global).
+pub fn encode_worker_registry_prefix() -> Vec<u8> {
+    WORKER_REGISTRY_PREFIX.to_vec()
+}
+
+/// Encode a worker queue key (global).
+///
+/// Format: `_worker_queue_{priority:u8}_{fire_time_ms:memcomparable}_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}_{task_id:be8}`
+///
+/// Priority byte comes first so lower values (higher priority) sort first.
+/// Fire time uses memcomparable encoding so earlier times sort first (handles negative values correctly).
+pub fn encode_worker_queue_key(
+    priority: u8,
+    fire_time_ms: i64,
+    keyspace: &str,
+    db_id: u64,
+    task_id: i64,
+) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(WORKER_QUEUE_PREFIX.len() + 1 + 8 + 2 + keyspace.len() + 1 + 8 + 8);
+    key.extend_from_slice(WORKER_QUEUE_PREFIX);
+    key.push(priority);
+    key.extend(memcomparable::to_vec(&fire_time_ms).unwrap());
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&task_id.to_be_bytes());
+    key
+}
+
+/// Encode the prefix for all worker queue keys (global).
+pub fn encode_worker_queue_prefix() -> Vec<u8> {
+    WORKER_QUEUE_PREFIX.to_vec()
+}
+
+/// Encode the exclusive upper bound for a worker queue range scan.
+///
+/// Used to scan all queue entries with a given priority and fire_time.
+/// Format: `_worker_queue_{priority:u8}_{fire_time_ms:memcomparable}` (no keyspace/db_id/task_id)
+pub fn encode_worker_queue_scan_end(priority: u8, fire_time_ms: i64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(WORKER_QUEUE_PREFIX.len() + 1 + 8);
+    key.extend_from_slice(WORKER_QUEUE_PREFIX);
+    key.push(priority);
+    key.extend(memcomparable::to_vec(&fire_time_ms).unwrap());
+    key
+}
+
+/// Decode fire_time_ms from a worker queue key.
+///
+/// Extracts the fire_time field from a queue key for sorting/filtering.
+/// Returns None if the key is too short or malformed.
+pub fn decode_worker_queue_fire_time(key: &[u8]) -> Option<i64> {
+    if key.len() < WORKER_QUEUE_PREFIX.len() + 1 {
+        return None;
+    }
+    let offset = WORKER_QUEUE_PREFIX.len() + 1;
+    let payload = &key[offset..];
+    let mut deserializer = Deserializer::new(payload);
+    serde::Deserialize::deserialize(&mut deserializer).ok()
+}
+
+/// Encode a worker claim key (global).
+///
+/// Format: `_worker_claim_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}_{task_id:be8}_{fire_time_min:be8}`
+pub fn encode_worker_claim_key(
+    keyspace: &str,
+    db_id: u64,
+    task_id: i64,
+    fire_time_min: i64,
+) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(WORKER_CLAIM_PREFIX.len() + 2 + keyspace.len() + 1 + 8 + 1 + 8 + 8);
+    key.extend_from_slice(WORKER_CLAIM_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&task_id.to_be_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&fire_time_min.to_be_bytes());
+    key
+}
+
+/// Encode the prefix for all worker claim keys (global).
+pub fn encode_worker_claim_prefix() -> Vec<u8> {
+    WORKER_CLAIM_PREFIX.to_vec()
+}
+
+/// Encode a worker background result key (global).
+///
+/// Format: `_worker_bg_result_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}_{task_id:be8}`
+pub fn encode_worker_bg_result_key(keyspace: &str, db_id: u64, task_id: i64) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(WORKER_BG_RESULT_PREFIX.len() + 2 + keyspace.len() + 1 + 8 + 1 + 8);
+    key.extend_from_slice(WORKER_BG_RESULT_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&task_id.to_be_bytes());
+    key
+}
+
+// ============================================================================
+// View / materialized view keys
+// ============================================================================
+
+pub fn encode_view_key_v2(db_id: u64, view_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_VIEW_PREFIX);
+    key.extend_from_slice(view_name.as_bytes());
+    key
+}
+
+pub fn encode_view_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_VIEW_PREFIX);
+    key
+}
+
+pub fn encode_matview_key_v2(db_id: u64, matview_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_MATVIEW_PREFIX);
+    key.extend_from_slice(matview_name.as_bytes());
+    key
+}
+
+pub fn encode_matview_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_MATVIEW_PREFIX);
+    key
+}
+
+// ============================================================================
+// Procedure / function keys
+// ============================================================================
+
+pub fn encode_procedure_key_v2(db_id: u64, proc_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_PROCEDURE_PREFIX);
+    key.extend_from_slice(proc_name.as_bytes());
+    key
+}
+
+pub fn encode_procedure_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_PROCEDURE_PREFIX);
+    key
+}
+
+pub fn encode_function_key_v2(db_id: u64, full_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_FUNCTION_PREFIX);
+    key.extend_from_slice(full_name.as_bytes());
+    key
+}
+
+pub fn encode_function_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_FUNCTION_PREFIX);
+    key
+}
+
+// ============================================================================
+// Trigger keys
+// ============================================================================
+
+pub fn encode_trigger_key_v2(db_id: u64, table_full_name: &str, trigger_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_TRIGGER_PREFIX);
+    key.extend_from_slice(table_full_name.as_bytes());
+    key.push(b'/');
+    key.extend_from_slice(trigger_name.as_bytes());
+    key
+}
+
+pub fn encode_trigger_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_TRIGGER_PREFIX);
+    key
+}
+
+pub fn encode_trigger_table_prefix_v2(db_id: u64, table_full_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_TRIGGER_PREFIX);
+    key.extend_from_slice(table_full_name.as_bytes());
+    key.push(b'/');
+    key
+}
+
+// ============================================================================
+// Comment keys
+// ============================================================================
+
+pub(crate) fn encode_comment_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_COMMENT_PREFIX);
+    key
+}
+
+pub(crate) fn encode_comment_extension_key_v2(db_id: u64, ext_name: &str) -> Vec<u8> {
+    let mut key = encode_comment_prefix_v2(db_id);
+    key.push(b'e');
+    key.push(0);
+    key.extend_from_slice(ext_name.as_bytes());
+    key
+}
+
+pub(crate) fn encode_comment_function_key_v2(db_id: u64, func_full_name: &str) -> Vec<u8> {
+    let mut key = encode_comment_prefix_v2(db_id);
+    key.push(b'f');
+    key.push(0);
+    key.extend_from_slice(func_full_name.as_bytes());
+    key
+}
+
+pub(crate) fn encode_comment_table_key_v2(db_id: u64, table_full_name: &str) -> Vec<u8> {
+    let mut key = encode_comment_prefix_v2(db_id);
+    key.push(b't');
+    key.push(0);
+    key.extend_from_slice(table_full_name.as_bytes());
+    key
+}
+
+pub(crate) fn encode_comment_column_key_v2(
+    db_id: u64,
+    table_full_name: &str,
+    column_name: &str,
+) -> Vec<u8> {
+    let mut key = encode_comment_prefix_v2(db_id);
+    key.push(b'c');
+    key.push(0);
+    key.extend_from_slice(table_full_name.as_bytes());
+    key.push(0);
+    key.extend_from_slice(column_name.as_bytes());
+    key
+}

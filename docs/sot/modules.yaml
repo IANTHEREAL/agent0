@@ -71,7 +71,7 @@ modules:
       - 'pgwire message framing and protocol-level behavior (authoritative: `protocol-pgwire`)'
       - 'RBAC policy definitions (authoritative: `auth-rbac`)'
     code_entrypoints:
-      - path: src/sql/parser.rs
+      - path: src/sql/parser/mod.rs
         symbols: [parse_sql]
       - path: src/sql/planner.rs
         symbols: [choose_join_algorithm]
@@ -128,7 +128,7 @@ modules:
       - 'pgwire protocol and startup messaging (authoritative: `protocol-pgwire`)'
       - 'auth/RBAC semantics (authoritative: `auth-rbac`)'
     code_entrypoints:
-      - path: src/storage/encoding.rs
+      - path: src/storage/encoding/mod.rs
       - path: src/storage/tikv_store/mod.rs
         symbols: [TikvStore]
       - path: src/pool.rs
@@ -242,7 +242,7 @@ modules:
       - path: src/sql/executor/extensions.rs
       - path: src/sql/gin.rs
       - path: src/sql/fts.rs
-      - path: src/storage/encoding.rs
+      - path: src/storage/encoding/mod.rs
     gate_tests:
       - ci:.github/workflows/orm-tests.yml/test
       - cmd:python3 scripts/integration_test.py --dsn "$PG_DSN" tests/86_extensions_framework_http.sql
