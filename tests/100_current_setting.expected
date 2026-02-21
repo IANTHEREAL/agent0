@@ -16,3 +16,30 @@ public, ss_s1
 search_path
 public, ss_s1
 (1 row)
+tz_notempty
+t
+(1 row)
+sp_len
+t
+(1 row)
+scs_check
+t
+(1 row)
+unknown_null
+t
+(1 row)
+text_missing_ok
+t
+(1 row)
+null_name
+t
+(1 row)
+null_missing_ok
+t
+(1 row)
+current_setting
+Asia/Shanghai
+(1 row)
+current_setting
+UTC
+(1 row)

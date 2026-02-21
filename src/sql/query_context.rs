@@ -4,6 +4,7 @@
 //! `STATEMENT_TIMESTAMP_MILLIS` (statement_time.rs), `TIMEZONE` (session_context.rs).
 //! Legacy paths still read task-locals; eval functions require explicit context threading.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ tokio::task_local! {
     static CURRENT_TIMEZONE: Arc<str>;
     static QUERY_PARAMS: Vec<Option<Value>>;
     static QUERY_PARAM_TYPES: Vec<Option<crate::types::DataType>>;
+    static SETTINGS_SNAPSHOT: Arc<HashMap<String, String>>;
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +42,9 @@ pub struct QueryContext {
     /// Threaded to execute-time Analyzer so re-analysis uses the same type hints.
     /// Empty vec for simple-query path or when no types were finalized.
     pub param_types: Vec<Option<crate::types::DataType>>,
+    /// Snapshot of all session settings at statement start.
+    /// Used by `current_setting()` in expression contexts.
+    pub settings_snapshot: Option<Arc<HashMap<String, String>>>,
 }
 
 impl QueryContext {
@@ -60,6 +65,7 @@ impl QueryContext {
             timezone,
             params: vec![],
             param_types: vec![],
+            settings_snapshot: None,
         }
     }
 
@@ -144,6 +150,7 @@ impl QueryContext {
         );
         qctx.params = params;
         qctx.param_types = Self::current_query_param_types();
+        qctx.settings_snapshot = SETTINGS_SNAPSHOT.try_with(|s| s.clone()).ok();
         qctx
     }
 
@@ -204,19 +211,27 @@ pub(crate) async fn with_scoped_query_context<R, Fut>(qctx: &QueryContext, fut: 
 where
     Fut: Future<Output = R>,
 {
+    // Always scope SETTINGS_SNAPSHOT to prevent stale inheritance from outer async scopes.
+    let snapshot = qctx
+        .settings_snapshot
+        .clone()
+        .unwrap_or_else(|| Arc::new(HashMap::new()));
     with_query_context(
         qctx.connection_id,
         qctx.database_name.clone(),
         qctx.current_user.clone(),
         qctx.timezone.clone(),
-        QUERY_PARAM_TYPES.scope(
-            qctx.param_types.clone(),
-            QUERY_PARAMS.scope(
-                qctx.params.clone(),
-                crate::sql::statement_time::with_timestamps(
-                    qctx.statement_timestamp_ms,
-                    qctx.transaction_timestamp_ms,
-                    fut,
+        SETTINGS_SNAPSHOT.scope(
+            snapshot,
+            QUERY_PARAM_TYPES.scope(
+                qctx.param_types.clone(),
+                QUERY_PARAMS.scope(
+                    qctx.params.clone(),
+                    crate::sql::statement_time::with_timestamps(
+                        qctx.statement_timestamp_ms,
+                        qctx.transaction_timestamp_ms,
+                        fut,
+                    ),
                 ),
             ),
         ),

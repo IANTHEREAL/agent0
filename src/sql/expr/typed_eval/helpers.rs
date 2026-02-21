@@ -106,6 +106,45 @@ pub(super) fn eval_function_call(
         "VERSION" => {
             return Ok(Value::Text(crate::sql::expr::VERSION_STRING.to_string()));
         }
+        "CURRENT_SETTING" | "PG_CATALOG.CURRENT_SETTING" => {
+            // Arg 0: setting name (text). NULL → NULL (strict function).
+            let name = match args.first() {
+                Some(Value::Text(s)) => s.to_lowercase(),
+                Some(Value::Null) | None => return Ok(Value::Null),
+                _ => return Err(anyhow!("current_setting requires text argument")),
+            };
+            let canonical =
+                crate::sql::session::settings::SessionSettings::canonical_setting_name(&name);
+            // Arg 1: missing_ok (boolean, default false).
+            // Accept Boolean directly, coerce Text→Boolean (PG accepts 'true'/'false'),
+            // NULL → NULL (strict), anything else → type error.
+            let missing_ok = match args.get(1) {
+                None => false,
+                Some(Value::Boolean(b)) => *b,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Text(s)) => {
+                    // Coerce text to boolean — propagate SqlError::InvalidInputSyntax directly.
+                    match crate::sql::types::cast::cast(
+                        Value::Text(s.clone()),
+                        &crate::types::DataType::Boolean,
+                        crate::sql::types::cast::CastContext::Implicit,
+                    )? {
+                        Value::Boolean(b) => b,
+                        _ => false,
+                    }
+                }
+                Some(_) => return Err(anyhow!("argument of current_setting must be type boolean")),
+            };
+            if let Some(ref snapshot) = qctx.settings_snapshot {
+                return match snapshot.get(canonical) {
+                    Some(v) => Ok(Value::Text(v.clone())),
+                    None if missing_ok => Ok(Value::Null),
+                    None => Err(anyhow!("unrecognized configuration parameter \"{}\"", name)),
+                };
+            }
+            // No snapshot (unit tests, DDL contexts) — fall through to error
+            return Err(anyhow!("unrecognized configuration parameter \"{}\"", name));
+        }
         "SET_CONFIG" | "PG_CATALOG.SET_CONFIG" => return Ok(Value::Text(String::new())),
         "PG_GET_USERBYID" => return Ok(Value::Text("postgres".to_string())),
         "NEXTVAL" | "CURRVAL" | "SETVAL" => {

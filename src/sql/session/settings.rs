@@ -101,7 +101,7 @@ impl SessionSettings {
         }
     }
 
-    fn canonical_setting_name<'a>(name: &'a str) -> &'a str {
+    pub(crate) fn canonical_setting_name<'a>(name: &'a str) -> &'a str {
         match name {
             "transaction.isolation.level" => "transaction_isolation",
             "tipg.max_sort_bytes" => "pgtikv.max_sort_bytes",
@@ -696,5 +696,75 @@ impl SessionSettings {
             }
         }
         self.max_sort_bytes
+    }
+
+    /// All keys that `show_value()` and `default_value()` handle explicitly.
+    ///
+    /// Kept adjacent to `show_value()` so that adding a new built-in GUC
+    /// to `show_value()` without adding it here is an obvious oversight.
+    const KNOWN_SETTING_KEYS: &'static [&'static str] = &[
+        // show_value() match arms
+        "server_version",
+        "server_version_num",
+        "server_encoding",
+        "search_path",
+        "datestyle",
+        "integer_datetimes",
+        "intervalstyle",
+        "statement_timeout",
+        "lock_timeout",
+        "idle_in_transaction_session_timeout",
+        "pgtikv.max_sort_bytes",
+        "tipg.use_optimizer",
+        "timezone",
+        "application_name",
+        "client_encoding",
+        "standard_conforming_strings",
+        "check_function_bodies",
+        "xmloption",
+        "client_min_messages",
+        "row_security",
+        "default_tablespace",
+        "default_table_access_method",
+        "transaction_isolation",
+        "default_transaction_isolation",
+        "default_transaction_read_only",
+        // default_value() fallthrough keys
+        "extra_float_digits",
+        "bytea_output",
+        "lc_messages",
+        "lc_monetary",
+        "lc_numeric",
+        "lc_time",
+        "max_identifier_length",
+        "max_index_keys",
+        "work_mem",
+        "default_text_search_config",
+        "in_hot_standby",
+        "password_encryption",
+    ];
+
+    /// Collect all current settings into a flat map.
+    ///
+    /// Resolves every key through `show_value()` so precedence
+    /// (local_overrides > typed fields > extra_settings > default_value)
+    /// is identical to `SHOW`.
+    pub(crate) fn all_values(&self) -> HashMap<String, String> {
+        use std::collections::HashSet;
+
+        let all_keys: HashSet<&str> = Self::KNOWN_SETTING_KEYS
+            .iter()
+            .copied()
+            .chain(self.extra_settings.keys().map(String::as_str))
+            .chain(self.local_overrides.keys().map(String::as_str))
+            .collect();
+
+        let mut map = HashMap::with_capacity(all_keys.len());
+        for key in all_keys {
+            if let Some(v) = self.show_value(key) {
+                map.insert(key.to_string(), v);
+            }
+        }
+        map
     }
 }

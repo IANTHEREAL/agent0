@@ -208,6 +208,8 @@ impl Session {
         if !self.pending_param_types.is_empty() {
             qctx.param_types = std::mem::take(&mut self.pending_param_types);
         }
+        // Snapshot all session settings so current_setting() works in expression contexts.
+        qctx.settings_snapshot = Some(Arc::new(self.all_settings_snapshot()));
         qctx
     }
 
@@ -352,6 +354,26 @@ impl Session {
 
     pub(crate) fn reset_all_settings(&mut self) {
         self.settings.reset_all_settings();
+    }
+
+    /// Snapshot all session settings into a flat map for `current_setting()` in
+    /// expression contexts. Includes both `SessionSettings` values and session-level
+    /// values (`is_superuser`, `session_authorization`).
+    pub(crate) fn all_settings_snapshot(&self) -> HashMap<String, String> {
+        let mut map = self.settings.all_values();
+        map.insert(
+            "is_superuser".to_string(),
+            if self.is_superuser { "on" } else { "off" }.to_string(),
+        );
+        let session_auth = self
+            .session_user
+            .as_deref()
+            .or(self.current_user.as_deref())
+            .unwrap_or("postgres")
+            .to_string();
+        map.insert("session_authorization".to_string(), session_auth.clone());
+        map.insert("session.authorization".to_string(), session_auth);
+        map
     }
 
     pub(crate) fn show_setting_value(&self, name: &str) -> Option<String> {
