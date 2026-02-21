@@ -12,4 +12,4 @@ ERROR:  cron.schedule() requires 2 or 3 arguments, got 0
 ERROR:  cron.schedule() requires 2 or 3 arguments, got 4
 ERROR:  cron.unschedule() requires exactly 1 argument, got 0
 ERROR:  cron.unschedule() requires exactly 1 argument, got 2
-ERROR:  cron.alter_job() requires 1 to 6 arguments, got 0
+ERROR:  cron.alter_job() requires 1 to 7 arguments, got 0
