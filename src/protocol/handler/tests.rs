@@ -349,6 +349,59 @@ fn prepared_text_column_plus_text_column_stays_42883() {
     assert_eq!(sql.sqlstate(), "42883");
 }
 
+// ── Mixed-unknown prepared statement tests (PG 42725 parity) ────
+
+#[test]
+fn prepared_param_plus_literal_returns_42725() {
+    let catalog = MockCatalog::empty();
+    let stmt = parse_single_statement("SELECT $1 + '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+    assert!(sql.to_string().contains("operator is not unique"));
+}
+
+#[test]
+fn prepared_param_minus_literal_returns_42725() {
+    let catalog = MockCatalog::empty();
+    let stmt = parse_single_statement("SELECT $1 - '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn prepared_param_mod_literal_returns_42725() {
+    let catalog = MockCatalog::empty();
+    let stmt = parse_single_statement("SELECT $1 % '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn prepared_explicit_cast_stays_42883() {
+    let catalog = MockCatalog::empty();
+    let stmt = parse_single_statement("SELECT $1 + '1'::text");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
+#[test]
+fn prepared_param_plus_null_returns_42725() {
+    let catalog = MockCatalog::empty();
+    let stmt = parse_single_statement("SELECT $1 + NULL");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
 #[test]
 fn test_update_tx_status_after_execution_clears_error_on_rollback_to_savepoint() {
     let status = TransactionStatus::Error;

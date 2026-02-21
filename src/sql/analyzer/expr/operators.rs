@@ -35,6 +35,46 @@ impl<'a> Analyzer<'a> {
             r = TypedExpr::null(l.data_type.clone());
         }
 
+        // Both-unknown ambiguity check (PG UNKNOWN type rule).
+        // Must run BEFORE contextual parameter typing to catch mixed-unknown
+        // cases like `$1 + '1'`, `NULL + '1'`, `NULL + NULL`.
+        if self.is_semantically_unknown(&l) && self.is_semantically_unknown(&r) {
+            if Self::resolves_unknown_pair_to_text(&typed_op) {
+                // Resolve unresolved params to Text; literals are already Text.
+                if let TypedExprKind::Parameter { index } = &l.kind {
+                    if self.is_unresolved_param(&l) {
+                        self.resolve_param_type(*index, &DataType::Text)?;
+                        l = TypedExpr::new(
+                            TypedExprKind::Parameter { index: *index },
+                            DataType::Text,
+                        );
+                    }
+                }
+                if let TypedExprKind::Parameter { index } = &r.kind {
+                    if self.is_unresolved_param(&r) {
+                        self.resolve_param_type(*index, &DataType::Text)?;
+                        r = TypedExpr::new(
+                            TypedExprKind::Parameter { index: *index },
+                            DataType::Text,
+                        );
+                    }
+                }
+                // Ensure NULLs carry Text data_type for downstream resolution
+                if l.is_null_constant() {
+                    l = TypedExpr::null(DataType::Text);
+                }
+                if r.is_null_constant() {
+                    r = TypedExpr::null(DataType::Text);
+                }
+            } else if Self::is_ambiguous_unknown_pair_op(&typed_op) {
+                return Err(AnalyzerError::AmbiguousOperator {
+                    operator: typed_op.to_string(),
+                    left: "unknown".to_string(),
+                    right: "unknown".to_string(),
+                });
+            }
+        }
+
         // Contextual parameter typing (mirrors NULL typing above).
         // Resolve parameter from the concrete type on the other side.
         // Always call resolve_param_type for conflict detection, even for
@@ -86,37 +126,6 @@ impl<'a> Analyzer<'a> {
                         DataType::Boolean,
                     );
                 }
-            }
-        }
-
-        let left_unresolved_param = match &l.kind {
-            TypedExprKind::Parameter { index } if self.is_unresolved_param(&l) => Some(*index),
-            _ => None,
-        };
-        let right_unresolved_param = match &r.kind {
-            TypedExprKind::Parameter { index } if self.is_unresolved_param(&r) => Some(*index),
-            _ => None,
-        };
-        if let (Some(left_index), Some(right_index)) =
-            (left_unresolved_param, right_unresolved_param)
-        {
-            if Self::resolves_unknown_pair_to_text(&typed_op) {
-                self.resolve_param_type(left_index, &DataType::Text)?;
-                self.resolve_param_type(right_index, &DataType::Text)?;
-                l = TypedExpr::new(
-                    TypedExprKind::Parameter { index: left_index },
-                    DataType::Text,
-                );
-                r = TypedExpr::new(
-                    TypedExprKind::Parameter { index: right_index },
-                    DataType::Text,
-                );
-            } else if Self::is_ambiguous_unknown_pair_op(&typed_op) {
-                return Err(AnalyzerError::AmbiguousOperator {
-                    operator: typed_op.to_string(),
-                    left: "unknown".to_string(),
-                    right: "unknown".to_string(),
-                });
             }
         }
 
@@ -244,6 +253,18 @@ impl<'a> Analyzer<'a> {
                 | BinaryOp::ShiftLeft
                 | BinaryOp::ShiftRight
         )
+    }
+
+    /// Returns true if `expr` is "semantically unknown" in PostgreSQL's sense:
+    /// an unresolved parameter, a bare (uncast) string literal, or a NULL constant.
+    /// This mirrors PG's `unknown` type category for operator overload resolution.
+    fn is_semantically_unknown(&self, expr: &TypedExpr) -> bool {
+        match &expr.kind {
+            TypedExprKind::Parameter { .. } => self.is_unresolved_param(expr),
+            TypedExprKind::Constant(Value::Text(_)) => true,
+            TypedExprKind::Constant(Value::Null) => true,
+            _ => false,
+        }
     }
 
     pub(super) fn convert_binary_op(

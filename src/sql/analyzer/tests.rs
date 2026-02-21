@@ -1970,6 +1970,185 @@ fn analyze_unknown_plus_unknown_reports_ambiguous_operator() {
     assert!(sql.to_string().contains("operator is not unique"));
 }
 
+// ── Mixed-unknown operator ambiguity tests (PG 42725 parity) ────
+
+#[test]
+fn analyze_param_plus_literal_reports_ambiguous_operator() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 + '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_param_minus_literal_reports_ambiguous_operator() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 - '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_param_mul_literal_reports_ambiguous_operator() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 * '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_param_div_literal_reports_ambiguous_operator() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 / '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_param_mod_literal_reports_ambiguous_operator() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 % '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_param_bitand_literal_reports_ambiguous_operator() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 & '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_param_bitor_literal_reports_ambiguous_operator() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 | '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_param_shl_literal_reports_ambiguous_operator() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 << '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_param_shr_literal_reports_ambiguous_operator() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 >> '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_null_plus_literal_reports_ambiguous_operator() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT NULL + '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_null_plus_null_reports_ambiguous_operator() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT NULL + NULL");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_param_plus_null_reports_ambiguous_operator() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 + NULL");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_null_plus_param_reports_ambiguous_operator() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT NULL + $1");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_param_concat_literal_resolves_to_text() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 || '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text]);
+}
+
+#[test]
+fn analyze_literal_plus_literal_reports_ambiguous_operator() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT '1' + '1'");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
+#[test]
+fn analyze_explicit_cast_plus_literal_stays_42883() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT $1 + '1'::text");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
+#[test]
+fn analyze_param_bitxor_literal_reports_ambiguous_operator() {
+    // sqlparser 0.40 doesn't parse `#` as BitwiseXor in PG dialect,
+    // so we construct the AST directly to exercise the ambiguity path.
+    use sqlparser::ast::{self as ast, BinaryOperator};
+    let catalog = test_catalog();
+    let expr = ast::Expr::BinaryOp {
+        left: Box::new(ast::Expr::Value(ast::Value::Placeholder("$1".into()))),
+        op: BinaryOperator::BitwiseXor,
+        right: Box::new(ast::Expr::Value(ast::Value::SingleQuotedString("1".into()))),
+    };
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let err = analyzer.analyze_expr(&expr).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42725");
+}
+
 #[test]
 fn analyze_unknown_plus_int_infers_integer_and_succeeds() {
     let catalog = test_catalog();
