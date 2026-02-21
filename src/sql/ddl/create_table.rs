@@ -9,6 +9,7 @@ use sqlparser::ast::{
 };
 use tikv_client::Transaction;
 
+use crate::sql::dml::{resolve_fk_ref_lookup, FkRefLookup};
 use crate::sql::error::SqlError;
 use crate::sql::names;
 use crate::sql::names::normalize_ident;
@@ -26,6 +27,10 @@ use super::{
     create_implicit_sequences_for_schema, parse_referential_action, resolve_column_data_type,
     warn_legacy_relname_conflict_scan_once,
 };
+
+fn short_relation_name(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
 
 pub async fn execute_create_table(
     store: &Arc<TikvStore>,
@@ -155,6 +160,36 @@ pub async fn execute_create_table(
                     let ref_cols: Vec<String> =
                         referred_columns.iter().map(normalize_ident).collect();
                     let fk_name = format!("{}_{}_fkey", table_object_name, col_name);
+
+                    if ref_table != table_full_name {
+                        let ref_table_schema = store
+                            .get_schema(txn, db_id, &ref_table)
+                            .await?
+                            .ok_or_else(|| SqlError::RelationNotFound(ref_table.clone()))?;
+                        if ref_cols.is_empty() {
+                            if ref_table_schema.pk_indices.is_empty() {
+                                return Err(anyhow!(
+                                    "there is no primary key for referenced table \"{}\"",
+                                    short_relation_name(&ref_table)
+                                ));
+                            }
+                            if ref_table_schema.pk_indices.len() != 1 {
+                                return Err(anyhow!(
+                                    "number of referencing and referenced columns for foreign key disagree"
+                                ));
+                            }
+                        } else if ref_cols.len() != 1 {
+                            return Err(anyhow!(
+                                "number of referencing and referenced columns for foreign key disagree"
+                            ));
+                        }
+                        let lookup = resolve_fk_ref_lookup(&ref_cols, &ref_table_schema)?;
+                        if matches!(lookup, FkRefLookup::UniqueIndex { .. }) {
+                            return Err(anyhow!(
+                                "foreign key constraints referencing non-primary-key unique columns are not yet supported"
+                            ));
+                        }
+                    }
 
                     foreign_keys.push(ForeignKeyConstraint {
                         name: fk_name,
@@ -292,6 +327,36 @@ pub async fn execute_create_table(
                     .map(|n| n.value.clone())
                     .unwrap_or_else(|| format!("{}_{}_fkey", table_object_name, fk_cols.join("_")));
 
+                if ref_table != table_full_name {
+                    let ref_table_schema = store
+                        .get_schema(txn, db_id, &ref_table)
+                        .await?
+                        .ok_or_else(|| SqlError::RelationNotFound(ref_table.clone()))?;
+                    if ref_cols.is_empty() {
+                        if ref_table_schema.pk_indices.is_empty() {
+                            return Err(anyhow!(
+                                "there is no primary key for referenced table \"{}\"",
+                                short_relation_name(&ref_table)
+                            ));
+                        }
+                        if fk_cols.len() != ref_table_schema.pk_indices.len() {
+                            return Err(anyhow!(
+                                "number of referencing and referenced columns for foreign key disagree"
+                            ));
+                        }
+                    } else if fk_cols.len() != ref_cols.len() {
+                        return Err(anyhow!(
+                            "number of referencing and referenced columns for foreign key disagree"
+                        ));
+                    }
+                    let lookup = resolve_fk_ref_lookup(&ref_cols, &ref_table_schema)?;
+                    if matches!(lookup, FkRefLookup::UniqueIndex { .. }) {
+                        return Err(anyhow!(
+                            "foreign key constraints referencing non-primary-key unique columns are not yet supported"
+                        ));
+                    }
+                }
+
                 foreign_keys.push(ForeignKeyConstraint {
                     name: fk_name,
                     columns: fk_cols,
@@ -326,6 +391,38 @@ pub async fn execute_create_table(
         owner: "postgres".to_string(),
         from_alias: None,
     };
+
+    // Validate self-referencing FK constraints against the final built schema.
+    for fk in &schema.foreign_keys {
+        if fk.ref_table != table_full_name {
+            continue;
+        }
+        if fk.ref_columns.is_empty() {
+            if schema.pk_indices.is_empty() {
+                return Err(anyhow!(
+                    "there is no primary key for referenced table \"{}\"",
+                    table_object_name
+                ));
+            }
+            if fk.columns.len() != schema.pk_indices.len() {
+                return Err(anyhow!(
+                    "number of referencing and referenced columns for foreign key disagree"
+                ));
+            }
+        } else if fk.columns.len() != fk.ref_columns.len() {
+            return Err(anyhow!(
+                "number of referencing and referenced columns for foreign key disagree"
+            ));
+        }
+
+        let lookup = resolve_fk_ref_lookup(&fk.ref_columns, &schema)?;
+        if matches!(lookup, FkRefLookup::UniqueIndex { .. }) {
+            return Err(anyhow!(
+                "foreign key constraints referencing non-primary-key unique columns are not yet supported"
+            ));
+        }
+    }
+
     store.create_table(txn, db_id, schema.clone()).await?;
     create_implicit_sequences_for_schema(store, txn, db_id, &schema).await?;
 

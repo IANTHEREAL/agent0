@@ -10,6 +10,7 @@ use sqlparser::ast::{
 };
 use tikv_client::Transaction;
 
+use crate::sql::dml::{resolve_fk_ref_lookup, FkRefLookup};
 use crate::sql::error::SqlError;
 use crate::sql::names;
 use crate::sql::names::normalize_ident;
@@ -320,16 +321,29 @@ pub async fn execute_alter_table(
                     return Err(anyhow!("Constraint '{}' already exists", fk_name));
                 }
 
-                if ref_schema.pk_indices.is_empty() {
+                let short_ref = ref_table.rsplit('.').next().unwrap_or(&ref_table);
+                if ref_cols.is_empty() {
+                    if ref_schema.pk_indices.is_empty() {
+                        return Err(anyhow!(
+                            "there is no primary key for referenced table \"{}\"",
+                            short_ref
+                        ));
+                    }
+                    if fk_cols.len() != ref_schema.pk_indices.len() {
+                        return Err(anyhow!(
+                            "number of referencing and referenced columns for foreign key disagree"
+                        ));
+                    }
+                } else if fk_cols.len() != ref_cols.len() {
                     return Err(anyhow!(
-                        "Unsupported foreign key '{}': referenced table has no primary key",
-                        fk_name
+                        "number of referencing and referenced columns for foreign key disagree"
                     ));
                 }
-                if fk_cols.len() != ref_schema.pk_indices.len() {
+
+                let fk_lookup = resolve_fk_ref_lookup(&ref_cols, &ref_schema)?;
+                if matches!(fk_lookup, FkRefLookup::UniqueIndex { .. }) {
                     return Err(anyhow!(
-                        "Unsupported foreign key '{}': must reference primary key columns",
-                        fk_name
+                        "foreign key constraints referencing non-primary-key unique columns are not yet supported"
                     ));
                 }
 
@@ -343,17 +357,18 @@ pub async fn execute_alter_table(
                         fill_row_defaults(&mut row, &schema)?;
 
                         let mut fk_values: Vec<Value> = Vec::with_capacity(fk_cols.len());
-                        let mut all_null = true;
+                        let mut any_null = false;
                         for col_name in &fk_cols {
                             let idx = schema.column_index(col_name).expect("validated above");
                             let val = row.values[idx].clone();
-                            if val != Value::Null {
-                                all_null = false;
+                            if val == Value::Null {
+                                any_null = true;
                             }
                             fk_values.push(val);
                         }
 
-                        if all_null {
+                        // MATCH SIMPLE: skip FK check if any referencing column is NULL.
+                        if any_null {
                             continue;
                         }
 

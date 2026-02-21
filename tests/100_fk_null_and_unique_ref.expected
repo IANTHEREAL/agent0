@@ -1,0 +1,44 @@
+ERROR:  insert or update on table "fk_child_cmp" violates foreign key constraint "fk_child_cmp_a_b_fkey"
+DETAIL:  Key (a, b)=(9, 99) is not present in table "fk_parent_cmp".
+id|a|b
+1|NULL|1
+2|1|NULL
+3|NULL|NULL
+4|1|1
+(4 rows)
+ERROR:  insert or update on table "fk_child_pk" violates foreign key constraint "fk_child_pk_pid_fkey"
+DETAIL:  Key (pid)=(99) is not present in table "fk_parent_pk".
+id|pid
+1|10
+2|NULL
+(2 rows)
+ERROR:  foreign key constraints referencing non-primary-key unique columns are not yet supported
+ERROR:  foreign key constraints referencing non-primary-key unique columns are not yet supported
+ERROR:  number of referencing and referenced columns for foreign key disagree
+ERROR:  number of referencing and referenced columns for foreign key disagree
+ERROR:  there is no primary key for referenced table "fk_parent_no_pk"
+ERROR:  insert or update on table "fk_child_omit" violates foreign key constraint "fk_child_omit_pid_fkey"
+DETAIL:  Key (pid)=(2) is not present in table "fk_parent_omit".
+id|pid
+1|1
+2|NULL
+(2 rows)
+ERROR:  insert or update on table "fk_alter_child" violates foreign key constraint "fk_alter_child_ab_fkey"
+DETAIL:  Key (a, b)=(9, 9) is not present in table "fk_alter_parent".
+id|a|b
+1|1|1
+2|NULL|1
+3|1|NULL
+4|NULL|NULL
+(4 rows)
+ERROR:  update or delete on table "fk_parent_del" violates foreign key constraint "fk_child_restrict_pid_fkey" on table "fk_child_restrict"
+DETAIL:  Key (id)=(1) is still referenced from table "fk_child_restrict".
+id
+1
+(1 row)
+id|pid
+1|1
+(1 row)
+id|pid
+1|1
+(1 row)

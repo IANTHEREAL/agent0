@@ -10,13 +10,96 @@ use tikv_client::Transaction;
 use crate::sql::error::SqlError;
 use crate::sql::projection::eval_default_expr;
 use crate::storage::TikvStore;
-use crate::types::{Row, TableSchema, Value};
+use crate::types::{DataType, Row, TableSchema, Value};
+use crate::worker::types::IndexState;
 
 use super::insert::build_enum_label_cache;
 use super::update::execute_update_row;
 
 fn short_relation_name(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
+}
+
+/// Lookup strategy for FK parent row existence checks.
+#[derive(Debug)]
+pub(crate) enum FkRefLookup {
+    /// `ref_columns` maps to parent primary key columns.
+    Pk,
+    /// `ref_columns` maps to an eligible unique index on the parent.
+    UniqueIndex {
+        index_id: u64,
+        pk_types: Vec<DataType>,
+    },
+}
+
+/// Resolve lookup strategy for referenced columns against parent schema.
+///
+/// Rules:
+/// - empty `ref_columns` => parent PK (error if parent has no PK)
+/// - exact positional PK column match => PK lookup
+/// - eligible unique index match => index lookup
+/// - otherwise => unique-constraint-missing error
+pub(crate) fn resolve_fk_ref_lookup(
+    ref_columns: &[String],
+    ref_schema: &TableSchema,
+) -> Result<FkRefLookup> {
+    let pk_col_names: Vec<&str> = ref_schema
+        .pk_indices
+        .iter()
+        .map(|&i| ref_schema.columns[i].name.as_str())
+        .collect();
+
+    if ref_columns.is_empty() {
+        if ref_schema.pk_indices.is_empty() {
+            return Err(anyhow!(
+                "there is no primary key for referenced table \"{}\"",
+                short_relation_name(&ref_schema.name)
+            ));
+        }
+        return Ok(FkRefLookup::Pk);
+    }
+
+    if ref_columns.len() == pk_col_names.len()
+        && ref_columns.iter().zip(&pk_col_names).all(|(a, b)| a == *b)
+    {
+        return Ok(FkRefLookup::Pk);
+    }
+
+    for index in &ref_schema.indexes {
+        if !index.unique || index.state != IndexState::Ready {
+            continue;
+        }
+        if index.predicate.is_some() || !index.expressions.is_empty() {
+            continue;
+        }
+        if let Some(method) = &index.method {
+            if !method.eq_ignore_ascii_case("btree") {
+                continue;
+            }
+        }
+        if index.columns.len() == ref_columns.len()
+            && index.columns.iter().zip(ref_columns).all(|(a, b)| a == b)
+        {
+            let pk_types = if ref_schema.pk_indices.is_empty() {
+                vec![DataType::Uuid]
+            } else {
+                ref_schema
+                    .pk_indices
+                    .iter()
+                    .map(|&i| ref_schema.columns[i].data_type.clone())
+                    .collect()
+            };
+            return Ok(FkRefLookup::UniqueIndex {
+                index_id: index.id,
+                pk_types,
+            });
+        }
+    }
+
+    Err(anyhow!(
+        "there is no unique constraint matching given keys for referenced table \"{}\"",
+        short_relation_name(&ref_schema.name)
+    ))
 }
 
 pub async fn validate_foreign_keys(
@@ -28,20 +111,21 @@ pub async fn validate_foreign_keys(
 ) -> Result<()> {
     for fk in &schema.foreign_keys {
         let mut fk_values: Vec<Value> = Vec::with_capacity(fk.columns.len());
-        let mut all_null = true;
+        let mut any_null = false;
 
         for col_name in &fk.columns {
             let col_idx = schema
                 .column_index(col_name)
                 .ok_or_else(|| anyhow!("FK column '{}' not found in schema", col_name))?;
             let val = row.values[col_idx].clone();
-            if val != Value::Null {
-                all_null = false;
+            if val == Value::Null {
+                any_null = true;
             }
             fk_values.push(val);
         }
 
-        if all_null {
+        // MATCH SIMPLE: skip FK check if any referencing column is NULL.
+        if any_null {
             continue;
         }
 
@@ -56,17 +140,38 @@ pub async fn validate_foreign_keys(
                 )
             })?;
 
-        let ref_rows = store
-            .batch_get_rows(
-                txn,
-                db_id,
-                ref_schema.table_id,
-                vec![fk_values.clone()],
-                &ref_schema,
-            )
-            .await?;
+        let lookup = resolve_fk_ref_lookup(&fk.ref_columns, &ref_schema)?;
+        let parent_exists = match lookup {
+            FkRefLookup::Pk => {
+                let ref_rows = store
+                    .batch_get_rows(
+                        txn,
+                        db_id,
+                        ref_schema.table_id,
+                        vec![fk_values.clone()],
+                        &ref_schema,
+                    )
+                    .await?;
+                !ref_rows.is_empty()
+            }
+            FkRefLookup::UniqueIndex { index_id, pk_types } => {
+                let pks = store
+                    .scan_index(
+                        txn,
+                        db_id,
+                        ref_schema.table_id,
+                        index_id,
+                        &fk_values,
+                        true,
+                        &pk_types,
+                        Some(1),
+                    )
+                    .await?;
+                !pks.is_empty()
+            }
+        };
 
-        if ref_rows.is_empty() {
+        if !parent_exists {
             let cols = fk.columns.join(", ");
             let vals: Vec<String> = fk_values.iter().map(|v| format!("{}", v)).collect();
             let short_table = short_relation_name(&schema.name);
