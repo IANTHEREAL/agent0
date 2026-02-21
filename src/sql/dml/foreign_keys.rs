@@ -14,6 +14,8 @@ use crate::storage::TikvStore;
 use crate::types::{DataType, ForeignKeyConstraint, Row, TableSchema, Value};
 use crate::worker::types::IndexState;
 
+use crate::sql::value_coercion::coerce_value_for_column;
+
 use super::insert::build_enum_label_cache;
 use super::update::execute_update_row;
 
@@ -732,6 +734,8 @@ async fn handle_foreign_key_on_update_no_ctx(
     old_row: &Row,
     new_row: &Row,
 ) -> Result<()> {
+    use crate::types::ForeignKeyAction;
+
     let table_names = store.list_tables(txn, db_id).await?;
 
     for other_table in &table_names {
@@ -751,33 +755,145 @@ async fn handle_foreign_key_on_update_no_ctx(
                 continue;
             }
 
-            let all_rows = store.scan(txn, db_id, other_table, None).await?;
-            let rows_to_update = collect_fk_update_rows(
-                fk,
-                schema,
-                table_name,
-                other_table,
-                &other_schema,
-                &all_rows,
-                &old_ref_values,
-                &new_ref_values,
-            )?;
+            match fk.on_update {
+                ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
+                    // Single scan: error on first child still referencing old parent key.
+                    let all_rows = store.scan(txn, db_id, other_table, None).await?;
+                    for other_row in &all_rows {
+                        let Some(fk_values) = fk_values_for_row(fk, &other_schema, other_row)
+                        else {
+                            continue;
+                        };
+                        if fk_values == old_ref_values {
+                            let cols = ref_column_names(fk, schema);
+                            let ref_val_strs: Vec<String> =
+                                old_ref_values.iter().map(|v| format!("{}", v)).collect();
+                            let short_table = short_relation_name(table_name);
+                            let short_other_table = short_relation_name(other_table);
+                            return Err(SqlError::ForeignKeyViolation {
+                                constraint: fk.name.clone(),
+                                message: format!(
+                                    "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"\n\
+                                     DETAIL:  Key ({})=({}) is still referenced from table \"{}\".",
+                                    short_table,
+                                    fk.name,
+                                    short_other_table,
+                                    cols,
+                                    ref_val_strs.join(", "),
+                                    short_other_table
+                                ),
+                            }
+                            .into());
+                        }
+                    }
+                }
 
-            if !rows_to_update.is_empty() {
-                let enum_cache = build_enum_label_cache(store, txn, db_id, &other_schema).await?;
-                for (old_child_row, new_child_row) in rows_to_update {
-                    Box::pin(execute_update_row(
-                        store,
-                        txn,
-                        db_id,
-                        other_table,
-                        &other_schema,
-                        &old_child_row,
-                        new_child_row,
-                        &enum_cache,
-                        None,
-                    ))
-                    .await?;
+                ForeignKeyAction::Cascade
+                | ForeignKeyAction::SetNull
+                | ForeignKeyAction::SetDefault => {
+                    // Fixpoint: scan → find first match → update → repeat.
+                    // Each iteration re-reads from storage to see prior side-effects,
+                    // eliminating the intra-batch staleness bug (#924 parity for UPDATE).
+                    let enum_cache =
+                        build_enum_label_cache(store, txn, db_id, &other_schema).await?;
+                    loop {
+                        let all_rows = store.scan(txn, db_id, other_table, None).await?;
+                        let child_row = all_rows.iter().find_map(|r| {
+                            let fk_vals = fk_values_for_row(fk, &other_schema, r)?;
+                            if fk_vals == old_ref_values {
+                                Some(r.clone())
+                            } else {
+                                None
+                            }
+                        });
+                        let child_row = match child_row {
+                            None => break,
+                            Some(r) => r,
+                        };
+
+                        let mut new_values = child_row.values.clone();
+                        match fk.on_update {
+                            ForeignKeyAction::Cascade => {
+                                for (i, col_name) in fk.columns.iter().enumerate() {
+                                    if let Some(idx) = other_schema.column_index(col_name) {
+                                        if i < new_ref_values.len() {
+                                            new_values[idx] = new_ref_values[i].clone();
+                                        }
+                                    }
+                                }
+                            }
+                            ForeignKeyAction::SetNull => {
+                                for col_name in &fk.columns {
+                                    if let Some(idx) = other_schema.column_index(col_name) {
+                                        new_values[idx] = Value::Null;
+                                    }
+                                }
+                            }
+                            ForeignKeyAction::SetDefault => {
+                                for col_name in &fk.columns {
+                                    if let Some(idx) = other_schema.column_index(col_name) {
+                                        let col = &other_schema.columns[idx];
+                                        new_values[idx] =
+                                            if let Some(ref def_expr) = col.default_expr {
+                                                eval_default_expr(def_expr)?
+                                            } else {
+                                                Value::Null
+                                            };
+                                    }
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+
+                        // Convergence check: if new FK values still match
+                        // old_ref_values (e.g. SET DEFAULT where default ==
+                        // old parent key), the child still references the
+                        // departed parent value. Produce PG-parity parent-side
+                        // error before execute_update_row tries child-side
+                        // validate_foreign_keys.
+                        let mut post_fk_values: Vec<Value> = Vec::new();
+                        for col_name in &fk.columns {
+                            if let Some(idx) = other_schema.column_index(col_name) {
+                                let col = &other_schema.columns[idx];
+                                post_fk_values
+                                    .push(coerce_value_for_column(new_values[idx].clone(), col)?);
+                            }
+                        }
+                        if post_fk_values == old_ref_values {
+                            let cols = ref_column_names(fk, schema);
+                            let ref_val_strs: Vec<String> =
+                                old_ref_values.iter().map(|v| format!("{}", v)).collect();
+                            let short_parent = short_relation_name(table_name);
+                            let short_child = short_relation_name(other_table);
+                            return Err(SqlError::ForeignKeyViolation {
+                                constraint: fk.name.clone(),
+                                message: format!(
+                                    "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"\n\
+                                     DETAIL:  Key ({})=({}) is still referenced from table \"{}\".",
+                                    short_parent,
+                                    fk.name,
+                                    short_child,
+                                    cols,
+                                    ref_val_strs.join(", "),
+                                    short_child
+                                ),
+                            }
+                            .into());
+                        }
+
+                        Box::pin(execute_update_row(
+                            store,
+                            txn,
+                            db_id,
+                            other_table,
+                            &other_schema,
+                            &child_row,
+                            Row::new(new_values),
+                            &enum_cache,
+                            None,
+                        ))
+                        .await?;
+                    }
                 }
             }
         }

@@ -1,5 +1,17 @@
 -- FK NULL semantics (MATCH SIMPLE) + referenced-key validation coverage
 
+DROP TABLE IF EXISTS fk_upd_sd_err_child CASCADE;
+DROP TABLE IF EXISTS fk_upd_sd_err_parent CASCADE;
+DROP TABLE IF EXISTS fk_upd_batch_child CASCADE;
+DROP TABLE IF EXISTS fk_upd_batch_parent CASCADE;
+DROP TABLE IF EXISTS fk_upd_sd_child CASCADE;
+DROP TABLE IF EXISTS fk_upd_sd_parent CASCADE;
+DROP TABLE IF EXISTS fk_upd_sn_child CASCADE;
+DROP TABLE IF EXISTS fk_upd_sn_parent CASCADE;
+DROP TABLE IF EXISTS fk_upd_xfk_child CASCADE;
+DROP TABLE IF EXISTS fk_upd_xfk_parent CASCADE;
+DROP TABLE IF EXISTS fk_comp_uniq_child CASCADE;
+DROP TABLE IF EXISTS fk_comp_uniq_parent CASCADE;
 DROP TABLE IF EXISTS fk924f_child CASCADE;
 DROP TABLE IF EXISTS fk924f_parent CASCADE;
 DROP TABLE IF EXISTS fk924e_child CASCADE;
@@ -498,3 +510,86 @@ INSERT INTO fk924f_parent VALUES (1);
 INSERT INTO fk924f_child VALUES (1, 1);
 DELETE FROM fk924f_parent WHERE id = 1;
 SELECT id, pid FROM fk924f_child ORDER BY id;
+
+-- 34) Composite FK → composite UNIQUE (not PK)
+CREATE TABLE fk_comp_uniq_parent (
+    id INT PRIMARY KEY, a INT, b INT, UNIQUE (a, b)
+);
+CREATE TABLE fk_comp_uniq_child (
+    id INT PRIMARY KEY, pa INT, pb INT,
+    FOREIGN KEY (pa, pb) REFERENCES fk_comp_uniq_parent(a, b)
+        ON DELETE CASCADE ON UPDATE CASCADE
+);
+INSERT INTO fk_comp_uniq_parent VALUES (1, 10, 20), (2, 30, 40);
+INSERT INTO fk_comp_uniq_child VALUES (1, 10, 20);
+INSERT INTO fk_comp_uniq_child VALUES (2, 10, 99);
+UPDATE fk_comp_uniq_parent SET a = 11 WHERE id = 1;
+SELECT id, pa, pb FROM fk_comp_uniq_child ORDER BY id;
+DELETE FROM fk_comp_uniq_parent WHERE id = 1;
+SELECT id, pa, pb FROM fk_comp_uniq_child ORDER BY id;
+
+-- 35) ON UPDATE cross-FK (two FKs, same child, same parent)
+CREATE TABLE fk_upd_xfk_parent (id INT PRIMARY KEY, code TEXT UNIQUE);
+CREATE TABLE fk_upd_xfk_child (
+    id INT PRIMARY KEY,
+    pid INT REFERENCES fk_upd_xfk_parent(id) ON UPDATE CASCADE,
+    pcode TEXT REFERENCES fk_upd_xfk_parent(code) ON UPDATE CASCADE
+);
+INSERT INTO fk_upd_xfk_parent VALUES (1, 'A');
+INSERT INTO fk_upd_xfk_child VALUES (1, 1, 'A');
+UPDATE fk_upd_xfk_parent SET id = 2, code = 'B' WHERE id = 1;
+SELECT id, pid, pcode FROM fk_upd_xfk_child ORDER BY id;
+
+-- 36) ON UPDATE SET NULL with two FKs on same child
+CREATE TABLE fk_upd_sn_parent (id INT PRIMARY KEY);
+CREATE TABLE fk_upd_sn_child (
+    id INT PRIMARY KEY,
+    a INT REFERENCES fk_upd_sn_parent(id) ON UPDATE SET NULL,
+    b INT REFERENCES fk_upd_sn_parent(id) ON UPDATE SET NULL
+);
+INSERT INTO fk_upd_sn_parent VALUES (1);
+INSERT INTO fk_upd_sn_child VALUES (1, 1, 1);
+UPDATE fk_upd_sn_parent SET id = 2 WHERE id = 1;
+SELECT id, a, b FROM fk_upd_sn_child WHERE id = 1;
+
+-- 37) ON UPDATE SET DEFAULT with two FKs
+CREATE TABLE fk_upd_sd_parent (id INT PRIMARY KEY);
+CREATE TABLE fk_upd_sd_child (
+    id INT PRIMARY KEY,
+    a INT DEFAULT 0 REFERENCES fk_upd_sd_parent(id) ON UPDATE SET DEFAULT,
+    b INT DEFAULT 0 REFERENCES fk_upd_sd_parent(id) ON UPDATE SET DEFAULT
+);
+INSERT INTO fk_upd_sd_parent VALUES (0), (1);
+INSERT INTO fk_upd_sd_child VALUES (1, 1, 1);
+UPDATE fk_upd_sd_parent SET id = 2 WHERE id = 1;
+SELECT id, a, b FROM fk_upd_sd_child WHERE id = 1;
+
+-- 38) ON UPDATE intra-batch staleness (fails pre-fix, passes post-fix)
+CREATE TABLE fk_upd_batch_parent (id INT PRIMARY KEY);
+CREATE TABLE fk_upd_batch_child (
+    id INT PRIMARY KEY,
+    a INT,
+    b INT,
+    ref_a INT,
+    ref_b INT,
+    UNIQUE (a, b),
+    FOREIGN KEY (a) REFERENCES fk_upd_batch_parent(id) ON UPDATE SET NULL,
+    FOREIGN KEY (ref_a, ref_b) REFERENCES fk_upd_batch_child(a, b) ON UPDATE CASCADE
+);
+INSERT INTO fk_upd_batch_parent VALUES (1);
+INSERT INTO fk_upd_batch_child VALUES (1, 1, 10, NULL, NULL);
+INSERT INTO fk_upd_batch_child VALUES (2, 1, 20, 1, 10);
+UPDATE fk_upd_batch_parent SET id = 2 WHERE id = 1;
+SELECT id, a, b, ref_a, ref_b FROM fk_upd_batch_child ORDER BY id;
+
+-- 39) ON UPDATE SET DEFAULT where default == old ref (parent-side FK error + rollback)
+CREATE TABLE fk_upd_sd_err_parent (id INT PRIMARY KEY);
+CREATE TABLE fk_upd_sd_err_child (
+    id INT PRIMARY KEY,
+    pid INT DEFAULT 1 REFERENCES fk_upd_sd_err_parent(id) ON UPDATE SET DEFAULT
+);
+INSERT INTO fk_upd_sd_err_parent VALUES (1);
+INSERT INTO fk_upd_sd_err_child VALUES (1, 1);
+UPDATE fk_upd_sd_err_parent SET id = 2 WHERE id = 1;
+SELECT id FROM fk_upd_sd_err_parent ORDER BY id;
+SELECT id, pid FROM fk_upd_sd_err_child WHERE id = 1;

@@ -146,3 +146,31 @@ DETAIL:  Key (id)=(1) is still referenced from table "fk924f_child".
 id|pid
 1|1
 (1 row)
+ERROR:  insert or update on table "fk_comp_uniq_child" violates foreign key constraint "fk_comp_uniq_child_pa_pb_fkey"
+DETAIL:  Key (pa, pb)=(10, 99) is not present in table "fk_comp_uniq_parent".
+id|pa|pb
+1|11|20
+(1 row)
+id|pa|pb
+(0 rows)
+id|pid|pcode
+1|2|B
+(1 row)
+id|a|b
+1|NULL|NULL
+(1 row)
+id|a|b
+1|0|0
+(1 row)
+id|a|b|ref_a|ref_b
+1|NULL|10|NULL|NULL
+2|NULL|20|NULL|10
+(2 rows)
+ERROR:  update or delete on table "fk_upd_sd_err_parent" violates foreign key constraint "fk_upd_sd_err_child_pid_fkey" on table "fk_upd_sd_err_child"
+DETAIL:  Key (id)=(1) is still referenced from table "fk_upd_sd_err_child".
+id
+1
+(1 row)
+id|pid
+1|1
+(1 row)
