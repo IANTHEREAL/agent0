@@ -20,6 +20,8 @@ DROP TABLE IF EXISTS fk_parent_pk CASCADE;
 DROP TABLE IF EXISTS fk_child_cmp CASCADE;
 DROP TABLE IF EXISTS fk_parent_cmp CASCADE;
 DROP TABLE IF EXISTS fk_self_unique CASCADE;
+DROP TABLE IF EXISTS fk_alter_uniq_child CASCADE;
+DROP TABLE IF EXISTS fk_alter_uniq_parent CASCADE;
 
 -- 1) Composite FK + MATCH SIMPLE (any NULL skips check)
 CREATE TABLE fk_parent_cmp (
@@ -178,3 +180,18 @@ DELETE FROM fk_parent_del WHERE id = 2;
 SELECT id FROM fk_parent_del ORDER BY id;
 SELECT id, pid FROM fk_child_restrict ORDER BY id;
 SELECT id, pid FROM fk_child_cascade ORDER BY id;
+
+-- 10) ALTER TABLE ADD FK to UNIQUE non-PK is rejected (gated)
+CREATE TABLE fk_alter_uniq_parent (
+    id INT PRIMARY KEY,
+    code TEXT UNIQUE
+);
+
+CREATE TABLE fk_alter_uniq_child (
+    id INT PRIMARY KEY,
+    code TEXT
+);
+
+ALTER TABLE fk_alter_uniq_child
+ADD CONSTRAINT fk_alter_uniq_child_code_fkey
+FOREIGN KEY (code) REFERENCES fk_alter_uniq_parent(code);

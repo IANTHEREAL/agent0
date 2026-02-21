@@ -42,3 +42,4 @@ id|pid
 id|pid
 1|1
 (1 row)
+ERROR:  foreign key constraints referencing non-primary-key unique columns are not yet supported
