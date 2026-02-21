@@ -10,7 +10,7 @@ use tikv_client::Transaction;
 use crate::sql::error::SqlError;
 use crate::sql::projection::eval_default_expr;
 use crate::storage::TikvStore;
-use crate::types::{DataType, Row, TableSchema, Value};
+use crate::types::{DataType, ForeignKeyConstraint, Row, TableSchema, Value};
 use crate::worker::types::IndexState;
 
 use super::insert::build_enum_label_cache;
@@ -18,6 +18,47 @@ use super::update::execute_update_row;
 
 fn short_relation_name(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
+}
+
+/// Extract referenced-column values from a parent row for a given FK.
+/// Falls back to PK values when ref_columns is empty (implicit PK reference).
+fn get_ref_values(
+    fk: &ForeignKeyConstraint,
+    parent_schema: &TableSchema,
+    parent_row: &Row,
+) -> Result<Vec<Value>> {
+    if fk.ref_columns.is_empty() {
+        Ok(parent_schema.get_pk_values(parent_row))
+    } else {
+        fk.ref_columns
+            .iter()
+            .map(|col_name| {
+                let idx = parent_schema.column_index(col_name).ok_or_else(|| {
+                    anyhow!(
+                        "FK ref_column '{}' not found in parent schema '{}'",
+                        col_name,
+                        parent_schema.name
+                    )
+                })?;
+                Ok(parent_row.values[idx].clone())
+            })
+            .collect()
+    }
+}
+
+/// Return the referenced column names for error messages.
+/// Falls back to PK column names when ref_columns is empty.
+fn ref_column_names(fk: &ForeignKeyConstraint, parent_schema: &TableSchema) -> String {
+    if fk.ref_columns.is_empty() {
+        parent_schema
+            .pk_indices
+            .iter()
+            .map(|&i| parent_schema.columns[i].name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        fk.ref_columns.join(", ")
+    }
 }
 
 /// Lookup strategy for FK parent row existence checks.
@@ -202,8 +243,6 @@ pub async fn handle_foreign_key_on_delete(
     schema: &TableSchema,
     row: &Row,
 ) -> Result<()> {
-    let pk_values = schema.get_pk_values(row);
-
     let table_names = store.list_tables(txn, db_id).await?;
     let mut table_rows: HashMap<String, Vec<Row>> = HashMap::new();
     let mut table_schemas: HashMap<String, TableSchema> = HashMap::new();
@@ -218,13 +257,20 @@ pub async fn handle_foreign_key_on_delete(
     }
 
     let mut deleted_pks: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
+    // Pre-seed with the initial row being deleted to prevent cyclic self-cascades
+    // from re-visiting it.
+    deleted_pks
+        .entry(table_name.to_string())
+        .or_default()
+        .push(schema.get_pk_values(row));
 
     Box::pin(cascade_delete_recursive(
         store,
         txn,
         db_id,
         table_name,
-        &pk_values,
+        row,
+        schema,
         &table_rows,
         &table_schemas,
         &mut deleted_pks,
@@ -237,7 +283,8 @@ async fn cascade_delete_recursive(
     txn: &mut Transaction,
     db_id: u64,
     table_name: &str,
-    pk_values: &[Value],
+    parent_row: &Row,
+    parent_schema: &TableSchema,
     table_rows: &HashMap<String, Vec<Row>>,
     table_schemas: &HashMap<String, TableSchema>,
     deleted_pks: &mut HashMap<String, Vec<Vec<Value>>>,
@@ -245,14 +292,19 @@ async fn cascade_delete_recursive(
     use crate::types::ForeignKeyAction;
 
     for (other_table, other_schema) in table_schemas {
-        if other_table == table_name {
-            continue;
-        }
-
         for fk in &other_schema.foreign_keys {
             if fk.ref_table != table_name {
                 continue;
             }
+
+            let ref_values = get_ref_values(fk, parent_schema, parent_row)?;
+
+            // For self-referencing FKs, skip the row being deleted itself.
+            let self_ref_parent_pk = if other_table.as_str() == table_name {
+                Some(parent_schema.get_pk_values(parent_row))
+            } else {
+                None
+            };
 
             let all_rows = table_rows.get(other_table).cloned().unwrap_or_default();
             let deleted_in_table = deleted_pks.entry(other_table.clone()).or_default();
@@ -266,24 +318,31 @@ async fn cascade_delete_recursive(
                     continue;
                 }
 
+                // Don't let the row being deleted RESTRICT/cascade against itself.
+                if let Some(ref parent_pk) = self_ref_parent_pk {
+                    if other_pk == *parent_pk {
+                        continue;
+                    }
+                }
+
                 let mut fk_values: Vec<Value> = Vec::new();
-                let mut all_null = true;
+                let mut any_null = false;
 
                 for col_name in &fk.columns {
                     if let Some(idx) = other_schema.column_index(col_name) {
                         let val = other_row.values[idx].clone();
-                        if val != Value::Null {
-                            all_null = false;
+                        if val == Value::Null {
+                            any_null = true;
                         }
                         fk_values.push(val);
                     }
                 }
 
-                if all_null {
+                if any_null {
                     continue;
                 }
 
-                if fk_values == pk_values {
+                if fk_values == ref_values {
                     match fk.on_delete {
                         ForeignKeyAction::Cascade => {
                             rows_to_cascade.push(other_row.clone());
@@ -298,9 +357,9 @@ async fn cascade_delete_recursive(
                             rows_to_update.push((other_row.clone(), Row::new(new_values)));
                         }
                         ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
-                            let cols = fk.ref_columns.join(", ");
-                            let pk_val_strs: Vec<String> =
-                                pk_values.iter().map(|v| format!("{}", v)).collect();
+                            let cols = ref_column_names(fk, parent_schema);
+                            let ref_val_strs: Vec<String> =
+                                ref_values.iter().map(|v| format!("{}", v)).collect();
                             let short_table = short_relation_name(table_name);
                             let short_other_table = short_relation_name(other_table);
                             return Err(SqlError::ForeignKeyViolation {
@@ -312,7 +371,7 @@ async fn cascade_delete_recursive(
                                     fk.name,
                                     short_other_table,
                                     cols,
-                                    pk_val_strs.join(", "),
+                                    ref_val_strs.join(", "),
                                     short_other_table
                                 ),
                             }
@@ -340,22 +399,25 @@ async fn cascade_delete_recursive(
             for del_row in rows_to_cascade {
                 let del_pk = other_schema.get_pk_values(&del_row);
 
+                // Record as deleted BEFORE recursion to prevent infinite cycles
+                // on self-referencing or mutually-referencing rows.
+                deleted_pks
+                    .entry(other_table.clone())
+                    .or_default()
+                    .push(del_pk.clone());
+
                 Box::pin(cascade_delete_recursive(
                     store,
                     txn,
                     db_id,
                     other_table,
-                    &del_pk,
+                    &del_row,
+                    other_schema,
                     table_rows,
                     table_schemas,
                     deleted_pks,
                 ))
                 .await?;
-
-                deleted_pks
-                    .entry(other_table.clone())
-                    .or_default()
-                    .push(del_pk.clone());
 
                 super::delete::delete_row_storage_entries(
                     store,
@@ -398,20 +460,9 @@ pub async fn handle_foreign_key_on_update(
 ) -> Result<()> {
     use crate::types::ForeignKeyAction;
 
-    let old_pk_values = schema.get_pk_values(old_row);
-    let new_pk_values = schema.get_pk_values(new_row);
-
-    if old_pk_values == new_pk_values {
-        return Ok(());
-    }
-
     let table_names = store.list_tables(txn, db_id).await?;
 
     for other_table in &table_names {
-        if other_table == table_name {
-            continue;
-        }
-
         let other_schema = match store.get_schema(txn, db_id, other_table).await? {
             Some(s) => s,
             None => continue,
@@ -422,35 +473,42 @@ pub async fn handle_foreign_key_on_update(
                 continue;
             }
 
+            let old_ref_values = get_ref_values(fk, schema, old_row)?;
+            let new_ref_values = get_ref_values(fk, schema, new_row)?;
+
+            if old_ref_values == new_ref_values {
+                continue;
+            }
+
             let all_rows = store.scan(txn, db_id, other_table, None).await?;
             let mut rows_to_update: Vec<(Row, Row)> = Vec::new();
 
             for other_row in &all_rows {
                 let mut fk_values: Vec<Value> = Vec::new();
-                let mut all_null = true;
+                let mut any_null = false;
 
                 for col_name in &fk.columns {
                     if let Some(idx) = other_schema.column_index(col_name) {
                         let val = other_row.values[idx].clone();
-                        if val != Value::Null {
-                            all_null = false;
+                        if val == Value::Null {
+                            any_null = true;
                         }
                         fk_values.push(val);
                     }
                 }
 
-                if all_null {
+                if any_null {
                     continue;
                 }
 
-                if fk_values == old_pk_values {
+                if fk_values == old_ref_values {
                     match fk.on_update {
                         ForeignKeyAction::Cascade => {
                             let mut new_values = other_row.values.clone();
                             for (i, col_name) in fk.columns.iter().enumerate() {
                                 if let Some(idx) = other_schema.column_index(col_name) {
-                                    if i < new_pk_values.len() {
-                                        new_values[idx] = new_pk_values[i].clone();
+                                    if i < new_ref_values.len() {
+                                        new_values[idx] = new_ref_values[i].clone();
                                     }
                                 }
                             }
@@ -481,9 +539,9 @@ pub async fn handle_foreign_key_on_update(
                             rows_to_update.push((other_row.clone(), Row::new(new_values)));
                         }
                         ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
-                            let cols = fk.ref_columns.join(", ");
-                            let pk_val_strs: Vec<String> =
-                                old_pk_values.iter().map(|v| format!("{}", v)).collect();
+                            let cols = ref_column_names(fk, schema);
+                            let ref_val_strs: Vec<String> =
+                                old_ref_values.iter().map(|v| format!("{}", v)).collect();
                             let short_table = short_relation_name(table_name);
                             let short_other_table = short_relation_name(other_table);
                             return Err(SqlError::ForeignKeyViolation {
@@ -495,7 +553,7 @@ pub async fn handle_foreign_key_on_update(
                                     fk.name,
                                     short_other_table,
                                     cols,
-                                    pk_val_strs.join(", "),
+                                    ref_val_strs.join(", "),
                                     short_other_table
                                 ),
                             }

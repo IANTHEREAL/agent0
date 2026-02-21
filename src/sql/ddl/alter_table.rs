@@ -341,11 +341,6 @@ pub async fn execute_alter_table(
                 }
 
                 let fk_lookup = resolve_fk_ref_lookup(&ref_cols, &ref_schema)?;
-                if matches!(fk_lookup, FkRefLookup::UniqueIndex { .. }) {
-                    return Err(anyhow!(
-                        "foreign key constraints referencing non-primary-key unique columns are not yet supported"
-                    ));
-                }
 
                 // PostgreSQL validates existing rows by default (unless NOT VALID).
                 let (start, end) =
@@ -372,29 +367,52 @@ pub async fn execute_alter_table(
                             continue;
                         }
 
-                        let ref_rows = store
-                            .batch_get_rows(
-                                txn,
-                                db_id,
-                                ref_schema.table_id,
-                                vec![fk_values.clone()],
-                                &ref_schema,
-                            )
-                            .await?;
-                        if ref_rows.is_empty() {
+                        let parent_exists = match &fk_lookup {
+                            FkRefLookup::Pk => {
+                                let ref_rows = store
+                                    .batch_get_rows(
+                                        txn,
+                                        db_id,
+                                        ref_schema.table_id,
+                                        vec![fk_values.clone()],
+                                        &ref_schema,
+                                    )
+                                    .await?;
+                                !ref_rows.is_empty()
+                            }
+                            FkRefLookup::UniqueIndex { index_id, pk_types } => {
+                                let pks = store
+                                    .scan_index(
+                                        txn,
+                                        db_id,
+                                        ref_schema.table_id,
+                                        *index_id,
+                                        &fk_values,
+                                        true,
+                                        pk_types,
+                                        Some(1),
+                                    )
+                                    .await?;
+                                !pks.is_empty()
+                            }
+                        };
+                        if !parent_exists {
                             let cols = fk_cols.join(", ");
                             let vals: Vec<String> =
                                 fk_values.iter().map(|v| format!("{}", v)).collect();
+                            let short_table =
+                                schema.name.rsplit('.').next().unwrap_or(&schema.name);
+                            let short_ref = ref_table.rsplit('.').next().unwrap_or(&ref_table);
                             return Err(SqlError::ForeignKeyViolation {
                                 constraint: fk_name.clone(),
                                 message: format!(
                                     "insert or update on table \"{}\" violates foreign key constraint \"{}\"\n\
                                      DETAIL:  Key ({})=({}) is not present in table \"{}\".",
-                                    schema.name,
+                                    short_table,
                                     fk_name,
                                     cols,
                                     vals.join(", "),
-                                    ref_table
+                                    short_ref
                                 ),
                             }
                             .into());

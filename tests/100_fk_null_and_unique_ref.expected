@@ -12,8 +12,19 @@ id|pid
 1|10
 2|NULL
 (2 rows)
-ERROR:  foreign key constraints referencing non-primary-key unique columns are not yet supported
-ERROR:  foreign key constraints referencing non-primary-key unique columns are not yet supported
+ERROR:  insert or update on table "fk_child_unique_ref" violates foreign key constraint "fk_child_unique_ref_code_fkey"
+DETAIL:  Key (code)=(Z) is not present in table "fk_parent_unique".
+id|code
+1|A
+2|NULL
+(2 rows)
+id|code
+1|AA
+2|NULL
+(2 rows)
+id|code
+2|NULL
+(1 row)
 ERROR:  number of referencing and referenced columns for foreign key disagree
 ERROR:  number of referencing and referenced columns for foreign key disagree
 ERROR:  there is no primary key for referenced table "fk_parent_no_pk"
@@ -42,4 +53,33 @@ id|pid
 id|pid
 1|1
 (1 row)
-ERROR:  foreign key constraints referencing non-primary-key unique columns are not yet supported
+ERROR:  insert or update on table "fk_alter_uniq_child" violates foreign key constraint "fk_alter_uniq_child_code_fkey"
+DETAIL:  Key (code)=(INVALID) is not present in table "fk_alter_uniq_parent".
+id|code
+1|X
+(1 row)
+id|code
+1|Z
+(1 row)
+ERROR:  update or delete on table "fk_impl_parent" violates foreign key constraint "fk_impl_child_pid_fkey" on table "fk_impl_child"
+DETAIL:  Key (id)=(1) is still referenced from table "fk_impl_child".
+ERROR:  update or delete on table "fk_self_restrict" violates foreign key constraint "fk_self_restrict_parent_id_fkey" on table "fk_self_restrict"
+DETAIL:  Key (id)=(1) is still referenced from table "fk_self_restrict".
+id|parent_id
+1|NULL
+2|1
+(2 rows)
+(0 rows)
+id|code|ref_code
+1|AA|NULL
+2|B|AA
+(2 rows)
+id|code|ref_code
+1|AA|AA
+(1 row)
+ERROR:  update or delete on table "fk_self_row_restrict" violates foreign key constraint "fk_self_row_restrict_ref_code_fkey" on table "fk_self_row_restrict"
+DETAIL:  Key (code)=(A) is still referenced from table "fk_self_row_restrict".
+id|code|ref_code
+1|A|A
+(1 row)
+(0 rows)

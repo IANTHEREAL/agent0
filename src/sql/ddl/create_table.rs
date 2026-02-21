@@ -9,7 +9,7 @@ use sqlparser::ast::{
 };
 use tikv_client::Transaction;
 
-use crate::sql::dml::{resolve_fk_ref_lookup, FkRefLookup};
+use crate::sql::dml::resolve_fk_ref_lookup;
 use crate::sql::error::SqlError;
 use crate::sql::names;
 use crate::sql::names::normalize_ident;
@@ -183,12 +183,7 @@ pub async fn execute_create_table(
                                 "number of referencing and referenced columns for foreign key disagree"
                             ));
                         }
-                        let lookup = resolve_fk_ref_lookup(&ref_cols, &ref_table_schema)?;
-                        if matches!(lookup, FkRefLookup::UniqueIndex { .. }) {
-                            return Err(anyhow!(
-                                "foreign key constraints referencing non-primary-key unique columns are not yet supported"
-                            ));
-                        }
+                        resolve_fk_ref_lookup(&ref_cols, &ref_table_schema)?;
                     }
 
                     foreign_keys.push(ForeignKeyConstraint {
@@ -349,12 +344,7 @@ pub async fn execute_create_table(
                             "number of referencing and referenced columns for foreign key disagree"
                         ));
                     }
-                    let lookup = resolve_fk_ref_lookup(&ref_cols, &ref_table_schema)?;
-                    if matches!(lookup, FkRefLookup::UniqueIndex { .. }) {
-                        return Err(anyhow!(
-                            "foreign key constraints referencing non-primary-key unique columns are not yet supported"
-                        ));
-                    }
+                    resolve_fk_ref_lookup(&ref_cols, &ref_table_schema)?;
                 }
 
                 foreign_keys.push(ForeignKeyConstraint {
@@ -415,12 +405,7 @@ pub async fn execute_create_table(
             ));
         }
 
-        let lookup = resolve_fk_ref_lookup(&fk.ref_columns, &schema)?;
-        if matches!(lookup, FkRefLookup::UniqueIndex { .. }) {
-            return Err(anyhow!(
-                "foreign key constraints referencing non-primary-key unique columns are not yet supported"
-            ));
-        }
+        resolve_fk_ref_lookup(&fk.ref_columns, &schema)?;
     }
 
     store.create_table(txn, db_id, schema.clone()).await?;
