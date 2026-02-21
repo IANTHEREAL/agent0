@@ -11,8 +11,7 @@ use super::*;
 use crate::sql::analyzer::types::{AnalyzedQuery, AnalyzedStatement};
 use crate::sql::analyzer::Analyzer;
 use crate::sql::error::SqlError;
-use crate::types::ColumnDef;
-use sqlparser::ast::SetOperator;
+use crate::sql::names::normalize_ident;
 
 /// Result of analyzing a SQL statement for prepared execution.
 pub enum PreparedAnalysis {
@@ -208,7 +207,19 @@ impl Executor {
             let schema_query = if with.recursive
                 && crate::sql::executor::cte::cte_is_recursive(&cte.query, &cte_name)
             {
-                recursive_seed_query(&cte.query, &cte_name)?
+                let (base_expr, _, _) =
+                    crate::sql::executor::cte::decompose_recursive_union(&cte.query, &cte_name)?;
+                Query {
+                    with: None,
+                    body: base_expr,
+                    order_by: vec![],
+                    limit: None,
+                    offset: None,
+                    fetch: None,
+                    locks: vec![],
+                    limit_by: vec![],
+                    for_clause: None,
+                }
             } else {
                 cte.query.as_ref().clone()
             };
@@ -223,7 +234,18 @@ impl Executor {
                     client_oids,
                 )
                 .await?;
-            let table_schema = cte_table_schema(&cte_name, &cte.alias.columns, &output_schema);
+            let columns: Vec<(String, DataType)> = if cte.alias.columns.is_empty() {
+                output_schema
+            } else {
+                cte.alias
+                    .columns
+                    .iter()
+                    .zip(output_schema.iter())
+                    .map(|(alias_col, (_, dt))| (normalize_ident(alias_col), dt.clone()))
+                    .collect()
+            };
+            let table_schema =
+                crate::sql::executor::cte::build_cte_table_schema(&cte_name, columns);
             ctes.insert(cte_name, (table_schema, vec![]));
         }
 
@@ -272,89 +294,6 @@ fn returning_schema(
             .collect(),
         None => vec![],
     }
-}
-
-fn cte_table_schema(
-    cte_name: &str,
-    alias_columns: &[sqlparser::ast::Ident],
-    output_schema: &[(String, DataType)],
-) -> TableSchema {
-    let columns: Vec<(String, DataType)> = if alias_columns.is_empty() {
-        output_schema.to_vec()
-    } else {
-        alias_columns
-            .iter()
-            .zip(output_schema.iter())
-            .map(|(alias_col, (_, dt))| (alias_col.value.clone(), dt.clone()))
-            .collect()
-    };
-
-    TableSchema {
-        table_id: 0,
-        name: cte_name.to_string(),
-        columns: columns
-            .into_iter()
-            .map(|(name, data_type)| ColumnDef {
-                name,
-                data_type,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-            })
-            .collect(),
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        version: 1,
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        from_alias: None,
-    }
-}
-
-fn recursive_seed_query(query: &Query, cte_name: &str) -> Result<Query> {
-    let (left, right) = match &*query.body {
-        SetExpr::SetOperation {
-            op: SetOperator::Union,
-            left,
-            right,
-            ..
-        } => (left.as_ref(), right.as_ref()),
-        _ => {
-            return Err(SqlError::Unsupported(
-                "recursive CTE must use UNION or UNION ALL".to_string(),
-            )
-            .into())
-        }
-    };
-
-    let left_refs_self = crate::sql::executor::cte::set_expr_references_table(left, cte_name);
-    let right_refs_self = crate::sql::executor::cte::set_expr_references_table(right, cte_name);
-    let base_expr = match (left_refs_self, right_refs_self) {
-        (false, true) => left.clone(),
-        (true, false) => right.clone(),
-        _ => {
-            return Err(SqlError::Unsupported(
-                "recursive CTE must have one non-recursive UNION arm".to_string(),
-            )
-            .into())
-        }
-    };
-
-    Ok(Query {
-        with: None,
-        body: Box::new(base_expr),
-        order_by: vec![],
-        limit: None,
-        offset: None,
-        fetch: None,
-        locks: vec![],
-        limit_by: vec![],
-        for_clause: None,
-    })
 }
 
 fn query_contains_recursive_cte(query: &Query) -> bool {
