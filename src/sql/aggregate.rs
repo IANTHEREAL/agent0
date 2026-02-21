@@ -43,6 +43,9 @@ pub enum Aggregator {
     },
     BoolAnd(Option<bool>),
     BoolOr(Option<bool>),
+    JsonAgg {
+        values: Vec<Value>,
+    },
 }
 
 impl Aggregator {
@@ -70,6 +73,7 @@ impl Aggregator {
             "ARRAY_AGG" => Ok(Aggregator::ArrayAgg { values: Vec::new() }),
             "BOOL_AND" | "EVERY" => Ok(Aggregator::BoolAnd(None)),
             "BOOL_OR" => Ok(Aggregator::BoolOr(None)),
+            "JSON_AGG" | "JSONB_AGG" => Ok(Aggregator::JsonAgg { values: Vec::new() }),
             _ => Err(
                 SqlError::Unsupported(format!("Unsupported aggregate function: {}", kind)).into(),
             ),
@@ -199,6 +203,9 @@ impl Aggregator {
                 }
                 _ => return Err(anyhow!("BOOL_OR requires boolean type")),
             },
+            Aggregator::JsonAgg { values } => {
+                values.push(val.clone());
+            }
         }
         Ok(())
     }
@@ -239,6 +246,59 @@ impl Aggregator {
             }
             Aggregator::BoolAnd(opt) => opt.map_or(Value::Null, Value::Boolean),
             Aggregator::BoolOr(opt) => opt.map_or(Value::Null, Value::Boolean),
+            Aggregator::JsonAgg { values } => {
+                if values.is_empty() {
+                    Value::Null
+                } else {
+                    let items: Vec<String> = values.iter().map(value_to_json_str).collect();
+                    Value::Json(format!("[{}]", items.join(",")))
+                }
+            }
+        }
+    }
+}
+
+/// Convert a Value to its JSON representation string.
+fn value_to_json_str(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Int32(i) => i.to_string(),
+        Value::Int64(i) => i.to_string(),
+        Value::Float64(f) => {
+            if f.is_nan() || f.is_infinite() {
+                "null".to_string()
+            } else {
+                f.to_string()
+            }
+        }
+        Value::Numeric(d) => d.to_string(),
+        Value::Text(s) => {
+            let escaped = s
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            format!("\"{}\"", escaped)
+        }
+        Value::Json(j) => j.clone(),
+        Value::Bytes(b) => {
+            format!("\"\\\\x{}\"", hex::encode(b))
+        }
+        Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(value_to_json_str).collect();
+            format!("[{}]", items.join(","))
+        }
+        _ => {
+            let s = v.to_string();
+            let escaped = s
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            format!("\"{}\"", escaped)
         }
     }
 }
