@@ -143,6 +143,7 @@ pub enum ExecuteResult {
     /// Server notice message (sent as NoticeResponse on the wire)
     Notice {
         message: String,
+        severity: String,
     },
 }
 

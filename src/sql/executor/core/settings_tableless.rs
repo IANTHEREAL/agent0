@@ -7,6 +7,7 @@ use super::{
 };
 use crate::session_context;
 use crate::sql::error::SqlError;
+use crate::sql::session::SessionSettings;
 use anyhow::{anyhow, Result};
 
 pub(super) fn unwrap_top_level_cast<'a>(
@@ -165,7 +166,7 @@ pub(super) fn try_execute_set_config_select(
     let Some(new_value) = try_parse_const_text(val_expr) else {
         return Ok(None);
     };
-    let Some(_is_local) = try_parse_const_bool(local_expr) else {
+    let Some(is_local) = try_parse_const_bool(local_expr) else {
         return Ok(None);
     };
 
@@ -173,7 +174,21 @@ pub(super) fn try_execute_set_config_select(
     if var_name == "search_path" {
         let parsed = parse_search_path_guc_value(&new_value);
         let new_search_path = normalize_search_path_entries(parsed)?;
-        session.set_search_path(new_search_path);
+        if is_local && !session.is_in_transaction() {
+            let display_value = SessionSettings::format_search_path_show(&new_search_path);
+            return Ok(Some(ExecuteResult::Select {
+                columns: vec![alias.unwrap_or_else(|| "set_config".to_string())],
+                column_types: Some(vec![DataType::Text]),
+                rows: vec![Row::new(vec![Value::Text(display_value)])],
+                timezone: session_context::current_timezone(),
+            }));
+        }
+
+        if is_local {
+            session.set_local_search_path(new_search_path);
+        } else {
+            session.set_search_path(new_search_path);
+        }
         let current = session
             .show_setting_value("search_path")
             .unwrap_or_else(|| "public".to_string());
@@ -187,7 +202,23 @@ pub(super) fn try_execute_set_config_select(
         }));
     }
 
-    if session.set_known_setting(&var_name, new_value)? {
+    if is_local && !session.is_in_transaction() {
+        let display_value = SessionSettings::validate_and_normalize_value(&var_name, &new_value)?;
+        return Ok(Some(ExecuteResult::Select {
+            columns: vec![alias.unwrap_or_else(|| "set_config".to_string())],
+            column_types: Some(vec![DataType::Text]),
+            rows: vec![Row::new(vec![Value::Text(display_value)])],
+            timezone: session_context::current_timezone(),
+        }));
+    }
+
+    let applied = if is_local {
+        session.set_local_setting(&var_name, new_value)?
+    } else {
+        session.set_known_setting(&var_name, new_value)?
+    };
+
+    if applied {
         let current = session
             .show_setting_value(&var_name)
             .unwrap_or_else(|| "".to_string());

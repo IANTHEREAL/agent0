@@ -204,13 +204,13 @@ fn client_min_messages_rank(level: &str) -> Option<u8> {
     }
 }
 
-fn client_allows_notice(client_min_messages: Option<String>) -> bool {
+pub(super) fn client_allows_message(client_min_messages: Option<&str>, severity: &str) -> bool {
     let notice_rank = client_min_messages_rank("notice").unwrap_or(8);
+    let severity_rank = client_min_messages_rank(severity).unwrap_or(notice_rank);
     let min_rank = client_min_messages
-        .as_deref()
         .and_then(client_min_messages_rank)
         .unwrap_or(notice_rank);
-    notice_rank >= min_rank
+    severity_rank >= min_rank
 }
 
 async fn send_notices_and_get_last_response<C>(
@@ -243,14 +243,14 @@ where
     C::Error: Debug,
     PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
 {
-    let allow_notice = client_allows_notice(client_min_messages);
+    let client_min_messages = client_min_messages.as_deref();
     let mut last: Option<Response<'static>> = None;
     for result in results.into_vec() {
         match result {
-            ExecuteResult::Notice { message } => {
-                if allow_notice {
+            ExecuteResult::Notice { message, severity } => {
+                if client_allows_message(client_min_messages, &severity) {
                     let notice = NoticeResponse::from(ErrorInfo::new(
-                        "NOTICE".to_string(),
+                        severity,
                         "00000".to_string(),
                         message,
                     ));

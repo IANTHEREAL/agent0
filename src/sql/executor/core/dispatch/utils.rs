@@ -102,6 +102,7 @@ impl Executor {
                         .unwrap_or("?");
                     notices.push(ExecuteResult::Notice {
                         message: format!("table \"{}\" does not exist, skipping", base),
+                        severity: "NOTICE".to_string(),
                     });
                 }
                 Ok(notices)

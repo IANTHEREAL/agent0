@@ -1624,6 +1624,7 @@ async fn test_extended_query_notice_emits_notice_response() {
     let results = crate::sql::ExecuteResults(vec![
         ExecuteResult::Notice {
             message: "table \"flow3_notice_test\" does not exist, skipping".to_string(),
+            severity: "NOTICE".to_string(),
         },
         ExecuteResult::CommandComplete { tag: "DROP TABLE" },
     ]);
@@ -1665,6 +1666,7 @@ async fn test_extended_query_notice_respects_client_min_messages() {
     let results = crate::sql::ExecuteResults(vec![
         ExecuteResult::Notice {
             message: "test notice".to_string(),
+            severity: "NOTICE".to_string(),
         },
         ExecuteResult::CommandComplete { tag: "DROP TABLE" },
     ]);
@@ -1675,6 +1677,14 @@ async fn test_extended_query_notice_respects_client_min_messages() {
             .unwrap();
 
     assert!(client.messages.is_empty());
+}
+
+#[test]
+fn test_client_allows_message_defaults_to_notice_threshold() {
+    // PG default client_min_messages is NOTICE.
+    assert!(client_allows_message(None, "NOTICE"));
+    assert!(client_allows_message(None, "WARNING"));
+    assert!(!client_allows_message(None, "INFO"));
 }
 
 // ── decode_parameters tests (converted from substitute_parameters) ──────────

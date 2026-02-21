@@ -327,10 +327,23 @@ impl Session {
 
     pub fn set_search_path(&mut self, search_path: Vec<String>) {
         self.settings.set_search_path(search_path);
+        self.settings.remove_local_override("search_path");
     }
 
     pub(crate) fn set_known_setting(&mut self, name: &str, value: String) -> Result<bool> {
         self.settings.set_known_setting(name, value)
+    }
+
+    pub(crate) fn set_local_setting(&mut self, name: &str, value: String) -> Result<bool> {
+        self.settings.set_local_override(name, value)
+    }
+
+    pub(crate) fn set_local_search_path(&mut self, search_path: Vec<String>) {
+        self.settings.set_local_search_path(search_path);
+    }
+
+    pub(crate) fn clear_local_overrides(&mut self) {
+        self.settings.clear_local_overrides();
     }
 
     pub(crate) fn reset_setting(&mut self, name: &str) {

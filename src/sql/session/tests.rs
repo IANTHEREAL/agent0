@@ -629,4 +629,96 @@ mod tests {
         assert!(SessionSettings::parse_timeout_value("abc").is_err());
         assert!(SessionSettings::parse_timeout_value("1unknown").is_err());
     }
+
+    #[test]
+    fn test_set_local_override_precedence_and_regular_set_clears_it() {
+        let mut settings = SessionSettings::new();
+
+        settings
+            .set_known_setting("statement_timeout", "7000".to_string())
+            .unwrap();
+        settings
+            .set_local_override("statement_timeout", "2000".to_string())
+            .unwrap();
+
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("2000ms")
+        );
+        assert_eq!(
+            settings.statement_timeout(),
+            Some(Duration::from_millis(2_000))
+        );
+
+        settings
+            .set_known_setting("statement_timeout", "3000".to_string())
+            .unwrap();
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("3000ms")
+        );
+        assert_eq!(
+            settings.statement_timeout(),
+            Some(Duration::from_millis(3_000))
+        );
+    }
+
+    #[test]
+    fn test_local_settings_savepoint_rollback_and_release() {
+        let mut settings = SessionSettings::new();
+
+        settings
+            .set_local_override("statement_timeout", "1000".to_string())
+            .unwrap();
+        settings.push_settings_savepoint("sp1".to_string());
+
+        settings
+            .set_local_override("statement_timeout", "2000".to_string())
+            .unwrap();
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("2000ms")
+        );
+
+        settings.rollback_settings_to_savepoint("sp1");
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("1000ms")
+        );
+
+        settings.push_settings_savepoint("sp2".to_string());
+        settings
+            .set_local_override("statement_timeout", "3000".to_string())
+            .unwrap();
+        settings.release_settings_savepoint("sp2");
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("3000ms")
+        );
+    }
+
+    #[test]
+    fn test_reset_all_clears_local_overrides_but_preserves_savepoint_snapshots() {
+        let mut settings = SessionSettings::new();
+
+        settings
+            .set_local_override("statement_timeout", "1500".to_string())
+            .unwrap();
+        settings.push_settings_savepoint("sp1".to_string());
+        settings
+            .set_local_override("statement_timeout", "2500".to_string())
+            .unwrap();
+
+        settings.reset_all_settings();
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("0")
+        );
+
+        settings.rollback_settings_to_savepoint("sp1");
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("1500ms")
+        );
+    }
 }

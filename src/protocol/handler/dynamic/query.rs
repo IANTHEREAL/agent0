@@ -41,7 +41,7 @@ use super::super::portal::{on_execute_with_tx_status_fix, on_query_with_tx_statu
 use super::super::prepared::{PreparedExec, PreparedStatement};
 use super::super::resolve_copy_columns;
 use super::super::{
-    client_allows_notice, rollback_autocommit_or_mark_failed,
+    client_allows_message, rollback_autocommit_or_mark_failed,
     send_notices_and_get_last_response_with_format, CopyContext,
 };
 
@@ -428,10 +428,13 @@ impl SimpleQueryHandler for DynamicPgHandler {
                 session.record_command_complete();
                 let mut responses: Vec<Response<'a>> = Vec::new();
                 for result in results.into_vec() {
-                    if let ExecuteResult::Notice { message } = result {
-                        if client_allows_notice(session.show_setting_value("client_min_messages")) {
+                    if let ExecuteResult::Notice { message, severity } = result {
+                        if client_allows_message(
+                            session.show_setting_value("client_min_messages").as_deref(),
+                            &severity,
+                        ) {
                             let notice = NoticeResponse::from(ErrorInfo::new(
-                                "NOTICE".to_string(),
+                                severity,
                                 "00000".to_string(),
                                 message,
                             ));

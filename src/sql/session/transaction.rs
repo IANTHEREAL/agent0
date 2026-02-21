@@ -16,7 +16,10 @@ impl Session {
         if self.is_transaction_failed() {
             return Err(SqlError::InFailedTransaction.into());
         }
-        self.savepoints.create(name).await
+        let name_for_settings = name.clone();
+        self.savepoints.create(name).await?;
+        self.settings.push_settings_savepoint(name_for_settings);
+        Ok(())
     }
 
     pub async fn release_savepoint(&mut self, name: &str) -> Result<()> {
@@ -29,7 +32,9 @@ impl Session {
         if self.is_transaction_failed() {
             return Err(SqlError::InFailedTransaction.into());
         }
-        self.savepoints.release(name).await
+        self.savepoints.release(name).await?;
+        self.settings.release_settings_savepoint(name);
+        Ok(())
     }
 
     pub async fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
@@ -73,6 +78,9 @@ impl Session {
             let _ = self.rollback().await;
             return Err(e);
         }
+        // TODO(#601-followup): Regular SET (non-LOCAL) is not restored on savepoint rollback.
+        // PostgreSQL restores it; tracking that session-state undo separately from SET LOCAL.
+        self.settings.rollback_settings_to_savepoint(name);
         self.clear_failed_transaction();
         Ok(())
     }
@@ -113,6 +121,7 @@ impl Session {
                 self.savepoints.reset().await?;
                 match txn.commit().await {
                     Ok(_) => {
+                        self.clear_local_overrides();
                         self.observability.record_commit();
                         Ok(())
                     }
@@ -125,7 +134,10 @@ impl Session {
             TransactionState::Failed(mut txn) => {
                 self.savepoints.reset().await?;
                 match txn.rollback().await {
-                    Ok(_) => Ok(()),
+                    Ok(_) => {
+                        self.clear_local_overrides();
+                        Ok(())
+                    }
                     Err(e) => {
                         self.state = TransactionState::Failed(txn);
                         Err(anyhow!(e))
@@ -143,7 +155,10 @@ impl Session {
             TransactionState::Active(mut txn) => {
                 self.savepoints.reset().await?;
                 match txn.rollback().await {
-                    Ok(_) => Ok(()),
+                    Ok(_) => {
+                        self.clear_local_overrides();
+                        Ok(())
+                    }
                     Err(e) => {
                         self.state = TransactionState::Failed(txn);
                         Err(anyhow!(e))
@@ -153,7 +168,10 @@ impl Session {
             TransactionState::Failed(mut txn) => {
                 self.savepoints.reset().await?;
                 match txn.rollback().await {
-                    Ok(_) => Ok(()),
+                    Ok(_) => {
+                        self.clear_local_overrides();
+                        Ok(())
+                    }
                     Err(e) => {
                         self.state = TransactionState::Failed(txn);
                         Err(anyhow!(e))

@@ -1,0 +1,35 @@
+Asia/Shanghai
+UTC
+Asia/Shanghai
+UTC
+America/New_York
+Asia/Shanghai
+UTC
+WARNING:  SET LOCAL can only be used in transaction blocks
+UTC
+
+
+on
+on
+UTC
+Asia/Shanghai
+UTC
+UTC
+Asia/Shanghai
+Asia/Shanghai
+UTC
+Asia/Shanghai
+UTC
+Asia/Shanghai
+UTC
+Europe/London
+America/New_York
+Asia/Shanghai
+UTC
+on
+off
+on
+pg_catalog, public
+public
+WARNING:  SET LOCAL can only be used in transaction blocks
+public

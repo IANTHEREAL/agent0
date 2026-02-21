@@ -11,6 +11,13 @@ use std::time::Duration;
 
 use super::DEFAULT_MAX_SORT_BYTES;
 
+#[derive(Clone, Debug, Default)]
+struct SettingsSavepoint {
+    name: String,
+    overrides: HashMap<String, String>,
+    search_path: Option<Vec<String>>,
+}
+
 /// A small, per-connection container for session-level settings (GUCs).
 ///
 /// This is intentionally compact and avoids heap allocations unless a setting is
@@ -46,6 +53,13 @@ pub(crate) struct SessionSettings {
     /// drivers expect to SET/SHOW without error (e.g. `extra_float_digits`,
     /// `DateStyle`, `work_mem`). Values are stored as-is for `SHOW` readback.
     extra_settings: HashMap<String, String>,
+
+    /// Transaction-local overrides populated by `SET LOCAL`.
+    local_overrides: HashMap<String, String>,
+    /// Parsed search_path override for local scope.
+    local_search_path: Option<Vec<String>>,
+    /// Savepoint snapshots for transaction-local overrides.
+    settings_savepoint_stack: Vec<SettingsSavepoint>,
 }
 
 impl SessionSettings {
@@ -71,7 +85,7 @@ impl SessionSettings {
         }
     }
 
-    fn format_search_path_show(search_path: &[String]) -> String {
+    pub(crate) fn format_search_path_show(search_path: &[String]) -> String {
         search_path
             .iter()
             .map(|s| Self::quote_search_path_schema(s))
@@ -85,6 +99,28 @@ impl SessionSettings {
         } else {
             format!("{}ms", ms)
         }
+    }
+
+    fn canonical_setting_name<'a>(name: &'a str) -> &'a str {
+        match name {
+            "transaction.isolation.level" => "transaction_isolation",
+            "tipg.max_sort_bytes" => "pgtikv.max_sort_bytes",
+            _ => name,
+        }
+    }
+
+    fn is_immutable_setting(name: &str) -> bool {
+        matches!(
+            name,
+            "server_version"
+                | "server_version_num"
+                | "server_encoding"
+                | "datestyle"
+                | "integer_datetimes"
+                | "intervalstyle"
+                | "tipg.use_optimizer"
+                | "default_transaction_isolation"
+        )
     }
 
     pub(crate) fn new() -> Self {
@@ -107,7 +143,9 @@ impl SessionSettings {
     }
 
     pub(crate) fn search_path(&self) -> &[String] {
-        &self.search_path
+        self.local_search_path
+            .as_deref()
+            .unwrap_or(&self.search_path)
     }
 
     pub(crate) fn set_search_path(&mut self, search_path: Vec<String>) {
@@ -244,133 +282,209 @@ impl SessionSettings {
         Ok(total as usize)
     }
 
-    /// Set a session setting. Known settings (timeout, encoding, etc.) are validated
-    /// and stored in typed fields. Unknown GUCs are stored in a generic map for
-    /// `SHOW` readback — this allows drivers that SET parameters like `extra_float_digits`
-    /// or `DateStyle` to work without error.
-    pub(crate) fn set_known_setting(&mut self, name: &str, value: String) -> Result<bool> {
-        match name {
-            "statement_timeout" => self.statement_timeout_ms = Self::parse_timeout_millis(&value)?,
-            "lock_timeout" => self.lock_timeout_ms = Self::parse_timeout_millis(&value)?,
-            "idle_in_transaction_session_timeout" => {
-                self.idle_in_transaction_session_timeout_ms = Self::parse_timeout_millis(&value)?
+    pub(crate) fn validate_and_normalize_value(name: &str, value: &str) -> Result<String> {
+        match Self::canonical_setting_name(name) {
+            "statement_timeout" | "lock_timeout" | "idle_in_transaction_session_timeout" => {
+                let ms = Self::parse_timeout_millis(value)?;
+                Ok(Self::format_timeout_show(ms))
             }
             "pgtikv.max_sort_bytes" => {
-                self.max_sort_bytes = Self::parse_byte_size(&value)?;
+                let bytes = Self::parse_byte_size(value)?;
+                Ok(bytes.to_string())
             }
             "tipg.use_optimizer" => {
                 let normalized = value.trim().to_lowercase();
                 match normalized.as_str() {
-                    "on" | "true" | "yes" | "1" => { /* already on, no-op */ }
+                    "on" | "true" | "yes" | "1" => Ok(value.to_string()),
                     "off" | "false" | "no" | "0" => {
                         tracing::info!(
                             "NOTICE: optimizer cannot be disabled; \
                              tipg.use_optimizer setting ignored"
                         );
+                        Ok(value.to_string())
                     }
-                    _ => {
-                        return Err(SqlError::InvalidParameterValue {
-                            message: "parameter \"tipg.use_optimizer\" requires a Boolean value"
-                                .into(),
-                        }
-                        .into())
+                    _ => Err(SqlError::InvalidParameterValue {
+                        message: "parameter \"tipg.use_optimizer\" requires a Boolean value".into(),
                     }
+                    .into()),
                 }
             }
             "timezone" => {
-                crate::types::timestamp::TimeZoneSpec::try_parse(&value)?;
-                self.timezone = Some(value);
+                crate::types::timestamp::TimeZoneSpec::try_parse(value)?;
+                Ok(value.to_string())
             }
-            "application_name" => self.application_name = Some(value),
             "client_encoding" => {
                 let enc = value.trim();
                 if enc.eq_ignore_ascii_case("utf8") || enc.eq_ignore_ascii_case("utf-8") {
-                    // Server is UTF-8 only and does not support transcoding. Accept UTF-8 aliases
-                    // and store the canonical Postgres spelling.
-                    self.client_encoding = Some("UTF8".to_string());
+                    Ok("UTF8".to_string())
                 } else {
-                    return Err(SqlError::Unsupported(format!(
+                    Err(SqlError::Unsupported(format!(
                         "unsupported client_encoding '{}'; only UTF8 is supported",
                         value
                     ))
-                    .into());
+                    .into())
                 }
             }
-            "standard_conforming_strings" => self.standard_conforming_strings = Some(value),
-            "check_function_bodies" => self.check_function_bodies = Some(value),
-            "xmloption" => self.xmloption = Some(value),
-            "client_min_messages" => self.client_min_messages = Some(value),
-            "row_security" => self.row_security = Some(value),
-            "default_tablespace" => self.default_tablespace = Some(value),
-            "default_table_access_method" => self.default_table_access_method = Some(value),
             "transaction_isolation" => {
                 let normalized = value.trim().to_lowercase();
                 match normalized.as_str() {
                     "read uncommitted" | "read committed" => {
-                        // TiKV snapshot isolation is equivalent to REPEATABLE READ.
-                        // Accept these levels for driver compatibility but honestly
-                        // report what the engine actually provides.
                         tracing::warn!(
                             requested = normalized.as_str(),
                             actual = "repeatable read",
                             "TiKV provides snapshot isolation (REPEATABLE READ); \
                              the requested isolation level has been upgraded"
                         );
-                        self.transaction_isolation = Some("repeatable read".to_string());
+                        Ok("repeatable read".to_string())
                     }
-                    "repeatable read" => {
-                        self.transaction_isolation = Some("repeatable read".to_string());
+                    "repeatable read" => Ok("repeatable read".to_string()),
+                    "serializable" => Err(SqlError::Unsupported(
+                        "SERIALIZABLE isolation level is not supported".into(),
+                    )
+                    .into()),
+                    _ => Err(SqlError::InvalidParameterValue {
+                        message: format!(
+                            "invalid value for parameter \"transaction_isolation\": \"{}\"",
+                            value
+                        ),
                     }
-                    "serializable" => {
-                        return Err(SqlError::Unsupported(
-                            "SERIALIZABLE isolation level is not supported".into(),
-                        )
-                        .into());
-                    }
-                    _ => {
-                        return Err(SqlError::InvalidParameterValue {
-                            message: format!(
-                                "invalid value for parameter \"transaction_isolation\": \"{}\"",
-                                value
-                            ),
-                        }
-                        .into());
-                    }
+                    .into()),
                 }
             }
             "default_transaction_read_only" => {
                 let normalized = value.trim().to_lowercase();
                 match normalized.as_str() {
-                    "on" | "true" | "yes" | "1" => {
-                        self.default_transaction_read_only = Some("on".to_string());
+                    "on" | "true" | "yes" | "1" => Ok("on".to_string()),
+                    "off" | "false" | "no" | "0" => Ok("off".to_string()),
+                    _ => Err(SqlError::InvalidParameterValue {
+                        message:
+                            "parameter \"default_transaction_read_only\" requires a Boolean value"
+                                .into(),
                     }
-                    "off" | "false" | "no" | "0" => {
-                        self.default_transaction_read_only = Some("off".to_string());
-                    }
-                    _ => {
-                        return Err(SqlError::InvalidParameterValue {
-                            message:
-                                "parameter \"default_transaction_read_only\" requires a Boolean value"
-                                    .into(),
-                        }
-                        .into());
-                    }
+                    .into()),
                 }
             }
+            _ => Ok(value.to_string()),
+        }
+    }
+
+    /// Set a session setting. Known settings (timeout, encoding, etc.) are validated
+    /// and stored in typed fields. Unknown GUCs are stored in a generic map for
+    /// `SHOW` readback — this allows drivers that SET parameters like `extra_float_digits`
+    /// or `DateStyle` to work without error.
+    pub(crate) fn set_known_setting(&mut self, name: &str, value: String) -> Result<bool> {
+        let canonical = Self::canonical_setting_name(name);
+        let normalized = Self::validate_and_normalize_value(canonical, &value)?;
+
+        match canonical {
+            "statement_timeout" => {
+                self.statement_timeout_ms = Self::parse_timeout_millis(&normalized)?;
+            }
+            "lock_timeout" => self.lock_timeout_ms = Self::parse_timeout_millis(&normalized)?,
+            "idle_in_transaction_session_timeout" => {
+                self.idle_in_transaction_session_timeout_ms =
+                    Self::parse_timeout_millis(&normalized)?
+            }
+            "pgtikv.max_sort_bytes" => {
+                self.max_sort_bytes = Self::parse_byte_size(&normalized)?;
+            }
+            "tipg.use_optimizer" => {}
+            "timezone" => self.timezone = Some(normalized.clone()),
+            "application_name" => self.application_name = Some(normalized.clone()),
+            "client_encoding" => self.client_encoding = Some(normalized.clone()),
+            "standard_conforming_strings" => {
+                self.standard_conforming_strings = Some(normalized.clone())
+            }
+            "check_function_bodies" => self.check_function_bodies = Some(normalized.clone()),
+            "xmloption" => self.xmloption = Some(normalized.clone()),
+            "client_min_messages" => self.client_min_messages = Some(normalized.clone()),
+            "row_security" => self.row_security = Some(normalized.clone()),
+            "default_tablespace" => self.default_tablespace = Some(normalized.clone()),
+            "default_table_access_method" => {
+                self.default_table_access_method = Some(normalized.clone())
+            }
+            "transaction_isolation" => self.transaction_isolation = Some(normalized.clone()),
+            "default_transaction_read_only" => {
+                self.default_transaction_read_only = Some(normalized.clone())
+            }
             _ => {
-                // Generic storage for GUC parameters that tipg does not actively
-                // use but drivers expect to SET/SHOW (e.g. extra_float_digits,
-                // DateStyle, work_mem). Store as-is for SHOW readback.
-                self.extra_settings.insert(name.to_string(), value);
-                return Ok(true);
+                self.extra_settings
+                    .insert(canonical.to_string(), normalized.clone());
             }
         }
+        self.remove_local_override(canonical);
         Ok(true)
+    }
+
+    pub(crate) fn set_local_override(&mut self, name: &str, value: String) -> Result<bool> {
+        let canonical = Self::canonical_setting_name(name);
+        let normalized = Self::validate_and_normalize_value(canonical, &value)?;
+        self.local_overrides
+            .insert(canonical.to_string(), normalized);
+        Ok(true)
+    }
+
+    pub(crate) fn set_local_search_path(&mut self, search_path: Vec<String>) {
+        self.local_overrides.insert(
+            "search_path".to_string(),
+            Self::format_search_path_show(&search_path),
+        );
+        self.local_search_path = Some(search_path);
+    }
+
+    pub(crate) fn clear_local_overrides(&mut self) {
+        self.local_overrides.clear();
+        self.local_search_path = None;
+        self.settings_savepoint_stack.clear();
+    }
+
+    pub(crate) fn remove_local_override(&mut self, name: &str) {
+        let canonical = Self::canonical_setting_name(name);
+        self.local_overrides.remove(canonical);
+        if canonical == "search_path" {
+            self.local_search_path = None;
+        }
+    }
+
+    pub(crate) fn push_settings_savepoint(&mut self, name: String) {
+        self.settings_savepoint_stack.push(SettingsSavepoint {
+            name,
+            overrides: self.local_overrides.clone(),
+            search_path: self.local_search_path.clone(),
+        });
+    }
+
+    pub(crate) fn rollback_settings_to_savepoint(&mut self, name: &str) {
+        let Some(target_idx) = self
+            .settings_savepoint_stack
+            .iter()
+            .rposition(|sp| sp.name == name)
+        else {
+            return;
+        };
+
+        let snapshot = self.settings_savepoint_stack[target_idx].clone();
+        self.local_overrides = snapshot.overrides;
+        self.local_search_path = snapshot.search_path;
+        self.settings_savepoint_stack.truncate(target_idx + 1);
+    }
+
+    pub(crate) fn release_settings_savepoint(&mut self, name: &str) {
+        let Some(target_idx) = self
+            .settings_savepoint_stack
+            .iter()
+            .rposition(|sp| sp.name == name)
+        else {
+            return;
+        };
+
+        self.settings_savepoint_stack.truncate(target_idx);
     }
 
     /// Reset a single session setting to its default value.
     pub(crate) fn reset_setting(&mut self, name: &str) {
-        match name {
+        let canonical = Self::canonical_setting_name(name);
+        match canonical {
             "search_path" => self.search_path = Self::default_search_path(),
             "statement_timeout" => self.statement_timeout_ms = self.default_statement_timeout_ms,
             "lock_timeout" => self.lock_timeout_ms = 0,
@@ -378,9 +492,7 @@ impl SessionSettings {
                 self.idle_in_transaction_session_timeout_ms =
                     self.default_idle_in_transaction_session_timeout_ms
             }
-            "pgtikv.max_sort_bytes" | "tipg.max_sort_bytes" => {
-                self.max_sort_bytes = DEFAULT_MAX_SORT_BYTES
-            }
+            "pgtikv.max_sort_bytes" => self.max_sort_bytes = DEFAULT_MAX_SORT_BYTES,
             "tipg.use_optimizer" => {}
             "timezone" => self.timezone = None,
             "application_name" => self.application_name = None,
@@ -395,27 +507,41 @@ impl SessionSettings {
             "transaction_isolation" => self.transaction_isolation = None,
             "default_transaction_read_only" => self.default_transaction_read_only = None,
             _ => {
-                self.extra_settings.remove(name);
+                self.extra_settings.remove(canonical);
             }
         }
+        self.remove_local_override(canonical);
     }
 
     /// Reset all session settings to their defaults.
     pub(crate) fn reset_all_settings(&mut self) {
+        let savepoint_stack = std::mem::take(&mut self.settings_savepoint_stack);
         *self = Self::new_with_defaults(
             self.default_statement_timeout_ms,
             self.default_idle_in_transaction_session_timeout_ms,
         );
+        self.settings_savepoint_stack = savepoint_stack;
     }
 
     /// Get a session setting value in a Postgres-like string form, for `SHOW`.
     pub(crate) fn show_value(&self, name: &str) -> Option<String> {
-        match name {
+        let canonical = Self::canonical_setting_name(name);
+        if !Self::is_immutable_setting(canonical) {
+            if let Some(v) = self.local_overrides.get(canonical) {
+                return Some(v.clone());
+            }
+        }
+
+        match canonical {
             // These are used heavily by drivers for feature detection.
             "server_version" => Some("16.0".to_string()),
             "server_version_num" => Some("160000".to_string()),
             "server_encoding" => Some("UTF8".to_string()),
-            "search_path" => Some(Self::format_search_path_show(&self.search_path)),
+            "search_path" => Some(Self::format_search_path_show(
+                self.local_search_path
+                    .as_deref()
+                    .unwrap_or(&self.search_path),
+            )),
             "datestyle" => Some("ISO, MDY".to_string()),
             "integer_datetimes" => Some("on".to_string()),
             "intervalstyle" => Some("postgres".to_string()),
@@ -463,10 +589,8 @@ impl SessionSettings {
                     .unwrap_or("heap")
                     .to_string(),
             ),
-            // Transaction isolation level. Support both forms:
-            // - "transaction_isolation" (standard PostgreSQL GUC name)
-            // - "transaction.isolation.level" (how SHOW transaction isolation level parses)
-            "transaction_isolation" | "transaction.isolation.level" => Some(
+            // `transaction.isolation.level` alias is canonicalized above.
+            "transaction_isolation" => Some(
                 self.transaction_isolation
                     .as_deref()
                     .unwrap_or("repeatable read")
@@ -481,9 +605,9 @@ impl SessionSettings {
             ),
             _ => self
                 .extra_settings
-                .get(name)
+                .get(canonical)
                 .cloned()
-                .or_else(|| Self::default_value(name).map(String::from)),
+                .or_else(|| Self::default_value(canonical).map(String::from)),
         }
     }
 
@@ -510,6 +634,20 @@ impl SessionSettings {
     }
 
     pub(crate) fn statement_timeout(&self) -> Option<Duration> {
+        if let Some(v) = self.local_overrides.get("statement_timeout") {
+            match Self::parse_timeout_millis(v) {
+                Ok(ms) if ms == 0 => return None,
+                Ok(ms) => return Some(Duration::from_millis(ms)),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        value = v,
+                        "invalid local statement_timeout override"
+                    );
+                }
+            }
+        }
+
         if self.statement_timeout_ms == 0 {
             None
         } else {
@@ -518,6 +656,23 @@ impl SessionSettings {
     }
 
     pub(crate) fn idle_in_transaction_session_timeout(&self) -> Option<Duration> {
+        if let Some(v) = self
+            .local_overrides
+            .get("idle_in_transaction_session_timeout")
+        {
+            match Self::parse_timeout_millis(v) {
+                Ok(ms) if ms == 0 => return None,
+                Ok(ms) => return Some(Duration::from_millis(ms)),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        value = v,
+                        "invalid local idle_in_transaction_session_timeout override"
+                    );
+                }
+            }
+        }
+
         if self.idle_in_transaction_session_timeout_ms == 0 {
             None
         } else {
@@ -528,6 +683,18 @@ impl SessionSettings {
     }
 
     pub(crate) fn max_sort_bytes(&self) -> usize {
+        if let Some(v) = self.local_overrides.get("pgtikv.max_sort_bytes") {
+            match Self::parse_byte_size(v) {
+                Ok(bytes) => return bytes,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        value = v,
+                        "invalid local pgtikv.max_sort_bytes override"
+                    );
+                }
+            }
+        }
         self.max_sort_bytes
     }
 }

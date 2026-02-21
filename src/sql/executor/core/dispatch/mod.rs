@@ -743,7 +743,10 @@ impl Executor {
 	                                Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }])
 	                            }
                             Statement::SetVariable {
-                                variable, value, ..
+                                local,
+                                variable,
+                                value,
+                                ..
                             } => {
                                 let var_name = variable
                                     .0
@@ -778,18 +781,74 @@ impl Executor {
                                     }
                                     let new_search_path =
                                         normalize_search_path_entries(new_search_path)?;
-                                    session.set_search_path(new_search_path);
+                                    if *local && !session.is_in_transaction() {
+                                        return Ok(vec![
+                                            ExecuteResult::Notice {
+                                                message:
+                                                    "SET LOCAL can only be used in transaction blocks"
+                                                        .to_string(),
+                                                severity: "WARNING".to_string(),
+                                            },
+                                            ExecuteResult::CommandComplete { tag: "SET" },
+                                        ]);
+                                    }
+
+                                    if *local {
+                                        session.set_local_search_path(new_search_path);
+                                    } else {
+                                        session.set_search_path(new_search_path);
+                                    }
                                 } else {
                                     let value = set_variable_value_to_string(value)?;
-                                    session.set_known_setting(&var_name, value)?;
+                                    if *local && !session.is_in_transaction() {
+                                        crate::sql::session::SessionSettings::validate_and_normalize_value(
+                                            &var_name,
+                                            &value,
+                                        )?;
+                                        return Ok(vec![
+                                            ExecuteResult::Notice {
+                                                message:
+                                                    "SET LOCAL can only be used in transaction blocks"
+                                                        .to_string(),
+                                                severity: "WARNING".to_string(),
+                                            },
+                                            ExecuteResult::CommandComplete { tag: "SET" },
+                                        ]);
+                                    }
+
+                                    if *local {
+                                        session.set_local_setting(&var_name, value)?;
+                                    } else {
+                                        session.set_known_setting(&var_name, value)?;
+                                    }
                                 }
                                 Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }])
                             }
-                            Statement::SetTimeZone { value, .. } => {
+                            Statement::SetTimeZone { local, value, .. } => {
                                 let value = set_variable_value_to_string(std::slice::from_ref(
                                     value,
                                 ))?;
-                                session.set_known_setting("timezone", value)?;
+                                if *local && !session.is_in_transaction() {
+                                    crate::sql::session::SessionSettings::validate_and_normalize_value(
+                                        "timezone",
+                                        &value,
+                                    )?;
+                                    return Ok(vec![
+                                        ExecuteResult::Notice {
+                                            message:
+                                                "SET LOCAL can only be used in transaction blocks"
+                                                    .to_string(),
+                                            severity: "WARNING".to_string(),
+                                        },
+                                        ExecuteResult::CommandComplete { tag: "SET" },
+                                    ]);
+                                }
+
+                                if *local {
+                                    session.set_local_setting("timezone", value)?;
+                                } else {
+                                    session.set_known_setting("timezone", value)?;
+                                }
                                 Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }])
                             }
                             Statement::SetNames { charset_name, collation_name } => {
