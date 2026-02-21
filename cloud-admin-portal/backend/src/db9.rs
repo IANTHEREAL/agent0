@@ -1105,7 +1105,9 @@ async fn upload_single_file(
         let parent_str = parent.to_string_lossy();
         if parent_str != "/" && !parent_str.is_empty() {
             if let Err(e) = fs9_mkdir(client, fs9_url, token, &parent_str).await {
-                eprintln!("warning: mkdir '{}': {e}", parent_str);
+                if verbose {
+                    eprintln!("warning: mkdir '{}': {e}", parent_str);
+                }
             }
         }
     }
@@ -1139,7 +1141,9 @@ async fn upload_dir_recursive(
     skipped: &mut u64,
 ) {
     if let Err(e) = fs9_mkdir(client, fs9_url, token, remote_dir).await {
-        eprintln!("warning: mkdir '{}': {e}", remote_dir);
+        if verbose {
+            eprintln!("warning: mkdir '{}': {e}", remote_dir);
+        }
     }
 
     let entries = std::fs::read_dir(local_dir).unwrap_or_else(|e| {
