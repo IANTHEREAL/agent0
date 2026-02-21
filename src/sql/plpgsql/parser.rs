@@ -48,13 +48,12 @@ pub(super) fn parse_declare_block(
     HashMap<String, DataType>,
     &str,
 )> {
-    let body_upper = body.to_uppercase();
+    let body_bytes = body.as_bytes();
     let mut var_defaults: HashMap<String, Option<String>> = HashMap::new();
     let mut types = HashMap::new();
 
-    let declare_pos = body_upper.find("DECLARE");
-    let begin_pos = body_upper
-        .find("BEGIN")
+    let declare_pos = find_ascii_keyword(body_bytes, b"DECLARE");
+    let begin_pos = find_ascii_keyword(body_bytes, b"BEGIN")
         .ok_or_else(|| anyhow!("PL/pgSQL function must have BEGIN block"))?;
 
     let rest = if let Some(decl_pos) = declare_pos {
@@ -71,7 +70,7 @@ pub(super) fn parse_declare_block(
                     let rest = parts[1].trim();
 
                     let (type_str, default_expr) =
-                        if let Some(def_pos) = rest.to_uppercase().find("DEFAULT") {
+                        if let Some(def_pos) = find_ascii_keyword(rest.as_bytes(), b"DEFAULT") {
                             (
                                 rest[..def_pos].trim(),
                                 Some(rest[def_pos + 7..].trim().to_string()),
@@ -104,10 +103,8 @@ pub(super) fn parse_begin_block(
     body: &str,
     declared_vars: &HashSet<String>,
 ) -> Result<Vec<PlpgsqlStatement>> {
-    let body_upper = body.to_uppercase();
-    let begin_pos = body_upper
-        .find("BEGIN")
-        .ok_or_else(|| anyhow!("Missing BEGIN"))?;
+    let begin_pos =
+        find_ascii_keyword(body.as_bytes(), b"BEGIN").ok_or_else(|| anyhow!("Missing BEGIN"))?;
     let end_pos = find_matching_end(&body[begin_pos..])
         .ok_or_else(|| anyhow!("Missing END for BEGIN block"))?;
 
@@ -116,13 +113,12 @@ pub(super) fn parse_begin_block(
 }
 
 fn find_matching_end(s: &str) -> Option<usize> {
-    let s_upper = s.to_uppercase();
     let mut depth = 0;
     let mut i = 0;
-    let bytes = s_upper.as_bytes();
+    let bytes = s.as_bytes();
 
     while i < bytes.len() {
-        if i + 5 <= bytes.len() && &s_upper[i..i + 5] == "BEGIN" {
+        if ascii_keyword_at(bytes, i, b"BEGIN") {
             if i == 0 || !bytes[i - 1].is_ascii_alphanumeric() {
                 if i + 5 == bytes.len() || !bytes[i + 5].is_ascii_alphanumeric() {
                     depth += 1;
@@ -131,7 +127,7 @@ fn find_matching_end(s: &str) -> Option<usize> {
                 }
             }
         }
-        if i + 2 <= bytes.len() && &s_upper[i..i + 2] == "IF" {
+        if ascii_keyword_at(bytes, i, b"IF") {
             if (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
                 && (i + 2 == bytes.len() || !bytes[i + 2].is_ascii_alphanumeric())
             {
@@ -140,14 +136,14 @@ fn find_matching_end(s: &str) -> Option<usize> {
                 continue;
             }
         }
-        if i + 8 <= bytes.len() && &s_upper[i..i + 8] == "END LOOP" {
+        if ascii_keyword_at(bytes, i, b"END LOOP") {
             if i == 0 || !bytes[i - 1].is_ascii_alphanumeric() {
                 depth -= 1;
                 i += 8;
                 continue;
             }
         }
-        if i + 4 <= bytes.len() && &s_upper[i..i + 4] == "LOOP" {
+        if ascii_keyword_at(bytes, i, b"LOOP") {
             if (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
                 && (i + 4 == bytes.len() || !bytes[i + 4].is_ascii_alphanumeric())
             {
@@ -156,21 +152,24 @@ fn find_matching_end(s: &str) -> Option<usize> {
                 continue;
             }
         }
-        if i + 6 <= bytes.len() && &s_upper[i..i + 6] == "END IF" {
+        if ascii_keyword_at(bytes, i, b"END IF") {
             if i == 0 || !bytes[i - 1].is_ascii_alphanumeric() {
                 depth -= 1;
                 i += 6;
                 continue;
             }
         }
-        if i + 3 <= bytes.len() && &s_upper[i..i + 3] == "END" {
+        if ascii_keyword_at(bytes, i, b"END") {
             if (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
                 && (i + 3 == bytes.len()
                     || !bytes[i + 3].is_ascii_alphanumeric()
                     || (i + 4 <= bytes.len() && bytes[i + 3] == b';'))
             {
-                let rest = s_upper[i + 3..].trim_start();
-                if !rest.starts_with("IF") {
+                let mut rest_pos = i + 3;
+                while rest_pos < bytes.len() && bytes[rest_pos].is_ascii_whitespace() {
+                    rest_pos += 1;
+                }
+                if !ascii_keyword_at(bytes, rest_pos, b"IF") {
                     depth -= 1;
                     if depth == 0 {
                         return Some(i);
@@ -200,22 +199,22 @@ pub(super) fn parse_statements(
     while !remaining.trim().is_empty() {
         remaining = remaining.trim();
 
-        let remaining_upper = remaining.to_uppercase();
-        if remaining_upper.starts_with("IF ") || remaining_upper.starts_with("IF\n") {
+        let rem_bytes = remaining.as_bytes();
+        if ascii_keyword_at(rem_bytes, 0, b"IF ") || ascii_keyword_at(rem_bytes, 0, b"IF\n") {
             let (if_stmt, rest) = parse_if_statement(remaining, declared_vars)?;
             statements.push(if_stmt);
             remaining = rest;
             continue;
         }
 
-        if remaining_upper.starts_with("ELSIF ") || remaining_upper.starts_with("ELSIF\n") {
+        if ascii_keyword_at(rem_bytes, 0, b"ELSIF ") || ascii_keyword_at(rem_bytes, 0, b"ELSIF\n") {
             let synthetic_if = format!("IF{} END IF", &remaining[5..]);
             let (if_stmt, _rest) = parse_if_statement(&synthetic_if, declared_vars)?;
             statements.push(if_stmt);
             break;
         }
 
-        if remaining_upper.starts_with("FOR ") || remaining_upper.starts_with("FOR\n") {
+        if ascii_keyword_at(rem_bytes, 0, b"FOR ") || ascii_keyword_at(rem_bytes, 0, b"FOR\n") {
             let (for_stmt, rest) = parse_for_statement(remaining, declared_vars)?;
             statements.push(for_stmt);
             remaining = rest;
@@ -267,28 +266,30 @@ fn find_statement_end(s: &str) -> Option<usize> {
 
 fn parse_single_statement(s: &str, declared_vars: &HashSet<String>) -> Result<PlpgsqlStatement> {
     let s = s.trim();
-    let s_upper = s.to_uppercase();
+    let s_bytes = s.as_bytes();
 
-    if s_upper == "NULL" {
+    if ascii_keyword_at(s_bytes, 0, b"NULL") && s_bytes.len() == 4 {
         return Ok(PlpgsqlStatement::Null);
     }
 
-    if s_upper.starts_with("RETURN ") || s_upper == "RETURN" {
+    if ascii_keyword_at(s_bytes, 0, b"RETURN ")
+        || (ascii_keyword_at(s_bytes, 0, b"RETURN") && s_bytes.len() == 6)
+    {
         let expr = if s.len() > 7 { s[7..].trim() } else { "" };
         return Ok(PlpgsqlStatement::Return(expr.to_string()));
     }
 
-    if s_upper.starts_with("CALL ") {
+    if ascii_keyword_at(s_bytes, 0, b"CALL ") {
         return Err(anyhow!("CALL is not allowed in a function"));
     }
 
-    if s_upper.starts_with("RAISE ") {
+    if ascii_keyword_at(s_bytes, 0, b"RAISE ") {
         let rest = s[6..].trim();
-        let rest_upper = rest.to_uppercase();
-        if rest_upper.starts_with("NOTICE ") {
+        let rest_bytes = rest.as_bytes();
+        if ascii_keyword_at(rest_bytes, 0, b"NOTICE ") {
             return Ok(PlpgsqlStatement::RaiseNotice(rest[7..].trim().to_string()));
         }
-        if rest_upper.starts_with("EXCEPTION ") {
+        if ascii_keyword_at(rest_bytes, 0, b"EXCEPTION ") {
             return Ok(PlpgsqlStatement::RaiseException(
                 rest[10..].trim().to_string(),
             ));
@@ -296,28 +297,30 @@ fn parse_single_statement(s: &str, declared_vars: &HashSet<String>) -> Result<Pl
         return Ok(PlpgsqlStatement::RaiseException(rest.to_string()));
     }
 
-    if s_upper == "EXIT" || s_upper.starts_with("EXIT ") {
+    if (ascii_keyword_at(s_bytes, 0, b"EXIT") && s_bytes.len() == 4)
+        || ascii_keyword_at(s_bytes, 0, b"EXIT ")
+    {
         return Ok(PlpgsqlStatement::Exit);
     }
 
-    if s_upper.starts_with("PERFORM ") {
+    if ascii_keyword_at(s_bytes, 0, b"PERFORM ") {
         let query = s[8..].trim();
         return Ok(PlpgsqlStatement::Perform(query.to_string()));
     }
 
-    if s_upper.starts_with("SELECT ") {
+    if ascii_keyword_at(s_bytes, 0, b"SELECT ") {
         if let Some(stmt) = parse_select_into_statement(s, declared_vars)? {
             return Ok(stmt);
         }
     }
 
-    if s_upper.starts_with("INSERT ")
-        || s_upper.starts_with("UPDATE ")
-        || s_upper.starts_with("DELETE ")
-        || s_upper.starts_with("CREATE ")
-        || s_upper.starts_with("DROP ")
-        || s_upper.starts_with("ALTER ")
-        || s_upper.starts_with("TRUNCATE ")
+    if ascii_keyword_at(s_bytes, 0, b"INSERT ")
+        || ascii_keyword_at(s_bytes, 0, b"UPDATE ")
+        || ascii_keyword_at(s_bytes, 0, b"DELETE ")
+        || ascii_keyword_at(s_bytes, 0, b"CREATE ")
+        || ascii_keyword_at(s_bytes, 0, b"DROP ")
+        || ascii_keyword_at(s_bytes, 0, b"ALTER ")
+        || ascii_keyword_at(s_bytes, 0, b"TRUNCATE ")
     {
         return Ok(PlpgsqlStatement::Sql(s.to_string()));
     }
@@ -335,32 +338,32 @@ fn parse_select_into_statement(
     s: &str,
     declared_vars: &HashSet<String>,
 ) -> Result<Option<PlpgsqlStatement>> {
-    let upper = s.to_uppercase();
-    let Some(select_pos) = upper.find("SELECT") else {
+    let s_bytes = s.as_bytes();
+    let Some(select_pos) = find_ascii_keyword(s_bytes, b"SELECT") else {
         return Ok(None);
     };
-    let Some(into_pos) = upper.find("INTO") else {
+    let Some(into_pos) = find_ascii_keyword(s_bytes, b"INTO") else {
         return Ok(None);
     };
     if into_pos <= select_pos {
         return Ok(None);
     }
 
-    let from_pos = upper.find("FROM");
+    let from_pos = find_ascii_keyword(s_bytes, b"FROM");
     if let Some(fp) = from_pos {
         if into_pos >= fp {
             return Ok(None);
         }
     }
 
-    let mut projection = s[select_pos + 6..into_pos].trim().to_string();
+    let projection = s[select_pos + 6..into_pos].trim().to_string();
     let mut var_part = if let Some(fp) = from_pos {
         s[into_pos + 4..fp].trim()
     } else {
         s[into_pos + 4..].trim()
     };
 
-    let strict = var_part.to_uppercase().starts_with("STRICT");
+    let strict = ascii_keyword_at(var_part.as_bytes(), 0, b"STRICT");
     if strict {
         var_part = var_part[6..].trim();
     }
@@ -462,13 +465,12 @@ fn parse_for_statement<'a>(
     s: &'a str,
     declared_vars: &HashSet<String>,
 ) -> Result<(PlpgsqlStatement, &'a str)> {
-    let s_upper = s.to_uppercase();
-    let bytes = s_upper.as_bytes();
+    let bytes = s.as_bytes();
 
     let mut loop_pos = None;
     let mut i = 0;
     while i + 4 <= bytes.len() {
-        if &s_upper[i..i + 4] == "LOOP"
+        if ascii_keyword_at(bytes, i, b"LOOP")
             && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
             && (i + 4 == bytes.len() || !bytes[i + 4].is_ascii_alphanumeric())
         {
@@ -490,15 +492,13 @@ fn parse_for_statement<'a>(
             }
         })
         .collect();
-    let in_pos = header_norm
-        .to_uppercase()
-        .find(" IN ")
+    let in_pos = find_ascii_keyword(header_norm.as_bytes(), b" IN ")
         .ok_or_else(|| anyhow!("FOR without IN"))?;
     let variable = header_norm[..in_pos].trim().to_string();
     let mut in_expr = header_norm[in_pos + 4..].trim().to_string();
 
     let mut reverse = false;
-    if in_expr.to_uppercase().starts_with("REVERSE ") {
+    if ascii_keyword_at(in_expr.as_bytes(), 0, b"REVERSE ") {
         reverse = true;
         in_expr = in_expr[8..].trim().to_string();
     }
@@ -507,7 +507,7 @@ fn parse_for_statement<'a>(
     let mut end_loop_pos = None;
     i = loop_pos + 4;
     while i < bytes.len() {
-        if i + 8 <= bytes.len() && &s_upper[i..i + 8] == "END LOOP" {
+        if ascii_keyword_at(bytes, i, b"END LOOP") {
             if i == 0 || !bytes[i - 1].is_ascii_alphanumeric() {
                 depth -= 1;
                 if depth == 0 {
@@ -519,7 +519,7 @@ fn parse_for_statement<'a>(
             }
         }
 
-        if i + 4 <= bytes.len() && &s_upper[i..i + 4] == "LOOP" {
+        if ascii_keyword_at(bytes, i, b"LOOP") {
             if (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
                 && (i + 4 == bytes.len() || !bytes[i + 4].is_ascii_alphanumeric())
             {
@@ -547,15 +547,15 @@ fn parse_for_statement<'a>(
     if let Some(range_pos) = in_expr.find("..") {
         let start_expr = in_expr[..range_pos].trim().to_string();
         let end_and_by = in_expr[range_pos + 2..].trim();
-        let end_and_by_upper = end_and_by.to_uppercase();
-        let (end_expr, step_expr) = if let Some(by_pos) = end_and_by_upper.find(" BY ") {
-            (
-                end_and_by[..by_pos].trim().to_string(),
-                Some(end_and_by[by_pos + 4..].trim().to_string()),
-            )
-        } else {
-            (end_and_by.to_string(), None)
-        };
+        let (end_expr, step_expr) =
+            if let Some(by_pos) = find_ascii_keyword(end_and_by.as_bytes(), b" BY ") {
+                (
+                    end_and_by[..by_pos].trim().to_string(),
+                    Some(end_and_by[by_pos + 4..].trim().to_string()),
+                )
+            } else {
+                (end_and_by.to_string(), None)
+            };
 
         return Ok((
             PlpgsqlStatement::ForRange {
@@ -584,11 +584,9 @@ fn parse_if_statement<'a>(
     s: &'a str,
     declared_vars: &HashSet<String>,
 ) -> Result<(PlpgsqlStatement, &'a str)> {
-    let s_upper = s.to_uppercase();
-
-    let then_pos = s_upper
-        .find(" THEN")
-        .or_else(|| s_upper.find("\nTHEN"))
+    let s_bytes = s.as_bytes();
+    let then_pos = find_ascii_keyword(s_bytes, b" THEN")
+        .or_else(|| find_ascii_keyword(s_bytes, b"\nTHEN"))
         .ok_or_else(|| anyhow!("IF without THEN"))?;
 
     let condition = s[2..then_pos].trim().to_string();
@@ -615,16 +613,15 @@ enum ElseBranchType {
 }
 
 fn find_if_blocks(s: &str) -> Result<(&str, &str, &str)> {
-    let s_upper = s.to_uppercase();
     let mut depth = 1;
     let mut i = 0;
-    let bytes = s_upper.as_bytes();
+    let bytes = s.as_bytes();
     let mut else_branch: Option<ElseBranchType> = None;
     let mut end_if_pos: Option<usize> = None;
 
     while i < bytes.len() {
         if i + 3 <= bytes.len()
-            && &s_upper[i..i + 2] == "IF"
+            && ascii_keyword_at(bytes, i, b"IF")
             && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
             && !bytes[i + 2].is_ascii_alphanumeric()
         {
@@ -635,7 +632,7 @@ fn find_if_blocks(s: &str) -> Result<(&str, &str, &str)> {
 
         if depth == 1
             && i + 5 <= bytes.len()
-            && &s_upper[i..i + 5] == "ELSIF"
+            && ascii_keyword_at(bytes, i, b"ELSIF")
             && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
         {
             if else_branch.is_none() {
@@ -647,7 +644,7 @@ fn find_if_blocks(s: &str) -> Result<(&str, &str, &str)> {
 
         if depth == 1
             && i + 4 <= bytes.len()
-            && &s_upper[i..i + 4] == "ELSE"
+            && ascii_keyword_at(bytes, i, b"ELSE")
             && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
             && (i + 4 == bytes.len() || !bytes[i + 4].is_ascii_alphanumeric())
         {
@@ -658,7 +655,7 @@ fn find_if_blocks(s: &str) -> Result<(&str, &str, &str)> {
             continue;
         }
 
-        if i + 6 <= bytes.len() && &s_upper[i..i + 6] == "END IF" {
+        if ascii_keyword_at(bytes, i, b"END IF") {
             if i == 0 || !bytes[i - 1].is_ascii_alphanumeric() {
                 depth -= 1;
                 if depth == 0 {
@@ -694,4 +691,21 @@ fn find_if_blocks(s: &str) -> Result<(&str, &str, &str)> {
     };
 
     Ok((then_block.trim(), else_block.trim(), rest))
+}
+
+fn ascii_keyword_at(bytes: &[u8], pos: usize, keyword: &[u8]) -> bool {
+    if pos + keyword.len() > bytes.len() {
+        return false;
+    }
+    bytes[pos..pos + keyword.len()]
+        .iter()
+        .zip(keyword.iter())
+        .all(|(a, b)| a.to_ascii_uppercase() == *b)
+}
+
+fn find_ascii_keyword(bytes: &[u8], keyword: &[u8]) -> Option<usize> {
+    if keyword.is_empty() || keyword.len() > bytes.len() {
+        return None;
+    }
+    (0..=bytes.len() - keyword.len()).find(|&i| ascii_keyword_at(bytes, i, keyword))
 }
