@@ -1,5 +1,46 @@
 # Worklog
 
+## 2026-02-21: Structural Fix for Extended-Protocol Worker Stack Overflow (#907)
+
+### Problem
+tokio-runtime-worker hits stack overflow when executing prepared statements via
+the extended protocol. GDB shows the `do_query` closure requests ~198 MiB on an
+8 MiB worker stack. Root cause: Rust async compiler monomorphizes deeply nested
+async call chains into enormous future state machines.
+
+Critical path: `do_query → execute_prepared → execute_via_optimizer` (275-line
+`async fn` with ~8 `.await` points holding large types across await boundaries).
+
+### Solution
+Convert three key `async fn` into functions returning `Pin<Box<dyn Future>>`:
+1. `execute_via_optimizer` — the largest async state machine (275 lines, ~8 awaits)
+2. `execute_subquery` — seals the recursion boundary
+3. `try_execute_analyzed` — entry point from simple-query path
+
+This is idiomatic Rust for recursive/large async functions, already used in 13+
+places in this codebase (e.g. `build_cte_context_from_analyzed_with_base`).
+
+### User Feedback Incorporated
+1. Signature guards placed OUTSIDE `#[cfg(test)]` — checked by `cargo build`
+2. Smoke test should run with `PGTIKV_TOKIO_STACK_MB=8` for deterministic signal
+3. Performance: at least one `Box` per boundary + additional per subquery recursion
+4. `main.rs` comment: "keeps bounded" not "is sufficient" (avoids absolute certainty)
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `src/sql/executor/select/analyzed/mod.rs` | Convert 3 `async fn` → `fn -> Pin<Box<...>>`, add signature guards |
+| `scripts/extended_protocol_smoke.py` | Add #907 regression test cases |
+| `src/main.rs` | Update comment |
+
+### Verification
+- `cargo build` — compiles cleanly (signature guards pass type-check)
+- `cargo test` — 1826 tests pass, 0 failures
+- No semantic changes to SQL execution
+- All callers unchanged (`.await` on `Pin<Box<dyn Future>>` is identical)
+
+---
+
 ## 2026-02-20: Canonical TypedExpr Visitor/Transform API (#870)
 
 ### Summary

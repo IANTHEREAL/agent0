@@ -124,16 +124,48 @@ def main():
         deep_sql = f"SELECT * FROM ({deep_sql}) t{i}"
     tests.append(("deep_nested_subquery_20_levels", deep_sql, (1,)))
 
+    # Regression tests for #907: prepared scalar expression and catalog-heavy
+    # subquery must not stack-overflow under default 8 MiB worker stack.
+    # Run with PGTIKV_TOKIO_STACK_MB=8 to get a deterministic signal.
+    # 4th element is an optional (checker_fn, description) for result validation.
+    tests.append(
+        (
+            "issue_907_prepared_scalar_expr",
+            "SELECT %s::int + 1",
+            (42,),
+            (lambda rows: rows == [(43,)], "expected [(43,)]"),
+        )
+    )
+    tests.append(
+        (
+            "issue_907_catalog_subquery",
+            "SELECT (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = %s)",
+            ("public",),
+            (
+                lambda rows: len(rows) == 1 and len(rows[0]) == 1 and isinstance(rows[0][0], int) and rows[0][0] >= 0,
+                "expected 1 row with non-negative integer count",
+            ),
+        )
+    )
+
     passed = 0
     failed = 0
     total = len(tests)
     start = time.monotonic()
 
-    for name, query, params in tests:
+    for test_entry in tests:
+        name, query, params = test_entry[0], test_entry[1], test_entry[2]
+        checker = test_entry[3] if len(test_entry) > 3 else None
         test_start = time.monotonic()
         try:
             cur.execute(query, params)
-            _ = cur.fetchall()
+            rows = cur.fetchall()
+            if checker is not None:
+                check_fn, check_desc = checker
+                if not check_fn(rows):
+                    raise AssertionError(
+                        f"result mismatch: got {rows!r}, {check_desc}"
+                    )
             elapsed = time.monotonic() - test_start
             if elapsed > 5.0:
                 print(f"WARN [{name}] slow: {elapsed:.1f}s")

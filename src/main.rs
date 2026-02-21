@@ -93,9 +93,10 @@ fn main() -> Result<()> {
         }
     };
 
-    // Some analyzed-path queries (notably catalog-heavy scalar-subquery shapes)
-    // can create deep async call chains in a single worker poll cycle.
-    // Keep a safer default stack budget while allowing operators to tune it.
+    // Critical execution boundaries (execute_via_optimizer, execute_subquery,
+    // try_execute_analyzed) return boxed futures to keep async frame sizes
+    // bounded for deep call chains (#907).
+    // Override via PGTIKV_TOKIO_STACK_MB for operational edge cases.
     let stack_mb: usize = env::var("PGTIKV_TOKIO_STACK_MB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
