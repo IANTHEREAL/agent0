@@ -5,6 +5,7 @@ proname
 http_delete
 http_get
 http_head
+http_patch
 http_post
 http_put
-(5 rows)
+(6 rows)

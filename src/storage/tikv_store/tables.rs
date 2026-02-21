@@ -506,6 +506,43 @@ impl TikvStore {
         Ok(tables)
     }
 
+    /// Batch-load table schemas by explicit table names.
+    ///
+    /// The result preserves `table_names` order and skips names that do not
+    /// exist. This keeps caller-level filtering (e.g. `ScanContext.user_tables`)
+    /// as the source of truth while avoiding N per-table `get_schema` calls.
+    pub async fn list_table_schemas(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_names: &[String],
+    ) -> Result<Vec<TableSchema>> {
+        let mut schemas = Vec::with_capacity(table_names.len());
+        for chunk in table_names.chunks(BATCH_GET_CHUNK_SIZE) {
+            let keys: Vec<Vec<u8>> = chunk
+                .iter()
+                .map(|name| self.key(&encode_schema_key_v2(db_id, name)))
+                .collect();
+
+            kv_stats::record_batch_get_keys(keys.len());
+            let pairs = txn.batch_get(keys.iter().cloned()).await?;
+            let mut by_key: HashMap<Key, tikv_client::Value> = HashMap::with_capacity(keys.len());
+            for pair in pairs {
+                let tikv_client::KvPair(key, value) = pair;
+                by_key.insert(key, value);
+            }
+
+            for key in &keys {
+                let key_ref: &Key = key.into();
+                if let Some(val) = by_key.get(key_ref) {
+                    schemas.push(deserialize_schema(val)?);
+                }
+            }
+        }
+
+        Ok(schemas)
+    }
+
     /// Scan rows in batches for ANALYZE, calling `process` on each deserialized row.
     /// Returns total row count. Does not materialize the full table in memory.
     pub async fn scan_analyze_batch(

@@ -84,113 +84,112 @@ impl VirtualTable for Columns {
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
         let sequence_defs = ctx.store.list_sequences(ctx.txn, ctx.db_id).await?;
+        let schemas = ctx
+            .store
+            .list_table_schemas(ctx.txn, ctx.db_id, ctx.user_tables)
+            .await?;
 
-        for full_table_name in ctx.user_tables {
+        for schema in &schemas {
+            let full_table_name = &schema.name;
             let (table_schema, table_name) = split_schema_and_name(full_table_name);
-            if let Some(schema) = ctx
-                .store
-                .get_schema(ctx.txn, ctx.db_id, full_table_name)
-                .await?
-            {
-                for (i, col) in schema.columns.iter().enumerate() {
-                    let (data_type_str, udt_schema, udt_name) = match &col.data_type {
-                        DataType::UserDefined(full_udt) => {
-                            let (schema_name, type_name) = full_udt
-                                .rsplit_once('.')
-                                .unwrap_or(("public", full_udt.as_str()));
-                            ("USER-DEFINED", schema_name, type_name)
-                        }
-                        _ => {
-                            let pg_type = data_type_to_pg_type(&col.data_type);
-                            let udt = data_type_to_udt_name(&col.data_type);
-                            (pg_type, "pg_catalog", udt)
-                        }
-                    };
-                    let is_nullable = if col.nullable { "YES" } else { "NO" };
-                    let ordinal = (i + 1) as i64;
+            for (i, col) in schema.columns.iter().enumerate() {
+                let (data_type_str, udt_schema, udt_name) = match &col.data_type {
+                    DataType::UserDefined(full_udt) => {
+                        let (schema_name, type_name) = full_udt
+                            .rsplit_once('.')
+                            .unwrap_or(("public", full_udt.as_str()));
+                        ("USER-DEFINED", schema_name, type_name)
+                    }
+                    _ => {
+                        let pg_type = data_type_to_pg_type(&col.data_type);
+                        let udt = data_type_to_udt_name(&col.data_type);
+                        (pg_type, "pg_catalog", udt)
+                    }
+                };
+                let is_nullable = if col.nullable { "YES" } else { "NO" };
+                let ordinal = (i + 1) as i64;
 
-                    let (char_max_len, num_precision, num_scale) = match &col.data_type {
-                        DataType::Int32 => (null_val(), int_val(32), int_val(0)),
-                        DataType::Int64 => (null_val(), int_val(64), int_val(0)),
-                        DataType::Float64 => (null_val(), int_val(53), null_val()),
-                        DataType::Text => (null_val(), null_val(), null_val()),
-                        DataType::Varchar(n) => (int_val(*n as i64), null_val(), null_val()),
-                        DataType::Numeric { precision, scale } => {
-                            let p = precision.map(|v| int_val(v as i64)).unwrap_or(null_val());
-                            let s = scale.map(|v| int_val(v as i64)).unwrap_or(null_val());
-                            (null_val(), p, s)
-                        }
-                        _ => (null_val(), null_val(), null_val()),
-                    };
+                let (char_max_len, num_precision, num_scale) = match &col.data_type {
+                    DataType::Int32 => (null_val(), int_val(32), int_val(0)),
+                    DataType::Int64 => (null_val(), int_val(64), int_val(0)),
+                    DataType::Float64 => (null_val(), int_val(53), null_val()),
+                    DataType::Text => (null_val(), null_val(), null_val()),
+                    DataType::Varchar(n) => (int_val(*n as i64), null_val(), null_val()),
+                    DataType::Numeric { precision, scale } => {
+                        let p = precision.map(|v| int_val(v as i64)).unwrap_or(null_val());
+                        let s = scale.map(|v| int_val(v as i64)).unwrap_or(null_val());
+                        (null_val(), p, s)
+                    }
+                    _ => (null_val(), null_val(), null_val()),
+                };
 
-                    let column_default = if col.is_serial {
-                        let seq_full_name = match sequences::find_owned_sequence_full_name(
-                            &sequence_defs,
-                            full_table_name,
-                            &col.name,
-                        )? {
-                            Some(full_name) => full_name,
-                            None => format!(
-                                "{}.{}",
-                                table_schema,
-                                sequences::implicit_sequence_name(&table_name, &col.name)
-                            ),
-                        };
-                        text_val(&format!("nextval('{}'::regclass)", seq_full_name))
-                    } else {
-                        col.default_expr
-                            .as_ref()
-                            .map(|s| text_val(s))
-                            .unwrap_or(null_val())
+                let column_default = if col.is_serial {
+                    let seq_full_name = match sequences::find_owned_sequence_full_name(
+                        &sequence_defs,
+                        full_table_name,
+                        &col.name,
+                    )? {
+                        Some(full_name) => full_name,
+                        None => format!(
+                            "{}.{}",
+                            table_schema,
+                            sequences::implicit_sequence_name(&table_name, &col.name)
+                        ),
                     };
+                    text_val(&format!("nextval('{}'::regclass)", seq_full_name))
+                } else {
+                    col.default_expr
+                        .as_ref()
+                        .map(|s| text_val(s))
+                        .unwrap_or(null_val())
+                };
 
-                    rows.push(Row::new(vec![
-                        text_val(ctx.database_name),
-                        text_val(&table_schema),
-                        text_val(&table_name),
-                        text_val(&col.name),
-                        int_val(ordinal),
-                        column_default,
-                        text_val(is_nullable),
-                        text_val(data_type_str),
-                        char_max_len,
-                        null_val(),
-                        num_precision,
-                        int_val(2),
-                        num_scale,
-                        null_val(),
-                        null_val(),
-                        null_val(),
-                        null_val(),
-                        null_val(),
-                        null_val(),
-                        null_val(),
-                        null_val(),
-                        null_val(),
-                        null_val(),
-                        null_val(),
-                        null_val(),
-                        text_val(ctx.database_name),
-                        text_val(udt_schema),
-                        text_val(udt_name),
-                        null_val(),
-                        null_val(),
-                        null_val(),
-                        null_val(),
-                        text_val(&ordinal.to_string()),
-                        text_val("NO"),
-                        text_val("NO"),
-                        null_val(),
-                        null_val(),
-                        null_val(),
-                        null_val(),
-                        null_val(),
-                        null_val(),
-                        text_val("NEVER"),
-                        null_val(),
-                        text_val("YES"),
-                    ]));
-                }
+                rows.push(Row::new(vec![
+                    text_val(ctx.database_name),
+                    text_val(&table_schema),
+                    text_val(&table_name),
+                    text_val(&col.name),
+                    int_val(ordinal),
+                    column_default,
+                    text_val(is_nullable),
+                    text_val(data_type_str),
+                    char_max_len,
+                    null_val(),
+                    num_precision,
+                    int_val(2),
+                    num_scale,
+                    null_val(),
+                    null_val(),
+                    null_val(),
+                    null_val(),
+                    null_val(),
+                    null_val(),
+                    null_val(),
+                    null_val(),
+                    null_val(),
+                    null_val(),
+                    null_val(),
+                    null_val(),
+                    text_val(ctx.database_name),
+                    text_val(udt_schema),
+                    text_val(udt_name),
+                    null_val(),
+                    null_val(),
+                    null_val(),
+                    null_val(),
+                    text_val(&ordinal.to_string()),
+                    text_val("NO"),
+                    text_val("NO"),
+                    null_val(),
+                    null_val(),
+                    null_val(),
+                    null_val(),
+                    null_val(),
+                    null_val(),
+                    text_val("NEVER"),
+                    null_val(),
+                    text_val("YES"),
+                ]));
             }
         }
 
