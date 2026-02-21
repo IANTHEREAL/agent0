@@ -139,6 +139,26 @@ fn reorder_recursive(plan: LogicalPlan, ctx: &PlanningContext) -> LogicalPlan {
             left: Box::new(reorder_recursive(*left, ctx)),
             right: Box::new(reorder_recursive(*right, ctx)),
         },
+        // SemiJoin/AntiJoin: opaque barrier — recurse into left and right individually,
+        // do NOT flatten into join groups.
+        LogicalNode::SemiJoin {
+            left,
+            right,
+            condition,
+        } => LogicalNode::SemiJoin {
+            left: Box::new(reorder_recursive(*left, ctx)),
+            right: Box::new(reorder_recursive(*right, ctx)),
+            condition,
+        },
+        LogicalNode::AntiJoin {
+            left,
+            right,
+            condition,
+        } => LogicalNode::AntiJoin {
+            left: Box::new(reorder_recursive(*left, ctx)),
+            right: Box::new(reorder_recursive(*right, ctx)),
+            condition,
+        },
         LogicalNode::Subquery { subplan, alias } => LogicalNode::Subquery {
             subplan: Box::new(reorder_recursive(*subplan, ctx)),
             alias,
@@ -400,6 +420,16 @@ pub(super) fn logical_has_unresolved_subquery(plan: &LogicalPlan) -> bool {
             right,
             condition,
             ..
+        }
+        | LogicalNode::SemiJoin {
+            left,
+            right,
+            condition,
+        }
+        | LogicalNode::AntiJoin {
+            left,
+            right,
+            condition,
         } => {
             join_condition_has(condition, has_unresolved_subquery)
                 || logical_has_unresolved_subquery(left)
@@ -482,6 +512,16 @@ pub(super) fn logical_has_correlated_refs(plan: &LogicalPlan) -> bool {
             right,
             condition,
             ..
+        }
+        | LogicalNode::SemiJoin {
+            left,
+            right,
+            condition,
+        }
+        | LogicalNode::AntiJoin {
+            left,
+            right,
+            condition,
         } => {
             join_condition_has(condition, has_correlated_ref)
                 || logical_has_correlated_refs(left)

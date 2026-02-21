@@ -145,6 +145,22 @@ pub enum LogicalNode {
         right: Box<LogicalPlan>,
     },
 
+    /// Semi-join: output left rows with ≥1 match in right.
+    /// Output schema = left-side only (critical invariant).
+    SemiJoin {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        condition: JoinCondition,
+    },
+
+    /// Anti-join: output left rows with 0 matches in right.
+    /// Output schema = left-side only (critical invariant).
+    AntiJoin {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        condition: JoinCondition,
+    },
+
     // ── Correlated ──────────────────────────────────────
     /// Subquery in FROM (opaque — treated as a single plan node).
     Subquery {
@@ -253,6 +269,34 @@ impl LogicalPlan {
             node: LogicalNode::DistinctOn {
                 on_exprs,
                 input: Box::new(self),
+            },
+            schema,
+        }
+    }
+
+    /// Wrap this plan in a SemiJoin node.
+    /// Output schema = left-side only (this plan's schema).
+    pub fn semi_join(self, right: LogicalPlan, condition: JoinCondition) -> Self {
+        let schema = self.schema.clone(); // LEFT-ONLY
+        Self {
+            node: LogicalNode::SemiJoin {
+                left: Box::new(self),
+                right: Box::new(right),
+                condition,
+            },
+            schema,
+        }
+    }
+
+    /// Wrap this plan in an AntiJoin node.
+    /// Output schema = left-side only (this plan's schema).
+    pub fn anti_join(self, right: LogicalPlan, condition: JoinCondition) -> Self {
+        let schema = self.schema.clone(); // LEFT-ONLY
+        Self {
+            node: LogicalNode::AntiJoin {
+                left: Box::new(self),
+                right: Box::new(right),
+                condition,
             },
             schema,
         }

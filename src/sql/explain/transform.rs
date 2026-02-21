@@ -178,6 +178,22 @@ pub fn physical_plan_to_plan_node(
             // Window functions don't have a dedicated PlanNode — show child.
             physical_plan_to_plan_node(input)
         }
+        PhysicalNode::HashSemiJoin {
+            left,
+            right,
+            anti,
+            condition,
+        } => {
+            let left_node = physical_plan_to_plan_node(left);
+            let right_node = physical_plan_to_plan_node(right);
+            let cond_str = format_join_condition(condition);
+            PlanNode::SemiJoin {
+                anti: *anti,
+                hash_cond: cond_str,
+                cost,
+                children: vec![left_node, right_node],
+            }
+        }
         PhysicalNode::SetOperation { left, right, .. } => {
             // Approximate as nested loop for display purposes.
             let left_node = physical_plan_to_plan_node(left);

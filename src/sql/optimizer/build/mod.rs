@@ -29,8 +29,8 @@ use crate::sql::analyzer::types::{JoinType, SetOpKind, TypedExpr};
 use crate::sql::expr::typed_eval::eval_const_usize;
 use crate::sql::operators::{
     BoxedOperator, DistinctOnOperator, DistinctOperator, FilterOperator, HashJoinConfig,
-    HashJoinOperator, HashJoinType, LimitOperator, NestedLoopJoinOperator, ProjectOperator,
-    SetOperationOperator, SetOperationType, SortOperator, TableScanOperator,
+    HashJoinOperator, HashJoinType, HashSemiJoinOperator, LimitOperator, NestedLoopJoinOperator,
+    ProjectOperator, SetOperationOperator, SetOperationType, SortOperator, TableScanOperator,
 };
 use crate::types::{DataType, Row, TableSchema};
 
@@ -365,6 +365,25 @@ impl PhysicalPlan {
                 };
                 Ok(Box::new(SetOperationOperator::new(
                     left_op, right_op, op_type,
+                )))
+            }
+
+            PhysicalNode::HashSemiJoin {
+                left,
+                right,
+                anti,
+                condition,
+            } => {
+                let left_op = left.build_operators(ctx)?;
+                let right_op = right.build_operators(ctx)?;
+                let (left_key_indices, right_key_indices, _no_residual) =
+                    join::extract_hash_join_keys(condition, left.schema.columns.len())?;
+                Ok(Box::new(HashSemiJoinOperator::new(
+                    left_op,
+                    right_op,
+                    *anti,
+                    left_key_indices,
+                    right_key_indices,
                 )))
             }
 

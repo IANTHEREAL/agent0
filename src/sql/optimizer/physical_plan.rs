@@ -163,6 +163,15 @@ pub enum PhysicalNode {
         right: Box<PhysicalPlan>,
     },
 
+    /// Hash-based semi/anti join.
+    /// Build side = always right. Output schema = left-side only.
+    HashSemiJoin {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        anti: bool,
+        condition: JoinCondition,
+    },
+
     // ── Correlated ──────────────────────────────────────
     /// Subquery (opaque subplan).
     #[allow(dead_code)] // Phase 2+: alias field

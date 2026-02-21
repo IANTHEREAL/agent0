@@ -166,6 +166,47 @@ impl PhysicalPlanner {
         inner_est.max(min_rows).max(1)
     }
 
+    /// Estimate join selectivity for semi/anti join cost estimation.
+    fn estimate_join_selectivity(
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        condition: &JoinCondition,
+        ctx: &PlanningContext,
+    ) -> f64 {
+        let left_width = left.schema.columns.len();
+        if let Some((left_keys, right_keys)) =
+            join_keys::try_extract_equi_keys(condition, left_width)
+        {
+            let left_stats = Self::resolve_stats(left, ctx);
+            let right_stats = Self::resolve_stats(right, ctx);
+            match (left_stats, right_stats) {
+                (Some(ls), Some(rs)) => {
+                    let mut sel = 1.0;
+                    for (&lk, &rk) in left_keys.iter().zip(right_keys.iter()) {
+                        let left_col_name =
+                            left.schema.columns.get(lk).map(|(n, _)| n.as_str());
+                        let right_col_name =
+                            right.schema.columns.get(rk).map(|(n, _)| n.as_str());
+                        let left_ndv = left_col_name
+                            .and_then(|n| selectivity::get_column_stats(ls, n))
+                            .map(|c| selectivity::n_distinct_raw(c, ls.row_count));
+                        let right_ndv = right_col_name
+                            .and_then(|n| selectivity::get_column_stats(rs, n))
+                            .map(|c| selectivity::n_distinct_raw(c, rs.row_count));
+                        sel *= match (left_ndv, right_ndv) {
+                            (Some(l), Some(r)) => 1.0 / l.max(r).max(1.0),
+                            _ => DEFAULT_JOIN_SEL,
+                        };
+                    }
+                    sel
+                }
+                _ => DEFAULT_JOIN_SEL,
+            }
+        } else {
+            DEFAULT_JOIN_SEL
+        }
+    }
+
     fn plan_node(logical: &LogicalPlan, ctx: &PlanningContext) -> PhysicalPlan {
         match &logical.node {
             // ── Leaf nodes ──────────────────────────────
@@ -589,6 +630,64 @@ impl PhysicalPlanner {
                     },
                     schema: logical.schema.clone(),
                     cost,
+                }
+            }
+
+            LogicalNode::SemiJoin {
+                left,
+                right,
+                condition,
+            } => {
+                let left_phys = Self::plan_node(left, ctx);
+                let right_phys = Self::plan_node(right, ctx);
+                let left_rows = left_phys.cost.rows;
+                let sel = Self::estimate_join_selectivity(left, right, condition, ctx);
+                let rows = ((left_rows as f64) * sel).ceil() as usize;
+                let rows = rows.max(1);
+                let total_cost =
+                    left_phys.cost.total + right_phys.cost.total + rows as f64 * 0.01;
+                PhysicalPlan {
+                    node: PhysicalNode::HashSemiJoin {
+                        left: Box::new(left_phys),
+                        right: Box::new(right_phys),
+                        anti: false,
+                        condition: condition.clone(),
+                    },
+                    schema: logical.schema.clone(),
+                    cost: PhysicalCost {
+                        startup: 0.0,
+                        total: total_cost,
+                        rows,
+                    },
+                }
+            }
+
+            LogicalNode::AntiJoin {
+                left,
+                right,
+                condition,
+            } => {
+                let left_phys = Self::plan_node(left, ctx);
+                let right_phys = Self::plan_node(right, ctx);
+                let left_rows = left_phys.cost.rows;
+                let sel = Self::estimate_join_selectivity(left, right, condition, ctx);
+                let rows = ((left_rows as f64) * (1.0 - sel)).ceil() as usize;
+                let rows = rows.max(1);
+                let total_cost =
+                    left_phys.cost.total + right_phys.cost.total + rows as f64 * 0.01;
+                PhysicalPlan {
+                    node: PhysicalNode::HashSemiJoin {
+                        left: Box::new(left_phys),
+                        right: Box::new(right_phys),
+                        anti: true,
+                        condition: condition.clone(),
+                    },
+                    schema: logical.schema.clone(),
+                    cost: PhysicalCost {
+                        startup: 0.0,
+                        total: total_cost,
+                        rows,
+                    },
                 }
             }
 

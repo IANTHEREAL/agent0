@@ -226,6 +226,30 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
                 format_plan_node(output, child, indent + 6, i == 0);
             }
         }
+        PlanNode::SemiJoin {
+            anti,
+            hash_cond,
+            cost,
+            children,
+        } => {
+            let join_name = if *anti {
+                "Hash Anti Join"
+            } else {
+                "Hash Semi Join"
+            };
+            writeln!(
+                output,
+                "{}{}  (cost={:.2}..{:.2} rows={} width={})",
+                prefix, join_name, cost.startup, cost.total, cost.rows, cost.width
+            )
+            .unwrap();
+            if let Some(cond) = hash_cond {
+                writeln!(output, "{}  Hash Cond: {}", " ".repeat(indent), cond).unwrap();
+            }
+            for (i, child) in children.iter().enumerate() {
+                format_plan_node(output, child, indent + 6, i == 0);
+            }
+        }
         PlanNode::Sort {
             sort_key,
             cost,

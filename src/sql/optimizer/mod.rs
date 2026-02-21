@@ -73,12 +73,49 @@ fn collect_body_refs<'a>(
             for table_ref in &select.from {
                 collect_join_tree_refs(table_ref, refs);
             }
+            // Collect refs from WHERE-clause subqueries so their schemas
+            // get pre-loaded for the optimizer (needed for decorrelation).
+            if let Some(where_clause) = &select.where_clause {
+                collect_expr_subquery_table_refs(where_clause, refs);
+            }
         }
         AnalyzedQueryBody::SetOperation { left, right, .. } => {
             collect_body_refs(&left.body, refs);
             collect_body_refs(&right.body, refs);
         }
         AnalyzedQueryBody::Values(_) => {}
+    }
+}
+
+/// Walk a TypedExpr tree and collect table refs from any subquery payloads.
+/// Intentionally crosses subquery boundaries.
+fn collect_expr_subquery_table_refs<'a>(
+    expr: &'a crate::sql::analyzer::types::TypedExpr,
+    refs: &mut Vec<(&'a str, &'a TableRefSchema, Option<&'a str>)>,
+) {
+    use crate::sql::analyzer::types::TypedExprKind;
+
+    match &expr.kind {
+        TypedExprKind::Exists { subquery, .. } => {
+            collect_body_refs(&subquery.body, refs);
+        }
+        TypedExprKind::InSubquery { expr: inner, subquery, .. } => {
+            collect_expr_subquery_table_refs(inner, refs);
+            collect_body_refs(&subquery.body, refs);
+        }
+        TypedExprKind::ScalarSubquery(q) | TypedExprKind::ArraySubquery(q) => {
+            collect_body_refs(&q.body, refs);
+        }
+        TypedExprKind::AnyAll { expr: inner, subquery, .. } => {
+            collect_expr_subquery_table_refs(inner, refs);
+            collect_body_refs(&subquery.body, refs);
+        }
+        _ => {
+            // Recurse into TypedExpr children (but NOT subquery payloads — handled above)
+            crate::sql::expr::traverse::for_each_child(expr, &mut |child| {
+                collect_expr_subquery_table_refs(child, refs);
+            });
+        }
     }
 }
 

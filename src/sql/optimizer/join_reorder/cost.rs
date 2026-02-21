@@ -79,6 +79,16 @@ pub(super) fn estimate_subtree_rows(plan: &LogicalPlan, ctx: &PlanningContext) -
             )
         }
 
+        // Semi/anti joins: output = left rows * selectivity
+        LogicalNode::SemiJoin { left, .. } => {
+            let left_rows = estimate_subtree_rows(left, ctx);
+            ((left_rows as f64) * DEFAULT_JOIN_SEL).ceil() as usize
+        }
+        LogicalNode::AntiJoin { left, .. } => {
+            let left_rows = estimate_subtree_rows(left, ctx);
+            ((left_rows as f64) * (1.0 - DEFAULT_JOIN_SEL)).ceil() as usize
+        }
+
         LogicalNode::SetOperation { left, right, .. } => {
             estimate_subtree_rows(left, ctx) + estimate_subtree_rows(right, ctx)
         }

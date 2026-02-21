@@ -19,6 +19,8 @@ use crate::sql::analyzer::types::{
 use crate::sql::expr::classify::{has_correlated_ref, has_unresolved_subquery, is_volatile};
 use crate::types::DataType;
 
+mod decorrelate;
+
 // ── Rewrite framework ──────────────────────────────────────────
 
 /// A rewrite rule that transforms a logical plan.
@@ -35,8 +37,10 @@ pub fn apply_rewrites(
     plan: LogicalPlan,
     planning_ctx: Option<&super::physical_planner::PlanningContext>,
 ) -> LogicalPlan {
+    // Phase 0: Subquery decorrelation (EXISTS/NOT EXISTS → SemiJoin/AntiJoin)
+    let mut current = decorrelate::SubqueryDecorrelation.rewrite(plan);
     // Phase 1: Predicate pushdown + cross-join elimination
-    let mut current = PredicatePushdown.rewrite(plan);
+    current = PredicatePushdown.rewrite(current);
     current = CrossJoinElimination.rewrite(current);
 
     // Phase 2: Join reordering (requires PlanningContext for cost estimation)
@@ -144,6 +148,24 @@ fn rewrite_children(plan: LogicalPlan) -> LogicalPlan {
             left: Box::new(rewrite_plan(*left)),
             right: Box::new(rewrite_plan(*right)),
         },
+        LogicalNode::SemiJoin {
+            left,
+            right,
+            condition,
+        } => LogicalNode::SemiJoin {
+            left: Box::new(rewrite_plan(*left)),
+            right: Box::new(rewrite_plan(*right)),
+            condition,
+        },
+        LogicalNode::AntiJoin {
+            left,
+            right,
+            condition,
+        } => LogicalNode::AntiJoin {
+            left: Box::new(rewrite_plan(*left)),
+            right: Box::new(rewrite_plan(*right)),
+            condition,
+        },
         LogicalNode::Subquery { subplan, alias } => LogicalNode::Subquery {
             subplan: Box::new(rewrite_plan(*subplan)),
             alias,
@@ -195,6 +217,18 @@ fn push_filter_down(predicate: TypedExpr, input: LogicalPlan) -> LogicalPlan {
                 schema,
             }
         }
+
+        // SemiJoin / AntiJoin: output schema = left-only, push left-only predicates to left child
+        LogicalNode::SemiJoin {
+            left,
+            right,
+            condition,
+        } => push_filter_through_semi_anti(predicate, *left, *right, condition, input.schema, false),
+        LogicalNode::AntiJoin {
+            left,
+            right,
+            condition,
+        } => push_filter_through_semi_anti(predicate, *left, *right, condition, input.schema, true),
 
         // Barriers — never push through these
         LogicalNode::Project { .. }
@@ -341,6 +375,80 @@ fn push_filter_through_join(
     result
 }
 
+/// Push filter predicates through a SemiJoin or AntiJoin node.
+///
+/// Output schema = left-side only. Only left-only predicates can be pushed.
+/// Any predicate referencing column_index >= left_width is invalid (would be a bug)
+/// since the output has no right-side columns — keep above unchanged as defensive guard.
+fn push_filter_through_semi_anti(
+    predicate: TypedExpr,
+    left: LogicalPlan,
+    right: LogicalPlan,
+    condition: JoinCondition,
+    join_schema: PlanSchema,
+    is_anti: bool,
+) -> LogicalPlan {
+    let left_width = left.schema.columns.len();
+    let conjuncts = split_conjunction(predicate);
+
+    let mut left_pushable = Vec::new();
+    let mut remaining = Vec::new();
+
+    for conj in conjuncts {
+        if is_volatile(&conj) || has_correlated_ref(&conj) || has_unresolved_subquery(&conj) {
+            remaining.push(conj);
+            continue;
+        }
+
+        let indices = collect_column_indices(&conj);
+        let all_left = indices.is_empty() || indices.iter().all(|&i| i < left_width);
+
+        if all_left {
+            left_pushable.push(conj);
+        } else {
+            // Defensive: should never happen since output = left-only
+            remaining.push(conj);
+        }
+    }
+
+    let new_left = if left_pushable.is_empty() {
+        left
+    } else {
+        let pred = conjuncts_to_predicate(left_pushable);
+        push_filter_down(pred, left)
+    };
+
+    let mut result = LogicalPlan {
+        node: if is_anti {
+            LogicalNode::AntiJoin {
+                left: Box::new(new_left),
+                right: Box::new(right),
+                condition,
+            }
+        } else {
+            LogicalNode::SemiJoin {
+                left: Box::new(new_left),
+                right: Box::new(right),
+                condition,
+            }
+        },
+        schema: join_schema.clone(),
+    };
+
+    if !remaining.is_empty() {
+        let pred = conjuncts_to_predicate(remaining);
+        result = LogicalPlan {
+            node: LogicalNode::Filter {
+                predicate: pred,
+                input: Box::new(result),
+            },
+            schema: join_schema,
+        };
+    }
+
+    result
+}
+
 // ── Cross-join elimination ───────────────────────────────────
 
 struct CrossJoinElimination;
@@ -471,6 +579,24 @@ fn elim_rewrite_children(plan: LogicalPlan) -> LogicalPlan {
             all,
             left: Box::new(eliminate_cross_joins(*left)),
             right: Box::new(eliminate_cross_joins(*right)),
+        },
+        LogicalNode::SemiJoin {
+            left,
+            right,
+            condition,
+        } => LogicalNode::SemiJoin {
+            left: Box::new(eliminate_cross_joins(*left)),
+            right: Box::new(eliminate_cross_joins(*right)),
+            condition,
+        },
+        LogicalNode::AntiJoin {
+            left,
+            right,
+            condition,
+        } => LogicalNode::AntiJoin {
+            left: Box::new(eliminate_cross_joins(*left)),
+            right: Box::new(eliminate_cross_joins(*right)),
+            condition,
         },
         LogicalNode::Subquery { subplan, alias } => LogicalNode::Subquery {
             subplan: Box::new(eliminate_cross_joins(*subplan)),

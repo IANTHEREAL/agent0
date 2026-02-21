@@ -61,6 +61,12 @@ pub enum PlanNode {
         cost: PlanCost,
         children: Vec<PlanNode>,
     },
+    SemiJoin {
+        anti: bool,
+        hash_cond: Option<String>,
+        cost: PlanCost,
+        children: Vec<PlanNode>,
+    },
     Sort {
         sort_key: Vec<String>,
         cost: PlanCost,
@@ -591,6 +597,7 @@ fn get_plan_cost(plan: &PlanNode) -> PlanCost {
         PlanNode::Sort { cost, .. } => cost.clone(),
         PlanNode::Limit { cost, .. } => cost.clone(),
         PlanNode::Aggregate { cost, .. } => cost.clone(),
+        PlanNode::SemiJoin { cost, .. } => cost.clone(),
         PlanNode::Filter { cost, .. } => cost.clone(),
         PlanNode::TableFunctionScan { cost, .. } => cost.clone(),
         PlanNode::Result { cost } => cost.clone(),

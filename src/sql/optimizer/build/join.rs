@@ -112,6 +112,16 @@ pub(super) fn plan_has_correlated_refs(plan: &PhysicalPlan) -> bool {
                 || plan_has_correlated_refs(left)
                 || plan_has_correlated_refs(right)
         }
+        PhysicalNode::HashSemiJoin {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            join_condition_has_correlated_ref(condition)
+                || plan_has_correlated_refs(left)
+                || plan_has_correlated_refs(right)
+        }
         PhysicalNode::SetOperation { left, right, .. } => {
             plan_has_correlated_refs(left) || plan_has_correlated_refs(right)
         }

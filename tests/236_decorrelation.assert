@@ -1,0 +1,60 @@
+-- Test 1: Simple EXISTS
+Alice
+Bob
+Charlie
+
+-- Test 2: NOT EXISTS
+Diana
+
+-- Test 3: EXISTS with inner-only predicate
+Alice
+Bob
+Charlie
+
+-- Test 4: Multiple EXISTS in same WHERE
+Alice
+Bob
+
+-- Test 5: Multi-column equi-correlation
+Alice
+Bob
+Charlie
+
+-- Test 6: Duplicate matches: outer row emitted exactly ONCE for semi
+Alice
+Bob
+Charlie
+
+-- Test 7: anti suppresses outer row correctly
+Diana
+
+-- Test 8: NULL join keys: anti-join must NOT match
+Diana
+NullRef
+
+-- Test 9: EXPLAIN shows Hash Semi Join
+Hash Semi Join
+
+-- Test 10: EXPLAIN shows Hash Anti Join
+Hash Anti Join
+
+-- Test 11: Subquery with LIMIT (reject decorrelation, but still correct)
+Alice
+Bob
+Charlie
+
+-- Test 12: Subquery with GROUP BY (reject decorrelation, but still correct)
+Alice
+Bob
+Charlie
+
+-- Test 13: Non-equi correlation (reject, but still correct)
+Alice
+Bob
+Charlie
+Diana
+
+-- Test 14: EXISTS combined with non-correlated filter
+Alice
+Bob
+Charlie

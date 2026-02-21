@@ -29,7 +29,7 @@
 //! all rewrite operations return `Result` so that failures are propagated
 //! as errors rather than panicking.
 
-mod nodes;
+pub(crate) mod nodes;
 
 use super::logical_plan::{LogicalNode, LogicalPlan, PlanSchema};
 use super::window_rewrite::{

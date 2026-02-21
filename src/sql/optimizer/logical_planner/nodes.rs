@@ -220,7 +220,7 @@ pub(super) fn extract_window_funcs(
 
 // ── FROM / JOIN builders ───────────────────────────────────────────
 
-pub(super) fn build_from(from: &[AnalyzedTableRef]) -> Result<LogicalPlan> {
+pub(crate) fn build_from(from: &[AnalyzedTableRef]) -> Result<LogicalPlan> {
     if from.is_empty() {
         return Ok(LogicalPlan::empty(PlanSchema::from_columns(vec![])));
     }
