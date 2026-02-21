@@ -3110,7 +3110,7 @@ async fn cmd_cron_status(api: &ApiClient, output: &OutputFormat, id: &str, job: 
         None => {
             let sql = "SELECT j.jobid, j.jobname, j.schedule, j.active, j.next_run_at, \
                         d.last_status, d.last_message, d.last_run_at, \
-                        d.total_runs, d.succeeded, d.failed \
+                        agg.total_runs, agg.succeeded, agg.failed \
                         FROM cron.job j \
                         LEFT JOIN ( \
                           SELECT jobid, \
