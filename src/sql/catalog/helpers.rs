@@ -236,3 +236,12 @@ pub fn data_type_to_udt_name(dt: &DataType) -> &'static str {
         DataType::Varchar(_) => "varchar",
     }
 }
+
+pub fn format_epoch_ms(epoch_ms: i64) -> String {
+    let secs = epoch_ms / 1000;
+    let nanos = ((epoch_ms % 1000) * 1_000_000) as u32;
+    match chrono::DateTime::from_timestamp(secs, nanos) {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S%.3f+00").to_string(),
+        None => epoch_ms.to_string(),
+    }
+}

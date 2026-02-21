@@ -290,6 +290,11 @@ enum CronAction {
         /// Job ID (number) or job name (text)
         job: String,
     },
+    /// Show cron job execution status
+    Status {
+        /// Optional: job ID (number) or job name (text) for single-job detail
+        job: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -794,6 +799,9 @@ async fn main() {
                 }
                 CronAction::Disable { job } => {
                     cmd_cron_disable(&api, &cli.effective_output(), id, job).await
+                }
+                CronAction::Status { job } => {
+                    cmd_cron_status(&api, &cli.effective_output(), id, job.as_deref()).await
                 }
             },
         },
@@ -3098,6 +3106,131 @@ async fn cmd_cron_disable(api: &ApiClient, output: &OutputFormat, id: &str, job:
     match output {
         OutputFormat::Json => print_json(&data),
         _ => println!("Job '{}' disabled.", job),
+    }
+}
+
+async fn cmd_cron_status(api: &ApiClient, output: &OutputFormat, id: &str, job: Option<&str>) {
+    match job {
+        None => {
+            let sql = "SELECT j.jobid, j.jobname, j.schedule, j.active, j.next_run_at, \
+                        d.last_status, d.last_message, d.last_run_at, \
+                        agg.total_runs, agg.succeeded, agg.failed \
+                        FROM cron.job j \
+                        LEFT JOIN ( \
+                          SELECT jobid, \
+                                 COUNT(*) as total_runs, \
+                                 COUNT(*) FILTER (WHERE status = 'succeeded') as succeeded, \
+                                 COUNT(*) FILTER (WHERE status = 'failed') as failed \
+                          FROM cron.job_run_details GROUP BY jobid \
+                        ) agg ON agg.jobid = j.jobid \
+                        LEFT JOIN ( \
+                          SELECT jobid, status as last_status, return_message as last_message, end_time as last_run_at \
+                          FROM cron.job_run_details d2 \
+                          WHERE runid = (SELECT MAX(runid) FROM cron.job_run_details d3 WHERE d3.jobid = d2.jobid) \
+                        ) d ON d.jobid = j.jobid \
+                        ORDER BY j.jobid";
+            let data = execute_sql(api, id, sql).await;
+            check_sql_error(&data);
+
+            match output {
+                OutputFormat::Json => print_json(&data),
+                _ => repl::output::print_sql_result(
+                    &data,
+                    output,
+                    false,
+                    &None,
+                    ExpandedMode::Off,
+                    "NULL",
+                    1,
+                    repl::LinestyleMode::Ascii,
+                ),
+            }
+        }
+        Some(j) => {
+            let where_clause = if j.parse::<i64>().is_ok() {
+                format!("jobid = {}", j)
+            } else {
+                format!(
+                    "jobid IN (SELECT jobid FROM cron.job WHERE jobname = '{}')",
+                    escape_sql(j)
+                )
+            };
+
+            let sql1 = format!(
+                "SELECT jobid, jobname, schedule, command, active, database, username, next_run_at \
+                 FROM cron.job WHERE {}",
+                where_clause
+            );
+            let data1 = execute_sql(api, id, &sql1).await;
+            check_sql_error(&data1);
+
+            if data1["rows"].as_array().map_or(true, |r| r.is_empty()) {
+                eprintln!("Job '{}' not found.", j);
+                process::exit(1);
+            }
+
+            let sql2 = format!(
+                "SELECT COUNT(*) as total, \
+                 COUNT(*) FILTER (WHERE status = 'succeeded') as succeeded, \
+                 COUNT(*) FILTER (WHERE status = 'failed') as failed \
+                 FROM cron.job_run_details WHERE {}",
+                where_clause
+            );
+            let data2 = execute_sql(api, id, &sql2).await;
+            check_sql_error(&data2);
+
+            let sql3 = format!(
+                "SELECT runid, status, return_message, start_time, end_time \
+                 FROM cron.job_run_details WHERE {} \
+                 ORDER BY runid DESC LIMIT 10",
+                where_clause
+            );
+            let data3 = execute_sql(api, id, &sql3).await;
+            check_sql_error(&data3);
+
+            match output {
+                OutputFormat::Json => {
+                    let combined = serde_json::json!({
+                        "job": data1,
+                        "stats": data2,
+                        "recent_runs": data3,
+                    });
+                    print_json(&combined);
+                }
+                _ => {
+                    let row = &data1["rows"][0];
+                    let val = |i: usize| row[i].as_str().unwrap_or("NULL");
+
+                    println!("Job:       {} (ID: {})", val(1), val(0));
+                    println!("Schedule:  {}", val(2));
+                    println!("Command:   {}", val(3));
+                    println!("Active:    {}", val(4));
+                    println!("Next Run:  {}", val(7));
+                    println!("Database:  {}", val(5));
+                    println!();
+
+                    let srow = &data2["rows"][0];
+                    let sval = |i: usize| srow[i].as_str().unwrap_or("0");
+                    println!("Execution Summary:");
+                    println!("  Total Runs:  {}", sval(0));
+                    println!("  Succeeded:   {}", sval(1));
+                    println!("  Failed:      {}", sval(2));
+
+                    println!();
+                    println!("Recent Runs:");
+                    repl::output::print_sql_result(
+                        &data3,
+                        output,
+                        false,
+                        &None,
+                        ExpandedMode::Off,
+                        "NULL",
+                        1,
+                        repl::LinestyleMode::Ascii,
+                    );
+                }
+            }
+        }
     }
 }
 

@@ -1,8 +1,10 @@
-use super::helpers::{bool_col, int_col, null_val, text_col, text_val};
+use super::helpers::{bool_col, format_epoch_ms, int_col, null_val, text_col, text_val};
 use super::{ScanContext, VirtualTable};
+use crate::cron::parser::{next_occurrence, parse_cron_expression};
 use crate::types::{Row, TableSchema, Value};
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::Utc;
 
 pub struct CronJobTable;
 
@@ -31,6 +33,7 @@ impl VirtualTable for CronJobTable {
                 bool_col("active"),
                 text_col("jobname"),
                 text_col("max_runtime"),
+                text_col("next_run_at"),
             ],
             version: 1,
             pk_constraint_name: None,
@@ -66,6 +69,13 @@ impl VirtualTable for CronJobTable {
         let rows = filtered
             .into_iter()
             .map(|job| {
+                let next_run_at = match parse_cron_expression(&job.schedule) {
+                    Ok(parsed) => match next_occurrence(&parsed, Utc::now()) {
+                        Some(dt) => text_val(&format_epoch_ms(dt.timestamp_millis())),
+                        None => null_val(),
+                    },
+                    Err(_) => null_val(),
+                };
                 Row::new(vec![
                     Value::Int64(job.job_id),
                     text_val(&job.schedule),
@@ -80,6 +90,7 @@ impl VirtualTable for CronJobTable {
                         .map(text_val)
                         .unwrap_or_else(null_val),
                     text_val(&format_runtime_ms(job.max_runtime_ms)),
+                    next_run_at,
                 ])
             })
             .collect();
