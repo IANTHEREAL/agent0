@@ -1,6 +1,6 @@
 //! Unit tests for the PL/pgSQL module.
 
-use super::utils::replace_identifier;
+use super::{utils::replace_identifier, validate_plpgsql_body};
 
 #[test]
 fn test_replace_identifier_respects_word_boundaries() {
@@ -29,4 +29,22 @@ fn test_replace_identifier_skips_string_literals() {
         replace_identifier("'it''s a test' || n", "n", "5"),
         "'it''s a test' || 5"
     );
+}
+
+#[test]
+fn test_validate_plpgsql_body_with_non_ascii() {
+    let body = "BEGIN\n    -- cafe ≈ naive\n    RETURN 1;\nEND;";
+    assert!(validate_plpgsql_body(body).is_ok());
+}
+
+#[test]
+fn test_validate_plpgsql_body_with_unicode_in_strings() {
+    let body = "DECLARE\n    v TEXT;\nBEGIN\n    v := '日本語テスト';\n    RETURN v;\nEND;";
+    assert!(validate_plpgsql_body(body).is_ok());
+}
+
+#[test]
+fn test_validate_plpgsql_body_with_emoji() {
+    let body = "BEGIN\n    -- 🎉 celebration\n    RETURN 42;\nEND;";
+    assert!(validate_plpgsql_body(body).is_ok());
 }
