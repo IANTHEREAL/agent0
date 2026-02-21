@@ -5,8 +5,8 @@ mod prepared;
 mod utils;
 
 use utils::{
-    autocommit_backoff, apply_statement_timeout, validate_transaction_modes, wrap_with_runtime_context,
-    RuntimeSettings,
+    apply_statement_timeout, autocommit_backoff, validate_transaction_modes,
+    wrap_with_runtime_context, RuntimeSettings,
 };
 
 use super::*;

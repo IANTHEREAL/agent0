@@ -99,14 +99,22 @@ fn collect_expr_subquery_table_refs<'a>(
         TypedExprKind::Exists { subquery, .. } => {
             collect_body_refs(&subquery.body, refs);
         }
-        TypedExprKind::InSubquery { expr: inner, subquery, .. } => {
+        TypedExprKind::InSubquery {
+            expr: inner,
+            subquery,
+            ..
+        } => {
             collect_expr_subquery_table_refs(inner, refs);
             collect_body_refs(&subquery.body, refs);
         }
         TypedExprKind::ScalarSubquery(q) | TypedExprKind::ArraySubquery(q) => {
             collect_body_refs(&q.body, refs);
         }
-        TypedExprKind::AnyAll { expr: inner, subquery, .. } => {
+        TypedExprKind::AnyAll {
+            expr: inner,
+            subquery,
+            ..
+        } => {
             collect_expr_subquery_table_refs(inner, refs);
             collect_body_refs(&subquery.body, refs);
         }

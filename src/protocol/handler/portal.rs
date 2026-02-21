@@ -1,15 +1,20 @@
 use futures::{Sink, SinkExt, StreamExt};
+use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{QueryResponse, Response, Tag};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{ClientInfo, ClientPortalStore, PgWireConnectionState};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
-use pgwire::messages::data::DataRow;
+use pgwire::messages::data::{DataRow, FieldDescription, RowDescription};
 use pgwire::messages::response::{EmptyQueryResponse, TransactionStatus};
 use pgwire::messages::PgWireBackendMessage;
+use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use tokio::sync::Mutex;
+
+use super::datatype_to_pgtype;
+use super::prepared::{PreparedExec, PreparedStatement};
 
 fn is_empty_simple_query(query: &str) -> bool {
     let trimmed = query.trim();
@@ -119,6 +124,7 @@ pub(in crate::protocol::handler) async fn on_execute_with_tx_status_fix<H, C>(
 ) -> PgWireResult<()>
 where
     H: ExtendedQueryHandler,
+    H::Statement: 'static,
     C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
     C::PortalStore: PortalStore<Statement = H::Statement>,
     C::Error: Debug,
@@ -170,8 +176,11 @@ where
                         .await?;
                 }
                 Response::Query(results) => {
+                    let send_describe =
+                        should_send_row_description_for_portal(portal.as_ref(), &results);
                     if max_rows == 0 {
-                        pgwire::api::query::send_query_response(client, results, false).await?;
+                        pgwire::api::query::send_query_response(client, results, send_describe)
+                            .await?;
                     } else {
                         send_limited_query_response(
                             client,
@@ -179,6 +188,7 @@ where
                             portal_name,
                             results,
                             max_rows,
+                            send_describe,
                         )
                         .await?;
                     }
@@ -301,6 +311,7 @@ async fn send_limited_query_response<C>(
     portal_name: &str,
     results: QueryResponse<'_>,
     max_rows: usize,
+    send_describe: bool,
 ) -> PgWireResult<()>
 where
     C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -308,6 +319,18 @@ where
     PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
 {
     let command_tag = results.command_tag().to_owned();
+    if send_describe {
+        let row_schema = results.row_schema();
+        let row_desc = RowDescription::new(
+            row_schema
+                .iter()
+                .map(FieldDescription::from)
+                .collect::<Vec<_>>(),
+        );
+        client
+            .send(PgWireBackendMessage::RowDescription(row_desc))
+            .await?;
+    }
     let mut data_rows = results.data_rows();
 
     let mut rows_sent = 0usize;
@@ -369,4 +392,37 @@ where
     }
 
     Ok(())
+}
+
+fn should_send_row_description_for_portal<S: 'static>(
+    portal: &Portal<S>,
+    results: &QueryResponse<'_>,
+) -> bool {
+    let stmt_any = &portal.statement.statement as &dyn Any;
+    let Some(prepared) = stmt_any.downcast_ref::<PreparedStatement>() else {
+        return false;
+    };
+
+    // Utility prepared statements use static Describe metadata and do not
+    // participate in schema-drift fallback.
+    if matches!(prepared.exec, PreparedExec::RawSqlUtility) {
+        return false;
+    }
+
+    let runtime_schema = results.row_schema();
+    if prepared.output_schema.len() != runtime_schema.len() {
+        return true;
+    }
+
+    for ((expected_name, expected_dt), actual) in
+        prepared.output_schema.iter().zip(runtime_schema.iter())
+    {
+        if expected_name != actual.name()
+            || datatype_to_pgtype(Some(expected_dt)) != *actual.datatype()
+        {
+            return true;
+        }
+    }
+
+    false
 }

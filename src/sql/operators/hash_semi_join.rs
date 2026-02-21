@@ -197,9 +197,6 @@ impl PhysicalOperator for HashSemiJoinOperator {
     }
 
     fn explain_info(&self) -> Option<String> {
-        Some(format!(
-            "anti={}",
-            self.anti,
-        ))
+        Some(format!("anti={}", self.anti,))
     }
 }

@@ -198,10 +198,7 @@ struct DecorrelationInfo {
 
 /// Check if a subquery is eligible for decorrelation.
 /// Returns `None` (skip) if any gate rejects.
-fn is_decorrelatable(
-    subquery: &AnalyzedQuery,
-    outer_width: usize,
-) -> Option<DecorrelationInfo> {
+fn is_decorrelatable(subquery: &AnalyzedQuery, outer_width: usize) -> Option<DecorrelationInfo> {
     // Must be a plain SELECT body
     let select = match &subquery.body {
         AnalyzedQueryBody::Select(s) => s,
@@ -758,7 +755,6 @@ fn extract_col_ref(expr: &TypedExpr) -> Option<(u32, usize)> {
 fn expr_has_deeply_correlated_refs(expr: &TypedExpr) -> bool {
     expr_has_outer_refs_beyond(expr, 1)
 }
-
 
 // ── The decorrelation transform ─────────────────────────────────
 

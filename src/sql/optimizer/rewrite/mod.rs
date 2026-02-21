@@ -223,7 +223,9 @@ fn push_filter_down(predicate: TypedExpr, input: LogicalPlan) -> LogicalPlan {
             left,
             right,
             condition,
-        } => push_filter_through_semi_anti(predicate, *left, *right, condition, input.schema, false),
+        } => {
+            push_filter_through_semi_anti(predicate, *left, *right, condition, input.schema, false)
+        }
         LogicalNode::AntiJoin {
             left,
             right,

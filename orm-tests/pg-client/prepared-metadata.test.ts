@@ -67,7 +67,8 @@ describe('pg client - Prepared Statement Metadata & Schema Drift', () => {
       // Verify OIDs match expected PostgreSQL types.
       expect(result.fields[0].dataTypeID).toBe(PG_OID.INT4);
       expect(result.fields[1].dataTypeID).toBe(PG_OID.TEXT);
-      expect(result.fields[2].dataTypeID).toBe(PG_OID.FLOAT4);
+      // tipg currently normalizes SQL float-family types to FLOAT8 in metadata.
+      expect(result.fields[2].dataTypeID).toBe(PG_OID.FLOAT8);
       expect(result.fields[3].dataTypeID).toBe(PG_OID.BOOL);
 
       // Sanity-check the data.

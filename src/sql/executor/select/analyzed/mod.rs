@@ -641,18 +641,12 @@ fn query_needs_pre_materialization(analyzed: &AnalyzedQuery) -> bool {
                     .having
                     .as_ref()
                     .is_some_and(|h| needs_pre_materialization(h))
-                || select
-                    .group_by
-                    .iter()
-                    .any(|e| needs_pre_materialization(e))
+                || select.group_by.iter().any(|e| needs_pre_materialization(e))
                 || matches!(
                     &select.distinct,
                     AnalyzedDistinct::DistinctOn(exprs) if exprs.iter().any(|e| needs_pre_materialization(e))
                 )
-                || select
-                    .from
-                    .iter()
-                    .any(table_ref_needs_pre_materialization)
+                || select.from.iter().any(table_ref_needs_pre_materialization)
         }
         AnalyzedQueryBody::SetOperation { left, right, .. } => {
             query_needs_pre_materialization(left) || query_needs_pre_materialization(right)

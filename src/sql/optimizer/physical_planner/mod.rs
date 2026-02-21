@@ -183,10 +183,8 @@ impl PhysicalPlanner {
                 (Some(ls), Some(rs)) => {
                     let mut sel = 1.0;
                     for (&lk, &rk) in left_keys.iter().zip(right_keys.iter()) {
-                        let left_col_name =
-                            left.schema.columns.get(lk).map(|(n, _)| n.as_str());
-                        let right_col_name =
-                            right.schema.columns.get(rk).map(|(n, _)| n.as_str());
+                        let left_col_name = left.schema.columns.get(lk).map(|(n, _)| n.as_str());
+                        let right_col_name = right.schema.columns.get(rk).map(|(n, _)| n.as_str());
                         let left_ndv = left_col_name
                             .and_then(|n| selectivity::get_column_stats(ls, n))
                             .map(|c| selectivity::n_distinct_raw(c, ls.row_count));
@@ -644,8 +642,7 @@ impl PhysicalPlanner {
                 let sel = Self::estimate_join_selectivity(left, right, condition, ctx);
                 let rows = ((left_rows as f64) * sel).ceil() as usize;
                 let rows = rows.max(1);
-                let total_cost =
-                    left_phys.cost.total + right_phys.cost.total + rows as f64 * 0.01;
+                let total_cost = left_phys.cost.total + right_phys.cost.total + rows as f64 * 0.01;
                 PhysicalPlan {
                     node: PhysicalNode::HashSemiJoin {
                         left: Box::new(left_phys),
@@ -673,8 +670,7 @@ impl PhysicalPlanner {
                 let sel = Self::estimate_join_selectivity(left, right, condition, ctx);
                 let rows = ((left_rows as f64) * (1.0 - sel)).ceil() as usize;
                 let rows = rows.max(1);
-                let total_cost =
-                    left_phys.cost.total + right_phys.cost.total + rows as f64 * 0.01;
+                let total_cost = left_phys.cost.total + right_phys.cost.total + rows as f64 * 0.01;
                 PhysicalPlan {
                     node: PhysicalNode::HashSemiJoin {
                         left: Box::new(left_phys),
