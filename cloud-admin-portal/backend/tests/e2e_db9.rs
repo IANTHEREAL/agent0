@@ -74,6 +74,7 @@ async fn setup() -> AppState {
         fs9_meta_url: None,
         fs9_meta_key: None,
         fs9_jwt_secret: None,
+        fs9_server_url: None,
     };
 
     AppState {
@@ -615,4 +616,116 @@ async fn sql_file_with_multiple_statements() {
         "should pass auth: {combined}"
     );
     assert!(!lower.contains("not found"), "should find DB: {combined}");
+}
+
+// ══════════════════════════════════════════════════════════════════
+// login --api-key regression tests (#920)
+// ══════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_api_key_valid_token_succeeds() {
+    let (addr, state) = start_server().await;
+    let api_url = format!("http://{addr}");
+
+    let email = format!("e2e-apikey-ok-{}@test.com", uuid::Uuid::new_v4());
+    let token = register_and_login(&state, &email, "TestPass123!").await;
+
+    // Fresh home — no credentials pre-written
+    let home = TempHome::new();
+
+    let output = db9_cmd(&api_url, &home)
+        .args(["login", "--api-key", &token])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "login --api-key should succeed, stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Login successful"),
+        "should print success message, got: {stdout}"
+    );
+
+    // Credentials file should exist with the exact token
+    let cred_path = home.path().join(".db9").join("credentials");
+    assert!(cred_path.exists(), "credentials file should be created");
+    let cred_content = std::fs::read_to_string(&cred_path).unwrap();
+    let cred: toml::Value = cred_content.parse().expect("credentials should be valid TOML");
+    assert_eq!(
+        cred["token"].as_str().unwrap(),
+        token,
+        "stored token should match exactly"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_api_key_invalid_token_fails() {
+    let (addr, _state) = start_server().await;
+    let api_url = format!("http://{addr}");
+
+    let home = TempHome::new();
+
+    let output = db9_cmd(&api_url, &home)
+        .args(["login", "--api-key", "bogus-token-12345"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "login --api-key with invalid token should fail, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Invalid API key"),
+        "should print invalid key message, got: {stderr}"
+    );
+
+    // Credentials file should NOT be created (verify-before-save)
+    let cred_path = home.path().join(".db9").join("credentials");
+    assert!(
+        !cred_path.exists(),
+        "credentials file should not be created for invalid token"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_api_key_invalid_preserves_existing_credentials() {
+    let (addr, state) = start_server().await;
+    let api_url = format!("http://{addr}");
+
+    let email = format!("e2e-apikey-preserve-{}@test.com", uuid::Uuid::new_v4());
+    let token = register_and_login(&state, &email, "TestPass123!").await;
+
+    // Pre-populate valid credentials
+    let home = TempHome::new();
+    home.write_credentials(&token);
+
+    let output = db9_cmd(&api_url, &home)
+        .args(["login", "--api-key", "bad-token-xyz"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "login --api-key with bad token should fail, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Invalid API key"),
+        "should print invalid key message, got: {stderr}"
+    );
+
+    // Original credentials should be preserved exactly
+    let cred_path = home.path().join(".db9").join("credentials");
+    assert!(cred_path.exists(), "credentials file should still exist");
+    let cred_content = std::fs::read_to_string(&cred_path).unwrap();
+    let cred: toml::Value = cred_content.parse().expect("credentials should be valid TOML");
+    assert_eq!(
+        cred["token"].as_str().unwrap(),
+        token,
+        "original valid token should be preserved exactly"
+    );
 }

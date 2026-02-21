@@ -1702,22 +1702,32 @@ async fn cmd_register(api: &ApiClient, output: &OutputFormat) {
 }
 
 async fn cmd_login(api: &ApiClient, output: &OutputFormat, api_key: Option<String>) {
-    // If --api-key is provided, save it directly and verify
+    // If --api-key is provided, verify first then save
     if let Some(key) = api_key {
-        if let Err(e) = save_token(&key) {
-            eprintln!("{e}");
+        // Verify the token using Bearer auth (same as every other authenticated command)
+        let headers = make_auth_headers(&key);
+        let result = match api.try_request("GET", "/customer/me", None, Some(&headers)).await {
+            Ok(val) => val,
+            Err((status, detail)) => {
+                if status == 401 || status == 403 {
+                    eprintln!("Invalid API key");
+                } else if status == 0 {
+                    eprintln!("{detail}");
+                } else {
+                    eprintln!("Error {status}: {detail}");
+                }
+                process::exit(1);
+            }
+        };
+
+        if result.get("id").is_none() {
+            eprintln!("Invalid API key");
             process::exit(1);
         }
 
-        // Verify the token works by creating a new client with it and calling /customer/me
-        let verify_api = ApiClient::new(api.base_url(), Some(&key));
-        let result = verify_api.request("GET", "/customer/me", None, None).await;
-
-        if result.get("error").is_some() || result.get("id").is_none() {
-            // Token invalid, remove it
-            let cred_path = config_dir().join("credentials");
-            let _ = std::fs::remove_file(&cred_path);
-            eprintln!("Invalid API key");
+        // Token verified — now save it
+        if let Err(e) = save_token(&key) {
+            eprintln!("{e}");
             process::exit(1);
         }
 
