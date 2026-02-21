@@ -41,6 +41,9 @@ const AUTOCOMMIT_MAX_RETRIES: usize = 10;
 const SCAN_LIMIT: u32 = u32::MAX;
 const BATCH_GET_CHUNK_SIZE: usize = 256;
 
+/// Batch size for paginated table scans / deletes to avoid exceeding gRPC message size limits.
+const TABLE_SCAN_BATCH_SIZE: u32 = 1024;
+
 fn scan_limit_to_u32(limit: Option<usize>) -> u32 {
     match limit {
         Some(0) => 0,

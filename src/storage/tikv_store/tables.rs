@@ -236,18 +236,19 @@ impl TikvStore {
         if let Some(schema) = schema_opt {
             let schema_key = self.key(&encode_schema_key_v2(db_id, table_name));
             txn_delete(txn, schema_key).await?;
-            let (raw_start, raw_end) = encode_table_data_range_v2(db_id, schema.table_id);
-            let range: BoundRange = (self.key(&raw_start)..self.key(&raw_end)).into();
-            let pairs = txn.scan(range, SCAN_LIMIT).await?;
-            for pair in pairs {
-                txn_delete(txn, pair.into_key().into()).await?;
+
+            // Delete all data rows (paginated).
+            {
+                let (raw_start, raw_end) = encode_table_data_range_v2(db_id, schema.table_id);
+                self.delete_range_paginated(txn, &raw_start, &raw_end)
+                    .await?;
             }
 
-            let (raw_start, raw_end) = encode_table_index_range_v2(db_id, schema.table_id);
-            let range: BoundRange = (self.key(&raw_start)..self.key(&raw_end)).into();
-            let pairs = txn.scan(range, SCAN_LIMIT).await?;
-            for pair in pairs {
-                txn_delete(txn, pair.into_key().into()).await?;
+            // Delete all index entries (paginated).
+            {
+                let (raw_start, raw_end) = encode_table_index_range_v2(db_id, schema.table_id);
+                self.delete_range_paginated(txn, &raw_start, &raw_end)
+                    .await?;
             }
 
             // Remove the per-table sequence counter (used by TableId-backed sequences),
@@ -404,7 +405,7 @@ impl TikvStore {
         Ok(())
     }
 
-    /// Scan all rows from a table
+    /// Scan all rows from a table (paginated to avoid gRPC message size overflow).
     pub async fn scan(
         &self,
         txn: &mut Transaction,
@@ -417,16 +418,44 @@ impl TikvStore {
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
         let (raw_start, raw_end) = encode_table_data_range_v2(db_id, schema.table_id);
-        let range: BoundRange = (self.key(&raw_start)..self.key(&raw_end)).into();
-        let pairs = txn.scan(range, scan_limit_to_u32(limit)).await?;
+        let end_key = self.key(&raw_end);
+        let mut start_key = self.key(&raw_start);
+        let total_limit = limit.unwrap_or(usize::MAX);
         let mut rows = Vec::new();
-        let mut scanned_pairs = 0usize;
-        for pair in pairs {
-            scanned_pairs += 1;
-            let row = deserialize_row(pair.value())?;
-            rows.push(row);
+
+        loop {
+            if rows.len() >= total_limit {
+                break;
+            }
+            let remaining = total_limit - rows.len();
+            let batch_size = std::cmp::min(TABLE_SCAN_BATCH_SIZE as usize, remaining) as u32;
+            let range: BoundRange = (start_key.clone()..end_key.clone()).into();
+            let pairs = txn.scan(range, batch_size).await?;
+            let mut batch_count = 0u32;
+            let mut last_key: Option<Vec<u8>> = None;
+
+            for pair in pairs {
+                let key_ref: &[u8] = pair.key().as_ref().into();
+                last_key = Some(key_ref.to_vec());
+                let row = deserialize_row(pair.value())?;
+                rows.push(row);
+                batch_count += 1;
+            }
+
+            if batch_count < batch_size {
+                break;
+            }
+
+            // Advance past the last key for the next batch.
+            if let Some(mut lk) = last_key {
+                lk.push(0x00);
+                start_key = lk;
+            } else {
+                break;
+            }
         }
-        kv_stats::record_table_scan_pairs(scanned_pairs);
+
+        kv_stats::record_table_scan_pairs(rows.len());
         debug!("Scanned {} rows from '{}'", rows.len(), table_name);
         Ok(rows)
     }
@@ -454,6 +483,11 @@ impl TikvStore {
         }
     }
 
+    /// List all table names for a database.
+    ///
+    /// Uses an unbounded scan (`SCAN_LIMIT`) because this reads schema metadata
+    /// keys (one small key per table), not row data.  Even with thousands of
+    /// tables the response fits well within gRPC message size limits.
     pub async fn list_tables(&self, txn: &mut Transaction, db_id: u64) -> Result<Vec<String>> {
         let prefix = encode_schema_prefix_v2(db_id);
         let mut end = prefix.clone();
@@ -528,18 +562,18 @@ impl TikvStore {
     ) -> Result<bool> {
         let schema_opt = self.get_schema(txn, db_id, table_name).await?;
         if let Some(schema) = schema_opt {
-            let (raw_start, raw_end) = encode_table_data_range_v2(db_id, schema.table_id);
-            let range: BoundRange = (self.key(&raw_start)..self.key(&raw_end)).into();
-            let pairs = txn.scan(range, SCAN_LIMIT).await?;
-            for pair in pairs {
-                txn_delete(txn, pair.into_key().into()).await?;
+            // Delete all data rows (paginated).
+            {
+                let (raw_start, raw_end) = encode_table_data_range_v2(db_id, schema.table_id);
+                self.delete_range_paginated(txn, &raw_start, &raw_end)
+                    .await?;
             }
 
-            let (raw_start, raw_end) = encode_table_index_range_v2(db_id, schema.table_id);
-            let range: BoundRange = (self.key(&raw_start)..self.key(&raw_end)).into();
-            let pairs = txn.scan(range, SCAN_LIMIT).await?;
-            for pair in pairs {
-                txn_delete(txn, pair.into_key().into()).await?;
+            // Delete all index entries (paginated).
+            {
+                let (raw_start, raw_end) = encode_table_index_range_v2(db_id, schema.table_id);
+                self.delete_range_paginated(txn, &raw_start, &raw_end)
+                    .await?;
             }
             info!("Truncated table '{}'", table_name);
             Ok(true)
@@ -648,6 +682,40 @@ impl TikvStore {
             .await?;
         self.rewrite_sequences_owned_by_column(txn, db_id, table_full_name, old_column, new_column)
             .await?;
+        Ok(())
+    }
+
+    /// Delete all keys in the given range using paginated scans to avoid
+    /// exceeding gRPC message size limits on large tables.
+    async fn delete_range_paginated(
+        &self,
+        txn: &mut Transaction,
+        raw_start: &[u8],
+        raw_end: &[u8],
+    ) -> Result<()> {
+        let end_key = self.key(raw_end);
+        let mut start_key = self.key(raw_start);
+        loop {
+            let range: BoundRange = (start_key.clone()..end_key.clone()).into();
+            let pairs = txn.scan(range, TABLE_SCAN_BATCH_SIZE).await?;
+            let mut batch_count = 0u32;
+            let mut last_key: Option<Vec<u8>> = None;
+            for pair in pairs {
+                let key_ref: &[u8] = pair.key().as_ref().into();
+                last_key = Some(key_ref.to_vec());
+                txn_delete(txn, pair.into_key().into()).await?;
+                batch_count += 1;
+            }
+            if batch_count < TABLE_SCAN_BATCH_SIZE {
+                break;
+            }
+            if let Some(mut lk) = last_key {
+                lk.push(0x00);
+                start_key = lk;
+            } else {
+                break;
+            }
+        }
         Ok(())
     }
 }
