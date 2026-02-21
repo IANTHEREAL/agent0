@@ -106,7 +106,9 @@ impl PhysicalOperator for TableScanOperator {
     }
 
     async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.buffer.clear();
+        if !self.preloaded {
+            self.buffer.clear();
+        }
         self.opened = false;
         Ok(())
     }

@@ -1,0 +1,15 @@
+name|len
+alpha|5
+beta|4
+gamma|5
+(3 rows)
+name|label
+alpha|alpha-1
+beta|beta-2
+gamma|gamma-3
+(3 rows)
+name|val
+alpha|42
+beta|42
+gamma|42
+(3 rows)

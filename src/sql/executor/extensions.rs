@@ -251,6 +251,27 @@ impl Executor {
                     headers,
                 })
             }
+            "HTTP_PATCH" => {
+                if args.len() < 3 || args.len() > 4 {
+                    return Err(anyhow!(
+                        "http_patch(url text, body text, content_type text [, headers jsonb]) requires 3-4 arguments"
+                    ));
+                }
+                let url = expect_text(eval_const_ast_expr(extract_expr_arg(&args[0])?)?, "url")?;
+                let body = expect_text(eval_const_ast_expr(extract_expr_arg(&args[1])?)?, "body")?;
+                let content_type = expect_text(
+                    eval_const_ast_expr(extract_expr_arg(&args[2])?)?,
+                    "content_type",
+                )?;
+                let headers = extract_optional_headers(args, 3)?;
+                Some(HttpTableFunctionCall::Universal {
+                    method: "PATCH".to_string(),
+                    url,
+                    headers,
+                    content_type: Some(content_type),
+                    body: Some(body),
+                })
+            }
             "HTTP" => {
                 // http(method, uri [, headers jsonb [, content_type text [, content text]]])
                 if args.len() < 2 || args.len() > 5 {

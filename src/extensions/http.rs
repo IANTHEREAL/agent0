@@ -163,9 +163,8 @@ fn http_response_schema(name: &str) -> TableSchema {
 pub(crate) fn table_function_schema(func_name: &str) -> Option<TableSchema> {
     let name = func_name.trim().to_ascii_lowercase();
     match name.as_str() {
-        "http" | "http_get" | "http_head" | "http_delete" | "http_post" | "http_put" => {
-            Some(http_response_schema(&name))
-        }
+        "http" | "http_get" | "http_head" | "http_delete" | "http_post" | "http_put"
+        | "http_patch" => Some(http_response_schema(&name)),
         _ => None,
     }
 }
