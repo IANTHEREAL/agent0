@@ -112,6 +112,9 @@ impl SecurityManager {
             .keep_alive_timeout(Duration::from_secs(3));
         Ok(endpoint)
     }
+
+    /// Maximum gRPC message size for TiKV client connections (64 MB).
+    pub const MAX_GRPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 }
 
 #[cfg(test)]
