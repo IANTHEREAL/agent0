@@ -1,0 +1,55 @@
+extra_float_digits
+1
+(1 row)
+bytea_output
+hex
+(1 row)
+lc_messages
+C
+(1 row)
+lc_monetary
+C
+(1 row)
+lc_numeric
+C
+(1 row)
+lc_time
+C
+(1 row)
+max_identifier_length
+63
+(1 row)
+max_index_keys
+32
+(1 row)
+work_mem
+4MB
+(1 row)
+in_hot_standby
+off
+(1 row)
+password_encryption
+scram-sha-256
+(1 row)
+extra_float_digits
+3
+(1 row)
+extra_float_digits
+1
+(1 row)
+current_setting
+hex
+(1 row)
+current_setting
+63
+(1 row)
+datestyle
+ISO, MDY
+(1 row)
+server_encoding
+UTF8
+(1 row)
+integer_datetimes
+on
+(1 row)
+ERROR:  unrecognized configuration parameter "nonexistent_setting_xyz"

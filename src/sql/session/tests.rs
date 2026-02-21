@@ -384,7 +384,61 @@ mod tests {
         assert_eq!(settings.show_value("timezone").as_deref(), Some("UTC"));
 
         settings.reset_setting("extra_float_digits");
-        assert_eq!(settings.show_value("extra_float_digits"), None);
+        assert_eq!(
+            settings.show_value("extra_float_digits").as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn test_default_value_fallback_and_set_precedence() {
+        let mut settings = SessionSettings::new();
+
+        // Before SET: fallback table provides defaults.
+        assert_eq!(
+            settings.show_value("extra_float_digits").as_deref(),
+            Some("1")
+        );
+        assert_eq!(settings.show_value("bytea_output").as_deref(), Some("hex"));
+        assert_eq!(
+            settings.show_value("max_identifier_length").as_deref(),
+            Some("63")
+        );
+        assert_eq!(
+            settings.show_value("default_text_search_config").as_deref(),
+            Some(crate::sql::fts_tokenizers::default_text_search_config())
+        );
+
+        // SET overrides fallback via extra_settings.
+        settings
+            .set_known_setting("extra_float_digits", "3".to_string())
+            .unwrap();
+        assert_eq!(
+            settings.show_value("extra_float_digits").as_deref(),
+            Some("3")
+        );
+        settings
+            .set_known_setting("default_text_search_config", "english".to_string())
+            .unwrap();
+        assert_eq!(
+            settings.show_value("default_text_search_config").as_deref(),
+            Some("english")
+        );
+
+        // RESET restores fallback values.
+        settings.reset_setting("extra_float_digits");
+        assert_eq!(
+            settings.show_value("extra_float_digits").as_deref(),
+            Some("1")
+        );
+        settings.reset_setting("default_text_search_config");
+        assert_eq!(
+            settings.show_value("default_text_search_config").as_deref(),
+            Some(crate::sql::fts_tokenizers::default_text_search_config())
+        );
+
+        // Unknown GUC remains unknown.
+        assert_eq!(settings.show_value("totally_unknown_guc"), None);
     }
 
     #[test]

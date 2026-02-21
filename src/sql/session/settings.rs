@@ -479,7 +479,33 @@ impl SessionSettings {
                     .unwrap_or("off")
                     .to_string(),
             ),
-            _ => self.extra_settings.get(name).cloned(),
+            _ => self
+                .extra_settings
+                .get(name)
+                .cloned()
+                .or_else(|| Self::default_value(name).map(String::from)),
+        }
+    }
+
+    /// PostgreSQL-compatible defaults for common GUC parameters that tipg does
+    /// not actively track but drivers/ORMs expect to SHOW without error.
+    fn default_value(name: &str) -> Option<&'static str> {
+        match name {
+            "extra_float_digits" => Some("1"),
+            "bytea_output" => Some("hex"),
+            "lc_messages" => Some("C"),
+            "lc_monetary" => Some("C"),
+            "lc_numeric" => Some("C"),
+            "lc_time" => Some("C"),
+            "max_identifier_length" => Some("63"),
+            "max_index_keys" => Some("32"),
+            "work_mem" => Some("4MB"),
+            "default_text_search_config" => {
+                Some(crate::sql::fts_tokenizers::default_text_search_config())
+            }
+            "in_hot_standby" => Some("off"),
+            "password_encryption" => Some("scram-sha-256"),
+            _ => None,
         }
     }
 
