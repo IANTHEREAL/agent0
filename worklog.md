@@ -1,5 +1,58 @@
 # Worklog
 
+## 2026-02-21: Issue #924 — FK ON DELETE Cascade Stale Snapshot Fix (Bug 7)
+
+### Problem
+FK `ON DELETE` cascade handling used a pre-cached `table_rows` HashMap (populated once before cascade processing). This caused stale data in three vectors:
+1. **Cross-FK:** FK2 overwrites FK1's changes (e.g., two SET NULL FKs on same child row — second FK still sees stale pre-SET-NULL values)
+2. **Intra-batch:** `rows_to_update` pre-computed from one scan; `execute_update_row` triggers ON UPDATE CASCADE that mutates rows still pending in the batch
+3. **SET DEFAULT loop:** SET DEFAULT where default == deleted key produces no-op updates, looping forever
+
+Bugs 1-6 were already fixed in commit `ee9962d`. This addresses Bug 7 (stale snapshots).
+
+### Solution: Three Complementary Changes
+
+**A. Swap deletion order in `execute_delete_row` (`delete.rs`)**
+Delete parent from storage FIRST, then run FK cascades. Matches PostgreSQL semantics (FK triggers fire AFTER the DELETE). On RESTRICT failure, transaction rollback undoes the parent deletion.
+
+**B. Fixpoint loop in `cascade_delete_recursive` (`foreign_keys.rs`)**
+Replace batch-collect-then-apply with per-row fixpoint:
+- RESTRICT/NoAction: one-shot scan, error if any match
+- CASCADE: loop { scan → find first match → mark deleted → recurse → delete }
+- SET NULL/SET DEFAULT: loop { scan → find first match → compute new values → update }
+
+Each iteration re-scans from storage, seeing all prior side-effects. Eliminates all staleness by construction.
+
+**C. No-op guard (defense-in-depth)**
+In SET NULL/SET DEFAULT fixpoint, if `new_values == fresh_row.values`, raise FK violation error. Prevents infinite loops from SET DEFAULT where default == deleted key. Primary enforcement is via `execute_update_row → validate_foreign_keys` (parent already deleted).
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `src/sql/dml/delete.rs` | Swap order: `delete_row_storage_entries` before `handle_foreign_key_on_delete` |
+| `src/sql/dml/foreign_keys.rs` | Remove `table_rows` pre-cache, add `find_first_fk_match` helper with stmt_deleting_pks integration, replace batch logic with fixpoint loop |
+| `tests/100_fk_null_and_unique_ref.sql` | Add tests 28-33 (6 new FK staleness tests) |
+| `tests/100_fk_null_and_unique_ref.expected` | Add expected output for tests 28-33 |
+
+### Termination Guarantees
+- SET NULL: FK column → NULL → `any_null` skip → no match
+- SET DEFAULT (default ≠ ref_values): FK column → default → doesn't match → no match
+- SET DEFAULT (default = ref_values): no-op guard raises FK violation + `validate_foreign_keys` catches post-delete
+- CASCADE: row deleted from storage → absent from next scan; `deleted_pks` guards recursion
+
+### What Did NOT Change
+- `handle_foreign_key_on_update()` — already uses fresh `store.scan()` per FK
+- `validate_foreign_keys()` — read-only, no cascade
+- `deleted_pks` mechanism — still needed for CASCADE cycle prevention
+- `table_schemas` caching — schemas don't change during DML
+- PK-less table identity (synthetic UUID PKs) — documented as out-of-scope
+
+### Verification
+- `cargo build` — clean compile
+- 6 new regression tests covering cross-FK, intra-batch, and termination vectors
+
+---
+
 ## 2026-02-21: Statement-Level FK NO ACTION/RESTRICT Deferral for DELETE
 
 ### Problem

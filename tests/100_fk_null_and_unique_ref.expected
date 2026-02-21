@@ -125,3 +125,24 @@ id|parent_id
 3|NULL
 (1 row)
 (0 rows)
+id|a|b
+10|NULL|NULL
+(1 row)
+id|a|b|c
+10|NULL|NULL|NULL
+(1 row)
+id|a|b
+10|0|0
+(1 row)
+id|a|b
+10|NULL|0
+(1 row)
+id|a|b|ref_a|ref_b
+1|NULL|10|NULL|NULL
+2|NULL|20|NULL|10
+(2 rows)
+ERROR:  update or delete on table "fk924f_parent" violates foreign key constraint "fk924f_child_pid_fkey" on table "fk924f_child"
+DETAIL:  Key (id)=(1) is still referenced from table "fk924f_child".
+id|pid
+1|1
+(1 row)

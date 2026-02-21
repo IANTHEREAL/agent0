@@ -277,13 +277,10 @@ pub async fn handle_foreign_key_on_delete(
     stmt_deleting_pks: &HashSet<String>,
 ) -> Result<()> {
     let table_names = store.list_tables(txn, db_id).await?;
-    let mut table_rows: HashMap<String, Vec<Row>> = HashMap::new();
     let mut table_schemas: HashMap<String, TableSchema> = HashMap::new();
     for t in &table_names {
         if let Some(s) = store.get_schema(txn, db_id, t).await? {
             if !s.foreign_keys.is_empty() {
-                let rows = store.scan(txn, db_id, t, None).await?;
-                table_rows.insert(t.clone(), rows);
                 table_schemas.insert(t.clone(), s);
             }
         }
@@ -304,7 +301,6 @@ pub async fn handle_foreign_key_on_delete(
         table_name,
         row,
         schema,
-        &table_rows,
         &table_schemas,
         &mut deleted_pks,
         stmt_deleting_pks,
@@ -313,6 +309,62 @@ pub async fn handle_foreign_key_on_delete(
     .await
 }
 
+/// Find the first child row whose FK columns match `ref_values`.
+/// Skips NULL FK columns (MATCH SIMPLE), already-deleted rows, the self-ref parent,
+/// and rows being deleted by the same statement (statement-level deferral).
+/// Returns an owned `Row` (clone) to avoid borrow-checker conflicts with `deleted_pks`
+/// mutation in the caller.
+fn find_first_fk_match(
+    rows: &[Row],
+    other_schema: &TableSchema,
+    fk: &ForeignKeyConstraint,
+    ref_values: &[Value],
+    deleted_in_table: Option<&Vec<Vec<Value>>>,
+    self_ref_parent_pk: Option<&Vec<Value>>,
+    stmt_deleting_pks: &HashSet<String>,
+    is_stmt_target_table: bool,
+) -> Option<Row> {
+    for row in rows {
+        let pk = other_schema.get_pk_values(row);
+        if let Some(deleted) = deleted_in_table {
+            if deleted.contains(&pk) {
+                continue;
+            }
+        }
+        // Statement-level deferral: skip referencing rows that are
+        // also being deleted by the same DELETE statement.
+        if is_stmt_target_table && stmt_deleting_pks.contains(&pk_to_hash_key(&pk)) {
+            continue;
+        }
+        if let Some(parent_pk) = self_ref_parent_pk {
+            if pk == *parent_pk {
+                continue;
+            }
+        }
+        let mut fk_values: Vec<Value> = Vec::new();
+        let mut any_null = false;
+        for col_name in &fk.columns {
+            if let Some(idx) = other_schema.column_index(col_name) {
+                let val = row.values[idx].clone();
+                if val == Value::Null {
+                    any_null = true;
+                }
+                fk_values.push(val);
+            }
+        }
+        if any_null {
+            continue;
+        }
+        if fk_values == ref_values {
+            return Some(row.clone());
+        }
+    }
+    None
+}
+
+/// Fixpoint-based cascade delete: processes one matching child row at a time,
+/// re-scanning from storage before each iteration to see the latest transactional state.
+/// This eliminates all staleness vectors (cross-FK, intra-batch, PK mutation).
 async fn cascade_delete_recursive(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -320,7 +372,6 @@ async fn cascade_delete_recursive(
     table_name: &str,
     parent_row: &Row,
     parent_schema: &TableSchema,
-    table_rows: &HashMap<String, Vec<Row>>,
     table_schemas: &HashMap<String, TableSchema>,
     deleted_pks: &mut HashMap<String, Vec<Vec<Value>>>,
     stmt_deleting_pks: &HashSet<String>,
@@ -343,155 +394,190 @@ async fn cascade_delete_recursive(
                 None
             };
 
-            let all_rows = table_rows.get(other_table).cloned().unwrap_or_default();
-            let deleted_in_table = deleted_pks.entry(other_table.clone()).or_default();
+            let is_stmt_target = other_table.as_str() == stmt_target_table;
 
-            let mut rows_to_cascade: Vec<Row> = Vec::new();
-            let mut rows_to_update: Vec<(Row, Row)> = Vec::new();
-
-            for other_row in &all_rows {
-                let other_pk = other_schema.get_pk_values(other_row);
-                if deleted_in_table.contains(&other_pk) {
-                    continue;
-                }
-
-                // Statement-level deferral: skip referencing rows that are
-                // also being deleted by the same DELETE statement.  Gives
-                // correct PostgreSQL semantics for both NO ACTION and RESTRICT.
-                // O(1) lookup via pre-built HashSet<String>.
-                if other_table.as_str() == stmt_target_table
-                    && stmt_deleting_pks.contains(&pk_to_hash_key(&other_pk))
-                {
-                    continue;
-                }
-
-                // Don't let the row being deleted RESTRICT/cascade against itself.
-                if let Some(ref parent_pk) = self_ref_parent_pk {
-                    if other_pk == *parent_pk {
-                        continue;
+            match fk.on_delete {
+                ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
+                    // One-shot scan: error if any child still references this parent.
+                    let all_rows = store.scan(txn, db_id, other_table, None).await?;
+                    if find_first_fk_match(
+                        &all_rows,
+                        other_schema,
+                        fk,
+                        &ref_values,
+                        deleted_pks.get(other_table),
+                        self_ref_parent_pk.as_ref(),
+                        stmt_deleting_pks,
+                        is_stmt_target,
+                    )
+                    .is_some()
+                    {
+                        let cols = ref_column_names(fk, parent_schema);
+                        let ref_val_strs: Vec<String> =
+                            ref_values.iter().map(|v| format!("{}", v)).collect();
+                        let short_table = short_relation_name(table_name);
+                        let short_other_table = short_relation_name(other_table);
+                        return Err(SqlError::ForeignKeyViolation {
+                            constraint: fk.name.clone(),
+                            message: format!(
+                                "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"\n\
+                                 DETAIL:  Key ({})=({}) is still referenced from table \"{}\".",
+                                short_table,
+                                fk.name,
+                                short_other_table,
+                                cols,
+                                ref_val_strs.join(", "),
+                                short_other_table
+                            ),
+                        }
+                        .into());
                     }
                 }
 
-                let mut fk_values: Vec<Value> = Vec::new();
-                let mut any_null = false;
+                ForeignKeyAction::Cascade => {
+                    // Fixpoint: scan → find first match → mark deleted → recurse → delete → repeat.
+                    loop {
+                        let all_rows = store.scan(txn, db_id, other_table, None).await?;
+                        let matched = find_first_fk_match(
+                            &all_rows,
+                            other_schema,
+                            fk,
+                            &ref_values,
+                            deleted_pks.get(other_table),
+                            self_ref_parent_pk.as_ref(),
+                            stmt_deleting_pks,
+                            is_stmt_target,
+                        );
+                        let del_row = match matched {
+                            None => break,
+                            Some(r) => r,
+                        };
+                        let del_pk = other_schema.get_pk_values(&del_row);
+                        deleted_pks
+                            .entry(other_table.clone())
+                            .or_default()
+                            .push(del_pk);
 
-                for col_name in &fk.columns {
-                    if let Some(idx) = other_schema.column_index(col_name) {
-                        let val = other_row.values[idx].clone();
-                        if val == Value::Null {
-                            any_null = true;
-                        }
-                        fk_values.push(val);
+                        Box::pin(cascade_delete_recursive(
+                            store,
+                            txn,
+                            db_id,
+                            other_table,
+                            &del_row,
+                            other_schema,
+                            table_schemas,
+                            deleted_pks,
+                            stmt_deleting_pks,
+                            stmt_target_table,
+                        ))
+                        .await?;
+
+                        super::delete::delete_row_storage_entries(
+                            store,
+                            txn,
+                            db_id,
+                            other_table,
+                            other_schema,
+                            &del_row,
+                        )
+                        .await?;
                     }
                 }
 
-                if any_null {
-                    continue;
-                }
+                ForeignKeyAction::SetNull | ForeignKeyAction::SetDefault => {
+                    // Fixpoint: scan → find first match → compute new values → update → repeat.
+                    // Each iteration re-reads from storage to see all prior side-effects.
+                    let enum_cache =
+                        build_enum_label_cache(store, txn, db_id, other_schema).await?;
+                    loop {
+                        let all_rows = store.scan(txn, db_id, other_table, None).await?;
+                        let matched = find_first_fk_match(
+                            &all_rows,
+                            other_schema,
+                            fk,
+                            &ref_values,
+                            deleted_pks.get(other_table),
+                            self_ref_parent_pk.as_ref(),
+                            stmt_deleting_pks,
+                            is_stmt_target,
+                        );
+                        let fresh_row = match matched {
+                            None => break,
+                            Some(r) => r,
+                        };
 
-                if fk_values == ref_values {
-                    match fk.on_delete {
-                        ForeignKeyAction::Cascade => {
-                            rows_to_cascade.push(other_row.clone());
-                        }
-                        ForeignKeyAction::SetNull => {
-                            let mut new_values = other_row.values.clone();
-                            for col_name in &fk.columns {
-                                if let Some(idx) = other_schema.column_index(col_name) {
-                                    new_values[idx] = Value::Null;
+                        let mut new_values = fresh_row.values.clone();
+                        match fk.on_delete {
+                            ForeignKeyAction::SetNull => {
+                                for col_name in &fk.columns {
+                                    if let Some(idx) = other_schema.column_index(col_name) {
+                                        new_values[idx] = Value::Null;
+                                    }
                                 }
                             }
-                            rows_to_update.push((other_row.clone(), Row::new(new_values)));
+                            ForeignKeyAction::SetDefault => {
+                                for col_name in &fk.columns {
+                                    if let Some(idx) = other_schema.column_index(col_name) {
+                                        let col = &other_schema.columns[idx];
+                                        new_values[idx] =
+                                            if let Some(ref def_expr) = col.default_expr {
+                                                eval_default_expr(def_expr)?
+                                            } else {
+                                                Value::Null
+                                            };
+                                    }
+                                }
+                            }
+                            _ => unreachable!(),
                         }
-                        ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
+
+                        let updated_row = execute_update_row(
+                            store,
+                            txn,
+                            db_id,
+                            other_table,
+                            other_schema,
+                            &fresh_row,
+                            Row::new(new_values),
+                            &enum_cache,
+                        )
+                        .await?;
+
+                        // Post-update convergence check: extract FK column values from
+                        // the coerced result and verify they no longer match ref_values.
+                        // If they still match, SET DEFAULT produced the deleted parent key
+                        // (possibly after type coercion, e.g. Int32→Int64). The child
+                        // still references a non-existent parent — produce the PG-compatible
+                        // parent-side "still referenced" error and terminate the fixpoint.
+                        let mut post_fk_values: Vec<Value> = Vec::new();
+                        for col_name in &fk.columns {
+                            if let Some(idx) = other_schema.column_index(col_name) {
+                                post_fk_values.push(updated_row.values[idx].clone());
+                            }
+                        }
+                        if post_fk_values == ref_values {
                             let cols = ref_column_names(fk, parent_schema);
                             let ref_val_strs: Vec<String> =
                                 ref_values.iter().map(|v| format!("{}", v)).collect();
-                            let short_table = short_relation_name(table_name);
-                            let short_other_table = short_relation_name(other_table);
+                            let short_parent = short_relation_name(table_name);
+                            let short_child = short_relation_name(other_table);
                             return Err(SqlError::ForeignKeyViolation {
                                 constraint: fk.name.clone(),
                                 message: format!(
                                     "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"\n\
                                      DETAIL:  Key ({})=({}) is still referenced from table \"{}\".",
-                                    short_table,
+                                    short_parent,
                                     fk.name,
-                                    short_other_table,
+                                    short_child,
                                     cols,
                                     ref_val_strs.join(", "),
-                                    short_other_table
+                                    short_child
                                 ),
                             }
                             .into());
                         }
-                        ForeignKeyAction::SetDefault => {
-                            let mut new_values = other_row.values.clone();
-                            for col_name in &fk.columns {
-                                if let Some(idx) = other_schema.column_index(col_name) {
-                                    let col = &other_schema.columns[idx];
-                                    let default_val = if let Some(ref def_expr) = col.default_expr {
-                                        eval_default_expr(def_expr)?
-                                    } else {
-                                        Value::Null
-                                    };
-                                    new_values[idx] = default_val;
-                                }
-                            }
-                            rows_to_update.push((other_row.clone(), Row::new(new_values)));
-                        }
                     }
                 }
-            }
-
-            for del_row in rows_to_cascade {
-                let del_pk = other_schema.get_pk_values(&del_row);
-
-                // Record as deleted BEFORE recursion to prevent infinite cycles
-                // on self-referencing or mutually-referencing rows.
-                deleted_pks
-                    .entry(other_table.clone())
-                    .or_default()
-                    .push(del_pk.clone());
-
-                Box::pin(cascade_delete_recursive(
-                    store,
-                    txn,
-                    db_id,
-                    other_table,
-                    &del_row,
-                    other_schema,
-                    table_rows,
-                    table_schemas,
-                    deleted_pks,
-                    stmt_deleting_pks,
-                    stmt_target_table,
-                ))
-                .await?;
-
-                super::delete::delete_row_storage_entries(
-                    store,
-                    txn,
-                    db_id,
-                    other_table,
-                    other_schema,
-                    &del_row,
-                )
-                .await?;
-            }
-
-            let enum_cache = build_enum_label_cache(store, txn, db_id, other_schema).await?;
-            for (old_row, new_row) in rows_to_update {
-                execute_update_row(
-                    store,
-                    txn,
-                    db_id,
-                    other_table,
-                    other_schema,
-                    &old_row,
-                    new_row,
-                    &enum_cache,
-                )
-                .await?;
             }
         }
     }

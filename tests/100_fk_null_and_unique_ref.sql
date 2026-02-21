@@ -1,5 +1,17 @@
 -- FK NULL semantics (MATCH SIMPLE) + referenced-key validation coverage
 
+DROP TABLE IF EXISTS fk924f_child CASCADE;
+DROP TABLE IF EXISTS fk924f_parent CASCADE;
+DROP TABLE IF EXISTS fk924e_child CASCADE;
+DROP TABLE IF EXISTS fk924e_parent CASCADE;
+DROP TABLE IF EXISTS fk924d_child CASCADE;
+DROP TABLE IF EXISTS fk924d_parent CASCADE;
+DROP TABLE IF EXISTS fk924c_child CASCADE;
+DROP TABLE IF EXISTS fk924c_parent CASCADE;
+DROP TABLE IF EXISTS fk924b_child CASCADE;
+DROP TABLE IF EXISTS fk924b_parent CASCADE;
+DROP TABLE IF EXISTS fk924_child CASCADE;
+DROP TABLE IF EXISTS fk924_parent CASCADE;
 DROP TABLE IF EXISTS fk_self_restrict_all CASCADE;
 DROP TABLE IF EXISTS fk_self_noaction_all CASCADE;
 DROP TABLE IF EXISTS fk_child_cascade CASCADE;
@@ -408,3 +420,81 @@ CREATE TABLE fk_self_restrict_all (
 INSERT INTO fk_self_restrict_all VALUES (1, NULL), (2, 1), (3, 2);
 DELETE FROM fk_self_restrict_all;
 SELECT id, parent_id FROM fk_self_restrict_all ORDER BY id;
+
+-- 28) Bug #924: cross-FK stale snapshot – two FKs on same child, same parent, ON DELETE SET NULL
+CREATE TABLE fk924_parent (id INT PRIMARY KEY);
+CREATE TABLE fk924_child (
+    id INT PRIMARY KEY,
+    a INT REFERENCES fk924_parent(id) ON DELETE SET NULL,
+    b INT REFERENCES fk924_parent(id) ON DELETE SET NULL
+);
+INSERT INTO fk924_parent VALUES (1);
+INSERT INTO fk924_child VALUES (10, 1, 1);
+DELETE FROM fk924_parent WHERE id = 1;
+SELECT id, a, b FROM fk924_child WHERE id = 10;
+
+-- 29) Bug #924 variant: three FKs on same child, same parent, ON DELETE SET NULL
+CREATE TABLE fk924b_parent (id INT PRIMARY KEY);
+CREATE TABLE fk924b_child (
+    id INT PRIMARY KEY,
+    a INT REFERENCES fk924b_parent(id) ON DELETE SET NULL,
+    b INT REFERENCES fk924b_parent(id) ON DELETE SET NULL,
+    c INT REFERENCES fk924b_parent(id) ON DELETE SET NULL
+);
+INSERT INTO fk924b_parent VALUES (1);
+INSERT INTO fk924b_child VALUES (10, 1, 1, 1);
+DELETE FROM fk924b_parent WHERE id = 1;
+SELECT id, a, b, c FROM fk924b_child WHERE id = 10;
+
+-- 30) Bug #924 variant: two FKs on same child, same parent, ON DELETE SET DEFAULT
+CREATE TABLE fk924c_parent (id INT PRIMARY KEY);
+CREATE TABLE fk924c_child (
+    id INT PRIMARY KEY,
+    a INT DEFAULT 0 REFERENCES fk924c_parent(id) ON DELETE SET DEFAULT,
+    b INT DEFAULT 0 REFERENCES fk924c_parent(id) ON DELETE SET DEFAULT
+);
+INSERT INTO fk924c_parent VALUES (0), (1);
+INSERT INTO fk924c_child VALUES (10, 1, 1);
+DELETE FROM fk924c_parent WHERE id = 1;
+SELECT id, a, b FROM fk924c_child WHERE id = 10;
+
+-- 31) Bug #924 variant: mixed SET NULL + SET DEFAULT on same child row
+CREATE TABLE fk924d_parent (id INT PRIMARY KEY);
+CREATE TABLE fk924d_child (
+    id INT PRIMARY KEY,
+    a INT REFERENCES fk924d_parent(id) ON DELETE SET NULL,
+    b INT DEFAULT 0 REFERENCES fk924d_parent(id) ON DELETE SET DEFAULT
+);
+INSERT INTO fk924d_parent VALUES (0), (1);
+INSERT INTO fk924d_child VALUES (10, 1, 1);
+DELETE FROM fk924d_parent WHERE id = 1;
+SELECT id, a, b FROM fk924d_child WHERE id = 10;
+
+-- 32) Bug #924: intra-batch staleness via ON UPDATE CASCADE side-effect
+CREATE TABLE fk924e_parent (id INT PRIMARY KEY);
+CREATE TABLE fk924e_child (
+    id INT PRIMARY KEY,
+    a INT,
+    b INT,
+    ref_a INT,
+    ref_b INT,
+    UNIQUE (a, b),
+    FOREIGN KEY (a) REFERENCES fk924e_parent(id) ON DELETE SET NULL,
+    FOREIGN KEY (ref_a, ref_b) REFERENCES fk924e_child(a, b) ON UPDATE CASCADE
+);
+INSERT INTO fk924e_parent VALUES (1);
+INSERT INTO fk924e_child VALUES (1, 1, 10, NULL, NULL);
+INSERT INTO fk924e_child VALUES (2, 1, 20, 1, 10);
+DELETE FROM fk924e_parent WHERE id = 1;
+SELECT id, a, b, ref_a, ref_b FROM fk924e_child ORDER BY id;
+
+-- 33) Bug #924: SET DEFAULT where default equals deleted parent key
+CREATE TABLE fk924f_parent (id INT PRIMARY KEY);
+CREATE TABLE fk924f_child (
+    id INT PRIMARY KEY,
+    pid INT DEFAULT 1 REFERENCES fk924f_parent(id) ON DELETE SET DEFAULT
+);
+INSERT INTO fk924f_parent VALUES (1);
+INSERT INTO fk924f_child VALUES (1, 1);
+DELETE FROM fk924f_parent WHERE id = 1;
+SELECT id, pid FROM fk924f_child ORDER BY id;
