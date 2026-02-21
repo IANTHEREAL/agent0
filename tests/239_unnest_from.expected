@@ -1,0 +1,39 @@
+x
+1
+2
+3
+(3 rows)
+unnest
+1
+2
+3
+(3 rows)
+unnest
+1
+2
+3
+(3 rows)
+x|y
+1|a
+2|b
+NULL|c
+(3 rows)
+i|b
+1|t
+2|f
+NULL|t
+(3 rows)
+x
+(0 rows)
+x
+(0 rows)
+x|val
+1|10
+1|20
+2|10
+2|20
+(4 rows)
+x
+4
+5
+(2 rows)

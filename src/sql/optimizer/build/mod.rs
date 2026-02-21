@@ -26,6 +26,7 @@ use anyhow::{anyhow, Result};
 
 use super::physical_plan::{PhysicalNode, PhysicalPlan};
 use crate::sql::analyzer::types::{JoinType, SetOpKind, TypedExpr};
+use crate::sql::error::SqlError;
 use crate::sql::expr::typed_eval::eval_const_usize;
 use crate::sql::operators::{
     BoxedOperator, DistinctOnOperator, DistinctOperator, FilterOperator, HashJoinConfig,
@@ -161,11 +162,12 @@ impl PhysicalPlan {
                         .correlated_table_functions
                         .contains(function_name.as_str())
                 {
-                    return Err(anyhow!(
+                    return Err(SqlError::Unsupported(format!(
                         "table function {}() has correlated arguments referencing an outer query; \
                          LATERAL table functions are not yet supported",
                         function_name
-                    ));
+                    ))
+                    .into());
                 }
                 let rows = ctx
                     .preloaded_rows

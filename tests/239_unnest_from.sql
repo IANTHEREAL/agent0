@@ -1,0 +1,23 @@
+-- UNNEST as FROM relation
+
+SELECT * FROM UNNEST(ARRAY[1,2,3]) AS t(x);
+
+SELECT * FROM UNNEST(ARRAY[1,2,3]) AS t;
+
+SELECT * FROM UNNEST(ARRAY[1,2,3]);
+
+SELECT * FROM UNNEST(ARRAY[1,2], ARRAY['a','b','c']) AS t(x, y);
+
+SELECT * FROM UNNEST(ARRAY[1,2], ARRAY[true,false,true]) AS t(i, b);
+
+SELECT * FROM UNNEST(ARRAY[]::INT[]) AS t(x);
+
+SELECT * FROM UNNEST(NULL::INT[]) AS t(x);
+
+SELECT v.x, u.val
+FROM (VALUES (1),(2)) AS v(x), UNNEST(ARRAY[10,20]) AS u(val)
+ORDER BY v.x, u.val;
+
+SELECT * FROM UNNEST(ARRAY[1,2,3,4,5]) AS t(x)
+WHERE x > 3
+ORDER BY x;

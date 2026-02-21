@@ -3,7 +3,7 @@
 use super::*;
 use crate::auth::{GrantedPrivilege, Privilege, PrivilegeObject};
 use crate::sql::error::SqlError;
-use sqlparser::ast::{ObjectType, ReferentialAction, SchemaName};
+use sqlparser::ast::{Expr, ObjectType, ReferentialAction, SchemaName};
 
 impl Executor {
     pub(super) async fn execute_ddl_statement(
@@ -102,9 +102,6 @@ impl Executor {
                 predicate,
                 ..
             } => {
-                let index_name = name
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("Index name required"))?;
                 let resolved = names::resolve_existing_table_name(
                     self.store.as_ref(),
                     txn,
@@ -123,21 +120,39 @@ impl Executor {
                     resolved.schema.clone(),
                 )
                 .await?;
-                self.execute_create_index(
-                    txn,
-                    db_id,
-                    search_path,
-                    index_name,
-                    table_name,
-                    using.as_ref(),
-                    columns,
-                    *unique,
-                    *if_not_exists,
-                    *concurrently,
-                    predicate.as_ref(),
-                    current_role.unwrap_or("postgres"),
-                )
-                .await
+                if let Some(index_name) = name.as_ref() {
+                    self.execute_create_index(
+                        txn,
+                        db_id,
+                        search_path,
+                        index_name,
+                        table_name,
+                        using.as_ref(),
+                        columns,
+                        *unique,
+                        *if_not_exists,
+                        *concurrently,
+                        predicate.as_ref(),
+                        current_role.unwrap_or("postgres"),
+                    )
+                    .await
+                } else {
+                    self.execute_create_index_with_implicit_name(
+                        txn,
+                        db_id,
+                        search_path,
+                        &resolved.name,
+                        table_name,
+                        using.as_ref(),
+                        columns,
+                        *unique,
+                        *if_not_exists,
+                        *concurrently,
+                        predicate.as_ref(),
+                        current_role.unwrap_or("postgres"),
+                    )
+                    .await
+                }
             }
             Statement::Drop {
                 object_type,
@@ -572,6 +587,70 @@ impl Executor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_create_index_with_implicit_name(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        search_path: &[String],
+        resolved_table_name: &str,
+        table_name: &sqlparser::ast::ObjectName,
+        using: Option<&sqlparser::ast::Ident>,
+        columns: &[sqlparser::ast::OrderByExpr],
+        unique: bool,
+        if_not_exists: bool,
+        concurrently: bool,
+        predicate: Option<&Expr>,
+        current_role: &str,
+    ) -> Result<ExecuteResult> {
+        // PostgreSQL auto-generates a relation name for unnamed CREATE INDEX.
+        // For compatibility we generate `<table>_<cols>_idx`, retrying with
+        // numeric suffixes on name collisions.
+        let base_name = build_implicit_index_name(resolved_table_name, columns);
+
+        for attempt in 0..MAX_IMPLICIT_INDEX_NAME_RETRIES {
+            let candidate = if attempt == 0 {
+                base_name.clone()
+            } else {
+                format!("{base_name}{attempt}")
+            };
+            let idx_name = names::object_name_from_str(&candidate)?;
+            match self
+                .execute_create_index(
+                    txn,
+                    db_id,
+                    search_path,
+                    &idx_name,
+                    table_name,
+                    using,
+                    columns,
+                    unique,
+                    if_not_exists,
+                    concurrently,
+                    predicate,
+                    current_role,
+                )
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    if e.downcast_ref::<SqlError>()
+                        .is_some_and(|se| matches!(se, SqlError::DuplicateRelation(_)))
+                    {
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "failed to generate a unique implicit index name for table '{}' after {} attempts",
+            resolved_table_name,
+            MAX_IMPLICIT_INDEX_NAME_RETRIES
+        ))
+    }
+
     async fn grant_schema_owner_privileges(
         &self,
         txn: &mut Transaction,
@@ -735,5 +814,33 @@ impl Executor {
         Ok(ExecuteResult::AlterIndex {
             index_name: new_idx_name,
         })
+    }
+}
+
+const MAX_IMPLICIT_INDEX_NAME_RETRIES: u32 = 100;
+
+fn build_implicit_index_name(table_name: &str, columns: &[sqlparser::ast::OrderByExpr]) -> String {
+    let mut col_parts: Vec<String> = columns
+        .iter()
+        .map(|ob| implicit_index_col_part(&ob.expr))
+        .collect();
+    if col_parts.is_empty() {
+        col_parts.push("expr".to_string());
+    }
+    format!("{}_{}_idx", table_name, col_parts.join("_"))
+}
+
+fn implicit_index_col_part(expr: &Expr) -> String {
+    let mut cur = expr;
+    while let Expr::Nested(inner) = cur {
+        cur = inner.as_ref();
+    }
+    match cur {
+        Expr::Identifier(ident) => names::normalize_ident(ident),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(names::normalize_ident)
+            .unwrap_or_else(|| "expr".to_string()),
+        _ => "expr".to_string(),
     }
 }

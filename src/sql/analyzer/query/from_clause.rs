@@ -381,6 +381,93 @@ impl<'a> Analyzer<'a> {
                 }
             }
 
+            TableFactor::UNNEST {
+                array_exprs,
+                alias,
+                with_offset,
+                with_offset_alias,
+            } => {
+                let alias_str = alias
+                    .as_ref()
+                    .map(|a| normalize_ident(&a.name))
+                    .unwrap_or_else(|| "unnest".to_string());
+
+                let mut typed_args = Vec::with_capacity(array_exprs.len());
+                let mut output_cols: Vec<(String, DataType, bool)> =
+                    Vec::with_capacity(array_exprs.len() + usize::from(*with_offset));
+
+                for (i, expr) in array_exprs.iter().enumerate() {
+                    let analyzed = self.analyze_expr(expr)?;
+                    let elem_type = match &analyzed.data_type {
+                        DataType::Array(inner) => inner.as_ref().clone(),
+                        _ => {
+                            return Err(AnalyzerError::FunctionNotFound {
+                                name: "unnest".to_string(),
+                                arg_types: vec![analyzed.data_type.clone()],
+                            });
+                        }
+                    };
+
+                    let col_name = if array_exprs.len() <= 1 || i == 0 {
+                        "unnest".to_string()
+                    } else {
+                        format!("unnest_{}", i + 1)
+                    };
+                    output_cols.push((col_name, elem_type, true));
+                    typed_args.push(TypedFunctionArg::Positional(analyzed));
+                }
+
+                if *with_offset {
+                    let ord_name = with_offset_alias
+                        .as_ref()
+                        .map(crate::sql::names::normalize_ident)
+                        .unwrap_or_else(|| "ordinality".to_string());
+                    output_cols.push((ord_name, DataType::Int64, false));
+                }
+
+                // Apply alias column list (renames output columns).
+                if let Some(ta) = alias {
+                    if !ta.columns.is_empty() {
+                        if ta.columns.len() != output_cols.len() {
+                            return Err(AnalyzerError::Unsupported(format!(
+                                "table function alias column count mismatch: expected {}, got {}",
+                                output_cols.len(),
+                                ta.columns.len()
+                            )));
+                        }
+                        for (i, ident) in ta.columns.iter().enumerate() {
+                            output_cols[i].0 = crate::sql::names::normalize_ident(ident);
+                        }
+                    }
+                }
+
+                self.scopes
+                    .current_mut()
+                    .add_table(&alias_str, &output_cols);
+
+                let output_columns: Vec<(String, DataType)> = output_cols
+                    .iter()
+                    .map(|(n, dt, _)| (n.clone(), dt.clone()))
+                    .collect();
+
+                let func = ResolvedFunction {
+                    name: "UNNEST".to_string(),
+                    kind: FunctionKind::Builtin,
+                    // Placeholder for table-function refs; caller consumes output_columns
+                    // for the real per-column output types.
+                    return_type: DataType::Text,
+                };
+
+                Ok(AnalyzedTableRef {
+                    kind: AnalyzedTableRefKind::Function {
+                        func,
+                        args: typed_args,
+                        output_columns,
+                    },
+                    alias: Some(alias_str),
+                })
+            }
+
             TableFactor::Derived {
                 subquery, alias, ..
             } => {
