@@ -135,4 +135,8 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         "TXID_CURRENT",
         FunctionSignature::fixed(DataType::Int64).with_args(0, Some(0)),
     );
+    r.register(
+        "HASHTEXT",
+        FunctionSignature::fixed(DataType::Int32).with_args(1, Some(1)),
+    );
 }

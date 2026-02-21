@@ -33,6 +33,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     // Bit manipulation on bytea
     map.insert("SET_BIT", set_bit_bytea);
     map.insert("GET_BIT", get_bit_bytea);
+    map.insert("HASHTEXT", hashtext);
 }
 
 fn pg_typeof_name(val: &Value) -> String {
@@ -434,6 +435,19 @@ pub fn get_bit_bytea(args: Vec<Value>) -> Result<Value> {
     Ok(Value::Int32(bit_val as i32))
 }
 
+pub fn hashtext(args: Vec<Value>) -> Result<Value> {
+    let text = match args.into_iter().next() {
+        Some(Value::Text(s)) => s,
+        Some(Value::Null) | None => return Ok(Value::Null),
+        Some(v) => v.to_string(),
+    };
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    let h = hasher.finish();
+    Ok(Value::Int32(h as i32))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::sql::expr::functions::string::{quote_ident, quote_literal, quote_nullable};
@@ -618,5 +632,17 @@ mod tests {
             get_bit_bytea(vec![Value::Bytes(vec![0x80]), Value::Int32(7)]).unwrap(),
             Value::Int32(1)
         );
+    }
+
+    #[test]
+    fn test_hashtext() {
+        let h1 = hashtext(vec![Value::Text("hello".into())]).unwrap();
+        let h2 = hashtext(vec![Value::Text("hello".into())]).unwrap();
+        assert_eq!(h1, h2);
+
+        let h3 = hashtext(vec![Value::Text("world".into())]).unwrap();
+        assert_ne!(h1, h3);
+
+        assert_eq!(hashtext(vec![Value::Null]).unwrap(), Value::Null);
     }
 }
