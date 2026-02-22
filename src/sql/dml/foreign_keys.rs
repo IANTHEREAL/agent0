@@ -697,12 +697,20 @@ async fn handle_foreign_key_on_update_with_ctx(
             continue;
         };
 
+        if !other_schema
+            .foreign_keys
+            .iter()
+            .any(|fk| fk.ref_table == table_name)
+        {
+            continue;
+        }
+
         let rules = build_fk_update_rules(&other_schema, table_name, schema, old_row, new_row)?;
         if rules.is_empty() {
             continue;
         }
 
-        let enum_cache = build_enum_label_cache(store, txn, db_id, &other_schema).await?;
+        let mut enum_cache = None;
         let mut pending_propagations: Vec<(Row, Row)> = Vec::new();
         let mut touched_pk_keys: HashSet<String> = HashSet::new();
         let mut touched_pks: Vec<Vec<Value>> = Vec::new();
@@ -733,6 +741,10 @@ async fn handle_foreign_key_on_update_with_ctx(
                 break;
             };
 
+            if enum_cache.is_none() {
+                enum_cache = Some(build_enum_label_cache(store, txn, db_id, &other_schema).await?);
+            }
+            let enum_cache = enum_cache.as_ref().expect("enum cache initialized");
             let updated_row = Box::pin(execute_update_row_without_fk_update(
                 store,
                 txn,
@@ -741,7 +753,7 @@ async fn handle_foreign_key_on_update_with_ctx(
                 &other_schema,
                 &old_child_row,
                 new_child_row,
-                &enum_cache,
+                enum_cache,
                 Some(fk_ctx),
             ))
             .await?;
@@ -803,12 +815,20 @@ async fn handle_foreign_key_on_update_no_ctx(
             None => continue,
         };
 
+        if !other_schema
+            .foreign_keys
+            .iter()
+            .any(|fk| fk.ref_table == table_name)
+        {
+            continue;
+        }
+
         let rules = build_fk_update_rules(&other_schema, table_name, schema, old_row, new_row)?;
         if rules.is_empty() {
             continue;
         }
 
-        let enum_cache = build_enum_label_cache(store, txn, db_id, &other_schema).await?;
+        let mut enum_cache = None;
         let mut pending_propagations: Vec<(Row, Row)> = Vec::new();
         let mut touched_pk_keys: HashSet<String> = HashSet::new();
         let mut touched_pks: Vec<Vec<Value>> = Vec::new();
@@ -835,6 +855,10 @@ async fn handle_foreign_key_on_update_no_ctx(
                 break;
             };
 
+            if enum_cache.is_none() {
+                enum_cache = Some(build_enum_label_cache(store, txn, db_id, &other_schema).await?);
+            }
+            let enum_cache = enum_cache.as_ref().expect("enum cache initialized");
             let updated_row = Box::pin(execute_update_row_without_fk_update(
                 store,
                 txn,
@@ -843,7 +867,7 @@ async fn handle_foreign_key_on_update_no_ctx(
                 &other_schema,
                 &old_child_row,
                 new_child_row,
-                &enum_cache,
+                enum_cache,
                 None,
             ))
             .await?;
