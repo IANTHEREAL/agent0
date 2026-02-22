@@ -11,12 +11,26 @@
 
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::executor::core::Executor;
+use crate::sql::expr::classify::needs_pre_materialization;
 use crate::sql::query_context::QueryContext;
 use crate::types::{Row, TableSchema};
 
 use anyhow::Result;
 use std::collections::HashMap;
 use tikv_client::Transaction;
+
+enum PreMaterializeDecision {
+    Skip(TypedExpr),
+    Run(TypedExpr),
+}
+
+fn decide_pre_materialize_subqueries(substituted: TypedExpr) -> PreMaterializeDecision {
+    if needs_pre_materialization(&substituted) {
+        PreMaterializeDecision::Run(substituted)
+    } else {
+        PreMaterializeDecision::Skip(substituted)
+    }
+}
 
 impl Executor {
     /// Materialize a typed expression for evaluation on a specific row.
@@ -43,16 +57,20 @@ impl Executor {
         let substituted = super::subquery::substitute_outer_refs_in_expr(expr, outer_row);
 
         // 2) Resolve any now-uncorrelated subqueries.
-        let subqueries_materialized = self
-            .pre_materialize_async_exprs(
-                &substituted,
-                txn,
-                db_id,
-                sequence_values,
-                search_path,
-                ctes,
-            )
-            .await?;
+        let subqueries_materialized = match decide_pre_materialize_subqueries(substituted) {
+            PreMaterializeDecision::Run(expr) => {
+                self.pre_materialize_async_exprs_prechecked(
+                    &expr,
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    ctes,
+                )
+                .await?
+            }
+            PreMaterializeDecision::Skip(expr) => expr,
+        };
 
         // 3) Resolve catalog-dependent functions.
         self.materialize_catalog_functions(
@@ -66,5 +84,79 @@ impl Executor {
             qctx,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::analyzer::types::{AnalyzedQuery, AnalyzedQueryBody, TypedExprKind};
+    use crate::types::{DataType, Value};
+
+    fn const_bool(v: bool) -> TypedExpr {
+        TypedExpr::new(
+            TypedExprKind::Constant(Value::Boolean(v)),
+            DataType::Boolean,
+        )
+    }
+
+    fn scalar_subquery_expr() -> TypedExpr {
+        let subquery = AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Values(vec![vec![TypedExpr::new(
+                TypedExprKind::Constant(Value::Int32(1)),
+                DataType::Int32,
+            )]]),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("v".to_string(), DataType::Int32)],
+        };
+        TypedExpr::new(
+            TypedExprKind::ScalarSubquery(Box::new(subquery)),
+            DataType::Int32,
+        )
+    }
+
+    #[test]
+    fn decide_pre_materialize_subqueries_skips_non_async_expr() {
+        let expr = const_bool(true);
+        let decision = decide_pre_materialize_subqueries(expr);
+        match decision {
+            PreMaterializeDecision::Skip(TypedExpr {
+                kind: TypedExprKind::Constant(Value::Boolean(true)),
+                ..
+            }) => {}
+            PreMaterializeDecision::Skip(other) => {
+                panic!(
+                    "expected boolean constant passthrough, got {:?}",
+                    other.kind
+                )
+            }
+            PreMaterializeDecision::Run(_) => {
+                panic!("non-async expression must not trigger pre-materialization")
+            }
+        }
+    }
+
+    #[test]
+    fn decide_pre_materialize_subqueries_routes_subquery_expr() {
+        let expr = scalar_subquery_expr();
+        let decision = decide_pre_materialize_subqueries(expr);
+        match decision {
+            PreMaterializeDecision::Run(TypedExpr {
+                kind: TypedExprKind::ScalarSubquery(_),
+                ..
+            }) => {}
+            PreMaterializeDecision::Run(other) => {
+                panic!(
+                    "expected scalar-subquery pre-materialization route, got {:?}",
+                    other.kind
+                )
+            }
+            PreMaterializeDecision::Skip(_) => {
+                panic!("subquery expression must trigger pre-materialization")
+            }
+        }
     }
 }

@@ -27,6 +27,30 @@ use super::postprocess::build_any_all_rhs_constant_expr;
 use super::subquery::is_correlated_query;
 
 impl Executor {
+    fn pre_materialize_async_exprs_impl<'a>(
+        &'a self,
+        expr: &'a TypedExpr,
+        txn: &'a mut Transaction,
+        db_id: u64,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+        skip_root_check_once: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<TypedExpr>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut transform = PreMaterializeTransform {
+                executor: self,
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                ctes,
+                skip_root_check_once,
+            };
+            transform.transform_expr(expr).await
+        })
+    }
+
     /// Pre-materialize all uncorrelated subqueries in a TypedExpr tree.
     ///
     /// Walks the tree and replaces:
@@ -50,17 +74,40 @@ impl Executor {
         search_path: &'a [String],
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Pin<Box<dyn Future<Output = Result<TypedExpr>> + Send + 'a>> {
-        Box::pin(async move {
-            let mut transform = PreMaterializeTransform {
-                executor: self,
-                txn,
-                db_id,
-                sequence_values,
-                search_path,
-                ctes,
-            };
-            transform.transform_expr(expr).await
-        })
+        self.pre_materialize_async_exprs_impl(
+            expr,
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            ctes,
+            false,
+        )
+    }
+
+    /// Pre-materialize expression when caller already checked
+    /// [`needs_pre_materialization`] at the root.
+    ///
+    /// This keeps per-node short-circuiting during recursion, but avoids one
+    /// duplicate full-tree classification at the entry point.
+    pub(in crate::sql::executor::select::analyzed) fn pre_materialize_async_exprs_prechecked<'a>(
+        &'a self,
+        expr: &'a TypedExpr,
+        txn: &'a mut Transaction,
+        db_id: u64,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> Pin<Box<dyn Future<Output = Result<TypedExpr>> + Send + 'a>> {
+        self.pre_materialize_async_exprs_impl(
+            expr,
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            ctes,
+            true,
+        )
     }
 }
 
@@ -77,6 +124,16 @@ pub(super) struct PreMaterializeTransform<'a> {
     sequence_values: &'a mut HashMap<String, i64>,
     search_path: &'a [String],
     ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+    skip_root_check_once: bool,
+}
+
+fn should_return_expr_unchanged(skip_root_check_once: &mut bool, expr: &TypedExpr) -> bool {
+    if *skip_root_check_once {
+        *skip_root_check_once = false;
+        false
+    } else {
+        !needs_pre_materialization(expr)
+    }
 }
 
 impl AsyncExprTransform for PreMaterializeTransform<'_> {
@@ -85,7 +142,7 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
         expr: &'a TypedExpr,
     ) -> Pin<Box<dyn Future<Output = Result<TypedExpr>> + Send + 'a>> {
         Box::pin(async move {
-            if !needs_pre_materialization(expr) {
+            if should_return_expr_unchanged(&mut self.skip_root_check_once, expr) {
                 return Ok(expr.clone());
             }
             match &expr.kind {
@@ -470,5 +527,79 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::analyzer::types::{AnalyzedQuery, AnalyzedQueryBody};
+    use crate::types::{DataType, Value};
+
+    fn const_bool(v: bool) -> TypedExpr {
+        TypedExpr::new(
+            TypedExprKind::Constant(Value::Boolean(v)),
+            DataType::Boolean,
+        )
+    }
+
+    fn scalar_subquery_expr() -> TypedExpr {
+        let subquery = AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Values(vec![vec![TypedExpr::new(
+                TypedExprKind::Constant(Value::Int32(1)),
+                DataType::Int32,
+            )]]),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("v".to_string(), DataType::Int32)],
+        };
+        TypedExpr::new(
+            TypedExprKind::ScalarSubquery(Box::new(subquery)),
+            DataType::Int32,
+        )
+    }
+
+    #[test]
+    fn prechecked_root_guard_is_one_shot_for_non_async_expr() {
+        let expr = const_bool(true);
+        let mut skip_root_check_once = true;
+
+        assert!(!should_return_expr_unchanged(
+            &mut skip_root_check_once,
+            &expr
+        ));
+        assert!(!skip_root_check_once);
+        assert!(should_return_expr_unchanged(
+            &mut skip_root_check_once,
+            &expr
+        ));
+    }
+
+    #[test]
+    fn non_async_expr_short_circuits_when_not_prechecked() {
+        let expr = const_bool(false);
+        let mut skip_root_check_once = false;
+        assert!(should_return_expr_unchanged(
+            &mut skip_root_check_once,
+            &expr
+        ));
+    }
+
+    #[test]
+    fn async_expr_never_short_circuits_after_root_skip_consumed() {
+        let expr = scalar_subquery_expr();
+        let mut skip_root_check_once = true;
+
+        assert!(!should_return_expr_unchanged(
+            &mut skip_root_check_once,
+            &expr
+        ));
+        assert!(!skip_root_check_once);
+        assert!(!should_return_expr_unchanged(
+            &mut skip_root_check_once,
+            &expr
+        ));
     }
 }
