@@ -1,6 +1,13 @@
 use super::*;
 use crate::cron::types::{CronJob, CronJobLegacy, CronRun};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronRunClaimStatus {
+    Claimed,
+    AlreadyClaimedForMinute,
+    BlockedByRunningGuard,
+}
+
 fn deserialize_cron_job(data: &[u8]) -> anyhow::Result<CronJob> {
     match bincode::deserialize::<CronJob>(data) {
         Ok(job) => Ok(job),
@@ -171,13 +178,51 @@ impl TikvStore {
         db_id: u64,
         job_id: i64,
         scheduled_min: i64,
-    ) -> Result<bool> {
+    ) -> Result<CronRunClaimStatus> {
+        // Step 1: Check if there's a running guard for this job
+        let guard_key = self.key(&encode_cron_running_guard_key_v2(db_id, job_id));
+        if let Some(guard_data) = txn.get(guard_key.clone()).await? {
+            // Guard exists, check if the referenced run is still active
+            if guard_data.len() == 8 {
+                let run_id = i64::from_be_bytes(
+                    guard_data
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow!("Invalid running guard format"))?,
+                );
+
+                // Check if the run exists and is in an active state
+                if let Some(run) = self.get_cron_run(txn, db_id, run_id).await? {
+                    use crate::cron::types::CronRunStatus;
+                    match run.status {
+                        CronRunStatus::Starting | CronRunStatus::Running => {
+                            // Job is still running, reject this claim
+                            return Ok(CronRunClaimStatus::BlockedByRunningGuard);
+                        }
+                        CronRunStatus::Succeeded
+                        | CronRunStatus::Failed
+                        | CronRunStatus::Cancelled => {
+                            // Stale guard, delete it and continue
+                            txn_delete(txn, guard_key).await?;
+                        }
+                    }
+                } else {
+                    // Run doesn't exist, stale guard, delete it
+                    txn_delete(txn, guard_key).await?;
+                }
+            } else {
+                // Invalid guard data, delete it
+                txn_delete(txn, guard_key).await?;
+            }
+        }
+
+        // Step 2: Proceed with existing same-minute claim logic
         let key = self.key(&encode_cron_claim_key_v2(db_id, job_id, scheduled_min));
         if txn.get(key.clone()).await?.is_some() {
-            return Ok(false);
+            return Ok(CronRunClaimStatus::AlreadyClaimedForMinute);
         }
         txn_put(txn, key, vec![1]).await?;
-        Ok(true)
+        Ok(CronRunClaimStatus::Claimed)
     }
 
     pub async fn delete_cron_runs_for_job(
@@ -225,11 +270,51 @@ impl TikvStore {
         Ok(txn.get(key).await?.is_some())
     }
 
+    pub async fn set_cron_running_guard(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        job_id: i64,
+        run_id: i64,
+    ) -> Result<()> {
+        let key = self.key(&encode_cron_running_guard_key_v2(db_id, job_id));
+        txn_put(txn, key, run_id.to_be_bytes().to_vec()).await?;
+        Ok(())
+    }
+
+    pub async fn clear_cron_running_guard(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        job_id: i64,
+        expected_run_id: i64,
+    ) -> Result<()> {
+        let key = self.key(&encode_cron_running_guard_key_v2(db_id, job_id));
+        if let Some(data) = txn.get(key.clone()).await? {
+            if data.len() != 8 {
+                // Self-heal malformed guard payloads.
+                txn_delete(txn, key).await?;
+                return Ok(());
+            }
+
+            let current_run_id = i64::from_be_bytes(
+                data.as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("Invalid running guard format"))?,
+            );
+            if current_run_id == expected_run_id {
+                txn_delete(txn, key).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn delete_all_cron_data(&self, txn: &mut Transaction, db_id: u64) -> Result<()> {
         let prefixes = [
             encode_cron_job_prefix_v2(db_id),
             encode_cron_run_prefix_v2(db_id),
             encode_cron_claim_prefix_v2(db_id),
+            encode_cron_running_guard_prefix_v2(db_id),
         ];
 
         for prefix in &prefixes {

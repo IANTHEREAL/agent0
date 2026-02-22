@@ -51,7 +51,9 @@ impl WorkerGc {
 
     /// Scan worker registry for keyspaces with cron jobs and GC their run history.
     async fn cleanup_cron_runs(&self) -> Result<()> {
-        let cron_config = CronConfig::from_env();
+        let mut cron_config = CronConfig::from_env();
+        cron_config.orphan_timeout_sec =
+            effective_cron_orphan_timeout_sec(&cron_config, &self.config);
 
         let mut txn = self.system_store.begin().await?;
         let registry_entries = self.system_store.list_worker_registry(&mut txn).await?;
@@ -143,6 +145,14 @@ fn rand_jitter_secs(max_secs: u64) -> u64 {
     (seed % max_secs as u128) as u64
 }
 
+fn effective_cron_orphan_timeout_sec(
+    cron_config: &CronConfig,
+    worker_config: &WorkerConfig,
+) -> u64 {
+    let worker_timeout_sec = worker_config.cron_job_timeout_ms.saturating_add(999) / 1000;
+    cron_config.orphan_timeout_sec.max(worker_timeout_sec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +195,33 @@ mod tests {
     fn test_rand_jitter_secs_max_one() {
         let jitter = rand_jitter_secs(1);
         assert_eq!(jitter, 0, "jitter with max=1 must be 0");
+    }
+
+    #[test]
+    fn test_effective_cron_orphan_timeout_respects_worker_timeout() {
+        let mut cron_cfg = CronConfig::default();
+        cron_cfg.orphan_timeout_sec = 300;
+
+        let mut worker_cfg = WorkerConfig::default();
+        worker_cfg.cron_job_timeout_ms = 1_800_000;
+
+        assert_eq!(
+            effective_cron_orphan_timeout_sec(&cron_cfg, &worker_cfg),
+            1_800
+        );
+    }
+
+    #[test]
+    fn test_effective_cron_orphan_timeout_keeps_larger_cron_value() {
+        let mut cron_cfg = CronConfig::default();
+        cron_cfg.orphan_timeout_sec = 7_200;
+
+        let mut worker_cfg = WorkerConfig::default();
+        worker_cfg.cron_job_timeout_ms = 1_800_000;
+
+        assert_eq!(
+            effective_cron_orphan_timeout_sec(&cron_cfg, &worker_cfg),
+            7_200
+        );
     }
 }

@@ -2,11 +2,18 @@ use anyhow::{anyhow, Result};
 use std::cell::Cell;
 use std::future::Future;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionKind {
+    Interactive,
+    Cron,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ExtensionContextOpts {
     pub(crate) is_superuser: bool,
     pub(crate) allow_local_fs: bool,
     pub(crate) tenant_keyspace: String,
+    pub(crate) execution_kind: ExecutionKind,
 }
 
 impl ExtensionContextOpts {
@@ -15,6 +22,16 @@ impl ExtensionContextOpts {
             is_superuser,
             allow_local_fs: is_superuser,
             tenant_keyspace: tenant_keyspace.to_string(),
+            execution_kind: ExecutionKind::Interactive,
+        }
+    }
+
+    pub(crate) fn cron(tenant_keyspace: &str) -> Self {
+        Self {
+            is_superuser: true,
+            allow_local_fs: false,
+            tenant_keyspace: tenant_keyspace.to_string(),
+            execution_kind: ExecutionKind::Cron,
         }
     }
 }
@@ -24,6 +41,7 @@ pub(crate) struct ExtensionContext {
     pub(crate) is_superuser: bool,
     pub(crate) allow_local_fs: bool,
     pub(crate) tenant_keyspace: String,
+    execution_kind: ExecutionKind,
     http_requests: Cell<u32>,
 }
 
@@ -54,6 +72,7 @@ pub(crate) async fn with_context_opts<R>(
         is_superuser: opts.is_superuser,
         allow_local_fs: opts.allow_local_fs,
         tenant_keyspace: opts.tenant_keyspace,
+        execution_kind: opts.execution_kind,
         http_requests: Cell::new(0),
     };
 
@@ -79,6 +98,11 @@ pub(crate) fn allow_local_fs() -> bool {
 
 pub(crate) fn tenant_keyspace() -> Option<String> {
     CTX.try_with(|ctx| ctx.tenant_keyspace.clone()).ok()
+}
+
+pub(crate) fn execution_kind() -> ExecutionKind {
+    CTX.try_with(|ctx| ctx.execution_kind)
+        .unwrap_or(ExecutionKind::Interactive)
 }
 
 pub(crate) fn try_consume_http_request(max_per_statement: u32) -> Result<()> {

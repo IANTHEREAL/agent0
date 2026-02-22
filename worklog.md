@@ -264,3 +264,75 @@ Extracted canonical tree-traversal primitives for `TypedExprKind` (28 variants) 
 - New code: ~1,000 LOC (traverse.rs with tests + PreMaterializeTransform)
 - Deleted code: ~2,200 LOC (across migration targets)
 - Net: ~-1,200 LOC
+
+## 2026-02-22: Issue #968 — Cron overlap guard + HTTP quota + per-statement reset
+
+### Problem
+Three independent bugs in cron job execution and HTTP extension infrastructure:
+
+**Bug 1: Cron overlap accumulation**
+- `try_claim_cron_run()` only prevents same-minute duplicates using claim key `(db_id, job_id, scheduled_min)`
+- Long-running cron jobs can overlap across minutes: job fires at T+0, still running at T+1, fires again
+- No persistent per-job running guard to track active executions
+
+**Bug 2: HTTP semaphore starvation**
+- `MAX_INFLIGHT_REQUESTS_PER_TENANT_PER_NODE = 20` shared across interactive + cron
+- Burst of cron jobs can exhaust all 20 permits → interactive requests blocked
+- Single-pool design allows cron to fully starve interactive workloads
+
+**Bug 3: HTTP request counter is per-task not per-statement**
+- Extension context created once per task in `worker/engine.rs:752` via `with_context_opts`
+- Multi-statement cron commands share a single `http_requests` counter
+- First statement can consume all 100 requests → subsequent statements fail with quota exceeded
+
+### Solution
+
+**Bug 1: Persistent running-guard key**
+- Added `encode_cron_running_guard_key_v2(db_id, job_id)` in `metadata_keys.rs`
+  - Key format: `d_{db_id:8bytes}_sys_cron_running_guard_{job_id:be8}`
+  - Value: big-endian i64 of current `run_id` (self-describing)
+- Updated `TikvStore::try_claim_cron_run()`:
+  1. Check running-guard key first
+  2. If present, load referenced `CronRun` and check status
+  3. If `Starting`/`Running` → reject claim (job in progress)
+  4. If `Succeeded`/`Failed`/`Cancelled` → stale guard, delete and continue
+  5. If run missing → stale guard, delete and continue
+  6. Then proceed with existing same-minute claim logic
+- Set guard in `claim_and_record_cron_run()` when run created
+- Clear guard in `finalize_cron_run()` when run reaches terminal state
+- Added `encode_cron_running_guard_prefix_v2()` to `delete_all_cron_data()`
+
+**Bug 2: Two-tier HTTP permit pools**
+- Introduced `ExecutionKind` enum (`Interactive`/`Cron`) in `context.rs`
+- Extended `ExtensionContextOpts` to include `execution_kind` field
+- Added `ExtensionContextOpts::cron()` factory with `ExecutionKind::Cron`
+- Replaced single `Semaphore` with `TenantQuota` struct:
+  - `interactive_pool`: 5 permits (reserved exclusively for interactive)
+  - `shared_pool`: 15 permits (usable by both interactive and cron)
+- Updated `execute_request()` permit acquisition:
+  - Interactive: try-acquire from `interactive_pool` (non-blocking), fall back to `shared_pool` on exhaustion
+  - Cron: acquire from `shared_pool` only
+- Guarantees cron cannot consume all 20 permits → interactive always has ≥5 available
+- Added unit tests: `test_quota_interactive_gets_reserved_pool`, `test_quota_cron_cannot_starve_interactive`
+
+**Bug 3: Statement-level extension context scoping**
+- Moved `with_context_opts()` call from wrapping entire task to wrapping each individual statement
+- Each statement now runs in fresh extension context with `http_requests = 0`
+- Multi-statement cron commands get 100 HTTP requests per statement (not per task)
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `src/storage/encoding/metadata_keys.rs` | Add `DB_SYS_CRON_RUNNING_GUARD_PREFIX_V2`, `encode_cron_running_guard_key_v2()`, `encode_cron_running_guard_prefix_v2()` |
+| `src/storage/encoding/mod.rs` | Re-export new guard key encoders |
+| `src/storage/tikv_store/cron.rs` | Add guard checking to `try_claim_cron_run()`, add `set_cron_running_guard()`, `clear_cron_running_guard()`, update `delete_all_cron_data()` |
+| `src/worker/engine.rs` | Set guard in `claim_and_record_cron_run()`, clear guard in `finalize_cron_run()`, move `with_context_opts()` to per-statement scope, use `ExecutionKind::Cron` |
+| `src/extensions/context.rs` | Add `ExecutionKind` enum, extend `ExtensionContextOpts`, add `execution_kind()` getter, add `ExtensionContextOpts::cron()` |
+| `src/extensions/http.rs` | Replace `TenantLimiters` with `TenantQuota` dual-pool system, update `execute_request()` to use execution-kind-aware permit acquisition, add quota tests |
+
+### Verification
+Validated on branch `fix/968-cron-overlap` (HEAD SHA: `b36c3709f64e0379b66c9600ac686578bc68f1d8`):
+- `cargo test -- cron`: 52 passed
+- `cargo test -- http`: 19 passed
+- `cargo test -- context`: 12 passed
+

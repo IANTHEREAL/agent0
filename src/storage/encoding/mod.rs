@@ -39,7 +39,8 @@ pub(crate) use metadata_keys::{
 pub use metadata_keys::{
     encode_cron_claim_key_v2, encode_cron_claim_prefix_v2, encode_cron_enabled_key_v2,
     encode_cron_job_key_v2, encode_cron_job_prefix_v2, encode_cron_run_key_v2,
-    encode_cron_run_prefix_v2, encode_extension_config_key_v2, encode_extension_key_v2,
+    encode_cron_run_prefix_v2, encode_cron_running_guard_key_v2,
+    encode_cron_running_guard_prefix_v2, encode_extension_config_key_v2, encode_extension_key_v2,
     encode_extension_prefix_v2, encode_function_key_v2, encode_function_prefix_v2,
     encode_matview_key_v2, encode_matview_prefix_v2, encode_migration_key, encode_migration_prefix,
     encode_next_cron_job_id_key_v2, encode_next_cron_run_id_key_v2,

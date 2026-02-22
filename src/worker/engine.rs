@@ -7,7 +7,7 @@ use crate::sql::ddl;
 use crate::sql::parse_sql;
 use crate::sql::query_context::{self, QueryContext};
 use crate::sql::Executor;
-use crate::storage::TikvStore;
+use crate::storage::{CronRunClaimStatus, TikvStore};
 use crate::worker::config::WorkerConfig;
 use crate::worker::metrics::WorkerMetrics;
 use crate::worker::types::*;
@@ -402,10 +402,10 @@ impl WorkerEngine {
         }
         txn.commit().await?;
 
-        let cron_run = if entry.task_type == TaskType::Cron {
+        let (cron_run, keep_queue_entry) = if entry.task_type == TaskType::Cron {
             Self::claim_and_record_cron_run(pool, &entry, fire_time_min).await?
         } else {
-            None
+            (None, false)
         };
         let should_requeue_cron = cron_run.is_some();
 
@@ -475,9 +475,11 @@ impl WorkerEngine {
                 fire_time_min,
             )
             .await?;
-        system_store
-            .delete_worker_queue_entry(&mut txn, &queue_key)
-            .await?;
+        if !keep_queue_entry {
+            system_store
+                .delete_worker_queue_entry(&mut txn, &queue_key)
+                .await?;
+        }
 
         if entry.task_type == TaskType::Cron && should_requeue_cron {
             if let Some(next_entry) = Self::load_next_cron_queue_entry(pool, &entry).await? {
@@ -533,31 +535,39 @@ impl WorkerEngine {
         pool: &Arc<TikvClientPool>,
         entry: &TaskQueueEntry,
         scheduled_minute: i64,
-    ) -> Result<Option<(Arc<TikvStore>, u64, CronRun, i64, Option<u64>)>> {
+    ) -> Result<(
+        Option<(Arc<TikvStore>, u64, CronRun, i64, Option<u64>)>,
+        bool,
+    )> {
         let handle = pool.acquire(Some(entry.keyspace.clone())).await?;
         let store = handle.store().clone();
         let mut txn = store.begin().await?;
 
         let claim_result = async {
             if !store.is_cron_enabled(&mut txn, entry.db_id).await? {
-                return Ok(None);
+                return Ok((None, false));
             }
 
-            let claimed = store
+            let claim_status = store
                 .try_claim_cron_run(&mut txn, entry.db_id, entry.task_id, scheduled_minute)
                 .await?;
-            if !claimed {
-                return Ok(None);
+            match claim_status {
+                CronRunClaimStatus::Claimed => {}
+                CronRunClaimStatus::AlreadyClaimedForMinute
+                | CronRunClaimStatus::BlockedByRunningGuard => {
+                    // Keep the queue entry so the cron trigger can be retried later.
+                    return Ok((None, true));
+                }
             }
 
             let Some(job) = store
                 .get_cron_job(&mut txn, entry.db_id, entry.task_id)
                 .await?
             else {
-                return Ok(None);
+                return Ok((None, false));
             };
             if !job.active {
-                return Ok(None);
+                return Ok((None, false));
             }
 
             let database = store
@@ -583,18 +593,25 @@ impl WorkerEngine {
                 end_time: None,
             };
             store.put_cron_run(&mut txn, entry.db_id, &run).await?;
-            Ok(Some((store, entry.db_id, run, started_at, max_runtime_ms)))
+            // Set the running guard to prevent overlapping runs
+            store
+                .set_cron_running_guard(&mut txn, entry.db_id, entry.task_id, run_id)
+                .await?;
+            Ok((
+                Some((store, entry.db_id, run, started_at, max_runtime_ms)),
+                false,
+            ))
         }
         .await;
 
         match claim_result {
-            Ok(Some(run)) => {
+            Ok((Some(run), keep_queue_entry)) => {
                 txn.commit().await?;
-                Ok(Some(run))
+                Ok((Some(run), keep_queue_entry))
             }
-            Ok(None) => {
+            Ok((None, keep_queue_entry)) => {
                 txn.rollback().await.ok();
-                Ok(None)
+                Ok((None, keep_queue_entry))
             }
             Err(e) => {
                 txn.rollback().await.ok();
@@ -612,6 +629,10 @@ impl WorkerEngine {
         let mut txn = store.begin().await?;
 
         let result: Result<Option<TaskQueueEntry>> = async {
+            if !store.is_cron_enabled(&mut txn, entry.db_id).await? {
+                return Ok(None);
+            }
+
             let Some(job) = store
                 .get_cron_job(&mut txn, entry.db_id, entry.task_id)
                 .await?
@@ -663,7 +684,12 @@ impl WorkerEngine {
             run.return_message = return_message;
             run.start_time = Some(start_time);
             run.end_time = Some(end_time);
-            store.put_cron_run(&mut txn, db_id, run).await
+            store.put_cron_run(&mut txn, db_id, run).await?;
+            // Clear the running guard now that the run is in a terminal state
+            store
+                .clear_cron_running_guard(&mut txn, db_id, run.job_id, run.run_id)
+                .await?;
+            Ok(())
         }
         .await;
 
@@ -743,28 +769,36 @@ impl WorkerEngine {
         } else {
             vec!["public".to_string()]
         };
-        let ext_ctx = ExtensionContextOpts {
-            is_superuser: true,
-            allow_local_fs: false,
-            tenant_keyspace: entry.keyspace.clone(),
+        let ext_ctx = if entry.task_type == TaskType::Cron {
+            ExtensionContextOpts::cron(&entry.keyspace)
+        } else {
+            ExtensionContextOpts {
+                is_superuser: true,
+                allow_local_fs: false,
+                tenant_keyspace: entry.keyspace.clone(),
+                execution_kind: crate::extensions::context::ExecutionKind::Interactive,
+            }
         };
 
-        with_context_opts(ext_ctx, async {
-            let mut txn = store.begin().await?;
-            let mut sequence_values: HashMap<String, i64> = HashMap::new();
-            let result = async {
-                let statements = parse_sql(&entry.command)?;
-                for stmt in &statements {
-                    let stmt_ts = chrono::Utc::now().timestamp_millis();
-                    let qctx = QueryContext::new(
-                        0,
-                        database_name.clone(),
-                        current_user.clone(),
-                        stmt_ts,
-                        tx_start_ms,
-                        timezone.clone(),
-                    );
-                    let fut = query_context::with_scoped_query_context(
+        let mut txn = store.begin().await?;
+        let mut sequence_values: HashMap<String, i64> = HashMap::new();
+        let result = async {
+            let statements = parse_sql(&entry.command)?;
+            for stmt in &statements {
+                let stmt_ts = chrono::Utc::now().timestamp_millis();
+                let qctx = QueryContext::new(
+                    0,
+                    database_name.clone(),
+                    current_user.clone(),
+                    stmt_ts,
+                    tx_start_ms,
+                    timezone.clone(),
+                );
+
+                // Wrap each statement in its own extension context to reset http_requests counter
+                let fut = with_context_opts(
+                    ext_ctx.clone(),
+                    query_context::with_scoped_query_context(
                         &qctx,
                         exec.execute_statement_on_txn(
                             &mut txn,
@@ -774,41 +808,41 @@ impl WorkerEngine {
                             stmt,
                             None,
                         ),
-                    );
-                    let res = match (&stmt_timeout, &cancel_signal) {
-                        (Some(t), Some(sig)) => tokio::select! {
-                            r = tokio::time::timeout(*t, fut) => match r {
-                                Ok(res) => res,
-                                Err(_) => Err(anyhow::anyhow!("canceling statement due to statement timeout")),
-                            },
-                            _ = sig.notified() => Err(anyhow::anyhow!("cancelled by administrator")),
-                        },
-                        (Some(t), None) => match tokio::time::timeout(*t, fut).await {
+                    ),
+                );
+
+                let res = match (&stmt_timeout, &cancel_signal) {
+                    (Some(t), Some(sig)) => tokio::select! {
+                        r = tokio::time::timeout(*t, fut) => match r {
                             Ok(res) => res,
                             Err(_) => Err(anyhow::anyhow!("canceling statement due to statement timeout")),
                         },
-                        (None, Some(sig)) => tokio::select! {
-                            r = fut => r,
-                            _ = sig.notified() => Err(anyhow::anyhow!("cancelled by administrator")),
-                        },
-                        (None, None) => fut.await,
-                    };
-                    let _ = res?;
-                }
-                txn.commit().await?;
-                Ok(statements.len())
+                        _ = sig.notified() => Err(anyhow::anyhow!("cancelled by administrator")),
+                    },
+                    (Some(t), None) => match tokio::time::timeout(*t, fut).await {
+                        Ok(res) => res,
+                        Err(_) => Err(anyhow::anyhow!("canceling statement due to statement timeout")),
+                    },
+                    (None, Some(sig)) => tokio::select! {
+                        r = fut => r,
+                        _ = sig.notified() => Err(anyhow::anyhow!("cancelled by administrator")),
+                    },
+                    (None, None) => fut.await,
+                };
+                let _ = res?;
             }
-            .await;
+            txn.commit().await?;
+            Ok(statements.len())
+        }
+        .await;
 
-            match result {
-                Ok(completed_commands) => Ok(completed_commands),
-                Err(e) => {
-                    let _ = txn.rollback().await;
-                    Err(e)
-                }
+        match result {
+            Ok(completed_commands) => Ok(completed_commands),
+            Err(e) => {
+                let _ = txn.rollback().await;
+                Err(e)
             }
-        })
-        .await
+        }
     }
 
     async fn execute_bg_ddl_backfill(store: &Arc<TikvStore>, entry: &TaskQueueEntry) -> Result<()> {

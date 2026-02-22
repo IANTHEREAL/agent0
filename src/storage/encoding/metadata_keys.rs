@@ -36,6 +36,7 @@ const DB_SYS_CRON_SEQ_PREFIX_V2: &[u8] = b"sys_next_cron_job_id";
 const DB_SYS_CRON_RUN_SEQ_PREFIX_V2: &[u8] = b"sys_next_cron_run_id";
 const DB_SYS_CRON_ENABLED_PREFIX_V2: &[u8] = b"sys_cron_enabled";
 const DB_SYS_CRON_CLAIM_PREFIX_V2: &[u8] = b"sys_cron_claim_";
+const DB_SYS_CRON_RUNNING_GUARD_PREFIX_V2: &[u8] = b"sys_cron_running_guard_";
 
 // Worker system prefixes (global, not per-database)
 pub(super) const WORKER_REGISTRY_PREFIX: &[u8] = b"_worker_registry_";
@@ -284,6 +285,23 @@ pub fn encode_next_cron_run_id_key_v2(db_id: u64) -> Vec<u8> {
 pub fn encode_cron_enabled_key_v2(db_id: u64) -> Vec<u8> {
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_CRON_ENABLED_PREFIX_V2);
+    key
+}
+
+/// Encode a cron running-guard key to prevent overlapping runs of the same job.
+///
+/// Format: `d_{db_id:8bytes}_sys_cron_running_guard_{job_id:be8}`
+/// Value: big-endian i64 of the current run_id
+pub fn encode_cron_running_guard_key_v2(db_id: u64, job_id: i64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_RUNNING_GUARD_PREFIX_V2);
+    key.extend_from_slice(&job_id.to_be_bytes());
+    key
+}
+
+pub fn encode_cron_running_guard_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_CRON_RUNNING_GUARD_PREFIX_V2);
     key
 }
 

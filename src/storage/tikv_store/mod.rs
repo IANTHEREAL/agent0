@@ -30,6 +30,7 @@ mod triggers;
 mod types;
 mod views;
 pub mod worker;
+pub use cron::CronRunClaimStatus;
 
 // Import helper functions for tests
 #[cfg(test)]

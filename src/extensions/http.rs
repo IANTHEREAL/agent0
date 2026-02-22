@@ -12,7 +12,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::net::lookup_host;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Check if insecure HTTP (non-HTTPS) requests are allowed.
 /// Controlled by `PGTIKV_HTTP_ALLOW_INSECURE` environment variable.
@@ -28,6 +28,7 @@ fn allow_insecure_http() -> bool {
 
 const MAX_REQUESTS_PER_STATEMENT: u32 = 100;
 const MAX_INFLIGHT_REQUESTS_PER_TENANT_PER_NODE: usize = 20;
+const RESERVED_FOR_INTERACTIVE: usize = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1000);
 const TIMEOUT: Duration = Duration::from_millis(5000);
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -70,19 +71,36 @@ pub(crate) enum HttpTableFunctionCall {
     },
 }
 
+struct TenantQuota {
+    /// Reserved exclusively for interactive requests
+    interactive_pool: Arc<Semaphore>,
+    /// Shared pool usable by both interactive and cron
+    shared_pool: Arc<Semaphore>,
+}
+
+impl TenantQuota {
+    fn new() -> Self {
+        let shared_capacity = MAX_INFLIGHT_REQUESTS_PER_TENANT_PER_NODE - RESERVED_FOR_INTERACTIVE;
+        Self {
+            interactive_pool: Arc::new(Semaphore::new(RESERVED_FOR_INTERACTIVE)),
+            shared_pool: Arc::new(Semaphore::new(shared_capacity)),
+        }
+    }
+}
+
 struct TenantLimiters {
-    by_tenant: Mutex<HashMap<String, Arc<Semaphore>>>,
+    by_tenant: Mutex<HashMap<String, Arc<TenantQuota>>>,
 }
 
 impl TenantLimiters {
-    fn semaphore(&self, tenant: &str) -> Arc<Semaphore> {
-        let mut guard = self.by_tenant.lock().expect("http tenant semaphore lock");
+    fn quota(&self, tenant: &str) -> Arc<TenantQuota> {
+        let mut guard = self.by_tenant.lock().expect("http tenant limiter lock");
         if let Some(existing) = guard.get(tenant) {
             return existing.clone();
         }
-        let sem = Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS_PER_TENANT_PER_NODE));
-        guard.insert(tenant.to_string(), sem.clone());
-        sem
+        let quota = Arc::new(TenantQuota::new());
+        guard.insert(tenant.to_string(), quota.clone());
+        quota
     }
 }
 
@@ -398,11 +416,8 @@ async fn execute_request(
         None => None,
     };
 
-    let semaphore = limiters().semaphore(tenant);
-    let _permit = semaphore
-        .acquire()
-        .await
-        .map_err(|_| anyhow!("http: limiter closed"))?;
+    let quota = limiters().quota(tenant);
+    let _permit = acquire_quota_permit(quota, context::execution_kind()).await?;
 
     for redirect_count in 0..=MAX_REDIRECTS {
         validate_url(&url).await?;
@@ -461,6 +476,39 @@ async fn execute_request(
     }
 
     Err(anyhow!("http: redirect loop"))
+}
+
+async fn acquire_quota_permit(
+    quota: Arc<TenantQuota>,
+    execution_kind: context::ExecutionKind,
+) -> Result<OwnedSemaphorePermit> {
+    match execution_kind {
+        context::ExecutionKind::Cron => quota
+            .shared_pool
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("http: limiter closed")),
+        context::ExecutionKind::Interactive => {
+            // Fast path: avoid await if either pool currently has free capacity.
+            if let Ok(permit) = quota.interactive_pool.clone().try_acquire_owned() {
+                return Ok(permit);
+            }
+            if let Ok(permit) = quota.shared_pool.clone().try_acquire_owned() {
+                return Ok(permit);
+            }
+
+            // Wait on both pools so interactive traffic can wake when reserved capacity frees up.
+            tokio::select! {
+                permit = quota.interactive_pool.clone().acquire_owned() => {
+                    permit.map_err(|_| anyhow!("http: limiter closed"))
+                }
+                permit = quota.shared_pool.clone().acquire_owned() => {
+                    permit.map_err(|_| anyhow!("http: limiter closed"))
+                }
+            }
+        }
+    }
 }
 
 pub(crate) async fn execute_table_function(
@@ -701,5 +749,89 @@ mod tests {
     #[test]
     fn test_parse_custom_headers_scalar_rejected() {
         assert!(parse_custom_headers(r#""just a string""#).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_quota_interactive_gets_reserved_pool() {
+        let quota = TenantQuota::new();
+
+        // Interactive should be able to acquire from reserved pool
+        let permits: Vec<_> = (0..RESERVED_FOR_INTERACTIVE)
+            .map(|_| quota.interactive_pool.clone().try_acquire_owned().unwrap())
+            .collect();
+
+        // Reserved pool exhausted
+        assert!(quota.interactive_pool.clone().try_acquire_owned().is_err());
+
+        // But shared pool should still have capacity
+        let _shared_permit = quota.shared_pool.clone().try_acquire_owned().unwrap();
+
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn test_quota_cron_cannot_starve_interactive() {
+        let quota = TenantQuota::new();
+        let shared_capacity = MAX_INFLIGHT_REQUESTS_PER_TENANT_PER_NODE - RESERVED_FOR_INTERACTIVE;
+
+        // Cron fills the shared pool
+        let _cron_permits: Vec<_> = (0..shared_capacity)
+            .map(|_| quota.shared_pool.clone().try_acquire_owned().unwrap())
+            .collect();
+
+        // Shared pool is now exhausted
+        assert!(quota.shared_pool.clone().try_acquire_owned().is_err());
+
+        // But interactive can still acquire from its reserved pool
+        let _interactive_permit = quota.interactive_pool.clone().try_acquire_owned().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_quota_interactive_waits_on_reserved_when_shared_is_saturated() {
+        let quota = Arc::new(TenantQuota::new());
+        let shared_capacity = MAX_INFLIGHT_REQUESTS_PER_TENANT_PER_NODE - RESERVED_FOR_INTERACTIVE;
+
+        let _shared_permits: Vec<_> = (0..shared_capacity)
+            .map(|_| quota.shared_pool.clone().try_acquire_owned().unwrap())
+            .collect();
+        let mut interactive_permits: Vec<_> = (0..RESERVED_FOR_INTERACTIVE)
+            .map(|_| quota.interactive_pool.clone().try_acquire_owned().unwrap())
+            .collect();
+
+        let waiter_quota = quota.clone();
+        let waiter = tokio::spawn(async move {
+            acquire_quota_permit(waiter_quota, context::ExecutionKind::Interactive)
+                .await
+                .expect("interactive acquire should eventually succeed")
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+
+        drop(interactive_permits.pop());
+
+        let permit = tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("interactive waiter should wake after reserved permit is released")
+            .expect("waiter task should not panic");
+        drop(permit);
+    }
+
+    #[test]
+    fn test_quota_constants() {
+        assert!(
+            RESERVED_FOR_INTERACTIVE > 0,
+            "Must reserve some capacity for interactive"
+        );
+        assert!(
+            RESERVED_FOR_INTERACTIVE < MAX_INFLIGHT_REQUESTS_PER_TENANT_PER_NODE,
+            "Reserved pool cannot be the entire capacity"
+        );
+        assert_eq!(
+            RESERVED_FOR_INTERACTIVE
+                + (MAX_INFLIGHT_REQUESTS_PER_TENANT_PER_NODE - RESERVED_FOR_INTERACTIVE),
+            MAX_INFLIGHT_REQUESTS_PER_TENANT_PER_NODE,
+            "Pools must sum to total capacity"
+        );
     }
 }
