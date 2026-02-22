@@ -1688,6 +1688,52 @@ async fn test_result_to_response_with_format_falls_back_to_text_for_array_binary
 }
 
 #[tokio::test]
+async fn test_result_to_response_does_not_rewrite_question_column_by_value() {
+    let resp = result_to_response_with_format(
+        ExecuteResult::Select {
+            columns: vec!["?column?".to_string()],
+            column_types: Some(vec![DataType::Text]),
+            rows: vec![Row::new(vec![Value::Text(
+                "PostgreSQL 17.7 on x86_64-pc-linux-gnu".to_string(),
+            )])],
+            timezone: Arc::<str>::from("UTC"),
+        },
+        &Format::UnifiedText,
+    )
+    .unwrap();
+
+    let Response::Query(query) = resp else {
+        panic!("expected query response");
+    };
+    let schema = query.row_schema();
+    assert_eq!(schema.len(), 1);
+    assert_eq!(schema[0].name(), "?column?");
+}
+
+#[tokio::test]
+async fn test_result_to_response_preserves_explicit_version_column_name() {
+    let resp = result_to_response_with_format(
+        ExecuteResult::Select {
+            columns: vec!["version".to_string()],
+            column_types: Some(vec![DataType::Text]),
+            rows: vec![Row::new(vec![Value::Text(
+                "PostgreSQL 17.7 on x86_64-pc-linux-gnu".to_string(),
+            )])],
+            timezone: Arc::<str>::from("UTC"),
+        },
+        &Format::UnifiedText,
+    )
+    .unwrap();
+
+    let Response::Query(query) = resp else {
+        panic!("expected query response");
+    };
+    let schema = query.row_schema();
+    assert_eq!(schema.len(), 1);
+    assert_eq!(schema[0].name(), "version");
+}
+
+#[tokio::test]
 async fn test_extended_query_notice_emits_notice_response() {
     let mut client = RecordingSink::default();
     let results = crate::sql::ExecuteResults(vec![

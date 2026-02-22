@@ -1,14 +1,14 @@
 use super::types::datatype_to_pgtype;
 use super::value::encode_value;
 use crate::sql::ExecuteResult;
-use crate::types::{DataType, Value};
+use crate::types::DataType;
 use futures::stream;
 use pgwire::api::portal::Format;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::Type;
 use pgwire::error::PgWireResult;
 use pgwire::messages::data::DataRow;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 pub(in crate::protocol::handler) fn result_to_response(
     result: ExecuteResult,
@@ -87,34 +87,7 @@ pub(in crate::protocol::handler) fn result_to_response_with_format(
                 .map(|(i, pg_type)| effective_result_format(pg_type, result_format.format_for(i)))
                 .collect();
 
-            let fixed_columns: Vec<String> = if columns.len() == 1 && columns[0] == "?column?" {
-                if let Some(first_row) = rows.first() {
-                    if let Some(first_val) = first_row.values.first() {
-                        match first_val {
-                            Value::Text(s) if s.starts_with("PostgreSQL") => {
-                                static WARN_VERSION_HACK: Once = Once::new();
-                                WARN_VERSION_HACK.call_once(|| {
-                                    tracing::warn!(
-                                        issue = "#693",
-                                        "version() column rename triggered in wire layer; expected Analyzer to set column name"
-                                    );
-                                });
-                                vec!["version".to_string()]
-                            }
-                            Value::Text(s) if s == "postgres" || !s.contains(' ') => {
-                                vec!["?column?".to_string()]
-                            }
-                            _ => columns,
-                        }
-                    } else {
-                        columns
-                    }
-                } else {
-                    columns
-                }
-            } else {
-                columns
-            };
+            let fixed_columns: Vec<String> = columns;
 
             let fields: Vec<FieldInfo> = fixed_columns
                 .iter()

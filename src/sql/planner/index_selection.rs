@@ -82,9 +82,12 @@ pub fn choose_best_access_path_for_typed_filter(
 /// Choose the best B-tree access path for a typed filter expression.
 ///
 /// Used by the CBO physical planner for access-path selection.
-/// Unlike [`choose_best_access_path_for_typed_filter`], this function
-/// **excludes GIN index selection** -- GIN queries receive SeqScan from
-/// the optimizer path until a future milestone implements real GIN execution.
+/// This is the explicit runtime-safe entry point (full-table + B-tree variants).
+///
+/// While GIN access-path planning is disabled, this is behaviorally equivalent
+/// to [`choose_best_access_path_for_typed_filter`]. It remains separate to keep
+/// the runtime contract explicit and prevent future planner/executor drift when
+/// GIN is reintroduced.
 ///
 /// Covers: B-tree point lookup, range scan, bounded-range scan, in-list scan,
 /// expression-index matching, and partial-index predicate implication.

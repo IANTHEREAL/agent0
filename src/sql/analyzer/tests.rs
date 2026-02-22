@@ -631,6 +631,18 @@ fn analyze_simple_select() {
 }
 
 #[test]
+fn analyze_select_version_infers_function_column_alias() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT version()");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    assert_eq!(result.output_schema.len(), 1);
+    assert_eq!(result.output_schema[0].0, "version");
+    assert_eq!(result.output_schema[0].1, DataType::Text);
+}
+
+#[test]
 fn analyze_select_star() {
     let catalog = test_catalog();
     let mut analyzer = Analyzer::new(&catalog);
