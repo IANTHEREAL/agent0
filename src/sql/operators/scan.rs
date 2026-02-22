@@ -126,12 +126,18 @@ impl PhysicalOperator for TableScanOperator {
     }
 }
 
+// ── Index scan shared infrastructure ─────────────────────────────
+
+/// Shared state and methods for all index scan operators.
+///
+/// Each concrete index scan variant (point, range, in-list) holds an
+/// `IndexScanBase` plus variant-specific fields. The base handles the
+/// common pk_queue → batch_get_rows → row_buffer pipeline.
 #[derive(Debug)]
-pub struct IndexScanOperator {
+struct IndexScanBase {
     schema: TableSchema,
     index_id: u64,
     index_name: String,
-    lookup_values: Vec<Value>,
     scan_limit: Option<usize>,
     pk_queue: Vec<Vec<Value>>,
     row_buffer: Vec<Row>,
@@ -139,19 +145,17 @@ pub struct IndexScanOperator {
     opened: bool,
 }
 
-impl IndexScanOperator {
-    pub fn new_with_scan_limit(
+impl IndexScanBase {
+    fn new(
         schema: TableSchema,
         index_id: u64,
         index_name: String,
-        lookup_values: Vec<Value>,
         scan_limit: Option<usize>,
     ) -> Self {
         Self {
             schema,
             index_id,
             index_name,
-            lookup_values,
             scan_limit,
             pk_queue: Vec::new(),
             row_buffer: Vec::new(),
@@ -160,6 +164,56 @@ impl IndexScanOperator {
         }
     }
 
+    /// Reset state and mark as opened. Called at the start of each open().
+    fn reset_and_open(&mut self) {
+        self.pk_queue.clear();
+        self.row_buffer.clear();
+        self.position = 0;
+        self.opened = true;
+    }
+
+    /// Resolve the index metadata and compute PK types from the schema.
+    fn resolve_index_meta(&self) -> Result<(&crate::types::IndexDef, Vec<crate::types::DataType>)> {
+        let index = self
+            .schema
+            .indexes
+            .iter()
+            .find(|i| i.id == self.index_id)
+            .ok_or_else(|| anyhow!("Index {} not found", self.index_name))?;
+
+        let pk_types: Vec<_> = if self.schema.pk_indices.is_empty() {
+            vec![crate::types::DataType::Uuid]
+        } else {
+            self.schema
+                .pk_indices
+                .iter()
+                .map(|&idx| self.schema.columns[idx].data_type.clone())
+                .collect()
+        };
+
+        Ok((index, pk_types))
+    }
+
+    /// Resolve index column types (needed by scan_index_prefix and scan_index_range).
+    fn resolve_index_column_types(
+        &self,
+        index: &crate::types::IndexDef,
+    ) -> Result<Vec<crate::types::DataType>> {
+        index
+            .columns
+            .iter()
+            .map(|col| {
+                self.schema
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(col))
+                    .map(|c| c.data_type.clone())
+                    .ok_or_else(|| anyhow!("Index column '{}' not found", col))
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// Fetch the next batch of rows from the pk_queue via batch_get_rows.
     async fn load_next_batch(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
         self.row_buffer.clear();
         self.position = 0;
@@ -186,86 +240,9 @@ impl IndexScanOperator {
 
         Ok(())
     }
-}
 
-#[async_trait]
-impl PhysicalOperator for IndexScanOperator {
-    fn schema(&self) -> &TableSchema {
-        &self.schema
-    }
-
-    async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.pk_queue.clear();
-        self.row_buffer.clear();
-        self.position = 0;
-        self.opened = true;
-
-        let index = self
-            .schema
-            .indexes
-            .iter()
-            .find(|i| i.id == self.index_id)
-            .ok_or_else(|| anyhow!("Index {} not found", self.index_name))?;
-
-        let index_column_types: Vec<_> = index
-            .columns
-            .iter()
-            .map(|col| {
-                self.schema
-                    .columns
-                    .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(col))
-                    .map(|c| c.data_type.clone())
-                    .ok_or_else(|| anyhow!("Index column '{}' not found", col))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let pk_types: Vec<_> = if self.schema.pk_indices.is_empty() {
-            vec![crate::types::DataType::Uuid]
-        } else {
-            self.schema
-                .pk_indices
-                .iter()
-                .map(|&idx| self.schema.columns[idx].data_type.clone())
-                .collect()
-        };
-
-        let pks = if self.lookup_values.len() < index.columns.len() {
-            ctx.store
-                .scan_index_prefix(
-                    ctx.txn,
-                    ctx.db_id,
-                    self.schema.table_id,
-                    self.index_id,
-                    &self.lookup_values,
-                    index.unique,
-                    &index_column_types,
-                    &pk_types,
-                    self.scan_limit,
-                )
-                .await?
-        } else {
-            ctx.store
-                .scan_index(
-                    ctx.txn,
-                    ctx.db_id,
-                    self.schema.table_id,
-                    self.index_id,
-                    &self.lookup_values,
-                    index.unique,
-                    &pk_types,
-                    self.scan_limit,
-                )
-                .await?
-        };
-
-        self.pk_queue = pks;
-        self.load_next_batch(ctx).await?;
-
-        Ok(())
-    }
-
-    async fn next(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
+    /// Return the next row from the buffer, fetching a new batch if needed.
+    async fn next_row(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
         if !self.opened {
             return Err(anyhow!("Operator not opened"));
         }
@@ -286,10 +263,90 @@ impl PhysicalOperator for IndexScanOperator {
         }
     }
 
-    async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
+    /// Release buffers and mark as closed.
+    fn close(&mut self) {
         self.pk_queue.clear();
         self.row_buffer.clear();
         self.opened = false;
+    }
+}
+
+// ── IndexScanOperator (point / prefix lookup) ────────────────────
+
+#[derive(Debug)]
+pub struct IndexScanOperator {
+    base: IndexScanBase,
+    lookup_values: Vec<Value>,
+}
+
+impl IndexScanOperator {
+    pub fn new_with_scan_limit(
+        schema: TableSchema,
+        index_id: u64,
+        index_name: String,
+        lookup_values: Vec<Value>,
+        scan_limit: Option<usize>,
+    ) -> Self {
+        Self {
+            base: IndexScanBase::new(schema, index_id, index_name, scan_limit),
+            lookup_values,
+        }
+    }
+}
+
+#[async_trait]
+impl PhysicalOperator for IndexScanOperator {
+    fn schema(&self) -> &TableSchema {
+        &self.base.schema
+    }
+
+    async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        self.base.reset_and_open();
+
+        let (index, pk_types) = self.base.resolve_index_meta()?;
+        let index_column_types = self.base.resolve_index_column_types(index)?;
+
+        let pks = if self.lookup_values.len() < index.columns.len() {
+            ctx.store
+                .scan_index_prefix(
+                    ctx.txn,
+                    ctx.db_id,
+                    self.base.schema.table_id,
+                    self.base.index_id,
+                    &self.lookup_values,
+                    index.unique,
+                    &index_column_types,
+                    &pk_types,
+                    self.base.scan_limit,
+                )
+                .await?
+        } else {
+            ctx.store
+                .scan_index(
+                    ctx.txn,
+                    ctx.db_id,
+                    self.base.schema.table_id,
+                    self.base.index_id,
+                    &self.lookup_values,
+                    index.unique,
+                    &pk_types,
+                    self.base.scan_limit,
+                )
+                .await?
+        };
+
+        self.base.pk_queue = pks;
+        self.base.load_next_batch(ctx).await?;
+
+        Ok(())
+    }
+
+    async fn next(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
+        self.base.next_row(ctx).await
+    }
+
+    async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        self.base.close();
         Ok(())
     }
 
@@ -300,26 +357,21 @@ impl PhysicalOperator for IndexScanOperator {
     fn explain_info(&self) -> Option<String> {
         Some(format!(
             "table={}, index={}",
-            self.schema.name, self.index_name
+            self.base.schema.name, self.base.index_name
         ))
     }
 }
 
+// ── RangeIndexScanOperator ───────────────────────────────────────
+
 #[derive(Debug)]
 pub struct RangeIndexScanOperator {
-    schema: TableSchema,
-    index_id: u64,
-    index_name: String,
+    base: IndexScanBase,
     prefix_values: Vec<Value>,
     range_start: Option<Value>,
     start_inclusive: bool,
     range_end: Option<Value>,
     end_inclusive: bool,
-    scan_limit: Option<usize>,
-    pk_queue: Vec<Vec<Value>>,
-    row_buffer: Vec<Row>,
-    position: usize,
-    opened: bool,
 }
 
 impl RangeIndexScanOperator {
@@ -334,99 +386,35 @@ impl RangeIndexScanOperator {
         end_inclusive: bool,
     ) -> Self {
         Self {
-            schema,
-            index_id,
-            index_name,
+            base: IndexScanBase::new(schema, index_id, index_name, None),
             prefix_values,
             range_start,
             start_inclusive,
             range_end,
             end_inclusive,
-            scan_limit: None,
-            pk_queue: Vec::new(),
-            row_buffer: Vec::new(),
-            position: 0,
-            opened: false,
         }
-    }
-
-    async fn load_next_batch(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.row_buffer.clear();
-        self.position = 0;
-
-        while self.row_buffer.is_empty() && !self.pk_queue.is_empty() {
-            let batch_size = OPERATOR_BATCH_FETCH_SIZE.min(self.pk_queue.len());
-            let batch_pks: Vec<Vec<Value>> = self.pk_queue.drain(..batch_size).collect();
-            let rows = ctx
-                .store
-                .batch_get_rows(
-                    ctx.txn,
-                    ctx.db_id,
-                    self.schema.table_id,
-                    batch_pks,
-                    &self.schema,
-                )
-                .await?;
-
-            self.row_buffer = rows
-                .into_iter()
-                .map(|r| fill_row_defaults_scan(r, &self.schema))
-                .collect::<Result<Vec<_>>>()?;
-        }
-
-        Ok(())
     }
 }
 
 #[async_trait]
 impl PhysicalOperator for RangeIndexScanOperator {
     fn schema(&self) -> &TableSchema {
-        &self.schema
+        &self.base.schema
     }
 
     async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.pk_queue.clear();
-        self.row_buffer.clear();
-        self.position = 0;
-        self.opened = true;
+        self.base.reset_and_open();
 
-        let index = self
-            .schema
-            .indexes
-            .iter()
-            .find(|i| i.id == self.index_id)
-            .ok_or_else(|| anyhow!("Index {} not found", self.index_name))?;
-
-        let index_column_types: Vec<_> = index
-            .columns
-            .iter()
-            .map(|col| {
-                self.schema
-                    .columns
-                    .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(col))
-                    .map(|c| c.data_type.clone())
-                    .ok_or_else(|| anyhow!("Index column '{}' not found", col))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let pk_types: Vec<_> = if self.schema.pk_indices.is_empty() {
-            vec![crate::types::DataType::Uuid]
-        } else {
-            self.schema
-                .pk_indices
-                .iter()
-                .map(|&idx| self.schema.columns[idx].data_type.clone())
-                .collect()
-        };
+        let (index, pk_types) = self.base.resolve_index_meta()?;
+        let index_column_types = self.base.resolve_index_column_types(index)?;
 
         let pks = ctx
             .store
             .scan_index_range(
                 ctx.txn,
                 ctx.db_id,
-                self.schema.table_id,
-                self.index_id,
+                self.base.schema.table_id,
+                self.base.index_id,
                 &self.prefix_values,
                 self.range_start.as_ref(),
                 self.start_inclusive,
@@ -435,41 +423,22 @@ impl PhysicalOperator for RangeIndexScanOperator {
                 index.unique,
                 &index_column_types,
                 &pk_types,
-                self.scan_limit,
+                self.base.scan_limit,
             )
             .await?;
 
-        self.pk_queue = pks;
-        self.load_next_batch(ctx).await?;
+        self.base.pk_queue = pks;
+        self.base.load_next_batch(ctx).await?;
 
         Ok(())
     }
 
     async fn next(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
-        if !self.opened {
-            return Err(anyhow!("Operator not opened"));
-        }
-
-        if self.position < self.row_buffer.len() {
-            let row = self.row_buffer[self.position].clone();
-            self.position += 1;
-            Ok(Some(row))
-        } else {
-            self.load_next_batch(ctx).await?;
-            if self.position < self.row_buffer.len() {
-                let row = self.row_buffer[self.position].clone();
-                self.position += 1;
-                Ok(Some(row))
-            } else {
-                Ok(None)
-            }
-        }
+        self.base.next_row(ctx).await
     }
 
     async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.pk_queue.clear();
-        self.row_buffer.clear();
-        self.opened = false;
+        self.base.close();
         Ok(())
     }
 
@@ -480,22 +449,17 @@ impl PhysicalOperator for RangeIndexScanOperator {
     fn explain_info(&self) -> Option<String> {
         Some(format!(
             "table={}, index={}",
-            self.schema.name, self.index_name
+            self.base.schema.name, self.base.index_name
         ))
     }
 }
 
+// ── InListScanOperator ───────────────────────────────────────────
+
 #[derive(Debug)]
 pub struct InListScanOperator {
-    schema: TableSchema,
-    index_id: u64,
-    index_name: String,
+    base: IndexScanBase,
     column_values: Vec<Vec<Value>>,
-    scan_limit: Option<usize>,
-    pk_queue: Vec<Vec<Value>>,
-    row_buffer: Vec<Row>,
-    position: usize,
-    opened: bool,
 }
 
 impl InListScanOperator {
@@ -506,74 +470,22 @@ impl InListScanOperator {
         column_values: Vec<Vec<Value>>,
     ) -> Self {
         Self {
-            schema,
-            index_id,
-            index_name,
+            base: IndexScanBase::new(schema, index_id, index_name, None),
             column_values,
-            scan_limit: None,
-            pk_queue: Vec::new(),
-            row_buffer: Vec::new(),
-            position: 0,
-            opened: false,
         }
-    }
-
-    async fn load_next_batch(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.row_buffer.clear();
-        self.position = 0;
-
-        while self.row_buffer.is_empty() && !self.pk_queue.is_empty() {
-            let batch_size = OPERATOR_BATCH_FETCH_SIZE.min(self.pk_queue.len());
-            let batch_pks: Vec<Vec<Value>> = self.pk_queue.drain(..batch_size).collect();
-            let rows = ctx
-                .store
-                .batch_get_rows(
-                    ctx.txn,
-                    ctx.db_id,
-                    self.schema.table_id,
-                    batch_pks,
-                    &self.schema,
-                )
-                .await?;
-
-            self.row_buffer = rows
-                .into_iter()
-                .map(|r| fill_row_defaults_scan(r, &self.schema))
-                .collect::<Result<Vec<_>>>()?;
-        }
-
-        Ok(())
     }
 }
 
 #[async_trait]
 impl PhysicalOperator for InListScanOperator {
     fn schema(&self) -> &TableSchema {
-        &self.schema
+        &self.base.schema
     }
 
     async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.pk_queue.clear();
-        self.row_buffer.clear();
-        self.position = 0;
-        self.opened = true;
+        self.base.reset_and_open();
 
-        let index = self
-            .schema
-            .indexes
-            .iter()
-            .find(|i| i.id == self.index_id)
-            .ok_or_else(|| anyhow!("Index {} not found", self.index_name))?;
-
-        let pk_types: Vec<_> = if self.schema.pk_indices.is_empty() {
-            vec![crate::types::DataType::Uuid]
-        } else {
-            self.schema
-                .pk_indices
-                .iter()
-                .map(|&idx| self.schema.columns[idx].data_type.clone())
-                .collect()
-        };
+        let (index, pk_types) = self.base.resolve_index_meta()?;
 
         let mut all_pks = Vec::new();
         for values in &self.column_values {
@@ -582,8 +494,8 @@ impl PhysicalOperator for InListScanOperator {
                 .scan_index(
                     ctx.txn,
                     ctx.db_id,
-                    self.schema.table_id,
-                    self.index_id,
+                    self.base.schema.table_id,
+                    self.base.index_id,
                     values,
                     index.unique,
                     &pk_types,
@@ -599,41 +511,22 @@ impl PhysicalOperator for InListScanOperator {
                 deduped_pks.push(pk);
             }
         }
-        if let Some(limit) = self.scan_limit {
+        if let Some(limit) = self.base.scan_limit {
             deduped_pks.truncate(limit);
         }
 
-        self.pk_queue = deduped_pks;
-        self.load_next_batch(ctx).await?;
+        self.base.pk_queue = deduped_pks;
+        self.base.load_next_batch(ctx).await?;
 
         Ok(())
     }
 
     async fn next(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
-        if !self.opened {
-            return Err(anyhow!("Operator not opened"));
-        }
-
-        if self.position < self.row_buffer.len() {
-            let row = self.row_buffer[self.position].clone();
-            self.position += 1;
-            Ok(Some(row))
-        } else {
-            self.load_next_batch(ctx).await?;
-            if self.position < self.row_buffer.len() {
-                let row = self.row_buffer[self.position].clone();
-                self.position += 1;
-                Ok(Some(row))
-            } else {
-                Ok(None)
-            }
-        }
+        self.base.next_row(ctx).await
     }
 
     async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.pk_queue.clear();
-        self.row_buffer.clear();
-        self.opened = false;
+        self.base.close();
         Ok(())
     }
 
@@ -644,7 +537,7 @@ impl PhysicalOperator for InListScanOperator {
     fn explain_info(&self) -> Option<String> {
         Some(format!(
             "table={}, index={}",
-            self.schema.name, self.index_name
+            self.base.schema.name, self.base.index_name
         ))
     }
 }
