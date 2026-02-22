@@ -1,30 +1,25 @@
 # Multi-platform db9 release builder
-# Builds db9 for: linux/amd64, linux/arm64, darwin/amd64, darwin/arm64
+# Linux targets use Alpine (musl) for fully static binaries — no glibc version dependency
 
-# --- linux/amd64 ---
-FROM --platform=linux/amd64 rust:1.85-bookworm AS builder-linux-amd64
+# --- linux/amd64 (static musl) ---
+FROM --platform=linux/amd64 rust:1.85-alpine AS builder-linux-amd64
+RUN apk add --no-cache musl-dev pkgconf
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 RUN cargo build --release --bin db9
 RUN cp /app/target/release/db9 /db9-linux-amd64
 
-# --- linux/arm64 (cross-compiled from amd64) ---
-FROM --platform=linux/amd64 rust:1.85-bookworm AS builder-linux-arm64
-RUN dpkg --add-architecture arm64 && \
-    apt-get update && apt-get install -y \
-    gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-    libc6-dev-arm64-cross \
-    && rm -rf /var/lib/apt/lists/*
-RUN rustup target add aarch64-unknown-linux-gnu
-ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
-    CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+# --- linux/arm64 (cross-compiled amd64 → aarch64-musl) ---
+FROM --platform=linux/amd64 rust:1.85-alpine AS builder-linux-arm64
+RUN apk add --no-cache musl-dev pkgconf
+RUN rustup target add aarch64-unknown-linux-musl
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
-RUN cargo build --release --bin db9 --target aarch64-unknown-linux-gnu
-RUN cp /app/target/aarch64-unknown-linux-gnu/release/db9 /db9-linux-arm64
+RUN CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+    cargo build --release --bin db9 --target aarch64-unknown-linux-musl
+RUN cp /app/target/aarch64-unknown-linux-musl/release/db9 /db9-linux-arm64
 
 # --- macOS (cross-compiled using joseluisq/rust-linux-darwin-builder) ---
 FROM --platform=linux/amd64 joseluisq/rust-linux-darwin-builder:1.85.0 AS builder-darwin
@@ -37,7 +32,7 @@ RUN cp /app/target/x86_64-apple-darwin/release/db9 /db9-darwin-amd64
 RUN cp /app/target/aarch64-apple-darwin/release/db9 /db9-darwin-arm64
 
 # --- Collect all binaries ---
-FROM --platform=linux/amd64 debian:bookworm-slim AS release
+FROM --platform=linux/amd64 alpine:3.20 AS release
 COPY --from=builder-linux-amd64 /db9-linux-amd64 /releases/db9-linux-amd64
 COPY --from=builder-linux-arm64 /db9-linux-arm64 /releases/db9-linux-arm64
 COPY --from=builder-darwin /db9-darwin-amd64 /releases/db9-darwin-amd64
