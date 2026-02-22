@@ -1,26 +1,50 @@
 # Protocol Module
 
-PostgreSQL wire protocol via pgwire.
+PostgreSQL wire protocol via pgwire. ~12,000 lines across 28 files.
 
-## Files
+## Layout
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| `handler/dynamic.rs` | ~2000 | pgwire handlers, type mapping, on_parse analysis |
-| `handler/mod.rs` | ~280 | Exports, utility functions |
-| `handler/params/` | | Parameter counting + decoding |
-| `handler/encode/` | | Value encoding, type mapping |
+```
+src/protocol/
+├── mod.rs                      # Module exports
+├── copy_format.rs              # COPY format parsing (CSV, TEXT, BINARY) (~900 lines)
+└── handler/
+    ├── mod.rs                  # Handler exports, connection ID counter, utility functions
+    ├── dynamic/                # DynamicPgHandler — main pgwire handler (~2,200 lines)
+    │   ├── mod.rs              # DynamicPgHandler struct, DynamicHandlerFactory
+    │   ├── query.rs            # Extended/simple query protocol handling
+    │   ├── copy.rs             # COPY FROM STDIN / COPY TO STDOUT protocol
+    │   └── startup.rs          # Authentication + executor initialization
+    ├── encode/                 # Value encoding + type mapping (~840 lines)
+    │   ├── mod.rs              # Re-exports
+    │   ├── types.rs            # DataType <-> PostgreSQL OID mapping
+    │   ├── result.rs           # result_to_response(): ExecuteResult → pgwire Response
+    │   └── value.rs            # Internal types → pgwire wire format
+    ├── params/                 # Parameter counting + decoding (~480 lines)
+    │   ├── mod.rs              # Re-exports
+    │   ├── scan.rs             # count_sql_parameters(): $N placeholder counting
+    │   └── decode.rs           # decode_parameters(): wire bytes → Value (Bind phase)
+    ├── copy/                   # COPY context management (~100 lines)
+    │   └── mod.rs              # CopyContext struct, push_copy_data(), max line size (32MB)
+    ├── portal.rs               # Portal state management + suspended portal handling (~430 lines)
+    ├── query_parser.rs         # TipgQueryParser: pgwire QueryParser trait (~110 lines)
+    ├── server_params.rs        # PgServerParameterProvider: ParameterStatus (~150 lines)
+    ├── tenant.rs               # parse_tenant_username(): multi-tenancy (~50 lines)
+    ├── errors.rs               # SQLSTATE mapping, error helpers (~75 lines)
+    ├── prepared.rs             # Prepared statement facade (re-exports from SQL layer)
+    └── tests.rs                # Comprehensive protocol test suite (~2,700 lines)
+```
 
 ## Handlers
 
-- `DynamicPgHandler` - Production handler (per-connection TiKV client)
-- `DynamicHandlerFactory` - Creates handlers with keyspace from username
+- `DynamicPgHandler` — Production handler (per-connection TiKV client)
+- `DynamicHandlerFactory` — Creates handlers with keyspace from username
 
 ## Protocol Flows
 
 **Simple Query:**
 ```
-Query("SELECT ...") → do_query() → executor.execute() → result_to_response()
+Query("SELECT ...") → on_query() → executor.execute() → result_to_response()
 ```
 
 **Extended Query (ORMs):**
@@ -41,22 +65,29 @@ Describe uses `utility_describe_fields()` for static schema mapping.
 | Task | Location |
 |------|----------|
 | Add PostgreSQL type | `encode/types.rs` → `datatype_to_pgtype()` |
-| Fix type OID | Analyzer `output_schema` (analyzer/query.rs) |
-| Change value encoding | `encode/result.rs` → `encode_value()` |
+| Fix type OID | Analyzer `output_schema` (analyzer/query/) |
+| Change value encoding | `encode/result.rs` → `encode_value()` / `encode/value.rs` |
 | Fix parameter decoding | `params/decode.rs` → `decode_parameters()` |
+| Portal / suspended queries | `portal.rs` |
+| Multi-tenancy parsing | `tenant.rs` → `parse_tenant_username()` |
+| Server parameters | `server_params.rs` → `PgServerParameterProvider` |
+| COPY protocol | `dynamic/copy.rs` + `copy/mod.rs` + `copy_format.rs` |
+| Error handling | `errors.rs` (SQLSTATE mapping, in-failed-transaction errors) |
+| Query parsing (pgwire trait) | `query_parser.rs` → `TipgQueryParser` |
 
 ## Key Functions
 
-```
-count_sql_parameters()       # Count $N placeholders in SQL
-decode_parameters()          # Wire bytes → Value (Bind phase)
-utility_describe_fields()    # Static Describe for SHOW/EXPLAIN
-is_data_statement()          # AST-based SELECT/DML classification
-reject_unanalyzed_if_needed()# Guard: reject unanalyzed data SQL
-result_to_response()         # ExecuteResult → pgwire Response
-datatype_to_pgtype()         # Internal type → pg Type
-parse_tenant_username()      # "tenant.user" → (keyspace, user)
-```
+| Function | Location | Purpose |
+|----------|----------|---------|
+| `parse_tenant_username()` | `tenant.rs` | Multi-tenancy: extract keyspace from "tenant.user" |
+| `is_data_statement()` | `dynamic/query.rs` | Classify SELECT/DML statements |
+| `reject_unanalyzed_if_needed()` | `dynamic/query.rs` | Guard unanalyzed data SQL |
+| `utility_describe_fields()` | `dynamic/query.rs` | Static Describe for utility statements |
+| `count_sql_parameters()` | `params/scan.rs` | Count $N placeholders |
+| `decode_parameters()` | `params/decode.rs` | Wire bytes → Value |
+| `datatype_to_pgtype()` | `encode/types.rs` | Internal type → PostgreSQL OID |
+| `result_to_response()` | `encode/result.rs` | ExecuteResult → pgwire Response |
+| `TipgQueryParser::parse_sql()` | `query_parser.rs` | Parse + analyze SQL (pgwire QueryParser trait) |
 
 ## PostgreSQL Type OIDs
 
@@ -74,9 +105,14 @@ parse_tenant_username()      # "tenant.user" → (keyspace, user)
 ## Multi-Tenancy
 
 Username format: `tenant.user` or `tenant:user`
-- Extracts keyspace from username
+- `tenant.rs` extracts keyspace from username
 - Each keyspace gets isolated TiKV client
 - Pooled in `src/pool.rs`
+
+Metadata keys passed via pgwire ClientInfo:
+- `METADATA_KEYSPACE` — Extracted tenant keyspace
+- `METADATA_ACTUAL_USER` — Username after tenant.user parsing
+- `METADATA_AUTH_IS_SUPERUSER` — Authentication status ("on"/"off")
 
 ## Common Issues
 
@@ -85,4 +121,7 @@ Username format: `tenant.user` or `tenant:user`
 - Check `column_types` in executor result
 
 **Describe returns empty for SHOW/EXPLAIN:**
-- Check `utility_describe_fields()` in dynamic.rs
+- Check `utility_describe_fields()` in `dynamic/query.rs`
+
+**Portal suspension / cursor issues:**
+- Check `portal.rs` for portal state management

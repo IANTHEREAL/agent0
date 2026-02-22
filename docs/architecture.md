@@ -1,7 +1,7 @@
 # pg-tikv Architecture Design
 
 > PostgreSQL-compatible distributed SQL database on TiKV.
-> Last updated: 2026-02-17
+> Last updated: 2026-02-22
 
 ## 1. Design Principles
 
@@ -68,17 +68,23 @@ All persistent data must be isolated per keyspace. Process-level global state is
 │  │  ┌──────────────────────────────────────┐             │  │
 │  │  │     Executor + Physical Operators     │             │  │
 │  │  │  scan | filter | project | sort | agg │             │  │
-│  │  │  join | hash_join | window | limit    │             │  │
+│  │  │  join | hash_join | hash_semi_join     │             │  │
+│  │  │  window | limit | set_operation       │             │  │
 │  │  └──────────────────────────────────────┘             │  │
 │  │       ↓                                                │  │
 │  │  ┌──────────────────────────────────────┐             │  │
-│  │  │  Catalog (35+ pg_catalog/info_schema) │             │  │
+│  │  │  Catalog (40+ pg_catalog/info_schema) │             │  │
 │  │  └──────────────────────────────────────┘             │  │
 │  ├───────────────────────────────────────────────────────┤  │
 │  │                  Storage Layer                         │  │
-│  │  • Key Encoding        • Schema Management             │  │
+│  │  • Key Encoding (v2)   • Schema Management             │  │
 │  │  • Index Management    • Transaction Wrapper           │  │
 │  │  • Keyspace Isolation  • Statistics Persistence        │  │
+│  ├───────────────────────────────────────────────────────┤  │
+│  │              Background Services                       │  │
+│  │  • Worker Engine (cron, triggers, auto-analyze, bg-sql)│  │
+│  │  • Cron Scheduler (pg_cron-compatible expressions)     │  │
+│  │  • Worker GC (orphan recovery, DLQ cleanup)            │  │
 │  └───────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
                               │
@@ -249,27 +255,33 @@ EXPLAIN query
 
 **Purpose**: Cost-based query optimization. Transforms `AnalyzedQuery` into an optimized physical plan.
 
-**Current status**: Always ON single path. Covers single-table, multi-table joins, set operations (UNION/INTERSECT/EXCEPT), CTEs, window functions, and DISTINCT ON. Includes selectivity estimation and index selection. `tipg.use_optimizer` remains compatibility/readback only.
+**Current status**: Always ON single path. Covers single-table, multi-table joins, set operations (UNION/INTERSECT/EXCEPT), CTEs, window functions, and DISTINCT ON. Includes selectivity estimation, index selection, join reordering (DPccp), subquery decorrelation (EXISTS/NOT EXISTS → SemiJoin/AntiJoin), and predicate pushdown. `tipg.use_optimizer` remains compatibility/readback only.
 
 ```
 AnalyzedQuery
     → LogicalPlanner::build()     → LogicalPlan (abstract tree)
+    → Rewrite passes (decorrelate, predicate pushdown, join reorder)
     → PhysicalPlanner::plan()     → PhysicalPlan (with cost estimates)
     → PhysicalPlan::build_operators() → BoxedOperator (executable)
 ```
 
-| File | Purpose |
-|------|---------|
-| `logical_planner.rs` | AnalyzedQuery → LogicalPlan conversion |
+| Module | Purpose |
+|--------|---------|
+| `logical_planner/` | AnalyzedQuery → LogicalPlan conversion |
 | `logical_plan.rs` | LogicalPlan IR definition |
-| `physical_planner.rs` | LogicalPlan → PhysicalPlan with operator selection |
-| `build.rs` | PhysicalPlan → BoxedOperator, wires execution context |
-| `selectivity.rs` | Selectivity estimation from column statistics |
+| `physical_planner/` | LogicalPlan → PhysicalPlan with operator selection |
+| `physical_plan.rs` | PhysicalPlan IR definition |
+| `build/` | PhysicalPlan → BoxedOperator (scan, join, aggregate, utils) |
+| `selectivity/` | Selectivity estimation from column statistics |
 | `statistics.rs` | `ColumnStatistics`, `TableStatistics` structures |
+| `rewrite/` | Plan rewrite passes: decorrelation (EXISTS→SemiJoin), predicate pushdown |
+| `join_reorder/` | Cost-based join reordering via DPccp algorithm |
+| `join_keys.rs` | Join key extraction and analysis |
+| `eligibility.rs` | Query eligibility checks for optimizer paths |
+| `window_rewrite.rs` | Window function plan rewriting |
 
 **Roadmap**:
-- Phase 3: Join reordering, subquery decorrelation, predicate pushdown (#705)
-- Phase 4: Plan cache for prepared statement reuse (#707)
+- Plan cache for prepared statement reuse (#707)
 
 ### 4.3 Physical Operators (`src/sql/operators/`)
 
@@ -281,11 +293,12 @@ AnalyzedQuery
 | Filter | `filter.rs` | WHERE clause predicate evaluation |
 | Project | `project.rs` | Column selection + expression evaluation |
 | NestedLoopJoin | `join.rs` | Streaming outer, materializes right side only |
-| HashJoin | `hash_join.rs` | Equi-join with in-memory hash table |
+| HashJoin | `hash_join/` | Equi-join with in-memory hash table (mod.rs, hash_table.rs) |
+| HashSemiJoin | `hash_semi_join.rs` | Semi/anti-join for EXISTS/NOT EXISTS decorrelation |
 | HashAggregate | `aggregate.rs` | GROUP BY with incremental aggregation |
 | Sort | `sort.rs` | ORDER BY (full materialization required) |
 | Distinct | `distinct.rs` | DISTINCT / UNION deduplication |
-| Window | `window.rs` | Window functions (OVER clauses) |
+| Window | `window/` | Window functions (mod.rs, access.rs, aggregates.rs, ranking.rs) |
 | Limit | `limit.rs` | LIMIT / OFFSET |
 | SetOperation | `set_operation.rs` | UNION / INTERSECT / EXCEPT |
 | CTE | `cte.rs` | Common Table Expression iteration |
@@ -297,34 +310,50 @@ AnalyzedQuery
 
 ```
 executor/
-├── core/                  # Statement dispatch + infrastructure
-│   ├── dispatch.rs        # Route statements to handlers
-│   ├── statement.rs       # Privilege checks + common helpers
-│   ├── analyze.rs         # ANALYZE command (statistics collection)
-│   ├── view_rewrite.rs    # View expansion + privilege enforcement
-│   └── catalog_prefetch.rs# Batch catalog lookups
+├── core/                      # Statement dispatch + infrastructure
+│   ├── dispatch/              # Statement routing (mod.rs, prepared.rs, utils.rs)
+│   ├── statement.rs           # Privilege checks + common helpers
+│   ├── analyze.rs             # ANALYZE command (statistics collection)
+│   ├── view_rewrite/          # View expansion + privilege enforcement (mod.rs, expr.rs, query.rs, table.rs)
+│   ├── catalog_prefetch/      # Batch catalog lookups (mod.rs, extraction.rs, resolution.rs)
+│   ├── stmt_ddl.rs            # DDL statement execution
+│   ├── stmt_dml.rs            # DML statement execution
+│   ├── stmt_query.rs          # Query statement execution
+│   ├── stmt_rbac.rs           # RBAC statement execution
+│   ├── settings_tableless.rs  # GUC / tableless settings queries
+│   └── observability.rs       # Query observability hooks
 ├── select/
-│   └── analyzed/          # Single-path SELECT executor
-│       ├── mod.rs         # Main orchestrator (try_execute_analyzed)
-│       ├── query_plan.rs  # QueryPlan routing decisions
-│       ├── rewrite.rs     # Expression simplification
-│       └── subquery.rs    # Subquery execution
-├── cte.rs                 # CTE pre-materialization
-├── dml_analyzed.rs        # Analyzed INSERT/UPDATE/DELETE
-├── ddl.rs                 # DDL dispatch
-├── triggers.rs            # Trigger dispatch
-└── procedure.rs           # CALL (stored procedures)
+│   └── analyzed/              # Single-path SELECT executor
+│       ├── mod.rs             # Main orchestrator
+│       ├── pipeline.rs        # Query execution pipeline
+│       ├── pre_materialize.rs # CTE/subquery pre-materialization
+│       ├── postprocess.rs     # Result post-processing
+│       ├── rewrite.rs         # Expression simplification
+│       ├── subquery/          # Subquery execution (mod.rs, tests.rs)
+│       └── materialize_catalog.rs # Catalog query materialization
+├── dml_analyzed/              # Analyzed INSERT/UPDATE/DELETE (mod.rs, insert.rs, update.rs, delete.rs)
+├── procedure/                 # CALL + materialized views
+├── table_utils/               # Table function helpers (generate_series)
+├── cte.rs                     # CTE pre-materialization
+├── ddl.rs                     # DDL dispatch
+├── triggers.rs                # Trigger dispatch
+├── default_privileges.rs      # DEFAULT PRIVILEGES management
+├── user_function.rs           # User-defined function execution
+└── bg_sql.rs                  # Background SQL execution (worker integration)
 ```
 
 ### 4.5 Expression System (`src/sql/expr/`)
 
 **Purpose**: Runtime evaluation of typed expressions against rows.
 
-| File | Purpose |
-|------|---------|
-| `typed_eval.rs` | Core evaluator: `eval_typed_expr(expr, row, ctx) → Value` (~2,800 lines) |
+| Module | Purpose |
+|--------|---------|
+| `typed_eval/` | Core evaluator: `eval_typed_expr(expr, row, ctx) → Value` (mod.rs, arithmetic.rs, helpers.rs) |
 | `typed_fold.rs` | AST tree transformation |
 | `typed_rewrite.rs` | Constant folding, expression rewriting |
+| `traverse/` | Expression tree traversal and visitor utilities |
+| `classify.rs` | Expression classification (aggregate, window, volatile) |
+| `static_eval.rs` | Compile-time constant expression evaluation |
 | `operators.rs` | Binary/unary operator implementations |
 | `numeric.rs` | Numeric arithmetic with overflow handling |
 | `functions/` | 14 categories: array, datetime, encoding, fs9, fts, json, math, misc, pg_compat, regex, string, uuid, vector |
@@ -333,12 +362,12 @@ executor/
 
 **Purpose**: Type inference, coercion, and PostgreSQL type mapping.
 
-| File | Purpose |
-|------|---------|
-| `registry.rs` | `FunctionRegistry`: 200+ builtin function signatures |
+| Module | Purpose |
+|--------|---------|
+| `registry/` | `FunctionRegistry`: 200+ builtin function signatures (aggregate_window, json, math, misc, string, system, temporal) |
 | `infer.rs` | `TypeInferrer`: core type inference logic |
 | `coercion.rs` | `common_type()` (Text wins) + `comparison_target_type()` (non-Text wins) |
-| `cast.rs` | CAST between any two types |
+| `cast/` | CAST between any two types (mod.rs, tests.rs) |
 | `mapping.rs` | PostgreSQL DataType <-> internal Value types |
 
 **Key design**: Two coercion functions with intentionally different behavior:
@@ -347,11 +376,11 @@ executor/
 
 ### 4.7 Catalog (`src/sql/catalog/`)
 
-**Purpose**: PostgreSQL system catalog compatibility. 35+ virtual table implementations for `pg_catalog` and `information_schema`.
+**Purpose**: PostgreSQL system catalog compatibility. 40+ virtual table implementations for `pg_catalog`, `information_schema`, and `cron`.
 
-Implements: `pg_class`, `pg_attribute`, `pg_type`, `pg_index`, `pg_namespace`, `pg_constraint`, `pg_proc`, `pg_roles`, `pg_trigger`, `pg_views`, `pg_description`, `pg_database`, `pg_extension`, `pg_depend`, `pg_am`, `pg_collation`, `pg_enum`, `pg_range`, `pg_sequence`, `pg_attrdef`, `pg_db_role_setting`, `tables`, `columns`, `schemata`, `sequences`, `routines`, `key_column_usage`, `table_constraints`, `constraint_column_usage`, `check_constraints`, `referential_constraints`, `table_privileges`, `pg_indexes`, and more.
+Implements: `pg_class`, `pg_attribute`, `pg_type`, `pg_index`, `pg_namespace`, `pg_constraint`, `pg_proc`, `pg_roles`, `pg_trigger`, `pg_views`, `pg_description`, `pg_database`, `pg_extension`, `pg_depend`, `pg_am`, `pg_collation`, `pg_enum`, `pg_range`, `pg_sequence`, `pg_attrdef`, `pg_db_role_setting`, `pg_tables`, `pg_indexes`, `tables`, `columns`, `schemata`, `sequences`, `routines`, `key_column_usage`, `table_constraints`, `constraint_column_usage`, `check_constraints`, `referential_constraints`, `table_privileges`, `cron_job`, `cron_job_run_details`, `cron_running_jobs`, and more.
 
-### 4.8 Index Planning (`src/sql/planner.rs`)
+### 4.8 Index Planning (`src/sql/planner/`)
 
 **Purpose**: Access path selection. Given a query's WHERE predicates and available indexes, choose the best scan strategy.
 
@@ -407,11 +436,15 @@ The protocol handler (`src/protocol/handler/`) is decomposed into focused module
 
 | Module | Purpose |
 |--------|---------|
-| `dynamic.rs` | `DynamicPgHandler`: main pgwire handler |
-| `view_infer.rs` | View definition inference for Describe |
-| `schema_resolve.rs` | Schema resolution for extended protocol |
-| `type_infer.rs` | Result field type inference |
-| `encode/types.rs` | DataType → PostgreSQL OID mapping |
+| `dynamic/` | `DynamicPgHandler`: main pgwire handler (mod.rs, query.rs, copy.rs, startup.rs) |
+| `portal.rs` | Portal state management and suspended portal handling |
+| `query_parser.rs` | `TipgQueryParser`: SQL parsing + analysis (pgwire QueryParser trait) |
+| `server_params.rs` | `PgServerParameterProvider`: ParameterStatus for pgwire |
+| `tenant.rs` | `parse_tenant_username()`: multi-tenancy username parsing |
+| `errors.rs` | Error helpers: SQLSTATE mapping, in-failed-transaction errors |
+| `encode/` | Value encoding + type mapping (types.rs, result.rs, value.rs) |
+| `params/` | Parameter counting + decoding (scan.rs, decode.rs) |
+| `copy/` | COPY context management |
 
 ---
 
@@ -419,17 +452,39 @@ The protocol handler (`src/protocol/handler/`) is decomposed into focused module
 
 ### 6.1 Key Layout
 
-All keys are keyspace-prefixed by TiKV for multi-tenant isolation.
+All keys are keyspace-prefixed by TiKV for multi-tenant isolation. Storage format v2 uses database-scoped keys.
+
+**Metadata keys (keyspace-level):**
 
 | Key Pattern | Content |
 |-------------|---------|
 | `_sys_next_table_id` | Auto-increment counter for table IDs |
-| `_sys_schema_{table}` | `TableSchema` (bincode serialized) |
+| `_sys_next_database_id` | Auto-increment counter for database IDs |
+| `_sys_format_version` | Storage format version marker |
+| `_sys_schema_{table}` | `TableSchema` (bincode with magic header `PGTIKV_SCHEMA_V1\0`) |
 | `_sys_view_{name}` | View SQL definition |
 | `_sys_matview_{name}` | Materialized view SQL definition |
 | `_sys_proc_{name}` | Stored procedure SQL definition |
-| `t_{table_id}_{pk_values}` | Data row (bincode serialized) |
-| `i_{table_id}_{idx_id}_{vals}` | Index entry (unique: pk value, non-unique: empty) |
+| `_sys_dbname_{name}` | Database name → ID mapping |
+| `_sys_dbid_{id}` | Database ID → name mapping |
+| `_sys_migration_*` | Global migration tracking |
+
+**Data keys (database-scoped v2):**
+
+| Key Pattern | Content |
+|-------------|---------|
+| `d_{db_id}_t_{table_id}_{pk_values}` | Data row (bincode serialized) |
+| `d_{db_id}_i_{table_id}_{idx_id}_{vals}[_{pk}]` | Index entry (unique: pk, non-unique: empty) |
+| `d_{db_id}_i_{table_id}_{idx_id}_gin_{token_hash}{SEP}{pk}` | GIN index entry |
+
+**Worker keys (system keyspace `_sys_worker`):**
+
+| Key Pattern | Content |
+|-------------|---------|
+| `_worker_registry_` | Task type registries |
+| `_worker_queue_` | Task queues (Cron, AsyncTrigger, AutoAnalyze, BgDdl, BgSql) |
+| `_worker_claim_` | Worker claims (pessimistic lock prevents duplicates) |
+| `_worker_bg_result_` | Background job results |
 
 ### 6.2 Transaction Model
 
@@ -452,14 +507,19 @@ Username format: "tenant.user" or "tenant:user"
 
 ## 7. Transaction & Session Management
 
-### 7.1 Session State (`src/sql/session.rs`)
+### 7.1 Session State (`src/sql/session/`)
 
-Per-connection state:
+Per-connection state (session/ module: mod.rs, settings.rs, transaction.rs):
 - Current database, search path, timezone
 - Transaction state (idle, active, failed)
 - Sequence value cache (NEXTVAL/CURRVAL)
 - GUC settings (SET/SHOW/RESET)
 - Statement timeout
+
+Task-local session context (`src/session_context.rs`):
+- Timezone scoping (per-connection, tokio task-local)
+- Max sort bytes (per-connection memory limit)
+- Search path isolation
 
 ### 7.2 Transaction Flow
 
@@ -477,14 +537,15 @@ Explicit transaction:
 ### 7.3 Trigger Execution
 
 ```
-BEFORE triggers: inline during DML execution (src/sql/triggers.rs)
-    → Body compiled and cached in TriggerCache
-    → Evaluated synchronously before row modification
+BEFORE triggers: inline during DML execution (src/sql/triggers/)
+    → Body compiled and cached in TriggerCache (cache.rs)
+    → Evaluated synchronously before row modification (before.rs)
+    → Row reference substitution (rewrite.rs)
 
-AFTER triggers: deferred to commit (src/sql/trigger_worker.rs)
-    → Queued during DML execution
-    → Fired asynchronously after successful commit
-    → Background tokio task processes queue
+AFTER triggers: deferred to worker engine (src/worker/)
+    → Queued during DML execution (triggers/enqueue.rs)
+    → Dispatched by WorkerEngine as AsyncTrigger task type
+    → Executed in background (triggers/execute.rs)
 ```
 
 ### 7.4 Runtime Stack Budget
@@ -499,7 +560,45 @@ Runtime contract:
 
 ---
 
-## 8. Current State & Roadmap
+## 8. Background Services
+
+### 8.1 Worker Engine (`src/worker/`)
+
+Unified async task engine. All pg-tikv instances share a global task queue in TiKV — no leader election, natural load balancing via pessimistic transaction contention.
+
+```
+Startup (main.rs):
+    → WorkerConfig::from_env()
+    → init_system_store(pd_addrs) → TikvStore for _sys_worker keyspace
+    → tokio::spawn(WorkerEngine::run())   # task processing loop
+    → tokio::spawn(WorkerGc::run())       # orphan recovery + DLQ cleanup
+```
+
+**Task types**: Cron, AsyncTrigger, AutoAnalyze, BgDdl, BgSql
+
+| File | Purpose |
+|------|---------|
+| `engine.rs` | Core worker loop: claim tasks, execute, manage state |
+| `types.rs` | Task types, claims, execution context, retry logic |
+| `config.rs` | Worker configuration (enabled, polling intervals, system keyspace) |
+| `gc.rs` | Garbage collector for completed tasks and orphaned claims |
+| `metrics.rs` | Worker metrics tracking (tasks/second, latency, errors) |
+
+### 8.2 Cron Scheduler (`src/cron/`)
+
+pg_cron-compatible cron job scheduling integrated with the worker engine.
+
+| File | Purpose |
+|------|---------|
+| `parser.rs` | PostgreSQL cron expression parser (min/hour/day/month/dow) |
+| `types.rs` | Cron job types, state, metadata |
+| `config.rs` | Cron configuration (interval, concurrency) |
+| `worker.rs` | Cron worker task processing |
+| `process_list.rs` | pg_cron-compatible virtual table for job inspection |
+
+---
+
+## 9. Current State & Roadmap
 
 ### Completed
 
@@ -507,19 +606,26 @@ Runtime contract:
 |-----------|-------------|-----------|
 | Analyzer pipeline | Single-path typed IR for all SELECT queries | `analyzer/` |
 | CBO optimizer | LogicalPlan → PhysicalPlan → BoxedOperator pipeline (default ON, multi-table + set ops + CTEs + window + DISTINCT ON) | `optimizer/` |
-| ANALYZE + stats | Selectivity estimation + stats cache + warm-up | `optimizer/selectivity.rs`, `stats.rs` |
+| ANALYZE + stats | Selectivity estimation + stats cache + warm-up | `optimizer/selectivity/`, `stats.rs` |
+| CBO Phase 3 | Join reordering (DPccp), subquery decorrelation (EXISTS→SemiJoin/AntiJoin), predicate pushdown, cross-join elimination, hash join selection | `optimizer/join_reorder/`, `optimizer/rewrite/` |
 | Legacy cleanup | Removed 10 legacy code items, single execution path | All |
 | Privilege enforcement | SELECT privilege on every base table | `executor/core/statement.rs` |
-| 35+ catalog views | pg_catalog + information_schema compatibility | `catalog/` |
+| 40+ catalog views | pg_catalog + information_schema + cron compatibility | `catalog/` |
 | Full-text search | GIN indexes + Chinese tokenizer | `gin.rs`, `fts.rs` |
-| SQL Rewriter phase | Shared analyzed rewrite entry for execution/EXPLAIN, no SELECT/WITH runtime fallback | `executor/core/analyze_rewrite.rs`, `rewriter.rs`, `parser.rs` |
+| SQL Rewriter phase | Shared analyzed rewrite entry for execution/EXPLAIN, no SELECT/WITH runtime fallback | `executor/core/analyze_rewrite.rs`, `rewriter/`, `parser/` |
+| Worker engine | Unified async task engine: cron, async triggers, auto-analyze, bg-sql, bg-ddl | `src/worker/` |
+| Cron scheduler | pg_cron-compatible cron expressions, job management, virtual tables | `src/cron/`, `catalog/cron_*.rs` |
+| Prepared statement unification | Analyzer-backed Describe, TypedExpr visitor, error unification | `protocol/handler/` |
+| Protocol hardening | SQLSTATE mapping, memory/stack guards, handler decomposition | `protocol/handler/` |
+| FK correctness | ref_columns validation, NULL MATCH SIMPLE, stale snapshots, self-referential (#925/#923/#924/#922) | `sql/dml/foreign_keys.rs` |
+| GUC + SHOW | SET LOCAL, current_setting(), SHOW ALL, PostgreSQL-compatible GUC defaults (#601/#884/#600/#599) | `sql/session/` |
+| SQL parity | UNNEST as JOIN, JSONB canonicalization, SQLSTATE 42725 parity (#408/#281/#910/#911) | `sql/analyzer/`, `sql/executor/` |
 
 ### In Progress
 
 | Phase | Description | Issue |
 |-------|-------------|-------|
-| CBO Phase 3 | Join reordering, subquery decorrelation, predicate pushdown | #705 |
-| CBO Phase 4 | Plan cache for prepared statement optimization | #707 |
+| Plan cache | Plan cache for prepared statement optimization | #707 |
 
 ### Future
 
@@ -529,7 +635,7 @@ Runtime contract:
 
 ---
 
-## 9. Invariants (Must Always Hold)
+## 10. Invariants (Must Always Hold)
 
 1. **Single execution path**: No hidden fallback. If the Analyzer succeeds, execution uses typed expressions only.
 2. **TypedExpr completeness**: Every expression node carries a resolved `DataType`. No unresolved names escape the Analyzer.
@@ -541,3 +647,4 @@ Runtime contract:
 8. **Autocommit retry is safe**: Only autocommit (implicit) transactions are retried. Explicit transactions never retry automatically.
 9. **Trigger ordering**: BEFORE triggers execute inline (blocking). AFTER triggers execute asynchronously after commit.
 10. **Test expectations match PostgreSQL**: No `.expected` file may be updated without verifying against real PostgreSQL 17.7 output.
+11. **Worker queue isolation**: Worker tasks are scoped to `_sys_worker` keyspace. Task claiming uses pessimistic transactions — no duplicate execution across instances.

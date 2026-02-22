@@ -42,11 +42,13 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 ### Module Boundaries
 
 - `Analyzer` (`src/sql/analyzer/`): name resolution, scope checking, and type inference; outputs `AnalyzedQuery` / `TypedExpr`.
-- `Optimizer` (`src/sql/optimizer/`): `AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator`. Handles single-table, multi-table joins, set operations (UNION/INTERSECT/EXCEPT), CTEs, window functions, and DISTINCT ON. Always-on (the `tipg.use_optimizer` GUC is accepted for compatibility but is a no-op — `SET ... = off` logs a notice and is ignored; `SHOW` always returns `on`).
-- `Operators` (`src/sql/operators/`): physical operators (scan, filter, project, sort, aggregate, hash_join, NLJ, window, CTE, set_operation, table_function).
-- `Executor` (`src/sql/executor/`): DDL/DML dispatch, SELECT execution (analyzed path at `executor/select/analyzed/`).
-- `Catalog` (`src/sql/catalog/`): `information_schema` / `pg_catalog` compatibility surface (35+ virtual table implementations).
-- `Storage`: all persistent keys must remain keyspace-isolated via `TikvStore`.
+- `Optimizer` (`src/sql/optimizer/`): `AnalyzedQuery → LogicalPlan → (rewrite: decorrelation, predicate pushdown, join reorder) → PhysicalPlan → BoxedOperator`. Handles single-table, multi-table joins, set operations (UNION/INTERSECT/EXCEPT), CTEs, window functions, DISTINCT ON, SemiJoin/AntiJoin. Always-on (the `tipg.use_optimizer` GUC is accepted for compatibility but is a no-op — `SET ... = off` logs a notice and is ignored; `SHOW` always returns `on`).
+- `Operators` (`src/sql/operators/`): physical operators (scan, filter, project, sort, aggregate, hash_join, hash_semi_join, NLJ, window/, CTE, set_operation, table_function).
+- `Executor` (`src/sql/executor/`): DDL/DML dispatch, SELECT execution (analyzed path at `executor/select/analyzed/`), background SQL (`bg_sql.rs`).
+- `Catalog` (`src/sql/catalog/`): `information_schema` / `pg_catalog` / `cron` compatibility surface (40+ virtual table implementations).
+- `Storage` (`src/storage/`): all persistent keys must remain keyspace-isolated via `TikvStore`. Database-scoped v2 key format (`d_{db_id}_*`).
+- `Worker` (`src/worker/`): unified async task engine (Cron, AsyncTrigger, AutoAnalyze, BgDdl, BgSql). Global task queue in TiKV, pessimistic locking, no leader election.
+- `Cron` (`src/cron/`): pg_cron-compatible scheduler integrated with worker engine.
 
 ### Multi-tenancy Invariant (Critical)
 
@@ -89,6 +91,8 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 
 ### Other Recent
 
+- **Worker engine** (`src/worker/`): unified async task engine — Cron, AsyncTrigger, AutoAnalyze, BgDdl, BgSql. Global TiKV queue, pessimistic locking, GC.
+- **Cron scheduler** (`src/cron/`): pg_cron-compatible expressions, job management, virtual tables (`cron_job`, `cron_job_run_details`, `cron_running_jobs`).
 - **Prisma ORM** binary wire protocol (#841/#842).
 - **PL/pgSQL** execution: SELECT INTO, FOR loops, EXIT, correlated table functions (#863).
 - **Cron** runtime management: job timeout, cancel, process list (#896), status command (#913), --file + dollar-quoting (#892).
@@ -96,34 +100,30 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 - **SQL functions**: json_agg/jsonb_agg, hashtext (#930), RETURNS TABLE syntax (#895).
 - **FTS** Chinese tokenizer support for GIN full-text search (#774).
 - **Infra**: SQL execution timeout protection (#860), stack overflow prevention (#929), information_schema.columns optimization (#936), unified SqlError with SQLSTATE (#900).
+- **Refactoring**: dispatch_raw! macro for executor dispatch (#966), deduplicated utility functions (#964), LogicalPlan::map_children() (#963), IndexScanBase coverage (#970).
+
+### Phase 1 — Core Correctness (ALL DONE)
+
+- **FK cluster** (#925, #923, #924, #922): ref_columns validation, NULL MATCH SIMPLE, stale snapshots, self-referential constraints — all fixed in `src/sql/dml/foreign_keys.rs`.
+- **Analyzer/operators** (#910, #911): SQLSTATE 42725 parity for mixed unknown binary ops + test coverage.
+- **GUC** (#601, #884): SET LOCAL (transaction-scoped), `current_setting()`, SET LOCAL rollback.
+- **SHOW** (#600, #599): PostgreSQL-compatible SHOW defaults + SHOW ALL.
+- **SQL parity** (#408): UNNEST(...) as JOIN relation.
+- **JSONB** (#281): JSON/JSONB canonicalization (key order, whitespace).
+- **CLI** (#920): db9 login --api-key 401 auth fix.
 
 ## Open Issues (Active)
 
-### Correctness — FK cluster (shared module: `src/sql/dml/foreign_keys.rs` + `src/sql/ddl/alter_table.rs`)
+### Correctness — SQL parity
 
-All 4 FK issues touch shared validation/cascade paths. Safe execution order: (#925 + #923) first, then (#924 + #922).
-
-- **#925** FK runtime validation ignores ref_columns, enforces parent PK only.
-- **#923** FK NULL handling doesn't match PostgreSQL MATCH SIMPLE.
-- **#924** FK ON DELETE path uses stale child snapshots across multiple FKs. Depends on: #925.
-- **#922** FK self-referential constraints skipped in UPDATE/DELETE. Depends on: #925.
-
-### Correctness — Analyzer / SQL semantics
-
-- **#910** Mixed unknown binary ops miss SQLSTATE 42725 parity. → **#911** (test coverage).
-- **#601** Implement SET LOCAL (transaction-scoped settings). → **#884** (`current_setting()` + SET LOCAL rollback).
-- **#600** PostgreSQL-compatible defaults for SHOW on common GUCs. → **#599** (SHOW ALL).
-- **#408** Support UNNEST(...) as JOIN relation. Blocks: #885.
 - **#397/#396** Collated string index test mismatches.
 - **#395** ALTER TYPE test mismatch.
-- **#281** JSON/JSONB canonicalization mismatches (key order, whitespace). Blocks: #375.
 
 ### Usability — ORM compatibility
 
-- **#885** Activepieces drop-in compatibility. Depends on: #408, #601, remaining syntax gaps.
-- **#840** Prisma ORM remaining 6 test gaps (upsert, JSONB path, SERIALIZABLE). Depends on: Phase 1 correctness.
-- **#375** Dify compatibility (introspection, RETURNING, JSONB operators). Depends on: #281.
-- **#920** db9 CLI: `login --api-key` 401 chicken-and-egg auth bug. Independent.
+- **#885** Activepieces drop-in compatibility. Depends on: remaining syntax gaps.
+- **#840** Prisma ORM remaining test gaps (upsert, JSONB path, SERIALIZABLE).
+- **#375** Dify compatibility (introspection, RETURNING, JSONB operators).
 
 ### Performance (deferred)
 
@@ -142,7 +142,6 @@ All 4 FK issues touch shared validation/cascade paths. Safe execution order: (#9
 
 ### Testing / Infra
 
-- **#911** Broaden 42725 parity test coverage. Depends on: #910.
 - **#898** Handler-level on_parse fallback-path tests.
 - **#411** Enforce clippy policy.
 - **#317** integration_test NO_COLOR + diff on golden mismatch.
@@ -151,37 +150,27 @@ All 4 FK issues touch shared validation/cascade paths. Safe execution order: (#9
 ## Issue Resolution Map (Execution Order)
 
 ```
-Phase 0 — Quick wins (start now, parallel lanes)
-├── Lane T1: #898 || #317 || #419 || #411    [testing/infra, independent]
-├── Lane T2: #920                              [db9 CLI auth, independent]
-└── Lane T3: #700 → #699                      [admin portal: security before refactor]
-    Validation: cargo test, db9 CLI smoke, admin-portal E2E
+Phase 0 — Testing / Infra (parallel, independent)
+├── #898 || #317 || #419 || #411
+└── #700 → #699                      [admin portal: security before refactor]
+    Validation: cargo test, admin-portal E2E
 
-Phase 1 — Core correctness (highest priority)
-├── Lane C1 (FK):       (#925 + #923) → (#924 + #922)
-│   Shared: src/sql/dml/foreign_keys.rs, src/sql/ddl/alter_table.rs
-│   Validation: cargo test + SQL integration (FK-specific tests)
-├── Lane C2 (GUC):      #601 → #884
-│   Validation: cargo test + SHOW/SET integration tests
-├── Lane C3 (SHOW):     #600 → #599
-│   Validation: cargo test + psql SHOW ALL comparison vs PG 17.7
-├── Lane C4 (operator):  #910 → #911
-│   Validation: cargo test + SQLSTATE parity tests
-└── Lane C5 (SQL parity): #408 || #281 || #395 || #396 || #397
+Phase 1 — SQL parity (remaining)
+└── #395 || #396 || #397             [collated index + ALTER TYPE mismatches]
     Validation: cargo test + SQL integration + golden file diff vs PG 17.7
 
-Phase 2 — ORM compatibility (after Phase 1)
-├── #840 Prisma (depends on Phase 1 correctness lanes)
-├── #375 Dify (depends on #281)
-└── #885 Activepieces (depends on #840 + #375 + #408 + #601)
+Phase 2 — ORM compatibility
+├── #840 Prisma
+├── #375 Dify
+└── #885 Activepieces (depends on #840 + #375)
     Validation: cargo test + orm-tests (npm test) + Activepieces migration suite
 
-Phase 3 — Performance (after Phase 1 stabilizes)
+Phase 3 — Performance
 ├── #857 → #707 (pre-materialization dedup, then plan cache)
 └── #708 (parallel execution, independent long-term track)
     Validation: cargo test + cargo bench + SQL integration
 
-Phase 4 — Architecture debt (parallel, after Phase 1 stabilizes)
+Phase 4 — Architecture debt (parallel)
 ├── Independent: #696 || #695 || #694 || #693
 └── #779 (sequential: connection caps → tenant QPS → timeout → memory)
     Validation: cargo test + cargo clippy
@@ -192,32 +181,82 @@ Phase 4 — Architecture debt (parallel, after Phase 1 stabilizes)
 ```
 pg-tikv/
 ├── src/
-│   ├── sql/
-│   │   ├── analyzer/          # Semantic analysis → AnalyzedQuery/TypedExpr
-│   │   ├── optimizer/         # CBO: LogicalPlan → PhysicalPlan → operators
-│   │   ├── operators/         # Physical operators (scan, join, sort, agg, window…)
-│   │   ├── executor/          # DDL/DML dispatch + select/analyzed/ path
-│   │   ├── expr/              # Expression system + functions/ (14 categories)
-│   │   ├── catalog/           # information_schema + pg_catalog (35+ views)
-│   │   ├── types/             # Type inference, coercion, mapping
-│   │   ├── binder/            # Legacy name binding
-│   │   ├── planner/           # Query planner (index selection, scan planning)
-│   │   ├── explain/           # EXPLAIN (uses analyzed pipeline)
-│   │   ├── triggers/           # Trigger subsystem (cache, before, queue, worker, enqueue, execute, claim, gc)
-│   │   ├── stats.rs           # TableStatsCache (per-tenant)
-│   │   └── ...
+│   ├── sql/                           # SQL engine (~118K lines)
+│   │   ├── analyzer/                  # Semantic analysis → AnalyzedQuery/TypedExpr
+│   │   │   ├── expr/                  # Expression analysis (coercion, functions, literals, operators)
+│   │   │   ├── query/                 # Query analysis (from_clause, group_by, projection, set_expr)
+│   │   │   └── types/                 # Typed IR definitions (TypedExpr, AnalyzedQuery)
+│   │   ├── optimizer/                 # CBO: LogicalPlan → PhysicalPlan → operators
+│   │   │   ├── logical_planner/       # AnalyzedQuery → LogicalPlan
+│   │   │   ├── physical_planner/      # LogicalPlan → PhysicalPlan
+│   │   │   ├── build/                 # PhysicalPlan → BoxedOperator (scan, join, aggregate)
+│   │   │   ├── rewrite/               # Plan rewrites (decorrelation, predicate pushdown)
+│   │   │   ├── join_reorder/          # Cost-based join reordering (DPccp algorithm)
+│   │   │   └── selectivity/           # Selectivity estimation from column statistics
+│   │   ├── operators/                 # Physical operators (Volcano iterator model)
+│   │   │   ├── hash_join/             # Equi-join with hash table
+│   │   │   ├── hash_semi_join.rs      # Semi/anti-join for EXISTS decorrelation
+│   │   │   └── window/                # Window functions (access, aggregates, ranking)
+│   │   ├── executor/                  # DDL/DML dispatch + SELECT execution
+│   │   │   ├── core/                  # Statement dispatch + infrastructure
+│   │   │   │   ├── dispatch/          # Statement routing (mod.rs, prepared.rs, utils.rs)
+│   │   │   │   ├── view_rewrite/      # View expansion (expr.rs, query.rs, table.rs)
+│   │   │   │   └── catalog_prefetch/  # Batch catalog lookups
+│   │   │   ├── select/analyzed/       # Single-path SELECT executor
+│   │   │   ├── dml_analyzed/          # Analyzed INSERT/UPDATE/DELETE
+│   │   │   └── procedure/             # Stored procedures + materialized views
+│   │   ├── expr/                      # Expression system
+│   │   │   ├── typed_eval/            # Runtime evaluator (arithmetic, helpers)
+│   │   │   ├── traverse/              # Expression tree traversal
+│   │   │   └── functions/             # 14 categories (array…vector)
+│   │   ├── catalog/                   # information_schema + pg_catalog + cron (40+ views)
+│   │   ├── types/                     # Type inference, coercion, mapping
+│   │   │   ├── registry/              # FunctionRegistry (aggregate_window, json, math, misc, string, system, temporal)
+│   │   │   └── cast/                  # CAST between types
+│   │   ├── ddl/                       # DDL: CREATE/ALTER/DROP (alter_table, create_index, create_table, drop, view)
+│   │   ├── dml/                       # DML helpers: defaults, foreign_keys, insert, update, delete
+│   │   ├── session/                   # Per-session state (settings, transaction)
+│   │   ├── planner/                   # Index selection, scan strategy, expression-index support
+│   │   ├── explain/                   # EXPLAIN output (format, transform)
+│   │   ├── triggers/                  # Trigger subsystem (cache, before, rewrite, enqueue, execute)
+│   │   ├── sequences/                 # SEQUENCE management (DDL, eval, replace)
+│   │   ├── rewriter/                  # SQL rewriter (flatten, remap)
+│   │   ├── plpgsql/                   # PL/pgSQL parser + executor
+│   │   ├── parser/                    # SQL parser (operator_rewrite, preprocess, tokenizer)
+│   │   ├── binder/                    # Legacy name binding
+│   │   └── stats.rs                   # TableStatsCache (per-tenant)
 │   ├── protocol/
-│   │   └── handler/           # pgwire handler (dynamic/ module: mod.rs, query.rs, copy.rs, startup.rs)
+│   │   ├── copy_format.rs             # COPY format parsing (CSV, TEXT, BINARY)
+│   │   └── handler/                   # pgwire handler
+│   │       ├── dynamic/               # DynamicPgHandler (mod.rs, query.rs, copy.rs, startup.rs)
+│   │       ├── encode/                # Value encoding + type mapping
+│   │       ├── params/                # Parameter counting + decoding
+│   │       ├── copy/                  # COPY context management
+│   │       ├── portal.rs              # Portal state + suspended queries
+│   │       ├── query_parser.rs        # TipgQueryParser (pgwire QueryParser trait)
+│   │       ├── server_params.rs       # ParameterStatus provider
+│   │       ├── tenant.rs              # Multi-tenancy username parsing
+│   │       └── errors.rs              # SQLSTATE mapping + error helpers
 │   ├── storage/
-│   ├── extensions/            # HTTP extensions + fs9 file operations
-│   ├── auth/
-│   ├── types/
-│   ├── txn/                   # Transaction state + savepoints
-│   ├── pool.rs
-│   ├── tls.rs
-│   └── main.rs
-├── tests/         # SQL integration tests
-├── orm-tests/     # TypeORM, Prisma, Sequelize compatibility
+│   │   ├── encoding/                  # Key encoding (data_keys, metadata_keys, value_encoding, serialization)
+│   │   ├── tikv_store/               # TiKV operations (tables, indexes, schemas, sequences, cron, worker, statistics, migrations)
+│   │   └── kv_stats.rs               # KV read statistics tracking (task-local)
+│   ├── worker/                        # Unified async task engine (Cron, AsyncTrigger, AutoAnalyze, BgDdl, BgSql)
+│   ├── cron/                          # pg_cron-compatible scheduler (parser, types, config, worker, process_list)
+│   ├── extensions/                    # HTTP extensions + fs9 file system (backend, decoders, streaming, glob)
+│   ├── auth/                          # Authentication + RBAC
+│   ├── types/                         # Type system (separate from sql/types/ — debt #695)
+│   ├── txn/                           # Transaction state + savepoints
+│   ├── main.rs                        # Server entry point (TLS, worker/cron startup)
+│   ├── cli.rs                         # CLI argument parser
+│   ├── config.rs                      # Server configuration
+│   ├── session_context.rs             # Tokio task-local session context
+│   ├── observability.rs               # Logging, tracing, metrics
+│   ├── pool.rs                        # TiKV connection pool
+│   └── tls.rs                         # TLS setup
+├── docs/                              # Architecture + feature docs
+├── tests/                             # SQL integration tests (557 test files)
+├── orm-tests/                         # TypeORM, Prisma, Sequelize compatibility
 └── scripts/
 ```
 
@@ -226,19 +265,28 @@ pg-tikv/
 | Task | Location |
 |------|----------|
 | Add SQL function | `src/sql/expr/functions/` (14 categories: array, datetime, encoding, fs9, fts, json, math, misc, pg_compat, regex, string, uuid, vector) |
-| Add SQL statement | `src/sql/executor/` (DDL in `ddl.rs`, DML in `dml_analyzed/` (insert.rs, update.rs, delete.rs), SELECT in `select/analyzed/`) |
+| Add SQL statement | `src/sql/executor/` (DDL in `ddl.rs`/`ddl/`, DML in `dml_analyzed/`, SELECT in `select/analyzed/`) |
 | Fix type inference | `src/sql/types/infer.rs` |
 | Fix analyzer / name resolution | `src/sql/analyzer/` (query/, expr/, scope.rs) |
-| Optimizer / query planning | `src/sql/optimizer/` (logical_planner/ → physical_planner/ → build/) |
-| Physical operators | `src/sql/operators/` (scan, join, hash_join, sort, aggregate, window, etc.) |
+| Optimizer / query planning | `src/sql/optimizer/` (logical_planner/ → rewrite/ → physical_planner/ → build/) |
+| Join reordering | `src/sql/optimizer/join_reorder/` (algorithms.rs, cost.rs, predicates.rs) |
+| Subquery decorrelation | `src/sql/optimizer/rewrite/decorrelate.rs` |
+| Physical operators | `src/sql/operators/` (scan, join, hash_join/, hash_semi_join, sort, aggregate, window/, etc.) |
 | Index planning / scan strategy | `src/sql/planner/` (mod.rs, index_selection.rs, predicate.rs, scan_type.rs) |
 | EXPLAIN output | `src/sql/explain/` (mod.rs, format.rs, transform.rs) |
 | Add PostgreSQL type mapping | `src/protocol/handler/encode/types.rs` |
 | Change key encoding | `src/storage/encoding/` (data_keys.rs, metadata_keys.rs, value_encoding.rs, serialization.rs) |
-| Catalog / pg_catalog views | `src/sql/catalog/` (35+ pg_* view implementations) |
-| Multi-tenancy | `src/pool.rs` + username parsing in handler |
-| Triggers | `src/sql/triggers/` (cache, before, queue, worker, enqueue, execute, claim, gc) + `src/sql/executor/triggers.rs` (DDL) |
+| Catalog / pg_catalog views | `src/sql/catalog/` (40+ virtual table implementations) |
+| Multi-tenancy | `src/pool.rs` + `src/protocol/handler/tenant.rs` |
+| Triggers | `src/sql/triggers/` (cache, before, rewrite, enqueue, execute) + `src/sql/executor/triggers.rs` (DDL) |
 | Transaction state | `src/txn/` (state.rs, savepoints.rs) |
+| Session state / GUCs | `src/sql/session/` (mod.rs, settings.rs, transaction.rs) + `src/session_context.rs` |
+| Worker / background tasks | `src/worker/` (engine.rs, types.rs, config.rs, gc.rs, metrics.rs) |
+| Cron scheduling | `src/cron/` (parser.rs, types.rs, config.rs, worker.rs, process_list.rs) |
+| DDL (CREATE/ALTER/DROP) | `src/sql/ddl/` (alter_table.rs, create_index.rs, create_table.rs, drop.rs, view.rs) |
+| DML helpers / FK validation | `src/sql/dml/` (foreign_keys.rs, defaults.rs, insert.rs, update.rs, delete.rs) |
+| PL/pgSQL | `src/sql/plpgsql/` (parser.rs, executor.rs, utils.rs) |
+| fs9 file operations | `src/extensions/fs/` (mod.rs, backend.rs, decoders.rs, streaming.rs, glob.rs) |
 
 ## Build & Test Commands
 
@@ -257,8 +305,15 @@ cd orm-tests && npm test
 - Do not update expected outputs blindly; validate against real PostgreSQL first.
 - **Before changing any `.expected`, `.errors`, or `.assert` file, you MUST run the corresponding `.sql` against real PostgreSQL 17.7 and verify the new expected output matches PG's actual output.** No exceptions — guessing what PG returns is not acceptable.
 
-## Child AGENTS.md
+## Documentation
 
-- `src/sql/AGENTS.md` - SQL execution details
+- `docs/architecture.md` - Full architecture design document
+- `src/sql/AGENTS.md` - SQL execution layer details
 - `src/protocol/AGENTS.md` - Wire protocol details
 - `src/storage/AGENTS.md` - Storage layer details
+- `docs/worker.md` - Worker engine deep dive
+- `docs/extensions.md` - Extension functions
+- `docs/fs9_extension.md` - fs9 filesystem extension
+- `docs/authentication.md` - Auth/RBAC
+- `docs/multi-tenancy.md` - Keyspace isolation
+- `docs/prepared-statement-contract.md` - Prepared statement semantics
