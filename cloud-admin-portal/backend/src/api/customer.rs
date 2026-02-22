@@ -1,13 +1,17 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::{Html, IntoResponse};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+use serde::Deserialize;
+
 use crate::auth::CustomerAuth;
 use crate::db;
+use crate::device_code::DeviceCodeStatus;
 use crate::error::AppError;
 use crate::models::*;
 use crate::services::pd_client::PdClient;
@@ -62,6 +66,12 @@ pub fn router() -> Router<AppState> {
             post(apply_database_migration).get(list_database_migrations),
         )
         .route("/databases/:database_id/branch", post(branch_database))
+        .route("/device-code", post(create_device_code))
+        .route("/device-token", post(poll_device_token))
+        .route(
+            "/device-verify",
+            get(device_verify_page).post(device_verify_submit),
+        )
 }
 
 // ── Helper functions ────────────────────────────────────────────
@@ -1791,4 +1801,216 @@ pub async fn delete_database_user(
     Ok(Json(MessageResponse {
         message: format!("User '{username}' deleted"),
     }))
+}
+
+// ── Device Code Flow ────────────────────────────────────────────
+
+pub async fn create_device_code(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<DeviceCodeResponse>, AppError> {
+    let entry = state.device_codes.create();
+
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("https");
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    let verification_uri = format!(
+        "{scheme}://{host}/api/customer/device-verify?code={}",
+        entry.user_code
+    );
+
+    Ok(Json(DeviceCodeResponse {
+        device_code: entry.device_code,
+        user_code: entry.user_code,
+        verification_uri,
+        expires_in: 600,
+        interval: 5,
+    }))
+}
+
+pub async fn poll_device_token(
+    State(state): State<AppState>,
+    Json(req): Json<DeviceTokenRequest>,
+) -> impl IntoResponse {
+    let entry = match state.device_codes.poll_and_consume(&req.device_code) {
+        Some(e) => e,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "expired_token"})),
+            )
+        }
+    };
+
+    match entry.status {
+        DeviceCodeStatus::Pending => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "authorization_pending"})),
+        ),
+        DeviceCodeStatus::Approved { token, expires_at } => (
+            StatusCode::OK,
+            Json(serde_json::json!({"token": token, "expires_at": expires_at})),
+        ),
+        DeviceCodeStatus::Denied => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "access_denied"})),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct DeviceVerifyQuery {
+    code: Option<String>,
+}
+
+pub async fn device_verify_page(
+    Query(q): Query<DeviceVerifyQuery>,
+) -> Html<String> {
+    let raw = q.code.unwrap_or_default();
+    let code: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(9)
+        .collect();
+    Html(format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>db9 — Authorize Device</title>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #0a0a0a; color: #e0e0e0; display: flex; justify-content: center;
+         align-items: center; min-height: 100vh; }}
+  .card {{ background: #1a1a1a; border: 1px solid #333; border-radius: 12px;
+           padding: 2rem; width: 100%; max-width: 400px; }}
+  h1 {{ font-size: 1.4rem; margin-bottom: 0.5rem; }}
+  p {{ color: #888; font-size: 0.9rem; margin-bottom: 1.5rem; }}
+  label {{ display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 0.3rem; }}
+  input {{ width: 100%; padding: 0.6rem 0.8rem; background: #111; border: 1px solid #333;
+          border-radius: 6px; color: #e0e0e0; font-size: 0.95rem; margin-bottom: 1rem; }}
+  input:focus {{ outline: none; border-color: #dc150b; }}
+  button {{ width: 100%; padding: 0.7rem; background: #dc150b; color: #fff; border: none;
+           border-radius: 6px; font-size: 1rem; cursor: pointer; }}
+  button:hover {{ background: #b01209; }}
+  .code-display {{ text-align: center; font-family: 'JetBrains Mono', monospace;
+                   font-size: 1.8rem; letter-spacing: 0.15em; color: #dc150b;
+                   margin-bottom: 1.5rem; padding: 0.8rem; background: #111;
+                   border-radius: 8px; border: 1px dashed #333; }}
+  .msg {{ text-align: center; padding: 1rem; border-radius: 8px; margin-top: 1rem; }}
+  .msg.ok {{ background: #0a2e0a; color: #4ade80; }}
+  .msg.err {{ background: #2e0a0a; color: #f87171; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Authorize Device</h1>
+  <p>Confirm the code shown in your terminal, then log in to authorize.</p>
+  <div class="code-display" id="code-display">{code}</div>
+  <form id="form">
+    <input type="hidden" name="user_code" id="user_code" value="{code}">
+    <label for="email">Email</label>
+    <input type="email" id="email" name="email" required autofocus>
+    <label for="password">Password</label>
+    <input type="password" id="password" name="password" required>
+    <button type="submit">Authorize</button>
+  </form>
+  <div id="msg" class="msg" style="display:none"></div>
+</div>
+<script>
+document.getElementById('form').addEventListener('submit', async (e) => {{
+  e.preventDefault();
+  const msg = document.getElementById('msg');
+  const btn = e.target.querySelector('button');
+  btn.disabled = true; btn.textContent = 'Authorizing…';
+  try {{
+    const resp = await fetch(window.location.pathname, {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{
+        user_code: document.getElementById('user_code').value,
+        email: document.getElementById('email').value,
+        password: document.getElementById('password').value,
+      }})
+    }});
+    const data = await resp.json();
+    if (resp.ok) {{
+      msg.className = 'msg ok'; msg.textContent = '✓ Device authorized! You can close this window.';
+      msg.style.display = 'block';
+      document.getElementById('form').style.display = 'none';
+    }} else {{
+      msg.className = 'msg err'; msg.textContent = data.message || 'Authorization failed';
+      msg.style.display = 'block';
+      btn.disabled = false; btn.textContent = 'Authorize';
+    }}
+  }} catch {{ msg.className = 'msg err'; msg.textContent = 'Network error';
+             msg.style.display = 'block'; btn.disabled = false; btn.textContent = 'Authorize'; }}
+}});
+</script>
+</body>
+</html>"#
+    ))
+}
+
+pub async fn device_verify_submit(
+    State(state): State<AppState>,
+    Json(req): Json<DeviceVerifyRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let _entry = state
+        .device_codes
+        .lookup_by_user_code(&req.user_code)
+        .ok_or_else(|| {
+            AppError::new(StatusCode::BAD_REQUEST, "Invalid or expired device code")
+        })?;
+
+    let customer = db::get_customer_by_email(&state.db, &req.email)
+        .await?
+        .ok_or_else(|| AppError::unauthorized("Invalid email or password"))?;
+
+    use argon2::{Argon2, PasswordHash, PasswordVerifier};
+    let parsed_hash = PasswordHash::new(&customer.password_hash)
+        .map_err(|_| AppError::internal("Invalid stored password hash"))?;
+    Argon2::default()
+        .verify_password(req.password.as_bytes(), &parsed_hash)
+        .map_err(|_| AppError::unauthorized("Invalid email or password"))?;
+
+    use rand::RngCore;
+    let mut token_bytes = [0u8; 64];
+    rand::thread_rng().fill_bytes(&mut token_bytes);
+    let token = token_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    let hash_bytes = Sha256::digest(token.as_bytes());
+    let token_hash = hash_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    let expires_at = (chrono::Utc::now() + chrono::Duration::days(90)).to_rfc3339();
+    let token_id = uuid::Uuid::new_v4().to_string();
+
+    db::create_customer_token(
+        &state.db,
+        &token_id,
+        &customer.id,
+        &token_hash,
+        "device-code",
+        &expires_at,
+    )
+    .await?;
+
+    state
+        .device_codes
+        .approve(&req.user_code, token, expires_at);
+
+    Ok(Json(serde_json::json!({"status": "approved"})))
 }
