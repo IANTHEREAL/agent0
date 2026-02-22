@@ -1,4 +1,4 @@
-ERROR:  insert or update on table "fk_child_cmp" violates foreign key constraint "fk_child_cmp_a_b_fkey"
+psql:tests/100_fk_null_and_unique_ref.sql:86: ERROR:  insert or update on table "fk_child_cmp" violates foreign key constraint "fk_child_cmp_a_b_fkey"
 DETAIL:  Key (a, b)=(9, 99) is not present in table "fk_parent_cmp".
 id|a|b
 1|NULL|1
@@ -6,13 +6,13 @@ id|a|b
 3|NULL|NULL
 4|1|1
 (4 rows)
-ERROR:  insert or update on table "fk_child_pk" violates foreign key constraint "fk_child_pk_pid_fkey"
+psql:tests/100_fk_null_and_unique_ref.sql:103: ERROR:  insert or update on table "fk_child_pk" violates foreign key constraint "fk_child_pk_pid_fkey"
 DETAIL:  Key (pid)=(99) is not present in table "fk_parent_pk".
 id|pid
 1|10
 2|NULL
 (2 rows)
-ERROR:  insert or update on table "fk_child_unique_ref" violates foreign key constraint "fk_child_unique_ref_code_fkey"
+psql:tests/100_fk_null_and_unique_ref.sql:121: ERROR:  insert or update on table "fk_child_unique_ref" violates foreign key constraint "fk_child_unique_ref_code_fkey"
 DETAIL:  Key (code)=(Z) is not present in table "fk_parent_unique".
 id|code
 1|A
@@ -25,16 +25,16 @@ id|code
 id|code
 2|NULL
 (1 row)
-ERROR:  number of referencing and referenced columns for foreign key disagree
-ERROR:  number of referencing and referenced columns for foreign key disagree
-ERROR:  there is no primary key for referenced table "fk_parent_no_pk"
-ERROR:  insert or update on table "fk_child_omit" violates foreign key constraint "fk_child_omit_pid_fkey"
+psql:tests/100_fk_null_and_unique_ref.sql:145: ERROR:  number of referencing and referenced columns for foreign key disagree
+psql:tests/100_fk_null_and_unique_ref.sql:155: ERROR:  number of referencing and referenced columns for foreign key disagree
+psql:tests/100_fk_null_and_unique_ref.sql:165: ERROR:  there is no primary key for referenced table "fk_parent_no_pk"
+psql:tests/100_fk_null_and_unique_ref.sql:180: ERROR:  insert or update on table "fk_child_omit" violates foreign key constraint "fk_child_omit_pid_fkey"
 DETAIL:  Key (pid)=(2) is not present in table "fk_parent_omit".
 id|pid
 1|1
 2|NULL
 (2 rows)
-ERROR:  insert or update on table "fk_alter_child" violates foreign key constraint "fk_alter_child_ab_fkey"
+psql:tests/100_fk_null_and_unique_ref.sql:207: ERROR:  insert or update on table "fk_alter_child" violates foreign key constraint "fk_alter_child_ab_fkey"
 DETAIL:  Key (a, b)=(9, 9) is not present in table "fk_alter_parent".
 id|a|b
 1|1|1
@@ -42,7 +42,7 @@ id|a|b
 3|1|NULL
 4|NULL|NULL
 (4 rows)
-ERROR:  update or delete on table "fk_parent_del" violates foreign key constraint "fk_child_restrict_pid_fkey" on table "fk_child_restrict"
+psql:tests/100_fk_null_and_unique_ref.sql:229: ERROR:  update or delete on table "fk_parent_del" violates foreign key constraint "fk_child_restrict_pid_fkey" on table "fk_child_restrict"
 DETAIL:  Key (id)=(1) is still referenced from table "fk_child_restrict".
 id
 1
@@ -53,7 +53,7 @@ id|pid
 id|pid
 1|1
 (1 row)
-ERROR:  insert or update on table "fk_alter_uniq_child" violates foreign key constraint "fk_alter_uniq_child_code_fkey"
+psql:tests/100_fk_null_and_unique_ref.sql:253: ERROR:  insert or update on table "fk_alter_uniq_child" violates foreign key constraint "fk_alter_uniq_child_code_fkey"
 DETAIL:  Key (code)=(INVALID) is not present in table "fk_alter_uniq_parent".
 id|code
 1|X
@@ -61,14 +61,15 @@ id|code
 id|code
 1|Z
 (1 row)
-ERROR:  update or delete on table "fk_impl_parent" violates foreign key constraint "fk_impl_child_pid_fkey" on table "fk_impl_child"
+psql:tests/100_fk_null_and_unique_ref.sql:289: ERROR:  update or delete on table "fk_impl_parent" violates foreign key constraint "fk_impl_child_pid_fkey" on table "fk_impl_child"
 DETAIL:  Key (id)=(1) is still referenced from table "fk_impl_child".
-ERROR:  update or delete on table "fk_self_restrict" violates foreign key constraint "fk_self_restrict_parent_id_fkey" on table "fk_self_restrict"
+psql:tests/100_fk_null_and_unique_ref.sql:298: ERROR:  update or delete on table "fk_self_restrict" violates foreign key constraint "fk_self_restrict_parent_id_fkey" on table "fk_self_restrict"
 DETAIL:  Key (id)=(1) is still referenced from table "fk_self_restrict".
 id|parent_id
 1|NULL
 2|1
 (2 rows)
+id|parent_id
 (0 rows)
 id|code|ref_code
 1|AA|NULL
@@ -77,18 +78,19 @@ id|code|ref_code
 id|code|ref_code
 1|AA|AA
 (1 row)
-ERROR:  update or delete on table "fk_self_row_restrict" violates foreign key constraint "fk_self_row_restrict_ref_code_fkey" on table "fk_self_row_restrict"
+psql:tests/100_fk_null_and_unique_ref.sql:336: ERROR:  update or delete on table "fk_self_row_restrict" violates foreign key constraint "fk_self_row_restrict_ref_code_fkey" on table "fk_self_row_restrict"
 DETAIL:  Key (code)=(A) is still referenced from table "fk_self_row_restrict".
 id|code|ref_code
 1|A|A
 (1 row)
+id|ref_id
 (0 rows)
-ERROR:  insert or update on table "fk_self_insert_pk" violates foreign key constraint "fk_self_insert_pk_parent_id_fkey"
+psql:tests/100_fk_null_and_unique_ref.sql:356: ERROR:  insert or update on table "fk_self_insert_pk" violates foreign key constraint "fk_self_insert_pk_parent_id_fkey"
 DETAIL:  Key (parent_id)=(99) is not present in table "fk_self_insert_pk".
 id|parent_id
 1|1
 (1 row)
-ERROR:  insert or update on table "fk_self_insert_unique" violates foreign key constraint "fk_self_insert_unique_ref_code_fkey"
+psql:tests/100_fk_null_and_unique_ref.sql:366: ERROR:  insert or update on table "fk_self_insert_unique" violates foreign key constraint "fk_self_insert_unique_ref_code_fkey"
 DETAIL:  Key (ref_code)=(Z) is not present in table "fk_self_insert_unique".
 id|code|ref_code
 1|A|A
@@ -96,25 +98,26 @@ id|code|ref_code
 id|parent_id
 2|2
 (1 row)
-ERROR:  insert or update on table "fk_self_update_pk" violates foreign key constraint "fk_self_update_pk_parent_id_fkey"
+psql:tests/100_fk_null_and_unique_ref.sql:381: ERROR:  insert or update on table "fk_self_update_pk" violates foreign key constraint "fk_self_update_pk_parent_id_fkey"
 DETAIL:  Key (parent_id)=(99) is not present in table "fk_self_update_pk".
 id|parent_id
 2|2
 4|2
 (2 rows)
-ERROR:  insert or update on table "fk_self_composite" violates foreign key constraint "fk_self_composite_ref_a_ref_b_fkey"
+psql:tests/100_fk_null_and_unique_ref.sql:392: ERROR:  insert or update on table "fk_self_composite" violates foreign key constraint "fk_self_composite_ref_a_ref_b_fkey"
 DETAIL:  Key (ref_a, ref_b)=(9, 9) is not present in table "fk_self_composite".
 a|b|ref_a|ref_b
 1|1|1|1
 (1 row)
-ERROR:  insert or update on table "fk_self_insert_other" violates foreign key constraint "fk_self_insert_other_parent_id_fkey"
+psql:tests/100_fk_null_and_unique_ref.sql:402: ERROR:  insert or update on table "fk_self_insert_other" violates foreign key constraint "fk_self_insert_other_parent_id_fkey"
 DETAIL:  Key (parent_id)=(5) is not present in table "fk_self_insert_other".
 id|parent_id
 1|NULL
 2|1
 (2 rows)
+id|parent_id
 (0 rows)
-ERROR:  update or delete on table "fk_self_noaction_all" violates foreign key constraint "fk_self_noaction_all_parent_id_fkey" on table "fk_self_noaction_all"
+psql:tests/100_fk_null_and_unique_ref.sql:417: ERROR:  update or delete on table "fk_self_noaction_all" violates foreign key constraint "fk_self_noaction_all_parent_id_fkey" on table "fk_self_noaction_all"
 DETAIL:  Key (id)=(1) is still referenced from table "fk_self_noaction_all".
 id|parent_id
 1|NULL
@@ -124,6 +127,7 @@ id|parent_id
 id|parent_id
 3|NULL
 (1 row)
+id|parent_id
 (0 rows)
 id|a|b
 10|NULL|NULL
@@ -141,12 +145,12 @@ id|a|b|ref_a|ref_b
 1|NULL|10|NULL|NULL
 2|NULL|20|NULL|10
 (2 rows)
-ERROR:  update or delete on table "fk924f_parent" violates foreign key constraint "fk924f_child_pid_fkey" on table "fk924f_child"
+psql:tests/100_fk_null_and_unique_ref.sql:511: ERROR:  update or delete on table "fk924f_parent" violates foreign key constraint "fk924f_child_pid_fkey" on table "fk924f_child"
 DETAIL:  Key (id)=(1) is still referenced from table "fk924f_child".
 id|pid
 1|1
 (1 row)
-ERROR:  insert or update on table "fk_comp_uniq_child" violates foreign key constraint "fk_comp_uniq_child_pa_pb_fkey"
+psql:tests/100_fk_null_and_unique_ref.sql:525: ERROR:  insert or update on table "fk_comp_uniq_child" violates foreign key constraint "fk_comp_uniq_child_pa_pb_fkey"
 DETAIL:  Key (pa, pb)=(10, 99) is not present in table "fk_comp_uniq_parent".
 id|pa|pb
 1|11|20
@@ -166,7 +170,7 @@ id|a|b|ref_a|ref_b
 1|NULL|10|NULL|NULL
 2|NULL|20|NULL|10
 (2 rows)
-ERROR:  update or delete on table "fk_upd_sd_err_parent" violates foreign key constraint "fk_upd_sd_err_child_pid_fkey" on table "fk_upd_sd_err_child"
+psql:tests/100_fk_null_and_unique_ref.sql:593: ERROR:  update or delete on table "fk_upd_sd_err_parent" violates foreign key constraint "fk_upd_sd_err_child_pid_fkey" on table "fk_upd_sd_err_child"
 DETAIL:  Key (id)=(1) is still referenced from table "fk_upd_sd_err_child".
 id
 1

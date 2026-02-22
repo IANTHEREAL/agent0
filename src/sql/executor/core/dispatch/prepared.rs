@@ -397,7 +397,7 @@ impl Executor {
         self.execute(session, sql).await
     }
 
-    async fn execute_prepared_on_txn(
+    pub(in crate::sql::executor::core) async fn execute_prepared_on_txn(
         &self,
         txn: &mut Transaction,
         db_id: u64,

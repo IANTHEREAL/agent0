@@ -179,7 +179,7 @@ impl Executor {
                 "system".to_string(),
                 128,
             );
-            let result: Result<(), anyhow::Error> = async {
+            let result: Result<bool, anyhow::Error> = async {
                 let mut txn = store.begin().await?;
                 let existing = store
                     .scan_queue_entries_for_task(&mut txn, &keyspace, db_id, table_id as i64)
@@ -202,14 +202,19 @@ impl Executor {
                         )
                         .await?;
                     txn.commit().await?;
+                    Ok(true)
                 } else {
                     txn.rollback().await.ok();
+                    Ok(false)
                 }
-                Ok(())
             }
             .await;
-            if let Err(e) = result {
-                tracing::warn!("Failed to enqueue auto-ANALYZE for {}: {}", table_name, e);
+            match result {
+                Ok(true) => crate::worker::wake_worker(),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!("Failed to enqueue auto-ANALYZE for {}: {}", table_name, e);
+                }
             }
         });
     }

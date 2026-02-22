@@ -55,7 +55,9 @@ pub(super) async fn delete_row_storage_entries(
         .await?;
 
     for index in &schema.indexes {
-        if matches!(index.state, IndexState::Building | IndexState::Invalid) {
+        if matches!(index.state, IndexState::Invalid)
+            || (matches!(index.state, IndexState::Building) && !index.unique)
+        {
             continue;
         }
         let gin_hashes = extract_gin_token_hashes_from_row(schema, index, row)?;

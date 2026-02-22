@@ -73,6 +73,7 @@ class TestConfig:
     db: DbConfig = field(default_factory=DbConfig)
     verbose: bool = False
     stop_on_error: bool = False
+    clean_start_external: bool = True
     test_files: List[Path] = field(default_factory=list)
 
 
@@ -468,11 +469,16 @@ def _normalize_pipe_line(line: str) -> str:
 def _assert_contains(output: str, needle: str) -> bool:
     if needle in output:
         return True
-    if "|" not in needle:
-        return False
-    normalized_output = "\n".join(_normalize_pipe_line(line) for line in output.splitlines())
-    normalized_needle = _normalize_pipe_line(needle)
-    return normalized_needle in normalized_output
+    if "|" in needle:
+        normalized_output = "\n".join(_normalize_pipe_line(line) for line in output.splitlines())
+        normalized_needle = _normalize_pipe_line(needle)
+        if normalized_needle in normalized_output:
+            return True
+        # JSON text formatting can differ only by insignificant spaces.
+        return normalize_json_whitespace(normalized_needle) in normalize_json_whitespace(
+            normalized_output
+        )
+    return False
 
 
 def check_connection() -> bool:
@@ -707,8 +713,136 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
     return TestResult.PASSED
 
 
+def _quote_ident(ident: str) -> str:
+    return '"' + ident.replace('"', '""') + '"'
+
+
+_ROW_COUNT_RE = re.compile(r"^\(\d+ rows?\)$")
+
+
+def _parse_unaligned_single_column(output: str, header: str) -> List[str]:
+    lines: List[str] = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if _ROW_COUNT_RE.match(line):
+            continue
+        lines.append(line)
+
+    if lines and lines[0] == header:
+        lines = lines[1:]
+    return lines
+
+
+def _clean_database_in_place(database: str) -> bool:
+    ext_output, ext_code = run_sql(
+        "SELECT extname FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY extname",
+        database=database,
+    )
+    if ext_code != 0:
+        log_error(f"Failed to list extensions in database '{database}'")
+        print(ext_output[:400])
+        return False
+
+    extensions = _parse_unaligned_single_column(ext_output, "extname")
+    for ext in extensions:
+        drop_ext_output, drop_ext_code = run_sql(
+            f"DROP EXTENSION IF EXISTS {_quote_ident(ext)} CASCADE",
+            database=database,
+        )
+        if drop_ext_code != 0:
+            log_error(f"Failed to drop extension '{ext}' in database '{database}'")
+            print(drop_ext_output[:400])
+            return False
+
+    schema_output, schema_code = run_sql(
+        "SELECT nspname FROM pg_namespace "
+        "WHERE nspname NOT LIKE 'pg_%' "
+        "AND nspname NOT IN ('information_schema', 'extensions', 'public') "
+        "ORDER BY nspname",
+        database=database,
+    )
+    if schema_code != 0:
+        log_error(f"Failed to list schemas in database '{database}'")
+        print(schema_output[:400])
+        return False
+
+    schemas = _parse_unaligned_single_column(schema_output, "nspname")
+    for schema in schemas:
+        drop_schema_output, drop_schema_code = run_sql(
+            f"DROP SCHEMA IF EXISTS {_quote_ident(schema)} CASCADE",
+            database=database,
+        )
+        if drop_schema_code != 0:
+            log_error(f"Failed to drop schema '{schema}' in database '{database}'")
+            print(drop_schema_output[:400])
+            return False
+
+    return True
+
+
+def clean_external_test_database() -> bool:
+    target_db = config.db.database
+    if target_db == "postgres":
+        log_info(
+            "Target database is system database 'postgres'; applying in-place cleanup"
+        )
+        ok = _clean_database_in_place(database=target_db)
+        if ok:
+            log_info("External-test database cleanup complete")
+        return ok
+
+    maintenance_db = "postgres"
+
+    log_info(
+        f"Resetting external-test database '{target_db}' via maintenance DB '{maintenance_db}'"
+    )
+
+    maintenance_ping_output, maintenance_ping_code = run_sql(
+        "SELECT 1",
+        database=maintenance_db,
+    )
+    if maintenance_ping_code != 0:
+        log_error(f"Cannot connect to maintenance database '{maintenance_db}'")
+        print(maintenance_ping_output[:400])
+        return False
+
+    drop_target_output, drop_target_code = run_sql(
+        f"DROP DATABASE {_quote_ident(target_db)}",
+        database=maintenance_db,
+    )
+    if drop_target_code != 0 and "does not exist" not in drop_target_output.lower():
+        log_error(f"Failed to drop target database '{target_db}'")
+        print(drop_target_output[:400])
+        return False
+
+    create_target_output, create_target_code = run_sql(
+        f"CREATE DATABASE {_quote_ident(target_db)}",
+        database=maintenance_db,
+    )
+    if create_target_code != 0:
+        log_error(f"Failed to recreate target database '{target_db}'")
+        print(create_target_output[:400])
+        return False
+
+    target_ping_output, target_ping_code = run_sql("SELECT 1", database=target_db)
+    if target_ping_code != 0:
+        log_error(f"Cannot reconnect to recreated target database '{target_db}'")
+        print(target_ping_output[:400])
+        return False
+
+    log_info("External-test database reset complete")
+    return True
+
+
 def run_external_tests(test_paths: List[Path]) -> TestStats:
     stats = TestStats()
+
+    if config.clean_start_external:
+        if not clean_external_test_database():
+            stats.failed += 1
+            return stats
 
     sql_files = []
     for path in test_paths:
@@ -1383,6 +1517,11 @@ Examples:
     parser.add_argument("--dsn", default=default_dsn, help="PostgreSQL connection DSN")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show SQL output")
     parser.add_argument("--stop-on-error", "-x", action="store_true", help="Stop on first error")
+    parser.add_argument(
+        "--no-clean-start",
+        action="store_true",
+        help="Preserve existing DB state for external SQL tests (skip cleanup)",
+    )
 
     args = parser.parse_args()
 
@@ -1390,6 +1529,7 @@ Examples:
         db=DbConfig.from_dsn(args.dsn),
         verbose=args.verbose,
         stop_on_error=args.stop_on_error,
+        clean_start_external=not args.no_clean_start,
         test_files=[Path(t) for t in args.tests] if args.tests else [],
     )
 

@@ -308,6 +308,7 @@ impl Executor {
                         )
                         .await?;
                     sys_txn.commit().await?;
+                    crate::worker::wake_worker();
                 }
 
                 Ok(ExecuteResult::RefreshMaterializedView {

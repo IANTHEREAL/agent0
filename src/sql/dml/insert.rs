@@ -139,7 +139,9 @@ pub async fn execute_insert_row(
         Ok(pk_values) => {
             let mut created_index_entries: Vec<(u64, Vec<Value>, bool)> = Vec::new();
             for index in &schema.indexes {
-                if matches!(index.state, IndexState::Building | IndexState::Invalid) {
+                if matches!(index.state, IndexState::Invalid)
+                    || (matches!(index.state, IndexState::Building) && !index.unique)
+                {
                     continue;
                 }
                 if !index_helpers::is_index_materializable(index) {
@@ -164,7 +166,10 @@ pub async fn execute_insert_row(
                 if let Err(e) = result {
                     if is_unique_duplicate_error(&e) {
                         if index.unique
-                            && matches!(index.state, IndexState::WriteOnly | IndexState::Ready)
+                            && matches!(
+                                index.state,
+                                IndexState::Building | IndexState::WriteOnly | IndexState::Ready
+                            )
                         {
                             match resolve_unique_index_conflict(
                                 store,

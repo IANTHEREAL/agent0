@@ -179,14 +179,15 @@ pub(super) fn extract_on_condition(condition: &JoinCondition) -> Option<TypedExp
 
 /// Extract equi-join key indices from a JoinCondition for hash join.
 ///
-/// Delegates to `join_keys::try_extract_equi_keys` for validated, rebased indices.
+/// Delegates to `join_keys::extract_equi_keys_with_residual` for validated,
+/// rebased indices and optional residual ON filter.
 /// Returns (left_key_indices, right_key_indices, optional_residual_filter).
 pub(super) fn extract_hash_join_keys(
     condition: &JoinCondition,
     left_width: usize,
 ) -> Result<(Vec<usize>, Vec<usize>, Option<TypedExpr>)> {
-    match crate::sql::optimizer::join_keys::try_extract_equi_keys(condition, left_width) {
-        Some((left_keys, right_keys)) => Ok((left_keys, right_keys, None)),
+    match crate::sql::optimizer::join_keys::extract_equi_keys_with_residual(condition, left_width) {
+        Some((left_keys, right_keys, residual)) => Ok((left_keys, right_keys, residual)),
         None => match condition {
             JoinCondition::None => Ok((vec![], vec![], None)),
             _ => Err(anyhow!(

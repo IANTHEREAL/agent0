@@ -14,6 +14,7 @@ pub(crate) use settings::SessionSettings;
 use crate::config::SharedServerConfig;
 use crate::observability::TenantObservability;
 use crate::sql::error::SqlError;
+use crate::sql::executor::core::prepared_stmt::PreparedStatement as SqlPreparedStatement;
 use crate::sql::query_context::QueryContext;
 use crate::storage::TikvStore;
 use crate::txn::SavepointState;
@@ -65,6 +66,8 @@ pub struct Session {
     /// Set by the protocol handler, consumed by `query_context_for_statement()`
     /// so they flow into `QUERY_PARAM_TYPES`.
     pending_param_types: Vec<Option<crate::types::DataType>>,
+    /// SQL PREPARE/EXECUTE statement cache (session-scoped, PostgreSQL semantics).
+    sql_prepared_statements: HashMap<String, SqlPreparedStatement>,
 }
 
 /// Force-insert or overwrite a setting in a sorted `(name, value, description)` vec.
@@ -113,6 +116,7 @@ impl Session {
             server_config: None,
             pending_params: vec![],
             pending_param_types: vec![],
+            sql_prepared_statements: HashMap::new(),
         }
     }
 
@@ -150,6 +154,7 @@ impl Session {
             server_config: None,
             pending_params: vec![],
             pending_param_types: vec![],
+            sql_prepared_statements: HashMap::new(),
         }
     }
 
@@ -238,6 +243,25 @@ impl Session {
     /// Consumed (drained) by `query_context_for_statement()`.
     pub fn set_pending_param_types(&mut self, types: Vec<Option<crate::types::DataType>>) {
         self.pending_param_types = types;
+    }
+
+    pub(crate) fn put_sql_prepared_statement(&mut self, name: String, stmt: SqlPreparedStatement) {
+        self.sql_prepared_statements.insert(name, stmt);
+    }
+
+    pub(crate) fn get_sql_prepared_statement_cloned(
+        &self,
+        name: &str,
+    ) -> Option<SqlPreparedStatement> {
+        self.sql_prepared_statements.get(name).cloned()
+    }
+
+    pub(crate) fn remove_sql_prepared_statement(&mut self, name: &str) -> bool {
+        self.sql_prepared_statements.remove(name).is_some()
+    }
+
+    pub(crate) fn clear_sql_prepared_statements(&mut self) {
+        self.sql_prepared_statements.clear();
     }
 
     /// Check if currently in a transaction block

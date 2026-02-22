@@ -117,30 +117,48 @@ impl TikvStore {
     /// Scan all due queue entries across all priorities (0-255) up to the given time.
     ///
     /// Returns entries ordered by priority (lower value = higher priority sorts first),
-    /// then by fire_time (earlier times sort first). This single range scan covers all
-    /// priority levels in one pass, ensuring higher-priority tasks are processed before
-    /// lower-priority ones regardless of fire_time.
+    /// then by fire_time (earlier times sort first).
+    ///
+    /// The queue key is ordered as `priority -> fire_time -> ...`, so a single upper bound
+    /// on `(priority=255, fire_time=now)` is not sufficient to constrain fire_time for
+    /// lower priorities. We therefore scan each priority range independently.
     pub async fn scan_due_queue_entries(
         &self,
         txn: &mut Transaction,
         now_ms: i64,
         limit: u32,
     ) -> Result<Vec<(Vec<u8>, TaskQueueEntry)>> {
-        let start = encode_worker_queue_prefix();
-        let end = encode_worker_queue_scan_end(255, now_ms);
-        let range: BoundRange = (start.clone()..end).into();
-        let scan_limit = scan_limit_to_u32(Some(limit as usize));
-        let pairs = txn.scan(range, scan_limit).await?;
-
         let mut results = Vec::new();
-        for pair in pairs {
-            let key: &[u8] = pair.key().as_ref().into();
-            if !key.starts_with(&start) {
-                continue;
+        if limit == 0 {
+            return Ok(results);
+        }
+
+        // Use `now+1ms` as exclusive upper bound so entries scheduled exactly at `now_ms`
+        // are included in the half-open range scan.
+        let due_exclusive = now_ms.saturating_add(1);
+
+        for priority in 0u8..=255 {
+            if results.len() >= limit as usize {
+                break;
             }
-            let entry: TaskQueueEntry = bincode::deserialize(pair.value())
-                .context("Failed to deserialize worker queue entry")?;
-            results.push((key.to_vec(), entry));
+
+            let mut start = encode_worker_queue_prefix();
+            start.push(priority);
+            let end = encode_worker_queue_scan_end(priority, due_exclusive);
+            let range: BoundRange = (start.clone()..end).into();
+            let remaining = limit as usize - results.len();
+            let scan_limit = scan_limit_to_u32(Some(remaining));
+            let pairs = txn.scan(range, scan_limit).await?;
+
+            for pair in pairs {
+                let key: &[u8] = pair.key().as_ref().into();
+                if !key.starts_with(&start) {
+                    continue;
+                }
+                let entry: TaskQueueEntry = bincode::deserialize(pair.value())
+                    .context("Failed to deserialize worker queue entry")?;
+                results.push((key.to_vec(), entry));
+            }
         }
         Ok(results)
     }

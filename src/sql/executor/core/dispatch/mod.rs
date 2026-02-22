@@ -9,7 +9,11 @@ use utils::{
     wrap_with_runtime_context, RuntimeSettings,
 };
 
+use super::prepared_analysis::PreparedAnalysis;
+use super::prepared_stmt::{PreparedExec, PreparedStatement};
 use super::*;
+use crate::sql::expr::bridge::eval_const_ast_expr;
+use crate::sql::types::sql_datatype_to_internal_strict;
 
 /// Dispatch a raw-SQL command: time it, record observability, handle txn failure.
 macro_rules! dispatch_raw {
@@ -65,6 +69,260 @@ fn build_show_all_result(session: &Session, timezone: Arc<str>) -> ExecuteResult
 }
 
 impl Executor {
+    async fn execute_sql_prepare_statement(
+        &self,
+        session: &mut Session,
+        name: &sqlparser::ast::Ident,
+        data_types: &[sqlparser::ast::DataType],
+        statement: &Statement,
+    ) -> Result<Vec<ExecuteResult>> {
+        let prepared_name = normalize_ident(name);
+        let prepared_sql = statement.to_string();
+
+        let mut client_oids: Vec<Option<DataType>> = Vec::with_capacity(data_types.len());
+        for sql_type in data_types {
+            client_oids.push(Some(sql_datatype_to_internal_strict(sql_type)?));
+        }
+
+        let is_autocommit = !session.is_in_transaction();
+        if is_autocommit {
+            session.begin().await?;
+        }
+
+        let db_id = session.current_database_id();
+        let analysis_result = {
+            let (txn, _sequence_values, search_path) = session
+                .get_mut_txn_sequence_values_and_search_path()
+                .expect("Transaction must be active");
+            self.analyze_for_prepared(
+                txn,
+                db_id,
+                search_path,
+                &prepared_sql,
+                client_oids.len(),
+                &client_oids,
+            )
+            .await
+        };
+
+        let analysis = match analysis_result {
+            Ok(analysis) => {
+                if is_autocommit {
+                    session.commit().await?;
+                    self.flush_trigger_activations();
+                }
+                analysis
+            }
+            Err(err) => {
+                if is_autocommit {
+                    session.rollback().await?;
+                    self.clear_trigger_activations();
+                }
+                return Err(err);
+            }
+        };
+
+        let prepared_stmt = match analysis {
+            PreparedAnalysis::Query {
+                analyzed,
+                locks,
+                select_into,
+                output_schema,
+                param_types,
+                base_table_names,
+                table_versions,
+                has_recursive_cte,
+            } => {
+                let required_privileges = base_table_names
+                    .into_iter()
+                    .map(|t| (t, crate::auth::Privilege::Select))
+                    .collect();
+                PreparedStatement {
+                    sql: prepared_sql,
+                    exec: PreparedExec::AnalyzedQuery {
+                        analyzed,
+                        locks,
+                        select_into,
+                        required_privileges,
+                        has_recursive_cte,
+                    },
+                    output_schema,
+                    param_data_types: param_types,
+                    table_versions,
+                }
+            }
+            PreparedAnalysis::Dml {
+                analyzed,
+                output_schema,
+                param_types,
+                table_versions,
+            } => {
+                let required_privileges = PreparedStatement::compute_privileges(&analyzed, &[]);
+                PreparedStatement {
+                    sql: prepared_sql,
+                    exec: PreparedExec::AnalyzedDml {
+                        analyzed,
+                        required_privileges,
+                    },
+                    output_schema,
+                    param_data_types: param_types,
+                    table_versions,
+                }
+            }
+            PreparedAnalysis::Utility => {
+                return Err(SqlError::Unsupported(
+                    "PREPARE only supports SELECT/INSERT/UPDATE/DELETE statements".to_string(),
+                )
+                .into());
+            }
+        };
+
+        session.put_sql_prepared_statement(prepared_name, prepared_stmt);
+        Ok(vec![ExecuteResult::CommandComplete { tag: "PREPARE" }])
+    }
+
+    async fn execute_sql_execute_statement(
+        &self,
+        session: &mut Session,
+        name: &sqlparser::ast::Ident,
+        parameters: &[Expr],
+    ) -> Result<Vec<ExecuteResult>> {
+        let prepared_name = normalize_ident(name);
+        let prepared = session
+            .get_sql_prepared_statement_cloned(&prepared_name)
+            .ok_or_else(|| {
+                SqlError::UndefinedObject(format!(
+                    "prepared statement \"{}\" does not exist",
+                    prepared_name
+                ))
+            })?;
+
+        if parameters.len() != prepared.param_data_types.len() {
+            return Err(SqlError::InvalidParameterUsage {
+                index: prepared.param_data_types.len().max(1),
+                context: format!(
+                    "prepared statement \"{}\" expects {} parameters, but {} were given",
+                    prepared_name,
+                    prepared.param_data_types.len(),
+                    parameters.len()
+                ),
+            }
+            .into());
+        }
+
+        let mut param_values: Vec<Option<Value>> = Vec::with_capacity(parameters.len());
+        for expr in parameters {
+            param_values.push(Some(eval_const_ast_expr(expr)?));
+        }
+
+        let statement_ts = statement_time::now_timestamp_millis();
+        let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
+        let mut qctx = session.query_context_for_statement(statement_ts, transaction_ts);
+        qctx.params = param_values;
+        if !prepared.param_data_types.is_empty() {
+            qctx.param_types = prepared
+                .param_data_types
+                .iter()
+                .cloned()
+                .map(Some)
+                .collect();
+        }
+        let qctx = Arc::new(qctx);
+        let savepoints = session.savepoints();
+
+        crate::sql::query_context::with_scoped_query_context(
+            qctx.as_ref(),
+            crate::txn::with_savepoints(savepoints, async {
+                let is_autocommit = !session.is_in_transaction();
+                let db_id = session.current_database_id();
+                let max_attempts = if is_autocommit { 10usize } else { 1usize };
+
+                for attempt in 0..max_attempts {
+                    if is_autocommit {
+                        session.begin().await?;
+                    }
+
+                    let timeout = session.statement_timeout();
+                    let current_role = session.current_user().map(|u| u.to_string());
+                    let fut = async {
+                        let (txn, sequence_values, search_path) = session
+                            .get_mut_txn_sequence_values_and_search_path()
+                            .expect("Transaction must be active");
+                        self.execute_prepared_on_txn(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            &prepared.exec,
+                            current_role.as_deref(),
+                        )
+                        .await
+                    };
+
+                    let res = apply_statement_timeout(timeout, fut).await;
+
+                    if res
+                        .as_ref()
+                        .err()
+                        .is_some_and(|e| e.is::<StatementTimeoutError>())
+                        && !is_autocommit
+                    {
+                        session.rollback().await?;
+                        self.clear_trigger_activations();
+                    }
+
+                    if is_autocommit {
+                        match res {
+                            Ok(result) => {
+                                session.commit().await?;
+                                self.flush_trigger_activations();
+                                return Ok(vec![result]);
+                            }
+                            Err(err) => {
+                                session.rollback().await?;
+                                self.clear_trigger_activations();
+                                let should_retry =
+                                    attempt + 1 < max_attempts && is_retryable_tikv_error(&err);
+                                if should_retry {
+                                    autocommit_backoff(attempt).await;
+                                    continue;
+                                }
+                                return Err(err);
+                            }
+                        }
+                    } else {
+                        return Ok(vec![res?]);
+                    }
+                }
+
+                unreachable!("retry loop must return")
+            }),
+        )
+        .await
+    }
+
+    fn execute_sql_deallocate_statement(
+        &self,
+        session: &mut Session,
+        name: &sqlparser::ast::Ident,
+    ) -> Result<Vec<ExecuteResult>> {
+        let prepared_name = normalize_ident(name);
+        if prepared_name.eq_ignore_ascii_case("all") {
+            session.clear_sql_prepared_statements();
+            return Ok(vec![ExecuteResult::CommandComplete { tag: "DEALLOCATE" }]);
+        }
+
+        if !session.remove_sql_prepared_statement(&prepared_name) {
+            return Err(SqlError::UndefinedObject(format!(
+                "prepared statement \"{}\" does not exist",
+                prepared_name
+            ))
+            .into());
+        }
+
+        Ok(vec![ExecuteResult::CommandComplete { tag: "DEALLOCATE" }])
+    }
+
     /// Execute a SQL statement string using the provided session.
     ///
     /// Supports multiple statements separated by semicolons (e.g., "BEGIN; UPDATE...; COMMIT;")
@@ -739,6 +997,26 @@ impl Executor {
                                     rows: vec![Row::new(vec![Value::Text(value)])],
                                     timezone: session_context::current_timezone(),
                                 }])
+                            }
+                            Statement::Prepare {
+                                name,
+                                data_types,
+                                statement,
+                            } => {
+                                self.execute_sql_prepare_statement(
+                                    session,
+                                    name,
+                                    data_types,
+                                    statement.as_ref(),
+                                )
+                                .await
+                            }
+                            Statement::Execute { name, parameters } => {
+                                self.execute_sql_execute_statement(session, name, parameters)
+                                    .await
+                            }
+                            Statement::Deallocate { name, .. } => {
+                                self.execute_sql_deallocate_statement(session, name)
                             }
                             // DDL/DML - delegated to session transaction management
                             _ => {

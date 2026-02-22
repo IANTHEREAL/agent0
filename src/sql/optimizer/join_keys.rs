@@ -48,6 +48,94 @@ pub(super) fn try_extract_equi_keys(
     }
 }
 
+/// Extract hash-join keys and residual predicate from a JoinCondition.
+///
+/// Unlike [`try_extract_equi_keys`], this supports mixed ON predicates:
+/// `equi_conjunct AND residual_conjunct ...`.
+///
+/// Returns `Some((left_keys, right_keys, residual))` when at least one
+/// cross-boundary equi key is present. `residual` contains the remaining ON
+/// conjuncts (if any) to be applied as a post-key join filter.
+pub(super) fn extract_equi_keys_with_residual(
+    condition: &JoinCondition,
+    left_width: usize,
+) -> Option<(Vec<usize>, Vec<usize>, Option<TypedExpr>)> {
+    match condition {
+        JoinCondition::Using(cols) => {
+            if cols.is_empty() {
+                return None;
+            }
+            let left_keys = cols.iter().map(|c| c.left_index).collect();
+            let right_keys = cols.iter().map(|c| c.right_index).collect();
+            Some((left_keys, right_keys, None))
+        }
+        JoinCondition::On(expr) => {
+            let mut conjuncts = Vec::new();
+            collect_and_conjuncts(expr, &mut conjuncts);
+
+            let mut left_keys = Vec::new();
+            let mut right_keys = Vec::new();
+            let mut residual_terms = Vec::new();
+
+            for term in conjuncts {
+                if let Some((lk, rk)) = extract_single_equi_key(&term, left_width) {
+                    left_keys.push(lk);
+                    right_keys.push(rk);
+                } else {
+                    residual_terms.push(term);
+                }
+            }
+
+            if left_keys.is_empty() {
+                None
+            } else {
+                Some((left_keys, right_keys, combine_and_terms(residual_terms)))
+            }
+        }
+        JoinCondition::None => None,
+    }
+}
+
+fn collect_and_conjuncts(expr: &TypedExpr, out: &mut Vec<TypedExpr>) {
+    match &expr.kind {
+        TypedExprKind::BinaryOp {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => {
+            collect_and_conjuncts(left, out);
+            collect_and_conjuncts(right, out);
+        }
+        _ => out.push(expr.clone()),
+    }
+}
+
+fn combine_and_terms(mut terms: Vec<TypedExpr>) -> Option<TypedExpr> {
+    if terms.is_empty() {
+        return None;
+    }
+    let first = terms.remove(0);
+    Some(terms.into_iter().fold(first, |acc, next| TypedExpr {
+        kind: TypedExprKind::BinaryOp {
+            left: Box::new(acc),
+            op: BinaryOp::And,
+            right: Box::new(next),
+        },
+        data_type: crate::types::DataType::Boolean,
+    }))
+}
+
+fn extract_single_equi_key(term: &TypedExpr, left_width: usize) -> Option<(usize, usize)> {
+    match &term.kind {
+        TypedExprKind::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+        } => extract_cross_boundary_eq(left, right, left_width),
+        _ => None,
+    }
+}
+
 /// Recursive AND-tree walker. Returns false on first non-equi or same-side conjunct.
 fn extract_validated(
     expr: &TypedExpr,
@@ -68,36 +156,46 @@ fn extract_validated(
             left,
             op: BinaryOp::Eq,
             right,
-        } => {
-            if let (
-                TypedExprKind::ColumnRef {
-                    column_index: a,
-                    scope_depth: 0,
-                    ..
-                },
-                TypedExprKind::ColumnRef {
-                    column_index: b,
-                    scope_depth: 0,
-                    ..
-                },
-            ) = (&left.kind, &right.kind)
-            {
-                if *a < left_width && *b >= left_width {
-                    left_keys.push(*a);
-                    right_keys.push(*b - left_width);
-                    true
-                } else if *b < left_width && *a >= left_width {
-                    left_keys.push(*b);
-                    right_keys.push(*a - left_width);
-                    true
-                } else {
-                    false // same-side equality — not a cross-boundary equi-key
-                }
-            } else {
-                false // not a simple column=column
+        } => match extract_cross_boundary_eq(left, right, left_width) {
+            Some((lk, rk)) => {
+                left_keys.push(lk);
+                right_keys.push(rk);
+                true
             }
-        }
+            None => false,
+        },
         _ => false,
+    }
+}
+
+fn extract_cross_boundary_eq(
+    left: &TypedExpr,
+    right: &TypedExpr,
+    left_width: usize,
+) -> Option<(usize, usize)> {
+    let (left_sd, left_idx) = peel_column_ref(left)?;
+    let (right_sd, right_idx) = peel_column_ref(right)?;
+    if left_sd != 0 || right_sd != 0 {
+        return None;
+    }
+
+    if left_idx < left_width && right_idx >= left_width {
+        Some((left_idx, right_idx - left_width))
+    } else if right_idx < left_width && left_idx >= left_width {
+        Some((right_idx, left_idx - left_width))
+    } else {
+        None
+    }
+}
+
+fn peel_column_ref(expr: &TypedExpr) -> Option<(u32, usize)> {
+    match &expr.kind {
+        TypedExprKind::ColumnRef {
+            scope_depth,
+            column_index,
+            ..
+        } => Some((*scope_depth, *column_index)),
+        _ => None,
     }
 }
 
@@ -226,5 +324,98 @@ mod tests {
         let cond = JoinCondition::On(eq_expr(correlated, local));
         let result = try_extract_equi_keys(&cond, 2);
         assert_eq!(result, None, "correlated ref must be rejected");
+    }
+
+    #[test]
+    fn test_extract_with_residual_mixed_on() {
+        // ON col[0] = col[2] AND col[1] > col[3], left_width=2
+        let mixed = and_expr(
+            eq_expr(col_ref(0), col_ref(2)),
+            TypedExpr {
+                kind: TypedExprKind::BinaryOp {
+                    left: Box::new(col_ref(1)),
+                    op: BinaryOp::Gt,
+                    right: Box::new(col_ref(3)),
+                },
+                data_type: DataType::Boolean,
+            },
+        );
+        let cond = JoinCondition::On(mixed);
+        let (left_keys, right_keys, residual) =
+            extract_equi_keys_with_residual(&cond, 2).expect("must extract hash keys");
+        assert_eq!(left_keys, vec![0]);
+        assert_eq!(right_keys, vec![0]);
+        assert!(
+            residual.is_some(),
+            "non-equi conjunct must stay as residual"
+        );
+    }
+
+    #[test]
+    fn test_extract_with_residual_pure_equi_has_no_residual() {
+        let cond = JoinCondition::On(eq_expr(col_ref(0), col_ref(2)));
+        let (left_keys, right_keys, residual) =
+            extract_equi_keys_with_residual(&cond, 2).expect("must extract pure equi");
+        assert_eq!(left_keys, vec![0]);
+        assert_eq!(right_keys, vec![0]);
+        assert!(residual.is_none());
+    }
+
+    #[test]
+    fn test_extract_with_residual_non_equi_rejected() {
+        let cond = JoinCondition::On(TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(col_ref(0)),
+                op: BinaryOp::Gt,
+                right: Box::new(col_ref(2)),
+            },
+            data_type: DataType::Boolean,
+        });
+        let result = extract_equi_keys_with_residual(&cond, 2);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_with_residual_same_side_eq_kept_as_residual() {
+        // ON col[0] = col[2] AND col[0] = col[1], left_width=2.
+        // The same-side conjunct must not become a hash key.
+        let cond = JoinCondition::On(and_expr(
+            eq_expr(col_ref(0), col_ref(2)),
+            eq_expr(col_ref(0), col_ref(1)),
+        ));
+        let (left_keys, right_keys, residual) =
+            extract_equi_keys_with_residual(&cond, 2).expect("must keep cross-boundary key");
+        assert_eq!(left_keys, vec![0]);
+        assert_eq!(right_keys, vec![0]);
+        assert!(
+            residual.is_some(),
+            "same-side equality must remain residual"
+        );
+    }
+
+    #[test]
+    fn test_extract_with_residual_rejects_cast_wrapped_column_refs() {
+        let casted_left = TypedExpr {
+            kind: TypedExprKind::Cast {
+                expr: Box::new(col_ref(0)),
+                target_type: DataType::Text,
+                cast_context: crate::sql::types::CastContext::Implicit,
+            },
+            data_type: DataType::Text,
+        };
+        let casted_right = TypedExpr {
+            kind: TypedExprKind::Cast {
+                expr: Box::new(col_ref(2)),
+                target_type: DataType::Text,
+                cast_context: crate::sql::types::CastContext::Implicit,
+            },
+            data_type: DataType::Text,
+        };
+        let cond = JoinCondition::On(eq_expr(casted_left, casted_right));
+        let result = extract_equi_keys_with_residual(&cond, 2);
+        assert!(
+            result.is_none(),
+            "cast-wrapped equality must not be extracted as hash key"
+        );
     }
 }

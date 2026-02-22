@@ -5,6 +5,7 @@ use crate::observability;
 use crate::pool::TikvClientPool;
 use crate::sql::ddl;
 use crate::sql::parse_sql;
+use crate::sql::query_context::{self, QueryContext};
 use crate::sql::Executor;
 use crate::storage::TikvStore;
 use crate::worker::config::WorkerConfig;
@@ -406,6 +407,7 @@ impl WorkerEngine {
         } else {
             None
         };
+        let should_requeue_cron = cron_run.is_some();
 
         let exec_result = if entry.task_type == TaskType::Cron && cron_run.is_none() {
             Ok(0usize)
@@ -477,12 +479,14 @@ impl WorkerEngine {
             .delete_worker_queue_entry(&mut txn, &queue_key)
             .await?;
 
-        if entry.task_type == TaskType::Cron {
-            if let Some(ref schedule) = entry.schedule {
-                if let Ok(next_fire) = compute_next_fire_time(schedule) {
-                    system_store
-                        .put_worker_queue_entry(&mut txn, &entry, next_fire)
-                        .await?;
+        if entry.task_type == TaskType::Cron && should_requeue_cron {
+            if let Some(next_entry) = Self::load_next_cron_queue_entry(pool, &entry).await? {
+                if let Some(schedule) = next_entry.schedule.as_deref() {
+                    if let Ok(next_fire) = compute_next_fire_time(schedule) {
+                        system_store
+                            .put_worker_queue_entry(&mut txn, &next_entry, next_fire)
+                            .await?;
+                    }
                 }
             }
         }
@@ -546,16 +550,23 @@ impl WorkerEngine {
                 return Ok(None);
             }
 
+            let Some(job) = store
+                .get_cron_job(&mut txn, entry.db_id, entry.task_id)
+                .await?
+            else {
+                return Ok(None);
+            };
+            if !job.active {
+                return Ok(None);
+            }
+
             let database = store
                 .get_database_by_id(&mut txn, entry.db_id)
                 .await?
                 .map(|db| db.name)
                 .unwrap_or_else(|| "postgres".to_string());
 
-            let max_runtime_ms = store
-                .get_cron_job(&mut txn, entry.db_id, entry.task_id)
-                .await?
-                .and_then(|j| j.max_runtime_ms);
+            let max_runtime_ms = job.max_runtime_ms;
 
             let run_id = store.next_cron_run_id(entry.db_id).await?;
             let started_at = now_ms();
@@ -564,8 +575,8 @@ impl WorkerEngine {
                 job_id: entry.task_id,
                 job_pid: None,
                 database,
-                username: entry.username.clone(),
-                command: entry.command.clone(),
+                username: job.username.clone(),
+                command: job.command.clone(),
                 status: CronRunStatus::Running,
                 return_message: None,
                 start_time: Some(started_at),
@@ -584,6 +595,51 @@ impl WorkerEngine {
             Ok(None) => {
                 txn.rollback().await.ok();
                 Ok(None)
+            }
+            Err(e) => {
+                txn.rollback().await.ok();
+                Err(e)
+            }
+        }
+    }
+
+    async fn load_next_cron_queue_entry(
+        pool: &Arc<TikvClientPool>,
+        entry: &TaskQueueEntry,
+    ) -> Result<Option<TaskQueueEntry>> {
+        let handle = pool.acquire(Some(entry.keyspace.clone())).await?;
+        let store = handle.store().clone();
+        let mut txn = store.begin().await?;
+
+        let result: Result<Option<TaskQueueEntry>> = async {
+            let Some(job) = store
+                .get_cron_job(&mut txn, entry.db_id, entry.task_id)
+                .await?
+            else {
+                return Ok(None);
+            };
+            if !job.active {
+                return Ok(None);
+            }
+            Ok(Some(
+                TaskQueueEntry::new(
+                    entry.keyspace.clone(),
+                    entry.db_id,
+                    entry.task_id,
+                    TaskType::Cron,
+                    job.command.clone(),
+                    job.username.clone(),
+                    entry.priority,
+                )
+                .with_schedule(job.schedule.clone()),
+            ))
+        }
+        .await;
+
+        match result {
+            Ok(next_entry) => {
+                txn.commit().await?;
+                Ok(next_entry)
             }
             Err(e) => {
                 txn.rollback().await.ok();
@@ -631,11 +687,37 @@ impl WorkerEngine {
     ) -> Result<usize> {
         let handle = pool.acquire(Some(entry.keyspace.clone())).await?;
         let store = handle.store().clone();
+        let database_name: Arc<str> = {
+            let mut db_txn = store.begin().await?;
+            let resolved = store
+                .get_database_by_id(&mut db_txn, entry.db_id)
+                .await?
+                .map(|db| db.name)
+                .unwrap_or_else(|| "postgres".to_string());
+            db_txn.commit().await?;
+            Arc::from(resolved)
+        };
+        let current_user: Arc<str> = Arc::from(entry.username.clone());
+        let timezone: Arc<str> = Arc::from("UTC");
+        let tx_start_ms = chrono::Utc::now().timestamp_millis();
 
         // BgDdl tasks (e.g. CREATE INDEX CONCURRENTLY backfill) are exempt from
         // statement_timeout — they legitimately run for extended periods.
         if entry.task_type == TaskType::BgDdl && entry.command.starts_with("__backfill_index ") {
-            Self::execute_bg_ddl_backfill(&store, entry).await?;
+            let stmt_ts = chrono::Utc::now().timestamp_millis();
+            let qctx = QueryContext::new(
+                0,
+                database_name.clone(),
+                current_user.clone(),
+                stmt_ts,
+                tx_start_ms,
+                timezone.clone(),
+            );
+            query_context::with_scoped_query_context(
+                &qctx,
+                Self::execute_bg_ddl_backfill(&store, entry),
+            )
+            .await?;
             return Ok(1);
         }
 
@@ -673,13 +755,25 @@ impl WorkerEngine {
             let result = async {
                 let statements = parse_sql(&entry.command)?;
                 for stmt in &statements {
-                    let fut = exec.execute_statement_on_txn(
-                        &mut txn,
-                        entry.db_id,
-                        &mut sequence_values,
-                        &search_path,
-                        stmt,
-                        None,
+                    let stmt_ts = chrono::Utc::now().timestamp_millis();
+                    let qctx = QueryContext::new(
+                        0,
+                        database_name.clone(),
+                        current_user.clone(),
+                        stmt_ts,
+                        tx_start_ms,
+                        timezone.clone(),
+                    );
+                    let fut = query_context::with_scoped_query_context(
+                        &qctx,
+                        exec.execute_statement_on_txn(
+                            &mut txn,
+                            entry.db_id,
+                            &mut sequence_values,
+                            &search_path,
+                            stmt,
+                            None,
+                        ),
                     );
                     let res = match (&stmt_timeout, &cancel_signal) {
                         (Some(t), Some(sig)) => tokio::select! {

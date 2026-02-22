@@ -57,7 +57,9 @@ async fn update_row_indexes(
     new_row: &Row,
 ) -> Result<()> {
     for index in &schema.indexes {
-        if matches!(index.state, IndexState::Building | IndexState::Invalid) {
+        if matches!(index.state, IndexState::Invalid)
+            || (matches!(index.state, IndexState::Building) && !index.unique)
+        {
             continue;
         }
         if index_helpers::index_values_unchanged(index, schema, old_row, new_row)? {
@@ -130,7 +132,10 @@ async fn update_row_indexes(
                 .await;
             if let Err(e) = create_result {
                 if index.unique
-                    && matches!(index.state, IndexState::WriteOnly | IndexState::Ready)
+                    && matches!(
+                        index.state,
+                        IndexState::Building | IndexState::WriteOnly | IndexState::Ready
+                    )
                     && is_unique_duplicate_error(&e)
                 {
                     match resolve_unique_index_conflict(
@@ -162,6 +167,42 @@ pub async fn execute_update_row(
     enum_cache: &EnumLabelCache,
     fk_ctx: Option<&mut FkDeleteContext>,
 ) -> Result<Row> {
+    execute_update_row_inner(
+        store, txn, db_id, table_name, schema, old_row, new_row, enum_cache, fk_ctx, true, true,
+    )
+    .await
+}
+
+pub(crate) async fn execute_update_row_without_fk_update(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    table_name: &str,
+    schema: &TableSchema,
+    old_row: &Row,
+    new_row: Row,
+    enum_cache: &EnumLabelCache,
+    fk_ctx: Option<&mut FkDeleteContext>,
+) -> Result<Row> {
+    execute_update_row_inner(
+        store, txn, db_id, table_name, schema, old_row, new_row, enum_cache, fk_ctx, false, false,
+    )
+    .await
+}
+
+async fn execute_update_row_inner(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    table_name: &str,
+    schema: &TableSchema,
+    old_row: &Row,
+    new_row: Row,
+    enum_cache: &EnumLabelCache,
+    fk_ctx: Option<&mut FkDeleteContext>,
+    propagate_fk_update: bool,
+    validate_fk_now: bool,
+) -> Result<Row> {
     let mut new_row_values = new_row.values;
     coerce_row_values(schema, &mut new_row_values)?;
     let new_row = Row::new(new_row_values);
@@ -172,7 +213,7 @@ pub async fn execute_update_row(
     let new_pks = schema.get_pk_values(&new_row);
     let pk_changed = old_pks != new_pks;
 
-    if !schema.foreign_keys.is_empty() {
+    if validate_fk_now && !schema.foreign_keys.is_empty() {
         validate_foreign_keys(store, txn, db_id, schema, &new_row).await?;
     }
 
@@ -203,7 +244,9 @@ pub async fn execute_update_row(
     }
 
     for index in &schema.indexes {
-        if matches!(index.state, IndexState::Building | IndexState::Invalid) {
+        if matches!(index.state, IndexState::Invalid)
+            || (matches!(index.state, IndexState::Building) && !index.unique)
+        {
             continue;
         }
         if !pk_changed && index_helpers::index_values_unchanged(index, schema, old_row, &new_row)? {
@@ -254,7 +297,9 @@ pub async fn execute_update_row(
         .await?;
 
     for index in &schema.indexes {
-        if matches!(index.state, IndexState::Building | IndexState::Invalid) {
+        if matches!(index.state, IndexState::Invalid)
+            || (matches!(index.state, IndexState::Building) && !index.unique)
+        {
             continue;
         }
         if !pk_changed && index_helpers::index_values_unchanged(index, schema, old_row, &new_row)? {
@@ -297,7 +342,10 @@ pub async fn execute_update_row(
             if let Err(e) = create_result {
                 if is_unique_duplicate_error(&e) {
                     if index.unique
-                        && matches!(index.state, IndexState::WriteOnly | IndexState::Ready)
+                        && matches!(
+                            index.state,
+                            IndexState::Building | IndexState::WriteOnly | IndexState::Ready
+                        )
                     {
                         match resolve_unique_index_conflict(
                             store, txn, db_id, schema, index, &new_idx, &new_pks,
@@ -326,9 +374,11 @@ pub async fn execute_update_row(
         }
     }
 
-    handle_foreign_key_on_update(
-        store, txn, db_id, table_name, schema, old_row, &new_row, fk_ctx,
-    )
-    .await?;
+    if propagate_fk_update {
+        handle_foreign_key_on_update(
+            store, txn, db_id, table_name, schema, old_row, &new_row, fk_ctx,
+        )
+        .await?;
+    }
     Ok(new_row)
 }

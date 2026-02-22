@@ -940,6 +940,60 @@ fn non_equi_on_condition() -> JoinCondition {
     })
 }
 
+fn mixed_on_condition() -> JoinCondition {
+    // col[0] = col[2] AND col[1] > col[3]
+    JoinCondition::On(TypedExpr {
+        kind: TypedExprKind::BinaryOp {
+            left: Box::new(TypedExpr {
+                kind: TypedExprKind::BinaryOp {
+                    left: Box::new(TypedExpr {
+                        kind: TypedExprKind::ColumnRef {
+                            scope_depth: 0,
+                            column_index: 0,
+                            column_name: "id".to_string(),
+                        },
+                        data_type: DataType::Int64,
+                    }),
+                    op: BinaryOp::Eq,
+                    right: Box::new(TypedExpr {
+                        kind: TypedExprKind::ColumnRef {
+                            scope_depth: 0,
+                            column_index: 2,
+                            column_name: "id".to_string(),
+                        },
+                        data_type: DataType::Int64,
+                    }),
+                },
+                data_type: DataType::Boolean,
+            }),
+            op: BinaryOp::And,
+            right: Box::new(TypedExpr {
+                kind: TypedExprKind::BinaryOp {
+                    left: Box::new(TypedExpr {
+                        kind: TypedExprKind::ColumnRef {
+                            scope_depth: 0,
+                            column_index: 1,
+                            column_name: "val".to_string(),
+                        },
+                        data_type: DataType::Text,
+                    }),
+                    op: BinaryOp::Gt,
+                    right: Box::new(TypedExpr {
+                        kind: TypedExprKind::ColumnRef {
+                            scope_depth: 0,
+                            column_index: 3,
+                            column_name: "name".to_string(),
+                        },
+                        data_type: DataType::Text,
+                    }),
+                },
+                data_type: DataType::Boolean,
+            }),
+        },
+        data_type: DataType::Boolean,
+    })
+}
+
 #[test]
 fn test_hash_join_for_equi() {
     let (join, ctx) = make_join_plan(1000, 1000, JoinType::Inner, equi_on_condition());
@@ -958,6 +1012,16 @@ fn test_nlj_for_non_equi() {
     assert!(
         matches!(physical.node, PhysicalNode::NestedLoopJoin { .. }),
         "non-equi should produce NLJ"
+    );
+}
+
+#[test]
+fn test_hash_join_for_mixed_equi_and_residual() {
+    let (join, ctx) = make_join_plan(1000, 1000, JoinType::Inner, mixed_on_condition());
+    let physical = PhysicalPlanner::plan(&join, &ctx);
+    assert!(
+        matches!(physical.node, PhysicalNode::HashJoin { .. }),
+        "mixed (equi + residual) should produce HashJoin with residual filter"
     );
 }
 

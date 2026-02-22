@@ -116,13 +116,13 @@ impl PhysicalPlanner {
     ) -> usize {
         let left_width = left_logical.schema.columns.len();
 
-        let selectivity = if let Some((left_keys, right_keys)) =
-            join_keys::try_extract_equi_keys(condition, left_width)
+        let selectivity = if let Some((left_keys, right_keys, residual_filter)) =
+            join_keys::extract_equi_keys_with_residual(condition, left_width)
         {
             let left_stats = Self::resolve_stats(left_logical, ctx);
             let right_stats = Self::resolve_stats(right_logical, ctx);
 
-            match (left_stats, right_stats) {
+            let equi_sel = match (left_stats, right_stats) {
                 (Some(ls), Some(rs)) => {
                     let mut sel = 1.0;
                     for (&lk, &rk) in left_keys.iter().zip(right_keys.iter()) {
@@ -149,6 +149,12 @@ impl PhysicalPlanner {
                     sel
                 }
                 _ => DEFAULT_JOIN_SEL,
+            };
+
+            if residual_filter.is_some() {
+                equi_sel * DEFAULT_JOIN_SEL
+            } else {
+                equi_sel
             }
         } else {
             1.0 // Non-equi or cross — Cartesian
@@ -174,12 +180,12 @@ impl PhysicalPlanner {
         ctx: &PlanningContext,
     ) -> f64 {
         let left_width = left.schema.columns.len();
-        if let Some((left_keys, right_keys)) =
-            join_keys::try_extract_equi_keys(condition, left_width)
+        if let Some((left_keys, right_keys, residual_filter)) =
+            join_keys::extract_equi_keys_with_residual(condition, left_width)
         {
             let left_stats = Self::resolve_stats(left, ctx);
             let right_stats = Self::resolve_stats(right, ctx);
-            match (left_stats, right_stats) {
+            let equi_sel = match (left_stats, right_stats) {
                 (Some(ls), Some(rs)) => {
                     let mut sel = 1.0;
                     for (&lk, &rk) in left_keys.iter().zip(right_keys.iter()) {
@@ -199,6 +205,11 @@ impl PhysicalPlanner {
                     sel
                 }
                 _ => DEFAULT_JOIN_SEL,
+            };
+            if residual_filter.is_some() {
+                (equi_sel * DEFAULT_JOIN_SEL).clamp(0.0, 1.0)
+            } else {
+                equi_sel
             }
         } else {
             DEFAULT_JOIN_SEL
@@ -578,9 +589,12 @@ impl PhysicalPlanner {
                     rows: total_rows,
                 };
 
-                // Algorithm selection: HashJoin for pure equi-joins, NLJ otherwise.
-                // Mixed ON (equi + residual) → NLJ for now (limitation L1).
-                let node = if join_keys::try_extract_equi_keys(condition, left_width).is_some() {
+                // Algorithm selection: HashJoin whenever ON has at least one
+                // cross-boundary equi key (residual conjuncts are evaluated as
+                // hash-join filters), NLJ otherwise.
+                let node = if join_keys::extract_equi_keys_with_residual(condition, left_width)
+                    .is_some()
+                {
                     let left_is_build = left_rows <= right_rows;
                     PhysicalNode::HashJoin {
                         left: Box::new(left_phys),

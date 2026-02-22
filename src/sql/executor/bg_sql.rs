@@ -89,6 +89,7 @@ async fn execute_bg_launch(
         .update_registry_task_types(&mut sys_txn, keyspace, db_id, TASK_TYPE_BG_SQL, 0)
         .await?;
     sys_txn.commit().await?;
+    crate::worker::wake_worker();
 
     Ok(Value::Int64(task_id))
 }

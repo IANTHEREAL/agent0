@@ -373,6 +373,8 @@ async fn enqueue_cron_to_worker(keyspace: &str, db_id: u64, job: &CronJob) {
 
     if let Err(e) = result {
         tracing::warn!("Failed to enqueue cron job to worker queue: {}", e);
+    } else {
+        crate::worker::wake_worker();
     }
 }
 
