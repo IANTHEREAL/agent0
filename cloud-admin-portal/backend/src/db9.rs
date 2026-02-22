@@ -74,6 +74,9 @@ enum Commands {
         /// Use API key directly instead of email/password
         #[arg(long)]
         api_key: Option<String>,
+
+        #[command(subcommand)]
+        method: Option<LoginMethod>,
     },
     /// Claim anonymous account with email and password
     Claim,
@@ -101,6 +104,8 @@ enum Commands {
     },
     /// Guided setup: register, login, and create your first database
     Init,
+    /// Check login status
+    Status,
     /// Filesystem operations (fs9/sh9)
     Fs {
         #[command(subcommand)]
@@ -111,6 +116,16 @@ enum Commands {
         /// Shell to generate for
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum LoginMethod {
+    /// Login via browser-based SSO (device code flow)
+    Sso {
+        /// Print the verification URL instead of opening a browser
+        #[arg(long)]
+        no_browser: bool,
     },
 }
 
@@ -532,6 +547,13 @@ fn clear_anonymous_credentials() -> Result<(), String> {
 }
 
 fn require_token() -> String {
+    // 1. Environment variable — side-effect free, no persistence
+    if let Ok(key) = std::env::var("DB9_API_KEY") {
+        if !key.is_empty() {
+            return key;
+        }
+    }
+    // 2. File-based credentials (~/.db9/credentials)
     match load_token() {
         Ok(t) => t,
         Err(msg) => {
@@ -618,11 +640,18 @@ async fn main() {
 
     match cli.command {
         Commands::Register => cmd_register(&api, &cli.effective_output()).await,
-        Commands::Login { ref api_key } => {
-            cmd_login(&api, &cli.effective_output(), api_key.clone()).await
-        }
+        Commands::Login {
+            ref api_key,
+            ref method,
+        } => match method {
+            Some(LoginMethod::Sso { no_browser }) => {
+                cmd_login_sso(&api, &cli.effective_output(), *no_browser).await
+            }
+            None => cmd_login(&api, &cli.effective_output(), api_key.clone()).await,
+        },
         Commands::Claim => cmd_claim(&api, &cli.effective_output()).await,
         Commands::Logout => cmd_logout(),
+        Commands::Status => cmd_status(&api, &cli.effective_output()).await,
         Commands::Init => cmd_init(&api, &cli.effective_output()).await,
         Commands::Fs { ref action } => match action {
             FsAction::Sh {
@@ -1793,6 +1822,172 @@ async fn cmd_login(api: &ApiClient, output: &OutputFormat, api_key: Option<Strin
                 "Login successful! Token expires: {}",
                 format_time(data.get("expires_at"))
             );
+        }
+    }
+}
+
+async fn cmd_login_sso(api: &ApiClient, output: &OutputFormat, no_browser: bool) {
+    let data = api
+        .request("POST", "/customer/device-code", None::<&serde_json::Value>, None)
+        .await;
+
+    let device_code = data["device_code"].as_str().unwrap_or_else(|| {
+        eprintln!("Failed to initiate SSO login");
+        process::exit(1);
+    });
+    let user_code = data["user_code"].as_str().unwrap_or("");
+    let server_uri = data["verification_uri"].as_str().unwrap_or("");
+    let verification_uri = if server_uri.starts_with("http") {
+        server_uri.to_string()
+    } else {
+        format!(
+            "{}/customer/device-verify?code={user_code}",
+            api.base_url()
+        )
+    };
+    let interval = data["interval"].as_u64().unwrap_or(5);
+    let expires_in = data["expires_in"].as_u64().unwrap_or(600);
+
+    if no_browser {
+        eprintln!("Open this URL in your browser to authorize:\n");
+        eprintln!("  {verification_uri}\n");
+        eprintln!("Your code: {user_code}\n");
+    } else {
+        eprintln!("Opening browser to authorize...");
+        eprintln!("Your code: {user_code}\n");
+        if open::that(&verification_uri).is_err() {
+            eprintln!("Could not open browser. Open this URL manually:\n");
+            eprintln!("  {verification_uri}\n");
+        }
+    }
+
+    eprintln!("Waiting for authorization...");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires_in);
+    let poll_body = serde_json::json!({ "device_code": device_code });
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+
+        if std::time::Instant::now() > deadline {
+            eprintln!("Authorization timed out. Please try again.");
+            process::exit(1);
+        }
+
+        match api
+            .try_request("POST", "/customer/device-token", Some(&poll_body), None)
+            .await
+        {
+            Ok(data) => {
+                if let Some(token) = data["token"].as_str() {
+                    if let Err(e) = save_token(token) {
+                        eprintln!("{e}");
+                        process::exit(1);
+                    }
+                    if let Err(e) = clear_anonymous_credentials() {
+                        eprintln!("Warning: failed to clear anonymous credentials: {e}");
+                    }
+
+                    match output {
+                        OutputFormat::Json => {
+                            let safe = serde_json::json!({
+                                "expires_at": data["expires_at"],
+                            });
+                            print_json(&safe);
+                        }
+                        _ => {
+                            println!(
+                                "Login successful! Token expires: {}",
+                                format_time(data.get("expires_at"))
+                            );
+                        }
+                    }
+                    return;
+                }
+            }
+            Err((_, detail)) => {
+                if detail.contains("authorization_pending") {
+                    continue;
+                }
+                if detail.contains("slow_down") {
+                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                    continue;
+                }
+                if detail.contains("access_denied") {
+                    eprintln!("Authorization denied.");
+                    process::exit(1);
+                }
+                if detail.contains("expired_token") {
+                    eprintln!("Authorization timed out. Please try again.");
+                    process::exit(1);
+                }
+                eprintln!("SSO login error: {detail}");
+                process::exit(1);
+            }
+        }
+    }
+}
+
+async fn cmd_status(api: &ApiClient, output: &OutputFormat) {
+    let (token, source) = if let Ok(key) = std::env::var("DB9_API_KEY") {
+        if !key.is_empty() {
+            (key, "DB9_API_KEY")
+        } else {
+            match load_token() {
+                Ok(t) => (t, "credentials"),
+                Err(_) => {
+                    match output {
+                        OutputFormat::Json => {
+                            print_json(&serde_json::json!({"status": "not_logged_in"}));
+                        }
+                        _ => eprintln!("Not logged in."),
+                    }
+                    process::exit(1);
+                }
+            }
+        }
+    } else {
+        match load_token() {
+            Ok(t) => (t, "credentials"),
+            Err(_) => {
+                match output {
+                    OutputFormat::Json => {
+                        print_json(&serde_json::json!({"status": "not_logged_in"}));
+                    }
+                    _ => eprintln!("Not logged in."),
+                }
+                process::exit(1);
+            }
+        }
+    };
+
+    let headers = make_auth_headers(&token);
+    match api.try_request("GET", "/customer/me", None, Some(&headers)).await {
+        Ok(data) => match output {
+            OutputFormat::Json => print_json(&data),
+            _ => {
+                let label = if source == "DB9_API_KEY" {
+                    "Logged in via DB9_API_KEY as"
+                } else {
+                    "Logged in as"
+                };
+                println!(
+                    "{label}: {}",
+                    data["email"].as_str().unwrap_or("unknown")
+                );
+            }
+        },
+        Err((status, detail)) => {
+            if status == 401 || status == 403 {
+                if source == "DB9_API_KEY" {
+                    eprintln!("DB9_API_KEY is set but invalid.");
+                } else {
+                    eprintln!("Token expired or invalid. Run 'db9 login' to re-authenticate.");
+                }
+            } else {
+                eprintln!("Error {status}: {detail}");
+            }
+            process::exit(1);
         }
     }
 }
