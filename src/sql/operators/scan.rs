@@ -545,7 +545,7 @@ impl PhysicalOperator for InListScanOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ColumnDef, DataType};
+    use crate::types::{ColumnDef, DataType, IndexDef};
 
     fn test_schema() -> TableSchema {
         TableSchema {
@@ -582,6 +582,21 @@ mod tests {
         }
     }
 
+    fn test_schema_with_index(index_columns: Vec<&str>) -> TableSchema {
+        let mut schema = test_schema();
+        schema.indexes = vec![IndexDef {
+            name: "idx_users_name".to_string(),
+            id: 42,
+            columns: index_columns.into_iter().map(|c| c.to_string()).collect(),
+            unique: false,
+            method: None,
+            predicate: None,
+            expressions: vec![],
+            state: Default::default(),
+        }];
+        schema
+    }
+
     #[test]
     fn test_table_scan_creation() {
         let schema = test_schema();
@@ -610,5 +625,138 @@ mod tests {
         assert_eq!(filled.values.len(), 2);
         assert_eq!(filled.values[0], Value::Int32(1));
         assert_eq!(filled.values[1], Value::Null);
+    }
+
+    #[test]
+    fn test_index_scan_base_reset_and_close_state() {
+        let schema = test_schema_with_index(vec!["name"]);
+        let mut base = IndexScanBase::new(schema, 42, "idx_users_name".to_string(), Some(5));
+        base.pk_queue = vec![vec![Value::Int32(1)]];
+        base.row_buffer = vec![Row::new(vec![
+            Value::Int32(1),
+            Value::Text("Alice".to_string()),
+        ])];
+        base.position = 9;
+        base.opened = false;
+
+        base.reset_and_open();
+        assert!(base.opened);
+        assert_eq!(base.position, 0);
+        assert!(base.pk_queue.is_empty());
+        assert!(base.row_buffer.is_empty());
+
+        base.pk_queue = vec![vec![Value::Int32(2)]];
+        base.row_buffer = vec![Row::new(vec![
+            Value::Int32(2),
+            Value::Text("Bob".to_string()),
+        ])];
+        base.close();
+        assert!(!base.opened);
+        assert!(base.pk_queue.is_empty());
+        assert!(base.row_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_index_scan_base_resolve_index_meta_uses_pk_types() {
+        let schema = test_schema_with_index(vec!["name"]);
+        let base = IndexScanBase::new(schema, 42, "idx_users_name".to_string(), None);
+        let (index, pk_types) = base.resolve_index_meta().unwrap();
+
+        assert_eq!(index.name, "idx_users_name");
+        assert_eq!(pk_types, vec![DataType::Int32]);
+    }
+
+    #[test]
+    fn test_index_scan_base_resolve_index_meta_defaults_uuid_without_pk() {
+        let mut schema = test_schema_with_index(vec!["name"]);
+        schema.pk_indices.clear();
+
+        let base = IndexScanBase::new(schema, 42, "idx_users_name".to_string(), None);
+        let (_, pk_types) = base.resolve_index_meta().unwrap();
+
+        assert_eq!(pk_types, vec![DataType::Uuid]);
+    }
+
+    #[test]
+    fn test_index_scan_base_resolve_index_meta_missing_index() {
+        let schema = test_schema_with_index(vec!["name"]);
+        let base = IndexScanBase::new(schema, 99, "idx_missing".to_string(), None);
+
+        let err = base.resolve_index_meta().unwrap_err();
+        assert!(err.to_string().contains("Index idx_missing not found"));
+    }
+
+    #[test]
+    fn test_index_scan_base_resolve_index_column_types_case_insensitive() {
+        let schema = test_schema_with_index(vec!["NAME"]);
+        let base = IndexScanBase::new(schema, 42, "idx_users_name".to_string(), None);
+        let (index, _) = base.resolve_index_meta().unwrap();
+
+        let types = base.resolve_index_column_types(index).unwrap();
+        assert_eq!(types, vec![DataType::Text]);
+    }
+
+    #[test]
+    fn test_index_scan_base_resolve_index_column_types_missing_column() {
+        let schema = test_schema_with_index(vec!["missing_column"]);
+        let base = IndexScanBase::new(schema, 42, "idx_users_name".to_string(), None);
+        let (index, _) = base.resolve_index_meta().unwrap();
+
+        let err = base.resolve_index_column_types(index).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Index column 'missing_column' not found"));
+    }
+
+    #[test]
+    fn test_index_scan_wrappers_use_base_fields() {
+        let schema = test_schema_with_index(vec!["name"]);
+
+        let point = IndexScanOperator::new_with_scan_limit(
+            schema.clone(),
+            42,
+            "idx_users_name".to_string(),
+            vec![Value::Text("Alice".to_string())],
+            Some(3),
+        );
+        assert_eq!(point.name(), "IndexScan");
+        assert_eq!(
+            point.explain_info(),
+            Some("table=users, index=idx_users_name".to_string())
+        );
+        assert_eq!(point.base.scan_limit, Some(3));
+
+        let range = RangeIndexScanOperator::new(
+            schema.clone(),
+            42,
+            "idx_users_name".to_string(),
+            vec![Value::Text("A".to_string())],
+            Some(Value::Text("A".to_string())),
+            true,
+            Some(Value::Text("M".to_string())),
+            false,
+        );
+        assert_eq!(range.name(), "RangeIndexScan");
+        assert_eq!(
+            range.explain_info(),
+            Some("table=users, index=idx_users_name".to_string())
+        );
+        assert_eq!(range.base.scan_limit, None);
+
+        let in_list = InListScanOperator::new(
+            schema,
+            42,
+            "idx_users_name".to_string(),
+            vec![
+                vec![Value::Text("Alice".to_string())],
+                vec![Value::Text("Bob".to_string())],
+            ],
+        );
+        assert_eq!(in_list.name(), "InListScan");
+        assert_eq!(
+            in_list.explain_info(),
+            Some("table=users, index=idx_users_name".to_string())
+        );
+        assert_eq!(in_list.base.scan_limit, None);
     }
 }
