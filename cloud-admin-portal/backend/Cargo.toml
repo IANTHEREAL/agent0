@@ -44,6 +44,10 @@ atty = "0.2"
 crossterm = "0.28"
 rustyline = "14"
 
+# Static SQLite for musl targets (no system libsqlite3 available)
+[target.'cfg(target_env = "musl")'.dependencies]
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
 http-body-util = "0.1"

@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-# db9 installer (includes sh9 filesystem shell)
+# db9 installer
 # Usage: curl -fsSL https://db9.shared.aws.tidbcloud.com/install | sh
 
 BASE_URL="https://db9.shared.aws.tidbcloud.com/releases"
@@ -71,38 +71,20 @@ main() {
   fi
   chmod +x "$TMP_DIR/db9"
 
-  # Download sh9
-  info "Downloading sh9..."
-  if ! download "${BASE_URL}/sh9-${OS}-${ARCH}" "$TMP_DIR/sh9"; then
-    warn "sh9 binary not available for ${OS}/${ARCH} — skipping (install later with: curl -fsSL https://db9.shared.aws.tidbcloud.com/install-sh9 | sh)"
-    SH9_OK=0
-  else
-    chmod +x "$TMP_DIR/sh9"
-    SH9_OK=1
-  fi
-
-  # Install
   if [ -w "$INSTALL_DIR" ]; then
     mv "$TMP_DIR/db9" "$INSTALL_DIR/db9"
-    [ "$SH9_OK" = "1" ] && mv "$TMP_DIR/sh9" "$INSTALL_DIR/sh9"
   else
     info "Installing to ${INSTALL_DIR} (requires sudo)..."
     sudo mv "$TMP_DIR/db9" "$INSTALL_DIR/db9"
-    [ "$SH9_OK" = "1" ] && sudo mv "$TMP_DIR/sh9" "$INSTALL_DIR/sh9"
   fi
 
   printf "\n"
   success "db9 installed successfully! ($(${INSTALL_DIR}/db9 --version 2>/dev/null || echo 'db9'))"
-  if [ "$SH9_OK" = "1" ]; then
-    success "sh9 installed successfully! ($(${INSTALL_DIR}/sh9 --version 2>/dev/null || echo 'sh9'))"
-  fi
   printf "\n"
   printf "  Get started:\n"
+  printf "    ${DIM}\$${RESET} db9 init                     ${DIM}# guided setup${RESET}\n"
   printf "    ${DIM}\$${RESET} db9 db create --name myapp\n"
-  printf "    ${DIM}\$${RESET} db9 sh                       ${DIM}# filesystem shell${RESET}\n"
-  printf "\n"
-  printf "  ${DIM}No account needed — an anonymous account is created automatically.${RESET}\n"
-  printf "  ${DIM}Claim it later with: db9 claim${RESET}\n"
+  printf "    ${DIM}\$${RESET} db9 db sql <id> -q 'SELECT 1'\n"
   printf "\n"
 }
 
