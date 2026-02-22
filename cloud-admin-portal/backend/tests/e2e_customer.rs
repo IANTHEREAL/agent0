@@ -38,12 +38,14 @@ async fn setup() -> (Router, AppState) {
         fs9_meta_url: None,
         fs9_meta_key: None,
         fs9_jwt_secret: None,
+        fs9_server_url: None,
     };
 
     let state = AppState {
         db: pool,
         config: Arc::new(config),
         sessions: Arc::new(SessionManager::new(1)),
+        device_codes: Arc::new(pgtikv_admin::device_code::DeviceCodeStore::new(600)),
         http_client: reqwest::Client::new(),
         fs9_client: None,
     };

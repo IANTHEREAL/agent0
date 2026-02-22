@@ -81,6 +81,7 @@ async fn setup() -> AppState {
         db: pool,
         config: Arc::new(config),
         sessions: Arc::new(SessionManager::new(1)),
+        device_codes: Arc::new(pgtikv_admin::device_code::DeviceCodeStore::new(600)),
         http_client: reqwest::Client::new(),
         fs9_client: None,
     }
@@ -727,5 +728,237 @@ async fn login_api_key_invalid_preserves_existing_credentials() {
         cred["token"].as_str().unwrap(),
         token,
         "original valid token should be preserved exactly"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Device Code Flow tests
+// ══════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn device_code_create_returns_codes() {
+    let (_addr, state) = start_server().await;
+    let app = api::router().with_state(state.clone());
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/customer/device-code")
+                .header("Content-Type", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert!(body["device_code"].as_str().is_some(), "should return device_code");
+    assert!(body["user_code"].as_str().is_some(), "should return user_code");
+    assert!(body["verification_uri"].as_str().is_some(), "should return verification_uri");
+    assert!(body["expires_in"].as_u64().is_some(), "should return expires_in");
+    assert!(body["interval"].as_u64().is_some(), "should return interval");
+
+    let user_code = body["user_code"].as_str().unwrap();
+    assert!(user_code.contains('-'), "user_code should be formatted XXXX-XXXX, got: {user_code}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn device_token_poll_returns_pending() {
+    let (_addr, state) = start_server().await;
+
+    let app = api::router().with_state(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/customer/device-code")
+                .header("Content-Type", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let dc: Value = serde_json::from_slice(&bytes).unwrap();
+    let device_code = dc["device_code"].as_str().unwrap();
+
+    let app = api::router().with_state(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/customer/device-token")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"device_code": device_code})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"].as_str().unwrap(), "authorization_pending");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn device_verify_and_poll_succeeds() {
+    let (_addr, state) = start_server().await;
+
+    let email = format!("e2e-device-{}@test.com", uuid::Uuid::new_v4());
+    let password = "TestPass123!";
+    register_and_login(&state, &email, password).await;
+
+    let app = api::router().with_state(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/customer/device-code")
+                .header("Content-Type", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let dc: Value = serde_json::from_slice(&bytes).unwrap();
+    let device_code = dc["device_code"].as_str().unwrap();
+    let user_code = dc["user_code"].as_str().unwrap();
+
+    let app = api::router().with_state(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/customer/device-verify")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "user_code": user_code,
+                        "email": email,
+                        "password": password,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "device-verify should succeed"
+    );
+
+    let app = api::router().with_state(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/customer/device-token")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"device_code": device_code})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK, "polling after verify should return token");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(body["token"].as_str().is_some(), "should return a token");
+    assert!(body["expires_at"].as_str().is_some(), "should return expires_at");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn device_verify_wrong_password_fails() {
+    let (_addr, state) = start_server().await;
+
+    let email = format!("e2e-device-bad-{}@test.com", uuid::Uuid::new_v4());
+    register_and_login(&state, &email, "TestPass123!").await;
+
+    let app = api::router().with_state(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/customer/device-code")
+                .header("Content-Type", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let dc: Value = serde_json::from_slice(&bytes).unwrap();
+    let user_code = dc["user_code"].as_str().unwrap();
+
+    let app = api::router().with_state(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/customer/device-verify")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "user_code": user_code,
+                        "email": email,
+                        "password": "WrongPassword!",
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "device-verify with wrong password should fail"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// DB9_API_KEY env var tests
+// ══════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn db9_api_key_env_var_authenticates() {
+    let (addr, state) = start_server().await;
+    let api_url = format!("http://{addr}");
+
+    let email = format!("e2e-envkey-{}@test.com", uuid::Uuid::new_v4());
+    let token = register_and_login(&state, &email, "TestPass123!").await;
+
+    let home = TempHome::new();
+
+    let output = db9_cmd(&api_url, &home)
+        .env("DB9_API_KEY", &token)
+        .args(["status"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "status with DB9_API_KEY should succeed, stdout: {stdout}, stderr: {stderr}"
+    );
+
+    let cred_path = home.path().join(".db9").join("credentials");
+    assert!(
+        !cred_path.exists(),
+        "DB9_API_KEY should not create credentials file"
     );
 }
