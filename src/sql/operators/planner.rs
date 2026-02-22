@@ -14,58 +14,17 @@
 use anyhow::Result;
 use std::collections::HashMap;
 
-use crate::sql::analyzer::types::{
-    BinaryOp as TypedBinaryOp, TypedExpr, TypedExprKind, TypedOrderByExpr,
-};
+use crate::sql::analyzer::types::{TypedExpr, TypedOrderByExpr};
 
 use super::{
     BoxedOperator, FilterOperator, InListScanOperator, IndexScanOperator, LimitOperator,
     RangeIndexScanOperator, SortOperator, TableScanOperator,
 };
-use crate::sql::planner::{choose_best_access_path_for_typed_filter, ScanType};
+use crate::sql::planner::{
+    choose_best_access_path_for_typed_filter, collect_typed_eq_predicates, ScanType,
+};
 use crate::sql::value_coercion::coerce_value_for_column;
 use crate::types::{TableSchema, Value};
-
-fn collect_eq_predicates(expr: &TypedExpr, out: &mut HashMap<String, Value>) -> Option<()> {
-    match &expr.kind {
-        TypedExprKind::BinaryOp { left, op, right } => match op {
-            TypedBinaryOp::And => {
-                collect_eq_predicates(left, out)?;
-                collect_eq_predicates(right, out)?;
-                Some(())
-            }
-            TypedBinaryOp::Eq => {
-                let (col, val) = if let TypedExprKind::ColumnRef { column_name, .. } = &left.kind {
-                    if let TypedExprKind::Constant(v) = &right.kind {
-                        (column_name.to_lowercase(), v.clone())
-                    } else {
-                        return None;
-                    }
-                } else if let TypedExprKind::ColumnRef { column_name, .. } = &right.kind {
-                    if let TypedExprKind::Constant(v) = &left.kind {
-                        (column_name.to_lowercase(), v.clone())
-                    } else {
-                        return None;
-                    }
-                } else {
-                    return None;
-                };
-
-                if let Some(existing) = out.get(&col) {
-                    if existing != &val {
-                        return None;
-                    }
-                    return Some(());
-                }
-
-                out.insert(col, val);
-                Some(())
-            }
-            _ => None,
-        },
-        _ => None,
-    }
-}
 
 fn filter_is_exact_index_lookup(
     filter: &TypedExpr,
@@ -82,7 +41,7 @@ fn filter_is_exact_index_lookup(
     }
 
     let mut predicates: HashMap<String, Value> = HashMap::new();
-    if collect_eq_predicates(filter, &mut predicates).is_none() {
+    if collect_typed_eq_predicates(filter, &mut predicates).is_none() {
         return false;
     }
 
@@ -299,7 +258,7 @@ mod tests {
     fn test_collect_eq_predicates_single() {
         let expr = make_typed_eq_expr("id", 0, 42);
         let mut out = HashMap::new();
-        assert!(super::collect_eq_predicates(&expr, &mut out).is_some());
+        assert!(super::collect_typed_eq_predicates(&expr, &mut out).is_some());
         assert_eq!(out.len(), 1);
         assert_eq!(out.get("id"), Some(&Value::Int32(42)));
     }
@@ -315,7 +274,7 @@ mod tests {
             data_type: DataType::Boolean,
         };
         let mut out = HashMap::new();
-        assert!(super::collect_eq_predicates(&expr, &mut out).is_some());
+        assert!(super::collect_typed_eq_predicates(&expr, &mut out).is_some());
         assert_eq!(out.len(), 2);
         assert!(out.contains_key("a"));
         assert!(out.contains_key("b"));
@@ -342,7 +301,7 @@ mod tests {
             data_type: DataType::Boolean,
         };
         let mut out = HashMap::new();
-        assert!(super::collect_eq_predicates(&expr, &mut out).is_none());
+        assert!(super::collect_typed_eq_predicates(&expr, &mut out).is_none());
         assert!(out.is_empty());
     }
 
@@ -357,6 +316,6 @@ mod tests {
             data_type: DataType::Boolean,
         };
         let mut out = HashMap::new();
-        assert!(super::collect_eq_predicates(&expr, &mut out).is_none());
+        assert!(super::collect_typed_eq_predicates(&expr, &mut out).is_none());
     }
 }

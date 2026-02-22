@@ -23,9 +23,7 @@ fn object_name_from_token(token: &str) -> Result<ObjectName> {
     }
 }
 
-fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
-    s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
-}
+use super::core::starts_with_ignore_ascii_case;
 
 pub(crate) fn strip_leading_sql_comments(sql: &str) -> &str {
     let mut s = sql;

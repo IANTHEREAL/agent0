@@ -4,15 +4,13 @@
 //! join reordering.
 
 use crate::sql::analyzer::types::{JoinCondition, JoinType, TypedExpr, TypedExprKind};
+use crate::sql::optimizer::{extract_constant_usize, DEFAULT_ESTIMATED_ROWS, DEFAULT_JOIN_SEL};
 
 use super::super::logical_plan::{LogicalNode, LogicalPlan};
 use super::super::physical_planner::PlanningContext;
 use super::super::selectivity;
 use super::super::statistics::TableStatistics;
 use super::predicates::BaseRelation;
-
-pub(super) const DEFAULT_ESTIMATED_ROWS: usize = 1000;
-pub(super) const DEFAULT_JOIN_SEL: f64 = 0.1;
 
 // ── Subtree row estimation ──────────────────────────────────────
 
@@ -173,14 +171,6 @@ fn estimate_join_rows_logical(
     };
 
     inner_est.max(min_rows).max(1)
-}
-
-fn extract_constant_usize(expr: &TypedExpr) -> Option<usize> {
-    match &expr.kind {
-        TypedExprKind::Constant(crate::types::Value::Int32(v)) => Some(*v as usize),
-        TypedExprKind::Constant(crate::types::Value::Int64(v)) => Some(*v as usize),
-        _ => None,
-    }
 }
 
 // ── Candidate row estimation ────────────────────────────────────

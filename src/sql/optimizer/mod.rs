@@ -21,6 +21,11 @@ pub use build::BuildContext;
 pub use logical_planner::LogicalPlanner;
 pub use physical_planner::{PhysicalPlanner, PlanningContext};
 
+/// Default row estimate when no ANALYZE statistics exist.
+pub(crate) const DEFAULT_ESTIMATED_ROWS: usize = 1000;
+/// Default join selectivity (fraction of cross-product retained).
+pub(crate) const DEFAULT_JOIN_SEL: f64 = 0.1;
+
 /// Build a scope-safe key for schema/stats maps from a table name and optional alias.
 ///
 /// When a query has subqueries, table refs from different scopes are collected
@@ -42,7 +47,19 @@ pub fn schema_map_key(table_name: &str, alias: Option<&str>) -> String {
 
 use crate::sql::analyzer::types::{
     AnalyzedQuery, AnalyzedQueryBody, AnalyzedTableRef, AnalyzedTableRefKind, TableRefSchema,
+    TypedExprKind,
 };
+
+/// Extract a constant integer value from a TypedExpr.
+pub(crate) fn extract_constant_usize(
+    expr: &crate::sql::analyzer::types::TypedExpr,
+) -> Option<usize> {
+    match &expr.kind {
+        TypedExprKind::Constant(crate::types::Value::Int32(v)) => Some(*v as usize),
+        TypedExprKind::Constant(crate::types::Value::Int64(v)) => Some(*v as usize),
+        _ => None,
+    }
+}
 use physical_plan::PhysicalPlan;
 
 // ── Query table-ref collection ────────────────────────────────────────

@@ -18,9 +18,8 @@ pub use self::index_selection::{
     choose_best_access_path_for_filter, choose_best_access_path_for_typed_filter,
     choose_btree_access_path_for_typed_filter,
 };
+pub(crate) use self::predicate::collect_typed_eq_predicates;
 pub use self::predicate::{analyze_predicates, analyze_typed_predicates};
-
-use std::collections::HashMap;
 
 use sqlparser::ast::{BinaryOperator, Expr};
 

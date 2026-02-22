@@ -30,9 +30,8 @@ use guc::{
     normalize_search_path_entries, parse_search_path_guc_value, set_variable_value_to_string,
     try_parse_const_bool, try_parse_const_text,
 };
-use misc::{
-    get_skip_reason, get_unsupported_reason, split_sql_statements, starts_with_ignore_ascii_case,
-};
+pub(crate) use misc::starts_with_ignore_ascii_case;
+use misc::{get_skip_reason, get_unsupported_reason, split_sql_statements};
 use observability::{
     is_observability_system_query, is_observability_tableless_query, OBSERVABILITY_USER,
 };

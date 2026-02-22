@@ -16,15 +16,15 @@
 use super::logical_plan::{LogicalNode, LogicalPlan};
 use super::physical_plan::{PhysicalCost, PhysicalNode, PhysicalPlan};
 use super::statistics::TableStatistics;
-use super::{join_keys, selectivity};
-use crate::sql::analyzer::types::{JoinCondition, JoinType, TypedExprKind};
+use super::{
+    extract_constant_usize, join_keys, selectivity, DEFAULT_ESTIMATED_ROWS, DEFAULT_JOIN_SEL,
+};
+use crate::sql::analyzer::types::{JoinCondition, JoinType};
 use crate::types::TableSchema;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-const DEFAULT_ESTIMATED_ROWS: usize = 1000;
 const TOPN_THRESHOLD: usize = 1000;
-const DEFAULT_JOIN_SEL: f64 = 0.1;
 
 /// Context for physical planning, carrying table statistics and schemas.
 ///
@@ -700,15 +700,6 @@ impl PhysicalPlanner {
                 }
             }
         }
-    }
-}
-
-/// Extract a constant integer value from a TypedExpr.
-fn extract_constant_usize(expr: &crate::sql::analyzer::types::TypedExpr) -> Option<usize> {
-    match &expr.kind {
-        TypedExprKind::Constant(crate::types::Value::Int32(v)) => Some(*v as usize),
-        TypedExprKind::Constant(crate::types::Value::Int64(v)) => Some(*v as usize),
-        _ => None,
     }
 }
 

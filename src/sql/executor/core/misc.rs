@@ -1,6 +1,6 @@
 //! Misc executor helpers
 
-pub(super) fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
+pub(crate) fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
     let haystack = haystack.as_bytes();
     let prefix = prefix.as_bytes();
     haystack

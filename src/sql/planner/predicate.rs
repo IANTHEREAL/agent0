@@ -3,6 +3,8 @@
 //! Extracts structured [`PredicateInfo`] from both AST (`Expr`) and Analyzer
 //! (`TypedExpr`) expression trees, enabling index selection and cost estimation.
 
+use std::collections::HashMap;
+
 use sqlparser::ast::{BinaryOperator, Expr};
 
 use super::{PredicateInfo, PredicateOp};
@@ -26,6 +28,57 @@ pub fn analyze_typed_predicates(
     let mut predicates = Vec::new();
     collect_typed_predicates(expr, &mut predicates);
     predicates
+}
+
+/// Collect a conjunction of `col = const` predicates into a map keyed by
+/// lower-cased column name.
+///
+/// Returns `None` if the expression is not an AND tree of equality predicates,
+/// or if the same column appears with conflicting constant values.
+pub(crate) fn collect_typed_eq_predicates(
+    expr: &crate::sql::analyzer::types::TypedExpr,
+    out: &mut HashMap<String, Value>,
+) -> Option<()> {
+    use crate::sql::analyzer::types::{BinaryOp as TypedBinaryOp, TypedExprKind};
+
+    match &expr.kind {
+        TypedExprKind::BinaryOp { left, op, right } => match op {
+            TypedBinaryOp::And => {
+                collect_typed_eq_predicates(left, out)?;
+                collect_typed_eq_predicates(right, out)?;
+                Some(())
+            }
+            TypedBinaryOp::Eq => {
+                let (col, val) = if let TypedExprKind::ColumnRef { column_name, .. } = &left.kind {
+                    if let TypedExprKind::Constant(v) = &right.kind {
+                        (column_name.to_lowercase(), v.clone())
+                    } else {
+                        return None;
+                    }
+                } else if let TypedExprKind::ColumnRef { column_name, .. } = &right.kind {
+                    if let TypedExprKind::Constant(v) = &left.kind {
+                        (column_name.to_lowercase(), v.clone())
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                };
+
+                if let Some(existing) = out.get(&col) {
+                    if existing != &val {
+                        return None;
+                    }
+                    return Some(());
+                }
+
+                out.insert(col, val);
+                Some(())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 pub(super) fn collect_typed_predicates(

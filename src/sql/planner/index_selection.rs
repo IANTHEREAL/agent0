@@ -240,6 +240,11 @@ fn is_planner_usable_index(index: &IndexDef) -> bool {
         .unwrap_or(true)
 }
 
+/// Compute index scan cost from estimated matching rows.
+fn index_scan_cost(estimated_rows: usize) -> f64 {
+    1.0 + estimated_rows as f64 * 0.5
+}
+
 fn evaluate_expression_index(
     index: &IndexDef,
     filter: &Expr,
@@ -248,7 +253,7 @@ fn evaluate_expression_index(
     let values = match_expression_predicates(index, filter)?;
     let selectivity = estimate_selectivity(index, values.len(), true);
     let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
-    let cost = 1.0 + estimated_rows as f64 * 0.5;
+    let cost = index_scan_cost(estimated_rows);
 
     Some((
         ScanType::IndexScan {
@@ -362,7 +367,7 @@ fn evaluate_index(
     if prefix_values.len() == index.columns.len() {
         let selectivity = estimate_selectivity(index, prefix_values.len(), true);
         let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
-        let cost = 1.0 + estimated_rows as f64 * 0.5;
+        let cost = index_scan_cost(estimated_rows);
 
         return Some((
             ScanType::IndexScan {
@@ -394,7 +399,7 @@ fn evaluate_index(
         let table_rows = estimated_table_rows.max(1);
         let selectivity = ((in_pred.in_values.len() as f64) * (1.0 / table_rows as f64)).min(0.5);
         let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
-        let cost = 1.0 + estimated_rows as f64 * 0.5;
+        let cost = index_scan_cost(estimated_rows);
 
         return Some((
             ScanType::InListScan {
@@ -452,7 +457,7 @@ fn evaluate_index(
         let two_sided = range_start.is_some() && range_end.is_some();
         let selectivity = if two_sided { 0.1 } else { 0.3 };
         let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
-        let cost = 1.0 + estimated_rows as f64 * 0.5;
+        let cost = index_scan_cost(estimated_rows);
 
         return Some((
             ScanType::IndexBoundedRangeScan {
@@ -475,7 +480,7 @@ fn evaluate_index(
 
     let selectivity = estimate_selectivity(index, prefix_values.len(), false);
     let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
-    let cost = 1.0 + estimated_rows as f64 * 0.5;
+    let cost = index_scan_cost(estimated_rows);
 
     Some((
         ScanType::IndexRangeScan {
@@ -525,7 +530,7 @@ fn evaluate_expression_index_typed(
     let values = match_expression_predicates_typed(index, filter)?;
     let selectivity = estimate_selectivity(index, values.len(), true);
     let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
-    let cost = 1.0 + estimated_rows as f64 * 0.5;
+    let cost = index_scan_cost(estimated_rows);
 
     Some((
         ScanType::IndexScan {

@@ -5,13 +5,13 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Result};
 
 use super::BuildContext;
-use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
+use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::operators::{
     BoxedOperator, InListScanOperator, IndexScanOperator, ProjectOperator, RangeIndexScanOperator,
     TableScanOperator,
 };
 use crate::sql::optimizer::physical_plan::{PhysicalNode, PhysicalPlan};
-use crate::sql::planner::ScanType;
+use crate::sql::planner::{collect_typed_eq_predicates, ScanType};
 use crate::sql::value_coercion::coerce_value_for_column;
 use crate::types::{DataType, TableSchema, Value};
 
@@ -210,47 +210,6 @@ pub(super) fn build_limit_child_with_scan_pushdown(
     }
 }
 
-fn collect_eq_predicates(expr: &TypedExpr, out: &mut HashMap<String, Value>) -> Option<()> {
-    match &expr.kind {
-        TypedExprKind::BinaryOp { left, op, right } => match op {
-            crate::sql::analyzer::types::BinaryOp::And => {
-                collect_eq_predicates(left, out)?;
-                collect_eq_predicates(right, out)?;
-                Some(())
-            }
-            crate::sql::analyzer::types::BinaryOp::Eq => {
-                let (col, val) = if let TypedExprKind::ColumnRef { column_name, .. } = &left.kind {
-                    if let TypedExprKind::Constant(v) = &right.kind {
-                        (column_name.to_lowercase(), v.clone())
-                    } else {
-                        return None;
-                    }
-                } else if let TypedExprKind::ColumnRef { column_name, .. } = &right.kind {
-                    if let TypedExprKind::Constant(v) = &left.kind {
-                        (column_name.to_lowercase(), v.clone())
-                    } else {
-                        return None;
-                    }
-                } else {
-                    return None;
-                };
-
-                if let Some(existing) = out.get(&col) {
-                    if existing != &val {
-                        return None;
-                    }
-                    return Some(());
-                }
-
-                out.insert(col, val);
-                Some(())
-            }
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 fn typed_filter_is_exact_index_lookup(
     filter: &TypedExpr,
     schema: &TableSchema,
@@ -266,7 +225,7 @@ fn typed_filter_is_exact_index_lookup(
     }
 
     let mut predicates: HashMap<String, Value> = HashMap::new();
-    if collect_eq_predicates(filter, &mut predicates).is_none() {
+    if collect_typed_eq_predicates(filter, &mut predicates).is_none() {
         return false;
     }
     if predicates.len() != lookup_values.len() {

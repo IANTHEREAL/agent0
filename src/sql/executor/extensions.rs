@@ -44,9 +44,7 @@ fn apply_table_function_alias(schema: &mut TableSchema, alias: Option<&TableAlia
     Ok(())
 }
 
-fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
-    s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
-}
+use super::core::starts_with_ignore_ascii_case;
 
 fn parse_extension_name_token(token: &str) -> Result<String> {
     let token = token.trim().trim_end_matches(';');
