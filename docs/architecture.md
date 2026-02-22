@@ -386,10 +386,12 @@ Implements: `pg_class`, `pg_attribute`, `pg_type`, `pg_index`, `pg_namespace`, `
 
 Supports:
 - B-tree index scans (equality, range, prefix)
-- GIN index scans (full-text search, array containment)
 - Expression indexes (indexes on computed expressions)
 - Partial indexes (indexes with WHERE predicates)
 - Multi-column index prefix matching
+
+Current note:
+- `ScanType::GinIndexScan` is reserved for planned future support, but GIN access-path selection is currently disabled so EXPLAIN and runtime behavior stay aligned.
 
 ### 4.9 Statistics (`src/sql/stats.rs` + `optimizer/statistics.rs`)
 
@@ -611,7 +613,7 @@ pg_cron-compatible cron job scheduling integrated with the worker engine.
 | Legacy cleanup | Removed 10 legacy code items, single execution path | All |
 | Privilege enforcement | SELECT privilege on every base table | `executor/core/statement.rs` |
 | 40+ catalog views | pg_catalog + information_schema + cron compatibility | `catalog/` |
-| Full-text search | GIN indexes + Chinese tokenizer | `gin.rs`, `fts.rs` |
+| Full-text search | FTS functions + GIN tokenization/storage (GIN planner access path currently disabled) + Chinese tokenizer | `gin.rs`, `fts.rs`, `planner/index_selection.rs` |
 | SQL Rewriter phase | Shared analyzed rewrite entry for execution/EXPLAIN, no SELECT/WITH runtime fallback | `executor/core/analyze_rewrite.rs`, `rewriter/`, `parser/` |
 | Worker engine | Unified async task engine: cron, async triggers, auto-analyze, bg-sql, bg-ddl | `src/worker/` |
 | Cron scheduler | pg_cron-compatible cron expressions, job management, virtual tables | `src/cron/`, `catalog/cron_*.rs` |

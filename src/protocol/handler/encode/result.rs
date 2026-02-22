@@ -8,7 +8,7 @@ use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse
 use pgwire::api::Type;
 use pgwire::error::PgWireResult;
 use pgwire::messages::data::DataRow;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 pub(in crate::protocol::handler) fn result_to_response(
     result: ExecuteResult,
@@ -92,6 +92,13 @@ pub(in crate::protocol::handler) fn result_to_response_with_format(
                     if let Some(first_val) = first_row.values.first() {
                         match first_val {
                             Value::Text(s) if s.starts_with("PostgreSQL") => {
+                                static WARN_VERSION_HACK: Once = Once::new();
+                                WARN_VERSION_HACK.call_once(|| {
+                                    tracing::warn!(
+                                        issue = "#693",
+                                        "version() column rename triggered in wire layer; expected Analyzer to set column name"
+                                    );
+                                });
                                 vec!["version".to_string()]
                             }
                             Value::Text(s) if s == "postgres" || !s.contains(' ') => {

@@ -11,7 +11,7 @@
 //! - Optional ORDER BY
 //! - Optional LIMIT/OFFSET
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
 use crate::sql::analyzer::types::{TypedExpr, TypedOrderByExpr};
@@ -127,89 +127,13 @@ impl PhysicalPlanner {
             None => None,
         };
 
-        let mut root: BoxedOperator = match access_path.scan_type {
-            ScanType::FullTableScan => {
-                let scan_limit = if filter.is_none() && order_by.is_empty() {
-                    scan_upper_bound
-                } else {
-                    None
-                };
-                Box::new(TableScanOperator::new_with_scan_limit(schema, scan_limit))
-            }
-            ScanType::IndexScan {
-                index_id,
-                index_name,
-                values,
-                ..
-            } => {
-                let scan_limit = if order_by.is_empty()
-                    && scan_upper_bound.is_some()
-                    && filter.is_some_and(|f| {
-                        filter_is_exact_index_lookup(f, &schema, index_id, &values)
-                    }) {
-                    scan_upper_bound
-                } else {
-                    None
-                };
-                Box::new(IndexScanOperator::new_with_scan_limit(
-                    schema, index_id, index_name, values, scan_limit,
-                ))
-            }
-            ScanType::IndexRangeScan {
-                index_id,
-                index_name,
-                prefix_values,
-                ..
-            } => {
-                let scan_limit = if order_by.is_empty()
-                    && scan_upper_bound.is_some()
-                    && filter.is_some_and(|f| {
-                        filter_is_exact_index_lookup(f, &schema, index_id, &prefix_values)
-                    }) {
-                    scan_upper_bound
-                } else {
-                    None
-                };
-                Box::new(IndexScanOperator::new_with_scan_limit(
-                    schema,
-                    index_id,
-                    index_name,
-                    prefix_values,
-                    scan_limit,
-                ))
-            }
-            ScanType::IndexBoundedRangeScan {
-                index_id,
-                index_name,
-                prefix_values,
-                range_start,
-                start_inclusive,
-                range_end,
-                end_inclusive,
-                ..
-            } => Box::new(RangeIndexScanOperator::new(
-                schema,
-                index_id,
-                index_name,
-                prefix_values,
-                range_start,
-                start_inclusive,
-                range_end,
-                end_inclusive,
-            )),
-            ScanType::InListScan {
-                index_id,
-                index_name,
-                column_values,
-                ..
-            } => Box::new(InListScanOperator::new(
-                schema,
-                index_id,
-                index_name,
-                column_values,
-            )),
-            ScanType::GinIndexScan { .. } => Box::new(TableScanOperator::new(schema)),
-        };
+        let mut root: BoxedOperator = build_scan_root_from_scan_type(
+            schema,
+            access_path.scan_type,
+            scan_upper_bound,
+            filter,
+            &order_by,
+        )?;
 
         if let Some(filter_expr) = filter {
             root = Box::new(FilterOperator::new(root, filter_expr.clone()));
@@ -227,11 +151,109 @@ impl PhysicalPlanner {
     }
 }
 
+fn build_scan_root_from_scan_type(
+    schema: TableSchema,
+    scan_type: ScanType,
+    scan_upper_bound: Option<usize>,
+    filter: Option<&TypedExpr>,
+    order_by: &[TypedOrderByExpr],
+) -> Result<BoxedOperator> {
+    let table_name = schema.name.clone();
+    match scan_type {
+        ScanType::FullTableScan => {
+            let scan_limit = if filter.is_none() && order_by.is_empty() {
+                scan_upper_bound
+            } else {
+                None
+            };
+            Ok(Box::new(TableScanOperator::new_with_scan_limit(
+                schema, scan_limit,
+            )))
+        }
+        ScanType::IndexScan {
+            index_id,
+            index_name,
+            values,
+            ..
+        } => {
+            let scan_limit = if order_by.is_empty()
+                && scan_upper_bound.is_some()
+                && filter
+                    .is_some_and(|f| filter_is_exact_index_lookup(f, &schema, index_id, &values))
+            {
+                scan_upper_bound
+            } else {
+                None
+            };
+            Ok(Box::new(IndexScanOperator::new_with_scan_limit(
+                schema, index_id, index_name, values, scan_limit,
+            )))
+        }
+        ScanType::IndexRangeScan {
+            index_id,
+            index_name,
+            prefix_values,
+            ..
+        } => {
+            let scan_limit = if order_by.is_empty()
+                && scan_upper_bound.is_some()
+                && filter.is_some_and(|f| {
+                    filter_is_exact_index_lookup(f, &schema, index_id, &prefix_values)
+                }) {
+                scan_upper_bound
+            } else {
+                None
+            };
+            Ok(Box::new(IndexScanOperator::new_with_scan_limit(
+                schema,
+                index_id,
+                index_name,
+                prefix_values,
+                scan_limit,
+            )))
+        }
+        ScanType::IndexBoundedRangeScan {
+            index_id,
+            index_name,
+            prefix_values,
+            range_start,
+            start_inclusive,
+            range_end,
+            end_inclusive,
+            ..
+        } => Ok(Box::new(RangeIndexScanOperator::new(
+            schema,
+            index_id,
+            index_name,
+            prefix_values,
+            range_start,
+            start_inclusive,
+            range_end,
+            end_inclusive,
+        ))),
+        ScanType::InListScan {
+            index_id,
+            index_name,
+            column_values,
+            ..
+        } => Ok(Box::new(InListScanOperator::new(
+            schema,
+            index_id,
+            index_name,
+            column_values,
+        ))),
+        ScanType::GinIndexScan { .. } => Err(anyhow!(
+            "Unexpected ScanType::GinIndexScan in operators::planner for table '{}'",
+            table_name
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql::analyzer::types::{BinaryOp as TypedBinaryOp, TypedExpr, TypedExprKind};
-    use crate::types::DataType;
+    use crate::types::{ColumnDef, DataType};
 
     fn make_typed_eq_expr(col: &str, col_idx: usize, val: i32) -> TypedExpr {
         TypedExpr {
@@ -317,5 +339,44 @@ mod tests {
         };
         let mut out = HashMap::new();
         assert!(super::collect_typed_eq_predicates(&expr, &mut out).is_none());
+    }
+
+    fn planner_test_schema() -> TableSchema {
+        TableSchema::new(
+            "t".to_string(),
+            1,
+            vec![ColumnDef {
+                name: "body".to_string(),
+                data_type: DataType::Tsvector,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            vec![],
+        )
+    }
+
+    #[test]
+    fn test_build_scan_root_rejects_gin_scan_type() {
+        let err = build_scan_root_from_scan_type(
+            planner_test_schema(),
+            ScanType::GinIndexScan {
+                index_id: 7,
+                index_name: "idx_body_gin".to_string(),
+                column: "body".to_string(),
+                pattern: Value::Tsquery("hello".to_string()),
+                estimated_rows: 1,
+            },
+            None,
+            None,
+            &[],
+        )
+        .expect_err("GinIndexScan must not be built in operators planner");
+
+        let msg = err.to_string();
+        assert!(msg.contains("Unexpected ScanType::GinIndexScan"));
+        assert!(msg.contains("table 't'"));
     }
 }

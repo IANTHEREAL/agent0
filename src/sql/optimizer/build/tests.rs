@@ -66,6 +66,25 @@ fn test_seq_scan() {
 }
 
 #[test]
+fn test_build_index_scan_operator_rejects_gin_scan_type() {
+    let ctx = test_ctx();
+    let scan_type = crate::sql::planner::ScanType::GinIndexScan {
+        index_id: 7,
+        index_name: "idx_body_gin".to_string(),
+        column: "body".to_string(),
+        pattern: Value::Tsquery("hello".to_string()),
+        estimated_rows: 1,
+    };
+
+    let err = super::scan::build_index_scan_operator(&ctx, "test_table", None, &scan_type, None)
+        .expect_err("GinIndexScan must not be accepted by optimizer build scan");
+
+    let msg = err.to_string();
+    assert!(msg.contains("Unexpected ScanType"));
+    assert!(msg.contains("GinIndexScan"));
+}
+
+#[test]
 fn test_seq_scan_with_alias() {
     let plan = PhysicalPlan {
         node: PhysicalNode::SeqScan {

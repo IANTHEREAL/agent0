@@ -117,9 +117,6 @@ pub(super) fn build_index_scan_operator(
             index_name.clone(),
             column_values.clone(),
         ))),
-        // GIN execution operator is not implemented yet. Keep runtime semantics
-        // correct by scanning table rows and letting the parent Filter evaluate.
-        ScanType::GinIndexScan { .. } => Ok(Box::new(TableScanOperator::new(schema))),
         // FullTableScan should not appear in PhysicalNode::IndexScan.
         other => Err(anyhow!(
             "Unexpected ScanType {:?} in PhysicalNode::IndexScan for table '{}'",

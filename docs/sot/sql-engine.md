@@ -43,8 +43,10 @@
   - Evidence: `src/sql/coercion.rs` (`coerce_value_for_column`), `src/sql/dml.rs` (`coerce_row_values`, DML write helpers), `tests/155_dml_type_coercion_invariant_issue407.sql`.
 - **Trigger execution model** (high level): BEFORE triggers execute in-statement; AFTER triggers are enqueued and processed asynchronously by a worker (exact queue/storage details are implementation-defined and may evolve).
   - Evidence: `src/sql/triggers.rs`, `src/sql/trigger_queue.rs`, `src/sql/trigger_worker.rs`, `src/sql/executor/triggers.rs`, `tests/53_trigger_execution.sql`.
-- **Index access paths are planner-driven**: plan selection (btree vs GIN-like) is chosen based on schema/index metadata + predicates; the index encoding itself is specified in `./storage-format.md`.
-  - Evidence: `src/sql/planner.rs`, `src/sql/executor/select/mod.rs`.
+- **Index access paths are planner-driven**: plan selection currently chooses full-table + B-tree variants based on schema/index metadata + predicates; index encoding details are specified in `./storage-format.md`.
+  - Evidence: `src/sql/planner/index_selection.rs`, `src/sql/executor/select/mod.rs`.
+- **[Experimental] GIN access path is currently disabled in planner/runtime**: `ScanType::GinIndexScan` is retained as a future contract shape, but current access-path selection does not emit it and runtime builders reject it if reached unexpectedly.
+  - Evidence: `src/sql/planner/index_selection.rs`, `src/sql/optimizer/build/scan.rs`, `src/sql/operators/planner.rs`.
 
 ## Configuration
 This module MUST NOT redefine config keys. Relevant keys are defined exactly once in `./ops-config.md`:

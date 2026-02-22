@@ -562,7 +562,7 @@ fn test_expression_index_case_insensitive_match() {
 }
 
 #[test]
-fn test_choose_gin_index_scan_for_jsonb_contains() {
+fn test_gin_index_skipped_without_operator() {
     use crate::types::ColumnDef;
     let schema = TableSchema {
         name: "test".to_string(),
@@ -610,10 +610,7 @@ fn test_choose_gin_index_scan_for_jsonb_contains() {
     let filter = select.selection.as_ref().expect("WHERE exists");
 
     let path = choose_best_access_path_for_filter(0, &schema, Some(filter), 1000);
-    match path.scan_type {
-        ScanType::GinIndexScan { index_id, .. } => assert_eq!(index_id, 7),
-        other => panic!("expected GinIndexScan, got {:?}", other),
-    }
+    assert!(matches!(path.scan_type, ScanType::FullTableScan));
 }
 
 #[test]
@@ -1553,7 +1550,7 @@ fn gin_schema() -> TableSchema {
 }
 
 #[test]
-fn test_gin_typed_tsmatch_selects_gin_index() {
+fn test_gin_typed_tsmatch_skipped_without_operator() {
     let schema = gin_schema();
     // body @@ to_tsquery('hello')
     let filter = typed_binop(
@@ -1564,19 +1561,11 @@ fn test_gin_typed_tsmatch_selects_gin_index() {
     );
 
     let path = choose_best_access_path_for_typed_filter(0, &schema, Some(&filter), 10000);
-    match &path.scan_type {
-        ScanType::GinIndexScan {
-            index_name, column, ..
-        } => {
-            assert_eq!(index_name, "idx_body_gin");
-            assert_eq!(column, "body");
-        }
-        other => panic!("expected GinIndexScan, got {:?}", other),
-    }
+    assert!(matches!(path.scan_type, ScanType::FullTableScan));
 }
 
 #[test]
-fn test_gin_typed_json_contains_selects_gin_index() {
+fn test_gin_typed_json_contains_skipped_without_operator() {
     let schema = gin_schema();
     // data @> '{"key": "val"}'::jsonb
     let filter = typed_binop(
@@ -1590,15 +1579,7 @@ fn test_gin_typed_json_contains_selects_gin_index() {
     );
 
     let path = choose_best_access_path_for_typed_filter(0, &schema, Some(&filter), 10000);
-    match &path.scan_type {
-        ScanType::GinIndexScan {
-            index_name, column, ..
-        } => {
-            assert_eq!(index_name, "idx_data_gin");
-            assert_eq!(column, "data");
-        }
-        other => panic!("expected GinIndexScan, got {:?}", other),
-    }
+    assert!(matches!(path.scan_type, ScanType::FullTableScan));
 }
 
 #[test]

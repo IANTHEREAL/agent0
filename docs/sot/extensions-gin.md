@@ -2,10 +2,12 @@
 
 ## Scope
 - HTTP extension framework and table functions (`extensions.http_*`) and their security model (SSRF protection, limits, superuser boundary).
-- GIN-like inverted index semantics used for:
+- GIN-like inverted index storage/maintenance semantics used for:
   - JSON/JSONB containment (`@>`),
   - ARRAY containment (`@>`),
   - FTS match (`@@`) via `TSVECTOR`/`TSQUERY`.
+- Planner access-path note: in the current single-path engine, `GIN` scan selection is
+  intentionally disabled until a real runtime GIN operator is implemented.
 - Extension-owned configuration knobs and feature flags (defined once; see `./ops-config.md`).
 
 ## Non-goals
@@ -38,15 +40,20 @@
   - HTTP extension execution MUST enforce per-statement request count limits and per-tenant in-flight concurrency limits.
   - Evidence: `src/extensions/context.rs` (`try_consume_http_request`), `src/extensions/http.rs` (`MAX_REQUESTS_PER_STATEMENT`, `MAX_INFLIGHT_REQUESTS_PER_TENANT_PER_NODE`, `TenantLimiters`).
 
-- **[Stable] GIN-like indexing for JSONB/ARRAY/TSVECTOR**
-  - The engine supports a lightweight inverted index (“GIN-like”) for a restricted subset of `USING gin` indexes:
+- **[Stable] GIN-like index lifecycle for JSONB/ARRAY/TSVECTOR**
+  - The engine supports a lightweight inverted index (“GIN-like”) storage lifecycle for a restricted subset of `USING gin` indexes:
     - exactly one indexed column,
     - no expressions,
     - no partial predicate,
     - column type is `JSON/JSONB`, `ARRAY`, or `TSVECTOR`.
-  - Evidence: `src/sql/ddl.rs` (`supported_gin_index_column`, `create_gin_index_entries` backfill path), `src/sql/dml.rs` (maintenance), `src/sql/planner.rs` (`choose_gin_access_path`), `tests/94_gin_index_query.sql`, `tests/131_gin_fts.sql`.
-  - Note: `USING gin` indexes on other column types are accepted syntactically, but they are not eligible for the GIN access path and may not be populated/used.
-    - Evidence: `src/sql/index_helpers.rs` (`is_index_materializable`), `src/sql/planner.rs` (`choose_gin_access_path` type checks).
+  - Evidence: `src/sql/ddl.rs` (`supported_gin_index_column`, `create_gin_index_entries` backfill path), `src/sql/dml.rs` (maintenance), `src/sql/gin.rs`, `tests/94_gin_index_query.sql`, `tests/131_gin_fts.sql`.
+  - Note: `USING gin` indexes on other column types are accepted syntactically but are outside the supported lifecycle and may not be populated/used.
+    - Evidence: `src/sql/index_helpers.rs` (`is_index_materializable`).
+
+- **[Experimental] GIN planner/executor access path is currently disabled**
+  - The planner currently does not select `ScanType::GinIndexScan`; GIN-eligible predicates execute through non-GIN scan paths with predicate filtering.
+  - Runtime/operator builders reject accidental `GinIndexScan` routing with explicit errors (no silent fallback).
+  - Evidence: `src/sql/planner/index_selection.rs`, `src/sql/optimizer/build/scan.rs`, `src/sql/operators/planner.rs`, `src/sql/planner/tests.rs`, `tests/131_gin_fts.assert`.
 
 - **[Experimental] Tokenization guarantees and limits**
   - For JSONB containment (`@>`), tokenization MUST avoid false negatives and MAY allow false positives (final containment recheck is required for correctness).
@@ -100,7 +107,6 @@ Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
   - `python3 scripts/integration_test.py --dsn "$PG_DSN" tests/131_gin_fts.sql`
 
 ## Change Management
-- Any change to HTTP extension security posture (superuser boundary, URL validation rules, limits/timeouts), GIN-like access path eligibility, or tokenization semantics MUST update this document and the corresponding module entries in `docs/sot/modules.yaml`.
+- Any change to HTTP extension security posture (superuser boundary, URL validation rules, limits/timeouts), GIN-like access-path eligibility, or tokenization semantics MUST update this document and the corresponding module entries in `docs/sot/modules.yaml`.
 - Breaking changes to security defaults or contracts require DR/ADR per #368 rules (impact surface + migration + rollback + verification updates).
 - Reference: https://github.com/c4pt0r/tipg/issues/368
-
