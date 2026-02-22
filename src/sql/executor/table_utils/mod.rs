@@ -318,6 +318,7 @@ impl Executor {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             }],
             pk_constraint_name: None,
             pk_indices: vec![],
@@ -399,6 +400,7 @@ impl Executor {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "applied_at".to_string(),
@@ -408,6 +410,7 @@ impl Executor {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "status".to_string(),
@@ -417,6 +420,7 @@ impl Executor {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
             ],
             pk_constraint_name: None,

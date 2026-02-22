@@ -87,12 +87,16 @@ pub(super) fn analyze_row_level_expr(
     schema: &TableSchema,
     db_id: u64,
     search_path: &[String],
+    collations: &[crate::sql::collation::CollationDef],
 ) -> Result<TypedExpr> {
     let mut catalog = CatalogSnapshot::new(search_path.to_vec(), db_id);
     let table_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
     catalog.add_table(table_name, schema.name.clone(), schema.clone());
     if let Some(alias) = &schema.from_alias {
         catalog.add_table(alias, schema.name.clone(), schema.clone());
+    }
+    for def in collations {
+        catalog.add_collation(&def.name, def.clone());
     }
 
     let typed = Analyzer::analyze_expr_with_scope(

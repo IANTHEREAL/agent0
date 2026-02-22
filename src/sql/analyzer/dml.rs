@@ -52,10 +52,17 @@ impl<'a> Analyzer<'a> {
         };
 
         // Build scope for the target table (needed for RETURNING and ON CONFLICT).
-        let table_cols: Vec<(String, DataType, bool)> = schema
+        let table_cols: Vec<(String, DataType, bool, Option<String>)> = schema
             .columns
             .iter()
-            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+            .map(|c| {
+                (
+                    c.name.clone(),
+                    c.data_type.clone(),
+                    c.nullable,
+                    c.collation.clone(),
+                )
+            })
             .collect();
 
         // Analyze source rows.
@@ -144,7 +151,7 @@ impl<'a> Analyzer<'a> {
     fn analyze_on_conflict(
         &mut self,
         on_insert: &OnInsert,
-        table_cols: &[(String, DataType, bool)],
+        table_cols: &[(String, DataType, bool, Option<String>)],
         schema: &crate::types::TableSchema,
         table_scope_name: &str,
         table_name_for_errors: &str,
@@ -256,10 +263,17 @@ impl<'a> Analyzer<'a> {
         let (resolved_name, table_schema, schema) = self.resolve_dml_target(target_name)?;
 
         // Build scope: target table (+ FROM tables if present).
-        let table_cols: Vec<(String, DataType, bool)> = schema
+        let table_cols: Vec<(String, DataType, bool, Option<String>)> = schema
             .columns
             .iter()
-            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+            .map(|c| {
+                (
+                    c.name.clone(),
+                    c.data_type.clone(),
+                    c.nullable,
+                    c.collation.clone(),
+                )
+            })
             .collect();
 
         let mut scope = Scope::new();
@@ -354,10 +368,17 @@ impl<'a> Analyzer<'a> {
         let (resolved_name, table_schema, schema) = self.resolve_dml_target(target_name)?;
 
         // Build scope: target table + USING tables.
-        let table_cols: Vec<(String, DataType, bool)> = schema
+        let table_cols: Vec<(String, DataType, bool, Option<String>)> = schema
             .columns
             .iter()
-            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+            .map(|c| {
+                (
+                    c.name.clone(),
+                    c.data_type.clone(),
+                    c.nullable,
+                    c.collation.clone(),
+                )
+            })
             .collect();
 
         let mut scope = Scope::new();

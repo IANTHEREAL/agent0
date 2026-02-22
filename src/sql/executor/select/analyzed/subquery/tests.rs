@@ -18,7 +18,7 @@ fn scalar_values_query(v: i32) -> AnalyzedQuery {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("v".to_string(), DataType::Int32)],
+        output_schema: vec![("v".to_string(), DataType::Int32, None)],
     }
 }
 
@@ -79,7 +79,7 @@ fn is_correlated_query_detects_outer_ref_inside_any_all() {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("?column?".to_string(), DataType::Int32)],
+        output_schema: vec![("?column?".to_string(), DataType::Int32, None)],
     };
 
     assert!(is_correlated_query(&query));
@@ -124,7 +124,7 @@ fn is_correlated_query_detects_outer_ref_in_table_function_args() {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("?column?".to_string(), DataType::Int32)],
+        output_schema: vec![("?column?".to_string(), DataType::Int32, None)],
     };
 
     assert!(is_correlated_query(&query));
@@ -154,7 +154,7 @@ fn correlated_values_query() -> AnalyzedQuery {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("outer_x".to_string(), DataType::Int32)],
+        output_schema: vec![("outer_x".to_string(), DataType::Int32, None)],
     }
 }
 
@@ -194,7 +194,7 @@ fn is_correlated_query_does_not_treat_nested_correlation_as_outer_ref() {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("?column?".to_string(), DataType::Int32)],
+        output_schema: vec![("?column?".to_string(), DataType::Int32, None)],
     };
 
     assert!(!is_correlated_query(&query));
@@ -225,7 +225,7 @@ fn is_correlated_query_detects_nested_ref_beyond_current_scope() {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("grand_outer".to_string(), DataType::Int32)],
+        output_schema: vec![("grand_outer".to_string(), DataType::Int32, None)],
     };
 
     let expr = TypedExpr::new(
@@ -268,7 +268,7 @@ fn is_correlated_query_detects_nested_ref_beyond_current_scope() {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("?column?".to_string(), DataType::Int32)],
+        output_schema: vec![("?column?".to_string(), DataType::Int32, None)],
     };
 
     assert!(is_correlated_query(&query));
@@ -313,7 +313,7 @@ fn substitute_outer_refs_in_query_rewrites_table_function_args() {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("?column?".to_string(), DataType::Int32)],
+        output_schema: vec![("?column?".to_string(), DataType::Int32, None)],
     };
     let outer_row = Row::new(vec![Value::Int32(7), Value::Int32(5)]);
 
@@ -515,7 +515,7 @@ fn derived_subquery_scope_depth_1_does_not_make_parent_correlated() {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("outer_col".to_string(), DataType::Int32)],
+        output_schema: vec![("outer_col".to_string(), DataType::Int32, None)],
     };
 
     let parent_query = AnalyzedQuery {
@@ -537,7 +537,7 @@ fn derived_subquery_scope_depth_1_does_not_make_parent_correlated() {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("?column?".to_string(), DataType::Int32)],
+        output_schema: vec![("?column?".to_string(), DataType::Int32, None)],
     };
 
     // The parent query should NOT be classified as correlated — the derived
@@ -576,7 +576,7 @@ fn derived_subquery_scope_depth_2_makes_parent_correlated() {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("gp".to_string(), DataType::Int32)],
+        output_schema: vec![("gp".to_string(), DataType::Int32, None)],
     };
 
     let parent_query = AnalyzedQuery {
@@ -598,7 +598,7 @@ fn derived_subquery_scope_depth_2_makes_parent_correlated() {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("?column?".to_string(), DataType::Int32)],
+        output_schema: vec![("?column?".to_string(), DataType::Int32, None)],
     };
 
     assert!(

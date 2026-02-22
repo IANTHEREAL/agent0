@@ -169,6 +169,7 @@ impl HashJoinOperator {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             });
         }
         for col in &right_child.schema().columns {
@@ -180,6 +181,7 @@ impl HashJoinOperator {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             });
         }
 

@@ -196,7 +196,7 @@ async fn resolve_view_output_schema(
     let columns: Vec<ColumnDef> = analyzed
         .output_schema
         .iter()
-        .map(|(col_name, data_type)| ColumnDef {
+        .map(|(col_name, data_type, _coll)| ColumnDef {
             name: col_name.clone(),
             data_type: data_type.clone(),
             nullable: true,
@@ -204,6 +204,7 @@ async fn resolve_view_output_schema(
             unique: false,
             is_serial: false,
             default_expr: None,
+            collation: None,
         })
         .collect();
 
@@ -330,6 +331,7 @@ fn infer_returns_table_schema(ret_lower: &str) -> Option<TableSchema> {
             unique: false,
             is_serial: false,
             default_expr: None,
+            collation: None,
         });
     }
 
@@ -661,6 +663,13 @@ pub(super) async fn build_catalog_snapshot_inner(
         &mut snapshot,
     )
     .await?;
+
+    // 6. Prefetch user-defined collations for Analyzer resolution.
+    let collation_defs = store.list_collations(txn, db_id).await?;
+    for def in collation_defs {
+        let name = def.name.clone();
+        snapshot.add_collation(&name, def);
+    }
 
     Ok(snapshot)
 }

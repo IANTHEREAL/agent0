@@ -15,6 +15,7 @@ use tikv_client::{
 use tracing::{debug, info};
 
 // Submodules
+mod collations;
 pub mod cron;
 mod database;
 mod extensions;

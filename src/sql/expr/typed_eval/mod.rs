@@ -474,5 +474,12 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
                 .collect::<Result<Vec<_>>>()?;
             Ok(Value::Array(vals))
         }
+
+        // ── Collation ───────────────────────────────────────
+        TypedExprKind::Collate { expr: inner, .. } => {
+            // For now, just evaluate the inner expression.
+            // The collation metadata is used during comparison operations.
+            eval_typed_expr(inner, row, qctx)
+        }
     }
 }

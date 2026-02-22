@@ -110,7 +110,11 @@ impl Executor {
 
                 // 6. Finalize parameter types
                 let param_types = analyzer.finalize_param_types().map_err(SqlError::from)?;
-                let output_schema = rewritten.output_schema.clone();
+                let output_schema: Vec<(String, DataType)> = rewritten
+                    .output_schema
+                    .iter()
+                    .map(|(name, dt, _coll)| (name.clone(), dt.clone()))
+                    .collect();
 
                 // 7. Collect base table names for RBAC
                 let base_table_names = catalog
@@ -158,8 +162,12 @@ impl Executor {
                 let analyzed_stmt = analyzer.analyze_statement(stmt).map_err(SqlError::from)?;
                 let param_types = analyzer.finalize_param_types().map_err(SqlError::from)?;
 
-                let output_schema = match &analyzed_stmt {
-                    AnalyzedStatement::Query(q) => q.output_schema.clone(),
+                let output_schema: Vec<(String, DataType)> = match &analyzed_stmt {
+                    AnalyzedStatement::Query(q) => q
+                        .output_schema
+                        .iter()
+                        .map(|(name, dt, _coll)| (name.clone(), dt.clone()))
+                        .collect(),
                     AnalyzedStatement::Insert(i) => returning_schema(&i.returning),
                     AnalyzedStatement::Update(u) => returning_schema(&u.returning),
                     AnalyzedStatement::Delete(d) => returning_schema(&d.returning),
@@ -280,7 +288,11 @@ impl Executor {
         })
         .map_err(SqlError::from)?;
         crate::sql::stack_safety::drop_on_grown_stack(expanded);
-        Ok(analyzed.output_schema)
+        Ok(analyzed
+            .output_schema
+            .into_iter()
+            .map(|(name, dt, _coll)| (name, dt))
+            .collect())
     }
 }
 

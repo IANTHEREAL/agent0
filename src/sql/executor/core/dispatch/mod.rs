@@ -476,6 +476,14 @@ impl Executor {
                     dispatch_raw!(self, session, sql_trimmed,
                         self.execute_drop_type_cmd(session, sql).await);
                 }
+                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::CreateCollation)) {
+                    dispatch_raw!(self, session, sql_trimmed,
+                        self.execute_create_collation_cmd(session, sql).await);
+                }
+                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::DropCollation)) {
+                    dispatch_raw!(self, session, sql_trimmed,
+                        self.execute_drop_collation_cmd(session, sql).await);
+                }
                 if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::Analyze)) {
                     dispatch_raw!(self, session, sql_trimmed,
                         self.execute_analyze_cmd(session, sql_trimmed).await);

@@ -227,6 +227,7 @@ impl Executor {
                                     unique: false,
                                     is_serial: false,
                                     default_expr: None,
+                                    collation: None,
                                 })
                                 .collect(),
                             pk_constraint_name: None,
@@ -597,11 +598,11 @@ impl Executor {
             // ── Step 9: Build result ──
             let columns: Vec<String> = final_output_schema
                 .iter()
-                .map(|(name, _)| name.clone())
+                .map(|(name, _, _)| name.clone())
                 .collect();
             let column_types: Vec<DataType> = final_output_schema
                 .iter()
-                .map(|(_, dt)| dt.clone())
+                .map(|(_, dt, _)| dt.clone())
                 .collect();
 
             Ok(ExecuteResult::Select {
@@ -750,7 +751,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
-            output_schema: vec![("v".to_string(), DataType::Int32)],
+            output_schema: vec![("v".to_string(), DataType::Int32, None)],
         }
     }
 
@@ -767,7 +768,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
-            output_schema: vec![("v".to_string(), DataType::Int32)],
+            output_schema: vec![("v".to_string(), DataType::Int32, None)],
         }
     }
 
@@ -841,7 +842,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
-            output_schema: vec![("x".to_string(), DataType::Int32)],
+            output_schema: vec![("x".to_string(), DataType::Int32, None)],
         };
 
         let nested = collect_immediate_nested_analyzed_queries(&root);
@@ -870,7 +871,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
-            output_schema: vec![("v".to_string(), DataType::Int32)],
+            output_schema: vec![("v".to_string(), DataType::Int32, None)],
         };
 
         let nested = collect_immediate_nested_analyzed_queries(&root);
@@ -911,7 +912,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
-            output_schema: vec![("v".to_string(), DataType::Int32)],
+            output_schema: vec![("v".to_string(), DataType::Int32, None)],
         };
         let root = AnalyzedQuery {
             ctes: vec![],

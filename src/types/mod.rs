@@ -421,6 +421,8 @@ pub struct ColumnDef {
     pub unique: bool,
     pub is_serial: bool,
     pub default_expr: Option<String>,
+    #[serde(default)]
+    pub collation: Option<String>,
 }
 
 /// Index definition

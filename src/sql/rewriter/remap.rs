@@ -288,6 +288,17 @@ pub(super) fn remap_column_refs(
                 .map(|e| remap_column_refs(e, column_map, base_names))
                 .collect(),
         ),
+
+        // Collate
+        TypedExprKind::Collate {
+            expr,
+            collation,
+            resolved,
+        } => TypedExprKind::Collate {
+            expr: Box::new(remap_column_refs(*expr, column_map, base_names)),
+            collation,
+            resolved,
+        },
     };
 
     TypedExpr::new(new_kind, data_type)

@@ -133,7 +133,7 @@ fn for_each_child_subquery_opaque() {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("v".to_string(), DataType::Int32)],
+        output_schema: vec![("v".to_string(), DataType::Int32, None)],
     };
     let expr = TypedExpr::new(
         TypedExprKind::ScalarSubquery(Box::new(subquery)),

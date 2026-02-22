@@ -244,6 +244,7 @@ impl<'a> Analyzer<'a> {
             TypedExprKind::JsonAccess { expr, path, .. } => {
                 Self::contains_aggregate_call(expr) || Self::contains_aggregate_call(path)
             }
+            TypedExprKind::Collate { expr, .. } => Self::contains_aggregate_call(expr),
             TypedExprKind::Constant(_)
             | TypedExprKind::ColumnRef { .. }
             | TypedExprKind::ScalarSubquery(_)
@@ -545,6 +546,10 @@ impl<'a> Analyzer<'a> {
                             in_aggregate,
                         )
                     })
+            }
+
+            TypedExprKind::Collate { expr, .. } => {
+                Self::find_ungrouped_column(expr, grouped_columns, grouped_expr_keys, in_aggregate)
             }
 
             TypedExprKind::Constant(_)

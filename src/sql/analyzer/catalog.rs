@@ -4,6 +4,7 @@
 //! `CatalogSnapshot` implementation is built by pre-fetching all referenced
 //! relations from TiKV before analysis begins (async fetch → sync analysis).
 
+use crate::sql::collation::CollationDef;
 use crate::types::{ColumnDef, DataType, FunctionDef, TableSchema, UserTypeDef, ViewDef};
 use std::collections::{HashMap, HashSet};
 
@@ -78,6 +79,12 @@ pub trait Catalog: Send + Sync {
     /// The current database ID (for scope isolation).
     #[allow(dead_code)]
     fn database_id(&self) -> u64;
+
+    /// Check if a collation exists (built-in or user-defined).
+    fn collation_exists(&self, name: &str) -> bool;
+
+    /// Get a collation definition by name.
+    fn get_collation(&self, name: &str) -> Option<CollationDef>;
 }
 
 // ── CatalogSnapshot ─────────────────────────────────────────
@@ -98,6 +105,7 @@ pub struct CatalogSnapshot {
     functions: HashMap<String, FunctionDef>,
     #[allow(dead_code)] // FUTURE: user-defined type resolution
     types: HashMap<String, UserTypeDef>,
+    collations: HashMap<String, CollationDef>,
     search_path: Vec<String>,
     #[allow(dead_code)] // FUTURE: cross-database query isolation
     database_id: u64,
@@ -115,6 +123,7 @@ impl CatalogSnapshot {
             views: HashMap::new(),
             functions: HashMap::new(),
             types: HashMap::new(),
+            collations: HashMap::new(),
             search_path,
             database_id,
             non_base_names: HashSet::new(),
@@ -148,6 +157,11 @@ impl CatalogSnapshot {
     #[allow(dead_code)] // FUTURE: user-defined type resolution
     pub fn add_type(&mut self, name: &str, udt: UserTypeDef) {
         self.types.insert(name.to_lowercase(), udt);
+    }
+
+    /// Add a user-defined collation to the snapshot.
+    pub fn add_collation(&mut self, name: &str, def: CollationDef) {
+        self.collations.insert(name.to_lowercase(), def);
     }
 
     /// Check if a table name is already in the snapshot.
@@ -303,6 +317,42 @@ impl Catalog for CatalogSnapshot {
     fn database_id(&self) -> u64 {
         self.database_id
     }
+
+    fn collation_exists(&self, name: &str) -> bool {
+        let lower = name.to_lowercase();
+        // Built-in collations are always available
+        if matches!(lower.as_str(), "c" | "posix" | "default") {
+            return true;
+        }
+        // Check catalog snapshot
+        self.collations.contains_key(&lower)
+    }
+
+    fn get_collation(&self, name: &str) -> Option<CollationDef> {
+        let lower = name.to_lowercase();
+        // Built-in collations
+        match lower.as_str() {
+            "c" => Some(CollationDef {
+                name: "C".to_string(),
+                provider: "c".to_string(),
+                locale: Some("C".to_string()),
+                deterministic: true,
+            }),
+            "posix" => Some(CollationDef {
+                name: "POSIX".to_string(),
+                provider: "c".to_string(),
+                locale: Some("POSIX".to_string()),
+                deterministic: true,
+            }),
+            "default" => Some(CollationDef {
+                name: "default".to_string(),
+                provider: "d".to_string(),
+                locale: None,
+                deterministic: true,
+            }),
+            _ => self.collations.get(&lower).cloned(),
+        }
+    }
 }
 
 // ── NullCatalog ─────────────────────────────────────────────
@@ -358,6 +408,16 @@ impl Catalog for NullCatalog {
 
     fn database_id(&self) -> u64 {
         0
+    }
+
+    fn collation_exists(&self, name: &str) -> bool {
+        // NullCatalog only knows built-in collations
+        let lower = name.to_lowercase();
+        matches!(lower.as_str(), "c" | "posix" | "default")
+    }
+
+    fn get_collation(&self, _name: &str) -> Option<CollationDef> {
+        None
     }
 }
 
@@ -434,6 +494,14 @@ impl Catalog for MockCatalog {
     fn database_id(&self) -> u64 {
         self.snapshot.database_id()
     }
+
+    fn collation_exists(&self, name: &str) -> bool {
+        self.snapshot.collation_exists(name)
+    }
+
+    fn get_collation(&self, name: &str) -> Option<CollationDef> {
+        self.snapshot.get_collation(name)
+    }
 }
 
 /// Builder for `MockCatalog`.
@@ -457,6 +525,7 @@ impl MockCatalogBuilder {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             })
             .collect();
 
@@ -521,6 +590,7 @@ mod tests {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             }],
             vec![],
         );

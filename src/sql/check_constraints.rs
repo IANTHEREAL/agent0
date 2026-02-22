@@ -99,6 +99,7 @@ mod tests {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             }],
             version: 1,
             pk_constraint_name: None,

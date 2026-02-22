@@ -52,6 +52,41 @@ pub(super) fn eval_binary(
     let lv = eval_typed_expr(left, row, qctx)?;
     let rv = eval_typed_expr(right, row, qctx)?;
 
+    // For comparison operations on text, check if collation is specified
+    if matches!(
+        op,
+        BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
+    ) {
+        use crate::sql::expr::collation_aware::{
+            compare_with_collation_from_expr, extract_collation,
+        };
+
+        // Check if either operand has a collation
+        if extract_collation(left).is_some() || extract_collation(right).is_some() {
+            // NULL guard: any comparison with NULL yields NULL (SQL three-valued logic)
+            if matches!(lv, Value::Null) || matches!(rv, Value::Null) {
+                return Ok(Value::Null);
+            }
+            // Use collation-aware comparison
+            let cmp_result = compare_with_collation_from_expr(&lv, &rv, left, right)?;
+            let result = match op {
+                BinaryOp::Eq => cmp_result == 0,
+                BinaryOp::NotEq => cmp_result != 0,
+                BinaryOp::Lt => cmp_result < 0,
+                BinaryOp::LtEq => cmp_result <= 0,
+                BinaryOp::Gt => cmp_result > 0,
+                BinaryOp::GtEq => cmp_result >= 0,
+                _ => unreachable!(),
+            };
+            return Ok(Value::Boolean(result));
+        }
+    }
+
     // Operators that map directly to eval_binary_op via sqlparser's BinaryOperator
     if let Some(sqlparser_op) = to_sqlparser_binary_op(op) {
         return eval_binary_op(lv, &sqlparser_op, rv);

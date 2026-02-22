@@ -349,6 +349,7 @@ pub(crate) fn build_cte_table_schema(
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             })
             .collect(),
         pk_constraint_name: None,

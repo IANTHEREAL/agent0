@@ -10,6 +10,7 @@ fn int_col(name: &str) -> ColumnDef {
         unique: false,
         is_serial: false,
         default_expr: None,
+        collation: None,
     }
 }
 
@@ -22,6 +23,7 @@ fn text_col(name: &str) -> ColumnDef {
         unique: false,
         is_serial: false,
         default_expr: None,
+        collation: None,
     }
 }
 

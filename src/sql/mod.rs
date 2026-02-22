@@ -6,6 +6,7 @@ pub(crate) mod binder;
 pub(crate) mod bytea;
 mod catalog_oids;
 mod check_constraints;
+pub(crate) mod collation;
 mod default_privileges;
 
 mod alter_sequence_owned_by;

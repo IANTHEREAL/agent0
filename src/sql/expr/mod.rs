@@ -2,6 +2,7 @@
 
 pub mod bridge;
 pub mod classify;
+pub(crate) mod collation_aware;
 pub mod compile;
 pub mod functions;
 mod numeric;
@@ -298,6 +299,16 @@ pub fn compare_order_by_values(
     nulls_first: bool,
 ) -> anyhow::Result<std::cmp::Ordering> {
     operators::compare_order_by_values(left, right, asc, nulls_first)
+}
+
+pub fn compare_order_by_values_collated(
+    left: &Value,
+    right: &Value,
+    asc: bool,
+    nulls_first: bool,
+    collation: Option<&crate::sql::collation::ResolvedCollation>,
+) -> anyhow::Result<std::cmp::Ordering> {
+    operators::compare_order_by_values_collated(left, right, asc, nulls_first, collation)
 }
 
 pub(crate) fn eval_json_access(

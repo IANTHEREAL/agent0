@@ -224,6 +224,7 @@ impl ProjectOperator {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 })
                 .collect(),
             version: 1,
@@ -440,6 +441,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "name".to_string(),
@@ -449,6 +451,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "age".to_string(),
@@ -458,6 +461,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
             ],
             version: 1,

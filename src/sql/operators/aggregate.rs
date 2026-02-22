@@ -54,6 +54,7 @@ impl HashAggregateOperator {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             });
         }
 
@@ -66,6 +67,7 @@ impl HashAggregateOperator {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             });
         }
 
@@ -342,6 +344,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "amount".to_string(),
@@ -351,6 +354,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
             ],
             version: 1,

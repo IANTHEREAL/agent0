@@ -221,7 +221,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
-            output_schema: vec![("id".to_string(), DataType::Int64)],
+            output_schema: vec![("id".to_string(), DataType::Int64, None)],
         }
     }
 
@@ -382,7 +382,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
-            output_schema: vec![("id".to_string(), DataType::Int64)],
+            output_schema: vec![("id".to_string(), DataType::Int64, None)],
         };
 
         let q = AnalyzedQuery {
@@ -415,7 +415,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
-            output_schema: vec![("id".to_string(), DataType::Int64)],
+            output_schema: vec![("id".to_string(), DataType::Int64, None)],
         };
         assert!(
             is_optimizer_eligible(&q),

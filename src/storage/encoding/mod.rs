@@ -32,17 +32,14 @@ pub use data_keys::{
 };
 #[allow(unused_imports)]
 pub use metadata_keys::decode_worker_queue_fire_time;
-pub(crate) use metadata_keys::{
-    encode_comment_column_key_v2, encode_comment_extension_key_v2, encode_comment_function_key_v2,
-    encode_comment_prefix_v2, encode_comment_table_key_v2,
-};
 pub use metadata_keys::{
-    encode_cron_claim_key_v2, encode_cron_claim_prefix_v2, encode_cron_enabled_key_v2,
-    encode_cron_job_key_v2, encode_cron_job_prefix_v2, encode_cron_run_key_v2,
-    encode_cron_run_prefix_v2, encode_cron_running_guard_key_v2,
-    encode_cron_running_guard_prefix_v2, encode_extension_config_key_v2, encode_extension_key_v2,
-    encode_extension_prefix_v2, encode_function_key_v2, encode_function_prefix_v2,
-    encode_matview_key_v2, encode_matview_prefix_v2, encode_migration_key, encode_migration_prefix,
+    encode_collation_key_v2, encode_collation_prefix_v2, encode_cron_claim_key_v2,
+    encode_cron_claim_prefix_v2, encode_cron_enabled_key_v2, encode_cron_job_key_v2,
+    encode_cron_job_prefix_v2, encode_cron_run_key_v2, encode_cron_run_prefix_v2,
+    encode_cron_running_guard_key_v2, encode_cron_running_guard_prefix_v2,
+    encode_extension_config_key_v2, encode_extension_key_v2, encode_extension_prefix_v2,
+    encode_function_key_v2, encode_function_prefix_v2, encode_matview_key_v2,
+    encode_matview_prefix_v2, encode_migration_key, encode_migration_prefix,
     encode_next_cron_job_id_key_v2, encode_next_cron_run_id_key_v2,
     encode_next_function_oid_key_v2, encode_next_schema_oid_key_v2,
     encode_next_sequence_oid_key_v2, encode_next_table_id_key_v2, encode_next_trigger_oid_key_v2,
@@ -56,6 +53,10 @@ pub use metadata_keys::{
     encode_worker_claim_key, encode_worker_claim_prefix, encode_worker_queue_key,
     encode_worker_queue_prefix, encode_worker_queue_scan_end, encode_worker_registry_key,
     encode_worker_registry_prefix,
+};
+pub(crate) use metadata_keys::{
+    encode_comment_column_key_v2, encode_comment_extension_key_v2, encode_comment_function_key_v2,
+    encode_comment_prefix_v2, encode_comment_table_key_v2,
 };
 pub use serialization::{
     deserialize_function_def, deserialize_row, deserialize_schema, serialize_function_def,

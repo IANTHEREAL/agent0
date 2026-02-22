@@ -812,6 +812,58 @@ pub fn compare_order_by_values(
     }
 }
 
+/// ORDER BY comparator with collation support.
+///
+/// When `collation` is `Some`, text values are compared using the resolved
+/// collation. For non-text values or `None` collation, falls back to
+/// `compare_values()`.
+pub fn compare_order_by_values_collated(
+    left: &Value,
+    right: &Value,
+    asc: bool,
+    nulls_first: bool,
+    collation: Option<&crate::sql::collation::ResolvedCollation>,
+) -> Result<std::cmp::Ordering> {
+    match (left, right) {
+        (Value::Null, Value::Null) => Ok(std::cmp::Ordering::Equal),
+        (Value::Null, _) => {
+            if nulls_first {
+                Ok(std::cmp::Ordering::Less)
+            } else {
+                Ok(std::cmp::Ordering::Greater)
+            }
+        }
+        (_, Value::Null) => {
+            if nulls_first {
+                Ok(std::cmp::Ordering::Greater)
+            } else {
+                Ok(std::cmp::Ordering::Less)
+            }
+        }
+        _ => {
+            let cmp = if let (Some(coll), Value::Text(a), Value::Text(b)) = (collation, left, right)
+            {
+                crate::sql::collation::compare_with_resolved_collation(a, b, coll)?
+            } else {
+                compare_values(left, right)? as i32
+            };
+            if cmp == 0 {
+                Ok(std::cmp::Ordering::Equal)
+            } else if asc {
+                if cmp > 0 {
+                    Ok(std::cmp::Ordering::Greater)
+                } else {
+                    Ok(std::cmp::Ordering::Less)
+                }
+            } else if cmp > 0 {
+                Ok(std::cmp::Ordering::Less)
+            } else {
+                Ok(std::cmp::Ordering::Greater)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

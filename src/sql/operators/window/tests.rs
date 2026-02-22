@@ -17,6 +17,7 @@ fn test_schema() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "amount".to_string(),
@@ -26,6 +27,7 @@ fn test_schema() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
         ],
         version: 1,
@@ -131,6 +133,7 @@ fn test_schema_with_float_partition() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "grp".to_string(),
@@ -140,6 +143,7 @@ fn test_schema_with_float_partition() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
         ],
         version: 1,
@@ -166,6 +170,7 @@ fn test_schema_with_numeric_partition() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "grp".to_string(),
@@ -178,6 +183,7 @@ fn test_schema_with_numeric_partition() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
         ],
         version: 1,
@@ -367,6 +373,7 @@ fn test_window_row_number_partitioned() {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "id".to_string(),
@@ -376,6 +383,7 @@ fn test_window_row_number_partitioned() {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
         ],
         version: 1,

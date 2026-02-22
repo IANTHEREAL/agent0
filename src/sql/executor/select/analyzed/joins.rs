@@ -31,7 +31,7 @@ pub(super) fn build_set_op_schema(columns: &[String], types: &[DataType]) -> Tab
                 unique: false,
                 is_serial: false,
                 default_expr: None,
-            })
+        collation: None,            })
             .collect(),
         version: 1,
         pk_constraint_name: None,

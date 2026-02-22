@@ -378,7 +378,7 @@ fn test_end_to_end_with_stats() {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("id".to_string(), DataType::Int64)],
+        output_schema: vec![("id".to_string(), DataType::Int64, None)],
     };
 
     let logical = LogicalPlanner::build(&query).unwrap();
@@ -420,7 +420,7 @@ fn test_single_table_physical() {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("id".to_string(), DataType::Int64)],
+        output_schema: vec![("id".to_string(), DataType::Int64, None)],
     };
 
     let logical = LogicalPlanner::build(&query).unwrap();
@@ -464,7 +464,7 @@ fn test_topn_optimization() {
             DataType::Int64,
         )),
         offset: None,
-        output_schema: vec![("id".to_string(), DataType::Int64)],
+        output_schema: vec![("id".to_string(), DataType::Int64, None)],
     };
 
     let logical = LogicalPlanner::build(&query).unwrap();
@@ -532,8 +532,8 @@ fn test_hash_aggregate() {
         limit: None,
         offset: None,
         output_schema: vec![
-            ("status".to_string(), DataType::Text),
-            ("count".to_string(), DataType::Int64),
+            ("status".to_string(), DataType::Text, None),
+            ("count".to_string(), DataType::Int64, None),
         ],
     };
 
@@ -1294,6 +1294,7 @@ fn make_schema_with_index() -> TableSchema {
                 unique: true,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "name".to_string(),
@@ -1303,6 +1304,7 @@ fn make_schema_with_index() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
         ],
         vec![0],

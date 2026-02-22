@@ -135,6 +135,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "active".to_string(),
@@ -144,6 +145,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
             ],
             version: 1,

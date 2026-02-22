@@ -465,6 +465,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "id2".to_string(),
@@ -474,6 +475,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
             ],
             version: 1,
@@ -514,6 +516,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "id2".to_string(),
@@ -523,6 +526,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "added".to_string(),
@@ -532,6 +536,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
             ],
             version: 1,
@@ -573,6 +578,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "aa".to_string(),
@@ -582,6 +588,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
             ],
             version: 1,

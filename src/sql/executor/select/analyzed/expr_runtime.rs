@@ -648,6 +648,7 @@ pub(super) fn build_join_output_schema(
             unique: false,
             is_serial: false,
             default_expr: None,
+            collation: None,
         });
     }
     for col in &right_schema.columns {
@@ -659,6 +660,7 @@ pub(super) fn build_join_output_schema(
             unique: false,
             is_serial: false,
             default_expr: None,
+            collation: None,
         });
     }
     TableSchema {

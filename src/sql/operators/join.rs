@@ -96,6 +96,7 @@ impl NestedLoopJoinOperator {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             });
         }
 
@@ -108,6 +109,7 @@ impl NestedLoopJoinOperator {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             });
         }
 
@@ -410,6 +412,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "name".to_string(),
@@ -419,6 +422,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
             ],
             version: 1,
@@ -445,6 +449,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "user_id".to_string(),
@@ -454,6 +459,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
             ],
             version: 1,

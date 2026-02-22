@@ -29,6 +29,8 @@ pub struct ScopeColumn {
     /// Whether this column is hidden from SELECT * expansion.
     /// Used for USING join columns: the right-side duplicate is hidden.
     pub hidden: bool,
+    /// Collation name (if column has a declared collation).
+    pub collation: Option<String>,
 }
 
 /// Metadata for an unqualified column merged by JOIN ... USING / NATURAL JOIN.
@@ -59,6 +61,8 @@ pub struct ResolvedColumnRef {
     pub data_type: DataType,
     /// JOIN ... USING / NATURAL merged-column metadata for unqualified refs.
     pub merged_using: Option<UsingMergedColumn>,
+    /// Collation name (if column has a declared collation).
+    pub collation: Option<String>,
 }
 
 /// A single scope frame in the scope stack.
@@ -118,10 +122,17 @@ impl Scope {
     /// `TableSchema`. Columns are added in schema order with their catalog types.
     pub fn from_table_schema(alias: &str, schema: &crate::types::TableSchema) -> Self {
         let mut scope = Self::new();
-        let cols: Vec<(String, DataType, bool)> = schema
+        let cols: Vec<(String, DataType, bool, Option<String>)> = schema
             .columns
             .iter()
-            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+            .map(|c| {
+                (
+                    c.name.clone(),
+                    c.data_type.clone(),
+                    c.nullable,
+                    c.collation.clone(),
+                )
+            })
             .collect();
         scope.add_table(alias, &cols);
         scope
@@ -132,9 +143,9 @@ impl Scope {
     /// `alias` is the table alias (or real name if no alias). Columns are
     /// appended to the flattened row, with `column_index` set to the absolute
     /// position starting from the current column count.
-    pub fn add_table(&mut self, alias: &str, columns: &[(String, DataType, bool)]) {
+    pub fn add_table(&mut self, alias: &str, columns: &[(String, DataType, bool, Option<String>)]) {
         let base_offset = self.columns.len();
-        for (idx, (name, data_type, nullable)) in columns.iter().enumerate() {
+        for (idx, (name, data_type, nullable, collation)) in columns.iter().enumerate() {
             let abs_index = base_offset + idx;
             let col = ScopeColumn {
                 table_alias: Some(alias.to_string()),
@@ -143,6 +154,7 @@ impl Scope {
                 data_type: data_type.clone(),
                 nullable: *nullable,
                 hidden: false,
+                collation: collation.clone(),
             };
 
             // Add to unqualified index (for ambiguity detection)
@@ -166,6 +178,7 @@ impl Scope {
         name: &str,
         data_type: DataType,
         nullable: bool,
+        collation: Option<String>,
     ) {
         let abs_index = self.columns.len();
         let col = ScopeColumn {
@@ -175,6 +188,7 @@ impl Scope {
             data_type,
             nullable,
             hidden: false,
+            collation,
         };
 
         self.column_index
@@ -252,6 +266,7 @@ impl Scope {
                         .map(|m| m.data_type.clone())
                         .unwrap_or_else(|| col.data_type.clone()),
                     merged_using: self.using_merged_by_left.get(&col.column_index).cloned(),
+                    collation: col.collation.clone(),
                 }))
             }
         }
@@ -289,6 +304,7 @@ impl Scope {
                         .map(|m| m.data_type.clone())
                         .unwrap_or_else(|| col.data_type.clone()),
                     merged_using: self.using_merged_by_left.get(&col.column_index).cloned(),
+                    collation: col.collation.clone(),
                 }))
             }
             _ => {
@@ -454,6 +470,7 @@ impl ScopeStack {
                         column_name: resolved.column_name,
                         data_type: resolved.data_type,
                         merged_using: resolved.merged_using,
+                        collation: resolved.collation,
                     });
                 }
                 None => continue,
@@ -485,6 +502,7 @@ impl ScopeStack {
                         column_name: resolved.column_name,
                         data_type: resolved.data_type,
                         merged_using: resolved.merged_using,
+                        collation: resolved.collation,
                     });
                 }
                 None => continue,
@@ -517,6 +535,7 @@ impl ScopeStack {
                     column_name: col.column_name.clone(),
                     data_type: col.data_type.clone(),
                     merged_using: None,
+                    collation: col.collation.clone(),
                 });
             }
         }
@@ -546,6 +565,7 @@ impl ScopeStack {
                     column_name: col.column_name.clone(),
                     data_type: col.data_type.clone(),
                     merged_using: None,
+                    collation: col.collation.clone(),
                 });
             }
         }
@@ -588,12 +608,12 @@ impl ScopeStack {
 mod tests {
     use super::*;
 
-    fn int_col(name: &str) -> (String, DataType, bool) {
-        (name.to_string(), DataType::Int32, false)
+    fn int_col(name: &str) -> (String, DataType, bool, Option<String>) {
+        (name.to_string(), DataType::Int32, false, None)
     }
 
-    fn text_col(name: &str) -> (String, DataType, bool) {
-        (name.to_string(), DataType::Text, true)
+    fn text_col(name: &str) -> (String, DataType, bool, Option<String>) {
+        (name.to_string(), DataType::Text, true, None)
     }
 
     #[test]

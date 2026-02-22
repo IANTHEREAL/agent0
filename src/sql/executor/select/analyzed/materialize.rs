@@ -110,7 +110,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
-            output_schema: vec![("v".to_string(), DataType::Int32)],
+            output_schema: vec![("v".to_string(), DataType::Int32, None)],
         };
         TypedExpr::new(
             TypedExprKind::ScalarSubquery(Box::new(subquery)),

@@ -240,6 +240,15 @@ pub enum TypedExprKind {
     /// `$N` placeholder from extended protocol. 0-indexed internally.
     /// Type is resolved at analysis time from context / client OIDs.
     Parameter { index: usize },
+
+    /// `expr COLLATE collation` — attach collation to a text expression.
+    /// `collation` is the canonical name (for EXPLAIN/Display).
+    /// `resolved` is the runtime descriptor resolved at analysis time.
+    Collate {
+        expr: Box<TypedExpr>,
+        collation: String,
+        resolved: crate::sql::collation::ResolvedCollation,
+    },
 }
 
 // ── Binary operators ────────────────────────────────────────
@@ -444,8 +453,12 @@ pub struct AnalyzedQuery {
     pub limit: Option<TypedExpr>,
     /// OFFSET expression.
     pub offset: Option<TypedExpr>,
-    /// Output schema: (column_name, data_type) for each output column.
-    pub output_schema: Vec<(String, DataType)>,
+    /// Output schema: (column_name, data_type, collation) for each output column.
+    pub output_schema: Vec<(
+        String,
+        DataType,
+        Option<crate::sql::collation::ResolvedCollation>,
+    )>,
 }
 
 /// The body of an analyzed query.

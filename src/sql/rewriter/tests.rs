@@ -88,8 +88,8 @@ mod tests {
             limit: None,
             offset: None,
             output_schema: vec![
-                ("id".to_string(), DataType::Int64),
-                ("name".to_string(), DataType::Text),
+                ("id".to_string(), DataType::Int64, None),
+                ("name".to_string(), DataType::Text, None),
             ],
         }
     }
@@ -500,7 +500,7 @@ mod tests {
             }],
             limit: None,
             offset: None,
-            output_schema: vec![("a".to_string(), DataType::Int64)],
+            output_schema: vec![("a".to_string(), DataType::Int64, None)],
         };
 
         let result = rewrite_query(query);
@@ -534,7 +534,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
-            output_schema: vec![("x".to_string(), DataType::Text)],
+            output_schema: vec![("x".to_string(), DataType::Text, None)],
         };
 
         let result = rewrite_query(query);
@@ -583,7 +583,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
-            output_schema: vec![("x".to_string(), DataType::Int64)],
+            output_schema: vec![("x".to_string(), DataType::Int64, None)],
         };
 
         let result = rewrite_query(query);
@@ -629,7 +629,7 @@ mod tests {
             }],
             limit: None,
             offset: None,
-            output_schema: vec![("x".to_string(), DataType::Text)],
+            output_schema: vec![("x".to_string(), DataType::Text, None)],
         };
 
         let result = rewrite_query(query);

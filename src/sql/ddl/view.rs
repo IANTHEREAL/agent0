@@ -118,9 +118,19 @@ async fn analyze_view_output_schema(
             catalog.add_table(&full.clone(), full, schema);
         }
     }
+    // Prefetch user-defined collations for Analyzer resolution.
+    let collation_defs = store.list_collations(txn, db_id).await?;
+    for def in collation_defs {
+        let name = def.name.clone();
+        catalog.add_collation(&name, def);
+    }
     let mut analyzer = Analyzer::new(&catalog);
     let analyzed = analyzer.analyze_query(query).map_err(SqlError::from)?;
-    Ok(analyzed.output_schema)
+    Ok(analyzed
+        .output_schema
+        .into_iter()
+        .map(|(name, dt, _collation)| (name, dt))
+        .collect())
 }
 
 pub async fn execute_create_view(

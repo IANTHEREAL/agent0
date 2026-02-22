@@ -6,6 +6,8 @@
 
 use sqlparser::ast::{self as ast, Select, SelectItem};
 
+use crate::sql::collation::ResolvedCollation;
+use crate::sql::expr::collation_aware::extract_resolved_collation;
 use crate::types::{ColumnDef, DataType, TableSchema};
 
 use super::super::error::AnalyzerError;
@@ -70,6 +72,7 @@ impl<'a> Analyzer<'a> {
                         unique: false,
                         is_serial: false,
                         default_expr: None,
+                        collation: None,
                     })
                     .collect(),
                 version: 1,
@@ -87,7 +90,7 @@ impl<'a> Analyzer<'a> {
                 columns: query
                     .output_schema
                     .iter()
-                    .map(|(col_name, data_type)| ColumnDef {
+                    .map(|(col_name, data_type, _coll)| ColumnDef {
                         name: col_name.clone(),
                         data_type: data_type.clone(),
                         nullable: true,
@@ -95,6 +98,7 @@ impl<'a> Analyzer<'a> {
                         unique: false,
                         is_serial: false,
                         default_expr: None,
+                        collation: None,
                     })
                     .collect(),
                 version: 1,
@@ -123,6 +127,7 @@ impl<'a> Analyzer<'a> {
                         unique: false,
                         is_serial: false,
                         default_expr: None,
+                        collation: None,
                     })
                     .collect(),
                 version: 1,
@@ -186,7 +191,13 @@ impl<'a> Analyzer<'a> {
         &mut self,
         items: &[SelectItem],
         wildcard_order: Option<&[(String, usize)]>,
-    ) -> Result<(Vec<AnalyzedProjection>, Vec<(String, DataType)>), AnalyzerError> {
+    ) -> Result<
+        (
+            Vec<AnalyzedProjection>,
+            Vec<(String, DataType, Option<ResolvedCollation>)>,
+        ),
+        AnalyzerError,
+    > {
         let mut projection = Vec::new();
         let mut output_schema = Vec::new();
 
@@ -196,7 +207,8 @@ impl<'a> Analyzer<'a> {
                     let analyzed = self.analyze_expr(expr)?;
                     let analyzed = self.resolve_projection_param_type(analyzed)?;
                     let name = self.infer_column_alias(expr);
-                    output_schema.push((name.clone(), analyzed.data_type.clone()));
+                    let coll = extract_resolved_collation(&analyzed);
+                    output_schema.push((name.clone(), analyzed.data_type.clone(), coll));
                     projection.push(AnalyzedProjection {
                         expr: analyzed,
                         output_name: name,
@@ -207,7 +219,8 @@ impl<'a> Analyzer<'a> {
                     let analyzed = self.analyze_expr(expr)?;
                     let analyzed = self.resolve_projection_param_type(analyzed)?;
                     let name = alias.value.clone();
-                    output_schema.push((name.clone(), analyzed.data_type.clone()));
+                    let coll = extract_resolved_collation(&analyzed);
+                    output_schema.push((name.clone(), analyzed.data_type.clone(), coll));
                     projection.push(AnalyzedProjection {
                         expr: analyzed,
                         output_name: name,
@@ -221,7 +234,8 @@ impl<'a> Analyzer<'a> {
                             if let Some((_col_name, expr, data_type)) =
                                 Self::scope_column_projection(scope, *column_index)
                             {
-                                output_schema.push((name.clone(), data_type.clone()));
+                                let coll = extract_resolved_collation(&expr);
+                                output_schema.push((name.clone(), data_type.clone(), coll));
                                 projection.push(AnalyzedProjection {
                                     expr,
                                     output_name: name.clone(),
@@ -239,7 +253,8 @@ impl<'a> Analyzer<'a> {
                         if let Some((name, expr, data_type)) =
                             Self::scope_column_projection(scope, col.column_index)
                         {
-                            output_schema.push((name.clone(), data_type.clone()));
+                            let coll = extract_resolved_collation(&expr);
+                            output_schema.push((name.clone(), data_type.clone(), coll));
                             projection.push(AnalyzedProjection {
                                 expr,
                                 output_name: name,
@@ -280,7 +295,7 @@ impl<'a> Analyzer<'a> {
                             },
                             col.data_type.clone(),
                         );
-                        output_schema.push((col.column_name.clone(), col.data_type.clone()));
+                        output_schema.push((col.column_name.clone(), col.data_type.clone(), None));
                         projection.push(AnalyzedProjection {
                             expr,
                             output_name: col.column_name.clone(),

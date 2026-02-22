@@ -85,6 +85,7 @@ fn test_column(name: &str, data_type: DataType) -> ColumnDef {
         unique: false,
         is_serial: false,
         default_expr: None,
+        collation: None,
     }
 }
 
@@ -1855,7 +1856,11 @@ async fn extended_query_bind_parameter_count_mismatch_returns_08p01() {
 
 fn test_prepared_stmt_analyzed(
     sql: &str,
-    output_schema: Vec<(String, DataType)>,
+    output_schema: Vec<(
+        String,
+        DataType,
+        Option<crate::sql::collation::ResolvedCollation>,
+    )>,
     param_data_types: Vec<DataType>,
 ) -> PreparedStatement {
     let analyzed = crate::sql::analyzer::types::AnalyzedQuery {
@@ -1875,7 +1880,10 @@ fn test_prepared_stmt_analyzed(
             required_privileges: vec![],
             has_recursive_cte: false,
         },
-        output_schema,
+        output_schema: output_schema
+            .iter()
+            .map(|(name, dt, _)| (name.clone(), dt.clone()))
+            .collect(),
         param_data_types,
         table_versions: vec![],
     }
@@ -1900,7 +1908,11 @@ fn extract_query_schema(resp: Response<'static>) -> Vec<(String, Type)> {
 
 async fn assert_describe_execute_metadata_agreement(
     sql: &str,
-    output_schema: Vec<(String, DataType)>,
+    output_schema: Vec<(
+        String,
+        DataType,
+        Option<crate::sql::collation::ResolvedCollation>,
+    )>,
     param_types: Vec<Type>,
 ) {
     let handler = test_dynamic_handler();
@@ -1918,8 +1930,8 @@ async fn assert_describe_execute_metadata_agreement(
         .map(|f| (f.name().to_string(), f.datatype().clone()))
         .collect();
 
-    let exec_columns: Vec<String> = output_schema.iter().map(|(n, _)| n.clone()).collect();
-    let exec_types: Vec<DataType> = output_schema.iter().map(|(_, t)| t.clone()).collect();
+    let exec_columns: Vec<String> = output_schema.iter().map(|(n, _, _)| n.clone()).collect();
+    let exec_types: Vec<DataType> = output_schema.iter().map(|(_, t, _)| t.clone()).collect();
     let execute_resp = result_to_response_with_format(
         ExecuteResult::Select {
             columns: exec_columns,
@@ -2055,8 +2067,8 @@ async fn describe_execute_metadata_agreement_for_select() {
     assert_describe_execute_metadata_agreement(
         "SELECT id, name FROM t WHERE id = $1",
         vec![
-            ("id".to_string(), DataType::Int32),
-            ("name".to_string(), DataType::Text),
+            ("id".to_string(), DataType::Int32, None),
+            ("name".to_string(), DataType::Text, None),
         ],
         vec![Type::INT4],
     )
@@ -2067,7 +2079,7 @@ async fn describe_execute_metadata_agreement_for_select() {
 async fn describe_execute_metadata_agreement_for_insert_returning() {
     assert_describe_execute_metadata_agreement(
         "INSERT INTO t VALUES ($1, $2) RETURNING id",
-        vec![("id".to_string(), DataType::Int32)],
+        vec![("id".to_string(), DataType::Int32, None)],
         vec![Type::INT4, Type::TEXT],
     )
     .await;
@@ -2077,7 +2089,7 @@ async fn describe_execute_metadata_agreement_for_insert_returning() {
 async fn describe_execute_metadata_agreement_for_update_returning() {
     assert_describe_execute_metadata_agreement(
         "UPDATE t SET name = $1 RETURNING name",
-        vec![("name".to_string(), DataType::Text)],
+        vec![("name".to_string(), DataType::Text, None)],
         vec![Type::TEXT],
     )
     .await;

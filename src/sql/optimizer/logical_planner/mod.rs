@@ -54,7 +54,12 @@ impl LogicalPlanner {
     /// Returns `Err` if an aggregate rewrite fails (e.g. HAVING expression
     /// references a column that is neither a GROUP BY key nor an aggregate).
     pub fn build(query: &AnalyzedQuery) -> Result<LogicalPlan> {
-        let mut plan = Self::build_body(&query.body, &query.output_schema, &query.order_by)?;
+        let schema_no_collation: Vec<(String, DataType)> = query
+            .output_schema
+            .iter()
+            .map(|(name, dt, _)| (name.clone(), dt.clone()))
+            .collect();
+        let mut plan = Self::build_body(&query.body, &schema_no_collation, &query.order_by)?;
 
         // LIMIT / OFFSET
         if query.limit.is_some() || query.offset.is_some() {

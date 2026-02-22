@@ -102,13 +102,13 @@ fn analyze_expr_with_users(sql: &str) -> Result<TypedExpr, AnalyzerError> {
     scope.add_table(
         "users",
         &[
-            ("id".to_string(), DataType::Int32, false),
-            ("name".to_string(), DataType::Text, true),
-            ("age".to_string(), DataType::Int32, true),
-            ("email".to_string(), DataType::Text, true),
-            ("active".to_string(), DataType::Boolean, true),
-            ("score".to_string(), DataType::Float64, true),
-            ("created_at".to_string(), DataType::Timestamp, true),
+            ("id".to_string(), DataType::Int32, false, None),
+            ("name".to_string(), DataType::Text, true, None),
+            ("age".to_string(), DataType::Int32, true, None),
+            ("email".to_string(), DataType::Text, true, None),
+            ("active".to_string(), DataType::Boolean, true, None),
+            ("score".to_string(), DataType::Float64, true, None),
+            ("created_at".to_string(), DataType::Timestamp, true, None),
         ],
     );
     Analyzer::analyze_expr_with_scope(&catalog, scope, &parse_expr(sql))
@@ -123,13 +123,13 @@ fn analyze_expr_no_aggregates(sql: &str) -> Result<TypedExpr, AnalyzerError> {
     scope.add_table(
         "users",
         &[
-            ("id".to_string(), DataType::Int32, false),
-            ("name".to_string(), DataType::Text, true),
-            ("age".to_string(), DataType::Int32, true),
-            ("email".to_string(), DataType::Text, true),
-            ("active".to_string(), DataType::Boolean, true),
-            ("score".to_string(), DataType::Float64, true),
-            ("created_at".to_string(), DataType::Timestamp, true),
+            ("id".to_string(), DataType::Int32, false, None),
+            ("name".to_string(), DataType::Text, true, None),
+            ("age".to_string(), DataType::Int32, true, None),
+            ("email".to_string(), DataType::Text, true, None),
+            ("active".to_string(), DataType::Boolean, true, None),
+            ("score".to_string(), DataType::Float64, true, None),
+            ("created_at".to_string(), DataType::Timestamp, true, None),
         ],
     );
     Analyzer::analyze_expr_with_scope(&catalog, scope, &parse_expr(sql))
@@ -622,10 +622,13 @@ fn analyze_simple_select() {
     let result = analyzer.analyze_query(&query).unwrap();
 
     assert_eq!(result.output_schema.len(), 2);
-    assert_eq!(result.output_schema[0], ("id".to_string(), DataType::Int32));
+    assert_eq!(
+        result.output_schema[0],
+        ("id".to_string(), DataType::Int32, None)
+    );
     assert_eq!(
         result.output_schema[1],
-        ("name".to_string(), DataType::Text)
+        ("name".to_string(), DataType::Text, None)
     );
     assert!(expect_select(&result).where_clause.is_some());
 }
@@ -828,11 +831,11 @@ fn analyze_values_query_body() {
     assert_eq!(result.output_schema.len(), 2);
     assert_eq!(
         result.output_schema[0],
-        ("column1".to_string(), DataType::Int32)
+        ("column1".to_string(), DataType::Int32, None)
     );
     assert_eq!(
         result.output_schema[1],
-        ("column2".to_string(), DataType::Text)
+        ("column2".to_string(), DataType::Text, None)
     );
     match &result.body {
         AnalyzedQueryBody::Values(rows) => {

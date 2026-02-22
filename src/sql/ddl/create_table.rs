@@ -99,6 +99,7 @@ pub async fn execute_create_table(
         let mut nullable = true;
         let mut unique = false;
         let mut default_expr = None;
+        let mut collation: Option<String> = col.collation.as_ref().map(|c| c.to_string());
 
         for opt in &col.options {
             match &opt.option {
@@ -214,6 +215,7 @@ pub async fn execute_create_table(
             unique,
             is_serial,
             default_expr,
+            collation,
         });
     }
 
@@ -469,6 +471,7 @@ pub async fn create_table_from_query_result(
         unique: true,
         is_serial: true,
         default_expr: None,
+        collation: None,
     }];
 
     if explicit_columns.is_empty() {
@@ -486,6 +489,7 @@ pub async fn create_table_from_query_result(
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             }
         }));
     } else {
@@ -502,6 +506,7 @@ pub async fn create_table_from_query_result(
                         unique: false,
                         is_serial: false,
                         default_expr: None,
+                        collation: None,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -567,6 +572,7 @@ pub async fn create_table_from_select_into(
         unique: true,
         is_serial: true,
         default_expr: None,
+        collation: None,
     }];
 
     col_defs.extend(result_cols.iter().enumerate().map(|(i, col_name)| {
@@ -583,6 +589,7 @@ pub async fn create_table_from_select_into(
             unique: false,
             is_serial: false,
             default_expr: None,
+            collation: None,
         }
     }));
 

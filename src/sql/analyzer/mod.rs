@@ -115,6 +115,45 @@ impl<'a> Analyzer<'a> {
         Ok(result)
     }
 
+    /// Resolve a collation name to a `ResolvedCollation`.
+    ///
+    /// Checks the catalog first (for TiKV-persisted collations loaded during prefetch),
+    /// then falls back to the global registry (for same-session CREATE COLLATION).
+    /// Built-in collations (C, POSIX) are handled by both paths.
+    pub(crate) fn resolve_collation(
+        &self,
+        name: &str,
+    ) -> Result<crate::sql::collation::ResolvedCollation, anyhow::Error> {
+        use crate::sql::collation::ResolvedCollation;
+
+        // Built-in binary collations (always available, no lookup needed)
+        let lower = name.to_lowercase();
+        if matches!(lower.as_str(), "c" | "posix") {
+            return Ok(ResolvedCollation::Binary);
+        }
+        if lower == "default" {
+            return Ok(ResolvedCollation::Binary);
+        }
+
+        // Try catalog first (TiKV-persisted collations)
+        if let Some(def) = self.catalog.get_collation(name) {
+            return match def.provider.as_str() {
+                "icu" => {
+                    let locale = def
+                        .locale
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("ICU collation '{}' has no locale", name))?;
+                    Ok(ResolvedCollation::Icu(locale.clone()))
+                }
+                "c" => Ok(ResolvedCollation::Binary),
+                _ => Ok(ResolvedCollation::Binary),
+            };
+        }
+
+        // Fall back to global registry (same-session CREATE COLLATION)
+        crate::sql::collation::resolve_collation_from_registry(name)
+    }
+
     /// Analyze a complete SQL statement (DML or query).
     ///
     /// Entry point for DML analysis. Queries are handled via `analyze_query()`.

@@ -53,14 +53,31 @@ impl<'a> Analyzer<'a> {
                     ));
                 }
 
-                Ok(TypedExpr::new(
+                let mut expr = TypedExpr::new(
                     TypedExprKind::ColumnRef {
                         scope_depth: resolved.scope_depth,
                         column_index: resolved.column_index,
                         column_name: resolved.column_name,
                     },
-                    resolved.data_type,
-                ))
+                    resolved.data_type.clone(),
+                );
+
+                // Wrap in Collate if column has a declared collation
+                if let Some(collation) = resolved.collation {
+                    let resolved_coll = self
+                        .resolve_collation(&collation)
+                        .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                    expr = TypedExpr::new(
+                        TypedExprKind::Collate {
+                            expr: Box::new(expr),
+                            collation,
+                            resolved: resolved_coll,
+                        },
+                        resolved.data_type,
+                    );
+                }
+
+                Ok(expr)
             }
             Err(AnalyzerError::ColumnNotFound { .. }) => {
                 if let Some((scope_depth, cols)) = self.scopes.resolve_table_alias_columns(ident) {
@@ -106,14 +123,31 @@ impl<'a> Analyzer<'a> {
             let resolved = self
                 .scopes
                 .resolve_qualified_column_idents(&parts[0], &parts[1])?;
-            return Ok(TypedExpr::new(
+            let mut expr = TypedExpr::new(
                 TypedExprKind::ColumnRef {
                     scope_depth: resolved.scope_depth,
                     column_index: resolved.column_index,
                     column_name: resolved.column_name,
                 },
-                resolved.data_type,
-            ));
+                resolved.data_type.clone(),
+            );
+
+            // Wrap in Collate if column has a declared collation
+            if let Some(collation) = resolved.collation {
+                let resolved_coll = self
+                    .resolve_collation(&collation)
+                    .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                expr = TypedExpr::new(
+                    TypedExprKind::Collate {
+                        expr: Box::new(expr),
+                        collation,
+                        resolved: resolved_coll,
+                    },
+                    resolved.data_type,
+                );
+            }
+
+            return Ok(expr);
         }
 
         // Three-part: schema.table.column -- use last two parts
@@ -122,14 +156,31 @@ impl<'a> Analyzer<'a> {
             let resolved = self
                 .scopes
                 .resolve_qualified_column_idents(&parts[n - 2], &parts[n - 1])?;
-            return Ok(TypedExpr::new(
+            let mut expr = TypedExpr::new(
                 TypedExprKind::ColumnRef {
                     scope_depth: resolved.scope_depth,
                     column_index: resolved.column_index,
                     column_name: resolved.column_name,
                 },
-                resolved.data_type,
-            ));
+                resolved.data_type.clone(),
+            );
+
+            // Wrap in Collate if column has a declared collation
+            if let Some(collation) = resolved.collation {
+                let resolved_coll = self
+                    .resolve_collation(&collation)
+                    .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                expr = TypedExpr::new(
+                    TypedExprKind::Collate {
+                        expr: Box::new(expr),
+                        collation,
+                        resolved: resolved_coll,
+                    },
+                    resolved.data_type,
+                );
+            }
+
+            return Ok(expr);
         }
 
         // Single part (shouldn't reach here, but handle gracefully)

@@ -16,6 +16,7 @@ fn schema_left() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "l".to_string(),
@@ -25,6 +26,7 @@ fn schema_left() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
         ],
         version: 1,
@@ -51,6 +53,7 @@ fn schema_right() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "r".to_string(),
@@ -60,6 +63,7 @@ fn schema_right() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
         ],
         version: 1,

@@ -55,7 +55,11 @@ impl PreparedStatement {
     /// Extract output schema from an AnalyzedStatement.
     pub fn output_schema_from(stmt: &AnalyzedStatement) -> Vec<(String, DataType)> {
         match stmt {
-            AnalyzedStatement::Query(q) => q.output_schema.clone(),
+            AnalyzedStatement::Query(q) => q
+                .output_schema
+                .iter()
+                .map(|(name, dt, _coll)| (name.clone(), dt.clone()))
+                .collect(),
             AnalyzedStatement::Insert(i) => returning_schema(&i.returning),
             AnalyzedStatement::Update(u) => returning_schema(&u.returning),
             AnalyzedStatement::Delete(d) => returning_schema(&d.returning),

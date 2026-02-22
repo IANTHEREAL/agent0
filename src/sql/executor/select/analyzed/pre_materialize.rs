@@ -278,7 +278,7 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
                     let rhs_declared_type = subquery
                         .output_schema
                         .first()
-                        .map(|(_, dt)| dt.clone())
+                        .map(|(_, dt, _)| dt.clone())
                         .ok_or_else(|| anyhow!("ANY/ALL subquery has empty output schema"))?;
                     let values: Vec<TypedExpr> = rows
                         .into_iter()
@@ -553,7 +553,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
-            output_schema: vec![("v".to_string(), DataType::Int32)],
+            output_schema: vec![("v".to_string(), DataType::Int32, None)],
         };
         TypedExpr::new(
             TypedExprKind::ScalarSubquery(Box::new(subquery)),

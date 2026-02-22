@@ -98,6 +98,13 @@ pub(crate) async fn build_catalog_snapshot_for_statement(
     )
     .await?;
 
+    // Prefetch user-defined collations for Analyzer resolution.
+    let collation_defs = store.list_collations(txn, db_id).await?;
+    for def in collation_defs {
+        let name = def.name.clone();
+        snapshot.add_collation(&name, def);
+    }
+
     // For INSERT ... SELECT, also build snapshot for the subquery.
     if let Statement::Insert {
         source: Some(query),

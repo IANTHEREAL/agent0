@@ -173,6 +173,7 @@ impl Executor {
             nullable: false,
             primary_key: true,
             default_expr: None,
+            collation: None,
             is_serial: true,
             unique: true,
         }];
@@ -188,6 +189,7 @@ impl Executor {
                 nullable: true,
                 primary_key: false,
                 default_expr: None,
+                collation: None,
                 is_serial: false,
                 unique: false,
             }

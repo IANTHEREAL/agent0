@@ -148,10 +148,10 @@ impl<'a> Analyzer<'a> {
 
                 // Add output columns to scope for ORDER BY resolution.
                 // Set operation ORDER BY references output column names, not FROM columns.
-                for (name, dt) in &output_schema {
+                for (name, dt, _coll) in &output_schema {
                     self.scopes
                         .current_mut()
-                        .add_column(None, name, dt.clone(), true);
+                        .add_column(None, name, dt.clone(), true, None);
                 }
 
                 let analyzed_order_by = self.analyze_order_by_exprs(&query.order_by, &[])?;
@@ -310,17 +310,17 @@ impl<'a> Analyzer<'a> {
         let (rows, output_schema) = self.analyze_values_rows(&values.rows)?;
 
         // Expose VALUES output columns (column1, column2, ...) for ORDER BY resolution.
-        for (name, dt) in &output_schema {
+        for (name, dt, _coll) in &output_schema {
             self.scopes
                 .current_mut()
-                .add_column(None, name, dt.clone(), true);
+                .add_column(None, name, dt.clone(), true, None);
         }
 
         // Build synthetic projection so ORDER BY positional refs (ORDER BY 1) map correctly.
         let projection: Vec<AnalyzedProjection> = output_schema
             .iter()
             .enumerate()
-            .map(|(idx, (name, dt))| AnalyzedProjection {
+            .map(|(idx, (name, dt, _coll))| AnalyzedProjection {
                 expr: TypedExpr::new(
                     TypedExprKind::ColumnRef {
                         scope_depth: 0,
@@ -437,7 +437,17 @@ impl<'a> Analyzer<'a> {
     fn analyze_values_rows(
         &mut self,
         rows: &[Vec<Expr>],
-    ) -> Result<(Vec<Vec<TypedExpr>>, Vec<(String, DataType)>), AnalyzerError> {
+    ) -> Result<
+        (
+            Vec<Vec<TypedExpr>>,
+            Vec<(
+                String,
+                DataType,
+                Option<crate::sql::collation::ResolvedCollation>,
+            )>,
+        ),
+        AnalyzerError,
+    > {
         if rows.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -490,7 +500,7 @@ impl<'a> Analyzer<'a> {
                 row[col_idx] = Self::coerce_values_expr(expr, &target_type);
             }
 
-            output_schema.push((format!("column{}", col_idx + 1), target_type));
+            output_schema.push((format!("column{}", col_idx + 1), target_type, None));
         }
 
         Ok((analyzed_rows, output_schema))
@@ -592,13 +602,17 @@ impl<'a> Analyzer<'a> {
 
                 // Determine output columns (may be overridden by explicit column list)
                 let columns: Vec<(String, DataType)> = if cte.alias.columns.is_empty() {
-                    analyzed.output_schema.clone()
+                    analyzed
+                        .output_schema
+                        .iter()
+                        .map(|(name, dt, _coll)| (name.clone(), dt.clone()))
+                        .collect()
                 } else {
                     cte.alias
                         .columns
                         .iter()
                         .zip(analyzed.output_schema.iter())
-                        .map(|(alias_col, (_, dt))| (alias_col.value.clone(), dt.clone()))
+                        .map(|(alias_col, (_, dt, _coll))| (alias_col.value.clone(), dt.clone()))
                         .collect()
                 };
 

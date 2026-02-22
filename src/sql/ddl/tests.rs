@@ -240,6 +240,7 @@ fn coerce_jsonb_to_text_produces_canonical_output() {
         unique: false,
         is_serial: false,
         default_expr: None,
+        collation: None,
     };
     let result =
         coerce_value_for_type_change(Value::Jsonb(r#"{"b":1,"a":2}"#.to_string()), &col).unwrap();
@@ -256,6 +257,7 @@ fn coerce_json_to_text_preserves_raw_format() {
         unique: false,
         is_serial: false,
         default_expr: None,
+        collation: None,
     };
     let result =
         coerce_value_for_type_change(Value::Json(r#"{"b":1,"a":2}"#.to_string()), &col).unwrap();

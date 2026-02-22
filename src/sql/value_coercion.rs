@@ -466,6 +466,7 @@ mod tests {
             unique: false,
             is_serial: false,
             default_expr: None,
+            collation: None,
         }
     }
 

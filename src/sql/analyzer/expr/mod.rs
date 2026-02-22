@@ -796,6 +796,41 @@ impl<'a> Analyzer<'a> {
                 )))
             }
 
+            // -- COLLATE --
+            Expr::Collate { expr, collation } => {
+                let analyzed_expr = self.analyze_expr(expr)?;
+                // Validate that the expression is a text type
+                match &analyzed_expr.data_type {
+                    DataType::Text | DataType::Varchar(_) => {}
+                    other => {
+                        return Err(AnalyzerError::Unsupported(format!(
+                            "COLLATE can only be applied to text types, got {}",
+                            other
+                        )));
+                    }
+                }
+                // ObjectName is a Vec<Ident>, get the last part as collation name
+                let collation_name = if collation.0.len() == 1 {
+                    crate::sql::names::normalize_ident(&collation.0[0])
+                } else {
+                    collation.to_string()
+                };
+                // Resolve the collation at analysis time (catalog first, then registry)
+                let resolved = self
+                    .resolve_collation(&collation_name)
+                    .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                // COLLATE preserves the input expression's type (P1-7 fix)
+                let result_type = analyzed_expr.data_type.clone();
+                Ok(TypedExpr::new(
+                    TypedExprKind::Collate {
+                        expr: Box::new(analyzed_expr),
+                        collation: collation_name,
+                        resolved,
+                    },
+                    result_type,
+                ))
+            }
+
             // -- Catch-all for unsupported expressions --
             other => Err(AnalyzerError::Unsupported(format!(
                 "expression type not yet supported: {:?}",

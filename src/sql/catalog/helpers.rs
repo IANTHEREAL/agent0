@@ -10,6 +10,7 @@ pub fn text_col(name: &str) -> ColumnDef {
         unique: false,
         is_serial: false,
         default_expr: None,
+        collation: None,
     }
 }
 
@@ -22,6 +23,7 @@ pub fn name_col(name: &str) -> ColumnDef {
         unique: false,
         is_serial: false,
         default_expr: None,
+        collation: None,
     }
 }
 
@@ -34,6 +36,7 @@ pub fn int_col(name: &str) -> ColumnDef {
         unique: false,
         is_serial: false,
         default_expr: None,
+        collation: None,
     }
 }
 
@@ -46,6 +49,7 @@ pub fn float_col(name: &str) -> ColumnDef {
         unique: false,
         is_serial: false,
         default_expr: None,
+        collation: None,
     }
 }
 
@@ -58,6 +62,7 @@ pub fn bool_col(name: &str) -> ColumnDef {
         unique: false,
         is_serial: false,
         default_expr: None,
+        collation: None,
     }
 }
 
@@ -70,6 +75,7 @@ pub fn int2vector_col(name: &str) -> ColumnDef {
         unique: false,
         is_serial: false,
         default_expr: None,
+        collation: None,
     }
 }
 
@@ -82,6 +88,7 @@ pub fn int_array_col(name: &str) -> ColumnDef {
         unique: false,
         is_serial: false,
         default_expr: None,
+        collation: None,
     }
 }
 
@@ -94,6 +101,7 @@ pub fn text_array_col(name: &str) -> ColumnDef {
         unique: false,
         is_serial: false,
         default_expr: None,
+        collation: None,
     }
 }
 

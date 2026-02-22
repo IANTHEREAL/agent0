@@ -50,6 +50,7 @@ fn fs9_file_schema(name: &str) -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "line".to_string(),
@@ -59,6 +60,7 @@ fn fs9_file_schema(name: &str) -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "_path".to_string(),
@@ -68,6 +70,7 @@ fn fs9_file_schema(name: &str) -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
         ],
         pk_constraint_name: None,
@@ -94,6 +97,7 @@ fn fs9_events_schema() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "event_type".to_string(),
@@ -103,6 +107,7 @@ fn fs9_events_schema() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "path".to_string(),
@@ -112,6 +117,7 @@ fn fs9_events_schema() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "count".to_string(),
@@ -121,6 +127,7 @@ fn fs9_events_schema() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
         ],
         pk_constraint_name: None,

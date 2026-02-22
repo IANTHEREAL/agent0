@@ -35,6 +35,8 @@ pub(crate) enum RawSqlKind {
     CreateProcedure,
     CreateTypeEnum,
     DropType,
+    CreateCollation,
+    DropCollation,
     /// `RESET <guc>` or `RESET ALL` — handled directly by executor (bypasses
     /// sqlparser which does not support standalone `RESET`).  `RESET ROLE` is
     /// excluded: it is rewritten to `SET ROLE NONE` in the parser layer.
@@ -223,6 +225,12 @@ pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
     }
     if sql_upper.starts_with("DROP TYPE") {
         return Some(RawSqlKind::DropType);
+    }
+    if sql_upper.starts_with("CREATE COLLATION") {
+        return Some(RawSqlKind::CreateCollation);
+    }
+    if sql_upper.starts_with("DROP COLLATION") {
+        return Some(RawSqlKind::DropCollation);
     }
 
     // ANALYZE — keyword boundary only; all syntax validation lives in the handler.

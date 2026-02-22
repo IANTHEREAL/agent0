@@ -72,6 +72,9 @@ pub async fn execute_alter_table(
     // (column added/dropped/renamed/retyped) to signal stats invalidation.
     let mut invalidate_stats = false;
 
+    // Prefetch user-defined collations for row-level expression analysis.
+    let collations = store.list_collations(txn, db_id).await?;
+
     match operation {
         AlterTableOperation::AddColumn { column_def, .. } => {
             let col_name = normalize_ident(&column_def.name);
@@ -119,6 +122,7 @@ pub async fn execute_alter_table(
                 unique: false,
                 is_serial,
                 default_expr,
+                collation: None,
             });
             if is_serial {
                 store
@@ -462,7 +466,8 @@ pub async fn execute_alter_table(
                 }
 
                 // PostgreSQL validates existing rows by default (unless NOT VALID).
-                let typed_check_expr = analyze_row_level_expr(expr, &schema, db_id, search_path)?;
+                let typed_check_expr =
+                    analyze_row_level_expr(expr, &schema, db_id, search_path, &collations)?;
                 let qctx = QueryContext::from_task_locals();
                 let (start, end) =
                     crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
@@ -966,6 +971,7 @@ pub async fn execute_alter_table(
                             &schema,
                             db_id,
                             search_path,
+                            &collations,
                         )?)
                     } else {
                         None

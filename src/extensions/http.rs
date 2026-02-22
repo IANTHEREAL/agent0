@@ -138,6 +138,7 @@ fn http_response_schema(name: &str) -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "content_type".to_string(),
@@ -147,6 +148,7 @@ fn http_response_schema(name: &str) -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "headers".to_string(),
@@ -156,6 +158,7 @@ fn http_response_schema(name: &str) -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "content".to_string(),
@@ -165,6 +168,7 @@ fn http_response_schema(name: &str) -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
         ],
         pk_constraint_name: None,

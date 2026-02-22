@@ -17,6 +17,7 @@ fn dummy_schema_lookup(name: &str) -> Option<TableSchema> {
                     unique: true,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "name".to_string(),
@@ -26,6 +27,7 @@ fn dummy_schema_lookup(name: &str) -> Option<TableSchema> {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
             ],
             version: 1,

@@ -156,6 +156,7 @@ pub fn for_each_child<'a>(expr: &'a TypedExpr, f: &mut impl FnMut(&'a TypedExpr)
             f(expr);
             f(path);
         }
+        TypedExprKind::Collate { expr, .. } => f(expr),
     }
 }
 
@@ -365,6 +366,15 @@ pub fn map_children(
             operator: *operator,
         },
         TypedExprKind::Row(args) => TypedExprKind::Row(args.iter().map(|e| f(e)).collect()),
+        TypedExprKind::Collate {
+            expr,
+            collation,
+            resolved,
+        } => TypedExprKind::Collate {
+            expr: Box::new(f(expr)),
+            collation: collation.clone(),
+            resolved: resolved.clone(),
+        },
     }
 }
 
@@ -729,6 +739,15 @@ pub(crate) fn map_children_async<'a, T: AsyncExprTransform>(
                 }
                 TypedExprKind::Row(new)
             }
+            TypedExprKind::Collate {
+                expr,
+                collation,
+                resolved,
+            } => TypedExprKind::Collate {
+                expr: Box::new(t.transform_expr(expr).await?),
+                collation: collation.clone(),
+                resolved: resolved.clone(),
+            },
         })
     })
 }

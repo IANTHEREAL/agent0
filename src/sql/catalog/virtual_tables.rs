@@ -14,6 +14,7 @@ fn col(name: &str, data_type: DataType) -> ColumnDef {
         unique: false,
         is_serial: false,
         default_expr: None,
+        collation: None,
     }
 }
 
@@ -26,6 +27,7 @@ fn col_nullable(name: &str, data_type: DataType) -> ColumnDef {
         unique: false,
         is_serial: false,
         default_expr: None,
+        collation: None,
     }
 }
 

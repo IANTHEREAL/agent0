@@ -162,6 +162,7 @@ fn test_serialize_deserialize_schema() {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "name".to_string(),
@@ -171,6 +172,7 @@ fn test_serialize_deserialize_schema() {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
         ],
         version: 1,

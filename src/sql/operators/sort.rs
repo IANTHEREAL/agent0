@@ -3,7 +3,9 @@ use async_trait::async_trait;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::analyzer::types::TypedOrderByExpr;
-use crate::sql::expr::compare_order_by_values;
+use crate::sql::collation::ResolvedCollation;
+use crate::sql::expr::collation_aware::extract_resolved_collation;
+use crate::sql::expr::compare_order_by_values_collated;
 use crate::sql::expr::operators::sort_by_fallible;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::types::{Row, TableSchema, Value};
@@ -67,6 +69,8 @@ fn enforce_sort_memory_limit(
 pub struct SortOperator {
     child: BoxedOperator,
     order_by: Vec<TypedOrderByExpr>,
+    /// Resolved collation per ORDER BY key (extracted at construction time).
+    collations: Vec<Option<ResolvedCollation>>,
     sorted_rows: Vec<Row>,
     position: usize,
     opened: bool,
@@ -74,9 +78,14 @@ pub struct SortOperator {
 
 impl SortOperator {
     pub fn new(child: BoxedOperator, order_by: Vec<TypedOrderByExpr>) -> Self {
+        let collations: Vec<Option<ResolvedCollation>> = order_by
+            .iter()
+            .map(|ob| extract_resolved_collation(&ob.expr))
+            .collect();
         Self {
             child,
             order_by,
+            collations,
             sorted_rows: Vec::new(),
             position: 0,
             opened: false,
@@ -96,8 +105,15 @@ impl SortOperator {
         for (i, order_expr) in self.order_by.iter().enumerate() {
             let asc = order_expr.asc;
             let nulls_first = order_expr.nulls_first;
+            let collation = self.collations[i].as_ref();
 
-            let ordering = compare_order_by_values(&keys_a[i], &keys_b[i], asc, nulls_first)?;
+            let ordering = compare_order_by_values_collated(
+                &keys_a[i],
+                &keys_b[i],
+                asc,
+                nulls_first,
+                collation,
+            )?;
             if ordering != std::cmp::Ordering::Equal {
                 return Ok(ordering);
             }
@@ -203,6 +219,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "name".to_string(),
@@ -212,6 +229,7 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    collation: None,
                 },
             ],
             version: 1,

@@ -71,8 +71,8 @@ fn test_single_table_select() {
         limit: None,
         offset: None,
         output_schema: vec![
-            ("id".to_string(), DataType::Int64),
-            ("name".to_string(), DataType::Text),
+            ("id".to_string(), DataType::Int64, None),
+            ("name".to_string(), DataType::Text, None),
         ],
     };
 
@@ -108,7 +108,7 @@ fn test_tableless_select() {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("?column?".to_string(), DataType::Int32)],
+        output_schema: vec![("?column?".to_string(), DataType::Int32, None)],
     };
 
     let plan = LogicalPlanner::build(&query).unwrap();
@@ -152,7 +152,7 @@ fn test_order_by_limit() {
             DataType::Int64,
         )),
         offset: None,
-        output_schema: vec![("id".to_string(), DataType::Int64)],
+        output_schema: vec![("id".to_string(), DataType::Int64, None)],
     };
 
     let plan = LogicalPlanner::build(&query).unwrap();
@@ -200,7 +200,7 @@ fn test_set_operation() {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("id".to_string(), DataType::Int64)],
+        output_schema: vec![("id".to_string(), DataType::Int64, None)],
     };
     let right = left.clone();
 
@@ -215,7 +215,7 @@ fn test_set_operation() {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("id".to_string(), DataType::Int64)],
+        output_schema: vec![("id".to_string(), DataType::Int64, None)],
     };
 
     let plan = LogicalPlanner::build(&query).unwrap();
@@ -272,8 +272,8 @@ fn test_group_by() {
         limit: None,
         offset: None,
         output_schema: vec![
-            ("status".to_string(), DataType::Text),
-            ("count".to_string(), DataType::Int64),
+            ("status".to_string(), DataType::Text, None),
+            ("count".to_string(), DataType::Int64, None),
         ],
     };
 
@@ -311,7 +311,7 @@ fn test_distinct() {
         order_by: vec![],
         limit: None,
         offset: None,
-        output_schema: vec![("name".to_string(), DataType::Text)],
+        output_schema: vec![("name".to_string(), DataType::Text, None)],
     };
 
     let plan = LogicalPlanner::build(&query).unwrap();
@@ -375,8 +375,8 @@ fn test_aggregate_order_by_rewrite() {
         limit: None,
         offset: None,
         output_schema: vec![
-            ("status".to_string(), DataType::Text),
-            ("count".to_string(), DataType::Int64),
+            ("status".to_string(), DataType::Text, None),
+            ("count".to_string(), DataType::Int64, None),
         ],
     };
 
@@ -462,8 +462,8 @@ fn test_aggregate_having_rewrite() {
         limit: None,
         offset: None,
         output_schema: vec![
-            ("status".to_string(), DataType::Text),
-            ("count".to_string(), DataType::Int64),
+            ("status".to_string(), DataType::Text, None),
+            ("count".to_string(), DataType::Int64, None),
         ],
     };
 

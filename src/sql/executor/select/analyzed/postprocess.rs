@@ -213,7 +213,13 @@ pub(super) fn build_deferred_async_expr(expr: &TypedExpr, output_col_idx: usize)
 /// Walks the FROM tree (handling joins, tables, functions) and collects
 /// `(column_name, data_type)` pairs in the same order the analyzer assigns
 /// column indices.
-pub(super) fn collect_source_columns(select: &AnalyzedSelect) -> Vec<(String, DataType)> {
+pub(super) fn collect_source_columns(
+    select: &AnalyzedSelect,
+) -> Vec<(
+    String,
+    DataType,
+    Option<crate::sql::collation::ResolvedCollation>,
+)> {
     let mut cols = Vec::new();
     for tr in &select.from {
         collect_table_ref_columns(tr, &mut cols);
@@ -221,11 +227,18 @@ pub(super) fn collect_source_columns(select: &AnalyzedSelect) -> Vec<(String, Da
     cols
 }
 
-fn collect_table_ref_columns(tr: &AnalyzedTableRef, out: &mut Vec<(String, DataType)>) {
+fn collect_table_ref_columns(
+    tr: &AnalyzedTableRef,
+    out: &mut Vec<(
+        String,
+        DataType,
+        Option<crate::sql::collation::ResolvedCollation>,
+    )>,
+) {
     match &tr.kind {
         AnalyzedTableRefKind::Table { schema, .. } => {
             for (name, dt, _nullable) in &schema.columns {
-                out.push((name.clone(), dt.clone()));
+                out.push((name.clone(), dt.clone(), None));
             }
         }
         AnalyzedTableRefKind::Join { left, right, .. } => {
@@ -234,12 +247,12 @@ fn collect_table_ref_columns(tr: &AnalyzedTableRef, out: &mut Vec<(String, DataT
         }
         AnalyzedTableRefKind::Function { output_columns, .. } => {
             for (name, dt) in output_columns {
-                out.push((name.clone(), dt.clone()));
+                out.push((name.clone(), dt.clone(), None));
             }
         }
         AnalyzedTableRefKind::Subquery(subquery) => {
-            for (name, dt) in &subquery.output_schema {
-                out.push((name.clone(), dt.clone()));
+            for (name, dt, coll) in &subquery.output_schema {
+                out.push((name.clone(), dt.clone(), coll.clone()));
             }
         }
     }
@@ -247,13 +260,17 @@ fn collect_table_ref_columns(tr: &AnalyzedTableRef, out: &mut Vec<(String, DataT
 
 /// Create a passthrough projection that emits all source columns as ColumnRef.
 pub(super) fn create_passthrough_projection(
-    columns: &[(String, DataType)],
+    columns: &[(
+        String,
+        DataType,
+        Option<crate::sql::collation::ResolvedCollation>,
+    )],
 ) -> Vec<crate::sql::analyzer::types::AnalyzedProjection> {
     columns
         .iter()
         .enumerate()
         .map(
-            |(i, (name, dt))| crate::sql::analyzer::types::AnalyzedProjection {
+            |(i, (name, dt, _coll))| crate::sql::analyzer::types::AnalyzedProjection {
                 expr: TypedExpr {
                     kind: TypedExprKind::ColumnRef {
                         scope_depth: 0,
@@ -268,14 +285,21 @@ pub(super) fn create_passthrough_projection(
         .collect()
 }
 
-/// Build a TableSchema from column name/type pairs.
-pub(super) fn build_schema_from_columns(name: &str, columns: &[(String, DataType)]) -> TableSchema {
+/// Build a TableSchema from column name/type/collation triples.
+pub(super) fn build_schema_from_columns(
+    name: &str,
+    columns: &[(
+        String,
+        DataType,
+        Option<crate::sql::collation::ResolvedCollation>,
+    )],
+) -> TableSchema {
     TableSchema::new(
         name.to_string(),
         0,
         columns
             .iter()
-            .map(|(col_name, dt)| crate::types::ColumnDef {
+            .map(|(col_name, dt, _coll)| crate::types::ColumnDef {
                 name: col_name.clone(),
                 data_type: dt.clone(),
                 nullable: true,
@@ -283,6 +307,7 @@ pub(super) fn build_schema_from_columns(name: &str, columns: &[(String, DataType
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             })
             .collect(),
         vec![],
@@ -302,21 +327,29 @@ pub(super) fn build_output_schema(analyzed: &AnalyzedQuery) -> TableSchema {
 pub(super) fn sort_projected_rows(
     mut rows: Vec<Row>,
     deferred_ob: &[TypedOrderByExpr],
-    output_schema: &[(String, DataType)],
+    output_schema: &[(
+        String,
+        DataType,
+        Option<crate::sql::collation::ResolvedCollation>,
+    )],
     limit: Option<usize>,
     offset: usize,
 ) -> Result<Vec<Row>> {
-    // Map each ORDER BY expression to an output column index.
+    // Map each ORDER BY expression to an output column index + collation.
     // Strategy: for ColumnRef ORDER BY, use column_name to find the output column.
     // For complex expressions (ScalarSubquery cloned from alias), find by data_type match.
-    let mut ob_col_indices: Vec<(usize, bool, bool)> = Vec::with_capacity(deferred_ob.len());
+    use crate::sql::collation::ResolvedCollation;
+    use crate::sql::expr::collation_aware::extract_resolved_collation;
+
+    let mut ob_col_indices: Vec<(usize, bool, bool, Option<ResolvedCollation>)> =
+        Vec::with_capacity(deferred_ob.len());
     for ob in deferred_ob {
         let idx = match &ob.expr.kind {
             TypedExprKind::ColumnRef { column_name, .. } => {
                 // Match by column name against output schema.
                 output_schema
                     .iter()
-                    .position(|(name, _)| name.eq_ignore_ascii_case(column_name))
+                    .position(|(name, _, _)| name.eq_ignore_ascii_case(column_name))
             }
             _ => {
                 // For complex expressions (ScalarSubquery, etc.): the Analyzer cloned
@@ -326,7 +359,7 @@ pub(super) fn sort_projected_rows(
                 let matches: Vec<usize> = output_schema
                     .iter()
                     .enumerate()
-                    .filter(|(_, (_, dt))| dt == target_type)
+                    .filter(|(_, (_, dt, _))| dt == target_type)
                     .map(|(i, _)| i)
                     .collect();
                 if matches.len() == 1 {
@@ -337,16 +370,23 @@ pub(super) fn sort_projected_rows(
                 }
             }
         };
-        ob_col_indices.push((idx.unwrap_or(0), ob.asc, ob.nulls_first));
+        let collation = extract_resolved_collation(&ob.expr);
+        ob_col_indices.push((idx.unwrap_or(0), ob.asc, ob.nulls_first, collation));
     }
 
     // Sort.
     use crate::sql::expr::operators::sort_by_fallible;
     sort_by_fallible(&mut rows, |a, b| {
-        for &(col_idx, asc, nulls_first) in &ob_col_indices {
-            let va = a.values.get(col_idx).unwrap_or(&Value::Null);
-            let vb = b.values.get(col_idx).unwrap_or(&Value::Null);
-            let ord = crate::sql::expr::compare_order_by_values(va, vb, asc, nulls_first)?;
+        for (col_idx, asc, nulls_first, ref collation) in &ob_col_indices {
+            let va = a.values.get(*col_idx).unwrap_or(&Value::Null);
+            let vb = b.values.get(*col_idx).unwrap_or(&Value::Null);
+            let ord = crate::sql::expr::compare_order_by_values_collated(
+                va,
+                vb,
+                *asc,
+                *nulls_first,
+                collation.as_ref(),
+            )?;
             if ord != std::cmp::Ordering::Equal {
                 return Ok(ord);
             }

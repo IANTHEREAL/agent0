@@ -305,6 +305,7 @@ mod tests {
                     unique: false,
                     is_serial: true,
                     default_expr: None,
+                    collation: None,
                 },
                 ColumnDef {
                     name: "email".to_string(),
@@ -314,6 +315,7 @@ mod tests {
                     unique: true,
                     is_serial: false,
                     default_expr: Some("'x@example.com'".to_string()),
+                    collation: None,
                 },
             ],
             version: 1,

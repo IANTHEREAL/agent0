@@ -641,6 +641,7 @@ fn infer_index_value_types_for_reconcile(
     schema: &TableSchema,
     db_id: u64,
     table_name: &str,
+    collations: &[crate::sql::collation::CollationDef],
 ) -> Result<Vec<DataType>> {
     let mut types = Vec::with_capacity(index.columns.len() + index.expressions.len());
 
@@ -673,7 +674,7 @@ fn infer_index_value_types_for_reconcile(
                     e
                 )
             })?;
-        let typed = analyze_row_level_expr(&expr, schema, db_id, &search_path)?;
+        let typed = analyze_row_level_expr(&expr, schema, db_id, &search_path, collations)?;
         types.push(typed.data_type.clone());
     }
 
@@ -725,8 +726,9 @@ async fn reconcile_index_pass(
         }
 
         let pk_types = pk_types_for_schema(&schema);
+        let collations = store.list_collations(&mut txn, db_id).await?;
         let index_value_types =
-            infer_index_value_types_for_reconcile(&index, &schema, db_id, table_name)?;
+            infer_index_value_types_for_reconcile(&index, &schema, db_id, table_name, &collations)?;
         let (start, end) = index_prefix_range(db_id, schema.table_id, index.id);
         let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
         while let Some(batch) = scanner.next_batch(&mut txn).await? {

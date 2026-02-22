@@ -201,6 +201,11 @@ impl fmt::Display for TypedExpr {
                 let items: Vec<String> = elems.iter().map(|e| format!("{}", e)).collect();
                 write!(f, "ROW({})", items.join(", "))
             }
+            TypedExprKind::Collate {
+                expr, collation, ..
+            } => {
+                write!(f, "({} COLLATE {})", expr, collation)
+            }
             TypedExprKind::Default => write!(f, "DEFAULT"),
             TypedExprKind::Parameter { index } => write!(f, "${}", index + 1),
         }

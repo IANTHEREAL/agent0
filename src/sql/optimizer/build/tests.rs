@@ -22,6 +22,7 @@ fn test_table_schema() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "name".to_string(),
@@ -31,6 +32,7 @@ fn test_table_schema() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
         ],
         vec![0],
@@ -360,6 +362,7 @@ fn test_nlj() {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "val".to_string(),
@@ -369,6 +372,7 @@ fn test_nlj() {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
         ],
         vec![0],
@@ -719,6 +723,7 @@ fn test_hash_join_right_keys_are_local() {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
             ColumnDef {
                 name: "val".to_string(),
@@ -728,6 +733,7 @@ fn test_hash_join_right_keys_are_local() {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                collation: None,
             },
         ],
         vec![0],
@@ -829,6 +835,7 @@ fn test_duplicate_aggregate_produces_correct_output_width() {
             unique: false,
             is_serial: false,
             default_expr: None,
+            collation: None,
         }],
         vec![0],
     );

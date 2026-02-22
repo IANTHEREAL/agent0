@@ -5,6 +5,7 @@
 
 use sqlparser::ast::{self as ast, SetExpr};
 
+use crate::sql::collation::ResolvedCollation;
 use crate::sql::types::coercion::common_type;
 use crate::sql::types::CastContext;
 use crate::types::DataType;
@@ -78,7 +79,7 @@ impl<'a> Analyzer<'a> {
         left: &AnalyzedQuery,
         right: &AnalyzedQuery,
         op: SetOpKind,
-    ) -> Result<Vec<(String, DataType)>, AnalyzerError> {
+    ) -> Result<Vec<(String, DataType, Option<ResolvedCollation>)>, AnalyzerError> {
         if left.output_schema.len() != right.output_schema.len() {
             return Err(AnalyzerError::SetOperationColumnMismatch {
                 left: left.output_schema.len(),
@@ -95,9 +96,9 @@ impl<'a> Analyzer<'a> {
         left.output_schema
             .iter()
             .zip(right.output_schema.iter())
-            .map(|((name, left_dt), (_, right_dt))| {
+            .map(|((name, left_dt, left_coll), (_, right_dt, _right_coll))| {
                 if left_dt == right_dt {
-                    Ok((name.clone(), left_dt.clone()))
+                    Ok((name.clone(), left_dt.clone(), left_coll.clone()))
                 } else {
                     let unified = common_type(left_dt, right_dt).ok_or_else(|| {
                         AnalyzerError::TypesCannotBeMatched {
@@ -105,7 +106,7 @@ impl<'a> Analyzer<'a> {
                             context: op_name.to_string(),
                         }
                     })?;
-                    Ok((name.clone(), unified))
+                    Ok((name.clone(), unified, left_coll.clone()))
                 }
             })
             .collect()
@@ -125,7 +126,7 @@ impl<'a> Analyzer<'a> {
     pub(super) fn wrap_set_op_arm_with_coercion(
         &self,
         arm: AnalyzedQuery,
-        unified_schema: &[(String, DataType)],
+        unified_schema: &[(String, DataType, Option<ResolvedCollation>)],
         subquery_alias: &str,
     ) -> AnalyzedQuery {
         let arm_output_schema = arm.output_schema.clone();
@@ -133,7 +134,7 @@ impl<'a> Analyzer<'a> {
             .output_schema
             .iter()
             .zip(unified_schema.iter())
-            .any(|((_, arm_ty), (_, unified_ty))| arm_ty != unified_ty);
+            .any(|((_, arm_ty, _), (_, unified_ty, _))| arm_ty != unified_ty);
 
         if !needs_wrap {
             return arm;
@@ -147,9 +148,9 @@ impl<'a> Analyzer<'a> {
         let projection: Vec<AnalyzedProjection> = unified_schema
             .iter()
             .enumerate()
-            .map(|(idx, (out_name, unified_ty))| {
+            .map(|(idx, (out_name, unified_ty, _coll))| {
                 // The input type is the arm's output type at this position.
-                let (input_name, input_ty) = &arm_output_schema[idx];
+                let (input_name, input_ty, _input_coll) = &arm_output_schema[idx];
 
                 let col_ref = TypedExpr::new(
                     TypedExprKind::ColumnRef {
