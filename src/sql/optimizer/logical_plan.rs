@@ -302,6 +302,115 @@ impl LogicalPlan {
         }
     }
 
+    /// Apply `f` to every immediate child `LogicalPlan`, preserving all
+    /// non-child fields.  Leaf nodes (Scan, Values, TableFunction, Empty) are
+    /// returned unchanged.
+    pub(crate) fn map_children(self, mut f: impl FnMut(LogicalPlan) -> LogicalPlan) -> LogicalPlan {
+        let schema = self.schema;
+        let node = match self.node {
+            // ── Leaf nodes ──────────────────────────────────────
+            node @ (LogicalNode::Scan { .. }
+            | LogicalNode::Values { .. }
+            | LogicalNode::TableFunction { .. }
+            | LogicalNode::Empty) => node,
+
+            // ── Unary operators ─────────────────────────────────
+            LogicalNode::Filter { predicate, input } => LogicalNode::Filter {
+                predicate,
+                input: Box::new(f(*input)),
+            },
+            LogicalNode::Project { projections, input } => LogicalNode::Project {
+                projections,
+                input: Box::new(f(*input)),
+            },
+            LogicalNode::Aggregate {
+                group_by,
+                projections,
+                input,
+            } => LogicalNode::Aggregate {
+                group_by,
+                projections,
+                input: Box::new(f(*input)),
+            },
+            LogicalNode::Sort { order_by, input } => LogicalNode::Sort {
+                order_by,
+                input: Box::new(f(*input)),
+            },
+            LogicalNode::Limit {
+                limit,
+                offset,
+                input,
+            } => LogicalNode::Limit {
+                limit,
+                offset,
+                input: Box::new(f(*input)),
+            },
+            LogicalNode::Distinct { input } => LogicalNode::Distinct {
+                input: Box::new(f(*input)),
+            },
+            LogicalNode::DistinctOn { on_exprs, input } => LogicalNode::DistinctOn {
+                on_exprs,
+                input: Box::new(f(*input)),
+            },
+            LogicalNode::Window {
+                window_functions,
+                input_col_count,
+                input,
+            } => LogicalNode::Window {
+                window_functions,
+                input_col_count,
+                input: Box::new(f(*input)),
+            },
+            LogicalNode::Subquery { subplan, alias } => LogicalNode::Subquery {
+                subplan: Box::new(f(*subplan)),
+                alias,
+            },
+
+            // ── Binary operators ────────────────────────────────
+            LogicalNode::Join {
+                left,
+                right,
+                join_type,
+                condition,
+            } => LogicalNode::Join {
+                left: Box::new(f(*left)),
+                right: Box::new(f(*right)),
+                join_type,
+                condition,
+            },
+            LogicalNode::SetOperation {
+                op,
+                all,
+                left,
+                right,
+            } => LogicalNode::SetOperation {
+                op,
+                all,
+                left: Box::new(f(*left)),
+                right: Box::new(f(*right)),
+            },
+            LogicalNode::SemiJoin {
+                left,
+                right,
+                condition,
+            } => LogicalNode::SemiJoin {
+                left: Box::new(f(*left)),
+                right: Box::new(f(*right)),
+                condition,
+            },
+            LogicalNode::AntiJoin {
+                left,
+                right,
+                condition,
+            } => LogicalNode::AntiJoin {
+                left: Box::new(f(*left)),
+                right: Box::new(f(*right)),
+                condition,
+            },
+        };
+        LogicalPlan { node, schema }
+    }
+
     /// Wrap this plan in a Window node.
     ///
     /// The output schema extends the input with one column per window function.
@@ -319,5 +428,357 @@ impl LogicalPlan {
             },
             schema: output_schema,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LogicalNode, LogicalPlan, PlanSchema};
+    use crate::sql::analyzer::types::{
+        JoinCondition, JoinType, SetOpKind, TypedExpr, TypedExprKind,
+    };
+    use crate::types::{DataType, Value};
+
+    fn one_col_schema(name: &str) -> PlanSchema {
+        PlanSchema::from_columns(vec![(name.to_string(), DataType::Int64)])
+    }
+
+    fn two_col_schema(left: &str, right: &str) -> PlanSchema {
+        PlanSchema::from_columns(vec![
+            (left.to_string(), DataType::Int64),
+            (right.to_string(), DataType::Int64),
+        ])
+    }
+
+    fn scan(name: &str) -> LogicalPlan {
+        LogicalPlan::scan(
+            name.to_string(),
+            None,
+            one_col_schema(&format!("{name}_id")),
+        )
+    }
+
+    fn bool_const(v: bool) -> TypedExpr {
+        TypedExpr::new(
+            TypedExprKind::Constant(Value::Boolean(v)),
+            DataType::Boolean,
+        )
+    }
+
+    fn assert_schema_names(plan: &LogicalPlan, expected: &[&str]) {
+        let actual: Vec<&str> = plan
+            .schema
+            .columns
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    fn rename_scan_table(plan: LogicalPlan, new_name: &str) -> LogicalPlan {
+        match plan {
+            LogicalPlan {
+                node: LogicalNode::Scan { alias, .. },
+                schema,
+            } => LogicalPlan {
+                node: LogicalNode::Scan {
+                    table_name: new_name.to_string(),
+                    alias,
+                },
+                schema,
+            },
+            other => other,
+        }
+    }
+
+    fn assert_map_invocations(plan: LogicalPlan, expected_calls: usize) {
+        let mut calls = 0usize;
+        let _ = plan.map_children(|child| {
+            calls += 1;
+            child
+        });
+        assert_eq!(calls, expected_calls);
+    }
+
+    #[test]
+    fn map_children_leaf_nodes_are_identity() {
+        let mut calls = 0usize;
+        let plan = scan("t");
+        let mapped = plan.clone().map_children(|child| {
+            calls += 1;
+            rename_scan_table(child, "should_not_run")
+        });
+
+        assert_eq!(calls, 0);
+        match &mapped.node {
+            LogicalNode::Scan { table_name, alias } => {
+                assert_eq!(table_name, "t");
+                assert!(alias.is_none());
+            }
+            other => panic!("expected Scan, got {other:?}"),
+        }
+        assert_schema_names(&mapped, &["t_id"]);
+    }
+
+    #[test]
+    fn map_children_unary_preserves_fields_and_maps_single_child() {
+        let plan = LogicalPlan {
+            node: LogicalNode::Filter {
+                predicate: bool_const(true),
+                input: Box::new(scan("base")),
+            },
+            schema: one_col_schema("base_id"),
+        };
+
+        let mut calls = 0usize;
+        let mapped = plan.map_children(|child| {
+            calls += 1;
+            rename_scan_table(child, "mapped_base")
+        });
+
+        assert_eq!(calls, 1);
+        match &mapped.node {
+            LogicalNode::Filter { predicate, input } => {
+                match &predicate.kind {
+                    TypedExprKind::Constant(Value::Boolean(v)) => assert!(v),
+                    other => panic!("expected boolean constant predicate, got {other:?}"),
+                }
+                match &input.node {
+                    LogicalNode::Scan { table_name, .. } => assert_eq!(table_name, "mapped_base"),
+                    other => panic!("expected mapped scan input, got {other:?}"),
+                }
+            }
+            other => panic!("expected Filter, got {other:?}"),
+        }
+        assert_schema_names(&mapped, &["base_id"]);
+    }
+
+    #[test]
+    fn map_children_binary_maps_both_children_in_left_to_right_order() {
+        let plan = LogicalPlan {
+            node: LogicalNode::Join {
+                left: Box::new(scan("left_src")),
+                right: Box::new(scan("right_src")),
+                join_type: JoinType::Inner,
+                condition: JoinCondition::None,
+            },
+            schema: two_col_schema("left_id", "right_id"),
+        };
+
+        let mut visited = Vec::new();
+        let mapped = plan.map_children(|child| match child {
+            LogicalPlan {
+                node: LogicalNode::Scan { table_name, alias },
+                schema,
+            } => {
+                visited.push(table_name.clone());
+                LogicalPlan {
+                    node: LogicalNode::Scan {
+                        table_name: format!("mapped_{table_name}"),
+                        alias,
+                    },
+                    schema,
+                }
+            }
+            other => other,
+        });
+
+        assert_eq!(
+            visited,
+            vec!["left_src".to_string(), "right_src".to_string()]
+        );
+        match &mapped.node {
+            LogicalNode::Join {
+                left,
+                right,
+                join_type,
+                condition,
+            } => {
+                assert_eq!(join_type, &JoinType::Inner);
+                assert!(matches!(condition, JoinCondition::None));
+                match &left.node {
+                    LogicalNode::Scan { table_name, .. } => {
+                        assert_eq!(table_name, "mapped_left_src")
+                    }
+                    other => panic!("expected mapped left scan, got {other:?}"),
+                }
+                match &right.node {
+                    LogicalNode::Scan { table_name, .. } => {
+                        assert_eq!(table_name, "mapped_right_src")
+                    }
+                    other => panic!("expected mapped right scan, got {other:?}"),
+                }
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+        assert_schema_names(&mapped, &["left_id", "right_id"]);
+    }
+
+    #[test]
+    fn map_children_subquery_maps_subplan_and_preserves_alias() {
+        let plan = LogicalPlan {
+            node: LogicalNode::Subquery {
+                subplan: Box::new(scan("inner_sq")),
+                alias: Some("sq_alias".to_string()),
+            },
+            schema: one_col_schema("sq_col"),
+        };
+
+        let mapped = plan.map_children(|child| rename_scan_table(child, "mapped_inner_sq"));
+        match &mapped.node {
+            LogicalNode::Subquery { subplan, alias } => {
+                assert_eq!(alias.as_deref(), Some("sq_alias"));
+                match &subplan.node {
+                    LogicalNode::Scan { table_name, .. } => {
+                        assert_eq!(table_name, "mapped_inner_sq")
+                    }
+                    other => panic!("expected mapped subplan scan, got {other:?}"),
+                }
+            }
+            other => panic!("expected Subquery, got {other:?}"),
+        }
+        assert_schema_names(&mapped, &["sq_col"]);
+    }
+
+    #[test]
+    fn map_children_invocation_count_matches_node_arity() {
+        assert_map_invocations(scan("scan_leaf"), 0);
+        assert_map_invocations(
+            LogicalPlan {
+                node: LogicalNode::Values { rows: vec![] },
+                schema: one_col_schema("v"),
+            },
+            0,
+        );
+        assert_map_invocations(
+            LogicalPlan {
+                node: LogicalNode::TableFunction {
+                    function_name: "generate_series".to_string(),
+                    args: vec![],
+                    alias: None,
+                },
+                schema: one_col_schema("tf"),
+            },
+            0,
+        );
+        assert_map_invocations(LogicalPlan::empty(one_col_schema("e")), 0);
+
+        assert_map_invocations(
+            LogicalPlan {
+                node: LogicalNode::Project {
+                    projections: vec![],
+                    input: Box::new(scan("p")),
+                },
+                schema: one_col_schema("p"),
+            },
+            1,
+        );
+        assert_map_invocations(
+            LogicalPlan {
+                node: LogicalNode::Aggregate {
+                    group_by: vec![],
+                    projections: vec![],
+                    input: Box::new(scan("a")),
+                },
+                schema: one_col_schema("a"),
+            },
+            1,
+        );
+        assert_map_invocations(
+            LogicalPlan {
+                node: LogicalNode::Sort {
+                    order_by: vec![],
+                    input: Box::new(scan("s")),
+                },
+                schema: one_col_schema("s"),
+            },
+            1,
+        );
+        assert_map_invocations(
+            LogicalPlan {
+                node: LogicalNode::Limit {
+                    limit: None,
+                    offset: None,
+                    input: Box::new(scan("l")),
+                },
+                schema: one_col_schema("l"),
+            },
+            1,
+        );
+        assert_map_invocations(
+            LogicalPlan {
+                node: LogicalNode::Distinct {
+                    input: Box::new(scan("d")),
+                },
+                schema: one_col_schema("d"),
+            },
+            1,
+        );
+        assert_map_invocations(
+            LogicalPlan {
+                node: LogicalNode::DistinctOn {
+                    on_exprs: vec![],
+                    input: Box::new(scan("do")),
+                },
+                schema: one_col_schema("do"),
+            },
+            1,
+        );
+        assert_map_invocations(
+            LogicalPlan {
+                node: LogicalNode::Window {
+                    window_functions: vec![],
+                    input_col_count: 1,
+                    input: Box::new(scan("w")),
+                },
+                schema: one_col_schema("w"),
+            },
+            1,
+        );
+        assert_map_invocations(
+            LogicalPlan {
+                node: LogicalNode::Subquery {
+                    subplan: Box::new(scan("sq")),
+                    alias: Some("x".to_string()),
+                },
+                schema: one_col_schema("sq"),
+            },
+            1,
+        );
+
+        assert_map_invocations(
+            LogicalPlan {
+                node: LogicalNode::SetOperation {
+                    op: SetOpKind::Union,
+                    all: false,
+                    left: Box::new(scan("set_l")),
+                    right: Box::new(scan("set_r")),
+                },
+                schema: one_col_schema("set"),
+            },
+            2,
+        );
+        assert_map_invocations(
+            LogicalPlan {
+                node: LogicalNode::SemiJoin {
+                    left: Box::new(scan("semi_l")),
+                    right: Box::new(scan("semi_r")),
+                    condition: JoinCondition::None,
+                },
+                schema: one_col_schema("semi"),
+            },
+            2,
+        );
+        assert_map_invocations(
+            LogicalPlan {
+                node: LogicalNode::AntiJoin {
+                    left: Box::new(scan("anti_l")),
+                    right: Box::new(scan("anti_r")),
+                    condition: JoinCondition::None,
+                },
+                schema: one_col_schema("anti"),
+            },
+            2,
+        );
     }
 }
