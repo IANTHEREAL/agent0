@@ -338,6 +338,13 @@ enum BranchAction {
 enum TokenAction {
     /// Print the current raw token (for use with DB9_API_KEY)
     Show,
+    /// Create a new API token
+    Create {
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value = "365")]
+        expires_in_days: u32,
+    },
     /// List your API tokens
     List,
     /// Revoke a token
@@ -855,6 +862,13 @@ async fn main() {
         },
         Commands::Token { ref action } => match action {
             TokenAction::Show => cmd_token_show(&cli.effective_output()),
+            TokenAction::Create {
+                name,
+                expires_in_days,
+            } => {
+                cmd_token_create(&api, &cli.effective_output(), name.as_deref(), *expires_in_days)
+                    .await
+            }
             TokenAction::List => cmd_token_list(&api, &cli.effective_output()).await,
             TokenAction::Revoke { token_id } => {
                 cmd_token_revoke(&api, &cli.effective_output(), token_id).await
@@ -2704,6 +2718,42 @@ fn cmd_token_show(output: &OutputFormat) {
         Err(msg) => {
             eprintln!("{msg}");
             process::exit(1);
+        }
+    }
+}
+
+async fn cmd_token_create(
+    api: &ApiClient,
+    output: &OutputFormat,
+    name: Option<&str>,
+    expires_in_days: u32,
+) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    let mut body = serde_json::json!({ "expires_in_days": expires_in_days });
+    if let Some(n) = name {
+        body["name"] = serde_json::Value::String(n.to_string());
+    }
+
+    let data = api
+        .request("POST", "/customer/tokens", Some(&body), Some(&headers))
+        .await;
+
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => {
+            let raw = data["token"].as_str().unwrap_or("");
+            let id = data["id"].as_str().unwrap_or("");
+            let token_name = data["name"].as_str().unwrap_or("api-key");
+            let expires = format_time(data.get("expires_at"));
+            println!("Token created: {token_name} (id: {id})");
+            println!("Expires: {expires}");
+            println!();
+            println!("{raw}");
+            eprintln!();
+            eprintln!("Save this token — it won't be shown again.");
+            eprintln!("Use: export DB9_API_KEY=<token>");
         }
     }
 }

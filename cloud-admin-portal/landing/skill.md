@@ -144,8 +144,12 @@ curl https://db9.shared.aws.tidbcloud.com/api/customer/databases \
 ### Token Management
 
 ```bash
-# Print the raw token (for DB9_API_KEY or scripts)
+# Print the current raw token (for DB9_API_KEY or scripts)
 db9 token show
+
+# Create a new API token (for CI/CD, other environments)
+db9 token create --name ci-deploy
+db9 token create --name staging --expires-in-days 30
 
 # List active tokens (shows IDs, not raw values)
 db9 token list
@@ -924,6 +928,8 @@ db9
 │   └── status <id> [--dir <d>]       # Applied vs pending
 ├── token
 │   ├── show                          # Print raw token (for DB9_API_KEY)
+│   ├── create [--name <n>] [--expires-in-days <d>]
+│   │                                 # Create new API token
 │   ├── list                          # List API tokens
 │   └── revoke <token_id>             # Revoke a token
 ├── sh [<id>] [-c <cmd>]             # Filesystem shell (sh9)
