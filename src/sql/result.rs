@@ -1,7 +1,17 @@
 //! SQL execution result types
 
 use crate::types::{DataType, Row, TableSchema};
+use futures::stream::BoxStream;
 use std::sync::Arc;
+
+/// Opaque wrapper around a boxed async row stream for streaming CTAS.
+pub struct RowStream(pub BoxStream<'static, anyhow::Result<Row>>);
+
+impl std::fmt::Debug for RowStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<row_stream>")
+    }
+}
 
 /// Result of executing a SQL statement
 #[allow(dead_code)] // PG result message structural field
@@ -144,6 +154,13 @@ pub enum ExecuteResult {
     Notice {
         message: String,
         severity: String,
+    },
+    /// Streaming SELECT for CTAS — consumed by DDL, never sent over wire.
+    SelectStream {
+        columns: Vec<String>,
+        column_types: Vec<DataType>,
+        stream: RowStream,
+        timezone: Arc<str>,
     },
 }
 

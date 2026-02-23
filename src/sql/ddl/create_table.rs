@@ -551,6 +551,95 @@ pub async fn create_table_from_query_result(
     })
 }
 
+pub async fn create_table_from_stream(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    table_name: &str,
+    if_not_exists: bool,
+    result_cols: Vec<String>,
+    column_types: Vec<DataType>,
+    stream: crate::sql::result::RowStream,
+) -> Result<ExecuteResult> {
+    if if_not_exists && store.table_exists(txn, db_id, table_name).await? {
+        return Ok(ExecuteResult::CreateTable {
+            table_name: table_name.to_string(),
+        });
+    }
+
+    // Add synthetic _rowid column as primary key (allows UPDATE/DELETE on tables without explicit PK)
+    let mut col_defs: Vec<ColumnDef> = vec![ColumnDef {
+        name: "_rowid".to_string(),
+        data_type: DataType::Int64,
+        nullable: false,
+        primary_key: true,
+        unique: true,
+        is_serial: true,
+        default_expr: None,
+        collation: None,
+    }];
+
+    for (i, col_name) in result_cols.iter().enumerate() {
+        // INTENTIONAL: Text is the safe fallback for column types in streaming CTAS
+        let data_type = column_types.get(i).cloned().unwrap_or(DataType::Text);
+        col_defs.push(ColumnDef {
+            name: col_name.clone(),
+            data_type,
+            nullable: true,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+            collation: None,
+        });
+    }
+
+    let table_id = store.next_table_id(txn, db_id).await?;
+    // Streaming CTAS uses an internal synthetic row-id PK for storage only;
+    // same convention as batch CTAS — empty-name sentinel.
+    let pk_constraint_name = Some(String::new());
+    let schema = TableSchema {
+        name: table_name.to_string(),
+        table_id,
+        columns: col_defs,
+        version: 1,
+        pk_constraint_name,
+        pk_indices: vec![0],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: "postgres".to_string(),
+        from_alias: None,
+    };
+    store.create_table(txn, db_id, schema.clone()).await?;
+    create_implicit_sequences_for_schema(store, txn, db_id, &schema).await?;
+
+    use futures::StreamExt;
+    let mut row_stream = stream.0;
+    let mut row_count: usize = 0;
+    let mut batch_writes: usize = 0;
+    let mut has_committed_batches = false;
+
+    while let Some(row_result) = row_stream.next().await {
+        let row = row_result?;
+        row_count += 1;
+        let mut values = vec![Value::Int64(row_count as i64)];
+        values.extend(row.values);
+        store
+            .upsert(txn, db_id, table_name, Row::new(values))
+            .await?;
+        batch_writes += 1;
+        super::maybe_rotate_backfill_txn(store, txn, &mut batch_writes, &mut has_committed_batches)
+            .await?;
+    }
+
+    advance_implicit_sequences_for_seeded_rows(store, txn, db_id, &schema, row_count).await?;
+
+    Ok(ExecuteResult::CreateTable {
+        table_name: table_name.to_string(),
+    })
+}
+
 pub async fn create_table_from_select_into(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
