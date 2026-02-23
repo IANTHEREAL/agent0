@@ -6,7 +6,7 @@ use futures::stream;
 use pgwire::api::portal::Format;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::Type;
-use pgwire::error::PgWireResult;
+use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
 use std::sync::Arc;
 
@@ -303,5 +303,13 @@ pub(in crate::protocol::handler) fn result_to_response_with_format(
         ExecuteResult::Grant => Ok(Response::Execution(Tag::new("GRANT"))),
 
         ExecuteResult::Revoke => Ok(Response::Execution(Tag::new("REVOKE"))),
+
+        ExecuteResult::SelectStream { .. } => Err(PgWireError::UserError(Box::new(
+            pgwire::error::ErrorInfo::new(
+                "ERROR".to_string(),
+                "0A000".to_string(),
+                "streaming result cannot be sent directly to client".to_string(),
+            ),
+        ))),
     }
 }
