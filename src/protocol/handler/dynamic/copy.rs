@@ -237,7 +237,8 @@ impl DynamicPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let executor = self.get_executor()?;
+        let state = self.auth();
+        let executor = &state.executor;
 
         let select_sql = if columns.is_empty() {
             format!("SELECT * FROM {}", table_name)
@@ -245,17 +246,10 @@ impl DynamicPgHandler {
             format!("SELECT {} FROM {}", columns.join(", "), table_name)
         };
 
-        let mut session_guard = self.session.lock().await;
-        let session = session_guard.as_mut().ok_or_else(|| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_string(),
-                "XX000".to_string(),
-                "Session not initialized".to_string(),
-            )))
-        })?;
+        let mut session = state.session.lock().await;
 
         let result = executor
-            .execute(session, &select_sql)
+            .execute(&mut session, &select_sql)
             .await
             .map(|r| r.last())
             .map_err(|e| {
@@ -269,7 +263,7 @@ impl DynamicPgHandler {
         let (copy_resp, col_names, rows) = Self::copy_out_response_from_select_result(result)
             .map_err(|e| PgWireError::UserError(Box::new(e)))?;
 
-        drop(session_guard);
+        drop(session);
 
         pgwire::api::copy::send_copy_out_response(client, copy_resp).await?;
 
@@ -378,15 +372,9 @@ impl DynamicPgHandler {
         };
 
         // --- session setup (mirrors try_handle_copy_from_parquet) ---
-        let executor = self.get_executor()?;
-        let mut session_guard = self.session.lock().await;
-        let session = session_guard.as_mut().ok_or_else(|| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_string(),
-                "XX000".to_string(),
-                "Session not initialized".to_string(),
-            )))
-        })?;
+        let state = self.auth();
+        let executor = &state.executor;
+        let mut session = state.session.lock().await;
 
         if session.is_transaction_failed() {
             return Err(in_failed_sql_transaction_pgwire_error());
@@ -802,15 +790,9 @@ impl DynamicPgHandler {
             _ => return Ok(None),
         };
 
-        let executor = self.get_executor()?;
-        let mut session_guard = self.session.lock().await;
-        let session = session_guard.as_mut().ok_or_else(|| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_string(),
-                "XX000".to_string(),
-                "Session not initialized".to_string(),
-            )))
-        })?;
+        let state = self.auth();
+        let executor = &state.executor;
+        let mut session = state.session.lock().await;
 
         if session.is_transaction_failed() {
             return Err(in_failed_sql_transaction_pgwire_error());
@@ -1037,7 +1019,7 @@ impl CopyHandler for DynamicPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let executor = self.get_executor()?;
+        let executor = &self.auth().executor;
 
         let (parse_res, table_name, started_txn, qctx) = {
             let mut ctx_guard = self.copy_context.lock().await;
@@ -1099,10 +1081,8 @@ impl CopyHandler for DynamicPgHandler {
                 *ctx_guard = None;
                 drop(ctx_guard);
 
-                let mut session_guard = self.session.lock().await;
-                if let Some(session) = session_guard.as_mut() {
-                    rollback_autocommit_or_mark_failed(session, started_txn).await;
-                }
+                let mut session = self.auth().session.lock().await;
+                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
                 return Err(e);
             }
         };
@@ -1114,14 +1094,7 @@ impl CopyHandler for DynamicPgHandler {
 
         let insert_res: PgWireResult<()> =
             crate::sql::query_context::with_scoped_query_context(&qctx, async {
-                let mut session_guard = self.session.lock().await;
-                let session = session_guard.as_mut().ok_or_else(|| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(),
-                        "XX000".to_string(),
-                        "Session not initialized".to_string(),
-                    )))
-                })?;
+                let mut session = self.auth().session.lock().await;
 
                 if session.is_transaction_failed() {
                     return Err(in_failed_sql_transaction_pgwire_error());
@@ -1131,7 +1104,7 @@ impl CopyHandler for DynamicPgHandler {
                 crate::txn::with_savepoints(savepoints, async {
                     for (line_no, col_values) in rows_to_insert {
                         executor
-                            .execute_copy_insert(session, &table_name, col_values)
+                            .execute_copy_insert(&mut session, &table_name, col_values)
                             .await
                             .map_err(|e| {
                                 error!("COPY insert error: {}", e);
@@ -1158,11 +1131,9 @@ impl CopyHandler for DynamicPgHandler {
             .await;
 
         if let Err(e) = insert_res {
-            let mut session_guard = self.session.lock().await;
-            if let Some(session) = session_guard.as_mut() {
-                rollback_autocommit_or_mark_failed(session, started_txn).await;
-            }
-            drop(session_guard);
+            let mut session = self.auth().session.lock().await;
+            rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+            drop(session);
 
             let mut ctx_guard = self.copy_context.lock().await;
             *ctx_guard = None;
@@ -1189,18 +1160,11 @@ impl CopyHandler for DynamicPgHandler {
         };
 
         let row_count = if let Some(mut ctx) = ctx_opt {
-            let executor = self.get_executor()?;
+            let executor = &self.auth().executor;
             let qctx = ctx.query_context.clone();
 
             crate::sql::query_context::with_scoped_query_context(&qctx, async {
-                let mut session_guard = self.session.lock().await;
-                let session = session_guard.as_mut().ok_or_else(|| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(),
-                        "XX000".to_string(),
-                        "Session not initialized".to_string(),
-                    )))
-                })?;
+                let mut session = self.auth().session.lock().await;
 
                 if session.is_transaction_failed() {
                     return Err(in_failed_sql_transaction_pgwire_error());
@@ -1221,7 +1185,8 @@ impl CopyHandler for DynamicPgHandler {
                         ) {
                             Ok(values) => values,
                             Err(e) => {
-                                rollback_autocommit_or_mark_failed(session, ctx.started_txn).await;
+                                rollback_autocommit_or_mark_failed(&mut session, ctx.started_txn)
+                                    .await;
                                 return Err(e);
                             }
                         };
@@ -1229,7 +1194,7 @@ impl CopyHandler for DynamicPgHandler {
                         let savepoints = session.savepoints();
                         let insert_res = crate::txn::with_savepoints(savepoints, async {
                             executor
-                                .execute_copy_insert(session, &ctx.table_name, col_values)
+                                .execute_copy_insert(&mut session, &ctx.table_name, col_values)
                                 .await
                                 .map_err(|e| {
                                     error!("COPY insert error: {}", e);
@@ -1249,7 +1214,7 @@ impl CopyHandler for DynamicPgHandler {
                         .await;
 
                         if let Err(e) = insert_res {
-                            rollback_autocommit_or_mark_failed(session, ctx.started_txn).await;
+                            rollback_autocommit_or_mark_failed(&mut session, ctx.started_txn).await;
                             return Err(e);
                         }
 
@@ -1295,10 +1260,8 @@ impl CopyHandler for DynamicPgHandler {
         };
 
         if let Some(ctx) = ctx_opt {
-            let mut session_guard = self.session.lock().await;
-            if let Some(session) = session_guard.as_mut() {
-                rollback_autocommit_or_mark_failed(session, ctx.started_txn).await;
-            }
+            let mut session = self.auth().session.lock().await;
+            rollback_autocommit_or_mark_failed(&mut session, ctx.started_txn).await;
         }
 
         warn!("COPY failed: {}", fail.message);

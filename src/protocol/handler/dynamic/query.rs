@@ -214,7 +214,8 @@ impl SimpleQueryHandler for DynamicPgHandler {
     {
         debug!("Received query: {}", query);
 
-        let executor = self.get_executor()?;
+        let state = self.auth();
+        let executor = &state.executor;
 
         #[cfg(feature = "parquet")]
         if let Some(result) = self.try_handle_copy_from_fs9(client, query).await? {
@@ -247,14 +248,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
             );
 
             let (resolved_table, resolved_columns, column_types, col_count, started_txn, qctx) = {
-                let mut session_guard = self.session.lock().await;
-                let session = session_guard.as_mut().ok_or_else(|| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(),
-                        "XX000".to_string(),
-                        "Session not initialized".to_string(),
-                    )))
-                })?;
+                let mut session = state.session.lock().await;
 
                 if session.is_transaction_failed() {
                     return Err(in_failed_sql_transaction_pgwire_error());
@@ -313,7 +307,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
                         {
                             Ok(Some(schema)) => (resolved_table, schema),
                             Ok(None) => {
-                                rollback_autocommit_or_mark_failed(session, started_txn).await;
+                                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
                                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                                     "ERROR".to_string(),
                                     "42P01".to_string(),
@@ -321,7 +315,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
                                 ))));
                             }
                             Err(e) => {
-                                rollback_autocommit_or_mark_failed(session, started_txn).await;
+                                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
                                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                                     "ERROR".to_string(),
                                     "XX000".to_string(),
@@ -350,7 +344,8 @@ impl SimpleQueryHandler for DynamicPgHandler {
                                 }
                                 Ok(None) => continue,
                                 Err(e) => {
-                                    rollback_autocommit_or_mark_failed(session, started_txn).await;
+                                    rollback_autocommit_or_mark_failed(&mut session, started_txn)
+                                        .await;
                                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                                         "ERROR".to_string(),
                                         "XX000".to_string(),
@@ -363,7 +358,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
                         match found {
                             Some(found) => found,
                             None => {
-                                rollback_autocommit_or_mark_failed(session, started_txn).await;
+                                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
                                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                                     "ERROR".to_string(),
                                     "42P01".to_string(),
@@ -396,7 +391,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
                 };
 
                 if let Err(e) = privilege_result {
-                    rollback_autocommit_or_mark_failed(session, started_txn).await;
+                    rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".to_string(),
                         sqlstate_for_executor_error(&e).to_string(),
@@ -408,7 +403,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
                     match resolve_copy_columns(&schema, &columns, &table_name) {
                         Ok(resolved) => resolved,
                         Err(e) => {
-                            rollback_autocommit_or_mark_failed(session, started_txn).await;
+                            rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
                             return Err(e);
                         }
                     };
@@ -442,14 +437,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
             )]);
         }
 
-        let mut session_guard = self.session.lock().await;
-        let session = session_guard.as_mut().ok_or_else(|| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_string(),
-                "XX000".to_string(),
-                "Session not initialized".to_string(),
-            )))
-        })?;
+        let mut session = state.session.lock().await;
 
         if let Err(e) = session.check_idle_in_transaction_timeout() {
             let _ = session.rollback().await;
@@ -460,7 +448,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
             ))));
         }
 
-        match executor.execute(session, query).await {
+        match executor.execute(&mut session, query).await {
             Ok(results) => {
                 session.record_command_complete();
                 let mut responses: Vec<Response<'a>> = Vec::new();
@@ -545,151 +533,116 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             .collect();
 
         // 4. Analyze for frozen execution IR
-        if let Some(executor) = self.executor.get() {
-            let store = executor.store();
+        let state = self.auth();
+        let executor = &state.executor;
+        let store = executor.store();
 
-            // Brief session lock to read db_id + search_path
-            let (db_id, search_path) = {
-                let session_guard = self.session.lock().await;
-                match session_guard.as_ref() {
-                    Some(session) => (
-                        session.current_database_id(),
-                        session.search_path().to_vec(),
-                    ),
-                    None => {
-                        // No session yet -- reject data/parameterized SQL
-                        if let Some(err) = reject_unanalyzed_if_needed(
-                            &stored.statement.sql,
-                            param_count,
-                            "session not available",
-                        ) {
-                            return Err(err);
-                        }
-                        client.portal_store().put_statement(Arc::new(stored))?;
-                        client
-                            .send(PgWireBackendMessage::ParseComplete(
-                                pgwire::messages::extendedquery::ParseComplete::new(),
-                            ))
-                            .await?;
-                        return Ok(());
-                    }
-                }
-            };
+        // Brief session lock to read db_id + search_path
+        let (db_id, search_path) = {
+            let session = state.session.lock().await;
+            (
+                session.current_database_id(),
+                session.search_path().to_vec(),
+            )
+        };
 
-            // Temporary read-only transaction for catalog access
-            match store.begin().await {
-                Ok(mut txn) => {
-                    match executor
-                        .analyze_for_prepared(
-                            &mut txn,
-                            db_id,
-                            &search_path,
-                            &stored.statement.sql,
-                            param_count,
-                            &client_oids,
-                        )
-                        .await
-                    {
-                        Ok(analysis) => {
-                            match analysis {
-                                PreparedAnalysis::Query {
-                                    analyzed,
-                                    locks,
-                                    select_into,
-                                    output_schema,
-                                    param_types,
-                                    base_table_names,
-                                    table_versions,
-                                    has_recursive_cte,
-                                } => {
-                                    let required_privileges = base_table_names
-                                        .into_iter()
-                                        .map(|t| (t, Privilege::Select))
-                                        .collect();
-                                    stored.parameter_types = merge_parameter_types(
-                                        &stored.parameter_types,
-                                        &param_types,
-                                    );
-                                    stored.statement = PreparedStatement {
-                                        sql: stored.statement.sql,
-                                        exec: PreparedExec::AnalyzedQuery {
-                                            analyzed,
-                                            locks,
-                                            select_into,
-                                            required_privileges,
-                                            has_recursive_cte,
-                                        },
-                                        output_schema,
-                                        param_data_types: param_types,
-                                        table_versions,
-                                    };
-                                }
-                                PreparedAnalysis::Dml {
-                                    analyzed,
-                                    output_schema,
-                                    param_types,
-                                    table_versions,
-                                } => {
-                                    let required_privileges =
-                                        PreparedStatement::compute_privileges(&analyzed, &[]);
-                                    stored.parameter_types = merge_parameter_types(
-                                        &stored.parameter_types,
-                                        &param_types,
-                                    );
-                                    stored.statement = PreparedStatement {
-                                        sql: stored.statement.sql,
-                                        exec: PreparedExec::AnalyzedDml {
-                                            analyzed,
-                                            required_privileges,
-                                        },
-                                        output_schema,
-                                        param_data_types: param_types,
-                                        table_versions,
-                                    };
-                                }
-                                PreparedAnalysis::Utility => {
-                                    // Keep RawSqlUtility
-                                }
-                            }
-                        }
-                        Err(e) if param_count > 0 || is_data_statement(&stored.statement.sql) => {
-                            // Data statements and parameterized statements must be analyzed.
-                            let _ = txn.rollback().await;
-                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".to_string(),
-                                sqlstate_for_executor_error(&e).to_string(),
-                                e.to_string(),
-                            ))));
-                        }
-                        Err(_) => {
-                            // Utility, no params -- keep RawSqlUtility
-                        }
-                    }
-                    let _ = txn.rollback().await; // read-only, discard
-                }
-                Err(e) => {
-                    // Can't begin txn -- reject data/parameterized SQL
-                    if let Some(err) = reject_unanalyzed_if_needed(
+        // Temporary read-only transaction for catalog access
+        match store.begin().await {
+            Ok(mut txn) => {
+                match executor
+                    .analyze_for_prepared(
+                        &mut txn,
+                        db_id,
+                        &search_path,
                         &stored.statement.sql,
                         param_count,
-                        &format!("failed to begin catalog transaction: {}", e),
-                    ) {
-                        return Err(err);
+                        &client_oids,
+                    )
+                    .await
+                {
+                    Ok(analysis) => {
+                        match analysis {
+                            PreparedAnalysis::Query {
+                                analyzed,
+                                locks,
+                                select_into,
+                                output_schema,
+                                param_types,
+                                base_table_names,
+                                table_versions,
+                                has_recursive_cte,
+                            } => {
+                                let required_privileges = base_table_names
+                                    .into_iter()
+                                    .map(|t| (t, Privilege::Select))
+                                    .collect();
+                                stored.parameter_types =
+                                    merge_parameter_types(&stored.parameter_types, &param_types);
+                                stored.statement = PreparedStatement {
+                                    sql: stored.statement.sql,
+                                    exec: PreparedExec::AnalyzedQuery {
+                                        analyzed,
+                                        locks,
+                                        select_into,
+                                        required_privileges,
+                                        has_recursive_cte,
+                                    },
+                                    output_schema,
+                                    param_data_types: param_types,
+                                    table_versions,
+                                };
+                            }
+                            PreparedAnalysis::Dml {
+                                analyzed,
+                                output_schema,
+                                param_types,
+                                table_versions,
+                            } => {
+                                let required_privileges =
+                                    PreparedStatement::compute_privileges(&analyzed, &[]);
+                                stored.parameter_types =
+                                    merge_parameter_types(&stored.parameter_types, &param_types);
+                                stored.statement = PreparedStatement {
+                                    sql: stored.statement.sql,
+                                    exec: PreparedExec::AnalyzedDml {
+                                        analyzed,
+                                        required_privileges,
+                                    },
+                                    output_schema,
+                                    param_data_types: param_types,
+                                    table_versions,
+                                };
+                            }
+                            PreparedAnalysis::Utility => {
+                                // Keep RawSqlUtility
+                            }
+                        }
                     }
-                    // Utility, no params -- keep RawSqlUtility
+                    Err(e) if param_count > 0 || is_data_statement(&stored.statement.sql) => {
+                        // Data statements and parameterized statements must be analyzed.
+                        let _ = txn.rollback().await;
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_string(),
+                            sqlstate_for_executor_error(&e).to_string(),
+                            e.to_string(),
+                        ))));
+                    }
+                    Err(_) => {
+                        // Utility, no params -- keep RawSqlUtility
+                    }
                 }
+                let _ = txn.rollback().await; // read-only, discard
             }
-        }
-
-        // Belt-and-suspenders: catch any future code path that produces
-        // unanalyzed data SQL or parameterized utility SQL.
-        if matches!(stored.statement.exec, PreparedExec::RawSqlUtility) {
-            if let Some(err) = reject_unanalyzed_if_needed(
-                &stored.statement.sql,
-                param_count,
-                "analysis was not performed",
-            ) {
-                return Err(err);
+            Err(e) => {
+                // Can't begin txn -- reject data/parameterized SQL
+                if let Some(err) = reject_unanalyzed_if_needed(
+                    &stored.statement.sql,
+                    param_count,
+                    &format!("failed to begin catalog transaction: {}", e),
+                ) {
+                    return Err(err);
+                }
+                // Utility, no params -- keep RawSqlUtility
             }
         }
 
@@ -852,19 +805,13 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let executor = self.get_executor()?;
+        let state = self.auth();
+        let executor = &state.executor;
         let prepared = &portal.statement.statement;
 
         debug!("Extended query: {}", prepared.sql);
 
-        let mut session_guard = self.session.lock().await;
-        let session = session_guard.as_mut().ok_or_else(|| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_string(),
-                "XX000".to_string(),
-                "Session not initialized".to_string(),
-            )))
-        })?;
+        let mut session = state.session.lock().await;
 
         if let Err(e) = session.check_idle_in_transaction_timeout() {
             let _ = session.rollback().await;
@@ -883,12 +830,12 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                     portal.statement.parameter_types.is_empty(),
                     "RawSqlUtility should never have parameters after Parse"
                 );
-                Box::pin(executor.execute(session, &prepared.sql))
+                Box::pin(executor.execute(&mut session, &prepared.sql))
             }
             PreparedExec::AnalyzedQuery { .. } | PreparedExec::AnalyzedDml { .. } => {
                 let params = decode_parameters(portal)?;
                 Box::pin(executor.execute_prepared(
-                    session,
+                    &mut session,
                     &prepared.sql,
                     &prepared.exec,
                     params,

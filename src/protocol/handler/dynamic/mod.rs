@@ -33,12 +33,19 @@ use tokio::sync::{Mutex, OnceCell};
 use crate::observability;
 use crate::pool::TenantHandle;
 
+/// Post-authentication query state. The pgwire state machine guarantees this
+/// exists before any query method runs: `ReadyForQuery` is only reached after
+/// `finish_authentication()`, called only after `init_executor()` succeeds.
+pub(super) struct AuthenticatedState {
+    pub executor: Arc<Executor>,
+    pub session: Mutex<Session>,
+}
+
 pub struct DynamicPgHandler {
     pub(super) client_pool: Option<Arc<TikvClientPool>>,
     pub(super) pd_endpoints: Vec<String>,
     pub(super) default_keyspace: Option<String>,
-    pub(super) executor: OnceCell<Arc<Executor>>,
-    pub(super) session: Mutex<Option<Session>>,
+    pub(super) auth_state: OnceCell<AuthenticatedState>,
     pub(super) connection_guard: OnceCell<observability::ConnectionGuard>,
     pub(super) tenant_handle: OnceCell<TenantHandle>,
     pub(super) copy_context: Mutex<Option<CopyContext>>,
@@ -58,8 +65,7 @@ impl DynamicPgHandler {
             client_pool: Some(client_pool),
             pd_endpoints: Vec::new(),
             default_keyspace,
-            executor: OnceCell::new(),
-            session: Mutex::new(None),
+            auth_state: OnceCell::new(),
             connection_guard: OnceCell::new(),
             tenant_handle: OnceCell::new(),
             copy_context: Mutex::new(None),
@@ -68,6 +74,20 @@ impl DynamicPgHandler {
             connection_id: CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             server_config,
         }
+    }
+
+    /// Returns the post-authentication state (executor + session).
+    ///
+    /// # Panics
+    ///
+    /// Panics if called before authentication completes. This is a structural
+    /// invariant assertion — the pgwire state machine guarantees query methods
+    /// are only dispatched after `finish_authentication()`.
+    #[inline]
+    pub(in crate::protocol::handler) fn auth(&self) -> &AuthenticatedState {
+        self.auth_state
+            .get()
+            .expect("BUG: query method called before authentication completed")
     }
 }
 

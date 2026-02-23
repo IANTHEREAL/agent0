@@ -338,6 +338,36 @@ mod tests {
             .expect("read");
         assert_eq!(n, 0);
     }
+
+    /// Verify that `process_message` in `AwaitingStartup` state routes
+    /// messages to `on_startup`, never to `on_parse`/`on_query`. This is the
+    /// framework-level guarantee that downstream handlers can rely on:
+    /// query methods are only called after authentication completes.
+    #[tokio::test]
+    async fn awaiting_startup_routes_parse_to_startup_handler_not_query() {
+        let (_client_io, server_io) = duplex(512);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let client_info = DefaultClient::<String>::new(addr, false);
+        let mut socket = Framed::new(server_io, PgWireMessageServerCodec::new(client_info));
+        socket.set_state(PgWireConnectionState::AwaitingStartup);
+
+        // A Parse message in AwaitingStartup goes to on_startup (which
+        // treats it as an unknown message type and returns Ok(())), NOT
+        // to on_parse on the extended query handler.
+        let parse_msg = PgWireFrontendMessage::Parse(
+            crate::messages::extendedquery::Parse::new(None, "SELECT 1".to_string(), vec![]),
+        );
+        process_message(
+            parse_msg,
+            &mut socket,
+            Arc::new(DummyStartupHandler),
+            Arc::new(DummySimpleQueryHandler),
+            Arc::new(PlaceholderExtendedQueryHandler),
+            Arc::new(NoopCopyHandler),
+        )
+        .await
+        .expect("Parse in AwaitingStartup must route to startup handler, not query handler");
+    }
 }
 
 impl<S> Encoder<PgWireBackendMessage> for PgWireMessageServerCodec<S> {

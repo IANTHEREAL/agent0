@@ -16,9 +16,7 @@ use pgwire::api::stmt::QueryParser;
 use pgwire::api::stmt::StoredStatement;
 use pgwire::api::store::PortalStore;
 use pgwire::api::DefaultClient;
-use pgwire::api::DEFAULT_NAME;
 use pgwire::api::{ClientInfo, ClientPortalStore, PgWireConnectionState, Type};
-use pgwire::messages::extendedquery::Parse;
 use pgwire::messages::response::CommandComplete;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -2681,188 +2679,16 @@ fn test_utility_describe_show_all_case_insensitive() {
     assert_eq!(fields[2].name(), "description");
 }
 
-// ── Handler-level on_parse fallback-path tests (#898) ────────────────────────
+// ── AuthenticatedState invariant tests (#1021) ───────────────────────────────
 
-/// Handler with executor initialized but session still None.
-/// Triggers the session-None guard at dynamic/query.rs:559–576.
-fn test_dynamic_handler_with_executor() -> DynamicPgHandler {
+/// Verify that `auth()` panics on a handler that was never authenticated.
+/// This is the structural invariant: the pgwire state machine guarantees
+/// query methods are only called after authentication, and `auth()` asserts it.
+#[tokio::test]
+#[should_panic(expected = "BUG: query method called before authentication completed")]
+async fn auth_panics_before_authentication() {
     let handler = test_dynamic_handler();
-    let store = crate::storage::TikvStore::new_stub();
-    let obs = crate::observability::registry().tenant("test");
-    let executor = crate::sql::Executor::new(
-        store,
-        "test".to_string(),
-        obs,
-        Arc::new(crate::sql::triggers::TriggerBodyCache::new()),
-        Arc::new(crate::sql::stats::TableStatsCache::new()),
-    );
-    handler
-        .executor
-        .set(Arc::new(executor))
-        .ok()
-        .expect("set executor once");
-    handler
-}
-
-// ── Scenario 2: executor == None (belt-and-suspenders guard) ─────────────────
-
-#[tokio::test]
-async fn on_parse_no_executor_rejects_data_sql_xx000() {
-    let handler = test_dynamic_handler();
-    let mut client = TestPreparedClient::new();
-
-    let parse = Parse::new(None, "SELECT 1".to_string(), vec![]);
-    let err = handler
-        .on_parse(&mut client, parse)
-        .await
-        .expect_err("data SQL must be rejected without executor");
-
-    match err {
-        PgWireError::UserError(info) => {
-            assert_eq!(info.code, "XX000");
-            assert!(
-                info.message.contains("cannot describe data statement"),
-                "message: {}",
-                info.message
-            );
-            assert!(
-                info.message.contains("analysis was not performed"),
-                "must cite belt-and-suspenders reason; message: {}",
-                info.message
-            );
-        }
-        other => panic!("expected UserError, got: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn on_parse_no_executor_rejects_utility_with_params_42p02() {
-    let handler = test_dynamic_handler();
-    let mut client = TestPreparedClient::new();
-
-    let parse = Parse::new(None, "SET x TO $1".to_string(), vec![]);
-    let err = handler
-        .on_parse(&mut client, parse)
-        .await
-        .expect_err("utility+params must be rejected without executor");
-
-    match err {
-        PgWireError::UserError(info) => {
-            assert_eq!(info.code, "42P02");
-        }
-        other => panic!("expected UserError, got: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn on_parse_no_executor_accepts_utility_no_params() {
-    let handler = test_dynamic_handler();
-    let mut client = TestPreparedClient::new();
-
-    let parse = Parse::new(None, "SET search_path TO public".to_string(), vec![]);
-    handler
-        .on_parse(&mut client, parse)
-        .await
-        .expect("utility without params must succeed");
-
-    // Verify ParseComplete was sent
-    assert!(
-        client
-            .sent
-            .iter()
-            .any(|m| matches!(m, PgWireBackendMessage::ParseComplete(_))),
-        "ParseComplete must be sent; got: {:?}",
-        client.sent
-    );
-
-    // Verify statement was stored under DEFAULT_NAME
-    let stored = client
-        .portal_store()
-        .get_statement(DEFAULT_NAME)
-        .expect("statement must be stored under DEFAULT_NAME");
-    assert_eq!(stored.statement.sql, "SET search_path TO public");
-    assert!(
-        matches!(stored.statement.exec, PreparedExec::RawSqlUtility),
-        "exec must be RawSqlUtility"
-    );
-}
-
-// ── Scenario 1: session == None (session-missing guard) ──────────────────────
-
-#[tokio::test]
-async fn on_parse_no_session_rejects_data_sql_xx000() {
-    let handler = test_dynamic_handler_with_executor();
-    let mut client = TestPreparedClient::new();
-
-    let parse = Parse::new(None, "SELECT 1".to_string(), vec![]);
-    let err = handler
-        .on_parse(&mut client, parse)
-        .await
-        .expect_err("data SQL must be rejected without session");
-
-    match err {
-        PgWireError::UserError(info) => {
-            assert_eq!(info.code, "XX000");
-            assert!(
-                info.message.contains("session not available"),
-                "must cite session reason; message: {}",
-                info.message
-            );
-        }
-        other => panic!("expected UserError, got: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn on_parse_no_session_rejects_utility_with_params_42p02() {
-    let handler = test_dynamic_handler_with_executor();
-    let mut client = TestPreparedClient::new();
-
-    let parse = Parse::new(None, "SET x TO $1".to_string(), vec![]);
-    let err = handler
-        .on_parse(&mut client, parse)
-        .await
-        .expect_err("utility+params must be rejected without session");
-
-    match err {
-        PgWireError::UserError(info) => {
-            assert_eq!(info.code, "42P02");
-        }
-        other => panic!("expected UserError, got: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn on_parse_no_session_accepts_utility_no_params() {
-    let handler = test_dynamic_handler_with_executor();
-    let mut client = TestPreparedClient::new();
-
-    let parse = Parse::new(None, "SHOW server_version".to_string(), vec![]);
-    handler
-        .on_parse(&mut client, parse)
-        .await
-        .expect("utility without params must succeed");
-
-    // Verify ParseComplete was sent
-    assert!(
-        client
-            .sent
-            .iter()
-            .any(|m| matches!(m, PgWireBackendMessage::ParseComplete(_))),
-        "ParseComplete must be sent; got: {:?}",
-        client.sent
-    );
-
-    // Verify statement was stored under DEFAULT_NAME
-    let stored = client
-        .portal_store()
-        .get_statement(DEFAULT_NAME)
-        .expect("statement must be stored under DEFAULT_NAME");
-    assert_eq!(stored.statement.sql, "SHOW server_version");
-    assert!(
-        matches!(stored.statement.exec, PreparedExec::RawSqlUtility),
-        "exec must be RawSqlUtility"
-    );
+    let _ = handler.auth();
 }
 
 // ── JSONB canonicalization regression tests ──────────────────────────────────

@@ -1,9 +1,9 @@
 //! Startup and authentication handling for [`DynamicPgHandler`].
 //!
-//! Contains `init_executor`, `get_executor`, `authenticate_user`, and the
+//! Contains `init_executor`, `authenticate_user`, and the
 //! [`StartupHandler`] trait implementation.
 
-use super::DynamicPgHandler;
+use super::{AuthenticatedState, DynamicPgHandler};
 use crate::auth::AuthManager;
 use crate::config;
 use crate::observability;
@@ -147,26 +147,23 @@ impl DynamicPgHandler {
         };
         session.set_server_config(self.server_config.clone());
 
-        let _ = self.executor.set(executor);
-
-        let mut session_guard = self.session.lock().await;
-        *session_guard = Some(session);
+        self.auth_state
+            .set(AuthenticatedState {
+                executor,
+                session: tokio::sync::Mutex::new(session),
+            })
+            .map_err(|_| {
+                fatal_internal(
+                    "Internal error: executor already initialized (double authentication)"
+                        .to_string(),
+                )
+            })?;
 
         debug!(
             "Initialized executor with keyspace: {:?}",
             effective_keyspace
         );
         Ok(())
-    }
-
-    pub(in crate::protocol::handler) fn get_executor(&self) -> Result<&Arc<Executor>, PgWireError> {
-        self.executor.get().ok_or_else(|| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "FATAL".to_string(),
-                "XX000".to_string(),
-                "Executor not initialized - authentication required".to_string(),
-            )))
-        })
     }
 
     pub(in crate::protocol::handler) async fn authenticate_user(
@@ -348,8 +345,8 @@ impl StartupHandler for DynamicPgHandler {
                             )
                             .await?;
 
-                            let mut session_guard = self.session.lock().await;
-                            if let Some(session) = session_guard.as_mut() {
+                            {
+                                let mut session = self.auth().session.lock().await;
                                 if let Some(options) = client.metadata().get("options") {
                                     for (key, value) in parse_startup_options(options) {
                                         if let Err(e) = session
