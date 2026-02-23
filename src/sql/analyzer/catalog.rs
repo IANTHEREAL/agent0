@@ -541,6 +541,53 @@ impl MockCatalogBuilder {
         self
     }
 
+    /// Add a table with columns that may have collation:
+    /// `(name, type, nullable, collation)`.
+    pub fn table_with_collations(
+        mut self,
+        name: &str,
+        columns: Vec<(&str, DataType, bool, Option<&str>)>,
+    ) -> Self {
+        let col_defs: Vec<ColumnDef> = columns
+            .iter()
+            .map(|(n, dt, nullable, coll)| ColumnDef {
+                name: n.to_string(),
+                data_type: dt.clone(),
+                nullable: *nullable,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+                collation: coll.map(|s| s.to_string()),
+            })
+            .collect();
+
+        let schema = TableSchema::new(
+            format!("public.{}", name),
+            1, // dummy table_id
+            col_defs,
+            vec![], // no pk for test
+        );
+
+        self.snapshot
+            .add_table(name, format!("public.{}", name), schema);
+        self
+    }
+
+    /// Register a user-defined collation.
+    pub fn collation(mut self, name: &str, locale: &str) -> Self {
+        self.snapshot.add_collation(
+            name,
+            crate::sql::collation::CollationDef {
+                name: name.to_string(),
+                provider: "icu".to_string(),
+                locale: Some(locale.to_string()),
+                deterministic: true,
+            },
+        );
+        self
+    }
+
     pub fn build(self) -> MockCatalog {
         MockCatalog {
             snapshot: self.snapshot,

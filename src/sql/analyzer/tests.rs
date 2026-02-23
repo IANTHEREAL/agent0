@@ -2631,3 +2631,160 @@ fn analyze_parameter_with_client_oid_does_not_use_inference_conflict_path() {
     let types = analyzer.finalize_param_types().unwrap();
     assert_eq!(types, vec![DataType::Int32]);
 }
+
+// -- Collation propagation tests --
+
+fn collation_catalog() -> MockCatalog {
+    MockCatalog::builder()
+        .collation("de", "de")
+        .table_with_collations(
+            "t1",
+            vec![
+                ("id", DataType::Int32, false, None),
+                ("a", DataType::Text, true, Some("de")),
+            ],
+        )
+        .table_with_collations(
+            "t2",
+            vec![
+                ("id", DataType::Int32, false, None),
+                ("a", DataType::Text, true, Some("de")),
+            ],
+        )
+        .build()
+}
+
+/// Helper: extract collation name from a TypedExpr (if wrapped in Collate).
+fn extract_collation_name(expr: &TypedExpr) -> Option<String> {
+    crate::sql::expr::collation_aware::extract_collation(expr)
+}
+
+#[test]
+fn collation_propagation_through_cte_select() {
+    let catalog = collation_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("WITH cte AS (SELECT a FROM t1) SELECT a FROM cte ORDER BY a");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    let sel = expect_select(&result);
+    // The projected column 'a' should carry the 'de' collation.
+    assert_eq!(
+        extract_collation_name(&sel.projection[0].expr),
+        Some("de".to_string()),
+        "CTE SELECT body must propagate collation"
+    );
+}
+
+#[test]
+fn collation_propagation_through_cte_union() {
+    let catalog = collation_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query(
+        "WITH cte AS (SELECT a FROM t1 UNION ALL SELECT a FROM t2) SELECT a FROM cte ORDER BY a",
+    );
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    let sel = expect_select(&result);
+    // Collation must survive the UNION ALL boundary inside a CTE.
+    assert_eq!(
+        extract_collation_name(&sel.projection[0].expr),
+        Some("de".to_string()),
+        "CTE UNION body must propagate collation from left arm"
+    );
+}
+
+#[test]
+fn collation_propagation_through_coercion_wrapped_union() {
+    // When set-op arms have different types (e.g. TEXT vs VARCHAR), the arm
+    // is coercion-wrapped. Collation must survive the wrapping.
+    let catalog = MockCatalog::builder()
+        .collation("de", "de")
+        .table_with_collations("t_text", vec![("a", DataType::Text, true, Some("de"))])
+        .table_with_collations(
+            "t_varchar",
+            vec![("a", DataType::Varchar(255), true, Some("de"))],
+        )
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query(
+        "WITH cte AS (SELECT a FROM t_varchar UNION ALL SELECT a FROM t_text) \
+         SELECT a FROM cte",
+    );
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    let sel = expect_select(&result);
+    assert_eq!(
+        extract_collation_name(&sel.projection[0].expr),
+        Some("de".to_string()),
+        "Coercion-wrapped UNION arm must preserve collation"
+    );
+}
+
+#[test]
+fn wildcard_carries_collation() {
+    let catalog = collation_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT * FROM t1");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    let sel = expect_select(&result);
+    // Column 'a' (index 1) should have collation 'de'.
+    assert_eq!(
+        extract_collation_name(&sel.projection[1].expr),
+        Some("de".to_string()),
+        "SELECT * must carry collation from scope column"
+    );
+    // Column 'id' (index 0) should have no collation.
+    assert_eq!(
+        extract_collation_name(&sel.projection[0].expr),
+        None,
+        "Non-collated column should have no collation"
+    );
+}
+
+#[test]
+fn qualified_wildcard_carries_collation() {
+    let catalog = collation_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT t1.* FROM t1");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    let sel = expect_select(&result);
+    assert_eq!(
+        extract_collation_name(&sel.projection[1].expr),
+        Some("de".to_string()),
+        "SELECT t.* must carry collation from scope column"
+    );
+}
+
+#[test]
+fn derived_table_propagates_collation() {
+    let catalog = collation_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT a FROM (SELECT a FROM t1) AS sub ORDER BY a");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    let sel = expect_select(&result);
+    assert_eq!(
+        extract_collation_name(&sel.projection[0].expr),
+        Some("de".to_string()),
+        "Derived table must propagate collation"
+    );
+}
+
+#[test]
+fn using_merged_column_carries_collation() {
+    // Explicit SELECT a from a USING join must carry collation from the
+    // merged column, consistent with the wildcard path.
+    let catalog = collation_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT a FROM t1 JOIN t2 USING (a)");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    let sel = expect_select(&result);
+    assert_eq!(
+        extract_collation_name(&sel.projection[0].expr),
+        Some("de".to_string()),
+        "Explicit SELECT a with USING join must carry collation"
+    );
+}

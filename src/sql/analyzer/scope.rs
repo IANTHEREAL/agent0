@@ -84,8 +84,8 @@ pub struct Scope {
     /// Metadata for merged USING/NATURAL columns keyed by left-side column index.
     using_merged_by_left: HashMap<usize, UsingMergedColumn>,
 
-    /// CTE schemas visible from this scope (name → output columns).
-    cte_schemas: HashMap<String, Vec<(String, DataType)>>,
+    /// CTE schemas visible from this scope (name → output columns with optional collation name).
+    cte_schemas: HashMap<String, Vec<(String, DataType, Option<String>)>>,
 
     /// Whether aggregate functions are allowed in expressions at this level.
     pub allow_aggregates: bool,
@@ -205,12 +205,12 @@ impl Scope {
     }
 
     /// Register a CTE's output schema so it can be resolved as a table.
-    pub fn add_cte(&mut self, name: &str, columns: Vec<(String, DataType)>) {
+    pub fn add_cte(&mut self, name: &str, columns: Vec<(String, DataType, Option<String>)>) {
         self.cte_schemas.insert(name.to_lowercase(), columns);
     }
 
     /// Look up a CTE by name.
-    pub fn get_cte(&self, name: &str) -> Option<&Vec<(String, DataType)>> {
+    pub fn get_cte(&self, name: &str) -> Option<&Vec<(String, DataType, Option<String>)>> {
         self.cte_schemas.get(&name.to_lowercase())
     }
 
@@ -594,7 +594,7 @@ impl ScopeStack {
     }
 
     /// Look up a CTE by name in any scope (innermost first).
-    pub fn resolve_cte(&self, name: &str) -> Option<Vec<(String, DataType)>> {
+    pub fn resolve_cte(&self, name: &str) -> Option<Vec<(String, DataType, Option<String>)>> {
         for scope in self.scopes.iter().rev() {
             if let Some(cols) = scope.get_cte(name) {
                 return Some(cols.clone());
@@ -720,15 +720,15 @@ mod tests {
         scope.add_cte(
             "my_cte",
             vec![
-                ("a".to_string(), DataType::Int32),
-                ("b".to_string(), DataType::Text),
+                ("a".to_string(), DataType::Int32, None),
+                ("b".to_string(), DataType::Text, None),
             ],
         );
         stack.push(scope);
 
         let cols = stack.resolve_cte("my_cte").unwrap();
         assert_eq!(cols.len(), 2);
-        assert_eq!(cols[0], ("a".to_string(), DataType::Int32));
+        assert_eq!(cols[0], ("a".to_string(), DataType::Int32, None));
 
         assert!(stack.resolve_cte("nonexistent").is_none());
     }

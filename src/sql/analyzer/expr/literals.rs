@@ -47,10 +47,31 @@ impl<'a> Analyzer<'a> {
                         right_expr = self.coerce_if_needed(right_expr, &merged.data_type)?;
                     }
 
-                    return Ok(TypedExpr::new(
+                    let mut expr = TypedExpr::new(
                         TypedExprKind::Coalesce(vec![left_expr, right_expr]),
-                        merged.data_type,
-                    ));
+                        merged.data_type.clone(),
+                    );
+
+                    // Wrap in Collate if the USING merged column has a declared
+                    // collation — consistent with the non-merged path below and
+                    // the wildcard path in scope_column_projection.
+                    if let Some(collation) = resolved.collation {
+                        if collation.to_lowercase() != "default" {
+                            let resolved_coll = self
+                                .resolve_collation(&collation)
+                                .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                            expr = TypedExpr::new(
+                                TypedExprKind::Collate {
+                                    expr: Box::new(expr),
+                                    collation,
+                                    resolved: resolved_coll,
+                                },
+                                merged.data_type,
+                            );
+                        }
+                    }
+
+                    return Ok(expr);
                 }
 
                 let mut expr = TypedExpr::new(
@@ -62,19 +83,23 @@ impl<'a> Analyzer<'a> {
                     resolved.data_type.clone(),
                 );
 
-                // Wrap in Collate if column has a declared collation
+                // Wrap in Collate if column has a declared collation.
+                // Skip "default" — it means "use the database default collation",
+                // which is the engine's default compare_text_pg path (no Collate node).
                 if let Some(collation) = resolved.collation {
-                    let resolved_coll = self
-                        .resolve_collation(&collation)
-                        .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
-                    expr = TypedExpr::new(
-                        TypedExprKind::Collate {
-                            expr: Box::new(expr),
-                            collation,
-                            resolved: resolved_coll,
-                        },
-                        resolved.data_type,
-                    );
+                    if collation.to_lowercase() != "default" {
+                        let resolved_coll = self
+                            .resolve_collation(&collation)
+                            .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                        expr = TypedExpr::new(
+                            TypedExprKind::Collate {
+                                expr: Box::new(expr),
+                                collation,
+                                resolved: resolved_coll,
+                            },
+                            resolved.data_type.clone(),
+                        );
+                    }
                 }
 
                 Ok(expr)
@@ -132,19 +157,21 @@ impl<'a> Analyzer<'a> {
                 resolved.data_type.clone(),
             );
 
-            // Wrap in Collate if column has a declared collation
+            // Wrap in Collate if column has a declared collation (skip "default").
             if let Some(collation) = resolved.collation {
-                let resolved_coll = self
-                    .resolve_collation(&collation)
-                    .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
-                expr = TypedExpr::new(
-                    TypedExprKind::Collate {
-                        expr: Box::new(expr),
-                        collation,
-                        resolved: resolved_coll,
-                    },
-                    resolved.data_type,
-                );
+                if collation.to_lowercase() != "default" {
+                    let resolved_coll = self
+                        .resolve_collation(&collation)
+                        .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                    expr = TypedExpr::new(
+                        TypedExprKind::Collate {
+                            expr: Box::new(expr),
+                            collation,
+                            resolved: resolved_coll,
+                        },
+                        resolved.data_type.clone(),
+                    );
+                }
             }
 
             return Ok(expr);
@@ -165,19 +192,21 @@ impl<'a> Analyzer<'a> {
                 resolved.data_type.clone(),
             );
 
-            // Wrap in Collate if column has a declared collation
+            // Wrap in Collate if column has a declared collation (skip "default").
             if let Some(collation) = resolved.collation {
-                let resolved_coll = self
-                    .resolve_collation(&collation)
-                    .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
-                expr = TypedExpr::new(
-                    TypedExprKind::Collate {
-                        expr: Box::new(expr),
-                        collation,
-                        resolved: resolved_coll,
-                    },
-                    resolved.data_type,
-                );
+                if collation.to_lowercase() != "default" {
+                    let resolved_coll = self
+                        .resolve_collation(&collation)
+                        .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                    expr = TypedExpr::new(
+                        TypedExprKind::Collate {
+                            expr: Box::new(expr),
+                            collation,
+                            resolved: resolved_coll,
+                        },
+                        resolved.data_type.clone(),
+                    );
+                }
             }
 
             return Ok(expr);

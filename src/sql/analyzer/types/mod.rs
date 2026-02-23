@@ -668,7 +668,7 @@ pub struct AnalyzedCte {
     #[allow(dead_code)]
     pub query: AnalyzedQuery,
     #[allow(dead_code)]
-    pub columns: Vec<(String, DataType)>,
+    pub columns: Vec<(String, DataType, Option<String>)>,
     /// Whether the CTE is materialized (`None` = unspecified / optimizer decides).
     #[allow(dead_code)]
     pub materialized: Option<bool>,

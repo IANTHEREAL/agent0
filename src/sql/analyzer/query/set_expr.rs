@@ -47,9 +47,9 @@ impl<'a> Analyzer<'a> {
                 let output_schema =
                     self.unify_set_operation_schemas(&left_query, &right_query, set_op_kind)?;
                 let left_query =
-                    self.wrap_set_op_arm_with_coercion(left_query, &output_schema, "__setop_l");
+                    self.wrap_set_op_arm_with_coercion(left_query, &output_schema, "__setop_l")?;
                 let right_query =
-                    self.wrap_set_op_arm_with_coercion(right_query, &output_schema, "__setop_r");
+                    self.wrap_set_op_arm_with_coercion(right_query, &output_schema, "__setop_r")?;
                 Ok(AnalyzedQuery {
                     ctes: vec![],
                     body: AnalyzedQueryBody::SetOperation {
@@ -123,12 +123,14 @@ impl<'a> Analyzer<'a> {
     /// ```
     ///
     /// This preserves the arm's own ORDER BY/LIMIT/OFFSET semantics.
+    /// Collation wrappers from the original arm are re-applied so that
+    /// collation semantics survive the coercion boundary.
     pub(super) fn wrap_set_op_arm_with_coercion(
         &self,
         arm: AnalyzedQuery,
         unified_schema: &[(String, DataType, Option<ResolvedCollation>)],
         subquery_alias: &str,
-    ) -> AnalyzedQuery {
+    ) -> Result<AnalyzedQuery, AnalyzerError> {
         let arm_output_schema = arm.output_schema.clone();
         let needs_wrap = arm
             .output_schema
@@ -137,51 +139,71 @@ impl<'a> Analyzer<'a> {
             .any(|((_, arm_ty, _), (_, unified_ty, _))| arm_ty != unified_ty);
 
         if !needs_wrap {
-            return arm;
+            return Ok(arm);
         }
+
+        // Extract collation names from the original arm before it is moved
+        // into the subquery. These are re-applied as Collate wrappers so that
+        // collation semantics survive the coercion projection.
+        let collation_names = super::extract_output_collation_names(&arm);
 
         let from = vec![AnalyzedTableRef {
             kind: AnalyzedTableRefKind::Subquery(Box::new(arm)),
             alias: Some(subquery_alias.to_string()),
         }];
 
-        let projection: Vec<AnalyzedProjection> = unified_schema
-            .iter()
-            .enumerate()
-            .map(|(idx, (out_name, unified_ty, _coll))| {
-                // The input type is the arm's output type at this position.
-                let (input_name, input_ty, _input_coll) = &arm_output_schema[idx];
+        let mut projection: Vec<AnalyzedProjection> = Vec::with_capacity(unified_schema.len());
+        for (idx, (out_name, unified_ty, _coll)) in unified_schema.iter().enumerate() {
+            // The input type is the arm's output type at this position.
+            let (input_name, input_ty, _input_coll) = &arm_output_schema[idx];
 
-                let col_ref = TypedExpr::new(
-                    TypedExprKind::ColumnRef {
-                        scope_depth: 0,
-                        column_index: idx,
-                        column_name: input_name.clone(),
+            let col_ref = TypedExpr::new(
+                TypedExprKind::ColumnRef {
+                    scope_depth: 0,
+                    column_index: idx,
+                    column_name: input_name.clone(),
+                },
+                input_ty.clone(),
+            );
+
+            let mut expr = if col_ref.data_type == *unified_ty {
+                col_ref
+            } else {
+                TypedExpr::new(
+                    TypedExprKind::Cast {
+                        expr: Box::new(col_ref),
+                        target_type: unified_ty.clone(),
+                        cast_context: CastContext::Implicit,
                     },
-                    input_ty.clone(),
-                );
+                    unified_ty.clone(),
+                )
+            };
 
-                let expr = if col_ref.data_type == *unified_ty {
-                    col_ref
-                } else {
-                    TypedExpr::new(
-                        TypedExprKind::Cast {
-                            expr: Box::new(col_ref),
-                            target_type: unified_ty.clone(),
-                            cast_context: CastContext::Implicit,
+            // Re-apply collation wrapper from the original arm
+            if let Some(Some(ref coll_name)) = collation_names.get(idx) {
+                let lower = coll_name.to_lowercase();
+                if lower != "default" {
+                    let resolved = self
+                        .resolve_collation(coll_name)
+                        .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                    expr = TypedExpr::new(
+                        TypedExprKind::Collate {
+                            expr: Box::new(expr),
+                            collation: coll_name.clone(),
+                            resolved,
                         },
                         unified_ty.clone(),
-                    )
-                };
-
-                AnalyzedProjection {
-                    expr,
-                    output_name: out_name.clone(),
+                    );
                 }
-            })
-            .collect();
+            }
 
-        AnalyzedQuery {
+            projection.push(AnalyzedProjection {
+                expr,
+                output_name: out_name.clone(),
+            });
+        }
+
+        Ok(AnalyzedQuery {
             ctes: vec![],
             body: AnalyzedQueryBody::Select(AnalyzedSelect {
                 projection,
@@ -195,7 +217,7 @@ impl<'a> Analyzer<'a> {
             limit: None,
             offset: None,
             output_schema: unified_schema.to_vec(),
-        }
+        })
     }
 
     pub(super) fn cast_to_implicit(expr: TypedExpr, target_type: &DataType) -> TypedExpr {

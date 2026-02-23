@@ -25,6 +25,31 @@ use super::scope::Scope;
 use super::types::*;
 use super::Analyzer;
 
+/// Extract collation names from an AnalyzedQuery's projection expressions.
+///
+/// For SELECT bodies, walks each projection expression to find the collation
+/// name string from any `Collate` wrapper. For set operations (UNION/INTERSECT/
+/// EXCEPT), recurses into the left arm since set operations inherit collation
+/// from the left branch. For VALUES, returns `None` for all columns.
+fn extract_output_collation_names(query: &AnalyzedQuery) -> Vec<Option<String>> {
+    use crate::sql::expr::collation_aware::extract_collation;
+
+    match &query.body {
+        AnalyzedQueryBody::Select(sel) => sel
+            .projection
+            .iter()
+            .map(|p| extract_collation(&p.expr))
+            .collect(),
+        AnalyzedQueryBody::SetOperation { left, .. } => {
+            // Set operations inherit collation from the left branch
+            // (see unify_set_operation_schemas). Recurse to find the
+            // original collation names from the leftmost SELECT arm.
+            extract_output_collation_names(left)
+        }
+        _ => vec![None; query.output_schema.len()],
+    }
+}
+
 impl<'a> Analyzer<'a> {
     /// Validate that an expression has Boolean type (for WHERE, HAVING, JOIN ON, CASE WHEN).
     ///
@@ -142,9 +167,9 @@ impl<'a> Analyzer<'a> {
                 // independently (including its own ORDER BY/LIMIT), then coerced
                 // before the set operation combines rows.
                 let left_query =
-                    self.wrap_set_op_arm_with_coercion(left_query, &output_schema, "__setop_l");
+                    self.wrap_set_op_arm_with_coercion(left_query, &output_schema, "__setop_l")?;
                 let right_query =
-                    self.wrap_set_op_arm_with_coercion(right_query, &output_schema, "__setop_r");
+                    self.wrap_set_op_arm_with_coercion(right_query, &output_schema, "__setop_r")?;
 
                 // Add output columns to scope for ORDER BY resolution.
                 // Set operation ORDER BY references output column names, not FROM columns.
@@ -600,21 +625,29 @@ impl<'a> Analyzer<'a> {
                 // Analyze CTE query body
                 let analyzed = self.analyze_query(&cte.query)?;
 
+                // Extract collation names from projection expressions (if SELECT body).
+                let coll_names: Vec<Option<String>> = extract_output_collation_names(&analyzed);
+
                 // Determine output columns (may be overridden by explicit column list)
-                let columns: Vec<(String, DataType)> = if cte.alias.columns.is_empty() {
-                    analyzed
-                        .output_schema
-                        .iter()
-                        .map(|(name, dt, _coll)| (name.clone(), dt.clone()))
-                        .collect()
-                } else {
-                    cte.alias
-                        .columns
-                        .iter()
-                        .zip(analyzed.output_schema.iter())
-                        .map(|(alias_col, (_, dt, _coll))| (alias_col.value.clone(), dt.clone()))
-                        .collect()
-                };
+                let columns: Vec<(String, DataType, Option<String>)> =
+                    if cte.alias.columns.is_empty() {
+                        analyzed
+                            .output_schema
+                            .iter()
+                            .zip(coll_names)
+                            .map(|((name, dt, _coll), cn)| (name.clone(), dt.clone(), cn))
+                            .collect()
+                    } else {
+                        cte.alias
+                            .columns
+                            .iter()
+                            .zip(analyzed.output_schema.iter())
+                            .zip(coll_names)
+                            .map(|((alias_col, (_, dt, _coll)), cn)| {
+                                (alias_col.value.clone(), dt.clone(), cn)
+                            })
+                            .collect()
+                    };
 
                 // Register in current scope for subsequent CTEs and main query
                 self.scopes

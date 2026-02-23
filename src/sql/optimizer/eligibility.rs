@@ -389,7 +389,7 @@ mod tests {
             ctes: vec![AnalyzedCte {
                 name: "pg_type".to_string(),
                 query: inner_query,
-                columns: vec![("id".to_string(), DataType::Int64)],
+                columns: vec![("id".to_string(), DataType::Int64, None)],
                 materialized: None,
             }],
             body: AnalyzedQueryBody::Select(AnalyzedSelect {

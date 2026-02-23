@@ -3,7 +3,7 @@
 //! Handles `analyze_from`, `analyze_table_with_joins`, `analyze_table_factor`,
 //! and join constraint/condition resolution.
 
-use sqlparser::ast::{self as ast, Expr, TableFactor, TableWithJoins};
+use sqlparser::ast::{self as ast, TableFactor, TableWithJoins};
 
 use crate::sql::names::{normalize_ident, split_object_name};
 use crate::sql::table_functions::table_function_key;
@@ -340,7 +340,7 @@ impl<'a> Analyzer<'a> {
                         let columns_for_scope: Vec<(String, DataType, bool, Option<String>)> =
                             cte_cols
                                 .iter()
-                                .map(|(n, dt)| (n.clone(), dt.clone(), true, None))
+                                .map(|(n, dt, coll)| (n.clone(), dt.clone(), true, coll.clone()))
                                 .collect();
 
                         self.scopes
@@ -349,7 +349,7 @@ impl<'a> Analyzer<'a> {
 
                         let columns_for_schema: Vec<(String, DataType, bool)> = cte_cols
                             .iter()
-                            .map(|(n, dt)| (n.clone(), dt.clone(), true))
+                            .map(|(n, dt, _coll)| (n.clone(), dt.clone(), true))
                             .collect();
 
                         let schema = TableRefSchema {
@@ -509,11 +509,13 @@ impl<'a> Analyzer<'a> {
                     .map(|a| normalize_ident(&a.name))
                     .unwrap_or_else(|| "subquery".to_string());
 
-                // Add subquery output columns to current scope
+                // Add subquery output columns to current scope (preserving collation names)
+                let coll_names = super::extract_output_collation_names(&analyzed);
                 let mut columns: Vec<(String, DataType, bool, Option<String>)> = analyzed
                     .output_schema
                     .iter()
-                    .map(|(name, dt, _coll)| (name.clone(), dt.clone(), true, None))
+                    .zip(coll_names)
+                    .map(|((name, dt, _coll), cn)| (name.clone(), dt.clone(), true, cn))
                     .collect();
 
                 if let Some(a) = alias {

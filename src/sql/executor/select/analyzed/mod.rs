@@ -202,7 +202,7 @@ impl Executor {
                         let col_names: Vec<String> = if cte.columns.is_empty() {
                             columns
                         } else {
-                            cte.columns.iter().map(|(n, _)| n.clone()).collect()
+                            cte.columns.iter().map(|(n, _, _)| n.clone()).collect()
                         };
                         let inferred_types: Vec<DataType> = if let Some(types) = column_types {
                             types
@@ -759,7 +759,7 @@ mod tests {
         let cte = crate::sql::analyzer::types::AnalyzedCte {
             name: name.to_string(),
             query: values_query(),
-            columns: vec![("v".to_string(), DataType::Int32)],
+            columns: vec![("v".to_string(), DataType::Int32, None)],
             materialized: None,
         };
         AnalyzedQuery {
@@ -892,7 +892,7 @@ mod tests {
             ctes: vec![crate::sql::analyzer::types::AnalyzedCte {
                 name: "child_cte".to_string(),
                 query: values_query(),
-                columns: vec![("v".to_string(), DataType::Int32)],
+                columns: vec![("v".to_string(), DataType::Int32, None)],
                 materialized: None,
             }],
             body: AnalyzedQueryBody::Select(AnalyzedSelect {

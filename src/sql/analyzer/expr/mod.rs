@@ -815,6 +815,12 @@ impl<'a> Analyzer<'a> {
                 } else {
                     collation.to_string()
                 };
+                // COLLATE "default" = use the database default collation, which is
+                // the engine's default compare_text_pg path. Skip the Collate node.
+                if collation_name.to_lowercase() == "default" {
+                    return Ok(analyzed_expr);
+                }
+
                 // Resolve the collation at analysis time (catalog first, then registry)
                 let resolved = self
                     .resolve_collation(&collation_name)

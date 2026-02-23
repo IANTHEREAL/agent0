@@ -4,7 +4,7 @@
 //! `collect_wildcard_sources`, `leaf_wildcard_source_schema`, and
 //! `scope_column_projection`.
 
-use sqlparser::ast::{self as ast, Select, SelectItem};
+use sqlparser::ast::{Select, SelectItem};
 
 use crate::sql::collation::ResolvedCollation;
 use crate::sql::expr::collation_aware::extract_resolved_collation;
@@ -144,10 +144,13 @@ impl<'a> Analyzer<'a> {
     }
 
     pub(super) fn scope_column_projection(
+        &self,
         scope: &Scope,
         column_index: usize,
-    ) -> Option<(String, TypedExpr, DataType)> {
-        let col = scope.columns().get(column_index)?;
+    ) -> Result<Option<(String, TypedExpr, DataType)>, AnalyzerError> {
+        let Some(col) = scope.columns().get(column_index) else {
+            return Ok(None);
+        };
         if let Some(merged) = scope.using_column_for_left(column_index) {
             let left_expr = TypedExpr::new(
                 TypedExprKind::ColumnRef {
@@ -166,17 +169,41 @@ impl<'a> Analyzer<'a> {
                 merged.right_type.clone(),
             );
 
-            let expr = TypedExpr::new(
+            let mut expr = TypedExpr::new(
                 TypedExprKind::Coalesce(vec![
                     Self::cast_to_implicit(left_expr, &merged.data_type),
                     Self::cast_to_implicit(right_expr, &merged.data_type),
                 ]),
                 merged.data_type.clone(),
             );
-            return Some((col.column_name.clone(), expr, merged.data_type.clone()));
+
+            // Wrap in Collate if the USING merged column has a declared collation.
+            // Hard-fail on invalid collation — consistent with all other column paths.
+            if let Some(ref collation) = col.collation {
+                let lower = collation.to_lowercase();
+                if lower != "default" {
+                    let resolved = self
+                        .resolve_collation(collation)
+                        .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                    expr = TypedExpr::new(
+                        TypedExprKind::Collate {
+                            expr: Box::new(expr),
+                            collation: collation.clone(),
+                            resolved,
+                        },
+                        merged.data_type.clone(),
+                    );
+                }
+            }
+
+            return Ok(Some((
+                col.column_name.clone(),
+                expr,
+                merged.data_type.clone(),
+            )));
         }
 
-        let expr = TypedExpr::new(
+        let mut expr = TypedExpr::new(
             TypedExprKind::ColumnRef {
                 scope_depth: 0,
                 column_index: col.column_index,
@@ -184,7 +211,29 @@ impl<'a> Analyzer<'a> {
             },
             col.data_type.clone(),
         );
-        Some((col.column_name.clone(), expr, col.data_type.clone()))
+
+        // Wrap in Collate if the column has a declared collation (preserves
+        // collation semantics through SELECT * / wildcard expansion).
+        // Hard-fail on invalid collation — consistent with explicit column paths
+        // in analyze_identifier / analyze_compound_identifier.
+        if let Some(ref collation) = col.collation {
+            let lower = collation.to_lowercase();
+            if lower != "default" {
+                let resolved = self
+                    .resolve_collation(collation)
+                    .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                expr = TypedExpr::new(
+                    TypedExprKind::Collate {
+                        expr: Box::new(expr),
+                        collation: collation.clone(),
+                        resolved,
+                    },
+                    col.data_type.clone(),
+                );
+            }
+        }
+
+        Ok(Some((col.column_name.clone(), expr, col.data_type.clone())))
     }
 
     pub(in crate::sql::analyzer) fn analyze_projection(
@@ -232,7 +281,7 @@ impl<'a> Analyzer<'a> {
                     if let Some(order) = wildcard_order {
                         for (name, column_index) in order {
                             if let Some((_col_name, expr, data_type)) =
-                                Self::scope_column_projection(scope, *column_index)
+                                self.scope_column_projection(scope, *column_index)?
                             {
                                 let coll = extract_resolved_collation(&expr);
                                 output_schema.push((name.clone(), data_type.clone(), coll));
@@ -251,7 +300,7 @@ impl<'a> Analyzer<'a> {
                             continue;
                         }
                         if let Some((name, expr, data_type)) =
-                            Self::scope_column_projection(scope, col.column_index)
+                            self.scope_column_projection(scope, col.column_index)?
                         {
                             let coll = extract_resolved_collation(&expr);
                             output_schema.push((name.clone(), data_type.clone(), coll));
@@ -287,7 +336,7 @@ impl<'a> Analyzer<'a> {
                     }
 
                     for col in matching_cols {
-                        let expr = TypedExpr::new(
+                        let mut expr = TypedExpr::new(
                             TypedExprKind::ColumnRef {
                                 scope_depth: 0,
                                 column_index: col.column_index,
@@ -295,7 +344,29 @@ impl<'a> Analyzer<'a> {
                             },
                             col.data_type.clone(),
                         );
-                        output_schema.push((col.column_name.clone(), col.data_type.clone(), None));
+
+                        // Wrap in Collate if column has a declared collation.
+                        // Hard-fail on invalid collation — consistent with explicit
+                        // column paths in analyze_identifier / analyze_compound_identifier.
+                        let mut coll: Option<ResolvedCollation> = None;
+                        if let Some(ref collation) = col.collation {
+                            let lower = collation.to_lowercase();
+                            if lower != "default" {
+                                let resolved = self
+                                    .resolve_collation(collation)
+                                    .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                                coll = Some(resolved.clone());
+                                expr = TypedExpr::new(
+                                    TypedExprKind::Collate {
+                                        expr: Box::new(expr),
+                                        collation: collation.clone(),
+                                        resolved,
+                                    },
+                                    col.data_type.clone(),
+                                );
+                            }
+                        }
+                        output_schema.push((col.column_name.clone(), col.data_type.clone(), coll));
                         projection.push(AnalyzedProjection {
                             expr,
                             output_name: col.column_name.clone(),
