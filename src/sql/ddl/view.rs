@@ -23,20 +23,21 @@ use super::{
     drop_dependent_views, drop_owned_sequences_for_table, was_cascade_dropped,
 };
 
-/// Resolve raw `RelationDep`s into fully-qualified dependency names.
+/// Resolve one relation reference captured from the binder into a
+/// fully-qualified relation name.
 ///
 /// - `Qualified { schema, name }` -> `"{schema}.{name}"` directly.
-/// - `Unqualified { name }` -> search each schema in `search_path` order,
-///   checking tables, views, and materialized views.  First hit wins.
-///   If no hit exists, returns PostgreSQL-style "relation does not exist".
-async fn resolve_view_deps(
+/// - `Unqualified { name }` -> search each schema in `search_path` order.
+///   First hit wins.
+/// - If no hit exists, returns PostgreSQL-style "relation does not exist".
+async fn resolve_view_relation_ref(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
     search_path: &[String],
     create_stmt_text: &str,
-    raw_deps: std::collections::HashSet<crate::sql::binder::RelationDep>,
-) -> Result<Vec<String>> {
+    raw_dep: &crate::sql::binder::RelationDep,
+) -> Result<String> {
     use crate::sql::binder::RelationDep;
 
     fn missing_relation_err(relation: &str, create_stmt_text: &str) -> anyhow::Error {
@@ -52,47 +53,67 @@ async fn resolve_view_deps(
         )
     }
 
-    let mut resolved = Vec::with_capacity(raw_deps.len());
-    for dep in raw_deps {
-        match dep {
-            RelationDep::Qualified { schema, name } => {
+    match raw_dep {
+        RelationDep::Qualified { schema, name } => {
+            let full = format!("{}.{}", schema, name);
+            if !(store.table_exists(txn, db_id, &full).await?
+                || store.get_view(txn, db_id, &full).await?.is_some()
+                || store
+                    .get_materialized_view(txn, db_id, &full)
+                    .await?
+                    .is_some())
+            {
+                return Err(missing_relation_err(&full, create_stmt_text));
+            }
+            Ok(full)
+        }
+        RelationDep::Unqualified { name } => {
+            let mut schemas: Vec<String> = search_path.to_vec();
+            if schemas.is_empty() {
+                schemas.push("public".to_string());
+            }
+            for schema in schemas {
                 let full = format!("{}.{}", schema, name);
-                if !(store.table_exists(txn, db_id, &full).await?
+                if store.table_exists(txn, db_id, &full).await?
                     || store.get_view(txn, db_id, &full).await?.is_some()
                     || store
                         .get_materialized_view(txn, db_id, &full)
                         .await?
-                        .is_some())
+                        .is_some()
                 {
-                    return Err(missing_relation_err(&full, create_stmt_text));
-                }
-                resolved.push(full);
-            }
-            RelationDep::Unqualified { name } => {
-                let mut found = false;
-                for schema in search_path {
-                    let full = format!("{}.{}", schema, name);
-                    if store.table_exists(txn, db_id, &full).await?
-                        || store.get_view(txn, db_id, &full).await?.is_some()
-                        || store
-                            .get_materialized_view(txn, db_id, &full)
-                            .await?
-                            .is_some()
-                    {
-                        resolved.push(full);
-                        found = true;
-                        break;
-                    }
-                }
-                if !found {
-                    return Err(missing_relation_err(&name, create_stmt_text));
+                    return Ok(full);
                 }
             }
+            Err(missing_relation_err(name, create_stmt_text))
         }
     }
-    resolved.sort();
-    resolved.dedup();
-    Ok(resolved)
+}
+
+/// Resolve ordered relation references into ordered fully-qualified bindings.
+async fn resolve_view_relation_bindings(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    create_stmt_text: &str,
+    raw_refs: &[crate::sql::binder::RelationDep],
+) -> Result<Vec<String>> {
+    let mut out = Vec::with_capacity(raw_refs.len());
+    for dep in raw_refs {
+        out.push(
+            resolve_view_relation_ref(store, txn, db_id, search_path, create_stmt_text, dep)
+                .await?,
+        );
+    }
+    Ok(out)
+}
+
+/// Derive deduplicated dependency set from ordered relation bindings.
+fn derive_view_deps(relation_bindings: &[String]) -> Vec<String> {
+    let mut deps = relation_bindings.to_vec();
+    deps.sort();
+    deps.dedup();
+    deps
 }
 
 async fn analyze_view_output_schema(
@@ -107,9 +128,17 @@ async fn analyze_view_output_schema(
     let mut catalog = CatalogSnapshot::new(search_path.to_vec(), db_id);
     let query_str = query.to_string();
     let create_stmt_text = format!("CREATE VIEW _ddl_schema_check AS {};", query_str);
-    let raw_deps = crate::sql::binder::extract_dependencies_from_query(query);
-    let deps =
-        resolve_view_deps(store, txn, db_id, search_path, &create_stmt_text, raw_deps).await?;
+    let raw_refs = crate::sql::binder::extract_relation_references_from_query(query);
+    let relation_bindings = resolve_view_relation_bindings(
+        store,
+        txn,
+        db_id,
+        search_path,
+        &create_stmt_text,
+        &raw_refs,
+    )
+    .await?;
+    let deps = derive_view_deps(&relation_bindings);
     for dep in deps {
         if let Some(schema) = store.get_schema(txn, db_id, &dep).await? {
             let bare = dep.rsplit('.').next().unwrap_or(&dep).to_string();
@@ -152,9 +181,17 @@ pub async fn execute_create_view(
     let create_stmt_text = format!("CREATE VIEW {} AS {};", name, query_str);
 
     // PostgreSQL parity: CREATE VIEW validates referenced relations up front.
-    let raw_deps = crate::sql::binder::extract_dependencies_from_query(query);
-    let deps =
-        resolve_view_deps(store, txn, db_id, search_path, &create_stmt_text, raw_deps).await?;
+    let raw_refs = crate::sql::binder::extract_relation_references_from_query(query);
+    let relation_bindings = resolve_view_relation_bindings(
+        store,
+        txn,
+        db_id,
+        search_path,
+        &create_stmt_text,
+        &raw_refs,
+    )
+    .await?;
+    let deps = derive_view_deps(&relation_bindings);
 
     // PostgreSQL parity: CREATE OR REPLACE VIEW may append columns only.
     if or_replace {
@@ -199,7 +236,15 @@ pub async fn execute_create_view(
         }
     }
     store
-        .create_view(txn, db_id, &view_name, &query_str, deps, or_replace)
+        .create_view(
+            txn,
+            db_id,
+            &view_name,
+            &query_str,
+            deps,
+            relation_bindings,
+            or_replace,
+        )
         .await?;
 
     Ok(ExecuteResult::CreateView { view_name })
@@ -293,11 +338,19 @@ pub async fn execute_create_materialized_view(
 
     let query_str = query.to_string();
     let create_stmt_text = format!("CREATE MATERIALIZED VIEW {} AS {};", name, query_str);
-    let raw_deps = crate::sql::binder::extract_dependencies_from_query(query);
-    let deps =
-        resolve_view_deps(store, txn, db_id, search_path, &create_stmt_text, raw_deps).await?;
+    let raw_refs = crate::sql::binder::extract_relation_references_from_query(query);
+    let relation_bindings = resolve_view_relation_bindings(
+        store,
+        txn,
+        db_id,
+        search_path,
+        &create_stmt_text,
+        &raw_refs,
+    )
+    .await?;
+    let deps = derive_view_deps(&relation_bindings);
     store
-        .create_materialized_view(txn, db_id, &view_name, &query_str, deps)
+        .create_materialized_view(txn, db_id, &view_name, &query_str, deps, relation_bindings)
         .await?;
 
     let row_count = rows.len();

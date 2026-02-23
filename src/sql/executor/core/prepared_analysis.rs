@@ -211,12 +211,12 @@ impl Executor {
         };
 
         for cte in &with.cte_tables {
-            let cte_name = cte.alias.name.value.to_lowercase();
+            let cte_name = normalize_ident(&cte.alias.name);
             let schema_query = if with.recursive
-                && crate::sql::executor::cte::cte_is_recursive(&cte.query, &cte_name)
+                && crate::sql::executor::cte_is_recursive(&cte.query, &cte_name)
             {
                 let (base_expr, _, _) =
-                    crate::sql::executor::cte::decompose_recursive_union(&cte.query, &cte_name)?;
+                    crate::sql::executor::decompose_recursive_union(&cte.query, &cte_name)?;
                 Query {
                     with: None,
                     body: base_expr,
@@ -319,9 +319,9 @@ fn query_contains_recursive_cte(query: &Query) -> bool {
         fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<Self::Break> {
             if let Some(with) = &q.with {
                 for cte in &with.cte_tables {
-                    let cte_name = cte.alias.name.value.to_lowercase();
+                    let cte_name = normalize_ident(&cte.alias.name);
                     if with.recursive
-                        && crate::sql::executor::cte::cte_is_recursive(&cte.query, &cte_name)
+                        && crate::sql::executor::cte_is_recursive(&cte.query, &cte_name)
                     {
                         self.has_recursive_cte = true;
                         return ControlFlow::Break(());

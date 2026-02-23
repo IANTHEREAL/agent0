@@ -19,6 +19,8 @@ const DB_SYS_SCHEMA_PREFIX: &[u8] = b"sys_schema_";
 const DB_SYS_SCHEMADEF_PREFIX: &[u8] = b"sys_schemadef_";
 const DB_SYS_VIEW_PREFIX: &[u8] = b"sys_view_";
 const DB_SYS_MATVIEW_PREFIX: &[u8] = b"sys_matview_";
+const DB_SYS_VIEW_BINDINGS_PREFIX: &[u8] = b"sys_view_bindings_";
+const DB_SYS_MATVIEW_BINDINGS_PREFIX: &[u8] = b"sys_matview_bindings_";
 const DB_SYS_PROCEDURE_PREFIX: &[u8] = b"sys_proc_";
 const DB_SYS_FUNCTION_PREFIX: &[u8] = b"sys_func_";
 const DB_SYS_TRIGGER_PREFIX: &[u8] = b"sys_trigger_";
@@ -464,6 +466,13 @@ pub fn encode_view_prefix_v2(db_id: u64) -> Vec<u8> {
     key
 }
 
+pub fn encode_view_bindings_key_v2(db_id: u64, view_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_VIEW_BINDINGS_PREFIX);
+    key.extend_from_slice(view_name.as_bytes());
+    key
+}
+
 pub fn encode_matview_key_v2(db_id: u64, matview_name: &str) -> Vec<u8> {
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_MATVIEW_PREFIX);
@@ -474,6 +483,13 @@ pub fn encode_matview_key_v2(db_id: u64, matview_name: &str) -> Vec<u8> {
 pub fn encode_matview_prefix_v2(db_id: u64) -> Vec<u8> {
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_MATVIEW_PREFIX);
+    key
+}
+
+pub fn encode_matview_bindings_key_v2(db_id: u64, matview_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_MATVIEW_BINDINGS_PREFIX);
+    key.extend_from_slice(matview_name.as_bytes());
     key
 }
 

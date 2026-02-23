@@ -9,9 +9,11 @@ impl TikvStore {
         name: &str,
         query: &str,
         deps: Vec<String>,
+        relation_bindings: Vec<String>,
         or_replace: bool,
     ) -> Result<()> {
         let key = self.key(&encode_view_key_v2(db_id, name));
+        let bindings_key = self.key(&encode_view_bindings_key_v2(db_id, name));
         if txn.get(key.clone()).await?.is_some() {
             if !or_replace {
                 return Err(SqlError::DuplicateRelation(name.to_string()).into());
@@ -25,6 +27,9 @@ impl TikvStore {
             def.deps = deps;
             let data = bincode::serialize(&def).context("Failed to serialize view definition")?;
             txn_put(txn, key, data).await?;
+            let bindings = bincode::serialize(&relation_bindings)
+                .context("Failed to serialize view relation bindings")?;
+            txn_put(txn, bindings_key, bindings).await?;
             info!("Replaced view '{}'", name);
             return Ok(());
         }
@@ -40,6 +45,9 @@ impl TikvStore {
         };
         let data = bincode::serialize(&def).context("Failed to serialize view definition")?;
         txn_put(txn, key, data).await?;
+        let bindings = bincode::serialize(&relation_bindings)
+            .context("Failed to serialize view relation bindings")?;
+        txn_put(txn, bindings_key, bindings).await?;
         info!("Created view '{}'", name);
         Ok(())
     }
@@ -61,10 +69,31 @@ impl TikvStore {
         }
     }
 
+    /// Update only the stored SQL text for an existing view definition.
+    pub async fn update_view_query(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        name: &str,
+        query: &str,
+    ) -> Result<()> {
+        let key = self.key(&encode_view_key_v2(db_id, name));
+        let mut def = self
+            .get_view(txn, db_id, name)
+            .await?
+            .ok_or_else(|| anyhow!("View '{}' does not exist", name))?;
+        def.query = query.to_string();
+        let data = bincode::serialize(&def).context("Failed to serialize view definition")?;
+        txn_put(txn, key, data).await?;
+        Ok(())
+    }
+
     pub async fn drop_view(&self, txn: &mut Transaction, db_id: u64, name: &str) -> Result<bool> {
         let key = self.key(&encode_view_key_v2(db_id, name));
+        let bindings_key = self.key(&encode_view_bindings_key_v2(db_id, name));
         if txn.get(key.clone()).await?.is_some() {
             txn_delete(txn, key).await?;
+            txn_delete(txn, bindings_key).await?;
             info!("Dropped view '{}'", name);
             Ok(true)
         } else {
@@ -91,6 +120,37 @@ impl TikvStore {
         Ok(views)
     }
 
+    pub async fn get_view_relation_bindings(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        name: &str,
+    ) -> Result<Option<Vec<String>>> {
+        let key = self.key(&encode_view_bindings_key_v2(db_id, name));
+        match txn.get(key).await? {
+            Some(data) => {
+                let bindings: Vec<String> = bincode::deserialize(&data)
+                    .context("Failed to deserialize view relation bindings")?;
+                Ok(Some(bindings))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn set_view_relation_bindings(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        name: &str,
+        relation_bindings: Vec<String>,
+    ) -> Result<()> {
+        let key = self.key(&encode_view_bindings_key_v2(db_id, name));
+        let bindings = bincode::serialize(&relation_bindings)
+            .context("Failed to serialize view relation bindings")?;
+        txn_put(txn, key, bindings).await?;
+        Ok(())
+    }
+
     pub async fn create_materialized_view(
         &self,
         txn: &mut Transaction,
@@ -98,8 +158,10 @@ impl TikvStore {
         name: &str,
         query: &str,
         deps: Vec<String>,
+        relation_bindings: Vec<String>,
     ) -> Result<()> {
         let key = self.key(&encode_matview_key_v2(db_id, name));
+        let bindings_key = self.key(&encode_matview_bindings_key_v2(db_id, name));
         if txn.get(key.clone()).await?.is_some() {
             return Err(SqlError::DuplicateRelation(name.to_string()).into());
         }
@@ -112,6 +174,9 @@ impl TikvStore {
         };
         let data = bincode::serialize(&def).context("Failed to serialize matview definition")?;
         txn_put(txn, key, data).await?;
+        let bindings = bincode::serialize(&relation_bindings)
+            .context("Failed to serialize matview relation bindings")?;
+        txn_put(txn, bindings_key, bindings).await?;
         info!("Created materialized view '{}'", name);
         Ok(())
     }
@@ -133,6 +198,25 @@ impl TikvStore {
         }
     }
 
+    /// Update only the stored SQL text for an existing materialized view definition.
+    pub async fn update_materialized_view_query(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        name: &str,
+        query: &str,
+    ) -> Result<()> {
+        let key = self.key(&encode_matview_key_v2(db_id, name));
+        let mut def = self
+            .get_materialized_view(txn, db_id, name)
+            .await?
+            .ok_or_else(|| anyhow!("Materialized view '{}' does not exist", name))?;
+        def.query = query.to_string();
+        let data = bincode::serialize(&def).context("Failed to serialize matview definition")?;
+        txn_put(txn, key, data).await?;
+        Ok(())
+    }
+
     pub async fn drop_materialized_view(
         &self,
         txn: &mut Transaction,
@@ -140,8 +224,10 @@ impl TikvStore {
         name: &str,
     ) -> Result<bool> {
         let key = self.key(&encode_matview_key_v2(db_id, name));
+        let bindings_key = self.key(&encode_matview_bindings_key_v2(db_id, name));
         if txn.get(key.clone()).await?.is_some() {
             txn_delete(txn, key).await?;
+            txn_delete(txn, bindings_key).await?;
             info!("Dropped materialized view '{}'", name);
             Ok(true)
         } else {
@@ -170,5 +256,36 @@ impl TikvStore {
             matviews.push(def);
         }
         Ok(matviews)
+    }
+
+    pub async fn get_materialized_view_relation_bindings(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        name: &str,
+    ) -> Result<Option<Vec<String>>> {
+        let key = self.key(&encode_matview_bindings_key_v2(db_id, name));
+        match txn.get(key).await? {
+            Some(data) => {
+                let bindings: Vec<String> = bincode::deserialize(&data)
+                    .context("Failed to deserialize matview relation bindings")?;
+                Ok(Some(bindings))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn set_materialized_view_relation_bindings(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        name: &str,
+        relation_bindings: Vec<String>,
+    ) -> Result<()> {
+        let key = self.key(&encode_matview_bindings_key_v2(db_id, name));
+        let bindings = bincode::serialize(&relation_bindings)
+            .context("Failed to serialize matview relation bindings")?;
+        txn_put(txn, key, bindings).await?;
+        Ok(())
     }
 }

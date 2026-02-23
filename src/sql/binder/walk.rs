@@ -27,6 +27,9 @@ impl Binder {
     /// Walk a Query node. This is the scope boundary: each Query gets its
     /// own BindScope frame for CTE name resolution.
     pub(super) fn walk_query(&mut self, query: &Query) {
+        let query_idx = self.query_relation_scopes.len();
+        self.query_relation_scopes.push(Vec::new());
+        self.query_stack.push(query_idx);
         self.push_scope();
 
         // Process CTEs in declaration order (sequential visibility).
@@ -71,6 +74,7 @@ impl Binder {
         }
 
         self.pop_scope();
+        self.query_stack.pop();
     }
 
     // ── SetExpr ────────────────────────────────────────────────────────
@@ -211,6 +215,7 @@ impl Binder {
         match tf {
             TableFactor::Table {
                 name,
+                alias,
                 args,
                 with_hints,
                 ..
@@ -224,7 +229,7 @@ impl Binder {
                     }
                 } else {
                     // Real table reference → check CTE scope, record dep.
-                    self.check_relation(name);
+                    self.check_relation(name, alias.as_ref().map(|a| &a.name));
                 }
                 for hint in with_hints {
                     self.walk_expr(hint);

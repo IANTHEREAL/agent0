@@ -130,6 +130,7 @@ impl TikvStore {
 
         store.check_format_version().await?;
         store.bootstrap_default_database("admin").await?;
+        store.ensure_view_relation_bindings_migration().await?;
 
         Ok(store)
     }

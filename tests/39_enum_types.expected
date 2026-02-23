@@ -15,6 +15,97 @@ r|role
 ERROR:  cannot drop type role because other objects depend on it
 DETAIL:  column r of table udt_enum_test depends on type role
 HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+enumlabel|enumsortorder
+red|1
+green|2
+blue|3
+yellow|4
+(4 rows)
+enumlabel|enumsortorder
+red|1
+cyan|2
+green|3
+blue|4
+yellow|5
+(5 rows)
+enumlabel|enumsortorder
+red|1
+cyan|2
+green|3
+blue|4
+magenta|5
+yellow|6
+(6 rows)
+NOTICE:  enum label "red" already exists, skipping
+ERROR:  enum label "red" already exists
+ERROR:  "nonexistent" is not an existing enum label
+id|c
+1|red
+2|green
+3|blue
+4|yellow
+(4 rows)
+enumlabel|enumsortorder
+scarlet|1
+cyan|2
+green|3
+blue|4
+magenta|5
+yellow|6
+(6 rows)
+id|c
+1|scarlet
+2|green
+3|blue
+4|yellow
+(4 rows)
+ERROR:  "red" is not an existing enum label
+ERROR:  enum label "green" already exists
+typname|typtype
+palette|e
+(1 row)
+id|c
+1|scarlet
+2|green
+3|blue
+4|yellow
+5|green
+(5 rows)
+column_name|udt_name
+c|palette
+(1 row)
+id|s
+1|active
+(1 row)
+id|s
+1|enabled
+2|enabled
+(2 rows)
+id|s
+1|enabled
+2|enabled
+3|enabled
+(3 rows)
+id|p
+1|minimal
+2|medium
+(2 rows)
+id|p
+10|minimal
+20|medium
+(2 rows)
+id|m
+1|happy
+(1 row)
+id|m
+1|happy
+2|happy
+(2 rows)
+enumlabel
+(0 rows)
+enumlabel
+first
+(1 row)
 typname|typtype
 comp|c
 (1 row)

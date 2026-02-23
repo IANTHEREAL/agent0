@@ -4,7 +4,7 @@ use tikv_client::Transaction;
 
 use super::super::names;
 use super::super::udt;
-use super::super::{ExecuteResult, Session};
+use super::super::{ExecuteResult, ExecuteResults, Session};
 use super::core::Executor;
 
 fn trim_sql_end(sql: &str) -> &str {
@@ -287,6 +287,100 @@ impl Executor {
                 return Err(anyhow!("schema '{}' does not exist", resolved.schema));
             }
             udt::create_enum_type(&store, txn, db_id, resolved.schema, resolved.name, labels).await
+        }
+        .await;
+
+        if is_autocommit {
+            if result.is_ok() {
+                session.commit().await?;
+            } else {
+                session.rollback().await?;
+            }
+        }
+
+        result
+    }
+
+    pub(crate) async fn execute_alter_type_cmd(
+        &self,
+        session: &mut Session,
+        sql: &str,
+    ) -> Result<ExecuteResults> {
+        use super::super::alter_type::{parse_alter_type_sql, AlterTypeCommand};
+
+        let cmd = parse_alter_type_sql(sql)?;
+        let search_path: Vec<String> = session.search_path().to_vec();
+
+        let is_autocommit = !session.is_in_transaction();
+        if is_autocommit {
+            session.begin().await?;
+        }
+
+        let result = async {
+            let db_id = session.current_database_id();
+            let txn: &mut Transaction = session.get_mut_txn().expect("Transaction must be active");
+            let store = self.store();
+
+            // Resolve the type name using search path.  The raw token from the
+            // parser preserves any double-quotes so parse_object_name_token
+            // builds the correct QuoteStyle for case-sensitive resolution.
+            let type_obj = parse_object_name_token(&cmd.type_name())?;
+            let resolved = names::resolve_existing_type_name(
+                store.as_ref(),
+                txn,
+                db_id,
+                &type_obj,
+                &search_path,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("type \"{}\" does not exist", cmd.type_name()))?;
+            let full_name = resolved.full;
+
+            let result = match cmd {
+                AlterTypeCommand::RenameType { new_name, .. } => {
+                    udt::alter_type_rename(&store, txn, db_id, &full_name, &new_name).await?
+                }
+                AlterTypeCommand::RenameValue {
+                    old_label,
+                    new_label,
+                    ..
+                } => {
+                    udt::alter_type_rename_value(
+                        &store, txn, db_id, &full_name, &old_label, &new_label,
+                    )
+                    .await?
+                }
+                AlterTypeCommand::AddValue {
+                    if_not_exists,
+                    new_label,
+                    position,
+                    ..
+                } => {
+                    udt::alter_type_add_value(
+                        &store,
+                        txn,
+                        db_id,
+                        &full_name,
+                        if_not_exists,
+                        &new_label,
+                        &position,
+                    )
+                    .await?
+                }
+            };
+
+            // If the subcommand returned a Notice (e.g. ADD VALUE IF NOT
+            // EXISTS duplicate), emit it followed by CommandComplete so the
+            // wire layer sends NoticeResponse + ALTER TYPE tag.
+            let results = if matches!(result, ExecuteResult::Notice { .. }) {
+                ExecuteResults(vec![
+                    result,
+                    ExecuteResult::CommandComplete { tag: "ALTER TYPE" },
+                ])
+            } else {
+                ExecuteResults::single(result)
+            };
+            Ok(results)
         }
         .await;
 

@@ -3,12 +3,11 @@
 use super::super::names::normalize_ident;
 use super::super::ExecuteResult;
 use super::core::Executor;
+use crate::sql::binder::{extract_relation_references_from_query, RelationDep};
 use crate::sql::error::SqlError;
 use crate::types::{ColumnDef, DataType, Row, TableSchema};
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{
-    Ident, Query, SetExpr, SetOperator, SetQuantifier, TableFactor, Visit, Visitor,
-};
+use sqlparser::ast::{Ident, Query, SetExpr, SetOperator, SetQuantifier, Visit, Visitor};
 use std::collections::HashMap;
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -29,7 +28,7 @@ impl Executor {
         let mut ctes: HashMap<String, (TableSchema, Vec<Row>)> = base_ctes.clone();
         if let Some(with) = &query.with {
             for cte in &with.cte_tables {
-                let cte_name = cte.alias.name.value.to_lowercase();
+                let cte_name = normalize_ident(&cte.alias.name);
 
                 if with.recursive && cte_is_recursive(&cte.query, &cte_name) {
                     let (schema, rows) = self
@@ -288,6 +287,20 @@ impl Executor {
     }
 }
 
+fn set_expr_as_query(expr: &SetExpr) -> Query {
+    Query {
+        with: None,
+        body: Box::new(expr.clone()),
+        order_by: vec![],
+        limit: None,
+        offset: None,
+        fetch: None,
+        locks: vec![],
+        limit_by: vec![],
+        for_clause: None,
+    }
+}
+
 /// Decompose a recursive CTE query into its base (non-recursive) and recursive arms.
 ///
 /// Returns `(base_expr, recursive_expr, is_union_all)`.
@@ -365,56 +378,22 @@ pub(crate) fn build_cte_table_schema(
 
 /// Check if a CTE is recursive (references itself in the UNION)
 pub(crate) fn cte_is_recursive(query: &Query, cte_name: &str) -> bool {
-    fn check(expr: &SetExpr, cte_name: &str) -> bool {
-        match expr {
-            SetExpr::SetOperation { left, right, .. } => {
-                set_expr_references_table(left, cte_name)
-                    || set_expr_references_table(right, cte_name)
-            }
-            SetExpr::Query(q) => check(&q.body, cte_name),
-            _ => false,
+    match query.body.as_ref() {
+        SetExpr::SetOperation { left, right, .. } => {
+            set_expr_references_table(left, cte_name) || set_expr_references_table(right, cte_name)
         }
+        SetExpr::Query(q) => cte_is_recursive(q, cte_name),
+        _ => false,
     }
-
-    check(&query.body, cte_name)
 }
 
 /// Check if a SetExpr references a specific table
 pub(crate) fn set_expr_references_table(expr: &SetExpr, table_name: &str) -> bool {
-    match expr {
-        SetExpr::Select(select) => {
-            for from in &select.from {
-                if table_factor_references(&from.relation, table_name) {
-                    return true;
-                }
-                for join in &from.joins {
-                    if table_factor_references(&join.relation, table_name) {
-                        return true;
-                    }
-                }
-            }
-            false
-        }
-        SetExpr::SetOperation { left, right, .. } => {
-            set_expr_references_table(left, table_name)
-                || set_expr_references_table(right, table_name)
-        }
-        SetExpr::Query(q) => set_expr_references_table(&q.body, table_name),
-        _ => false,
-    }
-}
-
-/// Check if a TableFactor references a specific table
-pub(crate) fn table_factor_references(factor: &TableFactor, table_name: &str) -> bool {
-    match factor {
-        TableFactor::Table { name, .. } => {
-            name.0.last().map(|i| i.value.to_lowercase()) == Some(table_name.to_lowercase())
-        }
-        TableFactor::Derived { subquery, .. } => {
-            set_expr_references_table(&subquery.body, table_name)
-        }
-        _ => false,
-    }
+    let target = table_name.to_string();
+    let query = set_expr_as_query(expr);
+    extract_relation_references_from_query(&query)
+        .into_iter()
+        .any(|dep| matches!(dep, RelationDep::Unqualified { name } if name == target))
 }
 
 /// Collect nested Query nodes (excluding root) that contain a WITH clause.
@@ -549,6 +528,39 @@ mod tests {
         );
         let (_base, _recursive, is_union_all) = decompose_recursive_union(&cte_q, "t").unwrap();
         assert!(!is_union_all);
+    }
+
+    #[test]
+    fn decompose_qualified_name_not_counted_as_self_reference() {
+        let cte_q = cte_query(
+            "WITH RECURSIVE t(n) AS (SELECT 1 FROM public.t UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT * FROM t",
+        );
+        let (base, recursive, is_union_all) = decompose_recursive_union(&cte_q, "t").unwrap();
+        assert!(is_union_all);
+        assert!(!set_expr_references_table(&base, "t"));
+        assert!(set_expr_references_table(&recursive, "t"));
+    }
+
+    #[test]
+    fn decompose_function_named_like_cte_not_counted_as_self_reference() {
+        let cte_q = cte_query(
+            "WITH RECURSIVE t(n) AS (SELECT 1 FROM t(1) UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT * FROM t",
+        );
+        let (base, recursive, is_union_all) = decompose_recursive_union(&cte_q, "t").unwrap();
+        assert!(is_union_all);
+        assert!(!set_expr_references_table(&base, "t"));
+        assert!(set_expr_references_table(&recursive, "t"));
+    }
+
+    #[test]
+    fn decompose_nested_join_self_reference_detected() {
+        let cte_q = cte_query(
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT t.n FROM (t JOIN (SELECT 1) s ON true) j) SELECT * FROM t",
+        );
+        let (base, recursive, is_union_all) = decompose_recursive_union(&cte_q, "t").unwrap();
+        assert!(is_union_all);
+        assert!(!set_expr_references_table(&base, "t"));
+        assert!(set_expr_references_table(&recursive, "t"));
     }
 
     // --- build_cte_table_schema tests ---

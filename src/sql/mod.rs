@@ -1,6 +1,7 @@
 //! SQL parsing and execution
 
 mod alter_owner;
+mod alter_type;
 pub mod analyzer;
 pub(crate) mod binder;
 pub(crate) mod bytea;

@@ -24,3 +24,4 @@ pub use core::*;
 pub(crate) use cron::{
     execute_cron_scalar_function, split_cron_scalar_function_name, try_execute_cron_scalar_function,
 };
+pub(crate) use cte::{cte_is_recursive, decompose_recursive_union};

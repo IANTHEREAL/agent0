@@ -472,6 +472,10 @@ impl Executor {
                     dispatch_raw!(self, session, sql_trimmed,
                         self.execute_create_type_enum_cmd(session, sql).await);
                 }
+                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::AlterType)) {
+                    dispatch_raw!(multi: self, session, sql_trimmed,
+                        self.execute_alter_type_cmd(session, sql).await);
+                }
                 if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::DropType)) {
                     dispatch_raw!(self, session, sql_trimmed,
                         self.execute_drop_type_cmd(session, sql).await);

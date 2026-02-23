@@ -34,6 +34,7 @@ pub(crate) enum RawSqlKind {
     DropProcedure,
     CreateProcedure,
     CreateTypeEnum,
+    AlterType,
     DropType,
     CreateCollation,
     DropCollation,
@@ -223,6 +224,9 @@ pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
     if is_create_type_as_enum_sql(sql_upper) {
         return Some(RawSqlKind::CreateTypeEnum);
     }
+    if sql_upper.starts_with("ALTER TYPE") {
+        return Some(RawSqlKind::AlterType);
+    }
     if sql_upper.starts_with("DROP TYPE") {
         return Some(RawSqlKind::DropType);
     }
@@ -289,9 +293,6 @@ pub(crate) fn unsupported_reason(sql_upper: &str) -> Option<&'static str> {
     if sql_upper.starts_with("CREATE AGGREGATE") {
         return Some("CREATE AGGREGATE not supported");
     }
-    if sql_upper.starts_with("ALTER TYPE") {
-        return Some("ALTER TYPE not supported");
-    }
     if sql_upper.starts_with("ALTER DOMAIN") {
         return Some("ALTER DOMAIN not supported");
     }
@@ -345,9 +346,6 @@ fn is_unsupported_sql_that_executor_skips(sql_upper: &str) -> bool {
     if sql_upper.starts_with("CREATE AGGREGATE") {
         return true;
     }
-    if sql_upper.starts_with("ALTER TYPE") {
-        return true;
-    }
     if sql_upper.starts_with("ALTER DOMAIN") {
         return true;
     }
@@ -388,6 +386,14 @@ mod tests {
         assert_eq!(
             classify("CREATE TYPE t AS ENUM ('a')"),
             Some(RawSqlKind::CreateTypeEnum)
+        );
+        assert_eq!(
+            classify("ALTER TYPE role ADD VALUE 'MODERATOR'"),
+            Some(RawSqlKind::AlterType)
+        );
+        assert_eq!(
+            classify("ALTER TYPE role RENAME TO new_role"),
+            Some(RawSqlKind::AlterType)
         );
         assert_eq!(classify("SELCT 1"), None);
         // RESET <guc> and RESET ALL are classified as Reset

@@ -30,6 +30,17 @@ pub(crate) enum RelationDep {
     Unqualified { name: String },
 }
 
+/// A single relation reference bound inside one query scope.
+///
+/// `qualifier` is the visible table qualifier for column references:
+/// - explicit alias (`FROM t AS x` -> `x`)
+/// - otherwise the relation name part (`FROM s.t` -> `t`)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueryRelationRef {
+    pub(crate) dep: RelationDep,
+    pub(crate) qualifier: String,
+}
+
 /// A single scope frame in the name resolution chain.
 /// Each `Query` node in the AST produces its own scope frame.
 pub(crate) struct BindScope {
@@ -52,6 +63,12 @@ pub(crate) struct Binder {
     scopes: Vec<BindScope>,
     /// Extracted relation dependencies.
     deps: HashSet<RelationDep>,
+    /// Extracted relation references in deterministic traversal order.
+    relation_refs: Vec<RelationDep>,
+    /// Per-query relation references (query pre-order).
+    query_relation_scopes: Vec<Vec<QueryRelationRef>>,
+    /// Stack of active query indices into `query_relation_scopes`.
+    query_stack: Vec<usize>,
 }
 
 impl Binder {
@@ -59,6 +76,9 @@ impl Binder {
         Self {
             scopes: Vec::new(),
             deps: HashSet::new(),
+            relation_refs: Vec::new(),
+            query_relation_scopes: Vec::new(),
+            query_stack: Vec::new(),
         }
     }
 
@@ -75,7 +95,11 @@ impl Binder {
     }
 
     /// Record a relation reference, checking CTE shadows first.
-    fn check_relation(&mut self, name: &sqlparser::ast::ObjectName) {
+    fn check_relation(
+        &mut self,
+        name: &sqlparser::ast::ObjectName,
+        alias: Option<&sqlparser::ast::Ident>,
+    ) {
         let parts: Vec<String> = name.0.iter().map(|id| names::normalize_ident(id)).collect();
 
         // Only unqualified (1-part) names can be shadowed by CTEs.
@@ -91,80 +115,81 @@ impl Binder {
         // Not shadowed → record as dependency.
         match parts.len() {
             1 => {
-                self.deps.insert(RelationDep::Unqualified {
+                let dep = RelationDep::Unqualified {
                     name: parts[0].clone(),
-                });
+                };
+                self.deps.insert(dep.clone());
+                self.relation_refs.push(dep.clone());
+                self.push_query_relation_ref(dep, alias, parts.last());
             }
             2 => {
-                self.deps.insert(RelationDep::Qualified {
+                let dep = RelationDep::Qualified {
                     schema: parts[0].clone(),
                     name: parts[1].clone(),
-                });
+                };
+                self.deps.insert(dep.clone());
+                self.relation_refs.push(dep.clone());
+                self.push_query_relation_ref(dep, alias, parts.last());
             }
             n if n >= 3 => {
-                self.deps.insert(RelationDep::Qualified {
+                let dep = RelationDep::Qualified {
                     schema: parts[n - 2].clone(),
                     name: parts[n - 1].clone(),
-                });
+                };
+                self.deps.insert(dep.clone());
+                self.relation_refs.push(dep.clone());
+                self.push_query_relation_ref(dep, alias, parts.last());
             }
             _ => {}
         }
+    }
+
+    fn push_query_relation_ref(
+        &mut self,
+        dep: RelationDep,
+        alias: Option<&sqlparser::ast::Ident>,
+        fallback_qualifier: Option<&String>,
+    ) {
+        let Some(&query_idx) = self.query_stack.last() else {
+            return;
+        };
+
+        let qualifier = alias
+            .map(names::normalize_ident)
+            .or_else(|| fallback_qualifier.cloned())
+            .unwrap_or_default();
+        self.query_relation_scopes[query_idx].push(QueryRelationRef { dep, qualifier });
     }
 
     /// Check whether a CTE body's top-level FROM clauses reference the
     /// given `cte_name`.  Used to distinguish truly recursive CTEs (where
     /// `FROM t` is the working table) from non-recursive CTEs that happen
     /// to be inside a `WITH RECURSIVE` block.
-    ///
-    /// Only inspects the immediate SetExpr level — nested subqueries have
-    /// their own scope and are not checked.
+    /// Uses the same binder relation-extraction path to avoid drift in
+    /// table-factor handling and CTE scoping semantics.
     fn cte_body_references_name(body: &sqlparser::ast::SetExpr, cte_name: &str) -> bool {
-        match body {
-            sqlparser::ast::SetExpr::Select(select) => {
-                for twj in &select.from {
-                    if Self::table_factor_has_name(&twj.relation, cte_name) {
-                        return true;
-                    }
-                    for join in &twj.joins {
-                        if Self::table_factor_has_name(&join.relation, cte_name) {
-                            return true;
-                        }
-                    }
-                }
-                false
-            }
-            sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
-                Self::cte_body_references_name(left, cte_name)
-                    || Self::cte_body_references_name(right, cte_name)
-            }
-            sqlparser::ast::SetExpr::Query(q) => Self::cte_body_references_name(&q.body, cte_name),
-            _ => false,
-        }
-    }
+        let query = sqlparser::ast::Query {
+            with: None,
+            body: Box::new(body.clone()),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            fetch: None,
+            locks: vec![],
+            limit_by: vec![],
+            for_clause: None,
+        };
 
-    fn table_factor_has_name(factor: &sqlparser::ast::TableFactor, cte_name: &str) -> bool {
-        match factor {
-            sqlparser::ast::TableFactor::Table { name, .. } => {
-                if let Some(last) = name.0.last() {
-                    name.0.len() == 1 && names::normalize_ident(last) == cte_name
-                } else {
-                    false
-                }
-            }
-            sqlparser::ast::TableFactor::Derived { subquery, .. } => {
-                // Don't descend into subqueries — they have their own scope.
-                // But do check the subquery's top-level body.
-                Self::cte_body_references_name(&subquery.body, cte_name)
-            }
-            _ => false,
-        }
+        extract_relation_references_from_query(&query)
+            .into_iter()
+            .any(|dep| matches!(dep, RelationDep::Unqualified { name } if name == cte_name))
     }
 }
 
 // ── Public API ─────────────────────────────────────────────────────────
 
 /// Extract all relation dependencies from SQL, with correct CTE scoping.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn extract_dependencies(sql: &str) -> Result<HashSet<RelationDep>> {
     let dialect = PostgreSqlDialect {};
     let stmts = Parser::parse_sql(&dialect, sql)?;
@@ -175,14 +200,25 @@ pub(crate) fn extract_dependencies(sql: &str) -> Result<HashSet<RelationDep>> {
     Ok(binder.deps)
 }
 
-/// Extract all relation dependencies from an already parsed query AST.
-///
-/// Used by CREATE VIEW / CREATE MATERIALIZED VIEW DDL to avoid SQL
-/// round-tripping and parser fallback behavior.
-pub(crate) fn extract_dependencies_from_query(
+/// Extract relation references from a parsed query in deterministic traversal
+/// order. Includes duplicates.
+pub(crate) fn extract_relation_references_from_query(
     query: &sqlparser::ast::Query,
-) -> HashSet<RelationDep> {
+) -> Vec<RelationDep> {
     let mut binder = Binder::new();
     binder.walk_query(query);
-    binder.deps
+    binder.relation_refs
+}
+
+/// Extract per-query relation references (query pre-order).
+///
+/// Each outer vector entry corresponds to one query node, and the inner vector
+/// stores table references visible in that query's own FROM scope, with
+/// qualifier information.
+pub(crate) fn extract_query_relation_refs_from_query(
+    query: &sqlparser::ast::Query,
+) -> Vec<Vec<QueryRelationRef>> {
+    let mut binder = Binder::new();
+    binder.walk_query(query);
+    binder.query_relation_scopes
 }
