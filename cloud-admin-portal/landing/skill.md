@@ -118,10 +118,16 @@ db9 register
 # Login (stores token in ~/.db9/credentials)
 db9 login
 
+# Login via SSO (browser-based device code flow)
+db9 login sso
+db9 login sso --no-browser   # headless: prints URL + code
+
 # Check who you are
-# (no direct CLI command — use the REST API)
-curl -s https://db9.shared.aws.tidbcloud.com/api/customer/me \
-  -H "Authorization: Bearer $(grep token ~/.db9/credentials | cut -d'"' -f2)" | jq
+db9 status
+
+# Use token via environment variable (no file writes)
+export DB9_API_KEY=$(db9 token show)
+db9 db list
 ```
 
 ### For REST API Users
@@ -138,7 +144,10 @@ curl https://db9.shared.aws.tidbcloud.com/api/customer/databases \
 ### Token Management
 
 ```bash
-# List active tokens
+# Print the raw token (for DB9_API_KEY or scripts)
+db9 token show
+
+# List active tokens (shows IDs, not raw values)
 db9 token list
 
 # Revoke a token
@@ -872,6 +881,9 @@ db9
 ├── init                              # Guided setup wizard
 ├── register                          # Create account (email + password)
 ├── login                             # Login and store token
+├── login sso [--no-browser]          # SSO login (device code flow)
+├── login --api-key <key>             # Login with API key
+├── status                            # Check current auth state
 ├── claim                             # Claim anonymous account
 ├── logout                            # Remove stored credentials
 ├── db
@@ -911,6 +923,7 @@ db9
 │   ├── up <id> [--dir <d>]           # Apply pending migrations
 │   └── status <id> [--dir <d>]       # Applied vs pending
 ├── token
+│   ├── show                          # Print raw token (for DB9_API_KEY)
 │   ├── list                          # List API tokens
 │   └── revoke <token_id>             # Revoke a token
 ├── sh [<id>] [-c <cmd>]             # Filesystem shell (sh9)
@@ -1058,6 +1071,7 @@ anonymous_secret = "def456"
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `DB9_API_KEY` | (none) | Raw token for side-effect-free auth (no file writes) |
 | `DB9_API_URL` | `https://db9.shared.aws.tidbcloud.com/api` | API endpoint |
 | `DB9_INSECURE` | `false` | Skip TLS verification (dev only) |
 | `DB9_INSTALL_DIR` | `/usr/local/bin` | Install directory |

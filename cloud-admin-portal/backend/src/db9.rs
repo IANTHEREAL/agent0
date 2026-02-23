@@ -336,6 +336,8 @@ enum BranchAction {
 
 #[derive(Subcommand)]
 enum TokenAction {
+    /// Print the current raw token (for use with DB9_API_KEY)
+    Show,
     /// List your API tokens
     List,
     /// Revoke a token
@@ -852,6 +854,7 @@ async fn main() {
             }
         },
         Commands::Token { ref action } => match action {
+            TokenAction::Show => cmd_token_show(&cli.effective_output()),
             TokenAction::List => cmd_token_list(&api, &cli.effective_output()).await,
             TokenAction::Revoke { token_id } => {
                 cmd_token_revoke(&api, &cli.effective_output(), token_id).await
@@ -2688,6 +2691,19 @@ async fn cmd_db_inspect_slow_queries(api: &ApiClient, output: &OutputFormat, id:
                     s["sample_count"].as_i64().unwrap_or(0),
                 );
             }
+        }
+    }
+}
+
+fn cmd_token_show(output: &OutputFormat) {
+    match load_token() {
+        Ok(token) => match output {
+            OutputFormat::Json => print_json(&serde_json::json!({"token": token})),
+            _ => println!("{token}"),
+        },
+        Err(msg) => {
+            eprintln!("{msg}");
+            process::exit(1);
         }
     }
 }

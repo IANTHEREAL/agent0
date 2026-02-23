@@ -531,7 +531,7 @@ db9
 │   ├── list                          # List local migrations
 │   ├── up <id>                       # Apply pending migrations
 │   └── status <id>                   # Show applied vs pending
-├── token list|revoke                 # API token management
+├── token show|list|revoke            # API token management
 └── completion bash|zsh|fish          # Shell completions
 ```
 
