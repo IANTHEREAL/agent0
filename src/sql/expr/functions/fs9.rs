@@ -164,7 +164,7 @@ fn fs9_mtime_remote(path: &str) -> Result<Value> {
 }
 
 fn fs9_remove_remote(path: &str, recursive: bool) -> Result<Value> {
-    let tenant = crate::extensions::context::tenant_keyspace()
+    let _tenant = crate::extensions::context::tenant_keyspace()
         .ok_or_else(|| anyhow!("fs9: tenant keyspace not available in extension context"))?;
     let bk = get_remote_backend()?;
 

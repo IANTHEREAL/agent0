@@ -1,24 +1,17 @@
-//! Type inference system
+//! Type system utilities
 //!
-//! This module provides a modular type inference system with:
-//! - `TypeContext`: Multi-table column resolution
+//! This module provides:
 //! - `FunctionRegistry`: Function signature lookup
-//! - `TypeInferrer`: Core type inference logic
+//! - Type coercion and cast logic
+//! - SQL ↔ internal type mapping
 
 pub(crate) mod cast;
 pub(crate) mod coercion;
-mod context;
-mod error;
-mod infer;
 pub(crate) mod mapping;
 pub(crate) mod registry;
 
-pub use context::TypeContext;
-pub use error::TypeError;
-pub use infer::TypeInferrer;
-
 pub(crate) use cast::CastContext;
-pub(crate) use mapping::{sql_datatype_to_internal, sql_datatype_to_internal_strict};
+pub(crate) use mapping::sql_datatype_to_internal_strict;
 
 // Re-exports for tests
 #[cfg(test)]

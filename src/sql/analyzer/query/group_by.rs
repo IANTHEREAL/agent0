@@ -8,7 +8,6 @@ use sqlparser::ast::{self as ast, Expr, SelectItem};
 use std::collections::HashSet;
 
 use crate::sql::names::normalize_ident;
-use crate::types::DataType;
 
 use super::super::error::AnalyzerError;
 use super::super::types::*;

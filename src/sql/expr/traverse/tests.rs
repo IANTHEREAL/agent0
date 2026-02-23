@@ -146,33 +146,6 @@ fn for_each_child_subquery_opaque() {
 }
 
 #[test]
-fn transform_bottom_up_replaces_constants() {
-    let expr = binary_add(int_const(1), int_const(2));
-    let result = transform_bottom_up(&expr, &mut |e| {
-        if let TypedExprKind::Constant(Value::Int32(v)) = &e.kind {
-            TypedExpr::new(
-                TypedExprKind::Constant(Value::Int32(v * 10)),
-                e.data_type.clone(),
-            )
-        } else {
-            e
-        }
-    });
-    if let TypedExprKind::BinaryOp { left, right, .. } = &result.kind {
-        assert!(matches!(
-            left.kind,
-            TypedExprKind::Constant(Value::Int32(10))
-        ));
-        assert!(matches!(
-            right.kind,
-            TypedExprKind::Constant(Value::Int32(20))
-        ));
-    } else {
-        panic!("expected BinaryOp");
-    }
-}
-
-#[test]
 fn for_each_child_like_escape() {
     let expr = TypedExpr::new(
         TypedExprKind::Like {

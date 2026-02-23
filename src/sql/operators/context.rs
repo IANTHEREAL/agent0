@@ -12,9 +12,9 @@ pub struct ExecutionContext<'a> {
     pub txn: &'a mut Transaction,
     pub store: Arc<TikvStore>,
     pub db_id: u64,
-    #[allow(dead_code)] // threaded through for future operator use
+    #[allow(dead_code)] // forward-compat: threaded through for future operator use
     pub search_path: &'a [String],
-    #[allow(dead_code)] // threaded through for future operator use
+    #[allow(dead_code)] // forward-compat: threaded through for future operator use
     pub sequence_values: &'a mut HashMap<String, i64>,
     pub cte_tables: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     pub query_ctx: &'a QueryContext,

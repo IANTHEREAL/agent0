@@ -32,45 +32,6 @@ const DEFAULT_PD_ENDPOINTS: &str = "127.0.0.1:2379";
 const DEFAULT_PG_LISTEN_ADDR: &str = "127.0.0.1";
 const DEFAULT_TOKIO_STACK_MB: usize = 8;
 
-/// Lightweight PD health check — just verifies PD is reachable without
-/// creating any TiKV client or keyspace connection.
-async fn check_pd_health(pd_endpoint: &str) -> Result<()> {
-    // Skip HTTP health check when TLS is configured (PD requires mTLS);
-    // the tikv-client will verify connectivity when it connects.
-    if std::env::var("TIKV_CA_PATH").is_ok() {
-        info!(
-            "PD health check skipped (TLS mode; tikv-client will verify connectivity to {})",
-            pd_endpoint
-        );
-        return Ok(());
-    }
-
-    let url = format!("http://{}/pd/api/v1/health", pd_endpoint);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| anyhow::anyhow!("HTTP client error: {}", e))?;
-
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("PD health check failed ({}): {}", url, e))?;
-
-    if resp.status().is_success() {
-        info!("PD health check passed ({})", pd_endpoint);
-        Ok(())
-    } else {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        Err(anyhow::anyhow!(
-            "PD health check returned {}: {}",
-            status,
-            text
-        ))
-    }
-}
-
 fn main() -> Result<()> {
     // Parse CLI args first (before tokio runtime, so --help/--version work without async)
     let args: Vec<String> = std::env::args().collect();

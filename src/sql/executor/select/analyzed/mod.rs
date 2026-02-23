@@ -678,7 +678,7 @@ fn table_ref_needs_pre_materialization(tr: &AnalyzedTableRef) -> bool {
 /// Compile-time guards for #907: these three functions MUST return
 /// `Pin<Box<dyn Future<...>>>`, not opaque `impl Future` (from `async fn`).
 /// Reverting any of them to `async fn` makes this a type error at `cargo build`.
-#[allow(dead_code, unreachable_code, unused_variables)]
+#[allow(dead_code, unreachable_code, unused_variables)] // framework: development diagnostic path
 mod _stack_overflow_signature_guards_907 {
     use super::*;
 

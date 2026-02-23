@@ -79,15 +79,12 @@ async fn eval_join_filter(
 pub struct HashJoinConfig {
     /// Maximum memory for the build-side hash table (bytes).
     pub max_memory_bytes: usize,
-    /// Minimum total input rows required to prefer hash join over nested loop.
-    pub min_rows_threshold: usize,
 }
 
 impl Default for HashJoinConfig {
     fn default() -> Self {
         Self {
             max_memory_bytes: 256 * 1024 * 1024,
-            min_rows_threshold: 100,
         }
     }
 }
@@ -129,7 +126,7 @@ enum HashJoinState {
 pub struct HashJoinOperator {
     build_child: BoxedOperator,
     probe_child: BoxedOperator,
-    #[allow(dead_code)] // hash join operator framework
+    #[allow(dead_code)] // framework: hash join operator
     join_type: HashJoinType,
     left_is_build: bool,
     build_key_indices: Vec<usize>,
@@ -230,7 +227,7 @@ impl HashJoinOperator {
     }
 }
 
-#[allow(dead_code)] // hash join operator framework
+#[allow(dead_code)] // framework: hash join operator
 #[async_trait]
 impl PhysicalOperator for HashJoinOperator {
     fn schema(&self) -> &TableSchema {

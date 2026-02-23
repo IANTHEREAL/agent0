@@ -4,9 +4,7 @@
 //! even though they are used by the protocol handler.
 
 use crate::auth::Privilege;
-use crate::sql::analyzer::types::{
-    AnalyzedOnConflict, AnalyzedProjection, AnalyzedQuery, AnalyzedStatement,
-};
+use crate::sql::analyzer::types::{AnalyzedOnConflict, AnalyzedQuery, AnalyzedStatement};
 use crate::types::DataType;
 use sqlparser::ast::LockClause;
 
@@ -52,20 +50,6 @@ pub struct PreparedStatement {
 }
 
 impl PreparedStatement {
-    /// Extract output schema from an AnalyzedStatement.
-    pub fn output_schema_from(stmt: &AnalyzedStatement) -> Vec<(String, DataType)> {
-        match stmt {
-            AnalyzedStatement::Query(q) => q
-                .output_schema
-                .iter()
-                .map(|(name, dt, _coll)| (name.clone(), dt.clone()))
-                .collect(),
-            AnalyzedStatement::Insert(i) => returning_schema(&i.returning),
-            AnalyzedStatement::Update(u) => returning_schema(&u.returning),
-            AnalyzedStatement::Delete(d) => returning_schema(&d.returning),
-        }
-    }
-
     /// Compute required privileges from an AnalyzedStatement.
     pub fn compute_privileges(
         stmt: &AnalyzedStatement,
@@ -90,15 +74,5 @@ impl PreparedStatement {
                 vec![(del.table_name.clone(), Privilege::Delete)]
             }
         }
-    }
-}
-
-fn returning_schema(ret: &Option<Vec<AnalyzedProjection>>) -> Vec<(String, DataType)> {
-    match ret {
-        Some(projections) => projections
-            .iter()
-            .map(|p| (p.output_name.clone(), p.expr.data_type.clone()))
-            .collect(),
-        None => vec![],
     }
 }

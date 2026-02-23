@@ -31,7 +31,7 @@ pub struct PlanSchema {
 }
 
 impl PlanSchema {
-    #[allow(dead_code)] // Phase 2+
+    #[allow(dead_code)] // forward-compat: Phase 2+ logical plan variant
     pub fn empty() -> Self {
         Self {
             columns: Vec::new(),
@@ -42,7 +42,7 @@ impl PlanSchema {
         Self { columns }
     }
 
-    #[allow(dead_code)] // Phase 2+
+    #[allow(dead_code)] // forward-compat: Phase 2+ logical plan variant
     pub fn num_columns(&self) -> usize {
         self.columns.len()
     }

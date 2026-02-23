@@ -307,18 +307,18 @@ struct FileInfoResponse {
     size: u64,
     file_type: String,
     mode: u32,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // serde: deserialized field
     uid: u32,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // serde: deserialized field
     gid: u32,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // serde: deserialized field
     atime: u64,
     mtime: u64,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // serde: deserialized field
     ctime: u64,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // serde: deserialized field
     etag: Option<String>,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // serde: deserialized field
     symlink_target: Option<String>,
 }
 
@@ -340,7 +340,7 @@ impl FileInfoResponse {
 #[derive(Deserialize)]
 struct Fs9ErrorResponse {
     error: String,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // serde: deserialized field
     code: Option<u16>,
 }
 

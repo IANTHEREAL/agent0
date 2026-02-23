@@ -115,37 +115,6 @@ impl TikvStore {
         }
     }
 
-    pub async fn list_cron_runs_for_job(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        job_id: i64,
-        limit: usize,
-    ) -> Result<Vec<CronRun>> {
-        let prefix = encode_cron_run_prefix_v2(db_id);
-        let mut end = prefix.clone();
-        end.push(0xFF);
-        let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
-
-        let mut runs = Vec::new();
-        for pair in pairs {
-            let key: &[u8] = pair.key().as_ref().into();
-            if !key.starts_with(&prefix) {
-                continue;
-            }
-            let run: CronRun =
-                bincode::deserialize(pair.value()).context("Failed to deserialize cron run")?;
-            if run.job_id == job_id {
-                runs.push(run);
-                if runs.len() >= limit {
-                    break;
-                }
-            }
-        }
-        Ok(runs)
-    }
-
     pub async fn list_all_cron_runs(
         &self,
         txn: &mut Transaction,

@@ -2,17 +2,15 @@
 //!
 //! Provides correlation detection (`is_correlated_query`, `has_outer_ref`),
 //! outer-reference substitution (`substitute_outer_refs_in_query`,
-//! `substitute_outer_refs_in_expr`), and WHERE clause splitting for async
-//! subquery handling (`split_where_for_async`).
+//! `substitute_outer_refs_in_expr`).
 
 use crate::sql::analyzer::types::{
-    AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind, BinaryOp,
-    JoinCondition, TypedExpr, TypedExprKind, TypedFunctionArg, TypedOrderByExpr,
+    AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind, JoinCondition,
+    TypedExpr, TypedExprKind, TypedFunctionArg, TypedOrderByExpr,
 };
 use crate::sql::analyzer::AnalyzedQuery;
-use crate::sql::expr::classify::has_unresolved_subquery;
 use crate::sql::expr::traverse::{map_children, visit_any};
-use crate::types::{DataType, Row, Value};
+use crate::types::{Row, Value};
 
 /// Check if an AnalyzedQuery references outer scope columns (correlated).
 ///
@@ -407,58 +405,6 @@ pub(super) fn substitute_outer_refs_in_expr(expr: &TypedExpr, outer_row: &Row) -
         kind,
         data_type: expr.data_type.clone(),
     }
-}
-
-// ── WHERE clause splitting for async subquery handling ────────
-
-/// Split a WHERE clause (AND-conjunction) into sync and async parts.
-///
-/// Returns `(sync_part, async_part)` where:
-/// - sync_part: conjuncts without subqueries, safe for FilterOperator
-/// - async_part: conjuncts with unresolved subqueries, needs per-row async evaluation
-pub(super) fn split_where_for_async(expr: &TypedExpr) -> (Option<TypedExpr>, Option<TypedExpr>) {
-    let mut sync_parts = Vec::new();
-    let mut async_parts = Vec::new();
-    flatten_and(expr, &mut sync_parts, &mut async_parts);
-
-    let sync_expr = combine_and(sync_parts);
-    let async_expr = combine_and(async_parts);
-    (sync_expr, async_expr)
-}
-
-/// Flatten top-level AND conjuncts, classifying each as sync or async.
-fn flatten_and<'a>(
-    expr: &'a TypedExpr,
-    sync_parts: &mut Vec<&'a TypedExpr>,
-    async_parts: &mut Vec<&'a TypedExpr>,
-) {
-    if let TypedExprKind::BinaryOp {
-        left,
-        right,
-        op: BinaryOp::And,
-    } = &expr.kind
-    {
-        flatten_and(left, sync_parts, async_parts);
-        flatten_and(right, sync_parts, async_parts);
-    } else if has_unresolved_subquery(expr) {
-        async_parts.push(expr);
-    } else {
-        sync_parts.push(expr);
-    }
-}
-
-/// Combine a list of expressions into an AND chain.
-fn combine_and(parts: Vec<&TypedExpr>) -> Option<TypedExpr> {
-    parts.into_iter().cloned().reduce(|a, b| {
-        TypedExpr::new(
-            TypedExprKind::BinaryOp {
-                left: Box::new(a),
-                op: BinaryOp::And,
-                right: Box::new(b),
-            },
-            DataType::Boolean,
-        )
-    })
 }
 
 #[cfg(test)]

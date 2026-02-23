@@ -29,12 +29,6 @@ const LEGACY_SUNSET_DATE: &str = "2026-12-31";
 
 static USE_V2_SCHEMA_FORMAT: AtomicBool = AtomicBool::new(false);
 
-/// Enable V2 msgpack schema writes cluster-wide.
-/// Call once all nodes can read V2 (i.e. run this binary or newer).
-pub fn enable_v2_schema_format() {
-    USE_V2_SCHEMA_FORMAT.store(true, Ordering::Relaxed);
-}
-
 pub fn serialize_schema(schema: &TableSchema) -> Result<Vec<u8>> {
     if USE_V2_SCHEMA_FORMAT.load(Ordering::Relaxed) {
         return serialize_schema_v2(schema);

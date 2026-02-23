@@ -62,11 +62,11 @@ pub enum PhysicalNode {
     Empty,
 
     /// Inline values.
-    #[allow(dead_code)] // Phase 2+: Values rows field
+    #[allow(dead_code)] // forward-compat: Phase 2+ Values rows field
     Values { rows: Vec<Vec<TypedExpr>> },
 
     /// Table-valued function.
-    #[allow(dead_code)] // Phase 2+: TableFunction fields
+    #[allow(dead_code)] // forward-compat: Phase 2+ TableFunction fields
     TableFunction {
         function_name: String,
         args: Vec<TypedFunctionArg>,
@@ -94,7 +94,7 @@ pub enum PhysicalNode {
     },
 
     /// Stream aggregate (requires sorted input).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // forward-compat: physical plan variant
     StreamAggregate {
         group_by: Vec<TypedExpr>,
         projections: Vec<AnalyzedProjection>,
@@ -174,7 +174,7 @@ pub enum PhysicalNode {
 
     // ── Correlated ──────────────────────────────────────
     /// Subquery (opaque subplan).
-    #[allow(dead_code)] // Phase 2+: alias field
+    #[allow(dead_code)] // forward-compat: Phase 2+ alias field
     Subquery {
         subplan: Box<PhysicalPlan>,
         alias: Option<String>,

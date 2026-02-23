@@ -69,15 +69,6 @@ impl CronProcessList {
         }
         false
     }
-
-    pub fn cancel_by_run_id(&self, run_id: i64) -> bool {
-        let guard = self.running.read().unwrap();
-        if let Some(entry) = guard.get(&run_id) {
-            entry.cancel_signal.notify_waiters();
-            return true;
-        }
-        false
-    }
 }
 
 #[cfg(test)]
@@ -120,13 +111,5 @@ mod tests {
         let _signal = pl.register(make_info(100, 42));
         assert!(pl.cancel_by_job_id(42));
         assert!(!pl.cancel_by_job_id(999));
-    }
-
-    #[test]
-    fn cancel_by_run_id_returns_true_when_found() {
-        let pl = CronProcessList::new();
-        let _signal = pl.register(make_info(100, 1));
-        assert!(pl.cancel_by_run_id(100));
-        assert!(!pl.cancel_by_run_id(999));
     }
 }

@@ -3,8 +3,6 @@
 //! All database-scoped metadata keys are built on top of `encode_database_data_prefix()`.
 //! Worker system keys are global (not per-database).
 
-use memcomparable::Deserializer;
-
 use super::{encode_database_data_prefix, SYS_MIGRATION_PREFIX};
 
 // Database-scoped metadata prefixes (used only in this module).
@@ -392,10 +390,9 @@ pub fn encode_worker_queue_scan_end(priority: u8, fire_time_ms: i64) -> Vec<u8> 
 }
 
 /// Decode fire_time_ms from a worker queue key.
-///
-/// Extracts the fire_time field from a queue key for sorting/filtering.
-/// Returns None if the key is too short or malformed.
+#[cfg(test)]
 pub fn decode_worker_queue_fire_time(key: &[u8]) -> Option<i64> {
+    use memcomparable::Deserializer;
     if key.len() < WORKER_QUEUE_PREFIX.len() + 1 {
         return None;
     }

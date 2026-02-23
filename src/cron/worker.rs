@@ -123,14 +123,6 @@ pub(crate) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-pub(crate) fn success_message(completed_commands: usize) -> String {
-    if completed_commands == 1 {
-        "1 command completed".to_string()
-    } else {
-        format!("{} commands completed", completed_commands)
-    }
-}
-
 /// Compute the orphan cutoff for a specific run, accounting for per-job max_runtime_ms.
 /// Returns the timestamp below which a running run should be considered orphaned.
 pub(crate) fn orphan_cutoff_for_run(

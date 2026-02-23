@@ -5,7 +5,7 @@
 
 use crate::sql::analyzer::types::*;
 use crate::sql::error::SqlError;
-use crate::sql::expr::operators::{compare_values, eval_binary_op};
+use crate::sql::expr::operators::eval_binary_op;
 use crate::types::{Row, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::BinaryOperator;

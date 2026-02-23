@@ -6,13 +6,6 @@ use std::str::FromStr;
 #[derive(Debug)]
 pub struct CronSchedule {
     schedule: Schedule,
-    expression: String,
-}
-
-impl CronSchedule {
-    pub fn expression(&self) -> &str {
-        &self.expression
-    }
 }
 
 pub fn parse_cron_expression(expr: &str) -> Result<CronSchedule> {
@@ -56,18 +49,11 @@ pub fn parse_cron_expression(expr: &str) -> Result<CronSchedule> {
     let schedule = Schedule::from_str(&expr_with_seconds)
         .map_err(|e| anyhow!("invalid cron expression '{}': {}", expr, e))?;
 
-    Ok(CronSchedule {
-        schedule,
-        expression: expr.to_string(),
-    })
+    Ok(CronSchedule { schedule })
 }
 
 pub fn next_occurrence(schedule: &CronSchedule, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
     schedule.schedule.after(&after).next()
-}
-
-pub fn is_due(schedule: &CronSchedule, at: DateTime<Utc>) -> bool {
-    schedule.schedule.includes(at)
 }
 
 #[cfg(test)]
@@ -181,21 +167,6 @@ mod tests {
         let after = Utc::now();
         let next = next_occurrence(&sched, after).unwrap();
         assert!(next > after);
-    }
-
-    #[test]
-    fn is_due_works_for_matching_time() {
-        let sched = parse_cron_expression("0 12 * * *").unwrap();
-        let at = Utc::now();
-        let result = is_due(&sched, at);
-        let _ = result;
-    }
-
-    #[test]
-    fn expression_stored_correctly() {
-        let expr = "*/15 * * * *";
-        let sched = parse_cron_expression(expr).unwrap();
-        assert_eq!(sched.expression(), expr);
     }
 
     #[test]

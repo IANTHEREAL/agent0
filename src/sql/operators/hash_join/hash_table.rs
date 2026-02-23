@@ -13,7 +13,7 @@ use crate::types::{Row, Value};
 ///
 /// Hashing is defined to be compatible with [`join_keys_equal`]:
 /// if `join_keys_equal(a, b)` is `true`, then `hash_join_key(a) == hash_join_key(b)`.
-#[allow(dead_code)] // hash join operator framework
+#[allow(dead_code)] // framework: hash join operator
 pub fn hash_join_key(values: &[Value]) -> u64 {
     let mut hasher = DefaultHasher::new();
     values.len().hash(&mut hasher);
@@ -109,7 +109,7 @@ pub(super) fn hash_single_value_for_join<H: Hasher>(hasher: &mut H, value: &Valu
 /// - `NaN == NaN` (returns `true`, PostgreSQL-like)
 /// - `Int32` and `Int64` are compared as `i64`
 /// - `Numeric` is normalized before compare (`1.0 == 1.00`)
-#[allow(dead_code)] // hash join operator framework
+#[allow(dead_code)] // framework: hash join operator
 pub fn join_keys_equal(left: &[Value], right: &[Value]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -263,7 +263,7 @@ impl JoinHashTable {
         row_key_has_null_for_join(row, &self.key_indices)
     }
 
-    #[allow(dead_code)] // hash join operator framework
+    #[allow(dead_code)] // framework: hash join operator
     pub(crate) fn row_key_equals_values(&self, row: &Row, probe_key: &[Value]) -> bool {
         if self.key_indices.len() != probe_key.len() {
             return false;
@@ -307,7 +307,7 @@ impl JoinHashTable {
             .map(|b| (b.rows.as_slice(), b.global_indices.as_slice()))
     }
 
-    #[allow(dead_code)] // hash join operator framework
+    #[allow(dead_code)] // framework: hash join operator
     pub fn all_rows_with_indices(&self) -> impl Iterator<Item = (usize, &Row)> + '_ {
         self.buckets
             .values()

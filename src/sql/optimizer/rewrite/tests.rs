@@ -3,7 +3,6 @@
 use super::*;
 use crate::sql::analyzer::types::{FunctionKind, ResolvedFunction};
 use crate::sql::expr::typed_fold::{fold_typed_expr, is_volatile_or_side_effecting_builtin};
-use crate::sql::expr::typed_visit::expr_any;
 use crate::sql::query_context::QueryContext;
 use crate::types::Value;
 use std::sync::Arc;
@@ -36,13 +35,6 @@ fn const_int(v: i64) -> TypedExpr {
     TypedExpr {
         kind: TypedExprKind::Constant(Value::Int64(v)),
         data_type: DataType::Int64,
-    }
-}
-
-fn const_bool(v: bool) -> TypedExpr {
-    TypedExpr {
-        kind: TypedExprKind::Constant(Value::Boolean(v)),
-        data_type: DataType::Boolean,
     }
 }
 

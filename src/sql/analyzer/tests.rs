@@ -116,7 +116,7 @@ fn analyze_expr_with_users(sql: &str) -> Result<TypedExpr, AnalyzerError> {
 
 /// Like analyze_expr_with_users, but with aggregates disallowed (simulates WHERE context).
 // Test infrastructure -- will be wired up when analyzer tests expand.
-#[allow(dead_code)]
+#[allow(dead_code)] // test: analyzer test helper
 fn analyze_expr_no_aggregates(sql: &str) -> Result<TypedExpr, AnalyzerError> {
     let catalog = test_catalog();
     let mut scope = Scope::new();

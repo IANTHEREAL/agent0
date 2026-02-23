@@ -51,7 +51,7 @@ pub fn is_numeric(dt: &DataType) -> bool {
     )
 }
 
-#[allow(dead_code)] // type inference module
+#[allow(dead_code)] // framework: type inference module
 pub fn is_temporal(dt: &DataType) -> bool {
     matches!(
         dt,
@@ -63,7 +63,7 @@ pub fn is_temporal(dt: &DataType) -> bool {
     )
 }
 
-#[allow(dead_code)] // type inference module
+#[allow(dead_code)] // framework: type inference module
 pub fn can_coerce(from: &DataType, to: &DataType) -> bool {
     if from == to {
         return true;

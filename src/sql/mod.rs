@@ -65,5 +65,3 @@ mod aggregate;
 pub use aggregate::*;
 pub(crate) mod value_coercion;
 mod value_key;
-
-pub(crate) use information_schema::get_information_schema_schema;

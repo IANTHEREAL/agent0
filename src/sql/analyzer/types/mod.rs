@@ -38,11 +38,6 @@ impl TypedExpr {
     pub fn is_null_constant(&self) -> bool {
         matches!(self.kind, TypedExprKind::Constant(Value::Null))
     }
-
-    /// Returns true if this expression is a `$N` parameter placeholder.
-    pub fn is_parameter(&self) -> bool {
-        matches!(self.kind, TypedExprKind::Parameter { .. })
-    }
 }
 
 // ── Expression kinds (22 variants) ──────────────────────────
@@ -228,7 +223,7 @@ pub enum TypedExprKind {
 
     // ── Composite ───────────────────────────────────────
     /// Row constructor: `ROW(a, b, c)` or `(a, b, c)`.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: typed IR variant
     Row(Vec<TypedExpr>),
 
     // ── DML placeholder ────────────────────────────────
@@ -303,7 +298,7 @@ pub enum BinaryOp {
     // JSON containment & existence
     JsonContains,
     JsonContainedBy,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: typed IR variant
     JsonExists,
     JsonExistsAny,
     JsonExistsAll,
@@ -369,10 +364,10 @@ pub struct ResolvedFunction {
     /// Canonical name (for EXPLAIN / error messages only — NOT used for dispatch).
     pub name: String,
     /// Whether builtin or user-defined.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: typed IR variant
     pub kind: FunctionKind,
     /// The resolved return type for this specific call (after overload resolution).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: typed IR variant
     pub return_type: DataType,
 }
 
@@ -537,7 +532,7 @@ pub enum AnalyzedTableRefKind {
     /// A base table with resolved schema.
     Table {
         name: String,
-        #[allow(dead_code)]
+        #[allow(dead_code)] // framework: typed IR variant
         schema: TableRefSchema,
     },
     /// A subquery in FROM.
@@ -564,10 +559,10 @@ pub enum AnalyzedTableRefKind {
 /// Resolved schema information for a base table reference.
 #[derive(Debug, Clone)]
 pub struct TableRefSchema {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: typed IR variant
     pub table_id: u64,
     /// (column_name, data_type, nullable)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: typed IR variant
     pub columns: Vec<(String, DataType, bool)>,
 }
 
@@ -663,14 +658,14 @@ pub fn reindex_typed_expr(expr: &TypedExpr, offset: usize) -> TypedExpr {
 /// A resolved CTE (WITH clause entry).
 #[derive(Debug, Clone)]
 pub struct AnalyzedCte {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: typed IR variant
     pub name: String,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: typed IR variant
     pub query: AnalyzedQuery,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: typed IR variant
     pub columns: Vec<(String, DataType, Option<String>)>,
     /// Whether the CTE is materialized (`None` = unspecified / optimizer decides).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: typed IR variant
     pub materialized: Option<bool>,
 }
 
@@ -694,7 +689,7 @@ pub enum SetOpKind {
 #[derive(Debug, Clone)]
 pub enum AnalyzedStatement {
     /// A SELECT / set operation.
-    #[allow(dead_code)] // Dispatched via pattern match; inner value used transitionally
+    #[allow(dead_code)] // framework: dispatched via pattern match
     Query(AnalyzedQuery),
     /// An INSERT statement.
     Insert(AnalyzedInsert),
@@ -710,7 +705,7 @@ pub struct AnalyzedInsert {
     /// Fully qualified table name (for storage ops).
     pub table_name: String,
     /// Resolved table schema (for IR completeness; executor re-fetches from store).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: typed IR variant
     pub table_schema: TableRefSchema,
     /// Column indices being inserted (maps to positions in `table_schema.columns`).
     pub target_columns: Vec<usize>,
@@ -754,10 +749,10 @@ pub struct AnalyzedUpdate {
     /// Fully qualified table name.
     pub table_name: String,
     /// Resolved table schema (for IR completeness; executor re-fetches from store).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: typed IR variant
     pub table_schema: TableRefSchema,
     /// Table alias (or bare table name).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: typed IR variant
     pub table_alias: String,
     /// SET assignments: (column_index, typed value expression).
     pub assignments: Vec<(usize, TypedExpr)>,
@@ -775,10 +770,10 @@ pub struct AnalyzedDelete {
     /// Fully qualified table name.
     pub table_name: String,
     /// Resolved table schema (for IR completeness; executor re-fetches from store).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: typed IR variant
     pub table_schema: TableRefSchema,
     /// Table alias (or bare table name).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: typed IR variant
     pub table_alias: String,
     /// USING clause tables (for DELETE ... USING ... WHERE ...).
     pub using: Vec<AnalyzedTableRef>,

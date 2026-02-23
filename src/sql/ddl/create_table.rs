@@ -99,7 +99,7 @@ pub async fn execute_create_table(
         let mut nullable = true;
         let mut unique = false;
         let mut default_expr = None;
-        let mut collation: Option<String> = col.collation.as_ref().map(|c| c.to_string());
+        let collation: Option<String> = col.collation.as_ref().map(|c| c.to_string());
 
         for opt in &col.options {
             match &opt.option {

@@ -163,15 +163,6 @@ fn ctx_with_stats(entries: Vec<(&str, usize, Vec<(&str, f64)>)>) -> PlanningCont
     ctx
 }
 
-/// Extract the scan table_name from a plan, descending through Filter.
-fn extract_scan_name(plan: &LogicalPlan) -> Option<&str> {
-    match &plan.node {
-        LogicalNode::Scan { table_name, .. } => Some(table_name.as_str()),
-        LogicalNode::Filter { input, .. } => extract_scan_name(input),
-        _ => None,
-    }
-}
-
 /// Collect all scan table names in DFS order.
 fn collect_scan_names(plan: &LogicalPlan) -> Vec<String> {
     let mut names = Vec::new();

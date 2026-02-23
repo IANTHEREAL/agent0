@@ -14,7 +14,7 @@ impl std::fmt::Debug for RowStream {
 }
 
 /// Result of executing a SQL statement
-#[allow(dead_code)] // PG result message structural field
+#[allow(dead_code)] // framework: PG result message structural field
 #[derive(Debug)]
 pub enum ExecuteResult {
     /// SELECT result with rows
@@ -124,7 +124,7 @@ pub enum ExecuteResult {
         tables: Vec<String>,
     },
     /// DESCRIBE table result
-    #[allow(dead_code)] // PG protocol
+    #[allow(dead_code)] // framework: PG protocol
     // variant constructed in protocol layer, field for schema introspection
     Describe {
         schema: TableSchema,

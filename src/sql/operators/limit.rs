@@ -57,12 +57,16 @@ impl LimitOperator {
             .or(self.limit)
     }
 
+    #[allow(dead_code)] // framework: supports explain_info trait method
     fn constant_offset(&self) -> Option<usize> {
-        if let Some(expr) = &self.offset_expr {
-            eval_const_usize(expr, false).ok()
-        } else {
-            Some(self.offset)
-        }
+        self.offset_expr
+            .as_ref()
+            .and_then(|expr| eval_const_usize(expr, false).ok())
+            .or(if self.offset > 0 {
+                Some(self.offset)
+            } else {
+                None
+            })
     }
 }
 

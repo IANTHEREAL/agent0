@@ -5,7 +5,6 @@
 //! as a bridge so existing `anyhow!()` call sites can be migrated gradually.
 
 use crate::sql::analyzer::AnalyzerError;
-use crate::sql::types::TypeError;
 use crate::types::DataType;
 
 fn column_not_found_display(column: &str, hint: &Option<String>) -> String {
@@ -21,7 +20,7 @@ fn column_not_found_display(column: &str, hint: &Option<String>) -> String {
 /// Variants are defined for all major PostgreSQL error categories.
 /// Not all variants are actively constructed yet — they exist for
 /// gradual migration from `anyhow!()` call sites.
-#[allow(dead_code)] // PG error code compatibility
+#[allow(dead_code)] // framework: PG error code compatibility
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
     // Syntax / parsing
@@ -256,7 +255,7 @@ impl SqlError {
         }
     }
 
-    #[allow(dead_code)] // PG error reporting API
+    #[allow(dead_code)] // framework: PG error reporting API
     pub fn severity(&self) -> &'static str {
         "ERROR"
     }
@@ -344,20 +343,6 @@ impl From<AnalyzerError> for SqlError {
             AnalyzerError::DmlWhereNotBoolean { .. } => SqlError::DataTypeMismatch {
                 message: e.to_string(),
             },
-            other => SqlError::Internal(anyhow::anyhow!("{}", other)),
-        }
-    }
-}
-
-impl From<TypeError> for SqlError {
-    fn from(e: TypeError) -> Self {
-        match e {
-            TypeError::ColumnNotFound { name, .. } => SqlError::ColumnNotFound {
-                column: name,
-                hint: None,
-            },
-            TypeError::AmbiguousColumn { name, .. } => SqlError::AmbiguousColumn(name),
-            TypeError::UnknownFunction(name) => SqlError::FunctionNotFound(name),
             other => SqlError::Internal(anyhow::anyhow!("{}", other)),
         }
     }

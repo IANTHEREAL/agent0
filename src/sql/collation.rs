@@ -5,8 +5,6 @@
 //! - `ResolvedCollation` enum embedded in the typed IR (resolved at analysis time)
 //! - Process-level ICU collator cache (keyed by locale string)
 //! - Collation registry for managing CREATE COLLATION definitions
-//! - Sort key generation for ORDER BY operations
-//! - Collation-aware text comparison
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
@@ -158,17 +156,6 @@ impl Collator {
             std::cmp::Ordering::Greater => 1,
         })
     }
-
-    /// Generate a sort key for the given string
-    /// Sort keys can be compared byte-wise to get the same ordering as compare()
-    pub fn sort_key(&self, s: &str) -> Result<Vec<u8>> {
-        let ustr = ustring::UChar::try_from(s)
-            .map_err(|e| anyhow!("Failed to convert string to UChar: {}", e))?;
-
-        let key = self.inner.get_sort_key(&ustr);
-
-        Ok(key)
-    }
 }
 
 // ── Collation registry (process-global, for DDL definitions) ────────
@@ -179,15 +166,12 @@ pub static COLLATION_REGISTRY: Lazy<CollationRegistry> = Lazy::new(CollationRegi
 pub struct CollationRegistry {
     // Map from collation name to collation definition
     definitions: DashMap<String, CollationDef>,
-    // Cache of collator instances
-    collators: DashMap<String, Arc<Collator>>,
 }
 
 impl CollationRegistry {
     fn new() -> Self {
         let registry = Self {
             definitions: DashMap::new(),
-            collators: DashMap::new(),
         };
 
         // Register built-in collations
@@ -222,138 +206,15 @@ impl CollationRegistry {
         registry
     }
 
-    /// Register a new collation
-    pub fn register(&self, def: CollationDef) {
-        self.definitions.insert(def.name.clone(), def);
-    }
-
-    /// Unregister a collation
-    pub fn unregister(&self, name: &str) -> Option<CollationDef> {
-        self.collators.remove(name);
-        self.definitions.remove(name).map(|(_, def)| def)
-    }
-
     /// Get a collation definition
     pub fn get_definition(&self, name: &str) -> Option<CollationDef> {
         self.definitions.get(name).map(|entry| entry.clone())
     }
-
-    /// Get all collation definitions
-    pub fn all_definitions(&self) -> Vec<CollationDef> {
-        self.definitions
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect()
-    }
-
-    /// Get or create a collator for the given collation name
-    pub fn get_collator(&self, name: &str) -> Result<Arc<Collator>> {
-        // Check cache first
-        if let Some(collator) = self.collators.get(name) {
-            return Ok(collator.clone());
-        }
-
-        // Get definition
-        let def = self
-            .get_definition(name)
-            .ok_or_else(|| anyhow!("Collation '{}' does not exist", name))?;
-
-        // Only ICU provider is supported for now
-        if def.provider != "icu" {
-            return Err(anyhow!(
-                "Only ICU collations are supported for collation-aware operations"
-            ));
-        }
-
-        let locale = def
-            .locale
-            .as_ref()
-            .ok_or_else(|| anyhow!("ICU collation '{}' has no locale", name))?;
-
-        // Create collator
-        let collator = Arc::new(Collator::new(locale)?);
-        self.collators.insert(name.to_string(), collator.clone());
-        Ok(collator)
-    }
-
-    /// Check if a collation exists (case-insensitive for built-in names)
-    pub fn exists(&self, name: &str) -> bool {
-        if self.definitions.contains_key(name) {
-            return true;
-        }
-        // Case-insensitive check for built-in names
-        let lower = name.to_lowercase();
-        matches!(lower.as_str(), "c" | "posix" | "default")
-    }
-
-    /// Check if a collation is binary-safe (can use index ordering)
-    pub fn is_binary_safe(&self, name: &str) -> bool {
-        // Only C/POSIX/default are binary-safe
-        matches!(name, "C" | "POSIX" | "default")
-    }
-}
-
-/// Compare two text values using the specified collation
-pub fn compare_with_collation(a: &str, b: &str, collation: Option<&str>) -> Result<i32> {
-    let collation_name = collation.unwrap_or("default");
-
-    // Fast path for binary-safe collations
-    if COLLATION_REGISTRY.is_binary_safe(collation_name) {
-        return Ok(match a.cmp(b) {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Equal => 0,
-            std::cmp::Ordering::Greater => 1,
-        });
-    }
-
-    // Use ICU collator
-    let collator = COLLATION_REGISTRY.get_collator(collation_name)?;
-    collator.compare(a, b)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_binary_collation() {
-        let result = compare_with_collation("a", "A", Some("C")).unwrap();
-        assert!(result > 0, "Binary collation: 'a' should sort after 'A'");
-    }
-
-    #[test]
-    fn test_icu_da_collation() {
-        // Register Danish collation
-        COLLATION_REGISTRY.register(CollationDef {
-            name: "da".to_string(),
-            provider: "icu".to_string(),
-            locale: Some("da-u-kf-lower".to_string()),
-            deterministic: true,
-        });
-
-        let result = compare_with_collation("a", "A", Some("da")).unwrap();
-        assert!(
-            result < 0,
-            "Danish collation: lowercase 'a' should sort before 'A'"
-        );
-    }
-
-    #[test]
-    fn test_icu_de_collation() {
-        // Register German collation
-        COLLATION_REGISTRY.register(CollationDef {
-            name: "de".to_string(),
-            provider: "icu".to_string(),
-            locale: Some("de".to_string()),
-            deterministic: true,
-        });
-
-        let result = compare_with_collation("a", "A", Some("de")).unwrap();
-        assert!(
-            result < 0,
-            "German collation: lowercase 'a' should sort before 'A'"
-        );
-    }
 
     #[test]
     fn test_resolved_collation_binary() {

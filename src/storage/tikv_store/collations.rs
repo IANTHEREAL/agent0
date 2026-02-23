@@ -22,22 +22,6 @@ impl TikvStore {
         Ok(())
     }
 
-    pub async fn get_collation(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        name: &str,
-    ) -> Result<Option<CollationDef>> {
-        let key = self.key(&encode_collation_key_v2(db_id, name));
-        match txn.get(key).await? {
-            Some(data) => Ok(Some(
-                bincode::deserialize(&data)
-                    .context("Failed to deserialize collation definition")?,
-            )),
-            None => Ok(None),
-        }
-    }
-
     pub async fn list_collations(
         &self,
         txn: &mut Transaction,

@@ -6,7 +6,6 @@
 //!
 //! Combinators built on top:
 //! - [`visit_any`]: stack-safe iterative predicate test over all descendants
-//! - [`transform_bottom_up`]: recursive bottom-up sync transform
 //!
 //! Async support:
 //! - [`AsyncExprTransform`]: trait for async expression transforms
@@ -436,22 +435,6 @@ pub fn visit_any(expr: &TypedExpr, mut predicate: impl FnMut(&TypedExpr) -> bool
         stack[before..].reverse();
     }
     false
-}
-
-// ── Combinator: transform_bottom_up ─────────────────────────
-
-/// Bottom-up sync transform: recurse children first, then apply `f`.
-///
-/// NOT stack-safe — acceptable since expression trees are shallow in practice.
-pub fn transform_bottom_up(
-    expr: &TypedExpr,
-    f: &mut impl FnMut(TypedExpr) -> TypedExpr,
-) -> TypedExpr {
-    let kind = map_children(expr, &mut |child| transform_bottom_up(child, f));
-    f(TypedExpr {
-        kind,
-        data_type: expr.data_type.clone(),
-    })
 }
 
 // ── Async support ───────────────────────────────────────────

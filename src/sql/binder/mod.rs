@@ -12,10 +12,6 @@ mod tests;
 
 use std::collections::HashSet;
 
-use anyhow::Result;
-use sqlparser::dialect::PostgreSqlDialect;
-use sqlparser::parser::Parser;
-
 use super::names;
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -190,7 +186,9 @@ impl Binder {
 
 /// Extract all relation dependencies from SQL, with correct CTE scoping.
 #[cfg(test)]
-pub(crate) fn extract_dependencies(sql: &str) -> Result<HashSet<RelationDep>> {
+pub(crate) fn extract_dependencies(sql: &str) -> anyhow::Result<HashSet<RelationDep>> {
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
     let dialect = PostgreSqlDialect {};
     let stmts = Parser::parse_sql(&dialect, sql)?;
     let mut binder = Binder::new();

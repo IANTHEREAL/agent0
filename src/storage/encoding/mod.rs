@@ -30,7 +30,7 @@ pub use data_keys::{
     encode_index_range_end_v2, encode_index_range_start_v2, encode_pk_values, encode_schema_prefix,
     encode_table_data_range_v2, encode_table_index_range_v2,
 };
-#[allow(unused_imports)]
+#[cfg(test)]
 pub use metadata_keys::decode_worker_queue_fire_time;
 pub use metadata_keys::{
     encode_collation_key_v2, encode_collation_prefix_v2, encode_cron_claim_key_v2,

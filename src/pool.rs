@@ -23,7 +23,7 @@ fn now_epoch_ms() -> u64 {
 }
 
 /// Per-tenant metadata inside the pool.
-#[allow(dead_code)] // fields accessed by pool lifecycle tests
+#[allow(dead_code)] // test: fields accessed by pool lifecycle tests
 pub(crate) struct TenantEntry {
     store: Arc<TikvStore>,
     /// Number of active connection-scoped handles (TenantHandle instances).
@@ -48,12 +48,12 @@ impl TenantEntry {
         }
     }
 
-    #[allow(dead_code)] // used in pool tests
+    #[allow(dead_code)] // test: used in pool tests
     pub(crate) fn store(&self) -> &Arc<TikvStore> {
         &self.store
     }
 
-    #[allow(dead_code)] // used in pool tests
+    #[allow(dead_code)] // test: used in pool tests
     pub(crate) fn active_connections(&self) -> u32 {
         self.active_connections.load(Ordering::Relaxed)
     }
@@ -278,13 +278,13 @@ impl TikvClientPool {
     }
 
     /// Number of tenants currently cached in the pool.
-    #[allow(dead_code)] // used in pool tests
+    #[allow(dead_code)] // test: used in pool tests
     pub async fn tenant_count(&self) -> usize {
         self.tenants.read().await.len()
     }
 
     /// Number of tenants with at least one active connection handle.
-    #[allow(dead_code)] // used in pool tests
+    #[allow(dead_code)] // test: used in pool tests
     pub async fn active_tenant_count(&self) -> usize {
         let tenants = self.tenants.read().await;
         tenants
@@ -295,31 +295,12 @@ impl TikvClientPool {
 
     /// Snapshot of the active connection count for a specific keyspace.
     /// Returns None if the keyspace is not in the pool.
-    #[allow(dead_code)] // used in pool tests
+    #[allow(dead_code)] // test: used in pool tests
     pub async fn connections_for(&self, keyspace: &str) -> Option<u32> {
         let tenants = self.tenants.read().await;
         tenants
             .get(keyspace)
             .map(|e| e.active_connections.load(Ordering::Relaxed))
-    }
-
-    pub async fn list_active_keyspaces(&self) -> Vec<String> {
-        let tenants = self.tenants.read().await;
-        tenants
-            .iter()
-            .filter_map(|(keyspace, entry)| {
-                if entry.active_connections.load(Ordering::Relaxed) > 0 {
-                    Some(keyspace.clone())
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    pub async fn list_all_keyspaces(&self) -> Vec<String> {
-        let tenants = self.tenants.read().await;
-        tenants.keys().cloned().collect()
     }
 
     /// Run a single eviction pass. Removes tenants that have zero active

@@ -83,35 +83,6 @@ pub enum DataType {
     Varchar(u64),
 }
 
-impl DataType {
-    pub fn estimated_size(&self) -> usize {
-        match self {
-            DataType::Boolean => 1,
-            DataType::Int32 => 4,
-            DataType::Int64 => 8,
-            DataType::Float64 => 8,
-            DataType::Text => 32,
-            DataType::Name => 32,
-            DataType::Bytes => 32,
-            DataType::Timestamp => 8,
-            DataType::Interval => 8,
-            DataType::Uuid => 16,
-            DataType::Array(_) => 64,
-            DataType::Vector(dim) => (*dim as usize) * 8,
-            DataType::Json => 64,
-            DataType::Jsonb => 64,
-            DataType::Time => 8,
-            DataType::UserDefined(_) => 32,
-            DataType::Date => 4,
-            DataType::Numeric { .. } => 16,
-            DataType::TimestampTz => 8,
-            DataType::Tsvector => 64,
-            DataType::Tsquery => 32,
-            DataType::Varchar(_) => 32,
-        }
-    }
-}
-
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -327,7 +298,7 @@ impl Value {
     /// Returns the underlying `BYTEA` contents as a borrowed byte slice.
     ///
     /// This is a zero-copy accessor; it does not allocate.
-    #[allow(dead_code)] // value conversion API
+    #[allow(dead_code)] // framework: value conversion API
     pub fn as_bytea(&self) -> Result<&[u8]> {
         match self {
             Value::Bytes(bytes) => Ok(bytes),
@@ -338,7 +309,7 @@ impl Value {
     /// Returns the value as a `uuid::Uuid`.
     ///
     /// This is a cheap conversion (16 bytes); it does not allocate.
-    #[allow(dead_code)] // value conversion API
+    #[allow(dead_code)] // framework: value conversion API
     pub fn as_uuid(&self) -> Result<uuid::Uuid> {
         match self {
             Value::Uuid(bytes) => Ok(uuid::Uuid::from_bytes(*bytes)),

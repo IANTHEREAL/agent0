@@ -43,8 +43,6 @@ use crate::sql::analyzer::AnalyzedQuery;
 use crate::types::DataType;
 use anyhow::Result;
 
-pub(crate) use nodes::expr_has_aggregate;
-
 /// Builds a [`LogicalPlan`] from an [`AnalyzedQuery`].
 pub struct LogicalPlanner;
 

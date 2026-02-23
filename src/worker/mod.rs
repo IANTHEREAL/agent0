@@ -76,7 +76,6 @@ async fn ensure_system_keyspace(pd_endpoints: &[String], keyspace: &str) -> Resu
                 if !(status.is_success() || status.as_u16() == 409) {
                     let body = resp.text().await.unwrap_or_default();
                     if status.as_u16() == 500 || status.as_u16() == 503 {
-                        last_err = format!("POST status={}, body={}", status, body);
                         // Fall through to GET existence check for idempotent success.
                     } else {
                         return Err(anyhow::anyhow!(

@@ -1,8 +1,12 @@
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, ObjectName};
 
-use crate::sql::expr::bridge::eval_const_ast_expr;
 use crate::sql::names;
-use crate::types::{TableSchema, Value};
+use crate::types::TableSchema;
+
+#[cfg(test)]
+use crate::sql::expr::bridge::eval_const_ast_expr;
+#[cfg(test)]
+use crate::types::Value;
 
 /// Build a stable signature key for a table-valued function call in FROM.
 ///
@@ -71,63 +75,7 @@ pub(crate) fn infer_system_virtual_table_function_schema(
     crate::sql::catalog::virtual_tables::virtual_table_schema(canonical)
 }
 
-pub(crate) async fn infer_extension_table_function_schema(
-    search_path: &[String],
-    schema_opt: Option<&str>,
-    func_name: &str,
-    args: &[FunctionArg],
-    is_superuser: bool,
-) -> Option<TableSchema> {
-    let in_extensions_schema = match schema_opt {
-        Some(schema) => schema.eq_ignore_ascii_case(crate::extensions::EXTENSIONS_SCHEMA),
-        None => search_path
-            .iter()
-            .any(|s| s.eq_ignore_ascii_case(crate::extensions::EXTENSIONS_SCHEMA)),
-    };
-    if !in_extensions_schema {
-        return None;
-    }
-
-    if let Some(schema) = crate::extensions::http::table_function_schema(func_name) {
-        return Some(schema);
-    }
-
-    if func_name.eq_ignore_ascii_case("fs9") {
-        return infer_fs9_table_function_schema(args, is_superuser).await;
-    }
-
-    if func_name.eq_ignore_ascii_case("fs9_events") {
-        return crate::extensions::fs::table_function_schema("fs9_events");
-    }
-
-    #[cfg(feature = "parquet")]
-    if func_name.eq_ignore_ascii_case("read_parquet") {
-        use sqlparser::ast::FunctionArgExpr;
-
-        let url = args
-            .first()
-            .and_then(|a| match a {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                    crate::sql::expr::bridge::eval_const_ast_expr(e).ok()
-                }
-                _ => None,
-            })
-            .and_then(|v| match v {
-                Value::Text(s) => Some(s),
-                _ => None,
-            });
-        if let Some(url) = url {
-            match crate::extensions::parquet::reader::infer_schema(&url).await {
-                Ok(schema) => return Some(schema),
-                Err(_) => return None,
-            }
-        }
-        return None;
-    }
-
-    crate::extensions::fs::table_function_schema(func_name)
-}
-
+#[cfg(test)]
 fn try_parse_fs9_mode_from_args(args: &[FunctionArg]) -> Option<crate::extensions::fs::Fs9Mode> {
     if args.is_empty() {
         return None;
@@ -222,6 +170,7 @@ fn try_parse_fs9_mode_from_args(args: &[FunctionArg]) -> Option<crate::extension
     Some(mode)
 }
 
+#[cfg(test)]
 pub(crate) async fn infer_fs9_table_function_schema(
     args: &[FunctionArg],
     is_superuser: bool,

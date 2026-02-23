@@ -33,6 +33,7 @@ pub enum TaskType {
 
 impl TaskType {
     /// Convert TaskType to its bitmask value
+    #[allow(dead_code)] // forward-compat: bitmask API for task type serialization
     pub fn to_bitmask(self) -> u8 {
         match self {
             TaskType::Cron => TASK_TYPE_CRON,
@@ -44,6 +45,7 @@ impl TaskType {
     }
 
     /// Convert bitmask value to TaskType (returns first matching type)
+    #[allow(dead_code)] // forward-compat: bitmask API for task type serialization
     pub fn from_bitmask(mask: u8) -> Option<Self> {
         if mask & TASK_TYPE_CRON != 0 {
             Some(TaskType::Cron)
@@ -110,41 +112,49 @@ impl TaskRegistryEntry {
     }
 
     /// Set cron bit
+    #[allow(dead_code)] // forward-compat: symmetric bitmask API
     pub fn set_cron(&mut self) {
         self.task_types |= TASK_TYPE_CRON;
     }
 
     /// Clear cron bit
+    #[allow(dead_code)] // forward-compat: symmetric bitmask API
     pub fn clear_cron(&mut self) {
         self.task_types &= !TASK_TYPE_CRON;
     }
 
     /// Check if async_trigger bit is set
+    #[allow(dead_code)] // forward-compat: symmetric bitmask API
     pub fn has_async_trigger(&self) -> bool {
         self.task_types & TASK_TYPE_ASYNC_TRIGGER != 0
     }
 
     /// Set async_trigger bit
+    #[allow(dead_code)] // forward-compat: symmetric bitmask API
     pub fn set_async_trigger(&mut self) {
         self.task_types |= TASK_TYPE_ASYNC_TRIGGER;
     }
 
     /// Clear async_trigger bit
+    #[allow(dead_code)] // forward-compat: symmetric bitmask API
     pub fn clear_async_trigger(&mut self) {
         self.task_types &= !TASK_TYPE_ASYNC_TRIGGER;
     }
 
     /// Check if auto_analyze bit is set
+    #[allow(dead_code)] // forward-compat: symmetric bitmask API
     pub fn has_auto_analyze(&self) -> bool {
         self.task_types & TASK_TYPE_AUTO_ANALYZE != 0
     }
 
     /// Set auto_analyze bit
+    #[allow(dead_code)] // forward-compat: symmetric bitmask API
     pub fn set_auto_analyze(&mut self) {
         self.task_types |= TASK_TYPE_AUTO_ANALYZE;
     }
 
     /// Clear auto_analyze bit
+    #[allow(dead_code)] // forward-compat: symmetric bitmask API
     pub fn clear_auto_analyze(&mut self) {
         self.task_types &= !TASK_TYPE_AUTO_ANALYZE;
     }
@@ -155,31 +165,37 @@ impl TaskRegistryEntry {
     }
 
     /// Set bg_ddl bit
+    #[allow(dead_code)] // forward-compat: symmetric bitmask API
     pub fn set_bg_ddl(&mut self) {
         self.task_types |= TASK_TYPE_BG_DDL;
     }
 
     /// Clear bg_ddl bit
+    #[allow(dead_code)] // forward-compat: symmetric bitmask API
     pub fn clear_bg_ddl(&mut self) {
         self.task_types &= !TASK_TYPE_BG_DDL;
     }
 
     /// Check if bg_sql bit is set
+    #[allow(dead_code)] // forward-compat: symmetric bitmask API
     pub fn has_bg_sql(&self) -> bool {
         self.task_types & TASK_TYPE_BG_SQL != 0
     }
 
     /// Set bg_sql bit
+    #[allow(dead_code)] // forward-compat: symmetric bitmask API
     pub fn set_bg_sql(&mut self) {
         self.task_types |= TASK_TYPE_BG_SQL;
     }
 
     /// Clear bg_sql bit
+    #[allow(dead_code)] // forward-compat: symmetric bitmask API
     pub fn clear_bg_sql(&mut self) {
         self.task_types &= !TASK_TYPE_BG_SQL;
     }
 
     /// Check if any task type is registered
+    #[allow(dead_code)] // forward-compat: symmetric bitmask API
     pub fn is_empty(&self) -> bool {
         self.task_types == 0
     }

@@ -27,7 +27,7 @@ pub(crate) struct GinTokens {
 }
 
 impl GinTokens {
-    #[allow(dead_code)] // used in unit tests only
+    #[allow(dead_code)] // test: used in unit tests only
     pub(crate) fn iter_hashes(&self) -> impl Iterator<Item = u64> + '_ {
         self.key_values
             .iter()
@@ -39,7 +39,7 @@ impl GinTokens {
     ///
     /// For intersection-based scans, scanning key-value tokens first typically reduces
     /// the candidate set size earlier.
-    #[allow(dead_code)] // used in unit tests only
+    #[allow(dead_code)] // test: used in unit tests only
     pub(crate) fn into_scan_hashes(mut self) -> Vec<u64> {
         self.key_values.sort_unstable();
         self.key_values.dedup();

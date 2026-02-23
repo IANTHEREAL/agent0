@@ -1,11 +1,10 @@
 //! Index cost evaluation and utility functions
 //!
-//! Contains helpers for column reference extraction, expression normalization,
-//! cost estimation, and TypedExpr-to-SQL canonicalization used by index selection.
+//! Contains helpers for expression normalization, cost estimation, and
+//! TypedExpr-to-SQL canonicalization used by index selection.
 
 use sqlparser::ast::Expr;
 
-use crate::sql::names::normalize_ident;
 use crate::types::{IndexDef, TableSchema, Value};
 
 // ---- TypedExpr expression-index and partial-index support ----
@@ -184,86 +183,4 @@ pub(super) fn estimate_selectivity(index: &IndexDef, matched_cols: usize, full_m
     };
 
     base_selectivity.max(0.0001)
-}
-
-pub(super) fn eval_const_typed_expr(
-    expr: &crate::sql::analyzer::types::TypedExpr,
-) -> Option<Value> {
-    use crate::sql::analyzer::types::TypedExprKind;
-
-    match &expr.kind {
-        TypedExprKind::Constant(v) => Some(v.clone()),
-        _ => {
-            let qctx = crate::sql::query_context::QueryContext::from_task_locals();
-            let row = crate::types::Row::new(vec![]);
-            crate::sql::expr::typed_eval::eval_typed_expr(expr, &row, &qctx).ok()
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ColumnRef {
-    pub(super) qualifier: Option<String>,
-    pub(super) name: String,
-}
-
-pub(super) fn extract_column_ref(expr: &Expr) -> Option<ColumnRef> {
-    match expr {
-        Expr::Identifier(ident) => Some(ColumnRef {
-            qualifier: None,
-            name: normalize_ident(ident),
-        }),
-        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
-            let qualifier = parts
-                .get(parts.len().saturating_sub(2))
-                .map(normalize_ident);
-            let name = parts.last().map(normalize_ident)?;
-            Some(ColumnRef { qualifier, name })
-        }
-        Expr::Nested(inner) => extract_column_ref(inner),
-        _ => None,
-    }
-}
-
-pub(super) fn resolve_column_index(schema: &TableSchema, col: &ColumnRef) -> Option<usize> {
-    if let Some(qualifier) = col.qualifier.as_deref() {
-        let qualified = format!("{}.{}", qualifier, col.name);
-        if let Some(idx) = schema.column_index(&qualified) {
-            return Some(idx);
-        }
-        if let Some(idx) = schema
-            .columns
-            .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&qualified))
-        {
-            return Some(idx);
-        }
-    }
-
-    if let Some(idx) = schema.column_index(&col.name) {
-        return Some(idx);
-    }
-    if let Some(idx) = schema
-        .columns
-        .iter()
-        .position(|c| c.name.eq_ignore_ascii_case(&col.name))
-    {
-        return Some(idx);
-    }
-
-    let mut match_idx: Option<usize> = None;
-    for (idx, schema_col) in schema.columns.iter().enumerate() {
-        let unqualified = schema_col
-            .name
-            .rsplit('.')
-            .next()
-            .unwrap_or(&schema_col.name);
-        if unqualified.eq_ignore_ascii_case(&col.name) {
-            if match_idx.is_some() {
-                return None;
-            }
-            match_idx = Some(idx);
-        }
-    }
-    match_idx
 }

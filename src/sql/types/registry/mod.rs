@@ -18,7 +18,7 @@ pub enum ReturnType {
     Fixed(DataType),
     SameAsArg(usize),
     FirstNonNull,
-    #[allow(dead_code)] // type inference module
+    #[allow(dead_code)] // framework: type inference module
     NumericPromotion,
     Custom(fn(&[DataType]) -> DataType),
 }
@@ -95,7 +95,7 @@ impl FunctionRegistry {
         self.functions.insert(name.to_uppercase(), sig);
     }
 
-    #[allow(dead_code)] // type inference module
+    #[allow(dead_code)] // framework: type inference module
     pub fn get(&self, name: &str) -> Option<&FunctionSignature> {
         self.functions.get(&name.to_uppercase())
     }

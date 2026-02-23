@@ -35,7 +35,6 @@ mod hash_join;
 mod hash_semi_join;
 mod join;
 mod limit;
-mod planner;
 mod project;
 mod scan;
 mod set_operation;
@@ -115,12 +114,12 @@ pub trait PhysicalOperator: Send + Sync + Debug {
     /// - Call `close()` on child operators
     async fn close(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()>;
 
-    #[allow(dead_code)] // operator trait API for EXPLAIN support
+    #[allow(dead_code)] // framework: operator trait API for EXPLAIN support
     fn children(&self) -> Vec<&dyn PhysicalOperator> {
         vec![]
     }
 
-    #[allow(dead_code)] // operator trait API for EXPLAIN support
+    #[allow(dead_code)] // framework: operator trait API for EXPLAIN support
     fn children_mut(&mut self) -> Vec<&mut dyn PhysicalOperator> {
         vec![]
     }
@@ -130,10 +129,10 @@ pub trait PhysicalOperator: Send + Sync + Debug {
         None
     }
 
-    #[allow(dead_code)] // operator trait API for EXPLAIN support
+    #[allow(dead_code)] // framework: operator trait API for EXPLAIN support
     fn name(&self) -> &'static str;
 
-    #[allow(dead_code)] // operator trait API for EXPLAIN support
+    #[allow(dead_code)] // framework: operator trait API for EXPLAIN support
     fn explain_info(&self) -> Option<String> {
         None
     }

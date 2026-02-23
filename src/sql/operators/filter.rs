@@ -5,6 +5,7 @@ use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::expr::classify::needs_async;
 use crate::sql::expr::typed_eval::eval_typed_expr;
+#[cfg(test)]
 use crate::sql::query_context::QueryContext;
 use crate::types::{Row, TableSchema, Value};
 
@@ -24,6 +25,7 @@ impl FilterOperator {
         }
     }
 
+    #[cfg(test)]
     fn evaluate_predicate(&self, row: &Row, query_ctx: &QueryContext) -> Result<bool> {
         let result = eval_typed_expr(&self.predicate, row, query_ctx)?;
         match result {

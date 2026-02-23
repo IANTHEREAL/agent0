@@ -14,7 +14,7 @@ use crate::sql::analyzer::types::{
     AnalyzedDistinct, AnalyzedQuery, AnalyzedQueryBody, AnalyzedSelect,
 };
 #[cfg(test)]
-use crate::sql::optimizer::logical_planner::expr_has_aggregate;
+use crate::sql::optimizer::logical_planner::nodes::expr_has_aggregate;
 
 /// Check whether a query is eligible for the CBO optimizer pipeline.
 ///

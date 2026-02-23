@@ -400,7 +400,7 @@ fn stitch_disconnected_components(
     rels: &[BaseRelation],
     edges: &[JoinEdge],
     remaining: &[TypedExpr],
-    ctx: &PlanningContext,
+    _ctx: &PlanningContext,
     root_schema: &PlanSchema,
     n: usize,
 ) -> LogicalPlan {

@@ -18,6 +18,7 @@ pub struct TableScanOperator {
 }
 
 impl TableScanOperator {
+    #[cfg(test)]
     pub fn new(schema: TableSchema) -> Self {
         Self {
             schema,

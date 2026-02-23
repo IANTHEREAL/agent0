@@ -46,7 +46,7 @@ use tokio::sync::Mutex;
 /// Test-local struct mirroring the deleted type_infer::SourceSchema.
 /// Only used by wildcard tests; production code uses `&[&TableSchema]`.
 struct SourceSchema {
-    alias: String,
+    _alias: String,
     schema: TableSchema,
 }
 
@@ -1143,15 +1143,15 @@ fn test_infer_wildcard_multiway_natural_join_dedups_columns() {
     );
     let sources = vec![
         SourceSchema {
-            alias: "a".to_string(),
+            _alias: "a".to_string(),
             schema: schema_a,
         },
         SourceSchema {
-            alias: "b".to_string(),
+            _alias: "b".to_string(),
             schema: schema_b,
         },
         SourceSchema {
-            alias: "c".to_string(),
+            _alias: "c".to_string(),
             schema: schema_c,
         },
     ];
@@ -1198,15 +1198,15 @@ fn test_infer_wildcard_multiway_using_join_dedups_columns() {
     );
     let sources = vec![
         SourceSchema {
-            alias: "a".to_string(),
+            _alias: "a".to_string(),
             schema: schema_a,
         },
         SourceSchema {
-            alias: "b".to_string(),
+            _alias: "b".to_string(),
             schema: schema_b,
         },
         SourceSchema {
-            alias: "c".to_string(),
+            _alias: "c".to_string(),
             schema: schema_c,
         },
     ];
@@ -1233,11 +1233,11 @@ fn test_infer_wildcard_natural_join_common_cols_is_case_sensitive() {
     let schema_b = test_schema("b", vec![test_column("foo", DataType::Int32)]);
     let sources = vec![
         SourceSchema {
-            alias: "a".to_string(),
+            _alias: "a".to_string(),
             schema: schema_a,
         },
         SourceSchema {
-            alias: "b".to_string(),
+            _alias: "b".to_string(),
             schema: schema_b,
         },
     ];

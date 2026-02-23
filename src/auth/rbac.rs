@@ -80,7 +80,7 @@ pub enum PrivilegeObject {
     Global,
 }
 
-#[allow(dead_code)] // RBAC enforcement planned
+#[allow(dead_code)] // forward-compat: RBAC enforcement planned
 impl PrivilegeObject {
     pub fn table(name: &str) -> Self {
         PrivilegeObject::Table {
@@ -176,7 +176,7 @@ impl User {
             .retain(|p| !(&p.privilege == privilege && &p.object == object));
     }
 
-    #[allow(dead_code)] // RBAC enforcement planned
+    #[allow(dead_code)] // forward-compat: RBAC enforcement planned
     pub fn has_privilege(&self, privilege: &Privilege, object: &PrivilegeObject) -> bool {
         if self.is_superuser {
             return true;
@@ -249,7 +249,7 @@ pub struct Role {
 }
 
 impl Role {
-    #[allow(dead_code)] // RBAC enforcement planned
+    #[allow(dead_code)] // forward-compat: RBAC enforcement planned
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -403,7 +403,7 @@ impl AuthManager {
         }
     }
 
-    #[allow(dead_code)] // RBAC enforcement planned
+    #[allow(dead_code)] // forward-compat: RBAC enforcement planned
     pub async fn create_role(&self, txn: &mut Transaction, role: Role) -> Result<()> {
         let key = self.role_key(&role.name);
         if txn.get(key.clone()).await?.is_some() {

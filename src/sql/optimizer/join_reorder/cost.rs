@@ -177,8 +177,8 @@ fn estimate_join_rows_logical(
 
 /// Estimate output rows for a candidate join based on raw (root-level) equi predicates.
 pub(super) fn estimate_candidate_rows(
-    left_plan: &LogicalPlan,
-    right_plan: &LogicalPlan,
+    _left_plan: &LogicalPlan,
+    _right_plan: &LogicalPlan,
     left_rows: usize,
     right_rows: usize,
     equi_preds: &[TypedExpr],

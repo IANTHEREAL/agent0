@@ -213,6 +213,7 @@ pub(super) fn client_allows_message(client_min_messages: Option<&str>, severity:
     severity_rank >= min_rank
 }
 
+#[cfg(test)]
 async fn send_notices_and_get_last_response<C>(
     client: &mut C,
     client_min_messages: Option<String>,

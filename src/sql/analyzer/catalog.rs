@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone)]
 pub enum CatalogError {
     /// Catalog data is inconsistent or corrupted.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: catalog trait API
     Internal(String),
 }
 
@@ -42,7 +42,7 @@ pub trait Catalog: Send + Sync {
     ) -> Result<Option<(String, TableSchema)>, CatalogError>;
 
     /// Resolve a view by name, optionally schema-qualified.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: catalog trait API
     fn resolve_view(
         &self,
         name: &str,
@@ -58,7 +58,7 @@ pub trait Catalog: Send + Sync {
     ) -> Result<Option<FunctionDef>, CatalogError>;
 
     /// Resolve a user-defined type by name.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: catalog trait API
     fn resolve_type(
         &self,
         name: &str,
@@ -73,15 +73,12 @@ pub trait Catalog: Send + Sync {
     fn resolve_table_function(&self, key: &str) -> Option<&TableSchema>;
 
     /// The current search path (ordered list of schema names).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: catalog trait API
     fn search_path(&self) -> &[String];
 
     /// The current database ID (for scope isolation).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: catalog trait API
     fn database_id(&self) -> u64;
-
-    /// Check if a collation exists (built-in or user-defined).
-    fn collation_exists(&self, name: &str) -> bool;
 
     /// Get a collation definition by name.
     fn get_collation(&self, name: &str) -> Option<CollationDef>;
@@ -100,14 +97,14 @@ pub trait Catalog: Send + Sync {
 pub struct CatalogSnapshot {
     tables: HashMap<String, (String, TableSchema)>,
     table_functions: HashMap<String, TableSchema>,
-    #[allow(dead_code)] // FUTURE: view-aware Analyzer path
+    #[allow(dead_code)] // forward-compat: view-aware Analyzer path
     views: HashMap<String, ViewDef>,
     functions: HashMap<String, FunctionDef>,
-    #[allow(dead_code)] // FUTURE: user-defined type resolution
+    #[allow(dead_code)] // forward-compat: user-defined type resolution
     types: HashMap<String, UserTypeDef>,
     collations: HashMap<String, CollationDef>,
     search_path: Vec<String>,
-    #[allow(dead_code)] // FUTURE: cross-database query isolation
+    #[allow(dead_code)] // forward-compat: cross-database query isolation
     database_id: u64,
     /// Qualified names that are NOT base tables (CTEs, virtual catalog tables).
     /// Used by `base_table_full_names()` to exclude non-privileged entries.
@@ -142,19 +139,19 @@ impl CatalogSnapshot {
     }
 
     /// Add a view to the snapshot.
-    #[allow(dead_code)] // FUTURE: view-aware Analyzer path
+    #[allow(dead_code)] // forward-compat: view-aware Analyzer path
     pub fn add_view(&mut self, name: &str, view: ViewDef) {
         self.views.insert(name.to_lowercase(), view);
     }
 
     /// Add a user-defined function to the snapshot.
-    #[allow(dead_code)] // FUTURE: UDF prefetch
+    #[allow(dead_code)] // forward-compat: UDF prefetch
     pub fn add_function(&mut self, name: &str, func: FunctionDef) {
         self.functions.insert(name.to_lowercase(), func);
     }
 
     /// Add a user-defined type to the snapshot.
-    #[allow(dead_code)] // FUTURE: user-defined type resolution
+    #[allow(dead_code)] // forward-compat: user-defined type resolution
     pub fn add_type(&mut self, name: &str, udt: UserTypeDef) {
         self.types.insert(name.to_lowercase(), udt);
     }
@@ -318,16 +315,6 @@ impl Catalog for CatalogSnapshot {
         self.database_id
     }
 
-    fn collation_exists(&self, name: &str) -> bool {
-        let lower = name.to_lowercase();
-        // Built-in collations are always available
-        if matches!(lower.as_str(), "c" | "posix" | "default") {
-            return true;
-        }
-        // Check catalog snapshot
-        self.collations.contains_key(&lower)
-    }
-
     fn get_collation(&self, name: &str) -> Option<CollationDef> {
         let lower = name.to_lowercase();
         // Built-in collations
@@ -410,12 +397,6 @@ impl Catalog for NullCatalog {
         0
     }
 
-    fn collation_exists(&self, name: &str) -> bool {
-        // NullCatalog only knows built-in collations
-        let lower = name.to_lowercase();
-        matches!(lower.as_str(), "c" | "posix" | "default")
-    }
-
     fn get_collation(&self, _name: &str) -> Option<CollationDef> {
         None
     }
@@ -427,13 +408,13 @@ impl Catalog for NullCatalog {
 ///
 /// Build with `MockCatalog::builder()` to fluently add tables.
 // Test infrastructure -- will be wired up when analyzer tests expand.
-#[allow(dead_code)]
+#[allow(dead_code)] // test: mock catalog implementation
 #[derive(Debug, Clone)]
 pub struct MockCatalog {
     snapshot: CatalogSnapshot,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // test: mock catalog implementation
 impl MockCatalog {
     pub fn builder() -> MockCatalogBuilder {
         MockCatalogBuilder {
@@ -495,10 +476,6 @@ impl Catalog for MockCatalog {
         self.snapshot.database_id()
     }
 
-    fn collation_exists(&self, name: &str) -> bool {
-        self.snapshot.collation_exists(name)
-    }
-
     fn get_collation(&self, name: &str) -> Option<CollationDef> {
         self.snapshot.get_collation(name)
     }
@@ -506,12 +483,12 @@ impl Catalog for MockCatalog {
 
 /// Builder for `MockCatalog`.
 // Test infrastructure -- will be wired up when analyzer tests expand.
-#[allow(dead_code)]
+#[allow(dead_code)] // test: mock catalog implementation
 pub struct MockCatalogBuilder {
     snapshot: CatalogSnapshot,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // test: mock catalog implementation
 impl MockCatalogBuilder {
     /// Add a table with given columns: `(name, type, nullable)`.
     pub fn table(mut self, name: &str, columns: Vec<(&str, DataType, bool)>) -> Self {

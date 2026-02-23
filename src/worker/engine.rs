@@ -51,10 +51,6 @@ impl WorkerEngine {
         }
     }
 
-    pub fn metrics(&self) -> &Arc<WorkerMetrics> {
-        &self.metrics
-    }
-
     pub async fn run(&self) {
         info!(
             "WorkerEngine starting (poll_ms={}, max_concurrent={})",

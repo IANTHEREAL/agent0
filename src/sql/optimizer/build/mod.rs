@@ -61,13 +61,13 @@ impl BuildContext {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: optimizer build context field
     pub fn with_schema(mut self, name: String, schema: TableSchema) -> Self {
         self.table_schemas.insert(name, schema);
         self
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: optimizer build context field
     pub fn with_preloaded_rows(mut self, name: String, rows: Vec<Row>) -> Self {
         self.preloaded_rows.insert(name, rows);
         self

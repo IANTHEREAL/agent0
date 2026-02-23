@@ -75,7 +75,7 @@ enum NLJPhase {
 }
 
 impl NestedLoopJoinOperator {
-    #[allow(dead_code)] // operator framework: join path
+    #[allow(dead_code)] // framework: join path
     pub fn new(
         left: BoxedOperator,
         right: BoxedOperator,
@@ -145,7 +145,7 @@ impl NestedLoopJoinOperator {
         }
     }
 
-    #[allow(dead_code)] // planner wiring: correlated/LATERAL subquery joins
+    #[allow(dead_code)] // forward-compat: correlated/LATERAL subquery joins
     pub fn new_with_outer_dependency(
         left: BoxedOperator,
         right: BoxedOperator,
@@ -158,7 +158,7 @@ impl NestedLoopJoinOperator {
         op
     }
 
-    #[allow(dead_code)] // planner wiring: correlated/LATERAL subquery joins
+    #[allow(dead_code)] // forward-compat: correlated/LATERAL subquery joins
     pub fn with_outer_dependency(mut self, right_depends_on_outer: bool) -> Self {
         self.right_depends_on_outer = right_depends_on_outer;
         self

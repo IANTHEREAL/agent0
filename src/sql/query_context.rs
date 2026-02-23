@@ -33,7 +33,7 @@ pub struct QueryContext {
     /// TRANSACTION_TIMESTAMP() — stable within a transaction block;
     /// equals statement_timestamp_ms for implicit (autocommit) transactions
     pub transaction_timestamp_ms: i64,
-    #[allow(dead_code)] // set during init; read path uses session_context fallback
+    #[allow(dead_code)] // framework: set during init; read path uses session_context fallback
     pub timezone: Arc<str>,
     /// Bound parameter values from extended protocol (Execute).
     /// `None` entries represent SQL NULL. Empty vec for simple-query path.

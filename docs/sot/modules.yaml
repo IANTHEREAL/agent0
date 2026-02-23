@@ -74,7 +74,7 @@ modules:
       - path: src/sql/parser/mod.rs
         symbols: [parse_sql]
       - path: src/sql/planner/mod.rs
-        symbols: [choose_join_algorithm]
+        symbols: [ScanType]
       - path: src/sql/executor/core/mod.rs
         symbols: [Executor]
       - path: src/sql/expr/typed_eval/mod.rs

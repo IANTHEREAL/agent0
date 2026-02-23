@@ -193,7 +193,7 @@ pub(crate) fn eval_srf(
 pub struct ProjectOperator {
     child: BoxedOperator,
     expressions: Vec<TypedExpr>,
-    #[allow(dead_code)] // preserved for EXPLAIN output
+    #[allow(dead_code)] // framework: preserved for EXPLAIN output
     output_names: Vec<String>,
     output_schema: TableSchema,
     opened: bool,

@@ -24,7 +24,7 @@ pub struct ScopeColumn {
     /// Resolved data type.
     pub data_type: DataType,
     /// Whether the column is nullable.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // framework: scope resolution field
     pub nullable: bool,
     /// Whether this column is hidden from SELECT * expansion.
     /// Used for USING join columns: the right-side duplicate is hidden.
@@ -214,64 +214,6 @@ impl Scope {
         self.cte_schemas.get(&name.to_lowercase())
     }
 
-    /// Resolve an unqualified column name within this scope.
-    ///
-    /// Returns `None` if not found, `Err` if ambiguous.
-    pub fn resolve_unqualified(&self, name: &str) -> Result<Option<&ScopeColumn>, AnalyzerError> {
-        let lower = name.to_lowercase();
-        match self.column_index.get(&lower) {
-            None => Ok(None),
-            Some(positions) if positions.len() > 1 => {
-                let tables: Vec<String> = positions
-                    .iter()
-                    .filter_map(|&pos| self.columns[pos].table_alias.clone())
-                    .collect();
-                Err(AnalyzerError::AmbiguousColumn {
-                    name: name.to_string(),
-                    tables,
-                })
-            }
-            Some(positions) => Ok(Some(&self.columns[positions[0]])),
-        }
-    }
-
-    /// Resolve an unqualified column and return merged USING metadata when present.
-    pub fn resolve_unqualified_with_merge(
-        &self,
-        name: &str,
-    ) -> Result<Option<ResolvedColumnRef>, AnalyzerError> {
-        let lower = name.to_lowercase();
-        match self.column_index.get(&lower) {
-            None => Ok(None),
-            Some(positions) if positions.len() > 1 => {
-                let tables: Vec<String> = positions
-                    .iter()
-                    .filter_map(|&pos| self.columns[pos].table_alias.clone())
-                    .collect();
-                Err(AnalyzerError::AmbiguousColumn {
-                    name: name.to_string(),
-                    tables,
-                })
-            }
-            Some(positions) => {
-                let pos = positions[0];
-                let col = &self.columns[pos];
-                Ok(Some(ResolvedColumnRef {
-                    scope_depth: 0,
-                    column_index: col.column_index,
-                    column_name: col.column_name.clone(),
-                    data_type: self
-                        .using_merged_by_left
-                        .get(&col.column_index)
-                        .map(|m| m.data_type.clone())
-                        .unwrap_or_else(|| col.data_type.clone()),
-                    merged_using: self.using_merged_by_left.get(&col.column_index).cloned(),
-                    collation: col.collation.clone(),
-                }))
-            }
-        }
-    }
-
     /// Resolve an unqualified column with SQL identifier semantics.
     ///
     /// Quoted identifiers are exact-match; unquoted identifiers are normalized
@@ -318,14 +260,6 @@ impl Scope {
                 })
             }
         }
-    }
-
-    /// Resolve a qualified column reference (`table.column`).
-    pub fn resolve_qualified(&self, table: &str, column: &str) -> Option<&ScopeColumn> {
-        let key = (table.to_lowercase(), column.to_lowercase());
-        self.qualified_index
-            .get(&key)
-            .map(|&pos| &self.columns[pos])
     }
 
     /// Resolve a qualified column with SQL identifier semantics.
@@ -455,41 +389,6 @@ impl ScopeStack {
         self.scopes.last().expect("ScopeStack: no active scope")
     }
 
-    /// Resolve a column reference, searching from innermost to outermost scope.
-    ///
-    /// Returns the resolved column with its `scope_depth` (0 = current).
-    /// For correlated subqueries, depth > 0 means "outer reference".
-    pub fn resolve_column(&self, name: &str) -> Result<ResolvedColumnRef, AnalyzerError> {
-        for (i, scope) in self.scopes.iter().rev().enumerate() {
-            match scope.resolve_unqualified_with_merge(name)? {
-                Some(mut resolved) => {
-                    resolved.scope_depth = i as u32;
-                    return Ok(ResolvedColumnRef {
-                        scope_depth: resolved.scope_depth,
-                        column_index: resolved.column_index,
-                        column_name: resolved.column_name,
-                        data_type: resolved.data_type,
-                        merged_using: resolved.merged_using,
-                        collation: resolved.collation,
-                    });
-                }
-                None => continue,
-            }
-        }
-
-        // Not found in any scope
-        let available = if let Some(scope) = self.scopes.last() {
-            scope.available_columns()
-        } else {
-            vec![]
-        };
-
-        Err(AnalyzerError::ColumnNotFound {
-            name: name.to_string(),
-            available,
-        })
-    }
-
     /// Resolve a column reference with SQL identifier semantics.
     pub fn resolve_column_ident(&self, ident: &Ident) -> Result<ResolvedColumnRef, AnalyzerError> {
         for (i, scope) in self.scopes.iter().rev().enumerate() {
@@ -517,37 +416,6 @@ impl ScopeStack {
 
         Err(AnalyzerError::ColumnNotFound {
             name: ident.value.clone(),
-            available,
-        })
-    }
-
-    /// Resolve a qualified column reference (`table.column`).
-    pub fn resolve_qualified_column(
-        &self,
-        table: &str,
-        column: &str,
-    ) -> Result<ResolvedColumnRef, AnalyzerError> {
-        for (i, scope) in self.scopes.iter().rev().enumerate() {
-            if let Some(col) = scope.resolve_qualified(table, column) {
-                return Ok(ResolvedColumnRef {
-                    scope_depth: i as u32,
-                    column_index: col.column_index,
-                    column_name: col.column_name.clone(),
-                    data_type: col.data_type.clone(),
-                    merged_using: None,
-                    collation: col.collation.clone(),
-                });
-            }
-        }
-
-        let available = if let Some(scope) = self.scopes.last() {
-            scope.available_columns()
-        } else {
-            vec![]
-        };
-
-        Err(AnalyzerError::ColumnNotFound {
-            name: format!("{}.{}", table, column),
             available,
         })
     }
@@ -617,73 +485,113 @@ mod tests {
     }
 
     #[test]
-    fn single_table_resolution() {
+    fn single_table_ident_resolution() {
+        use sqlparser::ast::Ident;
+
         let mut scope = Scope::new();
         scope.add_table("users", &[int_col("id"), text_col("name")]);
 
-        let col = scope.resolve_unqualified("id").unwrap().unwrap();
-        assert_eq!(col.column_index, 0);
-        assert_eq!(col.data_type, DataType::Int32);
+        let resolved = scope
+            .resolve_unqualified_with_ident(&Ident::new("id"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.column_index, 0);
+        assert_eq!(resolved.data_type, DataType::Int32);
 
-        let col = scope.resolve_unqualified("name").unwrap().unwrap();
-        assert_eq!(col.column_index, 1);
-        assert_eq!(col.data_type, DataType::Text);
+        let resolved = scope
+            .resolve_unqualified_with_ident(&Ident::new("name"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.column_index, 1);
+        assert_eq!(resolved.data_type, DataType::Text);
 
-        assert!(scope.resolve_unqualified("nonexistent").unwrap().is_none());
+        assert!(scope
+            .resolve_unqualified_with_ident(&Ident::new("nonexistent"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
-    fn case_insensitive_resolution() {
+    fn case_insensitive_ident_resolution() {
+        use sqlparser::ast::Ident;
+
         let mut scope = Scope::new();
         scope.add_table("t", &[int_col("age")]);
 
-        assert!(scope.resolve_unqualified("age").unwrap().is_some());
-        assert!(scope.resolve_unqualified("AGE").unwrap().is_some());
-        assert!(scope.resolve_unqualified("Age").unwrap().is_some());
+        // Unquoted idents are case-insensitive
+        assert!(scope
+            .resolve_unqualified_with_ident(&Ident::new("age"))
+            .unwrap()
+            .is_some());
+        assert!(scope
+            .resolve_unqualified_with_ident(&Ident::new("AGE"))
+            .unwrap()
+            .is_some());
     }
 
     #[test]
-    fn ambiguous_column() {
+    fn ambiguous_ident_column() {
+        use sqlparser::ast::Ident;
+
         let mut scope = Scope::new();
         scope.add_table("a", &[int_col("id"), text_col("x")]);
         scope.add_table("b", &[int_col("id"), text_col("y")]);
 
-        let err = scope.resolve_unqualified("id").unwrap_err();
+        let err = scope
+            .resolve_unqualified_with_ident(&Ident::new("id"))
+            .unwrap_err();
         assert!(matches!(err, AnalyzerError::AmbiguousColumn { .. }));
 
         // Non-ambiguous columns still resolve
-        let col = scope.resolve_unqualified("x").unwrap().unwrap();
+        let col = scope
+            .resolve_unqualified_with_ident(&Ident::new("x"))
+            .unwrap()
+            .unwrap();
         assert_eq!(col.column_index, 1);
     }
 
     #[test]
-    fn qualified_resolution() {
+    fn qualified_ident_resolution() {
+        use sqlparser::ast::Ident;
+
         let mut scope = Scope::new();
         scope.add_table("a", &[int_col("id")]);
         scope.add_table("b", &[int_col("id")]);
 
-        let col = scope.resolve_qualified("a", "id").unwrap();
+        let col = scope
+            .resolve_qualified_idents(&Ident::new("a"), &Ident::new("id"))
+            .unwrap();
         assert_eq!(col.column_index, 0);
 
-        let col = scope.resolve_qualified("b", "id").unwrap();
+        let col = scope
+            .resolve_qualified_idents(&Ident::new("b"), &Ident::new("id"))
+            .unwrap();
         assert_eq!(col.column_index, 1);
 
-        assert!(scope.resolve_qualified("c", "id").is_none());
+        assert!(scope
+            .resolve_qualified_idents(&Ident::new("c"), &Ident::new("id"))
+            .is_none());
     }
 
     #[test]
     fn flattened_row_offsets() {
+        use sqlparser::ast::Ident;
+
         let mut scope = Scope::new();
         scope.add_table("a", &[int_col("x"), int_col("y")]);
         scope.add_table("b", &[int_col("z")]);
 
         // a.x=0, a.y=1, b.z=2
-        let col = scope.resolve_qualified("b", "z").unwrap();
+        let col = scope
+            .resolve_qualified_idents(&Ident::new("b"), &Ident::new("z"))
+            .unwrap();
         assert_eq!(col.column_index, 2);
     }
 
     #[test]
-    fn scope_stack_correlated_subquery() {
+    fn scope_stack_ident_correlated_subquery() {
+        use sqlparser::ast::Ident;
+
         let mut stack = ScopeStack::new();
 
         // Outer scope: users(id, name)
@@ -697,18 +605,17 @@ mod tests {
         stack.push(inner);
 
         // Resolve inner column → depth 0
-        let resolved = stack.resolve_column("order_id").unwrap();
+        let resolved = stack.resolve_column_ident(&Ident::new("order_id")).unwrap();
         assert_eq!(resolved.scope_depth, 0);
         assert_eq!(resolved.column_index, 0);
 
         // Resolve outer column → depth 1
-        let resolved = stack.resolve_column("name").unwrap();
+        let resolved = stack.resolve_column_ident(&Ident::new("name")).unwrap();
         assert_eq!(resolved.scope_depth, 1);
         assert_eq!(resolved.column_index, 1);
 
-        // Ambiguous across scopes: inner "id" doesn't exist, outer "id" does
-        // (no ambiguity because they're in different scopes)
-        let resolved = stack.resolve_column("id").unwrap();
+        // Resolve from outer scope when inner doesn't have it
+        let resolved = stack.resolve_column_ident(&Ident::new("id")).unwrap();
         assert_eq!(resolved.scope_depth, 1);
         assert_eq!(resolved.column_index, 0);
     }

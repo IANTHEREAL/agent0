@@ -24,35 +24,6 @@ impl TikvStore {
         Ok(())
     }
 
-    pub async fn get_trigger(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        table_full_name: &str,
-        trigger_name: &str,
-    ) -> Result<Option<TriggerDef>> {
-        let key = self.key(&encode_trigger_key_v2(db_id, table_full_name, trigger_name));
-        match txn.get(key).await? {
-            Some(data) => {
-                let mut def: TriggerDef = bincode::deserialize(&data)
-                    .context("Failed to deserialize trigger definition")?;
-                if def.oid == 0 {
-                    def.oid = self.next_trigger_oid(txn, db_id).await?;
-                    let data = bincode::serialize(&def)
-                        .context("Failed to serialize trigger definition")?;
-                    txn_put(
-                        txn,
-                        self.key(&encode_trigger_key_v2(db_id, table_full_name, trigger_name)),
-                        data,
-                    )
-                    .await?;
-                }
-                Ok(Some(def))
-            }
-            None => Ok(None),
-        }
-    }
-
     pub async fn list_triggers(
         &self,
         txn: &mut Transaction,

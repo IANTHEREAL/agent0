@@ -21,7 +21,7 @@ use crate::extensions::http::{self, HttpTableFunctionCall};
 /// Result of executing an extension table function.
 /// Streaming mode returns an operator that yields rows lazily.
 /// Batch mode returns all rows materialized in a Vec.
-#[allow(dead_code)]
+#[allow(dead_code)] // framework: extension registry
 pub(crate) enum ExtensionTableFunctionResult {
     Batch(TableSchema, Vec<Row>),
     Streaming(TableSchema, BoxedOperator),
