@@ -1,0 +1,113 @@
+//! COPY TO STDOUT response building.
+
+use super::super::super::errors::{error_info, user_error};
+use super::super::DynamicPgHandler;
+use crate::sql::ExecuteResult;
+use futures::{Sink, SinkExt};
+use pgwire::api::results::CopyResponse;
+use pgwire::api::ClientInfo;
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::PgWireBackendMessage;
+use std::fmt::Debug;
+
+impl DynamicPgHandler {
+    #[allow(clippy::result_large_err)]
+    fn copy_out_response_from_select_result(
+        result: ExecuteResult,
+    ) -> Result<(CopyResponse, Vec<String>, Vec<crate::types::Row>), ErrorInfo> {
+        match result {
+            ExecuteResult::Select { columns, rows, .. } => {
+                let col_count = columns.len();
+                let column_formats: Vec<i16> = vec![0; col_count];
+                Ok((
+                    CopyResponse::new(0, col_count, column_formats),
+                    columns,
+                    rows,
+                ))
+            }
+            ExecuteResult::SelectStream { .. } => Err(error_info(
+                "0A000",
+                "streaming result cannot be used in COPY context",
+            )),
+            _ => Err(error_info(
+                "0A000",
+                "COPY TO STDOUT is only supported for tables",
+            )),
+        }
+    }
+
+    pub(in crate::protocol::handler) async fn handle_copy_to_stdout<'a, C>(
+        &self,
+        client: &mut C,
+        table_name: &str,
+        columns: &[String],
+        copy_opts: &crate::protocol::copy_format::CopyOptions,
+    ) -> PgWireResult<Vec<pgwire::api::results::Response<'a>>>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let state = self.auth();
+        let executor = &state.executor;
+
+        let select_sql = if columns.is_empty() {
+            format!("SELECT * FROM {}", table_name)
+        } else {
+            format!("SELECT {} FROM {}", columns.join(", "), table_name)
+        };
+
+        let mut session = state.session.lock().await;
+
+        let result = executor
+            .execute(&mut session, &select_sql)
+            .await
+            .map(|r| r.last())
+            .map_err(|e| user_error("XX000", e.to_string()))?;
+
+        let (copy_resp, col_names, rows) = Self::copy_out_response_from_select_result(result)
+            .map_err(|e| PgWireError::UserError(Box::new(e)))?;
+
+        drop(session);
+
+        pgwire::api::copy::send_copy_out_response(client, copy_resp).await?;
+
+        let mut buf = Vec::with_capacity(4096);
+
+        // Emit HEADER row if requested, encoding through format-specific logic
+        // so column names containing delimiter/quote/newline are handled correctly.
+        if copy_opts.header {
+            let header_values: Vec<crate::types::Value> = col_names
+                .iter()
+                .map(|name| crate::types::Value::Text(name.clone()))
+                .collect();
+            crate::protocol::copy_format::encode_row_with_options(
+                &header_values,
+                &mut buf,
+                copy_opts,
+            )
+            .map_err(|e| user_error("XX000", e.to_string()))?;
+            let data = pgwire::messages::copy::CopyData::new(bytes::Bytes::copy_from_slice(&buf));
+            client.send(PgWireBackendMessage::CopyData(data)).await?;
+        }
+
+        for row in &rows {
+            buf.clear();
+            crate::protocol::copy_format::encode_row_with_options(&row.values, &mut buf, copy_opts)
+                .map_err(|e| user_error("XX000", e.to_string()))?;
+            let data = pgwire::messages::copy::CopyData::new(bytes::Bytes::copy_from_slice(&buf));
+            client.send(PgWireBackendMessage::CopyData(data)).await?;
+        }
+
+        let done = pgwire::messages::copy::CopyDone::new();
+        client.send(PgWireBackendMessage::CopyDone(done)).await?;
+
+        let complete =
+            pgwire::messages::response::CommandComplete::new(format!("COPY {}", rows.len()));
+        client
+            .send(PgWireBackendMessage::CommandComplete(complete))
+            .await?;
+
+        Ok(vec![])
+    }
+}
