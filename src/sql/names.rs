@@ -19,6 +19,18 @@ pub fn normalize_ident(ident: &Ident) -> String {
     }
 }
 
+/// Like [`normalize_ident`], but operates on a raw string slice.
+/// Quoted identifiers (`"Foo"`) preserve case; unquoted are lowercased.
+#[cfg_attr(not(feature = "parquet"), allow(dead_code))]
+pub(crate) fn normalize_ident_str(s: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() > 1 {
+        trimmed[1..trimmed.len() - 1].to_string()
+    } else {
+        trimmed.to_lowercase()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ResolvedName {
     pub(crate) schema: String,

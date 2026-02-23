@@ -143,8 +143,15 @@ impl CopyOptions {
 }
 
 /// Encode a row using the given options (supports text and CSV formats).
+///
+/// Returns an error if format is Parquet (which must be rejected at the
+/// handler layer before reaching this point).
 #[inline]
-pub fn encode_row_with_options(values: &[Value], buf: &mut Vec<u8>, opts: &CopyOptions) {
+pub fn encode_row_with_options(
+    values: &[Value],
+    buf: &mut Vec<u8>,
+    opts: &CopyOptions,
+) -> anyhow::Result<()> {
     match opts.format {
         CopyFormat::Text => {
             for (i, value) in values.iter().enumerate() {
@@ -166,9 +173,7 @@ pub fn encode_row_with_options(values: &[Value], buf: &mut Vec<u8>, opts: &CopyO
             buf.push(NEWLINE);
         }
         CopyFormat::Parquet => {
-            // Parquet COPY TO is rejected at the protocol handler layer before reaching here.
-            // If we somehow get here, it is an internal bug.
-            panic!("BUG: Parquet rows must not be encoded via text COPY path; COPY TO with FORMAT parquet should be rejected at the handler layer");
+            anyhow::bail!("Parquet rows cannot be encoded via the text COPY path; COPY TO with FORMAT parquet should be rejected at the handler layer");
         }
         CopyFormat::Csv => {
             for (i, value) in values.iter().enumerate() {
@@ -180,6 +185,7 @@ pub fn encode_row_with_options(values: &[Value], buf: &mut Vec<u8>, opts: &CopyO
             buf.push(NEWLINE);
         }
     }
+    Ok(())
 }
 
 /// Encode a single value in CSV format with quoting.
@@ -406,7 +412,7 @@ mod tests {
     #[test]
     fn test_encode_null() {
         let mut buf = Vec::new();
-        encode_row_with_options(&[Value::Null], &mut buf, &CopyOptions::default());
+        encode_row_with_options(&[Value::Null], &mut buf, &CopyOptions::default()).unwrap();
         assert_eq!(buf, b"\\N\n");
     }
 
@@ -421,7 +427,8 @@ mod tests {
             ],
             &mut buf,
             &CopyOptions::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(buf, b"42\tt\thello\n");
     }
 
@@ -432,7 +439,8 @@ mod tests {
             &[Value::Text("a\tb\nc\\d".to_string())],
             &mut buf,
             &CopyOptions::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(buf, b"a\\tb\\nc\\\\d\n");
     }
 
@@ -443,7 +451,8 @@ mod tests {
             &[Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef])],
             &mut buf,
             &CopyOptions::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(buf, b"\\\\xdeadbeef\n");
     }
 
@@ -458,7 +467,8 @@ mod tests {
             ])],
             &mut buf,
             &CopyOptions::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(buf, b"{1,2,NULL}\n");
     }
 
@@ -472,7 +482,8 @@ mod tests {
             ])],
             &mut buf,
             &CopyOptions::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(buf, b"{\"a\",\"b\\\"c\"}\n");
     }
 
@@ -483,7 +494,8 @@ mod tests {
             &[Value::Float64(f64::NAN)],
             &mut buf,
             &CopyOptions::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(buf, b"NaN\n");
 
         buf.clear();
@@ -491,7 +503,8 @@ mod tests {
             &[Value::Float64(f64::INFINITY)],
             &mut buf,
             &CopyOptions::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(buf, b"Infinity\n");
 
         buf.clear();
@@ -499,7 +512,8 @@ mod tests {
             &[Value::Float64(f64::NEG_INFINITY)],
             &mut buf,
             &CopyOptions::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(buf, b"-Infinity\n");
     }
 
@@ -522,7 +536,8 @@ mod tests {
             ],
             &mut buf,
             &opts,
-        );
+        )
+        .unwrap();
         assert_eq!(buf, b"1,hello,\n");
     }
 
@@ -544,7 +559,8 @@ mod tests {
             ],
             &mut buf,
             &opts,
-        );
+        )
+        .unwrap();
         // "a,b" is quoted because it contains comma; "c""d" has doubled quote
         assert_eq!(buf, b"\"a,b\",\"c\"\"d\"\n");
     }
@@ -564,7 +580,8 @@ mod tests {
             &[Value::Int32(1), Value::Int32(2), Value::Null],
             &mut buf,
             &opts,
-        );
+        )
+        .unwrap();
         assert_eq!(buf, b"1|2|\\N\n");
     }
 
@@ -579,7 +596,7 @@ mod tests {
             escape: b'"',
         };
         let mut buf = Vec::new();
-        encode_row_with_options(&[Value::Null, Value::Int32(1)], &mut buf, &opts);
+        encode_row_with_options(&[Value::Null, Value::Int32(1)], &mut buf, &opts).unwrap();
         assert_eq!(buf, b"NULL,1\n");
     }
 
@@ -724,7 +741,8 @@ mod tests {
             escape: b'"',
         };
         let mut buf = Vec::new();
-        encode_row_with_options(&[Value::Null, Value::Text(String::new())], &mut buf, &opts);
+        encode_row_with_options(&[Value::Null, Value::Text(String::new())], &mut buf, &opts)
+            .unwrap();
         // NULL=unquoted empty, empty string=quoted ""
         assert_eq!(buf, b",\"\"\n");
     }
@@ -745,7 +763,8 @@ mod tests {
             &[Value::Null, Value::Text("NULL".to_string())],
             &mut buf,
             &opts,
-        );
+        )
+        .unwrap();
         // NULL=unquoted NULL, literal "NULL"=quoted "NULL"
         assert_eq!(buf, b"NULL,\"NULL\"\n");
     }
@@ -762,7 +781,7 @@ mod tests {
             escape: b'"',
         };
         let mut buf = Vec::new();
-        encode_row_with_options(&[Value::Bytes(vec![0xde, 0xad])], &mut buf, &opts);
+        encode_row_with_options(&[Value::Bytes(vec![0xde, 0xad])], &mut buf, &opts).unwrap();
         assert_eq!(buf, b"\\xdead\n");
     }
 
@@ -780,7 +799,7 @@ mod tests {
             escape: b'"',
         };
         let mut buf = Vec::new();
-        encode_row_with_options(&[Value::Text("a|b".to_string())], &mut buf, &opts);
+        encode_row_with_options(&[Value::Text("a|b".to_string())], &mut buf, &opts).unwrap();
         assert_eq!(buf, b"a\\|b\n");
     }
 
@@ -800,7 +819,8 @@ mod tests {
             &[Value::Null, Value::Text("NULL".to_string())],
             &mut buf,
             &opts,
-        );
+        )
+        .unwrap();
         // NULL emits "NULL", literal "NULL" emits "\NULL" (escaped first char)
         assert_eq!(buf, b"NULL\t\\NULL\n");
     }
@@ -814,7 +834,8 @@ mod tests {
             &[Value::Null, Value::Text("\\N".to_string())],
             &mut buf,
             &opts,
-        );
+        )
+        .unwrap();
         // NULL emits \N, literal "\N" is escaped to \\N — no collision
         assert_eq!(buf, b"\\N\t\\\\N\n");
     }
@@ -879,7 +900,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         // Comma triggers quoting; backslash must be escaped.
-        encode_row_with_options(&[Value::Text("a\\b,c".to_string())], &mut buf, &opts);
+        encode_row_with_options(&[Value::Text("a\\b,c".to_string())], &mut buf, &opts).unwrap();
         assert_eq!(buf, b"\"a\\\\b,c\"\n");
     }
 
@@ -895,7 +916,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         // Contains both quote and escape characters, plus delimiter for quoting.
-        encode_row_with_options(&[Value::Text("a\"b\\c,d".to_string())], &mut buf, &opts);
+        encode_row_with_options(&[Value::Text("a\"b\\c,d".to_string())], &mut buf, &opts).unwrap();
         // quote escaped as \", backslash escaped as \\
         assert_eq!(buf, b"\"a\\\"b\\\\c,d\"\n");
     }
@@ -912,7 +933,7 @@ mod tests {
             escape: b'"',
         };
         let mut buf = Vec::new();
-        encode_row_with_options(&[Value::Text("a\"b,c".to_string())], &mut buf, &opts);
+        encode_row_with_options(&[Value::Text("a\"b,c".to_string())], &mut buf, &opts).unwrap();
         assert_eq!(buf, b"\"a\"\"b,c\"\n");
     }
 
@@ -923,7 +944,8 @@ mod tests {
             &[Value::Jsonb(r#"{"b":1,"a":2}"#.to_string())],
             &mut buf,
             &CopyOptions::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(buf, b"{\"a\": 2, \"b\": 1}\n");
     }
 
@@ -942,7 +964,8 @@ mod tests {
             &[Value::Jsonb(r#"{"b":1,"a":2}"#.to_string())],
             &mut buf,
             &opts,
-        );
+        )
+        .unwrap();
         // CSV quotes the value because it contains commas
         assert_eq!(buf, b"\"{\"\"a\"\": 2, \"\"b\"\": 1}\"\n");
     }
@@ -954,7 +977,8 @@ mod tests {
             &[Value::Json(r#"{"b":1,"a":2}"#.to_string())],
             &mut buf,
             &CopyOptions::default(),
-        );
+        )
+        .unwrap();
         // JSON preserves original format (no canonicalization)
         assert_eq!(buf, b"{\"b\":1,\"a\":2}\n");
     }
@@ -967,7 +991,8 @@ mod tests {
             &[Value::Vector(vec![1.0, 2.0, 3.0])],
             &mut buf,
             &CopyOptions::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(buf, b"[1,2,3]\n");
 
         buf.clear();
@@ -975,7 +1000,25 @@ mod tests {
             &[Value::Vector(vec![1.0, 2.5, 3.0])],
             &mut buf,
             &CopyOptions::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(buf, b"[1,2.5,3]\n");
+    }
+
+    #[test]
+    fn test_encode_parquet_format_returns_error() {
+        let mut buf = Vec::new();
+        let opts = CopyOptions {
+            format: CopyFormat::Parquet,
+            ..CopyOptions::default()
+        };
+        let result = encode_row_with_options(&[Value::Int32(1)], &mut buf, &opts);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Parquet"),
+            "error message should mention Parquet, got: {}",
+            msg
+        );
     }
 }

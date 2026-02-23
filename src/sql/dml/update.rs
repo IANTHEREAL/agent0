@@ -16,7 +16,9 @@ use crate::types::{Row, TableSchema, Value};
 use crate::worker::types::IndexState;
 
 use super::defaults::coerce_row_values;
-use super::foreign_keys::{handle_foreign_key_on_update, validate_foreign_keys, FkDeleteContext};
+use super::foreign_keys::{
+    handle_foreign_key_on_update, validate_foreign_keys, FkDeleteContext, FkStoreCtx,
+};
 use super::insert::validate_enum_values;
 use super::EnumLabelCache;
 
@@ -375,8 +377,15 @@ async fn execute_update_row_inner(
     }
 
     if propagate_fk_update {
+        let fk_store_ctx = FkStoreCtx { store, db_id };
         handle_foreign_key_on_update(
-            store, txn, db_id, table_name, schema, old_row, &new_row, fk_ctx,
+            &fk_store_ctx,
+            txn,
+            table_name,
+            schema,
+            old_row,
+            &new_row,
+            fk_ctx,
         )
         .await?;
     }

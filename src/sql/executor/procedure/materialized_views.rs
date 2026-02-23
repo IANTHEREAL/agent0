@@ -57,7 +57,14 @@ pub(super) fn parse_refresh_materialized_view_name(sql: &str) -> Result<ObjectNa
     Ok(name)
 }
 
-pub(super) fn parse_drop_materialized_view(sql: &str) -> Result<(Vec<ObjectName>, bool, bool)> {
+/// Parsed result of a `DROP MATERIALIZED VIEW` statement.
+pub(super) struct DropMaterializedViewParsed {
+    pub names: Vec<ObjectName>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+pub(super) fn parse_drop_materialized_view(sql: &str) -> Result<DropMaterializedViewParsed> {
     let tokens = tokenize_non_whitespace(sql)?;
     let mut i = 0usize;
 
@@ -118,7 +125,11 @@ pub(super) fn parse_drop_materialized_view(sql: &str) -> Result<(Vec<ObjectName>
         cascade = true;
     }
 
-    Ok((names, if_exists, cascade))
+    Ok(DropMaterializedViewParsed {
+        names,
+        if_exists,
+        cascade,
+    })
 }
 
 // ── Executor impl ───────────────────────────────────────────
@@ -422,7 +433,11 @@ impl Executor {
         session: &mut Session,
         sql: &str,
     ) -> Result<ExecuteResult> {
-        let (names, if_exists, cascade) = parse_drop_materialized_view(sql)?;
+        let DropMaterializedViewParsed {
+            names,
+            if_exists,
+            cascade,
+        } = parse_drop_materialized_view(sql)?;
 
         let is_autocommit = !session.is_in_transaction();
         if is_autocommit {

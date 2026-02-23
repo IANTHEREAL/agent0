@@ -19,6 +19,14 @@ use crate::sql::value_coercion::coerce_value_for_column;
 use super::insert::build_enum_label_cache;
 use super::update::{execute_update_row, execute_update_row_without_fk_update};
 
+/// Read-only context grouping the immutable store reference and database ID
+/// for FK operations. Keeps `txn: &mut Transaction` separate to avoid
+/// borrow-checker complications in recursive async functions.
+pub(crate) struct FkStoreCtx<'a> {
+    pub store: &'a Arc<TikvStore>,
+    pub db_id: u64,
+}
+
 fn short_relation_name(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
 }
@@ -392,9 +400,8 @@ pub async fn validate_foreign_keys(
 }
 
 pub async fn handle_foreign_key_on_delete(
-    store: &Arc<TikvStore>,
+    ctx: &FkStoreCtx<'_>,
     txn: &mut Transaction,
-    db_id: u64,
     table_name: &str,
     schema: &TableSchema,
     row: &Row,
@@ -410,9 +417,8 @@ pub async fn handle_foreign_key_on_delete(
     fk_ctx.mark_deleted_pk(table_name, &schema.get_pk_values(row));
 
     Box::pin(cascade_delete_recursive(
-        store,
+        ctx,
         txn,
-        db_id,
         table_name,
         row,
         schema,
@@ -424,9 +430,8 @@ pub async fn handle_foreign_key_on_delete(
 }
 
 async fn cascade_delete_recursive(
-    store: &Arc<TikvStore>,
+    ctx: &FkStoreCtx<'_>,
     txn: &mut Transaction,
-    db_id: u64,
     table_name: &str,
     parent_row: &Row,
     parent_schema: &TableSchema,
@@ -534,9 +539,8 @@ async fn cascade_delete_recursive(
                 fk_ctx.mark_deleted_pk(&other_table, &del_pk);
 
                 Box::pin(cascade_delete_recursive(
-                    store,
+                    ctx,
                     txn,
-                    db_id,
                     &other_table,
                     &del_row,
                     &other_schema,
@@ -547,9 +551,9 @@ async fn cascade_delete_recursive(
                 .await?;
 
                 super::delete::delete_row_storage_entries(
-                    store,
+                    ctx.store,
                     txn,
-                    db_id,
+                    ctx.db_id,
                     &other_table,
                     &other_schema,
                     &del_row,
@@ -561,7 +565,8 @@ async fn cascade_delete_recursive(
             }
 
             if !rows_to_update_pks.is_empty() {
-                let enum_cache = build_enum_label_cache(store, txn, db_id, &other_schema).await?;
+                let enum_cache =
+                    build_enum_label_cache(ctx.store, txn, ctx.db_id, &other_schema).await?;
                 for target_pk in rows_to_update_pks {
                     let Some(current_row) =
                         fk_ctx.find_row_in_snapshot(&other_table, &other_schema, &target_pk)
@@ -598,9 +603,9 @@ async fn cascade_delete_recursive(
                     let desired_row = Row::new(new_values);
 
                     let updated_row = execute_update_row(
-                        store,
+                        ctx.store,
                         txn,
-                        db_id,
+                        ctx.db_id,
                         &other_table,
                         &other_schema,
                         &current_row,
@@ -657,29 +662,26 @@ async fn cascade_delete_recursive(
 }
 
 pub async fn handle_foreign_key_on_update(
-    store: &Arc<TikvStore>,
+    ctx: &FkStoreCtx<'_>,
     txn: &mut Transaction,
-    db_id: u64,
     table_name: &str,
     schema: &TableSchema,
     old_row: &Row,
     new_row: &Row,
     fk_ctx: Option<&mut FkDeleteContext>,
 ) -> Result<()> {
-    if let Some(ctx) = fk_ctx {
+    if let Some(del_ctx) = fk_ctx {
         return handle_foreign_key_on_update_with_ctx(
-            store, txn, db_id, table_name, schema, old_row, new_row, ctx,
+            ctx, txn, table_name, schema, old_row, new_row, del_ctx,
         )
         .await;
     }
-    handle_foreign_key_on_update_no_ctx(store, txn, db_id, table_name, schema, old_row, new_row)
-        .await
+    handle_foreign_key_on_update_no_ctx(ctx, txn, table_name, schema, old_row, new_row).await
 }
 
 async fn handle_foreign_key_on_update_with_ctx(
-    store: &Arc<TikvStore>,
+    ctx: &FkStoreCtx<'_>,
     txn: &mut Transaction,
-    db_id: u64,
     table_name: &str,
     schema: &TableSchema,
     old_row: &Row,
@@ -742,13 +744,14 @@ async fn handle_foreign_key_on_update_with_ctx(
             };
 
             if enum_cache.is_none() {
-                enum_cache = Some(build_enum_label_cache(store, txn, db_id, &other_schema).await?);
+                enum_cache =
+                    Some(build_enum_label_cache(ctx.store, txn, ctx.db_id, &other_schema).await?);
             }
             let enum_cache = enum_cache.as_ref().expect("enum cache initialized");
             let updated_row = Box::pin(execute_update_row_without_fk_update(
-                store,
+                ctx.store,
                 txn,
-                db_id,
+                ctx.db_id,
                 &other_table,
                 &other_schema,
                 &old_child_row,
@@ -773,9 +776,8 @@ async fn handle_foreign_key_on_update_with_ctx(
 
         for (old_child_row, updated_row) in pending_propagations {
             Box::pin(handle_foreign_key_on_update(
-                store,
+                ctx,
                 txn,
-                db_id,
                 &other_table,
                 &other_schema,
                 &old_child_row,
@@ -786,10 +788,18 @@ async fn handle_foreign_key_on_update_with_ctx(
         }
 
         for pk in touched_pks {
-            if let Some(current_row) =
-                fetch_row_by_pk(store, txn, db_id, other_schema.table_id, &other_schema, pk).await?
+            if let Some(current_row) = fetch_row_by_pk(
+                ctx.store,
+                txn,
+                ctx.db_id,
+                other_schema.table_id,
+                &other_schema,
+                pk,
+            )
+            .await?
             {
-                validate_foreign_keys(store, txn, db_id, &other_schema, &current_row).await?;
+                validate_foreign_keys(ctx.store, txn, ctx.db_id, &other_schema, &current_row)
+                    .await?;
             }
         }
     }
@@ -798,19 +808,18 @@ async fn handle_foreign_key_on_update_with_ctx(
 }
 
 async fn handle_foreign_key_on_update_no_ctx(
-    store: &Arc<TikvStore>,
+    ctx: &FkStoreCtx<'_>,
     txn: &mut Transaction,
-    db_id: u64,
     table_name: &str,
     schema: &TableSchema,
     old_row: &Row,
     new_row: &Row,
 ) -> Result<()> {
-    let table_names = store.list_tables(txn, db_id).await?;
+    let table_names = ctx.store.list_tables(txn, ctx.db_id).await?;
     let short_parent = short_relation_name(table_name);
 
     for other_table in &table_names {
-        let other_schema = match store.get_schema(txn, db_id, other_table).await? {
+        let other_schema = match ctx.store.get_schema(txn, ctx.db_id, other_table).await? {
             Some(s) => s,
             None => continue,
         };
@@ -833,7 +842,7 @@ async fn handle_foreign_key_on_update_no_ctx(
         let mut touched_pk_keys: HashSet<String> = HashSet::new();
         let mut touched_pks: Vec<Vec<Value>> = Vec::new();
         loop {
-            let all_rows = store.scan(txn, db_id, other_table, None).await?;
+            let all_rows = ctx.store.scan(txn, ctx.db_id, other_table, None).await?;
             let mut target_update: Option<(Row, Row)> = None;
             for child_row in all_rows {
                 let Some(new_child_row) = build_merged_fk_update_row(
@@ -856,13 +865,14 @@ async fn handle_foreign_key_on_update_no_ctx(
             };
 
             if enum_cache.is_none() {
-                enum_cache = Some(build_enum_label_cache(store, txn, db_id, &other_schema).await?);
+                enum_cache =
+                    Some(build_enum_label_cache(ctx.store, txn, ctx.db_id, &other_schema).await?);
             }
             let enum_cache = enum_cache.as_ref().expect("enum cache initialized");
             let updated_row = Box::pin(execute_update_row_without_fk_update(
-                store,
+                ctx.store,
                 txn,
-                db_id,
+                ctx.db_id,
                 other_table,
                 &other_schema,
                 &old_child_row,
@@ -881,9 +891,8 @@ async fn handle_foreign_key_on_update_no_ctx(
 
         for (old_child_row, updated_row) in pending_propagations {
             Box::pin(handle_foreign_key_on_update(
-                store,
+                ctx,
                 txn,
-                db_id,
                 other_table,
                 &other_schema,
                 &old_child_row,
@@ -894,10 +903,18 @@ async fn handle_foreign_key_on_update_no_ctx(
         }
 
         for pk in touched_pks {
-            if let Some(current_row) =
-                fetch_row_by_pk(store, txn, db_id, other_schema.table_id, &other_schema, pk).await?
+            if let Some(current_row) = fetch_row_by_pk(
+                ctx.store,
+                txn,
+                ctx.db_id,
+                other_schema.table_id,
+                &other_schema,
+                pk,
+            )
+            .await?
             {
-                validate_foreign_keys(store, txn, db_id, &other_schema, &current_row).await?;
+                validate_foreign_keys(ctx.store, txn, ctx.db_id, &other_schema, &current_row)
+                    .await?;
             }
         }
     }

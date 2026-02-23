@@ -116,23 +116,19 @@ impl Executor {
 
         // Resolve table name via search_path.
         // Quoted identifiers preserve case; unquoted are lowercased (PostgreSQL rule).
-        let normalize_ident = |s: &str| -> String {
-            let trimmed = s.trim();
-            if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() > 1 {
-                trimmed[1..trimmed.len() - 1].to_string()
-            } else {
-                trimmed.to_lowercase()
-            }
-        };
+        use crate::sql::names::normalize_ident_str;
         let (schema_opt, table_ident) = if table_name.contains('.') {
             let parts: Vec<&str> = table_name.splitn(2, '.').collect();
             if parts.len() == 2 {
-                (Some(normalize_ident(parts[0])), normalize_ident(parts[1]))
+                (
+                    Some(normalize_ident_str(parts[0])),
+                    normalize_ident_str(parts[1]),
+                )
             } else {
-                (None, normalize_ident(table_name))
+                (None, normalize_ident_str(table_name))
             }
         } else {
-            (None, normalize_ident(table_name))
+            (None, normalize_ident_str(table_name))
         };
 
         // Open a batch stream from the Parquet file (row-group-at-a-time)

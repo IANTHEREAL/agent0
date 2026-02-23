@@ -72,3 +72,13 @@ pub(super) fn syntax_error_pgwire_error(message: String) -> PgWireError {
         message,
     )))
 }
+
+/// Build an `ErrorInfo` with severity "ERROR".
+pub(super) fn error_info(sqlstate: &str, message: impl Into<String>) -> ErrorInfo {
+    ErrorInfo::new("ERROR".to_string(), sqlstate.to_string(), message.into())
+}
+
+/// Build a `PgWireError::UserError` with severity "ERROR".
+pub(super) fn user_error(sqlstate: &str, message: impl Into<String>) -> PgWireError {
+    PgWireError::UserError(Box::new(error_info(sqlstate, message)))
+}

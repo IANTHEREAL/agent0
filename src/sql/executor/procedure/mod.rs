@@ -288,6 +288,7 @@ pub(super) fn parse_object_name(tokens: &[Token]) -> Result<(ObjectName, usize)>
 mod tests {
     use super::materialized_views::{
         parse_drop_materialized_view, parse_refresh_materialized_view_name,
+        DropMaterializedViewParsed,
     };
     use super::*;
 
@@ -302,8 +303,11 @@ mod tests {
 
     #[test]
     fn parse_drop_materialized_view_preserves_quoted_ident_case() {
-        let (names, if_exists, cascade) =
-            parse_drop_materialized_view(r#"DROP MATERIALIZED VIEW IF EXISTS "MyMV";"#).unwrap();
+        let DropMaterializedViewParsed {
+            names,
+            if_exists,
+            cascade,
+        } = parse_drop_materialized_view(r#"DROP MATERIALIZED VIEW IF EXISTS "MyMV";"#).unwrap();
         assert!(if_exists);
         assert!(!cascade);
         assert_eq!(names.len(), 1);
@@ -327,7 +331,11 @@ mod tests {
 
     #[test]
     fn parse_drop_materialized_view_supports_multiple_names() {
-        let (names, if_exists, _cascade) = parse_drop_materialized_view(
+        let DropMaterializedViewParsed {
+            names,
+            if_exists,
+            cascade: _cascade,
+        } = parse_drop_materialized_view(
             r#"DROP MATERIALIZED VIEW IF EXISTS public."MyMV", "Other";"#,
         )
         .unwrap();
@@ -343,8 +351,11 @@ mod tests {
 
     #[test]
     fn parse_drop_materialized_view_cascade() {
-        let (names, if_exists, cascade) =
-            parse_drop_materialized_view(r#"DROP MATERIALIZED VIEW mv1 CASCADE;"#).unwrap();
+        let DropMaterializedViewParsed {
+            names,
+            if_exists,
+            cascade,
+        } = parse_drop_materialized_view(r#"DROP MATERIALIZED VIEW mv1 CASCADE;"#).unwrap();
         assert!(!if_exists);
         assert!(cascade);
         assert_eq!(names.len(), 1);

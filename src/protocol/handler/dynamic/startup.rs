@@ -28,6 +28,12 @@ use super::super::{
     METADATA_AUTH_IS_SUPERUSER, METADATA_KEYSPACE,
 };
 
+/// Result of user authentication.
+pub(in crate::protocol::handler) struct AuthResult {
+    pub is_authenticated: bool,
+    pub is_superuser: bool,
+}
+
 impl DynamicPgHandler {
     pub(in crate::protocol::handler) async fn init_executor(
         &self,
@@ -171,7 +177,7 @@ impl DynamicPgHandler {
         keyspace: &Option<String>,
         username: &str,
         password: &str,
-    ) -> Result<(bool, bool), anyhow::Error> {
+    ) -> Result<AuthResult, anyhow::Error> {
         let effective_keyspace = keyspace
             .clone()
             .or_else(|| self.default_keyspace.clone())
@@ -191,7 +197,10 @@ impl DynamicPgHandler {
                     } else {
                         error!("Failed to connect to TiKV for tenant '{}': {}", ks_name, e);
                     }
-                    return Ok((false, false));
+                    return Ok(AuthResult {
+                        is_authenticated: false,
+                        is_superuser: false,
+                    });
                 }
             }
         } else {
@@ -200,7 +209,10 @@ impl DynamicPgHandler {
                 Ok(s) => Arc::new(s),
                 Err(e) => {
                     error!("Failed to connect to TiKV: {}", e);
-                    return Ok((false, false));
+                    return Ok(AuthResult {
+                        is_authenticated: false,
+                        is_superuser: false,
+                    });
                 }
             }
         };
@@ -225,11 +237,17 @@ impl DynamicPgHandler {
         {
             Ok(Some(user)) => {
                 txn.commit().await.context("Failed to commit")?;
-                Ok((true, user.is_superuser))
+                Ok(AuthResult {
+                    is_authenticated: true,
+                    is_superuser: user.is_superuser,
+                })
             }
             Ok(None) => {
                 txn.rollback().await.ok();
-                Ok((false, false))
+                Ok(AuthResult {
+                    is_authenticated: false,
+                    is_superuser: false,
+                })
             }
             Err(e) => {
                 txn.rollback().await.ok();
@@ -335,7 +353,10 @@ impl StartupHandler for DynamicPgHandler {
                     .await;
 
                 match auth_result {
-                    Ok((is_authenticated, is_superuser)) => {
+                    Ok(AuthResult {
+                        is_authenticated,
+                        is_superuser,
+                    }) => {
                         if is_authenticated {
                             self.init_executor(
                                 keyspace.clone(),
@@ -410,5 +431,44 @@ impl StartupHandler for DynamicPgHandler {
             _ => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuthResult;
+
+    #[test]
+    fn auth_result_authenticated_superuser() {
+        let r = AuthResult {
+            is_authenticated: true,
+            is_superuser: true,
+        };
+        assert!(r.is_authenticated);
+        assert!(r.is_superuser);
+    }
+
+    #[test]
+    fn auth_result_not_authenticated() {
+        let r = AuthResult {
+            is_authenticated: false,
+            is_superuser: false,
+        };
+        assert!(!r.is_authenticated);
+        assert!(!r.is_superuser);
+    }
+
+    #[test]
+    fn auth_result_destructure() {
+        let r = AuthResult {
+            is_authenticated: true,
+            is_superuser: false,
+        };
+        let AuthResult {
+            is_authenticated,
+            is_superuser,
+        } = r;
+        assert!(is_authenticated);
+        assert!(!is_superuser);
     }
 }

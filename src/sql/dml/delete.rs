@@ -12,7 +12,7 @@ use crate::storage::TikvStore;
 use crate::types::{Row, TableSchema};
 use crate::worker::types::IndexState;
 
-use super::foreign_keys::{handle_foreign_key_on_delete, FkDeleteContext};
+use super::foreign_keys::{handle_foreign_key_on_delete, FkDeleteContext, FkStoreCtx};
 
 pub async fn execute_delete_row(
     store: &Arc<TikvStore>,
@@ -24,10 +24,10 @@ pub async fn execute_delete_row(
     stmt_deleting_pks: &HashSet<String>,
     fk_ctx: &mut FkDeleteContext,
 ) -> Result<()> {
+    let fk_store_ctx = FkStoreCtx { store, db_id };
     handle_foreign_key_on_delete(
-        store,
+        &fk_store_ctx,
         txn,
-        db_id,
         table_name,
         schema,
         row,

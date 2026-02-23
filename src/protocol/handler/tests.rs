@@ -1549,6 +1549,71 @@ fn test_parse_copy_command_many_columns() {
     );
 }
 
+// --- Merged COPY regex edge-case tests ---
+
+#[test]
+fn test_parse_copy_command_extra_spaces_before_columns() {
+    // Extra whitespace between table name and column list.
+    let result = DynamicPgHandler::parse_copy_command("COPY  users   (id, name) FROM stdin");
+    assert!(result.is_some());
+    let (table, cols) = result.unwrap();
+    assert_eq!(table, "users");
+    assert_eq!(cols, vec!["id", "name"]);
+}
+
+#[test]
+fn test_parse_copy_command_no_space_before_parens() {
+    // No space between table name and opening paren.
+    let result = DynamicPgHandler::parse_copy_command("COPY users(id, name) FROM stdin");
+    assert!(result.is_some());
+    let (table, cols) = result.unwrap();
+    assert_eq!(table, "users");
+    assert_eq!(cols, vec!["id", "name"]);
+}
+
+#[test]
+fn test_parse_copy_command_schema_no_columns() {
+    // Schema-qualified table with no column list.
+    let result = DynamicPgHandler::parse_copy_command("COPY myschema.users FROM stdin");
+    assert_eq!(result, Some(("myschema.users".to_string(), vec![])));
+}
+
+#[test]
+fn test_parse_copy_command_schema_with_columns() {
+    // Schema-qualified table with column list.
+    let result = DynamicPgHandler::parse_copy_command("COPY myschema.users (id) FROM stdin");
+    assert!(result.is_some());
+    let (table, cols) = result.unwrap();
+    assert_eq!(table, "myschema.users");
+    assert_eq!(cols, vec!["id"]);
+}
+
+#[test]
+fn test_parse_copy_command_single_column() {
+    let result = DynamicPgHandler::parse_copy_command("COPY t (col) FROM stdin");
+    assert!(result.is_some());
+    let (table, cols) = result.unwrap();
+    assert_eq!(table, "t");
+    assert_eq!(cols, vec!["col"]);
+}
+
+#[test]
+fn test_parse_copy_command_trailing_options_ignored() {
+    // WITH (OPTIONS ...) after stdin — regex only captures up to "stdin",
+    // so trailing text doesn't prevent a match.
+    let result = DynamicPgHandler::parse_copy_command("COPY t (a, b) FROM stdin WITH (FORMAT csv)");
+    assert!(result.is_some());
+    let (table, cols) = result.unwrap();
+    assert_eq!(table, "t");
+    assert_eq!(cols, vec!["a", "b"]);
+}
+
+#[test]
+fn test_parse_copy_command_to_stdout_rejected() {
+    // COPY ... TO stdout should not match (only FROM stdin).
+    assert!(DynamicPgHandler::parse_copy_command("COPY users TO stdout").is_none());
+}
+
 #[test]
 fn test_count_sql_parameters_ignores_dollar_quoted_strings() {
     assert_eq!(count_sql_parameters("SELECT $$ $99 $$, $1;"), 1);

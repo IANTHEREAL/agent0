@@ -435,7 +435,14 @@ fn parse_create_function_sql(sql: &str) -> Result<(ObjectName, FunctionDef, bool
     Ok((name, def, or_replace))
 }
 
-fn parse_drop_function_sql(sql: &str) -> Result<(bool, bool, Vec<ObjectName>)> {
+/// Parsed result of a `DROP FUNCTION` statement.
+struct DropFunctionParsed {
+    if_exists: bool,
+    cascade: bool,
+    names: Vec<ObjectName>,
+}
+
+fn parse_drop_function_sql(sql: &str) -> Result<DropFunctionParsed> {
     let sql = strip_leading_sql_comments(sql).trim();
     let sql = sql.trim_end_matches(';').trim_end();
 
@@ -478,7 +485,11 @@ fn parse_drop_function_sql(sql: &str) -> Result<(bool, bool, Vec<ObjectName>)> {
         names.push(object_name_from_token(name_token)?);
     }
 
-    Ok((if_exists, cascade, names))
+    Ok(DropFunctionParsed {
+        if_exists,
+        cascade,
+        names,
+    })
 }
 
 fn parse_create_trigger_sql(
@@ -668,7 +679,11 @@ impl Executor {
         session: &mut Session,
         sql: &str,
     ) -> Result<ExecuteResult> {
-        let (if_exists, cascade, names) = parse_drop_function_sql(sql)?;
+        let DropFunctionParsed {
+            if_exists,
+            cascade,
+            names,
+        } = parse_drop_function_sql(sql)?;
 
         let is_autocommit = !session.is_in_transaction();
         if is_autocommit {
@@ -873,5 +888,47 @@ impl Executor {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_drop_function_basic() {
+        let result = parse_drop_function_sql("DROP FUNCTION my_func();").unwrap();
+        assert!(!result.if_exists);
+        assert!(!result.cascade);
+        assert_eq!(result.names.len(), 1);
+        assert_eq!(result.names[0].to_string(), "my_func");
+    }
+
+    #[test]
+    fn parse_drop_function_if_exists_cascade() {
+        let result = parse_drop_function_sql("DROP FUNCTION IF EXISTS my_func() CASCADE;").unwrap();
+        assert!(result.if_exists);
+        assert!(result.cascade);
+        assert_eq!(result.names.len(), 1);
+    }
+
+    #[test]
+    fn parse_drop_function_multiple_names() {
+        let result = parse_drop_function_sql("DROP FUNCTION func_a(), func_b();").unwrap();
+        assert_eq!(result.names.len(), 2);
+        assert_eq!(result.names[0].to_string(), "func_a");
+        assert_eq!(result.names[1].to_string(), "func_b");
+    }
+
+    #[test]
+    fn parse_drop_function_destructure() {
+        let DropFunctionParsed {
+            if_exists,
+            cascade,
+            names,
+        } = parse_drop_function_sql("DROP FUNCTION IF EXISTS f() CASCADE;").unwrap();
+        assert!(if_exists);
+        assert!(cascade);
+        assert_eq!(names.len(), 1);
     }
 }

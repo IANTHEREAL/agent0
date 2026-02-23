@@ -23,7 +23,9 @@ use std::fmt::Debug;
 use tracing::{error, warn};
 
 use super::super::copy::copy_row_column_mismatch_error;
-use super::super::errors::{in_failed_sql_transaction_pgwire_error, sqlstate_for_executor_error};
+use super::super::errors::{
+    error_info, in_failed_sql_transaction_pgwire_error, sqlstate_for_executor_error, user_error,
+};
 use super::super::query_parser::strip_leading_whitespace_and_comments;
 use super::super::rollback_autocommit_or_mark_failed;
 use crate::sql::Executor;
@@ -42,37 +44,27 @@ impl DynamicPgHandler {
             return None;
         }
 
-        // Regex: COPY [schema.]table_name (col1, col2, ...) FROM stdin
-        let re = regex::Regex::new(r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s*\(([^)]+)\)\s+FROM\s+stdin")
-            .ok()?;
-        if let Some(caps) = re.captures(query) {
-            let schema = caps.get(1).map(|m| m.as_str().to_string());
-            let table = caps.get(2)?.as_str().to_string();
-            let table_name = match schema {
-                Some(s) => format!("{}.{}", s, table),
-                None => table,
-            };
-            let columns_str = caps.get(3)?.as_str();
-            let columns: Vec<String> = columns_str
+        // Single regex: COPY [schema.]table_name [(col1, col2, ...)] FROM stdin
+        let re = regex::Regex::new(
+            r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s*(?:\(([^)]+)\)\s+|\s+)FROM\s+stdin",
+        )
+        .ok()?;
+        let caps = re.captures(query)?;
+        let schema = caps.get(1).map(|m| m.as_str().to_string());
+        let table = caps.get(2)?.as_str().to_string();
+        let table_name = match schema {
+            Some(s) => format!("{}.{}", s, table),
+            None => table,
+        };
+        let columns = match caps.get(3) {
+            Some(cols) => cols
+                .as_str()
                 .split(',')
                 .map(|s| s.trim().to_string())
-                .collect();
-            return Some((table_name, columns));
-        }
-
-        // Regex: COPY [schema.]table_name FROM stdin (no column list)
-        let re2 = regex::Regex::new(r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s+FROM\s+stdin").ok()?;
-        if let Some(caps) = re2.captures(query) {
-            let schema = caps.get(1).map(|m| m.as_str().to_string());
-            let table = caps.get(2)?.as_str().to_string();
-            let table_name = match schema {
-                Some(s) => format!("{}.{}", s, table),
-                None => table,
-            };
-            return Some((table_name, vec![]));
-        }
-
-        None
+                .collect(),
+            None => vec![],
+        };
+        Some((table_name, columns))
     }
 
     #[allow(clippy::result_large_err)]
@@ -87,10 +79,9 @@ impl DynamicPgHandler {
         ErrorInfo,
     > {
         fn unsupported_copy_to_stdout_syntax() -> ErrorInfo {
-            ErrorInfo::new(
-                "ERROR".to_string(),
-                "0A000".to_string(),
-                "Unsupported COPY TO STDOUT syntax. Supported: COPY [schema.]table [(col1, col2, ...)] TO STDOUT [WITH (options)]".to_string(),
+            error_info(
+                "0A000",
+                "Unsupported COPY TO STDOUT syntax. Supported: COPY [schema.]table [(col1, col2, ...)] TO STDOUT [WITH (options)]",
             )
         }
 
@@ -143,13 +134,12 @@ impl DynamicPgHandler {
         }
 
         let copy_opts = crate::protocol::copy_format::CopyOptions::from_copy_options(options)
-            .map_err(|e| ErrorInfo::new("ERROR".to_string(), "0A000".to_string(), e))?;
+            .map_err(|e| error_info("0A000", e))?;
 
         if copy_opts.format == crate::protocol::copy_format::CopyFormat::Parquet {
-            return Err(ErrorInfo::new(
-                "ERROR".to_string(),
-                "0A000".to_string(),
-                "COPY TO with FORMAT parquet is not supported".to_string(),
+            return Err(error_info(
+                "0A000",
+                "COPY TO with FORMAT parquet is not supported",
             ));
         }
 
@@ -172,9 +162,8 @@ impl DynamicPgHandler {
                 return Err(unsupported_copy_to_stdout_syntax());
             }
             if !is_valid_unquoted_ident(&ident.value) {
-                return Err(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "42602".to_string(),
+                return Err(error_info(
+                    "42602",
                     format!("Invalid identifier in COPY TO STDOUT: \"{}\"", ident.value),
                 ));
             }
@@ -212,15 +201,13 @@ impl DynamicPgHandler {
                     rows,
                 ))
             }
-            ExecuteResult::SelectStream { .. } => Err(ErrorInfo::new(
-                "ERROR".to_string(),
-                "0A000".to_string(),
-                "streaming result cannot be used in COPY context".to_string(),
+            ExecuteResult::SelectStream { .. } => Err(error_info(
+                "0A000",
+                "streaming result cannot be used in COPY context",
             )),
-            _ => Err(ErrorInfo::new(
-                "ERROR".to_string(),
-                "0A000".to_string(),
-                "COPY TO STDOUT is only supported for tables".to_string(),
+            _ => Err(error_info(
+                "0A000",
+                "COPY TO STDOUT is only supported for tables",
             )),
         }
     }
@@ -252,13 +239,7 @@ impl DynamicPgHandler {
             .execute(&mut session, &select_sql)
             .await
             .map(|r| r.last())
-            .map_err(|e| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "XX000".to_string(),
-                    e.to_string(),
-                )))
-            })?;
+            .map_err(|e| user_error("XX000", e.to_string()))?;
 
         let (copy_resp, col_names, rows) = Self::copy_out_response_from_select_result(result)
             .map_err(|e| PgWireError::UserError(Box::new(e)))?;
@@ -280,14 +261,16 @@ impl DynamicPgHandler {
                 &header_values,
                 &mut buf,
                 copy_opts,
-            );
+            )
+            .map_err(|e| user_error("XX000", e.to_string()))?;
             let data = pgwire::messages::copy::CopyData::new(bytes::Bytes::copy_from_slice(&buf));
             client.send(PgWireBackendMessage::CopyData(data)).await?;
         }
 
         for row in &rows {
             buf.clear();
-            crate::protocol::copy_format::encode_row_with_options(&row.values, &mut buf, copy_opts);
+            crate::protocol::copy_format::encode_row_with_options(&row.values, &mut buf, copy_opts)
+                .map_err(|e| user_error("XX000", e.to_string()))?;
             let data = pgwire::messages::copy::CopyData::new(bytes::Bytes::copy_from_slice(&buf));
             client.send(PgWireBackendMessage::CopyData(data)).await?;
         }
@@ -740,12 +723,10 @@ impl DynamicPgHandler {
                         columns,
                     } => {
                         if !columns.is_empty() {
-                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".to_string(),
-                                "0A000".to_string(),
-                                "COPY FROM with FORMAT parquet does not support column lists"
-                                    .to_string(),
-                            ))));
+                            return Err(user_error(
+                                "0A000",
+                                "COPY FROM with FORMAT parquet does not support column lists",
+                            ));
                         }
                         table_name.to_string()
                     }
@@ -757,11 +738,10 @@ impl DynamicPgHandler {
                     match opt {
                         sqlparser::ast::CopyOption::Format(_) => {} // already handled
                         other => {
-                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".to_string(),
-                                "0A000".to_string(),
+                            return Err(user_error(
+                                "0A000",
                                 format!("option {:?} is not supported with FORMAT parquet", other),
-                            ))));
+                            ));
                         }
                     }
                 }
@@ -779,11 +759,7 @@ impl DynamicPgHandler {
                         if ident.value.eq_ignore_ascii_case("parquet"))
                 });
                 if is_parquet {
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(),
-                        "0A000".to_string(),
-                        "Parquet format does not support STDIN".to_string(),
-                    ))));
+                    return Err(user_error("0A000", "Parquet format does not support STDIN"));
                 }
                 return Ok(None);
             }
@@ -800,49 +776,34 @@ impl DynamicPgHandler {
 
         let started_txn = !session.is_in_transaction();
         if started_txn {
-            session.begin().await.map_err(|e| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "XX000".to_string(),
-                    e.to_string(),
-                )))
-            })?;
+            session
+                .begin()
+                .await
+                .map_err(|e| user_error("XX000", e.to_string()))?;
         }
 
         let db_id = session.current_database_id();
 
         // Check extension is installed
         {
-            let txn = session.get_mut_txn().ok_or_else(|| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "XX000".to_string(),
-                    "No transaction".to_string(),
-                )))
-            })?;
+            let txn = session
+                .get_mut_txn()
+                .ok_or_else(|| user_error("XX000", "No transaction"))?;
             let installed = executor
                 .store()
                 .get_extension(txn, db_id, "parquet")
                 .await
-                .map_err(|e| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(),
-                        "XX000".to_string(),
-                        e.to_string(),
-                    )))
-                })?;
+                .map_err(|e| user_error("XX000", e.to_string()))?;
             match installed {
                 Some(ref ext) if ext.enabled => {}
                 _ => {
                     if started_txn {
                         let _ = session.rollback().await;
                     }
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(),
-                        "0A000".to_string(),
-                        "extension \"parquet\" is not installed. Run: CREATE EXTENSION parquet"
-                            .to_string(),
-                    ))));
+                    return Err(user_error(
+                        "0A000",
+                        "extension \"parquet\" is not installed. Run: CREATE EXTENSION parquet",
+                    ));
                 }
             }
         }
@@ -850,13 +811,9 @@ impl DynamicPgHandler {
         // Require INSERT privilege (same as COPY FROM STDIN)
         {
             let current_role = session.current_user().map(|s| s.to_string());
-            let txn = session.get_mut_txn().ok_or_else(|| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "XX000".to_string(),
-                    "No transaction".to_string(),
-                )))
-            })?;
+            let txn = session
+                .get_mut_txn()
+                .ok_or_else(|| user_error("XX000", "No transaction"))?;
             executor
                 .require_table_privilege(
                     txn,
@@ -865,13 +822,7 @@ impl DynamicPgHandler {
                     &table_name,
                 )
                 .await
-                .map_err(|e| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(),
-                        "42501".to_string(),
-                        e.to_string(),
-                    )))
-                })?;
+                .map_err(|e| user_error("42501", e.to_string()))?;
         }
 
         // Set up statement context (timestamps, connection_id, etc.) required by
@@ -900,22 +851,15 @@ impl DynamicPgHandler {
             } else {
                 session.mark_transaction_failed();
             }
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_string(),
-                "XX000".to_string(),
-                e.to_string(),
-            ))));
+            return Err(user_error("XX000", e.to_string()));
         }
         let result = result.unwrap();
 
         if started_txn {
-            session.commit().await.map_err(|e| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "XX000".to_string(),
-                    e.to_string(),
-                )))
-            })?;
+            session
+                .commit()
+                .await
+                .map_err(|e| user_error("XX000", e.to_string()))?;
         }
 
         Ok(Some(vec![pgwire::api::results::Response::Execution(
@@ -935,14 +879,13 @@ fn copy_missing_data_error(
     raw_line: &str,
 ) -> PgWireError {
     let table = copy_display_table_name(resolved_table);
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".to_string(),
-        "22P04".to_string(),
+    user_error(
+        "22P04",
         format!(
             "missing data for column \"{}\"\nCONTEXT:  COPY {}, line {}: \"{}\"",
             column_name, table, line_no, raw_line
         ),
-    )))
+    )
 }
 
 fn copy_value_parse_error(
@@ -953,14 +896,13 @@ fn copy_value_parse_error(
     err: &anyhow::Error,
 ) -> PgWireError {
     let table = copy_display_table_name(resolved_table);
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".to_string(),
-        sqlstate_for_executor_error(err).to_string(),
+    user_error(
+        sqlstate_for_executor_error(err),
         format!(
             "{}\nCONTEXT:  COPY {}, line {}, column {}: \"{}\"",
             err, table, line_no, column_name, raw_value
         ),
-    )))
+    )
 }
 
 fn parse_copy_text_line(
@@ -1114,11 +1056,7 @@ impl CopyHandler for DynamicPgHandler {
                                 } else {
                                     e.to_string()
                                 };
-                                PgWireError::UserError(Box::new(ErrorInfo::new(
-                                    "ERROR".to_string(),
-                                    sqlstate_for_executor_error(&e).to_string(),
-                                    message,
-                                )))
+                                user_error(sqlstate_for_executor_error(&e), message)
                             })?;
                     }
 
@@ -1204,11 +1142,7 @@ impl CopyHandler for DynamicPgHandler {
                                     } else {
                                         e.to_string()
                                     };
-                                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                                        "ERROR".to_string(),
-                                        sqlstate_for_executor_error(&e).to_string(),
-                                        message,
-                                    )))
+                                    user_error(sqlstate_for_executor_error(&e), message)
                                 })
                         })
                         .await;
@@ -1223,13 +1157,10 @@ impl CopyHandler for DynamicPgHandler {
                 }
 
                 if ctx.started_txn {
-                    session.commit().await.map_err(|e| {
-                        PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".to_string(),
-                            "XX000".to_string(),
-                            e.to_string(),
-                        )))
-                    })?;
+                    session
+                        .commit()
+                        .await
+                        .map_err(|e| user_error("XX000", e.to_string()))?;
                 }
 
                 Ok::<usize, PgWireError>(ctx.row_count)
@@ -1266,10 +1197,9 @@ impl CopyHandler for DynamicPgHandler {
 
         warn!("COPY failed: {}", fail.message);
 
-        PgWireError::UserError(Box::new(ErrorInfo::new(
-            "ERROR".to_owned(),
-            "XX000".to_owned(),
+        user_error(
+            "XX000",
             format!("COPY IN mode terminated: {}", fail.message),
-        )))
+        )
     }
 }
