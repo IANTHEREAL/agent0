@@ -1777,11 +1777,6 @@ async fn cmd_login(api: &ApiClient, output: &OutputFormat, api_key: Option<Strin
             process::exit(1);
         }
 
-        // Clear any anonymous credentials
-        if let Err(e) = clear_anonymous_credentials() {
-            eprintln!("Warning: failed to clear anonymous credentials: {e}");
-        }
-
         match output {
             OutputFormat::Json => {
                 let safe = serde_json::json!({
@@ -1822,10 +1817,9 @@ async fn cmd_login(api: &ApiClient, output: &OutputFormat, api_key: Option<Strin
         process::exit(1);
     }
 
-    // Real login replaces any anonymous session — clear leftover flags.
-    if let Err(e) = clear_anonymous_credentials() {
-        eprintln!("Warning: failed to clear anonymous credentials: {e}");
-    }
+    // NOTE: Do NOT clear anonymous credentials here. They are needed by
+    // `db9 claim` to detect that the current session was anonymous.
+    // Anonymous credentials are cleared only after a successful claim or on logout.
 
     match output {
         OutputFormat::Json => {
@@ -1900,9 +1894,6 @@ async fn cmd_login_sso(api: &ApiClient, output: &OutputFormat, no_browser: bool)
                     if let Err(e) = save_token(token) {
                         eprintln!("{e}");
                         process::exit(1);
-                    }
-                    if let Err(e) = clear_anonymous_credentials() {
-                        eprintln!("Warning: failed to clear anonymous credentials: {e}");
                     }
 
                     match output {
