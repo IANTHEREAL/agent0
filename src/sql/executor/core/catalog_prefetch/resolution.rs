@@ -540,6 +540,33 @@ pub(super) async fn prefetch_table_function_schemas(
                 snapshot.add_table_function(&call.key, schema);
                 continue;
             }
+
+            #[cfg(feature = "parquet")]
+            if func_lower == "read_parquet" {
+                let installed = store.get_extension(txn, db_id, "parquet").await?;
+                let Some(installed) = installed else {
+                    continue;
+                };
+                if !installed.enabled {
+                    continue;
+                }
+                let url = match call.args.first() {
+                    Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => expr_to_text(e),
+                    _ => None,
+                };
+                let Some(url) = url else {
+                    continue;
+                };
+                match crate::extensions::parquet::reader::infer_schema(&url).await {
+                    Ok(schema) => {
+                        snapshot.add_table_function(&call.key, schema);
+                    }
+                    Err(e) => {
+                        tracing::warn!("read_parquet schema inference failed for {url}: {e}");
+                    }
+                }
+                continue;
+            }
         }
 
         // User-defined table functions: support RETURNS SETOF <table>.

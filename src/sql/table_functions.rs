@@ -100,6 +100,31 @@ pub(crate) async fn infer_extension_table_function_schema(
         return crate::extensions::fs::table_function_schema("fs9_events");
     }
 
+    #[cfg(feature = "parquet")]
+    if func_name.eq_ignore_ascii_case("read_parquet") {
+        use sqlparser::ast::FunctionArgExpr;
+
+        let url = args
+            .first()
+            .and_then(|a| match a {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                    crate::sql::expr::bridge::eval_const_ast_expr(e).ok()
+                }
+                _ => None,
+            })
+            .and_then(|v| match v {
+                Value::Text(s) => Some(s),
+                _ => None,
+            });
+        if let Some(url) = url {
+            match crate::extensions::parquet::reader::infer_schema(&url).await {
+                Ok(schema) => return Some(schema),
+                Err(_) => return None,
+            }
+        }
+        return None;
+    }
+
     crate::extensions::fs::table_function_schema(func_name)
 }
 
