@@ -63,6 +63,117 @@ fn pick_drop_index_target(
     Ok(None)
 }
 
+/// T10: Detect `SELECT * FROM read_parquet('url')` and return SelectStream directly,
+/// bypassing full CBO materialization. Only matches the exact simple pattern.
+#[cfg(feature = "parquet")]
+async fn try_streaming_ctas_for_read_parquet(
+    store: &std::sync::Arc<crate::storage::TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    query: &Query,
+) -> Result<Option<ExecuteResult>> {
+    use sqlparser::ast::{
+        FunctionArg, FunctionArgExpr, SelectItem, SetExpr, TableFactor, Value as AstValue,
+    };
+
+    // Match: SELECT * FROM read_parquet('url') with no WHERE/GROUP/HAVING/ORDER/LIMIT
+    let select = match query.body.as_ref() {
+        SetExpr::Select(s) => s,
+        _ => return Ok(None),
+    };
+    if !query.order_by.is_empty()
+        || query.limit.is_some()
+        || query.offset.is_some()
+        || select.selection.is_some()
+        || select.having.is_some()
+        || select.distinct.is_some()
+    {
+        return Ok(None);
+    }
+    // Check group_by is empty
+    match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs) => {
+            if !exprs.is_empty() {
+                return Ok(None);
+            }
+        }
+        _ => return Ok(None),
+    }
+    // Must be SELECT * (single wildcard projection)
+    if select.projection.len() != 1 {
+        return Ok(None);
+    }
+    if !matches!(&select.projection[0], SelectItem::Wildcard(_)) {
+        return Ok(None);
+    }
+    // Must have exactly one FROM table, which is a table function named read_parquet
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return Ok(None);
+    }
+    let (func_name, func_args) = match &select.from[0].relation {
+        TableFactor::Table {
+            name,
+            args: Some(tfa),
+            ..
+        } => (name.to_string(), tfa.as_slice()),
+        _ => return Ok(None),
+    };
+    if !func_name.eq_ignore_ascii_case("read_parquet") {
+        return Ok(None);
+    }
+
+    // Extract URL from first argument
+    let url = match func_args.first() {
+        Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(sqlparser::ast::Expr::Value(
+            AstValue::SingleQuotedString(s),
+        )))) => s.clone(),
+        _ => return Ok(None),
+    };
+
+    // Verify parquet extension is installed
+    let installed = store.get_extension(txn, db_id, "parquet").await?;
+    match installed {
+        Some(ext) if ext.enabled => {}
+        _ => {
+            return Err(anyhow!(
+                "extension parquet is not installed. Run: CREATE EXTENSION parquet"
+            ));
+        }
+    }
+
+    // Acquire per-tenant concurrency permit -- held across stream consumption
+    let tenant =
+        crate::extensions::context::tenant_keyspace().unwrap_or_else(|| "default".to_string());
+    let _permit = crate::extensions::parquet::limits::acquire_import_permit(&tenant)?;
+
+    tracing::info!("CTAS streaming path activated for read_parquet('{}')", url);
+
+    // Open streaming row reader
+    let (schema, row_stream) = crate::extensions::parquet::reader::open_row_stream(&url)
+        .await
+        .map_err(|e| anyhow!("Failed to open Parquet file for CTAS: {}", e))?;
+
+    let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    let column_types: Vec<crate::types::DataType> =
+        schema.columns.iter().map(|c| c.data_type.clone()).collect();
+
+    use futures::StreamExt;
+    let mapped_stream = row_stream.map(move |values_result| {
+        let _ = &_permit; // keep permit alive across stream consumption
+        values_result.map(|values| crate::types::Row::new(values))
+    });
+
+    let boxed: futures::stream::BoxStream<'static, anyhow::Result<crate::types::Row>> =
+        Box::pin(mapped_stream);
+
+    Ok(Some(ExecuteResult::SelectStream {
+        columns,
+        column_types,
+        stream: crate::sql::result::RowStream(boxed),
+        timezone: std::sync::Arc::from("UTC"),
+    }))
+}
+
 impl Executor {
     pub(crate) async fn execute_create_table_as(
         &self,
@@ -87,6 +198,34 @@ impl Executor {
         }
         let table_name = resolved.full;
 
+        // T10: Detect simple `SELECT * FROM read_parquet('url')` and use streaming CTAS
+        #[cfg(feature = "parquet")]
+        if let Some(stream_result) =
+            try_streaming_ctas_for_read_parquet(&self.store(), txn, db_id, query).await?
+        {
+            return match stream_result {
+                ExecuteResult::SelectStream {
+                    columns: cols,
+                    column_types,
+                    stream,
+                    ..
+                } => {
+                    ddl::create_table_from_stream(
+                        &self.store(),
+                        txn,
+                        db_id,
+                        &table_name,
+                        if_not_exists,
+                        cols,
+                        column_types,
+                        stream,
+                    )
+                    .await
+                }
+                _ => unreachable!(),
+            };
+        }
+
         let ctes = self
             .build_cte_context(
                 txn,
@@ -109,26 +248,44 @@ impl Executor {
             )
             .await?;
 
-        let (result_cols, result_rows) = match result {
+        match result {
             ExecuteResult::Select {
                 columns: cols,
                 rows,
                 ..
-            } => (cols, rows),
-            _ => return Err(anyhow!("CREATE TABLE AS requires a SELECT query")),
-        };
-
-        ddl::create_table_from_query_result(
-            &self.store(),
-            txn,
-            db_id,
-            &table_name,
-            if_not_exists,
-            result_cols,
-            result_rows,
-            columns,
-        )
-        .await
+            } => {
+                ddl::create_table_from_query_result(
+                    &self.store(),
+                    txn,
+                    db_id,
+                    &table_name,
+                    if_not_exists,
+                    cols,
+                    rows,
+                    columns,
+                )
+                .await
+            }
+            ExecuteResult::SelectStream {
+                columns: cols,
+                column_types,
+                stream,
+                ..
+            } => {
+                ddl::create_table_from_stream(
+                    &self.store(),
+                    txn,
+                    db_id,
+                    &table_name,
+                    if_not_exists,
+                    cols,
+                    column_types,
+                    stream,
+                )
+                .await
+            }
+            _ => Err(anyhow!("CREATE TABLE AS requires a SELECT query")),
+        }
     }
 
     pub(crate) async fn create_table_from_result(
@@ -149,24 +306,42 @@ impl Executor {
         }
         let table_name = resolved.full;
 
-        let (result_cols, result_rows) = match result {
+        match result {
             ExecuteResult::Select {
                 columns: cols,
                 rows,
                 ..
-            } => (cols, rows),
-            _ => return Err(anyhow!("SELECT INTO requires a SELECT query")),
-        };
-
-        ddl::create_table_from_select_into(
-            &self.store(),
-            txn,
-            db_id,
-            &table_name,
-            result_cols,
-            result_rows,
-        )
-        .await
+            } => {
+                ddl::create_table_from_select_into(
+                    &self.store(),
+                    txn,
+                    db_id,
+                    &table_name,
+                    cols,
+                    rows,
+                )
+                .await
+            }
+            ExecuteResult::SelectStream {
+                columns: cols,
+                column_types,
+                stream,
+                ..
+            } => {
+                ddl::create_table_from_stream(
+                    &self.store(),
+                    txn,
+                    db_id,
+                    &table_name,
+                    false,
+                    cols,
+                    column_types,
+                    stream,
+                )
+                .await
+            }
+            _ => Err(anyhow!("SELECT INTO requires a SELECT query")),
+        }
     }
 
     pub(crate) async fn execute_create_index(
