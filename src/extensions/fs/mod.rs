@@ -198,6 +198,18 @@ pub(crate) async fn infer_table_function_schema(
                     Ok(decoded.schema)
                 }
                 "jsonl" | "ndjson" => Ok(decoders::decode_jsonl(&data, path, 0).schema),
+                #[cfg(feature = "parquet")]
+                "parquet" => {
+                    let data = backend.read_file(path, crate::extensions::parquet::fs9_reader::MAX_FS9_PARQUET_FILE_BYTES).await?;
+                    let reader = crate::extensions::parquet::fs9_reader::Fs9ParquetReader::new(bytes::Bytes::from(data));
+                    let schema = crate::extensions::parquet::reader::infer_schema_from_reader(reader).await
+                        .map_err(|e| anyhow!("fs9: parquet schema inference error: {e}"))?;
+                    Ok(schema)
+                }
+                #[cfg(not(feature = "parquet"))]
+                "parquet" => {
+                    Err(anyhow!("fs9: parquet format requires the parquet extension (compile with --features parquet)"))
+                }
                 _ => Ok(decoders::decode_raw_text(&data, path, 0).schema),
             }
         }
@@ -296,6 +308,24 @@ pub(crate) async fn execute_table_function(
                 "jsonl" | "ndjson" => {
                     let decoded = decoders::decode_jsonl(&data, &path, usize::MAX);
                     Ok((decoded.schema, decoded.rows))
+                }
+                #[cfg(feature = "parquet")]
+                "parquet" => {
+                    let data = backend.read_file(&path, crate::extensions::parquet::fs9_reader::MAX_FS9_PARQUET_FILE_BYTES).await?;
+                    let reader = crate::extensions::parquet::fs9_reader::Fs9ParquetReader::new(bytes::Bytes::from(data));
+                    let (parquet_schema, row_stream) = crate::extensions::parquet::reader::open_row_stream_from_reader(reader, 8192).await
+                        .map_err(|e| anyhow!("fs9: parquet decode error: {e}"))?;
+                    let mut rows = Vec::new();
+                    futures::pin_mut!(row_stream);
+                    while let Some(values) = futures::StreamExt::next(&mut row_stream).await {
+                        let values = values.map_err(|e| anyhow!("fs9: parquet row error: {e}"))?;
+                        rows.push(crate::types::Row::new(values));
+                    }
+                    Ok((parquet_schema, rows))
+                }
+                #[cfg(not(feature = "parquet"))]
+                "parquet" => {
+                    Err(anyhow!("fs9: parquet format requires the parquet extension (compile with --features parquet)"))
                 }
                 _ => {
                     let decoded = decoders::decode_raw_text(&data, &path, usize::MAX);
@@ -523,6 +553,44 @@ pub(crate) async fn start_file_stream(
                 }
             });
             (schema, rx)
+        }
+        #[cfg(feature = "parquet")]
+        "parquet" => {
+            let data = backend
+                .read_file(
+                    path,
+                    crate::extensions::parquet::fs9_reader::MAX_FS9_PARQUET_FILE_BYTES,
+                )
+                .await?;
+            let reader = crate::extensions::parquet::fs9_reader::Fs9ParquetReader::new(
+                bytes::Bytes::from(data),
+            );
+            let (parquet_schema, row_stream) =
+                crate::extensions::parquet::reader::open_row_stream_from_reader(reader, 8192)
+                    .await
+                    .map_err(|e| anyhow!("fs9: parquet stream error: {e}"))?;
+            let (tx, rx) = mpsc::channel(256);
+            tokio::spawn(async move {
+                futures::pin_mut!(row_stream);
+                while let Some(values) = futures::StreamExt::next(&mut row_stream).await {
+                    match values {
+                        Ok(vals) => {
+                            if tx.send(crate::types::Row::new(vals)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!("fs9: parquet streaming error: {}", err);
+                            break;
+                        }
+                    }
+                }
+            });
+            (parquet_schema, rx)
+        }
+        #[cfg(not(feature = "parquet"))]
+        "parquet" => {
+            return Err(anyhow!("fs9: parquet format requires the parquet extension (compile with --features parquet)"));
         }
         _ => {
             let mut decoder = streaming::StreamingTextDecoder::new(reader, path.to_string());

@@ -20,6 +20,9 @@ pub(crate) fn detect_format(path: &str, explicit_format: Option<&str>) -> &'stat
         if fmt.eq_ignore_ascii_case("jsonl") || fmt.eq_ignore_ascii_case("ndjson") {
             return "jsonl";
         }
+        if fmt.eq_ignore_ascii_case("parquet") {
+            return "parquet";
+        }
         return "text";
     }
 
@@ -29,6 +32,7 @@ pub(crate) fn detect_format(path: &str, explicit_format: Option<&str>) -> &'stat
         Some(ext) if ext.eq_ignore_ascii_case("jsonl") || ext.eq_ignore_ascii_case("ndjson") => {
             "jsonl"
         }
+        Some(ext) if ext.eq_ignore_ascii_case("parquet") => "parquet",
         _ => "text",
     }
 }
@@ -309,6 +313,15 @@ mod tests {
     fn test_detect_format_explicit_override() {
         assert_eq!(detect_format("file.txt", Some("csv")), "csv");
         assert_eq!(detect_format("file.csv", Some("jsonl")), "jsonl");
+    }
+
+    #[test]
+    fn test_detect_parquet_format() {
+        assert_eq!(detect_format("data.parquet", None), "parquet");
+        assert_eq!(detect_format("DATA.PARQUET", None), "parquet");
+        assert_eq!(detect_format("data.Parquet", None), "parquet");
+        assert_eq!(detect_format("data.parquet", Some("csv")), "csv"); // explicit format overrides
+        assert_eq!(detect_format("data.csv", Some("parquet")), "parquet"); // explicit parquet
     }
 
     #[test]
