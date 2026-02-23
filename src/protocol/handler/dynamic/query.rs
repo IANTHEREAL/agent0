@@ -216,6 +216,16 @@ impl SimpleQueryHandler for DynamicPgHandler {
 
         let executor = self.get_executor()?;
 
+        #[cfg(feature = "parquet")]
+        if let Some(result) = self.try_handle_copy_from_fs9(client, query).await? {
+            return Ok(result);
+        }
+
+        #[cfg(feature = "parquet")]
+        if let Some(result) = self.try_handle_copy_from_parquet(client, query).await? {
+            return Ok(result);
+        }
+
         match DynamicPgHandler::parse_copy_to_command(query) {
             Ok(Some((table_name, columns, copy_opts))) => {
                 debug!(

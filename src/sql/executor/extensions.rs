@@ -21,6 +21,7 @@ use crate::extensions::http::{self, HttpTableFunctionCall};
 /// Result of executing an extension table function.
 /// Streaming mode returns an operator that yields rows lazily.
 /// Batch mode returns all rows materialized in a Vec.
+#[allow(dead_code)]
 pub(crate) enum ExtensionTableFunctionResult {
     Batch(TableSchema, Vec<Row>),
     Streaming(TableSchema, BoxedOperator),
@@ -570,6 +571,40 @@ impl Executor {
             )
             .await?;
             apply_table_function_alias(&mut schema, alias)?;
+            return Ok(Some(ExtensionTableFunctionResult::Batch(schema, rows)));
+        }
+
+        #[cfg(feature = "parquet")]
+        if func_name.eq_ignore_ascii_case("read_parquet") {
+            let installed = self.store().get_extension(txn, db_id, "parquet").await?;
+            match installed {
+                Some(ext) if ext.enabled => {}
+                _ => {
+                    return Err(anyhow!(
+                        "extension \"parquet\" is not installed. Run: CREATE EXTENSION parquet"
+                    ));
+                }
+            }
+            let url_arg = args.first().ok_or_else(|| {
+                anyhow!("read_parquet() requires exactly 1 argument: read_parquet('url')")
+            })?;
+            let url_expr = extract_expr_arg(url_arg)?;
+            let url = expect_text(eval_const_ast_expr(url_expr)?, "url")?;
+            let (mut schema, stream) =
+                crate::extensions::parquet::reader::open_row_stream(&url).await?;
+            apply_table_function_alias(&mut schema, alias)?;
+            use futures::TryStreamExt;
+            let mut rows: Vec<Row> = Vec::new();
+            futures::pin_mut!(stream);
+            while let Some(values) = stream.try_next().await? {
+                rows.push(Row::new(values));
+            }
+            if rows.len() > 1_000_000 {
+                tracing::warn!(
+                    "read_parquet() materialized {} rows in memory. For large files, use COPY FROM ... WITH (FORMAT parquet) instead.",
+                    rows.len()
+                );
+            }
             return Ok(Some(ExtensionTableFunctionResult::Batch(schema, rows)));
         }
 

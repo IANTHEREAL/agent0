@@ -7,11 +7,22 @@ const TAB: u8 = b'\t';
 const NEWLINE: u8 = b'\n';
 const BACKSLASH: u8 = b'\\';
 
-/// COPY format (text or CSV).
+/// COPY format (text, CSV, or Parquet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyFormat {
     Text,
     Csv,
+    Parquet,
+}
+
+impl std::fmt::Display for CopyFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CopyFormat::Text => write!(f, "text"),
+            CopyFormat::Csv => write!(f, "csv"),
+            CopyFormat::Parquet => write!(f, "parquet"),
+        }
+    }
 }
 
 /// Parsed COPY options (FORMAT, DELIMITER, NULL, HEADER, QUOTE, ESCAPE).
@@ -50,6 +61,8 @@ impl CopyOptions {
         // FORMAT CSV defaults don't override them regardless of option order.
         let mut delimiter_set = false;
         let mut null_string_set = false;
+        let mut quote_set = false;
+        let mut escape_set = false;
         for opt in options {
             match opt {
                 CopyOption::Format(ident) => {
@@ -58,6 +71,9 @@ impl CopyOptions {
                         "TEXT" => {} // default, nothing to change
                         "CSV" => {
                             opts.format = CopyFormat::Csv;
+                        }
+                        "PARQUET" => {
+                            opts.format = CopyFormat::Parquet;
                         }
                         "BINARY" => {
                             return Err("COPY FORMAT binary is not supported".to_string());
@@ -92,6 +108,7 @@ impl CopyOptions {
                         ));
                     }
                     opts.quote = *c as u8;
+                    quote_set = true;
                 }
                 CopyOption::Escape(c) => {
                     if !c.is_ascii() {
@@ -101,9 +118,16 @@ impl CopyOptions {
                         ));
                     }
                     opts.escape = *c as u8;
+                    escape_set = true;
                 }
                 _ => {} // Ignore FREEZE, FORCE_QUOTE, etc.
             }
+        }
+        if opts.format == CopyFormat::Parquet && (delimiter_set || quote_set || escape_set) {
+            return Err(
+                "COPY with FORMAT parquet does not support DELIMITER, QUOTE, or ESCAPE options"
+                    .to_string(),
+            );
         }
         // Apply CSV defaults only for options not explicitly set by the user.
         if opts.format == CopyFormat::Csv {
@@ -140,6 +164,11 @@ pub fn encode_row_with_options(values: &[Value], buf: &mut Vec<u8>, opts: &CopyO
                 }
             }
             buf.push(NEWLINE);
+        }
+        CopyFormat::Parquet => {
+            // Parquet COPY TO is rejected at the protocol handler layer before reaching here.
+            // If we somehow get here, it is an internal bug.
+            panic!("BUG: Parquet rows must not be encoded via text COPY path; COPY TO with FORMAT parquet should be rejected at the handler layer");
         }
         CopyFormat::Csv => {
             for (i, value) in values.iter().enumerate() {
@@ -584,9 +613,53 @@ mod tests {
 
     #[test]
     fn test_format_unknown_rejected() {
-        let opts = CopyOptions::from_copy_options(&[CopyOption::Format(Ident::new("parquet"))]);
+        let opts = CopyOptions::from_copy_options(&[CopyOption::Format(Ident::new("avro"))]);
         assert!(opts.is_err());
         assert!(opts.unwrap_err().contains("unrecognized COPY FORMAT"));
+    }
+
+    #[test]
+    fn test_format_parquet_accepted() {
+        let opts = CopyOptions::from_copy_options(&[CopyOption::Format(Ident::new("parquet"))]);
+        assert!(opts.is_ok());
+        assert_eq!(opts.unwrap().format, CopyFormat::Parquet);
+    }
+
+    #[test]
+    fn test_format_parquet_rejects_delimiter() {
+        let opts = CopyOptions::from_copy_options(&[
+            CopyOption::Format(Ident::new("parquet")),
+            CopyOption::Delimiter(','),
+        ]);
+        assert!(opts.is_err());
+        assert!(opts.unwrap_err().contains("does not support DELIMITER"));
+    }
+
+    #[test]
+    fn test_format_parquet_rejects_quote() {
+        let opts = CopyOptions::from_copy_options(&[
+            CopyOption::Format(Ident::new("parquet")),
+            CopyOption::Quote('"'),
+        ]);
+        assert!(opts.is_err());
+        assert!(opts.unwrap_err().contains("does not support DELIMITER"));
+    }
+
+    #[test]
+    fn test_format_parquet_rejects_escape() {
+        let opts = CopyOptions::from_copy_options(&[
+            CopyOption::Format(Ident::new("parquet")),
+            CopyOption::Escape('\\'),
+        ]);
+        assert!(opts.is_err());
+        assert!(opts.unwrap_err().contains("does not support DELIMITER"));
+    }
+
+    #[test]
+    fn test_format_parquet_display() {
+        assert_eq!(CopyFormat::Parquet.to_string(), "parquet");
+        assert_eq!(CopyFormat::Text.to_string(), "text");
+        assert_eq!(CopyFormat::Csv.to_string(), "csv");
     }
 
     #[test]

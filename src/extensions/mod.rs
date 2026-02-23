@@ -6,6 +6,8 @@
 pub(crate) mod context;
 pub(crate) mod fs;
 pub(crate) mod http;
+#[cfg(feature = "parquet")]
+pub(crate) mod parquet;
 
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -96,6 +98,13 @@ const PG_CRON_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
     default_schema: "cron",
 };
 
+const PARQUET_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
+    name: "parquet",
+    oid: 2005,
+    version: "0.1.0",
+    default_schema: EXTENSIONS_SCHEMA,
+};
+
 /// Lookup an extension descriptor by name (case-insensitive).
 pub fn descriptor(name: &str) -> Option<&'static ExtensionDescriptor> {
     if name.eq_ignore_ascii_case(HTTP_EXTENSION.name) {
@@ -112,6 +121,9 @@ pub fn descriptor(name: &str) -> Option<&'static ExtensionDescriptor> {
     }
     if name.eq_ignore_ascii_case(PG_CRON_EXTENSION.name) {
         return Some(&PG_CRON_EXTENSION);
+    }
+    if name.eq_ignore_ascii_case(PARQUET_EXTENSION.name) {
+        return Some(&PARQUET_EXTENSION);
     }
     None
 }
@@ -156,5 +168,13 @@ mod tests {
         assert_eq!(desc.name, "pg_cron");
         assert_eq!(desc.default_schema, "cron");
         assert_eq!(desc.oid, 2004);
+    }
+
+    #[test]
+    fn descriptor_parquet_is_registered() {
+        let desc = descriptor("parquet").expect("parquet must be registered");
+        assert_eq!(desc.name, "parquet");
+        assert_eq!(desc.default_schema, "extensions");
+        assert_eq!(desc.oid, 2005);
     }
 }

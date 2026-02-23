@@ -39,3 +39,6 @@ data/
 # Environment
 .env
 .env.local
+
+# Generated test data
+tests/parquet_testdata/
