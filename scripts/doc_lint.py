@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,6 +93,65 @@ def _repo_path_exists(path_str: str) -> bool:
     if path.is_absolute():
         return path.exists()
     return (PROJECT_DIR / path).exists()
+
+
+_RUST_SYMBOL_KEYWORDS: tuple[str, ...] = ("fn", "struct", "enum", "trait", "const", "type", "mod", "macro_rules!")
+_PYTHON_SYMBOL_KEYWORDS: tuple[str, ...] = ("def", "class")
+
+
+def _build_symbol_pattern(path_str: str) -> re.Pattern[str] | None:
+    if path_str.endswith(".rs"):
+        keywords = _RUST_SYMBOL_KEYWORDS
+    elif path_str.endswith(".py"):
+        keywords = _PYTHON_SYMBOL_KEYWORDS
+    else:
+        return None
+    alternatives = "|".join(re.escape(kw) for kw in keywords)
+    return re.compile(rf"\b(?:{alternatives})\s+(\w+)")
+
+
+def _file_defines_symbol(source_text: str, symbol: str, pattern: re.Pattern[str]) -> bool:
+    for match in pattern.finditer(source_text):
+        if match.group(1) == symbol:
+            return True
+    return False
+
+
+def _check_entrypoint_symbols(
+    linter: DocLinter,
+    ep_path: str,
+    symbols: list[Any],
+    module_ref: str,
+    ep_idx: int,
+    source_cache: dict[str, str | None],
+) -> None:
+    pattern = _build_symbol_pattern(ep_path)
+    if pattern is None:
+        return
+
+    if ep_path not in source_cache:
+        full_path = Path(ep_path)
+        if not full_path.is_absolute():
+            full_path = PROJECT_DIR / full_path
+        try:
+            source_cache[ep_path] = _read_text(full_path)
+        except (FileNotFoundError, OSError):
+            source_cache[ep_path] = None
+
+    source_text = source_cache[ep_path]
+    if source_text is None:
+        return
+
+    for sym in symbols:
+        if not _is_nonempty_str(sym):
+            linter.error(
+                f"{MODULES_YAML_PATH}: {module_ref}: code_entrypoints[{ep_idx}].symbols contains non-string entry: {sym!r}"
+            )
+            continue
+        if not _file_defines_symbol(source_text, sym, pattern):
+            linter.error(
+                f"{MODULES_YAML_PATH}: {module_ref}: symbol `{sym}` not found in {ep_path}"
+            )
 
 
 def _validate_module_required_fields(linter: DocLinter, module: dict[str, Any], module_ref: str) -> None:
@@ -290,6 +350,7 @@ def main(argv: list[str]) -> int:
 
     module_ids: list[str] = []
     seen_module_ids: set[str] = set()
+    source_cache: dict[str, str | None] = {}
 
     for idx, module in enumerate(modules):
         module_ref = f"modules[{idx}]"
@@ -323,6 +384,10 @@ def main(argv: list[str]) -> int:
                     continue
                 if not _repo_path_exists(ep_path):
                     linter.error(f"{args.modules}: {module_ref}: code_entrypoints[{ep_idx}].path does not exist: {ep_path}")
+                    continue
+                symbols = entry.get("symbols")
+                if isinstance(symbols, list) and symbols:
+                    _check_entrypoint_symbols(linter, ep_path, symbols, module_ref, ep_idx, source_cache)
 
         if _is_nonempty_str(doc_path):
             _check_sot_doc(linter, Path(doc_path), module_ref)

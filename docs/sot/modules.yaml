@@ -77,8 +77,8 @@ modules:
         symbols: [choose_join_algorithm]
       - path: src/sql/executor/core/mod.rs
         symbols: [Executor]
-      - path: src/sql/expr/mod.rs
-        symbols: [eval_expr, eval_join_expr]
+      - path: src/sql/expr/typed_eval/mod.rs
+        symbols: [eval_typed_expr]
       - path: src/sql/triggers/mod.rs
       - path: src/sql/triggers/cache.rs
       - path: src/sql/triggers/before.rs
@@ -135,7 +135,6 @@ modules:
         symbols: [TikvClientPool]
       - path: src/txn/mod.rs
       - path: src/main.rs
-        symbols: [create_keyspace]
     gate_tests:
       - ci:.github/workflows/regression-gate.yml/regression-gate
       - ci:.github/workflows/orm-tests.yml/test
