@@ -1,63 +1,147 @@
-//! Bincode schema/function/row serialization with versioning.
+//! Schema/function/row serialization with versioning.
 //!
-//! Stored values use a magic header prefix to allow future format evolution
-//! without breaking older clusters.
+//! ## Schema wire format
+//!
+//! ```text
+//! V2:  b"PGTIKV_SCHEMA_V2\0" ++ MessagePack (named map)  ← opt-in via serialize_schema_v2()
+//! V1:  b"PGTIKV_SCHEMA_V1\0" ++ bincode payload          ← default write format
+//! ```
+//!
+//! **Read** supports both V2 and V1 transparently.
+//!
+//! **Write** defaults to V1 bincode so older binaries can still read.
+//! Call `serialize_schema_v2()` to write V2 msgpack — enable once all
+//! nodes in the cluster can read V2 (i.e. run this code or newer).
+//!
+//! V2 uses MessagePack named-map mode so `#[serde(default)]` works
+//! natively — future field additions need zero legacy structs.
+//!
+//! V1 bincode is frozen; three sub-eras are handled for read compat.
 
 use crate::types::{FunctionDef, Row, TableSchema};
 use anyhow::{Context, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 
-const LEGACY_SCHEMA_DESERIALIZATION_SUNSET_DATE: &str = "2026-12-31";
+const SCHEMA_MAGIC_V2: &[u8] = b"PGTIKV_SCHEMA_V2\0";
+const SCHEMA_MAGIC_V1: &[u8] = b"PGTIKV_SCHEMA_V1\0";
+const LEGACY_SUNSET_DATE: &str = "2026-12-31";
 
-fn warn_legacy_schema_deserialization_once() {
-    static WARN_ONCE: Once = Once::new();
-    WARN_ONCE.call_once(|| {
-        tracing::warn!(
-            sunset_date = LEGACY_SCHEMA_DESERIALIZATION_SUNSET_DATE,
-            commit = "ce73a8a",
-            "legacy schema deserialization fallback is active; remove after all persisted schemas include IndexDef.state"
-        );
-    });
+static USE_V2_SCHEMA_FORMAT: AtomicBool = AtomicBool::new(false);
+
+/// Enable V2 msgpack schema writes cluster-wide.
+/// Call once all nodes can read V2 (i.e. run this binary or newer).
+pub fn enable_v2_schema_format() {
+    USE_V2_SCHEMA_FORMAT.store(true, Ordering::Relaxed);
 }
 
-/// Serialize a table schema
 pub fn serialize_schema(schema: &TableSchema) -> Result<Vec<u8>> {
-    const SCHEMA_MAGIC: &[u8] = b"PGTIKV_SCHEMA_V1\0";
+    if USE_V2_SCHEMA_FORMAT.load(Ordering::Relaxed) {
+        return serialize_schema_v2(schema);
+    }
     let payload = bincode::serialize(schema).context("Failed to serialize schema")?;
-    let mut out = Vec::with_capacity(SCHEMA_MAGIC.len() + payload.len());
-    out.extend_from_slice(SCHEMA_MAGIC);
+    let mut out = Vec::with_capacity(SCHEMA_MAGIC_V1.len() + payload.len());
+    out.extend_from_slice(SCHEMA_MAGIC_V1);
     out.extend_from_slice(&payload);
     Ok(out)
 }
 
-/// Deserialize a table schema.
-///
-/// Handles backward compatibility: schemas serialized before the `IndexDef.state`
-/// field was added (pre-`ce73a8a`) are transparently upgraded by falling back to
-/// a legacy struct layout when the primary deserialization fails.
-pub fn deserialize_schema(data: &[u8]) -> Result<TableSchema> {
-    const SCHEMA_MAGIC: &[u8] = b"PGTIKV_SCHEMA_V1\0";
-
-    let payload = data.strip_prefix(SCHEMA_MAGIC).context(
-        "Schema data missing PGTIKV_SCHEMA_V1 header (V1 legacy format no longer supported)",
-    )?;
-
-    // Try current format first.
-    if let Ok(schema) = bincode::deserialize::<TableSchema>(payload) {
-        return Ok(schema);
-    }
-
-    // Fallback: deserialize with legacy IndexDef (no `state` field), then upgrade.
-    // Sunset policy: remove after 2026-12-31 once all keyspaces are migrated.
-    warn_legacy_schema_deserialization_once();
-    let legacy: TableSchemaLegacy = bincode::deserialize(payload)
-        .context("Failed to deserialize schema (tried both current and legacy formats)")?;
-    Ok(legacy.into())
+pub fn serialize_schema_v2(schema: &TableSchema) -> Result<Vec<u8>> {
+    let payload =
+        rmp_serde::to_vec_named(schema).context("Failed to serialize schema to MessagePack")?;
+    let mut out = Vec::with_capacity(SCHEMA_MAGIC_V2.len() + payload.len());
+    out.extend_from_slice(SCHEMA_MAGIC_V2);
+    out.extend_from_slice(&payload);
+    Ok(out)
 }
 
-/// Legacy IndexDef without the `state` field (added in ce73a8a).
+pub fn deserialize_schema(data: &[u8]) -> Result<TableSchema> {
+    if let Some(payload) = data.strip_prefix(SCHEMA_MAGIC_V2) {
+        return rmp_serde::from_slice(payload)
+            .context("Failed to deserialize V2 MessagePack schema");
+    }
+    if let Some(payload) = data.strip_prefix(SCHEMA_MAGIC_V1) {
+        return deserialize_v1_bincode(payload);
+    }
+    anyhow::bail!("Schema data missing magic header (expected PGTIKV_SCHEMA_V2 or V1)")
+}
+
+// ===== V1 bincode (frozen — read only) =====
+//
+// | Era | ColumnDef.collation | IndexDef.state |
+// |-----|---------------------|----------------|
+// |  3  | ✓                   | ✓              |
+// |  2  | ✗                   | ✓              |
+// |  1  | ✗                   | ✗              |
+
+fn warn_v1_once(era: u8) {
+    static W1: Once = Once::new();
+    static W2: Once = Once::new();
+    static W3: Once = Once::new();
+    let w = match era {
+        1 => &W1,
+        2 => &W2,
+        _ => &W3,
+    };
+    w.call_once(|| {
+        tracing::warn!(
+            sunset_date = LEGACY_SUNSET_DATE,
+            era,
+            "V1 bincode schema active; will be rewritten as V2 msgpack on next DDL"
+        );
+    });
+}
+
+fn deserialize_v1_bincode(payload: &[u8]) -> Result<TableSchema> {
+    if let Ok(s) = bincode::deserialize::<TableSchema>(payload) {
+        warn_v1_once(3);
+        return Ok(s);
+    }
+    if let Ok(s) = bincode::deserialize::<V1Era2Schema>(payload) {
+        warn_v1_once(2);
+        return Ok(s.into());
+    }
+    if let Ok(s) = bincode::deserialize::<V1Era1Schema>(payload) {
+        warn_v1_once(1);
+        return Ok(s.into());
+    }
+    anyhow::bail!(
+        "Failed to deserialize V1 bincode schema (tried era-3, era-2/pre-collation, era-1/pre-index-state)"
+    )
+}
+
+// ===== V1 frozen struct mirrors =====
+
 #[derive(serde::Deserialize)]
-struct IndexDefLegacy {
+#[cfg_attr(test, derive(serde::Serialize))]
+struct V1ColumnDef {
+    pub name: String,
+    pub data_type: crate::types::DataType,
+    pub nullable: bool,
+    pub primary_key: bool,
+    pub unique: bool,
+    pub is_serial: bool,
+    pub default_expr: Option<String>,
+}
+
+impl From<V1ColumnDef> for crate::types::ColumnDef {
+    fn from(old: V1ColumnDef) -> Self {
+        crate::types::ColumnDef {
+            name: old.name,
+            data_type: old.data_type,
+            nullable: old.nullable,
+            primary_key: old.primary_key,
+            unique: old.unique,
+            is_serial: old.is_serial,
+            default_expr: old.default_expr,
+            collation: None,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+struct V1IndexDef {
     pub name: String,
     pub id: u64,
     pub columns: Vec<String>,
@@ -67,34 +151,69 @@ struct IndexDefLegacy {
     pub expressions: Vec<String>,
 }
 
-/// Legacy TableSchema matching the pre-ce73a8a serialization format.
+// Era 2: has IndexDef.state, no ColumnDef.collation
 #[derive(serde::Deserialize)]
-struct TableSchemaLegacy {
+#[cfg_attr(test, derive(serde::Serialize))]
+struct V1Era2Schema {
     pub name: String,
     pub table_id: u64,
-    pub columns: Vec<crate::types::ColumnDef>,
+    pub columns: Vec<V1ColumnDef>,
     pub version: u64,
     pub pk_constraint_name: Option<String>,
     pub pk_indices: Vec<usize>,
-    pub indexes: Vec<IndexDefLegacy>,
+    pub indexes: Vec<crate::types::IndexDef>,
     pub check_constraints: Vec<crate::types::CheckConstraint>,
     pub foreign_keys: Vec<crate::types::ForeignKeyConstraint>,
     pub owner: String,
 }
 
-impl From<TableSchemaLegacy> for TableSchema {
-    fn from(legacy: TableSchemaLegacy) -> Self {
+impl From<V1Era2Schema> for TableSchema {
+    fn from(s: V1Era2Schema) -> Self {
+        TableSchema {
+            name: s.name,
+            table_id: s.table_id,
+            columns: s.columns.into_iter().map(Into::into).collect(),
+            version: s.version,
+            pk_constraint_name: s.pk_constraint_name,
+            pk_indices: s.pk_indices,
+            indexes: s.indexes,
+            check_constraints: s.check_constraints,
+            foreign_keys: s.foreign_keys,
+            owner: s.owner,
+            from_alias: None,
+        }
+    }
+}
+
+// Era 1: no IndexDef.state, no ColumnDef.collation
+#[derive(serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+struct V1Era1Schema {
+    pub name: String,
+    pub table_id: u64,
+    pub columns: Vec<V1ColumnDef>,
+    pub version: u64,
+    pub pk_constraint_name: Option<String>,
+    pub pk_indices: Vec<usize>,
+    pub indexes: Vec<V1IndexDef>,
+    pub check_constraints: Vec<crate::types::CheckConstraint>,
+    pub foreign_keys: Vec<crate::types::ForeignKeyConstraint>,
+    pub owner: String,
+}
+
+impl From<V1Era1Schema> for TableSchema {
+    fn from(s: V1Era1Schema) -> Self {
         use crate::types::IndexDef;
         use crate::worker::types::IndexState;
 
         TableSchema {
-            name: legacy.name,
-            table_id: legacy.table_id,
-            columns: legacy.columns,
-            version: legacy.version,
-            pk_constraint_name: legacy.pk_constraint_name,
-            pk_indices: legacy.pk_indices,
-            indexes: legacy
+            name: s.name,
+            table_id: s.table_id,
+            columns: s.columns.into_iter().map(Into::into).collect(),
+            version: s.version,
+            pk_constraint_name: s.pk_constraint_name,
+            pk_indices: s.pk_indices,
+            indexes: s
                 .indexes
                 .into_iter()
                 .map(|idx| IndexDef {
@@ -108,28 +227,22 @@ impl From<TableSchemaLegacy> for TableSchema {
                     state: IndexState::Ready,
                 })
                 .collect(),
-            check_constraints: legacy.check_constraints,
-            foreign_keys: legacy.foreign_keys,
-            owner: legacy.owner,
+            check_constraints: s.check_constraints,
+            foreign_keys: s.foreign_keys,
+            owner: s.owner,
             from_alias: None,
         }
     }
 }
 
-/// Serialize a row
 pub fn serialize_row(row: &Row) -> Result<Vec<u8>> {
     bincode::serialize(row).context("Failed to serialize row")
 }
 
-/// Deserialize a row
 pub fn deserialize_row(data: &[u8]) -> Result<Row> {
     bincode::deserialize(data).context("Failed to deserialize row")
 }
 
-/// Serialize a function definition.
-///
-/// Stored values are versioned (magic header + bincode payload) to allow future evolution without
-/// breaking older clusters.
 pub fn serialize_function_def(def: &FunctionDef) -> Result<Vec<u8>> {
     const FUNCTION_MAGIC: &[u8] = b"PGTIKV_FUNCTION_V1\0";
     let payload = bincode::serialize(def).context("Failed to serialize function definition")?;
@@ -139,12 +252,203 @@ pub fn serialize_function_def(def: &FunctionDef) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Deserialize a function definition.
 pub fn deserialize_function_def(data: &[u8]) -> Result<FunctionDef> {
     const FUNCTION_MAGIC: &[u8] = b"PGTIKV_FUNCTION_V1\0";
-
     let payload = data.strip_prefix(FUNCTION_MAGIC).context(
         "Function data missing PGTIKV_FUNCTION_V1 header (V1 legacy format no longer supported)",
     )?;
     bincode::deserialize(payload).context("Failed to deserialize function definition")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ColumnDef, DataType, IndexDef};
+    use crate::worker::types::IndexState;
+
+    fn sample_schema() -> TableSchema {
+        TableSchema {
+            name: "public.users".into(),
+            table_id: 42,
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    primary_key: true,
+                    unique: true,
+                    is_serial: true,
+                    default_expr: None,
+                    collation: None,
+                },
+                ColumnDef {
+                    name: "name".into(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: Some("en_US".into()),
+                },
+            ],
+            version: 1,
+            pk_constraint_name: Some("users_pkey".into()),
+            pk_indices: vec![0],
+            indexes: vec![IndexDef {
+                name: "users_name_idx".into(),
+                id: 1,
+                columns: vec!["name".into()],
+                unique: false,
+                method: Some("btree".into()),
+                predicate: None,
+                expressions: vec![],
+                state: IndexState::Ready,
+            }],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: "admin".into(),
+            from_alias: None,
+        }
+    }
+
+    #[test]
+    fn default_write_is_v1_bincode() {
+        USE_V2_SCHEMA_FORMAT.store(false, Ordering::Relaxed);
+        let schema = sample_schema();
+        let data = serialize_schema(&schema).unwrap();
+        assert!(data.starts_with(SCHEMA_MAGIC_V1));
+        let decoded = deserialize_schema(&data).unwrap();
+        assert_eq!(decoded.name, schema.name);
+        assert_eq!(decoded.columns[1].collation, Some("en_US".into()));
+    }
+
+    #[test]
+    fn v2_msgpack_round_trip() {
+        let schema = sample_schema();
+        let data = serialize_schema_v2(&schema).unwrap();
+        assert!(data.starts_with(SCHEMA_MAGIC_V2));
+        let decoded = deserialize_schema(&data).unwrap();
+        assert_eq!(decoded.name, schema.name);
+        assert_eq!(decoded.table_id, schema.table_id);
+        assert_eq!(decoded.columns.len(), 2);
+        assert_eq!(decoded.columns[1].collation, Some("en_US".into()));
+        assert_eq!(decoded.indexes[0].state, IndexState::Ready);
+    }
+
+    #[test]
+    fn v1_bincode_era3_compat() {
+        let schema = sample_schema();
+        let payload = bincode::serialize(&schema).unwrap();
+        let mut data = Vec::from(SCHEMA_MAGIC_V1);
+        data.extend_from_slice(&payload);
+        let decoded = deserialize_schema(&data).unwrap();
+        assert_eq!(decoded.name, "public.users");
+        assert_eq!(decoded.columns[1].collation, Some("en_US".into()));
+    }
+
+    #[test]
+    fn v1_bincode_era2_compat() {
+        let era2 = V1Era2Schema {
+            name: "public.old_table".into(),
+            table_id: 7,
+            columns: vec![V1ColumnDef {
+                name: "col1".into(),
+                data_type: DataType::Text,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: "admin".into(),
+        };
+        let payload = bincode::serialize(&era2).unwrap();
+        let mut data = Vec::from(SCHEMA_MAGIC_V1);
+        data.extend_from_slice(&payload);
+        let decoded = deserialize_schema(&data).unwrap();
+        assert_eq!(decoded.name, "public.old_table");
+        assert_eq!(decoded.columns[0].collation, None);
+    }
+
+    #[test]
+    fn v1_bincode_era1_compat() {
+        let era1 = V1Era1Schema {
+            name: "public.ancient".into(),
+            table_id: 3,
+            columns: vec![V1ColumnDef {
+                name: "x".into(),
+                data_type: DataType::Int32,
+                nullable: false,
+                primary_key: true,
+                unique: true,
+                is_serial: false,
+                default_expr: None,
+            }],
+            version: 1,
+            pk_constraint_name: Some("ancient_pkey".into()),
+            pk_indices: vec![0],
+            indexes: vec![V1IndexDef {
+                name: "ancient_idx".into(),
+                id: 1,
+                columns: vec!["x".into()],
+                unique: true,
+                method: None,
+                predicate: None,
+                expressions: vec![],
+            }],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: "admin".into(),
+        };
+        let payload = bincode::serialize(&era1).unwrap();
+        let mut data = Vec::from(SCHEMA_MAGIC_V1);
+        data.extend_from_slice(&payload);
+        let decoded = deserialize_schema(&data).unwrap();
+        assert_eq!(decoded.name, "public.ancient");
+        assert_eq!(decoded.indexes[0].state, IndexState::Ready);
+        assert_eq!(decoded.columns[0].collation, None);
+    }
+
+    #[test]
+    fn v2_tolerates_unknown_fields() {
+        // Simulate a future binary that added a field — msgpack named-map ignores unknowns.
+        let schema = sample_schema();
+        let json = serde_json::to_value(&schema).unwrap();
+        let mut map: serde_json::Map<String, serde_json::Value> = json.as_object().unwrap().clone();
+        map.insert(
+            "future_field".into(),
+            serde_json::Value::String("hello".into()),
+        );
+        // Re-encode via msgpack named map
+        let payload = rmp_serde::to_vec_named(&map).unwrap();
+        let mut data = Vec::from(SCHEMA_MAGIC_V2);
+        data.extend_from_slice(&payload);
+        let decoded = deserialize_schema(&data).unwrap();
+        assert_eq!(decoded.name, "public.users");
+    }
+
+    #[test]
+    fn v2_tolerates_missing_default_fields() {
+        let schema = sample_schema();
+        let json = serde_json::to_value(&schema).unwrap();
+        let mut map: serde_json::Map<String, serde_json::Value> = json.as_object().unwrap().clone();
+        map.remove("check_constraints");
+        let payload = rmp_serde::to_vec_named(&map).unwrap();
+        let mut data = Vec::from(SCHEMA_MAGIC_V2);
+        data.extend_from_slice(&payload);
+        let decoded = deserialize_schema(&data).unwrap();
+        assert!(decoded.check_constraints.is_empty());
+    }
+
+    #[test]
+    fn bad_magic_rejected() {
+        assert!(deserialize_schema(b"GARBAGE\0payload").is_err());
+    }
 }
