@@ -6,6 +6,7 @@ use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tracing_subscriber::EnvFilter;
 
 use pgtikv_admin::config::Config;
+use pgtikv_admin::device_code::DeviceCodeStore;
 use pgtikv_admin::services::pd_client::PdClient;
 use pgtikv_admin::services::reconciler::Reconciler;
 use pgtikv_admin::session::SessionManager;
@@ -112,10 +113,12 @@ async fn main() {
         }
     };
 
+    let device_codes = Arc::new(DeviceCodeStore::new(600));
     let state = AppState {
         db: pool.clone(),
         config: config.clone(),
         sessions,
+        device_codes,
         http_client: http_client.clone(),
         fs9_client,
     };
@@ -156,6 +159,7 @@ async fn main() {
     // ── Background: session sweep + audit cleanup ─────────────
     {
         let sessions_ref = state.sessions.clone();
+        let device_codes_ref = state.device_codes.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
             loop {
@@ -163,6 +167,10 @@ async fn main() {
                 let swept = sessions_ref.sweep_expired();
                 if swept > 0 {
                     tracing::debug!("Session sweep: removed {swept} expired sessions");
+                }
+                let dc_swept = device_codes_ref.sweep_expired();
+                if dc_swept > 0 {
+                    tracing::debug!("Device code sweep: removed {dc_swept} expired entries");
                 }
             }
         });

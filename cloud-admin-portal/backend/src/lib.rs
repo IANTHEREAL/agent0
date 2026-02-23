@@ -20,6 +20,7 @@ pub mod cli_common;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod device_code;
 pub mod error;
 pub mod models;
 pub mod services;
@@ -30,6 +31,7 @@ use std::sync::Arc;
 use sqlx::AnyPool;
 
 use config::Config;
+use device_code::DeviceCodeStore;
 use services::fs9_client::Fs9Client;
 use session::SessionManager;
 
@@ -38,6 +40,7 @@ pub struct AppState {
     pub db: AnyPool,
     pub config: Arc<Config>,
     pub sessions: Arc<SessionManager>,
+    pub device_codes: Arc<DeviceCodeStore>,
     pub http_client: reqwest::Client,
     pub fs9_client: Option<Arc<Fs9Client>>,
 }

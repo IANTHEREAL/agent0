@@ -528,3 +528,37 @@ pub struct CustomerTokenRow {
     pub expires_at: Option<String>,
     pub created_at: String,
 }
+
+// ── Device Code Flow types ──────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct DeviceCodeResponse {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in: u64,
+    pub interval: u64,
+}
+
+#[derive(Deserialize)]
+pub struct DeviceTokenRequest {
+    pub device_code: String,
+}
+
+#[derive(Serialize)]
+pub struct DeviceTokenResponse {
+    pub token: String,
+    pub expires_at: String,
+}
+
+#[derive(Serialize)]
+pub struct DeviceErrorResponse {
+    pub error: String,
+}
+
+#[derive(Deserialize)]
+pub struct DeviceVerifyRequest {
+    pub user_code: String,
+    pub email: String,
+    pub password: String,
+}
