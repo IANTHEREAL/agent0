@@ -343,3 +343,15 @@ Reports will be saved under `test-reports/test-report-*.md`.
   - `./run_tests.sh` ❌ (Integration golden: 158 passed / 11 failed; ORM: Sequelize 3 suites fail; report: `test-reports/test-report-20260206-102557.md`)
   - PostgreSQL oracle ✅ (passed: `tests/01_ddl_basic.sql`, `tests/02_dml_crud.sql`)
   - `PG_DSN=... bash scripts/e2e_tests.sh gorm_smoke` ❌ (`record not found`)
+
+### 2026-02-24 (local full re-check)
+
+- Commit: `ac439c40` (`master`)
+- Host: `instance-20260207-085701.c.pantheon-479907.internal`
+- Commands executed (local evidence):
+  - `bash scripts/regression_gate.sh` ✅ (unit: 2035 passed; extended protocol smoke: 15/15; SQL pack: 42/42; ORM pack: 130/130; report dir: `test-reports/regression-gate-20260224-092403/`)
+  - `./run_tests.sh` ✅ (Integration golden: 267 passed / 0 failed; ORM: 593 passed / 1 skipped; report: `test-reports/test-report-20260224-092754-ac439c40.md`)
+  - `python3 scripts/integration_test.py --dsn "$PG_DSN"` ✅ (Built-in integration: 8 passed; executed against a temporary local db9-server)
+  - `PG_DSN=... bash scripts/e2e_tests.sh gorm_smoke` ✅ (`ok .../e2e/gorm_smoke`)
+  - `PG_DSN=... bash scripts/e2e_tests.sh sqlalchemy_smoke` ✅ (`1 passed`)
+  - `PG_DSN=... bash scripts/e2e_tests.sh dify_sqlalchemy_compat` ✅ (`19 passed`)
