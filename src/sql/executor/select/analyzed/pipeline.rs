@@ -574,7 +574,7 @@ impl Executor {
                                 .execute_generate_series(&bridge_args, &key, None, 0, None)
                                 .await?;
                             rows
-                        } else if func_upper == "_PGTIKV_SYS_RECORD_MIGRATION" {
+                        } else if func_upper == "_DB9_SYS_RECORD_MIGRATION" {
                             let (_, rows) =
                                 self.execute_record_migration(txn, &bridge_args).await?;
                             rows

@@ -3,7 +3,7 @@ import { DataSource, QueryFailedError } from 'typeorm';
 import { createDataSource } from './datasource.js';
 import { User, Post } from './entities/index.js';
 
-describe('TypeORM Error Semantics [pg-tikv]', () => {
+describe('TypeORM Error Semantics [db9-server]', () => {
   let dataSource: DataSource;
 
   beforeAll(async () => {

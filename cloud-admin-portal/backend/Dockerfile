@@ -27,10 +27,10 @@ FROM --platform=linux/arm64 debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/aarch64-unknown-linux-gnu/release/pgtikv-admin /usr/local/bin/pgtikv-admin
-COPY --from=builder /app/target/aarch64-unknown-linux-gnu/release/pgtikv-ctl /usr/local/bin/pgtikv-ctl
+COPY --from=builder /app/target/aarch64-unknown-linux-gnu/release/db9-admin /usr/local/bin/db9-admin
+COPY --from=builder /app/target/aarch64-unknown-linux-gnu/release/db9-ctl /usr/local/bin/db9-ctl
 COPY --from=builder /app/target/aarch64-unknown-linux-gnu/release/db9 /usr/local/bin/db9
 
 EXPOSE 8090
 
-CMD ["pgtikv-admin"]
+CMD ["db9-admin"]

@@ -1,7 +1,7 @@
 [project]
 name = "dify-sqlalchemy-compat"
 version = "0.1.0"
-description = "Dify SQLAlchemy compatibility E2E tests for pg-tikv"
+description = "Dify SQLAlchemy compatibility E2E tests for db9-server"
 requires-python = ">=3.12"
 dependencies = [
   # Mirror Dify's DB stack: Flask-SQLAlchemy + SQLAlchemy + psycopg2.

@@ -74,10 +74,9 @@ impl Executor {
 
         // Normalize for virtual tables (some accept optional trailing `()` legacy syntax).
         let t_upper = table_name.trim_end_matches("()").to_uppercase();
-        if t_upper == "_PGTIKV_SYS_OBSERVABILITY" || t_upper.ends_with("._PGTIKV_SYS_OBSERVABILITY")
-        {
+        if t_upper == "_DB9_SYS_OBSERVABILITY" || t_upper.ends_with("._DB9_SYS_OBSERVABILITY") {
             let snap = self.observability().snapshot_summary();
-            let mut schema = virtual_table_schema("_PGTIKV_SYS_OBSERVABILITY").unwrap();
+            let mut schema = virtual_table_schema("_DB9_SYS_OBSERVABILITY").unwrap();
             schema.name = table_name.to_string();
 
             let row = Row::new(vec![
@@ -93,10 +92,9 @@ impl Executor {
             ]);
             return Ok((schema, vec![row]));
         }
-        if t_upper == "_PGTIKV_SYS_QUERY_SAMPLES" || t_upper.ends_with("._PGTIKV_SYS_QUERY_SAMPLES")
-        {
+        if t_upper == "_DB9_SYS_QUERY_SAMPLES" || t_upper.ends_with("._DB9_SYS_QUERY_SAMPLES") {
             let groups = self.observability().snapshot_query_samples();
-            let mut schema = virtual_table_schema("_PGTIKV_SYS_QUERY_SAMPLES").unwrap();
+            let mut schema = virtual_table_schema("_DB9_SYS_QUERY_SAMPLES").unwrap();
             schema.name = table_name.to_string();
 
             let rows = groups
@@ -115,9 +113,9 @@ impl Executor {
                 .collect();
             return Ok((schema, rows));
         }
-        if t_upper == "_PGTIKV_SYS_EXPORT_DDL" || t_upper.ends_with("._PGTIKV_SYS_EXPORT_DDL") {
+        if t_upper == "_DB9_SYS_EXPORT_DDL" || t_upper.ends_with("._DB9_SYS_EXPORT_DDL") {
             let exported = ddl_export::export_all_ddl(self.store().as_ref(), txn, db_id).await?;
-            let mut schema = virtual_table_schema("_PGTIKV_SYS_EXPORT_DDL").unwrap();
+            let mut schema = virtual_table_schema("_DB9_SYS_EXPORT_DDL").unwrap();
             schema.name = table_name.to_string();
 
             let rows = exported
@@ -133,9 +131,9 @@ impl Executor {
             return Ok((schema, rows));
         }
 
-        if t_upper == "_PGTIKV_SYS_MIGRATIONS" || t_upper.ends_with("._PGTIKV_SYS_MIGRATIONS") {
+        if t_upper == "_DB9_SYS_MIGRATIONS" || t_upper.ends_with("._DB9_SYS_MIGRATIONS") {
             let migrations = self.store().list_migrations(txn).await?;
-            let mut schema = virtual_table_schema("_PGTIKV_SYS_MIGRATIONS").unwrap();
+            let mut schema = virtual_table_schema("_DB9_SYS_MIGRATIONS").unwrap();
             schema.name = table_name.to_string();
 
             let rows = migrations
@@ -152,8 +150,8 @@ impl Executor {
             return Ok((schema, rows));
         }
 
-        if t_upper == "_PGTIKV_SYS_TRIGGER_QUEUE_STATS"
-            || t_upper.ends_with("._PGTIKV_SYS_TRIGGER_QUEUE_STATS")
+        if t_upper == "_DB9_SYS_TRIGGER_QUEUE_STATS"
+            || t_upper.ends_with("._DB9_SYS_TRIGGER_QUEUE_STATS")
         {
             let now_ms = chrono::Utc::now().timestamp_millis();
             let cutoff_recent_ms = now_ms.saturating_sub(60_000);
@@ -205,7 +203,7 @@ impl Executor {
                 (latency_sum_ms as f64) / (latency_cnt as f64)
             };
 
-            let mut schema = virtual_table_schema("_PGTIKV_SYS_TRIGGER_QUEUE_STATS").unwrap();
+            let mut schema = virtual_table_schema("_DB9_SYS_TRIGGER_QUEUE_STATS").unwrap();
             schema.name = table_name.to_string();
 
             let row = Row::new(vec![
@@ -220,8 +218,8 @@ impl Executor {
             return Ok((schema, vec![row]));
         }
 
-        if t_upper == "_PGTIKV_SYS_TRIGGER_DLQ" || t_upper.ends_with("._PGTIKV_SYS_TRIGGER_DLQ") {
-            let mut schema = virtual_table_schema("_PGTIKV_SYS_TRIGGER_DLQ").unwrap();
+        if t_upper == "_DB9_SYS_TRIGGER_DLQ" || t_upper.ends_with("._DB9_SYS_TRIGGER_DLQ") {
+            let mut schema = virtual_table_schema("_DB9_SYS_TRIGGER_DLQ").unwrap();
             schema.name = table_name.to_string();
 
             return Ok((schema, Vec::new()));
@@ -345,36 +343,34 @@ impl Executor {
             match arg {
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
                 _ => Err(anyhow!(
-                    "_pgtikv_sys_record_migration requires expression arguments"
+                    "_db9_sys_record_migration requires expression arguments"
                 )),
             }
         }
 
         if args.len() != 3 {
             return Err(anyhow!(
-                "_pgtikv_sys_record_migration requires exactly 3 arguments"
+                "_db9_sys_record_migration requires exactly 3 arguments"
             ));
         }
 
         let name = match eval_const_ast_expr(extract_expr(&args[0])?)? {
             Value::Text(v) => v,
             _ => {
-                return Err(anyhow!("_pgtikv_sys_record_migration name must be TEXT"));
+                return Err(anyhow!("_db9_sys_record_migration name must be TEXT"));
             }
         };
         let checksum = match eval_const_ast_expr(extract_expr(&args[1])?)? {
             Value::Text(v) => v,
             _ => {
-                return Err(anyhow!(
-                    "_pgtikv_sys_record_migration checksum must be TEXT"
-                ));
+                return Err(anyhow!("_db9_sys_record_migration checksum must be TEXT"));
             }
         };
         let sql_preview = match eval_const_ast_expr(extract_expr(&args[2])?)? {
             Value::Text(v) => v,
             _ => {
                 return Err(anyhow!(
-                    "_pgtikv_sys_record_migration sql_preview must be TEXT"
+                    "_db9_sys_record_migration sql_preview must be TEXT"
                 ));
             }
         };
@@ -390,7 +386,7 @@ impl Executor {
 
         let schema = TableSchema {
             table_id: 0,
-            name: "_pgtikv_sys_record_migration".to_string(),
+            name: "_db9_sys_record_migration".to_string(),
             columns: vec![
                 ColumnDef {
                     name: "name".to_string(),

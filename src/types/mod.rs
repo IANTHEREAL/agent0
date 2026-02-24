@@ -421,7 +421,7 @@ pub struct CheckConstraint {
 
 /// Keyspace-local PostgreSQL database metadata (storage format v2).
 ///
-/// In pg-tikv, a TiKV keyspace maps to a tenant. Within a tenant, multiple logical
+/// In db9-server, a TiKV keyspace maps to a tenant. Within a tenant, multiple logical
 /// PostgreSQL databases are supported by partitioning all database-local keys
 /// under a fixed `database_id` prefix.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

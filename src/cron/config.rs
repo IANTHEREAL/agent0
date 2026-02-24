@@ -44,10 +44,10 @@ impl CronConfig {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
 
-        if let Ok(v) = env::var("PGTIKV_CRON_ENABLED") {
+        if let Ok(v) = env::var("DB9_CRON_ENABLED") {
             cfg.enabled = parse_bool(&v).unwrap_or(cfg.enabled);
         }
-        if let Ok(v) = env::var("PGTIKV_CRON_POLL_MS") {
+        if let Ok(v) = env::var("DB9_CRON_POLL_MS") {
             cfg.poll_ms = v
                 .parse::<u64>()
                 .ok()
@@ -55,35 +55,35 @@ impl CronConfig {
                 .unwrap_or(cfg.poll_ms);
             cfg.poll_ms = cfg.poll_ms.max(DEFAULT_POLL_MS);
         }
-        if let Ok(v) = env::var("PGTIKV_CRON_MAX_RUNNING_JOBS") {
+        if let Ok(v) = env::var("DB9_CRON_MAX_RUNNING_JOBS") {
             cfg.max_running_jobs = v
                 .parse::<usize>()
                 .ok()
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.max_running_jobs);
         }
-        if let Ok(v) = env::var("PGTIKV_CRON_MAX_JOBS_PER_DB") {
+        if let Ok(v) = env::var("DB9_CRON_MAX_JOBS_PER_DB") {
             cfg.max_jobs_per_db = v
                 .parse::<usize>()
                 .ok()
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.max_jobs_per_db);
         }
-        if let Ok(v) = env::var("PGTIKV_CRON_GC_INTERVAL_SEC") {
+        if let Ok(v) = env::var("DB9_CRON_GC_INTERVAL_SEC") {
             cfg.gc_interval_sec = v
                 .parse::<u64>()
                 .ok()
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.gc_interval_sec);
         }
-        if let Ok(v) = env::var("PGTIKV_CRON_RUN_RETENTION_DAYS") {
+        if let Ok(v) = env::var("DB9_CRON_RUN_RETENTION_DAYS") {
             cfg.run_retention_days = v
                 .parse::<u64>()
                 .ok()
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.run_retention_days);
         }
-        if let Ok(v) = env::var("PGTIKV_CRON_ORPHAN_TIMEOUT_SEC") {
+        if let Ok(v) = env::var("DB9_CRON_ORPHAN_TIMEOUT_SEC") {
             cfg.orphan_timeout_sec = v
                 .parse::<u64>()
                 .ok()
@@ -110,13 +110,13 @@ mod tests {
         let _guard = test_lock().lock().unwrap();
 
         let keys = [
-            "PGTIKV_CRON_ENABLED",
-            "PGTIKV_CRON_POLL_MS",
-            "PGTIKV_CRON_MAX_RUNNING_JOBS",
-            "PGTIKV_CRON_MAX_JOBS_PER_DB",
-            "PGTIKV_CRON_GC_INTERVAL_SEC",
-            "PGTIKV_CRON_RUN_RETENTION_DAYS",
-            "PGTIKV_CRON_ORPHAN_TIMEOUT_SEC",
+            "DB9_CRON_ENABLED",
+            "DB9_CRON_POLL_MS",
+            "DB9_CRON_MAX_RUNNING_JOBS",
+            "DB9_CRON_MAX_JOBS_PER_DB",
+            "DB9_CRON_GC_INTERVAL_SEC",
+            "DB9_CRON_RUN_RETENTION_DAYS",
+            "DB9_CRON_ORPHAN_TIMEOUT_SEC",
         ];
 
         let saved: Vec<(String, Option<String>)> = keys

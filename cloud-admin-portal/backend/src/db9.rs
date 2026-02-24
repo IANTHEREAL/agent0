@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::process;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use pgtikv_admin::cli_common::{
+use db9_admin::cli_common::{
     format_time, format_val, print_csv, print_json, print_table, ApiClient,
 };
 use serde_json::Value;
@@ -30,7 +30,7 @@ enum OutputFormat {
 #[derive(Parser)]
 #[command(
     name = "db9",
-    about = "db9 — Customer CLI for pg-tikv database service",
+    about = "db9 — Customer CLI for db9-server database service",
     version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")")
 )]
 struct Cli {

@@ -233,7 +233,7 @@ The CredentialsModal is now used for:
    ```bash
    # Option 1: Export in your shell
    export PD_ENDPOINTS=127.0.0.1:33395  # Use your actual PD port
-   export PGTIKV_PG_PORT=5433  # Use your actual pg-tikv port
+   export DB9_PG_PORT=5433  # Use your actual db9-server port
 
    # Option 2: Create .env file (recommended)
    cp .env.example .env
@@ -386,11 +386,11 @@ Backend configuration:
   - **IMPORTANT**: This must match your actual PD endpoint
   - For `tiup playground`, check the PD port in startup output (e.g., `127.0.0.1:33395`)
   - Incorrect endpoint will cause "tenant does not exist" errors
-- `PGTIKV_DATABASE_URL` - Database path (default: `sqlite:///backend/data/portal.db`)
-- `PGTIKV_PG_HOST` - pg-tikv host (default: `127.0.0.1`)
-- `PGTIKV_PG_PORT` - pg-tikv port (default: `5433`)
-- `PGTIKV_API_PORT` - API server port (default: `8080`)
-- `PGTIKV_SESSION_TTL_HOURS` - Session validity (default: `1`)
+- `DB9_DATABASE_URL` - Database path (default: `sqlite:///backend/data/portal.db`)
+- `DB9_PG_HOST` - db9-server host (default: `127.0.0.1`)
+- `DB9_PG_PORT` - db9-server port (default: `5433`)
+- `DB9_API_PORT` - API server port (default: `8080`)
+- `DB9_SESSION_TTL_HOURS` - Session validity (default: `1`)
 
 ### Database Location
 
@@ -398,7 +398,7 @@ Default: `backend/data/portal.db`
 
 Change via environment variable:
 ```bash
-export PGTIKV_DATABASE_URL="sqlite:///custom/path/portal.db"
+export DB9_DATABASE_URL="sqlite:///custom/path/portal.db"
 ```
 
 ---
@@ -571,7 +571,7 @@ For issues or questions:
 
 ## License
 
-Same as pg-tikv project.
+Same as db9-server project.
 
 ---
 

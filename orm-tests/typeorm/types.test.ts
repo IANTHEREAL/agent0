@@ -3,7 +3,7 @@ import { DataSource } from 'typeorm';
 import { createDataSource } from './datasource.js';
 import { User } from './entities/index.js';
 
-describe('TypeORM TypeScript Type Fidelity [pg-tikv]', () => {
+describe('TypeORM TypeScript Type Fidelity [db9-server]', () => {
   let dataSource: DataSource;
 
   beforeAll(async () => {

@@ -3,21 +3,21 @@ use std::io::{self, Write};
 use std::process;
 
 use clap::{Parser, Subcommand};
-use pgtikv_admin::cli_common::{format_time, format_val, print_json, print_table, ApiClient};
-use pgtikv_admin::{DEFAULT_ADMIN_USER, TENANT_ID_LEN};
+use db9_admin::cli_common::{format_time, format_val, print_json, print_table, ApiClient};
+use db9_admin::{DEFAULT_ADMIN_USER, TENANT_ID_LEN};
 use serde_json::Value;
 
 const DEFAULT_API_URL: &str = "http://localhost:8090/api";
 
 #[derive(Parser)]
-#[command(name = "pgtikv-ctl", about = "pg-tikv Admin Portal CLI", version)]
+#[command(name = "db9-ctl", about = "db9-server Admin Portal CLI", version)]
 struct Cli {
-    /// API base URL (env: PGTIKV_API_URL)
-    #[arg(long, env = "PGTIKV_API_URL", default_value = DEFAULT_API_URL)]
+    /// API base URL (env: DB9_API_URL)
+    #[arg(long, env = "DB9_API_URL", default_value = DEFAULT_API_URL)]
     api_url: String,
 
-    /// API key (env: PGTIKV_API_KEY)
-    #[arg(long, env = "PGTIKV_API_KEY")]
+    /// API key (env: DB9_API_KEY)
+    #[arg(long, env = "DB9_API_KEY")]
     api_key: Option<String>,
 
     /// Output as JSON
@@ -614,7 +614,7 @@ async fn main() {
             println!("Session:  {}", data["session_id"].as_str().unwrap_or("-"));
             println!("Expires:  {}", format_time(data.get("expires_at")));
             println!(
-                "\nUse with: pgtikv-ctl users list {tenant_id} --session {}",
+                "\nUse with: db9-ctl users list {tenant_id} --session {}",
                 data["session_id"].as_str().unwrap_or("<session_id>")
             );
         }
@@ -765,7 +765,7 @@ async fn main() {
 
             println!(
                 "{} v{}",
-                data["name"].as_str().unwrap_or("pg-tikv Admin API"),
+                data["name"].as_str().unwrap_or("db9-server Admin API"),
                 data["version"].as_str().unwrap_or("?")
             );
         }

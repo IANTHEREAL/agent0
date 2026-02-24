@@ -4,7 +4,7 @@
 # dependencies = []
 # ///
 """
-Concurrent Transaction Tests for pg-tikv
+Concurrent Transaction Tests for db9-server
 """
 
 import argparse

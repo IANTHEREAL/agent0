@@ -1,10 +1,10 @@
-psql:/home/dongxu/lab/pg-tikv/tests/214_vectorize_agg.sql:7: NOTICE:  table "bools" does not exist, skipping
-psql:/home/dongxu/lab/pg-tikv/tests/214_vectorize_agg.sql:8: ERROR:  Unsupported data type: Bool
-psql:/home/dongxu/lab/pg-tikv/tests/214_vectorize_agg.sql:11: ERROR:  Table 'bools' not found
-psql:/home/dongxu/lab/pg-tikv/tests/214_vectorize_agg.sql:14: ERROR:  Table 'bools' not found
-psql:/home/dongxu/lab/pg-tikv/tests/214_vectorize_agg.sql:23: ERROR:  Table 'bools' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/214_vectorize_agg.sql:26: ERROR:  Table 'bools' not found
-psql:/home/dongxu/lab/pg-tikv/tests/214_vectorize_agg.sql:28: NOTICE:  table "bytes_string" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/214_vectorize_agg.sql:7: NOTICE:  table "bools" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/214_vectorize_agg.sql:8: ERROR:  Unsupported data type: Bool
+psql:/home/dongxu/lab/db9-server/tests/214_vectorize_agg.sql:11: ERROR:  Table 'bools' not found
+psql:/home/dongxu/lab/db9-server/tests/214_vectorize_agg.sql:14: ERROR:  Table 'bools' not found
+psql:/home/dongxu/lab/db9-server/tests/214_vectorize_agg.sql:23: ERROR:  Table 'bools' does not exist
+psql:/home/dongxu/lab/db9-server/tests/214_vectorize_agg.sql:26: ERROR:  Table 'bools' not found
+psql:/home/dongxu/lab/db9-server/tests/214_vectorize_agg.sql:28: NOTICE:  table "bytes_string" does not exist, skipping
  string_agg | string_agg 
 ------------+------------
             | 
@@ -14,19 +14,19 @@ psql:/home/dongxu/lab/pg-tikv/tests/214_vectorize_agg.sql:28: NOTICE:  table "by
 ------------+------------
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/214_vectorize_agg.sql:49: ERROR:  Unsupported function: convert_to
+psql:/home/dongxu/lab/db9-server/tests/214_vectorize_agg.sql:49: ERROR:  Unsupported function: convert_to
  string_agg | string_agg 
 ------------+------------
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/214_vectorize_agg.sql:60: NOTICE:  table "t87619" does not exist, skipping
-psql:/home/dongxu/lab/pg-tikv/tests/214_vectorize_agg.sql:61: ERROR:  SQL parse error: sql parser error: Expected a data type name, found: ) at Line: 1, Column 23
-psql:/home/dongxu/lab/pg-tikv/tests/214_vectorize_agg.sql:67: ERROR:  Table 't87619' not found
-psql:/home/dongxu/lab/pg-tikv/tests/214_vectorize_agg.sql:75: NOTICE:  table "t97603" does not exist, skipping
-psql:/home/dongxu/lab/pg-tikv/tests/214_vectorize_agg.sql:77: ERROR:  GENERATE_SERIES is a set-returning function, not supported in this context
+psql:/home/dongxu/lab/db9-server/tests/214_vectorize_agg.sql:60: NOTICE:  table "t87619" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/214_vectorize_agg.sql:61: ERROR:  SQL parse error: sql parser error: Expected a data type name, found: ) at Line: 1, Column 23
+psql:/home/dongxu/lab/db9-server/tests/214_vectorize_agg.sql:67: ERROR:  Table 't87619' not found
+psql:/home/dongxu/lab/db9-server/tests/214_vectorize_agg.sql:75: NOTICE:  table "t97603" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/214_vectorize_agg.sql:77: ERROR:  GENERATE_SERIES is a set-returning function, not supported in this context
  count 
 -------
      0
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/214_vectorize_agg.sql:90: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/214_vectorize_agg.sql:90: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

@@ -125,7 +125,7 @@ func TestGormSmoke(t *testing.T) {
 	if err := db.WithContext(ctx).Where("happened_at = ?", createdAt).First(&byTime).Error; err != nil {
 		t.Fatalf("query by time param: %v", err)
 	}
-	// pg-tikv currently stores timestamps with millisecond precision. Accept small
+	// db9-server currently stores timestamps with millisecond precision. Accept small
 	// (<1ms) truncation/rounding deltas on roundtrip.
 	if delta := absDuration(byTime.HappenedAt.Sub(createdAt)); delta > time.Millisecond {
 		t.Fatalf("time roundtrip: expected %v, got %v (delta %v)", createdAt, byTime.HappenedAt, delta)

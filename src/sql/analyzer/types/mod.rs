@@ -248,7 +248,7 @@ pub enum TypedExprKind {
 
 // ── Binary operators ────────────────────────────────────────
 
-/// Binary operators — tipg's own enum, independent of sqlparser.
+/// Binary operators — db9's own enum, independent of sqlparser.
 ///
 /// Complete set covering arithmetic, comparison, logical, string, bitwise,
 /// regex, array, JSON, and full-text search operators.

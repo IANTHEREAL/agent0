@@ -1,18 +1,18 @@
 ---
 name: pg-tests-case-porting
-description: "Select, sanitize, de-dup, and port SQL cases from pg_tests PR#58 into tipg SQL integration tests (tests/*.sql + *.expected), with integration_test.py-compatible expected generation and verification."
+description: "Select, sanitize, de-dup, and port SQL cases from pg_tests PR#58 into db9 SQL integration tests (tests/*.sql + *.expected), with integration_test.py-compatible expected generation and verification."
 ---
 
-# pg_tests case porting → tipg integration tests
+# pg_tests case porting → db9 integration tests
 
-Port focused SQL cases from `pg_tests` PR#58 into `tipg` SQL integration tests (`tests/*.sql` + `tests/*.expected`).
+Port focused SQL cases from `pg_tests` PR#58 into `db9` SQL integration tests (`tests/*.sql` + `tests/*.expected`).
 
 ## Purpose & inputs
 
 Inputs:
 - A candidate SQL “case” from `pg_tests` PR#58 (query + required setup).
 - `PG_EXPECT_DSN`: reference Postgres DSN used ONLY to generate `.expected` (e.g. `postgres://admin:admin@127.0.0.1:38125/postgres`).
-- `TIPG_DSN`: tipg/pg-tikv DSN used for compatibility verification (e.g. `postgres://admin:admin@127.0.0.1:5433/postgres`).
+- `DB9_DSN`: db9/db9-server DSN used for compatibility verification (e.g. `postgres://admin:admin@127.0.0.1:5433/postgres`).
 - Target location: `tests/NN_<topic>.sql` + `tests/NN_<topic>.expected` (optional: `*_setup.sql`).
 
 Goal:
@@ -29,7 +29,7 @@ Hard reject anything that can escape the DB sandbox, touch the filesystem, or ru
   - `COPY ... PROGRAM '...'`
   - `pg_read_file`, `pg_ls_dir`, `lo_import`, etc.
 - **No multi-session/concurrency dependencies** (single `psql -f` run per test file).
-- **No environment introspection**: relying on `current_user`, `inet_client_addr()`, server version strings, etc. (unless the output is explicitly the thing being tested and is stable in tipg).
+- **No environment introspection**: relying on `current_user`, `inet_client_addr()`, server version strings, etc. (unless the output is explicitly the thing being tested and is stable in db9).
 
 Quick screens:
 ```bash
@@ -115,14 +115,14 @@ Run a single test against reference Postgres (sanity: `.expected` matches):
 python3 scripts/integration_test.py --dsn "$PG_EXPECT_DSN" tests/NN_<topic>.sql -v
 ```
 
-Run the same test against tipg/pg-tikv (real compatibility):
+Run the same test against db9/db9-server (real compatibility):
 ```bash
-python3 scripts/integration_test.py --dsn "$TIPG_DSN" tests/NN_<topic>.sql -v
+python3 scripts/integration_test.py --dsn "$DB9_DSN" tests/NN_<topic>.sql -v
 ```
 
 Run the full SQL test suite (optional):
 ```bash
-python3 scripts/integration_test.py --dsn "$TIPG_DSN" tests/
+python3 scripts/integration_test.py --dsn "$DB9_DSN" tests/
 ```
 
 ## PR checklist + template
@@ -132,14 +132,14 @@ Checklist:
 - [ ] Deterministic output (`ORDER BY`, fixed literals; no nondeterministic functions).
 - [ ] De-duped against `tests/` and `tests_pending/`.
 - [ ] `.expected` generated with `integration_test.py`-compatible `psql` flags.
-- [ ] Verified with `python3 scripts/integration_test.py --dsn "$PG_EXPECT_DSN" tests/NN_<topic>.sql` and `--dsn "$TIPG_DSN"`.
+- [ ] Verified with `python3 scripts/integration_test.py --dsn "$PG_EXPECT_DSN" tests/NN_<topic>.sql` and `--dsn "$DB9_DSN"`.
 
 PR title:
 - `test: port pg_tests PR#58 <topic>` (or batch ports: `test: port pg_tests PR#58 cases`)
 
 PR body (starter):
 ```text
-Ports <N> SQL case(s) from pg_tests PR#58 into tipg integration tests under tests/.
+Ports <N> SQL case(s) from pg_tests PR#58 into db9 integration tests under tests/.
 
 Notes:
 - Applied safety filters (no psql meta-commands, no DO, no file I/O / COPY PROGRAM).

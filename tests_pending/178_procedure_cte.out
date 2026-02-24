@@ -1,22 +1,22 @@
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:5: ERROR:  Table 'public.ab' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:11: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:14: ERROR:  Procedure 'p' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:17: ERROR:  Procedure 'public.p' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:20: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:23: ERROR:  Procedure 'p' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:26: ERROR:  Procedure 'public.p' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:29: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:32: ERROR:  Procedure 'p' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:35: ERROR:  Procedure 'public.p' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:40: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:43: ERROR:  Procedure 'p' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:46: ERROR:  Procedure 'public.p' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:53: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:56: ERROR:  Procedure 'p' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:59: ERROR:  Procedure 'public.p' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:65: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:68: ERROR:  No PK
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:71: ERROR:  Procedure 'p' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:77: ERROR:  Procedure 'public.p' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:90: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
-psql:/home/dongxu/lab/pg-tikv/tests/178_procedure_cte.sql:93: ERROR:  Procedure 'p' does not exist
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:5: ERROR:  Table 'public.ab' already exists
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:11: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:14: ERROR:  Procedure 'p' does not exist
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:17: ERROR:  Procedure 'public.p' does not exist
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:20: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:23: ERROR:  Procedure 'p' does not exist
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:26: ERROR:  Procedure 'public.p' does not exist
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:29: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:32: ERROR:  Procedure 'p' does not exist
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:35: ERROR:  Procedure 'public.p' does not exist
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:40: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:43: ERROR:  Procedure 'p' does not exist
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:46: ERROR:  Procedure 'public.p' does not exist
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:53: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:56: ERROR:  Procedure 'p' does not exist
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:59: ERROR:  Procedure 'public.p' does not exist
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:65: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:68: ERROR:  No PK
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:71: ERROR:  Procedure 'p' does not exist
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:77: ERROR:  Procedure 'public.p' does not exist
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:90: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/db9-server/tests/178_procedure_cte.sql:93: ERROR:  Procedure 'p' does not exist

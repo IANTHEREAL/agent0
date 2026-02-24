@@ -1,13 +1,13 @@
-# pg-tikv ORM Compatibility Tests
+# db9-server ORM Compatibility Tests
 
-This test suite validates pg-tikv's compatibility with popular TypeScript/JavaScript ORMs.
+This test suite validates db9-server's compatibility with popular TypeScript/JavaScript ORMs.
 
 ## Prerequisites
 
 - Node.js >= 18.0.0
 - npm or yarn
-- Running pg-tikv instance (default: `localhost:5433`)
-- TiKV cluster (for pg-tikv backend)
+- Running db9-server instance (default: `localhost:5433`)
+- TiKV cluster (for db9-server backend)
 
 ## Quick Start
 
@@ -15,8 +15,8 @@ This test suite validates pg-tikv's compatibility with popular TypeScript/JavaSc
 # 1. Start TiKV cluster
 tiup playground --mode tikv-slim
 
-# 2. Start pg-tikv (in another terminal)
-cd /path/to/pg-tikv
+# 2. Start db9-server (in another terminal)
+cd /path/to/db9-server
 cargo run
 
 # 3. Run ORM tests
@@ -231,7 +231,7 @@ orm-tests/
 
 ## Known Limitations
 
-### pg-tikv Limitations
+### db9-server Limitations
 
 1. **information_schema** - Limited support. Some TypeORM schema tests are skipped.
 
@@ -253,7 +253,7 @@ orm-tests/
 // orm-name/new-feature.test.ts
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 
-describe('ORM New Feature [pg-tikv]', () => {
+describe('ORM New Feature [db9-server]', () => {
   // Setup
   beforeAll(async () => {
     // Initialize connection and create test tables
@@ -272,7 +272,7 @@ describe('ORM New Feature [pg-tikv]', () => {
 ### 2. Follow Naming Conventions
 
 - Test files: `*.test.ts`
-- Describe blocks: `'ORM Feature [pg-tikv]'`
+- Describe blocks: `'ORM Feature [db9-server]'`
 - Table names: Prefix with ORM name (e.g., `typeorm_users`, `knex_posts`)
 
 ### 3. Run and Verify
@@ -291,7 +291,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { DataSource } from 'typeorm';
 import { createDataSource } from './datasource.js';
 
-describe('TypeORM Array Operations [pg-tikv]', () => {
+describe('TypeORM Array Operations [db9-server]', () => {
   let dataSource: DataSource;
 
   beforeAll(async () => {
@@ -346,7 +346,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { PrismaClient } from '@prisma/client';
 import { createPrismaClient } from './client.js';
 
-describe('Prisma JSON Operations [pg-tikv]', () => {
+describe('Prisma JSON Operations [db9-server]', () => {
   let prisma: PrismaClient;
 
   beforeAll(async () => {
@@ -401,7 +401,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createKnexClient } from './client.js';
 import type { Knex } from 'knex';
 
-describe('Knex Window Functions [pg-tikv]', () => {
+describe('Knex Window Functions [db9-server]', () => {
   let knex: Knex;
 
   beforeAll(async () => {
@@ -468,7 +468,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createSequelize } from './connection.js';
 import { Sequelize, QueryTypes } from 'sequelize';
 
-describe('Sequelize CTE Support [pg-tikv]', () => {
+describe('Sequelize CTE Support [db9-server]', () => {
   let sequelize: Sequelize;
 
   beforeAll(async () => {
@@ -539,7 +539,7 @@ import { drizzle } from 'drizzle-orm/node-postgres';
 import { sql } from 'drizzle-orm';
 import { createDrizzleClient, pool } from './client.js';
 
-describe('Drizzle Subquery Support [pg-tikv]', () => {
+describe('Drizzle Subquery Support [db9-server]', () => {
   let db: ReturnType<typeof drizzle>;
 
   beforeAll(async () => {
@@ -635,7 +635,7 @@ describe('Drizzle Subquery Support [pg-tikv]', () => {
 7. **Group related tests**: Use nested `describe` blocks for features
 
 ```typescript
-describe('Knex Advanced Queries [pg-tikv]', () => {
+describe('Knex Advanced Queries [db9-server]', () => {
   describe('window functions', () => {
     it('should support ROW_NUMBER', async () => { ... });
     it('should support RANK', async () => { ... });
@@ -654,7 +654,7 @@ GitHub Actions workflow is configured in `.github/workflows/orm-tests.yml`.
 
 The workflow:
 1. Starts TiKV cluster
-2. Builds and starts pg-tikv
+2. Builds and starts db9-server
 3. Runs all ORM tests
 4. Generates compatibility report
 
@@ -666,9 +666,9 @@ The workflow:
 Error: connect ECONNREFUSED 127.0.0.1:5433
 ```
 
-Ensure pg-tikv is running:
+Ensure db9-server is running:
 ```bash
-ps aux | grep pg-tikv
+ps aux | grep db9-server
 ```
 
 ### TiKV Not Available
@@ -713,7 +713,7 @@ PG_PORT=5434 npm test
 
 ## Contributing
 
-1. Add tests for new pg-tikv features
+1. Add tests for new db9-server features
 2. Ensure all ORMs have equivalent tests where possible
 3. Update this README if adding new test categories
 4. Run full test suite before submitting PR:

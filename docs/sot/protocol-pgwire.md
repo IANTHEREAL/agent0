@@ -17,7 +17,7 @@
   - The server MUST use cleartext password authentication on startup (`Authentication::CleartextPassword`) when accepting a connection.
   - When the connection is non-TLS:
     - if `PG_REQUIRE_TLS=1`, the server MUST reject the connection deterministically;
-    - otherwise, non-loopback clients are rejected unless `PGTIKV_INSECURE=1` or `PGTIKV_DEV=1`.
+    - otherwise, non-loopback clients are rejected unless `DB9_INSECURE=1` or `DB9_DEV=1`.
   - Evidence: `src/protocol/handler/dynamic.rs` (`impl StartupHandler for DynamicPgHandler`, `on_startup`).
 
 - **[Stable] Tenant keyspace routing via username**
@@ -53,11 +53,11 @@ This module MUST NOT redefine config keys. Relevant keys are defined exactly onc
 - `PG_TLS_CERT`, `PG_TLS_KEY`
 - `PG_REQUIRE_TLS`
 - `PG_KEYSPACE`
-- `PGTIKV_INSECURE`
-- `PGTIKV_DEV`
-- `PGTIKV_MAX_SUSPENDED_PORTALS`
-- `PGTIKV_MAX_SUSPENDED_PORTAL_BUFFER_ROWS`
-- `PGTIKV_MAX_SUSPENDED_PORTAL_BUFFER_BYTES`
+- `DB9_INSECURE`
+- `DB9_DEV`
+- `DB9_MAX_SUSPENDED_PORTALS`
+- `DB9_MAX_SUSPENDED_PORTAL_BUFFER_ROWS`
+- `DB9_MAX_SUSPENDED_PORTAL_BUFFER_BYTES`
 
 ## Entrypoints
 - `src/main.rs` (`main`)
@@ -80,4 +80,4 @@ Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
 ## Change Management
 - Any change to pgwire handshake semantics, username/keyspace parsing, extended query buffering limits, or COPY recognition MUST update this document and the corresponding module entries in `docs/sot/modules.yaml`.
 - Breaking changes to protocol surface (including error code changes) require DR/ADR per #368 rules.
-- Reference: https://github.com/c4pt0r/tipg/issues/368
+- Reference: https://github.com/c4pt0r/db9/issues/368

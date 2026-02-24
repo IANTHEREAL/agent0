@@ -1,4 +1,4 @@
-# pg-tikv Cloud Admin Portal - Production Docker Compose
+# db9-server Cloud Admin Portal - Production Docker Compose
 # Usage: docker compose up -d
 
 services:
@@ -21,15 +21,15 @@ services:
       context: ../backend
       dockerfile: Dockerfile
     environment:
-      - PGTIKV_PD_ENDPOINTS=${PD_ENDPOINTS:-localhost:2379}
-      - PGTIKV_PG_HOST=${PG_HOST:-host.docker.internal}
-      - PGTIKV_PG_PORT=${PG_PORT:-5433}
-      - PGTIKV_PG_PUBLIC_ENDPOINTS=${PG_PUBLIC_ENDPOINTS:-127.0.0.1:5433}
-      - PGTIKV_API_PORT=8090
-      - PGTIKV_API_HOST=0.0.0.0
-      - PGTIKV_DATABASE_URL=${DATABASE_URL:-sqlite://data/portal.db?mode=rwc}
-      - PGTIKV_API_KEYS=${API_KEYS:-}
-      - PGTIKV_CORS_ORIGINS=${CORS_ORIGINS:-http://localhost,https://admin.example.com}
+      - DB9_PD_ENDPOINTS=${PD_ENDPOINTS:-localhost:2379}
+      - DB9_PG_HOST=${PG_HOST:-host.docker.internal}
+      - DB9_PG_PORT=${PG_PORT:-5433}
+      - DB9_PG_PUBLIC_ENDPOINTS=${PG_PUBLIC_ENDPOINTS:-127.0.0.1:5433}
+      - DB9_API_PORT=8090
+      - DB9_API_HOST=0.0.0.0
+      - DB9_DATABASE_URL=${DATABASE_URL:-sqlite://data/portal.db?mode=rwc}
+      - DB9_API_KEYS=${API_KEYS:-}
+      - DB9_CORS_ORIGINS=${CORS_ORIGINS:-http://localhost,https://admin.example.com}
       - RUST_LOG=${RUST_LOG:-info}
     expose:
       - "8090"

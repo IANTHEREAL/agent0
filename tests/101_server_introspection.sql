@@ -1,7 +1,7 @@
 -- Server identity + common driver introspection
 
 SELECT version() LIKE 'PostgreSQL%' AS version_prefix;
-SELECT version() LIKE '%pg-tikv%' AS version_has_pgtikv;
+SELECT version() LIKE '%db9-server%' AS version_has_db9;
 
 SELECT current_setting('server_version') AS server_version;
 SELECT current_setting('server_version_num')::int AS server_version_num;
@@ -26,7 +26,7 @@ SELECT current_setting('default_transaction_isolation') AS default_transaction_i
 SELECT current_setting('is_superuser') AS is_superuser;
 SELECT current_setting('session_authorization') AS session_authorization;
 
-SET application_name = 'pg-tikv-tests';
+SET application_name = 'db9-server-tests';
 SELECT current_setting('application_name') AS application_name;
 
 SET TIME ZONE 'Asia/Shanghai';

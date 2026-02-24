@@ -12,7 +12,7 @@ src/storage/
 │   ├── mod.rs                      # Re-exports + keyspace constants
 │   ├── data_keys.rs                # Row/index/GIN key encoding (database-scoped v2)
 │   ├── metadata_keys.rs            # Schema/view/function/trigger/cron/worker keys
-│   ├── serialization.rs            # Bincode with magic headers (PGTIKV_SCHEMA_V1) + legacy fallback
+│   ├── serialization.rs            # Bincode with magic headers (DB9_SCHEMA_V1) + legacy fallback
 │   ├── value_encoding.rs           # Memcomparable encoding for all value types
 │   └── tests.rs                    # Encoding unit tests
 └── tikv_store/                     # TiKV store implementation (~5,000 lines)
@@ -42,7 +42,7 @@ src/storage/
 _sys_next_table_id              → u64 (auto-increment counter)
 _sys_next_database_id           → u64 (auto-increment counter)
 _sys_format_version             → storage format version marker
-_sys_schema_{table}             → TableSchema (bincode with magic header PGTIKV_SCHEMA_V1\0)
+_sys_schema_{table}             → TableSchema (bincode with magic header DB9_SCHEMA_V1\0)
 _sys_view_{name}                → SQL string
 _sys_matview_{name}             → SQL string
 _sys_proc_{name}                → SQL string
@@ -102,7 +102,7 @@ const TABLE_SCAN_BATCH_SIZE: usize = 1024;  // gRPC message size limit
 
 ## Serialization
 
-- **Schema format**: Bincode with magic header `PGTIKV_SCHEMA_V1\0`
+- **Schema format**: Bincode with magic header `DB9_SCHEMA_V1\0`
 - **Legacy fallback**: Schemas with old IndexDef format (pre-ce73a8a) fall back gracefully
 - **Cron legacy**: CronJobLegacy deserialization path for old format
 - **Sunset policy**: 2026-12-31 for legacy formats

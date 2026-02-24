@@ -89,7 +89,7 @@ function categorizeByORM(results: VitestResults): Map<string, ORMResults> {
 function generateMarkdownReport(ormResults: Map<string, ORMResults>): string {
   const lines: string[] = [];
 
-  lines.push('# pg-tikv ORM Compatibility Report');
+  lines.push('# db9-server ORM Compatibility Report');
   lines.push('');
   lines.push(`Generated: ${new Date().toISOString()}`);
   lines.push('');
@@ -190,7 +190,7 @@ function generateMarkdownReport(ormResults: Map<string, ORMResults>): string {
 
   lines.push('## Known Limitations');
   lines.push('');
-  lines.push('- **information_schema**: pg-tikv has limited support for `information_schema` queries');
+  lines.push('- **information_schema**: db9-server has limited support for `information_schema` queries');
   lines.push('- **Schema introspection**: Some ORMs rely on schema introspection which may not work fully');
   lines.push(
     '- **Drizzle type parsers**: Drizzle ORM modifies global pg type parsers; other ORMs restore defaults'

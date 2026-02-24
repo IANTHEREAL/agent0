@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { PrismaClient, Prisma } from '@prisma/client';
 import { getPrismaClient, disconnectPrisma } from './client.js';
 
-describe('Prisma Query Generation & SQL Compatibility [pg-tikv]', () => {
+describe('Prisma Query Generation & SQL Compatibility [db9-server]', () => {
   let prisma: PrismaClient;
 
   beforeAll(async () => {

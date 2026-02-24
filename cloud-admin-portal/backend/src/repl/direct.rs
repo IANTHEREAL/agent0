@@ -15,7 +15,7 @@ impl DirectExecutor {
             if msg.contains("authentication") {
                 format!("Authentication failed: {msg}")
             } else if msg.contains("Connection refused") || msg.contains("connect") {
-                format!("Connection refused: {msg}\nHint: Is pg-tikv running?")
+                format!("Connection refused: {msg}\nHint: Is db9-server running?")
             } else {
                 format!("Connection failed: {msg}")
             }

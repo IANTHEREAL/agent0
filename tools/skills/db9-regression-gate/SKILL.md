@@ -1,11 +1,11 @@
 ---
-name: tipg-regression-gate
-description: "Run pg-tikv test gates quickly (fast regression gate + full suite) and produce a standard evidence snippet for PRs."
+name: db9-regression-gate
+description: "Run db9-server test gates quickly (fast regression gate + full suite) and produce a standard evidence snippet for PRs."
 ---
 
-# tipg regression gate (fast + full)
+# db9 regression gate (fast + full)
 
-Run commands from the repo root (example: `cd /path/to/tipg`).
+Run commands from the repo root (example: `cd /path/to/db9`).
 
 ## Prerequisites (minimal)
 
@@ -17,7 +17,7 @@ Run commands from the repo root (example: `cd /path/to/tipg`).
 
 ## Fast gate (default for PRs)
 
-Runs unit tests + a curated SQL regression set against a fresh TiKV + pg-tikv instance:
+Runs unit tests + a curated SQL regression set against a fresh TiKV + db9-server instance:
 
 ```bash
 bash scripts/regression_gate.sh
@@ -26,7 +26,7 @@ bash scripts/regression_gate.sh
 Useful options:
 
 ```bash
-# Reuse an existing running pg-tikv instance (skip starting TiKV/pg-tikv):
+# Reuse an existing running db9-server instance (skip starting TiKV/db9-server):
 bash scripts/regression_gate.sh --dsn "$PG_DSN"
 
 # More verbose output + stop on first SQL failure:
@@ -41,7 +41,7 @@ Runs integration tests + ORM compatibility tests and writes a Markdown report:
 ./run_tests.sh
 ```
 
-Look for the line: `Report saved to: /path/to/tipg/test-reports/test-report-YYYYMMDD-HHMMSS.md` (absolute path; relative location is `test-reports/test-report-YYYYMMDD-HHMMSS.md`)
+Look for the line: `Report saved to: /path/to/db9/test-reports/test-report-YYYYMMDD-HHMMSS.md` (absolute path; relative location is `test-reports/test-report-YYYYMMDD-HHMMSS.md`)
 
 ## Evidence snippet (copy/paste into PR)
 

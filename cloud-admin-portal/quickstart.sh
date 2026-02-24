@@ -4,8 +4,8 @@
 #
 # 前置条件（三个服务都要跑起来）:
 #   1. TiKV 集群:  uv run scripts/tikv_admin.py start --name dev --persistent
-#   2. pg-tikv:    PD_ENDPOINTS=127.0.0.1:2379 PG_PORT=5433 cargo run --release
-#   3. admin API:  cd cloud-admin-portal/backend && ./target/release/pgtikv-admin
+#   2. db9-server:    PD_ENDPOINTS=127.0.0.1:2379 PG_PORT=5433 cargo run --release
+#   3. admin API:  cd cloud-admin-portal/backend && ./target/release/db9-admin
 #
 # 用法:
 #   bash cloud-admin-portal/quickstart.sh
@@ -38,9 +38,9 @@ ok "db9 二进制就绪: $DB9"
 export DB9_API_URL="$API"
 
 # ── 1. 检查服务是否可用 ──────────────────────────────────────────
-step "检查 pgtikv-admin 是否在运行 ..."
+step "检查 db9-admin 是否在运行 ..."
 if ! curl -sf "$API/health" > /dev/null 2>&1; then
-    fail "无法连接 $API/health — 请先启动 pgtikv-admin"
+    fail "无法连接 $API/health — 请先启动 db9-admin"
 fi
 ok "API 服务正常"
 
@@ -100,7 +100,7 @@ if [ -n "$CONN" ] && command -v psql &>/dev/null; then
     if psql "$CONN" -c "SELECT 'db9 quickstart ok!' AS greeting;" 2>/dev/null; then
         ok "psql 连接成功!"
     else
-        info "psql 连接失败（pg-tikv 可能还没启动，不影响 demo）"
+        info "psql 连接失败（db9-server 可能还没启动，不影响 demo）"
     fi
 else
     info "跳过 psql 测试（psql 未安装或无连接串）"

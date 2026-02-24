@@ -1,6 +1,6 @@
 //! View expansion rewrite.
 //!
-//! tipg stores views as SQL text in the catalog. Historically, `get_table_data`
+//! db9 stores views as SQL text in the catalog. Historically, `get_table_data`
 //! expanded views at runtime (executor layer) by re-parsing and executing the
 //! view query when a FROM item referenced a view name.
 //!

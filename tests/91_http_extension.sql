@@ -11,7 +11,7 @@ SELECT status,
        content::jsonb -> 'json' ->> 'message' AS posted_message
 FROM extensions.http_post(
     'https://httpbin.org/post',
-    '{"message": "hello from pg-tikv"}',
+    '{"message": "hello from db9-server"}',
     'application/json'
 );
 
@@ -64,7 +64,7 @@ SELECT status,
        content::jsonb -> 'headers' ->> 'X-Test-Header' AS test_header
 FROM extensions.http_get(
     'https://httpbin.org/get',
-    '[{"field":"X-Test-Header","value":"hello-from-pgtikv"}]'
+    '[{"field":"X-Test-Header","value":"hello-from-db9"}]'
 );
 
 -- Custom headers: object shorthand format

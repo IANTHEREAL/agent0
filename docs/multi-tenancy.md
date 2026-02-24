@@ -1,6 +1,6 @@
 # Multi-Tenancy Guide
 
-pg-tikv supports multi-tenancy through TiKV's Keyspace feature, providing complete data isolation between tenants.
+db9-server supports multi-tenancy through TiKV's Keyspace feature, providing complete data isolation between tenants.
 
 ## Overview
 
@@ -69,15 +69,15 @@ tiup ctl:v8.5.4 pd -u http://127.0.0.1:2379 keyspace create acme_corp
 tiup ctl:v8.5.4 pd -u http://127.0.0.1:2379 keyspace list
 ```
 
-### 3. Start pg-tikv
+### 3. Start db9-server
 
 ```bash
-PD_ENDPOINTS=127.0.0.1:2379 PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=<password> ./target/release/pg-tikv
+PD_ENDPOINTS=127.0.0.1:2379 DB9_BOOTSTRAP_ADMIN_PASSWORD=<password> ./target/release/db9-server
 ```
 
 ## Username Routing
 
-pg-tikv uses the username to route connections to the correct keyspace.
+db9-server uses the username to route connections to the correct keyspace.
 
 ### Username Format
 
@@ -200,16 +200,16 @@ psql -h 127.0.0.1 -p 5433 -U myuser
 You can also set a different default keyspace via environment variable:
 
 ```bash
-PG_KEYSPACE=my_default PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=<password> ./target/release/pg-tikv
+PG_KEYSPACE=my_default DB9_BOOTSTRAP_ADMIN_PASSWORD=<password> ./target/release/db9-server
 ```
 
 ## Bootstrap User
 
-When a keyspace has no superuser yet, pg-tikv bootstraps the initial superuser only when you explicitly set:
-- `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD` (required)
-- `PGTIKV_BOOTSTRAP_ADMIN_USER` (optional; default `admin`)
+When a keyspace has no superuser yet, db9-server bootstraps the initial superuser only when you explicitly set:
+- `DB9_BOOTSTRAP_ADMIN_PASSWORD` (required)
+- `DB9_BOOTSTRAP_ADMIN_USER` (optional; default `admin`)
 
-**Dev-only**: `PGTIKV_DEV=1` enables legacy insecure bootstrap behavior intended for local development only.
+**Dev-only**: `DB9_DEV=1` enables legacy insecure bootstrap behavior intended for local development only.
 
 **Security Note**: In production, use a strong bootstrap password and enable TLS (`PG_TLS_CERT` + `PG_TLS_KEY`).
 

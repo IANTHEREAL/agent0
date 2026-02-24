@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Benchmark boxed-future overhead in pg-tikv query execution.
+Benchmark boxed-future overhead in db9-server query execution.
 
 Modes:
 1) Benchmark mode:
@@ -490,12 +490,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--profile",
-        default=os.environ.get("PGTIKV_RUST_PROFILE", "release"),
+        default=os.environ.get("DB9_RUST_PROFILE", "release"),
         help="Rust profile label stored in metadata",
     )
     parser.add_argument(
         "--stack-mb-label",
-        default=os.environ.get("PGTIKV_TOKIO_STACK_MB", ""),
+        default=os.environ.get("DB9_TOKIO_STACK_MB", ""),
         help="Stack size label stored in metadata (e.g. 8 or 32)",
     )
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP, help="Warmup iterations")

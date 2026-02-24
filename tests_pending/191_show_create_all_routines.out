@@ -1,14 +1,14 @@
-psql:/home/dongxu/lab/pg-tikv/tests/191_show_create_all_routines.sql:22: ERROR:  Unsupported function in JOIN: pg_get_function_identity_arguments
-psql:/home/dongxu/lab/pg-tikv/tests/191_show_create_all_routines.sql:28: ERROR:  Unsupported function in JOIN: pg_get_function_identity_arguments
-psql:/home/dongxu/lab/pg-tikv/tests/191_show_create_all_routines.sql:37: ERROR:  SQL parse error: sql parser error: Expected [EXTERNAL] TABLE or [MATERIALIZED] VIEW or FUNCTION after CREATE OR REPLACE, found: PROCEDURE at Line: 1, Column 19
-psql:/home/dongxu/lab/pg-tikv/tests/191_show_create_all_routines.sql:40: ERROR:  Unsupported function in JOIN: pg_get_function_identity_arguments
-psql:/home/dongxu/lab/pg-tikv/tests/191_show_create_all_routines.sql:43: ERROR:  Function 'public.add_one' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/191_show_create_all_routines.sql:46: ERROR:  Unsupported function in JOIN: pg_get_function_identity_arguments
-psql:/home/dongxu/lab/pg-tikv/tests/191_show_create_all_routines.sql:52: ERROR:  Function 'public.add_one' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/191_show_create_all_routines.sql:55: ERROR:  Unsupported function in JOIN: pg_get_function_identity_arguments
-psql:/home/dongxu/lab/pg-tikv/tests/191_show_create_all_routines.sql:58: ERROR:  Procedure 'public.double_triple' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/191_show_create_all_routines.sql:61: ERROR:  Unsupported function in JOIN: pg_get_function_identity_arguments
-psql:/home/dongxu/lab/pg-tikv/tests/191_show_create_all_routines.sql:64: ERROR:  Schema 's' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/191_show_create_all_routines.sql:73: ERROR:  Unsupported function in JOIN: pg_get_function_identity_arguments
-psql:/home/dongxu/lab/pg-tikv/tests/191_show_create_all_routines.sql:84: ERROR:  Unsupported function in JOIN: pg_get_function_identity_arguments
-psql:/home/dongxu/lab/pg-tikv/tests/191_show_create_all_routines.sql:86: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/191_show_create_all_routines.sql:22: ERROR:  Unsupported function in JOIN: pg_get_function_identity_arguments
+psql:/home/dongxu/lab/db9-server/tests/191_show_create_all_routines.sql:28: ERROR:  Unsupported function in JOIN: pg_get_function_identity_arguments
+psql:/home/dongxu/lab/db9-server/tests/191_show_create_all_routines.sql:37: ERROR:  SQL parse error: sql parser error: Expected [EXTERNAL] TABLE or [MATERIALIZED] VIEW or FUNCTION after CREATE OR REPLACE, found: PROCEDURE at Line: 1, Column 19
+psql:/home/dongxu/lab/db9-server/tests/191_show_create_all_routines.sql:40: ERROR:  Unsupported function in JOIN: pg_get_function_identity_arguments
+psql:/home/dongxu/lab/db9-server/tests/191_show_create_all_routines.sql:43: ERROR:  Function 'public.add_one' already exists
+psql:/home/dongxu/lab/db9-server/tests/191_show_create_all_routines.sql:46: ERROR:  Unsupported function in JOIN: pg_get_function_identity_arguments
+psql:/home/dongxu/lab/db9-server/tests/191_show_create_all_routines.sql:52: ERROR:  Function 'public.add_one' does not exist
+psql:/home/dongxu/lab/db9-server/tests/191_show_create_all_routines.sql:55: ERROR:  Unsupported function in JOIN: pg_get_function_identity_arguments
+psql:/home/dongxu/lab/db9-server/tests/191_show_create_all_routines.sql:58: ERROR:  Procedure 'public.double_triple' does not exist
+psql:/home/dongxu/lab/db9-server/tests/191_show_create_all_routines.sql:61: ERROR:  Unsupported function in JOIN: pg_get_function_identity_arguments
+psql:/home/dongxu/lab/db9-server/tests/191_show_create_all_routines.sql:64: ERROR:  Schema 's' already exists
+psql:/home/dongxu/lab/db9-server/tests/191_show_create_all_routines.sql:73: ERROR:  Unsupported function in JOIN: pg_get_function_identity_arguments
+psql:/home/dongxu/lab/db9-server/tests/191_show_create_all_routines.sql:84: ERROR:  Unsupported function in JOIN: pg_get_function_identity_arguments
+psql:/home/dongxu/lab/db9-server/tests/191_show_create_all_routines.sql:86: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

@@ -3,7 +3,7 @@ import { Sequelize, Op } from 'sequelize';
 import { createSequelize } from './connection.js';
 import { User, Post, Tag } from './models.js';
 
-describe('Sequelize CRUD Semantics [pg-tikv]', () => {
+describe('Sequelize CRUD Semantics [db9-server]', () => {
   let sequelize: Sequelize;
 
   beforeAll(async () => {
@@ -65,7 +65,7 @@ describe('Sequelize CRUD Semantics [pg-tikv]', () => {
         age: 25,
       });
 
-      // KNOWN LIMITATION: pg-tikv returns null instead of true/false
+      // KNOWN LIMITATION: db9-server returns null instead of true/false
       // Real PostgreSQL would return true for insert
       expect(created === true || created === null).toBe(true);
       expect(user.name).toBe('New User');
@@ -87,7 +87,7 @@ describe('Sequelize CRUD Semantics [pg-tikv]', () => {
         age: 30,
       });
 
-      // KNOWN LIMITATION: pg-tikv returns null instead of true/false
+      // KNOWN LIMITATION: db9-server returns null instead of true/false
       // Real PostgreSQL would return false for update
       expect(created === false || created === null).toBe(true);
       expect(user.name).toBe('Updated');

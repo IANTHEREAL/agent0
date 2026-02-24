@@ -26,7 +26,7 @@
   9
 (10 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/180_propagate_input_ordering.sql:23: ERROR:  Column 'foo' not found
+psql:/home/dongxu/lab/db9-server/tests/180_propagate_input_ordering.sql:23: ERROR:  Column 'foo' not found
  i  | mod2 
 ----+------
  5  | 1
@@ -88,9 +88,9 @@ psql:/home/dongxu/lab/pg-tikv/tests/180_propagate_input_ordering.sql:23: ERROR: 
   1
 (10 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/180_propagate_input_ordering.sql:48: ERROR:  Table 'public.ab' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/180_propagate_input_ordering.sql:54: ERROR:  Table 'public.xy' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/180_propagate_input_ordering.sql:57: ERROR:  duplicate key value violates unique constraint "xy_pkey"
+psql:/home/dongxu/lab/db9-server/tests/180_propagate_input_ordering.sql:48: ERROR:  Table 'public.ab' already exists
+psql:/home/dongxu/lab/db9-server/tests/180_propagate_input_ordering.sql:54: ERROR:  Table 'public.xy' already exists
+psql:/home/dongxu/lab/db9-server/tests/180_propagate_input_ordering.sql:57: ERROR:  duplicate key value violates unique constraint "xy_pkey"
 DETAIL:  Key (x)=(2) already exists.
   v  
 -----

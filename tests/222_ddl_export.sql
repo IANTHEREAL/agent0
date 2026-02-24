@@ -36,10 +36,10 @@ CREATE VIEW export_test_view AS SELECT id, name, email FROM export_test_main WHE
 CREATE MATERIALIZED VIEW export_test_mv AS SELECT id, name FROM export_test_main;
 
 -- Query DDL export — verify all object types appear
-SELECT object_type, object_name FROM _pgtikv_sys_export_ddl() ORDER BY object_type, object_name;
+SELECT object_type, object_name FROM _db9_sys_export_ddl() ORDER BY object_type, object_name;
 
 -- Verify specific DDL content for the main table
-SELECT ddl_sql FROM _pgtikv_sys_export_ddl() WHERE object_name = 'public.export_test_main' AND object_type = 'table';
+SELECT ddl_sql FROM _db9_sys_export_ddl() WHERE object_name = 'public.export_test_main' AND object_type = 'table';
 
 -- Cleanup
 DROP MATERIALIZED VIEW export_test_mv;

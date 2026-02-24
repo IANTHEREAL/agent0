@@ -14,7 +14,7 @@ DROP TABLE IF EXISTS t225_stats;
 CREATE TABLE t225_stats (id INT PRIMARY KEY, name TEXT, extra INT);
 INSERT INTO t225_stats VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (4, 'd', 40), (5, 'e', 50);
 
-SET tipg.use_optimizer = on;
+SET db9.use_optimizer = on;
 
 -- Phase 1: ANALYZE populates stats (row_count = 5)
 ANALYZE t225_stats;

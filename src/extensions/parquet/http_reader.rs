@@ -44,7 +44,7 @@ pub(crate) fn validate_parquet_url(url: &str) -> anyhow::Result<()> {
 
 /// Validate URL against SSRF: block private IPs, localhost, link-local.
 /// Mirrors the network policy in `src/extensions/http.rs`.
-/// In insecure mode (PGTIKV_HTTP_ALLOW_INSECURE=true), all hosts are allowed.
+/// In insecure mode (DB9_HTTP_ALLOW_INSECURE=true), all hosts are allowed.
 pub(crate) async fn validate_parquet_url_security(url: &str) -> anyhow::Result<()> {
     use std::net::IpAddr;
     use tokio::net::lookup_host;
@@ -52,7 +52,7 @@ pub(crate) async fn validate_parquet_url_security(url: &str) -> anyhow::Result<(
     fn allow_insecure() -> bool {
         static ALLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ALLOW.get_or_init(|| {
-            std::env::var("PGTIKV_HTTP_ALLOW_INSECURE")
+            std::env::var("DB9_HTTP_ALLOW_INSECURE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false)
         })

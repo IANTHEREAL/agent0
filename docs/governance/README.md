@@ -8,4 +8,4 @@ This directory defines a minimal governance protocol intended to make complex wo
 - Mechanical enforcement (required check): `governance-lint.md`
 - System behavior/contracts SoT (authoritative spec): `docs/sot/**` (changes require SA sign-off; contract changes require AC)
 
-Reference exemplar (multi-phase pattern): https://github.com/c4pt0r/tipg/issues/368
+Reference exemplar (multi-phase pattern): https://github.com/c4pt0r/db9/issues/368

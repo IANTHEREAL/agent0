@@ -10,4 +10,4 @@ comment_test_fn|fn comment
 comment_rows
 0
 (1 row)
-psql:/home/dongxu/lab/pg-tikv/tests/97_comment_on.sql:5: NOTICE:  table "comment_test" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/97_comment_on.sql:5: NOTICE:  table "comment_test" does not exist, skipping

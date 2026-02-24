@@ -5,9 +5,9 @@ baseline:
   commit: b0ea7d1eb9af806b1487503efad9bb2661f1faa3
 
 sources:
-  evidence_snapshot: https://github.com/c4pt0r/tipg/issues/368#issuecomment-3847303069
-  gate_inventory: https://github.com/c4pt0r/tipg/issues/368#issuecomment-3847468216
-  ownership_evidence: https://github.com/c4pt0r/tipg/issues/368#issuecomment-3847519866
+  evidence_snapshot: https://github.com/c4pt0r/db9/issues/368#issuecomment-3847303069
+  gate_inventory: https://github.com/c4pt0r/db9/issues/368#issuecomment-3847468216
+  ownership_evidence: https://github.com/c4pt0r/db9/issues/368#issuecomment-3847519866
 
 modules:
   - module_id: protocol-pgwire

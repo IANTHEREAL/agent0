@@ -3,7 +3,7 @@ import { DataSource, Repository } from 'typeorm';
 import { createDataSource } from './datasource.js';
 import { Embedding } from './entities/Embedding.js';
 
-describe('TypeORM Vector Operations [pg-tikv]', () => {
+describe('TypeORM Vector Operations [db9-server]', () => {
   let dataSource: DataSource;
   let embeddingRepo: Repository<Embedding>;
 

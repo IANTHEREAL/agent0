@@ -5,7 +5,7 @@
 
 ## 背景与动机
 
-当前 pg-tikv 把 `DATE` 映射为 `TIMESTAMP`（`src/sql/helpers.rs:363`），这会导致：
+当前 db9-server 把 `DATE` 映射为 `TIMESTAMP`（`src/sql/helpers.rs:363`），这会导致：
 - 类型语义不一致：DATE 没有时间部分，但 TIMESTAMP 有
 - ORM 类型映射/迁移差异：很多 ORM 会区分 `date` 与 `timestamp`
 - introspection 输出不准确：`information_schema.columns.data_type` 等会误报

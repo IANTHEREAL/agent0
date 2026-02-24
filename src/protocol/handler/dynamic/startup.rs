@@ -296,8 +296,8 @@ impl StartupHandler for DynamicPgHandler {
                 client.set_state(PgWireConnectionState::AuthenticationInProgress);
 
                 let require_tls = config::env_bool("PG_REQUIRE_TLS");
-                let dev_mode = config::env_bool("PGTIKV_DEV");
-                let insecure_mode = config::env_bool("PGTIKV_INSECURE");
+                let dev_mode = config::env_bool("DB9_DEV");
+                let insecure_mode = config::env_bool("DB9_INSECURE");
 
                 if require_tls && !client.is_secure() {
                     let error_info = ErrorInfo::new(
@@ -315,14 +315,14 @@ impl StartupHandler for DynamicPgHandler {
                         let error_info = ErrorInfo::new(
                             "FATAL".to_owned(),
                             "28000".to_owned(),
-                            "Cleartext password authentication without TLS is disabled by default for non-loopback clients. Enable TLS (PG_TLS_CERT/PG_TLS_KEY) or explicitly opt into insecure mode (PGTIKV_DEV=1 or PGTIKV_INSECURE=1).".to_string(),
+                            "Cleartext password authentication without TLS is disabled by default for non-loopback clients. Enable TLS (PG_TLS_CERT/PG_TLS_KEY) or explicitly opt into insecure mode (DB9_DEV=1 or DB9_INSECURE=1).".to_string(),
                         );
                         return Err(PgWireError::UserError(Box::new(error_info)));
                     }
 
                     if !peer_ip.is_loopback() && (dev_mode || insecure_mode) {
                         warn!(
-                            "Allowing non-TLS cleartext auth for non-loopback connection from {} (PGTIKV_DEV={}, PGTIKV_INSECURE={})",
+                            "Allowing non-TLS cleartext auth for non-loopback connection from {} (DB9_DEV={}, DB9_INSECURE={})",
                             peer_ip, dev_mode, insecure_mode
                         );
                     }

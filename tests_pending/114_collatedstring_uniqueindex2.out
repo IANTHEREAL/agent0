@@ -1,6 +1,6 @@
-psql:/home/dongxu/lab/pg-tikv/tests/114_collatedstring_uniqueindex2.sql:6: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
-psql:/home/dongxu/lab/pg-tikv/tests/114_collatedstring_uniqueindex2.sql:24: ERROR:  Unsupported expression: Collate { expr: Value(SingleQuotedString("A")), collation: ObjectName([Ident { value: "de-x-icu", quote_style: Some('"') }]) }
-psql:/home/dongxu/lab/pg-tikv/tests/114_collatedstring_uniqueindex2.sql:27: ERROR:  Index name required
+psql:/home/dongxu/lab/db9-server/tests/114_collatedstring_uniqueindex2.sql:6: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/114_collatedstring_uniqueindex2.sql:24: ERROR:  Unsupported expression: Collate { expr: Value(SingleQuotedString("A")), collation: ObjectName([Ident { value: "de-x-icu", quote_style: Some('"') }]) }
+psql:/home/dongxu/lab/db9-server/tests/114_collatedstring_uniqueindex2.sql:27: ERROR:  Index name required
  a | b 
 ---+---
 (0 rows)
@@ -32,7 +32,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/114_collatedstring_uniqueindex2.sql:27: ERRO
 ---+---
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/114_collatedstring_uniqueindex2.sql:51: ERROR:  No PK
+psql:/home/dongxu/lab/db9-server/tests/114_collatedstring_uniqueindex2.sql:51: ERROR:  No PK
  a | b 
 ---+---
 (0 rows)

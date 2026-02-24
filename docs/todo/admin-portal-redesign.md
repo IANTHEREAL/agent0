@@ -1,9 +1,9 @@
-# pg-tikv Admin Portal Redesign
+# db9-server Admin Portal Redesign
 
 **Status**: In Progress  
 **Date**: 2025-01-14  
 **Updated**: 2025-01-16  
-**Related Code**: `scripts/pg_tikv_admin_api.py`, `scripts/pg_tikv_admin.py`  
+**Related Code**: `scripts/db9_admin_api.py`, `scripts/db9_admin.py`  
 **Implementation**: `cloud-admin-portal/` (new project)  
 **Progress Tracking**: [WEB_WORK.md](/WEB_WORK.md)
 
@@ -11,14 +11,14 @@
 
 ### 1.1 Current Architecture
 
-The pg-tikv Admin Portal is a web management interface for multi-tenant database instances. The current implementation resides in `scripts/pg_tikv_admin_api.py` as a single-file architecture:
+The db9-server Admin Portal is a web management interface for multi-tenant database instances. The current implementation resides in `scripts/db9_admin_api.py` as a single-file architecture:
 
 ```
-scripts/pg_tikv_admin_api.py (1734 lines)
+scripts/db9_admin_api.py (1734 lines)
 ├── FastAPI REST API (~400 lines)
 ├── Pydantic Models (~70 lines)
 ├── Embedded HTML/CSS/JS (~1200 lines)
-└── Business logic from pg_tikv_admin.py
+└── Business logic from db9_admin.py
 ```
 
 ### 1.2 System Component Relationships
@@ -26,16 +26,16 @@ scripts/pg_tikv_admin_api.py (1734 lines)
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        Admin Portal (Web UI)                        │
-│                    scripts/pg_tikv_admin_api.py                     │
+│                    scripts/db9_admin_api.py                     │
 └─────────────────────────────────────────────────────────────────────┘
                                    │
                                    │ HTTP REST API
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         TenantManager                               │
-│                    scripts/pg_tikv_admin.py                         │
+│                    scripts/db9_admin.py                         │
 │  ┌─────────────────────────────────────────────────────────────┐   │
-│  │  PDClient              │  PgTikvClient                      │   │
+│  │  PDClient              │  Db9Client                      │   │
 │  │  - create_keyspace()   │  - execute_sql()                   │   │
 │  │  - list_keyspaces()    │  - create_user()                   │   │
 │  │  - get_keyspace()      │  - list_users()                    │   │
@@ -46,7 +46,7 @@ scripts/pg_tikv_admin_api.py (1734 lines)
            │ HTTP                               │ psql subprocess
            ▼                                    ▼
 ┌──────────────────┐                ┌──────────────────────────────┐
-│    TiKV PD       │                │       pg-tikv Server         │
+│    TiKV PD       │                │       db9-server Server         │
 │  (Keyspace API)  │                │  src/protocol/handler.rs     │
 │                  │                │  src/auth/rbac.rs            │
 └──────────────────┘                └──────────────────────────────┘
@@ -61,7 +61,7 @@ scripts/pg_tikv_admin_api.py (1734 lines)
 | **Security** | admin_password passed in URL query params | High | Password logged in server logs/browser history |
 | **Security** | API has no authentication, completely open | High | Anyone can access admin interface |
 | **Security** | CORS configured as `allow_origins=["*"]` | Medium | Cross-site request vulnerability |
-| **Code** | PgTikvClient uses subprocess to call psql | Medium | External tool dependency, limited error handling |
+| **Code** | Db9Client uses subprocess to call psql | Medium | External tool dependency, limited error handling |
 | **Code** | Global singleton manager, hard to test | Medium | Difficult to write unit tests |
 | **Code** | Repetitive error handling patterns | Low | Code redundancy |
 | **UX** | Limited frontend functionality, no real-time updates | Low | Poor user experience |
@@ -140,13 +140,13 @@ This causes passwords to be:
 
 ### 4.1 New Architecture Overview
 
-**Note**: The implementation creates a standalone `cloud-admin-portal/` project at the pg-tikv root level, containing both backend and frontend code with deployment scripts. This keeps the admin portal as a separate deployable unit.
+**Note**: The implementation creates a standalone `cloud-admin-portal/` project at the db9-server root level, containing both backend and frontend code with deployment scripts. This keeps the admin portal as a separate deployable unit.
 
 ```
-pg-tikv/
+db9-server/
 ├── scripts/
-│   ├── pg_tikv_admin.py          # CLI tool (keep as-is)
-│   └── pg_tikv_admin_api.py      # Legacy API (deprecated)
+│   ├── db9_admin.py          # CLI tool (keep as-is)
+│   └── db9_admin_api.py      # Legacy API (deprecated)
 │
 └── cloud-admin-portal/            # NEW: Complete admin portal project
     ├── backend/                   # FastAPI backend (Python)
@@ -213,7 +213,7 @@ pg-tikv/
                     ┌───────────────────────┴───────────────────┐
                     ▼                                           ▼
           ┌─────────────────┐                       ┌─────────────────┐
-          │   TiKV PD       │                       │   pg-tikv       │
+          │   TiKV PD       │                       │   db9-server       │
           │   (Keyspaces)   │                       │   (SQL)         │
           └─────────────────┘                       └─────────────────┘
 ```
@@ -265,7 +265,7 @@ To avoid repeatedly entering tenant database credentials, introduce a "Tenant Se
 1. User authenticates to tenant via POST /api/tenants/{name}/connect
    Request Body: { "admin_user": "admin", "admin_password": "secret" }
    
-2. Server validates credentials against pg-tikv
+2. Server validates credentials against db9-server
    
 3. On success, returns session_id (stored in server memory, expires in 1 hour)
    Response: { "session_id": "ts_abc123", "expires_at": "..." }
@@ -880,7 +880,7 @@ export function useAuth() {
 │                                                                 │
 │                     ┌─────────────────────┐                     │
 │                     │      [Logo]         │                     │
-│                     │      pg-tikv        │                     │
+│                     │      db9-server        │                     │
 │                     │   Admin Console     │                     │
 │                     │                     │                     │
 │                     │  ┌───────────────┐  │                     │
@@ -899,7 +899,7 @@ export function useAuth() {
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  pg-tikv Admin                               [●] Connected  [⚙]│
+│  db9-server Admin                               [●] Connected  [⚙]│
 ├─────────┬───────────────────────────────────────────────────────┤
 │         │                                                       │
 │ Tenants │  Tenants                        [ + New Tenant ]      │
@@ -923,7 +923,7 @@ export function useAuth() {
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  pg-tikv Admin                               [●] Connected  [⚙]│
+│  db9-server Admin                               [●] Connected  [⚙]│
 ├─────────┬───────────────────────────────────────────────────────┤
 │         │                                                       │
 │ Tenants │  ← Back to Tenants                                    │
@@ -962,12 +962,12 @@ export function useAuth() {
 ### 7.1 New Code Structure
 
 ```python
-# scripts/pg_tikv_admin_api.py (refactored)
+# scripts/db9_admin_api.py (refactored)
 
 """
-pg-tikv Admin REST API Server
+db9-server Admin REST API Server
 
-RESTful API for pg-tikv multi-tenant administration.
+RESTful API for db9-server multi-tenant administration.
 """
 
 from contextlib import asynccontextmanager
@@ -986,7 +986,7 @@ from pydantic_settings import BaseSettings
 import jwt
 import uvicorn
 
-from pg_tikv_admin import TenantManager, generate_password, UserInfo
+from db9_admin import TenantManager, generate_password, UserInfo
 
 # ============================================================================
 # Configuration
@@ -1005,7 +1005,7 @@ class Settings(BaseSettings):
     tenant_session_expiry_hours: int = 1
 
     class Config:
-        env_prefix = "PGTIKV_"
+        env_prefix = "DB9_"
 
 
 @lru_cache()
@@ -1212,8 +1212,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="pg-tikv Admin API",
-    description="RESTful API for pg-tikv multi-tenant administration",
+    title="db9-server Admin API",
+    description="RESTful API for db9-server multi-tenant administration",
     version="2.0.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc",
@@ -1608,7 +1608,7 @@ async def health_check(manager: TenantManager = Depends(get_manager)):
 async def api_info():
     """Get API version and information."""
     return {
-        "name": "pg-tikv Admin API",
+        "name": "db9-server Admin API",
         "version": "2.0.0",
         "docs": "/api/docs",
     }
@@ -1624,7 +1624,7 @@ def main():
     
     print(f"""
 ╔═══════════════════════════════════════════════════════════════╗
-║              pg-tikv Admin API Server v2.0                    ║
+║              db9-server Admin API Server v2.0                    ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║  API URL:     http://0.0.0.0:{settings.api_port}/api
 ║  API Docs:    http://0.0.0.0:{settings.api_port}/api/docs
@@ -1658,7 +1658,7 @@ if __name__ == "__main__":
 
 ### Phase 1: Backend Refactoring (1-2 days)
 
-1. Refactor `pg_tikv_admin_api.py`
+1. Refactor `db9_admin_api.py`
    - Add JWT authentication
    - Implement Tenant Session mechanism
    - Fix CORS configuration
@@ -1797,13 +1797,13 @@ admin-ui/
 ### Modified Files
 
 ```
-scripts/pg_tikv_admin_api.py     # Refactored (remove embedded HTML, add auth)
+scripts/db9_admin_api.py     # Refactored (remove embedded HTML, add auth)
 ```
 
 ### Removed Content
 
 ```
-scripts/pg_tikv_admin_api.py: ADMIN_HTML variable (~1200 lines)
+scripts/db9_admin_api.py: ADMIN_HTML variable (~1200 lines)
 ```
 
 ## 10. Testing Strategy
@@ -1818,10 +1818,10 @@ from unittest.mock import patch, MagicMock
 
 # Import after setting test env vars
 import os
-os.environ["PGTIKV_ADMIN_PASSWORD"] = "test_password"
-os.environ["PGTIKV_JWT_SECRET"] = "test_secret"
+os.environ["DB9_ADMIN_PASSWORD"] = "test_password"
+os.environ["DB9_JWT_SECRET"] = "test_secret"
 
-from scripts.pg_tikv_admin_api import app, get_settings, get_manager
+from scripts.db9_admin_api import app, get_settings, get_manager
 
 client = TestClient(app)
 
@@ -1865,7 +1865,7 @@ class TestTenants:
         response = client.get("/api/tenants")
         assert response.status_code == 401
 
-    @patch("scripts.pg_tikv_admin_api.get_manager")
+    @patch("scripts.db9_admin_api.get_manager")
     def test_list_tenants_authorized(self, mock_get_manager, auth_headers):
         mock_manager = MagicMock()
         mock_manager.list_tenants.return_value = [
@@ -1928,7 +1928,7 @@ describe("LoginPage", () => {
   it("renders login form", () => {
     render(<LoginPage />, { wrapper })
     
-    expect(screen.getByText(/pg-tikv/i)).toBeInTheDocument()
+    expect(screen.getByText(/db9-server/i)).toBeInTheDocument()
     expect(screen.getByLabelText(/password/i)).toBeInTheDocument()
     expect(screen.getByRole("button", { name: /login/i })).toBeInTheDocument()
   })
@@ -1999,10 +1999,10 @@ describe("TenantTable", () => {
 
 ### 11.2 Production Deployment Recommendations
 
-1. **Change default password**: Set `PGTIKV_ADMIN_PASSWORD` environment variable
-2. **Configure JWT secret**: Set `PGTIKV_JWT_SECRET` environment variable (auto-generated if not set)
+1. **Change default password**: Set `DB9_ADMIN_PASSWORD` environment variable
+2. **Configure JWT secret**: Set `DB9_JWT_SECRET` environment variable (auto-generated if not set)
 3. **Enable HTTPS**: Use Nginx reverse proxy with TLS
-4. **Restrict CORS**: Set `PGTIKV_CORS_ORIGINS` to production domain only
+4. **Restrict CORS**: Set `DB9_CORS_ORIGINS` to production domain only
 5. **Use Redis**: Replace in-memory tenant session storage with Redis for horizontal scaling
 
 ### 11.3 Nginx Configuration Example
@@ -2043,12 +2043,12 @@ services:
       context: .
       dockerfile: Dockerfile.admin-api
     environment:
-      - PGTIKV_ADMIN_PASSWORD=${ADMIN_PASSWORD}
-      - PGTIKV_JWT_SECRET=${JWT_SECRET}
-      - PGTIKV_PD_ENDPOINTS=pd:2379
-      - PGTIKV_PG_HOST=pg-tikv
-      - PGTIKV_PG_PORT=5433
-      - PGTIKV_CORS_ORIGINS=["https://admin.example.com"]
+      - DB9_ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - DB9_JWT_SECRET=${JWT_SECRET}
+      - DB9_PD_ENDPOINTS=pd:2379
+      - DB9_PG_HOST=db9-server
+      - DB9_PG_PORT=5433
+      - DB9_CORS_ORIGINS=["https://admin.example.com"]
     ports:
       - "8080:8080"
 
@@ -2077,6 +2077,6 @@ The following features are identified but intentionally excluded from this desig
 - [shadcn/ui Documentation](https://ui.shadcn.com/)
 - [TanStack Query Documentation](https://tanstack.com/query/latest)
 - [TanStack Table Documentation](https://tanstack.com/table/latest)
-- [pg-tikv Multi-tenancy Guide](../multi-tenancy.md)
-- [pg-tikv Authentication Guide](../authentication.md)
+- [db9-server Multi-tenancy Guide](../multi-tenancy.md)
+- [db9-server Authentication Guide](../authentication.md)
 - [JWT Introduction](https://jwt.io/introduction)

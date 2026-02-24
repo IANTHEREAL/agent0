@@ -3,7 +3,7 @@
 Standalone webhook receiver for testing cloud database triggers.
 
 This script starts a simple HTTP server that receives webhook notifications
-from the TiPG database triggers. It runs independently so you can expose it
+from the db9 database triggers. It runs independently so you can expose it
 via ngrok or other tunneling services.
 
 Usage:
@@ -67,7 +67,7 @@ def main():
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 8765
 
     print("=" * 60)
-    print("TiPG Webhook Receiver")
+    print("db9 Webhook Receiver")
     print("=" * 60)
     print(f"Listening on: http://{host}:{port}")
     print("Press Ctrl+C to stop")

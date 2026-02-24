@@ -2,7 +2,7 @@
 
 ## 摘要
 
-本文设计一个适用于分布式、多租户（TiKV keyspace 隔离）的 `pg-tikv` 扩展机制，并在该机制之上实现一个类似 Supabase `http` 扩展（基于 `pgsql-http` 语义）的 HTTP 客户端扩展。
+本文设计一个适用于分布式、多租户（TiKV keyspace 隔离）的 `db9-server` 扩展机制，并在该机制之上实现一个类似 Supabase `http` 扩展（基于 `pgsql-http` 语义）的 HTTP 客户端扩展。
 
 核心原则：
 - **扩展代码内置（编译进二进制）**：不做运行时动态加载第三方二进制。
@@ -37,7 +37,7 @@
 当前 `FROM` 的特殊处理：
 - `generate_series`：已作为 SRF 支持（非 JOIN 路径 `src/sql/executor_select.rs:147`；JOIN 路径 `src/sql/executor_join.rs:585`）
 - 少数“标量当表用”的函数：JOIN 路径把 `FROM current_schema()` 当成一个单行单列的虚拟表（`src/sql/executor_join.rs:366` 起）
-- 可观测性虚拟表：`_pgtikv_sys_observability` / `_pgtikv_sys_query_samples`（`src/sql/executor_join.rs:59` 起）
+- 可观测性虚拟表：`_db9_sys_observability` / `_db9_sys_query_samples`（`src/sql/executor_join.rs:59` 起）
 
 但目前 JOIN 路径存在一个关键限制：只要 `args.is_some()` 就会被当成“标量函数”，并把 `FROM f(a,b)` 退化成 `f()` 丢弃参数（`src/sql/executor_join.rs:597` 和 `src/sql/executor_join.rs:605`）。
 

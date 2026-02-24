@@ -1,4 +1,4 @@
-# pg-tikv Cloud Admin Portal - Development Docker Compose
+# db9-server Cloud Admin Portal - Development Docker Compose
 # Usage: docker compose -f docker-compose.dev.yml up
 
 services:
@@ -7,14 +7,14 @@ services:
       context: ../backend
       dockerfile: Dockerfile
     ports:
-      - "${PGTIKV_API_PORT:-8090}:8090"
+      - "${DB9_API_PORT:-8090}:8090"
     environment:
-      - PGTIKV_PD_ENDPOINTS=${PD_ENDPOINTS:-localhost:2379}
-      - PGTIKV_PG_HOST=${PG_HOST:-host.docker.internal}
-      - PGTIKV_PG_PORT=${PG_PORT:-5433}
-      - PGTIKV_API_PORT=8090
-      - PGTIKV_API_HOST=0.0.0.0
-      - PGTIKV_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+      - DB9_PD_ENDPOINTS=${PD_ENDPOINTS:-localhost:2379}
+      - DB9_PG_HOST=${PG_HOST:-host.docker.internal}
+      - DB9_PG_PORT=${PG_PORT:-5433}
+      - DB9_API_PORT=8090
+      - DB9_API_HOST=0.0.0.0
+      - DB9_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
       - RUST_LOG=debug
     extra_hosts:
       - "host.docker.internal:host-gateway"

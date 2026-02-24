@@ -3,7 +3,7 @@ import { DataSource } from 'typeorm';
 import { createDataSource } from './datasource.js';
 import { User, Post, Tag } from './entities/index.js';
 
-describe('TypeORM Query Generation & SQL Compatibility [pg-tikv]', () => {
+describe('TypeORM Query Generation & SQL Compatibility [db9-server]', () => {
   let dataSource: DataSource;
 
   beforeAll(async () => {

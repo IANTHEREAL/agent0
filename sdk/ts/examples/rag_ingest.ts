@@ -1,6 +1,6 @@
 #!/usr/bin/env npx tsx
 /**
- * RAG Ingest Pipeline — reads files from fs9, chunks, embeds, stores in pg-tikv
+ * RAG Ingest Pipeline — reads files from fs9, chunks, embeds, stores in db9-server
  *
  * Usage: npx tsx examples/rag_ingest.ts
  *
@@ -276,7 +276,7 @@ async function exampleHybridSearch(
 
 async function main(): Promise<void> {
   console.log('╔══════════════════════════════════════════╗');
-  console.log('║     RAG Ingest Pipeline — pg-tikv/fs9    ║');
+  console.log('║     RAG Ingest Pipeline — db9-server/fs9    ║');
   console.log('╚══════════════════════════════════════════╝\n');
 
   const pool = await createPool();

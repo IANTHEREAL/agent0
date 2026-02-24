@@ -12,7 +12,7 @@ Dify 大量使用时区转换进行日期分组统计：
 DATE(DATE_TRUNC('day', created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York'))
 ```
 
-当前 pg-tikv 不支持 `AT TIME ZONE` 表达式，导致此类查询失败。
+当前 db9-server 不支持 `AT TIME ZONE` 表达式，导致此类查询失败。
 
 ## 目标
 

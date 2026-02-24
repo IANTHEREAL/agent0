@@ -1,6 +1,6 @@
 //! Classification of statements that may bypass `sqlparser` parsing.
 //!
-//! tipg historically allowed a small set of PostgreSQL statements to reach the
+//! db9 historically allowed a small set of PostgreSQL statements to reach the
 //! executor even when `sqlparser` couldn't parse them. These statements are
 //! either:
 //! - handled by raw-SQL interception in the executor/protocol layer, or
@@ -126,7 +126,7 @@ fn is_valid_tail(tail: &str) -> bool {
 
 /// Extract and validate the GUC name from the text after `RESET`.
 ///
-/// Accepts a single SQL identifier (including dotted names like `tipg.use_optimizer`),
+/// Accepts a single SQL identifier (including dotted names like `db9.use_optimizer`),
 /// optionally followed by `;`, `--` line comment, or `/* */` block comment.
 /// PostgreSQL treats comments as whitespace, so comments between `RESET` and the
 /// identifier are allowed (e.g. `RESET /*x*/ ALL`).
@@ -400,7 +400,7 @@ mod tests {
         assert_eq!(classify("RESET TIMEZONE"), Some(RawSqlKind::Reset));
         assert_eq!(classify("RESET ALL"), Some(RawSqlKind::Reset));
         assert_eq!(
-            classify("RESET TIPG.USE_OPTIMIZER;"),
+            classify("RESET DB9.USE_OPTIMIZER;"),
             Some(RawSqlKind::Reset)
         );
         // RESET ROLE is NOT classified as Reset (handled by parser rewrite)
@@ -413,14 +413,14 @@ mod tests {
         assert_eq!(extract_reset_name("TIMEZONE"), Some("TIMEZONE"));
         assert_eq!(extract_reset_name("ALL"), Some("ALL"));
         assert_eq!(
-            extract_reset_name("TIPG.USE_OPTIMIZER"),
-            Some("TIPG.USE_OPTIMIZER")
+            extract_reset_name("DB9.USE_OPTIMIZER"),
+            Some("DB9.USE_OPTIMIZER")
         );
 
         // Trailing semicolons
         assert_eq!(
-            extract_reset_name("TIPG.USE_OPTIMIZER;"),
-            Some("TIPG.USE_OPTIMIZER")
+            extract_reset_name("DB9.USE_OPTIMIZER;"),
+            Some("DB9.USE_OPTIMIZER")
         );
 
         // Trailing line comments

@@ -8,35 +8,35 @@
  SKIPPED: CREATE DATABASE not supported
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:15: ERROR:  SQL parse error: sql parser error: Expected TO, found: d at Line: 1, Column 26
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:15: ERROR:  SQL parse error: sql parser error: Expected TO, found: d at Line: 1, Column 26
 SET
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:32: ERROR:  Unsupported join table
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:46: ERROR:  Unsupported join table
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:49: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:63: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:32: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:46: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:49: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:63: ERROR:  Unsupported join table
 SET
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:72: ERROR:  SQL parse error: sql parser error: Expected an object type after CREATE, found: USER at Line: 1, Column 8
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:75: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:78: ERROR:  Schema 's' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:89: ERROR:  Unsupported join table
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:92: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:95: ERROR:  Schema 's2' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:106: ERROR:  Unsupported join table
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:109: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:123: ERROR:  Unsupported join table
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:126: ERROR:  SQL parse error: sql parser error: Expected TO, found: d at Line: 1, Column 26
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:72: ERROR:  SQL parse error: sql parser error: Expected an object type after CREATE, found: USER at Line: 1, Column 8
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:75: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:78: ERROR:  Schema 's' already exists
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:89: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:92: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:95: ERROR:  Schema 's2' already exists
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:106: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:109: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:123: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:126: ERROR:  SQL parse error: sql parser error: Expected TO, found: d at Line: 1, Column 26
 SET
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:135: ERROR:  Unsupported statement: SetRole { context_modifier: None, role_name: Some(Ident { value: "testuser", quote_style: None }) }
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:138: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:152: ERROR:  Unsupported join table
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:158: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:177: ERROR:  Unsupported join table
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:180: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:181: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:197: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:135: ERROR:  Unsupported statement: SetRole { context_modifier: None, role_name: Some(Ident { value: "testuser", quote_style: None }) }
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:138: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:152: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:158: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:177: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:180: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:181: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:197: ERROR:  Unsupported join table
                warning                
 --------------------------------------
  SKIPPED: DROP DATABASE not supported
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/99_alter_default_privileges_for_schema.sql:203: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/99_alter_default_privileges_for_schema.sql:203: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

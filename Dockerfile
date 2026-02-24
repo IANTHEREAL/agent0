@@ -49,8 +49,8 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/aarch64-unknown-linux-gnu/release/pg-tikv /usr/local/bin/pg-tikv
+COPY --from=builder /app/target/aarch64-unknown-linux-gnu/release/db9-server /usr/local/bin/db9-server
 
 EXPOSE 5433
 
-CMD ["pg-tikv"]
+CMD ["db9-server"]

@@ -6,7 +6,7 @@ import { getPgConfig } from '../shared/config.js';
 
 const { Pool } = pg;
 
-describe('Drizzle Advanced SQL Features [pg-tikv]', () => {
+describe('Drizzle Advanced SQL Features [db9-server]', () => {
   let pool: pg.Pool;
   let db: ReturnType<typeof drizzle>;
 

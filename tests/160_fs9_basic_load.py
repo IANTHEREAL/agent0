@@ -6,7 +6,7 @@ import os
 import shutil
 
 
-FIXTURE_DIR = "/tmp/pgtikv-fs9-test"
+FIXTURE_DIR = "/tmp/db9-fs9-test"
 
 
 def main() -> int:

@@ -288,25 +288,25 @@ impl AuthManager {
             return Ok(());
         }
 
-        if config::env_bool("PGTIKV_DEV") {
+        if config::env_bool("DB9_DEV") {
             // Legacy dev bootstrap (explicit opt-in only).
             if self.get_user(txn, DEFAULT_ADMIN_USER).await?.is_none() {
                 let admin = User::new_superuser(DEFAULT_ADMIN_USER, LEGACY_DEV_ADMIN_PASSWORD);
                 self.create_user(txn, admin).await?;
                 tracing::warn!(
-                    "PGTIKV_DEV=1: bootstrapped legacy default superuser '{}' (password omitted)",
+                    "DB9_DEV=1: bootstrapped legacy default superuser '{}' (password omitted)",
                     DEFAULT_ADMIN_USER
                 );
             }
             return Ok(());
         }
 
-        let bootstrap_user = config::env_string("PGTIKV_BOOTSTRAP_ADMIN_USER")
+        let bootstrap_user = config::env_string("DB9_BOOTSTRAP_ADMIN_USER")
             .unwrap_or_else(|| DEFAULT_ADMIN_USER.to_string());
         let bootstrap_password =
-            config::env_string("PGTIKV_BOOTSTRAP_ADMIN_PASSWORD").ok_or_else(|| {
+            config::env_string("DB9_BOOTSTRAP_ADMIN_PASSWORD").ok_or_else(|| {
                 SqlError::InvalidAuthorizationSpecification {
-                    message: "No superuser exists yet. Set PGTIKV_BOOTSTRAP_ADMIN_PASSWORD to bootstrap the initial superuser (optionally PGTIKV_BOOTSTRAP_ADMIN_USER), or set PGTIKV_DEV=1 for local development.".into(),
+                    message: "No superuser exists yet. Set DB9_BOOTSTRAP_ADMIN_PASSWORD to bootstrap the initial superuser (optionally DB9_BOOTSTRAP_ADMIN_USER), or set DB9_DEV=1 for local development.".into(),
                 }
             })?;
 

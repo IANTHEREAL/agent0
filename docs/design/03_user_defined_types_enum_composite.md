@@ -9,7 +9,7 @@ ORM 迁移里最常见的自定义类型是 **Enum**：
 - Prisma：`CREATE TYPE "Role" AS ENUM ('USER','ADMIN')`
 - TypeORM：在 `enum`/`simple-enum` 等映射下也会生成 `CREATE TYPE ... AS ENUM`
 
-当前 pg-tikv：
+当前 db9-server：
 - `CREATE TYPE` 在执行器里是 no-op（`src/sql/executor.rs` 对 `Statement::CreateType` 直接 `Ok(Empty)`）
 - `CREATE TYPE AS ENUM` 明确被标记为 unsupported（`src/sql/helpers.rs`）
 

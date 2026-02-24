@@ -1,4 +1,4 @@
--- Dify-lite workload (post-restore) for pg-tikv
+-- Dify-lite workload (post-restore) for db9-server
 --
 -- Requires: `tests/96_dify_schema.sql` has already restored the upstream Dify schema into database `dify_compat_96`.
 -- Goal: small, deterministic, hermetic workload traceable to real Dify behavior.

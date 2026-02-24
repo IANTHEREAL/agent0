@@ -44,10 +44,10 @@ WHERE search_vector @@ plainto_tsquery('nonexistent')
 ORDER BY id;
 
 -- Test 5: Verify index is used (via EXPLAIN).
--- tipg.use_optimizer toggles are compatibility no-ops; engine remains single-path.
-SET tipg.use_optimizer = off;
+-- db9.use_optimizer toggles are compatibility no-ops; engine remains single-path.
+SET db9.use_optimizer = off;
 EXPLAIN SELECT id FROM fts_articles WHERE search_vector @@ plainto_tsquery('postgresql');
-SET tipg.use_optimizer = on;
+SET db9.use_optimizer = on;
 
 -- Cleanup
 DROP TABLE fts_articles;

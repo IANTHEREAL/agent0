@@ -1,19 +1,19 @@
 #!/bin/bash
-# Dify Compatibility Test Script for pg-tikv
-# This script starts Dify with pg-tikv as the database backend
+# Dify Compatibility Test Script for db9-server
+# This script starts Dify with db9-server as the database backend
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PG_TIKV_DIR="$(dirname "$SCRIPT_DIR")"
+DB9_DIR="$(dirname "$SCRIPT_DIR")"
 DIFY_DIR="$HOME/lab/dify/docker"
 
 # Configuration
-PG_TIKV_PORT=${PG_TIKV_PORT:-5433}
-PG_TIKV_HOST=${PG_TIKV_HOST:-0.0.0.0}
+DB9_PORT=${DB9_PORT:-5433}
+DB9_HOST=${DB9_HOST:-0.0.0.0}
 PD_ENDPOINTS=${PD_ENDPOINTS:-127.0.0.1:46515}
 DIFY_KEYSPACE=${DIFY_KEYSPACE:-dify}
-PG_TIKV_ADMIN_PASSWORD=${PG_TIKV_ADMIN_PASSWORD:-admin}
+DB9_ADMIN_PASSWORD=${DB9_ADMIN_PASSWORD:-admin}
 
 # Colors
 RED='\033[0;31m'
@@ -30,20 +30,20 @@ usage() {
 Usage: $0 <command>
 
 Commands:
-    start       Start pg-tikv and Dify
-    stop        Stop Dify (pg-tikv keeps running)
+    start       Start db9-server and Dify
+    stop        Stop Dify (db9-server keeps running)
     restart     Restart Dify
     logs        Show Dify API logs
     status      Show status of all services
     clean       Stop Dify and clean up volumes
-    pgtikv      Start only pg-tikv (for manual Dify control)
+    db9      Start only db9-server (for manual Dify control)
 
 Environment Variables:
-    PG_TIKV_PORT    pg-tikv port (default: 5433)
-    PG_TIKV_HOST    pg-tikv listen address (default: 0.0.0.0)
+    DB9_PORT    db9-server port (default: 5433)
+    DB9_HOST    db9-server listen address (default: 0.0.0.0)
     PD_ENDPOINTS    TiKV PD endpoints (default: 127.0.0.1:46515)
     DIFY_KEYSPACE   Keyspace/tenant name (default: dify)
-    PG_TIKV_ADMIN_PASSWORD  Bootstrap/admin password for pg-tikv (default: admin)
+    DB9_ADMIN_PASSWORD  Bootstrap/admin password for db9-server (default: admin)
 
 Examples:
     $0 start                    # Start everything
@@ -56,49 +56,49 @@ check_tikv_cluster() {
     log_info "Checking TiKV cluster..."
     if ! curl -s "http://${PD_ENDPOINTS}/pd/api/v1/health" > /dev/null 2>&1; then
         log_error "TiKV cluster not running at $PD_ENDPOINTS"
-        log_info "Start a cluster with: cd $PG_TIKV_DIR && uv run scripts/tikv_admin.py start --name dify-test"
+        log_info "Start a cluster with: cd $DB9_DIR && uv run scripts/tikv_admin.py start --name dify-test"
         exit 1
     fi
     log_info "TiKV cluster is healthy"
 }
 
-start_pgtikv() {
-    log_info "Starting pg-tikv on ${PG_TIKV_HOST}:${PG_TIKV_PORT}..."
+start_db9() {
+    log_info "Starting db9-server on ${DB9_HOST}:${DB9_PORT}..."
     
     # Check if already running
-    if ss -tlnp 2>/dev/null | grep -q ":${PG_TIKV_PORT}.*pg-tikv"; then
-        log_info "pg-tikv already running on port ${PG_TIKV_PORT}"
+    if ss -tlnp 2>/dev/null | grep -q ":${DB9_PORT}.*db9-server"; then
+        log_info "db9-server already running on port ${DB9_PORT}"
         return 0
     fi
     
-    # Kill any existing pg-tikv on this port
-    pkill -f "pg-tikv.*PG_PORT=${PG_TIKV_PORT}" 2>/dev/null || true
+    # Kill any existing db9-server on this port
+    pkill -f "db9-server.*PG_PORT=${DB9_PORT}" 2>/dev/null || true
     
-    # Start pg-tikv
-    cd "$PG_TIKV_DIR"
+    # Start db9-server
+    cd "$DB9_DIR"
     PD_ENDPOINTS="$PD_ENDPOINTS" \
-    PG_PORT="$PG_TIKV_PORT" \
-    PG_LISTEN_ADDR="$PG_TIKV_HOST" \
+    PG_PORT="$DB9_PORT" \
+    PG_LISTEN_ADDR="$DB9_HOST" \
     PG_KEYSPACE="$DIFY_KEYSPACE" \
-    PGTIKV_BOOTSTRAP_ADMIN_USER=admin \
-    PGTIKV_BOOTSTRAP_ADMIN_PASSWORD="$PG_TIKV_ADMIN_PASSWORD" \
-    PGTIKV_INSECURE=1 \
-    ./target/release/pg-tikv > /tmp/pgtikv-dify.log 2>&1 &
+    DB9_BOOTSTRAP_ADMIN_USER=admin \
+    DB9_BOOTSTRAP_ADMIN_PASSWORD="$DB9_ADMIN_PASSWORD" \
+    DB9_INSECURE=1 \
+    ./target/release/db9-server > /tmp/db9-dify.log 2>&1 &
     
     # Wait for startup
     sleep 2
     
-    if ss -tlnp 2>/dev/null | grep -q ":${PG_TIKV_PORT}"; then
-        log_info "pg-tikv started successfully"
+    if ss -tlnp 2>/dev/null | grep -q ":${DB9_PORT}"; then
+        log_info "db9-server started successfully"
     else
-        log_error "pg-tikv failed to start. Check /tmp/pgtikv-dify.log"
-        tail -20 /tmp/pgtikv-dify.log
+        log_error "db9-server failed to start. Check /tmp/db9-dify.log"
+        tail -20 /tmp/db9-dify.log
         exit 1
     fi
 }
 
 setup_dify_env() {
-    log_info "Configuring Dify to use pg-tikv..."
+    log_info "Configuring Dify to use db9-server..."
     
     cd "$DIFY_DIR"
     
@@ -108,23 +108,23 @@ setup_dify_env() {
         log_info "Backed up original .env to .env.original"
     fi
     
-    # Create pg-tikv specific .env
+    # Create db9-server specific .env
     cp .env.original .env
     
-    # Modify database settings for pg-tikv
+    # Modify database settings for db9-server
     # Use host.docker.internal for Docker to access host machine
     sed -i "s|^DB_HOST=.*|DB_HOST=host.docker.internal|" .env
-    sed -i "s|^DB_PORT=.*|DB_PORT=${PG_TIKV_PORT}|" .env
+    sed -i "s|^DB_PORT=.*|DB_PORT=${DB9_PORT}|" .env
     sed -i "s|^DB_USERNAME=.*|DB_USERNAME=${DIFY_KEYSPACE}.admin|" .env
-    sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${PG_TIKV_ADMIN_PASSWORD}|" .env
+    sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DB9_ADMIN_PASSWORD}|" .env
     sed -i "s|^DB_DATABASE=.*|DB_DATABASE=postgres|" .env
     
     # Also update plugin daemon database
     sed -i "s|^DB_PLUGIN_DATABASE=.*|DB_PLUGIN_DATABASE=dify_plugin|" .env
     
-    log_info "Dify .env configured for pg-tikv"
+    log_info "Dify .env configured for db9-server"
     log_info "  DB_HOST=host.docker.internal"
-    log_info "  DB_PORT=${PG_TIKV_PORT}"
+    log_info "  DB_PORT=${DB9_PORT}"
     log_info "  DB_USERNAME=${DIFY_KEYSPACE}.admin"
 }
 
@@ -135,7 +135,7 @@ start_dify() {
     # Add host.docker.internal mapping for Linux
     # On Linux, we need to add extra_hosts to docker-compose
     
-    # Start only essential services (skip db_postgres since we use pg-tikv)
+    # Start only essential services (skip db_postgres since we use db9-server)
     docker compose up -d redis weaviate sandbox ssrf_proxy
     
     # Wait for redis
@@ -163,11 +163,11 @@ show_logs() {
 
 show_status() {
     echo ""
-    log_info "=== pg-tikv Status ==="
-    if ss -tlnp 2>/dev/null | grep -q ":${PG_TIKV_PORT}.*pg-tikv"; then
-        echo -e "pg-tikv: ${GREEN}Running${NC} on port ${PG_TIKV_PORT}"
+    log_info "=== db9-server Status ==="
+    if ss -tlnp 2>/dev/null | grep -q ":${DB9_PORT}.*db9-server"; then
+        echo -e "db9-server: ${GREEN}Running${NC} on port ${DB9_PORT}"
     else
-        echo -e "pg-tikv: ${RED}Not Running${NC}"
+        echo -e "db9-server: ${RED}Not Running${NC}"
     fi
     
     echo ""
@@ -202,10 +202,10 @@ clean_dify() {
 case "${1:-}" in
     start)
         check_tikv_cluster
-        start_pgtikv
+        start_db9
         setup_dify_env
         start_dify
-        log_info "Dify starting with pg-tikv backend"
+        log_info "Dify starting with db9-server backend"
         log_info "Access Dify at: http://localhost/install"
         ;;
     stop)
@@ -225,11 +225,11 @@ case "${1:-}" in
     clean)
         clean_dify
         ;;
-    pgtikv)
+    db9)
         check_tikv_cluster
-        start_pgtikv
-        log_info "pg-tikv is ready at ${PG_TIKV_HOST}:${PG_TIKV_PORT}"
-        log_info "Connect with: psql -h 127.0.0.1 -p ${PG_TIKV_PORT} -U ${DIFY_KEYSPACE}.admin"
+        start_db9
+        log_info "db9-server is ready at ${DB9_HOST}:${DB9_PORT}"
+        log_info "Connect with: psql -h 127.0.0.1 -p ${DB9_PORT} -U ${DIFY_KEYSPACE}.admin"
         ;;
     *)
         usage

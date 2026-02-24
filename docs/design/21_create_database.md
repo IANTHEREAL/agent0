@@ -9,7 +9,7 @@
 
 ### 当前状态
 
-pg-tikv 目前将 TiKV keyspace 等同于 PostgreSQL 的 database 概念，导致：
+db9-server 目前将 TiKV keyspace 等同于 PostgreSQL 的 database 概念，导致：
 
 1. **不支持 `CREATE DATABASE`** - 在 `helpers.rs` 中显式跳过
 2. **每个 keyspace 只有一个逻辑数据库** - 与 PostgreSQL 语义不兼容
@@ -18,7 +18,7 @@ pg-tikv 目前将 TiKV keyspace 等同于 PostgreSQL 的 database 概念，导�
 ### 正确的层级关系
 
 ```
-PostgreSQL:                          pg-tikv (当前):
+PostgreSQL:                          db9-server (当前):
 ┌─────────────────────┐              ┌─────────────────────┐
 │  Cluster            │              │  Keyspace (tenant)  │
 │  └── Database 1     │              │  └── Schema         │
@@ -29,7 +29,7 @@ PostgreSQL:                          pg-tikv (当前):
 │              └── T  │
 └─────────────────────┘
 
-pg-tikv (目标):
+db9-server (目标):
 ┌─────────────────────────────────┐
 │  Keyspace (tenant)              │
 │  └── Database 1 (e.g. postgres) │
@@ -1320,7 +1320,7 @@ fn eval_function(&self, name: &str, args: &[Expr], session: &Session, ...) -> Re
 | 迁移方式 | 需要重新初始化或使用迁移脚本 |
 
 **理由：**
-1. pg-tikv 目前处于早期开发阶段，没有生产环境数据需要迁移
+1. db9-server 目前处于早期开发阶段，没有生产环境数据需要迁移
 2. 双读策略增加代码复杂度，且有性能开销
 3. 新的 key 布局是根本性改变（增加 `d_{db_id}_` 前缀），双读维护成本高
 4. 清晰的版本边界比复杂的兼容层更易维护
@@ -1333,7 +1333,7 @@ tikv-ctl unsafe-recover drop-keyspace <keyspace>
 
 # 选项 2：数据导出/导入（如有需要保留的数据）
 pg_dump -h old-server -d postgres > backup.sql
-# 升级 pg-tikv
+# 升级 db9-server
 psql -h new-server -d postgres < backup.sql
 ```
 
@@ -1866,4 +1866,4 @@ MVP 仅支持：`CREATE DATABASE name [WITH OWNER = user_name]`
 
 - [PostgreSQL CREATE DATABASE](https://www.postgresql.org/docs/current/sql-createdatabase.html)
 - [TiKV Keyspace](https://docs.pingcap.com/tidb/stable/tikv-configuration-file#api-version)
-- [pg-tikv Multi-Tenancy](./multi-tenancy.md)
+- [db9-server Multi-Tenancy](./multi-tenancy.md)

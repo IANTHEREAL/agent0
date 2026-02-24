@@ -2,7 +2,7 @@
 
 use super::{ControlFlow, Query, SetExpr, Statement, TableFactor, Visit, Visitor};
 
-pub(super) const OBSERVABILITY_USER: &str = "_pgtikv_sys_observer";
+pub(super) const OBSERVABILITY_USER: &str = "_db9_sys_observer";
 
 fn query_has_nested_queries(query: &Query) -> bool {
     struct NestedQueryVisitor {
@@ -69,7 +69,7 @@ pub(super) fn is_observability_system_query(stmt: &Statement) -> bool {
         return false;
     };
     let base_upper = base.value.to_ascii_uppercase();
-    if base_upper != "_PGTIKV_SYS_OBSERVABILITY" && base_upper != "_PGTIKV_SYS_QUERY_SAMPLES" {
+    if base_upper != "_DB9_SYS_OBSERVABILITY" && base_upper != "_DB9_SYS_QUERY_SAMPLES" {
         return false;
     }
 

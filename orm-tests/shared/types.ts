@@ -25,7 +25,7 @@ export interface FeatureCompatibility {
 
 export interface TestReport {
   timestamp: string;
-  pgTikvVersion: string;
+  db9Version: string;
   matrices: CompatibilityMatrix[];
   summary: {
     totalTests: number;

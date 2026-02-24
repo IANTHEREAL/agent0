@@ -1,4 +1,4 @@
-# pg-tikv Knowledge Base (Living Document)
+# db9-server Knowledge Base (Living Document)
 
 ## Overview
 
@@ -42,7 +42,7 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 ### Module Boundaries
 
 - `Analyzer` (`src/sql/analyzer/`): name resolution, scope checking, and type inference; outputs `AnalyzedQuery` / `TypedExpr`.
-- `Optimizer` (`src/sql/optimizer/`): `AnalyzedQuery → LogicalPlan → (rewrite: decorrelation, predicate pushdown, join reorder) → PhysicalPlan → BoxedOperator`. Handles single-table, multi-table joins, set operations (UNION/INTERSECT/EXCEPT), CTEs, window functions, DISTINCT ON, SemiJoin/AntiJoin. Always-on (the `tipg.use_optimizer` GUC is accepted for compatibility but is a no-op — `SET ... = off` logs a notice and is ignored; `SHOW` always returns `on`).
+- `Optimizer` (`src/sql/optimizer/`): `AnalyzedQuery → LogicalPlan → (rewrite: decorrelation, predicate pushdown, join reorder) → PhysicalPlan → BoxedOperator`. Handles single-table, multi-table joins, set operations (UNION/INTERSECT/EXCEPT), CTEs, window functions, DISTINCT ON, SemiJoin/AntiJoin. Always-on (the `db9.use_optimizer` GUC is accepted for compatibility but is a no-op — `SET ... = off` logs a notice and is ignored; `SHOW` always returns `on`).
 - `Operators` (`src/sql/operators/`): physical operators (scan, filter, project, sort, aggregate, hash_join, hash_semi_join, NLJ, window/, CTE, set_operation, table_function).
 - `Executor` (`src/sql/executor/`): DDL/DML dispatch, SELECT execution (analyzed path at `executor/select/analyzed/`), background SQL (`bg_sql.rs`).
 - `Catalog` (`src/sql/catalog/`): `information_schema` / `pg_catalog` / `cron` compatibility surface (40+ virtual table implementations).
@@ -72,7 +72,7 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 - **Planner dual-path resolved:** TypedExpr path has full expression-index + partial-index support. EXPLAIN uses the analyzed pipeline (view expansion → Analyzer → typed planner). AST path retained only for non-SELECT EXPLAIN and analysis error fallback.
 - **GIN index status:** planner can produce GIN scan plans (visible in EXPLAIN), but the runtime operator falls back to table scan (`src/sql/optimizer/build/scan.rs`) — GIN execution operator is not yet implemented.
 - Coverage: single-table, multi-table joins, set operations (UNION/INTERSECT/EXCEPT), CTEs, window functions, DISTINCT ON.
-- `tipg.use_optimizer` GUC retained for compatibility (always-on, no-op when set to off).
+- `db9.use_optimizer` GUC retained for compatibility (always-on, no-op when set to off).
 - Handler decomposed: monolithic `dynamic.rs` split into `dynamic/` module (mod.rs, query.rs, copy.rs, startup.rs).
 - Index name uniqueness enforced within schema (#777).
 
@@ -179,7 +179,7 @@ Phase 4 — Architecture debt (parallel)
 ## Repository Layout (stable)
 
 ```
-pg-tikv/
+db9-server/
 ├── src/
 │   ├── sql/                           # SQL engine (~118K lines)
 │   │   ├── analyzer/                  # Semantic analysis → AnalyzedQuery/TypedExpr
@@ -233,7 +233,7 @@ pg-tikv/
 │   │       ├── params/                # Parameter counting + decoding
 │   │       ├── copy/                  # COPY context management
 │   │       ├── portal.rs              # Portal state + suspended queries
-│   │       ├── query_parser.rs        # TipgQueryParser (pgwire QueryParser trait)
+│   │       ├── query_parser.rs        # Db9QueryParser (pgwire QueryParser trait)
 │   │       ├── server_params.rs       # ParameterStatus provider
 │   │       ├── tenant.rs              # Multi-tenancy username parsing
 │   │       └── errors.rs              # SQLSTATE mapping + error helpers

@@ -1,5 +1,5 @@
 -- Test: Single-path optimizer index scan EXPLAIN verification.
--- tipg.use_optimizer toggles are compatibility no-ops; this suite validates
+-- db9.use_optimizer toggles are compatibility no-ops; this suite validates
 -- planner behavior and compatibility readback plumbing.
 
 DROP TABLE IF EXISTS ois_test;
@@ -20,7 +20,7 @@ INSERT INTO ois_test VALUES (5, 'Eve', 40);
 ANALYZE ois_test;
 
 -- Test 1: Point lookup on indexed column (optimizer ON)
-SET tipg.use_optimizer = on;
+SET db9.use_optimizer = on;
 EXPLAIN SELECT * FROM ois_test WHERE name = 'Alice';
 
 -- Test 2: Range predicate on indexed column (optimizer ON)
@@ -39,7 +39,7 @@ SELECT * FROM ois_test WHERE name = 'Alice' ORDER BY id;
 SELECT * FROM ois_test WHERE age > 25 ORDER BY id;
 
 -- Test 7: compatibility toggle OFF (no-op) — same queries should work
-SET tipg.use_optimizer = off;
+SET db9.use_optimizer = off;
 SELECT * FROM ois_test WHERE name = 'Alice' ORDER BY id;
 SELECT * FROM ois_test WHERE age > 25 ORDER BY id;
 

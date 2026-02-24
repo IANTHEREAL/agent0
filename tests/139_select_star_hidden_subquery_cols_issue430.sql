@@ -1,6 +1,6 @@
 -- Regression test for issue #430:
 -- Correlated scalar subquery in JOIN ON with SELECT * must produce correct
--- column set (no hidden __tipg_subquery_* columns) and correct results.
+-- column set (no hidden __db9_subquery_* columns) and correct results.
 
 DROP TABLE IF EXISTS ha_a;
 DROP TABLE IF EXISTS ha_b;

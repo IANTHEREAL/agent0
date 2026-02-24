@@ -56,7 +56,7 @@ fn enforce_sort_memory_limit(
     *total_bytes = total_bytes.saturating_add(estimated_row_size(row));
     if *total_bytes > max_sort_bytes {
         return Err(anyhow!(
-            "ORDER BY sort memory limit exceeded: estimated {} bytes exceeds pgtikv.max_sort_bytes={} bytes. Reduce result set with WHERE/LIMIT or increase pgtikv.max_sort_bytes",
+            "ORDER BY sort memory limit exceeded: estimated {} bytes exceeds db9.max_sort_bytes={} bytes. Reduce result set with WHERE/LIMIT or increase db9.max_sort_bytes",
             *total_bytes,
             max_sort_bytes
         ));
@@ -477,7 +477,7 @@ mod tests {
         let err = enforce_sort_memory_limit(&mut total_bytes, &row, limit).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("ORDER BY sort memory limit exceeded"));
-        assert!(msg.contains("pgtikv.max_sort_bytes"));
+        assert!(msg.contains("db9.max_sort_bytes"));
     }
 
     #[test]

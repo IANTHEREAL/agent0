@@ -1,6 +1,6 @@
 # get-db9
 
-TypeScript SDK for [pg-tikv](https://github.com/pgtikv/pg-tikv) — instant PostgreSQL-compatible databases on TiKV.
+TypeScript SDK for [db9-server](https://github.com/db9/db9-server) — instant PostgreSQL-compatible databases on TiKV.
 
 ## Install
 

@@ -1,7 +1,7 @@
 //! JSON/JSONB helper operations.
 //!
 //! This module centralizes PostgreSQL-compatible semantics for JSONB operators that are
-//! used by pg-tikv's expression evaluator.
+//! used by db9-server's expression evaluator.
 
 use serde_json::{Number as JsonNumber, Value as JsonValue};
 

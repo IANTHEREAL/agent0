@@ -1,5 +1,5 @@
-psql:/home/dongxu/lab/pg-tikv/tests/151_internal_executor.sql:14: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: DO at Line: 1, Column 1
-psql:/home/dongxu/lab/pg-tikv/tests/151_internal_executor.sql:17: ERROR:  Table 'public.t' already exists
+psql:/home/dongxu/lab/db9-server/tests/151_internal_executor.sql:14: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: DO at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/151_internal_executor.sql:17: ERROR:  Table 'public.t' already exists
  has_table_privilege 
 ---------------------
  t

@@ -21,7 +21,7 @@ use crate::{
     KEYSPACE_PREFIX, OBSERVABILITY_USER, TENANT_ID_LEN,
 };
 
-const SYSTEM_USER_PREFIX: &str = "_pgtikv_sys_";
+const SYSTEM_USER_PREFIX: &str = "_db9_sys_";
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -677,7 +677,7 @@ pub async fn create_database(
 
     // ── FS9 integration (best-effort) ────────────────────────────
     if let Some(ref fs9) = state.fs9_client {
-        let fs_keyspace = format!("tipg_fs_{}", tenant_id);
+        let fs_keyspace = format!("db9_fs_{}", tenant_id);
 
         // Create filesystem keyspace in PD
         if !pd.create_keyspace(&fs_keyspace).await {
@@ -874,9 +874,9 @@ pub async fn get_database(
             region: None,
             priority: 100 - (i as i32) * 10,
             description: if endpoint_tuples.len() > 1 {
-                Some(format!("pg-tikv endpoint {}", i + 1))
+                Some(format!("db9-server endpoint {}", i + 1))
             } else {
-                Some("pg-tikv primary endpoint".into())
+                Some("db9-server primary endpoint".into())
             },
             enabled: true,
         })
@@ -1016,7 +1016,7 @@ pub async fn reset_database_password(
             Some(&database_id),
             Some(&auth.customer_id),
             false,
-            Some("Failed to reset password in pg-tikv"),
+            Some("Failed to reset password in db9-server"),
             None,
         )
         .await
@@ -1217,7 +1217,7 @@ pub async fn dump_database(
             &tenant.id,
             &cred.username,
             &cred.password_plain,
-            "SELECT * FROM _pgtikv_sys_export_ddl() ORDER BY object_type",
+            "SELECT * FROM _db9_sys_export_ddl() ORDER BY object_type",
         )
         .await
         .map_err(|e| AppError::bad_gateway(format!("Failed to export DDL: {e}")))?;
@@ -1416,7 +1416,7 @@ pub async fn apply_database_migration(
             &tenant.id,
             &cred.username,
             &cred.password_plain,
-            "SELECT * FROM _pgtikv_sys_migrations()",
+            "SELECT * FROM _db9_sys_migrations()",
         )
         .await
         .map_err(|e| AppError::bad_gateway(format!("Failed to list migrations: {e}")))?;
@@ -1465,7 +1465,7 @@ pub async fn apply_database_migration(
         &req.sql
     };
     let record_sql = format!(
-        "SELECT * FROM _pgtikv_sys_record_migration('{}', '{}', '{}')",
+        "SELECT * FROM _db9_sys_record_migration('{}', '{}', '{}')",
         req.name.replace('\'', "''"),
         req.checksum.replace('\'', "''"),
         preview.replace('\'', "''"),
@@ -1499,7 +1499,7 @@ pub async fn list_database_migrations(
             &tenant.id,
             &cred.username,
             &cred.password_plain,
-            "SELECT * FROM _pgtikv_sys_migrations()",
+            "SELECT * FROM _db9_sys_migrations()",
         )
         .await
         .map_err(|e| AppError::bad_gateway(format!("Failed to list migrations: {e}")))?;
@@ -1544,7 +1544,7 @@ pub async fn branch_database(
             &source_tenant.id,
             &source_cred.username,
             &source_cred.password_plain,
-            "SELECT * FROM _pgtikv_sys_export_ddl() ORDER BY object_type",
+            "SELECT * FROM _db9_sys_export_ddl() ORDER BY object_type",
         )
         .await
         .map_err(|e| AppError::bad_gateway(format!("Failed to export source schema: {e}")))?;

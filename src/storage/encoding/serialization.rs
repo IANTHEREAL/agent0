@@ -3,8 +3,8 @@
 //! ## Schema wire format
 //!
 //! ```text
-//! V2:  b"PGTIKV_SCHEMA_V2\0" ++ MessagePack (named map)  ← opt-in via serialize_schema_v2()
-//! V1:  b"PGTIKV_SCHEMA_V1\0" ++ bincode payload          ← default write format
+//! V2:  b"DB9_SCHEMA_V2\0" ++ MessagePack (named map)  ← opt-in via serialize_schema_v2()
+//! V1:  b"DB9_SCHEMA_V1\0" ++ bincode payload          ← default write format
 //! ```
 //!
 //! **Read** supports both V2 and V1 transparently.
@@ -23,8 +23,8 @@ use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 
-const SCHEMA_MAGIC_V2: &[u8] = b"PGTIKV_SCHEMA_V2\0";
-const SCHEMA_MAGIC_V1: &[u8] = b"PGTIKV_SCHEMA_V1\0";
+const SCHEMA_MAGIC_V2: &[u8] = b"DB9_SCHEMA_V2\0";
+const SCHEMA_MAGIC_V1: &[u8] = b"DB9_SCHEMA_V1\0";
 const LEGACY_SUNSET_DATE: &str = "2026-12-31";
 
 static USE_V2_SCHEMA_FORMAT: AtomicBool = AtomicBool::new(false);
@@ -57,7 +57,7 @@ pub fn deserialize_schema(data: &[u8]) -> Result<TableSchema> {
     if let Some(payload) = data.strip_prefix(SCHEMA_MAGIC_V1) {
         return deserialize_v1_bincode(payload);
     }
-    anyhow::bail!("Schema data missing magic header (expected PGTIKV_SCHEMA_V2 or V1)")
+    anyhow::bail!("Schema data missing magic header (expected DB9_SCHEMA_V2 or V1)")
 }
 
 // ===== V1 bincode (frozen — read only) =====
@@ -238,7 +238,7 @@ pub fn deserialize_row(data: &[u8]) -> Result<Row> {
 }
 
 pub fn serialize_function_def(def: &FunctionDef) -> Result<Vec<u8>> {
-    const FUNCTION_MAGIC: &[u8] = b"PGTIKV_FUNCTION_V1\0";
+    const FUNCTION_MAGIC: &[u8] = b"DB9_FUNCTION_V1\0";
     let payload = bincode::serialize(def).context("Failed to serialize function definition")?;
     let mut out = Vec::with_capacity(FUNCTION_MAGIC.len() + payload.len());
     out.extend_from_slice(FUNCTION_MAGIC);
@@ -247,9 +247,9 @@ pub fn serialize_function_def(def: &FunctionDef) -> Result<Vec<u8>> {
 }
 
 pub fn deserialize_function_def(data: &[u8]) -> Result<FunctionDef> {
-    const FUNCTION_MAGIC: &[u8] = b"PGTIKV_FUNCTION_V1\0";
+    const FUNCTION_MAGIC: &[u8] = b"DB9_FUNCTION_V1\0";
     let payload = data.strip_prefix(FUNCTION_MAGIC).context(
-        "Function data missing PGTIKV_FUNCTION_V1 header (V1 legacy format no longer supported)",
+        "Function data missing DB9_FUNCTION_V1 header (V1 legacy format no longer supported)",
     )?;
     bincode::deserialize(payload).context("Failed to deserialize function definition")
 }

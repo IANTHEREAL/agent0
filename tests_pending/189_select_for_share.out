@@ -1,12 +1,12 @@
-psql:/home/dongxu/lab/pg-tikv/tests/189_select_for_share.sql:6: ERROR:  Extension 'dblink' is not available
-psql:/home/dongxu/lab/pg-tikv/tests/189_select_for_share.sql:7: ERROR:  Extension 'pgrowlocks' is not available
-psql:/home/dongxu/lab/pg-tikv/tests/189_select_for_share.sql:10: NOTICE:  table "t" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/189_select_for_share.sql:6: ERROR:  Extension 'dblink' is not available
+psql:/home/dongxu/lab/db9-server/tests/189_select_for_share.sql:7: ERROR:  Extension 'pgrowlocks' is not available
+psql:/home/dongxu/lab/db9-server/tests/189_select_for_share.sql:10: NOTICE:  table "t" does not exist, skipping
  a 
 ---
  1
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/189_select_for_share.sql:16: ERROR:  Cannot update PK
+psql:/home/dongxu/lab/db9-server/tests/189_select_for_share.sql:16: ERROR:  Cannot update PK
  a 
 ---
  1
@@ -16,10 +16,10 @@ psql:/home/dongxu/lab/pg-tikv/tests/189_select_for_share.sql:16: ERROR:  Cannot 
 ---
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/189_select_for_share.sql:31: ERROR:  Unsupported function: dblink_connect
-psql:/home/dongxu/lab/pg-tikv/tests/189_select_for_share.sql:32: ERROR:  Unsupported function: dblink_exec
-psql:/home/dongxu/lab/pg-tikv/tests/189_select_for_share.sql:33: ERROR:  SQL parse error: sql parser error: Expected ), found: INT at Line: 1, Column 86
-psql:/home/dongxu/lab/pg-tikv/tests/189_select_for_share.sql:35: ERROR:  Table 'pgrowlocks' not found
+psql:/home/dongxu/lab/db9-server/tests/189_select_for_share.sql:31: ERROR:  Unsupported function: dblink_connect
+psql:/home/dongxu/lab/db9-server/tests/189_select_for_share.sql:32: ERROR:  Unsupported function: dblink_exec
+psql:/home/dongxu/lab/db9-server/tests/189_select_for_share.sql:33: ERROR:  SQL parse error: sql parser error: Expected ), found: INT at Line: 1, Column 86
+psql:/home/dongxu/lab/db9-server/tests/189_select_for_share.sql:35: ERROR:  Table 'pgrowlocks' not found
  a 
 ---
  1
@@ -32,8 +32,8 @@ psql:/home/dongxu/lab/pg-tikv/tests/189_select_for_share.sql:35: ERROR:  Table '
  2
 (2 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/189_select_for_share.sql:41: ERROR:  Unsupported function: dblink_exec
-psql:/home/dongxu/lab/pg-tikv/tests/189_select_for_share.sql:42: ERROR:  Unsupported function: dblink_disconnect
+psql:/home/dongxu/lab/db9-server/tests/189_select_for_share.sql:41: ERROR:  Unsupported function: dblink_exec
+psql:/home/dongxu/lab/db9-server/tests/189_select_for_share.sql:42: ERROR:  Unsupported function: dblink_disconnect
  a 
 ---
  1
@@ -46,4 +46,4 @@ psql:/home/dongxu/lab/pg-tikv/tests/189_select_for_share.sql:42: ERROR:  Unsuppo
  2
 (2 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/189_select_for_share.sql:48: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/189_select_for_share.sql:48: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

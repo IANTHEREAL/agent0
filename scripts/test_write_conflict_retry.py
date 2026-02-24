@@ -2,7 +2,7 @@
 """
 Integration test for WriteConflict retry behavior.
 
-This test verifies that pg-tikv correctly retries autocommit statements
+This test verifies that db9-server correctly retries autocommit statements
 when TiKV returns WriteConflict errors due to concurrent updates.
 
 Usage:

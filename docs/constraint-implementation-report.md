@@ -1,6 +1,6 @@
-# pg-tikv 约束实现测试报告
+# db9-server 约束实现测试报告
 
-**项目**: pg-tikv - 基于 TiKV 的 PostgreSQL 兼容分布式 SQL 数据库  
+**项目**: db9-server - 基于 TiKV 的 PostgreSQL 兼容分布式 SQL 数据库  
 **日期**: 2026-01-07  
 **版本**: v0.1.0  
 
@@ -8,7 +8,7 @@
 
 ## 1. 概述
 
-本次开发为 pg-tikv 实现了完整的数据库约束支持，包括：
+本次开发为 db9-server 实现了完整的数据库约束支持，包括：
 
 - DOUBLE PRECISION 数据类型
 - CHECK 约束（列级）
@@ -375,7 +375,7 @@ DETAIL:  Key ({columns})=({values}) is still referenced from table "{ref_table}"
 
 ## 10. 结论
 
-本次实现成功为 pg-tikv 添加了完整的约束支持，包括：
+本次实现成功为 db9-server 添加了完整的约束支持，包括：
 
 - ✅ DOUBLE PRECISION 数据类型
 - ✅ 列级 CHECK 约束

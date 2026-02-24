@@ -30,7 +30,7 @@ fn is_internal_column_name(name: &str) -> bool {
     name.rsplit('.')
         .next()
         .unwrap_or(name)
-        .starts_with("__tipg_subquery_")
+        .starts_with("__db9_subquery_")
 }
 
 fn build_plan_for_table_with_joins(

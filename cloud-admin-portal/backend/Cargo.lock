@@ -518,6 +518,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "db9-admin"
+version = "2.0.0"
+dependencies = [
+ "aes-gcm",
+ "argon2",
+ "atty",
+ "axum",
+ "base64",
+ "bytes",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "crossterm",
+ "dirs",
+ "futures-util",
+ "http-body-util",
+ "libsqlite3-sys",
+ "open",
+ "rand 0.8.5",
+ "reqwest",
+ "rpassword",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tokio",
+ "tokio-postgres",
+ "toml",
+ "tower 0.4.13",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1546,43 +1583,6 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
-
-[[package]]
-name = "pgtikv-admin"
-version = "2.0.0"
-dependencies = [
- "aes-gcm",
- "argon2",
- "atty",
- "axum",
- "base64",
- "bytes",
- "chrono",
- "clap",
- "clap_complete",
- "crossterm",
- "dirs",
- "futures-util",
- "http-body-util",
- "libsqlite3-sys",
- "open",
- "rand 0.8.5",
- "reqwest",
- "rpassword",
- "rustyline",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "tokio",
- "tokio-postgres",
- "toml",
- "tower 0.4.13",
- "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
 
 [[package]]
 name = "phf"

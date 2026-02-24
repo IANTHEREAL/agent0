@@ -453,7 +453,7 @@ impl PgClient {
     /// Execute SQL and return structured results.
     ///
     /// Uses prepare() for column type metadata and simple_query() for data
-    /// retrieval (text format) to avoid binary encoding mismatches with pg-tikv.
+    /// retrieval (text format) to avoid binary encoding mismatches with db9-server.
     pub async fn run_sql_structured(
         &self,
         keyspace: &str,
@@ -555,7 +555,7 @@ impl PgClient {
                 keyspace,
                 user,
                 password,
-                "SELECT * FROM _pgtikv_sys_observability()",
+                "SELECT * FROM _db9_sys_observability()",
             )
             .await?;
         if out.is_empty() {
@@ -589,7 +589,7 @@ impl PgClient {
                 keyspace,
                 user,
                 password,
-                "SELECT * FROM _pgtikv_sys_query_samples()",
+                "SELECT * FROM _db9_sys_query_samples()",
             )
             .await
         {

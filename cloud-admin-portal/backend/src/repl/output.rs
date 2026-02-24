@@ -1,4 +1,4 @@
-use pgtikv_admin::cli_common::print_json;
+use db9_admin::cli_common::print_json;
 use serde_json::Value;
 use std::io::Write;
 use std::process::{Command, Stdio};

@@ -1,3 +1,3 @@
-psql:/home/dongxu/lab/pg-tikv/tests/134_distsql_tenant.sql:10: ERROR:  Table 'public.t' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/134_distsql_tenant.sql:16: ERROR:  Column 'k' not found
-psql:/home/dongxu/lab/pg-tikv/tests/134_distsql_tenant.sql:19: ERROR:  Column 'k' not found
+psql:/home/dongxu/lab/db9-server/tests/134_distsql_tenant.sql:10: ERROR:  Table 'public.t' already exists
+psql:/home/dongxu/lab/db9-server/tests/134_distsql_tenant.sql:16: ERROR:  Column 'k' not found
+psql:/home/dongxu/lab/db9-server/tests/134_distsql_tenant.sql:19: ERROR:  Column 'k' not found

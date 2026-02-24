@@ -4,7 +4,7 @@
 
 **Goal**: Enable the optimizer pipeline to handle multi-table JOIN queries using NLJ.
 Fix the `left_col_start` index normalization bug. Extract shared utilities to neutral
-layers. All changes remain behind `tipg.use_optimizer` GUC (default OFF).
+layers. All changes remain behind `db9.use_optimizer` GUC (default OFF).
 
 ---
 

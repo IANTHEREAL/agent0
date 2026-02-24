@@ -5,7 +5,7 @@
 
 ## 背景与动机
 
-ORM 与迁移工具会大量依赖系统表做 introspection（表/列/索引/约束/类型/序列等）。pg-tikv 已实现了一部分虚拟系统表（`src/sql/information_schema.rs`），但仍存在“空表/字段不足/关联关系不稳定”的风险点：
+ORM 与迁移工具会大量依赖系统表做 introspection（表/列/索引/约束/类型/序列等）。db9-server 已实现了一部分虚拟系统表（`src/sql/information_schema.rs`），但仍存在“空表/字段不足/关联关系不稳定”的风险点：
 
 - `pg_proc` 目前返回空（`src/sql/information_schema.rs:1687`）
 - 缺少 enum/sequence 等相关系统表（如 `pg_enum`、`pg_sequence`）

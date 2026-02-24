@@ -202,13 +202,13 @@ Stop the loop when either:
 
 Before merging, run a quick local validation on the PR head branch:
 1. `cargo build --release` succeeds
-2. tipg (pg-tikv) starts successfully against a local TiKV cluster
+2. db9 (db9-server) starts successfully against a local TiKV cluster
 3. `pg_isready` succeeds and `SELECT 1;` works
 4. CI required checks are green for the PR head
 
-Use the `local-tipg-up` skill for the exact commands. It starts a local TiKV cluster (via `scripts/tikv_admin.py` / tiup), builds `pg-tikv` in release mode, starts the server, and runs a smoke test (`pg_isready` + `SELECT 1`). Run it on the PR head branch:
+Use the `local-db9-up` skill for the exact commands. It starts a local TiKV cluster (via `scripts/tikv_admin.py` / tiup), builds `db9-server` in release mode, starts the server, and runs a smoke test (`pg_isready` + `SELECT 1`). Run it on the PR head branch:
 - `gh pr checkout {pr_number}` (or `git checkout {pr_head_branch}`)
-- Follow `local-tipg-up/SKILL.md`
+- Follow `local-db9-up/SKILL.md`
 
 Then ensure CI is green (required). CI failures are merge blockers (treat as `MERGE_BLOCKER=CI_FAILED`, not a P0/P1 review finding):
 - Wait for required checks: `gh pr checks {pr_number} --required --watch --fail-fast`

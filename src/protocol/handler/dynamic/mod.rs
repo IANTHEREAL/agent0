@@ -19,7 +19,7 @@ mod startup;
 pub(super) use query::{is_data_statement, reject_unanalyzed_if_needed, utility_describe_fields};
 
 use super::portal::SuspendedPortalState;
-use super::TipgQueryParser;
+use super::Db9QueryParser;
 use super::{CopyContext, CONNECTION_ID_COUNTER};
 use crate::config::SharedServerConfig;
 use crate::pool::TikvClientPool;
@@ -50,7 +50,7 @@ pub struct DynamicPgHandler {
     pub(super) tenant_handle: OnceCell<TenantHandle>,
     pub(super) copy_context: Mutex<Option<CopyContext>>,
     pub(super) suspended_portals: Mutex<HashMap<String, SuspendedPortalState>>,
-    pub(super) query_parser: Arc<TipgQueryParser>,
+    pub(super) query_parser: Arc<Db9QueryParser>,
     pub(super) connection_id: i32,
     pub(super) server_config: SharedServerConfig,
 }
@@ -70,7 +70,7 @@ impl DynamicPgHandler {
             tenant_handle: OnceCell::new(),
             copy_context: Mutex::new(None),
             suspended_portals: Mutex::new(HashMap::new()),
-            query_parser: Arc::new(TipgQueryParser::new()),
+            query_parser: Arc::new(Db9QueryParser::new()),
             connection_id: CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             server_config,
         }

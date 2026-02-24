@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-This document outlines the design for addressing pg-tikv limitations discovered during SQLAlchemy/psycopg2 compatibility testing. The features are prioritized by impact and effort.
+This document outlines the design for addressing db9-server limitations discovered during SQLAlchemy/psycopg2 compatibility testing. The features are prioritized by impact and effort.
 
 | Feature | Priority | Effort | Status |
 |---------|----------|--------|--------|
@@ -26,7 +26,7 @@ This document outlines the design for addressing pg-tikv limitations discovered 
 
 ### Problem Statement
 
-SQLAlchemy uses `pg_type_is_visible(oid)` to check if an enum type exists in the current search_path before creating or dropping it. This function is not implemented in pg-tikv, causing:
+SQLAlchemy uses `pg_type_is_visible(oid)` to check if an enum type exists in the current search_path before creating or dropping it. This function is not implemented in db9-server, causing:
 
 ```
 psycopg2.errors.InternalError_: Unsupported function: pg_type_is_visible
@@ -52,7 +52,7 @@ pub fn pg_table_is_visible(_args: Vec<Value>) -> Result<Value> {
 
 Add `pg_type_is_visible` with the same behavior as `pg_table_is_visible`.
 
-**Rationale**: In pg-tikv's keyspace-isolated architecture, all types within a tenant's keyspace are effectively "visible" since there's no cross-tenant schema leakage.
+**Rationale**: In db9-server's keyspace-isolated architecture, all types within a tenant's keyspace are effectively "visible" since there's no cross-tenant schema leakage.
 
 ### Implementation Details
 
@@ -67,7 +67,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
 
 /// Check if a type is visible in the current search_path.
 /// 
-/// In pg-tikv, all types within the keyspace are visible, so this always
+/// In db9-server, all types within the keyspace are visible, so this always
 /// returns true (similar to pg_table_is_visible).
 /// 
 /// PostgreSQL signature: pg_type_is_visible(type_oid oid) → boolean
@@ -109,7 +109,7 @@ DROP TYPE test_mood;
 
 | Risk | Mitigation |
 |------|------------|
-| Always returning `true` may differ from PostgreSQL behavior | Document as intentional simplification; pg-tikv lacks multi-schema complexity |
+| Always returning `true` may differ from PostgreSQL behavior | Document as intentional simplification; db9-server lacks multi-schema complexity |
 
 ### Estimated Effort
 
@@ -544,8 +544,8 @@ fn validate_trigger_body(body: &str) -> Result<()> {
         if body_lower.contains(func) {
             return Err(anyhow!(
                 "Trigger function uses unsupported function '{}'. \
-                 Full-text search functions are not yet implemented in pg-tikv. \
-                 See: https://github.com/pg-tikv/pg-tikv/issues/XXX",
+                 Full-text search functions are not yet implemented in db9-server. \
+                 See: https://github.com/db9-server/db9-server/issues/XXX",
                 func
             ));
         }

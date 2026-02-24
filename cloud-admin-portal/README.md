@@ -1,6 +1,6 @@
-# pg-tikv Cloud Admin Portal
+# db9-server Cloud Admin Portal
 
-A modern web interface and CLI for managing pg-tikv multi-tenant database instances.
+A modern web interface and CLI for managing db9-server multi-tenant database instances.
 
 ## Features
 
@@ -10,7 +10,7 @@ A modern web interface and CLI for managing pg-tikv multi-tenant database instan
 - **API Key Authentication**: Optional `X-API-Key` header for all endpoints
 - **Background Reconciler**: Automatically recovers stuck CREATING/DISABLING tenants
 - **Audit Logging**: All tenant/user operations logged with operator, timestamps, and metadata
-- **CLI Tool**: `pgtikv-ctl` for command-line tenant and user management
+- **CLI Tool**: `db9-ctl` for command-line tenant and user management
 - **Dual Database**: SQLite for development, PostgreSQL for production
 - **Modern UI**: React frontend with shadcn/ui components
 
@@ -21,13 +21,13 @@ cloud-admin-portal/
 ├── backend/                 # Rust backend (axum + sqlx)
 │   ├── src/
 │   │   ├── api/             # axum handlers (tenants, users, system, audit)
-│   │   ├── services/        # PD client, pg-tikv client, reconciler
+│   │   ├── services/        # PD client, db9-server client, reconciler
 │   │   ├── config.rs        # Env-based configuration
 │   │   ├── db.rs            # sqlx AnyPool (SQLite/PostgreSQL)
 │   │   ├── auth.rs          # API key + tenant session extractors
 │   │   ├── session.rs       # In-memory session manager
-│   │   ├── main.rs          # pgtikv-admin server binary
-│   │   └── cli.rs           # pgtikv-ctl CLI binary
+│   │   ├── main.rs          # db9-admin server binary
+│   │   └── cli.rs           # db9-ctl CLI binary
 │   └── Cargo.toml
 ├── frontend/                # React TypeScript frontend
 │   └── src/
@@ -49,42 +49,42 @@ cargo build --release
 ```
 
 Produces two binaries in `target/release/`:
-- **`pgtikv-admin`** — HTTP API server
-- **`pgtikv-ctl`** — CLI tool
+- **`db9-admin`** — HTTP API server
+- **`db9-ctl`** — CLI tool
 
 ### Run Server
 
 ```bash
 # Minimal (SQLite, no auth)
-./target/release/pgtikv-admin
+./target/release/db9-admin
 
 # Production
-PGTIKV_DATABASE_URL=postgres://user:pass@localhost/portal \
-PGTIKV_PD_ENDPOINTS=10.0.0.1:2379 \
-PGTIKV_API_KEYS=my-secret-key \
-./target/release/pgtikv-admin
+DB9_DATABASE_URL=postgres://user:pass@localhost/portal \
+DB9_PD_ENDPOINTS=10.0.0.1:2379 \
+DB9_API_KEYS=my-secret-key \
+./target/release/db9-admin
 ```
 
-### CLI Tool (`pgtikv-ctl`)
+### CLI Tool (`db9-ctl`)
 
 #### Global Options
 
 | Option | Env Var | Default | Description |
 |--------|---------|---------|-------------|
-| `--api-url <URL>` | `PGTIKV_API_URL` | `http://localhost:8090/api` | Admin API address |
-| `--api-key <KEY>` | `PGTIKV_API_KEY` | (empty) | API authentication key |
+| `--api-url <URL>` | `DB9_API_URL` | `http://localhost:8090/api` | Admin API address |
+| `--api-key <KEY>` | `DB9_API_KEY` | (empty) | API authentication key |
 | `--json` | — | `false` | Output as JSON (for scripting) |
 
 ```bash
 # Configure via environment (recommended)
-export PGTIKV_API_URL=http://admin.example.com/api
-export PGTIKV_API_KEY=my-secret-key
+export DB9_API_URL=http://admin.example.com/api
+export DB9_API_KEY=my-secret-key
 ```
 
 #### Command Overview
 
 ```
-pgtikv-ctl
+db9-ctl
 ├── tenants                # Tenant management
 │   ├── list               # List tenants
 │   ├── get <id>           # Get tenant details
@@ -106,24 +106,24 @@ pgtikv-ctl
 
 ```bash
 # List all tenants
-pgtikv-ctl tenants list
+db9-ctl tenants list
 
 # Filter by state, search, paginate
-pgtikv-ctl tenants list --state ACTIVE -q "production" --page 1 --size 20
+db9-ctl tenants list --state ACTIVE -q "production" --page 1 --size 20
 
 # Get tenant details (shows endpoints, tags, notes)
-pgtikv-ctl tenants get <tenant_id>
+db9-ctl tenants get <tenant_id>
 
 # Create tenant (auto-generates password if omitted)
-pgtikv-ctl tenants create
-pgtikv-ctl tenants create --admin-user dbadmin --admin-password mypass123
+db9-ctl tenants create
+db9-ctl tenants create --admin-user dbadmin --admin-password mypass123
 
 # Update metadata
-pgtikv-ctl tenants update <tenant_id> --notes "Production DB" --tags "prod,cn-east"
-pgtikv-ctl tenants update <tenant_id> --tags ""   # clear tags
+db9-ctl tenants update <tenant_id> --notes "Production DB" --tags "prod,cn-east"
+db9-ctl tenants update <tenant_id> --tags ""   # clear tags
 
 # Remove tenant (ACTIVE → DISABLING → DISABLED)
-pgtikv-ctl tenants remove <tenant_id>
+db9-ctl tenants remove <tenant_id>
 ```
 
 > **Note**: TiKV keyspaces can only be disabled, not physically deleted. Data is retained.
@@ -134,62 +134,62 @@ User management requires a tenant session obtained via `connect`:
 
 ```bash
 # 1. Get session
-pgtikv-ctl connect <tenant_id> --admin-user admin --admin-password <password>
+db9-ctl connect <tenant_id> --admin-user admin --admin-password <password>
 # → Session:  e3f4a5b6c7d8...
 # → Expires:  2026-02-08 23:25
 
 # Tip: capture session in a variable
-SESSION=$(pgtikv-ctl --json connect <tenant_id> \
+SESSION=$(db9-ctl --json connect <tenant_id> \
   --admin-user admin --admin-password <password> \
   | jq -r .session_id)
 
 # 2. List users
-pgtikv-ctl users list <tenant_id> --session $SESSION
+db9-ctl users list <tenant_id> --session $SESSION
 
 # 3. Create user (auto-generates password if omitted)
-pgtikv-ctl users create <tenant_id> --username appuser --session $SESSION
-pgtikv-ctl users create <tenant_id> --username dbadmin --password secret --superuser --session $SESSION
+db9-ctl users create <tenant_id> --username appuser --session $SESSION
+db9-ctl users create <tenant_id> --username dbadmin --password secret --superuser --session $SESSION
 
 # 4. Reset password
-pgtikv-ctl users reset-password <tenant_id> appuser --session $SESSION
+db9-ctl users reset-password <tenant_id> appuser --session $SESSION
 
 # 5. Delete user
-pgtikv-ctl users delete <tenant_id> appuser --session $SESSION
+db9-ctl users delete <tenant_id> appuser --session $SESSION
 ```
 
-Sessions expire after 1 hour by default (configured by `PGTIKV_SESSION_TTL_HOURS`).
+Sessions expire after 1 hour by default (configured by `DB9_SESSION_TTL_HOURS`).
 
 #### System Commands
 
 ```bash
-pgtikv-ctl health          # Status: ok  PD: ✓
-pgtikv-ctl info            # pg-tikv Admin API v2.0.0
+db9-ctl health          # Status: ok  PD: ✓
+db9-ctl info            # db9-server Admin API v2.0.0
 ```
 
 #### End-to-End Example
 
 ```bash
-export PGTIKV_API_URL=http://localhost:8090/api
+export DB9_API_URL=http://localhost:8090/api
 
 # Check service health
-pgtikv-ctl health
+db9-ctl health
 
 # Create a tenant
-pgtikv-ctl tenants create --admin-user admin
+db9-ctl tenants create --admin-user admin
 # → Tenant created: x9y8z7w6v5u4
 # → Admin password: aB3$kL9mP2xQ
 # → Connection:     psql -h pg.example.com -p 5433 -U x9y8z7w6v5u4.admin
 
 # Get session
-SESSION=$(pgtikv-ctl --json connect x9y8z7w6v5u4 \
+SESSION=$(db9-ctl --json connect x9y8z7w6v5u4 \
   --admin-user admin --admin-password 'aB3$kL9mP2xQ' \
   | jq -r .session_id)
 
 # Create an application user
-pgtikv-ctl users create x9y8z7w6v5u4 --username appuser --session $SESSION
+db9-ctl users create x9y8z7w6v5u4 --username appuser --session $SESSION
 
 # Verify
-pgtikv-ctl users list x9y8z7w6v5u4 --session $SESSION
+db9-ctl users list x9y8z7w6v5u4 --session $SESSION
 
 # Connect to the database
 psql -h pg.example.com -p 5433 -U x9y8z7w6v5u4.appuser
@@ -200,10 +200,10 @@ psql -h pg.example.com -p 5433 -U x9y8z7w6v5u4.appuser
 The CLI exits with code 1 on any API or connection error:
 
 ```bash
-$ pgtikv-ctl tenants get nonexistent
+$ db9-ctl tenants get nonexistent
 Error 404: Tenant not found
 
-$ pgtikv-ctl --api-url http://unreachable:8090/api health
+$ db9-ctl --api-url http://unreachable:8090/api health
 Connection failed: error sending request for url (http://unreachable:8090/api/health)
 ```
 
@@ -225,25 +225,25 @@ npm run dev
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PGTIKV_PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD addresses |
-| `PGTIKV_PG_HOST` | `127.0.0.1` | pg-tikv server host (internal) |
-| `PGTIKV_PG_PORT` | `5433` | pg-tikv server port (internal) |
-| `PGTIKV_PG_PUBLIC_ENDPOINTS` | `127.0.0.1:5433` | Public pg-tikv endpoints for clients (comma-separated) |
-| `PGTIKV_API_PORT` | `8090` | API server port |
-| `PGTIKV_API_HOST` | `0.0.0.0` | API server bind address |
-| `PGTIKV_DATABASE_URL` | `sqlite://data/portal.db?mode=rwc` | Metadata database (SQLite or PostgreSQL) |
-| `PGTIKV_API_KEYS` | (empty) | Comma-separated API keys (empty = no auth) |
-| `PGTIKV_CORS_ORIGINS` | `http://localhost:5173,http://localhost:3000` | Allowed CORS origins |
-| `PGTIKV_RECONCILER_ENABLED` | `true` | Enable background reconciler |
-| `PGTIKV_RECONCILER_INTERVAL_SECONDS` | `300` | Reconciler cycle interval |
-| `PGTIKV_SESSION_TTL_HOURS` | `1` | Tenant session expiry |
+| `DB9_PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD addresses |
+| `DB9_PG_HOST` | `127.0.0.1` | db9-server server host (internal) |
+| `DB9_PG_PORT` | `5433` | db9-server server port (internal) |
+| `DB9_PG_PUBLIC_ENDPOINTS` | `127.0.0.1:5433` | Public db9-server endpoints for clients (comma-separated) |
+| `DB9_API_PORT` | `8090` | API server port |
+| `DB9_API_HOST` | `0.0.0.0` | API server bind address |
+| `DB9_DATABASE_URL` | `sqlite://data/portal.db?mode=rwc` | Metadata database (SQLite or PostgreSQL) |
+| `DB9_API_KEYS` | (empty) | Comma-separated API keys (empty = no auth) |
+| `DB9_CORS_ORIGINS` | `http://localhost:5173,http://localhost:3000` | Allowed CORS origins |
+| `DB9_RECONCILER_ENABLED` | `true` | Enable background reconciler |
+| `DB9_RECONCILER_INTERVAL_SECONDS` | `300` | Reconciler cycle interval |
+| `DB9_SESSION_TTL_HOURS` | `1` | Tenant session expiry |
 
 ### CLI Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PGTIKV_API_URL` | `http://localhost:8090/api` | API base URL |
-| `PGTIKV_API_KEY` | (empty) | API key for authentication |
+| `DB9_API_URL` | `http://localhost:8090/api` | API base URL |
+| `DB9_API_KEY` | (empty) | API key for authentication |
 
 ### Frontend Environment Variables
 
@@ -289,7 +289,7 @@ npm run dev
 
 ### API Key Authentication
 
-When `PGTIKV_API_KEYS` is set, all endpoints require an `X-API-Key` header:
+When `DB9_API_KEYS` is set, all endpoints require an `X-API-Key` header:
 
 ```bash
 curl -H "X-API-Key: my-secret" http://localhost:8090/api/tenants
@@ -302,7 +302,7 @@ User management requires connecting to the tenant first:
 1. `POST /api/tenants/{id}/connect` with `{ "admin_user": "admin", "admin_password": "..." }`
 2. Returns `{ "session_id": "...", "expires_at": "..." }`
 3. Include `X-Tenant-Session: <session_id>` header for user management APIs
-4. Sessions expire after 1 hour (configurable via `PGTIKV_SESSION_TTL_HOURS`)
+4. Sessions expire after 1 hour (configurable via `DB9_SESSION_TTL_HOURS`)
 
 ## Tenant State Machine
 
@@ -322,7 +322,7 @@ Reconciler: DISABLING(>10min) → DISABLED
 ```bash
 cd backend
 cargo check                         # Type check
-cargo build --release               # Build both binaries (pgtikv-admin + pgtikv-ctl)
+cargo build --release               # Build both binaries (db9-admin + db9-ctl)
 ```
 
 ### Frontend
@@ -361,7 +361,7 @@ The `deploy/` directory provides a production-ready Docker Compose setup with ng
 # 1. Configure environment
 cd deploy
 cp .env.example .env
-# Edit .env with your configuration (PD endpoints, pg-tikv host/port, etc.)
+# Edit .env with your configuration (PD endpoints, db9-server host/port, etc.)
 
 # 2. Build and start services
 ../scripts/build.sh                 # Build frontend + Docker images
@@ -373,7 +373,7 @@ docker-compose up -d                # Start all services
 | Service | Description | Port |
 |---------|-------------|------|
 | `nginx` | Reverse proxy, serves frontend static files, proxies `/api` to backend | 80 (443 for HTTPS) |
-| `backend` | Rust API server (`pgtikv-admin`) | 8080 (internal) |
+| `backend` | Rust API server (`db9-admin`) | 8080 (internal) |
 | `frontend-builder` | Build stage that outputs static files to shared volume | - |
 
 **Architecture:**
@@ -412,8 +412,8 @@ Place `cert.pem` and `key.pem` in `deploy/ssl/`.
 
 ```bash
 PD_ENDPOINTS=127.0.0.1:2379          # TiKV PD addresses
-PG_HOST=127.0.0.1                    # pg-tikv host (internal backend connections)
-PG_PORT=5433                         # pg-tikv port (internal backend connections)
+PG_HOST=127.0.0.1                    # db9-server host (internal backend connections)
+PG_PORT=5433                         # db9-server port (internal backend connections)
 PG_PUBLIC_ENDPOINTS=pg.example.com:5433  # Public endpoints for end-user connections
 API_PORT=8080                        # Backend API port
 ```

@@ -58,10 +58,10 @@ impl WorkerConfig {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
 
-        if let Ok(v) = env::var("PGTIKV_WORKER_ENABLED") {
+        if let Ok(v) = env::var("DB9_WORKER_ENABLED") {
             cfg.enabled = parse_bool(&v).unwrap_or(cfg.enabled);
         }
-        if let Ok(v) = env::var("PGTIKV_WORKER_POLL_MS") {
+        if let Ok(v) = env::var("DB9_WORKER_POLL_MS") {
             cfg.poll_ms = v
                 .parse::<u64>()
                 .ok()
@@ -69,55 +69,55 @@ impl WorkerConfig {
                 .unwrap_or(cfg.poll_ms);
             cfg.poll_ms = cfg.poll_ms.max(DEFAULT_POLL_MS);
         }
-        if let Ok(v) = env::var("PGTIKV_WORKER_MAX_CONCURRENT_JOBS") {
+        if let Ok(v) = env::var("DB9_WORKER_MAX_CONCURRENT_JOBS") {
             cfg.max_concurrent_jobs = v
                 .parse::<usize>()
                 .ok()
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.max_concurrent_jobs);
         }
-        if let Ok(v) = env::var("PGTIKV_WORKER_ID") {
+        if let Ok(v) = env::var("DB9_WORKER_ID") {
             cfg.worker_id = v;
         }
-        if let Ok(v) = env::var("PGTIKV_WORKER_STATEMENT_TIMEOUT_MS") {
+        if let Ok(v) = env::var("DB9_WORKER_STATEMENT_TIMEOUT_MS") {
             cfg.statement_timeout_ms = v
                 .parse::<u64>()
                 .ok()
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.statement_timeout_ms);
         }
-        if let Ok(v) = env::var("PGTIKV_CRON_JOB_TIMEOUT_MS") {
+        if let Ok(v) = env::var("DB9_CRON_JOB_TIMEOUT_MS") {
             cfg.cron_job_timeout_ms = v
                 .parse::<u64>()
                 .ok()
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.cron_job_timeout_ms);
         }
-        if let Ok(v) = env::var("PGTIKV_WORKER_ORPHAN_TIMEOUT_SEC") {
+        if let Ok(v) = env::var("DB9_WORKER_ORPHAN_TIMEOUT_SEC") {
             cfg.orphan_timeout_sec = v
                 .parse::<u64>()
                 .ok()
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.orphan_timeout_sec);
         }
-        if let Ok(v) = env::var("PGTIKV_WORKER_GC_BATCH_SIZE") {
+        if let Ok(v) = env::var("DB9_WORKER_GC_BATCH_SIZE") {
             cfg.gc_batch_size = v
                 .parse::<usize>()
                 .ok()
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.gc_batch_size);
         }
-        if let Ok(v) = env::var("PGTIKV_AUTO_ANALYZE_ENABLED") {
+        if let Ok(v) = env::var("DB9_AUTO_ANALYZE_ENABLED") {
             cfg.auto_analyze_enabled = parse_bool(&v).unwrap_or(cfg.auto_analyze_enabled);
         }
-        if let Ok(v) = env::var("PGTIKV_AUTO_ANALYZE_THRESHOLD") {
+        if let Ok(v) = env::var("DB9_AUTO_ANALYZE_THRESHOLD") {
             cfg.auto_analyze_threshold = v
                 .parse::<u64>()
                 .ok()
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.auto_analyze_threshold);
         }
-        if let Ok(v) = env::var("PGTIKV_WORKER_SYSTEM_KEYSPACE") {
+        if let Ok(v) = env::var("DB9_WORKER_SYSTEM_KEYSPACE") {
             cfg.system_keyspace = v;
         }
 
@@ -140,17 +140,17 @@ mod tests {
         let _guard = test_lock().lock().unwrap();
 
         let keys = [
-            "PGTIKV_WORKER_ENABLED",
-            "PGTIKV_WORKER_POLL_MS",
-            "PGTIKV_WORKER_MAX_CONCURRENT_JOBS",
-            "PGTIKV_WORKER_ID",
-            "PGTIKV_WORKER_STATEMENT_TIMEOUT_MS",
-            "PGTIKV_CRON_JOB_TIMEOUT_MS",
-            "PGTIKV_WORKER_ORPHAN_TIMEOUT_SEC",
-            "PGTIKV_WORKER_GC_BATCH_SIZE",
-            "PGTIKV_AUTO_ANALYZE_ENABLED",
-            "PGTIKV_AUTO_ANALYZE_THRESHOLD",
-            "PGTIKV_WORKER_SYSTEM_KEYSPACE",
+            "DB9_WORKER_ENABLED",
+            "DB9_WORKER_POLL_MS",
+            "DB9_WORKER_MAX_CONCURRENT_JOBS",
+            "DB9_WORKER_ID",
+            "DB9_WORKER_STATEMENT_TIMEOUT_MS",
+            "DB9_CRON_JOB_TIMEOUT_MS",
+            "DB9_WORKER_ORPHAN_TIMEOUT_SEC",
+            "DB9_WORKER_GC_BATCH_SIZE",
+            "DB9_AUTO_ANALYZE_ENABLED",
+            "DB9_AUTO_ANALYZE_THRESHOLD",
+            "DB9_WORKER_SYSTEM_KEYSPACE",
         ];
 
         let saved: Vec<(String, Option<String>)> = keys

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup.sh — Bootstrap the tipg e2e local environment from scratch.
+# setup.sh — Bootstrap the db9 e2e local environment from scratch.
 #
 # What this script does:
 #   1. Validates prerequisites (docker, docker compose)
@@ -15,8 +15,8 @@
 #   ./setup.sh --reset                # wipe volumes, rebuild everything from scratch
 #   ./setup.sh --multi-tenant-test    # run multi-tenant isolation tests (in addition to smoke)
 #   ./setup.sh --binary svc=/path     # inject local binary into container after start
-#                                     # svc: pgtikv-admin, pg-tikv, fs9-server, fs9-meta
-#                                     # example: --binary pgtikv-admin=/target/release/pgtikv-admin
+#                                     # svc: db9-admin, db9-server, fs9-server, fs9-meta
+#                                     # example: --binary db9-admin=/target/release/db9-admin
 #                                     # multiple binaries: --binary a=/p1 --binary b=/p2
 
 set -euo pipefail
@@ -108,12 +108,12 @@ FS9_REPO_PATH=${fs9_path}
 FS9_JWT_SECRET=${jwt_secret}
 FS9_META_KEY=${meta_key}
 
-# PostgreSQL credentials for pgtikv-admin
+# PostgreSQL credentials for db9-admin
 POSTGRES_USER=admin
 POSTGRES_PASSWORD=admin
 
 # Optional: comma-separated API keys; empty = no key required
-PGTIKV_API_KEYS=
+DB9_API_KEYS=
 
 # Log level for all Rust services
 RUST_LOG=info
@@ -153,7 +153,7 @@ IGNORE
 
   # 3. Check for host port conflicts
   local ports=(5433 8090 9999)
-  local names=("pg-tikv" "pgtikv-admin" "fs9-server")
+  local names=("db9-server" "db9-admin" "fs9-server")
   local conflicts=()
 
   for i in "${!ports[@]}"; do
@@ -213,8 +213,8 @@ start_stack() {
 # Returns the in-container binary path for a given service name.
 container_bin_path() {
   case "$1" in
-    pgtikv-admin) echo "/app/pgtikv-admin" ;;
-    pg-tikv)      echo "/app/pg-tikv" ;;
+    db9-admin) echo "/app/db9-admin" ;;
+    db9-server)      echo "/app/db9-server" ;;
     fs9-server)   echo "/app/fs9-server" ;;
     fs9-meta)     echo "/app/fs9-meta" ;;
     *) echo "" ;;
@@ -235,7 +235,7 @@ inject_binaries() {
     container_path="$(container_bin_path "$svc")"
 
     [[ -f "$local_path" ]] || die "Binary not found: $local_path"
-    [[ -n "$container_path" ]] || die "Unknown service for binary injection: $svc (valid: pgtikv-admin, pg-tikv, fs9-server, fs9-meta)"
+    [[ -n "$container_path" ]] || die "Unknown service for binary injection: $svc (valid: db9-admin, db9-server, fs9-server, fs9-meta)"
 
     info "  Injecting ${svc}: ${local_path} → ${container_path}"
     docker compose cp "${local_path}" "${svc}:${container_path}"
@@ -250,7 +250,7 @@ inject_binaries() {
 
 # ── Wait for all services ─────────────────────────────────────────────────────
 wait_healthy() {
-  local services=(postgres pd tikv pg-tikv fs9-meta fs9-server pgtikv-admin)
+  local services=(postgres pd tikv db9-server fs9-meta fs9-server db9-admin)
   local timeout=300  # seconds
   local start=$SECONDS
 
@@ -293,7 +293,7 @@ wait_healthy() {
 run_smoke_tests() {
   info "Running smoke tests..."
 
-  local db9="docker compose exec -T pgtikv-admin db9 --api-url http://localhost:8090/api"
+  local db9="docker compose exec -T db9-admin db9 --api-url http://localhost:8090/api"
 
   # --- 1. db create ---
   info "  [1/3] db9 db create --name smoketest"
@@ -340,11 +340,11 @@ run_multi_tenant_tests() {
 
   # Register Alice and Bob
   info "  Registering two customer accounts..."
-  docker compose exec -T pgtikv-admin bash -c "
+  docker compose exec -T db9-admin bash -c "
     curl -sf -X POST http://localhost:8090/api/customer/register \
       -H 'Content-Type: application/json' \
       -d '{\"email\":\"${alice_email}\",\"password\":\"alice_password_123\"}' > /dev/null"
-  docker compose exec -T pgtikv-admin bash -c "
+  docker compose exec -T db9-admin bash -c "
     curl -sf -X POST http://localhost:8090/api/customer/register \
       -H 'Content-Type: application/json' \
       -d '{\"email\":\"${bob_email}\",\"password\":\"bob_password_456\"}' > /dev/null"
@@ -448,9 +448,9 @@ echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
 SCRIPT_END
 
-  docker compose cp "$tmp_script" "pgtikv-admin:/tmp/mt_test.sh"
+  docker compose cp "$tmp_script" "db9-admin:/tmp/mt_test.sh"
   local result
-  result=$(docker compose exec -T pgtikv-admin sh /tmp/mt_test.sh \
+  result=$(docker compose exec -T db9-admin sh /tmp/mt_test.sh \
     "$alice_email" "$bob_email" 2>&1)
 
   echo "$result"
@@ -463,20 +463,20 @@ SCRIPT_END
 print_summary() {
   echo ""
   echo "─────────────────────────────────────────────────────"
-  echo " tipg e2e stack is running"
+  echo " db9 e2e stack is running"
   echo "─────────────────────────────────────────────────────"
-  echo "  pgtikv-admin API : http://localhost:8090/api"
-  echo "  pg-tikv (psql)   : postgresql://localhost:5433"
+  echo "  db9-admin API : http://localhost:8090/api"
+  echo "  db9-server (psql)   : postgresql://localhost:5433"
   echo "  fs9-server       : http://localhost:9999"
   echo "  fs9-meta         : http://localhost:9998"
   echo ""
   echo " db9 usage (inside container):"
-  echo "  docker compose exec pgtikv-admin db9 --api-url http://localhost:8090/api db list"
-  echo "  docker compose exec pgtikv-admin db9 --api-url http://localhost:8090/api sh <id>"
+  echo "  docker compose exec db9-admin db9 --api-url http://localhost:8090/api db list"
+  echo "  docker compose exec db9-admin db9 --api-url http://localhost:8090/api sh <id>"
   echo ""
   echo " Inject a local binary (e.g. after cargo build):"
-  echo "  ./setup.sh --skip-build --binary=pgtikv-admin=../../target/release/pgtikv-admin"
-  echo "  ./setup.sh --skip-build --binary=pg-tikv=../../target/release/pg-tikv"
+  echo "  ./setup.sh --skip-build --binary=db9-admin=../../target/release/db9-admin"
+  echo "  ./setup.sh --skip-build --binary=db9-server=../../target/release/db9-server"
   echo ""
   echo " Useful commands:"
   echo "  docker compose logs -f            # tail all logs"

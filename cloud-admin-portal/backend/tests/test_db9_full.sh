@@ -3,7 +3,7 @@ set -euo pipefail
 
 API_URL="${API_URL:-http://localhost:8090/api}"
 API_BASE="${API_URL%/}"
-API_KEY="${API_KEY:-${PGTIKV_API_KEY:-}}"
+API_KEY="${API_KEY:-${DB9_API_KEY:-}}"
 HEALTH_URL="${HEALTH_URL:-${API_BASE}/health}"
 
 PASS_OK=0

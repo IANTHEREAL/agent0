@@ -15,4 +15,4 @@
 ---
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/140_function_lookup.sql:30: ERROR:  Unsupported RETURNING
+psql:/home/dongxu/lab/db9-server/tests/140_function_lookup.sql:30: ERROR:  Unsupported RETURNING

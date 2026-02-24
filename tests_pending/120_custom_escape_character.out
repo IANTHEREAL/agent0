@@ -1,12 +1,12 @@
-psql:/home/dongxu/lab/pg-tikv/tests/120_custom_escape_character.sql:5: ERROR:  SQL parse error: sql parser error: Expected literal string, found: CASE at Line: 1, Column 29
-psql:/home/dongxu/lab/pg-tikv/tests/120_custom_escape_character.sql:8: ERROR:  SQL parse error: sql parser error: Expected literal string, found: CASE at Line: 1, Column 29
-psql:/home/dongxu/lab/pg-tikv/tests/120_custom_escape_character.sql:11: ERROR:  SQL parse error: sql parser error: Expected literal string, found: CASE at Line: 1, Column 34
+psql:/home/dongxu/lab/db9-server/tests/120_custom_escape_character.sql:5: ERROR:  SQL parse error: sql parser error: Expected literal string, found: CASE at Line: 1, Column 29
+psql:/home/dongxu/lab/db9-server/tests/120_custom_escape_character.sql:8: ERROR:  SQL parse error: sql parser error: Expected literal string, found: CASE at Line: 1, Column 29
+psql:/home/dongxu/lab/db9-server/tests/120_custom_escape_character.sql:11: ERROR:  SQL parse error: sql parser error: Expected literal string, found: CASE at Line: 1, Column 34
  ?column? 
 ----------
  t
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/120_custom_escape_character.sql:17: ERROR:  SQL parse error: sql parser error: Expect a char, found "" at Line: 1, Column 29
+psql:/home/dongxu/lab/db9-server/tests/120_custom_escape_character.sql:17: ERROR:  SQL parse error: sql parser error: Expect a char, found "" at Line: 1, Column 29
  ?column? 
 ----------
  t
@@ -22,7 +22,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/120_custom_escape_character.sql:17: ERROR:  
  t
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/120_custom_escape_character.sql:29: server closed the connection unexpectedly
+psql:/home/dongxu/lab/db9-server/tests/120_custom_escape_character.sql:29: server closed the connection unexpectedly
 	This probably means the server terminated abnormally
 	before or while processing the request.
-psql:/home/dongxu/lab/pg-tikv/tests/120_custom_escape_character.sql:29: error: connection to server was lost
+psql:/home/dongxu/lab/db9-server/tests/120_custom_escape_character.sql:29: error: connection to server was lost

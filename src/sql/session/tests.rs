@@ -67,7 +67,7 @@ mod tests {
             Some("0")
         );
         assert_eq!(
-            settings.show_value("pgtikv.max_sort_bytes").as_deref(),
+            settings.show_value("db9.max_sort_bytes").as_deref(),
             Some("268435456")
         );
         assert_eq!(
@@ -100,11 +100,11 @@ mod tests {
         );
 
         assert!(settings
-            .set_known_setting("application_name", "pg-tikv-tests".to_string())
+            .set_known_setting("application_name", "db9-server-tests".to_string())
             .unwrap());
         assert_eq!(
             settings.show_value("application_name").as_deref(),
-            Some("pg-tikv-tests")
+            Some("db9-server-tests")
         );
 
         // Unknown GUCs are stored in extra_settings for driver compatibility
@@ -182,45 +182,45 @@ mod tests {
         let mut settings = SessionSettings::new();
 
         settings
-            .set_known_setting("pgtikv.max_sort_bytes", "268435456".to_string())
+            .set_known_setting("db9.max_sort_bytes", "268435456".to_string())
             .unwrap();
         assert_eq!(
-            settings.show_value("pgtikv.max_sort_bytes").as_deref(),
+            settings.show_value("db9.max_sort_bytes").as_deref(),
             Some("268435456")
         );
 
         settings
-            .set_known_setting("pgtikv.max_sort_bytes", "256MB".to_string())
+            .set_known_setting("db9.max_sort_bytes", "256MB".to_string())
             .unwrap();
         assert_eq!(
-            settings.show_value("pgtikv.max_sort_bytes").as_deref(),
+            settings.show_value("db9.max_sort_bytes").as_deref(),
             Some("268435456")
         );
 
         settings
-            .set_known_setting("pgtikv.max_sort_bytes", "1gb".to_string())
+            .set_known_setting("db9.max_sort_bytes", "1gb".to_string())
             .unwrap();
         assert_eq!(
-            settings.show_value("pgtikv.max_sort_bytes").as_deref(),
+            settings.show_value("db9.max_sort_bytes").as_deref(),
             Some("1073741824")
         );
 
         settings
-            .set_known_setting("pgtikv.max_sort_bytes", "0".to_string())
+            .set_known_setting("db9.max_sort_bytes", "0".to_string())
             .unwrap();
         assert_eq!(
-            settings.show_value("pgtikv.max_sort_bytes").as_deref(),
+            settings.show_value("db9.max_sort_bytes").as_deref(),
             Some("0")
         );
 
         assert!(settings
-            .set_known_setting("pgtikv.max_sort_bytes", "-1".to_string())
+            .set_known_setting("db9.max_sort_bytes", "-1".to_string())
             .is_err());
         assert!(settings
-            .set_known_setting("pgtikv.max_sort_bytes", "1TB".to_string())
+            .set_known_setting("db9.max_sort_bytes", "1TB".to_string())
             .is_err());
         assert!(settings
-            .set_known_setting("pgtikv.max_sort_bytes", "abc".to_string())
+            .set_known_setting("db9.max_sort_bytes", "abc".to_string())
             .is_err());
     }
 

@@ -14,6 +14,6 @@ Database Indexing
 (0 rows)
 
 # Test 5: EXPLAIN includes scan node + predicate.
-# Current tipg behavior keeps planner/runtime honest by not selecting GIN access path yet.
+# Current db9 behavior keeps planner/runtime honest by not selecting GIN access path yet.
 Scan on fts_articles
 search_vector @@ plainto_tsquery('postgresql'::text)

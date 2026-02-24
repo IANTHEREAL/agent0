@@ -41,7 +41,7 @@ jobs:
       - name: Install PostgreSQL client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
 
-      # TiKV + pg-tikv bring-up (mirrors the existing CI smoke/regression workflows).
+      # TiKV + db9-server bring-up (mirrors the existing CI smoke/regression workflows).
       - name: Install tiup
         shell: bash
         run: |
@@ -99,7 +99,7 @@ jobs:
           # Ensure the repository is initialized and trusted.
           tiup list >/dev/null
 
-      - name: Build pg-tikv
+      - name: Build db9-server
         run: cargo build --release
 
       - name: Start TiKV cluster
@@ -146,29 +146,29 @@ jobs:
           curl -sf http://127.0.0.1:2379/pd/api/v1/health || (cat "$PLAYGROUND_LOG" && exit 1)
           curl -sf http://127.0.0.1:2379/pd/api/v1/stores | grep -Eq '\"count\"[[:space:]]*:[[:space:]]*[1-9]' || (cat "$PLAYGROUND_LOG" && exit 1)
 
-      - name: Start pg-tikv
+      - name: Start db9-server
         shell: bash
         run: |
           set -euo pipefail
 
           PD_ENDPOINTS=127.0.0.1:2379 \
             PG_PORT="$PG_PORT" \
-            PGTIKV_BOOTSTRAP_ADMIN_USER="$PG_USER" \
-            PGTIKV_BOOTSTRAP_ADMIN_PASSWORD="$PG_PASSWORD" \
-            ./target/release/pg-tikv > /tmp/pgtikv.log 2>&1 &
-          echo "PG_TIKV_PID=$!" >> "$GITHUB_ENV"
+            DB9_BOOTSTRAP_ADMIN_USER="$PG_USER" \
+            DB9_BOOTSTRAP_ADMIN_PASSWORD="$PG_PASSWORD" \
+            ./target/release/db9-server > /tmp/db9.log 2>&1 &
+          echo "DB9_PID=$!" >> "$GITHUB_ENV"
 
-          # Wait for pg-tikv to be ready
+          # Wait for db9-server to be ready
           for i in $(seq 1 30); do
             if pg_isready -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -q 2>/dev/null; then
-              echo "pg-tikv ready after $i seconds"
+              echo "db9-server ready after $i seconds"
               break
             fi
             sleep 1
           done
 
-          # Verify pg-tikv is responding
-          PGPASSWORD="$PG_PASSWORD" psql -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -d postgres -c "SELECT 1" || (cat /tmp/pgtikv.log && exit 1)
+          # Verify db9-server is responding
+          PGPASSWORD="$PG_PASSWORD" psql -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -d postgres -c "SELECT 1" || (cat /tmp/db9.log && exit 1)
 
       - name: Run SQLAlchemy smoke suite
         shell: bash
@@ -189,4 +189,4 @@ jobs:
           name: sqlalchemy-smoke-logs
           path: |
             /tmp/tiup-playground.log
-            /tmp/pgtikv.log
+            /tmp/db9.log

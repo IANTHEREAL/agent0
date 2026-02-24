@@ -27,14 +27,14 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        let api_keys_raw = env::var("PGTIKV_API_KEYS").unwrap_or_default();
+        let api_keys_raw = env::var("DB9_API_KEYS").unwrap_or_default();
         let api_keys: Vec<String> = api_keys_raw
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
 
-        let cors_raw = env::var("PGTIKV_CORS_ORIGINS")
+        let cors_raw = env::var("DB9_CORS_ORIGINS")
             .unwrap_or_else(|_| "http://localhost:5173,http://localhost:3000".into());
         let cors_origins: Vec<String> = cors_raw
             .split(',')
@@ -43,44 +43,44 @@ impl Config {
             .collect();
 
         Self {
-            pd_endpoints: env::var("PGTIKV_PD_ENDPOINTS")
+            pd_endpoints: env::var("DB9_PD_ENDPOINTS")
                 .or_else(|_| env::var("PD_ENDPOINTS"))
                 .unwrap_or_else(|_| "127.0.0.1:2379".into()),
-            pg_host: env::var("PGTIKV_PG_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
-            pg_port: env::var("PGTIKV_PG_PORT")
+            pg_host: env::var("DB9_PG_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+            pg_port: env::var("DB9_PG_PORT")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_PG_PORT),
-            pg_public_endpoints: env::var("PGTIKV_PG_PUBLIC_ENDPOINTS")
+            pg_public_endpoints: env::var("DB9_PG_PUBLIC_ENDPOINTS")
                 .unwrap_or_else(|_| format!("127.0.0.1:{DEFAULT_PG_PORT}")),
-            api_port: env::var("PGTIKV_API_PORT")
+            api_port: env::var("DB9_API_PORT")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8090),
-            api_host: env::var("PGTIKV_API_HOST").unwrap_or_else(|_| "0.0.0.0".into()),
-            database_url: env::var("PGTIKV_DATABASE_URL")
+            api_host: env::var("DB9_API_HOST").unwrap_or_else(|_| "0.0.0.0".into()),
+            database_url: env::var("DB9_DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite://data/portal.db?mode=rwc".into()),
             cors_origins,
             api_keys,
-            reconciler_enabled: env::var("PGTIKV_RECONCILER_ENABLED")
+            reconciler_enabled: env::var("DB9_RECONCILER_ENABLED")
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(true),
-            reconciler_interval_secs: env::var("PGTIKV_RECONCILER_INTERVAL_SECONDS")
+            reconciler_interval_secs: env::var("DB9_RECONCILER_INTERVAL_SECONDS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
-            reconciler_sync_keyspaces: env::var("PGTIKV_RECONCILER_SYNC_KEYSPACES")
+            reconciler_sync_keyspaces: env::var("DB9_RECONCILER_SYNC_KEYSPACES")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
-            session_ttl_hours: env::var("PGTIKV_SESSION_TTL_HOURS")
+            session_ttl_hours: env::var("DB9_SESSION_TTL_HOURS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
-            audit_retention_days: env::var("PGTIKV_AUDIT_RETENTION_DAYS")
+            audit_retention_days: env::var("DB9_AUDIT_RETENTION_DAYS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(90),
-            credential_key: env::var("PGTIKV_CREDENTIAL_KEY")
+            credential_key: env::var("DB9_CREDENTIAL_KEY")
                 .ok()
                 .filter(|k| !k.is_empty()),
             fs9_meta_url: env::var("FS9_META_URL").ok().filter(|v| !v.is_empty()),

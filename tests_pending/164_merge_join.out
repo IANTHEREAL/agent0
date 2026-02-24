@@ -1,6 +1,6 @@
-psql:/home/dongxu/lab/pg-tikv/tests/164_merge_join.sql:5: NOTICE:  table "t1" does not exist, skipping
-psql:/home/dongxu/lab/pg-tikv/tests/164_merge_join.sql:7: NOTICE:  table "t44798_0" does not exist, skipping
-psql:/home/dongxu/lab/pg-tikv/tests/164_merge_join.sql:8: NOTICE:  table "t44798_1" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/164_merge_join.sql:5: NOTICE:  table "t1" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/164_merge_join.sql:7: NOTICE:  table "t44798_0" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/164_merge_join.sql:8: NOTICE:  table "t44798_1" does not exist, skipping
  k | v | x | y 
 ---+---+---+---
  0 | 4 | 0 | 5
@@ -13,14 +13,14 @@ psql:/home/dongxu/lab/pg-tikv/tests/164_merge_join.sql:8: NOTICE:  table "t44798
  0 | 0
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/164_merge_join.sql:52: ERROR:  Unsupported data type: Int4(None)
-psql:/home/dongxu/lab/pg-tikv/tests/164_merge_join.sql:53: ERROR:  Unsupported data type: Int8(None)
-psql:/home/dongxu/lab/pg-tikv/tests/164_merge_join.sql:56: ERROR:  Table 't44798_0' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/164_merge_join.sql:57: ERROR:  Table 't44798_1' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/164_merge_join.sql:60: ERROR:  Table 't44798_0' not found
+psql:/home/dongxu/lab/db9-server/tests/164_merge_join.sql:52: ERROR:  Unsupported data type: Int4(None)
+psql:/home/dongxu/lab/db9-server/tests/164_merge_join.sql:53: ERROR:  Unsupported data type: Int8(None)
+psql:/home/dongxu/lab/db9-server/tests/164_merge_join.sql:56: ERROR:  Table 't44798_0' does not exist
+psql:/home/dongxu/lab/db9-server/tests/164_merge_join.sql:57: ERROR:  Table 't44798_1' does not exist
+psql:/home/dongxu/lab/db9-server/tests/164_merge_join.sql:60: ERROR:  Table 't44798_0' not found
  l | ?column? 
 ---+----------
  2 | t
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/164_merge_join.sql:71: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/164_merge_join.sql:71: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

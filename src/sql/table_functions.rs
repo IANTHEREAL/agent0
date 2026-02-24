@@ -48,12 +48,12 @@ pub(crate) fn table_function_key(name: &ObjectName, args: &[FunctionArg]) -> Str
 
 fn canonical_system_virtual_table_function(func_name: &str) -> Option<&'static str> {
     match func_name.to_ascii_uppercase().as_str() {
-        "_PGTIKV_SYS_OBSERVABILITY" => Some("_PGTIKV_SYS_OBSERVABILITY"),
-        "_PGTIKV_SYS_QUERY_SAMPLES" => Some("_PGTIKV_SYS_QUERY_SAMPLES"),
-        "_PGTIKV_SYS_EXPORT_DDL" => Some("_PGTIKV_SYS_EXPORT_DDL"),
-        "_PGTIKV_SYS_MIGRATIONS" => Some("_PGTIKV_SYS_MIGRATIONS"),
-        "_PGTIKV_SYS_TRIGGER_QUEUE_STATS" => Some("_PGTIKV_SYS_TRIGGER_QUEUE_STATS"),
-        "_PGTIKV_SYS_TRIGGER_DLQ" => Some("_PGTIKV_SYS_TRIGGER_DLQ"),
+        "_DB9_SYS_OBSERVABILITY" => Some("_DB9_SYS_OBSERVABILITY"),
+        "_DB9_SYS_QUERY_SAMPLES" => Some("_DB9_SYS_QUERY_SAMPLES"),
+        "_DB9_SYS_EXPORT_DDL" => Some("_DB9_SYS_EXPORT_DDL"),
+        "_DB9_SYS_MIGRATIONS" => Some("_DB9_SYS_MIGRATIONS"),
+        "_DB9_SYS_TRIGGER_QUEUE_STATS" => Some("_DB9_SYS_TRIGGER_QUEUE_STATS"),
+        "_DB9_SYS_TRIGGER_DLQ" => Some("_DB9_SYS_TRIGGER_DLQ"),
         _ => None,
     }
 }

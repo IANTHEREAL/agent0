@@ -1,4 +1,4 @@
-# pg-tikv Architecture Review (From Code, Not Docs)
+# db9-server Architecture Review (From Code, Not Docs)
 
 **Reviewed**: All code under `src/` (~170K lines of Rust)
 **Date**: 2026-02-20
@@ -354,7 +354,7 @@ Multiple `.ok()` calls convert structured errors into `None`. Parameter type inf
 
 #### 3.13 Dead GUC and Legacy Fallbacks (NEW — Verified, Partially Resolved by #847)
 
-**`tipg.use_optimizer`** — **RESOLVED by PR #847** (scope of issue #844, now closed). The `use_optimizer` session field, task-local, and GUC handling have all been removed. Clean deletion.
+**`db9.use_optimizer`** — **RESOLVED by PR #847** (scope of issue #844, now closed). The `use_optimizer` session field, task-local, and GUC handling have all been removed. Clean deletion.
 
 **Legacy schema deserialization** (`encoding.rs:1130-1143`): Double-deserialization fallback — tries current format, falls back to legacy without `IndexDef.state` field. Necessary for clusters upgraded before ce73a8a.
 
@@ -558,7 +558,7 @@ Either implement GIN operator support or emit a WARNING/NOTICE when a GIN index 
 
 ### 10. Clean Dead Signals (NEW — Partially Resolved by #847)
 
-~~Remove `tipg.use_optimizer` GUC, task-local, and session field.~~ **Done by #847.** Remaining: remove or sunset legacy schema deserialization fallback. Legacy DDL name conflict scan already has sunset date (2026-12-31) added by #847.
+~~Remove `db9.use_optimizer` GUC, task-local, and session field.~~ **Done by #847.** Remaining: remove or sunset legacy schema deserialization fallback. Legacy DDL name conflict scan already has sunset date (2026-12-31) added by #847.
 
 ---
 

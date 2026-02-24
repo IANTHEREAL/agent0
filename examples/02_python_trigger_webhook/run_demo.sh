@@ -10,7 +10,7 @@ if [ -z "$1" ]; then
     echo ""
     echo "Prerequisites:"
     echo "  - TiKV running: tiup playground --mode tikv-slim"
-    echo "  - TiPG running: PGTIKV_TRIGGER_ENABLED=true PGTIKV_HTTP_ALLOW_INSECURE=true cargo run"
+    echo "  - db9 running: DB9_TRIGGER_ENABLED=true DB9_HTTP_ALLOW_INSECURE=true cargo run"
     exit 1
 fi
 

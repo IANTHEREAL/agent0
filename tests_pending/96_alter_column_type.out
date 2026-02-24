@@ -1,4 +1,4 @@
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:9: ERROR:  Table 'public.t' already exists
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:9: ERROR:  Table 'public.t' already exists
               x               | y  
 ------------------------------+----
  [1,2]                        |  5
@@ -36,8 +36,8 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:9: ERROR:  Table 'p
  3 | 0003
 (3 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:46: ERROR:  SQL parse error: sql parser error: Expected SET/DROP NOT NULL, SET DEFAULT, SET DATA TYPE after ALTER COLUMN, found: DROP at Line: 1, Column 30
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:49: ERROR:  DROP COLUMN ... CASCADE is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:46: ERROR:  SQL parse error: sql parser error: Expected SET/DROP NOT NULL, SET DEFAULT, SET DATA TYPE after ALTER COLUMN, found: DROP at Line: 1, Column 30
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:49: ERROR:  DROP COLUMN ... CASCADE is not supported
  column_name |     data_type     
 -------------+-------------------
  a           | integer
@@ -52,7 +52,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:49: ERROR:  DROP CO
  i           | integer
 (3 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:68: ERROR:  Column 'b' already exists
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:68: ERROR:  Column 'b' already exists
  a |  b   | i 
 ---+------+---
  1 | 01   |  
@@ -70,14 +70,14 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:68: ERROR:  Column 
  a           | integer
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:103: NOTICE:  table "t" does not exist, skipping
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:115: NOTICE:  table "t" does not exist, skipping
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:118: ERROR:  Table 'public.t1' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:121: ERROR:  invalid input syntax for type integer: "2024-07-26"
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:124: ERROR:  Column 'date' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:127: ERROR:  Column 'date' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:130: ERROR:  Table 'public.t2' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:133: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:103: NOTICE:  table "t" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:115: NOTICE:  table "t" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:118: ERROR:  Table 'public.t1' already exists
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:121: ERROR:  invalid input syntax for type integer: "2024-07-26"
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:124: ERROR:  Column 'date' does not exist
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:127: ERROR:  Column 'date' does not exist
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:130: ERROR:  Table 'public.t2' already exists
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:133: ERROR:  Column count mismatch
  column_name | data_type 
 -------------+-----------
  a           | integer
@@ -85,9 +85,9 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:133: ERROR:  Column
  c           | integer
 (3 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:143: ERROR:  Column count mismatch
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:146: ERROR:  Table 'public.t3' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:149: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:143: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:146: ERROR:  Table 'public.t3' already exists
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:149: ERROR:  Column count mismatch
  column_name | data_type 
 -------------+-----------
 (0 rows)
@@ -100,32 +100,32 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:149: ERROR:  Column
 -------------+-----------
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:173: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:173: ERROR:  Column count mismatch
 --
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:179: ERROR:  Table 'public.t5' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:182: ERROR:  Column count mismatch
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:185: ERROR:  Column count mismatch
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:188: ERROR:  Column 'x' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:191: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:179: ERROR:  Table 'public.t5' already exists
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:182: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:185: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:188: ERROR:  Column 'x' does not exist
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:191: ERROR:  Column count mismatch
 --
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:197: ERROR:  Table 'public.t6' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:200: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:197: ERROR:  Table 'public.t6' already exists
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:200: ERROR:  Column count mismatch
  column_name | data_type 
 -------------+-----------
  a           | integer
  b           | integer
 (2 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:210: ERROR:  Table 'public.t7' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:213: ERROR:  Unknown col
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:216: ERROR:  Column 'x' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:219: ERROR:  Column 'x' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:222: ERROR:  Column 'x' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:231: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:210: ERROR:  Table 'public.t7' already exists
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:213: ERROR:  Unknown col
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:216: ERROR:  Column 'x' does not exist
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:219: ERROR:  Column 'x' does not exist
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:222: ERROR:  Column 'x' does not exist
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:231: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
  column_name | data_type 
 -------------+-----------
  x           | integer
@@ -136,10 +136,10 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:231: ERROR:  ALTER 
  x           | integer
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:253: ERROR:  Table 'public.t9' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:259: ERROR:  Index name required
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:262: ERROR:  Table 'public.t11' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:274: ERROR:  Index name required
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:253: ERROR:  Table 'public.t9' already exists
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:259: ERROR:  Index name required
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:262: ERROR:  Table 'public.t11' already exists
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:274: ERROR:  Index name required
     x     
 ----------
  Backhaus
@@ -154,8 +154,8 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:274: ERROR:  Index 
  Bär
 (3 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:295: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:301: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:295: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:301: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
  column_name | data_type 
 -------------+-----------
  x           | integer
@@ -168,9 +168,9 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:301: ERROR:  ALTER 
  y           | integer
 (2 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:329: ERROR:  Index name required
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:350: ERROR:  Unsupported type conversion to TEXT
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:353: ERROR:  Unsupported type conversion to TEXT
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:329: ERROR:  Index name required
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:350: ERROR:  Unsupported type conversion to TEXT
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:353: ERROR:  Unsupported type conversion to TEXT
  column_name | data_type 
 -------------+-----------
  x           | integer
@@ -181,7 +181,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:353: ERROR:  Unsupp
  x           | integer
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:380: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:380: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
  x  
 ----
  -3
@@ -193,7 +193,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:380: ERROR:  ALTER 
   3
 (7 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:392: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:392: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
  column_name |     data_type     
 -------------+-------------------
  x           | character varying
@@ -204,9 +204,9 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:392: ERROR:  ALTER 
  x           | character varying
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:421: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:424: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:433: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:421: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:424: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:433: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
  x 
 ---
  1
@@ -221,21 +221,21 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:433: ERROR:  ALTER 
  3
 (3 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:463: ERROR:  Unsupported value literal: EscapedStringLiteral("a\\01")
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:466: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:472: ERROR:  View 'public.v' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:481: ERROR:  Table 'public.v' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:484: ERROR:  Materialized view 'v' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:496: ERROR:  No PK
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:499: ERROR:  integer out of range: -9223372036854775807
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:517: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:520: ERROR:  Unsupported type conversion to INT
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:551: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:463: ERROR:  Unsupported value literal: EscapedStringLiteral("a\\01")
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:466: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:472: ERROR:  View 'public.v' already exists
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:481: ERROR:  Table 'public.v' already exists
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:484: ERROR:  Materialized view 'v' does not exist
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:496: ERROR:  No PK
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:499: ERROR:  integer out of range: -9223372036854775807
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:517: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:520: ERROR:  Unsupported type conversion to INT
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:551: ERROR:  Column count mismatch
  vis1 | hid1 
 ------+------
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:557: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:557: ERROR:  Column count mismatch
  vis1 | hid1 
 ------+------
 (0 rows)
@@ -261,13 +261,13 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:557: ERROR:  Column
  1 | 3
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:606: ERROR:  Cannot update PK
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:606: ERROR:  Cannot update PK
  a | b 
 ---+---
  1 | 3
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:616: ERROR:  Cannot update PK
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:616: ERROR:  Cannot update PK
   a  | b 
 -----+---
    1 | 3
@@ -275,7 +275,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:616: ERROR:  Cannot
  100 | 3
 (3 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:624: ERROR:  Cannot update PK
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:624: ERROR:  Cannot update PK
    a   | b 
 -------+---
      1 | 3
@@ -313,7 +313,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:624: ERROR:  Cannot
  c1          | integer
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:732: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:732: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
   c1   |  c2   |     c3     
 -------+-------+------------
  hello | world | worldhello
@@ -326,20 +326,20 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:732: ERROR:  ALTER 
  
 (2 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:754: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:754: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
   c2   |     c3     
 -------+------------
  world | worldhello
        | 
 (2 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:760: ERROR:  No PK
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:764: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:769: ERROR:  No PK
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:773: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:776: ERROR:  invalid input syntax for type uuid: "worldhello"
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:778: ERROR:  No PK
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:780: ERROR:  invalid input syntax for type uuid: "worldhello"
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:760: ERROR:  No PK
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:764: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:769: ERROR:  No PK
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:773: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:776: ERROR:  invalid input syntax for type uuid: "worldhello"
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:778: ERROR:  No PK
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:780: ERROR:  invalid input syntax for type uuid: "worldhello"
   c2   |     c3     
 -------+------------
  world | worldhello
@@ -375,13 +375,13 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:780: ERROR:  invali
               |            |   
 (4 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:819: ERROR:  No PK
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:822: ERROR:  Unsupported type conversion to NUMERIC(7,2)
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:825: ERROR:  No PK
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:828: ERROR:  Unsupported type conversion to NUMERIC(7,2)
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:831: ERROR:  Unsupported type conversion to NUMERIC(10,2)
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:834: ERROR:  Unsupported type conversion to NUMERIC(5,2)
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:837: ERROR:  Unsupported type conversion to NUMERIC(6,1)
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:819: ERROR:  No PK
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:822: ERROR:  Unsupported type conversion to NUMERIC(7,2)
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:825: ERROR:  No PK
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:828: ERROR:  Unsupported type conversion to NUMERIC(7,2)
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:831: ERROR:  Unsupported type conversion to NUMERIC(10,2)
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:834: ERROR:  Unsupported type conversion to NUMERIC(5,2)
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:837: ERROR:  Unsupported type conversion to NUMERIC(6,1)
       c1      |     c2     | c3 
 --------------+------------+----
      99.77777 |   99.77777 | -6
@@ -411,21 +411,21 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:837: ERROR:  Unsupp
  c3          | numeric
 (3 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:877: ERROR:  SQL parse error: sql parser error: Expected ), found: '10101010' at Line: 1, Column 37
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:877: ERROR:  SQL parse error: sql parser error: Expected ), found: '10101010' at Line: 1, Column 37
  c1 | c2 | c3 | c4 | c5 
 ----+----+----+----+----
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:884: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:888: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:891: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: '1010' at Line: 1, Column 29
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:903: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: '1010' at Line: 1, Column 29
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:884: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:888: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:891: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: '1010' at Line: 1, Column 29
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:903: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: '1010' at Line: 1, Column 29
  c1 | c2 | c3 | c4 | c5 
 ----+----+----+----+----
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:912: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:919: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:912: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:919: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
  c1 | c2 | c3 | c4 | c5 
 ----+----+----+----+----
 (0 rows)
@@ -434,7 +434,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:919: ERROR:  ALTER 
 ----+----+----+----+----
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:935: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:935: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
  c1 | c2 | c3 | c4 | c5 
 ----+----+----+----+----
 (0 rows)
@@ -471,7 +471,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:935: ERROR:  ALTER 
  c1          | integer
 (2 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1027: ERROR:  Unsupported type conversion to TEXT
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:1027: ERROR:  Unsupported type conversion to TEXT
  c1  
 -----
    0
@@ -484,7 +484,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1027: ERROR:  Unsup
  c1          | integer
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1040: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:1040: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
  c1  
 -----
    0
@@ -497,8 +497,8 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1040: ERROR:  ALTER
  c1          | integer
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1053: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1056: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:1053: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:1056: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
  c1  
 -----
    0
@@ -511,7 +511,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1056: ERROR:  ALTER
  c1          | integer
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1069: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:1069: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
  column_name | data_type 
 -------------+-----------
  c1          | integer
@@ -529,7 +529,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1069: ERROR:  ALTER
  c1          | integer
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1098: ERROR:  Unknown col
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:1098: ERROR:  Unknown col
  a | comp1 
 ---+-------
 (0 rows)
@@ -550,7 +550,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1098: ERROR:  Unkno
 ---+-------
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1126: ERROR:  Unknown col
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:1126: ERROR:  Unknown col
  column_name | data_type 
 -------------+-----------
  a           | integer
@@ -567,9 +567,9 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1126: ERROR:  Unkno
 ---+-------
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1157: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1163: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1166: ERROR:  Unknown col
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:1157: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:1163: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:1166: ERROR:  Unknown col
  column_name |     data_type     
 -------------+-------------------
  a           | integer
@@ -586,8 +586,8 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1166: ERROR:  Unkno
 ---+-------
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1191: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1208: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:1191: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:1208: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
      c1     | v1 
 ------------+----
         100 |   
@@ -624,7 +624,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1208: ERROR:  ALTER
  v1          | integer
 (2 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1263: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:1263: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
              c1             | v1 
 ----------------------------+----
  2024-10-31 16:50:00.123456 | 
@@ -714,14 +714,14 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1263: ERROR:  ALTER
  dropme      | integer
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1426: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:1426: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
  c1 |   c2   |    c3     
 ----+--------+-----------
  10 | ten    | <default>
  20 | twenty | <default>
 (2 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1435: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:1435: ERROR:  ALTER COLUMN ... TYPE ... USING is not supported
  c1 |   c2   |    c3     
 ----+--------+-----------
  10 | ten    | <default>
@@ -742,4 +742,4 @@ psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1435: ERROR:  ALTER
  c3          | character varying
 (3 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/96_alter_column_type.sql:1461: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/96_alter_column_type.sql:1461: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

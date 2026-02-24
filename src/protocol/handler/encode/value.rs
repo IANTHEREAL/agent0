@@ -361,7 +361,7 @@ fn encode_value_binary(
             encoder.encode_field_with_type_and_format(d, &Type::NUMERIC, FieldFormat::Binary)
         }
         Value::Vector(vec) => {
-            // pgvector currently maps to TEXT OID in tipg; emit binary text bytes.
+            // pgvector currently maps to TEXT OID in db9; emit binary text bytes.
             encoder.encode_field_with_type_and_format(
                 &crate::types::format_vector_pg_text(vec),
                 &Type::TEXT,

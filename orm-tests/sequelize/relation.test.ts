@@ -3,7 +3,7 @@ import { Sequelize } from 'sequelize';
 import { createSequelize } from './connection.js';
 import { User, Post, Tag } from './models.js';
 
-describe('Sequelize Relations & Joins [pg-tikv]', () => {
+describe('Sequelize Relations & Joins [db9-server]', () => {
   let sequelize: Sequelize;
 
   beforeAll(async () => {

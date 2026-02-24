@@ -9,7 +9,7 @@
 - TypeORM：在已开启事务中再次 `startTransaction()` 通常会退化为 `SAVEPOINT`。
 - Knex/Sequelize：在部分驱动/配置下也会通过 savepoint 模拟嵌套事务语义。
 
-当前 pg-tikv 仅支持 `BEGIN/COMMIT/ROLLBACK`（见 `src/sql/session.rs`、`src/sql/executor.rs`），缺少 `SAVEPOINT / ROLLBACK TO SAVEPOINT / RELEASE SAVEPOINT`，会导致嵌套事务相关的 ORM 用例/生产逻辑失败。
+当前 db9-server 仅支持 `BEGIN/COMMIT/ROLLBACK`（见 `src/sql/session.rs`、`src/sql/executor.rs`），缺少 `SAVEPOINT / ROLLBACK TO SAVEPOINT / RELEASE SAVEPOINT`，会导致嵌套事务相关的 ORM 用例/生产逻辑失败。
 
 ## 目标
 
@@ -38,7 +38,7 @@
 
 ### 1) 写入拦截：在 `put/delete` 处记录 undo
 
-TiKV 的 txn API 本身不提供 savepoint，因此必须在 pg-tikv 侧记录“写入前的旧值（before image）”，并在 `ROLLBACK TO SAVEPOINT` 时把这些 key 恢复回去。
+TiKV 的 txn API 本身不提供 savepoint，因此必须在 db9-server 侧记录“写入前的旧值（before image）”，并在 `ROLLBACK TO SAVEPOINT` 时把这些 key 恢复回去。
 
 为了避免把 `&mut Transaction` 全链路替换成新类型（侵入面大、风险高），实现采用**集中写入点 hook**：
 
@@ -49,7 +49,7 @@ TiKV 的 txn API 本身不提供 savepoint，因此必须在 pg-tikv 侧记录�
 
 ### 2) Undo log：KV 级回滚（覆盖 DDL+DML）
 
-savepoint 的本质是“在同一事务内回滚部分写入”。在 pg-tikv 中，所有持久化变更最终都会落到一组 TiKV KV 写入（schema key、row key、index key、权限 key 等）。
+savepoint 的本质是“在同一事务内回滚部分写入”。在 db9-server 中，所有持久化变更最终都会落到一组 TiKV KV 写入（schema key、row key、index key、权限 key 等）。
 
 因此 MVP 推荐做 **KV 级 undo log**，天然覆盖 DDL + DML：
 

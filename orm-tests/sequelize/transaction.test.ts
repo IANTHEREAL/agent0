@@ -3,7 +3,7 @@ import { Sequelize, Transaction } from 'sequelize';
 import { createSequelize } from './connection.js';
 import { User } from './models.js';
 
-describe('Sequelize Transactions & Isolation [pg-tikv]', () => {
+describe('Sequelize Transactions & Isolation [db9-server]', () => {
   let sequelize: Sequelize;
 
   beforeAll(async () => {

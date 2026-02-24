@@ -114,7 +114,7 @@ fn unique_fs9_infer_base(name: &str) -> PathBuf {
         .expect("clock")
         .as_nanos();
     let dir = PathBuf::from(format!(
-        "/tmp/pgtikv-fs9-infer-test-{name}-{}-{id}-{nanos}",
+        "/tmp/db9-fs9-infer-test-{name}-{}-{id}-{nanos}",
         std::process::id()
     ));
     fs::create_dir_all(&dir).expect("create test dir");
@@ -144,7 +144,7 @@ fn extract_fs9_args(sql: &str) -> Vec<FunctionArg> {
 
 #[tokio::test]
 async fn extended_query_parse_rejects_invalid_sql() {
-    let parser = TipgQueryParser::new();
+    let parser = Db9QueryParser::new();
     let err = parser.parse_sql("SELCT 1", &[]).await.unwrap_err();
 
     match err {
@@ -158,7 +158,7 @@ async fn extended_query_parse_rejects_invalid_sql() {
 #[tokio::test]
 async fn extended_query_parse_allows_executor_handled_ddl() {
     // `CREATE DATABASE` is handled via the executor's string-based path (not sqlparser-rs).
-    let parser = TipgQueryParser::new();
+    let parser = Db9QueryParser::new();
     parser
         .parse_sql("CREATE DATABASE test_db", &[])
         .await
@@ -528,9 +528,10 @@ fn test_parameter_status_includes_common_keys() {
     client
         .metadata_mut()
         .insert(METADATA_ACTUAL_USER.to_string(), "admin".to_string());
-    client
-        .metadata_mut()
-        .insert("application_name".to_string(), "pg-tikv-tests".to_string());
+    client.metadata_mut().insert(
+        "application_name".to_string(),
+        "db9-server-tests".to_string(),
+    );
     client
         .metadata_mut()
         .insert(METADATA_AUTH_IS_SUPERUSER.to_string(), "on".to_string());
@@ -564,7 +565,7 @@ fn test_parameter_status_includes_common_keys() {
 
     assert_eq!(
         params.get("application_name").map(String::as_str),
-        Some("pg-tikv-tests")
+        Some("db9-server-tests")
     );
     assert_eq!(params.get("is_superuser").map(String::as_str), Some("on"));
     assert_eq!(
@@ -1252,14 +1253,14 @@ fn test_infer_wildcard_natural_join_common_cols_is_case_sensitive() {
 #[test]
 fn test_parse_tenant_username_dot() {
     let (ks, user) = parse_tenant_username("tenant_a.admin");
-    assert_eq!(ks, Some("tipg_tenant_tenant_a".to_string()));
+    assert_eq!(ks, Some("db9_tenant_tenant_a".to_string()));
     assert_eq!(user, "admin");
 }
 
 #[test]
 fn test_parse_tenant_username_colon() {
     let (ks, user) = parse_tenant_username("tenant_b:postgres");
-    assert_eq!(ks, Some("tipg_tenant_tenant_b".to_string()));
+    assert_eq!(ks, Some("db9_tenant_tenant_b".to_string()));
     assert_eq!(user, "postgres");
 }
 
@@ -1284,43 +1285,43 @@ fn test_parse_tenant_username_empty_parts() {
 #[test]
 fn test_parse_tenant_username_multiple_dots() {
     let (ks, user) = parse_tenant_username("prod.tenant_a.admin");
-    assert_eq!(ks, Some("tipg_tenant_prod".to_string()));
+    assert_eq!(ks, Some("db9_tenant_prod".to_string()));
     assert_eq!(user, "tenant_a.admin");
 }
 
 #[test]
 fn test_parse_tenant_username_multiple_colons() {
     let (ks, user) = parse_tenant_username("prod:tenant_a:admin");
-    assert_eq!(ks, Some("tipg_tenant_prod".to_string()));
+    assert_eq!(ks, Some("db9_tenant_prod".to_string()));
     assert_eq!(user, "tenant_a:admin");
 }
 
 #[test]
 fn test_parse_tenant_username_mixed_separators() {
     let (ks, user) = parse_tenant_username("tenant.user:name");
-    assert_eq!(ks, Some("tipg_tenant_tenant".to_string()));
+    assert_eq!(ks, Some("db9_tenant_tenant".to_string()));
     assert_eq!(user, "user:name");
 
     let (ks, user) = parse_tenant_username("tenant:user.name");
-    assert_eq!(ks, Some("tipg_tenant_tenant:user".to_string()));
+    assert_eq!(ks, Some("db9_tenant_tenant:user".to_string()));
     assert_eq!(user, "name");
 }
 
 #[test]
 fn test_parse_tenant_username_special_chars() {
     let (ks, user) = parse_tenant_username("tenant-1.user_name");
-    assert_eq!(ks, Some("tipg_tenant_tenant-1".to_string()));
+    assert_eq!(ks, Some("db9_tenant_tenant-1".to_string()));
     assert_eq!(user, "user_name");
 
     let (ks, user) = parse_tenant_username("my_tenant:pg-admin");
-    assert_eq!(ks, Some("tipg_tenant_my_tenant".to_string()));
+    assert_eq!(ks, Some("db9_tenant_my_tenant".to_string()));
     assert_eq!(user, "pg-admin");
 }
 
 #[test]
 fn test_parse_tenant_username_numbers() {
     let (ks, user) = parse_tenant_username("tenant123.user456");
-    assert_eq!(ks, Some("tipg_tenant_tenant123".to_string()));
+    assert_eq!(ks, Some("db9_tenant_tenant123".to_string()));
     assert_eq!(user, "user456");
 }
 
@@ -1345,18 +1346,18 @@ fn test_parse_tenant_username_only_separator() {
 #[test]
 fn test_parse_tenant_username_unicode() {
     let (ks, user) = parse_tenant_username("租户.用户");
-    assert_eq!(ks, Some("tipg_tenant_租户".to_string()));
+    assert_eq!(ks, Some("db9_tenant_租户".to_string()));
     assert_eq!(user, "用户");
 }
 
 #[test]
 fn test_parse_tenant_username_whitespace() {
     let (ks, user) = parse_tenant_username("tenant .user");
-    assert_eq!(ks, Some("tipg_tenant_tenant ".to_string()));
+    assert_eq!(ks, Some("db9_tenant_tenant ".to_string()));
     assert_eq!(user, "user");
 
     let (ks, user) = parse_tenant_username("tenant. user");
-    assert_eq!(ks, Some("tipg_tenant_tenant".to_string()));
+    assert_eq!(ks, Some("db9_tenant_tenant".to_string()));
     assert_eq!(user, " user");
 }
 
@@ -1366,7 +1367,7 @@ fn test_parse_tenant_username_long_names() {
     let long_user = "b".repeat(100);
     let input = format!("{}.{}", long_tenant, long_user);
     let (ks, user) = parse_tenant_username(&input);
-    assert_eq!(ks, Some(format!("tipg_tenant_{long_tenant}")));
+    assert_eq!(ks, Some(format!("db9_tenant_{long_tenant}")));
     assert_eq!(user, long_user);
 }
 

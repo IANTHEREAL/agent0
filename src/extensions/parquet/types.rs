@@ -39,7 +39,7 @@ pub(crate) fn arrow_type_to_pg_type(arrow_type: &ArrowDataType) -> Result<DataTy
         ArrowDataType::Decimal128(precision, scale) => {
             if *precision > 28 {
                 return Err(anyhow!(
-                    "Parquet Decimal128 with precision {} exceeds pg-tikv's maximum precision of 28",
+                    "Parquet Decimal128 with precision {} exceeds db9-server's maximum precision of 28",
                     precision
                 ));
             }
@@ -172,7 +172,7 @@ pub(crate) fn arrow_array_to_value(array: &dyn Array, row_idx: usize) -> Result<
         ArrowDataType::Decimal128(precision, scale) => {
             if *precision > 28 {
                 return Err(anyhow!(
-                    "Parquet Decimal128 with precision {} exceeds pg-tikv's maximum precision of 28",
+                    "Parquet Decimal128 with precision {} exceeds db9-server's maximum precision of 28",
                     precision
                 ));
             }
@@ -328,7 +328,7 @@ fn arrow_value_to_json(array: &dyn Array, row_idx: usize) -> Result<JsonValue> {
         ArrowDataType::Decimal128(precision, scale) => {
             if *precision > 28 {
                 return Err(anyhow!(
-                    "Parquet Decimal128 with precision {} exceeds pg-tikv's maximum precision of 28",
+                    "Parquet Decimal128 with precision {} exceeds db9-server's maximum precision of 28",
                     precision
                 ));
             }
@@ -594,7 +594,7 @@ mod tests {
             .expect_err("precision 29 should fail");
         assert!(
             err.to_string()
-                .contains("exceeds pg-tikv's maximum precision of 28"),
+                .contains("exceeds db9-server's maximum precision of 28"),
             "unexpected error: {err}"
         );
     }
@@ -796,7 +796,7 @@ mod tests {
         let err = arrow_array_to_value(&arr_err, 0).expect_err("precision 29 should fail");
         assert!(
             err.to_string()
-                .contains("exceeds pg-tikv's maximum precision of 28"),
+                .contains("exceeds db9-server's maximum precision of 28"),
             "unexpected error: {err}"
         );
     }

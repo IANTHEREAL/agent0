@@ -4,16 +4,16 @@
 **Commit:** 0fd997f
 **Branch:** master
 
-Web-based admin interface, CLI, and landing page for pg-tikv multi-tenant database. React 18 frontend + Rust backend (axum 0.7) + db9 CLI + landing page.
+Web-based admin interface, CLI, and landing page for db9-server multi-tenant database. React 18 frontend + Rust backend (axum 0.7) + db9 CLI + landing page.
 
 ## Commands
 
 ```bash
 # Rust backend (from backend/)
-cd backend && cargo build --release     # Build all binaries (pgtikv-admin, pgtikv-ctl, db9)
+cd backend && cargo build --release     # Build all binaries (db9-admin, db9-ctl, db9)
 cd backend && cargo check               # Type check only
-./backend/target/release/pgtikv-admin   # Run server (default: SQLite, port 8090)
-./backend/target/release/pgtikv-ctl     # CLI tool (internal)
+./backend/target/release/db9-admin   # Run server (default: SQLite, port 8090)
+./backend/target/release/db9-ctl     # CLI tool (internal)
 ./backend/target/release/db9            # CLI tool (user-facing, default API: https://db9.shared.aws.tidbcloud.com/api)
 
 # Frontend (from frontend/)
@@ -54,18 +54,18 @@ cloud-admin-portal/
 │   │   │   └── audit.rs     # Audit log query
 │   │   ├── services/        # External service clients
 │   │   │   ├── pd_client.rs # TiKV PD HTTP API (keyspace management)
-│   │   │   ├── pg_client.rs # pg-tikv connection via tokio-postgres
+│   │   │   ├── pg_client.rs # db9-server connection via tokio-postgres
 │   │   │   └── reconciler.rs# Background stuck-tenant recovery + keyspace sync
 │   │   ├── lib.rs           # Module declarations, constants, AppState
-│   │   ├── config.rs        # Env-based config (PGTIKV_ prefix)
+│   │   ├── config.rs        # Env-based config (DB9_ prefix)
 │   │   ├── db.rs            # sqlx AnyPool queries (SQLite/PostgreSQL)
 │   │   ├── models.rs        # serde request/response/DB row types
 │   │   ├── error.rs         # AppError → axum response, From<sqlx/reqwest>
 │   │   ├── auth.rs          # ApiKeyAuth extractor + TenantSessionExtractor
 │   │   ├── crypto.rs        # AES-256-GCM credential encryption (aes-gcm)
 │   │   ├── session.rs       # In-memory RwLock<HashMap> session manager
-│   │   ├── main.rs          # pgtikv-admin server binary
-│   │   ├── cli.rs           # pgtikv-ctl CLI binary (clap)
+│   │   ├── main.rs          # db9-admin server binary
+│   │   ├── cli.rs           # db9-ctl CLI binary (clap)
 │   │   ├── db9.rs           # db9 CLI binary (user-facing, default API: production)
 │   │   └── cli_common.rs    # Shared CLI utilities (ApiClient, output formatting)
 │   ├── app/                 # [DEAD] Legacy Python backend — only .pyc artifacts remain
@@ -122,7 +122,7 @@ cloud-admin-portal/
 | Add request/response type | `backend/src/models.rs` |
 | Change config | `backend/src/config.rs` (add field + `from_env()`) |
 | Change PD client | `backend/src/services/pd_client.rs` |
-| Change pg-tikv client | `backend/src/services/pg_client.rs` |
+| Change db9-server client | `backend/src/services/pg_client.rs` |
 | Change reconciler | `backend/src/services/reconciler.rs` |
 | Change CLI commands (internal) | `backend/src/cli.rs` |
 | Change db9 CLI commands | `backend/src/db9.rs` |
@@ -197,7 +197,7 @@ ACTIVE → SUSPENDED (future)
 
 Reconciler: CREATING(>10min) → check PD → ACTIVE or CREATE_FAILED
 Reconciler: DISABLING(>10min) → DISABLED
-Reconciler (sync mode): imports PD keyspaces as tenants when PGTIKV_RECONCILER_SYNC_KEYSPACES=true
+Reconciler (sync mode): imports PD keyspaces as tenants when DB9_RECONCILER_SYNC_KEYSPACES=true
 ```
 
 ### Tenant Session Flow
@@ -211,28 +211,28 @@ Reconciler (sync mode): imports PD keyspaces as tenants when PGTIKV_RECONCILER_S
 ### Observability Flow
 
 1. `POST /api/tenants/{id}/observability/bootstrap` with admin credentials
-2. Creates `_pgtikv_sys_observer` user in pg-tikv, stores encrypted credential in `tenant_credentials`
-3. `GET /api/tenants/{id}/observability` uses stored observer credentials to query pg-tikv
+2. Creates `_db9_sys_observer` user in db9-server, stores encrypted credential in `tenant_credentials`
+3. `GET /api/tenants/{id}/observability` uses stored observer credentials to query db9-server
 4. Frontend polls every 5s, stops on 409 (not bootstrapped)
 
 ### Credential Encryption
 
-When `PGTIKV_CREDENTIAL_KEY` is set (base64-encoded 32-byte key):
+When `DB9_CREDENTIAL_KEY` is set (base64-encoded 32-byte key):
 - Observer passwords encrypted via AES-256-GCM before storage in `tenant_credentials`
 - `crypto.rs` handles encrypt/decrypt with random 12-byte nonce
 
 ### Service Layer
 
 - `PdClient`: TiKV Placement Driver HTTP API (keyspace CRUD, health, list)
-- `PgClient`: pg-tikv connection via `tokio-postgres` (user management, SQL execution, observability)
+- `PgClient`: db9-server connection via `tokio-postgres` (user management, SQL execution, observability)
 - `Reconciler`: Background tokio task — recovers stuck tenants + optional keyspace sync
 
 ### Three Binaries
 
 | Binary | Entry | Purpose |
 |--------|-------|---------|
-| `pgtikv-admin` | `src/main.rs` | HTTP API server (axum, tokio) |
-| `pgtikv-ctl` | `src/cli.rs` | CLI tool, internal (clap, reqwest) |
+| `db9-admin` | `src/main.rs` | HTTP API server (axum, tokio) |
+| `db9-ctl` | `src/cli.rs` | CLI tool, internal (clap, reqwest) |
 | `db9` | `src/db9.rs` | CLI tool, user-facing (default API: `https://db9.shared.aws.tidbcloud.com/api`) |
 
 ### AppState
@@ -250,23 +250,23 @@ pub struct AppState {
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `PGTIKV_PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD addresses (also reads `PD_ENDPOINTS`) |
-| `PGTIKV_PG_HOST` | `127.0.0.1` | pg-tikv server host (internal) |
-| `PGTIKV_PG_PORT` | `5433` | pg-tikv server port (internal) |
-| `PGTIKV_PG_PUBLIC_ENDPOINTS` | `127.0.0.1:5433` | Public endpoints shown to users (comma-separated) |
-| `PGTIKV_API_PORT` | `8090` | Backend API port |
-| `PGTIKV_API_HOST` | `0.0.0.0` | Backend bind address |
-| `PGTIKV_DATABASE_URL` | `sqlite://data/portal.db?mode=rwc` | Metadata DB (sqlite:// or postgres://) |
-| `PGTIKV_API_KEYS` | (empty) | Comma-separated API keys (empty = no auth) |
-| `PGTIKV_CORS_ORIGINS` | `http://localhost:5173,http://localhost:3000` | CORS origins |
-| `PGTIKV_RECONCILER_ENABLED` | `true` | Enable background reconciler |
-| `PGTIKV_RECONCILER_INTERVAL_SECONDS` | `300` | Reconciler cycle interval |
-| `PGTIKV_RECONCILER_SYNC_KEYSPACES` | `false` | Auto-import PD keyspaces as tenants |
-| `PGTIKV_SESSION_TTL_HOURS` | `1` | Session expiry |
-| `PGTIKV_AUDIT_RETENTION_DAYS` | `90` | Audit log retention |
-| `PGTIKV_CREDENTIAL_KEY` | (empty) | Base64 AES-256 key for credential encryption |
-| `PGTIKV_API_URL` | `http://localhost:8090/api` | pgtikv-ctl CLI: API base URL |
-| `PGTIKV_API_KEY` | (empty) | pgtikv-ctl CLI: API key |
+| `DB9_PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD addresses (also reads `PD_ENDPOINTS`) |
+| `DB9_PG_HOST` | `127.0.0.1` | db9-server server host (internal) |
+| `DB9_PG_PORT` | `5433` | db9-server server port (internal) |
+| `DB9_PG_PUBLIC_ENDPOINTS` | `127.0.0.1:5433` | Public endpoints shown to users (comma-separated) |
+| `DB9_API_PORT` | `8090` | Backend API port |
+| `DB9_API_HOST` | `0.0.0.0` | Backend bind address |
+| `DB9_DATABASE_URL` | `sqlite://data/portal.db?mode=rwc` | Metadata DB (sqlite:// or postgres://) |
+| `DB9_API_KEYS` | (empty) | Comma-separated API keys (empty = no auth) |
+| `DB9_CORS_ORIGINS` | `http://localhost:5173,http://localhost:3000` | CORS origins |
+| `DB9_RECONCILER_ENABLED` | `true` | Enable background reconciler |
+| `DB9_RECONCILER_INTERVAL_SECONDS` | `300` | Reconciler cycle interval |
+| `DB9_RECONCILER_SYNC_KEYSPACES` | `false` | Auto-import PD keyspaces as tenants |
+| `DB9_SESSION_TTL_HOURS` | `1` | Session expiry |
+| `DB9_AUDIT_RETENTION_DAYS` | `90` | Audit log retention |
+| `DB9_CREDENTIAL_KEY` | (empty) | Base64 AES-256 key for credential encryption |
+| `DB9_API_URL` | `http://localhost:8090/api` | db9-ctl CLI: API base URL |
+| `DB9_API_KEY` | (empty) | db9-ctl CLI: API key |
 | `DB9_API_URL` | `https://db9.shared.aws.tidbcloud.com/api` | db9 CLI: API base URL (override via env or `--api-url`) |
 | `VITE_API_URL` | `/api` | Frontend API base URL |
 

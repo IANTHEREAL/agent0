@@ -2,7 +2,7 @@ import { describe, it, expect, afterAll } from 'vitest';
 import { PrismaClient } from '@prisma/client';
 import { getConnectionString } from '../shared/config.js';
 
-describe('Prisma Connection & Protocol Compatibility [pg-tikv]', () => {
+describe('Prisma Connection & Protocol Compatibility [db9-server]', () => {
   const clients: PrismaClient[] = [];
 
   afterAll(async () => {

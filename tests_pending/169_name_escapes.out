@@ -1,9 +1,9 @@
-psql:/home/dongxu/lab/pg-tikv/tests/169_name_escapes.sql:115: NOTICE:  table ";--dontask" does not exist, skipping
-psql:/home/dongxu/lab/pg-tikv/tests/169_name_escapes.sql:116: NOTICE:  table ";--notbetter" does not exist, skipping
-psql:/home/dongxu/lab/pg-tikv/tests/169_name_escapes.sql:117: NOTICE:  table "woo; DROP USER humpty;" does not exist, skipping
-psql:/home/dongxu/lab/pg-tikv/tests/169_name_escapes.sql:133: ERROR:  Table 'crdb_show_create_table' not found
-psql:/home/dongxu/lab/pg-tikv/tests/169_name_escapes.sql:136: ERROR:  Table 'crdb_show_create_table' not found
-psql:/home/dongxu/lab/pg-tikv/tests/169_name_escapes.sql:142: ERROR:  Table 'crdb_show_create_view' not found
-psql:/home/dongxu/lab/pg-tikv/tests/169_name_escapes.sql:150: ERROR:  Table 'crdb_show_create_table' not found
-psql:/home/dongxu/lab/pg-tikv/tests/169_name_escapes.sql:153: ERROR:  Table 'crdb_show_create_table' not found
-psql:/home/dongxu/lab/pg-tikv/tests/169_name_escapes.sql:155: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/169_name_escapes.sql:115: NOTICE:  table ";--dontask" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/169_name_escapes.sql:116: NOTICE:  table ";--notbetter" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/169_name_escapes.sql:117: NOTICE:  table "woo; DROP USER humpty;" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/169_name_escapes.sql:133: ERROR:  Table 'crdb_show_create_table' not found
+psql:/home/dongxu/lab/db9-server/tests/169_name_escapes.sql:136: ERROR:  Table 'crdb_show_create_table' not found
+psql:/home/dongxu/lab/db9-server/tests/169_name_escapes.sql:142: ERROR:  Table 'crdb_show_create_view' not found
+psql:/home/dongxu/lab/db9-server/tests/169_name_escapes.sql:150: ERROR:  Table 'crdb_show_create_table' not found
+psql:/home/dongxu/lab/db9-server/tests/169_name_escapes.sql:153: ERROR:  Table 'crdb_show_create_table' not found
+psql:/home/dongxu/lab/db9-server/tests/169_name_escapes.sql:155: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

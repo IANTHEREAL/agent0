@@ -12,7 +12,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-echo -e "${GREEN}pg-tikv Cloud Admin Portal - Production Build${NC}"
+echo -e "${GREEN}db9-server Cloud Admin Portal - Production Build${NC}"
 echo "================================================"
 
 # Build Rust backend
@@ -24,8 +24,8 @@ command -v cargo >/dev/null 2>&1 || { echo -e "${RED}cargo required but not foun
 cargo build --release
 
 echo -e "${GREEN}Backend binaries built:${NC}"
-echo "  pgtikv-admin: $PROJECT_DIR/backend/target/release/pgtikv-admin"
-echo "  pgtikv-ctl:   $PROJECT_DIR/backend/target/release/pgtikv-ctl"
+echo "  db9-admin: $PROJECT_DIR/backend/target/release/db9-admin"
+echo "  db9-ctl:   $PROJECT_DIR/backend/target/release/db9-ctl"
 
 # Build frontend
 echo -e "${YELLOW}Building frontend...${NC}"
@@ -51,7 +51,7 @@ echo ""
 echo -e "${GREEN}Build complete!${NC}"
 echo ""
 echo "To run locally:"
-echo "  ./backend/target/release/pgtikv-admin"
+echo "  ./backend/target/release/db9-admin"
 echo ""
 echo "To start Docker services:"
 echo "  cd deploy && docker compose up -d"

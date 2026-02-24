@@ -1,3 +1,3 @@
-psql:/home/dongxu/lab/pg-tikv/tests/183_routine_schema_change.sql:27: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
-psql:/home/dongxu/lab/pg-tikv/tests/183_routine_schema_change.sql:45: ERROR:  Procedure 'public.p' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/183_routine_schema_change.sql:47: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/183_routine_schema_change.sql:27: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/db9-server/tests/183_routine_schema_change.sql:45: ERROR:  Procedure 'public.p' does not exist
+psql:/home/dongxu/lab/db9-server/tests/183_routine_schema_change.sql:47: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

@@ -1,6 +1,6 @@
 # Authentication & RBAC
 
-pg-tikv implements PostgreSQL-compatible authentication and role-based access control (RBAC).
+db9-server implements PostgreSQL-compatible authentication and role-based access control (RBAC).
 
 ## Overview
 
@@ -13,12 +13,12 @@ pg-tikv implements PostgreSQL-compatible authentication and role-based access co
 ## Default User
 
 There is **no implicit default password** in non-dev mode. When a keyspace has no superuser yet, bootstrap the initial superuser by setting:
-- `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD` (required)
-- `PGTIKV_BOOTSTRAP_ADMIN_USER` (optional; default `admin`)
+- `DB9_BOOTSTRAP_ADMIN_PASSWORD` (required)
+- `DB9_BOOTSTRAP_ADMIN_USER` (optional; default `admin`)
 
 Then connect as `<keyspace>.<user>` (or `user` for the default keyspace).
 
-**Dev-only**: `PGTIKV_DEV=1` enables legacy insecure bootstrap behavior intended for local development only.
+**Dev-only**: `DB9_DEV=1` enables legacy insecure bootstrap behavior intended for local development only.
 
 **Important**: In production, enable TLS (`PG_TLS_CERT` + `PG_TLS_KEY`) and consider setting `PG_REQUIRE_TLS=1`.
 

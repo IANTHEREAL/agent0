@@ -1,4 +1,4 @@
-# pg-tikv Knowledge Base (Living Document)
+# db9-server Knowledge Base (Living Document)
 
 ## Overview
 
@@ -42,7 +42,7 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 ### Module Boundaries
 
 - `Analyzer` (`src/sql/analyzer/`): name resolution, scope checking, and type inference; outputs `AnalyzedQuery` / `TypedExpr`.
-- `Optimizer` (`src/sql/optimizer/`): `AnalyzedQuery -> LogicalPlan -> PhysicalPlan -> BoxedOperator`. Handles single-table, multi-table, set operations, CTEs, window functions, and DISTINCT ON. Always-on single path; `tipg.use_optimizer` remains a compatibility no-op GUC.
+- `Optimizer` (`src/sql/optimizer/`): `AnalyzedQuery -> LogicalPlan -> PhysicalPlan -> BoxedOperator`. Handles single-table, multi-table, set operations, CTEs, window functions, and DISTINCT ON. Always-on single path; `db9.use_optimizer` remains a compatibility no-op GUC.
 - `Operators` (`src/sql/operators/`): physical operators (scan, filter, project, sort, aggregate, hash_join, NLJ, window, CTE, set_operation, table_function).
 - `Executor` (`src/sql/executor/`): DDL/DML dispatch, SELECT execution (analyzed path at `executor/select/analyzed/`).
 - `Catalog` (`src/sql/catalog/`): `information_schema` / `pg_catalog` compatibility surface (35+ virtual table implementations).
@@ -69,7 +69,7 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 - `AnalyzedQuery -> LogicalPlan -> PhysicalPlan -> BoxedOperator` pipeline implemented in `src/sql/optimizer/`.
 - **Planner dual-path resolved:** TypedExpr path has full GIN + expression-index + partial-index support. EXPLAIN uses the analyzed pipeline (view expansion -> Analyzer -> typed planner). AST path retained only for non-SELECT EXPLAIN and analysis error fallback.
 - Coverage: single-table, multi-table joins, set operations (UNION/INTERSECT/EXCEPT), CTEs, window functions, DISTINCT ON.
-- GUC `tipg.use_optimizer` is retained for compatibility/readback only (accepted as no-op; engine remains single-path).
+- GUC `db9.use_optimizer` is retained for compatibility/readback only (accepted as no-op; engine remains single-path).
 - Handler decomposed: `view_infer.rs`, `schema_resolve.rs`, `type_infer.rs` extracted from monolithic handler.
 - Index name uniqueness enforced within schema (#777).
 
@@ -101,7 +101,7 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 ## Repository Layout (stable)
 
 ```
-pg-tikv/
+db9-server/
 ├── src/
 │   ├── sql/
 │   │   ├── analyzer/          # Semantic analysis -> AnalyzedQuery/TypedExpr
@@ -177,13 +177,13 @@ cd deploy/e2e
 After the stack is running, verify your change end-to-end via `db9` inside the container:
 
 ```bash
-docker compose exec pgtikv-admin db9 --api-url http://localhost:8090/api <command>
+docker compose exec db9-admin db9 --api-url http://localhost:8090/api <command>
 ```
 
 Rebuild only the affected service after code changes:
 
 ```bash
-docker compose build <service>   # pgtikv-admin | pg-tikv | fs9-server | fs9-meta
+docker compose build <service>   # db9-admin | db9-server | fs9-server | fs9-meta
 docker compose up -d <service>
 ```
 

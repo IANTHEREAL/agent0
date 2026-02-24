@@ -107,4 +107,4 @@ jobs:
           path: |
             test-reports/regression-gate-*/
             orm-tests/test-results.json
-            /tmp/pgtikv-regression.log
+            /tmp/db9-regression.log

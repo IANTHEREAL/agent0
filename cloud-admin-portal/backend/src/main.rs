@@ -5,15 +5,15 @@ use clap::Parser;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tracing_subscriber::EnvFilter;
 
-use pgtikv_admin::config::Config;
-use pgtikv_admin::device_code::DeviceCodeStore;
-use pgtikv_admin::services::pd_client::PdClient;
-use pgtikv_admin::services::reconciler::Reconciler;
-use pgtikv_admin::session::SessionManager;
-use pgtikv_admin::{api, db, AppState};
+use db9_admin::config::Config;
+use db9_admin::device_code::DeviceCodeStore;
+use db9_admin::services::pd_client::PdClient;
+use db9_admin::services::reconciler::Reconciler;
+use db9_admin::session::SessionManager;
+use db9_admin::{api, db, AppState};
 
 #[derive(Parser)]
-#[command(name = "pgtikv-admin", about = "pg-tikv Admin Portal Server", version)]
+#[command(name = "db9-admin", about = "db9-server Admin Portal Server", version)]
 struct Args {
     /// Listen port
     #[arg(short, long)]
@@ -46,7 +46,7 @@ async fn main() {
         config.database_url = url;
     }
     tracing::info!(
-        "Starting pgtikv-admin v2.0.0 on {}:{}",
+        "Starting db9-admin v2.0.0 on {}:{}",
         config.api_host,
         config.api_port
     );
@@ -100,7 +100,7 @@ async fn main() {
         (Some(url), Some(key)) => {
             tracing::info!("FS9 integration enabled: {}", url);
             Some(Arc::new(
-                pgtikv_admin::services::fs9_client::Fs9Client::new(
+                db9_admin::services::fs9_client::Fs9Client::new(
                     url.clone(),
                     key.clone(),
                     http_client.clone(),

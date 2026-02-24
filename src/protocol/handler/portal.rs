@@ -249,7 +249,7 @@ const DEFAULT_MAX_SUSPENDED_PORTAL_BUFFER_ROWS: usize = 10_000;
 const DEFAULT_MAX_SUSPENDED_PORTAL_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 pub(in crate::protocol::handler) fn max_suspended_portals() -> usize {
-    std::env::var("PGTIKV_MAX_SUSPENDED_PORTALS")
+    std::env::var("DB9_MAX_SUSPENDED_PORTALS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
@@ -257,7 +257,7 @@ pub(in crate::protocol::handler) fn max_suspended_portals() -> usize {
 }
 
 pub(in crate::protocol::handler) fn max_suspended_portal_buffer_rows() -> usize {
-    std::env::var("PGTIKV_MAX_SUSPENDED_PORTAL_BUFFER_ROWS")
+    std::env::var("DB9_MAX_SUSPENDED_PORTAL_BUFFER_ROWS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
@@ -265,7 +265,7 @@ pub(in crate::protocol::handler) fn max_suspended_portal_buffer_rows() -> usize 
 }
 
 fn max_suspended_portal_buffer_bytes() -> usize {
-    std::env::var("PGTIKV_MAX_SUSPENDED_PORTAL_BUFFER_BYTES")
+    std::env::var("DB9_MAX_SUSPENDED_PORTAL_BUFFER_BYTES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
@@ -352,7 +352,7 @@ where
                     "ERROR".to_owned(),
                     "54000".to_owned(),
                     format!(
-                        "portal suspension buffer exceeded (portal={portal_name}, max_rows={max_rows}, buffer_rows_limit={max_buffered_rows}, buffer_bytes_limit={max_buffered_bytes}); re-run with max_rows=0 or reduce result size; set PGTIKV_MAX_SUSPENDED_PORTAL_BUFFER_ROWS/BYTES to override"
+                        "portal suspension buffer exceeded (portal={portal_name}, max_rows={max_rows}, buffer_rows_limit={max_buffered_rows}, buffer_bytes_limit={max_buffered_bytes}); re-run with max_rows=0 or reduce result size; set DB9_MAX_SUSPENDED_PORTAL_BUFFER_ROWS/BYTES to override"
                     ),
                 ))));
             }
@@ -367,7 +367,7 @@ where
                 "ERROR".to_owned(),
                 "54000".to_owned(),
                 format!(
-                    "too many suspended portals (portal={portal_name}, max_rows={max_rows}, suspended_portals_limit={max_suspended}); close portals to free resources or re-run with max_rows=0; set PGTIKV_MAX_SUSPENDED_PORTALS to override"
+                    "too many suspended portals (portal={portal_name}, max_rows={max_rows}, suspended_portals_limit={max_suspended}); close portals to free resources or re-run with max_rows=0; set DB9_MAX_SUSPENDED_PORTALS to override"
                 ),
             ))));
         }

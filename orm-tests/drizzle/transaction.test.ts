@@ -6,7 +6,7 @@ import { createDrizzleClient, setupDrizzleTables, cleanupDrizzleTables } from '.
 import { drizzleUsers } from './schema.js';
 import * as schema from './schema.js';
 
-describe('Drizzle Transactions & Isolation [pg-tikv]', () => {
+describe('Drizzle Transactions & Isolation [db9-server]', () => {
   let pool: pg.Pool;
   let db: ReturnType<typeof drizzle<typeof schema>>;
 

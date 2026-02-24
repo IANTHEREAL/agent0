@@ -1,4 +1,4 @@
-# pg-tikv Codebase Architecture Review
+# db9-server Codebase Architecture Review
 
 **Date:** 2026-02-05
 **Commit:** `3e54788f66d1b81b618511e830e8e4c39adfea4b` (`chore: add .worktrees/ to .gitignore`)
@@ -258,7 +258,7 @@ All `.rs` files over 1000 lines:
 
 ## 7. Recommended Reading Order
 
-To understand pg-tikv in ~2.5 hours:
+To understand db9-server in ~2.5 hours:
 
 1. `CLAUDE.md` — project overview (5 min)
 2. `src/main.rs` — entry point (10 min)

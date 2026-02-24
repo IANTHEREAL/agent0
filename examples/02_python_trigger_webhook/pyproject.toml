@@ -1,7 +1,7 @@
 [project]
 name = "trigger-webhook"
 version = "0.1.0"
-description = "TiPG example: AFTER triggers + HTTP extension for webhook notifications"
+description = "db9 example: AFTER triggers + HTTP extension for webhook notifications"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { Sequelize, QueryTypes } from 'sequelize';
 import { createSequelize } from './connection.js';
 
-describe('Sequelize Advanced SQL Features [pg-tikv]', () => {
+describe('Sequelize Advanced SQL Features [db9-server]', () => {
   let sequelize: Sequelize;
 
   beforeAll(async () => {

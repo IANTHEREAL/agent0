@@ -1,4 +1,4 @@
--- Comprehensive function tests for pg-tikv
+-- Comprehensive function tests for db9-server
 -- Tests string, math, date/time, conditional, array, and JSON functions
 
 --------------------------------------------------------------------------------
@@ -262,7 +262,7 @@ INSERT INTO test_patterns VALUES (1, 'Hello World');
 INSERT INTO test_patterns VALUES (2, 'hello world');
 INSERT INTO test_patterns VALUES (3, 'HELLO WORLD');
 INSERT INTO test_patterns VALUES (4, 'PostgreSQL');
-INSERT INTO test_patterns VALUES (5, 'pg-tikv');
+INSERT INTO test_patterns VALUES (5, 'db9-server');
 
 -- LIKE
 SELECT id, val FROM test_patterns WHERE val LIKE 'Hello%' ORDER BY id;

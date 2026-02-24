@@ -13,10 +13,10 @@ Implement `version()` function to return a PostgreSQL-compatible version string.
 ### Functional
 ```sql
 SELECT version();
--- Returns: 'PostgreSQL 16.0 (pg-tikv 0.1.0 on TiKV)'
+-- Returns: 'PostgreSQL 16.0 (db9-server 0.1.0 on TiKV)'
 ```
 
-Format: `PostgreSQL <major>.<minor> (pg-tikv <version> on TiKV)`
+Format: `PostgreSQL <major>.<minor> (db9-server <version> on TiKV)`
 
 ### Non-functional
 - Compile-time constant (from Cargo.toml version)
@@ -26,7 +26,7 @@ Format: `PostgreSQL <major>.<minor> (pg-tikv <version> on TiKV)`
 ```sql
 SELECT version();
 -- Contains 'PostgreSQL'
--- Contains 'pg-tikv'
+-- Contains 'db9-server'
 
 SELECT version() LIKE 'PostgreSQL%';
 -- Returns: true
@@ -37,7 +37,7 @@ SELECT version() LIKE 'PostgreSQL%';
   ```rust
   "version" => {
       let ver = format!(
-          "PostgreSQL 16.0 (pg-tikv {} on TiKV)",
+          "PostgreSQL 16.0 (db9-server {} on TiKV)",
           env!("CARGO_PKG_VERSION")
       );
       Ok(Value::Text(ver))

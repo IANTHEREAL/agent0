@@ -1,4 +1,4 @@
-//! Single-source schema definitions for _PGTIKV_SYS_* virtual tables.
+//! Single-source schema definitions for _DB9_SYS_* virtual tables.
 //!
 //! Both the executor (data materialization) and the protocol handler
 //! (type inference) use these definitions, eliminating duplicate schemas.
@@ -31,12 +31,12 @@ fn col_nullable(name: &str, data_type: DataType) -> ColumnDef {
     }
 }
 
-/// Return the schema for a _PGTIKV_SYS_* virtual table, if `name` matches.
+/// Return the schema for a _DB9_SYS_* virtual table, if `name` matches.
 ///
 /// `name` is case-insensitive and used as-is for the returned schema's name field.
 pub fn virtual_table_schema(name: &str) -> Option<TableSchema> {
     let columns = match name.to_ascii_uppercase().as_str() {
-        "_PGTIKV_SYS_OBSERVABILITY" => vec![
+        "_DB9_SYS_OBSERVABILITY" => vec![
             col("window_seconds", DataType::Int64),
             col("statement_count", DataType::Int64),
             col("txn_commit_count", DataType::Int64),
@@ -47,7 +47,7 @@ pub fn virtual_table_schema(name: &str) -> Option<TableSchema> {
             col("latency_p99_ms", DataType::Float64),
             col("active_connections", DataType::Int64),
         ],
-        "_PGTIKV_SYS_QUERY_SAMPLES" => vec![
+        "_DB9_SYS_QUERY_SAMPLES" => vec![
             col("query", DataType::Text),
             col("sample_count", DataType::Int64),
             col("error_count", DataType::Int64),
@@ -56,23 +56,23 @@ pub fn virtual_table_schema(name: &str) -> Option<TableSchema> {
             col("latency_max_ms", DataType::Float64),
             col("last_seen_ms_ago", DataType::Int64),
         ],
-        "_PGTIKV_SYS_EXPORT_DDL" => vec![
+        "_DB9_SYS_EXPORT_DDL" => vec![
             col("object_type", DataType::Text),
             col("object_name", DataType::Text),
             col("ddl_sql", DataType::Text),
         ],
-        "_PGTIKV_SYS_MIGRATIONS" => vec![
+        "_DB9_SYS_MIGRATIONS" => vec![
             col("name", DataType::Text),
             col("applied_at", DataType::Text),
             col("checksum", DataType::Text),
             col("sql_preview", DataType::Text),
         ],
-        "_PGTIKV_SYS_RECORD_MIGRATION" => vec![
+        "_DB9_SYS_RECORD_MIGRATION" => vec![
             col("name", DataType::Text),
             col("applied_at", DataType::Text),
             col("status", DataType::Text),
         ],
-        "_PGTIKV_SYS_TRIGGER_QUEUE_STATS" => vec![
+        "_DB9_SYS_TRIGGER_QUEUE_STATS" => vec![
             col("keyspace", DataType::Text),
             col("pending", DataType::Int64),
             col("processing", DataType::Int64),
@@ -81,7 +81,7 @@ pub fn virtual_table_schema(name: &str) -> Option<TableSchema> {
             col("avg_latency_ms", DataType::Float64),
             col("events_per_min", DataType::Int64),
         ],
-        "_PGTIKV_SYS_TRIGGER_DLQ" => vec![
+        "_DB9_SYS_TRIGGER_DLQ" => vec![
             col("id", DataType::Int64),
             col("trigger_name", DataType::Text),
             col("table_name", DataType::Text),
@@ -115,13 +115,13 @@ mod tests {
     #[test]
     fn all_seven_tables_resolve() {
         let names = [
-            "_PGTIKV_SYS_OBSERVABILITY",
-            "_PGTIKV_SYS_QUERY_SAMPLES",
-            "_PGTIKV_SYS_EXPORT_DDL",
-            "_PGTIKV_SYS_MIGRATIONS",
-            "_PGTIKV_SYS_RECORD_MIGRATION",
-            "_PGTIKV_SYS_TRIGGER_QUEUE_STATS",
-            "_PGTIKV_SYS_TRIGGER_DLQ",
+            "_DB9_SYS_OBSERVABILITY",
+            "_DB9_SYS_QUERY_SAMPLES",
+            "_DB9_SYS_EXPORT_DDL",
+            "_DB9_SYS_MIGRATIONS",
+            "_DB9_SYS_RECORD_MIGRATION",
+            "_DB9_SYS_TRIGGER_QUEUE_STATS",
+            "_DB9_SYS_TRIGGER_DLQ",
         ];
         for name in names {
             assert!(
@@ -134,8 +134,8 @@ mod tests {
 
     #[test]
     fn case_insensitive_lookup() {
-        assert!(virtual_table_schema("_pgtikv_sys_observability").is_some());
-        assert!(virtual_table_schema("_PGTIKV_SYS_OBSERVABILITY").is_some());
+        assert!(virtual_table_schema("_db9_sys_observability").is_some());
+        assert!(virtual_table_schema("_DB9_SYS_OBSERVABILITY").is_some());
     }
 
     #[test]
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn trigger_dlq_error_msg_is_nullable() {
-        let schema = virtual_table_schema("_PGTIKV_SYS_TRIGGER_DLQ").unwrap();
+        let schema = virtual_table_schema("_DB9_SYS_TRIGGER_DLQ").unwrap();
         let error_msg = schema
             .columns
             .iter()
@@ -158,7 +158,7 @@ mod tests {
     fn schema_uses_provided_name() {
         let schema = virtual_table_schema("my_alias").is_none();
         assert!(schema);
-        let schema = virtual_table_schema("_pgtikv_sys_export_ddl").unwrap();
-        assert_eq!(schema.name, "_pgtikv_sys_export_ddl");
+        let schema = virtual_table_schema("_db9_sys_export_ddl").unwrap();
+        assert_eq!(schema.name, "_db9_sys_export_ddl");
     }
 }

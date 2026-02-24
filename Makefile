@@ -1,4 +1,4 @@
-# pg-tikv Makefile
+# db9-server Makefile
 # PostgreSQL-compatible distributed SQL database on TiKV
 
 .PHONY: all build release test unit-test integration-test orm-test \
@@ -49,11 +49,11 @@ unit-test:
 
 test: unit-test
 
-# Integration tests (requires running pg-tikv)
+# Integration tests (requires running db9-server)
 integration-test:
 	python3 scripts/integration_test.py --dsn "$${PG_DSN:-postgres://admin:admin@127.0.0.1:5433/postgres}"
 
-# ORM tests (requires running pg-tikv)
+# ORM tests (requires running db9-server)
 orm-test:
 	cd orm-tests && \
 	[ -d node_modules ] || npm install --silent && \
@@ -63,7 +63,7 @@ orm-test:
 regression:
 	bash scripts/regression_gate.sh
 
-# Full automated test suite (starts TiKV + pg-tikv)
+# Full automated test suite (starts TiKV + db9-server)
 full-test:
 	./run_tests.sh
 
@@ -105,7 +105,7 @@ tikv-list:
 # Development Workflow
 # ============================================================================
 
-# Start dev environment: TiKV cluster + pg-tikv
+# Start dev environment: TiKV cluster + db9-server
 dev: tikv-start
 	@echo "TiKV cluster '$(CLUSTER_NAME)' started"
 	@echo "Run 'make run' or 'make run-release' in another terminal"
@@ -118,7 +118,7 @@ quick: fmt check unit-test
 # ============================================================================
 
 help:
-	@echo "pg-tikv Makefile"
+	@echo "db9-server Makefile"
 	@echo ""
 	@echo "Build:"
 	@echo "  make build        - Build debug binary"
@@ -131,10 +131,10 @@ help:
 	@echo ""
 	@echo "Test:"
 	@echo "  make test         - Run unit tests"
-	@echo "  make integration-test - Run integration tests (requires pg-tikv)"
-	@echo "  make orm-test     - Run ORM tests (requires pg-tikv)"
+	@echo "  make integration-test - Run integration tests (requires db9-server)"
+	@echo "  make orm-test     - Run ORM tests (requires db9-server)"
 	@echo "  make regression   - Fast regression gate (<5min)"
-	@echo "  make full-test    - Full test suite (starts TiKV + pg-tikv)"
+	@echo "  make full-test    - Full test suite (starts TiKV + db9-server)"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  make fmt          - Format code"
@@ -152,6 +152,6 @@ help:
 	@echo ""
 	@echo "Environment Variables:"
 	@echo "  PD_ENDPOINTS      - TiKV PD address (default: 127.0.0.1:2379)"
-	@echo "  PG_PORT           - pg-tikv listen port (default: 5433)"
+	@echo "  PG_PORT           - db9-server listen port (default: 5433)"
 	@echo "  PG_DSN            - PostgreSQL DSN for tests"
 	@echo "  CLUSTER_NAME      - TiKV cluster name (default: dev)"

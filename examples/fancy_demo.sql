@@ -1,6 +1,6 @@
 -- ============================================================================
--- pg-tikv Fancy SQL Demo
--- A comprehensive showcase of pg-tikv's PostgreSQL compatibility
+-- db9-server Fancy SQL Demo
+-- A comprehensive showcase of db9-server's PostgreSQL compatibility
 -- ============================================================================
 
 -- ============================================================================

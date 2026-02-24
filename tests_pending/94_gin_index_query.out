@@ -15,4 +15,4 @@ count
 id
 4
 (1 row)
-psql:/home/dongxu/lab/pg-tikv/tests/94_gin_index_query.sql:4: NOTICE:  table "gin_test" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/94_gin_index_query.sql:4: NOTICE:  table "gin_test" does not exist, skipping

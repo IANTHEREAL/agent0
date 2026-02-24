@@ -2,7 +2,7 @@ import { describe, it, expect, afterAll } from 'vitest';
 import { Sequelize } from 'sequelize';
 import { createSequelize, createSequelizeOptions } from './connection.js';
 
-describe('Sequelize Connection & Protocol Compatibility [pg-tikv]', () => {
+describe('Sequelize Connection & Protocol Compatibility [db9-server]', () => {
   const instances: Sequelize[] = [];
 
   afterAll(async () => {

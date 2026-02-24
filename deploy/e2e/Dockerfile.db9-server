@@ -1,5 +1,5 @@
-# pg-tikv (tipg) — native platform build for local e2e testing
-# Build context: tipg repo root (../../)
+# db9-server (db9) — native platform build for local e2e testing
+# Build context: db9 repo root (../../)
 FROM rust:1.88-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
@@ -31,8 +31,8 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/pg-tikv /usr/local/bin/pg-tikv
+COPY --from=builder /app/target/release/db9-server /usr/local/bin/db9-server
 
 EXPOSE 5433
 
-CMD ["pg-tikv"]
+CMD ["db9-server"]

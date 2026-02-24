@@ -10,7 +10,7 @@
 - 审计/软删除等业务 trigger
 - 一些迁移工具会创建辅助函数（即使最终不调用）
 
-当前 pg-tikv：
+当前 db9-server：
 - `CREATE FUNCTION` 在执行器里是 no-op（`src/sql/executor.rs:260`）
 - `CREATE TRIGGER` 被明确标记为 unsupported（`src/sql/helpers.rs:803`）
 

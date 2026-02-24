@@ -7,15 +7,15 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use pgtikv_admin::config::Config;
-use pgtikv_admin::session::SessionManager;
-use pgtikv_admin::{api, db, AppState};
+use db9_admin::config::Config;
+use db9_admin::session::SessionManager;
+use db9_admin::{api, db, AppState};
 
 // ── Setup ────────────────────────────────────────────────────────
 
 async fn setup() -> (Router, AppState) {
     let db_id = uuid::Uuid::new_v4().to_string();
-    let url = format!("sqlite:///tmp/pgtikv_test_{db_id}.db?mode=rwc");
+    let url = format!("sqlite:///tmp/db9_test_{db_id}.db?mode=rwc");
     let pool = db::connect(&url).await.unwrap();
     db::create_tables(&pool).await.unwrap();
 
@@ -45,7 +45,7 @@ async fn setup() -> (Router, AppState) {
         db: pool,
         config: Arc::new(config),
         sessions: Arc::new(SessionManager::new(1)),
-        device_codes: Arc::new(pgtikv_admin::device_code::DeviceCodeStore::new(600)),
+        device_codes: Arc::new(db9_admin::device_code::DeviceCodeStore::new(600)),
         http_client: reqwest::Client::new(),
         fs9_client: None,
     };
@@ -175,7 +175,7 @@ async fn get_customer_id(state: &AppState, token: &str) -> String {
 /// Insert a tenant into DB and assign it to the given customer.
 async fn seed_customer_tenant(state: &AppState, customer_id: &str) -> String {
     let tenant_id = format!("t{}", &uuid::Uuid::new_v4().to_string()[..11]);
-    let keyspace = format!("tipg_tenant_{tenant_id}");
+    let keyspace = format!("db9_tenant_{tenant_id}");
     let now = chrono::Utc::now().to_rfc3339();
     db::insert_tenant(&state.db, &tenant_id, &keyspace, "ACTIVE", &now)
         .await

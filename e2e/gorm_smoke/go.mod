@@ -1,4 +1,4 @@
-module github.com/c4pt0r/tipg/e2e/gorm_smoke
+module github.com/c4pt0r/db9-server/e2e/gorm_smoke
 
 go 1.22
 

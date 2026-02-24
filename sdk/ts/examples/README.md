@@ -1,11 +1,11 @@
 # RAG Ingest Pipeline Example
 
-Reads text files from fs9, chunks them, generates embeddings via any OpenAI-compatible API, and stores the results in pg-tikv with vector similarity search and GIN full-text search support.
+Reads text files from fs9, chunks them, generates embeddings via any OpenAI-compatible API, and stores the results in db9-server with vector similarity search and GIN full-text search support.
 
 ## Prerequisites
 
 - Node.js 18+
-- A running pg-tikv / db9 instance
+- A running db9-server / db9 instance
 - An embedding API key (OpenAI, or any compatible endpoint)
 - Text files uploaded to fs9
 

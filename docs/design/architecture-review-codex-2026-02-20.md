@@ -1,8 +1,8 @@
-# pg-tikv Architecture Review (Codex Independent Report)
+# db9-server Architecture Review (Codex Independent Report)
 
 **Date**: 2026-02-20  
 **Reviewer**: Codex (independent review)  
-**Method**: code-first inspection (no trust in existing docs), with direct source references from `/home/zhaiyl/Work/agents/w3/tipg`
+**Method**: code-first inspection (no trust in existing docs), with direct source references from `/home/zhaiyl/Work/agents/w3/db9`
 
 ---
 
@@ -153,7 +153,7 @@ I confirm these findings as materially correct:
 
 1. Dead optimizer GUC signal (misleading operational contract).
 - Status after PR #847: partially fixed.
-- `tipg.use_optimizer` is now explicit compatibility no-op/readback-only:
+- `db9.use_optimizer` is now explicit compatibility no-op/readback-only:
 - `src/sql/session.rs:254`
 - `src/sql/session.rs:412`
 - dead field/task-local threading was removed, but acceptance still exists.
@@ -199,7 +199,7 @@ If this project wants strong PG/ORM compatibility, protocol-layer semantic dupli
 3. P1: remove `.ok()?` swallowing in protocol inference paths and return structured errors.
 4. P1: make GIN runtime fallback explicit in EXPLAIN/NOTICE, or implement true GIN operator execution.
 5. P1: refactor `pre_materialize_async_exprs()` onto shared typed rewrite traversal.
-6. P1: remove/replace dead `tipg.use_optimizer` toggle semantics.
+6. P1: remove/replace dead `db9.use_optimizer` toggle semantics.
 7. P1: propagate security context into internal SQL execution paths (especially user functions).
 8. P2: split god files (`ddl.rs`, `planner.rs`, `dynamic.rs`, `typed_eval.rs`) into subsystem modules.
 
@@ -211,7 +211,7 @@ If this project wants strong PG/ORM compatibility, protocol-layer semantic dupli
 
 1. Legacy fallback cleanup landed (tracking issue #844 closed).
 2. Parser RETURNING fallback was removed (shim count reduced).
-3. `tipg.use_optimizer` dead runtime threading was removed; setting is kept as compatibility no-op.
+3. `db9.use_optimizer` dead runtime threading was removed; setting is kept as compatibility no-op.
 4. Query-context scoping became cleaner (`with_scoped_query_context`) and less manually threaded.
 5. Legacy fallback paths now include explicit sunset policy annotations.
 

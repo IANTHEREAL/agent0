@@ -8,7 +8,7 @@ import * as schema from './schema.js';
 
 const { Pool } = pg;
 
-describe('Drizzle CRUD Semantics [pg-tikv]', () => {
+describe('Drizzle CRUD Semantics [db9-server]', () => {
   let pool: pg.Pool;
   let db: ReturnType<typeof drizzle<typeof schema>>;
 

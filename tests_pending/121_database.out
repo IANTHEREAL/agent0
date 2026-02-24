@@ -38,17 +38,17 @@
  SKIPPED: CREATE DATABASE not supported
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:34: ERROR:  Table 'pg_database' not found
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:34: ERROR:  Table 'pg_database' not found
  has_database_privilege 
 ------------------------
  t
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:43: ERROR:  Unsupported COMMENT ON statement
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:49: ERROR:  Table 'pg_database' not found
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:52: ERROR:  Unsupported COMMENT ON statement
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:58: ERROR:  Table 'pg_database' not found
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:62: ERROR:  Schema 's' already exists
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:43: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:49: ERROR:  Table 'pg_database' not found
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:52: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:58: ERROR:  Table 'pg_database' not found
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:62: ERROR:  Schema 's' already exists
     schema_name     
 --------------------
  crdb_internal
@@ -232,7 +232,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:62: ERROR:  Schema 's' alre
  SKIPPED: CREATE DATABASE not supported
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:142: ERROR:  Table 'pg_database' not found
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:142: ERROR:  Table 'pg_database' not found
  id 
 ----
   2
@@ -302,7 +302,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:142: ERROR:  Table 'pg_data
  SKIPPED: DROP DATABASE not supported
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:197: ERROR:  Table 'pg_database' not found
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:197: ERROR:  Table 'pg_database' not found
                warning                
 --------------------------------------
  SKIPPED: DROP DATABASE not supported
@@ -318,7 +318,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:197: ERROR:  Table 'pg_data
         1
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:208: ERROR:  Table 'public.a' already exists
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:208: ERROR:  Table 'public.a' already exists
  id 
 ----
   2
@@ -336,7 +336,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:208: ERROR:  Table 'public.
  SKIPPED: CREATE DATABASE not supported
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:220: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: USER at Line: 1, Column 7
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:220: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: USER at Line: 1, Column 7
                warning                
 --------------------------------------
  SKIPPED: DROP DATABASE not supported
@@ -372,7 +372,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:220: ERROR:  SQL parse erro
  SKIPPED: DROP DATABASE not supported
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:246: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: USER at Line: 1, Column 7
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:246: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: USER at Line: 1, Column 7
                warning                
 --------------------------------------
  SKIPPED: DROP DATABASE not supported
@@ -398,7 +398,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:246: ERROR:  SQL parse erro
  SKIPPED: DROP DATABASE not supported
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:271: ERROR:  Table 'pg_settings' not found
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:271: ERROR:  Table 'pg_settings' not found
   attrelid   |  attname  | atttypid | attnum | attlen | attnotnull | atthasdef | attisdropped | attislocal | atttypmod | attgenerated | attidentity 
 -------------+-----------+----------+--------+--------+------------+-----------+--------------+------------+-----------+--------------+-------------
  10000000055 | id        |       23 |      1 |      4 | t          | f         | f            | t          |        -1 |              | 
@@ -454,7 +454,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:271: ERROR:  Table 'pg_sett
  SKIPPED: CREATE DATABASE not supported
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:287: ERROR:  Schema 's' already exists
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:287: ERROR:  Schema 's' already exists
                warning                
 --------------------------------------
  SKIPPED: DROP DATABASE not supported
@@ -480,8 +480,8 @@ psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:287: ERROR:  Schema 's' alr
  SKIPPED: CREATE DATABASE not supported
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:323: ERROR:  Table 'pg_database' not found
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:327: ERROR:  SQL parse error: sql parser error: Expected an object type after CREATE, found: USER at Line: 1, Column 8
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:323: ERROR:  Table 'pg_database' not found
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:327: ERROR:  SQL parse error: sql parser error: Expected an object type after CREATE, found: USER at Line: 1, Column 8
                warning                
 --------------------------------------
  SKIPPED: DROP DATABASE not supported
@@ -502,7 +502,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:327: ERROR:  SQL parse erro
  SKIPPED: CREATE DATABASE not supported
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:344: ERROR:  Table 'pg_database' not found
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:344: ERROR:  Table 'pg_database' not found
                warning                
 --------------------------------------
  SKIPPED: DROP DATABASE not supported
@@ -513,7 +513,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:344: ERROR:  Table 'pg_data
  SKIPPED: CREATE DATABASE not supported
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:353: ERROR:  Table 'pg_database' not found
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:353: ERROR:  Table 'pg_database' not found
                warning                
 --------------------------------------
  SKIPPED: DROP DATABASE not supported
@@ -600,4 +600,4 @@ psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:353: ERROR:  Table 'pg_data
  SKIPPED: DROP DATABASE not supported
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:405: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/121_database.sql:405: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

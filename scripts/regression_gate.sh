@@ -16,9 +16,9 @@ fi
 PG_PORT="${PG_PORT:-15433}"
 PG_USER="${PG_USER:-admin}"
 PG_PASSWORD="${PG_PASSWORD:-admin}"
-WORKER_SYSTEM_KEYSPACE="${PGTIKV_WORKER_SYSTEM_KEYSPACE:-_sys_worker}"
+WORKER_SYSTEM_KEYSPACE="${DB9_WORKER_SYSTEM_KEYSPACE:-_sys_worker}"
 
-PGTIKV_PID=""
+DB9_PID=""
 CLUSTER_STARTED=0
 ORM_DATABASE=""
 ORM_DSN=""
@@ -38,15 +38,15 @@ Runs the fast regression gate (SQL regressions + optional ORM subset + unit test
 
 By default it will:
   1) Start a fresh TiKV cluster (via scripts/tikv_admin.py)
-  2) Build pg-tikv (release)
-  3) Start pg-tikv
+  2) Build db9-server (release)
+  3) Start db9-server
   4) Run the regression SQL pack (SSOT: scripts/regression_gate.list)
   5) (Optional) Run the regression ORM pack (SSOT: scripts/regression_gate.list)
   6) Stop & clean the cluster
 
 Options:
-  --dsn <dsn>         Use an existing running pg-tikv instance (skip cluster/server start)
-  --no-env            Skip starting TiKV/pg-tikv (alias of providing --dsn)
+  --dsn <dsn>         Use an existing running db9-server instance (skip cluster/server start)
+  --no-env            Skip starting TiKV/db9-server (alias of providing --dsn)
   --manifest <path>   Override regression manifest path (default: scripts/regression_gate.list)
   --skip-orm          Skip ORM regression pack
   --skip-unit         Skip `cargo test`
@@ -240,7 +240,7 @@ PY
 }
 
 worker_is_enabled() {
-  local raw="${PGTIKV_WORKER_ENABLED:-1}"
+  local raw="${DB9_WORKER_ENABLED:-1}"
   local raw_lc
   raw_lc="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
   case "$raw_lc" in
@@ -327,7 +327,7 @@ PY
 }
 
 verify_worker_startup() {
-  local log_file="/tmp/pgtikv-regression.log"
+  local log_file="/tmp/db9-regression.log"
 
   for _ in $(seq 1 20); do
     if grep -Fq "WorkerEngine and GC started" "$log_file" 2>/dev/null; then
@@ -397,10 +397,10 @@ cleanup() {
       -c "DROP DATABASE IF EXISTS \"$ORM_DATABASE\"" >/dev/null 2>&1 || true
   fi
 
-  if [[ -n "$PGTIKV_PID" ]] && kill -0 "$PGTIKV_PID" 2>/dev/null; then
-    echo "Stopping pg-tikv (PID: $PGTIKV_PID)..."
-    kill "$PGTIKV_PID" 2>/dev/null || true
-    wait "$PGTIKV_PID" 2>/dev/null || true
+  if [[ -n "$DB9_PID" ]] && kill -0 "$DB9_PID" 2>/dev/null; then
+    echo "Stopping db9-server (PID: $DB9_PID)..."
+    kill "$DB9_PID" 2>/dev/null || true
+    wait "$DB9_PID" 2>/dev/null || true
   fi
 
   if [[ "$CLUSTER_STARTED" -eq 1 ]]; then
@@ -442,7 +442,7 @@ if [[ -n "$DSN_DB_NAME" && "$DSN_DB_NAME" != "postgres" ]]; then
   REGRESSION_DSN="$(build_dsn_with_database "$PG_DSN" "postgres")"
 fi
 
-echo "=== pg-tikv Regression Gate ==="
+echo "=== db9-server Regression Gate ==="
 echo "PG_DSN: $PG_DSN"
 if [[ "$REGRESSION_DSN" != "$PG_DSN" ]]; then
   echo "Regression SQL DSN: $REGRESSION_DSN"
@@ -484,23 +484,23 @@ if [[ "$START_ENV" -eq 1 ]]; then
     echo "Ensuring worker system keyspace '${WORKER_SYSTEM_KEYSPACE}'..."
     ensure_pd_keyspace "$PD_ENDPOINTS" "$WORKER_SYSTEM_KEYSPACE"
   else
-    echo "Worker disabled (PGTIKV_WORKER_ENABLED='${PGTIKV_WORKER_ENABLED:-unset}'); skipping system keyspace provisioning."
+    echo "Worker disabled (DB9_WORKER_ENABLED='${DB9_WORKER_ENABLED:-unset}'); skipping system keyspace provisioning."
   fi
 
   echo ""
-  echo "[3/$TOTAL_STEPS] Building pg-tikv..."
+  echo "[3/$TOTAL_STEPS] Building db9-server..."
   (cd "$ROOT_DIR" && cargo build --release --quiet)
   echo ""
 
-	  echo "Starting pg-tikv on ${PG_HOST}:${PG_PORT} (PD_ENDPOINTS=${PD_ENDPOINTS})..."
+	  echo "Starting db9-server on ${PG_HOST}:${PG_PORT} (PD_ENDPOINTS=${PD_ENDPOINTS})..."
 	  pushd "$ROOT_DIR" >/dev/null
 	  PD_ENDPOINTS="$PD_ENDPOINTS" \
 	  PG_PORT="$PG_PORT" \
-	  PGTIKV_BOOTSTRAP_ADMIN_USER="$PG_USER" \
-	  PGTIKV_BOOTSTRAP_ADMIN_PASSWORD="$PG_PASSWORD" \
-	  PGTIKV_INSECURE=1 \
-	  ./target/release/pg-tikv > /tmp/pgtikv-regression.log 2>&1 &
-	  PGTIKV_PID=$!
+	  DB9_BOOTSTRAP_ADMIN_USER="$PG_USER" \
+	  DB9_BOOTSTRAP_ADMIN_PASSWORD="$PG_PASSWORD" \
+	  DB9_INSECURE=1 \
+	  ./target/release/db9-server > /tmp/db9-regression.log 2>&1 &
+	  DB9_PID=$!
 	  popd >/dev/null
 
   # Wait for readiness
@@ -509,9 +509,9 @@ if [[ "$START_ENV" -eq 1 ]]; then
       if pg_isready -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -q 2>/dev/null; then
         break
       fi
-      if ! kill -0 "$PGTIKV_PID" 2>/dev/null; then
-        echo "ERROR: pg-tikv exited during startup" >&2
-        sed -n '1,200p' /tmp/pgtikv-regression.log || true
+      if ! kill -0 "$DB9_PID" 2>/dev/null; then
+        echo "ERROR: db9-server exited during startup" >&2
+        sed -n '1,200p' /tmp/db9-regression.log || true
         exit 1
       fi
       sleep 1
@@ -520,12 +520,12 @@ if [[ "$START_ENV" -eq 1 ]]; then
 
   # Final check via psql
   if ! PGPASSWORD="$PG_PASSWORD" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d postgres -c "SELECT 1" >/dev/null 2>&1; then
-    echo "ERROR: pg-tikv not ready" >&2
-    sed -n '1,200p' /tmp/pgtikv-regression.log || true
+    echo "ERROR: db9-server not ready" >&2
+    sed -n '1,200p' /tmp/db9-regression.log || true
     exit 1
   fi
 
-  echo "pg-tikv ready (PID: $PGTIKV_PID)"
+  echo "db9-server ready (PID: $DB9_PID)"
 
   if worker_is_enabled; then
     verify_worker_startup
@@ -533,7 +533,7 @@ if [[ "$START_ENV" -eq 1 ]]; then
 
   echo ""
 else
-  echo "[2/$TOTAL_STEPS] Skipping TiKV/pg-tikv startup (--no-env/--dsn)"
+  echo "[2/$TOTAL_STEPS] Skipping TiKV/db9-server startup (--no-env/--dsn)"
   if manifest_requires_live_worker; then
     echo "Verifying worker runtime on external DSN..."
     verify_worker_runtime_with_dsn "$PG_DSN"

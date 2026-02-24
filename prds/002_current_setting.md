@@ -16,7 +16,7 @@ Support these commonly-queried settings:
 
 | Setting | Return Value |
 |---------|--------------|
-| `server_version` | `16.0` (or pg-tikv version) |
+| `server_version` | `16.0` (or db9-server version) |
 | `server_version_num` | `160000` |
 | `standard_conforming_strings` | `on` |
 | `client_encoding` | `UTF8` |

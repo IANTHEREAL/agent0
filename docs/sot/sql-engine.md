@@ -32,7 +32,7 @@
   - Evidence: `src/sql/executor/core.rs` (statement timeout handling + rollback-on-timeout comment).
 
 - **[Experimental] Observability sys pseudo-tables**
-  - The engine recognizes sys pseudo-table surfaces including `_PGTIKV_SYS_OBSERVABILITY` and `_PGTIKV_SYS_QUERY_SAMPLES` and restricts the “fast path” to simple, non-nested `SELECT ... FROM <sys_table>` queries.
+  - The engine recognizes sys pseudo-table surfaces including `_DB9_SYS_OBSERVABILITY` and `_DB9_SYS_QUERY_SAMPLES` and restricts the “fast path” to simple, non-nested `SELECT ... FROM <sys_table>` queries.
   - Evidence: `src/sql/executor/core.rs` (`is_observability_system_query`), `src/sql/executor/table_utils.rs` (sys table resolution paths).
   - Gap: explicit assertion-level gate coverage is tracked in `docs/sot/modules.yaml` (`sql-engine`).
 
@@ -50,9 +50,9 @@
 
 ## Configuration
 This module MUST NOT redefine config keys. Relevant keys are defined exactly once in `./ops-config.md`:
-- `PGTIKV_MAX_GENERATE_SERIES_ROWS`
-- `PGTIKV_TRIGGER_ENABLED`, `PGTIKV_TRIGGER_*`
-- `PGTIKV_OBS_ENABLED`, `PGTIKV_OBS_*`
+- `DB9_MAX_GENERATE_SERIES_ROWS`
+- `DB9_TRIGGER_ENABLED`, `DB9_TRIGGER_*`
+- `DB9_OBS_ENABLED`, `DB9_OBS_*`
 
 ## Entrypoints
 - `src/sql/parser.rs` (`parse_sql`)
@@ -76,4 +76,4 @@ Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
 ## Change Management
 - Any change to SQL-visible semantics (parser normalization, transaction/failure rules, planner/executor behavior, trigger model, observability sys surfaces) MUST update this document and the corresponding module entries in `docs/sot/modules.yaml`.
 - Breaking changes require DR/ADR per #368 rules (impact surface + migration + rollback + verification updates).
-- Reference: https://github.com/c4pt0r/tipg/issues/368
+- Reference: https://github.com/c4pt0r/db9/issues/368

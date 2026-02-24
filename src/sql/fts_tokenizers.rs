@@ -75,14 +75,13 @@ fn tokenize_jieba(text: &str) -> Vec<String> {
 
 /// Get the default text search configuration.
 ///
-/// Can be overridden via the `TIPG_DEFAULT_TEXT_SEARCH_CONFIG` environment variable.
+/// Can be overridden via the `DB9_DEFAULT_TEXT_SEARCH_CONFIG` environment variable.
 /// Defaults to "simple" if not set.
 pub fn default_text_search_config() -> &'static str {
     static DEFAULT: OnceLock<String> = OnceLock::new();
     DEFAULT
         .get_or_init(|| {
-            std::env::var("TIPG_DEFAULT_TEXT_SEARCH_CONFIG")
-                .unwrap_or_else(|_| "simple".to_string())
+            std::env::var("DB9_DEFAULT_TEXT_SEARCH_CONFIG").unwrap_or_else(|_| "simple".to_string())
         })
         .as_str()
 }

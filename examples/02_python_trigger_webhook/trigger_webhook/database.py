@@ -1,5 +1,5 @@
 """
-Database connection and trigger setup for TiPG.
+Database connection and trigger setup for db9.
 
 Sets up:
 1. HTTP extension (CREATE EXTENSION http)
@@ -35,7 +35,7 @@ class Database:
     def setup_tables(self):
         """Create the products and webhook_log tables."""
         # Use raw SQL with IF EXISTS for idempotent cleanup —
-        # SQLAlchemy's drop_all() omits IF EXISTS, which fails on TiPG
+        # SQLAlchemy's drop_all() omits IF EXISTS, which fails on db9
         # when the table doesn't exist yet.
         with self.engine.connect() as conn:
             conn.execute(text("DROP TRIGGER IF EXISTS trg_product_insert ON products"))
@@ -50,7 +50,7 @@ class Database:
         Base.metadata.create_all(self.engine)
 
     def setup_http_extension(self):
-        """Enable the TiPG HTTP extension."""
+        """Enable the db9 HTTP extension."""
         with self.engine.connect() as conn:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS http"))
             conn.commit()
@@ -64,7 +64,7 @@ class Database:
         2. POSTs it to the webhook URL via extensions.http_post()
         3. Logs the result (HTTP status) into webhook_log
 
-        Since TiPG does not support TG_OP / TG_TABLE_NAME special variables,
+        Since db9 does not support TG_OP / TG_TABLE_NAME special variables,
         we create one trigger function per event type.
         """
         with self.engine.connect() as conn:

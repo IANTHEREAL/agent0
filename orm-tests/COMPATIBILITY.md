@@ -1,4 +1,4 @@
-# pg-tikv ORM Compatibility Report
+# db9-server ORM Compatibility Report
 
 Generated: 2026-01-08T20:46:02.747Z
 
@@ -27,6 +27,6 @@ Generated: 2026-01-08T20:46:02.747Z
 
 ## Known Limitations
 
-- **information_schema**: pg-tikv has limited support for `information_schema` queries
+- **information_schema**: db9-server has limited support for `information_schema` queries
 - **Schema introspection**: Some ORMs rely on schema introspection which may not work fully
 - **Drizzle type parsers**: Drizzle ORM modifies global pg type parsers; other ORMs restore defaults

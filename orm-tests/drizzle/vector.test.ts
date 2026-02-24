@@ -3,7 +3,7 @@ import { drizzle, NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { sql } from 'drizzle-orm';
 import { createDrizzleClient } from './client.js';
 
-describe('Drizzle Vector Operations [pg-tikv]', () => {
+describe('Drizzle Vector Operations [db9-server]', () => {
   let db: NodePgDatabase;
 
   beforeAll(async () => {

@@ -1,6 +1,6 @@
 //! Timestamp utilities.
 //!
-//! pg-tikv currently represents timestamps as **milliseconds since Unix epoch** in
+//! db9-server currently represents timestamps as **milliseconds since Unix epoch** in
 //! `Value::Timestamp(i64)`. PostgreSQL supports up to microsecond precision for
 //! `CURRENT_TIMESTAMP(p)`, but until the internal representation is upgraded,
 //! precision finer than milliseconds is handled on a best-effort basis.
@@ -16,7 +16,7 @@ use chrono::{DateTime, FixedOffset, LocalResult, Offset, TimeZone, Utc};
 /// - `precision = 3` truncates to milliseconds.
 /// - `precision` is clamped to `0..=6`.
 ///
-/// Note: pg-tikv stores timestamps in milliseconds, so `precision > 3` cannot be
+/// Note: db9-server stores timestamps in milliseconds, so `precision > 3` cannot be
 /// represented precisely and is treated as millisecond precision.
 pub fn truncate_timestamp_millis(ts_millis: i64, precision: u32) -> i64 {
     let precision = precision.min(6);

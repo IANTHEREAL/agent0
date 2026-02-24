@@ -1,19 +1,19 @@
-# pg-tikv Admin CLI
+# db9-server Admin CLI
 
-Multi-tenant administration tool for pg-tikv cloud platform.
+Multi-tenant administration tool for db9-server cloud platform.
 
 ## Installation
 
 The CLI uses [uv](https://github.com/astral-sh/uv) for dependency management. Dependencies are declared inline using PEP 723.
 
 ```bash
-cd pg-tikv
+cd db9-server
 
 # Run directly (uv auto-installs dependencies)
-./scripts/pg_tikv_admin.py --help
+./scripts/db9_admin.py --help
 
 # Or via uv explicitly
-uv run scripts/pg_tikv_admin.py --help
+uv run scripts/db9_admin.py --help
 ```
 
 Requirements:
@@ -31,8 +31,8 @@ Set environment variables to configure the CLI:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD addresses (comma-separated) |
-| `PG_HOST` | `127.0.0.1` | pg-tikv server host |
-| `PG_PORT` | `5433` | pg-tikv server port |
+| `PG_HOST` | `127.0.0.1` | db9-server server host |
+| `PG_PORT` | `5433` | db9-server server port |
 
 Example:
 ```bash
@@ -48,7 +48,7 @@ export PG_PORT="5433"
 Create a new tenant with isolated keyspace.
 
 ```bash
-pg-tikv-admin create-tenant <tenant_name> [options]
+db9-server-admin create-tenant <tenant_name> [options]
 ```
 
 Options:
@@ -58,13 +58,13 @@ Options:
 Examples:
 ```bash
 # Create tenant with auto-generated password
-pg-tikv-admin create-tenant acme_corp
+db9-server-admin create-tenant acme_corp
 
 # Create tenant with specific password
-pg-tikv-admin create-tenant acme_corp --password "SecurePass123!"
+db9-server-admin create-tenant acme_corp --password "SecurePass123!"
 
 # Create tenant with custom admin user
-pg-tikv-admin create-tenant acme_corp --admin-user dbadmin --password "SecurePass123!"
+db9-server-admin create-tenant acme_corp --admin-user dbadmin --password "SecurePass123!"
 ```
 
 Output:
@@ -89,7 +89,7 @@ Connection String:
 List all tenants.
 
 ```bash
-pg-tikv-admin list-tenants
+db9-server-admin list-tenants
 ```
 
 Output:
@@ -102,7 +102,7 @@ beta_inc                       ENABLED
 
 JSON output:
 ```bash
-pg-tikv-admin --json list-tenants
+db9-server-admin --json list-tenants
 ```
 ```json
 [
@@ -116,12 +116,12 @@ pg-tikv-admin --json list-tenants
 Get tenant details.
 
 ```bash
-pg-tikv-admin get-tenant <tenant_name>
+db9-server-admin get-tenant <tenant_name>
 ```
 
 Example:
 ```bash
-pg-tikv-admin get-tenant acme_corp
+db9-server-admin get-tenant acme_corp
 ```
 
 Output:
@@ -137,7 +137,7 @@ User format: acme_corp.<username>
 Create a new user within a tenant.
 
 ```bash
-pg-tikv-admin create-user <tenant_name> <username> [options]
+db9-server-admin create-user <tenant_name> <username> [options]
 ```
 
 Options:
@@ -149,13 +149,13 @@ Options:
 Examples:
 ```bash
 # Create regular user
-pg-tikv-admin create-user acme_corp developer --admin-password admin
+db9-server-admin create-user acme_corp developer --admin-password admin
 
 # Create user with specific password
-pg-tikv-admin create-user acme_corp developer --admin-password admin --password "DevPass123!"
+db9-server-admin create-user acme_corp developer --admin-password admin --password "DevPass123!"
 
 # Create superuser
-pg-tikv-admin create-user acme_corp dba --admin-password admin --superuser
+db9-server-admin create-user acme_corp dba --admin-password admin --superuser
 ```
 
 Output:
@@ -170,7 +170,7 @@ Connection: psql -h 127.0.0.1 -p 5433 -U acme_corp.developer
 List users in a tenant.
 
 ```bash
-pg-tikv-admin list-users <tenant_name> [options]
+db9-server-admin list-users <tenant_name> [options]
 ```
 
 Options:
@@ -179,7 +179,7 @@ Options:
 
 Example:
 ```bash
-pg-tikv-admin list-users acme_corp --admin-password admin
+db9-server-admin list-users acme_corp --admin-password admin
 ```
 
 Output:
@@ -195,7 +195,7 @@ developer            No         Yes      No         No
 Reset a user's password.
 
 ```bash
-pg-tikv-admin reset-password <tenant_name> [options]
+db9-server-admin reset-password <tenant_name> [options]
 ```
 
 Options:
@@ -207,13 +207,13 @@ Options:
 Examples:
 ```bash
 # Reset admin password
-pg-tikv-admin reset-password acme_corp --admin-password admin
+db9-server-admin reset-password acme_corp --admin-password admin
 
 # Reset specific user's password
-pg-tikv-admin reset-password acme_corp --user developer --admin-password admin
+db9-server-admin reset-password acme_corp --user developer --admin-password admin
 
 # Reset with specific new password
-pg-tikv-admin reset-password acme_corp --user developer --admin-password admin --password "NewPass456!"
+db9-server-admin reset-password acme_corp --user developer --admin-password admin --password "NewPass456!"
 ```
 
 Output:
@@ -227,7 +227,7 @@ New password: 4FkWJgvJXMi^A3Os
 Delete a user from a tenant.
 
 ```bash
-pg-tikv-admin delete-user <tenant_name> <username> [options]
+db9-server-admin delete-user <tenant_name> <username> [options]
 ```
 
 Options:
@@ -236,7 +236,7 @@ Options:
 
 Example:
 ```bash
-pg-tikv-admin delete-user acme_corp developer --admin-password admin
+db9-server-admin delete-user acme_corp developer --admin-password admin
 ```
 
 Output:
@@ -249,7 +249,7 @@ User 'developer' deleted from tenant 'acme_corp'
 Disable a tenant.
 
 ```bash
-pg-tikv-admin delete-tenant <tenant_name> [options]
+db9-server-admin delete-tenant <tenant_name> [options]
 ```
 
 Options:
@@ -258,10 +258,10 @@ Options:
 Example:
 ```bash
 # Interactive confirmation
-pg-tikv-admin delete-tenant acme_corp
+db9-server-admin delete-tenant acme_corp
 
 # Skip confirmation
-pg-tikv-admin delete-tenant acme_corp --force
+db9-server-admin delete-tenant acme_corp --force
 ```
 
 > **Note**: TiKV keyspaces cannot be fully deleted, only disabled. The tenant data remains but becomes inaccessible.
@@ -271,9 +271,9 @@ pg-tikv-admin delete-tenant acme_corp --force
 All commands support `--json` flag for machine-readable output:
 
 ```bash
-pg-tikv-admin --json list-tenants
-pg-tikv-admin --json get-tenant acme_corp
-pg-tikv-admin --json create-tenant new_corp
+db9-server-admin --json list-tenants
+db9-server-admin --json get-tenant acme_corp
+db9-server-admin --json create-tenant new_corp
 ```
 
 ## Cloud Platform Integration
@@ -291,7 +291,7 @@ app = Flask(__name__)
 
 def run_admin(*args):
     result = subprocess.run(
-        ["python3", "scripts/pg_tikv_admin.py", "--json"] + list(args),
+        ["python3", "scripts/db9_admin.py", "--json"] + list(args),
         capture_output=True, text=True
     )
     if result.returncode == 0:
@@ -329,14 +329,14 @@ spec:
     spec:
       containers:
       - name: admin
-        image: pg-tikv:latest
-        command: ["python3", "scripts/pg_tikv_admin.py"]
+        image: db9-server:latest
+        command: ["python3", "scripts/db9_admin.py"]
         args: ["create-tenant", "acme_corp", "--password", "$(ADMIN_PASSWORD)"]
         env:
         - name: PD_ENDPOINTS
           value: "pd-0.pd:2379,pd-1.pd:2379,pd-2.pd:2379"
         - name: PG_HOST
-          value: "pg-tikv.default.svc"
+          value: "db9-server.default.svc"
         - name: ADMIN_PASSWORD
           valueFrom:
             secretKeyRef:
@@ -371,7 +371,7 @@ postgresql://acme_corp.admin:password@db.example.com:5433/postgres
 
 1. **Never use default passwords in production** - Always specify or reset passwords
 2. **Store generated passwords securely** - Use a secrets manager
-3. **Use TLS** - Configure `PG_TLS_CERT` and `PG_TLS_KEY` on pg-tikv server
+3. **Use TLS** - Configure `PG_TLS_CERT` and `PG_TLS_KEY` on db9-server server
 4. **Limit admin access** - Create non-superuser accounts for applications
 5. **Audit tenant creation** - Log all CLI operations
 
@@ -388,13 +388,13 @@ Check that PD is running and `PD_ENDPOINTS` is correct:
 curl http://127.0.0.1:2379/pd/api/v1/version
 ```
 
-### Cannot connect to pg-tikv
+### Cannot connect to db9-server
 
 ```
 psql: error: connection to server failed
 ```
 
-Check that pg-tikv is running and `PG_HOST`/`PG_PORT` are correct:
+Check that db9-server is running and `PG_HOST`/`PG_PORT` are correct:
 ```bash
 psql -h 127.0.0.1 -p 5433 -U admin -c "SELECT 1"
 ```
@@ -405,9 +405,9 @@ psql -h 127.0.0.1 -p 5433 -U admin -c "SELECT 1"
 FATAL: password authentication failed
 ```
 
-In non-dev mode, there is no implicit default admin password. The initial admin password comes from `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD` at bootstrap time (or `admin` when using `PGTIKV_DEV=1`). Reset it using:
+In non-dev mode, there is no implicit default admin password. The initial admin password comes from `DB9_BOOTSTRAP_ADMIN_PASSWORD` at bootstrap time (or `admin` when using `DB9_DEV=1`). Reset it using:
 ```bash
-pg-tikv-admin reset-password <tenant> --admin-password <current_admin_password> --user admin
+db9-server-admin reset-password <tenant> --admin-password <current_admin_password> --user admin
 ```
 
 ### Keyspace creation failed

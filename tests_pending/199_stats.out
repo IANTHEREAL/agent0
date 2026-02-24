@@ -1,12 +1,12 @@
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:9: ERROR:  Unsupported data type: Int2(None)
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:12: ERROR:  GENERATE_SERIES is a set-returning function, not supported in this context
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:13: ERROR:  GENERATE_SERIES is a set-returning function, not supported in this context
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:17: ERROR:  SQL parse error: sql parser error: Expected SET/DROP NOT NULL, SET DEFAULT, SET DATA TYPE after ALTER COLUMN, found: SET at Line: 1, Column 30
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:18: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t at Line: 1, Column 9
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:31: ERROR:  Table 'pg_stats' not found
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:34: ERROR:  Type 'public.greeting' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:38: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t122312 at Line: 1, Column 9
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:44: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t122312 at Line: 1, Column 9
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:9: ERROR:  Unsupported data type: Int2(None)
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:12: ERROR:  GENERATE_SERIES is a set-returning function, not supported in this context
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:13: ERROR:  GENERATE_SERIES is a set-returning function, not supported in this context
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:17: ERROR:  SQL parse error: sql parser error: Expected SET/DROP NOT NULL, SET DEFAULT, SET DATA TYPE after ALTER COLUMN, found: SET at Line: 1, Column 30
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:18: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t at Line: 1, Column 9
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:31: ERROR:  Table 'pg_stats' not found
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:34: ERROR:  Type 'public.greeting' already exists
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:38: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t122312 at Line: 1, Column 9
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:44: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t122312 at Line: 1, Column 9
               warning              
 -----------------------------------
  SKIPPED: ALTER TYPE not supported
@@ -17,13 +17,13 @@ psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:44: ERROR:  SQL parse error: s
  hi
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:54: ERROR:  SQL parse error: sql parser error: Expected SET/DROP NOT NULL, SET DEFAULT, SET DATA TYPE after ALTER COLUMN, found: SET at Line: 1, Column 36
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:60: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t139381 at Line: 1, Column 9
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:73: ERROR:  Table 'pg_stats' not found
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:78: ERROR:  SQL parse error: sql parser error: Expected SET/DROP NOT NULL, SET DEFAULT, SET DATA TYPE after ALTER COLUMN, found: SET at Line: 1, Column 36
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:81: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t139381 at Line: 1, Column 9
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:92: ERROR:  Table 'pg_stats' not found
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:95: ERROR:  Unsupported data type: Bool
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:98: ERROR:  Table 't141448' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:101: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t141448 at Line: 1, Column 9
-psql:/home/dongxu/lab/pg-tikv/tests/199_stats.sql:121: ERROR:  Table 'pg_stats' not found
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:54: ERROR:  SQL parse error: sql parser error: Expected SET/DROP NOT NULL, SET DEFAULT, SET DATA TYPE after ALTER COLUMN, found: SET at Line: 1, Column 36
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:60: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t139381 at Line: 1, Column 9
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:73: ERROR:  Table 'pg_stats' not found
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:78: ERROR:  SQL parse error: sql parser error: Expected SET/DROP NOT NULL, SET DEFAULT, SET DATA TYPE after ALTER COLUMN, found: SET at Line: 1, Column 36
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:81: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t139381 at Line: 1, Column 9
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:92: ERROR:  Table 'pg_stats' not found
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:95: ERROR:  Unsupported data type: Bool
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:98: ERROR:  Table 't141448' does not exist
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:101: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t141448 at Line: 1, Column 9
+psql:/home/dongxu/lab/db9-server/tests/199_stats.sql:121: ERROR:  Table 'pg_stats' not found

@@ -1,6 +1,6 @@
-psql:/home/dongxu/lab/pg-tikv/tests/215_vectorize_types.sql:23: ERROR:  Unsupported data type: Bool
-psql:/home/dongxu/lab/pg-tikv/tests/215_vectorize_types.sql:64: ERROR:  Table 'all_types' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/215_vectorize_types.sql:67: ERROR:  Table 'all_types' not found
+psql:/home/dongxu/lab/db9-server/tests/215_vectorize_types.sql:23: ERROR:  Unsupported data type: Bool
+psql:/home/dongxu/lab/db9-server/tests/215_vectorize_types.sql:64: ERROR:  Table 'all_types' does not exist
+psql:/home/dongxu/lab/db9-server/tests/215_vectorize_types.sql:67: ERROR:  Table 'all_types' not found
  case 
 ------
  0
@@ -11,16 +11,16 @@ psql:/home/dongxu/lab/pg-tikv/tests/215_vectorize_types.sql:67: ERROR:  Table 'a
  0
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/215_vectorize_types.sql:105: ERROR:  Unsupported data type: Int4(None)
-psql:/home/dongxu/lab/pg-tikv/tests/215_vectorize_types.sql:106: ERROR:  Unsupported data type: Int4(None)
-psql:/home/dongxu/lab/pg-tikv/tests/215_vectorize_types.sql:107: ERROR:  Table 't46714_0' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/215_vectorize_types.sql:108: ERROR:  Table 't46714_1' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/215_vectorize_types.sql:111: ERROR:  Table 't46714_0' not found
-psql:/home/dongxu/lab/pg-tikv/tests/215_vectorize_types.sql:114: ERROR:  Table 't46714_0' not found
-psql:/home/dongxu/lab/pg-tikv/tests/215_vectorize_types.sql:117: ERROR:  Unsupported data type: Int2(None)
-psql:/home/dongxu/lab/pg-tikv/tests/215_vectorize_types.sql:118: ERROR:  Table 't47131_0' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/215_vectorize_types.sql:121: ERROR:  Table 't47131_0' not found
-psql:/home/dongxu/lab/pg-tikv/tests/215_vectorize_types.sql:124: ERROR:  Table 't47131_0' not found
+psql:/home/dongxu/lab/db9-server/tests/215_vectorize_types.sql:105: ERROR:  Unsupported data type: Int4(None)
+psql:/home/dongxu/lab/db9-server/tests/215_vectorize_types.sql:106: ERROR:  Unsupported data type: Int4(None)
+psql:/home/dongxu/lab/db9-server/tests/215_vectorize_types.sql:107: ERROR:  Table 't46714_0' does not exist
+psql:/home/dongxu/lab/db9-server/tests/215_vectorize_types.sql:108: ERROR:  Table 't46714_1' does not exist
+psql:/home/dongxu/lab/db9-server/tests/215_vectorize_types.sql:111: ERROR:  Table 't46714_0' not found
+psql:/home/dongxu/lab/db9-server/tests/215_vectorize_types.sql:114: ERROR:  Table 't46714_0' not found
+psql:/home/dongxu/lab/db9-server/tests/215_vectorize_types.sql:117: ERROR:  Unsupported data type: Int2(None)
+psql:/home/dongxu/lab/db9-server/tests/215_vectorize_types.sql:118: ERROR:  Table 't47131_0' does not exist
+psql:/home/dongxu/lab/db9-server/tests/215_vectorize_types.sql:121: ERROR:  Table 't47131_0' not found
+psql:/home/dongxu/lab/db9-server/tests/215_vectorize_types.sql:124: ERROR:  Table 't47131_0' not found
   ?column?  
 ------------
  2021-05-08

@@ -1,29 +1,29 @@
 # Local E2E Integration Test Environment
 #
 # Services:
-#   postgres      — metadata DB for pgtikv-admin
+#   postgres      — metadata DB for db9-admin
 #   pd            — TiKV Placement Driver (single node)
 #   tikv          — TiKV server (single node, API v2)
-#   pg-tikv       — pg-tikv (tipg) PostgreSQL-compatible frontend  :5433
+#   db9-server       — db9-server (db9) PostgreSQL-compatible frontend  :5433
 #   fs9-meta      — FS9 metadata / auth service                    :9998
 #   fs9-server    — FS9 HTTP API with pagefs/TiKV backend          :9999
-#   pgtikv-admin  — cloud-admin-portal backend + db9 binary        :8090
+#   db9-admin  — cloud-admin-portal backend + db9 binary        :8090
 #
 # Setup:
 #   cp .env.example .env          # set FS9_REPO_PATH and secrets
 #   docker compose up -d --build
 #
-# Run db9 via exec (db9 binary lives inside the pgtikv-admin container):
-#   docker compose exec pgtikv-admin db9 --api-url http://localhost:8090/api login
-#   docker compose exec pgtikv-admin db9 --api-url http://localhost:8090/api db create --name hello
-#   docker compose exec pgtikv-admin db9 --api-url http://localhost:8090/api db list
-#   docker compose exec pgtikv-admin db9 --api-url http://localhost:8090/api sh <id>
+# Run db9 via exec (db9 binary lives inside the db9-admin container):
+#   docker compose exec db9-admin db9 --api-url http://localhost:8090/api login
+#   docker compose exec db9-admin db9 --api-url http://localhost:8090/api db create --name hello
+#   docker compose exec db9-admin db9 --api-url http://localhost:8090/api db list
+#   docker compose exec db9-admin db9 --api-url http://localhost:8090/api sh <id>
 #
 # Or from the host (with db9 binary installed locally):
 #   export DB9_API_URL=http://localhost:8090/api
 #   db9 db create --name hello
 
-name: tipg-e2e
+name: db9-e2e
 
 services:
 
@@ -31,13 +31,13 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: pgtikv_admin
+      POSTGRES_DB: db9_admin
       POSTGRES_USER: ${POSTGRES_USER:-admin}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-admin}
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U admin -d pgtikv_admin"]
+      test: ["CMD-SHELL", "pg_isready -U admin -d db9_admin"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -85,12 +85,12 @@ services:
       retries: 30
       start_period: 15s
 
-  # ─── pg-tikv (tipg) ─────────────────────────────────────────────────────────
-  # Build context: tipg repo root; Dockerfile path is relative to that context.
-  pg-tikv:
+  # ─── db9-server (db9) ─────────────────────────────────────────────────────────
+  # Build context: db9 repo root; Dockerfile path is relative to that context.
+  db9-server:
     build:
       context: ../..
-      dockerfile: deploy/e2e/Dockerfile.pg-tikv
+      dockerfile: deploy/e2e/Dockerfile.db9-server
     depends_on:
       tikv:
         condition: service_healthy
@@ -98,12 +98,12 @@ services:
       PD_ENDPOINTS: pd:2379
       PG_LISTEN_ADDR: 0.0.0.0
       PG_PORT: 5433
-      PGTIKV_INSECURE: "1"
-      # Bootstrap the initial superuser with password "admin" so pgtikv-admin
+      DB9_INSECURE: "1"
+      # Bootstrap the initial superuser with password "admin" so db9-admin
       # can connect (it uses DEFAULT_ADMIN_USER="admin", DEFAULT_ADMIN_PASSWORD="admin"
-      # for new keyspaces).  Do NOT set PGTIKV_BOOTSTRAP_ADMIN_USER — the default
-      # is "admin", which matches DEFAULT_ADMIN_USER in pgtikv-admin.
-      PGTIKV_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # for new keyspaces).  Do NOT set DB9_BOOTSTRAP_ADMIN_USER — the default
+      # is "admin", which matches DEFAULT_ADMIN_USER in db9-admin.
+      DB9_BOOTSTRAP_ADMIN_PASSWORD: admin
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "5433:5433"
@@ -167,10 +167,10 @@ services:
       retries: 20
       start_period: 30s
 
-  # ─── pgtikv-admin + db9 ──────────────────────────────────────────────────────
-  # Build context: tipg repo root (same as pg-tikv) so Dockerfile.admin can
+  # ─── db9-admin + db9 ──────────────────────────────────────────────────────
+  # Build context: db9 repo root (same as db9-server) so Dockerfile.admin can
   # reference cloud-admin-portal/backend/ paths.
-  pgtikv-admin:
+  db9-admin:
     build:
       context: ../..
       dockerfile: deploy/e2e/Dockerfile.admin
@@ -179,20 +179,20 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      pg-tikv:
+      db9-server:
         condition: service_healthy
       fs9-meta:
         condition: service_healthy
     environment:
-      PGTIKV_PD_ENDPOINTS: pd:2379
-      PGTIKV_PG_HOST: pg-tikv
-      PGTIKV_PG_PORT: "5433"
-      PGTIKV_PG_PUBLIC_ENDPOINTS: "127.0.0.1:5433"
-      PGTIKV_API_PORT: "8090"
-      PGTIKV_API_HOST: "0.0.0.0"
-      PGTIKV_DATABASE_URL: postgres://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-admin}@postgres:5432/pgtikv_admin
-      PGTIKV_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173"
-      PGTIKV_API_KEYS: ${PGTIKV_API_KEYS:-}
+      DB9_PD_ENDPOINTS: pd:2379
+      DB9_PG_HOST: db9-server
+      DB9_PG_PORT: "5433"
+      DB9_PG_PUBLIC_ENDPOINTS: "127.0.0.1:5433"
+      DB9_API_PORT: "8090"
+      DB9_API_HOST: "0.0.0.0"
+      DB9_DATABASE_URL: postgres://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-admin}@postgres:5432/db9_admin
+      DB9_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173"
+      DB9_API_KEYS: ${DB9_API_KEYS:-}
       FS9_META_URL: http://fs9-meta:9998
       FS9_META_KEY: ${FS9_META_KEY}
       FS9_JWT_SECRET: ${FS9_JWT_SECRET}

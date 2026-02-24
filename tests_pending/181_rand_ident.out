@@ -1,4 +1,4 @@
-psql:/home/dongxu/lab/pg-tikv/tests/181_rand_ident.sql:105: ERROR:  Table 'crdb_internal.gen_rand_ident' not found
+psql:/home/dongxu/lab/db9-server/tests/181_rand_ident.sql:105: ERROR:  Table 'crdb_internal.gen_rand_ident' not found
  gen_rand_ident 
 ----------------
  

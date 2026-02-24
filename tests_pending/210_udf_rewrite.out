@@ -1,26 +1,26 @@
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:43: ERROR:  Unsupported function: get_body_str
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:55: ERROR:  Unsupported function: get_body_str
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:67: ERROR:  Unsupported function: get_body_str
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:79: ERROR:  Unsupported function: get_body_str
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:88: ERROR:  CREATE FUNCTION requires RETURNS
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:91: ERROR:  Unsupported function: get_body_str
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:94: ERROR:  Function 'public.f_rewrite' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:100: ERROR:  CREATE FUNCTION requires RETURNS
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:103: ERROR:  Unsupported function: get_body_str
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:106: ERROR:  Function 'public.f_rewrite' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:112: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:115: ERROR:  Unsupported function: get_body_str
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:118: ERROR:  Procedure 'public.p_rewrite' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:124: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:127: ERROR:  Unsupported function: get_body_str
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:130: ERROR:  Procedure 'public.p_rewrite' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:136: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:139: ERROR:  Unsupported function: get_body_str
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:142: ERROR:  Procedure 'public.p_rewrite' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:148: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:151: ERROR:  Unsupported function: get_body_str
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:154: ERROR:  Procedure 'public.p_rewrite' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:165: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:168: ERROR:  Unsupported function: get_body_str
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:186: ERROR:  Unsupported function: get_body_str
-psql:/home/dongxu/lab/pg-tikv/tests/210_udf_rewrite.sql:188: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:43: ERROR:  Unsupported function: get_body_str
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:55: ERROR:  Unsupported function: get_body_str
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:67: ERROR:  Unsupported function: get_body_str
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:79: ERROR:  Unsupported function: get_body_str
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:88: ERROR:  CREATE FUNCTION requires RETURNS
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:91: ERROR:  Unsupported function: get_body_str
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:94: ERROR:  Function 'public.f_rewrite' does not exist
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:100: ERROR:  CREATE FUNCTION requires RETURNS
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:103: ERROR:  Unsupported function: get_body_str
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:106: ERROR:  Function 'public.f_rewrite' does not exist
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:112: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:115: ERROR:  Unsupported function: get_body_str
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:118: ERROR:  Procedure 'public.p_rewrite' does not exist
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:124: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:127: ERROR:  Unsupported function: get_body_str
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:130: ERROR:  Procedure 'public.p_rewrite' does not exist
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:136: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:139: ERROR:  Unsupported function: get_body_str
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:142: ERROR:  Procedure 'public.p_rewrite' does not exist
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:148: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:151: ERROR:  Unsupported function: get_body_str
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:154: ERROR:  Procedure 'public.p_rewrite' does not exist
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:165: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:168: ERROR:  Unsupported function: get_body_str
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:186: ERROR:  Unsupported function: get_body_str
+psql:/home/dongxu/lab/db9-server/tests/210_udf_rewrite.sql:188: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

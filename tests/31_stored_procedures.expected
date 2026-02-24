@@ -92,4 +92,4 @@ total_balance
 log_entries
 5
 (1 row)
-psql:/home/dongxu/lab/pg-tikv/tests/31_stored_procedures.sql:136: ERROR:  Procedure 'simple_insert' does not exist
+psql:/home/dongxu/lab/db9-server/tests/31_stored_procedures.sql:136: ERROR:  Procedure 'simple_insert' does not exist

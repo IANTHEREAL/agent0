@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # ///
 """
-pg-tikv Integration Test Runner
+db9-server Integration Test Runner
 
 Usage:
     integration_test.py --dsn postgres://user:pass@host:port/db
@@ -1308,7 +1308,7 @@ def test_savepoints() -> bool:
     run_sql("CREATE TABLE test_savepoints (id INTEGER PRIMARY KEY, value INTEGER)")
     run_sql("INSERT INTO test_savepoints VALUES (1, 100)")
 
-    # NOTE: pg-tikv currently returns only the result of the last statement in
+    # NOTE: db9-server currently returns only the result of the last statement in
     # a multi-statement simple query, so we validate savepoint semantics by
     # checking the final persisted state after COMMIT.
 
@@ -1504,7 +1504,7 @@ def parse_args() -> TestConfig:
     default_dsn = os.environ.get("PG_DSN", "postgres://admin:admin@127.0.0.1:5433/postgres")
 
     parser = argparse.ArgumentParser(
-        description="pg-tikv Integration Test Runner",
+        description="db9-server Integration Test Runner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1538,14 +1538,14 @@ def main():
     global config
     config = parse_args()
 
-    log_info("pg-tikv Integration Test Runner")
+    log_info("db9-server Integration Test Runner")
     log_info("================================")
     log_info(f"DSN: {config.db.to_dsn()}")
 
     try:
         if not check_connection():
-            log_error(f"Cannot connect to pg-tikv at {config.db.host}:{config.db.port}")
-            log_error("Make sure pg-tikv is running:")
+            log_error(f"Cannot connect to db9-server at {config.db.host}:{config.db.port}")
+            log_error("Make sure db9-server is running:")
             log_error("  1. uv run scripts/tikv_admin.py start --persistent")
             log_error("  2. PD_ENDPOINTS=127.0.0.1:<pd_port> cargo run --release")
             sys.exit(1)

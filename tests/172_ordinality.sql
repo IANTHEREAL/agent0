@@ -138,5 +138,5 @@ ORDER BY window_0 DESC;
 
 -- Test 20: query (line 113)
 SELECT row_number() OVER (ORDER BY x) + 0 AS rn
-FROM (VALUES (10, 'a'), (20, 'b')) AS t(__tipg_internal_window_0, x)
+FROM (VALUES (10, 'a'), (20, 'b')) AS t(__db9_internal_window_0, x)
 ORDER BY x;

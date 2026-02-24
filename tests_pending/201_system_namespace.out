@@ -1,5 +1,5 @@
-psql:/home/dongxu/lab/pg-tikv/tests/201_system_namespace.sql:8: ERROR:  cannot drop schema 'system': schema is not empty
-psql:/home/dongxu/lab/pg-tikv/tests/201_system_namespace.sql:9: ERROR:  Schema 'system' already exists
+psql:/home/dongxu/lab/db9-server/tests/201_system_namespace.sql:8: ERROR:  cannot drop schema 'system': schema is not empty
+psql:/home/dongxu/lab/db9-server/tests/201_system_namespace.sql:9: ERROR:  Schema 'system' already exists
  parentID | parentSchemaID |       name        | id  
 ----------+----------------+-------------------+-----
         0 |              0 | comments          |  50
@@ -17,4 +17,4 @@ psql:/home/dongxu/lab/pg-tikv/tests/201_system_namespace.sql:9: ERROR:  Schema '
  id             | integer
 (4 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/201_system_namespace.sql:37: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/201_system_namespace.sql:37: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

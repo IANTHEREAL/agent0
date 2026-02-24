@@ -1,4 +1,4 @@
-# pg-tikv
+# db9-server
 
 A PostgreSQL-compatible distributed SQL database built on TiKV.
 
@@ -15,7 +15,7 @@ A DATABASE FOR AI BY AI
                               │ PostgreSQL Wire Protocol (pgwire 0.28)
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                      pg-tikv Server                         │
+│                      db9-server Server                         │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │  Protocol: Simple Query, Extended Query, COPY         │  │
 │  ├───────────────────────────────────────────────────────┤  │
@@ -91,7 +91,7 @@ COALESCE, NULLIF, GREATEST, LEAST, gen_random_uuid()
 
 ### Extensions
 
-pg-tikv supports built-in extensions (compiled into the server binary) that can be enabled per-tenant:
+db9-server supports built-in extensions (compiled into the server binary) that can be enabled per-tenant:
 
 | Extension | Description |
 |-----------|-------------|
@@ -135,7 +135,7 @@ DROP EXTENSION pg_cron;
 
 ### Async Worker Engine
 
-pg-tikv includes a built-in async worker engine for background task execution. All instances share a global task queue in TiKV with automatic coordination — no leader election required.
+db9-server includes a built-in async worker engine for background task execution. All instances share a global task queue in TiKV with automatic coordination — no leader election required.
 
 | Feature | SQL |
 |---------|-----|
@@ -153,7 +153,7 @@ See [docs/worker.md](docs/worker.md) for configuration, deployment, and troubles
 # 1. Start TiKV
 tiup playground --mode tikv-slim
 
-# 2. Start pg-tikv
+# 2. Start db9-server
 cargo run
 
 # 3. Connect
@@ -232,12 +232,12 @@ pg_restore -h 127.0.0.1 -p 5433 -d postgres --no-owner --no-privileges ./backup/
 |---------------------|---------|-------------|
 | `PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD endpoints |
 | `PG_PORT` | `5433` | PostgreSQL protocol port |
-| `PGTIKV_TOKIO_STACK_MB` | `8` | Tokio worker thread stack size (MB) |
+| `DB9_TOKIO_STACK_MB` | `8` | Tokio worker thread stack size (MB) |
 | `PG_KEYSPACE` | `default` | Default TiKV keyspace for multi-tenancy |
 | `PG_TLS_CERT` | (empty) | Path to TLS certificate file |
 | `PG_TLS_KEY` | (empty) | Path to TLS private key file |
 
-`PGTIKV_TOKIO_STACK_MB` controls worker thread stack size for the async runtime. The default `8` MiB is chosen to safely handle deep analyzed-path subquery execution (especially catalog-heavy queries) without stack overflows. Increase it (for example to `16` or `32`) if your workload includes unusually deep nested query shapes.
+`DB9_TOKIO_STACK_MB` controls worker thread stack size for the async runtime. The default `8` MiB is chosen to safely handle deep analyzed-path subquery execution (especially catalog-heavy queries) without stack overflows. Increase it (for example to `16` or `32`) if your workload includes unusually deep nested query shapes.
 
 **Authentication**: Password authentication is always enabled via AuthManager. Each tenant has its own users stored in TiKV. Default admin user is created on bootstrap with password "admin".
 
@@ -385,7 +385,7 @@ orm-tests/               # ORM compatibility tests (pg, TypeORM, Sequelize, Knex
 
 ## ORM Compatibility
 
-pg-tikv is tested against popular TypeScript/JavaScript ORMs:
+db9-server is tested against popular TypeScript/JavaScript ORMs:
 
 | ORM | Tests | Status |
 |-----|-------|--------|
@@ -414,14 +414,14 @@ See [orm-tests/README.md](orm-tests/README.md) for details.
 
 ```bash
 # Fast, deterministic regression gate (recommended; <5min typical)
-# - Starts TiKV + pg-tikv by default
+# - Starts TiKV + db9-server by default
 # - Uses `scripts/regression_gate.list` as the single source of truth
 bash scripts/regression_gate.sh
 
-# Reuse an existing running pg-tikv instance
+# Reuse an existing running db9-server instance
 bash scripts/regression_gate.sh --dsn "$PG_DSN"
 
-# Tier-2 E2E suites (app-like smoke tests; requires running pg-tikv)
+# Tier-2 E2E suites (app-like smoke tests; requires running db9-server)
 PG_DSN=postgres://admin:<password>@127.0.0.1:5433/postgres bash scripts/e2e_tests.sh sqlalchemy_smoke
 
 # Full automated test suite (slower; broader coverage)
@@ -461,7 +461,7 @@ Notable integration workloads:
 
 ## db9 CLI
 
-`db9` is the customer-facing CLI for managing databases on pg-tikv. It handles account registration, database lifecycle, SQL execution, schema inspection, migrations, and more.
+`db9` is the customer-facing CLI for managing databases on db9-server. It handles account registration, database lifecycle, SQL execution, schema inspection, migrations, and more.
 
 ### Install
 

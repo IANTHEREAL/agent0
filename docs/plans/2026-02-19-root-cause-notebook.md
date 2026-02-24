@@ -1,7 +1,7 @@
 # Root-Cause Notebook (2026-02-19)
 
 - Branch: `issue-844-architecture-cleanup`
-- PR: `https://github.com/c4pt0r/tipg/pull/846`
+- PR: `https://github.com/c4pt0r/db9/pull/846`
 - Scope: architecture-cleanup follow-up, grouped root-cause burn-down
 
 ## Latest Iteration (2026-02-19 20:00 UTC)
@@ -205,7 +205,7 @@
    - Signals: missing/ambiguous columns (`name`, `foo`, `"Y"`, `distinctAlias.User_id`).
    - Files: `146`, `149`, `172`, `180`, `100`.
 4. DDL/catalog/TVF compatibility gaps:
-   - Signals: unsupported `_pgtikv_sys_*` TVFs and view/drop contract drift.
+   - Signals: unsupported `_db9_sys_*` TVFs and view/drop contract drift.
    - Files: `21`, `221`, `222`, `223`, `224`.
 5. Remaining semantic/perf buckets:
    - `28`, `39`, `95`, `222_structural_fixes_contract`.
@@ -266,7 +266,7 @@
 
 - Updated test SQL/expected:
   - `tests/105_expr_functions.sql`:
-    - `VERSION() LIKE '%pg-tikv%'` -> `VERSION() LIKE 'PostgreSQL%'` (PG 17.7 validated).
+    - `VERSION() LIKE '%db9-server%'` -> `VERSION() LIKE 'PostgreSQL%'` (PG 17.7 validated).
   - `tests/105_expr_functions.expected` adjusted accordingly (`version_test = t`).
 
 ## Current Open Failure Buckets (51)

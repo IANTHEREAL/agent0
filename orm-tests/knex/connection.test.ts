@@ -3,7 +3,7 @@ import knex, { Knex } from 'knex';
 import { createKnexClient } from './client.js';
 import { defaultConfig } from '../shared/config.js';
 
-describe('Knex Connection & Protocol Compatibility [pg-tikv]', () => {
+describe('Knex Connection & Protocol Compatibility [db9-server]', () => {
   const clients: Knex[] = [];
 
   afterAll(async () => {

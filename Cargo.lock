@@ -763,6 +763,59 @@ dependencies = [
 ]
 
 [[package]]
+name = "db9-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "arrow-array",
+ "arrow-cast",
+ "arrow-schema",
+ "async-trait",
+ "base64 0.22.1",
+ "bincode",
+ "bytes",
+ "chrono",
+ "chrono-tz",
+ "cron",
+ "csv",
+ "dashmap",
+ "futures",
+ "globset",
+ "hex",
+ "itoa",
+ "jieba-rs",
+ "jsonwebtoken",
+ "md5",
+ "memcomparable",
+ "once_cell",
+ "parquet",
+ "pgwire",
+ "rand 0.8.5",
+ "regex",
+ "reqwest",
+ "rmp-serde",
+ "rust_decimal",
+ "rust_icu_ucol",
+ "rust_icu_ustring",
+ "rustls-pemfile 2.2.0",
+ "rustls-pki-types",
+ "ryu",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlparser",
+ "stacker",
+ "thiserror 1.0.69",
+ "tikv-client",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "deranged"
 version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2140,59 +2193,6 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
-
-[[package]]
-name = "pg-tikv"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow",
- "arrow-array",
- "arrow-cast",
- "arrow-schema",
- "async-trait",
- "base64 0.22.1",
- "bincode",
- "bytes",
- "chrono",
- "chrono-tz",
- "cron",
- "csv",
- "dashmap",
- "futures",
- "globset",
- "hex",
- "itoa",
- "jieba-rs",
- "jsonwebtoken",
- "md5",
- "memcomparable",
- "once_cell",
- "parquet",
- "pgwire",
- "rand 0.8.5",
- "regex",
- "reqwest",
- "rmp-serde",
- "rust_decimal",
- "rust_icu_ucol",
- "rust_icu_ustring",
- "rustls-pemfile 2.2.0",
- "rustls-pki-types",
- "ryu",
- "serde",
- "serde_json",
- "sha2",
- "sqlparser",
- "stacker",
- "thiserror 1.0.69",
- "tikv-client",
- "tokio",
- "tokio-rustls 0.26.4",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
 
 [[package]]
 name = "pgwire"

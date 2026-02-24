@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { createKnexClient } from './client.js';
 import type { Knex } from 'knex';
 
-describe('Knex Advanced SQL Features [pg-tikv]', () => {
+describe('Knex Advanced SQL Features [db9-server]', () => {
   let knex: Knex;
 
   beforeAll(async () => {

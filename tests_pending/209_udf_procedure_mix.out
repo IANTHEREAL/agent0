@@ -1,13 +1,13 @@
-psql:/home/dongxu/lab/pg-tikv/tests/209_udf_procedure_mix.sql:18: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
-psql:/home/dongxu/lab/pg-tikv/tests/209_udf_procedure_mix.sql:21: ERROR:  Procedure 'insert_sum' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/209_udf_procedure_mix.sql:22: ERROR:  Procedure 'insert_sum' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/209_udf_procedure_mix.sql:23: ERROR:  Procedure 'insert_sum' does not exist
+psql:/home/dongxu/lab/db9-server/tests/209_udf_procedure_mix.sql:18: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/db9-server/tests/209_udf_procedure_mix.sql:21: ERROR:  Procedure 'insert_sum' does not exist
+psql:/home/dongxu/lab/db9-server/tests/209_udf_procedure_mix.sql:22: ERROR:  Procedure 'insert_sum' does not exist
+psql:/home/dongxu/lab/db9-server/tests/209_udf_procedure_mix.sql:23: ERROR:  Procedure 'insert_sum' does not exist
  i | sum 
 ---+-----
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/209_udf_procedure_mix.sql:37: ERROR:  Unsupported function: fetch_sum_1_to_n
-psql:/home/dongxu/lab/pg-tikv/tests/209_udf_procedure_mix.sql:41: ERROR:  Unsupported function: fetch_sum_1_to_n
+psql:/home/dongxu/lab/db9-server/tests/209_udf_procedure_mix.sql:37: ERROR:  Unsupported function: fetch_sum_1_to_n
+psql:/home/dongxu/lab/db9-server/tests/209_udf_procedure_mix.sql:41: ERROR:  Unsupported function: fetch_sum_1_to_n
  i | sum 
 ---+-----
 (0 rows)

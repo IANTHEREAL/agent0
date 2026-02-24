@@ -6,24 +6,24 @@
 # ]
 # ///
 """
-pg-tikv Multi-Tenant Administration CLI
+db9-server Multi-Tenant Administration CLI
 
-Cloud platform management tool for pg-tikv tenants.
+Cloud platform management tool for db9-server tenants.
 
 Usage:
-    pg-tikv-admin create-tenant <tenant_name> [--admin-user USER] [--password PWD]
-    pg-tikv-admin list-tenants
-    pg-tikv-admin get-tenant <tenant_name>
-    pg-tikv-admin reset-password <tenant_name> [--user USER] [--password PWD]
-    pg-tikv-admin delete-tenant <tenant_name> [--force]
-    pg-tikv-admin create-user <tenant_name> <username> [--password PWD] [--superuser]
-    pg-tikv-admin list-users <tenant_name>
-    pg-tikv-admin delete-user <tenant_name> <username>
+    db9-server-admin create-tenant <tenant_name> [--admin-user USER] [--password PWD]
+    db9-server-admin list-tenants
+    db9-server-admin get-tenant <tenant_name>
+    db9-server-admin reset-password <tenant_name> [--user USER] [--password PWD]
+    db9-server-admin delete-tenant <tenant_name> [--force]
+    db9-server-admin create-user <tenant_name> <username> [--password PWD] [--superuser]
+    db9-server-admin list-users <tenant_name>
+    db9-server-admin delete-user <tenant_name> <username>
 
 Environment:
     PD_ENDPOINTS    TiKV PD addresses (default: 127.0.0.1:2379)
-    PG_HOST         pg-tikv host (default: 127.0.0.1)
-    PG_PORT         pg-tikv port (default: 5433)
+    PG_HOST         db9-server host (default: 127.0.0.1)
+    PG_PORT         db9-server port (default: 5433)
 """
 
 import argparse
@@ -137,7 +137,7 @@ class PDClient:
             return False
 
 
-class PgTikvClient:
+class Db9Client:
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
@@ -240,7 +240,7 @@ class TenantManager:
 
     def __init__(self, pd_endpoints: str, pg_host: str, pg_port: int):
         self.pd = PDClient(pd_endpoints)
-        self.pg = PgTikvClient(pg_host, pg_port)
+        self.pg = Db9Client(pg_host, pg_port)
 
     def create_tenant(
         self,
@@ -260,7 +260,7 @@ class TenantManager:
             password = generate_password()
 
         print(f"Keyspace '{name}' created")
-        print(f"Waiting for pg-tikv to bootstrap admin user...")
+        print(f"Waiting for db9-server to bootstrap admin user...")
         print()
 
         result = {
@@ -532,32 +532,32 @@ def cmd_delete_user(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="pg-tikv Multi-Tenant Administration CLI",
+        description="db9-server Multi-Tenant Administration CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Environment Variables:
   PD_ENDPOINTS    TiKV PD addresses (default: 127.0.0.1:2379)
-  PG_HOST         pg-tikv host (default: 127.0.0.1)
-  PG_PORT         pg-tikv port (default: 5433)
+  PG_HOST         db9-server host (default: 127.0.0.1)
+  PG_PORT         db9-server port (default: 5433)
 
 Examples:
   # Create a new tenant with auto-generated password
-  pg-tikv-admin create-tenant acme_corp
+  db9-server-admin create-tenant acme_corp
 
   # Create tenant with specific password
-  pg-tikv-admin create-tenant acme_corp --password "SecurePass123!"
+  db9-server-admin create-tenant acme_corp --password "SecurePass123!"
 
   # List all tenants
-  pg-tikv-admin list-tenants
+  db9-server-admin list-tenants
 
   # Reset admin password
-  pg-tikv-admin reset-password acme_corp --user admin
+  db9-server-admin reset-password acme_corp --user admin
 
   # Create additional user
-  pg-tikv-admin create-user acme_corp developer --admin-password admin
+  db9-server-admin create-user acme_corp developer --admin-password admin
 
   # Delete tenant (requires confirmation)
-  pg-tikv-admin delete-tenant acme_corp
+  db9-server-admin delete-tenant acme_corp
 """,
     )
 

@@ -847,7 +847,7 @@ impl Executor {
                 Some(resolved) => resolved,
                 None => {
                     if if_exists {
-                        // PostgreSQL requires the relation to exist for DROP TRIGGER, but pg-tikv
+                        // PostgreSQL requires the relation to exist for DROP TRIGGER, but db9-server
                         // treats `IF EXISTS` as a fully idempotent no-op to support common
                         // migration patterns and keep scripts deterministic.
                         let resolved = names::resolve_ddl_object_name(&table, search_path)?;

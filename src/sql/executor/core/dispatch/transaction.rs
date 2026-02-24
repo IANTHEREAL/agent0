@@ -205,7 +205,7 @@ impl Executor {
                 .is_some_and(|e| e.is::<StatementTimeoutError>())
                 && !is_autocommit
             {
-                // pg-tikv does not currently implement PostgreSQL's "failed
+                // db9-server does not currently implement PostgreSQL's "failed
                 // transaction" state. To avoid leaving an open transaction in
                 // an unknown partial state, abort it on statement timeout.
                 session.rollback().await?;

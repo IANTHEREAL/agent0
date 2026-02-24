@@ -1,5 +1,5 @@
-psql:/home/dongxu/lab/pg-tikv/tests/186_schema_change_retry.sql:19: ERROR:  Table 'public.t' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/186_schema_change_retry.sql:22: ERROR:  Column not found
+psql:/home/dongxu/lab/db9-server/tests/186_schema_change_retry.sql:19: ERROR:  Table 'public.t' already exists
+psql:/home/dongxu/lab/db9-server/tests/186_schema_change_retry.sql:22: ERROR:  Column not found
          tablename         
 ---------------------------
  ;--dontask

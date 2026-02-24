@@ -1,11 +1,11 @@
 ---
-name: local-tipg-up
-description: "Start a local tipg (pg-tikv) instance in sandbox: start TiKV via scripts/tikv_admin.py, build with cargo, run pg-tikv, then smoke-test with pg_isready + a simple SQL (SELECT 1)."
+name: local-db9-up
+description: "Start a local db9 (db9-server) instance in sandbox: start TiKV via scripts/tikv_admin.py, build with cargo, run db9-server, then smoke-test with pg_isready + a simple SQL (SELECT 1)."
 ---
 
-# Local tipg up (sandbox)
+# Local db9 up (sandbox)
 
-Run everything from the repo root (example: `cd /path/to/tipg`).
+Run everything from the repo root (example: `cd /path/to/db9`).
 
 ## Prerequisites
 
@@ -36,18 +36,18 @@ If you already started it (or forgot the port), print it again:
 uv run scripts/tikv_admin.py status --name dev
 ```
 
-## Build tipg (pg-tikv) (confirm it compiles)
+## Build db9 (db9-server) (confirm it compiles)
 
 ```bash
 cargo build --release
 ```
 
-## Start pg-tikv
+## Start db9-server
 
 ```bash
 PD_ENDPOINTS=127.0.0.1:<pd_port> \
 PG_PORT=5433 \
-./target/release/pg-tikv
+./target/release/db9-server
 ```
 
 If you want to run it in the background (so you can smoke-test in the same terminal):
@@ -55,7 +55,7 @@ If you want to run it in the background (so you can smoke-test in the same termi
 ```bash
 PD_ENDPOINTS=127.0.0.1:<pd_port> \
 PG_PORT=5433 \
-./target/release/pg-tikv > /tmp/pg-tikv.log 2>&1 & echo $! > /tmp/pg-tikv.pid
+./target/release/db9-server > /tmp/db9-server.log 2>&1 & echo $! > /tmp/db9-server.pid
 ```
 
 Optional:
@@ -69,7 +69,7 @@ TLS (optional):
 ```bash
 PG_TLS_CERT=/path/server.crt \
 PG_TLS_KEY=/path/server.key \
-./target/release/pg-tikv
+./target/release/db9-server
 ```
 
 ## Verify + connect
@@ -102,18 +102,18 @@ uv run scripts/tikv_admin.py start --name dev --persistent
 
 ### `Address already in use` on port 5433
 
-- Reuse the existing pg-tikv if it’s already listening:
+- Reuse the existing db9-server if it’s already listening:
   - Check listener (pick one): `ss -ltn | grep -F ':5433'` OR `netstat -ltn 2>/dev/null | grep -F ':5433'` OR `lsof -nP -iTCP:5433 -sTCP:LISTEN`
 - Or pick a different port:
 
 ```bash
-PG_PORT=5434 PD_ENDPOINTS=127.0.0.1:<pd_port> ./target/release/pg-tikv
+PG_PORT=5434 PD_ENDPOINTS=127.0.0.1:<pd_port> ./target/release/db9-server
 pg_isready -h 127.0.0.1 -p 5434
 ```
 
 ## Stop
 
-- Stop `pg-tikv`: `Ctrl-C` in the server terminal
+- Stop `db9-server`: `Ctrl-C` in the server terminal
 - Stop TiKV cluster:
 
 ```bash

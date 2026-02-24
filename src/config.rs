@@ -41,10 +41,10 @@ impl ServerConfig {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
 
-        if let Ok(v) = env::var("PGTIKV_STATEMENT_TIMEOUT_MS") {
+        if let Ok(v) = env::var("DB9_STATEMENT_TIMEOUT_MS") {
             cfg.statement_timeout_ms = v.parse::<u64>().ok().unwrap_or(cfg.statement_timeout_ms);
         }
-        if let Ok(v) = env::var("PGTIKV_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS") {
+        if let Ok(v) = env::var("DB9_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS") {
             cfg.idle_in_transaction_session_timeout_ms = v
                 .parse::<u64>()
                 .ok()
@@ -84,8 +84,8 @@ mod tests {
         let _guard = test_lock().lock().unwrap();
 
         let keys = [
-            "PGTIKV_STATEMENT_TIMEOUT_MS",
-            "PGTIKV_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS",
+            "DB9_STATEMENT_TIMEOUT_MS",
+            "DB9_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS",
         ];
 
         let saved: Vec<(String, Option<String>)> = keys
@@ -119,7 +119,7 @@ mod tests {
     fn test_statement_timeout_env_override() {
         let _guard = test_lock().lock().unwrap();
 
-        let key = "PGTIKV_STATEMENT_TIMEOUT_MS";
+        let key = "DB9_STATEMENT_TIMEOUT_MS";
         let saved = env::var(key).ok();
 
         unsafe {
@@ -143,7 +143,7 @@ mod tests {
     fn test_idle_in_transaction_timeout_env_override() {
         let _guard = test_lock().lock().unwrap();
 
-        let key = "PGTIKV_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS";
+        let key = "DB9_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS";
         let saved = env::var(key).ok();
 
         unsafe {
@@ -167,7 +167,7 @@ mod tests {
     fn test_zero_timeout_allowed() {
         let _guard = test_lock().lock().unwrap();
 
-        let key = "PGTIKV_STATEMENT_TIMEOUT_MS";
+        let key = "DB9_STATEMENT_TIMEOUT_MS";
         let saved = env::var(key).ok();
 
         unsafe {
@@ -190,7 +190,7 @@ mod tests {
     fn test_invalid_env_var_falls_back_to_default() {
         let _guard = test_lock().lock().unwrap();
 
-        let key = "PGTIKV_STATEMENT_TIMEOUT_MS";
+        let key = "DB9_STATEMENT_TIMEOUT_MS";
         let saved = env::var(key).ok();
 
         unsafe {

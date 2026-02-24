@@ -10,4 +10,4 @@ owner_seq|alice
 routine_name|routine_owner
 test_func|alice
 (1 row)
-psql:/home/dongxu/lab/pg-tikv/tests/95_alter_owner.sql:6: NOTICE:  table "owner_test" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/95_alter_owner.sql:6: NOTICE:  table "owner_test" does not exist, skipping

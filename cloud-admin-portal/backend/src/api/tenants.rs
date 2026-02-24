@@ -238,9 +238,9 @@ pub async fn get_tenant(
             region: None,
             priority: 100 - (i as i32) * 10,
             description: if endpoint_tuples.len() > 1 {
-                Some(format!("pg-tikv endpoint {}", i + 1))
+                Some(format!("db9-server endpoint {}", i + 1))
             } else {
-                Some("pg-tikv primary endpoint".into())
+                Some("db9-server primary endpoint".into())
             },
             enabled: true,
         })

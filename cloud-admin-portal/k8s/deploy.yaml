@@ -17,7 +17,7 @@ spec:
   dnsNames:
     - db9.shared.aws.tidbcloud.com
 ---
-# Backend - pgtikv-admin API server
+# Backend - db9-admin API server
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -39,25 +39,25 @@ spec:
         ports:
         - containerPort: 8090
         env:
-        - name: PGTIKV_PD_ENDPOINTS
+        - name: DB9_PD_ENDPOINTS
           value: "https://serverless-cluster-pd.tidb-serverless.svc.cluster.local:2379"
-        - name: PGTIKV_PG_HOST
-          value: "pg-tikv.tipg.svc.cluster.local"
-        - name: PGTIKV_PG_PORT
+        - name: DB9_PG_HOST
+          value: "db9-server.db9.svc.cluster.local"
+        - name: DB9_PG_PORT
           value: "5433"
-        - name: PGTIKV_PG_PUBLIC_ENDPOINTS
+        - name: DB9_PG_PUBLIC_ENDPOINTS
           value: "pg.shared.aws.tidbcloud.com:5433"
-        - name: PGTIKV_API_HOST
+        - name: DB9_API_HOST
           value: "0.0.0.0"
-        - name: PGTIKV_API_PORT
+        - name: DB9_API_PORT
           value: "8090"
-        - name: PGTIKV_DATABASE_URL
+        - name: DB9_DATABASE_URL
           value: "postgresql://db9admin:NzZybD8wmfi028xN1AGDshXd@cloud-admin-pg:5432/db9"
-        - name: PGTIKV_CORS_ORIGINS
+        - name: DB9_CORS_ORIGINS
           value: "https://db9.shared.aws.tidbcloud.com"
-        - name: PGTIKV_RECONCILER_ENABLED
+        - name: DB9_RECONCILER_ENABLED
           value: "true"
-        - name: PGTIKV_RECONCILER_SYNC_KEYSPACES
+        - name: DB9_RECONCILER_SYNC_KEYSPACES
           value: "false"
         - name: TIKV_CA_PATH
           value: "/tls/ca.crt"

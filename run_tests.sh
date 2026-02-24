@@ -78,7 +78,7 @@ mkdir -p "$REPORT_DIR"
 
 # Timing
 START_TIME=$(date +%s)
-PGTIKV_PID=""
+DB9_PID=""
 ORM_DATABASE=""
 
 # Test results
@@ -90,17 +90,17 @@ ORM_OUTPUT=""
 cleanup() {
     echo ""
     echo "=== Cleaning up ==="
-    if [ -n "$ORM_DATABASE" ] && [ -n "$PGTIKV_PID" ] && kill -0 "$PGTIKV_PID" 2>/dev/null; then
+    if [ -n "$ORM_DATABASE" ] && [ -n "$DB9_PID" ] && kill -0 "$DB9_PID" 2>/dev/null; then
         echo "Dropping isolated ORM database '$ORM_DATABASE'..."
         PGPASSWORD="$PG_PASSWORD" psql -X -q \
             -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d postgres \
             -v ON_ERROR_STOP=1 \
             -c "DROP DATABASE IF EXISTS \"$ORM_DATABASE\"" 2>/dev/null || true
     fi
-    if [ -n "$PGTIKV_PID" ] && kill -0 "$PGTIKV_PID" 2>/dev/null; then
-        echo "Stopping pg-tikv (PID: $PGTIKV_PID)..."
-        kill "$PGTIKV_PID" 2>/dev/null || true
-        wait "$PGTIKV_PID" 2>/dev/null || true
+    if [ -n "$DB9_PID" ] && kill -0 "$DB9_PID" 2>/dev/null; then
+        echo "Stopping db9-server (PID: $DB9_PID)..."
+        kill "$DB9_PID" 2>/dev/null || true
+        wait "$DB9_PID" 2>/dev/null || true
     fi
     echo "Cleaning TiKV cluster '$CLUSTER_NAME'..."
     uv run "$SCRIPT_DIR/scripts/tikv_admin.py" clean --name "$CLUSTER_NAME" 2>/dev/null || true
@@ -116,7 +116,7 @@ log() {
 
 # Initialize report
 cat > "$REPORT_FILE" << EOF
-# pg-tikv Test Report
+# db9-server Test Report
 
 **Generated**: $(date '+%Y-%m-%d %H:%M:%S')
 **Host**: $(hostname)
@@ -130,7 +130,7 @@ cat > "$REPORT_FILE" << EOF
 
 EOF
 
-echo "=== pg-tikv Full Test Suite ==="
+echo "=== db9-server Full Test Suite ==="
 echo ""
 
 echo "[1/5] Starting TiKV cluster '$CLUSTER_NAME'..."
@@ -150,7 +150,7 @@ echo ""
 
 if [[ "$PG_PORT_IS_EXPLICIT" -eq 0 ]]; then
     PG_PORT="$(pick_free_port "$PG_HOST")"
-    echo "Selected free pg-tikv port: $PG_PORT"
+    echo "Selected free db9-server port: $PG_PORT"
 elif ! is_port_free "$PG_HOST" "$PG_PORT"; then
     echo "ERROR: requested PG_PORT=$PG_PORT is already in use"
     echo "### Error: requested PG_PORT=$PG_PORT is already in use" >> "$REPORT_FILE"
@@ -164,15 +164,15 @@ cat >> "$REPORT_FILE" << EOF
 |-----------|-------|
 | TiKV Cluster | $CLUSTER_NAME |
 | PD Endpoint | 127.0.0.1:$PD_PORT |
-| pg-tikv Host | $PG_HOST |
-| pg-tikv Port | $PG_PORT |
+| db9-server Host | $PG_HOST |
+| db9-server Port | $PG_PORT |
 | User | $PG_USER |
 | ORM Database | isolated (auto-created per run) |
 | Prisma | $([ "$INCLUDE_PRISMA" -eq 1 ] && echo "enabled" || echo "skipped") |
 
 EOF
 
-echo "[2/5] Building pg-tikv..."
+echo "[2/5] Building db9-server..."
 BUILD_START=$(date +%s)
 cargo build --release --quiet
 BUILD_END=$(date +%s)
@@ -186,21 +186,21 @@ echo "- Duration: ${BUILD_TIME}s" >> "$REPORT_FILE"
 echo "- Mode: release" >> "$REPORT_FILE"
 echo "" >> "$REPORT_FILE"
 
-echo "[3/5] Starting pg-tikv on port $PG_PORT..."
+echo "[3/5] Starting db9-server on port $PG_PORT..."
 PD_ENDPOINTS="127.0.0.1:$PD_PORT" \
 PG_LISTEN_ADDR="$PG_HOST" \
 PG_PORT="$PG_PORT" \
-PGTIKV_BOOTSTRAP_ADMIN_USER="$PG_USER" \
-PGTIKV_BOOTSTRAP_ADMIN_PASSWORD="$PG_PASSWORD" \
-PGTIKV_INSECURE=1 \
-"$SCRIPT_DIR/target/release/pg-tikv" > /tmp/pgtikv-test.log 2>&1 &
-PGTIKV_PID=$!
+DB9_BOOTSTRAP_ADMIN_USER="$PG_USER" \
+DB9_BOOTSTRAP_ADMIN_PASSWORD="$PG_PASSWORD" \
+DB9_INSECURE=1 \
+"$SCRIPT_DIR/target/release/db9-server" > /tmp/db9-test.log 2>&1 &
+DB9_PID=$!
 
 for i in $(seq 1 30); do
-    if ! kill -0 "$PGTIKV_PID" 2>/dev/null; then
-        echo "ERROR: pg-tikv failed to start"
-        cat /tmp/pgtikv-test.log
-        echo "### Error: pg-tikv failed to start" >> "$REPORT_FILE"
+    if ! kill -0 "$DB9_PID" 2>/dev/null; then
+        echo "ERROR: db9-server failed to start"
+        cat /tmp/db9-test.log
+        echo "### Error: db9-server failed to start" >> "$REPORT_FILE"
         exit 1
     fi
     if pg_isready -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -q 2>/dev/null; then
@@ -209,22 +209,22 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-if ! kill -0 "$PGTIKV_PID" 2>/dev/null; then
-    echo "ERROR: pg-tikv exited before readiness"
-    cat /tmp/pgtikv-test.log
-    echo "### Error: pg-tikv exited before readiness" >> "$REPORT_FILE"
+if ! kill -0 "$DB9_PID" 2>/dev/null; then
+    echo "ERROR: db9-server exited before readiness"
+    cat /tmp/db9-test.log
+    echo "### Error: db9-server exited before readiness" >> "$REPORT_FILE"
     exit 1
 fi
 
 if ! pg_isready -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -q 2>/dev/null; then
-    echo "ERROR: pg-tikv not ready after 30s"
-    cat /tmp/pgtikv-test.log
-    echo "### Error: pg-tikv not ready after 30s" >> "$REPORT_FILE"
+    echo "ERROR: db9-server not ready after 30s"
+    cat /tmp/db9-test.log
+    echo "### Error: db9-server not ready after 30s" >> "$REPORT_FILE"
     exit 1
 fi
 
 PG_DSN="postgres://$PG_USER:$PG_PASSWORD@$PG_HOST:$PG_PORT/postgres"
-echo "pg-tikv ready (PID: $PGTIKV_PID)"
+echo "db9-server ready (PID: $DB9_PID)"
 echo "PG_DSN: $PG_DSN"
 echo ""
 

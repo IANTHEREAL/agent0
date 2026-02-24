@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Extended protocol smoke test for pg-tikv.
+Extended protocol smoke test for db9-server.
 
 Exercises do_describe_statement by sending parameterized queries through the
 PostgreSQL extended query protocol (Parse/Bind/Describe/Execute). Uses psycopg3
@@ -126,7 +126,7 @@ def main():
 
     # Regression tests for #907: prepared scalar expression and catalog-heavy
     # subquery must not stack-overflow under default 8 MiB worker stack.
-    # Run with PGTIKV_TOKIO_STACK_MB=8 to get a deterministic signal.
+    # Run with DB9_TOKIO_STACK_MB=8 to get a deterministic signal.
     # 4th element is an optional (checker_fn, description) for result validation.
     tests.append(
         (

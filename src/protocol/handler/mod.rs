@@ -45,7 +45,7 @@ use encode::{datatype_to_pgtype, result_to_response, result_to_response_with_for
 pub use dynamic::DynamicHandlerFactory;
 #[allow(unused_imports)]
 pub use dynamic::DynamicPgHandler;
-pub use query_parser::TipgQueryParser;
+pub use query_parser::Db9QueryParser;
 pub use server_params::PgServerParameterProvider;
 
 /// Custom metadata key for storing the extracted keyspace

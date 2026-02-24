@@ -9,7 +9,7 @@
 
 ## 概述
 
-为 pg-tikv 添加 Hash Join 支持，将等值连接的时间复杂度从 O(N×M) 降低到 O(N+M)。
+为 db9-server 添加 Hash Join 支持，将等值连接的时间复杂度从 O(N×M) 降低到 O(N+M)。
 
 ## 动机
 

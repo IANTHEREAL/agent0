@@ -1,4 +1,4 @@
-# pg-tikv Documentation
+# db9-server Documentation
 
 A PostgreSQL-compatible distributed SQL database built on TiKV.
 
@@ -16,7 +16,7 @@ A PostgreSQL-compatible distributed SQL database built on TiKV.
 
 ## Overview
 
-pg-tikv provides a PostgreSQL wire protocol interface on top of TiKV's distributed key-value storage. This allows you to use standard PostgreSQL clients (psql, pgcli, language drivers) while benefiting from TiKV's horizontal scalability and strong consistency.
+db9-server provides a PostgreSQL wire protocol interface on top of TiKV's distributed key-value storage. This allows you to use standard PostgreSQL clients (psql, pgcli, language drivers) while benefiting from TiKV's horizontal scalability and strong consistency.
 
 ### Key Features
 
@@ -48,13 +48,13 @@ pg-tikv provides a PostgreSQL wire protocol interface on top of TiKV's distribut
 # Start TiKV (requires tiup)
 tiup playground --mode tikv-slim
 
-# Build and run pg-tikv
+# Build and run db9-server
 cargo build --release
-PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=<password> ./target/release/pg-tikv
+DB9_BOOTSTRAP_ADMIN_PASSWORD=<password> ./target/release/db9-server
 
 # Connect with psql
 psql -h 127.0.0.1 -p 5433 -U admin
-# Password: (the value you used for `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD`)
+# Password: (the value you used for `DB9_BOOTSTRAP_ADMIN_PASSWORD`)
 ```
 
 See [Quick Start Guide](./quickstart.md) for detailed instructions.

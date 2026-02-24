@@ -1,7 +1,7 @@
 """
 Database connection and pgvector table setup.
 
-Works with both standard PostgreSQL (+ pgvector extension) and pg-tikv
+Works with both standard PostgreSQL (+ pgvector extension) and db9-server
 (which has built-in vector support without needing CREATE EXTENSION).
 """
 
@@ -57,7 +57,7 @@ class VectorDB:
             else:
                 # Fallback: teach psycopg2 to send Python lists as vector literals
                 psycopg2.extensions.register_adapter(list, _adapt_list_as_vector)
-                logger.info("Connected (using string vector adapter for pg-tikv)")
+                logger.info("Connected (using string vector adapter for db9-server)")
             return True
         except Exception as e:
             logger.error(f"Connection failed: {e}")
@@ -74,12 +74,12 @@ class VectorDB:
     # ------------------------------------------------------------------
     def setup(self):
         with self.conn.cursor() as cur:
-            # pg-tikv has built-in vector; standard PG needs the extension
+            # db9-server has built-in vector; standard PG needs the extension
             try:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
                 logger.info("pgvector extension enabled")
             except Exception:
-                logger.info("CREATE EXTENSION skipped (pg-tikv has built-in vector support)")
+                logger.info("CREATE EXTENSION skipped (db9-server has built-in vector support)")
 
             cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS documents (
@@ -91,7 +91,7 @@ class VectorDB:
             """)
             logger.info("Table 'documents' ready")
 
-            # IVFFlat index — not supported on pg-tikv, optional on standard PG
+            # IVFFlat index — not supported on db9-server, optional on standard PG
             try:
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_documents_embedding

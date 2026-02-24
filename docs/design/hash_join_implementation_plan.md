@@ -11,7 +11,7 @@
 
 ### 1.1 问题陈述
 
-pg-tikv 当前所有 JOIN 操作都使用 Nested Loop Join，时间复杂度 O(N×M)。对于大表 JOIN：
+db9-server 当前所有 JOIN 操作都使用 Nested Loop Join，时间复杂度 O(N×M)。对于大表 JOIN：
 - 1K × 1K = 1M 次比较 → ~1秒
 - 10K × 10K = 100M 次比较 → ~100秒
 - 100K × 100K = 10B 次比较 → 超时

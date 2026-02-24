@@ -1,4 +1,4 @@
-# pg-tikv PRDs
+# db9-server PRDs
 
 Product Requirements Documents for planned features.
 

@@ -1,6 +1,6 @@
 # Configuration
 
-pg-tikv is configured through environment variables.
+db9-server is configured through environment variables.
 
 ## Environment Variables
 
@@ -15,18 +15,18 @@ This document is a convenience overview. The authoritative list of config keys +
 | `PG_TLS_CERT` | (unset) | TLS cert path (PEM); enable TLS only when both cert+key are set |
 | `PG_TLS_KEY` | (unset) | TLS key path (PEM; PKCS#8 or RSA) |
 | `PG_REQUIRE_TLS` | `false` | Require TLS for all pgwire connections |
-| `PGTIKV_BOOTSTRAP_ADMIN_USER` | `admin` | Initial superuser name for bootstrapping |
-| `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD` | (unset) | Initial superuser password for bootstrapping (required when no superuser exists yet) |
-| `PGTIKV_DEV` | `false` | Dev-only escape hatch (legacy insecure bootstrap) |
-| `PGTIKV_INSECURE` | `false` | Explicit insecure posture escape hatch |
-| `PGTIKV_TOKIO_STACK_MB` | `4` | Tokio worker thread stack size (MB) |
+| `DB9_BOOTSTRAP_ADMIN_USER` | `admin` | Initial superuser name for bootstrapping |
+| `DB9_BOOTSTRAP_ADMIN_PASSWORD` | (unset) | Initial superuser password for bootstrapping (required when no superuser exists yet) |
+| `DB9_DEV` | `false` | Dev-only escape hatch (legacy insecure bootstrap) |
+| `DB9_INSECURE` | `false` | Explicit insecure posture escape hatch |
+| `DB9_TOKIO_STACK_MB` | `4` | Tokio worker thread stack size (MB) |
 
 ## Examples
 
 ### Basic Configuration
 
 ```bash
-PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=<password> ./target/release/pg-tikv
+DB9_BOOTSTRAP_ADMIN_PASSWORD=<password> ./target/release/db9-server
 ```
 
 Uses all defaults:
@@ -38,14 +38,14 @@ Uses all defaults:
 
 ```bash
 PD_ENDPOINTS=10.0.0.1:2379,10.0.0.2:2379,10.0.0.3:2379 \
-PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=<password> \
-./target/release/pg-tikv
+DB9_BOOTSTRAP_ADMIN_PASSWORD=<password> \
+./target/release/db9-server
 ```
 
 ### Custom Port
 
 ```bash
-PG_PORT=5432 PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=<password> ./target/release/pg-tikv
+PG_PORT=5432 DB9_BOOTSTRAP_ADMIN_PASSWORD=<password> ./target/release/db9-server
 ```
 
 ### Full Production Example
@@ -54,11 +54,11 @@ PG_PORT=5432 PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=<password> ./target/release/pg-tikv
 PD_ENDPOINTS=pd1.example.com:2379,pd2.example.com:2379 \
 PG_PORT=5432 \
 PG_KEYSPACE=production \
-PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=<strong_password> \
+DB9_BOOTSTRAP_ADMIN_PASSWORD=<strong_password> \
 PG_TLS_CERT=/path/to/server.crt \
 PG_TLS_KEY=/path/to/server.key \
 PG_REQUIRE_TLS=1 \
-./target/release/pg-tikv
+./target/release/db9-server
 ```
 
 ## TiKV Configuration
@@ -166,12 +166,12 @@ let (client, connection) = tokio_postgres::connect(
 
 ## Logging
 
-pg-tikv uses the `tracing` crate for logging. Log level is set to INFO by default.
+db9-server uses the `tracing` crate for logging. Log level is set to INFO by default.
 
 ### Log Output
 
 ```
-INFO pg-tikv starting up...
+INFO db9-server starting up...
 INFO PD endpoints: 127.0.0.1:2379
 INFO PostgreSQL port: 5433
 INFO PostgreSQL listen addr: 127.0.0.1
@@ -198,7 +198,7 @@ let subscriber = FmtSubscriber::builder()
 
 ### Connection Limits
 
-pg-tikv doesn't currently implement connection limits. Each connection spawns a tokio task.
+db9-server doesn't currently implement connection limits. Each connection spawns a tokio task.
 
 ### Query Limits
 
@@ -206,7 +206,7 @@ No built-in query timeout or result size limits. These should be implemented at 
 
 ## Health Checks
 
-pg-tikv responds to PostgreSQL protocol, so standard PostgreSQL health checks work:
+db9-server responds to PostgreSQL protocol, so standard PostgreSQL health checks work:
 
 ```bash
 # Simple connectivity check
@@ -228,9 +228,9 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/pg-tikv /usr/local/bin/
+COPY --from=builder /app/target/release/db9-server /usr/local/bin/
 EXPOSE 5433
-CMD ["pg-tikv"]
+CMD ["db9-server"]
 ```
 
 ### Docker Compose
@@ -255,7 +255,7 @@ services:
       - --pd-endpoints=pd:2379
       - --addr=0.0.0.0:20160
 
-  pg-tikv:
+  db9-server:
     build: .
     depends_on:
       - tikv
@@ -268,20 +268,20 @@ services:
 
 ## Systemd Service
 
-Create `/etc/systemd/system/pg-tikv.service`:
+Create `/etc/systemd/system/db9-server.service`:
 
 ```ini
 [Unit]
-Description=pg-tikv PostgreSQL-compatible TiKV frontend
+Description=db9-server PostgreSQL-compatible TiKV frontend
 After=network.target
 
 [Service]
 Type=simple
-User=pgtikv
-Group=pgtikv
+User=db9
+Group=db9
 Environment=PD_ENDPOINTS=127.0.0.1:2379
 Environment=PG_PORT=5433
-ExecStart=/usr/local/bin/pg-tikv
+ExecStart=/usr/local/bin/db9-server
 Restart=always
 RestartSec=5
 
@@ -293,6 +293,6 @@ Enable and start:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable pg-tikv
-sudo systemctl start pg-tikv
+sudo systemctl enable db9-server
+sudo systemctl start db9-server
 ```

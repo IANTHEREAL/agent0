@@ -47,7 +47,7 @@ fn main() -> Result<()> {
         Ok(cli::CliAction::Run(cli_args)) => cli_args,
         Err(msg) => {
             eprintln!(
-                "Error: {}\nTry 'pg-tikv --help' for usage information.",
+                "Error: {}\nTry 'db9-server --help' for usage information.",
                 msg
             );
             std::process::exit(1);
@@ -57,8 +57,8 @@ fn main() -> Result<()> {
     // Critical execution boundaries (execute_via_optimizer, execute_subquery,
     // try_execute_analyzed) return boxed futures to keep async frame sizes
     // bounded for deep call chains (#907).
-    // Override via PGTIKV_TOKIO_STACK_MB for operational edge cases.
-    let stack_mb: usize = env::var("PGTIKV_TOKIO_STACK_MB")
+    // Override via DB9_TOKIO_STACK_MB for operational edge cases.
+    let stack_mb: usize = env::var("DB9_TOKIO_STACK_MB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&mb| mb > 0)
@@ -99,8 +99,8 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     let default_keyspace = cli_args.keyspace.or_else(|| env::var("PG_KEYSPACE").ok());
 
     let require_tls = config::env_bool("PG_REQUIRE_TLS");
-    let dev_mode = config::env_bool("PGTIKV_DEV");
-    let insecure_mode = config::env_bool("PGTIKV_INSECURE");
+    let dev_mode = config::env_bool("DB9_DEV");
+    let insecure_mode = config::env_bool("DB9_INSECURE");
     let server_config = ServerConfig::from_env().shared();
     info!(
         "Statement timeout default: {}ms, idle-in-transaction timeout default: {}ms",
@@ -114,7 +114,7 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     let tls_cert = cli_args.tls_cert.or_else(|| env::var("PG_TLS_CERT").ok());
     let tls_key = cli_args.tls_key.or_else(|| env::var("PG_TLS_KEY").ok());
 
-    info!("pg-tikv starting up...");
+    info!("db9-server starting up...");
     info!("PD endpoints: {}", pd_endpoints);
     info!("PostgreSQL port: {}", pg_port);
     info!("PostgreSQL listen addr: {}", pg_listen_addr);
@@ -129,12 +129,12 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     }
     if dev_mode {
         warn!(
-            "PGTIKV_DEV=1 enabled: legacy insecure dev behaviors may be allowed (DO NOT use in production)"
+            "DB9_DEV=1 enabled: legacy insecure dev behaviors may be allowed (DO NOT use in production)"
         );
     }
     if insecure_mode {
         warn!(
-            "PGTIKV_INSECURE=1 enabled: allowing explicitly insecure pgwire posture (DO NOT use in production)"
+            "DB9_INSECURE=1 enabled: allowing explicitly insecure pgwire posture (DO NOT use in production)"
         );
     }
 
@@ -173,7 +173,7 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     let listen_is_loopback = is_loopback_listen_addr(&pg_listen_addr);
     if !listen_is_loopback && tls_acceptor.is_none() && !(insecure_mode || dev_mode) {
         return Err(anyhow::anyhow!(
-            "Refusing to start without TLS on non-loopback PG_LISTEN_ADDR={}. Enable TLS (PG_TLS_CERT/PG_TLS_KEY) or explicitly opt into insecure mode (PGTIKV_INSECURE=1 or PGTIKV_DEV=1).",
+            "Refusing to start without TLS on non-loopback PG_LISTEN_ADDR={}. Enable TLS (PG_TLS_CERT/PG_TLS_KEY) or explicitly opt into insecure mode (DB9_INSECURE=1 or DB9_DEV=1).",
             pg_listen_addr
         ));
     }

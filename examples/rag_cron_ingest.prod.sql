@@ -33,7 +33,7 @@
 --     Option B (Shell): W parallel db9 processes (recommended for 10K+ files)
 --
 -- Prerequisites:
---   - pg-tikv with http extension
+--   - db9-server with http extension
 --   - Files uploaded to /inbox/ via `db9 fs cp` or SDK client.fs.write()
 --   - Set your OpenAI API key in rag_ingest_batch() below
 --
@@ -46,7 +46,7 @@
 --   6. Search:   db9 db sql <db-id> -q "SELECT * FROM rag_search('query')"
 --
 -- ============================================================================
--- KNOWN LIMITATIONS (pg-tikv PL/pgSQL)
+-- KNOWN LIMITATIONS (db9-server PL/pgSQL)
 -- ============================================================================
 --
 -- 1. Variable / column name conflicts:
@@ -121,9 +121,9 @@ CREATE TABLE rag_documents (
 );
 
 -- GIN index for full-text search
-SET tipg.use_optimizer = off;
+SET db9.use_optimizer = off;
 CREATE INDEX idx_rag_fts ON rag_documents USING GIN (tsv);
-SET tipg.use_optimizer = on;
+SET db9.use_optimizer = on;
 
 -- Per-transaction scratch space for batch embedding.
 -- Each concurrent worker writes with its own worker_id; rows are cleaned up

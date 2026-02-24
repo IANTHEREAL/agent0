@@ -542,7 +542,7 @@ pub(crate) fn get_backend(tenant_keyspace: &str) -> Box<dyn FsBackend> {
     };
 
     let tenant_id = tenant_keyspace
-        .strip_prefix("tipg_tenant_")
+        .strip_prefix("db9_tenant_")
         .unwrap_or(tenant_keyspace);
 
     let token = match mint_jwt(tenant_id, &secret) {
@@ -575,7 +575,7 @@ fn mint_jwt(tenant_id: &str, secret: &str) -> Result<String> {
         .as_secs();
 
     let claims = Claims {
-        sub: "pgtikv",
+        sub: "db9",
         ns: tenant_id,
         roles: ["admin"],
         exp: now + 300, // 5 minutes
@@ -605,7 +605,7 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let dir = PathBuf::from(format!(
-            "/tmp/pgtikv-fs9-backend-test-{name}-{}-{id}-{nanos}",
+            "/tmp/db9-fs9-backend-test-{name}-{}-{id}-{nanos}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("create test dir");
@@ -639,7 +639,7 @@ mod tests {
     async fn test_stat_nonexistent() {
         let backend = LocalFsBackend::new();
         let path = format!(
-            "/tmp/pgtikv-fs9-backend-missing-stat-{}",
+            "/tmp/db9-fs9-backend-missing-stat-{}",
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         );
         let err = backend

@@ -3,7 +3,7 @@
 - Updated: 2026-02-19 09:51 UTC
 - Branch: `issue-844-architecture-cleanup`
 - Commit: `216dfba`
-- PR: `https://github.com/c4pt0r/tipg/pull/846`
+- PR: `https://github.com/c4pt0r/db9/pull/846`
 
 ## Latest Update (2026-02-19 20:00 UTC)
 
@@ -180,7 +180,7 @@ Run full tests, summarize all failures, and investigate root causes with concret
 ### Initial failing environment (stale target)
 
 - Listener on `5433` was from deleted workspace binary:
-  - `/home/zhaiyl/Work/agents/w2/tipg/target/debug/pg-tikv (deleted)`
+  - `/home/zhaiyl/Work/agents/w2/db9/target/debug/db9-server (deleted)`
 - Version observed then: `db9 0.1.0-92287e20`
 
 ### Corrected environment (this branch)
@@ -221,7 +221,7 @@ Top surfaced SQL error signatures from integration log:
 - `unknown function: TO_CHAR`
 - `unknown function: BASIC_ADD` / `BASIC_MULTIPLY` / `REPLACE_TEST` / `TEST_ELSIF` / `TEST_INT4` / `TEST_RAISE_EXCEPTION`
 - `unsupported table-valued function: match_documents`
-- `unsupported table-valued function: _pgtikv_sys_export_ddl`
+- `unsupported table-valued function: _db9_sys_export_ddl`
 - `pg_background_launch: worker engine not available`
 - `expected BOOLEAN, found TEXT/INT in WHERE clause`
 - `cannot cast type DATE to TIMESTAMPTZ`
@@ -399,9 +399,9 @@ To eliminate local-environment drift, tests were rerun with a CI-equivalent stac
 
 - fresh `tiup playground` on `PD 127.0.0.1:2379`
 - `cargo build --release`
-- `PGTIKV_BOOTSTRAP_ADMIN_USER=admin`
-- `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=admin`
-- explicit `_sys_worker` keyspace creation via PD API v2 before pg-tikv startup
+- `DB9_BOOTSTRAP_ADMIN_USER=admin`
+- `DB9_BOOTSTRAP_ADMIN_PASSWORD=admin`
+- explicit `_sys_worker` keyspace creation via PD API v2 before db9-server startup
 
 ### Updated Results (CI-like stack)
 

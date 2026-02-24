@@ -1,7 +1,7 @@
 [project]
 name = "sqlalchemy-smoke"
 version = "0.1.0"
-description = "SQLAlchemy E2E smoke tests for pg-tikv"
+description = "SQLAlchemy E2E smoke tests for db9-server"
 requires-python = ">=3.12"
 dependencies = [
   "psycopg[binary]>=3.1.0",

@@ -1,8 +1,8 @@
 # cloud-admin-portal backend — native platform build for local e2e testing
-# Builds: pgtikv-admin (HTTP API server) + db9 (CLI) + sh9 (fs9 shell, from fs9 repo)
+# Builds: db9-admin (HTTP API server) + db9 (CLI) + sh9 (fs9 shell, from fs9 repo)
 #
 # Build contexts:
-#   default  — tipg repo root (../../)
+#   default  — db9 repo root (../../)
 #   fs9      — fs9 repo (${FS9_REPO_PATH}, via additional_contexts in docker-compose)
 
 # ── Stage 1: build sh9 from fs9 repo ────────────────────────────────────────
@@ -20,7 +20,7 @@ COPY --from=fs9 . .
 
 RUN cargo build --release -p sh9
 
-# ── Stage 2: build pgtikv-admin + db9 from tipg repo ────────────────────────
+# ── Stage 2: build db9-admin + db9 from db9 repo ────────────────────────
 FROM rust:1.88-bookworm AS admin-builder
 
 RUN apt-get update && apt-get install -y \
@@ -47,11 +47,11 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=admin-builder /app/target/release/pgtikv-admin /usr/local/bin/pgtikv-admin
-COPY --from=admin-builder /app/target/release/pgtikv-ctl /usr/local/bin/pgtikv-ctl
+COPY --from=admin-builder /app/target/release/db9-admin /usr/local/bin/db9-admin
+COPY --from=admin-builder /app/target/release/db9-ctl /usr/local/bin/db9-ctl
 COPY --from=admin-builder /app/target/release/db9 /usr/local/bin/db9
 COPY --from=sh9-builder /fs9/target/release/sh9 /usr/local/bin/sh9
 
 EXPOSE 8090
 
-CMD ["pgtikv-admin"]
+CMD ["db9-admin"]

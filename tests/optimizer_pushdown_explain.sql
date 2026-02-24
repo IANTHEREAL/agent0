@@ -5,7 +5,7 @@ CREATE TABLE opt_a (id INT PRIMARY KEY, x INT);
 CREATE TABLE opt_b (id INT PRIMARY KEY, aid INT, y INT);
 INSERT INTO opt_a VALUES (1, 10), (2, 20), (3, 30);
 INSERT INTO opt_b VALUES (1, 1, 100), (2, 2, 200), (3, 9, 300);
-SET tipg.use_optimizer = on;
+SET db9.use_optimizer = on;
 
 -- E1: INNER JOIN + left-only WHERE → Filter pushed below Join
 EXPLAIN SELECT a.id, b.y FROM opt_a a JOIN opt_b b ON a.id = b.aid WHERE a.x = 10;

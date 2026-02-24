@@ -20,7 +20,7 @@ class Embedding
   declare embedding: string;
 }
 
-describe('Sequelize Vector Operations [pg-tikv]', () => {
+describe('Sequelize Vector Operations [db9-server]', () => {
   let sequelize: Sequelize;
 
   beforeAll(async () => {

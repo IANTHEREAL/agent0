@@ -13,7 +13,7 @@ CREATE INDEX document_metadata_idx ON documents USING gin (doc_metadata);
 SELECT * FROM documents WHERE doc_metadata @> '{"type": "pdf"}';
 ```
 
-当前 pg-tikv：
+当前 db9-server：
 - 可以创建 GIN 索引（DDL 兼容）
 - **不会使用 GIN 索引**（全表扫描）
 

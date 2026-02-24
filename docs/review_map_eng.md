@@ -1,4 +1,4 @@
-# tipg / pg-tikv Global Map (v0)
+# db9 / db9-server Global Map (v0)
 
 > Goal: produce an “actionable navigation map” (direction first, details later). First provide global layering and how to locate the primary paths; later tasks will deepen and add evidence and details.  
 > Scope: **the entire repository**, but **heavily weighted toward the Rust core service**; `cloud-admin-portal/` is treated as a separate block (written separately in both horizontal and vertical dimensions).
@@ -79,8 +79,8 @@ Writing conventions:
 - [Partial] Flow 7 SELECT: `src/sql/executor.rs` `execute_query()` → `src/sql/executor_select.rs` `execute_query_with_ctes()` → (no FROM → tableless / has JOIN → `src/sql/executor_join.rs` / single table → planner+scan) → `src/sql/expr.rs`/`src/sql/aggregate.rs`/`src/sql/window.rs`
 - [Verified] Flow 8 COPY: `src/protocol/handler.rs` (COPY parse + CopyHandler) → `src/sql/executor.rs` `execute_copy_insert()` → `src/storage/*`
 - [Partial] Flow 9 Extensions/http: SQL table function → `src/sql/executor_extensions.rs` → `src/extensions/http.rs` (outbound requests + restrictions) → rowset
-- [Partial] Flow 10 Async AFTER triggers: `src/main.rs` `spawn_trigger_worker()` → `src/sql/trigger_worker.rs` (consume queue) ← `src/sql/executor_dml_ops.rs`/`src/sql/triggers.rs` (produce events) + diagnostics tables: `src/sql/executor_join.rs` (`_pgtikv_sys_trigger_queue_stats/_pgtikv_sys_trigger_dlq`)
-- [Verified] Flow 11 Observability: record `src/sql/executor.rs` (`record_statement`) + `src/sql/session.rs` (`record_commit`) → `src/observability.rs` (rolling window + samples) → sys tables `src/sql/executor_join.rs` (`_pgtikv_sys_observability/_pgtikv_sys_query_samples`) → portal (dashboard polling)
+- [Partial] Flow 10 Async AFTER triggers: `src/main.rs` `spawn_trigger_worker()` → `src/sql/trigger_worker.rs` (consume queue) ← `src/sql/executor_dml_ops.rs`/`src/sql/triggers.rs` (produce events) + diagnostics tables: `src/sql/executor_join.rs` (`_db9_sys_trigger_queue_stats/_db9_sys_trigger_dlq`)
+- [Verified] Flow 11 Observability: record `src/sql/executor.rs` (`record_statement`) + `src/sql/session.rs` (`record_commit`) → `src/observability.rs` (rolling window + samples) → sys tables `src/sql/executor_join.rs` (`_db9_sys_observability/_db9_sys_query_samples`) → portal (dashboard polling)
 - [Partial] Portal (admin plane): `cloud-admin-portal/backend/app/api/*.py` (tenant CRUD + connect/session + obs/query) ↔ `cloud-admin-portal/backend/app/services/{pd_client,pg_client}.py` ↔ `cloud-admin-portal/frontend/src/*` (`X-Tenant-Session` + polling)
 
 ---
@@ -128,8 +128,8 @@ Writing conventions:
     - Allowed value forms: `Identifier` / `CompoundIdentifier(len==1)` / `'a,b'` single-quoted string (split by comma); other expressions error out
     - Normalization: drop `$user`; `["default"]` becomes `["public"]`; schema names containing `.` are rejected; empty list defaults to `["public"]`
   - `DROP TABLE IF EXISTS ...`: for each missing table, generate an `ExecuteResult::Notice` before actual execution (`collect_notices_before_statement()`, message like `table "<name>" does not exist, skipping`)
-  - Observability account restriction: `_pgtikv_sys_observer` (non-superuser) is limited to:
-    - Single-table, no-JOIN queries from `_pgtikv_sys_observability/_pgtikv_sys_query_samples`
+  - Observability account restriction: `_db9_sys_observer` (non-superuser) is limited to:
+    - Single-table, no-JOIN queries from `_db9_sys_observability/_db9_sys_query_samples`
     - Tableless queries (`SELECT 1` without FROM; still restricted: no WITH/locks/subqueries)
     - Fact: for this account, transaction control statements (`BEGIN/COMMIT/ROLLBACK/SAVEPOINT/SET ...`) return `Empty` and `continue` directly in `Executor::execute()` (do not enter `session.*` branches); they appear allowed but have no effect. `UNKNOWN`: whether this intentionally prevents session state changes (verify with portal expectations and handler behavior).
   - Tableless query (`execute_tableless_query()`): allows a small set of SRF/functions (`UNNEST/regexp_split_to_table/regexp_matches/jsonb_*`) and `pg_sleep`; for multi-column SRF, rows are “zipped” by max length (short arrays padded with `NULL`)
@@ -172,7 +172,7 @@ Writing conventions:
     - `try_consume_http_request(max)`: per-statement counter; on overflow errors with `http: max_requests_per_statement exceeded`
   - `src/extensions/http.rs`: `http_*` table functions (outbound HTTP only)
     - Privilege: `execute_table_function()` requires `context::is_superuser()==true`, otherwise `permission denied for extension "http"`
-    - SSRF / security restrictions (`validate_url()`): only `http/https`; `http` is disabled by default (requires `PGTIKV_HTTP_ALLOW_INSECURE=true`); no userinfo; only default ports (`https:443` / `http:80`); disallow `localhost/*.localhost/*.local`; disallow direct or DNS-resolved loopback/private/link-local/unspecified IPs
+    - SSRF / security restrictions (`validate_url()`): only `http/https`; `http` is disabled by default (requires `DB9_HTTP_ALLOW_INSECURE=true`); no userinfo; only default ports (`https:443` / `http:80`); disallow `localhost/*.localhost/*.local`; disallow direct or DNS-resolved loopback/private/link-local/unspecified IPs
     - Resource limits:
       - max `5` requests per statement (via `ExtensionContext`)
       - max `20` concurrent requests per tenant per node (`Semaphore`, in-process)
@@ -195,12 +195,12 @@ Writing conventions:
 **Observability**
 - `src/observability.rs` (Verified): in-memory observability & sampling (`obs + perf`), plus support for portal/diagnostic queries
   - Config (env):
-    - `PGTIKV_OBS_ENABLED` (default true)
-    - `PGTIKV_OBS_SAMPLE_EVERY` (default 1000; 1/N sampling)
-    - `PGTIKV_OBS_SLOW_MS` (default 200ms; slow queries are always sampled)
-    - `PGTIKV_OBS_MAX_SAMPLE_EVENTS` (default 20000; sample event ring cap)
-    - `PGTIKV_OBS_MAX_SAMPLE_GROUPS` (default 50; max groups after aggregation)
-    - `PGTIKV_OBS_MAX_SQL_LEN` (default 512; normalized SQL is truncated and suffixed with `…`)
+    - `DB9_OBS_ENABLED` (default true)
+    - `DB9_OBS_SAMPLE_EVERY` (default 1000; 1/N sampling)
+    - `DB9_OBS_SLOW_MS` (default 200ms; slow queries are always sampled)
+    - `DB9_OBS_MAX_SAMPLE_EVENTS` (default 20000; sample event ring cap)
+    - `DB9_OBS_MAX_SAMPLE_GROUPS` (default 50; max groups after aggregation)
+    - `DB9_OBS_MAX_SQL_LEN` (default 512; normalized SQL is truncated and suffixed with `…`)
   - `ObservabilityRegistry::tenant(keyspace)`: get/cache `Arc<TenantObservability>` by keyspace (empty keyspace maps to `"default"`)
   - `TenantObservability`:
     - `connection_open()`: increments `active_connections`, decremented on Drop (approximate connection count)
@@ -225,14 +225,14 @@ Writing conventions:
   - `SessionManager` generates `session_id` as `ts_<hex>`, default TTL is 1 hour (`Settings.session_ttl_hours`)
   - Session contains `admin_user/admin_password` (in-memory; lost on process restart)
 - PG client: `cloud-admin-portal/backend/app/services/pg_client.py` (Verified)
-  - Uses `pg8000` (pure Python) to connect to pg-tikv; username is composed as `tenant.user` (dot-separated)
+  - Uses `pg8000` (pure Python) to connect to db9-server; username is composed as `tenant.user` (dot-separated)
   - `_run_sql()` formats results like `psql -t -A` (join columns with `|`, join rows with `\n`) for observability/SQL editor parsing
-  - Observability reads by querying `_pgtikv_sys_observability()` / `_pgtikv_sys_query_samples()` and splitting by `|` (therefore server-side sampling must avoid `|` in SQL; see replacement logic in `src/observability.rs`)
+  - Observability reads by querying `_db9_sys_observability()` / `_db9_sys_query_samples()` and splitting by `|` (therefore server-side sampling must avoid `|` in SQL; see replacement logic in `src/observability.rs`)
   - Key APIs (no global auth observed):
   - `cloud-admin-portal/backend/app/api/tenants.py` (Verified)
     - `POST /api/tenants/{tenant_id}/connect`: validate admin credentials, return `session_id` (frontend stores in `sessionStorage`, subsequent requests use `X-Tenant-Session`)
     - `POST /api/tenants/{tenant_id}/query`: requires `X-Tenant-Session`, executes arbitrary SQL using the admin credentials stored in the session
-    - `POST /api/tenants/{tenant_id}/observability/bootstrap`: create/rotate `_pgtikv_sys_observer` using admin credentials, store password in portal DB (observability API then uses that account)
+    - `POST /api/tenants/{tenant_id}/observability/bootstrap`: create/rotate `_db9_sys_observer` using admin credentials, store password in portal DB (observability API then uses that account)
     - `GET /api/tenants/{tenant_id}/observability`: read observer username/password from DB and query (endpoint itself does not require `X-Tenant-Session`)
   - `cloud-admin-portal/backend/app/api/users.py` (Verified): user management APIs require `X-Tenant-Session`
   - `cloud-admin-portal/backend/app/api/system.py` (Verified), `cloud-admin-portal/backend/app/api/audit.py` (Verified): health/info/audit logs without auth observed
@@ -387,7 +387,7 @@ Writing conventions:
     - join: JOIN present / multiple FROM → `src/sql/executor_join.rs` `execute_join_query_with_ctes(...)`
     - single-table: continue in `src/sql/executor_select.rs` (internally calls planner/scan/expr/agg/window, etc.)
   - “Data source” entrypoint: `src/sql/executor_join.rs` `get_table_data()`
-    - sys/virtual tables: `_pgtikv_sys_observability/_query_samples/_trigger_queue_stats/_trigger_dlq`, `current_schema/current_database/...`
+    - sys/virtual tables: `_db9_sys_observability/_query_samples/_trigger_queue_stats/_trigger_dlq`, `current_schema/current_database/...`
     - CTE: read directly from `ctes` map
     - `information_schema.*`: `src/sql/information_schema.rs`
     - view: `TikvStore::get_view()` → recursively execute view query
@@ -429,7 +429,7 @@ Writing conventions:
     - `http_*` table functions: extension must be installed and `enabled=true`, otherwise error
     - `http::execute_table_function()` additionally requires statement context `is_superuser==true` (otherwise `permission denied for extension "http"`)
   - Outbound request constraints (`src/extensions/http.rs`):
-    - Only `https://` by default (`http://` requires `PGTIKV_HTTP_ALLOW_INSECURE=true`)
+    - Only `https://` by default (`http://` requires `DB9_HTTP_ALLOW_INSECURE=true`)
     - Only default ports (`https:443` / `http:80`), no userinfo, disallow localhost/private/link-local/unspecified IPs (including DNS results)
     - Max 5 requests per statement; max 20 concurrent requests per tenant per node
     - connect timeout 1s, overall timeout 5s; request body ≤ 256KiB; response ≤ 1MiB; redirects ≤ 3
@@ -443,8 +443,8 @@ Writing conventions:
 - Facts (worker spawn + sys diagnostics entrypoints read):
   - Worker spawn: `src/main.rs` `sql::trigger_worker::spawn_trigger_worker(client_pool.clone())`
   - Sys diagnostics tables (`src/sql/executor_join.rs` `get_table_data()`):
-    - `_pgtikv_sys_trigger_queue_stats` (scan queue prefix and aggregate pending/processing/failed, DLQ count, events in last 1 minute, etc.)
-    - `_pgtikv_sys_trigger_dlq` (scan DLQ prefix and list failed events)
+    - `_db9_sys_trigger_queue_stats` (scan queue prefix and aggregate pending/processing/failed, DLQ count, events in last 1 minute, etc.)
+    - `_db9_sys_trigger_dlq` (scan DLQ prefix and list failed events)
   - DML path has trigger-related module clues: `src/sql/executor_dml_ops.rs` (imports `triggers/trigger_queue/trigger_worker`)
   - Event persistence/consumption entrypoints: `src/sql/trigger_queue.rs` / `src/sql/trigger_worker.rs`
 - Risks/Assumptions (to validate / needs experiments):
@@ -459,16 +459,16 @@ Writing conventions:
     - `Session::commit()`: after successful TiKV txn commit, call `TenantObservability::record_commit()` to increment commit count (TPS source; see `src/sql/session.rs`)
     - `TenantObservability::connection_open()`: each connection holds a `ConnectionGuard`, decremented on Drop
   - Sampling + normalization (`src/observability.rs`):
-    - Errors are always sampled; slow queries (≥`PGTIKV_OBS_SLOW_MS`) are always sampled; others sampled at `1/PGTIKV_OBS_SAMPLE_EVERY`
-    - SQL `normalize_sql()` (collapse whitespace, strip trailing `;`, truncate to `PGTIKV_OBS_MAX_SQL_LEN` and suffix with `…`), and replace `|` with space
+    - Errors are always sampled; slow queries (≥`DB9_OBS_SLOW_MS`) are always sampled; others sampled at `1/DB9_OBS_SAMPLE_EVERY`
+    - SQL `normalize_sql()` (collapse whitespace, strip trailing `;`, truncate to `DB9_OBS_MAX_SQL_LEN` and suffix with `…`), and replace `|` with space
   - External snapshots:
     - `snapshot_summary()`: statement/commit/error, QPS/TPS, avg/p99 latency, active_connections (window: last 1h / or min since process start)
     - `snapshot_query_samples()`: aggregate by `fnv1a_64(normalized_sql)`, return top-N by sample_count and include last_seen_ms_ago
   - Sys functions (SQL layer mapping):
-    - SQL execution treats `_pgtikv_sys_observability()` / `_pgtikv_sys_query_samples()` as “pseudo tables” under `FROM <table>`: `src/sql/executor_join.rs` `Executor::get_table_data()`
-    - Name matching supports `_PGTIKV_SYS_OBSERVABILITY` / `_PGTIKV_SYS_QUERY_SAMPLES`, and also schema-prefixed forms (`...ends_with("._PGTIKV_SYS_*")`)
+    - SQL execution treats `_db9_sys_observability()` / `_db9_sys_query_samples()` as “pseudo tables” under `FROM <table>`: `src/sql/executor_join.rs` `Executor::get_table_data()`
+    - Name matching supports `_DB9_SYS_OBSERVABILITY` / `_DB9_SYS_QUERY_SAMPLES`, and also schema-prefixed forms (`...ends_with("._DB9_SYS_*")`)
     - Data source: `self.observability().snapshot_summary()` / `snapshot_query_samples()`
-  - The same entrypoint also implements trigger queue diagnostics tables: `_pgtikv_sys_trigger_queue_stats` / `_pgtikv_sys_trigger_dlq` (scan queue/DLQ prefixes via TiKV `txn.scan(...)` and aggregate/list)
+  - The same entrypoint also implements trigger queue diagnostics tables: `_db9_sys_trigger_queue_stats` / `_db9_sys_trigger_dlq` (scan queue/DLQ prefixes via TiKV `txn.scan(...)` and aggregate/list)
 - Risks/Assumptions (to validate / needs experiments):
   - Lock contention / memory overhead of sampling under high concurrency and coupling with portal polling frequency (perf/obs risk; needs load tests and config validation)
 
@@ -476,7 +476,7 @@ Writing conventions:
 
 - Status: Partial
 - Flows (index):
-  1. **Portal login/tenant selection → connect to pg-tikv** (credentials/privilege model) (`security + tenancy`)
+  1. **Portal login/tenant selection → connect to db9-server** (credentials/privilege model) (`security + tenancy`)
   2. **Dashboard pulls observability data** (polling frequency, SQL normalization, error handling) (`obs + perf`)
   3. **Bootstrap/ops actions** (create observer account, privilege tightening, secret management) (`security + tenancy`)
 - Facts (key implementation entrypoints read):
@@ -486,10 +486,10 @@ Writing conventions:
     - Session storage: `cloud-admin-portal/backend/app/session.py` (in-memory; includes admin password; default 1h TTL)
   - Observability dashboard:
     - Frontend: `cloud-admin-portal/frontend/src/api/tenants.ts` `useTenantObservability()` polls every 5s by default; stops polling on HTTP 409 (not bootstrapped)
-    - Backend: `cloud-admin-portal/backend/app/api/tenants.py` `GET /api/tenants/{tenant_id}/observability` queries `_pgtikv_sys_observability()` / `_pgtikv_sys_query_samples()` using observer credentials stored in DB
+    - Backend: `cloud-admin-portal/backend/app/api/tenants.py` `GET /api/tenants/{tenant_id}/observability` queries `_db9_sys_observability()` / `_db9_sys_query_samples()` using observer credentials stored in DB
     - PG client: `cloud-admin-portal/backend/app/services/pg_client.py` (`pg8000` + pipe-delimited output parsing)
   - Bootstrap observer:
-    - Backend: `cloud-admin-portal/backend/app/api/tenants.py` `POST /api/tenants/{tenant_id}/observability/bootstrap` creates/rotates `_pgtikv_sys_observer` using admin credentials and stores the password in portal DB
+    - Backend: `cloud-admin-portal/backend/app/api/tenants.py` `POST /api/tenants/{tenant_id}/observability/bootstrap` creates/rotates `_db9_sys_observer` using admin credentials and stores the password in portal DB
   - Security boundary (implementation observation): multiple management APIs (e.g. `GET/POST /api/tenants`, `GET /api/audit-logs`, `GET /api/system/health`, `GET /api/tenants/{tenant_id}/observability`) have no global auth dependency observed; deployment may rely on network isolation / reverse proxy protection (verify with `cloud-admin-portal/deploy/` and real deployment)
 - Risks/Assumptions (to validate / needs experiments):
   - Whether `GET /api/tenants/{tenant_id}/observability` not requiring `X-Tenant-Session` is intentional design (confirm with threat model and deployment boundary)
@@ -596,7 +596,7 @@ Core service (Rust):
 - `docs/design/*.md`: P0/P1/P2 design details (implementation must follow code).
 - `docs/backlogs/*`: designs still marked “not implemented” (may conflict with current state; must be decided by code).
 - `docs/NEON_TUTORIAL_ASSESSMENT.md`: feature checklist aligned to the Neon tutorial (many conflicts with other docs; needs code comparison).
-- `TIPG_SQL_SPEC.md`: SQL spec summary based on “then-current code and tests” (may differ from current state).
+- `DB9_SQL_SPEC.md`: SQL spec summary based on “then-current code and tests” (may differ from current state).
 - `bug.md`: reproduction of Numeric result OID bug, root-cause hypothesis, portal workaround (needs code validation).
 - `review.md`: Async AFTER trigger queue design/implementation summary (provides entrypoint clues).
 - `PROGRESS.md` / `TODO.md`: historical progress and TODOs (clear timeline conflicts with current code/README; use cautiously).
@@ -623,7 +623,7 @@ In-repo guidance (affects later reading order and conventions):
 
 - **Feature positioning conflicts**:
   - `docs/architecture.md` “Not Supported” list (RIGHT/FULL JOIN, triggers, TLS, materialized views, etc.) clearly conflicts with `README.md` and `review.md`.
-  - `TIPG_SQL_SPEC.md` claims “triggers are only stored not executed / $$ strings not supported”, which may conflict with the direction in `review.md` / `docs/design/07_*`.
+  - `DB9_SQL_SPEC.md` claims “triggers are only stored not executed / $$ strings not supported”, which may conflict with the direction in `review.md` / `docs/design/07_*`.
   - `PROGRESS.md` still says “FK/CHECK not enforced”, conflicting with `docs/constraint-implementation-report.md` / `README.md`.
 - **Multi-tenant keyspace creation**:
   - `docs/multi-tenancy.md` says keyspaces must be created manually; `src/main.rs` appears to attempt PD HTTP API creation on connection failure (needs verification of the error branch and behavior).
@@ -652,12 +652,12 @@ Multi-tenancy (keyspace):
 
 Authentication / RBAC:
 - **Auth method**: Cleartext password (`docs/authentication.md`); production requires TLS (same doc).
-- **Bootstrap admin**: explicit initial superuser bootstrap via `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD` (optionally `PGTIKV_BOOTSTRAP_ADMIN_USER`), per keyspace; `PGTIKV_DEV=1` enables legacy dev bootstrap (insecure).
+- **Bootstrap admin**: explicit initial superuser bootstrap via `DB9_BOOTSTRAP_ADMIN_PASSWORD` (optionally `DB9_BOOTSTRAP_ADMIN_USER`), per keyspace; `DB9_DEV=1` enables legacy dev bootstrap (insecure).
 - **Fallback password**: no global fallback password mechanism is implemented; authentication depends on per-user passwords.
 
 HTTP extension:
 - **Default privilege**: only SUPERUSER may execute (`docs/extensions.md`).
-- **Network restrictions**: by default only `https://` + 443; `PGTIKV_HTTP_ALLOW_INSECURE=true` enables `http://` + 80.
+- **Network restrictions**: by default only `https://` + 443; `DB9_HTTP_ALLOW_INSECURE=true` enables `http://` + 80.
 - **SSRF protection**: disallow `localhost/.localhost/.local`, disallow resolving to loopback/private/link-local/unspecified ranges.
 - **Resource limits**: connect timeout 1s, total timeout 5s, max body 256KiB, max response 1MiB, max redirects 3, max 5 HTTP calls per statement, max 20 concurrent per tenant per node (docs claim “hard-coded in code”).
 

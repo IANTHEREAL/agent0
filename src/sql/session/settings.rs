@@ -60,6 +60,18 @@ pub(crate) const KNOWN_GUCS: &[GucMeta] = &[
         static_default: None,
     },
     GucMeta {
+        name: "db9.max_sort_bytes",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "db9.use_optimizer",
+        immutable: true,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
         name: "default_table_access_method",
         immutable: false,
         description: "",
@@ -168,12 +180,6 @@ pub(crate) const KNOWN_GUCS: &[GucMeta] = &[
         static_default: Some("scram-sha-256"),
     },
     GucMeta {
-        name: "pgtikv.max_sort_bytes",
-        immutable: false,
-        description: "",
-        static_default: None,
-    },
-    GucMeta {
         name: "row_security",
         immutable: false,
         description: "",
@@ -218,12 +224,6 @@ pub(crate) const KNOWN_GUCS: &[GucMeta] = &[
     GucMeta {
         name: "timezone",
         immutable: false,
-        description: "",
-        static_default: None,
-    },
-    GucMeta {
-        name: "tipg.use_optimizer",
-        immutable: true,
         description: "",
         static_default: None,
     },
@@ -285,7 +285,7 @@ pub(crate) struct SessionSettings {
     transaction_isolation: Option<String>,
     default_transaction_read_only: Option<String>,
 
-    /// Generic storage for GUC parameters that tipg does not actively use but
+    /// Generic storage for GUC parameters that db9 does not actively use but
     /// drivers expect to SET/SHOW without error (e.g. `extra_float_digits`,
     /// `DateStyle`, `work_mem`). Values are stored as-is for `SHOW` readback.
     extra_settings: HashMap<String, String>,
@@ -340,7 +340,7 @@ impl SessionSettings {
     pub(crate) fn canonical_setting_name<'a>(name: &'a str) -> &'a str {
         match name {
             "transaction.isolation.level" => "transaction_isolation",
-            "tipg.max_sort_bytes" => "pgtikv.max_sort_bytes",
+            "db9.max_sort_bytes" => "db9.max_sort_bytes",
             _ => name,
         }
     }
@@ -514,23 +514,23 @@ impl SessionSettings {
                 let ms = Self::parse_timeout_millis(value)?;
                 Ok(Self::format_timeout_show(ms))
             }
-            "pgtikv.max_sort_bytes" => {
+            "db9.max_sort_bytes" => {
                 let bytes = Self::parse_byte_size(value)?;
                 Ok(bytes.to_string())
             }
-            "tipg.use_optimizer" => {
+            "db9.use_optimizer" => {
                 let normalized = value.trim().to_lowercase();
                 match normalized.as_str() {
                     "on" | "true" | "yes" | "1" => Ok(value.to_string()),
                     "off" | "false" | "no" | "0" => {
                         tracing::info!(
                             "NOTICE: optimizer cannot be disabled; \
-                             tipg.use_optimizer setting ignored"
+                             db9.use_optimizer setting ignored"
                         );
                         Ok(value.to_string())
                     }
                     _ => Err(SqlError::InvalidParameterValue {
-                        message: "parameter \"tipg.use_optimizer\" requires a Boolean value".into(),
+                        message: "parameter \"db9.use_optimizer\" requires a Boolean value".into(),
                     }
                     .into()),
                 }
@@ -611,10 +611,10 @@ impl SessionSettings {
                 self.idle_in_transaction_session_timeout_ms =
                     Self::parse_timeout_millis(&normalized)?
             }
-            "pgtikv.max_sort_bytes" => {
+            "db9.max_sort_bytes" => {
                 self.max_sort_bytes = Self::parse_byte_size(&normalized)?;
             }
-            "tipg.use_optimizer" => {}
+            "db9.use_optimizer" => {}
             "timezone" => self.timezone = Some(normalized.clone()),
             "application_name" => self.application_name = Some(normalized.clone()),
             "client_encoding" => self.client_encoding = Some(normalized.clone()),
@@ -718,8 +718,8 @@ impl SessionSettings {
                 self.idle_in_transaction_session_timeout_ms =
                     self.default_idle_in_transaction_session_timeout_ms
             }
-            "pgtikv.max_sort_bytes" => self.max_sort_bytes = DEFAULT_MAX_SORT_BYTES,
-            "tipg.use_optimizer" => {}
+            "db9.max_sort_bytes" => self.max_sort_bytes = DEFAULT_MAX_SORT_BYTES,
+            "db9.use_optimizer" => {}
             "timezone" => self.timezone = None,
             "application_name" => self.application_name = None,
             "client_encoding" => self.client_encoding = None,
@@ -789,8 +789,8 @@ impl SessionSettings {
             "idle_in_transaction_session_timeout" => Some(Self::format_timeout_show(
                 self.idle_in_transaction_session_timeout_ms,
             )),
-            "pgtikv.max_sort_bytes" => Some(self.max_sort_bytes.to_string()),
-            "tipg.use_optimizer" => Some("on".to_string()),
+            "db9.max_sort_bytes" => Some(self.max_sort_bytes.to_string()),
+            "db9.use_optimizer" => Some("on".to_string()),
             "timezone" => Some(self.timezone.as_deref().unwrap_or("UTC").to_string()),
             "application_name" => Some(self.application_name.as_deref().unwrap_or("").to_string()),
             "client_encoding" => Some(
@@ -937,14 +937,14 @@ impl SessionSettings {
     }
 
     pub(crate) fn max_sort_bytes(&self) -> usize {
-        if let Some(v) = self.local_overrides.get("pgtikv.max_sort_bytes") {
+        if let Some(v) = self.local_overrides.get("db9.max_sort_bytes") {
             match Self::parse_byte_size(v) {
                 Ok(bytes) => return bytes,
                 Err(e) => {
                     tracing::error!(
                         error = %e,
                         value = v,
-                        "invalid local pgtikv.max_sort_bytes override"
+                        "invalid local db9.max_sort_bytes override"
                     );
                 }
             }
@@ -968,8 +968,8 @@ impl SessionSettings {
         "statement_timeout",
         "lock_timeout",
         "idle_in_transaction_session_timeout",
-        "pgtikv.max_sort_bytes",
-        "tipg.use_optimizer",
+        "db9.max_sort_bytes",
+        "db9.use_optimizer",
         "timezone",
         "application_name",
         "client_encoding",

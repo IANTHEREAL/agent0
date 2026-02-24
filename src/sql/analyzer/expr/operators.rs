@@ -132,7 +132,7 @@ impl<'a> Analyzer<'a> {
         // PostgreSQL UNKNOWN literal rule (partial):
         //
         // String literals are untyped (UNKNOWN) in PostgreSQL and can be coerced
-        // to match a numeric operator context. In tipg, string literals are
+        // to match a numeric operator context. In db9, string literals are
         // initially typed as TEXT, which would otherwise reject `TEXT + INT`.
         //
         // We only apply this for *literal* text constants (not TEXT columns, and

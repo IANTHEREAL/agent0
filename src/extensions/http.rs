@@ -15,12 +15,12 @@ use tokio::net::lookup_host;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Check if insecure HTTP (non-HTTPS) requests are allowed.
-/// Controlled by `PGTIKV_HTTP_ALLOW_INSECURE` environment variable.
+/// Controlled by `DB9_HTTP_ALLOW_INSECURE` environment variable.
 /// Default: false (HTTPS-only, locked down ports/hosts).
 fn allow_insecure_http() -> bool {
     static ALLOW_INSECURE: OnceLock<bool> = OnceLock::new();
     *ALLOW_INSECURE.get_or_init(|| {
-        std::env::var("PGTIKV_HTTP_ALLOW_INSECURE")
+        std::env::var("DB9_HTTP_ALLOW_INSECURE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
@@ -253,7 +253,7 @@ async fn validate_url_with_policy(url: &Url, allow_insecure: bool) -> Result<()>
 
     if is_http && !allow_insecure {
         return Err(anyhow!(
-            "http: insecure http requests are disabled (set PGTIKV_HTTP_ALLOW_INSECURE=true to enable)"
+            "http: insecure http requests are disabled (set DB9_HTTP_ALLOW_INSECURE=true to enable)"
         ));
     }
 

@@ -2,9 +2,9 @@
 
 ## Overview
 
-This document specifies the pg-tikv worker binary — a separate, horizontally-scalable process that executes background tasks (Cron, AsyncTrigger, AutoAnalyze, BgDdl, BgSql) by polling a task queue in TiKV and executing SQL via pgwire loopback to the pg-tikv server.
+This document specifies the db9-server worker binary — a separate, horizontally-scalable process that executes background tasks (Cron, AsyncTrigger, AutoAnalyze, BgDdl, BgSql) by polling a task queue in TiKV and executing SQL via pgwire loopback to the db9-server server.
 
-**Phase 2 Goal:** Decouple worker execution from the main pg-tikv process, enabling independent scaling and operational isolation.
+**Phase 2 Goal:** Decouple worker execution from the main db9-server process, enabling independent scaling and operational isolation.
 
 ---
 
@@ -16,7 +16,7 @@ Add a separate binary target to `Cargo.toml`:
 
 ```toml
 [[bin]]
-name = "pg-tikv-worker"
+name = "db9-server-worker"
 path = "src/worker/bin/main.rs"
 ```
 
@@ -25,7 +25,7 @@ path = "src/worker/bin/main.rs"
 The worker binary accepts the following CLI arguments:
 
 ```bash
-pg-tikv-worker \
+db9-server-worker \
   --pd-endpoints 127.0.0.1:2379 \
   --pg-host localhost \
   --pg-port 5432 \
@@ -35,13 +35,13 @@ pg-tikv-worker \
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `--pd-endpoints` | string | `127.0.0.1:2379` | Comma-separated TiKV PD endpoints for cluster discovery |
-| `--pg-host` | string | `localhost` | pg-tikv server hostname for pgwire loopback |
-| `--pg-port` | int | `5432` | pg-tikv server port for pgwire loopback |
+| `--pg-host` | string | `localhost` | db9-server server hostname for pgwire loopback |
+| `--pg-port` | int | `5432` | db9-server server port for pgwire loopback |
 | `--system-keyspace` | string | `_sys_worker` | System keyspace for task queue and registry |
 
 ### Module Reuse
 
-The worker binary reuses existing pg-tikv infrastructure:
+The worker binary reuses existing db9-server infrastructure:
 
 - **`src/worker/`** — Worker types, configuration, and engine:
   - `src/worker/types.rs` — Task, TaskStatus, TaskType (Cron, AsyncTrigger, AutoAnalyze, BgDdl, BgSql)
@@ -69,8 +69,8 @@ The worker connects directly to TiKV via the PD endpoints to:
 
 ### Connection Model
 
-The worker executes SQL by connecting back to the pg-tikv server via the PostgreSQL wire protocol (pgwire). This loopback design allows:
-- Reuse of pg-tikv's SQL parser, analyzer, and executor
+The worker executes SQL by connecting back to the db9-server server via the PostgreSQL wire protocol (pgwire). This loopback design allows:
+- Reuse of db9-server's SQL parser, analyzer, and executor
 - Proper transaction isolation and error handling
 - Audit trail via standard PostgreSQL logs
 
@@ -88,8 +88,8 @@ host=localhost port=5432 user=_sys_worker.postgres dbname=postgres
 ```
 
 Where:
-- `{pg_host}` — pg-tikv server hostname (from `--pg-host`)
-- `{pg_port}` — pg-tikv server port (from `--pg-port`)
+- `{pg_host}` — db9-server server hostname (from `--pg-host`)
+- `{pg_port}` — db9-server server port (from `--pg-port`)
 - `{keyspace}` — system keyspace (from `--system-keyspace`, default `_sys_worker`)
 - `{username}` — task owner or system user (e.g., `postgres`)
 
@@ -129,7 +129,7 @@ client.execute(&task.sql, &[]).await?;
 The timeout is:
 - Configured per task in the task registry
 - Defaults to 300 seconds (5 minutes)
-- Enforced by pg-tikv's statement timeout mechanism
+- Enforced by db9-server's statement timeout mechanism
 - Prevents runaway queries from blocking the worker
 
 ---
@@ -144,21 +144,21 @@ The worker binary is deployed as a separate Kubernetes Deployment:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: pg-tikv-worker
+  name: db9-server-worker
 spec:
   replicas: 3  # Initial; scaled by HPA
   selector:
     matchLabels:
-      app: pg-tikv-worker
+      app: db9-server-worker
   template:
     metadata:
       labels:
-        app: pg-tikv-worker
+        app: db9-server-worker
     spec:
       containers:
       - name: worker
-        image: pg-tikv:latest
-        command: ["pg-tikv-worker"]
+        image: db9-server:latest
+        command: ["db9-server-worker"]
         args:
           - "--pd-endpoints"
           - "$(PD_ENDPOINTS)"
@@ -172,20 +172,20 @@ spec:
           - name: PD_ENDPOINTS
             value: "pd-0.pd:2379,pd-1.pd:2379,pd-2.pd:2379"
           - name: PG_HOST
-            value: "pg-tikv-lb.default.svc.cluster.local"
+            value: "db9-server-lb.default.svc.cluster.local"
           - name: PG_PORT
             value: "5432"
           - name: SYSTEM_KEYSPACE
             value: "_sys_worker"
-          - name: PGTIKV_WORKER_POLL_MS
+          - name: DB9_WORKER_POLL_MS
             value: "1000"
-          - name: PGTIKV_WORKER_MAX_CONCURRENT_JOBS
+          - name: DB9_WORKER_MAX_CONCURRENT_JOBS
             value: "32"
-          - name: PGTIKV_WORKER_STATEMENT_TIMEOUT_MS
+          - name: DB9_WORKER_STATEMENT_TIMEOUT_MS
             value: "300000"
-          - name: PGTIKV_WORKER_ORPHAN_TIMEOUT_SEC
+          - name: DB9_WORKER_ORPHAN_TIMEOUT_SEC
             value: "3600"
-          - name: PGTIKV_WORKER_GC_BATCH_SIZE
+          - name: DB9_WORKER_GC_BATCH_SIZE
             value: "100"
         ports:
         - name: metrics
@@ -210,21 +210,21 @@ The worker binary respects the following environment variables (inherited from P
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `PGTIKV_WORKER_POLL_MS` | int | `1000` | Poll interval in milliseconds |
-| `PGTIKV_WORKER_MAX_CONCURRENT_JOBS` | int | `32` | Max concurrent task executions |
-| `PGTIKV_WORKER_STATEMENT_TIMEOUT_MS` | int | `300000` | Default statement timeout (5 min) |
-| `PGTIKV_WORKER_ORPHAN_TIMEOUT_SEC` | int | `3600` | Timeout for orphaned claims (1 hour) |
-| `PGTIKV_WORKER_GC_BATCH_SIZE` | int | `100` | Batch size for garbage collection |
-| `PGTIKV_WORKER_SYSTEM_KEYSPACE` | string | `_sys_worker` | System keyspace for task queue |
-| `PGTIKV_AUTO_ANALYZE_ENABLED` | bool | `true` | Enable auto-analyze background jobs |
-| `PGTIKV_AUTO_ANALYZE_THRESHOLD` | int | `10000` | Row count threshold for auto-analyze |
+| `DB9_WORKER_POLL_MS` | int | `1000` | Poll interval in milliseconds |
+| `DB9_WORKER_MAX_CONCURRENT_JOBS` | int | `32` | Max concurrent task executions |
+| `DB9_WORKER_STATEMENT_TIMEOUT_MS` | int | `300000` | Default statement timeout (5 min) |
+| `DB9_WORKER_ORPHAN_TIMEOUT_SEC` | int | `3600` | Timeout for orphaned claims (1 hour) |
+| `DB9_WORKER_GC_BATCH_SIZE` | int | `100` | Batch size for garbage collection |
+| `DB9_WORKER_SYSTEM_KEYSPACE` | string | `_sys_worker` | System keyspace for task queue |
+| `DB9_AUTO_ANALYZE_ENABLED` | bool | `true` | Enable auto-analyze background jobs |
+| `DB9_AUTO_ANALYZE_THRESHOLD` | int | `10000` | Row count threshold for auto-analyze |
 
 **New variables (Phase 2):**
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `PGTIKV_WORKER_PG_HOST` | string | `localhost` | pg-tikv server hostname |
-| `PGTIKV_WORKER_PG_PORT` | int | `5432` | pg-tikv server port |
+| `DB9_WORKER_PG_HOST` | string | `localhost` | db9-server server hostname |
+| `DB9_WORKER_PG_PORT` | int | `5432` | db9-server server port |
 
 ### Health Check Endpoint
 
@@ -265,22 +265,22 @@ Returns `200 OK` if the worker is ready to accept tasks:
 Exposes WorkerMetrics as Prometheus-compatible metrics:
 
 ```
-# HELP pg_tikv_worker_tasks_executed_total Total tasks executed
-# TYPE pg_tikv_worker_tasks_executed_total counter
-pg_tikv_worker_tasks_executed_total{status="ok"} 1250
-pg_tikv_worker_tasks_executed_total{status="error"} 15
+# HELP db9_server_worker_tasks_executed_total Total tasks executed
+# TYPE db9_server_worker_tasks_executed_total counter
+db9_server_worker_tasks_executed_total{status="ok"} 1250
+db9_server_worker_tasks_executed_total{status="error"} 15
 
-# HELP pg_tikv_worker_claims_total Total task claims
-# TYPE pg_tikv_worker_claims_total counter
-pg_tikv_worker_claims_total 1265
+# HELP db9_server_worker_claims_total Total task claims
+# TYPE db9_server_worker_claims_total counter
+db9_server_worker_claims_total 1265
 
-# HELP pg_tikv_worker_queue_depth Current queue depth
-# TYPE pg_tikv_worker_queue_depth gauge
-pg_tikv_worker_queue_depth 42
+# HELP db9_server_worker_queue_depth Current queue depth
+# TYPE db9_server_worker_queue_depth gauge
+db9_server_worker_queue_depth 42
 
-# HELP pg_tikv_worker_active_jobs Current active jobs
-# TYPE pg_tikv_worker_active_jobs gauge
-pg_tikv_worker_active_jobs 8
+# HELP db9_server_worker_active_jobs Current active jobs
+# TYPE db9_server_worker_active_jobs gauge
+db9_server_worker_active_jobs 8
 ```
 
 ### Horizontal Pod Autoscaling
@@ -291,18 +291,18 @@ Deploy an HPA to scale workers based on queue depth:
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: pg-tikv-worker-hpa
+  name: db9-server-worker-hpa
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: pg-tikv-worker
+    name: db9-server-worker
   minReplicas: 2
   maxReplicas: 20
   metrics:
   - type: Pods
     pods:
-      metricName: pg_tikv_worker_queue_depth
+      metricName: db9_server_worker_queue_depth
       targetAverageValue: "10"
 ```
 
@@ -316,13 +316,13 @@ The transition from Phase 1 (embedded worker) to Phase 2 (separate binary) is **
 
 #### Step 1: Disable Embedded Worker
 
-On the pg-tikv server, set:
+On the db9-server server, set:
 
 ```bash
-export PGTIKV_WORKER_ENABLED=false
+export DB9_WORKER_ENABLED=false
 ```
 
-This disables the embedded worker loop in pg-tikv. Existing tasks remain in the queue.
+This disables the embedded worker loop in db9-server. Existing tasks remain in the queue.
 
 **Verification:**
 ```sql
@@ -331,21 +331,21 @@ SELECT COUNT(*) FROM _sys_worker.task_queue WHERE status = 'pending';
 
 #### Step 2: Deploy Worker Binary
 
-Deploy the pg-tikv-worker binary as a separate Kubernetes Deployment (see Section 3).
+Deploy the db9-server-worker binary as a separate Kubernetes Deployment (see Section 3).
 
-Configure it to point at the pg-tikv server:
+Configure it to point at the db9-server server:
 
 ```bash
-pg-tikv-worker \
+db9-server-worker \
   --pd-endpoints pd-0.pd:2379,pd-1.pd:2379,pd-2.pd:2379 \
-  --pg-host pg-tikv-lb.default.svc.cluster.local \
+  --pg-host db9-server-lb.default.svc.cluster.local \
   --pg-port 5432 \
   --system-keyspace _sys_worker
 ```
 
 **Verification:**
 ```bash
-kubectl logs -f deployment/pg-tikv-worker
+kubectl logs -f deployment/db9-server-worker
 # Should show: "Worker started, polling queue..."
 ```
 
@@ -354,19 +354,19 @@ kubectl logs -f deployment/pg-tikv-worker
 Monitor the worker metrics to confirm tasks are being claimed and executed:
 
 ```bash
-curl http://pg-tikv-worker:9090/metrics | grep pg_tikv_worker_tasks_executed_total
+curl http://db9-server-worker:9090/metrics | grep db9_server_worker_tasks_executed_total
 ```
 
 Expected output:
 ```
-pg_tikv_worker_tasks_executed_total{status="ok"} 100
-pg_tikv_worker_tasks_executed_total{status="error"} 0
+db9_server_worker_tasks_executed_total{status="ok"} 100
+db9_server_worker_tasks_executed_total{status="error"} 0
 ```
 
 #### Step 4: Cleanup (Optional)
 
 Once the worker binary is stable and all pending tasks have been processed, you may:
-- Remove the `PGTIKV_WORKER_ENABLED` configuration from pg-tikv
+- Remove the `DB9_WORKER_ENABLED` configuration from db9-server
 - Archive old task execution logs
 - Update documentation to reference the worker binary
 
@@ -387,18 +387,18 @@ If the worker binary encounters issues:
 
 1. **Scale down the worker binary:**
    ```bash
-   kubectl scale deployment pg-tikv-worker --replicas=0
+   kubectl scale deployment db9-server-worker --replicas=0
    ```
 
-2. **Re-enable the embedded worker in pg-tikv:**
+2. **Re-enable the embedded worker in db9-server:**
    ```bash
-   export PGTIKV_WORKER_ENABLED=true
-   kubectl rollout restart deployment pg-tikv
+   export DB9_WORKER_ENABLED=true
+   kubectl rollout restart deployment db9-server
    ```
 
 3. **Verify task processing resumes:**
    ```bash
-   curl http://pg-tikv:9090/metrics | grep pg_tikv_worker_tasks_executed_total
+   curl http://db9-server:9090/metrics | grep db9_server_worker_tasks_executed_total
    ```
 
 The embedded worker will resume processing tasks from the queue without data loss.
@@ -444,7 +444,7 @@ These metrics are used for:
 
 **Important:** The `TriggerWorker` (async trigger execution) remains **separate** from the worker binary in Phase 2.
 
-- **TriggerWorker** — Embedded in pg-tikv, executes AFTER triggers asynchronously
+- **TriggerWorker** — Embedded in db9-server, executes AFTER triggers asynchronously
 - **Worker Binary** — Separate process, executes background tasks (Cron, AutoAnalyze, BgDdl, BgSql)
 
 This separation allows:

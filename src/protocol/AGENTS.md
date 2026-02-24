@@ -27,7 +27,7 @@ src/protocol/
     ├── copy/                   # COPY context management (~100 lines)
     │   └── mod.rs              # CopyContext struct, push_copy_data(), max line size (32MB)
     ├── portal.rs               # Portal state management + suspended portal handling (~430 lines)
-    ├── query_parser.rs         # TipgQueryParser: pgwire QueryParser trait (~110 lines)
+    ├── query_parser.rs         # Db9QueryParser: pgwire QueryParser trait (~110 lines)
     ├── server_params.rs        # PgServerParameterProvider: ParameterStatus (~150 lines)
     ├── tenant.rs               # parse_tenant_username(): multi-tenancy (~50 lines)
     ├── errors.rs               # SQLSTATE mapping, error helpers (~75 lines)
@@ -73,7 +73,7 @@ Describe uses `utility_describe_fields()` for static schema mapping.
 | Server parameters | `server_params.rs` → `PgServerParameterProvider` |
 | COPY protocol | `dynamic/copy.rs` + `copy/mod.rs` + `copy_format.rs` |
 | Error handling | `errors.rs` (SQLSTATE mapping, in-failed-transaction errors) |
-| Query parsing (pgwire trait) | `query_parser.rs` → `TipgQueryParser` |
+| Query parsing (pgwire trait) | `query_parser.rs` → `Db9QueryParser` |
 
 ## Key Functions
 
@@ -87,7 +87,7 @@ Describe uses `utility_describe_fields()` for static schema mapping.
 | `decode_parameters()` | `params/decode.rs` | Wire bytes → Value |
 | `datatype_to_pgtype()` | `encode/types.rs` | Internal type → PostgreSQL OID |
 | `result_to_response()` | `encode/result.rs` | ExecuteResult → pgwire Response |
-| `TipgQueryParser::parse_sql()` | `query_parser.rs` | Parse + analyze SQL (pgwire QueryParser trait) |
+| `Db9QueryParser::parse_sql()` | `query_parser.rs` | Parse + analyze SQL (pgwire QueryParser trait) |
 
 ## PostgreSQL Type OIDs
 

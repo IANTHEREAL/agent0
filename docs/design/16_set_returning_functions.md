@@ -9,7 +9,7 @@
 - 批量生成测试数据
 - 展开数组以做 join/过滤
 
-当前 pg-tikv：
+当前 db9-server：
 - `generate_series` 明确报错（`src/sql/expr.rs:1622`）
 - `UNNEST` 在 join context 被当作 scalar 返回第一个元素（`src/sql/expr.rs:640`），不符合 PG 的 set-returning 语义
 - `executor_join.rs` 已有 “FROM 子句函数调用” 的通道（`get_table_data` 中对 `table_name` 包含 `()` 的分支），可复用扩展为 SRF

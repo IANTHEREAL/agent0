@@ -1,5 +1,5 @@
 -- Regression: window operator must propagate eval errors, not swallow them as NULL.
--- Issue: https://github.com/c4pt0r/tipg/issues/588
+-- Issue: https://github.com/c4pt0r/db9/issues/588
 
 DROP TABLE IF EXISTS win_err_t;
 

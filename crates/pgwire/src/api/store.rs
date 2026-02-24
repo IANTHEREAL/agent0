@@ -42,8 +42,8 @@ pub struct MemPortalStore<S> {
 
 impl<S> Default for MemPortalStore<S> {
     fn default() -> Self {
-        let max_statements = env_limit("PGTIKV_MAX_STATEMENTS", DEFAULT_MAX_STATEMENTS);
-        let max_portals = env_limit("PGTIKV_MAX_PORTALS", DEFAULT_MAX_PORTALS);
+        let max_statements = env_limit("DB9_MAX_STATEMENTS", DEFAULT_MAX_STATEMENTS);
+        let max_portals = env_limit("DB9_MAX_PORTALS", DEFAULT_MAX_PORTALS);
         Self::new_with_limits(max_statements, max_portals)
     }
 }
@@ -63,7 +63,7 @@ impl<S> MemPortalStore<S> {
             "ERROR".to_string(),
             "54000".to_string(),
             format!(
-                "too many prepared statements (limit={}); set PGTIKV_MAX_STATEMENTS to override",
+                "too many prepared statements (limit={}); set DB9_MAX_STATEMENTS to override",
                 self.max_statements
             ),
         )))
@@ -74,7 +74,7 @@ impl<S> MemPortalStore<S> {
             "ERROR".to_string(),
             "54000".to_string(),
             format!(
-                "too many portals (limit={}); set PGTIKV_MAX_PORTALS to override",
+                "too many portals (limit={}); set DB9_MAX_PORTALS to override",
                 self.max_portals
             ),
         )))

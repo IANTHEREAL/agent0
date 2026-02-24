@@ -1,4 +1,4 @@
-# pg-tikv Cloud Admin Portal - Frontend Dockerfile
+# db9-server Cloud Admin Portal - Frontend Dockerfile
 
 # Build stage
 FROM node:20-alpine AS build

@@ -1,7 +1,7 @@
 -- ============================================================================
 -- RAG Ingest Pipeline via PL/pgSQL + pg_cron + OpenAI Embeddings
 --
--- Demonstrates the full pg-tikv agentic SQL stack:
+-- Demonstrates the full db9-server agentic SQL stack:
 --   PL/pgSQL control flow  (FOR loop, SELECT INTO, SQL execution)
 --   fs9 file system         (list files, read content)
 --   http extension          (call OpenAI API with custom Authorization header)
@@ -19,7 +19,7 @@
 --   → when /inbox/ is empty, function returns 0
 --
 -- Prerequisites:
---   - pg-tikv with http + pg_cron extensions
+--   - db9-server with http + pg_cron extensions
 --   - Files uploaded to /inbox/ via `db9 fs cp` or SDK client.fs.write()
 --   - Set your OpenAI API key below
 --
@@ -65,9 +65,9 @@ CREATE TABLE rag_documents (
 );
 
 -- GIN index for full-text search
-SET tipg.use_optimizer = off;
+SET db9.use_optimizer = off;
 CREATE INDEX idx_rag_fts ON rag_documents USING GIN (tsv);
-SET tipg.use_optimizer = on;
+SET db9.use_optimizer = on;
 
 -- ============================================================================
 -- CORE: rag_ingest_batch() — PL/pgSQL function

@@ -5,7 +5,7 @@
 
 ## 背景与动机
 
-pg-tikv 当前已经通过 pgwire 实现了 `COPY ... FROM STDIN`（用于 `pg_restore`/大批量导入），但仍存在几个关键缺口：
+db9-server 当前已经通过 pgwire 实现了 `COPY ... FROM STDIN`（用于 `pg_restore`/大批量导入），但仍存在几个关键缺口：
 - 缺 `COPY ... TO STDOUT`（`pg_dump` 常用，很多工具也用）
 - `COPY` 在 SQL 层被直接 skip（`src/sql/helpers.rs`），协议层只实现了 CopyIn 流程（`src/protocol/handler.rs`）
 - `COPY` 的常见 `WITH (...)` 选项（CSV/HEADER/DELIMITER/NULL 等）未覆盖

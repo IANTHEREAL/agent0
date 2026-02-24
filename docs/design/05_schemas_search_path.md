@@ -9,7 +9,7 @@ PostgreSQL 的 schema（`public`、自定义 schema）与 `search_path` 在 ORM 
 - TypeORM/Sequelize/Knex/Drizzle 都支持 `schema` / `withSchema()` 等，并会生成 `schema.table` 形式的 DDL/DML。
 - 迁移脚本常见 `CREATE SCHEMA`、`SET search_path`、`DROP SCHEMA`。
 
-当前 pg-tikv 的对象名处理大多直接取 `ObjectName` 的最后一段（`name.0.last()`），等价于“忽略 schema”，只能可靠支持单一 `public` 逻辑 schema。
+当前 db9-server 的对象名处理大多直接取 `ObjectName` 的最后一段（`name.0.last()`），等价于“忽略 schema”，只能可靠支持单一 `public` 逻辑 schema。
 
 ## 目标（MVP）
 

@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # ///
 """
-TiKV Cluster Administration Tool for pg-tikv Testing
+TiKV Cluster Administration Tool for db9-server Testing
 
 Manages TiKV test clusters using tiup playground with API v2 (keyspace support).
 
@@ -47,7 +47,7 @@ from typing import Optional, List, Dict
 from datetime import datetime
 from enum import Enum
 
-ADMIN_DIR = Path.home() / ".pg-tikv"
+ADMIN_DIR = Path.home() / ".db9-server"
 CLUSTERS_DIR = ADMIN_DIR / "clusters"
 LOCK_FILE = ADMIN_DIR / ".lock"
 DEFAULT_CLUSTER_NAME = "default"
@@ -128,11 +128,11 @@ def resolve_tiup_home() -> Path:
     - Prevents failures when the TiUP mirror is temporarily unavailable.
 
     Preference order:
-    1) `PGTIKV_TIUP_HOME` (explicit override for pg-tikv tooling)
+    1) `DB9_TIUP_HOME` (explicit override for db9-server tooling)
     2) `TIUP_HOME` (standard TiUP override)
     3) `~/.tiup` (default)
     """
-    env_home = os.environ.get("PGTIKV_TIUP_HOME") or os.environ.get("TIUP_HOME")
+    env_home = os.environ.get("DB9_TIUP_HOME") or os.environ.get("TIUP_HOME")
     if env_home:
         return Path(env_home).expanduser()
     return Path.home() / ".tiup"
@@ -302,8 +302,8 @@ enable-ttl = true
     tiup_home = resolve_tiup_home()
 
     # TiUP will store data in $TIUP_HOME/data/{tag}
-    # So the actual data directory will be: {tiup_home}/data/pg-tikv-{name}
-    data_dir = tiup_home / "data" / f"pg-tikv-{name}"
+    # So the actual data directory will be: {tiup_home}/data/db9-server-{name}
+    data_dir = tiup_home / "data" / f"db9-server-{name}"
 
     if pd_port is not None and pd_port < 2379:
         log_error(f"Invalid --pd-port {pd_port}: must be >= 2379")
@@ -349,7 +349,7 @@ enable-ttl = true
         "tiup", "playground",
         "--mode", "tikv-slim",
         "--kv.config", str(tikv_config),
-        "--tag", f"pg-tikv-{name}",
+        "--tag", f"db9-server-{name}",
         "--host", host,
         "--without-monitor",
         "--port-offset",
@@ -454,7 +454,7 @@ def stop_cluster(name: str, force: bool = False) -> bool:
         env = os.environ.copy()
         env["TIUP_HOME"] = str(tiup_home)
         subprocess.run(
-            ["tiup", "clean", f"pg-tikv-{name}"],
+            ["tiup", "clean", f"db9-server-{name}"],
             capture_output=True,
             env=env,
         )
@@ -604,7 +604,7 @@ def cmd_clean(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="TiKV Cluster Administration Tool for pg-tikv Testing",
+        description="TiKV Cluster Administration Tool for db9-server Testing",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")

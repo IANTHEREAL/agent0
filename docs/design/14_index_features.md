@@ -10,7 +10,7 @@ PostgreSQL 迁移里常出现更复杂的索引形式：
 - expression index：`CREATE INDEX ... ON t ((lower(col)))`
 - GIN（常用于 jsonb/array）：`CREATE INDEX ... USING gin (data)`
 
-当前 pg-tikv 的限制：
+当前 db9-server 的限制：
 - `CREATE INDEX` 仅允许列标识符，表达式直接报错（`src/sql/ddl.rs:482`）
 - `USING GIST` 被明确标记不支持（`src/sql/helpers.rs:842`）
 

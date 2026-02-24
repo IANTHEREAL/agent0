@@ -1,4 +1,4 @@
-# pg-tikv v0.1.0 Release Notes
+# db9-server v0.1.0 Release Notes
 
 ## Summary
 
@@ -34,12 +34,12 @@ Supported server env vars (v0.1.0):
 - `PD_ENDPOINTS`: PD endpoints (comma-separated)
 - `PG_PORT`: PostgreSQL protocol listen port
 - `PG_KEYSPACE`: Default keyspace when the username has no `<keyspace>.` prefix
-- `PGTIKV_TOKIO_STACK_MB`: Tokio worker thread stack size in MB (default: `4`)
+- `DB9_TOKIO_STACK_MB`: Tokio worker thread stack size in MB (default: `4`)
 - `PG_TLS_CERT` + `PG_TLS_KEY`: Enable TLS for pgwire connections (both required)
 
 ## Security Warning (Read Before Exposing)
 
-**Do not expose pg-tikv to the public internet with defaults.** In v0.1.0:
+**Do not expose db9-server to the public internet with defaults.** In v0.1.0:
 
 - The server binds to `0.0.0.0:${PG_PORT}` (all interfaces).
 - Each keyspace bootstraps a default superuser `admin` with password `admin`.
@@ -58,7 +58,7 @@ Minimum production hardening checklist:
 
 See `docs/quickstart.md`. Two details matter for a smooth first run:
 
-1. **TiKV must run with keyspace support**: pg-tikv uses TiKV keyspaces by default, which requires API v2.
+1. **TiKV must run with keyspace support**: db9-server uses TiKV keyspaces by default, which requires API v2.
    - With TiUP playground, pass a TiKV config containing `storage.api-version = 2`.
 2. **Extra tenants require keyspaces**: if you connect as `tenant_a.admin`, the `tenant_a` keyspace must already exist.
    - Create keyspaces via PD HTTP API (`/pd/api/v2/keyspaces`) or a pd-ctl equivalent.
@@ -67,8 +67,8 @@ See `docs/quickstart.md`. Two details matter for a smooth first run:
 
 v0.1.0 is the first tagged release and is intended as a developer preview. If you need to rollback:
 
-1. Stop the running `pg-tikv` process.
-2. Restart the previous `pg-tikv` binary with the same `PD_ENDPOINTS` / `PG_PORT` / `PG_KEYSPACE`.
+1. Stop the running `db9-server` process.
+2. Restart the previous `db9-server` binary with the same `PD_ENDPOINTS` / `PG_PORT` / `PG_KEYSPACE`.
 3. Data lives in TiKV (per keyspace). Keep PD/TiKV running during rollback.
 
 If you hit metadata incompatibilities between builds, the safest rollback is to:
@@ -81,5 +81,5 @@ If you hit metadata incompatibilities between builds, the safest rollback is to:
 - **ORM coverage**: `run_tests.sh` runs a subset of `orm-tests/` (pg client, TypeORM, Sequelize, Knex, Drizzle).
   - **Prisma is not run by `run_tests.sh`**, and `orm-tests/prisma` is not shipped in this repository at the moment. Prisma compatibility is not guaranteed in v0.1.0.
   - `kysely/` is also not currently included in the default `run_tests.sh` ORM subset.
-  - **TypeORM gate skip**: `UNNEST(...)` is not supported yet. The v0.1.0 gate currently skips `TypeORM SQL Features [pg-tikv] ARRAY operations should support UNNEST`.
+  - **TypeORM gate skip**: `UNNEST(...)` is not supported yet. The v0.1.0 gate currently skips `TypeORM SQL Features [db9-server] ARRAY operations should support UNNEST`.
 - **Passwords are sent in cleartext unless TLS is enabled** (use `PG_TLS_CERT` + `PG_TLS_KEY` in production).

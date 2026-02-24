@@ -1,4 +1,4 @@
-const KEYSPACE_PREFIX: &str = "tipg_tenant_";
+const KEYSPACE_PREFIX: &str = "db9_tenant_";
 
 /// Parse username in format "tenant_id.user" or "tenant_id:user" into (keyspace, actual_user).
 /// The tenant_id is mapped to a TiKV keyspace by prepending KEYSPACE_PREFIX.
@@ -28,14 +28,14 @@ mod tests {
     #[test]
     fn test_dot_separator() {
         let (ks, user) = parse_tenant_username("abc123.admin");
-        assert_eq!(ks.unwrap(), "tipg_tenant_abc123");
+        assert_eq!(ks.unwrap(), "db9_tenant_abc123");
         assert_eq!(user, "admin");
     }
 
     #[test]
     fn test_colon_separator() {
         let (ks, user) = parse_tenant_username("abc123:admin");
-        assert_eq!(ks.unwrap(), "tipg_tenant_abc123");
+        assert_eq!(ks.unwrap(), "db9_tenant_abc123");
         assert_eq!(user, "admin");
     }
 

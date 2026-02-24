@@ -22,7 +22,7 @@
                      │                 └─────────┘  └──┬─────┘ │
                      │                                 │       │
   TCP (5433)         │  ┌─────────┐    ┌───────────┐   │       │
-  ──────────────────►│  │  NLB    │───►│  pg-tikv  │   │       │
+  ──────────────────►│  │  NLB    │───►│  db9-server  │   │       │
   pg.example.com     │  └─────────┘    │(SQL engine)│   │       │
                      │                 └─────┬─────┘   │       │
                      │                       │         │       │
@@ -39,7 +39,7 @@
 
 | Component | Description | K8s Resource | Namespace | Port |
 |-----------|-------------|-------------|-----------|------|
-| **pg-tikv** | PostgreSQL-compatible SQL engine on TiKV | Deployment | `tipg` | 5433 |
+| **db9-server** | PostgreSQL-compatible SQL engine on TiKV | Deployment | `db9` | 5433 |
 | **backend** | Admin API (Rust/axum) — user auth, DB lifecycle, billing | Deployment | `cloud-admin-portal` | 8090 |
 | **landing** | Static landing page + CLI binaries (nginx:alpine) | Deployment | `cloud-admin-portal` | 80 |
 | **PostgreSQL** | Backend metadata database | StatefulSet (10Gi PVC) | `cloud-admin-portal` | 5432 |
@@ -49,7 +49,7 @@
 
 ### Namespace Layout
 
-- `tipg` — pg-tikv only (separate namespace for isolation)
+- `db9` — db9-server only (separate namespace for isolation)
 - `cloud-admin-portal` — backend, landing, PostgreSQL, fs9-server, fs9-meta
 - `tidb-serverless` — TiKV cluster (managed separately)
 
@@ -85,7 +85,7 @@ docker buildx inspect --bootstrap
 
 ---
 
-## Deploy Workflow: db9 (pg-tikv + backend + CLI + landing)
+## Deploy Workflow: db9 (db9-server + backend + CLI + landing)
 
 ### Step 0: Pull Latest & Detect Changes
 
@@ -103,7 +103,7 @@ if [ "$DEPLOYED_COMMIT" = "$CURRENT_COMMIT" ]; then
 fi
 
 # Detect which components changed
-PGTIKV_CHANGED=$(git diff --name-only ${DEPLOYED_COMMIT}..HEAD -- \
+DB9_CHANGED=$(git diff --name-only ${DEPLOYED_COMMIT}..HEAD -- \
   src/ vendor/ crates/ Cargo.toml Cargo.lock Dockerfile build.rs | head -1)
 BACKEND_CHANGED=$(git diff --name-only ${DEPLOYED_COMMIT}..HEAD -- \
   cloud-admin-portal/backend/ | head -1)
@@ -134,13 +134,13 @@ RUN_ID=$(gh run list --workflow=release-db9.yml --limit 1 --json databaseId -q '
 
 ### Step 3: Build & Push Images (parallel)
 
-**pg-tikv** (if changed):
+**db9-server** (if changed):
 ```bash
 cd <REPO_ROOT>
 docker buildx build --platform linux/arm64 \
   --build-arg BUILD_GIT_HASH=$(git rev-parse --short=8 HEAD) \
   --build-arg BUILD_DATE=$(date -u +%Y-%m-%d) \
-  -t <ECR_URI>/pg-tikv:latest \
+  -t <ECR_URI>/db9-server:latest \
   --push .
 ```
 
@@ -186,9 +186,9 @@ docker buildx build --platform linux/arm64 \
 ```bash
 kubectl apply -f <REPO_ROOT>/cloud-admin-portal/k8s/deploy.yaml
 
-# pg-tikv is in 'tipg' namespace (not cloud-admin-portal!)
-kubectl rollout restart deployment pg-tikv -n tipg
-kubectl rollout status deployment pg-tikv -n tipg --timeout=120s
+# db9-server is in 'db9' namespace (not cloud-admin-portal!)
+kubectl rollout restart deployment db9-server -n db9
+kubectl rollout status deployment db9-server -n db9 --timeout=120s
 
 # Backend & landing are in 'cloud-admin-portal'
 kubectl rollout restart deployment cloud-admin-backend -n cloud-admin-portal
@@ -289,28 +289,28 @@ kubectl logs -n cloud-admin-portal deployment/fs9-server --tail=10
 
 ---
 
-## pg-tikv Runtime Configuration
+## db9-server Runtime Configuration
 
 ### Critical Environment Variables
 
 | Variable | Purpose | Required |
 |----------|---------|----------|
-| `PGTIKV_INSECURE=1` | Allow cleartext password auth for internal connections (backend uses NoTls) | Yes (staging) |
-| `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=admin` | Default admin password for new keyspaces | Yes |
-| `PGTIKV_SESSION_TTL_HOURS` | Session TTL (default: 1h) | No |
+| `DB9_INSECURE=1` | Allow cleartext password auth for internal connections (backend uses NoTls) | Yes (staging) |
+| `DB9_BOOTSTRAP_ADMIN_PASSWORD=admin` | Default admin password for new keyspaces | Yes |
+| `DB9_SESSION_TTL_HOURS` | Session TTL (default: 1h) | No |
 
 These are set directly on the deployment (not in deploy.yaml):
 ```bash
-kubectl set env deployment/pg-tikv -n tipg \
-  PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=<password> \
-  PGTIKV_INSECURE=1
+kubectl set env deployment/db9-server -n db9 \
+  DB9_BOOTSTRAP_ADMIN_PASSWORD=<password> \
+  DB9_INSECURE=1
 ```
 
 Without these, `db9 db create` fails with "Failed to set admin password".
 
 ### Build Args
 
-pg-tikv embeds version info at build time:
+db9-server embeds version info at build time:
 ```bash
 --build-arg BUILD_GIT_HASH=$(git rev-parse --short=8 HEAD)
 --build-arg BUILD_DATE=$(date -u +%Y-%m-%d)
@@ -366,11 +366,11 @@ fs9-meta   → PostgreSQL (metadata store)
 
 ### Key Points
 
-- pagefs plugin connects to TiKV for persistent storage (one keyspace per tenant, prefix `tipg_fs_`)
+- pagefs plugin connects to TiKV for persistent storage (one keyspace per tenant, prefix `db9_fs_`)
 - Auto-provisioning: when a db9-authenticated request arrives for an unknown tenant, fs9-server auto-creates namespace in fs9-meta and mounts pagefs directly in-process (no mounts API in fs9-meta)
 - fs9-meta admin API uses `/api/v1/admin/` prefix (not `/api/v1/`)
-- pg-tikv's fs9 SQL extension connects to fs9-server via HTTP with short-lived JWT tokens
-- Cross-namespace communication: pg-tikv (in `tipg`) → fs9-server (in `cloud-admin-portal`) via `fs9-server.cloud-admin-portal.svc.cluster.local:9999`
+- db9-server's fs9 SQL extension connects to fs9-server via HTTP with short-lived JWT tokens
+- Cross-namespace communication: db9-server (in `db9`) → fs9-server (in `cloud-admin-portal`) via `fs9-server.cloud-admin-portal.svc.cluster.local:9999`
 - `fs9-secret` must exist in both namespaces
 
 ### Ingress Routing
@@ -406,12 +406,12 @@ Time ─────────────────────────
 
  ┌─ Trigger CLI CI ──────────── Wait for CI ── Download artifacts ──┐
  │                                                                  │
- ├─ Build pg-tikv image ───────┐                                    ├─ Build landing image
- │                             ├─ Restart pg-tikv + backend         │
+ ├─ Build db9-server image ───────┐                                    ├─ Build landing image
+ │                             ├─ Restart db9-server + backend         │
  └─ Build backend image ───────┘                                    └─ Restart landing
 ```
 
-- **Parallel group**: CLI CI trigger + pg-tikv build + backend build
+- **Parallel group**: CLI CI trigger + db9-server build + backend build
 - **Sequential**: Wait for CI → download → build landing (needs CLI binaries)
 - **Then**: restart all changed deployments
 
@@ -433,15 +433,15 @@ Time ─────────────────────────
 
 ### Docker Build Pitfalls
 
-- **Wrong build context**: running `docker buildx build --push .` from the wrong directory builds the wrong image (e.g., nginx instead of pg-tikv). Always verify your working directory matches the intended Dockerfile.
+- **Wrong build context**: running `docker buildx build --push .` from the wrong directory builds the wrong image (e.g., nginx instead of db9-server). Always verify your working directory matches the intended Dockerfile.
 - **Architecture mismatch**: EKS nodes are arm64. x86_64 images cause `exec format error` at runtime.
 - **Rust compiler version drift**: `Cargo.lock` can pull new crate versions requiring newer rustc. If build fails with version errors, bump the `rust:X.XX-bookworm` base image in Dockerfile.
 - **Cache staleness**: if buildx fails with cache errors, prune with `docker buildx prune --builder arm-builder -f`.
 
 ### Namespace Awareness
 
-- pg-tikv runs in `tipg` namespace, everything else in `cloud-admin-portal`.
-- Forgetting `-n tipg` for pg-tikv operations is a common mistake.
+- db9-server runs in `db9` namespace, everything else in `cloud-admin-portal`.
+- Forgetting `-n db9` for db9-server operations is a common mistake.
 - Cross-namespace service references use full DNS: `<service>.<namespace>.svc.cluster.local`.
 
 ### Deployment Safety
@@ -453,7 +453,7 @@ Time ─────────────────────────
 
 ### Credential Management
 
-- pg-tikv K8s deployment env vars (like `PGTIKV_INSECURE`, `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD`) are NOT in `deploy.yaml` — they're set via `kubectl set env` and persist across restarts.
+- db9-server K8s deployment env vars (like `DB9_INSECURE`, `DB9_BOOTSTRAP_ADMIN_PASSWORD`) are NOT in `deploy.yaml` — they're set via `kubectl set env` and persist across restarts.
 - Secrets (`cloud-admin-pg-secret`, `fs9-secret`) are managed separately from the deployment manifests.
 - SSO sessions expire frequently — always check auth before starting a deploy.
 
@@ -495,9 +495,9 @@ git checkout master
 | SSO session expired | `aws sso login` | Re-login with SSO profile |
 | Pod CrashLoopBackOff | Check logs: `kubectl logs -n <ns> -l app=<name> --tail=50` | Fix code or rollback |
 | `exec format error` | Wrong image architecture | Rebuild with `--platform linux/arm64` |
-| `Failed to set admin password` | Missing pg-tikv env vars | Set `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD` and `PGTIKV_INSECURE=1` |
+| `Failed to set admin password` | Missing db9-server env vars | Set `DB9_BOOTSTRAP_ADMIN_PASSWORD` and `DB9_INSECURE=1` |
 | `Failed to deserialize schema` | Backward-incompatible storage format change | Add fallback deserialization for legacy format |
-| `stack overflow` in pg-tikv | Deep async recursion | Box large futures, split dispatchers |
+| `stack overflow` in db9-server | Deep async recursion | Box large futures, split dispatchers |
 | CI job fails | Check failed job logs | `gh run view <ID> --log-failed` |
 | Image not updating after push | Image caching | Ensure `imagePullPolicy: Always` or use unique tags |
 | Cross-namespace DNS failure | Wrong service reference | Use `<svc>.<ns>.svc.cluster.local` |

@@ -2,7 +2,7 @@
 
 This document defines how we run tasks **on GitHub Issues as the single source of truth (SSOT)** for task process, ownership, and verification.
 
-Reference exemplar (multi-phase collaboration pattern): https://github.com/c4pt0r/tipg/issues/368
+Reference exemplar (multi-phase collaboration pattern): https://github.com/c4pt0r/db9/issues/368
 
 Inputs:
 - Roles: `ROLE_DEFINITIONS.md`

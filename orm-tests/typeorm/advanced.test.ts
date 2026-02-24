@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { DataSource } from 'typeorm';
 import { createDataSource } from './datasource.js';
 
-describe('TypeORM Advanced SQL Features [pg-tikv]', () => {
+describe('TypeORM Advanced SQL Features [db9-server]', () => {
   let dataSource: DataSource;
 
   beforeAll(async () => {

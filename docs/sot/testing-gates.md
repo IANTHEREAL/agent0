@@ -29,11 +29,11 @@ Evidence baseline: these gates are derived from `.github/workflows/**` job defin
 | Gate ID (used in registry) | Blocking | Category | What it runs (high-level) | Local reproduce |
 |---|---:|---|---|---|
 | `ci:.github/workflows/orm-tests.yml/lint` | Required | Structure | `cargo fmt -- --check` *(non-blocking)* + `cargo clippy` | `cargo fmt -- --check && cargo clippy` |
-| `ci:.github/workflows/orm-tests.yml/test` | Required | Correctness | build + unit tests + bring up TiKV + start `pg-tikv` + run `scripts/integration_test.py tests/**` + run ORM suites (best-effort thresholded) | `./run_tests.sh` |
-| `ci:.github/workflows/regression-gate.yml/regression-gate` | Required | Correctness | bring up TiKV + start `pg-tikv` + run `scripts/regression_gate.sh` (SQL regression packs; optional ORM pack) | `./scripts/regression_gate.sh` |
+| `ci:.github/workflows/orm-tests.yml/test` | Required | Correctness | build + unit tests + bring up TiKV + start `db9-server` + run `scripts/integration_test.py tests/**` + run ORM suites (best-effort thresholded) | `./run_tests.sh` |
+| `ci:.github/workflows/regression-gate.yml/regression-gate` | Required | Correctness | bring up TiKV + start `db9-server` + run `scripts/regression_gate.sh` (SQL regression packs; optional ORM pack) | `./scripts/regression_gate.sh` |
 | `ci:.github/workflows/doc-lint.yml/doc-lint` | Required | Structure | `uv run scripts/doc_lint.py` (SoT registry/doc drift prevention) | `uv run scripts/doc_lint.py` |
-| `ci:.github/workflows/gorm-smoke.yml/gorm-smoke` | Best-effort | Smoke | start TiKV + `pg-tikv` + run `bash scripts/e2e_tests.sh gorm_smoke` *(step is `continue-on-error: true`)* | `PG_DSN='postgres://admin:admin@127.0.0.1:<port>/postgres?sslmode=disable' bash scripts/e2e_tests.sh gorm_smoke` |
-| `ci:.github/workflows/sqlalchemy-smoke.yml/sqlalchemy-smoke` | Required | Smoke | start TiKV + `pg-tikv` + run `bash scripts/e2e_tests.sh sqlalchemy_smoke` + `bash scripts/e2e_tests.sh dify_sqlalchemy_compat` | `PG_DSN='postgres://admin:admin@127.0.0.1:<port>/postgres?sslmode=disable' bash scripts/e2e_tests.sh sqlalchemy_smoke && bash scripts/e2e_tests.sh dify_sqlalchemy_compat` |
+| `ci:.github/workflows/gorm-smoke.yml/gorm-smoke` | Best-effort | Smoke | start TiKV + `db9-server` + run `bash scripts/e2e_tests.sh gorm_smoke` *(step is `continue-on-error: true`)* | `PG_DSN='postgres://admin:admin@127.0.0.1:<port>/postgres?sslmode=disable' bash scripts/e2e_tests.sh gorm_smoke` |
+| `ci:.github/workflows/sqlalchemy-smoke.yml/sqlalchemy-smoke` | Required | Smoke | start TiKV + `db9-server` + run `bash scripts/e2e_tests.sh sqlalchemy_smoke` + `bash scripts/e2e_tests.sh dify_sqlalchemy_compat` | `PG_DSN='postgres://admin:admin@127.0.0.1:<port>/postgres?sslmode=disable' bash scripts/e2e_tests.sh sqlalchemy_smoke && bash scripts/e2e_tests.sh dify_sqlalchemy_compat` |
 
 Blocking definition (evidence-first):
 - **Required**: the job does not use `continue-on-error` for its core checks (it can fail the workflow run).
@@ -60,13 +60,13 @@ uv run scripts/doc_lint.py
 Optional smoke signals (best-effort):
 
 ```bash
-# Requires a running pg-tikv instance; set connection DSN accordingly.
+# Requires a running db9-server instance; set connection DSN accordingly.
 PG_DSN='postgres://admin:admin@127.0.0.1:<port>/postgres?sslmode=disable' bash scripts/e2e_tests.sh gorm_smoke
 PG_DSN='postgres://admin:admin@127.0.0.1:<port>/postgres?sslmode=disable' bash scripts/e2e_tests.sh sqlalchemy_smoke
 ```
 
 Notes:
-- Runtime env keys for starting `pg-tikv` (e.g. `PD_ENDPOINTS`, `PG_PORT`, TLS env) are SSOT in `./ops-config.md`.
+- Runtime env keys for starting `db9-server` (e.g. `PD_ENDPOINTS`, `PG_PORT`, TLS env) are SSOT in `./ops-config.md`.
 - Some scripts assume local tooling (`tiup`, `psql/pg_isready`, `python3`, `uv`, `node/npm`, `go`) — see each script’s help and the workflow steps as evidence.
 
 ## Verification (Gates)
@@ -81,4 +81,4 @@ Notes:
   - how to reproduce locally,
   - rollback plan (how to re-enable/restore the previous signal).
 - If a gate introduces new runtime config requirements, document the config keys in `./ops-config.md` (do not redefine them here).
-- Reference: https://github.com/c4pt0r/tipg/issues/368
+- Reference: https://github.com/c4pt0r/db9/issues/368

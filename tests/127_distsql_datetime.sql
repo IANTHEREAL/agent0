@@ -7,7 +7,7 @@
 DROP TABLE IF EXISTS ts;
 CREATE TABLE ts (a INT PRIMARY KEY, t TIMESTAMP);
 INSERT INTO ts
--- Use a timestamp range supported by tipg.
+-- Use a timestamp range supported by db9.
 SELECT i, TIMESTAMP '2000-01-01 00:00:00' + ((i::text || ' seconds')::interval)
 FROM generate_series(1, 5) AS g(i);
 

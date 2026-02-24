@@ -1,4 +1,4 @@
-psql:/home/dongxu/lab/pg-tikv/tests/103_alter_role.sql:7: ERROR:  SQL parse error: sql parser error: Expected an object type after CREATE, found: USER at Line: 1, Column 8
-psql:/home/dongxu/lab/pg-tikv/tests/103_alter_role.sql:10: ERROR:  Role 'roach' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/103_alter_role.sql:13: ERROR:  Role 'roach' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/103_alter_role.sql:15: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/103_alter_role.sql:7: ERROR:  SQL parse error: sql parser error: Expected an object type after CREATE, found: USER at Line: 1, Column 8
+psql:/home/dongxu/lab/db9-server/tests/103_alter_role.sql:10: ERROR:  Role 'roach' does not exist
+psql:/home/dongxu/lab/db9-server/tests/103_alter_role.sql:13: ERROR:  Role 'roach' does not exist
+psql:/home/dongxu/lab/db9-server/tests/103_alter_role.sql:15: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

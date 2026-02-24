@@ -5,7 +5,7 @@
 
 ## 背景与动机
 
-ORM 的 migration 引擎高度依赖 `ALTER TABLE` 的一组常见子操作（rename/drop constraint/alter column 等）。当前 pg-tikv 的 `ALTER TABLE` 支持面偏窄，会直接阻断迁移落地。
+ORM 的 migration 引擎高度依赖 `ALTER TABLE` 的一组常见子操作（rename/drop constraint/alter column 等）。当前 db9-server 的 `ALTER TABLE` 支持面偏窄，会直接阻断迁移落地。
 
 现状可见 `src/sql/ddl.rs` 的 `execute_alter_table()`（从 `725` 行附近开始）：
 - ✅ `ADD COLUMN`、`DROP COLUMN`、`RENAME COLUMN`
@@ -137,7 +137,7 @@ CHECK 表达式重写策略（避免“字符串替换误伤”）：
 
 ### 5) `DROP CONSTRAINT`
 
-pg-tikv 的约束在 schema 中分别存储：
+db9-server 的约束在 schema 中分别存储：
 - PK：`pk_indices` + `columns[].primary_key`
 - UNIQUE：通过 `indexes[]`（unique=true）表达（且可能由约束名决定 index 名）
 - CHECK：`check_constraints[]`
@@ -155,7 +155,7 @@ pg-tikv 的约束在 schema 中分别存储：
 - 对于未命名的 CHECK（`name=None`），我们需要在 create/alter add constraint 时生成并保存稳定默认名，保证后续可 `DROP CONSTRAINT`（现有 `information_schema.check_constraints` 会用 `"{table}_check{i+1}"` 作为兜底展示名）
 
 #### UNIQUE
-- 约束名通常等价于 index 名（至少在 pg-tikv 内部可以这样做，减少歧义）
+- 约束名通常等价于 index 名（至少在 db9-server 内部可以这样做，减少歧义）
 - drop 时：
   - 从 `schema.indexes` 移除对应 `IndexDef`
   - 清理已有 index entries：

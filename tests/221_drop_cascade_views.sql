@@ -108,7 +108,7 @@ DROP TABLE short_other;
 DROP VIEW IF EXISTS cycle_v2 CASCADE;
 DROP VIEW IF EXISTS cycle_v1 CASCADE;
 
--- tipg does not validate view references at CREATE time, so
+-- db9 does not validate view references at CREATE time, so
 -- cycles can be persisted.
 CREATE VIEW cycle_v1 AS SELECT * FROM cycle_v2;
 CREATE VIEW cycle_v2 AS SELECT * FROM cycle_v1;

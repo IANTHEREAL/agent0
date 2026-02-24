@@ -1,5 +1,5 @@
-psql:/home/dongxu/lab/pg-tikv/tests/170_notice.sql:7: ERROR:  Extension 'plpgsql' is not available
-psql:/home/dongxu/lab/pg-tikv/tests/170_notice.sql:8: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/170_notice.sql:7: ERROR:  Extension 'plpgsql' is not available
+psql:/home/dongxu/lab/db9-server/tests/170_notice.sql:8: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
  notice 
 --------
  
@@ -45,7 +45,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/170_notice.sql:8: ERROR:  SQL parse error: s
  
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/170_notice.sql:110: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/170_notice.sql:110: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
               warning              
 -----------------------------------
  SKIPPED: ALTER TYPE not supported
@@ -56,7 +56,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/170_notice.sql:110: ERROR:  SQL parse error:
  SKIPPED: ALTER TYPE not supported
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/170_notice.sql:130: ERROR:  Table 'public.v' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/170_notice.sql:131: ERROR:  Column not found
-psql:/home/dongxu/lab/pg-tikv/tests/170_notice.sql:134: ERROR:  Materialized view 'concurrently' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/170_notice.sql:137: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: UNLISTEN at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/170_notice.sql:130: ERROR:  Table 'public.v' already exists
+psql:/home/dongxu/lab/db9-server/tests/170_notice.sql:131: ERROR:  Column not found
+psql:/home/dongxu/lab/db9-server/tests/170_notice.sql:134: ERROR:  Materialized view 'concurrently' does not exist
+psql:/home/dongxu/lab/db9-server/tests/170_notice.sql:137: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: UNLISTEN at Line: 1, Column 1

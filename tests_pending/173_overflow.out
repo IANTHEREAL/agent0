@@ -1,17 +1,17 @@
-psql:/home/dongxu/lab/pg-tikv/tests/173_overflow.sql:7: NOTICE:  table "large_numbers" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/173_overflow.sql:7: NOTICE:  table "large_numbers" does not exist, skipping
          sum          
 ----------------------
  -9223372036854775808
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/173_overflow.sql:17: ERROR:  No PK
-psql:/home/dongxu/lab/pg-tikv/tests/173_overflow.sql:20: ERROR:  number too large to fit in target type
+psql:/home/dongxu/lab/db9-server/tests/173_overflow.sql:17: ERROR:  No PK
+psql:/home/dongxu/lab/db9-server/tests/173_overflow.sql:20: ERROR:  number too large to fit in target type
          sum          
 ----------------------
  -9223372036854775808
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/173_overflow.sql:26: NOTICE:  table "t88128" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/173_overflow.sql:26: NOTICE:  table "t88128" does not exist, skipping
  ?column? 
 ----------
  t
@@ -32,4 +32,4 @@ psql:/home/dongxu/lab/pg-tikv/tests/173_overflow.sql:26: NOTICE:  table "t88128"
  t
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/173_overflow.sql:44: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/173_overflow.sql:44: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

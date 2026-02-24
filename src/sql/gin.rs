@@ -1,6 +1,6 @@
 //! JSONB GIN token extraction.
 //!
-//! pg-tikv uses a lightweight, GIN-like inverted index to accelerate JSONB `@>` queries.
+//! db9-server uses a lightweight, GIN-like inverted index to accelerate JSONB `@>` queries.
 //! This module extracts "tokens" (key-exists and key-value) from a JSON value and hashes
 //! them into fixed-size identifiers that are stored in TiKV index keys.
 //!

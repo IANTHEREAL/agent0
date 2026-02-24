@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate test Parquet files for pg-tikv parquet extension integration tests.
+"""Generate test Parquet files for db9-server parquet extension integration tests.
 
 Requires: pip install pyarrow
 

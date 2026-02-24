@@ -14,7 +14,7 @@
 
 ## External Contracts
 - **[Stable] Storage format v2 marker and compatibility boundary**
-  - Each TiKV keyspace used by pg-tikv MUST contain a format marker `_sys_format_version` set to big-endian `u32(2)`.
+  - Each TiKV keyspace used by db9-server MUST contain a format marker `_sys_format_version` set to big-endian `u32(2)`.
   - If a keyspace contains `_sys_format_version != 2`, startup MUST fail with an incompatibility error.
   - If `_sys_format_version` is missing but v1-era table keys exist, startup MUST refuse to auto-upgrade and MUST require re-initialization/migration.
   - Evidence: `src/storage/tikv_store.rs` (`TikvStore::check_format_version`), `src/storage/encoding.rs` (`encode_format_version_key`, `encode_next_table_id_key`, `encode_schema_prefix`).
@@ -86,5 +86,5 @@ Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
 ## Change Management
 - Any change to key layouts, serialization formats, format version handling, keyspace/database isolation invariants, or transaction primitives MUST update this document and the corresponding module entries in `docs/sot/modules.yaml`.
 - Breaking changes to persistent format or invariants require DR/ADR per #368 rules (impact surface + migration + rollback + verification updates).
-- Reference: https://github.com/c4pt0r/tipg/issues/368
+- Reference: https://github.com/c4pt0r/db9/issues/368
 

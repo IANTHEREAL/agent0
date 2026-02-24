@@ -79,7 +79,7 @@ fi
 
 if [ $FAIL -ne 0 ]; then
     echo ""
-    echo "Error masking lint failed. See https://github.com/c4pt0r/tipg/issues/657"
+    echo "Error masking lint failed. See https://github.com/c4pt0r/db9/issues/657"
     exit 1
 fi
 

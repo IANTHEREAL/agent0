@@ -1,7 +1,7 @@
 """
-Demo: TiPG Trigger + HTTP Extension Webhook Notifications
+Demo: db9 Trigger + HTTP Extension Webhook Notifications
 
-This demo shows how to use TiPG's AFTER triggers combined with the HTTP
+This demo shows how to use db9's AFTER triggers combined with the HTTP
 extension to send webhook notifications whenever a table changes.
 
 Flow:
@@ -68,14 +68,14 @@ def demo(dsn: str, webhook_host: str = "127.0.0.1", webhook_port: int = 8765):
 
     # --- Step 1: Start webhook receiver ---
     print("=" * 60)
-    print("TiPG Trigger + HTTP Extension Webhook Demo")
+    print("db9 Trigger + HTTP Extension Webhook Demo")
     print("=" * 60)
     print(f"\n[1] Starting webhook receiver on {webhook_url} ...")
     server = start_webhook_server(webhook_host, webhook_port)
     print("    Webhook receiver is running.")
 
     # --- Step 2: Set up database ---
-    print(f"\n[2] Connecting to TiPG at {dsn} ...")
+    print(f"\n[2] Connecting to db9 at {dsn} ...")
     db = Database(dsn)
     print("    Setting up tables, HTTP extension, and triggers ...")
     db.setup_all(webhook_url)

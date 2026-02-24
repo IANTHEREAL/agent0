@@ -5,7 +5,7 @@
 
 ## Press Release (future tense)
 
-Today we are introducing a **Fast Regression Gate** for pg-tikv: a single command that developers and CI can run to quickly validate release-critical compatibility regressions with a stable evidence trail.
+Today we are introducing a **Fast Regression Gate** for db9-server: a single command that developers and CI can run to quickly validate release-critical compatibility regressions with a stable evidence trail.
 
 This change targets:
 - Faster, safer iteration on `master` without relying on release ceremony
@@ -27,11 +27,11 @@ This change targets:
 ### How do I run the fast gate?
 
 ```bash
-# default: start TiKV + pg-tikv, then run the gate pack
+# default: start TiKV + db9-server, then run the gate pack
 bash scripts/regression_gate.sh
 ```
 
-Reuse an existing running pg-tikv instance:
+Reuse an existing running db9-server instance:
 
 ```bash
 bash scripts/regression_gate.sh --dsn "$PG_DSN"

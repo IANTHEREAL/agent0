@@ -11,15 +11,15 @@ PG_USER="${PG_USER:-default.admin}"
 PG_PASSWORD="${PG_PASSWORD:-admin}"
 PG_DB="${PG_DB:-postgres}"
 PD_ENDPOINTS="${PD_ENDPOINTS:-127.0.0.1:2379}"
-CRON_POLL_MS="${PGTIKV_CRON_POLL_MS:-10000}"
-CRON_ORPHAN_TIMEOUT_SEC="${PGTIKV_CRON_ORPHAN_TIMEOUT_SEC:-30}"
+CRON_POLL_MS="${DB9_CRON_POLL_MS:-10000}"
+CRON_ORPHAN_TIMEOUT_SEC="${DB9_CRON_ORPHAN_TIMEOUT_SEC:-30}"
 WAIT_SECONDS="${WAIT_SECONDS:-190}"
 READY_TIMEOUT_SEC="${READY_TIMEOUT_SEC:-90}"
 
-PGTIKV_PID_A=""
-PGTIKV_PID_B=""
-LOG_A="/tmp/pgtikv-cron-concurrency-a.log"
-LOG_B="/tmp/pgtikv-cron-concurrency-b.log"
+DB9_PID_A=""
+DB9_PID_B=""
+LOG_A="/tmp/db9-cron-concurrency-a.log"
+LOG_B="/tmp/db9-cron-concurrency-b.log"
 
 TEST_DB_CONCURRENCY=""
 TEST_DB_NOEXT=""
@@ -38,17 +38,17 @@ Fully-automated pg_cron distributed concurrency and edge-case validation.
 
 Options:
   --pd-endpoints <addr>         TiKV PD endpoints (default: $PD_ENDPOINTS or 127.0.0.1:2379)
-  --port-a <port>               pg-tikv instance A port (default: 5433)
-  --port-b <port>               pg-tikv instance B port (default: 5434)
+  --port-a <port>               db9-server instance A port (default: 5433)
+  --port-b <port>               db9-server instance B port (default: 5434)
   --host <host>                 pg host for psql (default: 127.0.0.1)
   --wait-seconds <sec>          Concurrency wait duration (default: 190)
-  --cron-poll-ms <ms>           PGTIKV_CRON_POLL_MS (default: 10000)
-  --orphan-timeout-sec <sec>    PGTIKV_CRON_ORPHAN_TIMEOUT_SEC (default: 30)
+  --cron-poll-ms <ms>           DB9_CRON_POLL_MS (default: 10000)
+  --orphan-timeout-sec <sec>    DB9_CRON_ORPHAN_TIMEOUT_SEC (default: 30)
   -h, --help                    Show this help
 
 Environment overrides:
   PD_ENDPOINTS, PG_PORT_A, PG_PORT_B, PG_HOST, PG_USER, PG_PASSWORD,
-  PGTIKV_CRON_POLL_MS, PGTIKV_CRON_ORPHAN_TIMEOUT_SEC, WAIT_SECONDS
+  DB9_CRON_POLL_MS, DB9_CRON_ORPHAN_TIMEOUT_SEC, WAIT_SECONDS
 EOF
 }
 
@@ -154,16 +154,16 @@ cleanup() {
     drop_database_if_exists "$PG_PORT_A" "$TEST_DB_ORPHAN"
   fi
 
-  if [[ -n "$PGTIKV_PID_A" ]] && kill -0 "$PGTIKV_PID_A" 2>/dev/null; then
-    log "Stopping instance A (PID=$PGTIKV_PID_A)"
-    kill "$PGTIKV_PID_A" 2>/dev/null || true
-    wait "$PGTIKV_PID_A" 2>/dev/null || true
+  if [[ -n "$DB9_PID_A" ]] && kill -0 "$DB9_PID_A" 2>/dev/null; then
+    log "Stopping instance A (PID=$DB9_PID_A)"
+    kill "$DB9_PID_A" 2>/dev/null || true
+    wait "$DB9_PID_A" 2>/dev/null || true
   fi
 
-  if [[ -n "$PGTIKV_PID_B" ]] && kill -0 "$PGTIKV_PID_B" 2>/dev/null; then
-    log "Stopping instance B (PID=$PGTIKV_PID_B)"
-    kill "$PGTIKV_PID_B" 2>/dev/null || true
-    wait "$PGTIKV_PID_B" 2>/dev/null || true
+  if [[ -n "$DB9_PID_B" ]] && kill -0 "$DB9_PID_B" 2>/dev/null; then
+    log "Stopping instance B (PID=$DB9_PID_B)"
+    kill "$DB9_PID_B" 2>/dev/null || true
+    wait "$DB9_PID_B" 2>/dev/null || true
   fi
 
   log "Cleanup complete"
@@ -216,7 +216,7 @@ start_instances() {
   require_cmd cargo
   require_cmd psql
 
-  log "Building pg-tikv (release)"
+  log "Building db9-server (release)"
   (cd "$ROOT_DIR" && cargo build --release)
 
   log "Starting instance A on ${PG_HOST}:${PG_PORT_A}"
@@ -224,32 +224,32 @@ start_instances() {
     cd "$ROOT_DIR" && \
     PD_ENDPOINTS="$PD_ENDPOINTS" \
     PG_PORT="$PG_PORT_A" \
-    PGTIKV_CRON_POLL_MS="$CRON_POLL_MS" \
-    PGTIKV_CRON_ORPHAN_TIMEOUT_SEC="$CRON_ORPHAN_TIMEOUT_SEC" \
-    ./target/release/pg-tikv
+    DB9_CRON_POLL_MS="$CRON_POLL_MS" \
+    DB9_CRON_ORPHAN_TIMEOUT_SEC="$CRON_ORPHAN_TIMEOUT_SEC" \
+    ./target/release/db9-server
   ) >"$LOG_A" 2>&1 &
-  PGTIKV_PID_A=$!
+  DB9_PID_A=$!
 
   log "Starting instance B on ${PG_HOST}:${PG_PORT_B}"
   (
     cd "$ROOT_DIR" && \
     PD_ENDPOINTS="$PD_ENDPOINTS" \
     PG_PORT="$PG_PORT_B" \
-    PGTIKV_CRON_POLL_MS="$CRON_POLL_MS" \
-    PGTIKV_CRON_ORPHAN_TIMEOUT_SEC="$CRON_ORPHAN_TIMEOUT_SEC" \
-    ./target/release/pg-tikv
+    DB9_CRON_POLL_MS="$CRON_POLL_MS" \
+    DB9_CRON_ORPHAN_TIMEOUT_SEC="$CRON_ORPHAN_TIMEOUT_SEC" \
+    ./target/release/db9-server
   ) >"$LOG_B" 2>&1 &
-  PGTIKV_PID_B=$!
+  DB9_PID_B=$!
 
   log "Waiting for instance A readiness"
-  if ! wait_for_ready "$PG_PORT_A" "$PGTIKV_PID_A" "$READY_TIMEOUT_SEC"; then
+  if ! wait_for_ready "$PG_PORT_A" "$DB9_PID_A" "$READY_TIMEOUT_SEC"; then
     log "Instance A failed to become ready; tailing log"
     tail -n 200 "$LOG_A" || true
     return 1
   fi
 
   log "Waiting for instance B readiness"
-  if ! wait_for_ready "$PG_PORT_B" "$PGTIKV_PID_B" "$READY_TIMEOUT_SEC"; then
+  if ! wait_for_ready "$PG_PORT_B" "$DB9_PID_B" "$READY_TIMEOUT_SEC"; then
     log "Instance B failed to become ready; tailing log"
     tail -n 200 "$LOG_B" || true
     return 1
@@ -385,11 +385,11 @@ test_orphan_recovery_failover_smoke() {
   log "Orphan/failover concept: claim ownership is persisted in TiKV; after owner death and timeout (${CRON_ORPHAN_TIMEOUT_SEC}s), another instance can continue scheduling."
   log "Simulating abrupt owner loss by SIGKILL on instance A."
 
-  if [[ -n "$PGTIKV_PID_A" ]] && kill -0 "$PGTIKV_PID_A" 2>/dev/null; then
-    kill -9 "$PGTIKV_PID_A" 2>/dev/null || true
-    wait "$PGTIKV_PID_A" 2>/dev/null || true
+  if [[ -n "$DB9_PID_A" ]] && kill -0 "$DB9_PID_A" 2>/dev/null; then
+    kill -9 "$DB9_PID_A" 2>/dev/null || true
+    wait "$DB9_PID_A" 2>/dev/null || true
   fi
-  PGTIKV_PID_A=""
+  DB9_PID_A=""
 
   local deadline=$(( $(date +%s) + CRON_ORPHAN_TIMEOUT_SEC + 120 ))
   local current_runs="$initial_runs"

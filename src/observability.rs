@@ -45,38 +45,38 @@ impl ObservabilityConfig {
     fn from_env() -> Self {
         let mut cfg = Self::default();
 
-        if let Ok(v) = env::var("PGTIKV_OBS_ENABLED") {
+        if let Ok(v) = env::var("DB9_OBS_ENABLED") {
             cfg.enabled = parse_bool(&v).unwrap_or(cfg.enabled);
         }
-        if let Ok(v) = env::var("PGTIKV_OBS_SAMPLE_EVERY") {
+        if let Ok(v) = env::var("DB9_OBS_SAMPLE_EVERY") {
             cfg.sample_every = v
                 .parse::<u64>()
                 .ok()
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.sample_every);
         }
-        if let Ok(v) = env::var("PGTIKV_OBS_SLOW_MS") {
+        if let Ok(v) = env::var("DB9_OBS_SLOW_MS") {
             cfg.slow_query_threshold_us = v
                 .parse::<u64>()
                 .ok()
                 .map(|ms| ms.saturating_mul(1000))
                 .unwrap_or(cfg.slow_query_threshold_us);
         }
-        if let Ok(v) = env::var("PGTIKV_OBS_MAX_SAMPLE_EVENTS") {
+        if let Ok(v) = env::var("DB9_OBS_MAX_SAMPLE_EVENTS") {
             cfg.max_sample_events = v
                 .parse::<usize>()
                 .ok()
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.max_sample_events);
         }
-        if let Ok(v) = env::var("PGTIKV_OBS_MAX_SAMPLE_GROUPS") {
+        if let Ok(v) = env::var("DB9_OBS_MAX_SAMPLE_GROUPS") {
             cfg.max_sample_groups = v
                 .parse::<usize>()
                 .ok()
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.max_sample_groups);
         }
-        if let Ok(v) = env::var("PGTIKV_OBS_MAX_SQL_LEN") {
+        if let Ok(v) = env::var("DB9_OBS_MAX_SQL_LEN") {
             cfg.max_sql_len = v
                 .parse::<usize>()
                 .ok()

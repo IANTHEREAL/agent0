@@ -102,8 +102,8 @@
      3
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/124_distinct.sql:64: ERROR:  Table 'public.kv' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/124_distinct.sql:68: ERROR:  duplicate key value violates unique constraint "kv_pkey"
+psql:/home/dongxu/lab/db9-server/tests/124_distinct.sql:64: ERROR:  Table 'public.kv' already exists
+psql:/home/dongxu/lab/db9-server/tests/124_distinct.sql:68: ERROR:  duplicate key value violates unique constraint "kv_pkey"
 DETAIL:  Key (k)=(1) already exists.
  v 
 ---
@@ -132,7 +132,7 @@ DETAIL:  Key (k)=(1) already exists.
  5
 (5 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/124_distinct.sql:88: ERROR:  duplicate key value violates unique constraint "t0_c0_key"
+psql:/home/dongxu/lab/db9-server/tests/124_distinct.sql:88: ERROR:  duplicate key value violates unique constraint "t0_c0_key"
 DETAIL:  Key (c0)=(NULL) already exists.
  c0 
 ----
@@ -157,5 +157,5 @@ DETAIL:  Key (c0)=(NULL) already exists.
      3
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/124_distinct.sql:141: ERROR:  Unsupported function: jsonb_agg
-psql:/home/dongxu/lab/pg-tikv/tests/124_distinct.sql:143: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/124_distinct.sql:141: ERROR:  Unsupported function: jsonb_agg
+psql:/home/dongxu/lab/db9-server/tests/124_distinct.sql:143: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

@@ -25,7 +25,7 @@ brew install libpq
 
 ## Starting TiKV
 
-pg-tikv uses TiKV keyspaces for isolation. Your TiKV cluster must run with API v2 enabled (`storage.api-version = 2`).
+db9-server uses TiKV keyspaces for isolation. Your TiKV cluster must run with API v2 enabled (`storage.api-version = 2`).
 
 Create a config file `/tmp/tikv.toml`:
 
@@ -41,7 +41,7 @@ Start with config:
 tiup playground --mode tikv-slim --kv.config /tmp/tikv.toml
 ```
 
-Note the PD endpoint from the output (often `127.0.0.1:2379`). If it differs, set `PD_ENDPOINTS` when starting pg-tikv.
+Note the PD endpoint from the output (often `127.0.0.1:2379`). If it differs, set `PD_ENDPOINTS` when starting db9-server.
 
 ### Create Additional Keyspaces (Multi-Tenancy)
 
@@ -58,20 +58,20 @@ curl -sS -X POST http://127.0.0.1:2379/pd/api/v2/keyspaces \
   -d '{"name":"tenant_b"}'
 ```
 
-## Building pg-tikv
+## Building db9-server
 
 ```bash
-git clone https://github.com/c4pt0r/tipg.git
-cd tipg
+git clone https://github.com/c4pt0r/db9.git
+cd db9
 cargo build --release --locked
 ```
 
-## Running pg-tikv
+## Running db9-server
 
 ### Basic Start
 
 ```bash
-PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=admin ./target/release/pg-tikv
+DB9_BOOTSTRAP_ADMIN_PASSWORD=admin ./target/release/db9-server
 ```
 
 ### With Custom Configuration
@@ -80,16 +80,16 @@ PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=admin ./target/release/pg-tikv
 PD_ENDPOINTS=127.0.0.1:2379 \
 PG_PORT=5433 \
 PG_KEYSPACE=default \
-PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=admin \
-./target/release/pg-tikv
+DB9_BOOTSTRAP_ADMIN_PASSWORD=admin \
+./target/release/db9-server
 ```
 
 ## Security Note
 
-pg-tikv is **secure-by-default**:
-- By default, pg-tikv binds to `127.0.0.1:${PG_PORT}`.
-- The first superuser is bootstrapped only when you explicitly set `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD` (and optionally `PGTIKV_BOOTSTRAP_ADMIN_USER`).
-- Non-loopback binds without TLS are refused unless you explicitly opt into insecure mode (`PGTIKV_INSECURE=1` or `PGTIKV_DEV=1`).
+db9-server is **secure-by-default**:
+- By default, db9-server binds to `127.0.0.1:${PG_PORT}`.
+- The first superuser is bootstrapped only when you explicitly set `DB9_BOOTSTRAP_ADMIN_PASSWORD` (and optionally `DB9_BOOTSTRAP_ADMIN_USER`).
+- Non-loopback binds without TLS are refused unless you explicitly opt into insecure mode (`DB9_INSECURE=1` or `DB9_DEV=1`).
 
 For production-like usage, enable TLS (`PG_TLS_CERT` + `PG_TLS_KEY`), set `PG_REQUIRE_TLS=1`, and use a strong bootstrap password. See `docs/authentication.md` and `docs/release-notes-v0.1.0.md`.
 
@@ -102,7 +102,7 @@ pg_isready -h 127.0.0.1 -p 5433
 psql -h 127.0.0.1 -p 5433 -U admin -d postgres -c "SELECT 1;"
 # Or open an interactive shell:
 psql -h 127.0.0.1 -p 5433 -U admin -d postgres
-# Password: (the value you used for `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD`)
+# Password: (the value you used for `DB9_BOOTSTRAP_ADMIN_PASSWORD`)
 ```
 
 ### Multi-Tenant Connection
@@ -145,7 +145,7 @@ SHOW TABLES;
 
 ## Extensions (HTTP)
 
-pg-tikv supports built-in extensions that can be enabled per-tenant. The `http` extension provides Supabase-style HTTP table functions under the `extensions` schema:
+db9-server supports built-in extensions that can be enabled per-tenant. The `http` extension provides Supabase-style HTTP table functions under the `extensions` schema:
 
 ```sql
 -- Requires SUPERUSER
@@ -185,7 +185,7 @@ CREATE ROLE app_admin WITH PASSWORD 'admin123' LOGIN SUPERUSER;
 
 ## Loading Existing Data
 
-pg-tikv supports pg_restore for loading PostgreSQL dumps:
+db9-server supports pg_restore for loading PostgreSQL dumps:
 
 ```bash
 pg_restore -h 127.0.0.1 -p 5433 -U admin -d postgres \

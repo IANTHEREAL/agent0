@@ -1,4 +1,4 @@
-/// CLI argument parser for pg-tikv server.
+/// CLI argument parser for db9-server server.
 ///
 /// This module provides pure argument parsing without side effects.
 /// It does not read environment variables or call process::exit.
@@ -151,10 +151,10 @@ fn parse_port(s: &str) -> Result<u16, String> {
 
 /// Print help message to stdout.
 pub fn print_help() {
-    println!("pg-tikv - PostgreSQL-compatible distributed SQL database on TiKV");
+    println!("db9-server - PostgreSQL-compatible distributed SQL database on TiKV");
     println!();
     println!("USAGE:");
-    println!("    pg-tikv [OPTIONS]");
+    println!("    db9-server [OPTIONS]");
     println!();
     println!("OPTIONS:");
     println!("    -h, --help                     Print this help message and exit");
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_no_args() {
-        let result = parse_args(&args(&["pg-tikv"])).unwrap();
+        let result = parse_args(&args(&["db9-server"])).unwrap();
         match result {
             CliAction::Run(cli_args) => {
                 assert_eq!(cli_args.host, None);
@@ -208,31 +208,31 @@ mod tests {
 
     #[test]
     fn test_help_long() {
-        let result = parse_args(&args(&["pg-tikv", "--help"])).unwrap();
+        let result = parse_args(&args(&["db9-server", "--help"])).unwrap();
         assert_eq!(result, CliAction::ShowHelp);
     }
 
     #[test]
     fn test_help_short() {
-        let result = parse_args(&args(&["pg-tikv", "-h"])).unwrap();
+        let result = parse_args(&args(&["db9-server", "-h"])).unwrap();
         assert_eq!(result, CliAction::ShowHelp);
     }
 
     #[test]
     fn test_version_long() {
-        let result = parse_args(&args(&["pg-tikv", "--version"])).unwrap();
+        let result = parse_args(&args(&["db9-server", "--version"])).unwrap();
         assert_eq!(result, CliAction::ShowVersion);
     }
 
     #[test]
     fn test_version_short() {
-        let result = parse_args(&args(&["pg-tikv", "-V"])).unwrap();
+        let result = parse_args(&args(&["db9-server", "-V"])).unwrap();
         assert_eq!(result, CliAction::ShowVersion);
     }
 
     #[test]
     fn test_port_space() {
-        let result = parse_args(&args(&["pg-tikv", "--port", "1234"])).unwrap();
+        let result = parse_args(&args(&["db9-server", "--port", "1234"])).unwrap();
         match result {
             CliAction::Run(cli_args) => {
                 assert_eq!(cli_args.port, Some(1234));
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn test_port_equals() {
-        let result = parse_args(&args(&["pg-tikv", "--port=5555"])).unwrap();
+        let result = parse_args(&args(&["db9-server", "--port=5555"])).unwrap();
         match result {
             CliAction::Run(cli_args) => {
                 assert_eq!(cli_args.port, Some(5555));
@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn test_host() {
-        let result = parse_args(&args(&["pg-tikv", "--host", "0.0.0.0"])).unwrap();
+        let result = parse_args(&args(&["db9-server", "--host", "0.0.0.0"])).unwrap();
         match result {
             CliAction::Run(cli_args) => {
                 assert_eq!(cli_args.host, Some("0.0.0.0".to_string()));
@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn test_host_equals() {
-        let result = parse_args(&args(&["pg-tikv", "--host=::1"])).unwrap();
+        let result = parse_args(&args(&["db9-server", "--host=::1"])).unwrap();
         match result {
             CliAction::Run(cli_args) => {
                 assert_eq!(cli_args.host, Some("::1".to_string()));
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_pd_endpoints() {
-        let result = parse_args(&args(&["pg-tikv", "--pd-endpoints", "a:1,b:2"])).unwrap();
+        let result = parse_args(&args(&["db9-server", "--pd-endpoints", "a:1,b:2"])).unwrap();
         match result {
             CliAction::Run(cli_args) => {
                 assert_eq!(cli_args.pd_endpoints, Some("a:1,b:2".to_string()));
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn test_keyspace() {
-        let result = parse_args(&args(&["pg-tikv", "--keyspace", "myapp"])).unwrap();
+        let result = parse_args(&args(&["db9-server", "--keyspace", "myapp"])).unwrap();
         match result {
             CliAction::Run(cli_args) => {
                 assert_eq!(cli_args.keyspace, Some("myapp".to_string()));
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn test_tls_both() {
         let result = parse_args(&args(&[
-            "pg-tikv",
+            "db9-server",
             "--tls-cert",
             "c.pem",
             "--tls-key",
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn test_tls_cert_only() {
-        let result = parse_args(&args(&["pg-tikv", "--tls-cert", "c.pem"])).unwrap();
+        let result = parse_args(&args(&["db9-server", "--tls-cert", "c.pem"])).unwrap();
         match result {
             CliAction::Run(cli_args) => {
                 assert_eq!(cli_args.tls_cert, Some("c.pem".to_string()));
@@ -330,7 +330,7 @@ mod tests {
     #[test]
     fn test_all_flags() {
         let result = parse_args(&args(&[
-            "pg-tikv",
+            "db9-server",
             "--host",
             "localhost",
             "--port",
@@ -360,28 +360,28 @@ mod tests {
 
     #[test]
     fn test_unknown_flag() {
-        let result = parse_args(&args(&["pg-tikv", "--banana"]));
+        let result = parse_args(&args(&["db9-server", "--banana"]));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown"));
     }
 
     #[test]
     fn test_missing_value() {
-        let result = parse_args(&args(&["pg-tikv", "--port"]));
+        let result = parse_args(&args(&["db9-server", "--port"]));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("requires a value"));
     }
 
     #[test]
     fn test_invalid_port() {
-        let result = parse_args(&args(&["pg-tikv", "--port", "abc"]));
+        let result = parse_args(&args(&["db9-server", "--port", "abc"]));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid"));
     }
 
     #[test]
     fn test_last_wins() {
-        let result = parse_args(&args(&["pg-tikv", "--port", "1", "--port", "2"])).unwrap();
+        let result = parse_args(&args(&["db9-server", "--port", "1", "--port", "2"])).unwrap();
         match result {
             CliAction::Run(cli_args) => {
                 assert_eq!(cli_args.port, Some(2));
@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn test_double_dash() {
-        let result = parse_args(&args(&["pg-tikv", "--", "--port", "99"])).unwrap();
+        let result = parse_args(&args(&["db9-server", "--", "--port", "99"])).unwrap();
         match result {
             CliAction::Run(cli_args) => {
                 assert_eq!(cli_args.port, None);
@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_unexpected_positional() {
-        let result = parse_args(&args(&["pg-tikv", "something"]));
+        let result = parse_args(&args(&["db9-server", "something"]));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unexpected"));
     }

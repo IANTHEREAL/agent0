@@ -3,7 +3,7 @@
 ## Status
 
 - **Phase**: Implemented (Phase 1)
-- **Author**: pg-tikv team
+- **Author**: db9-server team
 - **Date**: 2026-02-18
 - **Related files**: `src/worker/`, `src/cron/`, `src/sql/triggers/`, `src/sql/executor/`, `src/storage/tikv_store/`
 
@@ -11,7 +11,7 @@
 
 ## Problem Statement
 
-pg-tikv currently has multiple independent async execution systems, each operating in isolation with the following issues:
+db9-server currently has multiple independent async execution systems, each operating in isolation with the following issues:
 
 ### Current State Analysis
 
@@ -33,7 +33,7 @@ Total cron jobs:                   20,000   (avg 2/tenant)
 Total async triggers:             100,000   (avg 2/tenant)
 Peak due jobs/minute:             200-500
 Peak async triggers/second:        50-200
-pg-tikv instances:                    10+
+db9-server instances:                    10+
 ```
 
 ### Core Pain Points
@@ -88,14 +88,14 @@ pg-tikv instances:                    10+
                     ┌────────────────────┼─────────────────────┐
                     │                    │                     │
               ┌─────┴─────┐       ┌─────┴─────┐       ┌───────┴───┐
-              │ pg-tikv 1  │       │ pg-tikv 2  │       │ pg-tikv M  │
+              │ db9-server 1  │       │ db9-server 2  │       │ db9-server M  │
               │ (SQL only) │       │ (SQL only) │       │ (SQL only) │
               └────────────┘       └────────────┘       └───────────┘
 ```
 
 ### Key Decisions
 
-1. **Workers connect back to pg-tikv via pgwire** to execute SQL rather than operating on TiKV data directly. This guarantees full SQL semantics (transactions, triggers, privilege checks, search_path).
+1. **Workers connect back to db9-server via pgwire** to execute SQL rather than operating on TiKV data directly. This guarantees full SQL semantics (transactions, triggers, privilege checks, search_path).
 2. **TiKV pessimistic transactions for claims** provide a natural distributed lock — no additional leader election needed.
 3. **A single engine serves all async task types**, differentiated by TaskType.
 
@@ -319,11 +319,11 @@ while let Some(result) = join_set.join_next().await {
 }
 ```
 
-#### Execution Path: Connect Back to pg-tikv via pgwire
+#### Execution Path: Connect Back to db9-server via pgwire
 
 ```rust
 async fn execute_task_sql(entry: &TaskQueueEntry) -> Result<()> {
-    // Connect to the corresponding tenant's pg-tikv
+    // Connect to the corresponding tenant's db9-server
     let connstr = format!(
         "host={} port={} user={}.{} password={} dbname=postgres",
         pg_host, pg_port, entry.keyspace, entry.username, service_password
@@ -341,7 +341,7 @@ async fn execute_task_sql(entry: &TaskQueueEntry) -> Result<()> {
 
 **Why pgwire instead of operating on TiKV directly**:
 - Guarantees full SQL semantics (transactions, triggers, privilege checks, search_path)
-- Worker doesn't need to understand pg-tikv internal state — purely stateless
+- Worker doesn't need to understand db9-server internal state — purely stateless
 - Can use standard connection pool (deadpool-postgres) to manage connections
 - Supports statement_timeout, search_path, and other SQL parameters
 
@@ -499,7 +499,7 @@ Note: The `_sys_cron_claim_` prefix is **deprecated** — claims are migrated to
 ### Phase 1: In-Process Worker (Current Architecture Improvement)
 
 ```
-pg-tikv process
+db9-server process
 ├── SQL handler (pgwire)
 ├── WorkerEngine (queue scan + concurrent execution)
 └── WorkerGc (orphan claim cleanup + run retention)
@@ -510,18 +510,18 @@ pg-tikv process
 - `list_all_keyspaces()` replaced with registry scan
 - Concurrent execution added
 - Trigger queue migrated from in-memory to TiKV
-- Controlled by `PGTIKV_WORKER_ENABLED` environment variable (default: `true`)
+- Controlled by `DB9_WORKER_ENABLED` environment variable (default: `true`)
 
 ### Phase 2: Standalone Worker Microservice
 
 ```
-pg-tikv process       ← SQL only
+db9-server process       ← SQL only
 worker process(es)    ← separate binary, independently scalable
 ```
 
-- Workers connect back to pg-tikv via pgwire
+- Workers connect back to db9-server via pgwire
 - Workers can use Kubernetes HPA to auto-scale based on queue depth
-- pg-tikv no longer embeds worker (set `PGTIKV_WORKER_ENABLED=false`)
+- db9-server no longer embeds worker (set `DB9_WORKER_ENABLED=false`)
 - Design spec: `docs/design/24_worker_binary_spec.md`
 
 ### Phase 3: Full Unified Engine
@@ -543,7 +543,7 @@ Same queue + claim + execute mechanism; different task_types only differ in enqu
 
 ### Step 1: Add Registry + Queue (Dual-Write)
 
-1. Deploy new version of pg-tikv
+1. Deploy new version of db9-server
 2. `cron.schedule()` writes to both tenant keyspace job **and** system keyspace queue entry
 3. Worker still scans from `list_all_keyspaces()` (old path), **also** scans from queue (new path)
 4. Dedup from both sources (same claim key)
@@ -560,7 +560,7 @@ SELECT _sys_backfill_cron_registry();
 ### Step 3: Switch to New Path
 
 1. Confirm queue jobs cover all tenants (compare registry entry count vs old-path scan count)
-2. Set `PGTIKV_CRON_USE_QUEUE=true`, worker reads only from queue
+2. Set `DB9_CRON_USE_QUEUE=true`, worker reads only from queue
 3. Observe for 1-2 days to confirm stability
 
 ### Step 4: Clean Up Old Path
@@ -575,17 +575,17 @@ SELECT _sys_backfill_cron_registry();
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `PGTIKV_WORKER_ENABLED` | `true` | Enable in-process worker |
-| `PGTIKV_WORKER_POLL_MS` | `60000` | Tick interval |
-| `PGTIKV_WORKER_MAX_CONCURRENT_JOBS` | `32` | Max concurrent tasks per worker |
-| `PGTIKV_WORKER_ID` | `{hostname}:{pid}` | Worker instance identifier |
-| `PGTIKV_WORKER_STATEMENT_TIMEOUT_MS` | `300000` | Per-task execution timeout (5 minutes) |
-| `PGTIKV_WORKER_ORPHAN_TIMEOUT_SEC` | `300` | Orphan claim timeout |
-| `PGTIKV_WORKER_GC_BATCH_SIZE` | `100` | Keyspaces processed per GC cycle |
-| `PGTIKV_WORKER_PG_HOST` | (same as pg-tikv) | Phase 2: pg-tikv address for worker connection |
-| `PGTIKV_WORKER_PG_PORT` | (same as pg-tikv) | Phase 2: pg-tikv port for worker connection |
-| `PGTIKV_AUTO_ANALYZE_ENABLED` | `true` | Enable automatic ANALYZE |
-| `PGTIKV_AUTO_ANALYZE_THRESHOLD` | `50` | Auto-ANALYZE base threshold |
+| `DB9_WORKER_ENABLED` | `true` | Enable in-process worker |
+| `DB9_WORKER_POLL_MS` | `60000` | Tick interval |
+| `DB9_WORKER_MAX_CONCURRENT_JOBS` | `32` | Max concurrent tasks per worker |
+| `DB9_WORKER_ID` | `{hostname}:{pid}` | Worker instance identifier |
+| `DB9_WORKER_STATEMENT_TIMEOUT_MS` | `300000` | Per-task execution timeout (5 minutes) |
+| `DB9_WORKER_ORPHAN_TIMEOUT_SEC` | `300` | Orphan claim timeout |
+| `DB9_WORKER_GC_BATCH_SIZE` | `100` | Keyspaces processed per GC cycle |
+| `DB9_WORKER_PG_HOST` | (same as db9-server) | Phase 2: db9-server address for worker connection |
+| `DB9_WORKER_PG_PORT` | (same as db9-server) | Phase 2: db9-server port for worker connection |
+| `DB9_AUTO_ANALYZE_ENABLED` | `true` | Enable automatic ANALYZE |
+| `DB9_AUTO_ANALYZE_THRESHOLD` | `50` | Auto-ANALYZE base threshold |
 
 ---
 
@@ -595,7 +595,7 @@ SELECT _sys_backfill_cron_registry();
 |---------|--------|----------|
 | Worker crash | Claimed tasks won't execute | Orphan GC cleans claim after 5 min; next fire time re-enqueues automatically |
 | TiKV partition | Worker can't scan queue or claim | Tick fails, warn log; resumes automatically after TiKV recovers |
-| pg-tikv unavailable | Worker claims successfully but SQL fails | run_details records failed; retries on next fire time |
+| db9-server unavailable | Worker claims successfully but SQL fails | run_details records failed; retries on next fire time |
 | Queue entry lost | Task no longer triggers | Periodic reconcile: compare registry keyspaces with tenant keyspace jobs, backfill missing queue entries |
 | Clock skew | Task fires early or late | Claim's `fire_time_min` uses minute-level truncation, tolerates ±30s |
 | All workers offline | No tasks execute | Queue entries persist in TiKV; workers catch up when they come back |
@@ -608,17 +608,17 @@ Exposes the following Prometheus metrics:
 
 ```
 # Gauge
-pg_tikv_worker_queue_depth{task_type}           # Queue depth
-pg_tikv_worker_active_jobs{worker_id}           # Active job count
-pg_tikv_worker_claim_success_rate{task_type}    # Claim success rate
+db9_server_worker_queue_depth{task_type}           # Queue depth
+db9_server_worker_active_jobs{worker_id}           # Active job count
+db9_server_worker_claim_success_rate{task_type}    # Claim success rate
 
 # Counter
-pg_tikv_worker_tasks_executed_total{task_type, status}  # Execution total
-pg_tikv_worker_tasks_failed_total{task_type, reason}    # Failure total
+db9_server_worker_tasks_executed_total{task_type, status}  # Execution total
+db9_server_worker_tasks_failed_total{task_type, reason}    # Failure total
 
 # Histogram
-pg_tikv_worker_task_duration_seconds{task_type}  # Execution duration
-pg_tikv_worker_queue_latency_seconds{task_type}  # Queue latency
+db9_server_worker_task_duration_seconds{task_type}  # Execution duration
+db9_server_worker_queue_latency_seconds{task_type}  # Queue latency
 ```
 
 ---

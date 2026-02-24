@@ -1,4 +1,4 @@
--- Basic Compatibility Tests for pg-tikv
+-- Basic Compatibility Tests for db9-server
 -- Tests common SQL patterns and PostgreSQL features
 
 -- ============================================

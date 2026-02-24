@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test script to verify cloud TiPG database can trigger webhooks.
+Test script to verify cloud db9 database can trigger webhooks.
 
 This script uses an online webhook testing service instead of a local server,
 making it perfect for testing cloud database triggers.
@@ -38,7 +38,7 @@ def test_triggers(dsn: str, webhook_url: str):
     """Test cloud database triggers with an online webhook service."""
 
     print("=" * 70)
-    print("TiPG Cloud Database → Webhook Trigger Test")
+    print("db9 Cloud Database → Webhook Trigger Test")
     print("=" * 70)
     print(f"\nDatabase: {dsn}")
     print(f"Webhook:  {webhook_url}")
@@ -128,7 +128,7 @@ def test_triggers(dsn: str, webhook_url: str):
                 print("   ⚠️  No webhook logs yet.")
                 print("   This might mean:")
                 print("   - Triggers haven't fired yet (try waiting longer)")
-                print("   - PGTIKV_TRIGGER_ENABLED is not set to 'true'")
+                print("   - DB9_TRIGGER_ENABLED is not set to 'true'")
                 print("   - HTTP extension is not working properly")
 
         # 6c: Instructions for checking online webhook service
@@ -145,11 +145,11 @@ def test_triggers(dsn: str, webhook_url: str):
             print("⚠️  Troubleshooting:")
             print("   If you don't see all 5 webhook logs:")
             print()
-            print("   1. Check TiPG server environment variables:")
-            print("      ✓ PGTIKV_TRIGGER_ENABLED=true")
-            print("      ✓ PGTIKV_HTTP_ALLOW_INSECURE=true (if using HTTP)")
+            print("   1. Check db9 server environment variables:")
+            print("      ✓ DB9_TRIGGER_ENABLED=true")
+            print("      ✓ DB9_HTTP_ALLOW_INSECURE=true (if using HTTP)")
             print()
-            print("   2. Check TiPG server logs for errors")
+            print("   2. Check db9 server logs for errors")
             print()
             print("   3. Verify the webhook URL is accessible:")
             print(f'      curl -X POST {webhook_url} -d \'{{"test":"ok"}}\'')

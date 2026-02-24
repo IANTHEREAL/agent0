@@ -229,7 +229,7 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let dir = PathBuf::from(format!(
-            "/tmp/pgtikv-fs9-glob-test-{name}-{}-{id}-{nanos}",
+            "/tmp/db9-fs9-glob-test-{name}-{}-{id}-{nanos}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("create test dir");

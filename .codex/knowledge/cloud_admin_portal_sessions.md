@@ -16,5 +16,5 @@
   - `cloud-admin-portal/frontend/src/hooks/useTenantSession.tsx`
 
 ## Notes
-- Observability endpoint does not require tenant session; it uses the per-tenant `_pgtikv_sys_observer` credentials stored in portal DB.
+- Observability endpoint does not require tenant session; it uses the per-tenant `_db9_sys_observer` credentials stored in portal DB.
 

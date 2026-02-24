@@ -3,7 +3,7 @@ status|has_content_type|has_content
 status|foo_param
 200|bar
 status|posted_message
-200|hello from pg-tikv
+200|hello from db9-server
 status|form_name
 200|test
 status|has_content_type|empty_content
@@ -27,7 +27,7 @@ subquery_status
 status_200|status_201
 200|201
 status|test_header
-200|hello-from-pgtikv
+200|hello-from-db9
 status|auth_header
 200|Bearer test-token-123
 status|api_key

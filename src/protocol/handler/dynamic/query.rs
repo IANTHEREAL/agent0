@@ -495,7 +495,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
 #[async_trait]
 impl ExtendedQueryHandler for DynamicPgHandler {
     type Statement = PreparedStatement;
-    type QueryParser = super::super::TipgQueryParser;
+    type QueryParser = super::super::Db9QueryParser;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
         self.query_parser.clone()

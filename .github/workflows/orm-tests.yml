@@ -1,4 +1,4 @@
-name: pg-tikv Tests
+name: db9-server Tests
 
 on:
   push:
@@ -91,7 +91,7 @@ jobs:
           # Ensure the repository is initialized and trusted.
           tiup list >/dev/null
 
-      - name: Build pg-tikv
+      - name: Build db9-server
         run: cargo build --release
 
       - name: Run unit tests
@@ -141,24 +141,24 @@ jobs:
           curl -sf http://127.0.0.1:2379/pd/api/v1/health || (cat "$PLAYGROUND_LOG" && exit 1)
           curl -sf http://127.0.0.1:2379/pd/api/v1/stores | grep -Eq '"count"[[:space:]]*:[[:space:]]*[1-9]' || (cat "$PLAYGROUND_LOG" && exit 1)
 
-      - name: Start pg-tikv
+      - name: Start db9-server
         run: |
           PD_ENDPOINTS=127.0.0.1:2379 \
             PG_PORT=$PG_PORT \
-            PGTIKV_BOOTSTRAP_ADMIN_USER=$PG_USER \
-            PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=$PG_PASSWORD \
-            ./target/release/pg-tikv > /tmp/pgtikv.log 2>&1 &
-          echo "PG_TIKV_PID=$!" >> $GITHUB_ENV
-          # Wait for pg-tikv to be ready
+            DB9_BOOTSTRAP_ADMIN_USER=$PG_USER \
+            DB9_BOOTSTRAP_ADMIN_PASSWORD=$PG_PASSWORD \
+            ./target/release/db9-server > /tmp/db9.log 2>&1 &
+          echo "DB9_PID=$!" >> $GITHUB_ENV
+          # Wait for db9-server to be ready
           for i in $(seq 1 30); do
             if pg_isready -h 127.0.0.1 -p $PG_PORT -U $PG_USER -q 2>/dev/null; then
-              echo "pg-tikv ready after $i seconds"
+              echo "db9-server ready after $i seconds"
               break
             fi
             sleep 1
           done
-          # Verify pg-tikv is responding
-          PGPASSWORD=$PG_PASSWORD psql -h 127.0.0.1 -p $PG_PORT -U $PG_USER -d postgres -c "SELECT 1" || (cat /tmp/pgtikv.log && exit 1)
+          # Verify db9-server is responding
+          PGPASSWORD=$PG_PASSWORD psql -h 127.0.0.1 -p $PG_PORT -U $PG_USER -d postgres -c "SELECT 1" || (cat /tmp/db9.log && exit 1)
 
       - name: Run integration tests
         run: |
@@ -186,7 +186,7 @@ jobs:
           name: test-results
           path: |
             orm-tests/test-results.json
-            /tmp/pgtikv.log
+            /tmp/db9.log
 
       - name: Generate test summary
         if: always()
@@ -200,7 +200,7 @@ jobs:
             const skipped = results.numPendingTests || 0;
             const total = passed + failed + skipped;
             
-            console.log('## pg-tikv Test Results');
+            console.log('## db9-server Test Results');
             console.log('');
             console.log('### ORM Compatibility Tests');
             console.log('');
@@ -214,7 +214,7 @@ jobs:
             console.log('**Pass Rate:** ' + (total > 0 ? ((passed / total) * 100).toFixed(1) : 0) + '%');
             " >> \$GITHUB_STEP_SUMMARY
           else
-            echo "## pg-tikv Test Results" >> \$GITHUB_STEP_SUMMARY
+            echo "## db9-server Test Results" >> \$GITHUB_STEP_SUMMARY
             echo "" >> \$GITHUB_STEP_SUMMARY
             echo "⚠️ No test results file found" >> \$GITHUB_STEP_SUMMARY
           fi

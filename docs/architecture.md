@@ -1,4 +1,4 @@
-# pg-tikv Architecture Design
+# db9-server Architecture Design
 
 > PostgreSQL-compatible distributed SQL database on TiKV.
 > Last updated: 2026-02-22
@@ -51,7 +51,7 @@ All persistent data must be isolated per keyspace. Process-level global state is
                               │ PostgreSQL Wire Protocol (pgwire)
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                       pg-tikv Server                         │
+│                       db9-server Server                         │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │               Protocol Layer (pgwire)                  │  │
 │  │  • Simple Query Handler    • Extended Query Handler    │  │
@@ -154,7 +154,7 @@ Client SQL string
 │  │   (selectivity estimation, cardinality propagation)       │
 │  ├─ build.rs: PhysicalPlan → BoxedOperator                   │
 │  └─ Execute operator tree → results                          │
-│  NOTE: tipg.use_optimizer is compatibility/readback only.    │
+│  NOTE: db9.use_optimizer is compatibility/readback only.    │
 └──────────────────────────────────────────────────────────────┘
     │
     ▼
@@ -255,7 +255,7 @@ EXPLAIN query
 
 **Purpose**: Cost-based query optimization. Transforms `AnalyzedQuery` into an optimized physical plan.
 
-**Current status**: Always ON single path. Covers single-table, multi-table joins, set operations (UNION/INTERSECT/EXCEPT), CTEs, window functions, and DISTINCT ON. Includes selectivity estimation, index selection, join reordering (DPccp), subquery decorrelation (EXISTS/NOT EXISTS → SemiJoin/AntiJoin), and predicate pushdown. `tipg.use_optimizer` remains compatibility/readback only.
+**Current status**: Always ON single path. Covers single-table, multi-table joins, set operations (UNION/INTERSECT/EXCEPT), CTEs, window functions, and DISTINCT ON. Includes selectivity estimation, index selection, join reordering (DPccp), subquery decorrelation (EXISTS/NOT EXISTS → SemiJoin/AntiJoin), and predicate pushdown. `db9.use_optimizer` remains compatibility/readback only.
 
 ```
 AnalyzedQuery
@@ -440,7 +440,7 @@ The protocol handler (`src/protocol/handler/`) is decomposed into focused module
 |--------|---------|
 | `dynamic/` | `DynamicPgHandler`: main pgwire handler (mod.rs, query.rs, copy.rs, startup.rs) |
 | `portal.rs` | Portal state management and suspended portal handling |
-| `query_parser.rs` | `TipgQueryParser`: SQL parsing + analysis (pgwire QueryParser trait) |
+| `query_parser.rs` | `Db9QueryParser`: SQL parsing + analysis (pgwire QueryParser trait) |
 | `server_params.rs` | `PgServerParameterProvider`: ParameterStatus for pgwire |
 | `tenant.rs` | `parse_tenant_username()`: multi-tenancy username parsing |
 | `errors.rs` | Error helpers: SQLSTATE mapping, in-failed-transaction errors |
@@ -463,7 +463,7 @@ All keys are keyspace-prefixed by TiKV for multi-tenant isolation. Storage forma
 | `_sys_next_table_id` | Auto-increment counter for table IDs |
 | `_sys_next_database_id` | Auto-increment counter for database IDs |
 | `_sys_format_version` | Storage format version marker |
-| `_sys_schema_{table}` | `TableSchema` (bincode with magic header `PGTIKV_SCHEMA_V1\0`) |
+| `_sys_schema_{table}` | `TableSchema` (bincode with magic header `DB9_SCHEMA_V1\0`) |
 | `_sys_view_{name}` | View SQL definition |
 | `_sys_matview_{name}` | Materialized view SQL definition |
 | `_sys_proc_{name}` | Stored procedure SQL definition |
@@ -552,10 +552,10 @@ AFTER triggers: deferred to worker engine (src/worker/)
 
 ### 7.4 Runtime Stack Budget
 
-`pg-tikv` runs on Tokio multi-thread workers. Certain valid SQL shapes (for example, scalar subqueries over `pg_catalog` views) can produce deep async call chains during analyzed-path execution.
+`db9-server` runs on Tokio multi-thread workers. Certain valid SQL shapes (for example, scalar subqueries over `pg_catalog` views) can produce deep async call chains during analyzed-path execution.
 
 Runtime contract:
-- `PGTIKV_TOKIO_STACK_MB` configures Tokio worker thread stack size.
+- `DB9_TOKIO_STACK_MB` configures Tokio worker thread stack size.
 - Default is `8` MiB (`src/main.rs`).
 - The setting is operational only: it does not change SQL semantics or planner/executor logic.
 - Increase this value (`16`/`32`) for workloads with unusually deep nested query trees or heavy catalog introspection.
@@ -566,7 +566,7 @@ Runtime contract:
 
 ### 8.1 Worker Engine (`src/worker/`)
 
-Unified async task engine. All pg-tikv instances share a global task queue in TiKV — no leader election, natural load balancing via pessimistic transaction contention.
+Unified async task engine. All db9-server instances share a global task queue in TiKV — no leader election, natural load balancing via pessimistic transaction contention.
 
 ```
 Startup (main.rs):

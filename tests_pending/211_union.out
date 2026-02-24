@@ -1,14 +1,14 @@
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:5: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:8: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:11: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:14: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:17: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:20: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:23: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:26: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:29: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:32: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:35: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:5: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:8: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:11: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:14: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:17: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:20: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:23: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:26: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:29: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:32: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:35: ERROR:  Unsupported set expression
  x | pg_typeof 
 ---+-----------
  1 | unknown
@@ -21,12 +21,12 @@ psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:35: ERROR:  Unsupported set ex
  2 | unknown
 (2 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:44: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:47: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:50: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:53: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:56: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:59: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:44: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:47: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:50: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:53: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:56: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:59: ERROR:  Unsupported set expression
  v 
 ---
  2
@@ -69,41 +69,41 @@ psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:59: ERROR:  Unsupported set ex
  2
 (2 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:97: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:97: ERROR:  Only SELECT supported
  v 
 ---
  3
  2
 (2 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:103: ERROR:  Only SELECT supported
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:106: ERROR:  Only SELECT supported
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:109: ERROR:  Table 'public.a' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:110: ERROR:  Table 'public.c' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:113: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:119: ERROR:  duplicate key value violates unique constraint "c_pkey"
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:103: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:106: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:109: ERROR:  Table 'public.a' already exists
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:110: ERROR:  Table 'public.c' already exists
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:113: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:119: ERROR:  duplicate key value violates unique constraint "c_pkey"
 DETAIL:  Key (k)=(1) already exists.
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:125: ERROR:  Column 'a' not found
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:128: ERROR:  Column 'a' not found
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:131: ERROR:  Column 'a' not found
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:134: ERROR:  Column 'a' not found
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:137: ERROR:  Column 'a' not found
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:146: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:156: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:168: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:171: ERROR:  Table 'public.ab' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:174: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:180: ERROR:  Unsupported data type: Int4(None)
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:183: ERROR:  Table 'ab' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:186: ERROR:  Table 'ab' not found
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:189: ERROR:  Table 'ab' not found
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:192: ERROR:  Table 'ab' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:213: ERROR:  Only SELECT supported
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:219: ERROR:  Unsupported set expression
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:223: ERROR:  Index name required
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:234: ERROR:  Table 'public.xy' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:235: ERROR:  Index name required
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:242: ERROR:  duplicate key value violates unique constraint "xy_pkey"
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:125: ERROR:  Column 'a' not found
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:128: ERROR:  Column 'a' not found
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:131: ERROR:  Column 'a' not found
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:134: ERROR:  Column 'a' not found
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:137: ERROR:  Column 'a' not found
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:146: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:156: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:168: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:171: ERROR:  Table 'public.ab' already exists
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:174: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:180: ERROR:  Unsupported data type: Int4(None)
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:183: ERROR:  Table 'ab' does not exist
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:186: ERROR:  Table 'ab' not found
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:189: ERROR:  Table 'ab' not found
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:192: ERROR:  Table 'ab' does not exist
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:213: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:219: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:223: ERROR:  Index name required
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:234: ERROR:  Table 'public.xy' already exists
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:235: ERROR:  Index name required
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:242: ERROR:  duplicate key value violates unique constraint "xy_pkey"
 DETAIL:  Key (x)=(2) already exists.
  a |  b  
 ---+-----
@@ -270,20 +270,20 @@ DETAIL:  Key (x)=(2) already exists.
  4 | 4
 (2 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:331: ERROR:  Only SELECT supported
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:334: ERROR:  Table 'public.abc' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:335: ERROR:  Index name required
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:337: ERROR:  Table 'public.def' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:338: ERROR:  duplicate key value violates unique constraint "def_pkey"
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:331: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:334: ERROR:  Table 'public.abc' already exists
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:335: ERROR:  Index name required
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:337: ERROR:  Table 'public.def' already exists
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:338: ERROR:  duplicate key value violates unique constraint "def_pkey"
 DETAIL:  Key (d, e)=(1, 1) already exists.
  d | e | f 
 ---+---+---
  2 | 1 | 1
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:344: ERROR:  Table 'public.abcd' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:345: ERROR:  Index name required
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:346: ERROR:  insert or update on table "public.abcd" violates foreign key constraint "abcd_c_fkey"
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:344: ERROR:  Table 'public.abcd' already exists
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:345: ERROR:  Index name required
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:346: ERROR:  insert or update on table "public.abcd" violates foreign key constraint "abcd_c_fkey"
 DETAIL:  Key (c)=(2) is not present in table "public.c".
  e | f | g | h 
 ---+---+---+---
@@ -309,12 +309,12 @@ DETAIL:  Key (c)=(2) is not present in table "public.c".
    |    |   
 (4 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:361: ERROR:  Index name required
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:364: ERROR:  Index name required
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:367: ERROR:  Index name required
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:390: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t127043_1 at Line: 1, Column 9
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:393: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t127043_2 at Line: 1, Column 9
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:396: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t127043_3 at Line: 1, Column 9
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:361: ERROR:  Index name required
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:364: ERROR:  Index name required
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:367: ERROR:  Index name required
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:390: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t127043_1 at Line: 1, Column 9
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:393: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t127043_2 at Line: 1, Column 9
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:396: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: t127043_3 at Line: 1, Column 9
  k | v 
 ---+---
  1 | 1
@@ -330,19 +330,19 @@ psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:396: ERROR:  SQL parse error: 
  1 | 1
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:408: ERROR:  SQL parse error: sql parser error: Expected an expression:, found: ; at Line: 1, Column 37
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:409: ERROR:  SQL parse error: sql parser error: Expected an expression:, found: ; at Line: 1, Column 37
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:412: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:415: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:418: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:421: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:424: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:427: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:430: ERROR:  Table 't130591_1' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:433: ERROR:  Table 't130591_1' not found
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:436: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:439: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:442: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:445: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:448: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
-psql:/home/dongxu/lab/pg-tikv/tests/211_union.sql:451: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:408: ERROR:  SQL parse error: sql parser error: Expected an expression:, found: ; at Line: 1, Column 37
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:409: ERROR:  SQL parse error: sql parser error: Expected an expression:, found: ; at Line: 1, Column 37
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:412: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:415: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:418: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:421: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:424: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:427: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:430: ERROR:  Table 't130591_1' does not exist
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:433: ERROR:  Table 't130591_1' not found
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:436: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:439: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:442: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:445: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:448: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/211_union.sql:451: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: TABLE at Line: 1, Column 1

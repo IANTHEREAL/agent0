@@ -1,6 +1,6 @@
 # fs9 Extension
 
-`fs9` is a built-in extension table function for pg-tikv that enables querying the server's local filesystem directly via SQL. It supports directory listing, single-file reading, and glob-based multi-file matching, with decoders for CSV, TSV, JSONL, and raw text formats.
+`fs9` is a built-in extension table function for db9-server that enables querying the server's local filesystem directly via SQL. It supports directory listing, single-file reading, and glob-based multi-file matching, with decoders for CSV, TSV, JSONL, and raw text formats.
 
 ## 1. Overview
 
@@ -11,7 +11,7 @@
 
 ## 2. Local Deployment / Quick Start
 
-To use the `fs9` extension, you need a running pg-tikv environment.
+To use the `fs9` extension, you need a running db9-server environment.
 
 ### Quick Start Steps
 
@@ -19,11 +19,11 @@ To use the `fs9` extension, you need a running pg-tikv environment.
 # 1. Start a TiKV cluster (API v2 mode required for keyspace support)
 uv run scripts/tikv_admin.py start --name dev --persistent
 
-# 2. Build pg-tikv (release mode recommended)
+# 2. Build db9-server (release mode recommended)
 cargo build --release
 
-# 3. Start pg-tikv
-PD_ENDPOINTS=127.0.0.1:2379 PG_PORT=5433 target/release/pg-tikv
+# 3. Start db9-server
+PD_ENDPOINTS=127.0.0.1:2379 PG_PORT=5433 target/release/db9-server
 
 # 4. Connect with psql
 PGPASSWORD=admin psql -h 127.0.0.1 -p 5433 -U admin -d postgres
@@ -36,7 +36,7 @@ PGPASSWORD=admin psql -h 127.0.0.1 -p 5433 -U admin -d postgres
 | Start TiKV | `uv run scripts/tikv_admin.py start --name dev --persistent` |
 | Stop TiKV | `uv run scripts/tikv_admin.py stop --name dev` |
 | List clusters | `uv run scripts/tikv_admin.py list` |
-| Start pg-tikv | `PD_ENDPOINTS=127.0.0.1:2379 PG_PORT=5433 cargo run --release` |
+| Start db9-server | `PD_ENDPOINTS=127.0.0.1:2379 PG_PORT=5433 cargo run --release` |
 | Connect | `PGPASSWORD=admin psql -h 127.0.0.1 -p 5433 -U admin -d postgres` |
 
 **Default credentials**: username `admin`, password `admin`.
@@ -247,7 +247,7 @@ cargo test extensions::fs
 
 ### Integration Tests
 
-Requires a running pg-tikv server with a TiKV cluster.
+Requires a running db9-server server with a TiKV cluster.
 
 ```bash
 # Create test fixtures

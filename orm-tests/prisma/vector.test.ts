@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { PrismaClient } from '@prisma/client';
 import { getPrismaClient } from './client.js';
 
-describe('Prisma Vector Operations [pg-tikv]', () => {
+describe('Prisma Vector Operations [db9-server]', () => {
   let prisma: PrismaClient;
 
   beforeAll(async () => {

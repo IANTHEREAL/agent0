@@ -1,6 +1,6 @@
 -- fs9 + parquet/CSV local integration tests
 -- Requires:
---   1) pg-tikv started with --features parquet
+--   1) db9-server started with --features parquet
 --   2) fs9 local backend configured (default for local filesystem)
 --   3) tests/parquet_testdata/basic.parquet (100 rows: id int32, name text, value float8)
 --   4) tests/parquet_testdata/test_copy.csv (10 rows with header: id,name,value)

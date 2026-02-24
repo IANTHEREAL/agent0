@@ -163,7 +163,7 @@ pub fn pg_table_is_visible(args: Vec<Value>) -> Result<Value> {
 
 /// Check if a type is visible in the current search_path.
 ///
-/// In pg-tikv, all types within the keyspace are visible, so this always
+/// In db9-server, all types within the keyspace are visible, so this always
 /// returns true for non-NULL inputs (similar to pg_table_is_visible).
 ///
 /// PostgreSQL signature: pg_type_is_visible(type_oid oid) → boolean

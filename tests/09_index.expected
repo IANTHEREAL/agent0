@@ -3,5 +3,5 @@ id|name|age
 2|Bob|30
 3|Alice|25
 (3 rows)
-psql:/home/dongxu/lab/pg-tikv/tests/09_index.sql:23: ERROR:  duplicate key value violates unique constraint "idx_age"
+psql:/home/dongxu/lab/db9-server/tests/09_index.sql:23: ERROR:  duplicate key value violates unique constraint "idx_age"
 DETAIL:  Key (age)=(20) already exists.

@@ -2,7 +2,7 @@
 
 **Written**: 2026-02-06
 
-> Applicable repo: `pg-tikv` (repo name: `tipg`)  
+> Applicable repo: `db9-server` (repo name: `db9`)  
 > Goal: help you quickly answer three questions: **what tests exist, what CI runs, and how to run them locally and reproduce**; and provide a method to "use PostgreSQL as an oracle to validate test cases".
 
 ---
@@ -58,7 +58,7 @@ Output formatting:
 
 - `orm-tests.yml` (main workflow)
   - `cargo test` (Rust unit tests)
-  - Start TiKV (`tiup playground`) + start `pg-tikv`
+  - Start TiKV (`tiup playground`) + start `db9-server`
   - `python3 scripts/integration_test.py --dsn ...` (Built-in integration; **does not run the `tests/` case corpus**)
   - `npm test` (ORM: first `|| true`, then gate via a "failure count threshold" to avoid CI being permanently red due to known limitations)
   - `cargo clippy`; `cargo fmt --check` (currently `fmt-check` is `continue-on-error: true`)
@@ -118,7 +118,7 @@ Start the service:
 sudo systemctl enable --now postgresql
 ```
 
-### 3.2 Create a test account (match pg-tikv defaults)
+### 3.2 Create a test account (match db9-server defaults)
 
 ```bash
 sudo -u postgres psql -v ON_ERROR_STOP=1 <<'SQL'
@@ -139,7 +139,7 @@ sudo -u postgres psql -v ON_ERROR_STOP=1 -c "GRANT ALL ON SCHEMA public TO admin
 
 ### 3.3 Run oracle validation
 
-> Note: not every case is guaranteed to pass 100% on vanilla PostgreSQL (some may contain pg-tikv-specific behavior/error text). Start with "basic compatibility" cases first.
+> Note: not every case is guaranteed to pass 100% on vanilla PostgreSQL (some may contain db9-server-specific behavior/error text). Start with "basic compatibility" cases first.
 
 ```bash
 export PG_DSN_PG='postgres://admin:admin@127.0.0.1:5432/postgres'
@@ -147,18 +147,18 @@ python3 scripts/integration_test.py --dsn "$PG_DSN_PG" tests/01_ddl_basic.sql
 python3 scripts/integration_test.py --dsn "$PG_DSN_PG" tests/02_dml_crud.sql
 ```
 
-Tip: the runner writes `tests/*.out` (ignored in `.gitignore`). If you run the same `.sql` against different backends (pg-tikv vs PostgreSQL), `.out` will be overwritten. Save it elsewhere if you need evidence.
+Tip: the runner writes `tests/*.out` (ignored in `.gitignore`). If you run the same `.sql` against different backends (db9-server vs PostgreSQL), `.out` will be overwritten. Save it elsewhere if you need evidence.
 
 If you want to validate whether a case’s `.expected` matches PostgreSQL output:
 
 - Pass: the case/expected is consistent with PostgreSQL (at least for that dimension)
 - Fail:
   - First confirm whether the diff is due to output formatting (aligned/unaligned) or normalizable differences (the runner already normalizes multiple classes of output)
-  - Then decide whether it is a **semantic difference between pg-tikv and PostgreSQL** or the **case/expected is wrong**
+  - Then decide whether it is a **semantic difference between db9-server and PostgreSQL** or the **case/expected is wrong**
 
 ---
 
-## 4) Local runbook: How to run each class of tests (pg-tikv)
+## 4) Local runbook: How to run each class of tests (db9-server)
 
 ### 4.1 Dependency check (local)
 
@@ -179,21 +179,21 @@ uv run scripts/tikv_admin.py stop --name dev
 uv run scripts/tikv_admin.py clean --name dev
 ```
 
-The output will contain `PD_ENDPOINTS=127.0.0.1:<port>`; use it to start `pg-tikv`.
+The output will contain `PD_ENDPOINTS=127.0.0.1:<port>`; use it to start `db9-server`.
 
 Note: `scripts/tikv_admin.py start` uses PD client port `2379` by default (and PD peer port `2380`). If you already have a cluster occupying these ports, it may "look like it started successfully but actually reused the old PD". Recommended:
 
 - Run `uv run scripts/tikv_admin.py list` to inspect existing clusters and stop/clean what you don't need.
 - Or explicitly specify a different free port: `uv run scripts/tikv_admin.py start --name dev --pd-port <free_port> --persistent`
 
-### 4.3 Start pg-tikv
+### 4.3 Start db9-server
 
 ```bash
 cargo build --release
 PD_ENDPOINTS=127.0.0.1:<pd_port> \
 PG_PORT=5433 \
-PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=admin \
-./target/release/pg-tikv
+DB9_BOOTSTRAP_ADMIN_PASSWORD=admin \
+./target/release/db9-server
 ```
 
 Connect (requires `psql`):
@@ -239,13 +239,13 @@ python3 scripts/integration_test.py --dsn "$PG_DSN" --stop-on-error tests/
 
 ### 4.6 Fast Regression Gate (recommended before/for every change)
 
-Default (automatically runs `cargo test` + starts TiKV + builds release + starts pg-tikv + runs the gate pack):
+Default (automatically runs `cargo test` + starts TiKV + builds release + starts db9-server + runs the gate pack):
 
 ```bash
 bash scripts/regression_gate.sh
 ```
 
-Reuse an existing pg-tikv (faster):
+Reuse an existing db9-server (faster):
 
 ```bash
 bash scripts/regression_gate.sh --dsn "$PG_DSN"
@@ -318,7 +318,7 @@ Reports will be saved under `test-reports/test-report-*.md`.
 
 > Goal: avoid "the doc commands don’t run". Record the commands you actually ran and key evidence here (update as needed).
 
-- Repo: `c4pt0r/tipg`
+- Repo: `c4pt0r/db9`
 
 ### 2026-02-06 (upstream maintainer)
 
@@ -327,7 +327,7 @@ Reports will be saved under `test-reports/test-report-*.md`.
 - Commands executed (local evidence):
   - `cargo test` ✅ (803 tests passed)
   - `bash scripts/regression_gate.sh` ✅ (SQL pack: 4 passed; ORM pack: 121 passed; report dir: `test-reports/regression-gate-20260206-093311/`)
-  - `python3 scripts/integration_test.py --dsn "$PG_DSN"` ✅ (Built-in integration: 8 passed; executed after starting a temporary `pg-tikv`)
+  - `python3 scripts/integration_test.py --dsn "$PG_DSN"` ✅ (Built-in integration: 8 passed; executed after starting a temporary `db9-server`)
   - `./run_tests.sh` ❌ (Integration golden: 159 passed / 10 failed; ORM: Sequelize 3 suites fail; full report: `test-reports/test-report-20260206-093943.md`)
   - PostgreSQL oracle ✅ (installed `postgresql` + `postgresql-client`; created `admin/admin` and ran `GRANT ALL ON SCHEMA public`; passed: `tests/01_ddl_basic.sql`, `tests/02_dml_crud.sql`)
   - `PG_DSN=... bash scripts/e2e_tests.sh gorm_smoke` ❌ (currently failing: `record not found`; in CI this workflow is currently non-blocking)
@@ -339,7 +339,7 @@ Reports will be saved under `test-reports/test-report-*.md`.
 - Commands executed (local evidence):
   - `cargo test` ✅ (803 passed)
   - `bash scripts/regression_gate.sh` ✅ (SQL pack: 4 passed; ORM pack: 121 passed; report dir: `test-reports/regression-gate-20260206-102239/`)
-  - `python3 scripts/integration_test.py --dsn "$PG_DSN"` ✅ (Built-in integration: 8 passed; ran against a temporary `pg-tikv`)
+  - `python3 scripts/integration_test.py --dsn "$PG_DSN"` ✅ (Built-in integration: 8 passed; ran against a temporary `db9-server`)
   - `./run_tests.sh` ❌ (Integration golden: 158 passed / 11 failed; ORM: Sequelize 3 suites fail; report: `test-reports/test-report-20260206-102557.md`)
   - PostgreSQL oracle ✅ (passed: `tests/01_ddl_basic.sql`, `tests/02_dml_crud.sql`)
   - `PG_DSN=... bash scripts/e2e_tests.sh gorm_smoke` ❌ (`record not found`)

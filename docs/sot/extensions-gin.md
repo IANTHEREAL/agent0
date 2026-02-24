@@ -34,7 +34,7 @@
 
 - **[Stable] Insecure HTTP is disabled by default**
   - Plain `http://` requests MUST be rejected by default and MAY be enabled only via config.
-  - Evidence: `src/extensions/http.rs` (`allow_insecure_http`), `./ops-config.md` (`PGTIKV_HTTP_ALLOW_INSECURE`).
+  - Evidence: `src/extensions/http.rs` (`allow_insecure_http`), `./ops-config.md` (`DB9_HTTP_ALLOW_INSECURE`).
 
 - **[Stable] Per-statement and per-tenant request limits**
   - HTTP extension execution MUST enforce per-statement request count limits and per-tenant in-flight concurrency limits.
@@ -69,7 +69,7 @@
   - The HTTP extension can reach arbitrary network targets unless constrained; it is therefore a security-sensitive surface.
 - **Default posture (MUST): secure by default**
   - Superuser-only execution is the default boundary.
-  - `http://` is disabled by default; enabling it via `PGTIKV_HTTP_ALLOW_INSECURE` changes security posture and requires DR/ADR per #368.
+  - `http://` is disabled by default; enabling it via `DB9_HTTP_ALLOW_INSECURE` changes security posture and requires DR/ADR per #368.
   - URL validation blocks private/loopback/local targets and non-default ports.
   - Evidence anchors: `src/extensions/http.rs` (`execute_table_function`, `validate_url`), tests `tests/87_http_ssrf_protection.sql`, `tests/88_http_permission.sql`.
 - **Operational guardrails**
@@ -85,7 +85,7 @@
 
 ## Configuration
 This module MUST NOT redefine config keys. Relevant keys are defined exactly once in `./ops-config.md`:
-- `PGTIKV_HTTP_ALLOW_INSECURE`
+- `DB9_HTTP_ALLOW_INSECURE`
 
 ## Entrypoints
 - `src/extensions/http.rs`
@@ -109,4 +109,4 @@ Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
 ## Change Management
 - Any change to HTTP extension security posture (superuser boundary, URL validation rules, limits/timeouts), GIN-like access-path eligibility, or tokenization semantics MUST update this document and the corresponding module entries in `docs/sot/modules.yaml`.
 - Breaking changes to security defaults or contracts require DR/ADR per #368 rules (impact surface + migration + rollback + verification updates).
-- Reference: https://github.com/c4pt0r/tipg/issues/368
+- Reference: https://github.com/c4pt0r/db9/issues/368

@@ -1,11 +1,11 @@
 # Async Worker Engine
 
-pg-tikv includes a built-in async worker engine that executes background tasks. All pg-tikv instances share a single global task queue stored in TiKV, competing for work via pessimistic transactions — no leader election or external dependencies required.
+db9-server includes a built-in async worker engine that executes background tasks. All db9-server instances share a single global task queue stored in TiKV, competing for work via pessimistic transactions — no leader election or external dependencies required.
 
 ## Overview
 
 ```
-pg-tikv instance 1            pg-tikv instance 2            pg-tikv instance N
+db9-server instance 1            db9-server instance 2            db9-server instance N
 ┌──────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐
 │  SQL handler (pgwire)│     │  SQL handler (pgwire)│     │  SQL handler (pgwire)│
 │  WorkerEngine        │     │  WorkerEngine        │     │  WorkerEngine        │
@@ -23,7 +23,7 @@ pg-tikv instance 1            pg-tikv instance 2            pg-tikv instance N
                               └─────────────────┘
 ```
 
-The worker engine is **enabled by default** on every pg-tikv instance. Each instance polls the global queue, claims due tasks, and executes them in-process. Multiple instances naturally load-balance through TiKV transaction contention — if two workers try to claim the same task, only one succeeds.
+The worker engine is **enabled by default** on every db9-server instance. Each instance polls the global queue, claims due tasks, and executes them in-process. Multiple instances naturally load-balance through TiKV transaction contention — if two workers try to claim the same task, only one succeeds.
 
 ## Task Types
 
@@ -41,10 +41,10 @@ The engine supports five task types, all sharing the same queue infrastructure:
 
 ## Quick Start
 
-The worker runs automatically when pg-tikv starts. No additional setup needed for basic usage.
+The worker runs automatically when db9-server starts. No additional setup needed for basic usage.
 
 ```bash
-# Start pg-tikv — worker is enabled by default
+# Start db9-server — worker is enabled by default
 PD_ENDPOINTS=127.0.0.1:2379 cargo run
 
 # Connect and use background features
@@ -54,7 +54,7 @@ psql -h 127.0.0.1 -p 5433 -U admin
 To disable the worker on a specific instance (SQL-only mode):
 
 ```bash
-PGTIKV_WORKER_ENABLED=false PD_ENDPOINTS=127.0.0.1:2379 cargo run
+DB9_WORKER_ENABLED=false PD_ENDPOINTS=127.0.0.1:2379 cargo run
 ```
 
 ---
@@ -218,7 +218,7 @@ Tables are automatically analyzed when modification counts exceed a threshold, k
 This feature is **enabled by default**. To disable:
 
 ```bash
-PGTIKV_AUTO_ANALYZE_ENABLED=false PD_ENDPOINTS=127.0.0.1:2379 cargo run
+DB9_AUTO_ANALYZE_ENABLED=false PD_ENDPOINTS=127.0.0.1:2379 cargo run
 ```
 
 ---
@@ -229,16 +229,16 @@ All settings are controlled via environment variables. Every setting has a sensi
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PGTIKV_WORKER_ENABLED` | `true` | Enable the worker engine. Set to `false` for SQL-only instances. |
-| `PGTIKV_WORKER_POLL_MS` | `60000` | Queue poll interval in milliseconds (minimum 60000). |
-| `PGTIKV_WORKER_MAX_CONCURRENT_JOBS` | `32` | Max tasks executing concurrently per instance. |
-| `PGTIKV_WORKER_ID` | `{hostname}:{pid}` | Unique identifier for this worker instance. Auto-generated if not set. |
-| `PGTIKV_WORKER_STATEMENT_TIMEOUT_MS` | `300000` | Per-task execution timeout (5 minutes). |
-| `PGTIKV_WORKER_ORPHAN_TIMEOUT_SEC` | `300` | Seconds before an uncompleted claim is considered orphaned (5 minutes). |
-| `PGTIKV_WORKER_GC_BATCH_SIZE` | `100` | Number of keyspaces processed per GC cycle. |
-| `PGTIKV_WORKER_SYSTEM_KEYSPACE` | `_sys_worker` | TiKV keyspace for global worker state (rarely needs changing). |
-| `PGTIKV_AUTO_ANALYZE_ENABLED` | `true` | Enable automatic ANALYZE on modified tables. |
-| `PGTIKV_AUTO_ANALYZE_THRESHOLD` | `50` | Base threshold for auto-ANALYZE (formula: threshold + 0.1 × row_count). |
+| `DB9_WORKER_ENABLED` | `true` | Enable the worker engine. Set to `false` for SQL-only instances. |
+| `DB9_WORKER_POLL_MS` | `60000` | Queue poll interval in milliseconds (minimum 60000). |
+| `DB9_WORKER_MAX_CONCURRENT_JOBS` | `32` | Max tasks executing concurrently per instance. |
+| `DB9_WORKER_ID` | `{hostname}:{pid}` | Unique identifier for this worker instance. Auto-generated if not set. |
+| `DB9_WORKER_STATEMENT_TIMEOUT_MS` | `300000` | Per-task execution timeout (5 minutes). |
+| `DB9_WORKER_ORPHAN_TIMEOUT_SEC` | `300` | Seconds before an uncompleted claim is considered orphaned (5 minutes). |
+| `DB9_WORKER_GC_BATCH_SIZE` | `100` | Number of keyspaces processed per GC cycle. |
+| `DB9_WORKER_SYSTEM_KEYSPACE` | `_sys_worker` | TiKV keyspace for global worker state (rarely needs changing). |
+| `DB9_AUTO_ANALYZE_ENABLED` | `true` | Enable automatic ANALYZE on modified tables. |
+| `DB9_AUTO_ANALYZE_THRESHOLD` | `50` | Base threshold for auto-ANALYZE (formula: threshold + 0.1 × row_count). |
 
 ### Deployment Scenarios
 
@@ -253,21 +253,21 @@ PD_ENDPOINTS=127.0.0.1:2379 cargo run
 
 ```bash
 # Instance 1: SQL + Worker
-PD_ENDPOINTS=pd1:2379,pd2:2379,pd3:2379 PGTIKV_WORKER_ID=worker-1 cargo run
+PD_ENDPOINTS=pd1:2379,pd2:2379,pd3:2379 DB9_WORKER_ID=worker-1 cargo run
 
 # Instance 2: SQL + Worker
-PD_ENDPOINTS=pd1:2379,pd2:2379,pd3:2379 PGTIKV_WORKER_ID=worker-2 cargo run
+PD_ENDPOINTS=pd1:2379,pd2:2379,pd3:2379 DB9_WORKER_ID=worker-2 cargo run
 
 # Instance 3: SQL only (no background task execution)
-PD_ENDPOINTS=pd1:2379,pd2:2379,pd3:2379 PGTIKV_WORKER_ENABLED=false cargo run
+PD_ENDPOINTS=pd1:2379,pd2:2379,pd3:2379 DB9_WORKER_ENABLED=false cargo run
 ```
 
 **High-throughput cron** (many scheduled jobs):
 
 ```bash
 # Increase concurrency and poll frequency
-PGTIKV_WORKER_MAX_CONCURRENT_JOBS=64 \
-PGTIKV_WORKER_POLL_MS=60000 \
+DB9_WORKER_MAX_CONCURRENT_JOBS=64 \
+DB9_WORKER_POLL_MS=60000 \
 PD_ENDPOINTS=pd1:2379 cargo run
 ```
 
@@ -275,7 +275,7 @@ PD_ENDPOINTS=pd1:2379 cargo run
 
 ## How Multi-Instance Works
 
-When multiple pg-tikv instances have the worker enabled, they coordinate automatically through TiKV:
+When multiple db9-server instances have the worker enabled, they coordinate automatically through TiKV:
 
 ```
              ┌─────────────────────────────────────────────────┐
@@ -355,7 +355,7 @@ Available programmatically (atomic counters):
 
 ### Task not executing
 
-1. **Is the worker enabled?** Check that `PGTIKV_WORKER_ENABLED` is not set to `false`.
+1. **Is the worker enabled?** Check that `DB9_WORKER_ENABLED` is not set to `false`.
 2. **Is TiKV reachable?** The worker needs TiKV to read the queue. Check logs for connection errors.
 3. **Is the task due?** Cron tasks only execute at their scheduled time. Check `cron.job` for schedule and `cron.job_run_details` for history.
 4. **Is `max_concurrent_jobs` reached?** If all slots are occupied, the worker skips claiming until a slot opens.
@@ -376,7 +376,7 @@ Common causes:
 - SQL syntax error in the job command
 - Table or object doesn't exist
 - Permission denied
-- Statement timeout exceeded (`PGTIKV_WORKER_STATEMENT_TIMEOUT_MS`)
+- Statement timeout exceeded (`DB9_WORKER_STATEMENT_TIMEOUT_MS`)
 
 ### Index stuck in "Building" state
 
@@ -401,7 +401,7 @@ CREATE INDEX CONCURRENTLY idx_name ON your_table (column);
 
 ### pg_background_launch returns error
 
-- `"worker engine not available"`: The worker is disabled on this instance (`PGTIKV_WORKER_ENABLED=false`). Connect to an instance with the worker enabled, or enable it.
+- `"worker engine not available"`: The worker is disabled on this instance (`DB9_WORKER_ENABLED=false`). Connect to an instance with the worker enabled, or enable it.
 
 ---
 

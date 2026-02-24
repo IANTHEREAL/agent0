@@ -6,7 +6,7 @@ import { getPgConfig, defaultConfig } from '../shared/config.js';
 
 const { Pool } = pg;
 
-describe('Drizzle Connection & Protocol Compatibility [pg-tikv]', () => {
+describe('Drizzle Connection & Protocol Compatibility [db9-server]', () => {
   const pools: pg.Pool[] = [];
 
   afterAll(async () => {

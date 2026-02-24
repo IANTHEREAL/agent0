@@ -15,7 +15,7 @@ order_date|product|quantity
 2024-01-25|Gizmo|1
 2024-02-20|Widget|3
 (4 rows)
-psql:/home/dongxu/lab/pg-tikv/tests/95_join_using.sql:2: NOTICE:  table "t2" does not exist, skipping
-psql:/home/dongxu/lab/pg-tikv/tests/95_join_using.sql:3: NOTICE:  table "t1" does not exist, skipping
-psql:/home/dongxu/lab/pg-tikv/tests/95_join_using.sql:38: NOTICE:  table "orders" does not exist, skipping
-psql:/home/dongxu/lab/pg-tikv/tests/95_join_using.sql:39: NOTICE:  table "order_details" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/95_join_using.sql:2: NOTICE:  table "t2" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/95_join_using.sql:3: NOTICE:  table "t1" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/95_join_using.sql:38: NOTICE:  table "orders" does not exist, skipping
+psql:/home/dongxu/lab/db9-server/tests/95_join_using.sql:39: NOTICE:  table "order_details" does not exist, skipping

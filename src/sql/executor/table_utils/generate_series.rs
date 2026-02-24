@@ -11,7 +11,7 @@ pub(crate) const DEFAULT_MAX_GENERATE_SERIES_ROWS: usize = 1_000_000;
 pub(crate) const FLOAT8_OFFSET_ADVANCE_MAX_ITER: usize = 1024;
 
 pub(crate) fn max_generate_series_rows() -> usize {
-    std::env::var("PGTIKV_MAX_GENERATE_SERIES_ROWS")
+    std::env::var("DB9_MAX_GENERATE_SERIES_ROWS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
@@ -37,7 +37,7 @@ pub(crate) fn generate_series_values_limited(
 ) -> Result<(Vec<Value>, DataType)> {
     let too_many_rows = || {
         anyhow!(
-            "generate_series exceeded max rows ({}); set PGTIKV_MAX_GENERATE_SERIES_ROWS to override",
+            "generate_series exceeded max rows ({}); set DB9_MAX_GENERATE_SERIES_ROWS to override",
             max_rows
         )
     };

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-use pgtikv_admin::cli_common::ApiClient;
+use db9_admin::cli_common::ApiClient;
 use serde_json::Value;
 
 use crate::{make_auth_headers, require_token, OutputFormat};

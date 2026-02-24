@@ -1,5 +1,5 @@
-psql:/home/dongxu/lab/pg-tikv/tests/128_distsql_distinct_on.sql:10: ERROR:  Table 'public.xyz' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/128_distsql_distinct_on.sql:20: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/db9-server/tests/128_distsql_distinct_on.sql:10: ERROR:  Table 'public.xyz' already exists
+psql:/home/dongxu/lab/db9-server/tests/128_distsql_distinct_on.sql:20: ERROR:  Column count mismatch
  x | y | z 
 ---+---+---
  1 | 2 | 3

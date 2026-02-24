@@ -14,9 +14,9 @@
 ## External Contracts
 - **[Stable] Auth bootstrap: explicit initial superuser**
   - If no superuser exists yet for a tenant/keyspace:
-    - the server MUST bootstrap an initial superuser only when `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD` is explicitly set (optionally `PGTIKV_BOOTSTRAP_ADMIN_USER`);
+    - the server MUST bootstrap an initial superuser only when `DB9_BOOTSTRAP_ADMIN_PASSWORD` is explicitly set (optionally `DB9_BOOTSTRAP_ADMIN_USER`);
     - otherwise (non-dev mode), startup/authentication MUST fail-closed with an actionable error.
-  - When `PGTIKV_DEV=1` is explicitly set, the server MAY use legacy dev bootstrap behavior (insecure; intended for local development only).
+  - When `DB9_DEV=1` is explicitly set, the server MAY use legacy dev bootstrap behavior (insecure; intended for local development only).
   - Evidence: `src/auth/rbac.rs` (`AuthManager::bootstrap`), `src/protocol/handler/dynamic.rs` (`authenticate_user` calls `bootstrap`), `src/main.rs` (startup fail-fast bootstrap for default keyspace).
   - Security note: this is security-sensitive; changes require DR/ADR per #368.
 
@@ -67,4 +67,4 @@ Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
 ## Change Management
 - Any change to password hashing format, auth bootstrap defaults, or superuser-only boundaries MUST update this document and the corresponding module entries in `docs/sot/modules.yaml`.
 - Breaking changes to security defaults require DR/ADR per #368 (impact surface + migration + rollback + verification updates).
-- Reference: https://github.com/c4pt0r/tipg/issues/368
+- Reference: https://github.com/c4pt0r/db9/issues/368

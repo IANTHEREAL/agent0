@@ -1,6 +1,6 @@
-# TiPG Example: Trigger + HTTP Extension Webhook
+# db9 Example: Trigger + HTTP Extension Webhook
 
-This example demonstrates how to use **TiPG's AFTER triggers** combined with the **HTTP extension** to automatically send webhook notifications whenever a table is modified.
+This example demonstrates how to use **db9's AFTER triggers** combined with the **HTTP extension** to automatically send webhook notifications whenever a table is modified.
 
 When a row is inserted, updated, or deleted in the `products` table, an AFTER trigger fires and:
 1. Calls `extensions.http_post()` to POST a JSON payload to a webhook URL
@@ -9,7 +9,7 @@ When a row is inserted, updated, or deleted in the `products` table, an AFTER tr
 ## Architecture
 
 ```
- SQLAlchemy App                          TiPG Server
+ SQLAlchemy App                          db9 Server
  ─────────────                          ────────────
   INSERT INTO products ──────────────▶  Execute INSERT
                                              │
@@ -27,14 +27,14 @@ When a row is inserted, updated, or deleted in the `products` table, an AFTER tr
 
 ## Prerequisites
 
-- **TiPG** running with the following environment variables:
+- **db9** running with the following environment variables:
 
   ```bash
   # Required: enable AFTER trigger background worker
-  PGTIKV_TRIGGER_ENABLED=true
+  DB9_TRIGGER_ENABLED=true
 
   # Required: allow HTTP (not just HTTPS) for local webhook receiver
-  PGTIKV_HTTP_ALLOW_INSECURE=true
+  DB9_HTTP_ALLOW_INSECURE=true
   ```
 
 - **Python 3.10+**
@@ -45,8 +45,8 @@ When a row is inserted, updated, or deleted in the `products` table, an AFTER tr
 # 1. Start TiKV
 tiup playground --mode tikv-slim
 
-# 2. Start TiPG (in another terminal)
-PGTIKV_TRIGGER_ENABLED=true PGTIKV_HTTP_ALLOW_INSECURE=true cargo run
+# 2. Start db9 (in another terminal)
+DB9_TRIGGER_ENABLED=true DB9_HTTP_ALLOW_INSECURE=true cargo run
 
 # 3. Run the demo (installs dependencies automatically)
 cd examples/02_python_trigger_webhook
@@ -61,13 +61,13 @@ uv run python run.py postgresql://admin:admin@127.0.0.1:5433/postgres
 
 ```
 ============================================================
-TiPG Trigger + HTTP Extension Webhook Demo
+db9 Trigger + HTTP Extension Webhook Demo
 ============================================================
 
 [1] Starting webhook receiver on http://127.0.0.1:8765/webhook ...
     Webhook receiver is running.
 
-[2] Connecting to TiPG at postgresql://admin:admin@127.0.0.1:5433/postgres ...
+[2] Connecting to db9 at postgresql://admin:admin@127.0.0.1:5433/postgres ...
     Setting up tables, HTTP extension, and triggers ...
     Done. Tables: products, webhook_log
     Triggers: trg_product_insert, trg_product_update, trg_product_delete
@@ -143,21 +143,21 @@ CREATE TRIGGER trg_product_insert
     FOR EACH ROW EXECUTE FUNCTION notify_product_insert();
 ```
 
-### Key TiPG Features Used
+### Key db9 Features Used
 
 | Feature | Description |
 |---------|-------------|
-| `AFTER` triggers | Fire asynchronously via TiPG's background trigger worker |
+| `AFTER` triggers | Fire asynchronously via db9's background trigger worker |
 | `extensions.http_post()` | Built-in HTTP extension for making outbound HTTP requests |
 | `NEW.column` / `OLD.column` | Access the inserted/updated/deleted row data inside trigger functions |
 | `webhook_log` table | Persist the HTTP call result for auditing |
 
 ## Notes
 
-- **AFTER triggers in TiPG are asynchronous**: they are queued and processed by a background worker, so there is a small delay between the DML operation and the webhook call. The demo uses `time.sleep(1)` to wait for processing.
-- **HTTP extension requires superuser**: the TiPG connection must use a superuser account (default `admin`).
-- **HTTPS by default**: TiPG only allows HTTPS URLs unless `PGTIKV_HTTP_ALLOW_INSECURE=true` is set. For production, use an HTTPS webhook endpoint.
-- **TiPG does not support `TG_OP`/`TG_TABLE_NAME`**: unlike PostgreSQL, TiPG trigger functions cannot access these special variables. This example creates separate functions per event type as a workaround.
+- **AFTER triggers in db9 are asynchronous**: they are queued and processed by a background worker, so there is a small delay between the DML operation and the webhook call. The demo uses `time.sleep(1)` to wait for processing.
+- **HTTP extension requires superuser**: the db9 connection must use a superuser account (default `admin`).
+- **HTTPS by default**: db9 only allows HTTPS URLs unless `DB9_HTTP_ALLOW_INSECURE=true` is set. For production, use an HTTPS webhook endpoint.
+- **db9 does not support `TG_OP`/`TG_TABLE_NAME`**: unlike PostgreSQL, db9 trigger functions cannot access these special variables. This example creates separate functions per event type as a workaround.
 
 ## Project Structure
 

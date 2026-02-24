@@ -1,17 +1,17 @@
-# Dify Compatibility Report for pg-tikv
+# Dify Compatibility Report for db9-server
 
-This document tracks compatibility issues found when running [Dify](https://github.com/langgenius/dify) with pg-tikv as the PostgreSQL backend.
+This document tracks compatibility issues found when running [Dify](https://github.com/langgenius/dify) with db9-server as the PostgreSQL backend.
 
 ## Test Environment
 
 - **Dify Version**: 1.11.4 (from docker-compose.yaml)
-- **pg-tikv**: Current development version
+- **db9-server**: Current development version
 - **Test Date**: 2026-01-22 (updated)
 
 ## Configuration
 
 ```bash
-# pg-tikv running on
+# db9-server running on
 PG_LISTEN_ADDR=0.0.0.0
 PG_PORT=5433
 PD_ENDPOINTS=127.0.0.1:36701  # Use actual PD port from tikv_admin.py
@@ -30,7 +30,7 @@ EXPOSE_NGINX_PORT=8088     # If port 80 is in use
 
 ### ✅ Working (All Core Features)
 
-1. **Database Connection** - Dify can connect to pg-tikv
+1. **Database Connection** - Dify can connect to db9-server
 2. **Database Migrations** - Alembic migrations complete successfully (121 tables created)
 3. **Table Creation** - All Dify tables created with proper schemas
 4. **Plugin Daemon** - Successfully initializes database without errors
@@ -164,7 +164,7 @@ LEFT JOIN pg_catalog.pg_description as pd ON ...
 ## Testing Progress
 
 - [x] Dify docker-compose starts
-- [x] pg-tikv accepts connections from Docker containers
+- [x] db9-server accepts connections from Docker containers
 - [x] Database migrations complete (121 tables)
 - [x] Plugin daemon initializes (slow but works - 2-3 min)
 - [x] Web interface loads
@@ -190,16 +190,16 @@ After setup, the following records were created successfully:
 
 ```bash
 # 1. Start TiKV cluster (if not already running)
-cd ~/lab/pg-tikv
+cd ~/lab/db9-server
 uv run scripts/tikv_admin.py start --name dify-test --persistent
 
-# 2. Start pg-tikv
+# 2. Start db9-server
 PD_ENDPOINTS=127.0.0.1:<pd_port> \
 PG_PORT=5433 \
 PG_LISTEN_ADDR=0.0.0.0 \
-PGTIKV_BOOTSTRAP_ADMIN_PASSWORD=admin \
-PGTIKV_INSECURE=1 \
-./target/release/pg-tikv
+DB9_BOOTSTRAP_ADMIN_PASSWORD=admin \
+DB9_INSECURE=1 \
+./target/release/db9-server
 
 # 3. Configure and start Dify
 cd ~/lab/dify/docker
@@ -207,7 +207,7 @@ cd ~/lab/dify/docker
 #   DB_HOST=<your-host-ip>  (use `ip route get 1 | awk '{print $7}'` to find)
 #   DB_PORT=5433
 #   DB_USERNAME=admin
-#   DB_PASSWORD=admin  (bootstrapped via `PGTIKV_BOOTSTRAP_ADMIN_PASSWORD`)
+#   DB_PASSWORD=admin  (bootstrapped via `DB9_BOOTSTRAP_ADMIN_PASSWORD`)
 #   COMPOSE_PROFILES=weaviate  (remove postgresql profile)
 #   EXPOSE_NGINX_PORT=8088     (if port 80 is in use)
 
@@ -220,7 +220,7 @@ open http://localhost:8088/install
 ### Using Test Script
 
 ```bash
-cd ~/lab/pg-tikv
+cd ~/lab/db9-server
 ./scripts/dify_test.sh start    # Start everything
 ./scripts/dify_test.sh logs     # View logs
 ./scripts/dify_test.sh status   # Check status
@@ -241,7 +241,7 @@ cd ~/lab/pg-tikv
 
 ## Conclusion
 
-**pg-tikv is compatible with Dify.** All core database operations work:
+**db9-server is compatible with Dify.** All core database operations work:
 
 - ✅ Database migrations (121 tables created)
 - ✅ User registration and workspace creation

@@ -224,11 +224,11 @@ The demo function in `main.py` provides a comprehensive test of all features:
 
 ## Compatibility Notes
 
-This application is designed for **standard PostgreSQL**. Some features may not work with PostgreSQL-compatible databases like pg-tikv (TiKV), CockroachDB, or YugabyteDB.
+This application is designed for **standard PostgreSQL**. Some features may not work with PostgreSQL-compatible databases like db9-server (TiKV), CockroachDB, or YugabyteDB.
 
 See [LIMITATIONS.md](LIMITATIONS.md) for detailed compatibility information and workarounds.
 
-### Known Limitations with pg-tikv
+### Known Limitations with db9-server
 - Full-text search (TSVECTOR) not supported
 - ARRAY types return as strings instead of lists
 - Cannot drop enum types cleanly

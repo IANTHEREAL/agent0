@@ -5,16 +5,16 @@ use pgwire::api::Type;
 use pgwire::error::PgWireResult;
 
 #[derive(Debug, Default)]
-pub struct TipgQueryParser;
+pub struct Db9QueryParser;
 
-impl TipgQueryParser {
+impl Db9QueryParser {
     pub fn new() -> Self {
         Self
     }
 }
 
 #[async_trait]
-impl pgwire::api::stmt::QueryParser for TipgQueryParser {
+impl pgwire::api::stmt::QueryParser for Db9QueryParser {
     type Statement = PreparedStatement;
 
     async fn parse_sql(&self, sql: &str, _types: &[Type]) -> PgWireResult<Self::Statement> {

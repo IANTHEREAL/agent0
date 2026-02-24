@@ -1,7 +1,7 @@
 {
-  "name": "pg-tikv-orm-compatibility-tests",
+  "name": "db9-server-orm-compatibility-tests",
   "version": "1.0.0",
-  "description": "PostgreSQL ORM compatibility tests for pg-tikv",
+  "description": "PostgreSQL ORM compatibility tests for db9-server",
   "type": "module",
   "scripts": {
     "test": "vitest run",

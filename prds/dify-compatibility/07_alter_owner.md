@@ -14,7 +14,7 @@ ALTER FUNCTION public.uuidv7() OWNER TO postgres;
 ALTER SEQUENCE public.task_id_sequence OWNER TO postgres;
 ```
 
-当前 pg-tikv：
+当前 db9-server：
 - **不支持** `ALTER ... OWNER TO` 语法
 - 在多语句执行时会跳过这些语句（见 `helpers.rs:981`）
 - 导入 schema 时产生警告信息

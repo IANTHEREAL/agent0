@@ -1,4 +1,4 @@
-psql:/home/dongxu/lab/pg-tikv/tests/127_distsql_datetime.sql:10: ERROR:  Unsupported types for multiplication
+psql:/home/dongxu/lab/db9-server/tests/127_distsql_datetime.sql:10: ERROR:  Unsupported types for multiplication
  ?column? 
 ----------
 (0 rows)

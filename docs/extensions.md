@@ -1,6 +1,6 @@
 # Extensions
 
-pg-tikv extensions are **built-in** (compiled into the server binary) and can be **enabled per-tenant** (TiKV keyspace isolated).
+db9-server extensions are **built-in** (compiled into the server binary) and can be **enabled per-tenant** (TiKV keyspace isolated).
 
 ## Manage Extensions
 
@@ -49,7 +49,7 @@ FROM extensions.http_get('https://example.com');
 
 - SUPERUSER-only execution (non-superusers get `permission denied for extension "http"`).
 - By default, only `https://` URLs on port `443` are allowed.
-- **Insecure HTTP support**: Set `PGTIKV_HTTP_ALLOW_INSECURE=true` to enable `http://` URLs on port `80`. Use with caution as HTTP traffic is unencrypted.
+- **Insecure HTTP support**: Set `DB9_HTTP_ALLOW_INSECURE=true` to enable `http://` URLs on port `80`. Use with caution as HTTP traffic is unencrypted.
 - SSRF protection blocks `localhost`, `.localhost`, `.local`, and any URL that resolves to loopback/private/link-local/unspecified IP ranges.
 - Limits (currently fixed in code): connect timeout 1s, total timeout 5s, max request body 256KiB, max response 1MiB, max redirects 3 (GET/POST/PUT/DELETE only), max 5 HTTP calls per SQL statement, max 20 in-flight requests per tenant per node.
 
@@ -57,4 +57,4 @@ FROM extensions.http_get('https://example.com');
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PGTIKV_HTTP_ALLOW_INSECURE` | `false` | Set to `true` or `1` to allow insecure HTTP requests (port 80) |
+| `DB9_HTTP_ALLOW_INSECURE` | `false` | Set to `true` or `1` to allow insecure HTTP requests (port 80) |

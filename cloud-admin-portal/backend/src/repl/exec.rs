@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use pgtikv_admin::cli_common::ApiClient;
+use db9_admin::cli_common::ApiClient;
 
 use crate::{make_auth_headers, require_token, OutputFormat};
 

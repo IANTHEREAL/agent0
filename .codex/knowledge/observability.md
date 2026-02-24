@@ -1,14 +1,14 @@
 # Observability v1 (per-tenant, rolling 1h) — facts + code locations
 
 ## Goal (Phase 1)
-- Low-overhead, in-memory observability for pg-tikv.
+- Low-overhead, in-memory observability for db9-server.
 - Retention: **last 1 hour** only.
 - Tenant isolation: metrics are keyed by tenant keyspace; tenant can only query its own metrics surface.
 - Key metrics: QPS/TPS, p99/avg latency, active connections.
 - Query samples: keep a bounded set of sampled SQL statements (slow + errors always sampled; plus probabilistic sampling).
 - Exposed to `cloud-admin-portal` tenant detail page.
 
-## Implementation overview (pg-tikv)
+## Implementation overview (db9-server)
 
 ### Core module
 - `src/observability.rs`
@@ -32,9 +32,9 @@
 
 ### SQL surface (for portal / operators)
 - `src/sql/executor_join.rs`: table-valued functions (resolved in `Executor::get_table_data`)
-  - `SELECT * FROM _pgtikv_sys_observability;` / `SELECT * FROM _pgtikv_sys_observability();`
+  - `SELECT * FROM _db9_sys_observability;` / `SELECT * FROM _db9_sys_observability();`
     - `window_seconds, statement_count, txn_commit_count, error_count, qps, tps, latency_avg_ms, latency_p99_ms, active_connections`
-  - `SELECT * FROM _pgtikv_sys_query_samples;` / `SELECT * FROM _pgtikv_sys_query_samples();`
+  - `SELECT * FROM _db9_sys_query_samples;` / `SELECT * FROM _db9_sys_query_samples();`
     - `query, sample_count, error_count, latency_avg_ms, latency_p99_ms, latency_max_ms, last_seen_ms_ago`
 
 ## Tenant isolation model
@@ -48,24 +48,24 @@
 - Time base: monotonic process uptime (no wall clock dependency).
 
 ## Configuration knobs (env)
-- `PGTIKV_OBS_ENABLED` (default `true`)
-- `PGTIKV_OBS_SAMPLE_EVERY` (default `1000`) — sample 1/N statements (slow/errors always sampled)
-- `PGTIKV_OBS_SLOW_MS` (default `200`) — always sample >= this latency
-- `PGTIKV_OBS_MAX_SAMPLE_EVENTS` (default `20000`) — per-tenant cap (still pruned to last 1h)
-- `PGTIKV_OBS_MAX_SAMPLE_GROUPS` (default `50`) — rows returned by `pgtikv_query_samples()`
-- `PGTIKV_OBS_MAX_SQL_LEN` (default `512`) — stored sample SQL length after normalization
+- `DB9_OBS_ENABLED` (default `true`)
+- `DB9_OBS_SAMPLE_EVERY` (default `1000`) — sample 1/N statements (slow/errors always sampled)
+- `DB9_OBS_SLOW_MS` (default `200`) — always sample >= this latency
+- `DB9_OBS_MAX_SAMPLE_EVENTS` (default `20000`) — per-tenant cap (still pruned to last 1h)
+- `DB9_OBS_MAX_SAMPLE_GROUPS` (default `50`) — rows returned by `db9_query_samples()`
+- `DB9_OBS_MAX_SQL_LEN` (default `512`) — stored sample SQL length after normalization
 
 ## cloud-admin-portal integration
 
 ### Backend
 - `cloud-admin-portal/backend/app/api/tenants.py`
   - `POST /api/tenants/{name}/observability/bootstrap` (called after tenant creation)
-    - Creates/rotates per-tenant observability account: `_pgtikv_sys_observer`
+    - Creates/rotates per-tenant observability account: `_db9_sys_observer`
     - Stores credentials in portal DB: `TenantDB.observability_user` / `TenantDB.observability_password`
   - `GET /api/tenants/{name}/observability` (no tenant session)
-    - Queries pg-tikv using the stored observability credentials and returns structured JSON.
+    - Queries db9-server using the stored observability credentials and returns structured JSON.
 - `cloud-admin-portal/backend/app/services/pg_client.py`
-  - `PgTikvClient` uses `pg8000` (pure Python, no `psql` subprocess); keeps the client minimal (no custom splitter/pool).
+  - `Db9Client` uses `pg8000` (pure Python, no `psql` subprocess); keeps the client minimal (no custom splitter/pool).
 
 ### Frontend
 - `cloud-admin-portal/frontend/src/pages/TenantDetailPage.tsx`
@@ -75,11 +75,11 @@
 - `cloud-admin-portal/frontend/src/api/tenants.ts`
   - `useTenantObservability()` auto-refreshes every 5s, but stops polling on HTTP 409 (observability not bootstrapped).
 
-## Readonly enforcement (pg-tikv)
-- Observability account: `_pgtikv_sys_observer`
+## Readonly enforcement (db9-server)
+- Observability account: `_db9_sys_observer`
 - Enforcement point: `src/sql/executor.rs`
   - Allows only:
-    - `SELECT ... FROM _pgtikv_sys_observability()` / `_pgtikv_sys_query_samples()` (no nested queries)
+    - `SELECT ... FROM _db9_sys_observability()` / `_db9_sys_query_samples()` (no nested queries)
     - tableless `SELECT ...` (e.g., `SELECT 1`) (no nested queries)
     - harmless session/tx control (`SET ...`, `BEGIN/COMMIT/ROLLBACK/...`) as **no-op** for client compatibility
   - Skips `TenantObservability::record_statement(...)` for observer queries (avoid self-pollution from portal polling).

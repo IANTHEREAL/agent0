@@ -12,7 +12,7 @@ Dify DDL 中大量使用精度截断的时间戳默认值：
 created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP(0) NOT NULL
 ```
 
-`CURRENT_TIMESTAMP(0)` 表示截断到秒（0 位小数），当前 pg-tikv 可能未正确处理精度参数。
+`CURRENT_TIMESTAMP(0)` 表示截断到秒（0 位小数），当前 db9-server 可能未正确处理精度参数。
 
 ## 目标
 

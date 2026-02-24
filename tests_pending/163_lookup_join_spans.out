@@ -1,6 +1,6 @@
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:52: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: metric_values at Line: 1, Column 9
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:53: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: metric_values_desc at Line: 1, Column 9
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:54: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: metrics at Line: 1, Column 9
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:52: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: metric_values at Line: 1, Column 9
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:53: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: metric_values_desc at Line: 1, Column 9
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:54: ERROR:  SQL parse error: sql parser error: Expected TABLE, found: metrics at Line: 1, Column 9
  v.metric_id |          v.time           | v.nullable | v.value | m.id | m.nullable | m.name 
 -------------+---------------------------+------------+---------+------+------------+--------
            1 | 2020-01-01 00:00:01+00:00 |          1 |       1 |    1 |            | cpu
@@ -112,24 +112,24 @@ psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:54: ERROR:  SQL pa
   3 |          | mem
 (3 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:198: ERROR:  AND requires boolean operands
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:208: ERROR:  AND requires boolean operands
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:218: ERROR:  AND requires boolean operands
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:228: ERROR:  AND requires boolean operands
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:238: ERROR:  AND requires boolean operands
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:248: ERROR:  AND requires boolean operands
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:258: ERROR:  AND requires boolean operands
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:268: ERROR:  AND requires boolean operands
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:278: ERROR:  AND requires boolean operands
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:288: ERROR:  AND requires boolean operands
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:298: ERROR:  AND requires boolean operands
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:309: ERROR:  AND requires boolean operands
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:320: ERROR:  AND requires boolean operands
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:323: ERROR:  Unsupported data type: Int8(None)
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:328: ERROR:  Table 'order_line' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:329: ERROR:  Table 'order_line' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:330: ERROR:  Unsupported data type: Int8(None)
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:331: ERROR:  Table 'stock' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:339: ERROR:  Table 'stock' not found
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:347: ERROR:  Table 'stock' not found
-psql:/home/dongxu/lab/pg-tikv/tests/163_lookup_join_spans.sql:349: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:198: ERROR:  AND requires boolean operands
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:208: ERROR:  AND requires boolean operands
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:218: ERROR:  AND requires boolean operands
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:228: ERROR:  AND requires boolean operands
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:238: ERROR:  AND requires boolean operands
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:248: ERROR:  AND requires boolean operands
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:258: ERROR:  AND requires boolean operands
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:268: ERROR:  AND requires boolean operands
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:278: ERROR:  AND requires boolean operands
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:288: ERROR:  AND requires boolean operands
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:298: ERROR:  AND requires boolean operands
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:309: ERROR:  AND requires boolean operands
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:320: ERROR:  AND requires boolean operands
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:323: ERROR:  Unsupported data type: Int8(None)
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:328: ERROR:  Table 'order_line' does not exist
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:329: ERROR:  Table 'order_line' does not exist
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:330: ERROR:  Unsupported data type: Int8(None)
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:331: ERROR:  Table 'stock' does not exist
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:339: ERROR:  Table 'stock' not found
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:347: ERROR:  Table 'stock' not found
+psql:/home/dongxu/lab/db9-server/tests/163_lookup_join_spans.sql:349: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

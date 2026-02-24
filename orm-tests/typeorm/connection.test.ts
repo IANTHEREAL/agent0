@@ -2,7 +2,7 @@ import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import { DataSource } from 'typeorm';
 import { createDataSource, closeSharedDataSource } from './datasource.js';
 
-describe('TypeORM Connection & Protocol Compatibility [pg-tikv]', () => {
+describe('TypeORM Connection & Protocol Compatibility [db9-server]', () => {
   describe('connection establishment', () => {
     it('should establish connection via pg driver', async () => {
       const ds = createDataSource();

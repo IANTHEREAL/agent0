@@ -1,32 +1,32 @@
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:34: ERROR:  SQL parse error: sql parser error: Expected [EXTERNAL] TABLE or [MATERIALIZED] VIEW or FUNCTION after CREATE OR REPLACE, found: PROCEDURE at Line: 1, Column 19
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:69: ERROR:  SQL parse error: sql parser error: Expected [EXTERNAL] TABLE or [MATERIALIZED] VIEW or FUNCTION after CREATE OR REPLACE, found: PROCEDURE at Line: 1, Column 19
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:84: ERROR:  SQL parse error: sql parser error: Expected [EXTERNAL] TABLE or [MATERIALIZED] VIEW or FUNCTION after CREATE OR REPLACE, found: PROCEDURE at Line: 1, Column 19
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:111: ERROR:  Table 'public.data' already exists
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:112: ERROR:  Index exists
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:113: ERROR:  Procedure 'pg_tests_set_auto_stats' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:119: ERROR:  duplicate key value violates unique constraint "data_pkey"
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:34: ERROR:  SQL parse error: sql parser error: Expected [EXTERNAL] TABLE or [MATERIALIZED] VIEW or FUNCTION after CREATE OR REPLACE, found: PROCEDURE at Line: 1, Column 19
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:69: ERROR:  SQL parse error: sql parser error: Expected [EXTERNAL] TABLE or [MATERIALIZED] VIEW or FUNCTION after CREATE OR REPLACE, found: PROCEDURE at Line: 1, Column 19
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:84: ERROR:  SQL parse error: sql parser error: Expected [EXTERNAL] TABLE or [MATERIALIZED] VIEW or FUNCTION after CREATE OR REPLACE, found: PROCEDURE at Line: 1, Column 19
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:111: ERROR:  Table 'public.data' already exists
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:112: ERROR:  Index exists
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:113: ERROR:  Procedure 'pg_tests_set_auto_stats' does not exist
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:119: ERROR:  duplicate key value violates unique constraint "data_pkey"
 DETAIL:  Key (a, b, c)=(1, 1, 1) already exists.
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:120: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:124: ERROR:  Table 'pg_tests_show_statistics' not found
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:127: ERROR:  Procedure 'pg_tests_set_auto_stats' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:130: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:134: ERROR:  Table 'pg_tests_show_statistics' not found
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:137: ERROR:  Procedure 'pg_tests_set_auto_stats' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:140: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:144: ERROR:  Table 'pg_tests_show_statistics' not found
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:153: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:157: ERROR:  Table 'pg_tests_show_statistics' not found
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:160: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:164: ERROR:  Table 'pg_tests_show_statistics' not found
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:168: ERROR:  Procedure 'pg_tests_set_auto_stats' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:169: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:173: ERROR:  Table 'pg_tests_show_statistics' not found
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:176: ERROR:  Procedure 'pg_tests_set_auto_stats' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:177: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:181: ERROR:  Table 'pg_tests_show_statistics' not found
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:184: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:188: ERROR:  Table 'pg_tests_show_statistics' not found
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:193: ERROR:  Procedure 'pg_tests_set_auto_stats' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:197: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:201: ERROR:  Table 'pg_tests_show_statistics' not found
-psql:/home/dongxu/lab/pg-tikv/tests/126_distsql_automatic_stats.sql:203: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:120: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:124: ERROR:  Table 'pg_tests_show_statistics' not found
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:127: ERROR:  Procedure 'pg_tests_set_auto_stats' does not exist
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:130: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:134: ERROR:  Table 'pg_tests_show_statistics' not found
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:137: ERROR:  Procedure 'pg_tests_set_auto_stats' does not exist
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:140: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:144: ERROR:  Table 'pg_tests_show_statistics' not found
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:153: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:157: ERROR:  Table 'pg_tests_show_statistics' not found
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:160: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:164: ERROR:  Table 'pg_tests_show_statistics' not found
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:168: ERROR:  Procedure 'pg_tests_set_auto_stats' does not exist
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:169: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:173: ERROR:  Table 'pg_tests_show_statistics' not found
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:176: ERROR:  Procedure 'pg_tests_set_auto_stats' does not exist
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:177: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:181: ERROR:  Table 'pg_tests_show_statistics' not found
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:184: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:188: ERROR:  Table 'pg_tests_show_statistics' not found
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:193: ERROR:  Procedure 'pg_tests_set_auto_stats' does not exist
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:197: ERROR:  Procedure 'pg_tests_maybe_collect_stats' does not exist
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:201: ERROR:  Table 'pg_tests_show_statistics' not found
+psql:/home/dongxu/lab/db9-server/tests/126_distsql_automatic_stats.sql:203: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

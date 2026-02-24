@@ -3,7 +3,7 @@
 ## 状态
 
 - **阶段**：设计中
-- **作者**：pg-tikv team
+- **作者**：db9-server team
 - **日期**：2026-02-17
 - **关联文件**：`src/cron/`、`src/sql/trigger_worker.rs`、`src/pool.rs`、`src/storage/tikv_store/cron.rs`
 
@@ -29,7 +29,7 @@
 启用 cron 的 tenant:     10,000   (1%)
 总 cron job:             20,000   (avg 2/tenant)
 峰值 due job/分钟:       200-500
-pg-tikv 实例:            10+
+db9-server 实例:            10+
 ```
 
 ---
@@ -73,14 +73,14 @@ pg-tikv 实例:            10+
                     ┌───────────────────┼─────────────────────┐
                     │                   │                     │
               ┌─────┴─────┐      ┌─────┴─────┐      ┌───────┴───┐
-              │ pg-tikv 1  │      │ pg-tikv 2  │      │ pg-tikv M  │
+              │ db9-server 1  │      │ db9-server 2  │      │ db9-server M  │
               │ (SQL only) │      │ (SQL only) │      │ (SQL only) │
               └────────────┘      └────────────┘      └───────────┘
 ```
 
 **关键决策**：
 
-1. Worker 通过 **pgwire 连回 pg-tikv** 执行 SQL，不直接操作 TiKV 数据。这保证了事务语义、权限检查、trigger 等完整 SQL 路径。
+1. Worker 通过 **pgwire 连回 db9-server** 执行 SQL，不直接操作 TiKV 数据。这保证了事务语义、权限检查、trigger 等完整 SQL 路径。
 2. Worker 通过 **TiKV 悲观事务** 做 claim，天然分布式锁，不需要额外的 leader election。
 3. 同一套引擎同时服务 cron job、async trigger、未来的 background job。
 
@@ -262,11 +262,11 @@ while let Some(result) = join_set.join_next().await {
 }
 ```
 
-#### 执行路径（新）：通过 pgwire 连回 pg-tikv
+#### 执行路径（新）：通过 pgwire 连回 db9-server
 
 ```rust
 async fn execute_job_sql(entry: &TaskQueueEntry) -> Result<()> {
-    // 连接到对应 tenant 的 pg-tikv
+    // 连接到对应 tenant 的 db9-server
     let connstr = format!(
         "host={} port={} user={}.{} password={} dbname=postgres",
         pg_host, pg_port, entry.keyspace, entry.username, service_password
@@ -280,7 +280,7 @@ async fn execute_job_sql(entry: &TaskQueueEntry) -> Result<()> {
 
 **为什么走 pgwire 而不是直接操作 TiKV**：
 - 保证完整 SQL 语义（事务、trigger、权限检查、search_path）
-- Worker 无需理解 pg-tikv 内部状态，纯无状态
+- Worker 无需理解 db9-server 内部状态，纯无状态
 - 可以用标准连接池（deadpool-postgres）管理连接
 
 #### 影响文件
@@ -377,7 +377,7 @@ _sys_next_cron_run_id_{db_id}                 → i64
 ### Phase 1：进程内 worker（当前架构改进）
 
 ```
-pg-tikv process
+db9-server process
 ├── SQL handler (pgwire)
 └── CronWorker (改用 queue scan + concurrent execution)
 ```
@@ -390,13 +390,13 @@ pg-tikv process
 ### Phase 2：独立 worker 微服务
 
 ```
-pg-tikv process       ← 只做 SQL
+db9-server process       ← 只做 SQL
 worker process(es)    ← 独立 binary，可独立扩缩
 ```
 
-- Worker 通过 pgwire 连回 pg-tikv
+- Worker 通过 pgwire 连回 db9-server
 - Worker 可以用 Kubernetes HPA 按 queue 深度自动扩缩
-- pg-tikv 不再内置 `CronWorker`（配置 `PGTIKV_CRON_ENABLED=false`）
+- db9-server 不再内置 `CronWorker`（配置 `DB9_CRON_ENABLED=false`）
 
 ### Phase 3：统一异步任务引擎
 
@@ -418,7 +418,7 @@ TaskQueueEntry.task_type:
 
 ### Step 1：添加 registry + queue（写双份）
 
-1. 部署新版本 pg-tikv
+1. 部署新版本 db9-server
 2. `cron.schedule()` 同时写 tenant keyspace 的 job **和** 系统 keyspace 的 queue entry
 3. Worker 仍然从 `list_all_keyspaces()` 扫描（旧路径），同时 **也** 从 queue 扫描（新路径）
 4. 对两个来源 dedup（claim key 相同）
@@ -435,7 +435,7 @@ SELECT _sys_backfill_cron_registry();
 ### Step 3：切换到新路径
 
 1. 确认 queue 中的 job 覆盖所有 tenant（对比 registry entry count vs 旧路径 scan count）
-2. 配置 `PGTIKV_CRON_USE_QUEUE=true`，worker 只从 queue 读取
+2. 配置 `DB9_CRON_USE_QUEUE=true`，worker 只从 queue 读取
 3. 观察 1-2 天确认稳定
 
 ### Step 4：清理旧路径
@@ -450,15 +450,15 @@ SELECT _sys_backfill_cron_registry();
 
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
-| `PGTIKV_CRON_ENABLED` | `true` | 是否启动进程内 worker |
-| `PGTIKV_CRON_POLL_MS` | `60000` | tick 间隔（不变） |
-| `PGTIKV_CRON_MAX_CONCURRENT_JOBS` | `32` | 单 worker 最大并发执行数 |
-| `PGTIKV_CRON_WORKER_ID` | `{hostname}:{pid}` | Worker 实例标识 |
-| `PGTIKV_CRON_USE_QUEUE` | `false` | Phase 2+ 开关：使用全局 queue 而非全量扫描 |
-| `PGTIKV_CRON_ORPHAN_TIMEOUT_SEC` | `300` | orphan claim 超时 |
-| `PGTIKV_CRON_GC_BATCH_SIZE` | `100` | 每轮 GC 处理的 keyspace 数 |
-| `PGTIKV_CRON_PG_HOST` | （同 pg-tikv） | Phase 2：worker 连回的 pg-tikv 地址 |
-| `PGTIKV_CRON_PG_PORT` | （同 pg-tikv） | Phase 2：worker 连回的 pg-tikv 端口 |
+| `DB9_CRON_ENABLED` | `true` | 是否启动进程内 worker |
+| `DB9_CRON_POLL_MS` | `60000` | tick 间隔（不变） |
+| `DB9_CRON_MAX_CONCURRENT_JOBS` | `32` | 单 worker 最大并发执行数 |
+| `DB9_CRON_WORKER_ID` | `{hostname}:{pid}` | Worker 实例标识 |
+| `DB9_CRON_USE_QUEUE` | `false` | Phase 2+ 开关：使用全局 queue 而非全量扫描 |
+| `DB9_CRON_ORPHAN_TIMEOUT_SEC` | `300` | orphan claim 超时 |
+| `DB9_CRON_GC_BATCH_SIZE` | `100` | 每轮 GC 处理的 keyspace 数 |
+| `DB9_CRON_PG_HOST` | （同 db9-server） | Phase 2：worker 连回的 db9-server 地址 |
+| `DB9_CRON_PG_PORT` | （同 db9-server） | Phase 2：worker 连回的 db9-server 端口 |
 
 ---
 
@@ -468,7 +468,7 @@ SELECT _sys_backfill_cron_registry();
 |------|------|------|
 | Worker crash | 已 claim 的 job 不会执行 | orphan GC 在 5 分钟后清理 claim；下一个 fire time 自动重新入队 |
 | TiKV 分区 | worker 无法 scan queue 或 claim | tick 失败，warn 日志；TiKV 恢复后自动继续 |
-| pg-tikv 不可用 | worker claim 成功但 SQL 执行失败 | run_details 记录 failed；下次 fire time 重试 |
+| db9-server 不可用 | worker claim 成功但 SQL 执行失败 | run_details 记录 failed；下次 fire time 重试 |
 | Queue entry 丢失 | job 不再触发 | 定期 reconcile：比对 registry 中的 keyspace 和 tenant keyspace 中的 job，补写缺失的 queue entry |
 | 时钟漂移 | job 早触发或晚触发 | claim 的 `fire_time_min` 做 minute 级截断，容忍 ±30s |
 | 所有 worker 下线 | 没有 cron 执行 | queue 中的 entry 不会丢失，worker 恢复后从 queue 中 catch up |
@@ -733,7 +733,7 @@ DROP EXTENSION pg_cron;
 
 ```bash
 #!/bin/bash
-# 前置条件：pg-tikv 运行中，TiKV 运行中
+# 前置条件：db9-server 运行中，TiKV 运行中
 
 # 1. 创建 cron job
 psql -c "CREATE EXTENSION IF NOT EXISTS pg_cron"
@@ -765,7 +765,7 @@ echo "PASS"
 #!/bin/bash
 # 测试目标：两个 worker 不会重复执行同一个 job
 
-# 1. 启动两个 pg-tikv 实例（不同端口，共享 TiKV）
+# 1. 启动两个 db9-server 实例（不同端口，共享 TiKV）
 # 2. 创建 cron job（counter 表递增）
 # 3. 等待 3 分钟（3 次 tick）
 # 4. 验证 counter = 3（不是 6 — 每分钟只执行一次，不重复）

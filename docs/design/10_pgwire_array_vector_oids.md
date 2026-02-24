@@ -5,7 +5,7 @@
 
 ## 背景与动机
 
-pg-tikv 的 SQL 层已经支持数组与向量值：
+db9-server 的 SQL 层已经支持数组与向量值：
 - `Value::Array` 在 pgwire 输出为 `{...}` 形式（`src/protocol/handler.rs:2156`）
 - `Value::Vector` 输出为 `[...]`（`src/protocol/handler.rs:2169`）
 

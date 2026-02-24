@@ -13,7 +13,7 @@ CREATE INDEX document_metadata_idx ON documents USING gin (doc_metadata);
 SELECT * FROM documents WHERE doc_metadata @> '{"type": "pdf"}';
 ```
 
-当前 pg-tikv 支持 `->` 和 `->>` 操作符，但缺少 `@>` 包含检查。
+当前 db9-server 支持 `->` 和 `->>` 操作符，但缺少 `@>` 包含检查。
 
 ## 目标
 

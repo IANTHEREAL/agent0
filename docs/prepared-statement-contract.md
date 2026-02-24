@@ -6,7 +6,7 @@ Parent roadmap: `#865`
 
 ## 1. Purpose
 
-Define the semantic contract for PostgreSQL extended query flow in tipg:
+Define the semantic contract for PostgreSQL extended query flow in db9:
 
 - Parse
 - Bind
@@ -118,7 +118,7 @@ For statement classes without prepared/analyzed execution support, behavior MUST
 
 ### 4.5 Statement/Portal Lifecycle and Close
 
-Tipg MUST preserve PostgreSQL-aligned extended-protocol lifecycle semantics for named and unnamed prepared objects.
+Db9 MUST preserve PostgreSQL-aligned extended-protocol lifecycle semantics for named and unnamed prepared objects.
 
 At minimum:
 
@@ -173,7 +173,7 @@ The following are required parity targets for extended protocol behavior.
 
 Important:
 
-- Tipg MUST not remap analyzer/executor errors to unrelated SQLSTATEs at protocol boundary.
+- Db9 MUST not remap analyzer/executor errors to unrelated SQLSTATEs at protocol boundary.
 - Final SQLSTATE mapping details are validated in `#867/#868` parity tests.
 
 ## 7. Invariants
@@ -198,7 +198,7 @@ The following parity samples were validated against local PostgreSQL 17.7 on 202
 - unresolved parameter type (`pg_typeof($1)` with unknown) -> `42P18`
 - placeholder in `CREATE TABLE ... DEFAULT $1` -> `42P02`
 
-These samples are contract anchors; implementation PRs MUST add reproducible parity tests in tipg.
+These samples are contract anchors; implementation PRs MUST add reproducible parity tests in db9.
 
 ### 8.1 Future Parity Targets (Beyond `#867/#868`)
 

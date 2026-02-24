@@ -10,7 +10,7 @@ use crate::models::*;
 use crate::services::pg_client::PgClient;
 use crate::AppState;
 
-const SYSTEM_USER_PREFIX: &str = "_pgtikv_sys_";
+const SYSTEM_USER_PREFIX: &str = "_db9_sys_";
 
 fn is_protected_user(username: &str, session_admin_user: &str) -> bool {
     username.starts_with(SYSTEM_USER_PREFIX) || username == session_admin_user

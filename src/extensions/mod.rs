@@ -65,7 +65,7 @@ const HTTP_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
 };
 
 // PostgreSQL built-in extension commonly used for UUID generation.
-// pg-tikv implements the required UUID functions as built-ins; installing the
+// db9-server implements the required UUID functions as built-ins; installing the
 // extension records metadata for compatibility with `pg_dump`/`pg_restore` flows.
 const UUID_OSSP_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
     name: "uuid-ossp",
@@ -75,7 +75,7 @@ const UUID_OSSP_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
 };
 
 // PostgreSQL contrib extension providing the `hstore` type.
-// We expose it as metadata for client compatibility; pg-tikv does not currently
+// We expose it as metadata for client compatibility; db9-server does not currently
 // implement full hstore semantics.
 const HSTORE_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
     name: "hstore",

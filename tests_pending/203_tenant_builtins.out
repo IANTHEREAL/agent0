@@ -1,1 +1,1 @@
-psql:/home/dongxu/lab/pg-tikv/tests/203_tenant_builtins.sql:18: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/203_tenant_builtins.sql:18: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

@@ -13,7 +13,7 @@
 - `CREATE FUNCTION ... AS $$ ... $$ LANGUAGE plpgsql;`
 - 纯 SQL 中把 `$$...$$` 当作字符串常量使用
 
-当前 pg-tikv 在 parse 前直接拦截包含 `$$`/`$_$` 的 SQL，并返回 “Dollar-quoted strings not supported”（`src/sql/helpers.rs`），导致上述迁移脚本无法执行（甚至无法“跳过/存储定义”）。
+当前 db9-server 在 parse 前直接拦截包含 `$$`/`$_$` 的 SQL，并返回 “Dollar-quoted strings not supported”（`src/sql/helpers.rs`），导致上述迁移脚本无法执行（甚至无法“跳过/存储定义”）。
 
 ## 目标（MVP）
 

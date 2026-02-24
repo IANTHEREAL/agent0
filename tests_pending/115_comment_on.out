@@ -1,16 +1,16 @@
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:17: ERROR:  Unsupported COMMENT ON statement
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:21: ERROR:  Table 'pg_database' not found
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:23: ERROR:  Unsupported COMMENT ON statement
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:27: ERROR:  Table 'pg_database' not found
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:29: ERROR:  Unsupported COMMENT ON statement
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:33: ERROR:  Table 'pg_database' not found
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:37: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:17: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:21: ERROR:  Table 'pg_database' not found
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:23: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:27: ERROR:  Table 'pg_database' not found
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:29: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:33: ERROR:  Table 'pg_database' not found
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:37: ERROR:  Unsupported COMMENT ON statement
  comment 
 ---------
  
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:40: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:40: ERROR:  Unsupported COMMENT ON statement
  comment 
 ---------
  
@@ -22,13 +22,13 @@ psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:40: ERROR:  Unsupported C
  sc          | 
 (2 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:50: ERROR:  schema name 'db.schema1' must not contain '.'
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:51: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:50: ERROR:  schema name 'db.schema1' must not contain '.'
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:51: ERROR:  Unsupported COMMENT ON statement
  schema_name | comment 
 -------------+---------
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:62: ERROR:  Table 'public.t' already exists
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:62: ERROR:  Table 'public.t' already exists
  table_comment | column_b_comment | index_comment | constraint_comment 
 ---------------+------------------+---------------+--------------------
                |                  |               | 
@@ -89,7 +89,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:62: ERROR:  Table 'public
                |                  |               | 
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:104: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:104: ERROR:  Unsupported COMMENT ON statement
  table_comment | column_b_comment | index_comment | constraint_comment 
 ---------------+------------------+---------------+--------------------
                |                  |               | 
@@ -100,7 +100,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:104: ERROR:  Unsupported 
                |                  |               | 
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:108: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:108: ERROR:  Unsupported COMMENT ON statement
  table_comment | column_b_comment | index_comment | constraint_comment 
 ---------------+------------------+---------------+--------------------
                |                  |               | 
@@ -111,7 +111,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:108: ERROR:  Unsupported 
                |                  |               | 
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:112: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:112: ERROR:  Unsupported COMMENT ON statement
  table_comment | column_b_comment | index_comment | constraint_comment 
 ---------------+------------------+---------------+--------------------
                |                  |               | 
@@ -122,7 +122,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:112: ERROR:  Unsupported 
                |                  |               | 
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:116: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:116: ERROR:  Unsupported COMMENT ON statement
  table_comment | column_b_comment | index_comment | constraint_comment 
 ---------------+------------------+---------------+--------------------
                |                  |               | 
@@ -133,7 +133,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:116: ERROR:  Unsupported 
                |                  |               | 
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:120: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:120: ERROR:  Unsupported COMMENT ON statement
  table_comment | column_b_comment | index_comment | constraint_comment 
 ---------------+------------------+---------------+--------------------
                |                  |               | 
@@ -144,7 +144,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:120: ERROR:  Unsupported 
                |                  |               | 
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:124: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:124: ERROR:  Unsupported COMMENT ON statement
  table_comment | column_b_comment | index_comment | constraint_comment 
 ---------------+------------------+---------------+--------------------
                |                  |               | 
@@ -155,21 +155,21 @@ psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:124: ERROR:  Unsupported 
                |                  |               | 
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:129: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:129: ERROR:  Unsupported COMMENT ON statement
  comment 
 ---------
  
 (1 row)
 
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:136: ERROR:  Unsupported COMMENT ON statement
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:137: ERROR:  Unsupported COMMENT ON statement
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:138: ERROR:  Unsupported COMMENT ON statement
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:139: ERROR:  Unsupported COMMENT ON statement
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:148: ERROR:  Unsupported function in JOIN: obj_description
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:150: ERROR:  Unsupported COMMENT ON statement
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:151: ERROR:  Unsupported COMMENT ON statement
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:160: ERROR:  Unsupported function in JOIN: obj_description
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:167: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:136: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:137: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:138: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:139: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:148: ERROR:  Unsupported function in JOIN: obj_description
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:150: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:151: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:160: ERROR:  Unsupported function in JOIN: obj_description
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:167: ERROR:  Unsupported COMMENT ON statement
  schema_name | type_name | comment 
 -------------+-----------+---------
 (0 rows)
@@ -178,4 +178,4 @@ psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:167: ERROR:  Unsupported 
 -------------
 (0 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/115_comment_on.sql:182: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/db9-server/tests/115_comment_on.sql:182: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

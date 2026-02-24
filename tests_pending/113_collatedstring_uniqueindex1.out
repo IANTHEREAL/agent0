@@ -1,7 +1,7 @@
-psql:/home/dongxu/lab/pg-tikv/tests/113_collatedstring_uniqueindex1.sql:6: ERROR:  SQL parse error: sql parser error: Expected an object type after CREATE, found: COLLATION at Line: 1, Column 8
-psql:/home/dongxu/lab/pg-tikv/tests/113_collatedstring_uniqueindex1.sql:13: ERROR:  Unsupported data type: Bool
-psql:/home/dongxu/lab/pg-tikv/tests/113_collatedstring_uniqueindex1.sql:25: ERROR:  Column count mismatch
-psql:/home/dongxu/lab/pg-tikv/tests/113_collatedstring_uniqueindex1.sql:28: ERROR:  Index name required
+psql:/home/dongxu/lab/db9-server/tests/113_collatedstring_uniqueindex1.sql:6: ERROR:  SQL parse error: sql parser error: Expected an object type after CREATE, found: COLLATION at Line: 1, Column 8
+psql:/home/dongxu/lab/db9-server/tests/113_collatedstring_uniqueindex1.sql:13: ERROR:  Unsupported data type: Bool
+psql:/home/dongxu/lab/db9-server/tests/113_collatedstring_uniqueindex1.sql:25: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/db9-server/tests/113_collatedstring_uniqueindex1.sql:28: ERROR:  Index name required
  a | b 
 ---+---
  4 | 
@@ -14,10 +14,10 @@ psql:/home/dongxu/lab/pg-tikv/tests/113_collatedstring_uniqueindex1.sql:28: ERRO
    | 5
 (2 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/113_collatedstring_uniqueindex1.sql:37: ERROR:  Unsupported expression: Collate { expr: Value(SingleQuotedString("a")), collation: ObjectName([Ident { value: "da", quote_style: None }]) }
-psql:/home/dongxu/lab/pg-tikv/tests/113_collatedstring_uniqueindex1.sql:40: ERROR:  Unsupported expression: Collate { expr: Value(SingleQuotedString("y")), collation: ObjectName([Ident { value: "da", quote_style: None }]) }
-psql:/home/dongxu/lab/pg-tikv/tests/113_collatedstring_uniqueindex1.sql:43: ERROR:  Unsupported expression: Collate { expr: Value(SingleQuotedString("a")), collation: ObjectName([Ident { value: "da", quote_style: None }]) }
-psql:/home/dongxu/lab/pg-tikv/tests/113_collatedstring_uniqueindex1.sql:46: ERROR:  No PK
+psql:/home/dongxu/lab/db9-server/tests/113_collatedstring_uniqueindex1.sql:37: ERROR:  Unsupported expression: Collate { expr: Value(SingleQuotedString("a")), collation: ObjectName([Ident { value: "da", quote_style: None }]) }
+psql:/home/dongxu/lab/db9-server/tests/113_collatedstring_uniqueindex1.sql:40: ERROR:  Unsupported expression: Collate { expr: Value(SingleQuotedString("y")), collation: ObjectName([Ident { value: "da", quote_style: None }]) }
+psql:/home/dongxu/lab/db9-server/tests/113_collatedstring_uniqueindex1.sql:43: ERROR:  Unsupported expression: Collate { expr: Value(SingleQuotedString("a")), collation: ObjectName([Ident { value: "da", quote_style: None }]) }
+psql:/home/dongxu/lab/db9-server/tests/113_collatedstring_uniqueindex1.sql:46: ERROR:  No PK
  a | b 
 ---+---
  4 | 
@@ -30,7 +30,7 @@ psql:/home/dongxu/lab/pg-tikv/tests/113_collatedstring_uniqueindex1.sql:46: ERRO
    | 5
 (2 rows)
 
-psql:/home/dongxu/lab/pg-tikv/tests/113_collatedstring_uniqueindex1.sql:56: ERROR:  No PK
+psql:/home/dongxu/lab/db9-server/tests/113_collatedstring_uniqueindex1.sql:56: ERROR:  No PK
  a | b 
 ---+---
  4 | 

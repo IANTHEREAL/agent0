@@ -5,7 +5,7 @@
 
 ## 背景与动机
 
-当前 `sqlparser` 的 `NUMERIC/DECIMAL` 在 pg-tikv 内被映射为 `FLOAT8`（`src/sql/helpers.rs:349`），这会带来：
+当前 `sqlparser` 的 `NUMERIC/DECIMAL` 在 db9-server 内被映射为 `FLOAT8`（`src/sql/helpers.rs:349`），这会带来：
 - 精度丢失（金额/计费/统计场景严重）
 - ORM 类型映射不一致（TypeORM/Prisma 的 Decimal 语义）
 

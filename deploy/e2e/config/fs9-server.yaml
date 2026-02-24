@@ -9,7 +9,7 @@ server:
   default_pagefs:
     pd_endpoints:
       - "pd:2379"
-    keyspace_prefix: "tipg_fs_"
+    keyspace_prefix: "db9_fs_"
 
   plugins:
     directories:

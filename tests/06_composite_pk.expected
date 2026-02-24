@@ -7,5 +7,5 @@ w_id|d_id|o_id|info
 1|1|101|Order 2
 1|2|100|Order 3
 (2 rows)
-psql:/home/dongxu/lab/pg-tikv/tests/06_composite_pk.sql:19: ERROR:  duplicate key value violates unique constraint "order_line_pkey"
+psql:/home/dongxu/lab/db9-server/tests/06_composite_pk.sql:19: ERROR:  duplicate key value violates unique constraint "order_line_pkey"
 DETAIL:  Key (w_id, d_id, o_id)=(1, 1, 100) already exists.

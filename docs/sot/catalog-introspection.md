@@ -60,4 +60,4 @@ Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
 ## Change Management
 - Any change to virtual catalog coverage (add/remove table/column), OID packing rules, or ORM-facing introspection semantics MUST update this document and the corresponding module entries in `docs/sot/modules.yaml`.
 - Breaking changes to catalog surface require DR/ADR per #368.
-- Reference: https://github.com/c4pt0r/tipg/issues/368
+- Reference: https://github.com/c4pt0r/db9/issues/368

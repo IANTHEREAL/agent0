@@ -5,7 +5,7 @@
 
 ## 背景与动机
 
-pg-tikv 已支持 `EXPLAIN`（见 `src/sql/executor.rs` + `src/sql/explain.rs`），但 `ANALYZE/VERBOSE` 目前被忽略：
+db9-server 已支持 `EXPLAIN`（见 `src/sql/executor.rs` + `src/sql/explain.rs`），但 `ANALYZE/VERBOSE` 目前被忽略：
 - `Executor::execute_explain(..., _analyze, _verbose)` 参数未使用
 
 虽然这不是迁移必需，但对生产排障/性能分析很有价值。

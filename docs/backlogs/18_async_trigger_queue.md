@@ -6,7 +6,7 @@
 
 ## 背景与动机
 
-pg-tikv 当前支持 BEFORE/AFTER ROW trigger 的同步执行（in-process），但在分布式多租户场景下存在局限：
+db9-server 当前支持 BEFORE/AFTER ROW trigger 的同步执行（in-process），但在分布式多租户场景下存在局限：
 
 1. **AFTER trigger 阻塞 DML**：同步执行增加响应延迟
 2. **trigger 执行失败影响事务**：一个 trigger 失败导致整个 DML 回滚
@@ -33,7 +33,7 @@ pg-tikv 当前支持 BEFORE/AFTER ROW trigger 的同步执行（in-process），
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        pg-tikv node                         │
+│                        db9-server node                         │
 │                                                             │
 │  ┌──────────────┐     ┌─────────────────────────────────┐  │
 │  │ SQL Handler  │     │        Trigger Worker           │  │
@@ -732,7 +732,7 @@ impl TieredTriggerWorker {
 
 ```sql
 -- 查询 trigger 队列状态
-SELECT * FROM _pgtikv_sys_trigger_queue_stats();
+SELECT * FROM _db9_sys_trigger_queue_stats();
 
 -- 返回:
 -- keyspace | pending | processing | failed | dlq_count | avg_latency_ms | events_per_min
@@ -741,7 +741,7 @@ SELECT * FROM _pgtikv_sys_trigger_queue_stats();
 -- tenant_b |       0 |          0 |      0 |         0 |            8.2 |            20
 
 -- 查询死信队列
-SELECT * FROM _pgtikv_sys_trigger_dlq() WHERE keyspace = 'tenant_a';
+SELECT * FROM _db9_sys_trigger_dlq() WHERE keyspace = 'tenant_a';
 
 -- 返回:
 -- id | trigger_name | table_name | operation | error_msg | retry_count | created_at
@@ -765,15 +765,15 @@ SELECT * FROM _pgtikv_sys_trigger_dlq() WHERE keyspace = 'tenant_a';
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `PGTIKV_TRIGGER_ENABLED` | `true` | 启用异步 trigger |
-| `PGTIKV_TRIGGER_POLL_MS` | `100` | 轮询间隔 |
-| `PGTIKV_TRIGGER_BATCH_SIZE` | `10` | 每租户每批次事件数 |
-| `PGTIKV_TRIGGER_MAX_RETRIES` | `3` | 最大重试次数 |
-| `PGTIKV_TRIGGER_QUEUE_LIMIT` | `10000` | 每租户队列上限 |
-| `PGTIKV_TRIGGER_GC_INTERVAL_SEC` | `60` | GC 检查间隔 |
-| `PGTIKV_TRIGGER_DONE_RETENTION_SEC` | `3600` | 已完成事件保留时间 |
-| `PGTIKV_TRIGGER_DLQ_RETENTION_DAYS` | `7` | 死信保留天数 |
-| `PGTIKV_TRIGGER_ORPHAN_TIMEOUT_SEC` | `300` | Processing 超时阈值 |
+| `DB9_TRIGGER_ENABLED` | `true` | 启用异步 trigger |
+| `DB9_TRIGGER_POLL_MS` | `100` | 轮询间隔 |
+| `DB9_TRIGGER_BATCH_SIZE` | `10` | 每租户每批次事件数 |
+| `DB9_TRIGGER_MAX_RETRIES` | `3` | 最大重试次数 |
+| `DB9_TRIGGER_QUEUE_LIMIT` | `10000` | 每租户队列上限 |
+| `DB9_TRIGGER_GC_INTERVAL_SEC` | `60` | GC 检查间隔 |
+| `DB9_TRIGGER_DONE_RETENTION_SEC` | `3600` | 已完成事件保留时间 |
+| `DB9_TRIGGER_DLQ_RETENTION_DAYS` | `7` | 死信保留天数 |
+| `DB9_TRIGGER_ORPHAN_TIMEOUT_SEC` | `300` | Processing 超时阈值 |
 
 ## 与现有 Trigger 的关系
 
@@ -874,8 +874,8 @@ DROP TABLE users, audit_log;
 - [ ] 配置化保留策略
 
 ### Phase 4：可观测性（1 天）
-- [ ] _pgtikv_sys_trigger_queue_stats()
-- [ ] _pgtikv_sys_trigger_dlq()
+- [ ] _db9_sys_trigger_queue_stats()
+- [ ] _db9_sys_trigger_dlq()
 - [ ] Prometheus 指标
 
 ### Phase 5：多租户优化（可选）

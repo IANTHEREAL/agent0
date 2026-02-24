@@ -7,13 +7,13 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use pgtikv_admin::config::Config;
-use pgtikv_admin::session::SessionManager;
-use pgtikv_admin::{api, db, AppState};
+use db9_admin::config::Config;
+use db9_admin::session::SessionManager;
+use db9_admin::{api, db, AppState};
 
 async fn setup() -> (Router, AppState) {
     let db_id = uuid::Uuid::new_v4().to_string();
-    let url = format!("sqlite:///tmp/pgtikv_test_{db_id}.db?mode=rwc");
+    let url = format!("sqlite:///tmp/db9_test_{db_id}.db?mode=rwc");
     let pool = db::connect(&url).await.unwrap();
     db::create_tables(&pool).await.unwrap();
 
@@ -43,7 +43,7 @@ async fn setup() -> (Router, AppState) {
         db: pool,
         config: Arc::new(config),
         sessions: Arc::new(SessionManager::new(1)),
-        device_codes: Arc::new(pgtikv_admin::device_code::DeviceCodeStore::new(600)),
+        device_codes: Arc::new(db9_admin::device_code::DeviceCodeStore::new(600)),
         http_client: reqwest::Client::new(),
         fs9_client: None,
     };
@@ -56,7 +56,7 @@ async fn seed_tenants(state: &AppState, count: usize) -> Vec<String> {
     let mut ids = Vec::new();
     for i in 0..count {
         let id = format!("tenant{i:06}");
-        let keyspace = format!("tipg_tenant_{id}");
+        let keyspace = format!("db9_tenant_{id}");
         let ts = format!("2025-01-{:02}T00:00:00+00:00", (i % 28) + 1);
         db::insert_tenant(&state.db, &id, &keyspace, "ACTIVE", &ts)
             .await
@@ -74,7 +74,7 @@ async fn seed_tenant_full(
     notes: Option<&str>,
     tags: Option<&str>,
 ) {
-    let keyspace = format!("tipg_tenant_{id}");
+    let keyspace = format!("db9_tenant_{id}");
     db::insert_tenant(&state.db, id, &keyspace, state_str, ts)
         .await
         .unwrap();

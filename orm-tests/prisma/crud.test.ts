@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { PrismaClient } from '@prisma/client';
 import { getPrismaClient, disconnectPrisma, cleanupPrismaTables } from './client.js';
 
-describe('Prisma CRUD Semantics [pg-tikv]', () => {
+describe('Prisma CRUD Semantics [db9-server]', () => {
   let prisma: PrismaClient;
 
   beforeAll(async () => {

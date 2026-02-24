@@ -1,7 +1,7 @@
 -- Dify schema restore smoke test
 --
 -- Generated from: /tmp/dify_schema.sql
--- Purpose: Ensure pg-tikv can restore a real-world pg_dump schema without errors.
+-- Purpose: Ensure db9-server can restore a real-world pg_dump schema without errors.
 
 --
 -- PostgreSQL database dump

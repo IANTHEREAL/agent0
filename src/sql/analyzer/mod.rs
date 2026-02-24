@@ -1,6 +1,6 @@
 //! Unified Analyzer: single-pass name resolution + type checking.
 //!
-//! The Analyzer transforms raw `sqlparser::ast` into tipg's own Typed IR
+//! The Analyzer transforms raw `sqlparser::ast` into db9's own Typed IR
 //! (`TypedExpr`, `AnalyzedQuery`). Every expression node in the output carries
 //! its resolved `DataType`, column references are positional indices, and all
 //! syntax sugar is normalized to canonical forms.

@@ -1,7 +1,7 @@
 version_prefix
 t
 (1 row)
-version_has_pgtikv
+version_has_db9
 t
 (1 row)
 server_version
@@ -17,7 +17,7 @@ timezone
 UTC
 (1 row)
 application_name
-pg-tikv-tests
+db9-server-tests
 (1 row)
 timezone
 Asia/Shanghai

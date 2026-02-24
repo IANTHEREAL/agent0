@@ -7,7 +7,7 @@
 
 ## Tracked Todo (7 Items)
 1. View dependency extraction empty-deps fallback (`src/sql/ddl.rs`) — status: done in branch, validate by tests.
-2. `tipg.use_optimizer` dual-path compatibility plumbing/tests — status: in progress; runtime must remain single path.
+2. `db9.use_optimizer` dual-path compatibility plumbing/tests — status: in progress; runtime must remain single path.
 3. `QueryContext` implicit default/task-local fallback — status: in progress; move to explicit context threading.
 4. RETURNING parser fallback path — status: in progress; keep deterministic parse path only.
 5. Legacy relation-name conflict scan (pre-`_sys_relname_`) — status: temporary keep with sunset date.
@@ -19,7 +19,7 @@
 | ID | Issue | Root Cause | Current Progress | Next Step |
 |---|---|---|---|---|
 | 1 | View dependency extraction silently falling back to empty deps | Error path returned empty dependency set on parse failure | Implemented hard-error behavior; no silent empty dependency fallback | Revalidate with DDL dependency/drop-cascade tests |
-| 2 | `tipg.use_optimizer` dual-path compatibility plumbing | Historical dual-path compatibility surface still present in code/tests | Runtime behavior already single-path; compatibility handling cleanup is partial | Remove remaining dead dual-path plumbing and align tests/docs to no-op compatibility |
+| 2 | `db9.use_optimizer` dual-path compatibility plumbing | Historical dual-path compatibility surface still present in code/tests | Runtime behavior already single-path; compatibility handling cleanup is partial | Remove remaining dead dual-path plumbing and align tests/docs to no-op compatibility |
 | 3 | `QueryContext` implicit defaults/task-locals | Execution paths still rely on `from_task_locals()` defaulting | Strict mode groundwork exists; call-site cleanup incomplete | Finish explicit context threading and remove production default reliance |
 | 4 | Parser RETURNING fallback path | Parse-error fallback masked parser gaps | Deterministic RETURNING parsing path landed; fallback removal validation still pending | Finish parser cleanup validation and remove leftover fallback scaffolding |
 | 5 | Legacy relation-name conflict scan (`pre-_sys_relname_`) | Migration compatibility for old clusters | Intentionally retained as temporary shim with warning + sunset | Keep until sunset window closes, then remove |
@@ -161,12 +161,12 @@
 - Root cause:
   - `run_tests.sh` defaulted to fixed port `15433`.
   - A stale existing server already occupied `15433`.
-  - New pg-tikv startup failed with `Address already in use`, but script readiness only checked `pg_isready`; it accidentally connected to stale server and continued.
+  - New db9-server startup failed with `Address already in use`, but script readiness only checked `pg_isready`; it accidentally connected to stale server and continued.
   - This produced false failures unrelated to current branch code.
 - Fix applied (clean harness fix, not test masking):
   - `run_tests.sh` now selects a free ephemeral port when `PG_PORT` is not explicitly set.
   - If `PG_PORT` is explicitly set and occupied, script fails fast with clear error.
-  - Readiness now requires spawned pg-tikv PID to remain alive; cannot pass readiness against an unrelated stale instance.
+  - Readiness now requires spawned db9-server PID to remain alive; cannot pass readiness against an unrelated stale instance.
   - DSN/psql host-port wiring uses explicit `PG_HOST`/`PG_PORT`.
 - Verification:
   - Re-ran `./run_tests.sh`; integration and ORM both passed end-to-end on the spawned instance.

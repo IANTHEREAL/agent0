@@ -1,4 +1,4 @@
-psql:/tmp/tipg-tests/tests/01_ddl_basic.sql:11: ERROR:  relation "t_ddl" already exists
+psql:/tmp/db9-tests/tests/01_ddl_basic.sql:11: ERROR:  relation "t_ddl" already exists
 id|val
 1|a
 2|b

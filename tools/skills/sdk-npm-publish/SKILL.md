@@ -8,12 +8,12 @@ description: "Build and publish the get-db9 TypeScript SDK to npm. Handles build
 ## SDK Location
 
 ```
-/home/dongxu/lab/pg-tikv-sdk/sdk/ts/
+/home/dongxu/lab/db9-server-sdk/sdk/ts/
 ```
 
 If the worktree doesn't exist, the SDK source is also at:
 ```
-/home/dongxu/lab/pg-tikv/sdk/ts/
+/home/dongxu/lab/db9-server/sdk/ts/
 ```
 
 ## npm Credentials
