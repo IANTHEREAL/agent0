@@ -1,3 +1,7 @@
+> **DEPRECATED**: This document is superseded by [docs/ARCHITECTURE.md](ARCHITECTURE.md)
+> and the component deep-dives in [docs/architecture/](architecture/).
+> Retained for historical reference only. Do not update.
+
 # db9 / db9-server Global Map (v0)
 
 > Goal: produce an “actionable navigation map” (direction first, details later). First provide global layering and how to locate the primary paths; later tasks will deepen and add evidence and details.  

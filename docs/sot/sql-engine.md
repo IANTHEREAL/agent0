@@ -16,37 +16,37 @@
 - **[Stable] PostgreSQL dialect parsing + multi-statement execution**
   - The engine MUST parse SQL using `sqlparser`’s PostgreSQL dialect and MUST support multiple statements in a single query string (e.g. `BEGIN; ...; COMMIT;`).
   - When multiple statements are provided, the engine MUST execute them in order and return a result stream containing each statement’s results (Simple Query protocol compliance).
-  - Evidence: `src/sql/parser.rs` (`parse_sql`), `src/sql/executor/core.rs` (`Executor::execute` docstring + statement loop), `tests/05_transaction.sql` (multi-statement examples).
+  - Evidence: `src/sql/parser/mod.rs` (`parse_sql`), `src/sql/executor/core/mod.rs` (`Executor::execute` docstring + statement loop), `tests/05_transaction.sql` (multi-statement examples).
 
 - **[Stable] Failed-transaction state (PostgreSQL compatibility)**
   - When a statement fails inside an explicit transaction, subsequent non-empty statements MUST error until the transaction is ended via `ROLLBACK`/`COMMIT`/`END`.
-  - Evidence: `src/sql/executor/core.rs` (`Executor::execute` early `InFailedSqlTransaction` check + `session.mark_transaction_failed()` paths).
+  - Evidence: `src/sql/executor/core/mod.rs` (`Executor::execute` early `InFailedSqlTransaction` check + `session.mark_transaction_failed()` paths).
 
 - **[Stable] Autocommit retry on TiKV write conflicts**
   - In autocommit mode, the engine MUST retry retryable TiKV write-conflict errors with backoff (bounded attempts) to better emulate PostgreSQL’s “wait + retry” behavior under concurrent updates.
-  - Evidence: `src/sql/executor/core.rs` (`is_retryable_tikv_error`, retry loop with `max_attempts = 10`), `tests/104_write_conflict_retry.sql` (infrastructure coverage).
+  - Evidence: `src/sql/executor/core/mod.rs` (`is_retryable_tikv_error`, retry loop with `max_attempts = 10`), `tests/104_write_conflict_retry.sql` (infrastructure coverage).
 
 - **[Experimental] Statement timeout behavior**
   - If a statement times out inside an explicit transaction, the engine currently aborts the transaction (ROLLBACK) to avoid leaving a partially-applied transaction open.
   - This differs from PostgreSQL’s typical “failed transaction” state handling; treat as experimental until a dedicated compatibility test exists.
-  - Evidence: `src/sql/executor/core.rs` (statement timeout handling + rollback-on-timeout comment).
+  - Evidence: `src/sql/executor/core/mod.rs` (statement timeout handling + rollback-on-timeout comment).
 
 - **[Experimental] Observability sys pseudo-tables**
   - The engine recognizes sys pseudo-table surfaces including `_DB9_SYS_OBSERVABILITY` and `_DB9_SYS_QUERY_SAMPLES` and restricts the “fast path” to simple, non-nested `SELECT ... FROM <sys_table>` queries.
-  - Evidence: `src/sql/executor/core.rs` (`is_observability_system_query`), `src/sql/executor/table_utils.rs` (sys table resolution paths).
+  - Evidence: `src/sql/executor/core/mod.rs` (`is_observability_system_query`), `src/sql/executor/table_utils/mod.rs` (sys table resolution paths).
   - Gap: explicit assertion-level gate coverage is tracked in `docs/sot/modules.yaml` (`sql-engine`).
 
 ## Data Model & Invariants
 - **Transaction state model**: statement execution is mediated by `Session` + an active TiKV transaction; savepoints and transaction boundaries are owned by the SQL engine layer, while TiKV transaction primitives are specified in `./storage-format.md`.
-  - Evidence: `src/sql/session.rs`, `src/sql/executor/core.rs` (`session.begin/commit/rollback`, `with_savepoints` wrapper).
+  - Evidence: `src/sql/session/mod.rs`, `src/sql/executor/core/mod.rs` (`session.begin/commit/rollback`, `with_savepoints` wrapper).
 - **[Stable] Stored values conform to schema types**: DML (INSERT/UPDATE/UPSERT) MUST NOT persist a `Value` variant that is incompatible with the declared column `DataType`. If an implicit DML cast/coercion is not supported, the statement MUST error and MUST be atomic (no partial row writes and no index corruption).
-  - Evidence: `src/sql/coercion.rs` (`coerce_value_for_column`), `src/sql/dml.rs` (`coerce_row_values`, DML write helpers), `tests/155_dml_type_coercion_invariant_issue407.sql`.
+  - Evidence: `src/sql/types/coercion.rs` (`coerce_value_for_column`), `src/sql/dml/mod.rs` (`coerce_row_values`, DML write helpers), `tests/155_dml_type_coercion_invariant_issue407.sql`.
 - **Trigger execution model** (high level): BEFORE triggers execute in-statement; AFTER triggers are enqueued and processed asynchronously by a worker (exact queue/storage details are implementation-defined and may evolve).
-  - Evidence: `src/sql/triggers.rs`, `src/sql/trigger_queue.rs`, `src/sql/trigger_worker.rs`, `src/sql/executor/triggers.rs`, `tests/53_trigger_execution.sql`.
+  - Evidence: `src/sql/triggers/mod.rs`, `src/sql/triggers/queue.rs`, `src/sql/triggers/worker.rs`, `src/sql/executor/triggers.rs`, `tests/53_trigger_execution.sql`.
 - **Index access paths are planner-driven**: plan selection currently chooses full-table + B-tree variants based on schema/index metadata + predicates; index encoding details are specified in `./storage-format.md`.
   - Evidence: `src/sql/planner/index_selection.rs`, `src/sql/executor/select/mod.rs`.
 - **[Experimental] GIN access path is currently disabled in planner/runtime**: `ScanType::GinIndexScan` is retained as a future contract shape, but current access-path selection does not emit it and runtime builders reject it if reached unexpectedly.
-  - Evidence: `src/sql/planner/index_selection.rs`, `src/sql/optimizer/build/scan.rs`, `src/sql/operators/planner.rs`.
+  - Evidence: `src/sql/planner/index_selection.rs`, `src/sql/optimizer/build/scan.rs`, `src/sql/gin.rs`.
 
 ## Configuration
 This module MUST NOT redefine config keys. Relevant keys are defined exactly once in `./ops-config.md`:
@@ -55,13 +55,13 @@ This module MUST NOT redefine config keys. Relevant keys are defined exactly onc
 - `DB9_OBS_ENABLED`, `DB9_OBS_*`
 
 ## Entrypoints
-- `src/sql/parser.rs` (`parse_sql`)
-- `src/sql/planner.rs` (`choose_join_algorithm`)
-- `src/sql/executor/core.rs` (`Executor`)
-- `src/sql/expr/mod.rs` (`eval_expr`, `eval_join_expr`)
-- `src/sql/triggers.rs`
-- `src/sql/trigger_queue.rs`
-- `src/sql/trigger_worker.rs`
+- `src/sql/parser/mod.rs` (`parse_sql`)
+- `src/sql/planner/mod.rs` (`ScanType`)
+- `src/sql/executor/core/mod.rs` (`Executor`)
+- `src/sql/expr/typed_eval/mod.rs` (`eval_typed_expr`)
+- `src/sql/triggers/mod.rs`
+- `src/sql/triggers/queue.rs`
+- `src/sql/triggers/worker.rs`
 - `src/sql/executor/triggers.rs`
 - `src/observability.rs`
 

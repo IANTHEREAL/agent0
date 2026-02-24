@@ -202,4 +202,4 @@ docker compose up -d <service>
 
 ## Design Documents
 
-- `docs/architecture.md` - Comprehensive architecture design with principles and execution pipeline
+- `docs/ARCHITECTURE.md` - Comprehensive architecture design with principles and execution pipeline

@@ -1,3 +1,6 @@
+> Architecture deep-dive: [docs/architecture/worker.md](architecture/worker.md)
+> Contracts: [docs/sot/worker-cron.md](sot/worker-cron.md)
+
 # Async Worker Engine
 
 db9-server includes a built-in async worker engine that executes background tasks. All db9-server instances share a single global task queue stored in TiKV, competing for work via pessimistic transactions — no leader election or external dependencies required.

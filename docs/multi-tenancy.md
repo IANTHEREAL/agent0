@@ -1,3 +1,6 @@
+> Architecture deep-dive: [docs/architecture/multi-tenancy.md](architecture/multi-tenancy.md)
+> Contracts: [docs/sot/multi-tenancy.md](sot/multi-tenancy.md)
+
 # Multi-Tenancy Guide
 
 db9-server supports multi-tenancy through TiKV's Keyspace feature, providing complete data isolation between tenants.

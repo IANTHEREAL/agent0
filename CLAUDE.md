@@ -45,7 +45,7 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 - `Optimizer` (`src/sql/optimizer/`): `AnalyzedQuery → LogicalPlan → (rewrite: decorrelation, predicate pushdown, join reorder) → PhysicalPlan → BoxedOperator`. Handles single-table, multi-table joins, set operations (UNION/INTERSECT/EXCEPT), CTEs, window functions, DISTINCT ON, SemiJoin/AntiJoin. Always-on (the `db9.use_optimizer` GUC is accepted for compatibility but is a no-op — `SET ... = off` logs a notice and is ignored; `SHOW` always returns `on`).
 - `Operators` (`src/sql/operators/`): physical operators (scan, filter, project, sort, aggregate, hash_join, hash_semi_join, NLJ, window/, CTE, set_operation, table_function).
 - `Executor` (`src/sql/executor/`): DDL/DML dispatch, SELECT execution (analyzed path at `executor/select/analyzed/`), background SQL (`bg_sql.rs`).
-- `Catalog` (`src/sql/catalog/`): `information_schema` / `pg_catalog` / `cron` compatibility surface (40+ virtual table implementations).
+- `Catalog` (`src/sql/catalog/`): `information_schema` / `pg_catalog` / `cron` compatibility surface (37 virtual table implementations).
 - `Storage` (`src/storage/`): all persistent keys must remain keyspace-isolated via `TikvStore`. Database-scoped v2 key format (`d_{db_id}_*`).
 - `Worker` (`src/worker/`): unified async task engine (Cron, AsyncTrigger, AutoAnalyze, BgDdl, BgSql). Global task queue in TiKV, pessimistic locking, no leader election.
 - `Cron` (`src/cron/`): pg_cron-compatible scheduler integrated with worker engine.
@@ -176,6 +176,7 @@ Phase 4 — Architecture debt (parallel)
     Validation: cargo test + cargo clippy
 ```
 
+<!-- Canonical source: docs/ARCHITECTURE.md — kept inline because CLAUDE.md must be self-contained for LLM context -->
 ## Repository Layout (stable)
 
 ```
@@ -208,8 +209,8 @@ db9-server/
 │   │   ├── expr/                      # Expression system
 │   │   │   ├── typed_eval/            # Runtime evaluator (arithmetic, helpers)
 │   │   │   ├── traverse/              # Expression tree traversal
-│   │   │   └── functions/             # 14 categories (array…vector)
-│   │   ├── catalog/                   # information_schema + pg_catalog + cron (40+ views)
+│   │   │   └── functions/             # 13 categories (array…vector)
+│   │   ├── catalog/                   # information_schema + pg_catalog + cron (37 views)
 │   │   ├── types/                     # Type inference, coercion, mapping
 │   │   │   ├── registry/              # FunctionRegistry (aggregate_window, json, math, misc, string, system, temporal)
 │   │   │   └── cast/                  # CAST between types
@@ -264,7 +265,7 @@ db9-server/
 
 | Task | Location |
 |------|----------|
-| Add SQL function | `src/sql/expr/functions/` (14 categories: array, datetime, encoding, fs9, fts, json, math, misc, pg_compat, regex, string, uuid, vector) |
+| Add SQL function | `src/sql/expr/functions/` (13 categories: array, datetime, encoding, fs9, fts, json, math, misc, pg_compat, regex, string, uuid, vector) |
 | Add SQL statement | `src/sql/executor/` (DDL in `ddl.rs`/`ddl/`, DML in `dml_analyzed/`, SELECT in `select/analyzed/`) |
 | Fix type inference | `src/sql/types/infer.rs` |
 | Fix analyzer / name resolution | `src/sql/analyzer/` (query/, expr/, scope.rs) |
@@ -276,7 +277,7 @@ db9-server/
 | EXPLAIN output | `src/sql/explain/` (mod.rs, format.rs, transform.rs) |
 | Add PostgreSQL type mapping | `src/protocol/handler/encode/types.rs` |
 | Change key encoding | `src/storage/encoding/` (data_keys.rs, metadata_keys.rs, value_encoding.rs, serialization.rs) |
-| Catalog / pg_catalog views | `src/sql/catalog/` (40+ virtual table implementations) |
+| Catalog / pg_catalog views | `src/sql/catalog/` (37 virtual table implementations) |
 | Multi-tenancy | `src/pool.rs` + `src/protocol/handler/tenant.rs` |
 | Triggers | `src/sql/triggers/` (cache, before, rewrite, enqueue, execute) + `src/sql/executor/triggers.rs` (DDL) |
 | Transaction state | `src/txn/` (state.rs, savepoints.rs) |
@@ -307,13 +308,8 @@ cd orm-tests && npm test
 
 ## Documentation
 
-- `docs/architecture.md` - Full architecture design document
-- `src/sql/AGENTS.md` - SQL execution layer details
-- `src/protocol/AGENTS.md` - Wire protocol details
-- `src/storage/AGENTS.md` - Storage layer details
-- `docs/worker.md` - Worker engine deep dive
-- `docs/extensions.md` - Extension functions
-- `docs/fs9_extension.md` - fs9 filesystem extension
-- `docs/authentication.md` - Auth/RBAC
-- `docs/multi-tenancy.md` - Keyspace isolation
-- `docs/prepared-statement-contract.md` - Prepared statement semantics
+- `docs/ARCHITECTURE.md` - Architecture entry point (module map, execution pipeline, documentation guide)
+- `src/sql/AGENTS.md` - SQL execution layer navigation (code paths and symbols)
+- `docs/sot/README.md` - Source of Truth module registry (normative contracts)
+
+For the full module-by-module documentation index, see [docs/ARCHITECTURE.md §4 Module Map](docs/ARCHITECTURE.md).

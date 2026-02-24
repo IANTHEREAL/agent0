@@ -11,7 +11,7 @@ A PostgreSQL-compatible distributed SQL database built on TiKV.
 - [Multi-Tenancy](./multi-tenancy.md)
 - [Authentication & RBAC](./authentication.md)
 - [Configuration](./configuration.md)
-- [Architecture](./architecture.md)
+- [Architecture](./ARCHITECTURE.md)
 - [PRFAQ: Testing Hardening](./prfaq/testing-hardening.md)
 
 ## Overview

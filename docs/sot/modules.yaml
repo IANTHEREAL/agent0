@@ -341,3 +341,84 @@ modules:
         reason: Engine behavior is influenced by env-configured knobs
       - module_id: extensions-gin
         reason: Extension flags and security knobs must be uniquely defined here
+
+  - module_id: worker-cron
+    doc_path: docs/sot/worker-cron.md
+    scope:
+      - async task engine lifecycle (claim, execute, complete, GC)
+      - 'task types: Cron, AsyncTrigger, AutoAnalyze, BgDdl, BgSql'
+      - cron expression parsing and scheduling (pg_cron-compatible)
+      - worker coordination across multiple db9-server instances
+    non_goals:
+      - 'SQL execution semantics (authoritative: `sql-engine`)'
+      - 'storage key layout (authoritative: `storage-format`)'
+      - 'auth policy (authoritative: `auth-rbac`)'
+    code_entrypoints:
+      - path: src/worker/engine.rs
+        symbols: [WorkerEngine]
+      - path: src/worker/types.rs
+      - path: src/worker/config.rs
+        symbols: [WorkerConfig]
+      - path: src/worker/gc.rs
+        symbols: [WorkerGc]
+      - path: src/worker/metrics.rs
+      - path: src/cron/parser.rs
+      - path: src/cron/types.rs
+      - path: src/cron/config.rs
+      - path: src/cron/worker.rs
+      - path: src/cron/process_list.rs
+    gate_tests:
+      - ci:.github/workflows/regression-gate.yml/regression-gate
+      - ci:.github/workflows/orm-tests.yml/test
+      - cmd:python3 scripts/integration_test.py --dsn "$PG_DSN" tests/
+    owners: [TBD]
+    status: PARTIAL
+    coverage_gaps:
+      - No CODEOWNERS/maintainer ownership signal on baseline commit.
+      - Owners are still `TBD` (needs maintainer confirmation).
+    next_step:
+      - Confirm owners and add CODEOWNERS for `src/worker/**` and `src/cron/**`.
+      - Keep `docs/sot/worker-cron.md` aligned with code/tests as semantics evolve.
+    xref:
+      - module_id: sql-engine
+        reason: AFTER triggers are enqueued by SQL engine, executed by worker
+      - module_id: storage-format
+        reason: Worker tasks stored in _sys_worker keyspace
+      - module_id: ops-config
+        reason: Worker/cron config keys must be uniquely defined there
+
+  - module_id: multi-tenancy
+    doc_path: docs/sot/multi-tenancy.md
+    scope:
+      - tenant username parsing and keyspace routing
+      - keyspace isolation invariants for persistent data
+      - per-tenant resource isolation (stats cache, schema cache)
+    non_goals:
+      - 'storage key encoding details (authoritative: `storage-format`)'
+      - 'auth policy and privilege model (authoritative: `auth-rbac`)'
+      - 'pgwire startup message framing (authoritative: `protocol-pgwire`)'
+    code_entrypoints:
+      - path: src/protocol/handler/tenant.rs
+        symbols: [parse_tenant_username]
+      - path: src/pool.rs
+        symbols: [TikvClientPool]
+      - path: src/session_context.rs
+    gate_tests:
+      - ci:.github/workflows/regression-gate.yml/regression-gate
+      - ci:.github/workflows/orm-tests.yml/test
+      - cmd:cargo test
+    owners: [TBD]
+    status: PARTIAL
+    coverage_gaps:
+      - No CODEOWNERS/maintainer ownership signal on baseline commit.
+      - Owners are still `TBD` (needs maintainer confirmation).
+    next_step:
+      - Confirm owners and add CODEOWNERS for tenant-related modules.
+      - Keep `docs/sot/multi-tenancy.md` aligned with code/tests as semantics evolve.
+    xref:
+      - module_id: protocol-pgwire
+        reason: Tenant username parsing happens during pgwire startup
+      - module_id: storage-format
+        reason: Keyspace isolation invariants and key prefixing
+      - module_id: ops-config
+        reason: PG_KEYSPACE and bootstrap config keys must be uniquely defined there
