@@ -19,6 +19,32 @@ use std::sync::Arc;
 use std::time::Duration;
 use tikv_client::Transaction;
 
+fn advisory_lock_timeout(
+    qctx_lock_timeout: Option<Duration>,
+    settings_snapshot: Option<&HashMap<String, String>>,
+) -> Option<Duration> {
+    if qctx_lock_timeout.is_some() {
+        return qctx_lock_timeout;
+    }
+
+    settings_snapshot
+        .and_then(|s| s.get("lock_timeout"))
+        .and_then(
+            |v| match crate::sql::session::SessionSettings::parse_timeout_value(v) {
+                Ok(ms) if ms > 0 => Some(Duration::from_millis(ms)),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        value = v,
+                        "invalid lock_timeout in settings snapshot for advisory lock execution"
+                    );
+                    None
+                }
+            },
+        )
+}
+
 impl Executor {
     pub(super) fn materialize_catalog_functions<'a>(
         &'a self,
@@ -205,6 +231,34 @@ impl Executor {
                             &func.name,
                             &arg_values,
                             self.tenant_keyspace(),
+                        )
+                        .await
+                        {
+                            return Ok(TypedExpr::new(
+                                TypedExprKind::Constant(result?),
+                                expr.data_type.clone(),
+                            ));
+                        }
+                    }
+
+                    if crate::sql::advisory_locks::is_advisory_lock_function(&func.name) {
+                        let mut arg_values = Vec::with_capacity(new_args.len());
+                        for arg in &new_args {
+                            arg_values.push(eval_typed_expr(arg, row, qctx)?);
+                        }
+                        let ks: Arc<str> = Arc::from(self.tenant_keyspace());
+                        let lock_timeout = advisory_lock_timeout(
+                            qctx.lock_timeout,
+                            qctx.settings_snapshot.as_deref(),
+                        );
+                        if let Some(result) = crate::sql::executor::execute_advisory_lock_function(
+                            &ks,
+                            qctx.connection_id,
+                            &func.name,
+                            &arg_values,
+                            lock_timeout,
+                            qctx.xact_advisory_lock_used.clone(),
+                            qctx.xact_advisory_savepoint_tracker.clone(),
                         )
                         .await
                         {
@@ -983,4 +1037,42 @@ async fn lookup_typname_by_oid(
         .into_iter()
         .find(|t| t.oid as i64 == oid)
         .map(|t| t.name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::advisory_lock_timeout;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    #[test]
+    fn test_advisory_lock_timeout_reads_lock_timeout_guc_when_typed_missing() {
+        let mut settings = HashMap::new();
+        settings.insert("statement_timeout".to_string(), "30s".to_string());
+        settings.insert("lock_timeout".to_string(), "100ms".to_string());
+        assert_eq!(
+            advisory_lock_timeout(None, Some(&settings)),
+            Some(Duration::from_millis(100))
+        );
+    }
+
+    #[test]
+    fn test_advisory_lock_timeout_ignores_zero_and_invalid_values() {
+        let mut settings = HashMap::new();
+        settings.insert("lock_timeout".to_string(), "0".to_string());
+        assert_eq!(advisory_lock_timeout(None, Some(&settings)), None);
+
+        settings.insert("lock_timeout".to_string(), "not_a_timeout".to_string());
+        assert_eq!(advisory_lock_timeout(None, Some(&settings)), None);
+    }
+
+    #[test]
+    fn test_advisory_lock_timeout_prefers_typed_query_context_timeout() {
+        let mut settings = HashMap::new();
+        settings.insert("lock_timeout".to_string(), "10ms".to_string());
+        assert_eq!(
+            advisory_lock_timeout(Some(Duration::from_millis(250)), Some(&settings)),
+            Some(Duration::from_millis(250))
+        );
+    }
 }

@@ -139,4 +139,54 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         "HASHTEXT",
         FunctionSignature::fixed(DataType::Int32).with_args(1, Some(1)),
     );
+
+    // Advisory lock functions — void-returning (Text = empty string, matching pg_sleep).
+    // The registry stores arity only; analyzer enforces two-arg overload as
+    // strict (integer, integer) to match PostgreSQL.
+    r.register(
+        "PG_ADVISORY_LOCK",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(2)),
+    );
+    r.register(
+        "PG_ADVISORY_LOCK_SHARED",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(2)),
+    );
+    r.register(
+        "PG_ADVISORY_XACT_LOCK",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(2)),
+    );
+    r.register(
+        "PG_ADVISORY_XACT_LOCK_SHARED",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(2)),
+    );
+    r.register(
+        "PG_ADVISORY_UNLOCK_ALL",
+        FunctionSignature::fixed(DataType::Text).with_args(0, Some(0)),
+    );
+
+    // Advisory lock functions — boolean-returning
+    r.register(
+        "PG_TRY_ADVISORY_LOCK",
+        FunctionSignature::fixed(DataType::Boolean).with_args(1, Some(2)),
+    );
+    r.register(
+        "PG_TRY_ADVISORY_LOCK_SHARED",
+        FunctionSignature::fixed(DataType::Boolean).with_args(1, Some(2)),
+    );
+    r.register(
+        "PG_TRY_ADVISORY_XACT_LOCK",
+        FunctionSignature::fixed(DataType::Boolean).with_args(1, Some(2)),
+    );
+    r.register(
+        "PG_TRY_ADVISORY_XACT_LOCK_SHARED",
+        FunctionSignature::fixed(DataType::Boolean).with_args(1, Some(2)),
+    );
+    r.register(
+        "PG_ADVISORY_UNLOCK",
+        FunctionSignature::fixed(DataType::Boolean).with_args(1, Some(2)),
+    );
+    r.register(
+        "PG_ADVISORY_UNLOCK_SHARED",
+        FunctionSignature::fixed(DataType::Boolean).with_args(1, Some(2)),
+    );
 }

@@ -1,11 +1,44 @@
 //! Transaction management: begin/commit/rollback and savepoint operations.
 
 use crate::sql::error::SqlError;
+use crate::sql::query_context::XactAdvisoryLockRecord;
 use anyhow::{anyhow, Result};
+use std::sync::atomic::Ordering;
 
 use super::{Session, TransactionState};
 
 impl Session {
+    fn reset_xact_advisory_savepoint_tracker(&self) {
+        let mut tracker = self
+            .xact_advisory_savepoint_tracker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tracker.reset();
+    }
+
+    fn release_rolled_back_xact_advisory_locks(&self, locks: Vec<XactAdvisoryLockRecord>) {
+        if locks.is_empty() {
+            return;
+        }
+        let manager = crate::sql::advisory_locks::global_lock_manager();
+        for lock in locks {
+            let released =
+                manager.release_xact(&lock.keyspace, lock.key, self.connection_id, lock.mode);
+            debug_assert!(
+                released,
+                "expected rolled-back xact advisory lock to be held: conn_id={}, key={}",
+                self.connection_id, lock.key
+            );
+        }
+    }
+
+    pub(super) fn release_xact_advisory_locks_if_needed(&self) {
+        if self.has_xact_advisory_locks.swap(false, Ordering::AcqRel) {
+            crate::sql::advisory_locks::global_lock_manager()
+                .release_xact_locks(self.connection_id);
+        }
+    }
+
     pub async fn create_savepoint(&mut self, name: String) -> Result<()> {
         if !self.is_in_transaction() {
             return Err(SqlError::NoActiveTransaction {
@@ -17,7 +50,15 @@ impl Session {
             return Err(SqlError::InFailedTransaction.into());
         }
         let name_for_settings = name.clone();
+        let name_for_tracker = name.clone();
         self.savepoints.create(name).await?;
+        {
+            let mut tracker = self
+                .xact_advisory_savepoint_tracker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tracker.create(name_for_tracker);
+        }
         self.settings.push_settings_savepoint(name_for_settings);
         Ok(())
     }
@@ -33,6 +74,13 @@ impl Session {
             return Err(SqlError::InFailedTransaction.into());
         }
         self.savepoints.release(name).await?;
+        {
+            let mut tracker = self
+                .xact_advisory_savepoint_tracker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tracker.release(name)?;
+        }
         self.settings.release_settings_savepoint(name);
         Ok(())
     }
@@ -46,6 +94,13 @@ impl Session {
         }
 
         let mut prepared = self.savepoints.prepare_rollback_to(name).await?;
+        let rolled_back_xact_locks = {
+            let mut tracker = self
+                .xact_advisory_savepoint_tracker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tracker.prepare_rollback_to(name)?
+        };
         let res = {
             let txn = self.get_mut_txn().expect("transaction must be active");
 
@@ -81,6 +136,7 @@ impl Session {
         // TODO(#601-followup): Regular SET (non-LOCAL) is not restored on savepoint rollback.
         // PostgreSQL restores it; tracking that session-state undo separately from SET LOCAL.
         self.settings.rollback_settings_to_savepoint(name);
+        self.release_rolled_back_xact_advisory_locks(rolled_back_xact_locks);
         self.clear_failed_transaction();
         Ok(())
     }
@@ -97,6 +153,7 @@ impl Session {
                 let ts = crate::sql::statement_time::statement_timestamp_millis_or_now();
                 let txn = self.store.begin().await?;
                 self.savepoints.reset().await?;
+                self.reset_xact_advisory_savepoint_tracker();
                 self.state = TransactionState::Active(txn);
                 self.transaction_timestamp_ms = Some(ts);
                 Ok(())
@@ -119,27 +176,33 @@ impl Session {
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
                 self.savepoints.reset().await?;
+                self.reset_xact_advisory_savepoint_tracker();
                 match txn.commit().await {
                     Ok(_) => {
                         self.clear_local_overrides();
+                        self.release_xact_advisory_locks_if_needed();
                         self.observability.record_commit();
                         Ok(())
                     }
                     Err(e) => {
                         self.state = TransactionState::Failed(txn);
+                        self.release_xact_advisory_locks_if_needed();
                         Err(anyhow!(e))
                     }
                 }
             }
             TransactionState::Failed(mut txn) => {
                 self.savepoints.reset().await?;
+                self.reset_xact_advisory_savepoint_tracker();
                 match txn.rollback().await {
                     Ok(_) => {
                         self.clear_local_overrides();
+                        self.release_xact_advisory_locks_if_needed();
                         Ok(())
                     }
                     Err(e) => {
                         self.state = TransactionState::Failed(txn);
+                        self.release_xact_advisory_locks_if_needed();
                         Err(anyhow!(e))
                     }
                 }
@@ -154,26 +217,32 @@ impl Session {
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
                 self.savepoints.reset().await?;
+                self.reset_xact_advisory_savepoint_tracker();
                 match txn.rollback().await {
                     Ok(_) => {
                         self.clear_local_overrides();
+                        self.release_xact_advisory_locks_if_needed();
                         Ok(())
                     }
                     Err(e) => {
                         self.state = TransactionState::Failed(txn);
+                        self.release_xact_advisory_locks_if_needed();
                         Err(anyhow!(e))
                     }
                 }
             }
             TransactionState::Failed(mut txn) => {
                 self.savepoints.reset().await?;
+                self.reset_xact_advisory_savepoint_tracker();
                 match txn.rollback().await {
                     Ok(_) => {
                         self.clear_local_overrides();
+                        self.release_xact_advisory_locks_if_needed();
                         Ok(())
                     }
                     Err(e) => {
                         self.state = TransactionState::Failed(txn);
+                        self.release_xact_advisory_locks_if_needed();
                         Err(anyhow!(e))
                     }
                 }

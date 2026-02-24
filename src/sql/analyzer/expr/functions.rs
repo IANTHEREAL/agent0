@@ -16,6 +16,22 @@ use crate::sql::analyzer::error::AnalyzerError;
 use crate::sql::analyzer::types::*;
 use crate::sql::analyzer::Analyzer;
 
+fn is_two_arg_advisory_lock_function(name: &str) -> bool {
+    matches!(
+        name,
+        "PG_ADVISORY_LOCK"
+            | "PG_ADVISORY_LOCK_SHARED"
+            | "PG_ADVISORY_XACT_LOCK"
+            | "PG_ADVISORY_XACT_LOCK_SHARED"
+            | "PG_TRY_ADVISORY_LOCK"
+            | "PG_TRY_ADVISORY_LOCK_SHARED"
+            | "PG_TRY_ADVISORY_XACT_LOCK"
+            | "PG_TRY_ADVISORY_XACT_LOCK_SHARED"
+            | "PG_ADVISORY_UNLOCK"
+            | "PG_ADVISORY_UNLOCK_SHARED"
+    )
+}
+
 impl<'a> Analyzer<'a> {
     // -- Helper: CASE --
 
@@ -389,8 +405,39 @@ impl<'a> Analyzer<'a> {
                 self.coerce_args_to_vector(args, 2)
             }
             "VECTOR_DIMS" | "VECTOR_NORM" => self.coerce_args_to_vector(args, 1),
+            _ if is_two_arg_advisory_lock_function(func_name) => {
+                self.coerce_advisory_lock_two_arg_signature(func_name, args)
+            }
             _ => Ok(args),
         }
+    }
+
+    fn coerce_advisory_lock_two_arg_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.len() != 2 {
+            return Ok(args);
+        }
+
+        let arg_types: Vec<DataType> = args.iter().map(|a| a.data_type.clone()).collect();
+        let mut coerced = Vec::with_capacity(2);
+        for arg in args {
+            if arg.data_type == DataType::Int32 {
+                coerced.push(arg);
+                continue;
+            }
+            if self.is_unresolved_param(&arg) || arg.is_null_constant() {
+                coerced.push(self.coerce_if_needed(arg, &DataType::Int32)?);
+                continue;
+            }
+            return Err(AnalyzerError::FunctionNotFound {
+                name: func_name.to_string(),
+                arg_types,
+            });
+        }
+        Ok(coerced)
     }
 
     fn coerce_args_to_vector(

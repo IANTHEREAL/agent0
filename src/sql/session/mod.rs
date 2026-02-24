@@ -15,12 +15,13 @@ use crate::config::SharedServerConfig;
 use crate::observability::TenantObservability;
 use crate::sql::error::SqlError;
 use crate::sql::executor::core::prepared_stmt::PreparedStatement as SqlPreparedStatement;
-use crate::sql::query_context::QueryContext;
+use crate::sql::query_context::{QueryContext, XactAdvisorySavepointTracker};
 use crate::storage::TikvStore;
 use crate::txn::SavepointState;
 use anyhow::Result;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tikv_client::Transaction;
 
@@ -68,6 +69,10 @@ pub struct Session {
     pending_param_types: Vec<Option<crate::types::DataType>>,
     /// SQL PREPARE/EXECUTE statement cache (session-scoped, PostgreSQL semantics).
     sql_prepared_statements: HashMap<String, SqlPreparedStatement>,
+    /// True when current transaction used xact-scoped advisory lock functions.
+    pub(crate) has_xact_advisory_locks: Arc<AtomicBool>,
+    /// Savepoint-scoped tracker for xact advisory lock acquisitions.
+    pub(crate) xact_advisory_savepoint_tracker: Arc<StdMutex<XactAdvisorySavepointTracker>>,
 }
 
 /// Force-insert or overwrite a setting in a sorted `(name, value, description)` vec.
@@ -117,6 +122,10 @@ impl Session {
             pending_params: vec![],
             pending_param_types: vec![],
             sql_prepared_statements: HashMap::new(),
+            has_xact_advisory_locks: Arc::new(AtomicBool::new(false)),
+            xact_advisory_savepoint_tracker: Arc::new(StdMutex::new(
+                XactAdvisorySavepointTracker::default(),
+            )),
         }
     }
 
@@ -155,6 +164,10 @@ impl Session {
             pending_params: vec![],
             pending_param_types: vec![],
             sql_prepared_statements: HashMap::new(),
+            has_xact_advisory_locks: Arc::new(AtomicBool::new(false)),
+            xact_advisory_savepoint_tracker: Arc::new(StdMutex::new(
+                XactAdvisorySavepointTracker::default(),
+            )),
         }
     }
 
@@ -228,6 +241,9 @@ impl Session {
         }
         // Snapshot all session settings so current_setting() works in expression contexts.
         qctx.settings_snapshot = Some(Arc::new(self.all_settings_snapshot()));
+        qctx.lock_timeout = self.lock_timeout();
+        qctx.xact_advisory_lock_used = Some(self.has_xact_advisory_locks.clone());
+        qctx.xact_advisory_savepoint_tracker = Some(self.xact_advisory_savepoint_tracker.clone());
         qctx
     }
 
@@ -297,6 +313,10 @@ impl Session {
             self.last_command_complete_at = Some(Instant::now());
         } else {
             self.last_command_complete_at = None;
+            // Defensive cleanup for implicit statement completion paths.
+            // If a future executor path sets the xact advisory marker without
+            // an explicit commit/rollback call, avoid leaking xact locks.
+            self.release_xact_advisory_locks_if_needed();
         }
     }
 
@@ -455,6 +475,10 @@ impl Session {
 
     pub(crate) fn statement_timeout(&self) -> Option<Duration> {
         self.settings.statement_timeout()
+    }
+
+    pub(crate) fn lock_timeout(&self) -> Option<Duration> {
+        self.settings.lock_timeout()
     }
 
     pub(crate) fn max_sort_bytes(&self) -> usize {

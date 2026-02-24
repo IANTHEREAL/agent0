@@ -339,7 +339,10 @@ fn is_catalog_dependent_function_check(
     if crate::sql::executor::split_cron_scalar_function_name(name).is_some() {
         return true;
     }
-    crate::sql::executor::is_bg_sql_function(name)
+    if crate::sql::executor::is_bg_sql_function(name) {
+        return true;
+    }
+    crate::sql::advisory_locks::is_advisory_lock_function(name)
 }
 
 /// Query-level volatile/catalog check — walks all clauses and all body types.

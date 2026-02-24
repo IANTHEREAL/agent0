@@ -120,6 +120,9 @@ fn is_foldable_function_call(
 }
 
 pub(crate) fn is_volatile_or_side_effecting_builtin(name: &str) -> bool {
+    if crate::sql::advisory_locks::is_advisory_lock_function(name) {
+        return true;
+    }
     matches!(
         name.to_ascii_uppercase().as_str(),
         "NEXTVAL"

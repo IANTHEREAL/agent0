@@ -2,7 +2,13 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::observability;
+    use crate::sql::advisory_locks::{global_lock_manager, AdvisoryLockMode, AdvisoryLockScope};
     use crate::sql::session::settings::SessionSettings;
+    use crate::sql::session::Session;
+    use crate::storage::TikvStore;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -606,6 +612,25 @@ mod tests {
     }
 
     #[test]
+    fn test_lock_timeout_getter_uses_typed_and_local_values() {
+        let mut settings = SessionSettings::new();
+        assert_eq!(settings.lock_timeout(), None);
+
+        settings
+            .set_known_setting("lock_timeout", "5s".to_string())
+            .unwrap();
+        assert_eq!(settings.lock_timeout(), Some(Duration::from_millis(5_000)));
+
+        settings
+            .set_local_override("lock_timeout", "1500".to_string())
+            .unwrap();
+        assert_eq!(settings.lock_timeout(), Some(Duration::from_millis(1_500)));
+
+        settings.reset_setting("lock_timeout");
+        assert_eq!(settings.lock_timeout(), None);
+    }
+
+    #[test]
     fn test_parse_timeout_value() {
         // Pure numeric (milliseconds)
         assert_eq!(SessionSettings::parse_timeout_value("5000").unwrap(), 5_000);
@@ -862,6 +887,73 @@ mod tests {
         assert_eq!(
             settings.show_value("statement_timeout").as_deref(),
             Some("1500ms")
+        );
+    }
+
+    #[test]
+    fn test_record_command_complete_releases_xact_locks_when_idle() {
+        struct ConnectionCleanup {
+            conn_ids: [i32; 2],
+        }
+
+        impl Drop for ConnectionCleanup {
+            fn drop(&mut self) {
+                let manager = global_lock_manager();
+                for conn_id in self.conn_ids {
+                    manager.release_all_for_connection(conn_id);
+                }
+            }
+        }
+
+        let keyspace: Arc<str> = Arc::from("tenant_record_complete_xact_release");
+        let conn_a = 190001;
+        let conn_b = 190002;
+        let _cleanup = ConnectionCleanup {
+            conn_ids: [conn_a, conn_b],
+        };
+
+        let store = TikvStore::new_stub();
+        let observability = observability::registry().tenant(&keyspace);
+        let mut session = Session::new_with_database(
+            store,
+            observability,
+            conn_a,
+            1,
+            "postgres".to_string(),
+            0,
+            0,
+        );
+
+        let manager = global_lock_manager();
+        assert!(manager.try_acquire(
+            &keyspace,
+            424242,
+            conn_a,
+            AdvisoryLockMode::Exclusive,
+            AdvisoryLockScope::Transaction
+        ));
+
+        session
+            .has_xact_advisory_locks
+            .store(true, Ordering::Release);
+        session.record_command_complete();
+
+        assert!(
+            !session.has_xact_advisory_locks.load(Ordering::Acquire),
+            "marker should be cleared after idle command completion"
+        );
+        let acquired = manager
+            .try_acquire_checked(
+                &keyspace,
+                424242,
+                conn_b,
+                AdvisoryLockMode::Exclusive,
+                AdvisoryLockScope::Transaction,
+            )
+            .expect("try lock should not hit lock-cap limit");
+        assert!(
+            acquired,
+            "idle command completion should release xact-scoped lock"
         );
     }
 }

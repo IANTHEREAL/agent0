@@ -2,6 +2,7 @@
 //!
 //! This module contains the main executor and all execution-related submodules.
 
+mod advisory_locks;
 mod bg_sql;
 mod collation;
 pub(crate) mod core;
@@ -19,6 +20,7 @@ pub(crate) mod triggers;
 mod udt;
 mod user_function;
 
+pub(crate) use advisory_locks::execute_advisory_lock_function;
 pub(crate) use bg_sql::{execute_bg_sql_function, is_bg_sql_function, try_execute_bg_sql_function};
 pub use core::*;
 pub(crate) use cron::{

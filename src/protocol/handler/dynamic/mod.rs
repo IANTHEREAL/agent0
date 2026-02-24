@@ -91,6 +91,13 @@ impl DynamicPgHandler {
     }
 }
 
+impl Drop for DynamicPgHandler {
+    fn drop(&mut self) {
+        crate::sql::advisory_locks::global_lock_manager()
+            .release_all_for_connection(self.connection_id);
+    }
+}
+
 pub struct DynamicHandlerFactory {
     handler: Arc<DynamicPgHandler>,
 }

@@ -544,6 +544,33 @@ fn analyze_count_star() {
     assert_eq!(expr.data_type, DataType::Int64);
 }
 
+#[test]
+fn analyze_advisory_lock_two_arg_accepts_integer_integer() {
+    let expr = analyze_expr_with_users("pg_advisory_lock(1, 2)").unwrap();
+    assert_eq!(expr.data_type, DataType::Text);
+    match &expr.kind {
+        TypedExprKind::FunctionCall { func, args, .. } => {
+            assert_eq!(func.name, "PG_ADVISORY_LOCK");
+            assert_eq!(args.len(), 2);
+            assert_eq!(args[0].data_type, DataType::Int32);
+            assert_eq!(args[1].data_type, DataType::Int32);
+        }
+        _ => panic!("expected FunctionCall"),
+    }
+}
+
+#[test]
+fn analyze_advisory_lock_two_arg_rejects_bigint_bigint() {
+    let err = analyze_expr_with_users("pg_advisory_lock(1::bigint, 2::bigint)").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound {
+            ref name,
+            arg_types
+        } if name == "PG_ADVISORY_LOCK" && arg_types == vec![DataType::Int64, DataType::Int64]
+    ));
+}
+
 // ── Syntax sugar normalization ──────────────────────────────
 
 #[test]

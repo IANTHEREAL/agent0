@@ -93,8 +93,14 @@ pub enum SqlError {
     #[error("terminating connection due to idle-in-transaction timeout")]
     IdleInTransactionTimeout,
 
+    #[error("canceling statement due to lock timeout")]
+    AdvisoryLockTimeout,
+
     #[error("could not obtain lock on row in relation \"{relation}\"")]
     LockNotAvailable { relation: String },
+
+    #[error("too many advisory locks held by this session (limit: {limit})")]
+    AdvisoryLockLimitExceeded { limit: usize },
 
     #[error("current transaction is aborted, commands ignored until end of transaction block")]
     InFailedTransaction,
@@ -224,7 +230,9 @@ impl SqlError {
             Self::DivisionByZero => "22012",
             Self::StatementTimeout => "57014",
             Self::IdleInTransactionTimeout => "25P03",
+            Self::AdvisoryLockTimeout => "55P03",
             Self::LockNotAvailable { .. } => "55P03",
+            Self::AdvisoryLockLimitExceeded { .. } => "54000",
             Self::InFailedTransaction => "25P02",
             Self::PermissionDenied { .. } => "42501",
             Self::DuplicateRelation(_) => "42P07",
@@ -419,6 +427,7 @@ mod tests {
         );
         assert_eq!(SqlError::DivisionByZero.sqlstate(), "22012");
         assert_eq!(SqlError::StatementTimeout.sqlstate(), "57014");
+        assert_eq!(SqlError::AdvisoryLockTimeout.sqlstate(), "55P03");
         assert_eq!(SqlError::InFailedTransaction.sqlstate(), "25P02");
         assert_eq!(
             SqlError::PermissionDenied {
@@ -434,6 +443,10 @@ mod tests {
             }
             .sqlstate(),
             "55P03"
+        );
+        assert_eq!(
+            SqlError::AdvisoryLockLimitExceeded { limit: 64 }.sqlstate(),
+            "54000"
         );
         assert_eq!(
             SqlError::DuplicateRelation("idx".into()).sqlstate(),

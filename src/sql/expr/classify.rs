@@ -39,7 +39,10 @@ fn is_catalog_dependent_function(func_kind: &FunctionKind, name: &str) -> bool {
     if crate::sql::executor::split_cron_scalar_function_name(name).is_some() {
         return true;
     }
-    crate::sql::executor::is_bg_sql_function(name)
+    if crate::sql::executor::is_bg_sql_function(name) {
+        return true;
+    }
+    crate::sql::advisory_locks::is_advisory_lock_function(name)
 }
 
 /// Check if a TypedExpr needs pre-materialization before operator execution.

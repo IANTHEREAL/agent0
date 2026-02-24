@@ -909,6 +909,24 @@ impl SessionSettings {
         }
     }
 
+    pub(crate) fn lock_timeout(&self) -> Option<Duration> {
+        if let Some(v) = self.local_overrides.get("lock_timeout") {
+            match Self::parse_timeout_millis(v) {
+                Ok(ms) if ms == 0 => return None,
+                Ok(ms) => return Some(Duration::from_millis(ms)),
+                Err(e) => {
+                    tracing::error!(error = %e, value = v, "invalid local lock_timeout override");
+                }
+            }
+        }
+
+        if self.lock_timeout_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(self.lock_timeout_ms))
+        }
+    }
+
     pub(crate) fn idle_in_transaction_session_timeout(&self) -> Option<Duration> {
         if let Some(v) = self
             .local_overrides

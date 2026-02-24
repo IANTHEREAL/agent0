@@ -153,6 +153,9 @@ pub(super) fn eval_function_call(
                 name
             ));
         }
+        name if crate::sql::advisory_locks::is_advisory_lock_function(name) => {
+            return Err(anyhow!("{} must be evaluated during execution", name));
+        }
         "GENERATE_SERIES" => {
             return Err(anyhow!(
                 "GENERATE_SERIES is a set-returning function, not supported in this context"

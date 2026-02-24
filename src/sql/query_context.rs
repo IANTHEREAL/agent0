@@ -6,8 +6,11 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
+use crate::sql::advisory_locks::AdvisoryLockMode;
 use crate::types::Value;
 
 tokio::task_local! {
@@ -18,6 +21,91 @@ tokio::task_local! {
     static QUERY_PARAMS: Vec<Option<Value>>;
     static QUERY_PARAM_TYPES: Vec<Option<crate::types::DataType>>;
     static SETTINGS_SNAPSHOT: Arc<HashMap<String, String>>;
+    static XACT_ADVISORY_LOCK_USED: Arc<AtomicBool>;
+    static XACT_ADVISORY_SAVEPOINT_TRACKER: Arc<StdMutex<XactAdvisorySavepointTracker>>;
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct XactAdvisoryLockRecord {
+    pub(crate) keyspace: Arc<str>,
+    pub(crate) key: i64,
+    pub(crate) mode: AdvisoryLockMode,
+}
+
+#[derive(Debug, Default)]
+struct XactAdvisorySavepointFrame {
+    name: String,
+    acquired_locks: Vec<XactAdvisoryLockRecord>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct XactAdvisorySavepointTracker {
+    stack: Vec<XactAdvisorySavepointFrame>,
+}
+
+impl XactAdvisorySavepointTracker {
+    pub(crate) fn reset(&mut self) {
+        self.stack.clear();
+    }
+
+    pub(crate) fn create(&mut self, name: String) {
+        self.stack.push(XactAdvisorySavepointFrame {
+            name,
+            acquired_locks: Vec::new(),
+        });
+    }
+
+    pub(crate) fn release(&mut self, name: &str) -> anyhow::Result<()> {
+        let target_index = self
+            .stack
+            .iter()
+            .rposition(|sp| sp.name == name)
+            .ok_or_else(|| anyhow::anyhow!("savepoint \"{}\" does not exist", name))?;
+
+        if target_index == 0 {
+            self.stack.clear();
+            return Ok(());
+        }
+
+        let mut released = self.stack.split_off(target_index);
+        let parent = self
+            .stack
+            .last_mut()
+            .expect("target_index > 0 implies parent savepoint exists");
+        for frame in released.iter_mut() {
+            parent.acquired_locks.append(&mut frame.acquired_locks);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_acquired_lock(&mut self, record: XactAdvisoryLockRecord) {
+        if let Some(current) = self.stack.last_mut() {
+            current.acquired_locks.push(record);
+        }
+    }
+
+    pub(crate) fn prepare_rollback_to(
+        &mut self,
+        name: &str,
+    ) -> anyhow::Result<Vec<XactAdvisoryLockRecord>> {
+        let target_index = self
+            .stack
+            .iter()
+            .rposition(|sp| sp.name == name)
+            .ok_or_else(|| anyhow::anyhow!("savepoint \"{}\" does not exist", name))?;
+
+        let mut popped = self.stack.split_off(target_index + 1);
+        let mut to_release = Vec::new();
+        for frame in popped.iter_mut().rev() {
+            to_release.append(&mut frame.acquired_locks);
+        }
+        let target = self
+            .stack
+            .get_mut(target_index)
+            .expect("target index must exist");
+        to_release.append(&mut target.acquired_locks);
+        Ok(to_release)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +133,13 @@ pub struct QueryContext {
     /// Snapshot of all session settings at statement start.
     /// Used by `current_setting()` in expression contexts.
     pub settings_snapshot: Option<Arc<HashMap<String, String>>>,
+    /// Typed lock timeout snapshot at statement start.
+    pub lock_timeout: Option<Duration>,
+    /// Shared per-session marker: true when current transaction used
+    /// xact-scoped advisory lock functions.
+    pub xact_advisory_lock_used: Option<Arc<AtomicBool>>,
+    /// Per-session savepoint tracker for xact-scoped advisory locks.
+    pub xact_advisory_savepoint_tracker: Option<Arc<StdMutex<XactAdvisorySavepointTracker>>>,
 }
 
 impl QueryContext {
@@ -66,6 +161,9 @@ impl QueryContext {
             params: vec![],
             param_types: vec![],
             settings_snapshot: None,
+            lock_timeout: None,
+            xact_advisory_lock_used: None,
+            xact_advisory_savepoint_tracker: None,
         }
     }
 
@@ -151,6 +249,25 @@ impl QueryContext {
         qctx.params = params;
         qctx.param_types = Self::current_query_param_types();
         qctx.settings_snapshot = SETTINGS_SNAPSHOT.try_with(|s| s.clone()).ok();
+        qctx.lock_timeout = qctx.settings_snapshot.as_deref().and_then(|snapshot| {
+            snapshot.get("lock_timeout").and_then(|raw| {
+                match crate::sql::session::SessionSettings::parse_timeout_value(raw) {
+                    Ok(0) => None,
+                    Ok(ms) => Some(Duration::from_millis(ms)),
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            value = raw,
+                            "invalid lock_timeout in query context settings snapshot"
+                        );
+                        None
+                    }
+                }
+            })
+        });
+        qctx.xact_advisory_lock_used = XACT_ADVISORY_LOCK_USED.try_with(|f| f.clone()).ok();
+        qctx.xact_advisory_savepoint_tracker =
+            XACT_ADVISORY_SAVEPOINT_TRACKER.try_with(|t| t.clone()).ok();
         qctx
     }
 
@@ -216,21 +333,37 @@ where
         .settings_snapshot
         .clone()
         .unwrap_or_else(|| Arc::new(HashMap::new()));
+    // Always scope the xact advisory marker so from_task_locals reads
+    // the same per-session flag used by commit/rollback cleanup.
+    let xact_advisory_lock_used = qctx
+        .xact_advisory_lock_used
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let xact_advisory_savepoint_tracker = qctx
+        .xact_advisory_savepoint_tracker
+        .clone()
+        .unwrap_or_else(|| Arc::new(StdMutex::new(XactAdvisorySavepointTracker::default())));
     with_query_context(
         qctx.connection_id,
         qctx.database_name.clone(),
         qctx.current_user.clone(),
         qctx.timezone.clone(),
-        SETTINGS_SNAPSHOT.scope(
-            snapshot,
-            QUERY_PARAM_TYPES.scope(
-                qctx.param_types.clone(),
-                QUERY_PARAMS.scope(
-                    qctx.params.clone(),
-                    crate::sql::statement_time::with_timestamps(
-                        qctx.statement_timestamp_ms,
-                        qctx.transaction_timestamp_ms,
-                        fut,
+        XACT_ADVISORY_SAVEPOINT_TRACKER.scope(
+            xact_advisory_savepoint_tracker,
+            XACT_ADVISORY_LOCK_USED.scope(
+                xact_advisory_lock_used,
+                SETTINGS_SNAPSHOT.scope(
+                    snapshot,
+                    QUERY_PARAM_TYPES.scope(
+                        qctx.param_types.clone(),
+                        QUERY_PARAMS.scope(
+                            qctx.params.clone(),
+                            crate::sql::statement_time::with_timestamps(
+                                qctx.statement_timestamp_ms,
+                                qctx.transaction_timestamp_ms,
+                                fut,
+                            ),
+                        ),
                     ),
                 ),
             ),
@@ -242,6 +375,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn query_context_clone() {
@@ -279,5 +413,68 @@ mod tests {
         assert_eq!(ctx.connection_id, 77);
         assert_eq!(ctx.database_name.as_ref(), "tenant_db");
         assert_eq!(ctx.current_user.as_ref(), "testuser");
+    }
+
+    #[tokio::test]
+    async fn with_scoped_query_context_propagates_xact_advisory_lock_marker() {
+        let mut qctx = QueryContext::for_tests();
+        let marker = Arc::new(AtomicBool::new(false));
+        let tracker = Arc::new(StdMutex::new(XactAdvisorySavepointTracker::default()));
+        qctx.xact_advisory_lock_used = Some(marker.clone());
+        qctx.xact_advisory_savepoint_tracker = Some(tracker.clone());
+
+        with_scoped_query_context(&qctx, async {
+            let from_locals = QueryContext::from_task_locals();
+            let scoped_marker = from_locals
+                .xact_advisory_lock_used
+                .expect("xact advisory marker should be scoped");
+            scoped_marker.store(true, Ordering::Release);
+
+            let scoped_tracker = from_locals
+                .xact_advisory_savepoint_tracker
+                .expect("xact advisory savepoint tracker should be scoped");
+            let mut locked = scoped_tracker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            locked.create("sp1".to_string());
+        })
+        .await;
+
+        assert!(marker.load(Ordering::Acquire));
+        let locked = tracker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(locked.stack.len(), 1);
+    }
+
+    #[test]
+    fn xact_advisory_savepoint_tracker_rollback_collects_target_and_nested_locks() {
+        let keyspace: Arc<str> = Arc::from("tenant_tracker_rollback");
+        let mut tracker = XactAdvisorySavepointTracker::default();
+        tracker.create("sp1".to_string());
+        tracker.record_acquired_lock(XactAdvisoryLockRecord {
+            keyspace: keyspace.clone(),
+            key: 11,
+            mode: AdvisoryLockMode::Exclusive,
+        });
+        tracker.create("sp2".to_string());
+        tracker.record_acquired_lock(XactAdvisoryLockRecord {
+            keyspace: keyspace.clone(),
+            key: 22,
+            mode: AdvisoryLockMode::Shared,
+        });
+
+        let released = tracker
+            .prepare_rollback_to("sp1")
+            .expect("savepoint should exist");
+
+        assert_eq!(released.len(), 2);
+        assert_eq!(released[0].key, 22);
+        assert_eq!(released[0].mode, AdvisoryLockMode::Shared);
+        assert_eq!(released[1].key, 11);
+        assert_eq!(released[1].mode, AdvisoryLockMode::Exclusive);
+        assert_eq!(tracker.stack.len(), 1);
+        assert_eq!(tracker.stack[0].name, "sp1");
+        assert!(tracker.stack[0].acquired_locks.is_empty());
     }
 }

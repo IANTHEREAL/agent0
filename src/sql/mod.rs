@@ -1,5 +1,6 @@
 //! SQL parsing and execution
 
+pub(crate) mod advisory_locks;
 mod alter_owner;
 mod alter_type;
 pub mod analyzer;
