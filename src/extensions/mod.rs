@@ -101,7 +101,7 @@ const PG_CRON_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
 const PARQUET_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
     name: "parquet",
     oid: 2005,
-    version: "0.1.0",
+    version: "1.0.0",
     default_schema: EXTENSIONS_SCHEMA,
 };
 

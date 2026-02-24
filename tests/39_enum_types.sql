@@ -1,4 +1,6 @@
 -- Enum type creation and use
+SET client_min_messages = warning;
+
 DROP TABLE IF EXISTS udt_enum_test;
 DROP TYPE IF EXISTS role;
 DROP TABLE IF EXISTS udt_comp_test;

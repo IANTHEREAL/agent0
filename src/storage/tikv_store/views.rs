@@ -103,6 +103,7 @@ impl TikvStore {
 
     pub async fn list_views(&self, txn: &mut Transaction, db_id: u64) -> Result<Vec<ViewDef>> {
         let prefix = encode_view_prefix_v2(db_id);
+        let bindings_prefix = encode_view_bindings_prefix_v2(db_id);
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
@@ -110,7 +111,7 @@ impl TikvStore {
         let mut views = Vec::new();
         for pair in pairs {
             let key_bytes: &[u8] = pair.key().as_ref().into();
-            if !key_bytes.starts_with(&prefix) {
+            if !is_definition_key(key_bytes, &prefix, &bindings_prefix) {
                 continue;
             }
             let def: ViewDef = bincode::deserialize(pair.value())
@@ -241,6 +242,7 @@ impl TikvStore {
         db_id: u64,
     ) -> Result<Vec<MatViewDef>> {
         let prefix = encode_matview_prefix_v2(db_id);
+        let bindings_prefix = encode_matview_bindings_prefix_v2(db_id);
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
@@ -248,7 +250,7 @@ impl TikvStore {
         let mut matviews = Vec::new();
         for pair in pairs {
             let key: &[u8] = pair.key().as_ref().into();
-            if !key.starts_with(&prefix) {
+            if !is_definition_key(key, &prefix, &bindings_prefix) {
                 continue;
             }
             let def: MatViewDef = bincode::deserialize(pair.value())
@@ -287,5 +289,51 @@ impl TikvStore {
             .context("Failed to serialize matview relation bindings")?;
         txn_put(txn, key, bindings).await?;
         Ok(())
+    }
+}
+
+fn is_definition_key(key: &[u8], definition_prefix: &[u8], bindings_prefix: &[u8]) -> bool {
+    key.starts_with(definition_prefix) && !key.starts_with(bindings_prefix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_definition_key;
+    use crate::storage::encoding::{
+        encode_matview_bindings_key_v2, encode_matview_bindings_prefix_v2, encode_matview_key_v2,
+        encode_matview_prefix_v2, encode_view_bindings_key_v2, encode_view_bindings_prefix_v2,
+        encode_view_key_v2, encode_view_prefix_v2,
+    };
+
+    #[test]
+    fn view_key_classification_excludes_bindings_keys() {
+        let db_id = 42;
+        let def_prefix = encode_view_prefix_v2(db_id);
+        let bindings_prefix = encode_view_bindings_prefix_v2(db_id);
+        let def_key = encode_view_key_v2(db_id, "public.v");
+        let bindings_key = encode_view_bindings_key_v2(db_id, "public.v");
+
+        assert!(is_definition_key(&def_key, &def_prefix, &bindings_prefix));
+        assert!(!is_definition_key(
+            &bindings_key,
+            &def_prefix,
+            &bindings_prefix
+        ));
+    }
+
+    #[test]
+    fn matview_key_classification_excludes_bindings_keys() {
+        let db_id = 42;
+        let def_prefix = encode_matview_prefix_v2(db_id);
+        let bindings_prefix = encode_matview_bindings_prefix_v2(db_id);
+        let def_key = encode_matview_key_v2(db_id, "public.mv");
+        let bindings_key = encode_matview_bindings_key_v2(db_id, "public.mv");
+
+        assert!(is_definition_key(&def_key, &def_prefix, &bindings_prefix));
+        assert!(!is_definition_key(
+            &bindings_key,
+            &def_prefix,
+            &bindings_prefix
+        ));
     }
 }

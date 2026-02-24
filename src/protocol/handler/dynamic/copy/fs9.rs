@@ -6,9 +6,7 @@ use super::super::super::errors::{
     in_failed_sql_transaction_pgwire_error, sqlstate_for_executor_error, user_error,
 };
 use super::super::DynamicPgHandler;
-use super::helpers::{
-    copy_display_table_name, parse_copy_text_line, should_add_copy_insert_context,
-};
+use super::helpers::{parse_copy_text_line, should_add_copy_insert_context};
 use crate::types::Value;
 use futures::Sink;
 use pgwire::api::ClientInfo;
@@ -371,7 +369,7 @@ impl DynamicPgHandler {
                 for (rec_idx, col_values) in records.into_iter().enumerate() {
                     let line_no = rec_idx + 1;
                     executor
-                        .execute_copy_insert(session, &resolved_table, col_values)
+                        .execute_copy_insert(&mut session, &resolved_table, col_values)
                         .await
                         .map_err(|e| {
                             let message = if should_add_copy_insert_context(&e) {
@@ -566,7 +564,7 @@ impl DynamicPgHandler {
         let result = crate::sql::query_context::with_scoped_query_context(&qctx, async {
             crate::extensions::context::with_context(is_super, &tenant_ks, async {
                 executor
-                    .execute_copy_from_parquet(session, &table_name, &url)
+                    .execute_copy_from_parquet(&mut session, &table_name, &url)
                     .await
             })
             .await

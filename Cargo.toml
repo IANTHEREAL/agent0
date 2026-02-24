@@ -75,6 +75,7 @@ arrow-schema = { version = "57", optional = true }
 arrow-cast = { version = "57", optional = true }
 
 [features]
+default = ["parquet"]
 parquet = ["dep:parquet", "dep:arrow", "dep:arrow-array", "dep:arrow-schema", "dep:arrow-cast"]
 
 [patch.crates-io]

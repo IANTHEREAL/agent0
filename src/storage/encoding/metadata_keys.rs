@@ -470,6 +470,12 @@ pub fn encode_view_bindings_key_v2(db_id: u64, view_name: &str) -> Vec<u8> {
     key
 }
 
+pub fn encode_view_bindings_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_VIEW_BINDINGS_PREFIX);
+    key
+}
+
 pub fn encode_matview_key_v2(db_id: u64, matview_name: &str) -> Vec<u8> {
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_MATVIEW_PREFIX);
@@ -487,6 +493,12 @@ pub fn encode_matview_bindings_key_v2(db_id: u64, matview_name: &str) -> Vec<u8>
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_MATVIEW_BINDINGS_PREFIX);
     key.extend_from_slice(matview_name.as_bytes());
+    key
+}
+
+pub fn encode_matview_bindings_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_MATVIEW_BINDINGS_PREFIX);
     key
 }
 

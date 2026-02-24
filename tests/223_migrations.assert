@@ -1,0 +1,4 @@
+name|applied_at|checksum|sql_preview
+20260223_000001_view_relation_bindings_v2
+view_relation_bindings_v2
+backfill persisted view/matview relation bindings from legacy deps

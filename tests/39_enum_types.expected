@@ -36,7 +36,6 @@ blue|4
 magenta|5
 yellow|6
 (6 rows)
-NOTICE:  enum label "red" already exists, skipping
 ERROR:  enum label "red" already exists
 ERROR:  "nonexistent" is not an existing enum label
 id|c

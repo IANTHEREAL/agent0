@@ -4,3 +4,4 @@ parquet|1.0.0
 count
 0
 (1 row)
+ERROR:  extension "parquet" is not installed. Run: CREATE EXTENSION parquet

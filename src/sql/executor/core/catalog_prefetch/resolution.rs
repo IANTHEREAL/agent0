@@ -15,6 +15,14 @@ use super::extraction::{
     extract_scalar_function_names, extract_table_function_calls, extract_table_names,
 };
 
+#[cfg(feature = "parquet")]
+fn parquet_fallback_table_function_schema() -> TableSchema {
+    // Keep planning deterministic even when prefetch-time schema inference cannot
+    // reach/inspect the parquet source. Runtime execution still enforces extension
+    // install state and emits the canonical user-facing error.
+    TableSchema::new("read_parquet".to_string(), 0, Vec::new(), Vec::new())
+}
+
 /// Try to resolve a table name through the search path and fetch its schema.
 ///
 /// Returns `(bare_or_qualified_name, fully_qualified_name, schema)` on success.
@@ -543,11 +551,14 @@ pub(super) async fn prefetch_table_function_schemas(
 
             #[cfg(feature = "parquet")]
             if func_lower == "read_parquet" {
+                let fallback_schema = parquet_fallback_table_function_schema();
                 let installed = store.get_extension(txn, db_id, "parquet").await?;
                 let Some(installed) = installed else {
+                    snapshot.add_table_function(&call.key, fallback_schema);
                     continue;
                 };
                 if !installed.enabled {
+                    snapshot.add_table_function(&call.key, fallback_schema);
                     continue;
                 }
                 let url = match call.args.first() {
@@ -555,6 +566,7 @@ pub(super) async fn prefetch_table_function_schemas(
                     _ => None,
                 };
                 let Some(url) = url else {
+                    snapshot.add_table_function(&call.key, fallback_schema);
                     continue;
                 };
                 match crate::extensions::parquet::reader::infer_schema(&url).await {
@@ -563,6 +575,7 @@ pub(super) async fn prefetch_table_function_schemas(
                     }
                     Err(e) => {
                         tracing::warn!("read_parquet schema inference failed for {url}: {e}");
+                        snapshot.add_table_function(&call.key, fallback_schema);
                     }
                 }
                 continue;
