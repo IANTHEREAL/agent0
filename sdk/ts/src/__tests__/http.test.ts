@@ -215,3 +215,133 @@ describe('createHttpClient', () => {
     expect(calls).toHaveLength(1);
   });
 });
+
+describe('timeout', () => {
+  it('aborts request after configured timeout', async () => {
+    const slowFetch: FetchFn = async (_url, init) => {
+      return new Promise<Response>((_resolve, reject) => {
+        if (init?.signal) {
+          init.signal.addEventListener('abort', () => {
+            reject(new DOMException('The operation was aborted.', 'AbortError'));
+          });
+        }
+      });
+    };
+    const client = createHttpClient({
+      baseUrl: 'http://test:8090/api',
+      fetch: slowFetch,
+      timeout: 50,
+    });
+
+    await expect(client.get('/slow')).rejects.toThrow();
+  });
+
+  it('completes normally when response is faster than timeout', async () => {
+    const fastFetch: FetchFn = async () => {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+    const client = createHttpClient({
+      baseUrl: 'http://test:8090/api',
+      fetch: fastFetch,
+      timeout: 5000,
+    });
+
+    const result = await client.get<{ ok: boolean }>('/fast');
+    expect(result.ok).toBe(true);
+  });
+});
+
+describe('retry', () => {
+  it('retries on 503 and succeeds', async () => {
+    let callCount = 0;
+    const fn: FetchFn = async () => {
+      callCount++;
+      if (callCount <= 2) {
+        return new Response(JSON.stringify({ message: 'Service Unavailable' }), { status: 503 });
+      }
+      return new Response(JSON.stringify({ data: 'ok' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+    const client = createHttpClient({
+      baseUrl: 'http://test:8090/api',
+      fetch: fn,
+      maxRetries: 2,
+      retryDelay: 10,
+    });
+
+    const result = await client.get<{ data: string }>('/retry-me');
+    expect(result.data).toBe('ok');
+    expect(callCount).toBe(3);
+  });
+
+  it('does NOT retry on 400 (client error)', async () => {
+    let callCount = 0;
+    const fn: FetchFn = async () => {
+      callCount++;
+      return new Response(JSON.stringify({ message: 'Bad Request' }), { status: 400 });
+    };
+    const client = createHttpClient({
+      baseUrl: 'http://test:8090/api',
+      fetch: fn,
+      maxRetries: 2,
+      retryDelay: 10,
+    });
+
+    await expect(client.get('/bad')).rejects.toThrow();
+    expect(callCount).toBe(1);
+  });
+
+  it('throws after all retries exhausted', async () => {
+    let callCount = 0;
+    const fn: FetchFn = async () => {
+      callCount++;
+      return new Response(JSON.stringify({ message: 'Error' }), { status: 500 });
+    };
+    const client = createHttpClient({
+      baseUrl: 'http://test:8090/api',
+      fetch: fn,
+      maxRetries: 2,
+      retryDelay: 10,
+    });
+
+    await expect(client.get('/fail')).rejects.toThrow();
+    expect(callCount).toBe(3);
+  });
+
+  it('default (no retry configured) behaves as before', async () => {
+    let callCount = 0;
+    const fn: FetchFn = async () => {
+      callCount++;
+      return new Response(JSON.stringify({ message: 'Error' }), { status: 500 });
+    };
+    const client = createHttpClient({
+      baseUrl: 'http://test:8090/api',
+      fetch: fn,
+    });
+
+    await expect(client.get('/fail')).rejects.toThrow();
+    expect(callCount).toBe(1);
+  });
+
+  it('caps maxRetries at 3 even if set higher', async () => {
+    let callCount = 0;
+    const fn: FetchFn = async () => {
+      callCount++;
+      return new Response(JSON.stringify({ message: 'Error' }), { status: 503 });
+    };
+    const client = createHttpClient({
+      baseUrl: 'http://test:8090/api',
+      fetch: fn,
+      maxRetries: 10,
+      retryDelay: 1,
+    });
+
+    await expect(client.get('/fail')).rejects.toThrow();
+    expect(callCount).toBe(4); // 1 original + 3 max retries
+  });
+});
