@@ -6,7 +6,7 @@
 #   fs9      — fs9 repo (${FS9_REPO_PATH}, via additional_contexts in docker-compose)
 
 # ── Stage 1: build sh9 from fs9 repo ────────────────────────────────────────
-FROM rust:1.85-bookworm AS sh9-builder
+FROM rust:1.88-bookworm AS sh9-builder
 
 RUN apt-get update && apt-get install -y \
     libssl-dev \
@@ -21,7 +21,7 @@ COPY --from=fs9 . .
 RUN cargo build --release -p sh9
 
 # ── Stage 2: build pgtikv-admin + db9 from tipg repo ────────────────────────
-FROM rust:1.85-bookworm AS admin-builder
+FROM rust:1.88-bookworm AS admin-builder
 
 RUN apt-get update && apt-get install -y \
     libssl-dev \

@@ -211,4 +211,76 @@ describe('instantDatabase()', () => {
     );
     expect(createCall?.body).toEqual({ name: 'myapp' });
   });
+
+  it('propagates timeout option to HttpClient', async () => {
+    const store = new MemoryCredentialStore();
+    await store.save({ token: 'existing-token' });
+
+    // Mock fetch that never resolves (simulates slow network)
+    const fn: FetchFn = async (_url, init) => {
+      return new Promise<Response>((_resolve, reject) => {
+        if (init?.signal) {
+          init.signal.addEventListener('abort', () => {
+            reject(new DOMException('The operation was aborted.', 'AbortError'));
+          });
+        }
+      });
+    };
+
+    await expect(
+      instantDatabase({
+        baseUrl: BASE,
+        fetch: fn,
+        credentialStore: store,
+        timeout: 50,
+      })
+    ).rejects.toThrow();
+  });
+
+  it('propagates maxRetries option — retries on 5xx', async () => {
+    const store = new MemoryCredentialStore();
+    await store.save({ token: 'existing-token' });
+
+    let callCount = 0;
+    const fn: FetchFn = async () => {
+      callCount++;
+      return new Response(JSON.stringify({ message: 'Error' }), { status: 503 });
+    };
+
+    await expect(
+      instantDatabase({
+        baseUrl: BASE,
+        fetch: fn,
+        credentialStore: store,
+        maxRetries: 2,
+        retryDelay: 1,
+      })
+    ).rejects.toThrow();
+    // 1 original + 2 retries = 3 calls
+    expect(callCount).toBe(3);
+  });
+
+  it('propagates retryDelay option — delays between retries', async () => {
+    const store = new MemoryCredentialStore();
+    await store.save({ token: 'existing-token' });
+
+    const timestamps: number[] = [];
+    const fn: FetchFn = async () => {
+      timestamps.push(Date.now());
+      return new Response(JSON.stringify({ message: 'Error' }), { status: 503 });
+    };
+
+    await expect(
+      instantDatabase({
+        baseUrl: BASE,
+        fetch: fn,
+        credentialStore: store,
+        maxRetries: 1,
+        retryDelay: 50,
+      })
+    ).rejects.toThrow();
+    expect(timestamps).toHaveLength(2);
+    // Second call should be at least 40ms after first (50ms base delay with some tolerance)
+    expect(timestamps[1] - timestamps[0]).toBeGreaterThanOrEqual(40);
+  });
 });

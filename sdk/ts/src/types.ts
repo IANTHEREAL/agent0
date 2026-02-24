@@ -24,12 +24,20 @@ export interface ColumnInfo {
   type: string;
 }
 
+export interface SqlErrorDetail {
+  message: string;
+  code?: string;
+  position?: number;
+  hint?: string;
+  detail?: string;
+}
+
 export interface SqlResult {
   columns: ColumnInfo[];
   rows: unknown[][];
   row_count: number;
   command: string;
-  error?: string;
+  error?: string | SqlErrorDetail;
 }
 
 // ── Admin request types ────────────────────────────────────────
@@ -267,6 +275,11 @@ export interface CreateUserRequest {
   password: string;
 }
 
+export interface CreateTokenRequest {
+  name?: string;
+  expires_in_days?: number;
+}
+
 // ── Customer response types ────────────────────────────────────
 
 export interface CustomerResponse {
@@ -330,6 +343,14 @@ export interface TokenResponse {
   expires_at?: string;
 }
 
+export interface CreateTokenResponse {
+  id: string;
+  name: string;
+  token: string;
+  expires_at?: string;
+  created_at: string;
+}
+
 export interface DumpResponse {
   sql: string;
   object_count: number;
@@ -368,6 +389,23 @@ export interface MigrationMetadata {
   checksum: string;
   applied_at: string;
   sql_preview: string;
+}
+
+export interface Fs9EventEntry {
+  id: string;
+  type: string;
+  path: string;
+  timestamp: string;
+  user_id?: string;
+  size?: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface Fs9EventOptions {
+  limit?: number;
+  offset?: number;
+  path?: string;
+  type?: string;
 }
 
 // ── Union types ────────────────────────────────────────────────

@@ -10,6 +10,9 @@ export interface InstantDatabaseOptions {
   credentialStore?: CredentialStore;
   seed?: string;
   seedFile?: string;
+  timeout?: number;
+  maxRetries?: number;
+  retryDelay?: number;
 }
 
 export interface InstantDatabaseResult {
@@ -30,6 +33,9 @@ export async function instantDatabase(
     baseUrl: options.baseUrl,
     fetch: options.fetch,
     credentialStore: options.credentialStore,
+    timeout: options.timeout,
+    maxRetries: options.maxRetries,
+    retryDelay: options.retryDelay,
   });
 
   const existing = await client.databases.list();

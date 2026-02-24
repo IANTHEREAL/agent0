@@ -193,7 +193,7 @@ describe('databases – user management', () => {
     expectAuth(calls);
   });
 
-  it('users.delete() → DELETE /customer/databases/:id/users/:username', async () => {
+   it('users.delete() → DELETE /customer/databases/:id/users/:username', async () => {
     const { fn, calls } = capturingFetch(200, { message: 'User deleted' });
     const client = authedClient(fn);
 
@@ -202,6 +202,132 @@ describe('databases – user management', () => {
     expect(res.message).toBe('User deleted');
     expect(calls[0].url).toBe(`${BASE}/customer/databases/db1/users/app`);
     expect(calls[0].init?.method).toBe('DELETE');
+    expectAuth(calls);
+  });
+});
+
+describe('databases – SQL error wrapping', () => {
+  it('wraps string error into SqlErrorDetail object', async () => {
+    const { fn, calls } = capturingFetch(200, {
+      error: 'relation "users" does not exist',
+      columns: [],
+      rows: [],
+    });
+    const client = authedClient(fn);
+
+    const result = await client.databases.sql('db1', 'SELECT * FROM users');
+
+    expect(result.error).toEqual({ message: 'relation "users" does not exist' });
+    expect(calls[0].init?.method).toBe('POST');
+  });
+
+  it('preserves undefined error on success', async () => {
+    const { fn } = capturingFetch(200, {
+      columns: ['id', 'name'],
+      rows: [[1, 'Alice']],
+    });
+    const client = authedClient(fn);
+
+    const result = await client.databases.sql('db1', 'SELECT * FROM users');
+
+    expect(result.error).toBeUndefined();
+    expect(result.columns).toEqual(['id', 'name']);
+  });
+
+  it('sqlFile also wraps string error', async () => {
+    const { fn } = capturingFetch(200, {
+      error: 'syntax error at position 1',
+      columns: [],
+      rows: [],
+    });
+    const client = authedClient(fn);
+
+    const result = await client.databases.sqlFile('db1', 'INVALID SQL');
+
+    expect(result.error).toEqual({ message: 'syntax error at position 1' });
+  });
+
+  it('parses JSON error string into SqlErrorDetail', async () => {
+    const { fn } = capturingFetch(200, {
+      error: '{"message":"fail","code":"42P01"}',
+      columns: [],
+      rows: [],
+    });
+    const client = authedClient(fn);
+
+    const result = await client.databases.sql('db1', 'SELECT 1');
+
+    expect(result.error).toEqual({ message: 'fail', code: '42P01' });
+  });
+
+  it('parses PostgreSQL-style error with SQLSTATE', async () => {
+    const { fn } = capturingFetch(200, {
+      error: 'ERROR: relation "users" does not exist (SQLSTATE 42P01)',
+      columns: [],
+      rows: [],
+    });
+    const client = authedClient(fn);
+
+    const result = await client.databases.sql('db1', 'SELECT 1');
+
+    expect(result.error).toMatchObject({
+      message: expect.stringContaining('relation "users" does not exist'),
+      code: '42P01',
+    });
+  });
+
+  it('sqlFile also parses JSON error string', async () => {
+    const { fn } = capturingFetch(200, {
+      error: '{"message":"syntax error","detail":"near SELECT"}',
+      columns: [],
+      rows: [],
+    });
+    const client = authedClient(fn);
+
+    const result = await client.databases.sqlFile('db1', 'BAD SQL');
+
+    expect(result.error).toEqual({ message: 'syntax error', detail: 'near SELECT' });
+  });
+});
+
+describe('tokens', () => {
+  it('create() → POST /customer/tokens with body', async () => {
+    const { fn, calls } = capturingFetch(200, {
+      id: 'tok_1',
+      name: 'test-token',
+      token: 'secret-plaintext',
+      expires_at: '2027-01-01T00:00:00Z',
+      created_at: '2026-01-01T00:00:00Z',
+    });
+    const client = authedClient(fn);
+
+    const res = await client.tokens.create({ name: 'test-token', expires_in_days: 30 });
+
+    expect(res.id).toBe('tok_1');
+    expect(res.name).toBe('test-token');
+    expect(res.token).toBe('secret-plaintext');
+    expect(calls[0].url).toBe(`${BASE}/customer/tokens`);
+    expect(calls[0].init?.method).toBe('POST');
+    expect(calls[0].init?.body).toBe(
+      JSON.stringify({ name: 'test-token', expires_in_days: 30 })
+    );
+    expectAuth(calls);
+  });
+
+  it('create() with empty request → POST /customer/tokens', async () => {
+    const { fn, calls } = capturingFetch(200, {
+      id: 'tok_2',
+      name: '',
+      token: 'secret',
+      created_at: '2026-01-01T00:00:00Z',
+    });
+    const client = authedClient(fn);
+
+    const res = await client.tokens.create({});
+
+    expect(res.id).toBe('tok_2');
+    expect(calls[0].url).toBe(`${BASE}/customer/tokens`);
+    expect(calls[0].init?.method).toBe('POST');
     expectAuth(calls);
   });
 });
