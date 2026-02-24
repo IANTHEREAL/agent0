@@ -119,7 +119,7 @@ describe('createDb9Client – auth endpoints', () => {
     ).toBe('Bearer my-token');
   });
 
-  it('getAnonymousSecret() → GET /customer/anonymous-secret with Authorization header', async () => {
+  it('getAnonymousSecret() → POST /customer/anonymous-secret with Authorization header', async () => {
     const { fn, calls } = capturingFetch(200, {
       anonymous_id: 'aid',
       anonymous_secret: 'asec',
@@ -134,7 +134,7 @@ describe('createDb9Client – auth endpoints', () => {
 
     expect(res.anonymous_id).toBe('aid');
     expect(calls[0].url).toBe(`${BASE}/customer/anonymous-secret`);
-    expect(calls[0].init?.method).toBe('GET');
+    expect(calls[0].init?.method).toBe('POST');
     expect(
       (calls[0].init?.headers as Record<string, string>)['Authorization']
     ).toBe('Bearer my-token');
@@ -406,5 +406,131 @@ describe('createDb9Client – defaults', () => {
     expect(client).toBeDefined();
     expect(client.auth).toBeDefined();
     expect(client.tokens).toBeDefined();
+  });
+});
+
+describe('auth.ensureAnonymousSecret()', () => {
+  it('is a no-op when anonymous_secret already exists', async () => {
+    const { fn, calls } = capturingFetch(200);
+    const store = new MemoryCredentialStore();
+    await store.save({
+      token: 'tok',
+      is_anonymous: true,
+      anonymous_id: 'anon-1',
+      anonymous_secret: 'existing-secret',
+    });
+    const client = createDb9Client({ baseUrl: BASE, fetch: fn, credentialStore: store });
+
+    await client.auth.ensureAnonymousSecret();
+
+    // No HTTP calls should be made
+    expect(calls).toHaveLength(0);
+  });
+
+  it('is a no-op when no anonymous_id exists', async () => {
+    const { fn, calls } = capturingFetch(200);
+    const store = new MemoryCredentialStore();
+    await store.save({ token: 'tok' });
+    const client = createDb9Client({ baseUrl: BASE, fetch: fn, credentialStore: store });
+
+    await client.auth.ensureAnonymousSecret();
+
+    expect(calls).toHaveLength(0);
+  });
+
+  it('fetches and saves secret when anonymous_id exists but no secret', async () => {
+    const { fn, calls } = capturingFetch(200, { anonymous_secret: 'new-secret' });
+    const store = new MemoryCredentialStore();
+    await store.save({
+      token: 'tok',
+      is_anonymous: true,
+      anonymous_id: 'anon-1',
+    });
+    const client = createDb9Client({ baseUrl: BASE, fetch: fn, credentialStore: store });
+
+    await client.auth.ensureAnonymousSecret();
+
+    // Should have made one POST call to /customer/anonymous-secret
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe(`${BASE}/customer/anonymous-secret`);
+    expect(calls[0].init?.method).toBe('POST');
+
+    // Secret should be saved in credential store
+    const updated = await store.load();
+    expect(updated?.anonymous_secret).toBe('new-secret');
+  });
+});
+
+describe('token auto-refresh', () => {
+  it('retries on 401 when anonymous credentials exist', async () => {
+    let callCount = 0;
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const fn: FetchFn = async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      callCount++;
+      if (callCount === 1) {
+        return new Response(JSON.stringify({ message: 'Unauthorized' }), { status: 401 });
+      } else if (callCount === 2) {
+        return new Response(JSON.stringify({ token: 'new-token' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } else {
+        return new Response(JSON.stringify({ id: 'cust-1', email: null }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    };
+    const store = new MemoryCredentialStore();
+    await store.save({
+      token: 'old-token',
+      is_anonymous: true,
+      anonymous_id: 'anon-1',
+      anonymous_secret: 'secret-1',
+    });
+    const client = createDb9Client({ baseUrl: BASE, fetch: fn, credentialStore: store });
+
+    const result = await client.auth.me();
+
+    expect(result.id).toBe('cust-1');
+    expect(calls).toHaveLength(3);
+    expect(calls[1].url).toBe(`${BASE}/customer/anonymous-refresh`);
+    const creds = await store.load();
+    expect(creds?.token).toBe('new-token');
+  });
+
+  it('throws 401 immediately when not anonymous', async () => {
+    const { fn, calls } = capturingFetch(401, { message: 'Unauthorized' });
+    const store = new MemoryCredentialStore();
+    await store.save({ token: 'user-token' });
+    const client = createDb9Client({ baseUrl: BASE, fetch: fn, credentialStore: store });
+
+    await expect(client.auth.me()).rejects.toThrow();
+    expect(calls).toHaveLength(1);
+  });
+
+  it('throws original error when refresh fails', async () => {
+    let callCount = 0;
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const fn: FetchFn = async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      callCount++;
+      if (callCount <= 2) {
+        return new Response(JSON.stringify({ message: 'Unauthorized' }), { status: 401 });
+      }
+      return new Response(null, { status: 200 });
+    };
+    const store = new MemoryCredentialStore();
+    await store.save({
+      token: 'old-token',
+      is_anonymous: true,
+      anonymous_id: 'anon-1',
+      anonymous_secret: 'secret-1',
+    });
+    const client = createDb9Client({ baseUrl: BASE, fetch: fn, credentialStore: store });
+
+    await expect(client.auth.me()).rejects.toThrow();
+    expect(calls).toHaveLength(2);
   });
 });

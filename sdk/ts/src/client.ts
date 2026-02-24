@@ -1,4 +1,4 @@
-import { createHttpClient, type FetchFn, type HttpClient } from './http';
+import { createHttpClient, type FetchFn, type HttpClient, type BodyInit } from './http';
 import {
   defaultCredentialStore,
   type CredentialStore,
@@ -23,6 +23,7 @@ import type {
   CustomerPasswordResetResponse,
   TenantObservabilityResponse,
   SqlResult,
+  SqlErrorDetail,
   SchemaResponse,
   DumpRequest,
   DumpResponse,
@@ -32,6 +33,10 @@ import type {
   BranchRequest,
   UserResponse,
   CreateUserRequest,
+  CreateTokenRequest,
+  CreateTokenResponse,
+  Fs9EventEntry,
+  Fs9EventOptions,
 } from './types';
 
 export interface Db9ClientOptions {
@@ -39,6 +44,9 @@ export interface Db9ClientOptions {
   token?: string;
   fetch?: FetchFn;
   credentialStore?: CredentialStore;
+  timeout?: number;
+  maxRetries?: number;
+  retryDelay?: number;
 }
 
 export function createDb9Client(options: Db9ClientOptions = {}) {
@@ -53,6 +61,9 @@ export function createDb9Client(options: Db9ClientOptions = {}) {
   const publicClient = createHttpClient({
     baseUrl,
     fetch: options.fetch,
+    timeout: options.timeout,
+    maxRetries: options.maxRetries,
+    retryDelay: options.retryDelay,
   });
 
   // Lazy-loading authenticated HTTP client
@@ -78,7 +89,56 @@ export function createDb9Client(options: Db9ClientOptions = {}) {
       baseUrl,
       fetch: options.fetch,
       headers: { Authorization: `Bearer ${token}` },
+      timeout: options.timeout,
+      maxRetries: options.maxRetries,
+      retryDelay: options.retryDelay,
     });
+  }
+
+  // ── Token auto-refresh on 401 ─────────────────────────────────
+  let refreshPromise: Promise<void> | null = null;
+
+  async function refreshAnonymousToken(): Promise<void> {
+    const creds = await store.load();
+    if (!creds?.anonymous_id || !creds?.anonymous_secret) {
+      throw new Error('Not an anonymous session');
+    }
+    const resp = await publicClient.post<AnonymousRefreshResponse>(
+      '/customer/anonymous-refresh',
+      {
+        anonymous_id: creds.anonymous_id,
+        anonymous_secret: creds.anonymous_secret,
+      }
+    );
+    token = resp.token;
+    await store.save({ ...creds, token: resp.token });
+  }
+
+  async function withAuthRetry<T>(
+    operation: (client: HttpClient) => Promise<T>
+  ): Promise<T> {
+    const client = await getAuthClient();
+    try {
+      return await operation(client);
+    } catch (err) {
+      if (!(err instanceof Db9Error) || err.statusCode !== 401) {
+        throw err;
+      }
+      // 401 — try anonymous refresh
+      try {
+        if (!refreshPromise) {
+          refreshPromise = refreshAnonymousToken();
+        }
+        await refreshPromise;
+      } catch {
+        throw err; // Refresh failed — throw original 401
+      } finally {
+        refreshPromise = null;
+      }
+      // Retry with new token
+      const newClient = await getAuthClient();
+      return operation(newClient);
+    }
   }
 
   // ── fs9 helpers ──────────────────────────────────────────────
@@ -87,39 +147,86 @@ export function createDb9Client(options: Db9ClientOptions = {}) {
     return `${origin}/fs9/${dbId}`;
   }
 
-  async function fsRequest(
-    method: string,
+  // ── FS-specific auth retry (shares refreshPromise singleton) ──
+  function getFsClient(dbId: string): HttpClient {
+    const fs9Base = deriveFs9Url(dbId) + '/api/v1';
+    return createHttpClient({
+      baseUrl: fs9Base,
+      fetch: options.fetch,
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      timeout: options.timeout,
+      maxRetries: options.maxRetries,
+      retryDelay: options.retryDelay,
+    });
+  }
+
+  async function withFsAuthRetry<T>(
     dbId: string,
-    fsPath: string,
-    body?: string,
-    contentType?: string
-  ): Promise<Response> {
-    // Ensure token is loaded (lazy auth pattern)
+    operation: (client: HttpClient) => Promise<T>
+  ): Promise<T> {
+    // Ensure token is loaded first
     if (!token && !tokenLoaded) {
-      await getAuthClient();
+      await getAuthClient(); // triggers lazy auth
+    }
+    const client = getFsClient(dbId);
+    try {
+      return await operation(client);
+    } catch (err) {
+      if (!(err instanceof Db9Error) || err.statusCode !== 401) {
+        throw err;
+      }
+      try {
+        if (!refreshPromise) {
+          refreshPromise = refreshAnonymousToken();
+        }
+        await refreshPromise;
+      } catch {
+        throw err;
+      } finally {
+        refreshPromise = null;
+      }
+      const newClient = getFsClient(dbId);
+      return operation(newClient);
+    }
+  }
+
+  // ── SQL Error Parsing ────────────────────────────────────────
+  function parseSqlError(raw: string): SqlErrorDetail {
+    // Strategy 1: Try JSON.parse
+    try {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed === 'object' && parsed !== null && typeof parsed.message === 'string') {
+        return parsed as SqlErrorDetail;
+      }
+    } catch {
+      // not JSON, continue
     }
 
-    const fs9Url = deriveFs9Url(dbId);
-    const url = `${fs9Url}/api/v1${fsPath}`;
-
-    const headers: Record<string, string> = {};
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
-    }
-    if (body !== undefined) {
-      headers['Content-Type'] = contentType || 'text/plain';
-    }
-
-    const init: RequestInit = { method, headers };
-    if (body !== undefined) {
-      init.body = body;
+    // Strategy 2: Regex for PostgreSQL-style errors
+    const pgMatch = raw.match(/^(?:ERROR:\s*)?(.+?)(?:\s+DETAIL:\s+(.+?))?(?:\s+HINT:\s+(.+?))?(?:\s+\(SQLSTATE\s+(\w+)\))?$/s);
+    if (pgMatch && pgMatch[1]) {
+      const result: SqlErrorDetail = { message: pgMatch[1].trim() };
+      if (pgMatch[2]) result.detail = pgMatch[2].trim();
+      if (pgMatch[3]) result.hint = pgMatch[3].trim();
+      if (pgMatch[4]) result.code = pgMatch[4];
+      return result;
     }
 
-    const response = await fetchFn(url, init);
-    if (!response.ok) {
-      throw await Db9Error.fromResponse(response);
-    }
-    return response;
+    // Strategy 3: Fallback
+    return { message: raw };
+  }
+
+  async function fsStat(dbId: string, path: string): Promise<Fs9FileEntry> {
+    return withFsAuthRetry(dbId, (client) =>
+      client.get<Fs9FileEntry>('/stat', { path })
+    );
+  }
+
+  // ── Anonymous Secret Helper ──────────────────────────────────
+  async function fetchAnonymousSecret(): Promise<AnonymousSecretResponse> {
+    return withAuthRetry((client) =>
+      client.post<AnonymousSecretResponse>('/customer/anonymous-secret', {})
+    );
   }
 
   return {
@@ -143,160 +250,185 @@ export function createDb9Client(options: Db9ClientOptions = {}) {
         ),
 
       // Authenticated endpoints
-      me: async () => {
-        const client = await getAuthClient();
-        return client.get<CustomerResponse>('/customer/me');
+      me: async () =>
+        withAuthRetry((client) =>
+          client.get<CustomerResponse>('/customer/me')
+        ),
+
+      getAnonymousSecret: (): Promise<AnonymousSecretResponse> => {
+        return fetchAnonymousSecret();
       },
 
-      getAnonymousSecret: async () => {
-        const client = await getAuthClient();
-        return client.get<AnonymousSecretResponse>(
-          '/customer/anonymous-secret'
-        );
-      },
+      claim: async (req: ClaimRequest) =>
+        withAuthRetry((client) =>
+          client.post<ClaimResponse>('/customer/claim', req)
+        ),
 
-      claim: async (req: ClaimRequest) => {
-        const client = await getAuthClient();
-        return client.post<ClaimResponse>('/customer/claim', req);
+      ensureAnonymousSecret: async () => {
+        const creds = await store.load();
+        if (!creds?.anonymous_id || creds.anonymous_secret) {
+          return; // No anonymous_id, or secret already exists
+        }
+        // Anonymous session without a secret — fetch one
+        const resp = await fetchAnonymousSecret();
+        await store.save({
+          ...creds,
+          anonymous_secret: resp.anonymous_secret,
+        });
       },
     },
 
     tokens: {
-      list: async () => {
-        const client = await getAuthClient();
-        return client.get<TokenResponse[]>('/customer/tokens');
-      },
+      list: async () =>
+        withAuthRetry((client) =>
+          client.get<TokenResponse[]>('/customer/tokens')
+        ),
 
-      revoke: async (tokenId: string) => {
-        const client = await getAuthClient();
-        return client.del<MessageResponse>(`/customer/tokens/${tokenId}`);
-      },
+      revoke: async (tokenId: string) =>
+        withAuthRetry((client) =>
+          client.del<MessageResponse>(`/customer/tokens/${tokenId}`)
+        ),
+
+      create: async (req: CreateTokenRequest) =>
+        withAuthRetry((client) =>
+          client.post<CreateTokenResponse>('/customer/tokens', req)
+        ),
     },
 
     databases: {
       // ── CRUD ──────────────────────────────────────────────────
-      create: async (req: CreateDatabaseRequest) => {
-        const client = await getAuthClient();
-        return client.post<DatabaseResponse>('/customer/databases', req);
-      },
+      create: async (req: CreateDatabaseRequest) =>
+        withAuthRetry((client) =>
+          client.post<DatabaseResponse>('/customer/databases', req)
+        ),
 
-      list: async () => {
-        const client = await getAuthClient();
-        return client.get<DatabaseResponse[]>('/customer/databases');
-      },
+      list: async () =>
+        withAuthRetry((client) =>
+          client.get<DatabaseResponse[]>('/customer/databases')
+        ),
 
-      get: async (databaseId: string) => {
-        const client = await getAuthClient();
-        return client.get<DatabaseResponse>(
-          `/customer/databases/${databaseId}`
-        );
-      },
+      get: async (databaseId: string) =>
+        withAuthRetry((client) =>
+          client.get<DatabaseResponse>(
+            `/customer/databases/${databaseId}`
+          )
+        ),
 
-      delete: async (databaseId: string) => {
-        const client = await getAuthClient();
-        return client.del<MessageResponse>(
-          `/customer/databases/${databaseId}`
-        );
-      },
+      delete: async (databaseId: string) =>
+        withAuthRetry((client) =>
+          client.del<MessageResponse>(
+            `/customer/databases/${databaseId}`
+          )
+        ),
 
-      resetPassword: async (databaseId: string) => {
-        const client = await getAuthClient();
-        return client.post<CustomerPasswordResetResponse>(
-          `/customer/databases/${databaseId}/reset-password`
-        );
-      },
+      resetPassword: async (databaseId: string) =>
+        withAuthRetry((client) =>
+          client.post<CustomerPasswordResetResponse>(
+            `/customer/databases/${databaseId}/reset-password`
+          )
+        ),
 
-      observability: async (databaseId: string) => {
-        const client = await getAuthClient();
-        return client.get<TenantObservabilityResponse>(
-          `/customer/databases/${databaseId}/observability`
-        );
-      },
+      observability: async (databaseId: string) =>
+        withAuthRetry((client) =>
+          client.get<TenantObservabilityResponse>(
+            `/customer/databases/${databaseId}/observability`
+          )
+        ),
 
       // ── SQL Execution ─────────────────────────────────────────
       sql: async (databaseId: string, query: string) => {
-        const client = await getAuthClient();
-        return client.post<SqlResult>(
-          `/customer/databases/${databaseId}/sql`,
-          { query }
+        const result = await withAuthRetry((client) =>
+          client.post<SqlResult>(
+            `/customer/databases/${databaseId}/sql`,
+            { query }
+          )
         );
+        if (result.error && typeof result.error === 'string') {
+          result.error = parseSqlError(result.error);
+        }
+        return result;
       },
 
       sqlFile: async (databaseId: string, fileContent: string) => {
-        const client = await getAuthClient();
-        return client.post<SqlResult>(
-          `/customer/databases/${databaseId}/sql`,
-          { file_content: fileContent }
+        const result = await withAuthRetry((client) =>
+          client.post<SqlResult>(
+            `/customer/databases/${databaseId}/sql`,
+            { file_content: fileContent }
+          )
         );
+        if (result.error && typeof result.error === 'string') {
+          result.error = parseSqlError(result.error);
+        }
+        return result;
       },
 
       // ── Schema & Dump ─────────────────────────────────────────
-      schema: async (databaseId: string) => {
-        const client = await getAuthClient();
-        return client.get<SchemaResponse>(
-          `/customer/databases/${databaseId}/schema`
-        );
-      },
+      schema: async (databaseId: string) =>
+        withAuthRetry((client) =>
+          client.get<SchemaResponse>(
+            `/customer/databases/${databaseId}/schema`
+          )
+        ),
 
-      dump: async (databaseId: string, req?: DumpRequest) => {
-        const client = await getAuthClient();
-        return client.post<DumpResponse>(
-          `/customer/databases/${databaseId}/dump`,
-          req
-        );
-      },
+      dump: async (databaseId: string, req?: DumpRequest) =>
+        withAuthRetry((client) =>
+          client.post<DumpResponse>(
+            `/customer/databases/${databaseId}/dump`,
+            req
+          )
+        ),
 
       // ── Migrations ────────────────────────────────────────────
       applyMigration: async (
         databaseId: string,
         req: MigrationApplyRequest
-      ) => {
-        const client = await getAuthClient();
-        return client.post<MigrationApplyResponse>(
-          `/customer/databases/${databaseId}/migrations`,
-          req
-        );
-      },
+      ) =>
+        withAuthRetry((client) =>
+          client.post<MigrationApplyResponse>(
+            `/customer/databases/${databaseId}/migrations`,
+            req
+          )
+        ),
 
-      listMigrations: async (databaseId: string) => {
-        const client = await getAuthClient();
-        return client.get<MigrationMetadata[]>(
-          `/customer/databases/${databaseId}/migrations`
-        );
-      },
+      listMigrations: async (databaseId: string) =>
+        withAuthRetry((client) =>
+          client.get<MigrationMetadata[]>(
+            `/customer/databases/${databaseId}/migrations`
+          )
+        ),
 
       // ── Branching ─────────────────────────────────────────────
-      branch: async (databaseId: string, req: BranchRequest) => {
-        const client = await getAuthClient();
-        return client.post<DatabaseResponse>(
-          `/customer/databases/${databaseId}/branch`,
-          req
-        );
-      },
+      branch: async (databaseId: string, req: BranchRequest) =>
+        withAuthRetry((client) =>
+          client.post<DatabaseResponse>(
+            `/customer/databases/${databaseId}/branch`,
+            req
+          )
+        ),
 
       // ── User Management ───────────────────────────────────────
       users: {
-        list: async (databaseId: string) => {
-          const client = await getAuthClient();
-          return client.get<UserResponse[]>(
-            `/customer/databases/${databaseId}/users`
-          );
-        },
+        list: async (databaseId: string) =>
+          withAuthRetry((client) =>
+            client.get<UserResponse[]>(
+              `/customer/databases/${databaseId}/users`
+            )
+          ),
 
-        create: async (databaseId: string, req: CreateUserRequest) => {
-          const client = await getAuthClient();
-          return client.post<MessageResponse>(
-            `/customer/databases/${databaseId}/users`,
-            req
-          );
-        },
+        create: async (databaseId: string, req: CreateUserRequest) =>
+          withAuthRetry((client) =>
+            client.post<MessageResponse>(
+              `/customer/databases/${databaseId}/users`,
+              req
+            )
+          ),
 
-        delete: async (databaseId: string, username: string) => {
-          const client = await getAuthClient();
-          return client.del<MessageResponse>(
-            `/customer/databases/${databaseId}/users/${username}`
-          );
-        },
+        delete: async (databaseId: string, username: string) =>
+          withAuthRetry((client) =>
+            client.del<MessageResponse>(
+              `/customer/databases/${databaseId}/users/${username}`
+            )
+          ),
       },
     },
 
@@ -306,70 +438,78 @@ export function createDb9Client(options: Db9ClientOptions = {}) {
         path: string,
         options?: Fs9ListOptions
       ): Promise<Fs9FileEntry[]> => {
-        const params = new URLSearchParams({ path });
-        if (options?.recursive) params.set('recursive', 'true');
-        const response = await fsRequest(
-          'GET',
-          dbId,
-          `/readdir?${params.toString()}`
+        const params: Record<string, string | undefined> = { path };
+        if (options?.recursive) params.recursive = 'true';
+        return withFsAuthRetry(dbId, (client) =>
+          client.get<Fs9FileEntry[]>('/readdir', params)
         );
-        return response.json() as Promise<Fs9FileEntry[]>;
       },
 
       read: async (dbId: string, path: string): Promise<string> => {
-        const params = new URLSearchParams({ path });
-        const response = await fsRequest(
-          'GET',
-          dbId,
-          `/download?${params.toString()}`
-        );
-        return response.text();
+        return withFsAuthRetry(dbId, async (client) => {
+          const resp = await client.getRaw('/download', { path });
+          return resp.text();
+        });
+      },
+
+      readBinary: async (dbId: string, path: string): Promise<ArrayBuffer> => {
+        return withFsAuthRetry(dbId, async (client) => {
+          const resp = await client.getRaw('/download', { path });
+          return resp.arrayBuffer();
+        });
       },
 
       write: async (
         dbId: string,
         path: string,
-        content: string
+        content: string | ArrayBuffer | Uint8Array | Blob
       ): Promise<void> => {
-        const params = new URLSearchParams({ path });
-        await fsRequest('PUT', dbId, `/upload?${params.toString()}`, content);
+        const contentType = typeof content === 'string' ? 'text/plain' : 'application/octet-stream';
+        await withFsAuthRetry(dbId, (client) =>
+          client.putRaw(`/upload?${new URLSearchParams({ path })}`, content as BodyInit, { 'Content-Type': contentType })
+        );
       },
 
-      stat: async (dbId: string, path: string): Promise<Fs9FileEntry> => {
-        const params = new URLSearchParams({ path });
-        const response = await fsRequest(
-          'GET',
-          dbId,
-          `/stat?${params.toString()}`
-        );
-        return response.json() as Promise<Fs9FileEntry>;
+      stat: (dbId: string, path: string): Promise<Fs9FileEntry> => {
+        return fsStat(dbId, path);
+      },
+
+      exists: async (dbId: string, path: string): Promise<boolean> => {
+        try {
+          await fsStat(dbId, path);
+          return true;
+        } catch (err) {
+          if (err instanceof Db9Error && err.statusCode === 404) {
+            return false;
+          }
+          throw err;
+        }
       },
 
       mkdir: async (dbId: string, path: string): Promise<void> => {
-        // mkdir = open with create+directory flags, then close the handle
-        const openResp = await fsRequest(
-          'POST',
-          dbId,
-          '/open',
-          JSON.stringify({
-            path,
-            flags: { create: true, directory: true },
-          }),
-          'application/json'
-        );
-        const { handle_id } = (await openResp.json()) as { handle_id: string };
-        await fsRequest(
-          'POST',
-          dbId,
-          '/close',
-          JSON.stringify({ handle_id }),
-          'application/json'
+        await withFsAuthRetry(dbId, (client) =>
+          client.postRaw(`/mkdir?${new URLSearchParams({ path, recursive: 'true' })}`)
         );
       },
 
       remove: async (dbId: string, path: string): Promise<void> => {
-        const params = new URLSearchParams({ path });
-        await fsRequest('DELETE', dbId, `/remove?${params.toString()}`);
+        await withFsAuthRetry(dbId, (client) =>
+          client.delRaw('/remove', { path })
+        );
+      },
+
+      events: async (
+        dbId: string,
+        options?: Fs9EventOptions
+      ): Promise<Fs9EventEntry[]> => {
+        const params: Record<string, string | undefined> = {};
+        if (options?.limit !== undefined) params.limit = String(options.limit);
+        if (options?.offset !== undefined) params.offset = String(options.offset);
+        if (options?.path) params.path = options.path;
+        if (options?.type) params.type = options.type;
+        return withFsAuthRetry(dbId, (client) =>
+          client.get<Fs9EventEntry[]>('/events', params)
+        );
       },
     },
   };
