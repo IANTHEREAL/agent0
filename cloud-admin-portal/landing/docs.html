@@ -474,7 +474,7 @@
   <main>
     <div class="container">
       <section class="docs-top">
-        <span class="docs-kicker">TypeScript SDK v0.4.1</span>
+        <span class="docs-kicker">TypeScript SDK v0.5.0</span>
         <h1>Complete <code>get-db9</code> API Documentation</h1>
         <p class="lead">Reference for every public export: installation, one-liner provisioning, full client surface, auth lifecycle, credential stores, error model, and all exported TypeScript interfaces.</p>
       </section>
@@ -583,6 +583,9 @@ console.log(db.state, db.createdAt);</code></pre>
                 <tr><td><code>credentialStore</code></td><td><code>CredentialStore</code></td><td>Token load/save strategy.</td></tr>
                 <tr><td><code>seed</code></td><td><code>string</code></td><td>SQL text executed via <code>client.databases.sql()</code>.</td></tr>
                 <tr><td><code>seedFile</code></td><td><code>string</code></td><td>SQL file content executed via <code>client.databases.sqlFile()</code>.</td></tr>
+                <tr><td><code>timeout</code></td><td><code>number</code></td><td>Request timeout in milliseconds.</td></tr>
+                <tr><td><code>maxRetries</code></td><td><code>number</code></td><td>Retry count for failed requests (capped at 3).</td></tr>
+                <tr><td><code>retryDelay</code></td><td><code>number</code></td><td>Delay between retries in milliseconds.</td></tr>
               </tbody>
             </table>
 
@@ -618,6 +621,9 @@ console.log(db.state, db.createdAt);</code></pre>
                 <tr><td><code>token</code></td><td><code>string</code></td><td>Optional bearer token; skips anonymous auto-flow.</td></tr>
                 <tr><td><code>fetch</code></td><td><code>FetchFn</code></td><td>Inject custom HTTP implementation.</td></tr>
                 <tr><td><code>credentialStore</code></td><td><code>CredentialStore</code></td><td>Load/save token state.</td></tr>
+                <tr><td><code>timeout</code></td><td><code>number</code></td><td>Request timeout in milliseconds.</td></tr>
+                <tr><td><code>maxRetries</code></td><td><code>number</code></td><td>Retry count for failed requests (capped at 3).</td></tr>
+                <tr><td><code>retryDelay</code></td><td><code>number</code></td><td>Delay between retries in milliseconds.</td></tr>
               </tbody>
             </table>
 
@@ -652,6 +658,7 @@ const client = createDb9Client({
               <li><code>anonymousRefresh(req: AnonymousRefreshRequest): Promise&lt;AnonymousRefreshResponse&gt;</code></li>
               <li><code>me(): Promise&lt;CustomerResponse&gt;</code></li>
               <li><code>getAnonymousSecret(): Promise&lt;AnonymousSecretResponse&gt;</code></li>
+              <li><code>ensureAnonymousSecret(): Promise&lt;void&gt;</code> <span class="muted">— Persists secret to credential store if missing</span></li>
               <li><code>claim(req: ClaimRequest): Promise&lt;ClaimResponse&gt;</code></li>
             </ul>
 
@@ -685,20 +692,30 @@ const claimed = await client.auth.claim({
           <section class="doc-section" id="token-management">
             <span class="badge">Section 06</span>
             <h2>Token Management (<code>client.tokens</code>)</h2>
-            <p class="section-note">Inspect active customer tokens and revoke compromised/unused tokens.</p>
+            <p class="section-note">Create, inspect, and revoke customer API tokens for CI/CD and programmatic access.</p>
 
             <ul class="method-list">
+              <li><code>create(req: CreateTokenRequest): Promise&lt;CreateTokenResponse&gt;</code> <span class="muted">— Create named token with optional expiry</span></li>
               <li><code>list(): Promise&lt;TokenResponse[]&gt;</code></li>
               <li><code>revoke(tokenId: string): Promise&lt;MessageResponse&gt;</code></li>
             </ul>
 
             <div class="code-block" data-lang="typescript">
               <div class="code-head"><span class="code-lang">typescript</span><button type="button" class="copy-btn">Copy</button></div>
-              <pre><code>const tokens = await client.tokens.list();
+              <pre><code>// Create a named API token
+const newToken = await client.tokens.create({
+  name: 'ci-deploy',
+  expires_in_days: 90
+});
+console.log(newToken.token); // Use this for CI/CD
+
+// List all tokens
+const tokens = await client.tokens.list();
 for (const token of tokens) {
   console.log(token.id, token.name, token.created_at, token.expires_at);
 }
 
+// Revoke a token
 await client.tokens.revoke(tokens[0].id);</code></pre>
             </div>
           </section>
@@ -769,7 +786,7 @@ const fromFile = await client.databases.sqlFile(databaseId, `
                 <tr><td><code>rows</code></td><td><code>unknown[][]</code></td><td>Result values matrix.</td></tr>
                 <tr><td><code>row_count</code></td><td><code>number</code></td><td>Rows affected/returned.</td></tr>
                 <tr><td><code>command</code></td><td><code>string</code></td><td>Executed command label (<code>SELECT</code>, <code>INSERT</code>, etc.).</td></tr>
-                <tr><td><code>error</code></td><td><code>string | undefined</code></td><td>Error message if command failed.</td></tr>
+                <tr><td><code>error</code></td><td><code>string | SqlErrorDetail</code></td><td>Structured error with message, code, detail, hint, and position.</td></tr>
               </tbody>
             </table>
           </section>
@@ -893,6 +910,8 @@ Registered customer account (same identity now claimed)</code></pre>
             <ol>
               <li>Anonymous token is auto-provisioned and cached.</li>
               <li><code>anonymousRefresh()</code> can rotate token using <code>anonymous_id</code> + <code>anonymous_secret</code>.</li>
+              <li>All authenticated API calls auto-retry on 401 with a fresh token (transparent to caller).</li>
+              <li><code>ensureAnonymousSecret()</code> persists the secret to credential store if missing.</li>
               <li><code>claim()</code> upgrades anonymous identity to email/password credentials.</li>
             </ol>
           </section>
@@ -975,9 +994,12 @@ try {
               <li><code>read(dbId, path): Promise&lt;string&gt;</code> — Read file content as text</li>
               <li><code>write(dbId, path, content): Promise&lt;void&gt;</code> — Write text content to a file</li>
               <li><code>stat(dbId, path): Promise&lt;Fs9FileEntry&gt;</code> — Get file metadata</li>
-              <li><code>mkdir(dbId, path): Promise&lt;void&gt;</code> — Create a directory</li>
-              <li><code>remove(dbId, path): Promise&lt;void&gt;</code> — Delete a file or directory</li>
-            </ul>
+               <li><code>mkdir(dbId, path): Promise&lt;void&gt;</code> — Create a directory (recursive)</li>
+               <li><code>remove(dbId, path): Promise&lt;void&gt;</code> — Delete a file or directory</li>
+               <li><code>readBinary(dbId, path): Promise&lt;ArrayBuffer&gt;</code> — Read file as binary</li>
+               <li><code>exists(dbId, path): Promise&lt;boolean&gt;</code> — Check if file exists</li>
+               <li><code>events(dbId, opts?): Promise&lt;Fs9EventEntry[]&gt;</code> — Get filesystem event log</li>
+             </ul>
 
             <div class="code-block" data-lang="typescript">
               <div class="code-head"><span class="code-lang">typescript</span><button type="button" class="copy-btn">Copy</button></div>
@@ -1002,6 +1024,16 @@ for (const file of files) {
 // Stat a file
 const info = await client.fs.stat(dbId, '/data/hello.txt');
 console.log(info.file_type, info.size, info.mtime);
+
+// Check existence
+const exists = await client.fs.exists(dbId, '/data/hello.txt');
+console.log('File exists:', exists);
+
+// Get events
+const events = await client.fs.events(dbId, { limit: 10, path: '/data' });
+for (const event of events) {
+  console.log(event.type, event.path, event.timestamp);
+}
 
 // Cleanup
 await client.fs.remove(dbId, '/data/hello.txt');
@@ -1040,10 +1072,10 @@ await client.fs.remove(dbId, '/data');</code></pre>
             <p class="section-note">The package re-exports all interfaces from <code>./types</code> in addition to <code>InstantDatabaseOptions</code>, <code>InstantDatabaseResult</code>, <code>Db9ClientOptions</code>, and credential/http types.</p>
 
             <div class="type-grid">
-              <div class="type-card"><h3>Common</h3><p><code>Endpoint</code>, <code>MessageResponse</code>, <code>HealthResponse</code>, <code>ColumnInfo</code>, <code>SqlResult</code>, <code>TenantState</code></p></div>
-              <div class="type-card"><h3>Customer Requests</h3><p><code>RegisterRequest</code>, <code>LoginRequest</code>, <code>CreateDatabaseRequest</code>, <code>SqlExecuteRequest</code>, <code>DumpRequest</code>, <code>MigrationApplyRequest</code>, <code>BranchRequest</code>, <code>ClaimRequest</code>, <code>AnonymousRefreshRequest</code>, <code>CreateUserRequest</code></p></div>
-              <div class="type-card"><h3>Customer Responses</h3><p><code>CustomerResponse</code>, <code>LoginResponse</code>, <code>AnonymousRegisterResponse</code>, <code>AnonymousRefreshResponse</code>, <code>AnonymousSecretResponse</code>, <code>ClaimResponse</code>, <code>DatabaseResponse</code>, <code>CustomerPasswordResetResponse</code>, <code>TokenResponse</code>, <code>DumpResponse</code>, <code>SchemaResponse</code>, <code>TableMetadata</code>, <code>ColumnMetadata</code>, <code>ViewMetadata</code>, <code>MigrationApplyResponse</code>, <code>MigrationMetadata</code>, <code>UserResponse</code>, <code>TenantObservabilityResponse</code>, <code>ObservabilitySummary</code>, <code>QuerySample</code></p></div>
-              <div class="type-card"><h3>Filesystem</h3><p><code>Fs9FileEntry</code>, <code>Fs9ListOptions</code></p></div>
+               <div class="type-card"><h3>Common</h3><p><code>Endpoint</code>, <code>MessageResponse</code>, <code>HealthResponse</code>, <code>ColumnInfo</code>, <code>SqlResult</code>, <code>SqlErrorDetail</code>, <code>TenantState</code></p></div>
+               <div class="type-card"><h3>Customer Requests</h3><p><code>RegisterRequest</code>, <code>LoginRequest</code>, <code>CreateDatabaseRequest</code>, <code>SqlExecuteRequest</code>, <code>DumpRequest</code>, <code>MigrationApplyRequest</code>, <code>BranchRequest</code>, <code>ClaimRequest</code>, <code>AnonymousRefreshRequest</code>, <code>CreateUserRequest</code>, <code>CreateTokenRequest</code></p></div>
+               <div class="type-card"><h3>Customer Responses</h3><p><code>CustomerResponse</code>, <code>LoginResponse</code>, <code>AnonymousRegisterResponse</code>, <code>AnonymousRefreshResponse</code>, <code>AnonymousSecretResponse</code>, <code>ClaimResponse</code>, <code>DatabaseResponse</code>, <code>CustomerPasswordResetResponse</code>, <code>TokenResponse</code>, <code>CreateTokenResponse</code>, <code>DumpResponse</code>, <code>SchemaResponse</code>, <code>TableMetadata</code>, <code>ColumnMetadata</code>, <code>ViewMetadata</code>, <code>MigrationApplyResponse</code>, <code>MigrationMetadata</code>, <code>UserResponse</code>, <code>TenantObservabilityResponse</code>, <code>ObservabilitySummary</code>, <code>QuerySample</code></p></div>
+               <div class="type-card"><h3>Filesystem</h3><p><code>Fs9FileEntry</code>, <code>Fs9ListOptions</code>, <code>Fs9EventEntry</code>, <code>Fs9EventOptions</code></p></div>
               <div class="type-card"><h3>Credential &amp; HTTP</h3><p><code>Credentials</code>, <code>CredentialStore</code>, <code>FetchFn</code>, <code>HttpClient</code>, <code>HttpClientOptions</code>, <code>InstantDatabaseOptions</code>, <code>InstantDatabaseResult</code>, <code>Db9ClientOptions</code>, <code>Db9Client</code>, <code>Endpoint</code></p></div>
             </div>
 
