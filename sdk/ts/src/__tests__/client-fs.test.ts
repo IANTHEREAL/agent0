@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { createDb9Client } from '../client';
 import type { FetchFn } from '../http';
 import type { Fs9FileEntry } from '../fs-types';
+import { MemoryCredentialStore } from '../credentials';
 
 function capturingFetch(status: number, body?: unknown) {
   const calls: { url: string; init?: RequestInit }[] = [];
@@ -223,6 +224,89 @@ describe('fs.write()', () => {
     expect(calls[0].init?.body).toBe(content);
     expectAuth(calls);
   });
+
+  it('sends application/octet-stream for ArrayBuffer content', async () => {
+    const { fn, calls } = capturingFetch(200);
+    const client = fsClient(fn);
+    const buffer = new ArrayBuffer(4);
+    new Uint8Array(buffer).set([0x89, 0x50, 0x4e, 0x47]);
+
+    await client.fs.write('db1', '/image.png', buffer);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe(
+      'http://test:8090/fs9/db1/api/v1/upload?path=%2Fimage.png'
+    );
+    expect(calls[0].init?.method).toBe('PUT');
+    expect(calls[0].init?.body).toBe(buffer);
+    expect((calls[0].init?.headers as Record<string, string>)['Content-Type']).toBe(
+      'application/octet-stream'
+    );
+    expectAuth(calls);
+  });
+
+  it('sends application/octet-stream for Uint8Array content', async () => {
+    const { fn, calls } = capturingFetch(200);
+    const client = fsClient(fn);
+    const data = new Uint8Array([0x00, 0x01, 0x02, 0x03]);
+
+    await client.fs.write('db1', '/binary.bin', data);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].init?.method).toBe('PUT');
+    expect(calls[0].init?.body).toBe(data);
+    expect((calls[0].init?.headers as Record<string, string>)['Content-Type']).toBe(
+      'application/octet-stream'
+    );
+    expectAuth(calls);
+  });
+});
+
+describe('fs.readBinary()', () => {
+  it('sends GET request to /download endpoint', async () => {
+    const data = new ArrayBuffer(4);
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const fn: FetchFn = async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return new Response(data, {
+        status: 200,
+        headers: { 'Content-Type': 'application/octet-stream' },
+      });
+    };
+    const client = fsClient(fn);
+
+    await client.fs.readBinary('db1', '/image.png');
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe(
+      'http://test:8090/fs9/db1/api/v1/download?path=%2Fimage.png'
+    );
+    expect(calls[0].init?.method).toBe('GET');
+    expectAuth(calls);
+  });
+
+  it('returns ArrayBuffer from response', async () => {
+    const source = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const fn: FetchFn = async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return new Response(source, {
+        status: 200,
+        headers: { 'Content-Type': 'application/octet-stream' },
+      });
+    };
+    const client = fsClient(fn);
+
+    const result = await client.fs.readBinary('db1', '/image.png');
+
+    expect(result).toBeInstanceOf(ArrayBuffer);
+    const view = new Uint8Array(result);
+    expect(view[0]).toBe(0x89);
+    expect(view[1]).toBe(0x50);
+    expect(view[2]).toBe(0x4e);
+    expect(view[3]).toBe(0x47);
+    expectAuth(calls);
+  });
 });
 
 describe('fs.stat()', () => {
@@ -262,6 +346,92 @@ describe('fs.stat()', () => {
     const result = await client.fs.stat('db1', '/uploads');
 
     expect(result.file_type).toBe('directory');
+    expectAuth(calls);
+  });
+});
+
+describe('fs.exists()', () => {
+  it('returns true when stat succeeds', async () => {
+    const mock = mockEntry({ path: '/test.txt', size: 100, mode: 33188, mtime: 1645174800 });
+    const { fn } = capturingFetch(200, mock);
+    const client = fsClient(fn);
+
+    const result = await client.fs.exists('db1', '/test.txt');
+
+    expect(result).toBe(true);
+  });
+
+  it('returns false when stat returns 404', async () => {
+    const { fn } = capturingFetch(404, { message: 'Not found' });
+    const client = fsClient(fn);
+
+    const result = await client.fs.exists('db1', '/nonexistent.txt');
+
+    expect(result).toBe(false);
+  });
+
+  it('re-throws non-404 errors', async () => {
+    const { fn } = capturingFetch(500, { message: 'Server error' });
+    const client = fsClient(fn);
+
+    await expect(client.fs.exists('db1', '/test.txt')).rejects.toThrow();
+  });
+
+  it('sends GET request to /stat endpoint', async () => {
+    const mock = mockEntry({ path: '/test.txt', size: 100, mode: 33188, mtime: 1645174800 });
+    const { fn, calls } = capturingFetch(200, mock);
+    const client = fsClient(fn);
+
+    await client.fs.exists('db1', '/test.txt');
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain('/stat');
+    expect(calls[0].init?.method).toBe('GET');
+  });
+});
+
+describe('fs.events()', () => {
+  it('sends GET request to /events endpoint with all options', async () => {
+    const { fn, calls } = capturingFetch(200, []);
+    const client = fsClient(fn);
+
+    await client.fs.events('db1', { limit: 50, offset: 10, path: '/uploads', type: 'write' });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain('/api/v1/events');
+    expect(calls[0].url).toContain('limit=50');
+    expect(calls[0].url).toContain('offset=10');
+    expect(calls[0].url).toContain('path=%2Fuploads');
+    expect(calls[0].url).toContain('type=write');
+    expect(calls[0].init?.method).toBe('GET');
+    expectAuth(calls);
+  });
+
+  it('sends GET to /events without query params when no options', async () => {
+    const { fn, calls } = capturingFetch(200, []);
+    const client = fsClient(fn);
+
+    await client.fs.events('db1');
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe('http://test:8090/fs9/db1/api/v1/events');
+    expect(calls[0].init?.method).toBe('GET');
+    expectAuth(calls);
+  });
+
+  it('returns typed Fs9EventEntry array', async () => {
+    const mockEvents = [
+      { id: 'e1', type: 'write', path: '/test.txt', timestamp: '2026-01-01T00:00:00Z' },
+      { id: 'e2', type: 'mkdir', path: '/newdir', timestamp: '2026-01-01T00:01:00Z' },
+    ];
+    const { fn, calls } = capturingFetch(200, mockEvents);
+    const client = fsClient(fn);
+
+    const result = await client.fs.events('db1');
+
+    expect(result).toHaveLength(2);
+    expect(result[0].type).toBe('write');
+    expect(result[1].type).toBe('mkdir');
     expectAuth(calls);
   });
 });
@@ -362,91 +532,39 @@ describe('fs – Error handling', () => {
 });
 
 describe('fs.mkdir()', () => {
-  it('sends POST to /open with create+directory flags, then POST to /close', async () => {
-    let callCount = 0;
-    const calls: { url: string; init?: RequestInit }[] = [];
-    const fn: FetchFn = async (url, init) => {
-      calls.push({ url: url.toString(), init });
-      callCount++;
-      if (callCount === 1) {
-        // First call: /open
-        return new Response(JSON.stringify({ handle_id: '42', metadata: {} }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      } else {
-        // Second call: /close
-        return new Response(null, {
-          status: 204,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-    };
+  it('sends POST to /mkdir endpoint with path and recursive params', async () => {
+    const { fn, calls } = capturingFetch(200);
     const client = fsClient(fn);
 
     await client.fs.mkdir('db1', '/testdir');
 
-    expect(calls).toHaveLength(2);
-    expect(calls[0].url).toContain('/open');
-    expect(calls[1].url).toContain('/close');
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe(
+      'http://test:8090/fs9/db1/api/v1/mkdir?path=%2Ftestdir&recursive=true'
+    );
+    expect(calls[0].init?.method).toBe('POST');
     expectAuth(calls);
   });
 
-  it('includes correct JSON body with path and flags in /open request', async () => {
-    let callCount = 0;
-    const calls: { url: string; init?: RequestInit }[] = [];
-    const fn: FetchFn = async (url, init) => {
-      calls.push({ url: url.toString(), init });
-      callCount++;
-      if (callCount === 1) {
-        return new Response(JSON.stringify({ handle_id: '42' }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      } else {
-        return new Response(null, { status: 204 });
-      }
-    };
+  it('handles nested directory paths', async () => {
+    const { fn, calls } = capturingFetch(200);
     const client = fsClient(fn);
 
-    await client.fs.mkdir('db1', '/testdir');
+    await client.fs.mkdir('db1', '/a/b/c/d');
 
-    const openCall = calls[0];
-    expect(openCall.init?.body).toBe(
-      JSON.stringify({
-        path: '/testdir',
-        flags: { create: true, directory: true },
-      })
-    );
-    expect((openCall.init?.headers as Record<string, string>)['Content-Type']).toBe(
-      'application/json'
-    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain('path=%2Fa%2Fb%2Fc%2Fd');
+    expect(calls[0].url).toContain('recursive=true');
+    expectAuth(calls);
   });
 
-  it('closes the handle after opening', async () => {
-    let callCount = 0;
-    const calls: { url: string; init?: RequestInit }[] = [];
-    const fn: FetchFn = async (url, init) => {
-      calls.push({ url: url.toString(), init });
-      callCount++;
-      if (callCount === 1) {
-        return new Response(JSON.stringify({ handle_id: '99' }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      } else {
-        return new Response(null, { status: 204 });
-      }
-    };
+  it('does not send a request body', async () => {
+    const { fn, calls } = capturingFetch(200);
     const client = fsClient(fn);
 
     await client.fs.mkdir('db1', '/testdir');
 
-    const closeCall = calls[1];
-    expect(closeCall.init?.body).toBe(JSON.stringify({ handle_id: '99' }));
-    expect((closeCall.init?.headers as Record<string, string>)['Content-Type']).toBe(
-      'application/json'
-    );
+    expect(calls[0].init?.body).toBeUndefined();
   });
 });
 
@@ -523,20 +641,7 @@ describe('fs – Authentication', () => {
   });
 
   it('includes Bearer token in Authorization header for mkdir', async () => {
-    let callCount = 0;
-    const calls: { url: string; init?: RequestInit }[] = [];
-    const fn: FetchFn = async (url, init) => {
-      calls.push({ url: url.toString(), init });
-      callCount++;
-      if (callCount === 1) {
-        return new Response(JSON.stringify({ handle_id: '42' }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      } else {
-        return new Response(null, { status: 204 });
-      }
-    };
+    const { fn, calls } = capturingFetch(200);
     const client = fsClient(fn);
 
     await client.fs.mkdir('db1', '/path');
@@ -551,5 +656,47 @@ describe('fs – Authentication', () => {
     await client.fs.remove('db1', '/path');
 
     expectAuth(calls);
+  });
+});
+
+describe('fs – 401 auto-refresh', () => {
+  it('concurrent 401s on fs.read trigger single refresh', async () => {
+    let callCount = 0;
+    let refreshCount = 0;
+    const fn: FetchFn = async (url, init) => {
+      const urlStr = url.toString();
+      if (urlStr.includes('/anonymous-refresh')) {
+        refreshCount++;
+        return new Response(JSON.stringify({ token: 'new-token' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      callCount++;
+      if (callCount <= 2) {
+        return new Response(JSON.stringify({ message: 'Unauthorized' }), { status: 401 });
+      }
+      return new Response('file content', {
+        status: 200,
+        headers: { 'Content-Type': 'text/plain' },
+      });
+    };
+    const store = new MemoryCredentialStore();
+    await store.save({
+      token: 'old-token',
+      is_anonymous: true,
+      anonymous_id: 'anon-1',
+      anonymous_secret: 'secret-1',
+    });
+    const client = createDb9Client({ baseUrl: BASE, fetch: fn, credentialStore: store });
+
+    const [r1, r2] = await Promise.all([
+      client.fs.read('db1', '/file1.txt'),
+      client.fs.read('db1', '/file2.txt'),
+    ]);
+
+    expect(r1).toBe('file content');
+    expect(r2).toBe('file content');
+    expect(refreshCount).toBe(1);
   });
 });
