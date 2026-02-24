@@ -707,6 +707,7 @@ console.<span class="fn">log</span>(db.<span class="prop">connectionString</span
 <span class="kw">const</span> content = <span class="kw">await</span> client.<span class="prop">fs</span>.<span class="fn">read</span>(dbId, <span class="str">'/data/hello.txt'</span>);
 <span class="kw">const</span> files = <span class="kw">await</span> client.<span class="prop">fs</span>.<span class="fn">list</span>(dbId, <span class="str">'/data/'</span>);
 <span class="kw">const</span> info = <span class="kw">await</span> client.<span class="prop">fs</span>.<span class="fn">stat</span>(dbId, <span class="str">'/data/hello.txt'</span>);
+<span class="kw">const</span> ok = <span class="kw">await</span> client.<span class="prop">fs</span>.<span class="fn">exists</span>(dbId, <span class="str">'/data/hello.txt'</span>);
 
 <span class="kw">await</span> client.<span class="prop">fs</span>.<span class="fn">remove</span>(dbId, <span class="str">'/data/hello.txt'</span>);</pre>
            </div>
@@ -762,6 +763,9 @@ console.<span class="fn">log</span>(db.<span class="prop">databaseId</span>, db.
                 <tr><td><code>credentialStore</code></td><td><code>CredentialStore</code></td><td>Token storage loader/saver.</td></tr>
                 <tr><td><code>seed</code></td><td><code>string</code></td><td>SQL executed right after creation.</td></tr>
                 <tr><td><code>seedFile</code></td><td><code>string</code></td><td>SQL file content executed after creation.</td></tr>
+                <tr><td><code>timeout</code></td><td><code>number</code></td><td>Request timeout in milliseconds.</td></tr>
+                <tr><td><code>maxRetries</code></td><td><code>number</code></td><td>Retry count (capped at 3).</td></tr>
+                <tr><td><code>retryDelay</code></td><td><code>number</code></td><td>Delay between retries in ms.</td></tr>
               </tbody>
             </table>
           </article>
@@ -785,6 +789,9 @@ console.<span class="fn">log</span>(db.<span class="prop">databaseId</span>, db.
                   <tr><td><code>token</code></td><td><code>string</code></td><td>Optional bearer token. If omitted, auto-registers anonymously.</td></tr>
                   <tr><td><code>fetch</code></td><td><code>FetchFn</code></td><td>Custom fetch implementation.</td></tr>
                   <tr><td><code>credentialStore</code></td><td><code>CredentialStore</code></td><td>Optional lazy token loader when no token passed.</td></tr>
+                  <tr><td><code>timeout</code></td><td><code>number</code></td><td>Request timeout in milliseconds.</td></tr>
+                  <tr><td><code>maxRetries</code></td><td><code>number</code></td><td>Retry count (capped at 3).</td></tr>
+                  <tr><td><code>retryDelay</code></td><td><code>number</code></td><td>Delay between retries in ms.</td></tr>
                 </tbody>
               </table>
             </article>
@@ -800,8 +807,11 @@ console.<span class="fn">log</span>(db.<span class="prop">databaseId</span>, db.
                 <tr><td><code>read(dbId, path)</code></td><td><code>Promise&lt;string&gt;</code></td><td>Read file content as text.</td></tr>
                 <tr><td><code>write(dbId, path, content)</code></td><td><code>Promise&lt;void&gt;</code></td><td>Write text content to a file.</td></tr>
                 <tr><td><code>stat(dbId, path)</code></td><td><code>Promise&lt;Fs9FileEntry&gt;</code></td><td>Get file metadata (size, type, timestamps).</td></tr>
-                <tr><td><code>mkdir(dbId, path)</code></td><td><code>Promise&lt;void&gt;</code></td><td>Create a directory.</td></tr>
+                <tr><td><code>mkdir(dbId, path)</code></td><td><code>Promise&lt;void&gt;</code></td><td>Create a directory (recursive).</td></tr>
                 <tr><td><code>remove(dbId, path)</code></td><td><code>Promise&lt;void&gt;</code></td><td>Delete a file or directory.</td></tr>
+                <tr><td><code>readBinary(dbId, path)</code></td><td><code>Promise&lt;ArrayBuffer&gt;</code></td><td>Read file as binary.</td></tr>
+                <tr><td><code>exists(dbId, path)</code></td><td><code>Promise&lt;boolean&gt;</code></td><td>Check if file exists.</td></tr>
+                <tr><td><code>events(dbId, opts?)</code></td><td><code>Promise&lt;Fs9EventEntry[]&gt;</code></td><td>Get filesystem event log.</td></tr>
               </tbody>
             </table>
             <div class="api-subtitle">Example</div>
@@ -874,6 +884,16 @@ console.<span class="fn">log</span>(db.<span class="prop">databaseId</span>, db.
           <div class="feature-icon">&#128193;</div>
           <h3>Cloud filesystem</h3>
           <p>Read, write, list, and manage files per database with <code>client.fs</code>.</p>
+        </div>
+        <div class="feature">
+          <div class="feature-icon">&#128273;</div>
+          <h3>Token management</h3>
+          <p>Create, list, and revoke named API tokens with <code>client.tokens</code>.</p>
+        </div>
+        <div class="feature">
+          <div class="feature-icon">&#128260;</div>
+          <h3>Auto 401 retry</h3>
+          <p>Automatic anonymous token refresh on 401 — zero manual re-auth needed.</p>
         </div>
       </div>
     </div>
