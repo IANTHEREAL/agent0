@@ -10,23 +10,62 @@ use crate::tenant_state;
 /// Global flag set once during `connect()` — true when the backend is SQLite.
 static IS_SQLITE: OnceLock<bool> = OnceLock::new();
 
-fn encrypt_password(password: &str, key: Option<&str>) -> String {
+// ── Credential error type ────────────────────────────────────────
+
+#[derive(Debug, thiserror::Error)]
+pub enum CredentialError {
+    #[error("credential encryption key not configured")]
+    KeyNotConfigured,
+    #[error("credential crypto operation failed: {0}")]
+    CryptoFailed(String),
+    #[error("database error: {0}")]
+    Sql(#[from] sqlx::Error),
+}
+
+/// Encrypt a password for storage.
+///
+/// Returns `(encrypted_value, key_version)`.
+/// - `key_version = 2`: encrypted with AES-256-GCM via current key
+/// - `key_version = 0`: plaintext (only when key is None, i.e. dev mode with
+///   `DB9_ALLOW_PLAINTEXT_CREDENTIALS=1`)
+fn encrypt_password(password: &str, key: Option<&str>) -> Result<(String, i32), CredentialError> {
     match key {
-        Some(k) => crypto::encrypt(password, k).unwrap_or_else(|e| {
-            tracing::error!("credential encryption failed: {e}");
-            password.to_string()
-        }),
-        None => password.to_string(),
+        Some(k) => {
+            let encrypted = crypto::encrypt(password, k).map_err(CredentialError::CryptoFailed)?;
+            Ok((encrypted, 2))
+        }
+        None => {
+            // Only reachable if startup allowed plaintext (DB9_ALLOW_PLAINTEXT_CREDENTIALS=1).
+            Ok((password.to_string(), 0))
+        }
     }
 }
 
-fn decrypt_password(stored: &str, key: Option<&str>) -> String {
-    match key {
-        Some(k) => crypto::decrypt(stored, k).unwrap_or_else(|e| {
-            tracing::warn!("credential decryption failed (might be plaintext): {e}");
-            stored.to_string()
-        }),
-        None => stored.to_string(),
+/// Decrypt a stored credential, branching on `key_version`.
+///
+/// - `key_version = 0`: plaintext, returned as-is (with warning)
+/// - `key_version = 1`: legacy unclassified row — error (must run bootstrap first)
+/// - `key_version = 2`: encrypted with current key — decrypt
+fn decrypt_password(
+    stored: &str,
+    key_version: i32,
+    key: Option<&str>,
+) -> Result<String, CredentialError> {
+    match key_version {
+        0 => {
+            tracing::warn!("credential stored as plaintext (key_version=0)");
+            Ok(stored.to_string())
+        }
+        1 => Err(CredentialError::CryptoFailed(
+            "legacy key_version=1 row — run bootstrap classification first".to_string(),
+        )),
+        2 => {
+            let k = key.ok_or(CredentialError::KeyNotConfigured)?;
+            crypto::decrypt(stored, k).map_err(CredentialError::CryptoFailed)
+        }
+        v => Err(CredentialError::CryptoFailed(format!(
+            "unknown key_version {v}"
+        ))),
     }
 }
 
@@ -473,9 +512,9 @@ pub async fn get_credential(
     tenant_id: &str,
     cred_type: &str,
     credential_key: Option<&str>,
-) -> Result<Option<CredentialRow>, sqlx::Error> {
+) -> Result<Option<CredentialRow>, CredentialError> {
     let sql = adapt_sql(
-        "SELECT id, tenant_id, credential_type, username, password_plain FROM tenant_credentials WHERE tenant_id = $1 AND credential_type = $2",
+        "SELECT id, tenant_id, credential_type, username, password_plain, key_version FROM tenant_credentials WHERE tenant_id = $1 AND credential_type = $2",
         pool,
     );
     let row = sqlx::query(&sql)
@@ -483,16 +522,21 @@ pub async fn get_credential(
         .bind(cred_type)
         .fetch_optional(pool)
         .await?;
-    Ok(row.map(|r| {
-        let stored: String = r.get("password_plain");
-        CredentialRow {
-            id: r.get("id"),
-            tenant_id: r.get("tenant_id"),
-            credential_type: r.get("credential_type"),
-            username: r.get("username"),
-            password_plain: decrypt_password(&stored, credential_key),
+    match row {
+        Some(r) => {
+            let stored: String = r.get("password_plain");
+            let key_ver: i32 = r.get("key_version");
+            let decrypted = decrypt_password(&stored, key_ver, credential_key)?;
+            Ok(Some(CredentialRow {
+                id: r.get("id"),
+                tenant_id: r.get("tenant_id"),
+                credential_type: r.get("credential_type"),
+                username: r.get("username"),
+                password_plain: decrypted,
+            }))
         }
-    }))
+        None => Ok(None),
+    }
 }
 
 pub async fn upsert_credential(
@@ -502,26 +546,38 @@ pub async fn upsert_credential(
     username: &str,
     password: &str,
     credential_key: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    let encrypted = encrypt_password(password, credential_key);
-    let existing = get_credential(pool, tenant_id, cred_type, credential_key).await?;
+) -> Result<(), CredentialError> {
+    let (encrypted, key_ver) = encrypt_password(password, credential_key)?;
     let now = chrono::Utc::now().to_rfc3339();
 
-    if let Some(cred) = existing {
+    // Check for existing row by looking at the raw table (no decrypt needed for existence check).
+    let check_sql = adapt_sql(
+        "SELECT id FROM tenant_credentials WHERE tenant_id = $1 AND credential_type = $2",
+        pool,
+    );
+    let existing = sqlx::query(&check_sql)
+        .bind(tenant_id)
+        .bind(cred_type)
+        .fetch_optional(pool)
+        .await?;
+
+    if let Some(row) = existing {
+        let existing_id: String = row.get("id");
         let sql = adapt_sql(
-            "UPDATE tenant_credentials SET password_plain = $1, rotated_at = $2 WHERE id = $3",
+            "UPDATE tenant_credentials SET password_plain = $1, key_version = $2, rotated_at = $3 WHERE id = $4",
             pool,
         );
         sqlx::query(&sql)
             .bind(&encrypted)
+            .bind(key_ver)
             .bind(&now)
-            .bind(&cred.id)
+            .bind(&existing_id)
             .execute(pool)
             .await?;
     } else {
         let id = uuid::Uuid::new_v4().to_string();
         let sql = adapt_sql(
-            "INSERT INTO tenant_credentials (id, tenant_id, credential_type, username, password_plain, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO tenant_credentials (id, tenant_id, credential_type, username, password_plain, key_version, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
             pool,
         );
         sqlx::query(&sql)
@@ -530,11 +586,147 @@ pub async fn upsert_credential(
             .bind(cred_type)
             .bind(username)
             .bind(&encrypted)
+            .bind(key_ver)
             .bind(&now)
             .execute(pool)
             .await?;
     }
     Ok(())
+}
+
+// ── Bootstrap classification + migration ────────────────────────
+
+pub struct BootstrapReport {
+    pub total_inspected: u32,
+    pub encrypted: u32,
+    pub reclassified_plaintext: u32,
+}
+
+/// Classify legacy rows where key_version=1 is the untrustworthy schema default.
+/// Reclassifies every key_version=1 row to either 2 (decryptable) or 0 (not decryptable).
+/// After this runs, no rows should have key_version=1.
+pub async fn bootstrap_classify_credentials(
+    pool: &AnyPool,
+    credential_key: &str,
+) -> Result<BootstrapReport, sqlx::Error> {
+    let sql = adapt_sql(
+        "SELECT id, password_plain FROM tenant_credentials WHERE key_version = 1",
+        pool,
+    );
+    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+
+    let mut encrypted = 0u32;
+    let mut reclassified_plaintext = 0u32;
+
+    for row in &rows {
+        let id: String = row.get("id");
+        let stored: String = row.get("password_plain");
+
+        match crypto::decrypt(&stored, credential_key) {
+            Ok(_) => {
+                let update_sql = adapt_sql(
+                    "UPDATE tenant_credentials SET key_version = 2 WHERE id = $1",
+                    pool,
+                );
+                sqlx::query(&update_sql).bind(&id).execute(pool).await?;
+                encrypted += 1;
+            }
+            Err(_) => {
+                let update_sql = adapt_sql(
+                    "UPDATE tenant_credentials SET key_version = 0 WHERE id = $1",
+                    pool,
+                );
+                sqlx::query(&update_sql).bind(&id).execute(pool).await?;
+                reclassified_plaintext += 1;
+                tracing::warn!(
+                    credential_id = %id,
+                    "credential reclassified to plaintext (key_version=0) — \
+                     could not decrypt with current key"
+                );
+            }
+        }
+    }
+
+    Ok(BootstrapReport {
+        total_inspected: rows.len() as u32,
+        encrypted,
+        reclassified_plaintext,
+    })
+}
+
+pub struct MigrationStatus {
+    pub total_credentials: i64,
+    pub encrypted: i64,
+    pub plaintext: i64,
+    pub unclassified: i64,
+    pub migration_complete: bool,
+}
+
+pub async fn credential_migration_status(pool: &AnyPool) -> Result<MigrationStatus, sqlx::Error> {
+    let sql = adapt_sql(
+        "SELECT key_version, COUNT(*) as cnt FROM tenant_credentials GROUP BY key_version",
+        pool,
+    );
+    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+
+    let mut encrypted: i64 = 0;
+    let mut plaintext: i64 = 0;
+    let mut unclassified: i64 = 0;
+
+    for row in &rows {
+        let kv: i32 = row.get("key_version");
+        let cnt: i64 = row.get("cnt");
+        match kv {
+            0 => plaintext = cnt,
+            1 => unclassified = cnt,
+            2 => encrypted = cnt,
+            _ => {}
+        }
+    }
+
+    let total = encrypted + plaintext + unclassified;
+    Ok(MigrationStatus {
+        total_credentials: total,
+        encrypted,
+        plaintext,
+        unclassified,
+        migration_complete: plaintext == 0 && unclassified == 0,
+    })
+}
+
+/// Re-encrypt all key_version=0 (plaintext) credentials with the provided key.
+/// Returns the number of rows migrated.
+pub async fn migrate_credentials(
+    pool: &AnyPool,
+    credential_key: &str,
+) -> Result<u32, CredentialError> {
+    let sql = adapt_sql(
+        "SELECT id, password_plain FROM tenant_credentials WHERE key_version = 0",
+        pool,
+    );
+    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+
+    let mut migrated = 0u32;
+    for row in &rows {
+        let id: String = row.get("id");
+        let plaintext: String = row.get("password_plain");
+
+        let encrypted =
+            crypto::encrypt(&plaintext, credential_key).map_err(CredentialError::CryptoFailed)?;
+
+        let update_sql = adapt_sql(
+            "UPDATE tenant_credentials SET password_plain = $1, key_version = 2 WHERE id = $2",
+            pool,
+        );
+        sqlx::query(&update_sql)
+            .bind(&encrypted)
+            .bind(&id)
+            .execute(pool)
+            .await?;
+        migrated += 1;
+    }
+
+    Ok(migrated)
 }
 
 // ── Audit queries ───────────────────────────────────────────────
@@ -1098,5 +1290,98 @@ mod tests {
         assert!(alter1.contains("DEFAULT 0"));
         assert!(alter2.contains("database_limit"));
         assert!(!alter2.contains("NOT NULL"));
+    }
+
+    // ── Credential encryption unit tests ─────────────────────────
+
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+    fn test_key() -> String {
+        B64.encode([0xABu8; 32])
+    }
+
+    fn test_key_alt() -> String {
+        B64.encode([0xCDu8; 32])
+    }
+
+    #[test]
+    fn encrypt_with_valid_key_returns_key_version_2() {
+        let key = test_key();
+        let (encrypted, kv) = encrypt_password("hunter2", Some(&key)).unwrap();
+        assert_eq!(kv, 2);
+        assert_ne!(encrypted, "hunter2");
+    }
+
+    #[test]
+    fn encrypt_without_key_returns_plaintext_key_version_0() {
+        let (value, kv) = encrypt_password("hunter2", None).unwrap();
+        assert_eq!(kv, 0);
+        assert_eq!(value, "hunter2");
+    }
+
+    #[test]
+    fn encrypt_with_bad_key_returns_error() {
+        let bad_key = B64.encode([0xABu8; 16]); // 16 bytes, not 32
+        let result = encrypt_password("test", Some(&bad_key));
+        assert!(result.is_err());
+        assert!(matches!(result, Err(CredentialError::CryptoFailed(_))));
+    }
+
+    #[test]
+    fn decrypt_key_version_2_roundtrip() {
+        let key = test_key();
+        let (encrypted, _) = encrypt_password("secret123", Some(&key)).unwrap();
+        let decrypted = decrypt_password(&encrypted, 2, Some(&key)).unwrap();
+        assert_eq!(decrypted, "secret123");
+    }
+
+    #[test]
+    fn decrypt_key_version_2_wrong_key_fails() {
+        let key1 = test_key();
+        let key2 = test_key_alt();
+        let (encrypted, _) = encrypt_password("secret", Some(&key1)).unwrap();
+        let result = decrypt_password(&encrypted, 2, Some(&key2));
+        assert!(result.is_err());
+        assert!(matches!(result, Err(CredentialError::CryptoFailed(_))));
+    }
+
+    #[test]
+    fn decrypt_key_version_2_no_key_fails() {
+        let key = test_key();
+        let (encrypted, _) = encrypt_password("secret", Some(&key)).unwrap();
+        let result = decrypt_password(&encrypted, 2, None);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(CredentialError::KeyNotConfigured)));
+    }
+
+    #[test]
+    fn decrypt_key_version_0_returns_plaintext() {
+        let result = decrypt_password("plaintext_pass", 0, Some(&test_key())).unwrap();
+        assert_eq!(result, "plaintext_pass");
+    }
+
+    #[test]
+    fn decrypt_key_version_0_no_key_returns_plaintext() {
+        let result = decrypt_password("plaintext_pass", 0, None).unwrap();
+        assert_eq!(result, "plaintext_pass");
+    }
+
+    #[test]
+    fn decrypt_key_version_1_fails_with_bootstrap_message() {
+        let result = decrypt_password("anything", 1, Some(&test_key()));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("bootstrap"));
+    }
+
+    #[test]
+    fn decrypt_unknown_key_version_fails() {
+        let result = decrypt_password("anything", 99, Some(&test_key()));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unknown key_version 99"));
     }
 }

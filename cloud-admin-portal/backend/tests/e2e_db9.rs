@@ -12,6 +12,11 @@ use db9_admin::config::Config;
 use db9_admin::session::SessionManager;
 use db9_admin::{api, db, AppState};
 
+fn test_credential_key() -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode([0xABu8; 32])
+}
+
 // ── Test infrastructure ─────────────────────────────────────────
 
 /// Temporary HOME directory for credential isolation.
@@ -70,7 +75,7 @@ async fn setup() -> AppState {
         reconciler_sync_keyspaces: false,
         session_ttl_hours: 1,
         audit_retention_days: 90,
-        credential_key: None,
+        credential_key: Some(test_credential_key()),
         fs9_meta_url: None,
         fs9_meta_key: None,
         fs9_jwt_secret: None,
@@ -168,9 +173,16 @@ async fn seed_tenant(state: &AppState, customer_id: &str) -> String {
     db::set_tenant_customer_id(&state.db, &tenant_id, customer_id)
         .await
         .unwrap();
-    db::upsert_credential(&state.db, &tenant_id, "admin", "admin", "testpass123", None)
-        .await
-        .unwrap();
+    db::upsert_credential(
+        &state.db,
+        &tenant_id,
+        "admin",
+        "admin",
+        "testpass123",
+        Some(&test_credential_key()),
+    )
+    .await
+    .unwrap();
     tenant_id
 }
 
@@ -654,7 +666,9 @@ async fn login_api_key_valid_token_succeeds() {
     let cred_path = home.path().join(".db9").join("credentials");
     assert!(cred_path.exists(), "credentials file should be created");
     let cred_content = std::fs::read_to_string(&cred_path).unwrap();
-    let cred: toml::Value = cred_content.parse().expect("credentials should be valid TOML");
+    let cred: toml::Value = cred_content
+        .parse()
+        .expect("credentials should be valid TOML");
     assert_eq!(
         cred["token"].as_str().unwrap(),
         token,
@@ -723,7 +737,9 @@ async fn login_api_key_invalid_preserves_existing_credentials() {
     let cred_path = home.path().join(".db9").join("credentials");
     assert!(cred_path.exists(), "credentials file should still exist");
     let cred_content = std::fs::read_to_string(&cred_path).unwrap();
-    let cred: toml::Value = cred_content.parse().expect("credentials should be valid TOML");
+    let cred: toml::Value = cred_content
+        .parse()
+        .expect("credentials should be valid TOML");
     assert_eq!(
         cred["token"].as_str().unwrap(),
         token,
@@ -756,14 +772,32 @@ async fn device_code_create_returns_codes() {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
 
-    assert!(body["device_code"].as_str().is_some(), "should return device_code");
-    assert!(body["user_code"].as_str().is_some(), "should return user_code");
-    assert!(body["verification_uri"].as_str().is_some(), "should return verification_uri");
-    assert!(body["expires_in"].as_u64().is_some(), "should return expires_in");
-    assert!(body["interval"].as_u64().is_some(), "should return interval");
+    assert!(
+        body["device_code"].as_str().is_some(),
+        "should return device_code"
+    );
+    assert!(
+        body["user_code"].as_str().is_some(),
+        "should return user_code"
+    );
+    assert!(
+        body["verification_uri"].as_str().is_some(),
+        "should return verification_uri"
+    );
+    assert!(
+        body["expires_in"].as_u64().is_some(),
+        "should return expires_in"
+    );
+    assert!(
+        body["interval"].as_u64().is_some(),
+        "should return interval"
+    );
 
     let user_code = body["user_code"].as_str().unwrap();
-    assert!(user_code.contains('-'), "user_code should be formatted XXXX-XXXX, got: {user_code}");
+    assert!(
+        user_code.contains('-'),
+        "user_code should be formatted XXXX-XXXX, got: {user_code}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -872,11 +906,18 @@ async fn device_verify_and_poll_succeeds() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK, "polling after verify should return token");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "polling after verify should return token"
+    );
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert!(body["token"].as_str().is_some(), "should return a token");
-    assert!(body["expires_at"].as_str().is_some(), "should return expires_at");
+    assert!(
+        body["expires_at"].as_str().is_some(),
+        "should return expires_at"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

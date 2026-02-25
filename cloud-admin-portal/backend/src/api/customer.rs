@@ -714,8 +714,7 @@ pub async fn create_database(
                             &token,
                             state.config.credential_key.as_deref(),
                         )
-                        .await
-                        .ok();
+                        .await?;
                     }
                     Err(e) => {
                         tracing::warn!(tenant_id, error = %e, "Failed to generate fs9 token (non-fatal)");
@@ -770,8 +769,7 @@ pub async fn create_database(
         &password,
         state.config.credential_key.as_deref(),
     )
-    .await
-    .ok();
+    .await?;
 
     let tags_json = req
         .region
@@ -1034,8 +1032,7 @@ pub async fn reset_database_password(
         &new_password,
         state.config.credential_key.as_deref(),
     )
-    .await
-    .ok();
+    .await?;
 
     db::insert_audit_log(
         &state.db,
@@ -1638,8 +1635,7 @@ pub async fn branch_database(
         &password,
         state.config.credential_key.as_deref(),
     )
-    .await
-    .ok();
+    .await?;
 
     let source_region = parse_region_from_tags(&source_tenant.tags);
     let tags_json = source_region
@@ -1868,9 +1864,7 @@ pub struct DeviceVerifyQuery {
     code: Option<String>,
 }
 
-pub async fn device_verify_page(
-    Query(q): Query<DeviceVerifyQuery>,
-) -> Html<String> {
+pub async fn device_verify_page(Query(q): Query<DeviceVerifyQuery>) -> Html<String> {
     let raw = q.code.unwrap_or_default();
     let code: String = raw
         .chars()
@@ -1966,9 +1960,7 @@ pub async fn device_verify_submit(
     let _entry = state
         .device_codes
         .lookup_by_user_code(&req.user_code)
-        .ok_or_else(|| {
-            AppError::new(StatusCode::BAD_REQUEST, "Invalid or expired device code")
-        })?;
+        .ok_or_else(|| AppError::new(StatusCode::BAD_REQUEST, "Invalid or expired device code"))?;
 
     let customer = db::get_customer_by_email(&state.db, &req.email)
         .await?

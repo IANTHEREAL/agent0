@@ -41,17 +41,11 @@ pub async fn fs9_proxy(
     let tenant = match db::get_tenant_for_customer(&state.db, &db_id, &auth.customer_id).await {
         Ok(Some(t)) => t,
         Ok(None) => return (StatusCode::NOT_FOUND, "Database not found").into_response(),
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
     if tenant.state != crate::tenant_state::ACTIVE {
-        return (
-            StatusCode::CONFLICT,
-            "Database is not active",
-        )
-            .into_response();
+        return (StatusCode::CONFLICT, "Database is not active").into_response();
     }
 
     // Retrieve the stored fs9 JWT for this tenant.
@@ -69,7 +63,11 @@ pub async fn fs9_proxy(
             match refresh_fs9_token(&state, &tenant.id, &auth.customer_id).await {
                 Ok(token) => token,
                 Err(e) => {
-                    return (StatusCode::UNAUTHORIZED, format!("No fs9 token and auto-provision failed: {e}")).into_response();
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        format!("No fs9 token and auto-provision failed: {e}"),
+                    )
+                        .into_response();
                 }
             }
         }
@@ -85,11 +83,7 @@ pub async fn fs9_proxy(
     let after_prefix = path_and_query
         .strip_prefix(&prefix)
         .unwrap_or(path_and_query);
-    let upstream_url = format!(
-        "{}/{db_id}{}",
-        fs9_url.trim_end_matches('/'),
-        after_prefix,
-    );
+    let upstream_url = format!("{}/{db_id}{}", fs9_url.trim_end_matches('/'), after_prefix,);
 
     // Collect request body (10 MB limit).
     let method = req.method().clone();
@@ -103,8 +97,14 @@ pub async fn fs9_proxy(
 
     // Forward request with fs9 token.
     let resp = forward_to_fs9(
-        &state.http_client, &method, &upstream_url, &headers, &body_bytes, &fs9_token,
-    ).await;
+        &state.http_client,
+        &method,
+        &upstream_url,
+        &headers,
+        &body_bytes,
+        &fs9_token,
+    )
+    .await;
 
     match resp {
         Ok((status, resp_headers, resp_body)) => {
@@ -114,10 +114,21 @@ pub async fn fs9_proxy(
                 match refresh_fs9_token(&state, &tenant.id, &auth.customer_id).await {
                     Ok(new_token) => {
                         match forward_to_fs9(
-                            &state.http_client, &method, &upstream_url, &headers, &body_bytes, &new_token,
-                        ).await {
+                            &state.http_client,
+                            &method,
+                            &upstream_url,
+                            &headers,
+                            &body_bytes,
+                            &new_token,
+                        )
+                        .await
+                        {
                             Ok((status, headers, body)) => build_response(status, headers, body),
-                            Err(e) => (StatusCode::BAD_GATEWAY, format!("Upstream error on retry: {e}")).into_response(),
+                            Err(e) => (
+                                StatusCode::BAD_GATEWAY,
+                                format!("Upstream error on retry: {e}"),
+                            )
+                                .into_response(),
                         }
                     }
                     Err(e) => {
@@ -185,7 +196,10 @@ async fn refresh_fs9_token(
     tenant_id: &str,
     customer_id: &str,
 ) -> Result<String, String> {
-    let fs9 = state.fs9_client.as_ref().ok_or("FS9 integration not configured")?;
+    let fs9 = state
+        .fs9_client
+        .as_ref()
+        .ok_or("FS9 integration not configured")?;
 
     // Ensure namespace + user exist (idempotent).
     fs9.create_namespace(tenant_id).await?;

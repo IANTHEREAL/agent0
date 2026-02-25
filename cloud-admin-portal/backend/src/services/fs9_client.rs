@@ -72,7 +72,10 @@ impl Fs9Client {
     /// Create a user (per-namespace); returns the user's internal ID.
     /// If user already exists (409), fetches and returns the existing ID.
     pub async fn create_user(&self, namespace: &str, username: &str) -> Result<String, String> {
-        let url = format!("{}/api/v1/admin/namespaces/{}/users", self.base_url, namespace);
+        let url = format!(
+            "{}/api/v1/admin/namespaces/{}/users",
+            self.base_url, namespace
+        );
         let resp = self
             .client
             .post(&url)
@@ -104,7 +107,10 @@ impl Fs9Client {
 
     /// Fetch the internal user ID for an existing user by username.
     async fn get_user_id(&self, namespace: &str, username: &str) -> Result<String, String> {
-        let url = format!("{}/api/v1/admin/namespaces/{}/users", self.base_url, namespace);
+        let url = format!(
+            "{}/api/v1/admin/namespaces/{}/users",
+            self.base_url, namespace
+        );
         let resp = self
             .client
             .get(&url)
@@ -122,11 +128,18 @@ impl Fs9Client {
                 .into_iter()
                 .find(|u| u.username == username)
                 .map(|u| u.id)
-                .ok_or_else(|| format!("fs9 user '{}' not found in namespace '{}'", username, namespace))
+                .ok_or_else(|| {
+                    format!(
+                        "fs9 user '{}' not found in namespace '{}'",
+                        username, namespace
+                    )
+                })
         } else {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            Err(format!("fs9 list_users failed: status={status}, body={body}"))
+            Err(format!(
+                "fs9 list_users failed: status={status}, body={body}"
+            ))
         }
     }
 

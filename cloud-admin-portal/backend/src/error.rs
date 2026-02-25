@@ -61,3 +61,10 @@ impl From<reqwest::Error> for AppError {
         Self::internal("Internal service error")
     }
 }
+
+impl From<crate::db::CredentialError> for AppError {
+    fn from(e: crate::db::CredentialError) -> Self {
+        tracing::error!("Credential error: {e}");
+        Self::internal("Credential encryption error")
+    }
+}

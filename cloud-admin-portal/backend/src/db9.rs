@@ -866,8 +866,13 @@ async fn main() {
                 name,
                 expires_in_days,
             } => {
-                cmd_token_create(&api, &cli.effective_output(), name.as_deref(), *expires_in_days)
-                    .await
+                cmd_token_create(
+                    &api,
+                    &cli.effective_output(),
+                    name.as_deref(),
+                    *expires_in_days,
+                )
+                .await
             }
             TokenAction::List => cmd_token_list(&api, &cli.effective_output()).await,
             TokenAction::Revoke { token_id } => {
@@ -1752,7 +1757,10 @@ async fn cmd_login(api: &ApiClient, output: &OutputFormat, api_key: Option<Strin
     if let Some(key) = api_key {
         // Verify the token using Bearer auth (same as every other authenticated command)
         let headers = make_auth_headers(&key);
-        let result = match api.try_request("GET", "/customer/me", None, Some(&headers)).await {
+        let result = match api
+            .try_request("GET", "/customer/me", None, Some(&headers))
+            .await
+        {
             Ok(val) => val,
             Err((status, detail)) => {
                 if status == 401 || status == 403 {
@@ -1839,7 +1847,12 @@ async fn cmd_login(api: &ApiClient, output: &OutputFormat, api_key: Option<Strin
 
 async fn cmd_login_sso(api: &ApiClient, output: &OutputFormat, no_browser: bool) {
     let data = api
-        .request("POST", "/customer/device-code", None::<&serde_json::Value>, None)
+        .request(
+            "POST",
+            "/customer/device-code",
+            None::<&serde_json::Value>,
+            None,
+        )
         .await;
 
     let device_code = data["device_code"].as_str().unwrap_or_else(|| {
@@ -1851,10 +1864,7 @@ async fn cmd_login_sso(api: &ApiClient, output: &OutputFormat, no_browser: bool)
     let verification_uri = if server_uri.starts_with("http") {
         server_uri.to_string()
     } else {
-        format!(
-            "{}/customer/device-verify?code={user_code}",
-            api.base_url()
-        )
+        format!("{}/customer/device-verify?code={user_code}", api.base_url())
     };
     let interval = data["interval"].as_u64().unwrap_or(5);
     let expires_in = data["expires_in"].as_u64().unwrap_or(600);
@@ -1970,7 +1980,10 @@ async fn cmd_status(api: &ApiClient, output: &OutputFormat) {
     };
 
     let headers = make_auth_headers(&token);
-    match api.try_request("GET", "/customer/me", None, Some(&headers)).await {
+    match api
+        .try_request("GET", "/customer/me", None, Some(&headers))
+        .await
+    {
         Ok(data) => match output {
             OutputFormat::Json => print_json(&data),
             _ => {
@@ -1979,10 +1992,7 @@ async fn cmd_status(api: &ApiClient, output: &OutputFormat) {
                 } else {
                     "Logged in as"
                 };
-                println!(
-                    "{label}: {}",
-                    data["email"].as_str().unwrap_or("unknown")
-                );
+                println!("{label}: {}", data["email"].as_str().unwrap_or("unknown"));
             }
         },
         Err((status, detail)) => {

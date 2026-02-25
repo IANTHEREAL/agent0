@@ -62,6 +62,78 @@ async fn main() {
 
     tracing::info!("Database ready: {}", config.database_url);
 
+    // ── Credential key validation ─────────────────────────────────
+    let allow_plaintext = std::env::var("DB9_ALLOW_PLAINTEXT_CREDENTIALS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if let Some(ref key) = config.credential_key {
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(key)
+            .expect("DB9_CREDENTIAL_KEY is not valid base64");
+        assert_eq!(
+            decoded.len(),
+            32,
+            "DB9_CREDENTIAL_KEY must be exactly 32 bytes (256 bits), got {}",
+            decoded.len()
+        );
+        tracing::info!("Credential encryption enabled (AES-256-GCM)");
+    } else if allow_plaintext {
+        tracing::warn!(
+            "DB9_CREDENTIAL_KEY is not set and DB9_ALLOW_PLAINTEXT_CREDENTIALS=1 — \
+             credentials will be stored in PLAINTEXT. Do NOT use this in production."
+        );
+    } else {
+        panic!(
+            "DB9_CREDENTIAL_KEY is required. Set a base64-encoded 32-byte key for credential encryption. \
+             For development only, set DB9_ALLOW_PLAINTEXT_CREDENTIALS=1 to bypass."
+        );
+    }
+
+    // ── Credential bootstrap classification ───────────────────────
+    if let Some(ref key) = config.credential_key {
+        let report = db::bootstrap_classify_credentials(&pool, key)
+            .await
+            .expect("credential bootstrap classification failed");
+
+        if report.total_inspected > 0 {
+            tracing::info!(
+                total = report.total_inspected,
+                encrypted = report.encrypted,
+                reclassified = report.reclassified_plaintext,
+                "Credential bootstrap classification complete"
+            );
+        }
+
+        if report.reclassified_plaintext > 0 {
+            tracing::warn!(
+                "{} credential(s) could not be decrypted with the current key and were \
+                 reclassified as plaintext (key_version=0). Run POST /api/admin/migrate-credentials \
+                 to re-encrypt, or reset affected credentials if they are unrecoverable.",
+                report.reclassified_plaintext
+            );
+        }
+
+        // Log migration status
+        let status = db::credential_migration_status(&pool)
+            .await
+            .expect("failed to query credential migration status");
+        if status.migration_complete {
+            tracing::info!(
+                "All {} credentials encrypted (migration complete)",
+                status.total_credentials
+            );
+        } else {
+            tracing::info!(
+                "Credential migration status: {}/{} encrypted, {} plaintext",
+                status.encrypted,
+                status.total_credentials,
+                status.plaintext
+            );
+        }
+    }
+
     // ── Shared state ─────────────────────────────────────────────
     let http_client = match (
         std::env::var("TIKV_CA_PATH"),
@@ -99,13 +171,11 @@ async fn main() {
     let fs9_client = match (&config.fs9_meta_url, &config.fs9_meta_key) {
         (Some(url), Some(key)) => {
             tracing::info!("FS9 integration enabled: {}", url);
-            Some(Arc::new(
-                db9_admin::services::fs9_client::Fs9Client::new(
-                    url.clone(),
-                    key.clone(),
-                    http_client.clone(),
-                ),
-            ))
+            Some(Arc::new(db9_admin::services::fs9_client::Fs9Client::new(
+                url.clone(),
+                key.clone(),
+                http_client.clone(),
+            )))
         }
         _ => {
             tracing::info!("FS9 integration disabled (FS9_META_URL or FS9_META_KEY not set)");
@@ -213,10 +283,7 @@ async fn main() {
     let app = Router::new()
         .nest("/api", api::router())
         // FS9 reverse-proxy: /fs9/{db_id}  and  /fs9/{db_id}/{*rest}
-        .route(
-            "/fs9/:db_id",
-            axum::routing::any(api::fs9_proxy::fs9_proxy),
-        )
+        .route("/fs9/:db_id", axum::routing::any(api::fs9_proxy::fs9_proxy))
         .route(
             "/fs9/:db_id/",
             axum::routing::any(api::fs9_proxy::fs9_proxy),
