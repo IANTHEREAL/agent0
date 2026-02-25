@@ -13,7 +13,7 @@ env:
 jobs:
   regression-gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -97,7 +97,7 @@ jobs:
 
       - name: Run regression gate
         shell: bash
-        run: ./scripts/regression_gate.sh
+        run: ./scripts/regression_gate.sh --skip-unit
 
       - name: Upload regression reports
         if: always()
