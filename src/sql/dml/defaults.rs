@@ -8,6 +8,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tikv_client::Transaction;
 
+use crate::model::{DataType, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::expr::compile::compile_const_expr;
 use crate::sql::expr::static_eval::{eval_static_typed_expr, needs_async_materialization};
@@ -16,7 +17,6 @@ use crate::sql::query_context::QueryContext;
 use crate::sql::sequences;
 use crate::sql::value_coercion::coerce_value_for_column;
 use crate::storage::TikvStore;
-use crate::types::{DataType, TableSchema, Value};
 
 async fn eval_default_expr_maybe_sequence(
     store: &Arc<TikvStore>,
@@ -70,7 +70,7 @@ async fn eval_column_default_or_null_inner(
     search_path: &[String],
     schema: &TableSchema,
     column_idx: usize,
-    sequence_defs: Option<&[crate::types::SequenceDef]>,
+    sequence_defs: Option<&[crate::model::SequenceDef]>,
 ) -> Result<Value> {
     let column = schema
         .columns

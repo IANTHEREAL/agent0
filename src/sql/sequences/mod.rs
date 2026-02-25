@@ -15,13 +15,13 @@ pub(crate) use eval::eval_expr_with_sequences;
 #[allow(unused_imports)]
 pub(crate) use replace::replace_sequence_functions;
 
+use crate::model::{
+    DataType, Row, SequenceBacking, SequenceDef, SequenceState, TableSchema, Value,
+};
 use crate::sql::error::SqlError;
 use crate::sql::names;
 use crate::sql::names::{function_name_upper, normalize_ident};
 use crate::storage::TikvStore;
-use crate::types::{
-    DataType, Row, SequenceBacking, SequenceDef, SequenceState, TableSchema, Value,
-};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, ObjectName};
 use std::sync::Arc;
@@ -278,10 +278,10 @@ pub(crate) fn find_owned_sequence_full_name(
 
 fn eval_i64(expr: &Expr) -> Result<i64> {
     match super::expr::bridge::eval_const_ast_expr(expr)? {
-        crate::types::Value::Int32(n) => Ok(n as i64),
-        crate::types::Value::Int64(n) => Ok(n),
-        crate::types::Value::Float64(n) => Ok(n as i64),
-        crate::types::Value::Text(s) => s
+        crate::model::Value::Int32(n) => Ok(n as i64),
+        crate::model::Value::Int64(n) => Ok(n),
+        crate::model::Value::Float64(n) => Ok(n as i64),
+        crate::model::Value::Text(s) => s
             .trim()
             .parse::<i64>()
             .map_err(|_| anyhow!("Expected integer, got {}", s)),
@@ -378,9 +378,9 @@ pub(crate) async fn resolve_sequence_full_name_from_value(
     txn: &mut Transaction,
     db_id: u64,
     search_path: &[String],
-    v: crate::types::Value,
+    v: crate::model::Value,
 ) -> Result<String> {
-    let crate::types::Value::Text(s) = v else {
+    let crate::model::Value::Text(s) = v else {
         return Err(anyhow!("Sequence name must be text/regclass"));
     };
 

@@ -10,11 +10,11 @@
 
 use super::super::logical_plan::{LogicalNode, LogicalPlan, PlanSchema};
 use super::{conjuncts_to_predicate, split_conjunction, LogicalRewriteRule};
+use crate::model::DataType;
 use crate::sql::analyzer::types::{
     AnalyzedDistinct, AnalyzedQuery, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRefKind,
     BinaryOp, JoinCondition, JoinType, TypedExpr, TypedExprKind,
 };
-use crate::types::DataType;
 
 // ── Rewrite rule ────────────────────────────────────────────────
 

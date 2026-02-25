@@ -3,6 +3,7 @@
 //! This pass is intentionally conservative: it only folds row-independent,
 //! sync-safe subtrees and avoids folding function/subquery nodes directly.
 
+use crate::model::{Row, Value};
 use crate::sql::analyzer::types::{
     FunctionKind, ResolvedFunction, TypedExpr, TypedExprKind, TypedOrderByExpr,
 };
@@ -10,7 +11,6 @@ use crate::sql::expr::traverse::map_children;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::expr::typed_visit::expr_any;
 use crate::sql::query_context::QueryContext;
-use crate::types::{Row, Value};
 
 /// Fold row-independent constant subtrees inside a typed expression.
 ///
@@ -142,8 +142,8 @@ pub(crate) fn is_volatile_or_side_effecting_builtin(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{DataType, Value};
     use crate::sql::analyzer::types::{BinaryOp, FunctionKind, ResolvedFunction};
-    use crate::types::{DataType, Value};
     use std::sync::Arc;
 
     fn test_qctx() -> QueryContext {

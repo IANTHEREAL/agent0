@@ -2,8 +2,8 @@ use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
 use crate::extensions::context;
+use crate::model::{ColumnDef, DataType, Row, TableSchema};
 use crate::sql::error::SqlError;
-use crate::types::{ColumnDef, DataType, Row, TableSchema};
 use std::collections::HashSet;
 use tracing::warn;
 
@@ -319,7 +319,7 @@ pub(crate) async fn execute_table_function(
                     futures::pin_mut!(row_stream);
                     while let Some(values) = futures::StreamExt::next(&mut row_stream).await {
                         let values = values.map_err(|e| anyhow!("fs9: parquet row error: {e}"))?;
-                        rows.push(crate::types::Row::new(values));
+                        rows.push(crate::model::Row::new(values));
                     }
                     Ok((parquet_schema, rows))
                 }
@@ -407,7 +407,7 @@ pub(crate) async fn execute_fs9_events(
     path_filter: Option<&str>,
     type_filter: Option<&str>,
 ) -> Result<(TableSchema, Vec<Row>)> {
-    use crate::types::Value;
+    use crate::model::Value;
 
     let bk = backend::get_backend(tenant);
     let http_backend = match bk.as_any().downcast_ref::<backend::Fs9HttpBackend>() {
@@ -575,7 +575,7 @@ pub(crate) async fn start_file_stream(
                 while let Some(values) = futures::StreamExt::next(&mut row_stream).await {
                     match values {
                         Ok(vals) => {
-                            if tx.send(crate::types::Row::new(vals)).await.is_err() {
+                            if tx.send(crate::model::Row::new(vals)).await.is_err() {
                                 break;
                             }
                         }
@@ -913,7 +913,7 @@ mod tests {
         backend, list_directory_entries, start_glob_stream, start_glob_stream_with_budget,
     };
     use crate::extensions::context;
-    use crate::types::Value;
+    use crate::model::Value;
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 

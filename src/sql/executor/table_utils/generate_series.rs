@@ -3,8 +3,8 @@
 //! Supports Int32, Int64, mixed-width integers, Float64, Timestamp, Date,
 //! and Numeric series with configurable offset, limit, and max-row guards.
 
+use crate::model::{DataType, Value};
 use crate::sql::error::SqlError;
-use crate::types::{DataType, Value};
 use anyhow::{anyhow, Result};
 
 pub(crate) const DEFAULT_MAX_GENERATE_SERIES_ROWS: usize = 1_000_000;
@@ -479,7 +479,7 @@ pub(crate) fn generate_series_values_limited(
                 return Ok((Vec::new(), DataType::TimestampTz));
             }
 
-            let tz = crate::types::timestamp::TimeZoneSpec::parse(
+            let tz = crate::model::timestamp::TimeZoneSpec::parse(
                 crate::session_context::current_timezone().as_ref(),
             );
             let naive_date_midnight_timestamptz = |date: chrono::NaiveDate| -> Result<i64> {
@@ -489,7 +489,7 @@ pub(crate) fn generate_series_values_limited(
                 tz.timestamp_millis_from_local_datetime(naive)
             };
             let date_midnight_timestamptz = |days: i32| -> Result<i64> {
-                let date = crate::types::date::date_days_to_naive_date(days)?;
+                let date = crate::model::date::date_days_to_naive_date(days)?;
                 naive_date_midnight_timestamptz(date)
             };
 
@@ -586,8 +586,8 @@ pub(crate) fn generate_series_values_limited(
                         with_months.checked_add_signed(chrono::Duration::days(step_days))
                     };
 
-                    let mut current = crate::types::date::date_days_to_naive_date(*s)?;
-                    let stop = crate::types::date::date_days_to_naive_date(*e)?;
+                    let mut current = crate::model::date::date_days_to_naive_date(*s)?;
+                    let stop = crate::model::date::date_days_to_naive_date(*e)?;
                     let step_forward =
                         step_interval.months > 0 || (step_interval.months == 0 && step_days > 0);
 
@@ -792,6 +792,6 @@ pub(crate) fn generate_series_values_limited(
     }
 }
 
-pub(crate) fn interval_to_millis(iv: &crate::types::IntervalValue) -> i64 {
+pub(crate) fn interval_to_millis(iv: &crate::model::IntervalValue) -> i64 {
     iv.to_millis_approx()
 }

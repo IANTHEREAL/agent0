@@ -13,7 +13,7 @@ use tikv_client::Transaction;
 use tracing::info;
 
 use crate::extensions::EXTENSIONS_SCHEMA;
-use crate::types::{Row, TableSchema, Value};
+use crate::model::{Row, TableSchema, Value};
 
 use crate::extensions::fs::{self, Fs9Mode};
 use crate::extensions::http::{self, HttpTableFunctionCall};
@@ -158,7 +158,7 @@ impl Executor {
                 other => Err(anyhow!(
                     "http: {} must be TEXT, got {}",
                     what,
-                    other.data_type().unwrap_or(crate::types::DataType::Text)
+                    other.data_type().unwrap_or(crate::model::DataType::Text)
                 )),
             }
         }
@@ -173,7 +173,7 @@ impl Executor {
                 Value::Text(s) | Value::Jsonb(s) => Ok(Some(s)),
                 other => Err(anyhow!(
                     "http: headers must be JSONB, got {}",
-                    other.data_type().unwrap_or(crate::types::DataType::Text)
+                    other.data_type().unwrap_or(crate::model::DataType::Text)
                 )),
             }
         }
@@ -289,7 +289,7 @@ impl Executor {
                         other => {
                             return Err(anyhow!(
                                 "http: content_type must be TEXT, got {}",
-                                other.data_type().unwrap_or(crate::types::DataType::Text)
+                                other.data_type().unwrap_or(crate::model::DataType::Text)
                             ))
                         }
                     }
@@ -303,7 +303,7 @@ impl Executor {
                         other => {
                             return Err(anyhow!(
                                 "http: content must be TEXT, got {}",
-                                other.data_type().unwrap_or(crate::types::DataType::Text)
+                                other.data_type().unwrap_or(crate::model::DataType::Text)
                             ))
                         }
                     }

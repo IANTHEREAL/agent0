@@ -1,4 +1,4 @@
-use crate::types::{DataType, Value};
+use crate::model::{DataType, Value};
 use pgwire::api::results::{DataRowEncoder, FieldFormat};
 use pgwire::api::Type;
 use pgwire::error::{PgWireError, PgWireResult};
@@ -28,7 +28,7 @@ pub(in crate::protocol::handler) fn encode_value(
     encoder: &mut DataRowEncoder,
     value: &Value,
     col_type: Option<&DataType>,
-    tz: crate::types::timestamp::TimeZoneSpec,
+    tz: crate::model::timestamp::TimeZoneSpec,
     format: FieldFormat,
 ) -> PgWireResult<()> {
     if format == FieldFormat::Binary {
@@ -42,7 +42,7 @@ fn encode_value_text(
     encoder: &mut DataRowEncoder,
     value: &Value,
     col_type: Option<&DataType>,
-    tz: crate::types::timestamp::TimeZoneSpec,
+    tz: crate::model::timestamp::TimeZoneSpec,
 ) -> PgWireResult<()> {
     match value {
         Value::Null => encoder.encode_field(&None::<String>),
@@ -156,7 +156,7 @@ fn encode_value_text(
         }
         Value::Json(s) => encoder.encode_field(s),
         Value::Jsonb(s) => encoder.encode_field(&crate::sql::jsonb::format_jsonb_pg_str(s)),
-        Value::Vector(vec) => encoder.encode_field(&crate::types::format_vector_pg_text(vec)),
+        Value::Vector(vec) => encoder.encode_field(&crate::model::format_vector_pg_text(vec)),
         Value::Time(micros) => {
             let total_secs = micros / 1_000_000;
             let hours = total_secs / 3600;
@@ -171,7 +171,7 @@ fn encode_value_text(
         }
         Value::Date(days) => {
             let s =
-                crate::types::date::format_date_days(*days).unwrap_or_else(|_| days.to_string());
+                crate::model::date::format_date_days(*days).unwrap_or_else(|_| days.to_string());
             encoder.encode_field(&s)
         }
         Value::Numeric(d) => encoder.encode_field(&d.to_string()),
@@ -186,7 +186,7 @@ fn encode_value_binary(
     encoder: &mut DataRowEncoder,
     value: &Value,
     col_type: Option<&DataType>,
-    _tz: crate::types::timestamp::TimeZoneSpec,
+    _tz: crate::model::timestamp::TimeZoneSpec,
 ) -> PgWireResult<()> {
     match value {
         Value::Null => encoder.encode_field_with_type_and_format(
@@ -284,7 +284,7 @@ fn encode_value_binary(
             )
         }
         Value::Date(days) => {
-            let date = crate::types::date::date_days_to_naive_date(*days)
+            let date = crate::model::date::date_days_to_naive_date(*days)
                 .map_err(|e| PgWireError::ApiError(e.into()))?;
             encoder.encode_field_with_type_and_format(&date, &Type::DATE, FieldFormat::Binary)
         }
@@ -363,7 +363,7 @@ fn encode_value_binary(
         Value::Vector(vec) => {
             // pgvector currently maps to TEXT OID in db9; emit binary text bytes.
             encoder.encode_field_with_type_and_format(
-                &crate::types::format_vector_pg_text(vec),
+                &crate::model::format_vector_pg_text(vec),
                 &Type::TEXT,
                 FieldFormat::Binary,
             )
@@ -379,7 +379,7 @@ fn encode_timestamp_text(
     encoder: &mut DataRowEncoder,
     ts: i64,
     col_type: Option<&DataType>,
-    tz: crate::types::timestamp::TimeZoneSpec,
+    tz: crate::model::timestamp::TimeZoneSpec,
 ) -> PgWireResult<()> {
     let dt = int64_to_datetime(ts);
     let micros = dt.timestamp_subsec_micros();

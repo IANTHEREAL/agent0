@@ -7,6 +7,7 @@
 //! Also contains the `pre_materialize_async_exprs` method on [`Executor`] that
 //! kicks off the transform.
 
+use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::{BinaryOp as TypedBinaryOp, TypedExpr, TypedExprKind};
 use crate::sql::error::SqlError;
 use crate::sql::executor::core::Executor;
@@ -15,7 +16,6 @@ use crate::sql::expr::traverse::{map_children_async, AsyncExprTransform};
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::sequences::resolve_sequence_full_name_from_value;
 use crate::sql::ExecuteResult;
-use crate::types::{DataType, Row, TableSchema, Value};
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -533,8 +533,8 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{DataType, Value};
     use crate::sql::analyzer::types::{AnalyzedQuery, AnalyzedQueryBody};
-    use crate::types::{DataType, Value};
 
     fn const_bool(v: bool) -> TypedExpr {
         TypedExpr::new(

@@ -7,7 +7,7 @@ use rust_decimal::Decimal;
 use sqlparser::ast;
 use std::str::FromStr;
 
-use crate::types::{DataType, Value};
+use crate::model::{DataType, Value};
 
 use crate::sql::analyzer::error::AnalyzerError;
 use crate::sql::analyzer::types::*;

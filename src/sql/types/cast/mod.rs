@@ -5,8 +5,8 @@
 //! - `Assignment`: INSERT/UPDATE column coercion — medium
 //! - `Implicit`: Comparison coercion — strictest
 
+use crate::model::{DataType, Value};
 use crate::sql::error::SqlError;
-use crate::types::{DataType, Value};
 use anyhow::{anyhow, Result};
 use rust_decimal::Decimal;
 use std::str::FromStr;
@@ -124,7 +124,7 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
 
         // ===== To Text / Name =====
         (Value::Timestamp(ts), DataType::Text | DataType::Name) => {
-            let formatted = crate::types::timestamp::format_timestamp_millis(ts, false)
+            let formatted = crate::model::timestamp::format_timestamp_millis(ts, false)
                 .unwrap_or_else(|_| ts.to_string());
             Ok(Value::Text(formatted))
         }
@@ -318,10 +318,10 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 })
             }),
         (Value::Text(s), DataType::Date) => {
-            crate::types::date::parse_date_days(&s).map(Value::Date)
+            crate::model::date::parse_date_days(&s).map(Value::Date)
         }
         (Value::Timestamp(ts), DataType::Date) => {
-            crate::types::date::timestamp_millis_to_date_days(ts).map(Value::Date)
+            crate::model::date::timestamp_millis_to_date_days(ts).map(Value::Date)
         }
         (Value::Date(days), DataType::Date) => Ok(Value::Date(days)),
         (Value::Text(s), DataType::Timestamp | DataType::TimestampTz) => {
@@ -340,7 +340,7 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             Ok(Value::Timestamp(ts))
         }
         (Value::Date(days), DataType::Timestamp | DataType::TimestampTz) => {
-            crate::types::date::date_days_to_timestamp_millis(days).map(Value::Timestamp)
+            crate::model::date::date_days_to_timestamp_millis(days).map(Value::Timestamp)
         }
         (Value::Text(s), DataType::Time) => {
             let trimmed = s.trim();

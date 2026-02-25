@@ -1,12 +1,12 @@
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, ObjectName};
 
+use crate::model::TableSchema;
 use crate::sql::names;
-use crate::types::TableSchema;
 
 #[cfg(test)]
-use crate::sql::expr::bridge::eval_const_ast_expr;
+use crate::model::Value;
 #[cfg(test)]
-use crate::types::Value;
+use crate::sql::expr::bridge::eval_const_ast_expr;
 
 /// Build a stable signature key for a table-valued function call in FROM.
 ///

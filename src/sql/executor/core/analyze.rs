@@ -9,11 +9,11 @@
 
 use super::*;
 use crate::auth::Privilege;
+use crate::model::TableSchema;
 use crate::sql::error::SqlError;
 use crate::sql::expr::operators::compare_values;
 use crate::sql::operators::key_encoding::{canonicalize_value, encode_value_key};
 use crate::sql::optimizer::statistics::{ColumnStatistics, TableStatistics};
-use crate::types::TableSchema;
 
 /// Maximum number of most-common-values to retain per column.
 const MCV_LIMIT: usize = 10;
@@ -460,8 +460,8 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Value;
     use crate::sql::optimizer::statistics::ColumnStatistics;
-    use crate::types::Value;
 
     /// Helper: build a ColumnAccumulator from a slice of Values, then finalize.
     fn stats_from_values(values: &[Value]) -> ColumnStatistics {

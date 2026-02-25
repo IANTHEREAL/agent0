@@ -16,10 +16,10 @@ use super::helpers::{
     is_comparison_op,
 };
 use super::rename::parse_stored_query;
+use crate::model::{ColumnDef, DataType, TableSchema};
 use crate::sql::analyzer::{Analyzer, CatalogSnapshot};
 use crate::sql::names::normalize_ident;
 use crate::storage::TikvStore;
-use crate::types::{ColumnDef, DataType, TableSchema};
 
 #[derive(Default, Clone)]
 pub(super) struct RelationColumnInfo {

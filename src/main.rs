@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod cron;
 mod extensions;
+mod model;
 mod observability;
 mod pool;
 mod protocol;
@@ -11,7 +12,6 @@ mod sql;
 mod storage;
 mod tls;
 mod txn;
-mod types;
 mod worker;
 
 use crate::config::ServerConfig;

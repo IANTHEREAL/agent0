@@ -1,6 +1,6 @@
 use super::SqlFn;
+use crate::model::Value;
 use crate::sql::fts;
-use crate::types::Value;
 use anyhow::Result;
 use std::collections::HashMap;
 

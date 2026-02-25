@@ -2,13 +2,13 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::model::{DataType, Value};
     use crate::sql::analyzer::types::{
         AnalyzedDistinct, AnalyzedProjection, AnalyzedQuery, AnalyzedQueryBody, AnalyzedSelect,
         AnalyzedTableRef, AnalyzedTableRefKind, BinaryOp, TableRefSchema, TypedExpr, TypedExprKind,
         TypedOrderByExpr,
     };
     use crate::sql::rewriter::rewrite_query;
-    use crate::types::{DataType, Value};
 
     // -- Test helpers --
 

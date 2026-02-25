@@ -5,11 +5,11 @@
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
+use crate::model::DataType;
 use crate::sql::analyzer::catalog::MockCatalog;
 use crate::sql::analyzer::scope::Scope;
 use crate::sql::analyzer::types::*;
 use crate::sql::analyzer::{Analyzer, AnalyzerError};
-use crate::types::DataType;
 
 /// Extract the `AnalyzedSelect` from a query, panicking if it's not a SELECT.
 fn expect_select(query: &AnalyzedQuery) -> &AnalyzedSelect {
@@ -46,7 +46,7 @@ fn parse_query(sql: &str) -> sqlparser::ast::Query {
 
 fn text_literal_value(expr: &TypedExpr) -> Option<&str> {
     match &expr.kind {
-        TypedExprKind::Constant(crate::types::Value::Text(s)) => Some(s.as_str()),
+        TypedExprKind::Constant(crate::model::Value::Text(s)) => Some(s.as_str()),
         TypedExprKind::Cast { expr, .. } => text_literal_value(expr),
         _ => None,
     }
@@ -143,7 +143,7 @@ fn analyze_integer_literal() {
     assert_eq!(expr.data_type, DataType::Int32);
     assert!(matches!(
         expr.kind,
-        TypedExprKind::Constant(crate::types::Value::Int32(42))
+        TypedExprKind::Constant(crate::model::Value::Int32(42))
     ));
 }
 
@@ -301,7 +301,7 @@ fn analyze_json_access_comparison_precedence_stays_binary_comparison() {
 
     assert!(matches!(
         right.kind,
-        TypedExprKind::Constant(crate::types::Value::Text(ref s)) if s == "senior"
+        TypedExprKind::Constant(crate::model::Value::Text(ref s)) if s == "senior"
     ));
 }
 
@@ -619,7 +619,7 @@ fn analyze_date_literal() {
     assert_eq!(expr.data_type, DataType::Date);
     assert!(matches!(
         expr.kind,
-        TypedExprKind::Constant(crate::types::Value::Date(_))
+        TypedExprKind::Constant(crate::model::Value::Date(_))
     ));
 }
 

@@ -1,12 +1,12 @@
 //! `replace_sequence_functions` -- recursive AST rewriting for NEXTVAL/CURRVAL/SETVAL/
 //! CURRENT_SCHEMA/PG_GET_INDEXDEF dispatch and user function evaluation.
 
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::names;
 use crate::sql::names::function_name_upper;
 use crate::sql::plpgsql;
 use crate::sql::value_coercion::value_to_sql_expr;
 use crate::storage::TikvStore;
-use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr};
 use std::collections::HashMap;
@@ -35,7 +35,7 @@ pub(crate) fn replace_sequence_functions<'a>(
             Expr::Function(func) => {
                 let name = function_name_upper(func);
                 match name.as_str() {
-                    "CURRENT_SCHEMA" => Ok(value_to_sql_expr(&crate::types::Value::Text(
+                    "CURRENT_SCHEMA" => Ok(value_to_sql_expr(&crate::model::Value::Text(
                         names::default_schema(search_path).to_string(),
                     ))),
                     "NEXTVAL" => {
@@ -50,7 +50,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         .await?;
                         let val = store.nextval_sequence(txn, db_id, &full_name).await?;
                         last_sequence_values.insert(full_name, val);
-                        Ok(value_to_sql_expr(&crate::types::Value::Int64(val)))
+                        Ok(value_to_sql_expr(&crate::model::Value::Int64(val)))
                     }
                     "CURRVAL" => {
                         let arg0 = extract_arg_expr(&func.args, 0)?;
@@ -78,7 +78,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                             full_name
                         )
                                 })?;
-                        Ok(value_to_sql_expr(&crate::types::Value::Int64(val)))
+                        Ok(value_to_sql_expr(&crate::model::Value::Int64(val)))
                     }
                     "SETVAL" => {
                         let arg0 = extract_arg_expr(&func.args, 0)?;
@@ -93,10 +93,10 @@ pub(crate) fn replace_sequence_functions<'a>(
                         .await?;
                         let val = eval_seq_expr(arg1, row, schema)?;
                         let value_i64 = match val {
-                            crate::types::Value::Int32(n) => n as i64,
-                            crate::types::Value::Int64(n) => n,
-                            crate::types::Value::Float64(n) => n as i64,
-                            crate::types::Value::Text(s) => s
+                            crate::model::Value::Int32(n) => n as i64,
+                            crate::model::Value::Int64(n) => n,
+                            crate::model::Value::Float64(n) => n as i64,
+                            crate::model::Value::Text(s) => s
                                 .trim()
                                 .parse::<i64>()
                                 .map_err(|_| anyhow!("setval: value must be integer, got {}", s))?,
@@ -107,8 +107,8 @@ pub(crate) fn replace_sequence_functions<'a>(
                         let is_called = if func.args.len() >= 3 {
                             let arg2 = extract_arg_expr(&func.args, 2)?;
                             match eval_seq_expr(arg2, row, schema)? {
-                                crate::types::Value::Boolean(b) => b,
-                                crate::types::Value::Text(s) => {
+                                crate::model::Value::Boolean(b) => b,
+                                crate::model::Value::Text(s) => {
                                     matches!(
                                         s.to_lowercase().as_str(),
                                         "true" | "t" | "1" | "yes" | "y"
@@ -127,7 +127,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         let res = store
                             .setval_sequence(txn, db_id, &full_name, value_i64, is_called)
                             .await?;
-                        Ok(value_to_sql_expr(&crate::types::Value::Int64(res)))
+                        Ok(value_to_sql_expr(&crate::model::Value::Int64(res)))
                     }
                     "PG_GET_INDEXDEF" => {
                         let arg0 = match extract_arg_expr(&func.args, 0) {

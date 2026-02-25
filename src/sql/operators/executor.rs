@@ -4,12 +4,12 @@ use std::sync::Arc;
 use tikv_client::Transaction;
 
 use super::{BoxedOperator, ExecutionContext};
+use crate::model::Row;
 use crate::sql::executor::Executor;
 use crate::sql::query_context::QueryContext;
 use crate::storage::TikvStore;
-use crate::types::Row;
 
-use crate::types::TableSchema;
+use crate::model::TableSchema;
 
 fn build_query_ctx_from_task_locals() -> QueryContext {
     QueryContext::from_task_locals()

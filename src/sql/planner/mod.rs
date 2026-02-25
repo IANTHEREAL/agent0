@@ -17,7 +17,7 @@ mod tests;
 pub use self::index_selection::choose_btree_access_path_for_typed_filter;
 pub(crate) use self::predicate::collect_typed_eq_predicates;
 
-use crate::types::Value;
+use crate::model::Value;
 
 #[derive(Debug, Clone)]
 pub enum ScanType {

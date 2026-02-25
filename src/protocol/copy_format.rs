@@ -1,6 +1,6 @@
 //! PostgreSQL COPY format encoding (text and CSV).
 
-use crate::types::Value;
+use crate::model::Value;
 use chrono::{TimeZone, Utc};
 
 const TAB: u8 = b'\t';
@@ -300,7 +300,7 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>, delimiter: u8) {
             }
         }
         Value::Date(days) => {
-            if let Ok(s) = crate::types::date::format_date_days(*days) {
+            if let Ok(s) = crate::model::date::format_date_days(*days) {
                 buf.extend_from_slice(s.as_bytes());
             }
         }
@@ -344,7 +344,7 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>, delimiter: u8) {
             buf.push(b'}');
         }
         Value::Vector(vec) => {
-            buf.extend_from_slice(crate::types::format_vector_pg_text(vec).as_bytes());
+            buf.extend_from_slice(crate::model::format_vector_pg_text(vec).as_bytes());
         }
         Value::Json(s) => {
             escape_text(s.as_bytes(), buf, delimiter);

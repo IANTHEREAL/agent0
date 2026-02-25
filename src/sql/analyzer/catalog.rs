@@ -4,8 +4,8 @@
 //! `CatalogSnapshot` implementation is built by pre-fetching all referenced
 //! relations from TiKV before analysis begins (async fetch → sync analysis).
 
+use crate::model::{ColumnDef, DataType, FunctionDef, TableSchema, UserTypeDef, ViewDef};
 use crate::sql::collation::CollationDef;
-use crate::types::{ColumnDef, DataType, FunctionDef, TableSchema, UserTypeDef, ViewDef};
 use std::collections::{HashMap, HashSet};
 
 // ── Catalog trait ───────────────────────────────────────────

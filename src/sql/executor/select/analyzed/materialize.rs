@@ -9,11 +9,11 @@
 //! 2. Uncorrelated subquery execution (IN/EXISTS/Scalar/Array/ANYALL)
 //! 3. Catalog-dependent function resolution (delegated to `materialize_catalog`)
 
+use crate::model::{Row, TableSchema};
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::classify::needs_pre_materialization;
 use crate::sql::query_context::QueryContext;
-use crate::types::{Row, TableSchema};
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -90,8 +90,8 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{DataType, Value};
     use crate::sql::analyzer::types::{AnalyzedQuery, AnalyzedQueryBody, TypedExprKind};
-    use crate::types::{DataType, Value};
 
     fn const_bool(v: bool) -> TypedExpr {
         TypedExpr::new(

@@ -10,12 +10,12 @@ mod update;
 
 use super::super::dml;
 use super::core::Executor;
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::analyzer::types::{AnalyzedProjection, TypedExpr, TypedExprKind};
 use crate::sql::expr::static_eval::needs_async_materialization;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
-use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tikv_client::Transaction;
@@ -267,7 +267,7 @@ pub(super) fn build_returning_columns_from_analyzed(
 pub(super) fn build_returning_types_from_analyzed(
     returning: &Option<Vec<AnalyzedProjection>>,
     _schema: &TableSchema,
-) -> Vec<crate::types::DataType> {
+) -> Vec<crate::model::DataType> {
     match returning {
         Some(projs) => projs.iter().map(|p| p.expr.data_type.clone()).collect(),
         None => vec![],

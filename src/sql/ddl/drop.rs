@@ -6,13 +6,13 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::ObjectName;
 use tikv_client::Transaction;
 
+use crate::model::{DataType, Row, TableSchema};
 use crate::sql::gin::extract_gin_token_hashes_from_row;
 use crate::sql::index_helpers;
 use crate::sql::names;
 use crate::sql::projection::fill_row_defaults;
 use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
-use crate::types::{DataType, Row, TableSchema};
 
 use super::{
     drop_dependent_views, drop_owned_sequences_for_table, KvScanBatches, DDL_SCAN_BATCH_SIZE,

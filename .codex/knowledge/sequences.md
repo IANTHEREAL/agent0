@@ -7,7 +7,7 @@
 ## Implementation (current)
 
 ### Types
-- `src/types/mod.rs`
+- `src/model/mod.rs`
   - `SequenceState { last_value: i64, is_called: bool }`
   - `SequenceBacking::{ TableId(u64), Standalone(SequenceState) }`
   - `SequenceDef { oid, schema, name, start_value, increment, min_value, max_value, cache_size, is_cycled, owned_by, owner, backing }`

@@ -1,7 +1,7 @@
 use super::catalog::{global_catalog, ScanContext};
 use super::query_context::QueryContext;
+use crate::model::{Row, TableSchema};
 use crate::storage::TikvStore;
-use crate::types::{Row, TableSchema};
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use tikv_client::Transaction;

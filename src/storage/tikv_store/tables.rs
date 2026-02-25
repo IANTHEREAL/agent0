@@ -333,10 +333,10 @@ impl TikvStore {
             let pk_val_strs: Vec<String> = pk_values
                 .iter()
                 .map(|v| match v {
-                    crate::types::Value::Int32(n) => n.to_string(),
-                    crate::types::Value::Int64(n) => n.to_string(),
-                    crate::types::Value::Text(s) => s.clone(),
-                    crate::types::Value::Uuid(bytes) => uuid::Uuid::from_bytes(*bytes).to_string(),
+                    crate::model::Value::Int32(n) => n.to_string(),
+                    crate::model::Value::Int64(n) => n.to_string(),
+                    crate::model::Value::Text(s) => s.clone(),
+                    crate::model::Value::Uuid(bytes) => uuid::Uuid::from_bytes(*bytes).to_string(),
                     other => format!("{}", other),
                 })
                 .collect();

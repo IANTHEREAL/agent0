@@ -1,11 +1,11 @@
 use super::encoding::*;
 use super::kv_stats;
 use crate::extensions::InstalledExtension;
-use crate::txn::{txn_delete, txn_put};
-use crate::types::{
+use crate::model::{
     DataType, DatabaseDef, FunctionDef, MatViewDef, MigrationRecord, Row, SequenceBacking,
     SequenceDef, SequenceState, TableSchema, TriggerDef, UserTypeDef, Value, ViewDef,
 };
+use crate::txn::{txn_delete, txn_put};
 use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

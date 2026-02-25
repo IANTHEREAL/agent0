@@ -3,10 +3,10 @@
 //! Contains function call dispatch, timezone evaluation, array indexing,
 //! JSON operator mapping, and string conversion utilities.
 
+use crate::model::{Row, Value};
 use crate::sql::analyzer::types::*;
 use crate::sql::error::SqlError;
 use crate::sql::query_context::QueryContext;
-use crate::types::{Row, Value};
 use anyhow::{anyhow, Result};
 
 use super::eval_typed_expr;
@@ -81,12 +81,12 @@ pub(super) fn eval_function_call(
             } else {
                 qctx.transaction_timestamp_ms
             };
-            let ts = crate::types::timestamp::truncate_timestamp_millis(ts, precision);
+            let ts = crate::model::timestamp::truncate_timestamp_millis(ts, precision);
             return Ok(Value::Timestamp(ts));
         }
         "CURRENT_DATE" => {
             let days =
-                crate::types::date::timestamp_millis_to_date_days(qctx.transaction_timestamp_ms)?;
+                crate::model::date::timestamp_millis_to_date_days(qctx.transaction_timestamp_ms)?;
             return Ok(Value::Date(days));
         }
         "PG_BACKEND_PID" => {
@@ -126,7 +126,7 @@ pub(super) fn eval_function_call(
                     // Coerce text to boolean — propagate SqlError::InvalidInputSyntax directly.
                     match crate::sql::types::cast::cast(
                         Value::Text(s.clone()),
-                        &crate::types::DataType::Boolean,
+                        &crate::model::DataType::Boolean,
                         crate::sql::types::cast::CastContext::Implicit,
                     )? {
                         Value::Boolean(b) => b,
@@ -206,7 +206,7 @@ pub(super) fn eval_timezone(
 
     let ts_millis = match ts_val {
         Value::Timestamp(ms) => ms,
-        Value::Date(days) => crate::types::date::date_days_to_timestamp_millis(days)?,
+        Value::Date(days) => crate::model::date::date_days_to_timestamp_millis(days)?,
         Value::Text(ref s) => match crate::sql::expr::parse_timestamp_string(s) {
             Ok(Value::Timestamp(ms)) => ms,
             _ => return Err(anyhow!("AT TIME ZONE requires timestamp, got text: {}", s)),
@@ -215,7 +215,7 @@ pub(super) fn eval_timezone(
         _ => return Err(anyhow!("AT TIME ZONE requires timestamp, got {:?}", ts_val)),
     };
 
-    use crate::types::DataType;
+    use crate::model::DataType;
     if matches!(ts_expr.data_type, DataType::TimestampTz) {
         // TIMESTAMPTZ → TIMESTAMP: convert from UTC to local
         Ok(Value::Timestamp(ts_millis + offset_ms))

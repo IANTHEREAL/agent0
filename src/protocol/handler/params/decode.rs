@@ -4,7 +4,7 @@
 //! dispatching on `StoredStatement.parameter_types` (wire `Type`) for
 //! correct binary decode width (e.g. INT2 = 2 bytes, FLOAT4 = 4 bytes).
 
-use crate::types::Value;
+use crate::model::Value;
 use pgwire::api::portal::Portal;
 use pgwire::api::results::FieldFormat;
 use pgwire::api::Type;
@@ -177,7 +177,7 @@ fn decode_binary(bytes: &[u8], pg_type: &Type, index: usize) -> PgWireResult<Val
             let total_ms = us / 1000
                 + (days as i64) * 24 * 60 * 60 * 1000
                 + (months as i64) * 30 * 24 * 60 * 60 * 1000;
-            Ok(Value::Interval(crate::types::IntervalValue::from_millis(
+            Ok(Value::Interval(crate::model::IntervalValue::from_millis(
                 total_ms,
             )))
         }
@@ -283,7 +283,7 @@ fn decode_text_value(
             crate::sql::expr::parse_timestamp_string(trimmed)
                 .map_err(|_| err(format!("\"{}\"", trimmed)))
         }
-        t if *t == Type::DATE => crate::types::date::parse_date_days(trimmed)
+        t if *t == Type::DATE => crate::model::date::parse_date_days(trimmed)
             .map(Value::Date)
             .map_err(|_| err(format!("\"{}\"", trimmed))),
         t if *t == Type::UUID => uuid::Uuid::parse_str(trimmed)

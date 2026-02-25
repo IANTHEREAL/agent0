@@ -1,6 +1,6 @@
 //! SQL execution result types
 
-use crate::types::{DataType, Row, TableSchema};
+use crate::model::{DataType, Row, TableSchema};
 use futures::stream::BoxStream;
 use std::sync::Arc;
 

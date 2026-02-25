@@ -7,6 +7,7 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::{Expr, OrderByExpr};
 use tikv_client::Transaction;
 
+use crate::model::{DataType, IndexDef, Row, TableSchema};
 use crate::sql::error::SqlError;
 use crate::sql::gin::{extract_gin_token_hashes_from_row, supported_gin_index_column};
 use crate::sql::index_consistency::{
@@ -19,7 +20,6 @@ use crate::sql::projection::fill_row_defaults;
 use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
 use crate::txn::txn_delete;
-use crate::types::{DataType, IndexDef, Row, TableSchema};
 use crate::worker::types::{IndexState, TaskQueueEntry, TaskType, TASK_TYPE_BG_DDL};
 
 use super::create_table::check_relation_name_available;

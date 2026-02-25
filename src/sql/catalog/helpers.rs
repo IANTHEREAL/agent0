@@ -1,4 +1,4 @@
-use crate::types::{ColumnDef, DataType, IndexDef, Value};
+use crate::model::{ColumnDef, DataType, IndexDef, Value};
 use std::collections::HashMap;
 
 pub fn text_col(name: &str) -> ColumnDef {

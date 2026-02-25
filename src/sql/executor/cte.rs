@@ -3,9 +3,9 @@
 use super::super::names::normalize_ident;
 use super::super::ExecuteResult;
 use super::core::Executor;
+use crate::model::{ColumnDef, DataType, Row, TableSchema};
 use crate::sql::binder::{extract_relation_references_from_query, RelationDep};
 use crate::sql::error::SqlError;
-use crate::types::{ColumnDef, DataType, Row, TableSchema};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Ident, Query, SetExpr, SetOperator, SetQuantifier, Visit, Visitor};
 use std::collections::HashMap;
@@ -72,7 +72,7 @@ impl Executor {
                             let inferred_types: Vec<DataType> = if let Some(types) = column_types {
                                 types
                             } else {
-                                crate::types::infer_column_types_from_rows(&rows, col_names.len())
+                                crate::model::infer_column_types_from_rows(&rows, col_names.len())
                             };
                             let schema = build_cte_table_schema(
                                 &cte_name,
@@ -209,7 +209,7 @@ impl Executor {
         let inferred_types: Vec<DataType> = if let Some(types) = base_types {
             types
         } else {
-            crate::types::infer_column_types_from_rows(&all_rows, col_names.len())
+            crate::model::infer_column_types_from_rows(&all_rows, col_names.len())
         };
         let schema = build_cte_table_schema(
             cte_name,

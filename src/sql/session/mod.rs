@@ -62,11 +62,11 @@ pub struct Session {
     /// Pending parameter values from extended-query Bind for the next Execute.
     /// Set by the protocol handler before calling `execute()`, consumed by
     /// `query_context_for_statement()` so they flow into `QUERY_PARAMS`.
-    pending_params: Vec<Option<crate::types::Value>>,
+    pending_params: Vec<Option<crate::model::Value>>,
     /// Pending parameter types from Parse-time analysis for the next Execute.
     /// Set by the protocol handler, consumed by `query_context_for_statement()`
     /// so they flow into `QUERY_PARAM_TYPES`.
-    pending_param_types: Vec<Option<crate::types::DataType>>,
+    pending_param_types: Vec<Option<crate::model::DataType>>,
     /// SQL PREPARE/EXECUTE statement cache (session-scoped, PostgreSQL semantics).
     sql_prepared_statements: HashMap<String, SqlPreparedStatement>,
     /// True when current transaction used xact-scoped advisory lock functions.
@@ -250,14 +250,14 @@ impl Session {
     /// Set parameter values for the next statement execution.
     /// Called by the protocol handler after decoding Bind parameters.
     /// Consumed (drained) by `query_context_for_statement()`.
-    pub fn set_pending_params(&mut self, params: Vec<Option<crate::types::Value>>) {
+    pub fn set_pending_params(&mut self, params: Vec<Option<crate::model::Value>>) {
         self.pending_params = params;
     }
 
     /// Set parameter types for the next statement execution.
     /// Called by the protocol handler to thread Parse-time types to Execute-time Analyzer.
     /// Consumed (drained) by `query_context_for_statement()`.
-    pub fn set_pending_param_types(&mut self, types: Vec<Option<crate::types::DataType>>) {
+    pub fn set_pending_param_types(&mut self, types: Vec<Option<crate::model::DataType>>) {
         self.pending_param_types = types;
     }
 

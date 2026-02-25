@@ -14,7 +14,7 @@
 
 use rust_decimal::Decimal;
 
-use crate::types::Value;
+use crate::model::Value;
 
 // ── Canonicalization ─────────────────────────────────────────────────────
 

@@ -1,6 +1,6 @@
 use crate::extensions::context;
+use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
 use crate::sql::error::SqlError;
-use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use reqwest::header::{CONTENT_TYPE, LOCATION};
 use reqwest::{Client, Method, Url};

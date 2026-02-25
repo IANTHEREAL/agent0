@@ -138,8 +138,8 @@ pub(crate) fn has_correlated_ref(expr: &TypedExpr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{DataType, Value};
     use crate::sql::analyzer::types::{BinaryOp, ResolvedFunction};
-    use crate::types::{DataType, Value};
 
     fn bool_const(v: bool) -> TypedExpr {
         TypedExpr::new(

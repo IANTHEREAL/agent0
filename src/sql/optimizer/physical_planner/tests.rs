@@ -1,11 +1,11 @@
 //! Tests for physical planner.
 
 use super::*;
+use crate::model::DataType;
 use crate::sql::analyzer::types::*;
 use crate::sql::optimizer::logical_plan::{LogicalPlan, PlanSchema};
 use crate::sql::optimizer::logical_planner::LogicalPlanner;
 use crate::sql::optimizer::statistics::ColumnStatistics;
-use crate::types::DataType;
 
 fn simple_column(name: &str, dt: DataType) -> TypedExpr {
     TypedExpr {
@@ -18,7 +18,7 @@ fn simple_column(name: &str, dt: DataType) -> TypedExpr {
     }
 }
 
-fn simple_constant(v: crate::types::Value, dt: DataType) -> TypedExpr {
+fn simple_constant(v: crate::model::Value, dt: DataType) -> TypedExpr {
     TypedExpr {
         kind: TypedExprKind::Constant(v),
         data_type: dt,
@@ -117,7 +117,7 @@ fn test_filter_with_stats() {
             left: Box::new(simple_column("id", DataType::Int64)),
             op: BinaryOp::Eq,
             right: Box::new(simple_constant(
-                crate::types::Value::Int32(1),
+                crate::model::Value::Int32(1),
                 DataType::Int64,
             )),
         },
@@ -148,7 +148,7 @@ fn test_filter_without_stats() {
             left: Box::new(simple_column("id", DataType::Int64)),
             op: BinaryOp::Eq,
             right: Box::new(simple_constant(
-                crate::types::Value::Int32(1),
+                crate::model::Value::Int32(1),
                 DataType::Int64,
             )),
         },
@@ -194,7 +194,7 @@ fn test_having_filter_uses_legacy() {
             left: Box::new(simple_column("cnt", DataType::Int64)),
             op: BinaryOp::Gt,
             right: Box::new(simple_constant(
-                crate::types::Value::Int32(5),
+                crate::model::Value::Int32(5),
                 DataType::Int64,
             )),
         },
@@ -365,7 +365,7 @@ fn test_end_to_end_with_stats() {
                     left: Box::new(simple_column("id", DataType::Int64)),
                     op: BinaryOp::Eq,
                     right: Box::new(simple_constant(
-                        crate::types::Value::Int32(42),
+                        crate::model::Value::Int32(42),
                         DataType::Int64,
                     )),
                 },
@@ -460,7 +460,7 @@ fn test_topn_optimization() {
             nulls_first: false,
         }],
         limit: Some(simple_constant(
-            crate::types::Value::Int64(10),
+            crate::model::Value::Int64(10),
             DataType::Int64,
         )),
         offset: None,
@@ -574,7 +574,7 @@ fn test_gate1_stats_improve_estimates() {
             left: Box::new(simple_column("id", DataType::Int64)),
             op: BinaryOp::Eq,
             right: Box::new(simple_constant(
-                crate::types::Value::Int32(1),
+                crate::model::Value::Int32(1),
                 DataType::Int64,
             )),
         },
@@ -609,7 +609,7 @@ fn test_gate2_no_stats_exact_legacy() {
             left: Box::new(simple_column("id", DataType::Int64)),
             op: BinaryOp::Eq,
             right: Box::new(simple_constant(
-                crate::types::Value::Int32(1),
+                crate::model::Value::Int32(1),
                 DataType::Int64,
             )),
         },
@@ -651,7 +651,7 @@ fn test_gate3_selectivity_bounds() {
             left: Box::new(simple_column("id", DataType::Int64)),
             op: BinaryOp::Eq,
             right: Box::new(simple_constant(
-                crate::types::Value::Int32(1),
+                crate::model::Value::Int32(1),
                 DataType::Int64,
             )),
         },
@@ -691,7 +691,7 @@ fn test_gate4_negative_n_distinct() {
             left: Box::new(simple_column("id", DataType::Int64)),
             op: BinaryOp::Eq,
             right: Box::new(simple_constant(
-                crate::types::Value::Int32(1),
+                crate::model::Value::Int32(1),
                 DataType::Int64,
             )),
         },
@@ -729,7 +729,7 @@ fn test_gate5_having_isolation() {
             left: Box::new(simple_column("cnt", DataType::Int64)),
             op: BinaryOp::Gt,
             right: Box::new(simple_constant(
-                crate::types::Value::Int32(5),
+                crate::model::Value::Int32(5),
                 DataType::Int64,
             )),
         },
@@ -760,7 +760,7 @@ fn test_gate6_null_constant_zero_selectivity() {
         kind: TypedExprKind::BinaryOp {
             left: Box::new(simple_column("id", DataType::Int64)),
             op: BinaryOp::Eq,
-            right: Box::new(simple_constant(crate::types::Value::Null, DataType::Int64)),
+            right: Box::new(simple_constant(crate::model::Value::Null, DataType::Int64)),
         },
         data_type: DataType::Boolean,
     });
@@ -803,7 +803,7 @@ fn test_gate8_negated_predicates_null_safe() {
             null_fraction: 0.2,
             n_distinct: 100.0,
             avg_width: 4,
-            most_common_vals: vec![crate::types::Value::Int32(1)],
+            most_common_vals: vec![crate::model::Value::Int32(1)],
             most_common_freqs: vec![0.1],
             histogram_bounds: vec![],
             correlation: 0.0,
@@ -823,7 +823,7 @@ fn test_gate8_negated_predicates_null_safe() {
             left: Box::new(simple_column("id", DataType::Int64)),
             op: BinaryOp::NotEq,
             right: Box::new(simple_constant(
-                crate::types::Value::Int32(1),
+                crate::model::Value::Int32(1),
                 DataType::Int64,
             )),
         },
@@ -1279,7 +1279,7 @@ fn test_build_side_smaller() {
 
 // ── Access-path selection tests ─────────────────────
 
-use crate::types::{ColumnDef, IndexDef};
+use crate::model::{ColumnDef, IndexDef};
 
 fn make_schema_with_index() -> TableSchema {
     let mut schema = TableSchema::new(
@@ -1346,7 +1346,7 @@ fn test_filter_above_scan_selects_index() {
             left: Box::new(simple_column("id", DataType::Int64)),
             op: BinaryOp::Eq,
             right: Box::new(simple_constant(
-                crate::types::Value::Int32(42),
+                crate::model::Value::Int32(42),
                 DataType::Int64,
             )),
         },
@@ -1391,7 +1391,7 @@ fn test_filter_above_scan_no_schema_stays_seqscan() {
             left: Box::new(simple_column("id", DataType::Int64)),
             op: BinaryOp::Eq,
             right: Box::new(simple_constant(
-                crate::types::Value::Int32(42),
+                crate::model::Value::Int32(42),
                 DataType::Int64,
             )),
         },
@@ -1430,7 +1430,7 @@ fn test_filter_above_scan_no_matching_index_stays_seqscan() {
             left: Box::new(simple_column("name", DataType::Text)),
             op: BinaryOp::Eq,
             right: Box::new(simple_constant(
-                crate::types::Value::Text("alice".to_string()),
+                crate::model::Value::Text("alice".to_string()),
                 DataType::Text,
             )),
         },
@@ -1468,7 +1468,7 @@ fn test_filter_above_scan_range_predicate() {
             left: Box::new(simple_column("id", DataType::Int64)),
             op: BinaryOp::Gt,
             right: Box::new(simple_constant(
-                crate::types::Value::Int32(100),
+                crate::model::Value::Int32(100),
                 DataType::Int64,
             )),
         },

@@ -1,9 +1,9 @@
 use super::execute::{execute_trigger_body_standalone, plpgsql_outer_block_range};
 use super::queue::TriggerOp;
 use super::rewrite::substitute_row_references;
+use crate::model::{Row, TriggerDef};
 use crate::sql::executor::{Executor, PendingAsyncTrigger};
 use crate::storage::TikvStore;
-use crate::types::{Row, TriggerDef};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -95,16 +95,16 @@ pub(crate) async fn enqueue_after_triggers(
 
 pub(crate) fn flatten_trigger_body_to_sql(
     body: &str,
-    schema: &crate::types::TableSchema,
+    schema: &crate::model::TableSchema,
     new_row: Option<&Row>,
     old_row: Option<&Row>,
 ) -> Option<String> {
     let mut new_values = match new_row {
         Some(r) => r.values.clone(),
-        None => vec![crate::types::Value::Null; schema.columns.len()],
+        None => vec![crate::model::Value::Null; schema.columns.len()],
     };
     if new_values.len() < schema.columns.len() {
-        new_values.resize(schema.columns.len(), crate::types::Value::Null);
+        new_values.resize(schema.columns.len(), crate::model::Value::Null);
     }
 
     let (begin_pos, end_pos) = plpgsql_outer_block_range(body)?;
@@ -149,8 +149,8 @@ pub(crate) fn flatten_trigger_body_to_sql(
 
 fn flatten_trigger_statement(
     stmt: &str,
-    schema: &crate::types::TableSchema,
-    new_values: &[crate::types::Value],
+    schema: &crate::model::TableSchema,
+    new_values: &[crate::model::Value],
     old_row: Option<&Row>,
 ) -> Option<String> {
     let stmt = stmt.trim().trim_end_matches(';').trim();

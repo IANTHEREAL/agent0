@@ -6,6 +6,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use tikv_client::Transaction;
 
+use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::gin::extract_gin_token_hashes_from_row;
 use crate::sql::index_consistency::{
@@ -13,7 +14,6 @@ use crate::sql::index_consistency::{
 };
 use crate::sql::index_helpers;
 use crate::storage::TikvStore;
-use crate::types::{DataType, Row, TableSchema, Value};
 use crate::worker::types::IndexState;
 
 use super::defaults::coerce_row_values;
@@ -42,10 +42,10 @@ pub async fn build_enum_label_cache(
             .await?
             .ok_or_else(|| anyhow!("Type '{}' does not exist", udt_name))?;
         match def.kind {
-            crate::types::UserTypeKind::Enum { labels } => {
+            crate::model::UserTypeKind::Enum { labels } => {
                 cache.insert(udt_name.to_string(), labels.into_iter().collect());
             }
-            crate::types::UserTypeKind::Composite { .. } => {}
+            crate::model::UserTypeKind::Composite { .. } => {}
         }
     }
 

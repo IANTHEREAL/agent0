@@ -3,8 +3,8 @@ use super::helpers::{
     text_col, text_val,
 };
 use super::{ScanContext, VirtualTable};
+use crate::model::{DataType, Row, TableSchema};
 use crate::sql::sequences;
-use crate::types::{DataType, Row, TableSchema};
 use anyhow::Result;
 use async_trait::async_trait;
 

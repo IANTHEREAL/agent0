@@ -9,10 +9,10 @@ use super::enum_rewrite::{
 };
 use super::helpers::enum_column_names;
 use super::rename::{can_match_unqualified_type_name, get_enum_type};
+use crate::model::{DataType, TableSchema, UserTypeKind};
 use crate::sql::alter_type::AddValuePosition;
 use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
-use crate::types::{DataType, TableSchema, UserTypeKind};
 
 /// `ALTER TYPE <name> RENAME VALUE '<old>' TO '<new>'`
 ///
@@ -112,7 +112,7 @@ pub async fn alter_type_rename_value(
                 let mut needs_update = false;
                 for &col_idx in &enum_col_indices {
                     if col_idx < old_row.values.len() {
-                        if let crate::types::Value::Text(ref v) = old_row.values[col_idx] {
+                        if let crate::model::Value::Text(ref v) = old_row.values[col_idx] {
                             if v == old_label {
                                 needs_update = true;
                                 break;
@@ -129,15 +129,15 @@ pub async fn alter_type_rename_value(
                 let mut new_values = old_row.values.clone();
                 for &col_idx in &enum_col_indices {
                     if col_idx < new_values.len() {
-                        if let crate::types::Value::Text(ref v) = new_values[col_idx] {
+                        if let crate::model::Value::Text(ref v) = new_values[col_idx] {
                             if v == old_label {
                                 new_values[col_idx] =
-                                    crate::types::Value::Text(new_label.to_string());
+                                    crate::model::Value::Text(new_label.to_string());
                             }
                         }
                     }
                 }
-                let new_row = crate::types::Row::new(new_values);
+                let new_row = crate::model::Row::new(new_values);
 
                 // Use the DML update path for index maintenance, but skip FK
                 // enforcement: enum label rename preserves value identity across

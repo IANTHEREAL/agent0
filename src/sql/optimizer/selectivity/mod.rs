@@ -4,10 +4,10 @@
 //! statistics collected by ANALYZE. Only called when stats are available;
 //! the physical planner falls back to legacy heuristics when no stats exist.
 
+use crate::model::Value;
 use crate::sql::analyzer::types::{BinaryOp, IsTestKind, TypedExpr, TypedExprKind, UnaryOp};
 use crate::sql::expr::compare_values;
 use crate::sql::optimizer::statistics::{ColumnStatistics, TableStatistics};
-use crate::types::Value;
 use std::cmp::Ordering;
 
 // ── PostgreSQL default selectivities ─────────────────────────

@@ -2,11 +2,11 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
+use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
 use crate::sql::expr::classify::needs_async;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::query_context::QueryContext;
-use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
 /// Identifies set-returning function kinds that expand one input row to many.
 #[derive(Copy, Clone, Debug)]
@@ -423,10 +423,10 @@ impl PhysicalOperator for ProjectOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ColumnDef;
     use crate::sql::analyzer::types::{BinaryOp as TypedBinaryOp, TypedExpr, TypedExprKind};
     use crate::sql::expr::typed_eval::eval_typed_expr;
     use crate::sql::query_context::QueryContext;
-    use crate::types::ColumnDef;
 
     fn test_schema() -> TableSchema {
         TableSchema {
@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn test_project_row_column_subset() {
         use super::super::scan::TableScanOperator;
-        use crate::types::Value;
+        use crate::model::Value;
 
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
@@ -569,7 +569,7 @@ mod tests {
     #[test]
     fn test_project_row_arithmetic_expression() {
         use super::super::scan::TableScanOperator;
-        use crate::types::Value;
+        use crate::model::Value;
 
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
@@ -607,7 +607,7 @@ mod tests {
     #[test]
     fn test_project_row_null_propagation() {
         use super::super::scan::TableScanOperator;
-        use crate::types::Value;
+        use crate::model::Value;
 
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));

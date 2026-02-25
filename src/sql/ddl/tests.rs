@@ -232,7 +232,7 @@ fn set_data_type_stats_invalidation_matches_type_change() {
 
 #[test]
 fn coerce_jsonb_to_text_produces_canonical_output() {
-    let col = crate::types::ColumnDef {
+    let col = crate::model::ColumnDef {
         name: "data".to_string(),
         data_type: DataType::Text,
         nullable: true,
@@ -249,7 +249,7 @@ fn coerce_jsonb_to_text_produces_canonical_output() {
 
 #[test]
 fn coerce_json_to_text_preserves_raw_format() {
-    let col = crate::types::ColumnDef {
+    let col = crate::model::ColumnDef {
         name: "data".to_string(),
         data_type: DataType::Text,
         nullable: true,

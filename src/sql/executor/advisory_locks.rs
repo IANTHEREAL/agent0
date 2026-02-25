@@ -2,12 +2,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use crate::model::Value;
 use crate::sql::advisory_locks::{
     global_lock_manager, AcquireError, AdvisoryLockManager, AdvisoryLockMode, AdvisoryLockScope,
 };
 use crate::sql::error::SqlError;
 use crate::sql::query_context::{XactAdvisoryLockRecord, XactAdvisorySavepointTracker};
-use crate::types::Value;
 use anyhow::{anyhow, Result};
 
 fn parse_lock_key(args: &[Value]) -> Result<Option<i64>> {

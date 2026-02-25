@@ -17,7 +17,7 @@ mod response;
 mod fs9;
 
 use super::DynamicPgHandler;
-use crate::types::Value;
+use crate::model::Value;
 use async_trait::async_trait;
 use futures::{Sink, SinkExt};
 use pgwire::api::copy::CopyHandler;

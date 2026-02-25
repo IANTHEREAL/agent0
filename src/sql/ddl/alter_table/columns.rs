@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::{ColumnOption, GeneratedAs};
 use tikv_client::Transaction;
 
+use crate::model::{DataType, IndexDef, Value};
 use crate::sql::error::SqlError;
 use crate::sql::names::normalize_ident;
 use crate::sql::projection::fill_row_defaults;
@@ -14,7 +15,6 @@ use crate::sql::sequences;
 use crate::sql::value_coercion::coerce_value_for_column;
 use crate::storage::TikvStore;
 use crate::txn::txn_put;
-use crate::types::{DataType, IndexDef, Value};
 
 use super::super::{
     analyze_row_level_expr, check_expr_references_column, coerce_value_for_type_change,
@@ -30,7 +30,7 @@ pub(super) async fn alter_table_add_column(
     txn: &mut Transaction,
     db_id: u64,
     search_path: &[String],
-    schema: &mut crate::types::TableSchema,
+    schema: &mut crate::model::TableSchema,
     column_def: &sqlparser::ast::ColumnDef,
 ) -> Result<()> {
     let col_name = normalize_ident(&column_def.name);
@@ -68,7 +68,7 @@ pub(super) async fn alter_table_add_column(
             return Err(anyhow!("Cannot add NOT NULL column without DEFAULT"));
         }
     }
-    schema.columns.push(crate::types::ColumnDef {
+    schema.columns.push(crate::model::ColumnDef {
         name: col_name,
         data_type,
         nullable,
@@ -107,7 +107,7 @@ pub(super) async fn alter_table_drop_column(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    schema: &mut crate::types::TableSchema,
+    schema: &mut crate::model::TableSchema,
     column_name: &sqlparser::ast::Ident,
     if_exists: bool,
     cascade: bool,
@@ -197,7 +197,7 @@ pub(super) async fn alter_table_alter_column_set_data_type(
     txn: &mut Transaction,
     db_id: u64,
     search_path: &[String],
-    schema: &mut crate::types::TableSchema,
+    schema: &mut crate::model::TableSchema,
     collations: &[crate::sql::collation::CollationDef],
     col_name: &str,
     col_idx: usize,

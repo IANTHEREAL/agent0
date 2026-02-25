@@ -1,7 +1,7 @@
 use super::helpers::{int_col, int_val, text_array_col};
 use super::{ScanContext, VirtualTable};
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::{catalog_oids, role_settings};
-use crate::types::{Row, TableSchema, Value};
 use anyhow::Result;
 use async_trait::async_trait;
 

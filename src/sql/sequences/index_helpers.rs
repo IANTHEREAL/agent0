@@ -1,8 +1,8 @@
 //! Index definition formatting and OID-based lookup for `pg_get_indexdef()`.
 
+use crate::model::IndexDef;
 use crate::sql::catalog_oids;
 use crate::storage::TikvStore;
-use crate::types::IndexDef;
 use anyhow::Result;
 use std::sync::Arc;
 use tikv_client::Transaction;

@@ -63,12 +63,12 @@ use super::super::value_coercion::parse_value_for_copy;
 use super::super::{parse_sql, ExecuteResult, ExecuteResults, Session};
 use super::triggers::strip_leading_sql_comments;
 use crate::auth::AuthManager;
+use crate::model::{DataType, Row, TableSchema, Value};
 use crate::observability::TenantObservability;
 use crate::session_context;
 use crate::sql::error::SqlError;
 use crate::sql::optimizer::statistics::TableStatistics;
 use crate::storage::{with_kv_read_stats, KvReadStatsSnapshot, TikvStore};
-use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     AlterIndexOperation, Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr, Statement,

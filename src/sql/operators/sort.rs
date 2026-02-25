@@ -2,13 +2,13 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::analyzer::types::TypedOrderByExpr;
 use crate::sql::collation::ResolvedCollation;
 use crate::sql::expr::collation_aware::extract_resolved_collation;
 use crate::sql::expr::compare_order_by_values_collated;
 use crate::sql::expr::operators::sort_by_fallible;
 use crate::sql::expr::typed_eval::eval_typed_expr;
-use crate::types::{Row, TableSchema, Value};
 
 fn estimated_value_size(value: &Value) -> usize {
     match value {
@@ -19,7 +19,7 @@ fn estimated_value_size(value: &Value) -> usize {
         Value::Text(s) => s.len(),
         Value::Bytes(b) => b.len(),
         Value::Timestamp(_) => 8,
-        Value::Interval(_) => std::mem::size_of::<crate::types::IntervalValue>(),
+        Value::Interval(_) => std::mem::size_of::<crate::model::IntervalValue>(),
         Value::Uuid(_) => 16,
         Value::Array(arr) => {
             std::mem::size_of::<Vec<Value>>()
@@ -203,8 +203,8 @@ impl PhysicalOperator for SortOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ColumnDef, DataType};
     use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
-    use crate::types::{ColumnDef, DataType};
 
     fn test_schema() -> TableSchema {
         TableSchema {

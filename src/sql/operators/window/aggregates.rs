@@ -3,10 +3,10 @@
 use anyhow::Result;
 
 use super::{WindowFunctionExpr, WindowOperator};
+use crate::model::{Row, Value};
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::pg_numeric::pg_numeric_div;
 use crate::sql::query_context::QueryContext;
-use crate::types::{Row, Value};
 
 impl WindowOperator {
     pub(super) fn compute_sum(

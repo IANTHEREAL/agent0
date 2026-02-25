@@ -1,8 +1,8 @@
 use super::helpers::{bool_col, int_col, int_val, name_col, text_col, text_val};
 use super::{ScanContext, VirtualTable};
+use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::catalog_oids;
 use crate::sql::pg_types;
-use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::Result;
 use async_trait::async_trait;
 

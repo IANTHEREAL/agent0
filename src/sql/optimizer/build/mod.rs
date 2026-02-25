@@ -25,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{anyhow, Result};
 
 use super::physical_plan::{PhysicalNode, PhysicalPlan};
+use crate::model::{DataType, Row, TableSchema};
 use crate::sql::analyzer::types::{JoinType, SetOpKind, TypedExpr};
 use crate::sql::error::SqlError;
 use crate::sql::expr::typed_eval::eval_const_usize;
@@ -33,7 +34,6 @@ use crate::sql::operators::{
     HashJoinOperator, HashJoinType, HashSemiJoinOperator, LimitOperator, NestedLoopJoinOperator,
     ProjectOperator, SetOperationOperator, SetOperationType, SortOperator, TableScanOperator,
 };
-use crate::types::{DataType, Row, TableSchema};
 
 /// Context needed to translate a [`PhysicalPlan`] into operator trees.
 ///
@@ -100,7 +100,7 @@ impl PhysicalPlan {
                 let schema = TableSchema::new("__empty".to_string(), 0, vec![], vec![]);
                 Ok(Box::new(TableScanOperator::new_with_rows(
                     schema,
-                    vec![crate::types::Row::new(vec![])],
+                    vec![crate::model::Row::new(vec![])],
                 )))
             }
 
@@ -126,7 +126,7 @@ impl PhysicalPlan {
                         .columns
                         .iter()
                         .enumerate()
-                        .map(|(_i, (name, dt))| crate::types::ColumnDef {
+                        .map(|(_i, (name, dt))| crate::model::ColumnDef {
                             name: name.clone(),
                             data_type: dt.clone(),
                             nullable: true,

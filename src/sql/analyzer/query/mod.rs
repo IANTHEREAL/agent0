@@ -15,10 +15,10 @@ mod set_expr;
 
 use sqlparser::ast::{self as ast, Expr, Query, Select, SetExpr};
 
+use crate::model::{DataType, Value};
 use crate::sql::expr::typed_visit::expr_any;
 use crate::sql::types::coercion::common_type;
 use crate::sql::types::CastContext;
-use crate::types::{DataType, Value};
 
 use super::error::AnalyzerError;
 use super::scope::Scope;

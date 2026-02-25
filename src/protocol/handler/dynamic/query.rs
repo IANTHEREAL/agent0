@@ -6,10 +6,10 @@
 
 use super::DynamicPgHandler;
 use crate::auth::Privilege;
+use crate::model::DataType;
 use crate::sql::error::SqlError;
 use crate::sql::executor::core::prepared_analysis::PreparedAnalysis;
 use crate::sql::ExecuteResult;
-use crate::types::DataType;
 use async_trait::async_trait;
 use futures::{Sink, SinkExt};
 use pgwire::api::portal::Portal;
@@ -330,7 +330,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
                             search_path.iter().map(|s| s.as_str()).collect()
                         };
 
-                        let mut found: Option<(String, crate::types::TableSchema)> = None;
+                        let mut found: Option<(String, crate::model::TableSchema)> = None;
                         for schema_ident in schemas {
                             let resolved_table = format!("{}.{}", schema_ident, table_ident);
                             match executor

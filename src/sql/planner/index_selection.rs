@@ -10,7 +10,7 @@ use super::scan_type::{
     typed_expr_to_canonical_sql,
 };
 use super::{AccessPath, PredicateInfo, PredicateOp, ScanType};
-use crate::types::{IndexDef, TableSchema, Value};
+use crate::model::{IndexDef, TableSchema, Value};
 use crate::worker::types::IndexState;
 
 /// Choose the best B-tree access path for a typed filter expression.

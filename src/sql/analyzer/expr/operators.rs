@@ -6,10 +6,10 @@
 
 use sqlparser::ast::{self as ast, BinaryOperator, Expr, UnaryOperator};
 
+use crate::model::{DataType, Value};
 use crate::sql::types::coercion::{
     binary_op_result_type, common_type, comparison_target_type, is_numeric,
 };
-use crate::types::{DataType, Value};
 
 use crate::sql::analyzer::error::AnalyzerError;
 use crate::sql::analyzer::types::*;

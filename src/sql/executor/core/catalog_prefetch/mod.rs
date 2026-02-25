@@ -12,9 +12,9 @@ mod resolution;
 #[cfg(test)]
 mod tests;
 
+use crate::model::{Row, TableSchema};
 use crate::sql::analyzer::CatalogSnapshot;
 use crate::storage::TikvStore;
-use crate::types::{Row, TableSchema};
 use anyhow::Result;
 use sqlparser::ast::{Query, Statement};
 use std::collections::{HashMap, HashSet};

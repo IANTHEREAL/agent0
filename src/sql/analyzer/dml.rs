@@ -6,9 +6,9 @@
 
 use sqlparser::ast::{self, Expr, Ident, ObjectName, OnInsert, Query, SelectItem, SetExpr, Values};
 
+use crate::model::{DataType, Value};
 use crate::sql::names::{normalize_ident, split_object_name};
 use crate::sql::types::cast::CastContext;
-use crate::types::{DataType, Value};
 
 use super::error::AnalyzerError;
 use super::scope::Scope;
@@ -152,7 +152,7 @@ impl<'a> Analyzer<'a> {
         &mut self,
         on_insert: &OnInsert,
         table_cols: &[(String, DataType, bool, Option<String>)],
-        schema: &crate::types::TableSchema,
+        schema: &crate::model::TableSchema,
         table_scope_name: &str,
         table_name_for_errors: &str,
     ) -> Result<AnalyzedOnConflict, AnalyzerError> {
@@ -437,7 +437,7 @@ impl<'a> Analyzer<'a> {
     fn resolve_dml_target(
         &self,
         name: &ObjectName,
-    ) -> Result<(String, TableRefSchema, crate::types::TableSchema), AnalyzerError> {
+    ) -> Result<(String, TableRefSchema, crate::model::TableSchema), AnalyzerError> {
         let (schema_opt, obj_name) =
             split_object_name(name).map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
         let (resolved_name, table_schema) = self
@@ -461,7 +461,7 @@ impl<'a> Analyzer<'a> {
     /// Find a column index by name in a table schema.
     fn find_column_index(
         &self,
-        schema: &crate::types::TableSchema,
+        schema: &crate::model::TableSchema,
         col_name: &str,
         table_name: &str,
     ) -> Result<usize, AnalyzerError> {
@@ -517,7 +517,7 @@ impl<'a> Analyzer<'a> {
     fn analyze_dml_assignment_expr(
         &mut self,
         expr: &Expr,
-        schema: &crate::types::TableSchema,
+        schema: &crate::model::TableSchema,
         col_idx: usize,
     ) -> Result<TypedExpr, AnalyzerError> {
         let col = &schema.columns[col_idx];

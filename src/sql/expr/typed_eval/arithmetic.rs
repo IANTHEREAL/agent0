@@ -3,10 +3,10 @@
 //! Contains `eval_binary` (with short-circuit AND/OR), `eval_unary`,
 //! bitwise operations, shift operations, and the BinaryOp → sqlparser mapping.
 
+use crate::model::{Row, Value};
 use crate::sql::analyzer::types::*;
 use crate::sql::error::SqlError;
 use crate::sql::expr::operators::eval_binary_op;
-use crate::types::{Row, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::BinaryOperator;
 

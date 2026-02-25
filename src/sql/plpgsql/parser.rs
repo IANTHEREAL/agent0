@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
 
 use super::utils::parse_plpgsql_type;
-use crate::types::DataType;
+use crate::model::DataType;
 
 /// Represents a single PL/pgSQL statement.
 #[derive(Debug)]

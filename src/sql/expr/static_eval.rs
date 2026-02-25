@@ -4,11 +4,11 @@
 //! execution. It does not perform name resolution; callers must provide
 //! analyzer-produced `TypedExpr`.
 
+use crate::model::{Row, Value};
 use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::expr::typed_visit::expr_any;
 use crate::sql::query_context::QueryContext;
-use crate::types::{Row, Value};
 use anyhow::{anyhow, Result};
 
 /// Return true when an expression requires row values.
@@ -56,8 +56,8 @@ pub fn eval_static_typed_expr(expr: &TypedExpr, qctx: &QueryContext) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::DataType;
     use crate::sql::analyzer::types::{FunctionKind, ResolvedFunction};
-    use crate::types::DataType;
     use std::sync::Arc;
 
     fn test_qctx() -> QueryContext {

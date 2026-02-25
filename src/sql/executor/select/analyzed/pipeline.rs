@@ -6,6 +6,7 @@
 //! - Loading table schemas and statistics into [`PlanningContext`]
 //! - Loading virtual table data and table function results into [`BuildContext`]
 
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::analyzer::types::{
     AnalyzedDistinct, AnalyzedQueryBody, AnalyzedTableRef, AnalyzedTableRefKind, JoinCondition,
     TypedExpr, TypedExprKind, TypedFunctionArg, TypedOrderByExpr,
@@ -18,7 +19,6 @@ use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::names;
 use crate::sql::optimizer::{BuildContext, PlanningContext};
 use crate::sql::table_functions::is_virtual_table_backed_system_function;
-use crate::types::{Row, TableSchema, Value};
 
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{FunctionArg, FunctionArgExpr};
@@ -510,7 +510,7 @@ impl Executor {
                         table_id: 0,
                         columns: output_columns
                             .iter()
-                            .map(|(name, dt)| crate::types::ColumnDef {
+                            .map(|(name, dt)| crate::model::ColumnDef {
                                 name: name.clone(),
                                 data_type: dt.clone(),
                                 nullable: true,

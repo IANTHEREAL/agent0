@@ -536,7 +536,7 @@ impl SessionSettings {
                 }
             }
             "timezone" => {
-                crate::types::timestamp::TimeZoneSpec::try_parse(value)?;
+                crate::model::timestamp::TimeZoneSpec::try_parse(value)?;
                 Ok(value.to_string())
             }
             "client_encoding" => {

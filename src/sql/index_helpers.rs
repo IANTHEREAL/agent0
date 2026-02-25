@@ -1,7 +1,7 @@
 //! Index evaluation helpers for partial and expression indexes.
 
+use crate::model::{DataType, IndexDef, Row, TableSchema, Value};
 use crate::sql::query_context::QueryContext;
-use crate::types::{DataType, IndexDef, Row, TableSchema, Value};
 use anyhow::Result;
 use sqlparser::ast::Expr;
 
@@ -143,10 +143,10 @@ pub fn index_values_unchanged(
 mod tests {
     use super::*;
 
-    fn test_col(name: &str) -> crate::types::ColumnDef {
-        crate::types::ColumnDef {
+    fn test_col(name: &str) -> crate::model::ColumnDef {
+        crate::model::ColumnDef {
             name: name.to_string(),
-            data_type: crate::types::DataType::Text,
+            data_type: crate::model::DataType::Text,
             nullable: true,
             primary_key: false,
             unique: false,
@@ -156,7 +156,7 @@ mod tests {
         }
     }
 
-    fn test_schema(columns: Vec<crate::types::ColumnDef>) -> TableSchema {
+    fn test_schema(columns: Vec<crate::model::ColumnDef>) -> TableSchema {
         TableSchema {
             name: "public.t".to_string(),
             table_id: 1,
@@ -342,8 +342,8 @@ mod tests {
         }
     }
 
-    fn test_col_typed(name: &str, data_type: crate::types::DataType) -> crate::types::ColumnDef {
-        crate::types::ColumnDef {
+    fn test_col_typed(name: &str, data_type: crate::model::DataType) -> crate::model::ColumnDef {
+        crate::model::ColumnDef {
             name: name.to_string(),
             data_type,
             nullable: true,
@@ -359,7 +359,7 @@ mod tests {
     fn test_validate_index_predicate_accepts_boolean_expr() {
         let schema = test_schema(vec![test_col_typed(
             "active",
-            crate::types::DataType::Boolean,
+            crate::model::DataType::Boolean,
         )]);
         let expr = parse_expr("active");
         assert!(validate_index_predicate(&expr, &schema).is_ok());
@@ -367,14 +367,14 @@ mod tests {
 
     #[test]
     fn test_validate_index_predicate_accepts_comparison() {
-        let schema = test_schema(vec![test_col_typed("age", crate::types::DataType::Int32)]);
+        let schema = test_schema(vec![test_col_typed("age", crate::model::DataType::Int32)]);
         let expr = parse_expr("age > 0");
         assert!(validate_index_predicate(&expr, &schema).is_ok());
     }
 
     #[test]
     fn test_validate_index_predicate_rejects_non_boolean() {
-        let schema = test_schema(vec![test_col_typed("name", crate::types::DataType::Text)]);
+        let schema = test_schema(vec![test_col_typed("name", crate::model::DataType::Text)]);
         let expr = parse_expr("name");
         let err = validate_index_predicate(&expr, &schema).unwrap_err();
         assert!(
@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn test_validate_index_predicate_rejects_integer_expr() {
-        let schema = test_schema(vec![test_col_typed("x", crate::types::DataType::Int32)]);
+        let schema = test_schema(vec![test_col_typed("x", crate::model::DataType::Int32)]);
         let expr = parse_expr("x + 1");
         let err = validate_index_predicate(&expr, &schema).unwrap_err();
         assert!(

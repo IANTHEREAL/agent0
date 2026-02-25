@@ -1,9 +1,9 @@
 //! Utility functions for aggregate expression collection and GROUP BY matching.
 
 use super::aggregate::aggregate_identity_matches;
+use crate::model::{DataType, Value};
 use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
 use crate::sql::operators::AggregateExpr;
-use crate::types::{DataType, Value};
 
 /// Find the index of a GROUP BY expression that matches `expr`.
 pub(crate) fn find_matching_group_by(expr: &TypedExpr, group_by: &[TypedExpr]) -> Option<usize> {

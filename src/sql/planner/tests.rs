@@ -9,12 +9,12 @@ use super::scan_type::{
     typed_expr_to_canonical_sql,
 };
 use super::*;
-use crate::types::{IndexDef, TableSchema};
+use crate::model::{IndexDef, TableSchema};
 
+use crate::model::DataType;
 use crate::sql::analyzer::types::{
     BinaryOp as TypedBinaryOp, ResolvedFunction, TypedExpr, TypedExprKind,
 };
-use crate::types::DataType;
 
 fn typed_constant(v: Value, dt: DataType) -> TypedExpr {
     TypedExpr {
@@ -50,7 +50,7 @@ fn gin_schema() -> TableSchema {
         name: "docs".to_string(),
         table_id: 1,
         columns: vec![
-            crate::types::ColumnDef {
+            crate::model::ColumnDef {
                 name: "id".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
@@ -60,7 +60,7 @@ fn gin_schema() -> TableSchema {
                 default_expr: None,
                 collation: None,
             },
-            crate::types::ColumnDef {
+            crate::model::ColumnDef {
                 name: "body".to_string(),
                 data_type: DataType::Tsvector,
                 nullable: true,
@@ -70,7 +70,7 @@ fn gin_schema() -> TableSchema {
                 default_expr: None,
                 collation: None,
             },
-            crate::types::ColumnDef {
+            crate::model::ColumnDef {
                 name: "data".to_string(),
                 data_type: DataType::Jsonb,
                 nullable: true,
@@ -152,7 +152,7 @@ fn test_gin_typed_no_gin_index_falls_back() {
     let schema = TableSchema {
         name: "plain".to_string(),
         table_id: 1,
-        columns: vec![crate::types::ColumnDef {
+        columns: vec![crate::model::ColumnDef {
             name: "body".to_string(),
             data_type: DataType::Tsvector,
             nullable: true,
@@ -189,7 +189,7 @@ fn test_expression_index_typed_lower() {
     let schema = TableSchema {
         name: "users".to_string(),
         table_id: 1,
-        columns: vec![crate::types::ColumnDef {
+        columns: vec![crate::model::ColumnDef {
             name: "name".to_string(),
             data_type: DataType::Text,
             nullable: false,
@@ -258,7 +258,7 @@ fn test_partial_index_typed_exact_predicate() {
         name: "orders".to_string(),
         table_id: 1,
         columns: vec![
-            crate::types::ColumnDef {
+            crate::model::ColumnDef {
                 name: "id".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
@@ -268,7 +268,7 @@ fn test_partial_index_typed_exact_predicate() {
                 default_expr: None,
                 collation: None,
             },
-            crate::types::ColumnDef {
+            crate::model::ColumnDef {
                 name: "status".to_string(),
                 data_type: DataType::Text,
                 nullable: false,
@@ -335,7 +335,7 @@ fn test_partial_index_typed_missing_predicate() {
         name: "orders".to_string(),
         table_id: 1,
         columns: vec![
-            crate::types::ColumnDef {
+            crate::model::ColumnDef {
                 name: "id".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
@@ -345,7 +345,7 @@ fn test_partial_index_typed_missing_predicate() {
                 default_expr: None,
                 collation: None,
             },
-            crate::types::ColumnDef {
+            crate::model::ColumnDef {
                 name: "status".to_string(),
                 data_type: DataType::Text,
                 nullable: false,

@@ -1,7 +1,7 @@
 //! Tests for the hash join module.
 
 use super::*;
-use crate::types::{ColumnDef, DataType};
+use crate::model::{ColumnDef, DataType};
 
 fn schema_left() -> TableSchema {
     TableSchema {

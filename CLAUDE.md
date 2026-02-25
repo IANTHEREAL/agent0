@@ -134,7 +134,7 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 ### Architecture / Code quality
 
 - **#696** Statement-type detection duplicated in query_parser.rs and dispatch.rs.
-- **#695** Dual type module hierarchy (src/types/ vs src/sql/types/).
+- **#695** Dual type module hierarchy (src/model/ vs src/sql/types/).
 - **#694** bincode serialization in SQL layer couples to storage encoding.
 - **#693** Version column name rewriting in wire encoding layer.
 - **#779** Per-tenant resource governance: connection caps → tenant QPS → timeout enforcement → memory/backpressure.
@@ -246,7 +246,7 @@ db9-server/
 │   ├── cron/                          # pg_cron-compatible scheduler (parser, types, config, worker, process_list)
 │   ├── extensions/                    # HTTP extensions + fs9 file system (backend, decoders, streaming, glob)
 │   ├── auth/                          # Authentication + RBAC
-│   ├── types/                         # Type system (separate from sql/types/ — debt #695)
+│   ├── model/                         # Data model types (DataType, Value, Row, TableSchema)
 │   ├── txn/                           # Transaction state + savepoints
 │   ├── main.rs                        # Server entry point (TLS, worker/cron startup)
 │   ├── cli.rs                         # CLI argument parser

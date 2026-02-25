@@ -1,7 +1,7 @@
 //! Tests for the encoding module.
 
 use super::*;
-use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
 
 #[test]
 fn test_encode_database_name_key() {

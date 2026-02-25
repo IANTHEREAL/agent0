@@ -17,12 +17,12 @@ mod helpers;
 #[cfg(test)]
 mod tests;
 
+use crate::model::{Row, Value};
 use crate::sql::analyzer::types::*;
 use crate::sql::expr::operators::compare_values;
 use crate::sql::expr::typed_fold::is_fold_candidate;
 use crate::sql::query_context::QueryContext;
 use crate::sql::types::cast;
-use crate::types::{Row, Value};
 use anyhow::{anyhow, Result};
 
 use arithmetic::{eval_binary, eval_unary};

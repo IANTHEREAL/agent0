@@ -9,6 +9,9 @@ use sqlparser::ast::{
 };
 use tikv_client::Transaction;
 
+use crate::model::{
+    CheckConstraint, ColumnDef, DataType, ForeignKeyConstraint, IndexDef, Row, TableSchema, Value,
+};
 use crate::sql::dml::resolve_fk_ref_lookup;
 use crate::sql::error::SqlError;
 use crate::sql::names;
@@ -17,9 +20,6 @@ use crate::sql::types::sql_datatype_to_internal_strict;
 use crate::sql::value_coercion::infer_data_type;
 use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
-use crate::types::{
-    CheckConstraint, ColumnDef, DataType, ForeignKeyConstraint, IndexDef, Row, TableSchema, Value,
-};
 use crate::worker::types::IndexState;
 
 use super::{

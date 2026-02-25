@@ -1,8 +1,8 @@
 //\! Tests for TypedExpr tree traversal primitives.
 
 use super::*;
+use crate::model::{DataType, Value};
 use crate::sql::analyzer::types::{BinaryOp, FunctionKind, ResolvedFunction, WindowFrameUnits};
-use crate::types::{DataType, Value};
 
 fn int_const(v: i32) -> TypedExpr {
     TypedExpr::new(TypedExprKind::Constant(Value::Int32(v)), DataType::Int32)

@@ -1,9 +1,9 @@
+use crate::model::{FunctionDef, Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::names;
 use crate::sql::plpgsql;
 use crate::sql::quoting;
 use crate::sql::{parse_sql, ExecuteResult};
-use crate::types::{FunctionDef, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, ObjectName, TableAlias};
 use std::collections::HashMap;
@@ -278,8 +278,8 @@ fn is_returns_table(ret_lower: &str) -> bool {
     ret_lower.starts_with("table(") || ret_lower.starts_with("table (")
 }
 
-fn parse_returns_table_columns(ret_lower: &str) -> Option<Vec<(String, crate::types::DataType)>> {
-    use crate::types::DataType;
+fn parse_returns_table_columns(ret_lower: &str) -> Option<Vec<(String, crate::model::DataType)>> {
+    use crate::model::DataType;
 
     let inner = ret_lower
         .strip_prefix("table")
@@ -337,8 +337,8 @@ fn parse_returns_table_columns(ret_lower: &str) -> Option<Vec<(String, crate::ty
     }
 }
 
-fn build_returns_table_schema(declared_cols: &[(String, crate::types::DataType)]) -> TableSchema {
-    use crate::types::ColumnDef;
+fn build_returns_table_schema(declared_cols: &[(String, crate::model::DataType)]) -> TableSchema {
+    use crate::model::ColumnDef;
 
     let cols: Vec<ColumnDef> = declared_cols
         .iter()
@@ -366,9 +366,9 @@ fn build_returns_table_schema(declared_cols: &[(String, crate::types::DataType)]
 fn build_output_schema(
     table_name: &str,
     columns: &[String],
-    column_types: &Option<Vec<crate::types::DataType>>,
+    column_types: &Option<Vec<crate::model::DataType>>,
 ) -> TableSchema {
-    use crate::types::{ColumnDef, DataType};
+    use crate::model::{ColumnDef, DataType};
 
     let cols: Vec<ColumnDef> = columns
         .iter()

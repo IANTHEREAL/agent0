@@ -8,6 +8,7 @@
 //! - Nested query collection for CTE materialization
 //! - AnyAll comparison type coercion helpers
 
+use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::{
     AnalyzedDistinct, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind,
     JoinCondition, TypedExpr, TypedExprKind, TypedFunctionArg, TypedOrderByExpr,
@@ -19,7 +20,6 @@ use crate::sql::expr::typed_eval::eval_const_usize;
 use crate::sql::optimizer::BuildContext;
 use crate::sql::types::coercion::comparison_target_type;
 use crate::sql::types::CastContext;
-use crate::types::{DataType, Row, TableSchema, Value};
 
 use anyhow::{anyhow, Result};
 use tikv_client::Transaction;
@@ -299,7 +299,7 @@ pub(super) fn build_schema_from_columns(
         0,
         columns
             .iter()
-            .map(|(col_name, dt, _coll)| crate::types::ColumnDef {
+            .map(|(col_name, dt, _coll)| crate::model::ColumnDef {
                 name: col_name.clone(),
                 data_type: dt.clone(),
                 nullable: true,

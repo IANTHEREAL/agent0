@@ -4,8 +4,8 @@
 //! PostgreSQL wire protocol error responses. Uses `#[from] anyhow::Error`
 //! as a bridge so existing `anyhow!()` call sites can be migrated gradually.
 
+use crate::model::DataType;
 use crate::sql::analyzer::AnalyzerError;
-use crate::types::DataType;
 
 fn column_not_found_display(column: &str, hint: &Option<String>) -> String {
     match hint {

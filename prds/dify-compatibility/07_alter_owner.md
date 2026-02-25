@@ -42,7 +42,7 @@ ALTER SEQUENCE public.task_id_sequence OWNER TO postgres;
 在 `TableSchema` 中添加 owner 字段：
 
 ```rust
-// src/types/mod.rs
+// src/model/mod.rs
 
 pub struct TableSchema {
     pub table_id: u64,
@@ -60,7 +60,7 @@ pub struct TableSchema {
 对于序列和函数，也需要添加 owner 字段：
 
 ```rust
-// src/types/mod.rs
+// src/model/mod.rs
 
 pub struct Sequence {
     pub name: String,
@@ -99,7 +99,7 @@ _sys_proc_{proc_name}       → StoredProcedure (包含 owner)
 #### 1) 更新类型定义
 
 ```rust
-// src/types/mod.rs
+// src/model/mod.rs
 
 impl TableSchema {
     pub fn new(table_name: String) -> Self {

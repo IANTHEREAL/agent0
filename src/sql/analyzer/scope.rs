@@ -6,7 +6,7 @@
 //! the `ColumnRef` node — enabling correlated subquery evaluation without
 //! `SubstituteVisitor`.
 
-use crate::types::DataType;
+use crate::model::DataType;
 use std::collections::HashMap;
 
 use super::error::AnalyzerError;
@@ -120,7 +120,7 @@ impl Scope {
     ///
     /// Convenience for DML contexts where the target table is already known as a
     /// `TableSchema`. Columns are added in schema order with their catalog types.
-    pub fn from_table_schema(alias: &str, schema: &crate::types::TableSchema) -> Self {
+    pub fn from_table_schema(alias: &str, schema: &crate::model::TableSchema) -> Self {
         let mut scope = Self::new();
         let cols: Vec<(String, DataType, bool, Option<String>)> = schema
             .columns

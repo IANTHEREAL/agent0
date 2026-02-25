@@ -8,12 +8,12 @@
 //! - TypedExpr from the Analyzer is reused directly — no re-lowering.
 //! - No cost or physical information in the logical plan.
 
+use crate::model::DataType;
 use crate::sql::analyzer::types::{
     AnalyzedProjection, JoinCondition, JoinType, SetOpKind, TypedExpr, TypedFunctionArg,
     TypedOrderByExpr,
 };
 use crate::sql::operators::WindowFunctionExpr;
-use crate::types::DataType;
 
 /// A logical plan tree node.
 #[derive(Debug, Clone)]
@@ -434,10 +434,10 @@ impl LogicalPlan {
 #[cfg(test)]
 mod tests {
     use super::{LogicalNode, LogicalPlan, PlanSchema};
+    use crate::model::{DataType, Value};
     use crate::sql::analyzer::types::{
         JoinCondition, JoinType, SetOpKind, TypedExpr, TypedExprKind,
     };
-    use crate::types::{DataType, Value};
 
     fn one_col_schema(name: &str) -> PlanSchema {
         PlanSchema::from_columns(vec![(name.to_string(), DataType::Int64)])

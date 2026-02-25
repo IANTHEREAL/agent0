@@ -196,7 +196,7 @@ fn hash_json_number(mut h: u64, n: &JsonNumber) -> u64 {
 // ARRAY GIN Token Extraction
 // ----------------------------
 
-use crate::types::{DataType, IndexDef, Row, TableSchema, Value};
+use crate::model::{DataType, IndexDef, Row, TableSchema, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GinColumnType {
@@ -538,7 +538,7 @@ mod tests {
         let schema = TableSchema::new(
             "public.docs".to_string(),
             1,
-            vec![crate::types::ColumnDef {
+            vec![crate::model::ColumnDef {
                 name: "payload".to_string(),
                 data_type: DataType::Jsonb,
                 nullable: true,

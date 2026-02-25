@@ -1,6 +1,6 @@
 use super::helpers::{bool_col, int_col, int_val, null_val, text_col, text_val};
 use super::{ScanContext, VirtualTable};
-use crate::types::{Row, TableSchema, Value};
+use crate::model::{Row, TableSchema, Value};
 use anyhow::Result;
 use async_trait::async_trait;
 

@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use sqlparser::ast::{JoinConstraint, JoinOperator, Select, TableWithJoins};
 
-use crate::types::{DataType, TableSchema};
+use crate::model::{DataType, TableSchema};
 
 use super::names::normalize_ident;
 
@@ -208,7 +208,7 @@ mod tests {
 
     use sqlparser::ast::{SetExpr, Statement};
 
-    use crate::types::ColumnDef;
+    use crate::model::ColumnDef;
 
     fn test_column(name: &str, data_type: DataType) -> ColumnDef {
         ColumnDef {

@@ -926,7 +926,7 @@ fn should_start_cic_backfill(state: IndexState) -> bool {
     matches!(state, IndexState::Building)
 }
 
-fn repair_incomplete_cic_states(schema: &mut crate::types::TableSchema) -> u32 {
+fn repair_incomplete_cic_states(schema: &mut crate::model::TableSchema) -> u32 {
     let mut repaired = 0u32;
     for idx in &mut schema.indexes {
         if matches!(idx.state, IndexState::Building | IndexState::WriteOnly) {
@@ -979,7 +979,7 @@ fn compute_next_fire_time(schedule: &str) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{DataType, IndexDef, TableSchema};
+    use crate::model::{DataType, IndexDef, TableSchema};
 
     fn idx(name: &str, state: IndexState) -> IndexDef {
         IndexDef {
@@ -999,7 +999,7 @@ mod tests {
         let mut schema = TableSchema {
             name: "public.t".to_string(),
             table_id: 1,
-            columns: vec![crate::types::ColumnDef {
+            columns: vec![crate::model::ColumnDef {
                 name: "c1".to_string(),
                 data_type: DataType::Int32,
                 nullable: true,

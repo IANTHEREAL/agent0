@@ -5,12 +5,12 @@ use async_trait::async_trait;
 
 use super::key_encoding::{encode_value_key, encode_values_key};
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
+use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::{TypedExpr, TypedOrderByExpr};
 use crate::sql::expr::compare_order_by_values;
 use crate::sql::expr::operators::sort_by_fallible;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::Aggregator;
-use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
 #[derive(Debug, Clone)]
 pub struct AggregateExpr {

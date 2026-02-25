@@ -1,4 +1,4 @@
-use crate::types::DataType;
+use crate::model::DataType;
 
 pub(crate) const OID_BOOL: i64 = 16;
 pub(crate) const OID_BYTEA: i64 = 17;

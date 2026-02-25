@@ -1,7 +1,7 @@
 //! Math function registrations.
 
 use super::FunctionSignature;
-use crate::types::DataType;
+use crate::model::DataType;
 
 pub(super) fn register(r: &mut super::FunctionRegistry) {
     // Math functions

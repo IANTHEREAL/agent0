@@ -262,7 +262,7 @@ To understand db9-server in ~2.5 hours:
 
 1. `CLAUDE.md` — project overview (5 min)
 2. `src/main.rs` — entry point (10 min)
-3. `src/types/mod.rs` — type system (20 min)
+3. `src/model/mod.rs` — type system (20 min)
 4. `src/storage/encoding.rs` — key layout (30 min, **critical**)
 5. `src/sql/session.rs` — transaction state machine (15 min)
 6. `src/sql/parser.rs` — SQL preprocessing (15 min)

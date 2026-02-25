@@ -99,9 +99,9 @@ I confirm these findings as materially correct:
 - `src/storage/tikv_store/mod.rs:94`
 
 10. Compatibility gaps confirmed by code surface.
-- no real `unknown` type in `DataType`: `src/types/mod.rs:53`
+- no real `unknown` type in `DataType`: `src/model/mod.rs:53`
 - only partial unknown-literal emulation: `src/sql/analyzer/expr.rs:1090`
-- numeric backend max 28 digits: `src/types/mod.rs:72`
+- numeric backend max 28 digits: `src/model/mod.rs:72`
 - `CREATE DOMAIN` unsupported: `src/sql/raw_sql.rs:278`
 - catalog set missing `pg_operator`/`pg_cast`/`pg_stat_user_tables` registrations: `src/sql/catalog/mod.rs:74`
 

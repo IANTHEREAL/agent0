@@ -2,11 +2,11 @@
 //! WHERE clause splitting).
 
 use super::*;
+use crate::model::DataType;
 use crate::sql::analyzer::types::{
     AnalyzedDistinct, AnalyzedProjection, AnalyzedQueryBody, AnalyzedTableRef,
     AnalyzedTableRefKind, BinaryOp, FunctionKind, ResolvedFunction, TypedFunctionArg,
 };
-use crate::types::DataType;
 
 fn int_const(v: i32) -> TypedExpr {
     TypedExpr::new(TypedExprKind::Constant(Value::Int32(v)), DataType::Int32)

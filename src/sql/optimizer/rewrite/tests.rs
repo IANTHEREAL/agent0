@@ -1,10 +1,10 @@
 //! Tests for logical plan rewrite rules.
 
 use super::*;
+use crate::model::Value;
 use crate::sql::analyzer::types::{FunctionKind, ResolvedFunction};
 use crate::sql::expr::typed_fold::{fold_typed_expr, is_volatile_or_side_effecting_builtin};
 use crate::sql::query_context::QueryContext;
-use crate::types::Value;
 use std::sync::Arc;
 
 // ── Test helpers ───────────────────────────────────────

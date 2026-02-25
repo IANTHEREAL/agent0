@@ -1,4 +1,4 @@
-use crate::types::{Row, TableSchema, Value};
+use crate::model::{Row, TableSchema, Value};
 
 use crate::sql::quoting;
 
@@ -211,7 +211,7 @@ pub(crate) fn value_to_sql_literal(value: &Value) -> String {
                 .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH);
             format!("'{}'", datetime.format("%Y-%m-%d %H:%M:%S%.3f"))
         }
-        Value::Date(days) => match crate::types::date::format_date_days(*days) {
+        Value::Date(days) => match crate::model::date::format_date_days(*days) {
             Ok(s) => format!("'{}'", s),
             Err(_) => format!("'{}'", days),
         },

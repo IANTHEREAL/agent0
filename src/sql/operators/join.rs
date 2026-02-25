@@ -3,10 +3,10 @@ use async_trait::async_trait;
 use sqlparser::ast::JoinOperator;
 
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
+use crate::model::{ColumnDef, Row, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::expr::classify::needs_async;
 use crate::sql::expr::typed_eval::eval_typed_expr;
-use crate::types::{ColumnDef, Row, TableSchema, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JoinType {
@@ -395,9 +395,9 @@ impl PhysicalOperator for NestedLoopJoinOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::DataType;
     use crate::sql::analyzer::types::{BinaryOp as TypedBinaryOp, TypedExprKind};
     use crate::sql::operators::scan::TableScanOperator;
-    use crate::types::DataType;
 
     fn users_schema() -> TableSchema {
         TableSchema {

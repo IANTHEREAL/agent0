@@ -2,7 +2,7 @@
 //! FTS, bytea, vector, FS9, background SQL, visibility, and GROUPING.
 
 use super::{FunctionSignature, ReturnType};
-use crate::types::DataType;
+use crate::model::DataType;
 
 pub(super) fn register(r: &mut super::FunctionRegistry) {
     // Array functions

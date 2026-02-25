@@ -9,7 +9,7 @@ use crate::sql::operators::{
     BoxedOperator, HashJoinConfig, HashJoinOperator, HashJoinType, JoinType as OpJoinType,
     NestedLoopJoinOperator,
 };
-use crate::types::{DataType, TableSchema};
+use crate::model::{DataType, TableSchema};
 use anyhow::Result;
 
 /// Build a synthetic TableSchema for set operation intermediate results.
@@ -23,7 +23,7 @@ pub(super) fn build_set_op_schema(columns: &[String], types: &[DataType]) -> Tab
         columns: columns
             .iter()
             .zip(types.iter())
-            .map(|(name, dt)| crate::types::ColumnDef {
+            .map(|(name, dt)| crate::model::ColumnDef {
                 name: name.clone(),
                 data_type: dt.clone(),
                 nullable: true,

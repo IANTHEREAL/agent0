@@ -7,6 +7,7 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::ObjectName;
 use tikv_client::Transaction;
 
+use crate::model::{CheckConstraint, DataType, ForeignKeyConstraint, Value};
 use crate::sql::dml::{resolve_fk_ref_lookup, FkRefLookup};
 use crate::sql::error::SqlError;
 use crate::sql::names;
@@ -15,7 +16,6 @@ use crate::sql::projection::fill_row_defaults;
 use crate::sql::query_context::QueryContext;
 use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
-use crate::types::{CheckConstraint, DataType, ForeignKeyConstraint, Value};
 use crate::worker::types::IndexState;
 
 use super::super::create_table::check_relation_name_available;
@@ -31,7 +31,7 @@ pub(super) async fn alter_table_add_primary_key(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    schema: &mut crate::types::TableSchema,
+    schema: &mut crate::model::TableSchema,
     table_object_name: &str,
     full_table_name: &str,
     name: &Option<sqlparser::ast::Ident>,
@@ -77,7 +77,7 @@ pub(super) async fn alter_table_add_unique_constraint(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    schema: &mut crate::types::TableSchema,
+    schema: &mut crate::model::TableSchema,
     table_object_name: &str,
     full_table_name: &str,
     name: &Option<sqlparser::ast::Ident>,
@@ -106,7 +106,7 @@ pub(super) async fn alter_table_add_unique_constraint(
     check_relation_name_available(store, txn, db_id, owning_schema, &index_name, false, None)
         .await?;
 
-    let new_index = crate::types::IndexDef {
+    let new_index = crate::model::IndexDef {
         id: schema
             .indexes
             .iter()
@@ -183,7 +183,7 @@ pub(super) async fn alter_table_add_foreign_key(
     txn: &mut Transaction,
     db_id: u64,
     search_path: &[String],
-    schema: &mut crate::types::TableSchema,
+    schema: &mut crate::model::TableSchema,
     table_object_name: &str,
     constraint_name: &Option<sqlparser::ast::Ident>,
     columns: &[sqlparser::ast::Ident],
@@ -334,7 +334,7 @@ pub(super) async fn alter_table_add_check_constraint(
     txn: &mut Transaction,
     db_id: u64,
     search_path: &[String],
-    schema: &mut crate::types::TableSchema,
+    schema: &mut crate::model::TableSchema,
     table_object_name: &str,
     collations: &[crate::sql::collation::CollationDef],
     constraint_name: &Option<sqlparser::ast::Ident>,
@@ -414,7 +414,7 @@ pub(super) async fn alter_table_drop_constraint(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    schema: &mut crate::types::TableSchema,
+    schema: &mut crate::model::TableSchema,
     full_table_name: &str,
     table_object_name: &str,
     result_table_name: &str,

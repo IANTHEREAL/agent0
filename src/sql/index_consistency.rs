@@ -5,8 +5,8 @@ use tikv_client::Transaction;
 
 use super::index_helpers;
 use super::projection::fill_row_defaults;
+use crate::model::{DataType, IndexDef, TableSchema, Value};
 use crate::storage::TikvStore;
-use crate::types::{DataType, IndexDef, TableSchema, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UniqueConflictResolution {
@@ -157,7 +157,7 @@ pub(crate) async fn resolve_unique_index_conflict(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ColumnDef;
+    use crate::model::ColumnDef;
 
     #[test]
     fn duplicate_error_matcher_detects_known_message() {

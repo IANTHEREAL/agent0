@@ -14,9 +14,9 @@ mod operators;
 
 use sqlparser::ast::{self as ast, BinaryOperator, Expr, TrimWhereField};
 
+use crate::model::{DataType, Value};
 use crate::sql::types::cast::CastContext;
 use crate::sql::types::mapping::sql_datatype_to_internal;
-use crate::types::{DataType, Value};
 
 use super::error::AnalyzerError;
 use super::types::*;

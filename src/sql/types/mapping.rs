@@ -6,8 +6,8 @@ use sqlparser::ast::{
     TimezoneInfo,
 };
 
+use crate::model::DataType;
 use crate::sql::error::SqlError;
-use crate::types::DataType;
 
 #[derive(Debug, Clone, Copy)]
 enum UnknownCustomMode {

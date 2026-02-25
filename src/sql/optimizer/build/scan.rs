@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Result};
 
 use super::BuildContext;
+use crate::model::{DataType, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::operators::{
     BoxedOperator, InListScanOperator, IndexScanOperator, ProjectOperator, RangeIndexScanOperator,
@@ -13,7 +14,6 @@ use crate::sql::operators::{
 use crate::sql::optimizer::physical_plan::{PhysicalNode, PhysicalPlan};
 use crate::sql::planner::{collect_typed_eq_predicates, ScanType};
 use crate::sql::value_coercion::coerce_value_for_column;
-use crate::types::{DataType, TableSchema, Value};
 
 pub(super) fn build_seq_scan_operator(
     ctx: &BuildContext,

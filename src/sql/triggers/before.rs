@@ -2,8 +2,8 @@
 
 use super::cache::{TriggerBodyCache, TriggerStatement};
 use super::rewrite::substitute_row_references;
+use crate::model::{FunctionDef, Row, TableSchema, TriggerDef};
 use crate::storage::TikvStore;
-use crate::types::{FunctionDef, Row, TableSchema, TriggerDef};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -117,7 +117,7 @@ async fn execute_trigger_function(
     db_id: u64,
     sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
-    func_def: &crate::types::FunctionDef,
+    func_def: &crate::model::FunctionDef,
     schema: &TableSchema,
     new_row: &Row,
     old_row: Option<&Row>,
@@ -248,8 +248,8 @@ async fn execute_trigger_body_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Value;
     use crate::sql::triggers::rewrite::value_to_sql_literal;
-    use crate::types::Value;
 
     #[test]
     fn test_substitute_row_references() {
@@ -257,9 +257,9 @@ mod tests {
             name: "test".to_string(),
             table_id: 1,
             columns: vec![
-                crate::types::ColumnDef {
+                crate::model::ColumnDef {
                     name: "id".to_string(),
-                    data_type: crate::types::DataType::Int32,
+                    data_type: crate::model::DataType::Int32,
                     nullable: false,
                     primary_key: true,
                     unique: false,
@@ -267,9 +267,9 @@ mod tests {
                     default_expr: None,
                     collation: None,
                 },
-                crate::types::ColumnDef {
+                crate::model::ColumnDef {
                     name: "updated_at".to_string(),
-                    data_type: crate::types::DataType::Timestamp,
+                    data_type: crate::model::DataType::Timestamp,
                     nullable: true,
                     primary_key: false,
                     unique: false,
@@ -303,9 +303,9 @@ mod tests {
             name: "test".to_string(),
             table_id: 1,
             columns: vec![
-                crate::types::ColumnDef {
+                crate::model::ColumnDef {
                     name: "id".to_string(),
-                    data_type: crate::types::DataType::Int32,
+                    data_type: crate::model::DataType::Int32,
                     nullable: false,
                     primary_key: true,
                     unique: false,
@@ -313,9 +313,9 @@ mod tests {
                     default_expr: None,
                     collation: None,
                 },
-                crate::types::ColumnDef {
+                crate::model::ColumnDef {
                     name: "id2".to_string(),
-                    data_type: crate::types::DataType::Int32,
+                    data_type: crate::model::DataType::Int32,
                     nullable: false,
                     primary_key: false,
                     unique: false,
@@ -354,9 +354,9 @@ mod tests {
             name: "test".to_string(),
             table_id: 1,
             columns: vec![
-                crate::types::ColumnDef {
+                crate::model::ColumnDef {
                     name: "a".to_string(),
-                    data_type: crate::types::DataType::Int32,
+                    data_type: crate::model::DataType::Int32,
                     nullable: false,
                     primary_key: false,
                     unique: false,
@@ -364,9 +364,9 @@ mod tests {
                     default_expr: None,
                     collation: None,
                 },
-                crate::types::ColumnDef {
+                crate::model::ColumnDef {
                     name: "aa".to_string(),
-                    data_type: crate::types::DataType::Int32,
+                    data_type: crate::model::DataType::Int32,
                     nullable: false,
                     primary_key: false,
                     unique: false,
@@ -396,9 +396,9 @@ mod tests {
             name: "test".to_string(),
             table_id: 1,
             columns: vec![
-                crate::types::ColumnDef {
+                crate::model::ColumnDef {
                     name: "a".to_string(),
-                    data_type: crate::types::DataType::Int32,
+                    data_type: crate::model::DataType::Int32,
                     nullable: false,
                     primary_key: false,
                     unique: false,
@@ -406,9 +406,9 @@ mod tests {
                     default_expr: None,
                     collation: None,
                 },
-                crate::types::ColumnDef {
+                crate::model::ColumnDef {
                     name: "aa".to_string(),
-                    data_type: crate::types::DataType::Int32,
+                    data_type: crate::model::DataType::Int32,
                     nullable: false,
                     primary_key: false,
                     unique: false,

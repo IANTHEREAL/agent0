@@ -10,13 +10,13 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::{AlterColumnOperation, AlterTableOperation, TableConstraint};
 use tikv_client::Transaction;
 
+use crate::model::{DataType, Value};
 use crate::sql::error::SqlError;
 use crate::sql::names;
 use crate::sql::names::normalize_ident;
 use crate::sql::projection::fill_row_defaults;
 use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
-use crate::types::{DataType, Value};
 
 use super::{
     assign_generated_check_constraint_names, check_expr_references_column, constraint_name_exists,

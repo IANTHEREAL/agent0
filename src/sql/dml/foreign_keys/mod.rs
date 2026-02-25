@@ -10,10 +10,10 @@ use anyhow::anyhow;
 use anyhow::Result;
 use tikv_client::Transaction;
 
+use crate::model::{DataType, ForeignKeyConstraint, Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::expr::compare_values;
 use crate::storage::TikvStore;
-use crate::types::{DataType, ForeignKeyConstraint, Row, TableSchema, Value};
 use crate::worker::types::IndexState;
 
 // ── Re-exports from submodules ──────────────────────────────────────────────

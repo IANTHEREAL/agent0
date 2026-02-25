@@ -51,7 +51,7 @@
     - `get_function/list_functions` assign `FunctionDef.oid` when missing and persist.
     - `list_triggers` assigns `TriggerDef.oid` when missing and persists (table+name key).
     - `create_sequence/create_function/replace_function/create_trigger` ensure OID is set before persisting.
-- `src/types/mod.rs`
+- `src/model/mod.rs`
   - New persisted OID fields (serde default 0 for backward compatibility):
     - `SequenceDef { oid: u32, ... }`
     - `FunctionDef { oid: u32, ... }`
@@ -82,13 +82,13 @@
     - `list_schema_oids(...)` reads OIDs; upgrades legacy empty values by allocating + persisting.
     - `list_schemas(...)` still scans keys for names (built-ins + custom).
 - Sequences:
-  - `src/types/mod.rs`: `SequenceDef { oid, schema, name, start_value, increment, min_value, max_value, cache_size, is_cycled, owned_by, owner, backing }`.
+  - `src/model/mod.rs`: `SequenceDef { oid, schema, name, start_value, increment, min_value, max_value, cache_size, is_cycled, owned_by, owner, backing }`.
   - `src/storage/tikv_store.rs`: `create_sequence/get_sequence/list_sequences` serialize/deserialize `SequenceDef` via `bincode`.
   - `src/sql/information_schema.rs`: sequences appear in:
     - `pg_class` (`relkind='S'`, OID = `catalog_oids::pg_class_sequence_oid(SequenceDef.oid)`)
     - `pg_sequence` (`seqrelid` matches the `pg_class` OID)
 - Functions / triggers:
-  - `src/types/mod.rs`: `FunctionDef { oid, ... }` and `TriggerDef { oid, ... }` stored via `bincode`.
+  - `src/model/mod.rs`: `FunctionDef { oid, ... }` and `TriggerDef { oid, ... }` stored via `bincode`.
   - `src/storage/tikv_store.rs`: CRUD + list for functions/triggers.
   - `src/sql/information_schema.rs`:
     - `pg_proc.oid` is derived from persisted function OID (`catalog_oids::pg_proc_function_oid(FunctionDef.oid)`).

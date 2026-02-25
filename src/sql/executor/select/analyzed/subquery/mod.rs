@@ -4,13 +4,13 @@
 //! outer-reference substitution (`substitute_outer_refs_in_query`,
 //! `substitute_outer_refs_in_expr`).
 
+use crate::model::{Row, Value};
 use crate::sql::analyzer::types::{
     AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind, JoinCondition,
     TypedExpr, TypedExprKind, TypedFunctionArg, TypedOrderByExpr,
 };
 use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::expr::traverse::{map_children, visit_any};
-use crate::types::{Row, Value};
 
 /// Check if an AnalyzedQuery references outer scope columns (correlated).
 ///

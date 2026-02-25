@@ -61,7 +61,7 @@ pub use sort::*;
 pub use table_function::*;
 pub use window::*;
 
-use crate::types::{Row, TableSchema};
+use crate::model::{Row, TableSchema};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::fmt::Debug;

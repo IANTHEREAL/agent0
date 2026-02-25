@@ -5,10 +5,10 @@
 
 use sqlparser::ast::{self as ast, SetExpr};
 
+use crate::model::DataType;
 use crate::sql::collation::ResolvedCollation;
 use crate::sql::types::coercion::common_type;
 use crate::sql::types::CastContext;
-use crate::types::DataType;
 
 use super::super::error::AnalyzerError;
 use super::super::types::*;

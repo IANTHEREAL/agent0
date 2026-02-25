@@ -123,7 +123,7 @@ db9-server/
 │   ├── storage/
 │   ├── extensions/            # HTTP extensions + fs9 file operations
 │   ├── auth/
-│   ├── types/
+│   ├── model/                 # Data model types (DataType, Value, Row, TableSchema)
 │   ├── txn/                   # Transaction state + savepoints
 │   ├── pool.rs
 │   ├── tls.rs

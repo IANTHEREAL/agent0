@@ -5,10 +5,10 @@
 
 use sqlparser::ast::{self as ast, TableFactor, TableWithJoins};
 
+use crate::model::DataType;
 use crate::sql::names::{normalize_ident, split_object_name};
 use crate::sql::table_functions::table_function_key;
 use crate::sql::types::coercion::common_type;
-use crate::types::DataType;
 
 use super::super::error::AnalyzerError;
 use super::super::types::*;

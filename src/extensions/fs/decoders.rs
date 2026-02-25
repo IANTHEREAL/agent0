@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, SecondsFormat, Utc};
 
 use crate::extensions::fs::backend::FsFileInfo;
-use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
 
 pub(crate) struct DecodedRows {
     pub schema: TableSchema,

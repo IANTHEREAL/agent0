@@ -6,8 +6,8 @@
 
 mod display;
 
+use crate::model::{DataType, Value};
 use crate::sql::types::CastContext;
-use crate::types::{DataType, Value};
 
 // ── Core IR node ────────────────────────────────────────────
 

@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tikv_client::Transaction;
 
+use crate::model::{DataType, FunctionDef, Value};
 use crate::sql::error::SqlError;
 use crate::sql::names;
 use crate::sql::parse_sql;
@@ -16,7 +17,6 @@ use crate::sql::sequences;
 use crate::sql::ExecuteResult;
 use crate::sql::Executor;
 use crate::storage::TikvStore;
-use crate::types::{DataType, FunctionDef, Value};
 
 use super::parser::{parse_begin_block, parse_declare_block, PlpgsqlStatement};
 use super::utils::{

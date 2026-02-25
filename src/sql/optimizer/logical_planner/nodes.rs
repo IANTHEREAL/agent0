@@ -98,7 +98,7 @@ pub(super) fn find_aggregate_typed_expr(
                 return_type: ae
                     .arg
                     .as_ref()
-                    .map_or(crate::types::DataType::Int64, |a| a.data_type.clone()),
+                    .map_or(crate::model::DataType::Int64, |a| a.data_type.clone()),
             },
             args: ae.arg.iter().cloned().collect(),
             distinct: ae.distinct,
@@ -108,7 +108,7 @@ pub(super) fn find_aggregate_typed_expr(
         data_type: ae
             .arg
             .as_ref()
-            .map_or(crate::types::DataType::Int64, |a| a.data_type.clone()),
+            .map_or(crate::model::DataType::Int64, |a| a.data_type.clone()),
     }
 }
 

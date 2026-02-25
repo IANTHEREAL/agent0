@@ -2,8 +2,8 @@ use super::helpers::{
     access_method_oid, bool_col, int_col, int_val, schema_oid, text_col, text_val,
 };
 use super::{ScanContext, VirtualTable};
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::catalog_oids;
-use crate::types::{Row, TableSchema, Value};
 use anyhow::Result;
 use async_trait::async_trait;
 

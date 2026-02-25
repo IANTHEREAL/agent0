@@ -3,9 +3,9 @@
 use anyhow::{anyhow, Result};
 
 use super::WindowFunctionExpr;
+use crate::model::{Row, Value};
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::query_context::QueryContext;
-use crate::types::{Row, Value};
 
 /// Compute `row_number()` for a partition.
 pub(super) fn compute_row_number(row_indices: &[usize], wf_idx: usize, results: &mut [Vec<Value>]) {

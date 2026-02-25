@@ -2,10 +2,10 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::expr::typed_eval::{eval_const_usize, eval_typed_expr};
 use crate::sql::query_context::QueryContext;
-use crate::types::{Row, TableSchema, Value};
 
 #[derive(Debug)]
 pub struct LimitOperator {
@@ -172,9 +172,9 @@ fn evaluate_limit_bound(expr: &TypedExpr, qctx: &QueryContext, clause: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ColumnDef, DataType};
     use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
     use crate::sql::query_context::QueryContext;
-    use crate::types::{ColumnDef, DataType};
 
     fn test_schema() -> TableSchema {
         TableSchema {

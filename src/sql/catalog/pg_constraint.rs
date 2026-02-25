@@ -3,8 +3,8 @@ use super::helpers::{
     text_col, text_val,
 };
 use super::{ScanContext, VirtualTable};
+use crate::model::{ForeignKeyAction, Row, TableSchema, Value};
 use crate::sql::catalog_oids;
-use crate::types::{ForeignKeyAction, Row, TableSchema, Value};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;

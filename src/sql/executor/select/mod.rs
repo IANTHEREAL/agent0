@@ -2,7 +2,7 @@
 
 use super::super::ExecuteResult;
 use super::core::Executor;
-use crate::types::{Row, TableSchema};
+use crate::model::{Row, TableSchema};
 use anyhow::Result;
 use sqlparser::ast::Query;
 use std::collections::HashMap;

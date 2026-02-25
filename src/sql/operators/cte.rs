@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use super::{ExecutionContext, PhysicalOperator};
-use crate::types::{Row, TableSchema};
+use crate::model::{Row, TableSchema};
 
 #[allow(dead_code)] // framework: CTE scan path
 #[derive(Debug)]
@@ -72,7 +72,7 @@ impl PhysicalOperator for CTEScanOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ColumnDef, DataType, Value};
+    use crate::model::{ColumnDef, DataType, Value};
 
     fn test_schema() -> TableSchema {
         TableSchema {

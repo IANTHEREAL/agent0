@@ -7,8 +7,8 @@ use sqlparser::ast::{
 };
 
 use super::rename::{parse_sql_expr, parse_stored_query};
+use crate::model::{DataType, TableSchema};
 use crate::sql::names::normalize_ident;
-use crate::types::{DataType, TableSchema};
 
 pub(super) fn datatype_has_unqualified_type_name(
     data_type: &SqlDataType,

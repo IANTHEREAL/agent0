@@ -5,9 +5,9 @@
 
 use sqlparser::ast::{self as ast, Expr};
 
+use crate::model::DataType;
 use crate::sql::types::cast::CastContext;
 use crate::sql::types::coercion::{common_type, unify_types};
-use crate::types::DataType;
 
 use crate::sql::analyzer::error::AnalyzerError;
 use crate::sql::analyzer::types::*;

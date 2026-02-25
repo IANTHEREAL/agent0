@@ -7,11 +7,11 @@ use rust_decimal::Decimal;
 #[cfg(test)]
 use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr};
 
+use crate::model::{DataType, Value};
 use crate::sql::expr::compare_values;
 #[cfg(test)]
 use crate::sql::names::function_name_upper;
 use crate::sql::pg_numeric::pg_numeric_div;
-use crate::types::{DataType, Value};
 
 #[cfg(test)]
 #[derive(Debug, Clone)]

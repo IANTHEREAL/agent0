@@ -6,10 +6,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use tikv_client::Transaction;
 
+use crate::model::{Row, TableSchema};
 use crate::sql::gin::extract_gin_token_hashes_from_row;
 use crate::sql::index_helpers;
 use crate::storage::TikvStore;
-use crate::types::{Row, TableSchema};
 use crate::worker::types::IndexState;
 
 use super::foreign_keys::{handle_foreign_key_on_delete, FkDeleteContext, FkStoreCtx};

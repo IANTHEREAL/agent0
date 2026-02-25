@@ -7,7 +7,7 @@ use super::super::super::errors::{
 };
 use super::super::DynamicPgHandler;
 use super::helpers::{parse_copy_text_line, should_add_copy_insert_context};
-use crate::types::Value;
+use crate::model::Value;
 use futures::Sink;
 use pgwire::api::ClientInfo;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
@@ -269,7 +269,7 @@ impl DynamicPgHandler {
             .iter()
             .map(|c| c.name.clone())
             .collect();
-        let column_types: Vec<Option<crate::types::DataType>> = table_schema
+        let column_types: Vec<Option<crate::model::DataType>> = table_schema
             .columns
             .iter()
             .map(|c| Some(c.data_type.clone()))

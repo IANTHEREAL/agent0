@@ -5,11 +5,11 @@
 //! `pg_sleep`, user-defined functions, cron/bg_sql scalar functions, and
 //! recursive traversal of composite expression nodes.
 
+use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::{FunctionKind, TypedExpr, TypedExprKind};
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::query_context::QueryContext;
-use crate::types::{DataType, Row, TableSchema, Value};
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;

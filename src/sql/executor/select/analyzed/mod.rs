@@ -6,6 +6,7 @@
 //!
 //! Handles FOR UPDATE/SHARE row locking and SELECT INTO natively.
 
+use crate::model::{DataType, Row, TableSchema};
 use crate::sql::analyzer::types::{
     AnalyzedDistinct, AnalyzedQueryBody, AnalyzedTableRef, AnalyzedTableRefKind, JoinCondition,
     TypedExpr, TypedExprKind, TypedOrderByExpr,
@@ -15,7 +16,6 @@ use crate::sql::executor::core::Executor;
 use crate::sql::expr::classify::needs_pre_materialization;
 use crate::sql::expr::typed_eval::eval_const_usize;
 use crate::sql::ExecuteResult;
-use crate::types::{DataType, Row, TableSchema};
 
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Query, SetExpr};
@@ -207,7 +207,7 @@ impl Executor {
                         let inferred_types: Vec<DataType> = if let Some(types) = column_types {
                             types
                         } else {
-                            crate::types::infer_column_types_from_rows(&rows, col_names.len())
+                            crate::model::infer_column_types_from_rows(&rows, col_names.len())
                         };
                         let schema = TableSchema {
                             table_id: 0,
@@ -215,7 +215,7 @@ impl Executor {
                             columns: col_names
                                 .iter()
                                 .enumerate()
-                                .map(|(idx, n)| crate::types::ColumnDef {
+                                .map(|(idx, n)| crate::model::ColumnDef {
                                     name: n.clone(),
                                     // Index guard: unreachable when types and columns are aligned.
                                     data_type: inferred_types
@@ -401,7 +401,7 @@ impl Executor {
                                 // Fallback: NULL constant (value will be replaced in
                                 // post-processing, but aggregate rewrite must still work).
                                 proj.expr = TypedExpr {
-                                    kind: TypedExprKind::Constant(crate::types::Value::Null),
+                                    kind: TypedExprKind::Constant(crate::model::Value::Null),
                                     data_type: proj.expr.data_type.clone(),
                                 };
                             }
@@ -719,6 +719,7 @@ mod _stack_overflow_signature_guards_907 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Value;
     use crate::sql::analyzer::types::{
         AnalyzedDistinct, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind,
         BinaryOp as TypedBinaryOp,
@@ -726,7 +727,6 @@ mod tests {
     use crate::sql::expr::typed_eval::eval_typed_expr;
     use crate::sql::query_context::QueryContext;
     use crate::sql::types::CastContext;
-    use crate::types::Value;
     use std::sync::Arc;
 
     fn test_qctx() -> QueryContext {

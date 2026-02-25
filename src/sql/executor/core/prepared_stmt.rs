@@ -4,8 +4,8 @@
 //! even though they are used by the protocol handler.
 
 use crate::auth::Privilege;
+use crate::model::DataType;
 use crate::sql::analyzer::types::{AnalyzedOnConflict, AnalyzedQuery, AnalyzedStatement};
-use crate::types::DataType;
 use sqlparser::ast::LockClause;
 
 /// Execution plan variant for a prepared statement.

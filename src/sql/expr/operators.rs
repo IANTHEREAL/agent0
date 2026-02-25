@@ -9,8 +9,8 @@
 //! - JSONB operators (?, @>, <@)
 //! - Array operators (&&)
 
+use crate::model::Value;
 use crate::sql::error::SqlError;
-use crate::types::Value;
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use sqlparser::ast::BinaryOperator;
@@ -304,7 +304,7 @@ pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<
 
 // --- Arithmetic Helpers ---
 
-fn add_interval_to_timestamp(ts_millis: i64, iv: &crate::types::IntervalValue) -> Result<i64> {
+fn add_interval_to_timestamp(ts_millis: i64, iv: &crate::model::IntervalValue) -> Result<i64> {
     use chrono::{Datelike, Duration, TimeZone, Utc};
 
     let dt = Utc
@@ -344,8 +344,8 @@ fn add_interval_to_timestamp(ts_millis: i64, iv: &crate::types::IntervalValue) -
     Ok(result.timestamp_millis())
 }
 
-fn sub_interval_from_timestamp(ts_millis: i64, iv: &crate::types::IntervalValue) -> Result<i64> {
-    let neg_iv = crate::types::IntervalValue::new(-iv.months, -iv.millis);
+fn sub_interval_from_timestamp(ts_millis: i64, iv: &crate::model::IntervalValue) -> Result<i64> {
+    let neg_iv = crate::model::IntervalValue::new(-iv.months, -iv.millis);
     add_interval_to_timestamp(ts_millis, &neg_iv)
 }
 
@@ -383,11 +383,11 @@ pub(super) fn add_values(left: Value, right: Value) -> Result<Value> {
             Ok(Value::Timestamp(add_interval_to_timestamp(ts, &iv)?))
         }
         (Value::Date(days), Value::Interval(iv)) => {
-            let ts = crate::types::date::date_days_to_timestamp_millis(days)?;
+            let ts = crate::model::date::date_days_to_timestamp_millis(days)?;
             Ok(Value::Timestamp(add_interval_to_timestamp(ts, &iv)?))
         }
         (Value::Interval(iv), Value::Date(days)) => {
-            let ts = crate::types::date::date_days_to_timestamp_millis(days)?;
+            let ts = crate::model::date::date_days_to_timestamp_millis(days)?;
             Ok(Value::Timestamp(add_interval_to_timestamp(ts, &iv)?))
         }
         (Value::Date(days), Value::Int32(n)) => Ok(Value::Date(days + n)),
@@ -426,13 +426,13 @@ pub(super) fn sub_values(left: Value, right: Value) -> Result<Value> {
 
     match (left, right) {
         (Value::Timestamp(l), Value::Timestamp(r)) => Ok(Value::Interval(
-            crate::types::IntervalValue::from_millis(l - r),
+            crate::model::IntervalValue::from_millis(l - r),
         )),
         (Value::Timestamp(ts), Value::Interval(iv)) => {
             Ok(Value::Timestamp(sub_interval_from_timestamp(ts, &iv)?))
         }
         (Value::Date(days), Value::Interval(iv)) => {
-            let ts = crate::types::date::date_days_to_timestamp_millis(days)?;
+            let ts = crate::model::date::date_days_to_timestamp_millis(days)?;
             Ok(Value::Timestamp(sub_interval_from_timestamp(ts, &iv)?))
         }
         (Value::Date(l), Value::Date(r)) => {
@@ -516,9 +516,9 @@ fn mul_values(left: Value, right: Value) -> Result<Value> {
     }
 
     fn mul_interval_by_int(
-        iv: crate::types::IntervalValue,
+        iv: crate::model::IntervalValue,
         factor: i64,
-    ) -> Result<crate::types::IntervalValue> {
+    ) -> Result<crate::model::IntervalValue> {
         let months_i64 = i64::from(iv.months)
             .checked_mul(factor)
             .ok_or_else(|| anyhow!("interval months out of range"))?;
@@ -528,7 +528,7 @@ fn mul_values(left: Value, right: Value) -> Result<Value> {
             .millis
             .checked_mul(factor)
             .ok_or_else(|| anyhow!("interval out of range"))?;
-        Ok(crate::types::IntervalValue::new(months, millis))
+        Ok(crate::model::IntervalValue::new(months, millis))
     }
 
     match (left, right) {
@@ -567,7 +567,7 @@ fn mul_values(left: Value, right: Value) -> Result<Value> {
                         if rounded < (i64::MIN as f64) || rounded > (i64::MAX as f64) {
                             return Err(anyhow!("interval out of range"));
                         }
-                        Ok(Value::Interval(crate::types::IntervalValue::from_millis(
+                        Ok(Value::Interval(crate::model::IntervalValue::from_millis(
                             rounded as i64,
                         )))
                     } else {
@@ -597,7 +597,7 @@ fn mul_values(left: Value, right: Value) -> Result<Value> {
                         if rounded < (i64::MIN as f64) || rounded > (i64::MAX as f64) {
                             return Err(anyhow!("interval out of range"));
                         }
-                        Ok(Value::Interval(crate::types::IntervalValue::from_millis(
+                        Ok(Value::Interval(crate::model::IntervalValue::from_millis(
                             rounded as i64,
                         )))
                     } else {
@@ -871,7 +871,7 @@ mod tests {
     #[test]
     fn test_add_interval_to_timestamp_millis_min_does_not_panic() {
         let ts_millis = 0;
-        let iv = crate::types::IntervalValue::new(0, i64::MIN);
+        let iv = crate::model::IntervalValue::new(0, i64::MIN);
 
         let err = add_interval_to_timestamp(ts_millis, &iv).unwrap_err();
         assert!(err.to_string().contains("Interval out of range"));
@@ -881,47 +881,47 @@ mod tests {
     fn test_add_interval_to_timestamp_month_overflow_does_not_panic() {
         let ts_millis = 0;
 
-        let iv = crate::types::IntervalValue::from_months(i32::MAX);
+        let iv = crate::model::IntervalValue::from_months(i32::MAX);
         let err = add_interval_to_timestamp(ts_millis, &iv).unwrap_err();
         assert!(err.to_string().contains("Date out of range"));
 
-        let iv = crate::types::IntervalValue::from_months(i32::MIN);
+        let iv = crate::model::IntervalValue::from_months(i32::MIN);
         let err = add_interval_to_timestamp(ts_millis, &iv).unwrap_err();
         assert!(err.to_string().contains("Date out of range"));
     }
 
     #[test]
     fn test_mul_values_interval_by_int() {
-        let iv = crate::types::IntervalValue::from_millis(1_000);
+        let iv = crate::model::IntervalValue::from_millis(1_000);
 
         assert_eq!(
             mul_values(Value::Int32(2), Value::Interval(iv)).unwrap(),
-            Value::Interval(crate::types::IntervalValue::from_millis(2_000))
+            Value::Interval(crate::model::IntervalValue::from_millis(2_000))
         );
         assert_eq!(
             mul_values(Value::Interval(iv), Value::Int64(3)).unwrap(),
-            Value::Interval(crate::types::IntervalValue::from_millis(3_000))
+            Value::Interval(crate::model::IntervalValue::from_millis(3_000))
         );
 
-        let iv_months = crate::types::IntervalValue::from_months(12);
+        let iv_months = crate::model::IntervalValue::from_months(12);
         assert_eq!(
             mul_values(Value::Interval(iv_months), Value::Int32(2)).unwrap(),
-            Value::Interval(crate::types::IntervalValue::from_months(24))
+            Value::Interval(crate::model::IntervalValue::from_months(24))
         );
     }
 
     #[test]
     fn test_mul_values_interval_by_fractional_when_months_zero() {
-        let iv = crate::types::IntervalValue::from_millis(1_000);
+        let iv = crate::model::IntervalValue::from_millis(1_000);
         assert_eq!(
             mul_values(Value::Interval(iv), Value::Float64(0.5)).unwrap(),
-            Value::Interval(crate::types::IntervalValue::from_millis(500))
+            Value::Interval(crate::model::IntervalValue::from_millis(500))
         );
     }
 
     #[test]
     fn test_mul_values_interval_fractional_rejects_months_component() {
-        let iv = crate::types::IntervalValue::new(1, 0);
+        let iv = crate::model::IntervalValue::new(1, 0);
         let err = mul_values(Value::Interval(iv), Value::Float64(0.5))
             .unwrap_err()
             .to_string();
@@ -930,7 +930,7 @@ mod tests {
 
     #[test]
     fn test_mul_values_interval_by_large_whole_float_overflow() {
-        let iv = crate::types::IntervalValue::from_millis(1_000);
+        let iv = crate::model::IntervalValue::from_millis(1_000);
         // Test with float that's whole but exceeds i64::MAX
         let err = mul_values(Value::Interval(iv), Value::Float64(1e19))
             .unwrap_err()

@@ -6,9 +6,9 @@
 
 use sqlparser::ast::{Select, SelectItem};
 
+use crate::model::{ColumnDef, DataType, TableSchema};
 use crate::sql::collation::ResolvedCollation;
 use crate::sql::expr::collation_aware::extract_resolved_collation;
-use crate::types::{ColumnDef, DataType, TableSchema};
 
 use super::super::error::AnalyzerError;
 use super::super::scope::Scope;

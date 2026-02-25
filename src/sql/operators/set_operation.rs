@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use super::key_encoding::encode_values_key;
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::types::{Row, TableSchema};
+use crate::model::{Row, TableSchema};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SetOperationType {
@@ -186,8 +186,8 @@ impl PhysicalOperator for SetOperationOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ColumnDef, DataType, Value};
     use crate::sql::operators::scan::TableScanOperator;
-    use crate::types::{ColumnDef, DataType, Value};
 
     fn test_schema() -> TableSchema {
         TableSchema {

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tikv_client::Transaction;
 
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::gin::extract_gin_token_hashes_from_row;
 use crate::sql::index_consistency::{
@@ -12,7 +13,6 @@ use crate::sql::index_consistency::{
 };
 use crate::sql::index_helpers;
 use crate::storage::TikvStore;
-use crate::types::{Row, TableSchema, Value};
 use crate::worker::types::IndexState;
 
 use super::defaults::coerce_row_values;

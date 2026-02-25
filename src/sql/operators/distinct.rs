@@ -5,9 +5,9 @@ use async_trait::async_trait;
 
 use super::key_encoding::encode_values_key;
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
+use crate::model::{Row, TableSchema};
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::expr::typed_eval::eval_typed_expr;
-use crate::types::{Row, TableSchema};
 
 #[derive(Debug)]
 pub struct DistinctOperator {
@@ -169,9 +169,9 @@ impl PhysicalOperator for DistinctOnOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ColumnDef, DataType, Value};
     use crate::sql::analyzer::types::TypedExprKind;
     use crate::sql::operators::scan::TableScanOperator;
-    use crate::types::{ColumnDef, DataType, Value};
 
     fn test_schema() -> TableSchema {
         TableSchema {

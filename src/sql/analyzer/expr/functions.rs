@@ -6,11 +6,11 @@
 
 use sqlparser::ast::{self as ast, Expr, Function, FunctionArg, FunctionArgExpr, WindowType};
 
+use crate::model::{DataType, Value};
 use crate::sql::names::function_name_upper;
 use crate::sql::types::coercion::comparison_target_type;
 use crate::sql::types::mapping::sql_datatype_to_internal;
 use crate::sql::types::registry::global_registry;
-use crate::types::{DataType, Value};
 
 use crate::sql::analyzer::error::AnalyzerError;
 use crate::sql::analyzer::types::*;

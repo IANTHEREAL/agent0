@@ -154,16 +154,16 @@ async fn try_streaming_ctas_for_read_parquet(
         .map_err(|e| anyhow!("Failed to open Parquet file for CTAS: {}", e))?;
 
     let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-    let column_types: Vec<crate::types::DataType> =
+    let column_types: Vec<crate::model::DataType> =
         schema.columns.iter().map(|c| c.data_type.clone()).collect();
 
     use futures::StreamExt;
     let mapped_stream = row_stream.map(move |values_result| {
         let _ = &_permit; // keep permit alive across stream consumption
-        values_result.map(|values| crate::types::Row::new(values))
+        values_result.map(|values| crate::model::Row::new(values))
     });
 
-    let boxed: futures::stream::BoxStream<'static, anyhow::Result<crate::types::Row>> =
+    let boxed: futures::stream::BoxStream<'static, anyhow::Result<crate::model::Row>> =
         Box::pin(mapped_stream);
 
     Ok(Some(ExecuteResult::SelectStream {

@@ -112,7 +112,7 @@ $$;
 ### 4) 类型转换辅助
 
 ```rust
-// src/types/mod.rs
+// src/model/mod.rs
 
 impl Value {
     pub fn as_bytea(&self) -> Result<&[u8]> {

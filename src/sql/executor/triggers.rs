@@ -2,8 +2,8 @@ use super::super::names;
 use super::super::plpgsql;
 use super::super::{ExecuteResult, Session};
 use super::core::Executor;
+use crate::model::{FunctionDef, TriggerDef};
 use crate::sql::error::SqlError;
-use crate::types::{FunctionDef, TriggerDef};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::ObjectName;
 

@@ -1,4 +1,4 @@
-use crate::types::Value;
+use crate::model::Value;
 use anyhow::{anyhow, Result};
 use rust_decimal::{Decimal, RoundingStrategy};
 use std::collections::HashMap;

@@ -1,9 +1,9 @@
+use crate::model::TableSchema;
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::analyzer::{Analyzer, NullCatalog, Scope};
 use crate::sql::error::SqlError;
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
-use crate::types::TableSchema;
 use anyhow::Result;
 
 /// Compile an AST expression that must not reference row columns.

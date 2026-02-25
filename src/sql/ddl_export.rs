@@ -1,8 +1,8 @@
-use crate::storage::TikvStore;
-use crate::types::{
+use crate::model::{
     ForeignKeyAction, IndexDef, SequenceDef, TableSchema, TriggerDef, UserTypeDef, UserTypeKind,
     ViewDef,
 };
+use crate::storage::TikvStore;
 use anyhow::Result;
 use tikv_client::Transaction;
 
@@ -27,10 +27,10 @@ fn foreign_key_action_sql(action: &ForeignKeyAction) -> &'static str {
     }
 }
 
-fn column_type_sql(schema_col: &crate::types::ColumnDef) -> String {
+fn column_type_sql(schema_col: &crate::model::ColumnDef) -> String {
     if schema_col.is_serial {
         return match schema_col.data_type {
-            crate::types::DataType::Int64 => "BIGSERIAL".to_string(),
+            crate::model::DataType::Int64 => "BIGSERIAL".to_string(),
             _ => "SERIAL".to_string(),
         };
     }
@@ -286,7 +286,7 @@ pub async fn export_all_ddl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{
+    use crate::model::{
         CheckConstraint, ColumnDef, DataType, ForeignKeyConstraint, IndexDef, SequenceBacking,
         SequenceState,
     };

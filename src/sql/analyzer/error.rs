@@ -2,7 +2,7 @@
 //!
 //! All errors follow PostgreSQL error message conventions where applicable.
 
-use crate::types::DataType;
+use crate::model::DataType;
 use std::fmt;
 
 /// Errors produced during semantic analysis.

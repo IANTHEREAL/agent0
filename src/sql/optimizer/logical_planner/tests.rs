@@ -1,8 +1,8 @@
 //! Tests for logical planner.
 
 use super::*;
+use crate::model::DataType;
 use crate::sql::analyzer::types::*;
-use crate::types::DataType;
 
 fn simple_column(name: &str, dt: DataType) -> TypedExpr {
     TypedExpr {
@@ -15,7 +15,7 @@ fn simple_column(name: &str, dt: DataType) -> TypedExpr {
     }
 }
 
-fn simple_constant(v: crate::types::Value, dt: DataType) -> TypedExpr {
+fn simple_constant(v: crate::model::Value, dt: DataType) -> TypedExpr {
     TypedExpr {
         kind: TypedExprKind::Constant(v),
         data_type: dt,
@@ -57,7 +57,7 @@ fn test_single_table_select() {
                     left: Box::new(simple_column("id", DataType::Int64)),
                     op: BinaryOp::Eq,
                     right: Box::new(simple_constant(
-                        crate::types::Value::Int64(1),
+                        crate::model::Value::Int64(1),
                         DataType::Int64,
                     )),
                 },
@@ -96,7 +96,7 @@ fn test_tableless_select() {
         ctes: vec![],
         body: AnalyzedQueryBody::Select(AnalyzedSelect {
             projection: vec![AnalyzedProjection {
-                expr: simple_constant(crate::types::Value::Int32(1), DataType::Int32),
+                expr: simple_constant(crate::model::Value::Int32(1), DataType::Int32),
                 output_name: "?column?".to_string(),
             }],
             from: vec![],
@@ -148,7 +148,7 @@ fn test_order_by_limit() {
             nulls_first: false,
         }],
         limit: Some(simple_constant(
-            crate::types::Value::Int64(10),
+            crate::model::Value::Int64(10),
             DataType::Int64,
         )),
         offset: None,
@@ -423,7 +423,7 @@ fn test_aggregate_having_rewrite() {
             left: Box::new(count_agg.clone()),
             op: BinaryOp::Gt,
             right: Box::new(simple_constant(
-                crate::types::Value::Int64(5),
+                crate::model::Value::Int64(5),
                 DataType::Int64,
             )),
         },

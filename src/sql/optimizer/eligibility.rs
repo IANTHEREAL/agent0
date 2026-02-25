@@ -141,11 +141,11 @@ fn can_rewrite_post_aggregate(select: &AnalyzedSelect, query: &AnalyzedQuery) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::DataType;
     use crate::sql::analyzer::types::{
         AnalyzedCte, AnalyzedProjection, AnalyzedTableRef, AnalyzedTableRefKind, FunctionKind,
         IsTestKind, JsonAccessOp, ResolvedFunction, TableRefSchema, TypedExpr, TypedExprKind,
     };
-    use crate::types::DataType;
 
     // ── helpers ─────────────────────────────────────────────
 
@@ -179,14 +179,14 @@ mod tests {
 
     fn const_int() -> TypedExpr {
         TypedExpr {
-            kind: TypedExprKind::Constant(crate::types::Value::Int64(1)),
+            kind: TypedExprKind::Constant(crate::model::Value::Int64(1)),
             data_type: DataType::Int64,
         }
     }
 
     fn const_text() -> TypedExpr {
         TypedExpr {
-            kind: TypedExprKind::Constant(crate::types::Value::Text("a".to_string())),
+            kind: TypedExprKind::Constant(crate::model::Value::Text("a".to_string())),
             data_type: DataType::Text,
         }
     }
