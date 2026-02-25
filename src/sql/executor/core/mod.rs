@@ -9,6 +9,7 @@ mod dispatch;
 mod guc;
 mod misc;
 mod observability;
+pub(crate) mod plan_cache;
 pub(crate) mod prepared_analysis;
 pub(crate) mod prepared_stmt;
 mod query_exec;

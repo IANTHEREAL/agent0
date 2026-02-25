@@ -23,7 +23,7 @@ pub enum PreparedAnalysis {
         output_schema: Vec<(String, DataType)>,
         param_types: Vec<DataType>,
         base_table_names: Vec<String>,
-        table_versions: Vec<(String, u64)>,
+        table_versions: Vec<(String, u64, u64)>,
         has_recursive_cte: bool,
     },
     /// INSERT / UPDATE / DELETE — analyzed DML IR.
@@ -31,7 +31,7 @@ pub enum PreparedAnalysis {
         analyzed: AnalyzedStatement,
         output_schema: Vec<(String, DataType)>,
         param_types: Vec<DataType>,
-        table_versions: Vec<(String, u64)>,
+        table_versions: Vec<(String, u64, u64)>,
     },
     /// DDL / utility / non-analyzable statement.
     Utility,

@@ -176,6 +176,8 @@ pub async fn execute_create_index(
 
     if concurrently {
         schema.indexes.push(new_index);
+        // Bump schema version so plan-cache drift detection catches index changes.
+        schema.version += 1;
         store.update_schema(txn, db_id, schema.clone()).await?;
 
         if let Some(system_store) = crate::worker::get_system_store() {
@@ -371,6 +373,8 @@ pub async fn execute_create_index(
         }
 
         schema.indexes.push(new_index.clone());
+        // Bump schema version so plan-cache drift detection catches index changes.
+        schema.version += 1;
         store.update_schema(txn, db_id, schema.clone()).await?;
         Ok(())
     }

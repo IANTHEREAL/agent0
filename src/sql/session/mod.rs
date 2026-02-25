@@ -14,6 +14,7 @@ pub(crate) use settings::SessionSettings;
 use crate::config::SharedServerConfig;
 use crate::observability::TenantObservability;
 use crate::sql::error::SqlError;
+use crate::sql::executor::core::plan_cache::PreparedPlanCache;
 use crate::sql::executor::core::prepared_stmt::PreparedStatement as SqlPreparedStatement;
 use crate::sql::query_context::{QueryContext, XactAdvisorySavepointTracker};
 use crate::storage::TikvStore;
@@ -73,6 +74,8 @@ pub struct Session {
     pending_param_types: Vec<Option<crate::model::DataType>>,
     /// SQL PREPARE/EXECUTE statement cache (session-scoped, PostgreSQL semantics).
     sql_prepared_statements: HashMap<String, SqlPreparedStatement>,
+    /// Session-local plan cache for prepared statements (bounded LRU).
+    plan_cache: PreparedPlanCache,
     /// True when current transaction used xact-scoped advisory lock functions.
     pub(crate) has_xact_advisory_locks: Arc<AtomicBool>,
     /// Savepoint-scoped tracker for xact advisory lock acquisitions.
@@ -103,6 +106,14 @@ impl Session {
         default_statement_timeout_ms: u64,
         default_idle_in_txn_timeout_ms: u64,
     ) -> Self {
+        let settings = SessionSettings::new_with_defaults(
+            default_statement_timeout_ms,
+            default_idle_in_txn_timeout_ms,
+        );
+        let plan_cache = PreparedPlanCache::new(
+            settings.prepared_plan_cache_size(),
+            settings.prepared_plan_cache_min_exec(),
+        );
         Self {
             store,
             observability,
@@ -113,10 +124,7 @@ impl Session {
             test_force_failed_transaction: false,
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: HashMap::new(),
-            settings: SessionSettings::new_with_defaults(
-                default_statement_timeout_ms,
-                default_idle_in_txn_timeout_ms,
-            ),
+            settings,
             session_user: None,
             session_user_is_superuser: false,
             current_user: None,
@@ -130,6 +138,7 @@ impl Session {
             pending_params: vec![],
             pending_param_types: vec![],
             sql_prepared_statements: HashMap::new(),
+            plan_cache,
             has_xact_advisory_locks: Arc::new(AtomicBool::new(false)),
             xact_advisory_savepoint_tracker: Arc::new(StdMutex::new(
                 XactAdvisorySavepointTracker::default(),
@@ -149,6 +158,14 @@ impl Session {
         default_statement_timeout_ms: u64,
         default_idle_in_txn_timeout_ms: u64,
     ) -> Self {
+        let settings = SessionSettings::new_with_defaults(
+            default_statement_timeout_ms,
+            default_idle_in_txn_timeout_ms,
+        );
+        let plan_cache = PreparedPlanCache::new(
+            settings.prepared_plan_cache_size(),
+            settings.prepared_plan_cache_min_exec(),
+        );
         Self {
             store,
             observability,
@@ -159,10 +176,7 @@ impl Session {
             test_force_failed_transaction: false,
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: HashMap::new(),
-            settings: SessionSettings::new_with_defaults(
-                default_statement_timeout_ms,
-                default_idle_in_txn_timeout_ms,
-            ),
+            settings,
             session_user: Some(username.clone()),
             session_user_is_superuser: is_superuser,
             current_user: Some(username),
@@ -176,6 +190,7 @@ impl Session {
             pending_params: vec![],
             pending_param_types: vec![],
             sql_prepared_statements: HashMap::new(),
+            plan_cache,
             has_xact_advisory_locks: Arc::new(AtomicBool::new(false)),
             xact_advisory_savepoint_tracker: Arc::new(StdMutex::new(
                 XactAdvisorySavepointTracker::default(),
@@ -290,6 +305,22 @@ impl Session {
 
     pub(crate) fn clear_sql_prepared_statements(&mut self) {
         self.sql_prepared_statements.clear();
+    }
+
+    pub(crate) fn plan_cache(&mut self) -> &mut PreparedPlanCache {
+        &mut self.plan_cache
+    }
+
+    /// Invalidate all cached plans that depend on the given table_id.
+    /// Called after DDL that changes a table's schema.
+    #[allow(dead_code)]
+    pub(crate) fn invalidate_plan_cache_for_table(&mut self, table_id: u64) {
+        self.plan_cache.invalidate_by_table_id(table_id);
+    }
+
+    /// Clear the entire plan cache. Called on transaction rollback.
+    pub(crate) fn clear_plan_cache(&mut self) {
+        self.plan_cache.clear();
     }
 
     #[cfg(test)]
@@ -426,11 +457,15 @@ impl Session {
     }
 
     pub(crate) fn set_known_setting(&mut self, name: &str, value: String) -> Result<bool> {
-        self.settings.set_known_setting(name, value)
+        let changed = self.settings.set_known_setting(name, value)?;
+        self.sync_plan_cache_settings();
+        Ok(changed)
     }
 
     pub(crate) fn set_local_setting(&mut self, name: &str, value: String) -> Result<bool> {
-        self.settings.set_local_override(name, value)
+        let changed = self.settings.set_local_override(name, value)?;
+        self.sync_plan_cache_settings();
+        Ok(changed)
     }
 
     pub(crate) fn set_local_search_path(&mut self, search_path: Vec<String>) {
@@ -439,14 +474,17 @@ impl Session {
 
     pub(crate) fn clear_local_overrides(&mut self) {
         self.settings.clear_local_overrides();
+        self.sync_plan_cache_settings();
     }
 
     pub(crate) fn reset_setting(&mut self, name: &str) {
         self.settings.reset_setting(name);
+        self.sync_plan_cache_settings();
     }
 
     pub(crate) fn reset_all_settings(&mut self) {
         self.settings.reset_all_settings();
+        self.sync_plan_cache_settings();
     }
 
     /// Snapshot all session settings into a flat map for `current_setting()` in
@@ -519,5 +557,12 @@ impl Session {
 
     pub(crate) fn max_sort_bytes(&self) -> usize {
         self.settings.max_sort_bytes()
+    }
+
+    fn sync_plan_cache_settings(&mut self) {
+        self.plan_cache.reconfigure(
+            self.settings.prepared_plan_cache_size(),
+            self.settings.prepared_plan_cache_min_exec(),
+        );
     }
 }

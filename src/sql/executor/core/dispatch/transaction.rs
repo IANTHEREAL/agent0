@@ -144,6 +144,20 @@ pub(super) async fn check_observability_statement_permission(
     }
 }
 
+/// Returns `true` for DDL statements that can alter table schemas and
+/// therefore invalidate cached prepared plans.
+fn is_plan_cache_invalidating_ddl(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::CreateTable { .. }
+            | Statement::CreateIndex { .. }
+            | Statement::Drop { .. }
+            | Statement::AlterTable { .. }
+            | Statement::AlterIndex { .. }
+            | Statement::Truncate { .. }
+    )
+}
+
 impl Executor {
     /// Execute a DDL/DML statement with autocommit retry logic.
     ///
@@ -198,6 +212,14 @@ impl Executor {
             };
 
             let res = apply_statement_timeout(timeout, fut).await;
+
+            // Invalidate plan cache after schema-altering DDL succeeds.
+            // Applies to both autocommit and explicit transactions: within an
+            // explicit txn, cached plans optimized before the DDL would use a
+            // stale schema; clearing eagerly prevents that.
+            if res.is_ok() && is_plan_cache_invalidating_ddl(stmt) {
+                session.clear_plan_cache();
+            }
 
             if res
                 .as_ref()

@@ -201,6 +201,8 @@ pub async fn execute_drop_index(
                     .await?;
             }
         }
+        // Bump schema version so plan-cache drift detection catches index changes.
+        schema.version += 1;
         store.update_schema(txn, db_id, schema.clone()).await?;
 
         // Release the reservation key for the dropped index name.

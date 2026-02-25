@@ -101,7 +101,7 @@ impl Executor {
             };
 
             // ── Single execution path: CBO optimizer pipeline ──────────
-            let result = self
+            let (result, _) = self
                 .execute_via_optimizer(
                     txn,
                     db_id,
@@ -110,6 +110,8 @@ impl Executor {
                     Cow::Owned(analyzed),
                     &prepared_ctes,
                     &query.locks,
+                    None,
+                    false,
                 )
                 .await?;
 
@@ -142,16 +144,20 @@ impl Executor {
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Pin<Box<dyn Future<Output = Result<ExecuteResult>> + Send + 'a>> {
         Box::pin(async move {
-            self.execute_via_optimizer(
-                txn,
-                db_id,
-                sequence_values,
-                search_path,
-                Cow::Borrowed(analyzed),
-                ctes,
-                &[],
-            )
-            .await
+            let (result, _) = self
+                .execute_via_optimizer(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    Cow::Borrowed(analyzed),
+                    ctes,
+                    &[],
+                    None,
+                    false,
+                )
+                .await?;
+            Ok(result)
         })
     }
 
@@ -309,6 +315,7 @@ impl Executor {
     /// execution path (~8 `.await` points holding `AnalyzedQuery`,
     /// `PlanningContext`, `BuildContext`, `Vec<Row>`, etc.). Boxing it keeps
     /// async frame sizes bounded for all callers (#907).
+    #[allow(clippy::type_complexity)]
     pub(crate) fn execute_via_optimizer<'a>(
         &'a self,
         txn: &'a mut Transaction,
@@ -318,7 +325,19 @@ impl Executor {
         analyzed: Cow<'a, AnalyzedQuery>,
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
         locks: &'a [sqlparser::ast::LockClause],
-    ) -> Pin<Box<dyn Future<Output = Result<ExecuteResult>> + Send + 'a>> {
+        cached_plan: Option<&'a crate::sql::optimizer::physical_plan::PhysicalPlan>,
+        capture_plan: bool,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<(
+                        ExecuteResult,
+                        Option<crate::sql::optimizer::physical_plan::PhysicalPlan>,
+                    )>,
+                > + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
             use crate::sql::expr::classify::needs_async;
             use crate::sql::optimizer::{BuildContext, PlanningContext};
@@ -485,10 +504,20 @@ impl Executor {
             )
             .await?;
 
-            // ── Step 5: AnalyzedQuery → PhysicalPlan ──
-            let physical = crate::sql::stack_safety::with_grown_stack(|| {
-                crate::sql::optimizer::optimize(&analyzed, &planning_ctx)
-            })?;
+            // ── Step 5: AnalyzedQuery → PhysicalPlan (or use cached) ──
+            let (physical, captured_plan) = if let Some(cached) = cached_plan {
+                (cached.clone(), None)
+            } else {
+                let optimized = crate::sql::stack_safety::with_grown_stack(|| {
+                    crate::sql::optimizer::optimize(&analyzed, &planning_ctx)
+                })?;
+                let captured = if capture_plan {
+                    Some(optimized.clone())
+                } else {
+                    None
+                };
+                (optimized, captured)
+            };
 
             // ── Step 6: PhysicalPlan → BoxedOperator ──
             let mut operator = crate::sql::stack_safety::with_grown_stack(|| {
@@ -607,12 +636,15 @@ impl Executor {
                 .map(|(_, dt, _)| dt.clone())
                 .collect();
 
-            Ok(ExecuteResult::Select {
-                columns,
-                column_types: Some(column_types),
-                rows,
-                timezone: crate::session_context::current_timezone(),
-            })
+            Ok((
+                ExecuteResult::Select {
+                    columns,
+                    column_types: Some(column_types),
+                    rows,
+                    timezone: crate::session_context::current_timezone(),
+                },
+                captured_plan,
+            ))
         })
     }
 }
@@ -622,7 +654,7 @@ impl Executor {
 /// This mirrors the scope of `pre_materialize_query_body` (pipeline.rs) to
 /// determine whether a `Cow::Borrowed` query must be cloned. For `Cow::Owned`
 /// callers this check is unnecessary (to_mut() on Owned is free).
-fn query_needs_pre_materialization(analyzed: &AnalyzedQuery) -> bool {
+pub(crate) fn query_needs_pre_materialization(analyzed: &AnalyzedQuery) -> bool {
     if analyzed
         .order_by
         .iter()
@@ -684,7 +716,8 @@ fn table_ref_needs_pre_materialization(tr: &AnalyzedTableRef) -> bool {
     dead_code,
     unreachable_code,
     unused_variables,
-    clippy::let_underscore_future
+    clippy::let_underscore_future,
+    clippy::type_complexity
 )]
 mod _stack_overflow_signature_guards_907 {
     use super::*;
@@ -696,8 +729,27 @@ mod _stack_overflow_signature_guards_907 {
         analyzed: AnalyzedQuery,
     ) {
         let ctes = HashMap::new();
-        let _: Pin<Box<dyn Future<Output = Result<ExecuteResult>> + Send + '_>> =
-            e.execute_via_optimizer(txn, 0, seq, &[], Cow::Owned(analyzed), &ctes, &[]);
+        let _: Pin<
+            Box<
+                dyn Future<
+                        Output = Result<(
+                            ExecuteResult,
+                            Option<crate::sql::optimizer::physical_plan::PhysicalPlan>,
+                        )>,
+                    > + Send
+                    + '_,
+            >,
+        > = e.execute_via_optimizer(
+            txn,
+            0,
+            seq,
+            &[],
+            Cow::Owned(analyzed),
+            &ctes,
+            &[],
+            None,
+            false,
+        );
     }
 
     fn _guard_execute_subquery(
