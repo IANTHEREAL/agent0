@@ -38,6 +38,32 @@ fn get_or_compile_regex(pattern: &str) -> Result<regex::Regex> {
     Ok(re)
 }
 
+fn value_to_text(v: &Value) -> String {
+    match v {
+        Value::Text(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Evaluate PostgreSQL regex operators: `~`, `~*`, `!~`, `!~*`.
+fn eval_regex_op(
+    left: &Value,
+    right: &Value,
+    case_insensitive: bool,
+    negate: bool,
+) -> Result<Value> {
+    let text = value_to_text(left);
+    let pattern = value_to_text(right);
+    let pattern = if case_insensitive {
+        format!("(?i){}", pattern)
+    } else {
+        pattern
+    };
+    let re = get_or_compile_regex(&pattern)?;
+    let matched = re.is_match(&text);
+    Ok(Value::Boolean(if negate { !matched } else { matched }))
+}
+
 /// Sort with fallible comparison. Propagates the first comparison error.
 /// After the first error, remaining comparisons short-circuit to Equal
 /// and the partially-sorted result is discarded.
@@ -206,57 +232,10 @@ pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<
         },
 
         // Regex operators (NULL already handled above; compiled regex is cached)
-        BinaryOperator::PGRegexMatch => {
-            let text = match &left {
-                Value::Text(s) => s.clone(),
-                v => v.to_string(),
-            };
-            let pattern = match &right {
-                Value::Text(s) => s.clone(),
-                v => v.to_string(),
-            };
-            let re = get_or_compile_regex(&pattern)?;
-            Ok(Value::Boolean(re.is_match(&text)))
-        }
-
-        BinaryOperator::PGRegexIMatch => {
-            let text = match &left {
-                Value::Text(s) => s.clone(),
-                v => v.to_string(),
-            };
-            let pattern = match &right {
-                Value::Text(s) => s.clone(),
-                v => v.to_string(),
-            };
-            let re = get_or_compile_regex(&format!("(?i){}", pattern))?;
-            Ok(Value::Boolean(re.is_match(&text)))
-        }
-
-        BinaryOperator::PGRegexNotMatch => {
-            let text = match &left {
-                Value::Text(s) => s.clone(),
-                v => v.to_string(),
-            };
-            let pattern = match &right {
-                Value::Text(s) => s.clone(),
-                v => v.to_string(),
-            };
-            let re = get_or_compile_regex(&pattern)?;
-            Ok(Value::Boolean(!re.is_match(&text)))
-        }
-
-        BinaryOperator::PGRegexNotIMatch => {
-            let text = match &left {
-                Value::Text(s) => s.clone(),
-                v => v.to_string(),
-            };
-            let pattern = match &right {
-                Value::Text(s) => s.clone(),
-                v => v.to_string(),
-            };
-            let re = get_or_compile_regex(&format!("(?i){}", pattern))?;
-            Ok(Value::Boolean(!re.is_match(&text)))
-        }
+        BinaryOperator::PGRegexMatch => eval_regex_op(&left, &right, false, false),
+        BinaryOperator::PGRegexIMatch => eval_regex_op(&left, &right, true, false),
+        BinaryOperator::PGRegexNotMatch => eval_regex_op(&left, &right, false, true),
+        BinaryOperator::PGRegexNotIMatch => eval_regex_op(&left, &right, true, true),
 
         // PostgreSQL JSONB existence operator: `jsonb ? text`
         // - For objects: key exists
@@ -967,5 +946,58 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Cannot compare values"));
+    }
+
+    #[test]
+    fn test_regex_operator_variants_share_semantics() {
+        let left = Value::Text("Hello".into());
+        let right = Value::Text("HELLO".into());
+
+        assert_eq!(
+            eval_binary_op(left.clone(), &BinaryOperator::PGRegexMatch, right.clone()).unwrap(),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            eval_binary_op(left.clone(), &BinaryOperator::PGRegexIMatch, right.clone()).unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval_binary_op(
+                left.clone(),
+                &BinaryOperator::PGRegexNotMatch,
+                right.clone()
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval_binary_op(left, &BinaryOperator::PGRegexNotIMatch, right).unwrap(),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn test_regex_operator_coerces_non_text_operands_to_text() {
+        assert_eq!(
+            eval_binary_op(
+                Value::Int32(42),
+                &BinaryOperator::PGRegexMatch,
+                Value::Text("^42$".into()),
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn test_regex_operator_invalid_pattern_surfaces_error() {
+        let err = eval_binary_op(
+            Value::Text("abc".into()),
+            &BinaryOperator::PGRegexMatch,
+            Value::Text("[".into()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Invalid regex pattern"));
     }
 }
