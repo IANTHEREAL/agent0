@@ -44,6 +44,8 @@ pub(crate) enum RawSqlKind {
     Reset,
     /// `ALTER SYSTEM SET <guc> = <value>` — server-level config change.
     AlterSystemSet,
+    /// `DO $$ ... $$` — anonymous PL/pgSQL block.
+    Do,
     /// `ANALYZE [table]` — collects table statistics for the query planner.
     /// All syntax validation (VERBOSE, quoted identifiers, trailing junk) is
     /// handled by `parse_analyze_table_name()` in the handler, not here.
@@ -240,6 +242,15 @@ pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
     }
     if sql_upper.starts_with("DROP COLLATION") {
         return Some(RawSqlKind::DropCollation);
+    }
+
+    // DO block: keyword boundary ensures we don't match DOCUMENT, DOUBLE, etc.
+    if sql_upper.len() > 2
+        && sql_upper.starts_with("DO")
+        && !sql_upper.as_bytes()[2].is_ascii_alphanumeric()
+        && sql_upper.as_bytes()[2] != b'_'
+    {
+        return Some(RawSqlKind::Do);
     }
 
     // ANALYZE — keyword boundary only; all syntax validation lives in the handler.
@@ -502,6 +513,20 @@ mod tests {
 
         // Embedded comments between RESET and GUC name
         assert_eq!(classify("RESET /*x*/ ALL"), Some(RawSqlKind::Reset));
+    }
+
+    #[test]
+    fn classify_do_block() {
+        assert_eq!(classify("DO $$ BEGIN END $$"), Some(RawSqlKind::Do));
+        assert_eq!(classify("DO$$ BEGIN END $$"), Some(RawSqlKind::Do));
+        assert_eq!(classify("DO\n$$ BEGIN END $$"), Some(RawSqlKind::Do));
+        assert_eq!(
+            classify("DO LANGUAGE PLPGSQL $$ BEGIN END $$"),
+            Some(RawSqlKind::Do)
+        );
+        // Must NOT match words that start with DO
+        assert_eq!(classify("DOUBLE PRECISION"), None);
+        assert_eq!(classify("DOCUMENT"), None);
     }
 
     #[test]

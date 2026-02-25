@@ -2815,3 +2815,60 @@ fn using_merged_column_carries_collation() {
         "Explicit SELECT a with USING join must carry collation"
     );
 }
+
+// ── ANY($1) parameter inference (Prisma compat, #1059) ──────
+
+#[test]
+fn any_with_unresolved_text_parameter_infers_array_type() {
+    // Prisma schema engine sends `WHERE nspname = ANY($1)` with OID=0.
+    // The analyzer must infer $1 as Array(Text) from the left operand type.
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let query = parse_query("SELECT name FROM users WHERE name = ANY($1)");
+    let _result = analyzer.analyze_query(&query).unwrap();
+
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(param_types, vec![DataType::Array(Box::new(DataType::Text))]);
+}
+
+#[test]
+fn any_with_unresolved_int_parameter_infers_int_array() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let query = parse_query("SELECT id FROM users WHERE id = ANY($1)");
+    let _result = analyzer.analyze_query(&query).unwrap();
+
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(
+        param_types,
+        vec![DataType::Array(Box::new(DataType::Int32))]
+    );
+}
+
+#[test]
+fn any_with_typed_array_parameter_still_works() {
+    // Client provides OID for text[] — should still work.
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(
+        &catalog,
+        1,
+        &[Some(DataType::Array(Box::new(DataType::Text)))],
+    );
+    let query = parse_query("SELECT name FROM users WHERE name = ANY($1)");
+    let _result = analyzer.analyze_query(&query).unwrap();
+
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(param_types, vec![DataType::Array(Box::new(DataType::Text))]);
+}
+
+#[test]
+fn any_with_cast_parameter_works() {
+    // `$1::text[]` — explicit SQL cast should work (existing path).
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let query = parse_query("SELECT name FROM users WHERE name = ANY($1::text[])");
+    let _result = analyzer.analyze_query(&query).unwrap();
+
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(param_types, vec![DataType::Array(Box::new(DataType::Text))]);
+}

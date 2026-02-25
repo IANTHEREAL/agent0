@@ -316,7 +316,18 @@ fn parse_arg_types(args: &str) -> Vec<String> {
     out
 }
 
-fn parse_sql_string_or_dollar_literal(s: &str) -> Result<String> {
+fn consume_keyword_token_ci<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
+    if s.len() < keyword.len() || !s[..keyword.len()].eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let next = s[keyword.len()..].chars().next();
+    if matches!(next, Some(ch) if !ch.is_ascii_whitespace()) {
+        return None;
+    }
+    Some(&s[keyword.len()..])
+}
+
+fn parse_sql_string_or_dollar_literal_with_tail(s: &str) -> Result<(String, &str)> {
     let s = s.trim_start();
     if s.starts_with('$') {
         let bytes = s.as_bytes();
@@ -334,7 +345,8 @@ fn parse_sql_string_or_dollar_literal(s: &str) -> Result<String> {
             return Err(anyhow!("Unterminated dollar-quoted string"));
         };
         let body_end = body_start + close_rel;
-        return Ok(s[body_start..body_end].to_string());
+        let tail_start = body_end + delim.len();
+        return Ok((s[body_start..body_end].to_string(), &s[tail_start..]));
     }
 
     if s.starts_with('\'') {
@@ -349,7 +361,7 @@ fn parse_sql_string_or_dollar_literal(s: &str) -> Result<String> {
                     i += 2;
                     continue;
                 }
-                return Ok(out);
+                return Ok((out, &s[i + 1..]));
             }
             out.push(b as char);
             i += 1;
@@ -358,6 +370,10 @@ fn parse_sql_string_or_dollar_literal(s: &str) -> Result<String> {
     }
 
     Err(anyhow!("Expected string literal after AS"))
+}
+
+fn parse_sql_string_or_dollar_literal(s: &str) -> Result<String> {
+    parse_sql_string_or_dollar_literal_with_tail(s).map(|(body, _tail)| body)
 }
 
 fn parse_create_function_sql(sql: &str) -> Result<(ObjectName, FunctionDef, bool)> {
@@ -609,7 +625,106 @@ fn parse_drop_trigger_sql(sql: &str) -> Result<(bool, String, ObjectName)> {
     Ok((if_exists, trigger_name, table))
 }
 
+/// Extract the PL/pgSQL body from a `DO` statement.
+///
+/// Accepts:
+/// - `DO $$ ... $$`
+/// - `DO $tag$ ... $tag$`
+/// - `DO LANGUAGE plpgsql $$ ... $$`
+/// - `DO LANGUAGE plpgsql $tag$ ... $tag$`
+fn parse_do_block_body(sql: &str) -> Result<String> {
+    let sql = strip_leading_sql_comments(sql).trim();
+    let sql = sql.trim_end_matches(';').trim_end();
+
+    if !starts_with_ignore_ascii_case(sql, "DO") {
+        return Err(anyhow!("Invalid DO syntax"));
+    }
+    let after_do = sql[2..].trim_start();
+
+    // Optional: LANGUAGE plpgsql (default if omitted)
+    let body_start = if let Some(after_language_kw) = consume_keyword_token_ci(after_do, "LANGUAGE")
+    {
+        let rest = after_language_kw.trim_start();
+        let lang = rest
+            .split(|c: char| c.is_ascii_whitespace() || c == '$')
+            .next()
+            .unwrap_or("");
+        if !lang.eq_ignore_ascii_case("plpgsql") {
+            return Err(anyhow!(
+                "DO: only LANGUAGE plpgsql is supported, got '{}'",
+                lang
+            ));
+        }
+        rest[lang.len()..].trim_start()
+    } else {
+        after_do
+    };
+
+    let (body, tail) = parse_sql_string_or_dollar_literal_with_tail(body_start)?;
+    if !tail.trim().is_empty() {
+        return Err(anyhow!("DO: unexpected tokens after block body"));
+    }
+    Ok(body)
+}
+
 impl Executor {
+    pub(crate) async fn execute_do_block_cmd(
+        &self,
+        session: &mut Session,
+        sql: &str,
+    ) -> Result<ExecuteResult> {
+        let body = parse_do_block_body(sql)?;
+        plpgsql::validate_plpgsql_body(&body)?;
+
+        let func_def = FunctionDef {
+            oid: 0,
+            schema: String::new(),
+            name: "<DO block>".to_string(),
+            arg_types: vec![],
+            return_type: "void".to_string(),
+            language: "plpgsql".to_string(),
+            body,
+            owner: session.current_user().unwrap_or("postgres").to_string(),
+        };
+
+        let is_autocommit = !session.is_in_transaction();
+        if is_autocommit {
+            session.begin().await?;
+        }
+
+        let result = async {
+            let db_id = session.current_database_id();
+            let (txn, sequence_values, search_path) = session
+                .get_mut_txn_sequence_values_and_search_path()
+                .expect("Transaction must be active");
+
+            plpgsql::execute_plpgsql_function(
+                &self.store(),
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                &func_def,
+                vec![],
+                Some(self),
+            )
+            .await?;
+
+            Ok(ExecuteResult::CommandComplete { tag: "DO" })
+        }
+        .await;
+
+        if is_autocommit {
+            if result.is_ok() {
+                session.commit().await?;
+            } else {
+                session.rollback().await?;
+            }
+        }
+
+        result
+    }
+
     pub(crate) async fn execute_create_function_cmd(
         &self,
         session: &mut Session,
@@ -921,5 +1036,49 @@ mod tests {
         assert!(if_exists);
         assert!(cascade);
         assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn parse_do_block_dollar_quoted() {
+        let body = parse_do_block_body("DO $$ BEGIN RAISE NOTICE 'hello'; END $$;").unwrap();
+        assert_eq!(body.trim(), "BEGIN RAISE NOTICE 'hello'; END");
+    }
+
+    #[test]
+    fn parse_do_block_tagged_dollar_quote() {
+        let body = parse_do_block_body("DO $body$ BEGIN END $body$;").unwrap();
+        assert_eq!(body.trim(), "BEGIN END");
+    }
+
+    #[test]
+    fn parse_do_block_with_language() {
+        let body = parse_do_block_body("DO LANGUAGE plpgsql $$ BEGIN END $$;").unwrap();
+        assert_eq!(body.trim(), "BEGIN END");
+    }
+
+    #[test]
+    fn parse_do_block_rejects_non_plpgsql_language() {
+        let err = parse_do_block_body("DO LANGUAGE sql $$ SELECT 1 $$;");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("plpgsql"));
+    }
+
+    #[test]
+    fn parse_do_block_rejects_language_without_token_boundary() {
+        let err = parse_do_block_body("DO LANGUAGEPLPGSQL $$ BEGIN END $$;");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn parse_do_block_rejects_trailing_tokens() {
+        let err = parse_do_block_body("DO $$ BEGIN END $$ garbage");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn parse_do_block_with_newlines() {
+        let body = parse_do_block_body("DO\n$$\nBEGIN\nEND\n$$").unwrap();
+        assert!(body.contains("BEGIN"));
+        assert!(body.contains("END"));
     }
 }

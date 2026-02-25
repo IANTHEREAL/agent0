@@ -321,8 +321,20 @@ fn decode_text_value(
         t if *t == Type::INT4_ARRAY
             || *t == Type::INT8_ARRAY
             || *t == Type::TEXT_ARRAY
+            || *t == Type::VARCHAR_ARRAY
+            || *t == Type::NAME_ARRAY
             || *t == Type::FLOAT8_ARRAY
-            || *t == Type::BOOL_ARRAY =>
+            || *t == Type::BOOL_ARRAY
+            || *t == Type::TIMESTAMP_ARRAY
+            || *t == Type::TIMESTAMPTZ_ARRAY
+            || *t == Type::DATE_ARRAY
+            || *t == Type::INTERVAL_ARRAY
+            || *t == Type::UUID_ARRAY
+            || *t == Type::BYTEA_ARRAY
+            || *t == Type::JSON_ARRAY
+            || *t == Type::JSONB_ARRAY
+            || *t == Type::TIME_ARRAY
+            || *t == Type::NUMERIC_ARRAY =>
         {
             crate::sql::value_coercion::parse_pg_array(trimmed)
                 .map(Value::Array)
@@ -347,5 +359,29 @@ mod tests {
     fn decode_text_numeric_still_accepts_surrounding_whitespace() {
         let v = decode_text(b"  42  ", &Type::INT4, 0).unwrap();
         assert_eq!(v, Value::Int32(42));
+    }
+
+    #[test]
+    fn decode_text_varchar_array_decodes_as_array() {
+        let v = decode_text(b"{alice,bob}", &Type::VARCHAR_ARRAY, 0).unwrap();
+        assert_eq!(
+            v,
+            Value::Array(vec![
+                Value::Text("alice".to_string()),
+                Value::Text("bob".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn decode_text_name_array_decodes_as_array() {
+        let v = decode_text(b"{public,tenant}", &Type::NAME_ARRAY, 0).unwrap();
+        assert_eq!(
+            v,
+            Value::Array(vec![
+                Value::Text("public".to_string()),
+                Value::Text("tenant".to_string()),
+            ])
+        );
     }
 }

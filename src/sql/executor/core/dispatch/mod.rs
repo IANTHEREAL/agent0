@@ -209,6 +209,10 @@ impl Executor {
                     dispatch_raw!(self, session, sql_trimmed,
                         self.execute_analyze_cmd(session, sql_trimmed).await);
                 }
+                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::Do)) {
+                    dispatch_raw!(self, session, sql_trimmed,
+                        self.execute_do_block_cmd(session, sql).await);
+                }
             }
 
                 if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::AlterSystemSet)) {

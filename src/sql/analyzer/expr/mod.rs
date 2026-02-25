@@ -726,9 +726,37 @@ impl<'a> Analyzer<'a> {
                     ));
                 }
 
+                // Infer array type for unresolved parameters in = ANY() context.
+                // Prisma schema engine sends `WHERE col = ANY($1)` with OID=0;
+                // PostgreSQL infers $1 as array(col_type) from context.
+                if matches!(compare_op, BinaryOperator::Eq) {
+                    if let TypedExprKind::Parameter { index } = &right_expr.kind {
+                        if self.is_unresolved_param(&right_expr) {
+                            let array_type = DataType::Array(Box::new(left_expr.data_type.clone()));
+                            self.resolve_param_type(*index, &array_type)?;
+                            let right_fixed = TypedExpr::new(
+                                TypedExprKind::Parameter { index: *index },
+                                array_type,
+                            );
+                            let array_pos = self.make_function_call(
+                                "ARRAY_POSITION",
+                                vec![right_fixed, left_expr],
+                            )?;
+                            return Ok(TypedExpr::new(
+                                TypedExprKind::IsTest {
+                                    expr: Box::new(array_pos),
+                                    test: IsTestKind::Null,
+                                    negated: true,
+                                },
+                                DataType::Boolean,
+                            ));
+                        }
+                    }
+                }
+
                 Err(AnalyzerError::Unsupported(format!(
-                    "ANY with non-array operand or non-equality operator: {:?}",
-                    compare_op,
+                    "ANY: right operand type {:?}, compare_op {:?}",
+                    right_expr.data_type, compare_op,
                 )))
             }
 
