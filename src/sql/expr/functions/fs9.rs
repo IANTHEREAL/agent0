@@ -124,7 +124,7 @@ fn fs9_exists_remote(path: &str) -> Result<Value> {
     let bk = get_remote_backend()?;
     match run_async(bk.stat(path)) {
         Ok(_) => Ok(Value::Boolean(true)),
-        Err(e) if e.to_string().contains("file not found") => Ok(Value::Boolean(false)),
+        Err(e) if { let msg = e.to_string(); msg.contains("not found") || msg.contains("NotFound") || msg.contains("404") } => Ok(Value::Boolean(false)),
         Err(e) => Err(e),
     }
 }
