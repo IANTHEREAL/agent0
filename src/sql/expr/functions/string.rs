@@ -5,6 +5,9 @@ use std::collections::HashMap;
 
 use super::SqlFn;
 
+/// Maximum output size in bytes for string-producing functions (matches PostgreSQL's MaxAllocSize).
+const MAX_STRING_OUTPUT_BYTES: usize = 1_073_741_823; // 1GB - 1
+
 pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("UPPER", upper);
     map.insert("LOWER", lower);
@@ -221,7 +224,7 @@ pub fn lpad(args: Vec<Value>) -> Result<Value> {
     };
     let len = match iter.next() {
         Some(Value::Int32(n)) => n.max(0) as usize,
-        Some(Value::Int64(n)) => n.max(0) as usize,
+        Some(Value::Int64(n)) => usize::try_from(n.max(0)).unwrap_or(usize::MAX),
         _ => return Ok(Value::Null),
     };
     let fill = match iter.next() {
@@ -230,14 +233,17 @@ pub fn lpad(args: Vec<Value>) -> Result<Value> {
     };
     let char_count = s.chars().count();
     if char_count >= len {
+        let byte_len: usize = s.chars().take(len).map(|c| c.len_utf8()).sum();
+        check_output_byte_size(byte_len)?;
         Ok(Value::Text(s.chars().take(len).collect()))
     } else {
         let fill_chars: Vec<char> = fill.chars().collect();
         if fill_chars.is_empty() {
             return Ok(Value::Text(s));
         }
-        let mut result = String::new();
         let needed = len - char_count;
+        check_pad_output_size(s.len(), needed, &fill, &fill_chars)?;
+        let mut result = String::new();
         for i in 0..needed {
             result.push(fill_chars[i % fill_chars.len()]);
         }
@@ -254,7 +260,7 @@ pub fn rpad(args: Vec<Value>) -> Result<Value> {
     };
     let len = match iter.next() {
         Some(Value::Int32(n)) => n.max(0) as usize,
-        Some(Value::Int64(n)) => n.max(0) as usize,
+        Some(Value::Int64(n)) => usize::try_from(n.max(0)).unwrap_or(usize::MAX),
         _ => return Ok(Value::Null),
     };
     let fill = match iter.next() {
@@ -263,14 +269,17 @@ pub fn rpad(args: Vec<Value>) -> Result<Value> {
     };
     let char_count = s.chars().count();
     if char_count >= len {
+        let byte_len: usize = s.chars().take(len).map(|c| c.len_utf8()).sum();
+        check_output_byte_size(byte_len)?;
         Ok(Value::Text(s.chars().take(len).collect()))
     } else {
         let fill_chars: Vec<char> = fill.chars().collect();
         if fill_chars.is_empty() {
             return Ok(Value::Text(s));
         }
-        let mut result = s;
         let needed = len - char_count;
+        check_pad_output_size(s.len(), needed, &fill, &fill_chars)?;
+        let mut result = s;
         for i in 0..needed {
             result.push(fill_chars[i % fill_chars.len()]);
         }
@@ -286,10 +295,50 @@ pub fn repeat(args: Vec<Value>) -> Result<Value> {
     };
     let n = match iter.next() {
         Some(Value::Int32(n)) => n.max(0) as usize,
-        Some(Value::Int64(n)) => n.max(0) as usize,
+        Some(Value::Int64(n)) => usize::try_from(n.max(0)).unwrap_or(usize::MAX),
         _ => return Ok(Value::Null),
     };
+    let output_len = s.len().saturating_mul(n);
+    if output_len > MAX_STRING_OUTPUT_BYTES {
+        anyhow::bail!("requested length too large");
+    }
     Ok(Value::Text(s.repeat(n)))
+}
+
+/// Check that a string output of `byte_len` bytes won't exceed MAX_STRING_OUTPUT_BYTES.
+fn check_output_byte_size(byte_len: usize) -> Result<()> {
+    if byte_len > MAX_STRING_OUTPUT_BYTES {
+        anyhow::bail!("requested length too large");
+    }
+    Ok(())
+}
+
+/// Check that the byte size of a padded string won't exceed MAX_STRING_OUTPUT_BYTES.
+/// `s_len` is the byte length of the original string.
+/// `needed` is the number of fill characters to add.
+/// `fill` is the fill string (its full byte length).
+/// `fill_chars` is the fill string's characters (for partial-cycle byte computation).
+fn check_pad_output_size(
+    s_len: usize,
+    needed: usize,
+    fill: &str,
+    fill_chars: &[char],
+) -> Result<()> {
+    let fill_char_count = fill_chars.len();
+    if fill_char_count == 0 {
+        return Ok(());
+    }
+    let full_cycles = needed / fill_char_count;
+    let remaining = needed % fill_char_count;
+    let partial_bytes: usize = fill_chars[..remaining].iter().map(|c| c.len_utf8()).sum();
+    let fill_bytes = full_cycles
+        .saturating_mul(fill.len())
+        .saturating_add(partial_bytes);
+    let total_bytes = fill_bytes.saturating_add(s_len);
+    if total_bytes > MAX_STRING_OUTPUT_BYTES {
+        anyhow::bail!("requested length too large");
+    }
+    Ok(())
 }
 
 pub fn replace(args: Vec<Value>) -> Result<Value> {
@@ -698,5 +747,133 @@ mod tests {
             .unwrap(),
             Value::Text("heLLo".into())
         );
+    }
+
+    #[test]
+    fn test_repeat_too_large() {
+        let result = repeat(vec![Value::Text("x".into()), Value::Int32(2_000_000_000)]);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requested length too large"));
+    }
+
+    #[test]
+    fn test_lpad_too_large() {
+        let result = lpad(vec![
+            Value::Text("x".into()),
+            Value::Int32(2_000_000_000),
+            Value::Text("y".into()),
+        ]);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requested length too large"));
+    }
+
+    #[test]
+    fn test_rpad_too_large() {
+        let result = rpad(vec![
+            Value::Text("x".into()),
+            Value::Int32(2_000_000_000),
+            Value::Text("y".into()),
+        ]);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requested length too large"));
+    }
+
+    #[test]
+    fn test_lpad_multibyte_too_large() {
+        // Each emoji is 4 bytes. 300M chars * 4 bytes = 1.2GB > 1GB limit.
+        let result = lpad(vec![
+            Value::Text("x".into()),
+            Value::Int32(300_000_000),
+            Value::Text("\u{1F600}".into()), // 😀 = 4 bytes
+        ]);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requested length too large"));
+    }
+
+    #[test]
+    fn test_rpad_multibyte_too_large() {
+        let result = rpad(vec![
+            Value::Text("x".into()),
+            Value::Int32(300_000_000),
+            Value::Text("\u{1F600}".into()), // 😀 = 4 bytes
+        ]);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requested length too large"));
+    }
+
+    #[test]
+    fn test_repeat_boundary_exact() {
+        // Verify the guard allows output of exactly MAX_STRING_OUTPUT_BYTES.
+        // We test with check_pad_output_size directly to avoid a real 1GB allocation.
+        // repeat("x", MAX) → output = MAX bytes → should pass.
+        let max = super::MAX_STRING_OUTPUT_BYTES;
+        assert!(super::check_pad_output_size(0, max, "x", &['x']).is_ok());
+    }
+
+    #[test]
+    fn test_repeat_boundary_one_over() {
+        // MAX + 1 bytes should fail.
+        let max = super::MAX_STRING_OUTPUT_BYTES;
+        let result = super::check_pad_output_size(0, max + 1, "x", &['x']);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requested length too large"));
+    }
+
+    #[test]
+    fn test_repeat_boundary_via_function() {
+        // Also verify via the repeat() function itself: 2-byte string * n
+        // where 2*n == MAX+1 → should fail (one byte over).
+        let max = super::MAX_STRING_OUTPUT_BYTES;
+        let n = (max / 2) + 1; // 2 * n = max + 1 (since max is odd, max/2 rounds down)
+        let result = repeat(vec![Value::Text("ab".into()), Value::Int64(n as i64)]);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requested length too large"));
+    }
+
+    #[test]
+    fn test_truncation_pre_check_rejects_oversized() {
+        // Verify check_output_byte_size rejects when byte size > MAX.
+        let max = super::MAX_STRING_OUTPUT_BYTES;
+        // Exactly at limit → ok.
+        assert!(super::check_output_byte_size(max).is_ok());
+        // One byte over → error.
+        let result = super::check_output_byte_size(max + 1);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requested length too large"));
+    }
+
+    #[test]
+    fn test_truncation_pre_check_boundary() {
+        // Test check_pad_output_size boundary for the truncation scenario:
+        // s already has the bytes, no fill needed.
+        let max = super::MAX_STRING_OUTPUT_BYTES;
+        // Equivalent to a string of MAX 1-byte chars truncated to MAX → exactly MAX bytes.
+        assert!(super::check_pad_output_size(max, 0, "x", &['x']).is_ok());
+        // MAX + 1 bytes → should fail.
+        assert!(super::check_pad_output_size(max + 1, 0, "x", &['x']).is_err());
     }
 }
