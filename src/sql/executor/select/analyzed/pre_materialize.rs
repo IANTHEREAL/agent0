@@ -188,6 +188,104 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
                     })
                 }
 
+                TypedExprKind::TupleInSubquery {
+                    exprs,
+                    subquery,
+                    negated,
+                } => {
+                    if is_correlated_query(subquery) {
+                        return Ok(expr.clone());
+                    }
+                    // Rewrite each tuple element expression.
+                    let mut rewritten_exprs = Vec::with_capacity(exprs.len());
+                    for e in exprs {
+                        rewritten_exprs.push(self.transform_expr(e).await?);
+                    }
+                    let result = self
+                        .executor
+                        .execute_subquery(
+                            &mut *self.txn,
+                            self.db_id,
+                            &mut *self.sequence_values,
+                            self.search_path,
+                            subquery,
+                            self.ctes,
+                        )
+                        .await?;
+                    let rows = match result {
+                        ExecuteResult::Select { rows, .. } => rows,
+                        _ => return Err(anyhow!("Expected SELECT from tuple IN subquery")),
+                    };
+                    if rows.is_empty() {
+                        // Empty set: IN → false, NOT IN → true
+                        return Ok(TypedExpr {
+                            kind: TypedExprKind::Constant(Value::Boolean(*negated)),
+                            data_type: DataType::Boolean,
+                        });
+                    }
+                    // Build: (e0 = r0[0] AND e1 = r0[1]) OR (e0 = r1[0] AND e1 = r1[1]) OR ...
+                    // Uses regular = (not IS NOT DISTINCT FROM) to preserve PostgreSQL's
+                    // three-valued NULL logic for IN/NOT IN.
+                    let row_comparisons: Vec<TypedExpr> = rows
+                        .into_iter()
+                        .map(|r| {
+                            let col_eqs: Vec<TypedExpr> = rewritten_exprs
+                                .iter()
+                                .enumerate()
+                                .map(|(i, lhs)| {
+                                    let rhs_val = r.values.get(i).cloned().unwrap_or(Value::Null);
+                                    TypedExpr {
+                                        kind: TypedExprKind::BinaryOp {
+                                            left: Box::new(lhs.clone()),
+                                            op: TypedBinaryOp::Eq,
+                                            right: Box::new(TypedExpr::new(
+                                                TypedExprKind::Constant(rhs_val),
+                                                lhs.data_type.clone(),
+                                            )),
+                                        },
+                                        data_type: DataType::Boolean,
+                                    }
+                                })
+                                .collect();
+                            // AND all column equalities together
+                            col_eqs
+                                .into_iter()
+                                .reduce(|a, b| TypedExpr {
+                                    kind: TypedExprKind::BinaryOp {
+                                        left: Box::new(a),
+                                        op: TypedBinaryOp::And,
+                                        right: Box::new(b),
+                                    },
+                                    data_type: DataType::Boolean,
+                                })
+                                .unwrap()
+                        })
+                        .collect();
+                    // OR all row comparisons together
+                    let combined = row_comparisons
+                        .into_iter()
+                        .reduce(|a, b| TypedExpr {
+                            kind: TypedExprKind::BinaryOp {
+                                left: Box::new(a),
+                                op: TypedBinaryOp::Or,
+                                right: Box::new(b),
+                            },
+                            data_type: DataType::Boolean,
+                        })
+                        .unwrap();
+                    if *negated {
+                        Ok(TypedExpr {
+                            kind: TypedExprKind::UnaryOp {
+                                op: crate::sql::analyzer::types::UnaryOp::Not,
+                                operand: Box::new(combined),
+                            },
+                            data_type: DataType::Boolean,
+                        })
+                    } else {
+                        Ok(combined)
+                    }
+                }
+
                 TypedExprKind::Exists { subquery, negated } => {
                     if is_correlated_query(subquery) {
                         return Ok(expr.clone());

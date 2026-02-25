@@ -74,8 +74,21 @@ pub async fn execute_alter_table(
     let collations = store.list_collations(txn, db_id).await?;
 
     match operation {
-        AlterTableOperation::AddColumn { column_def, .. } => {
-            alter_table_add_column(store, txn, db_id, search_path, &mut schema, column_def).await?;
+        AlterTableOperation::AddColumn {
+            column_def,
+            if_not_exists,
+            ..
+        } => {
+            alter_table_add_column(
+                store,
+                txn,
+                db_id,
+                search_path,
+                &mut schema,
+                column_def,
+                *if_not_exists,
+            )
+            .await?;
             invalidate_stats = true;
         }
         AlterTableOperation::AddConstraint(constraint) => match constraint {

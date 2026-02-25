@@ -310,6 +310,7 @@ impl Executor {
                 | TypedExprKind::ArraySubquery(_)
                 | TypedExprKind::Exists { .. }
                 | TypedExprKind::InSubquery { .. }
+                | TypedExprKind::TupleInSubquery { .. }
                 | TypedExprKind::AnyAll { .. } => Ok(expr.clone()),
 
                 // Recurse through composite nodes.

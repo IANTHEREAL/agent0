@@ -97,6 +97,18 @@ pub(super) fn remap_column_refs(
             subquery,
             negated,
         },
+        TypedExprKind::TupleInSubquery {
+            exprs,
+            subquery,
+            negated,
+        } => TypedExprKind::TupleInSubquery {
+            exprs: exprs
+                .into_iter()
+                .map(|e| remap_column_refs(e, column_map, base_names))
+                .collect(),
+            subquery,
+            negated,
+        },
         TypedExprKind::AnyAll {
             expr: inner_expr,
             op,
@@ -135,6 +147,15 @@ pub(super) fn remap_column_refs(
         } => TypedExprKind::IsTest {
             expr: Box::new(remap_column_refs(*inner, column_map, base_names)),
             test,
+            negated,
+        },
+        TypedExprKind::IsDistinctFrom {
+            left,
+            right,
+            negated,
+        } => TypedExprKind::IsDistinctFrom {
+            left: Box::new(remap_column_refs(*left, column_map, base_names)),
+            right: Box::new(remap_column_refs(*right, column_map, base_names)),
             negated,
         },
 

@@ -60,6 +60,7 @@ pub(crate) fn needs_pre_materialization(expr: &TypedExpr) -> bool {
         | TypedExprKind::ArraySubquery(_)
         | TypedExprKind::Exists { .. }
         | TypedExprKind::InSubquery { .. }
+        | TypedExprKind::TupleInSubquery { .. }
         | TypedExprKind::AnyAll { .. } => true,
         TypedExprKind::FunctionCall { func, .. } => {
             is_pre_materialized_sequence_function(&func.name)
@@ -88,6 +89,7 @@ pub(crate) fn has_unresolved_subquery(expr: &TypedExpr) -> bool {
                 | TypedExprKind::ArraySubquery(_)
                 | TypedExprKind::Exists { .. }
                 | TypedExprKind::InSubquery { .. }
+                | TypedExprKind::TupleInSubquery { .. }
                 | TypedExprKind::AnyAll { .. }
         )
     })

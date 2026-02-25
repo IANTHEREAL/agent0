@@ -205,6 +205,13 @@ impl Executor {
                 let res = self.execute_do_block_cmd(session, sql).await;
                 Some(self.finish_raw_single(session, &ctx.sql_trimmed, start, res))
             }
+            RawSqlKind::AlterIndexIfExists => {
+                let start = Instant::now();
+                let res = self
+                    .execute_alter_index_if_exists_rename(session, &ctx.sql_trimmed)
+                    .await;
+                Some(self.finish_raw_single(session, &ctx.sql_trimmed, start, res))
+            }
             _ => None,
         }
     }

@@ -25,6 +25,7 @@ pub fn needs_async_materialization(expr: &TypedExpr) -> bool {
         | TypedExprKind::ArraySubquery(_)
         | TypedExprKind::Exists { .. }
         | TypedExprKind::InSubquery { .. }
+        | TypedExprKind::TupleInSubquery { .. }
         | TypedExprKind::AnyAll { .. }
         | TypedExprKind::AggregateCall { .. }
         | TypedExprKind::WindowCall { .. } => true,

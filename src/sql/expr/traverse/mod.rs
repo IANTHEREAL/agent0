@@ -56,6 +56,11 @@ pub fn for_each_child<'a>(expr: &'a TypedExpr, f: &mut impl FnMut(&'a TypedExpr)
         | TypedExprKind::Cast { expr: operand, .. }
         | TypedExprKind::IsTest { expr: operand, .. } => f(operand),
 
+        TypedExprKind::IsDistinctFrom { left, right, .. } => {
+            f(left);
+            f(right);
+        }
+
         TypedExprKind::Between {
             expr, low, high, ..
         } => {
@@ -146,6 +151,8 @@ pub fn for_each_child<'a>(expr: &'a TypedExpr, f: &mut impl FnMut(&'a TypedExpr)
             }
         }
         TypedExprKind::InSubquery { expr, .. } | TypedExprKind::AnyAll { expr, .. } => f(expr),
+
+        TypedExprKind::TupleInSubquery { exprs, .. } => exprs.iter().for_each(f),
 
         TypedExprKind::ArrayIndex { array, index } => {
             f(array);
@@ -316,6 +323,15 @@ macro_rules! map_children_match {
                 test: *test,
                 negated: *negated,
             },
+            TypedExprKind::IsDistinctFrom {
+                left,
+                right,
+                negated,
+            } => TypedExprKind::IsDistinctFrom {
+                left: Box::new($map_one!($mapper, left)),
+                right: Box::new($map_one!($mapper, right)),
+                negated: *negated,
+            },
             TypedExprKind::Between {
                 expr: inner,
                 low,
@@ -421,6 +437,15 @@ macro_rules! map_children_match {
                 negated,
             } => TypedExprKind::InSubquery {
                 expr: Box::new($map_one!($mapper, inner)),
+                subquery: subquery.clone(),
+                negated: *negated,
+            },
+            TypedExprKind::TupleInSubquery {
+                exprs,
+                subquery,
+                negated,
+            } => TypedExprKind::TupleInSubquery {
+                exprs: $map_vec!($mapper, exprs),
                 subquery: subquery.clone(),
                 negated: *negated,
             },

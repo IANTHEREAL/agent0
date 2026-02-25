@@ -32,9 +32,13 @@ pub(super) async fn alter_table_add_column(
     search_path: &[String],
     schema: &mut crate::model::TableSchema,
     column_def: &sqlparser::ast::ColumnDef,
+    if_not_exists: bool,
 ) -> Result<()> {
     let col_name = normalize_ident(&column_def.name);
     if schema.column_index(&col_name).is_some() {
+        if if_not_exists {
+            return Ok(());
+        }
         return Err(anyhow!("Column exists"));
     }
     let (data_type, mut is_serial) =

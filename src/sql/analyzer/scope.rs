@@ -92,6 +92,11 @@ pub struct Scope {
 
     /// Whether window functions are allowed in expressions at this level.
     pub allow_windows: bool,
+
+    /// Whether `add_table` should append synthetic system columns (currently `ctid`).
+    /// Disabled by default; enabled only for DML scopes that need PostgreSQL
+    /// compatibility for table-qualified `alias.ctid`.
+    add_system_columns: bool,
 }
 
 impl Scope {
@@ -113,7 +118,13 @@ impl Scope {
             cte_schemas: HashMap::new(),
             allow_aggregates: false,
             allow_windows: false,
+            add_system_columns: false,
         }
+    }
+
+    /// Enable/disable synthetic system column registration for subsequent `add_table` calls.
+    pub fn set_add_system_columns(&mut self, enabled: bool) {
+        self.add_system_columns = enabled;
     }
 
     /// Build a scope from a `TableSchema`, using the table name (or alias) as qualifier.
@@ -144,6 +155,26 @@ impl Scope {
     /// appended to the flattened row, with `column_index` set to the absolute
     /// position starting from the current column count.
     pub fn add_table(&mut self, alias: &str, columns: &[(String, DataType, bool, Option<String>)]) {
+        self.add_table_internal(alias, columns, self.add_system_columns);
+    }
+
+    /// Add a table but force-disable synthetic system columns even when the
+    /// scope is in DML mode. Used for derived tables/CTEs/functions whose rows
+    /// do not carry physical tuple metadata like `ctid`.
+    pub fn add_table_without_system_columns(
+        &mut self,
+        alias: &str,
+        columns: &[(String, DataType, bool, Option<String>)],
+    ) {
+        self.add_table_internal(alias, columns, false);
+    }
+
+    fn add_table_internal(
+        &mut self,
+        alias: &str,
+        columns: &[(String, DataType, bool, Option<String>)],
+        include_system_columns: bool,
+    ) {
         let base_offset = self.columns.len();
         for (idx, (name, data_type, nullable, collation)) in columns.iter().enumerate() {
             let abs_index = base_offset + idx;
@@ -168,6 +199,23 @@ impl Scope {
                 .insert((alias.to_lowercase(), name.to_lowercase()), abs_index);
 
             self.columns.push(col);
+        }
+
+        if include_system_columns {
+            // Add synthetic ctid system column (hidden, only accessible via table.ctid).
+            let ctid_index = self.columns.len();
+            let ctid_col = ScopeColumn {
+                table_alias: Some(alias.to_string()),
+                column_name: "ctid".to_string(),
+                column_index: ctid_index,
+                data_type: DataType::Int64,
+                nullable: false,
+                hidden: true,
+                collation: None,
+            };
+            self.qualified_index
+                .insert((alias.to_lowercase(), "ctid".to_string()), ctid_index);
+            self.columns.push(ctid_col);
         }
     }
 
@@ -527,6 +575,27 @@ mod tests {
             .resolve_unqualified_with_ident(&Ident::new("AGE"))
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn system_columns_are_opt_in() {
+        use sqlparser::ast::Ident;
+
+        let mut scope = Scope::new();
+        scope.add_table("t", &[int_col("id")]);
+        assert!(scope
+            .resolve_qualified_idents(&Ident::new("t"), &Ident::new("ctid"))
+            .is_none());
+
+        let mut dml_scope = Scope::new();
+        dml_scope.set_add_system_columns(true);
+        dml_scope.add_table("t", &[int_col("id")]);
+        let ctid = dml_scope
+            .resolve_qualified_idents(&Ident::new("t"), &Ident::new("ctid"))
+            .expect("ctid should be visible when system columns are enabled");
+        assert_eq!(ctid.column_name, "ctid");
+        assert_eq!(ctid.column_index, 1);
+        assert_eq!(ctid.data_type, DataType::Int64);
     }
 
     #[test]

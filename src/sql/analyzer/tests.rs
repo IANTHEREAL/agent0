@@ -305,6 +305,36 @@ fn analyze_json_access_comparison_precedence_stays_binary_comparison() {
     ));
 }
 
+#[test]
+fn analyze_json_access_is_null_precedence_stays_is_test_over_json_access() {
+    let expr = analyze_expr_with_users(
+        "'{\"settings\":{}}'::jsonb -> 'settings' ->> 'inputUiInfo' IS NULL",
+    )
+    .unwrap();
+    assert_eq!(expr.data_type, DataType::Boolean);
+
+    let inner = match &expr.kind {
+        TypedExprKind::IsTest {
+            expr,
+            test,
+            negated,
+        } => {
+            assert_eq!(*test, IsTestKind::Null);
+            assert!(!negated);
+            expr
+        }
+        other => panic!("expected IsTest, got {:?}", other),
+    };
+
+    match &inner.kind {
+        TypedExprKind::JsonAccess { path, operator, .. } => {
+            assert_eq!(*operator, JsonAccessOp::LongArrow);
+            assert_eq!(text_literal_value(path), Some("inputUiInfo"));
+        }
+        other => panic!("expected JsonAccess under IS NULL, got {:?}", other),
+    }
+}
+
 // ── Unary operators ─────────────────────────────────────────
 
 #[test]
@@ -1424,6 +1454,54 @@ fn analyze_in_subquery_single_column_ok() {
     let mut analyzer = Analyzer::new(&catalog);
     let query = parse_query("SELECT id FROM users WHERE id IN (SELECT order_id FROM orders)");
     assert!(analyzer.analyze_query(&query).is_ok());
+}
+
+#[test]
+fn analyze_tuple_in_subquery_builds_tuple_variant() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query(
+        "SELECT id FROM users WHERE (id, name) IN (SELECT user_id, status FROM orders)",
+    );
+    let analyzed = analyzer.analyze_query(&query).unwrap();
+    let select = expect_select(&analyzed);
+    let where_expr = select.where_clause.as_ref().expect("missing WHERE clause");
+    match &where_expr.kind {
+        TypedExprKind::TupleInSubquery {
+            exprs,
+            subquery,
+            negated,
+        } => {
+            assert_eq!(exprs.len(), 2);
+            assert_eq!(subquery.output_schema.len(), 2);
+            assert!(!negated);
+        }
+        other => panic!(
+            "expected TupleInSubquery, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+}
+
+#[test]
+fn analyze_is_distinct_from_builds_typed_variant() {
+    let expr = analyze_expr_with_users("id IS DISTINCT FROM age").unwrap();
+    match &expr.kind {
+        TypedExprKind::IsDistinctFrom { negated, .. } => assert!(!negated),
+        other => panic!(
+            "expected IsDistinctFrom, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+
+    let expr = analyze_expr_with_users("id IS NOT DISTINCT FROM age").unwrap();
+    match &expr.kind {
+        TypedExprKind::IsDistinctFrom { negated, .. } => assert!(*negated),
+        other => panic!(
+            "expected IsDistinctFrom, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
 }
 
 #[test]

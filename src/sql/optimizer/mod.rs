@@ -124,6 +124,14 @@ fn collect_expr_subquery_table_refs<'a>(
             collect_expr_subquery_table_refs(inner, refs);
             collect_body_refs(&subquery.body, refs);
         }
+        TypedExprKind::TupleInSubquery {
+            exprs, subquery, ..
+        } => {
+            for inner in exprs {
+                collect_expr_subquery_table_refs(inner, refs);
+            }
+            collect_body_refs(&subquery.body, refs);
+        }
         TypedExprKind::ScalarSubquery(q) | TypedExprKind::ArraySubquery(q) => {
             collect_body_refs(&q.body, refs);
         }

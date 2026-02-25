@@ -94,6 +94,15 @@ pub enum TypedExprKind {
         negated: bool,
     },
 
+    /// `expr IS [NOT] DISTINCT FROM expr`.
+    /// PostgreSQL semantics: `IS DISTINCT FROM` is like `!=` but treats NULLs
+    /// as equal (NULL IS NOT DISTINCT FROM NULL → true).
+    IsDistinctFrom {
+        left: Box<TypedExpr>,
+        right: Box<TypedExpr>,
+        negated: bool,
+    },
+
     /// `expr [NOT] BETWEEN low AND high`.
     Between {
         expr: Box<TypedExpr>,
@@ -188,6 +197,14 @@ pub enum TypedExprKind {
     /// `expr [NOT] IN (SELECT ...)`.
     InSubquery {
         expr: Box<TypedExpr>,
+        subquery: Box<AnalyzedQuery>,
+        negated: bool,
+    },
+
+    /// `(expr, ...) [NOT] IN (SELECT ...)` — tuple IN subquery.
+    /// PostgreSQL three-valued NULL logic for NOT IN.
+    TupleInSubquery {
+        exprs: Vec<TypedExpr>,
         subquery: Box<AnalyzedQuery>,
         negated: bool,
     },

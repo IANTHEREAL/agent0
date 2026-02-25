@@ -277,6 +277,7 @@ impl<'a> Analyzer<'a> {
             .collect();
 
         let mut scope = Scope::new();
+        scope.set_add_system_columns(true);
         scope.add_table(&target_alias, &table_cols);
 
         // Analyze FROM clause if present.
@@ -382,6 +383,7 @@ impl<'a> Analyzer<'a> {
             .collect();
 
         let mut scope = Scope::new();
+        scope.set_add_system_columns(true);
         scope.add_table(&target_alias, &table_cols);
 
         // Analyze USING clause if present.

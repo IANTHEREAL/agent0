@@ -286,7 +286,7 @@ pub(super) fn create_passthrough_projection(
 }
 
 /// Build a TableSchema from column name/type/collation triples.
-pub(super) fn build_schema_from_columns(
+pub(crate) fn build_schema_from_columns(
     name: &str,
     columns: &[(
         String,
@@ -315,7 +315,7 @@ pub(super) fn build_schema_from_columns(
 }
 
 /// Build a TableSchema from the analyzed query's output schema.
-pub(super) fn build_output_schema(analyzed: &AnalyzedQuery) -> TableSchema {
+pub(crate) fn build_output_schema(analyzed: &AnalyzedQuery) -> TableSchema {
     build_schema_from_columns("__output", &analyzed.output_schema)
 }
 
@@ -517,6 +517,14 @@ fn collect_immediate_from_typed_expr<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a 
             ..
         } => {
             collect_immediate_from_typed_expr(lhs, out);
+            out.push(subquery);
+        }
+        TypedExprKind::TupleInSubquery {
+            exprs, subquery, ..
+        } => {
+            for e in exprs {
+                collect_immediate_from_typed_expr(e, out);
+            }
             out.push(subquery);
         }
         _ => {

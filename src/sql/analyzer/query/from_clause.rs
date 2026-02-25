@@ -233,7 +233,7 @@ impl<'a> Analyzer<'a> {
 
                 self.scopes
                     .current_mut()
-                    .add_table(&alias_str, &output_cols);
+                    .add_table_without_system_columns(&alias_str, &output_cols);
 
                 let output_columns: Vec<(String, DataType)> = output_cols
                     .iter()
@@ -302,7 +302,7 @@ impl<'a> Analyzer<'a> {
 
                         self.scopes
                             .current_mut()
-                            .add_table(&alias_str, &output_cols);
+                            .add_table_without_system_columns(&alias_str, &output_cols);
 
                         let output_columns: Vec<(String, DataType)> = output_cols
                             .iter()
@@ -345,7 +345,7 @@ impl<'a> Analyzer<'a> {
 
                         self.scopes
                             .current_mut()
-                            .add_table(&alias_str, &columns_for_scope);
+                            .add_table_without_system_columns(&alias_str, &columns_for_scope);
 
                         let columns_for_schema: Vec<(String, DataType, bool)> = cte_cols
                             .iter()
@@ -474,7 +474,7 @@ impl<'a> Analyzer<'a> {
 
                 self.scopes
                     .current_mut()
-                    .add_table(&alias_str, &output_cols);
+                    .add_table_without_system_columns(&alias_str, &output_cols);
 
                 let output_columns: Vec<(String, DataType)> = output_cols
                     .iter()
@@ -532,7 +532,9 @@ impl<'a> Analyzer<'a> {
                         }
                     }
                 }
-                self.scopes.current_mut().add_table(&alias_str, &columns);
+                self.scopes
+                    .current_mut()
+                    .add_table_without_system_columns(&alias_str, &columns);
 
                 Ok(AnalyzedTableRef {
                     kind: AnalyzedTableRefKind::Subquery(Box::new(analyzed)),

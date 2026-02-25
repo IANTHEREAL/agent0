@@ -34,6 +34,19 @@ impl fmt::Display for TypedExpr {
                     test
                 )
             }
+            TypedExprKind::IsDistinctFrom {
+                left,
+                right,
+                negated,
+            } => {
+                write!(
+                    f,
+                    "({} IS {}DISTINCT FROM {})",
+                    left,
+                    if *negated { "NOT " } else { "" },
+                    right
+                )
+            }
             TypedExprKind::Between {
                 expr,
                 low,
@@ -167,6 +180,15 @@ impl fmt::Display for TypedExpr {
                     f,
                     "({} {}IN (subquery))",
                     expr,
+                    if *negated { "NOT " } else { "" }
+                )
+            }
+            TypedExprKind::TupleInSubquery { exprs, negated, .. } => {
+                let items: Vec<String> = exprs.iter().map(|e| format!("{}", e)).collect();
+                write!(
+                    f,
+                    "(({}) {}IN (subquery))",
+                    items.join(", "),
                     if *negated { "NOT " } else { "" }
                 )
             }

@@ -7,8 +7,9 @@ use super::super::super::triggers::queue::TriggerOp;
 use super::super::super::ExecuteResult;
 use super::super::core::Executor;
 use super::{
-    build_returning_columns_from_analyzed, build_returning_types_from_analyzed, combine_rows,
-    eval_returning_typed, typed_value_to_bool,
+    append_ctid_to_rows, build_returning_columns_from_analyzed,
+    build_returning_types_from_analyzed, combine_rows, cross_product_rows, eval_returning_typed,
+    typed_value_to_bool,
 };
 use crate::model::{Row, TableSchema};
 use crate::sql::analyzer::types::AnalyzedUpdate;
@@ -56,22 +57,22 @@ impl Executor {
         let folded_where = upd.where_clause.as_ref().map(|e| fold_typed_expr(e, &qctx));
         let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         let compiled_checks = check_constraints::compile_check_constraints(&schema, &qctx)?;
-        let rows = self.scan_and_fill(txn, db_id, t, &schema).await?;
+        let mut rows = self.scan_and_fill(txn, db_id, t, &schema).await?;
+        append_ctid_to_rows(&mut rows);
         let mut cnt = 0;
         let mut ret_rows = Vec::new();
         let ret_cols = build_returning_columns_from_analyzed(&upd.returning, &schema);
 
-        // Handle FROM clause: scan FROM tables.
-        // NOTE: Only the first FROM table is supported. Multi-table FROM
-        // (e.g. UPDATE t SET ... FROM a, b WHERE ...) requires cross-product
-        // logic like DELETE's USING handler. Single FROM table covers the
-        // common case; multi-table FROM is a follow-up.
-        let from_data = if !upd.from.is_empty() {
-            let from_ref = &upd.from[0];
-            let (from_name, from_schema, from_rows) = self
-                .resolve_and_scan_table_ref(txn, db_id, search_path, from_ref)
-                .await?;
-            Some((from_name, from_schema, from_rows))
+        // Handle FROM clause: scan ALL FROM tables and build cross-product rows.
+        let from_combined_rows: Option<Vec<Row>> = if !upd.from.is_empty() {
+            let mut all_table_rows: Vec<Vec<Row>> = Vec::new();
+            for from_ref in &upd.from {
+                let (_name, _schema, rows) = self
+                    .resolve_and_scan_table_ref(txn, db_id, search_path, from_ref)
+                    .await?;
+                all_table_rows.push(rows);
+            }
+            Some(cross_product_rows(&all_table_rows))
         } else {
             None
         };
@@ -80,7 +81,7 @@ impl Executor {
             // Find the matching FROM row (if FROM clause exists) and check WHERE.
             // The matched FROM row is used for SET expression evaluation so that
             // column references from the FROM table resolve to the correct row.
-            let eval_row = if let Some((_, ref _from_schema, ref from_rows)) = from_data {
+            let eval_row = if let Some(ref from_rows) = from_combined_rows {
                 if from_rows.is_empty() {
                     continue;
                 } else if let Some(ref where_expr) = folded_where {
@@ -136,7 +137,9 @@ impl Executor {
                 r.clone()
             };
 
-            let mut new_vals = r.values.clone();
+            // Truncate to schema column count to strip synthetic ctid appended
+            // by append_ctid_to_rows — ctid must never be persisted.
+            let mut new_vals = r.values[..schema.columns.len()].to_vec();
             for (col_idx, ref typed_expr) in &upd.assignments {
                 let val = self
                     .eval_assignment_value(

@@ -244,6 +244,28 @@ impl<'a> Analyzer<'a> {
                 subquery,
                 negated,
             } => {
+                // Tuple form: (col1, col2, ...) [NOT] IN (SELECT ...)
+                if let Expr::Tuple(tuple_exprs) = expr.as_ref() {
+                    let analyzed_exprs: Vec<TypedExpr> = tuple_exprs
+                        .iter()
+                        .map(|e| self.analyze_expr(e))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let analyzed = self.analyze_query(subquery)?;
+                    if analyzed.output_schema.len() != analyzed_exprs.len() {
+                        return Err(AnalyzerError::ScalarSubqueryMultipleColumns {
+                            got: analyzed.output_schema.len(),
+                        });
+                    }
+                    return Ok(TypedExpr::new(
+                        TypedExprKind::TupleInSubquery {
+                            exprs: analyzed_exprs,
+                            subquery: Box::new(analyzed),
+                            negated: *negated,
+                        },
+                        DataType::Boolean,
+                    ));
+                }
+
                 let e = self.analyze_expr(expr)?;
                 let analyzed = self.analyze_query(subquery)?;
                 if analyzed.output_schema.len() != 1 {
@@ -420,6 +442,78 @@ impl<'a> Analyzer<'a> {
                         list: list.clone(),
                         negated: *negated,
                     };
+                    return self.analyze_expr(&outer);
+                }
+                if let Expr::IsNull(inner) = right.as_ref() {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: *operator,
+                        right: inner.clone(),
+                    };
+                    let outer = Expr::IsNull(Box::new(json_access));
+                    return self.analyze_expr(&outer);
+                }
+                if let Expr::IsNotNull(inner) = right.as_ref() {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: *operator,
+                        right: inner.clone(),
+                    };
+                    let outer = Expr::IsNotNull(Box::new(json_access));
+                    return self.analyze_expr(&outer);
+                }
+                if let Expr::IsTrue(inner) = right.as_ref() {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: *operator,
+                        right: inner.clone(),
+                    };
+                    let outer = Expr::IsTrue(Box::new(json_access));
+                    return self.analyze_expr(&outer);
+                }
+                if let Expr::IsNotTrue(inner) = right.as_ref() {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: *operator,
+                        right: inner.clone(),
+                    };
+                    let outer = Expr::IsNotTrue(Box::new(json_access));
+                    return self.analyze_expr(&outer);
+                }
+                if let Expr::IsFalse(inner) = right.as_ref() {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: *operator,
+                        right: inner.clone(),
+                    };
+                    let outer = Expr::IsFalse(Box::new(json_access));
+                    return self.analyze_expr(&outer);
+                }
+                if let Expr::IsNotFalse(inner) = right.as_ref() {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: *operator,
+                        right: inner.clone(),
+                    };
+                    let outer = Expr::IsNotFalse(Box::new(json_access));
+                    return self.analyze_expr(&outer);
+                }
+                if let Expr::IsUnknown(inner) = right.as_ref() {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: *operator,
+                        right: inner.clone(),
+                    };
+                    let outer = Expr::IsUnknown(Box::new(json_access));
+                    return self.analyze_expr(&outer);
+                }
+                if let Expr::IsNotUnknown(inner) = right.as_ref() {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: *operator,
+                        right: inner.clone(),
+                    };
+                    let outer = Expr::IsNotUnknown(Box::new(json_access));
                     return self.analyze_expr(&outer);
                 }
 
@@ -860,6 +954,32 @@ impl<'a> Analyzer<'a> {
                         resolved,
                     },
                     result_type,
+                ))
+            }
+
+            // -- IS [NOT] DISTINCT FROM --
+            Expr::IsDistinctFrom(left, right) => {
+                let l = self.analyze_expr(left)?;
+                let r = self.analyze_expr(right)?;
+                Ok(TypedExpr::new(
+                    TypedExprKind::IsDistinctFrom {
+                        left: Box::new(l),
+                        right: Box::new(r),
+                        negated: false,
+                    },
+                    DataType::Boolean,
+                ))
+            }
+            Expr::IsNotDistinctFrom(left, right) => {
+                let l = self.analyze_expr(left)?;
+                let r = self.analyze_expr(right)?;
+                Ok(TypedExpr::new(
+                    TypedExprKind::IsDistinctFrom {
+                        left: Box::new(l),
+                        right: Box::new(r),
+                        negated: true,
+                    },
+                    DataType::Boolean,
                 ))
             }
 

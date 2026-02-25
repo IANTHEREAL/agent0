@@ -50,6 +50,10 @@ pub(crate) enum RawSqlKind {
     /// All syntax validation (VERBOSE, quoted identifiers, trailing junk) is
     /// handled by `parse_analyze_table_name()` in the handler, not here.
     Analyze,
+    /// `ALTER INDEX IF EXISTS <name> RENAME TO <name>` — sqlparser 0.40 can't
+    /// parse `IF EXISTS` after `ALTER INDEX`. Intercepted here and dispatched
+    /// to a raw-SQL handler that extracts index names manually.
+    AlterIndexIfExists,
     /// Statements that we accept past Parse so the executor can return a stable
     /// "not supported" error (instead of a syntax error).
     UnsupportedExecutorSkips,
@@ -237,6 +241,9 @@ pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
     if sql_upper.starts_with("DROP TYPE") {
         return Some(RawSqlKind::DropType);
     }
+    if sql_upper.starts_with("ALTER INDEX IF EXISTS") {
+        return Some(RawSqlKind::AlterIndexIfExists);
+    }
     if sql_upper.starts_with("CREATE COLLATION") {
         return Some(RawSqlKind::CreateCollation);
     }
@@ -410,6 +417,11 @@ mod tests {
         assert_eq!(
             classify("ALTER TYPE role RENAME TO new_role"),
             Some(RawSqlKind::AlterType)
+        );
+        // ALTER INDEX IF EXISTS classification (#885)
+        assert_eq!(
+            classify("ALTER INDEX IF EXISTS \"IDX_OLD\" RENAME TO \"IDX_NEW\""),
+            Some(RawSqlKind::AlterIndexIfExists)
         );
         assert_eq!(classify("SELCT 1"), None);
         // ALTER SYSTEM SET classification

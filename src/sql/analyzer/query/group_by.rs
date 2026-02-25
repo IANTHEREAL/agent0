@@ -149,6 +149,9 @@ impl<'a> Analyzer<'a> {
             TypedExprKind::UnaryOp { operand, .. }
             | TypedExprKind::Cast { expr: operand, .. }
             | TypedExprKind::IsTest { expr: operand, .. } => Self::contains_aggregate_call(operand),
+            TypedExprKind::IsDistinctFrom { left, right, .. } => {
+                Self::contains_aggregate_call(left) || Self::contains_aggregate_call(right)
+            }
             TypedExprKind::Between {
                 expr, low, high, ..
             } => {
@@ -237,6 +240,9 @@ impl<'a> Analyzer<'a> {
             TypedExprKind::InSubquery { expr, .. } | TypedExprKind::AnyAll { expr, .. } => {
                 Self::contains_aggregate_call(expr)
             }
+            TypedExprKind::TupleInSubquery { exprs, .. } => {
+                exprs.iter().any(Self::contains_aggregate_call)
+            }
             TypedExprKind::ArrayIndex { array, index } => {
                 Self::contains_aggregate_call(array) || Self::contains_aggregate_call(index)
             }
@@ -309,6 +315,18 @@ impl<'a> Analyzer<'a> {
                 grouped_expr_keys,
                 in_aggregate,
             ),
+
+            TypedExprKind::IsDistinctFrom { left, right, .. } => {
+                Self::find_ungrouped_column(left, grouped_columns, grouped_expr_keys, in_aggregate)
+                    .or_else(|| {
+                        Self::find_ungrouped_column(
+                            right,
+                            grouped_columns,
+                            grouped_expr_keys,
+                            in_aggregate,
+                        )
+                    })
+            }
 
             TypedExprKind::Between {
                 expr, low, high, ..
@@ -522,6 +540,10 @@ impl<'a> Analyzer<'a> {
             TypedExprKind::InSubquery { expr, .. } | TypedExprKind::AnyAll { expr, .. } => {
                 Self::find_ungrouped_column(expr, grouped_columns, grouped_expr_keys, in_aggregate)
             }
+
+            TypedExprKind::TupleInSubquery { exprs, .. } => exprs.iter().find_map(|e| {
+                Self::find_ungrouped_column(e, grouped_columns, grouped_expr_keys, in_aggregate)
+            }),
 
             TypedExprKind::ArrayIndex { array, index } => {
                 Self::find_ungrouped_column(array, grouped_columns, grouped_expr_keys, in_aggregate)

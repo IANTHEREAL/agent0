@@ -47,6 +47,7 @@ fn has_outer_ref_beyond(expr: &TypedExpr, min_depth: u32) -> bool {
         }
         TypedExprKind::Exists { subquery, .. }
         | TypedExprKind::InSubquery { subquery, .. }
+        | TypedExprKind::TupleInSubquery { subquery, .. }
         | TypedExprKind::AnyAll { subquery, .. } => {
             query_has_outer_ref_beyond(subquery, min_depth + 1)
         }
@@ -366,6 +367,30 @@ pub(super) fn substitute_outer_refs_in_expr(expr: &TypedExpr, outer_row: &Row) -
             } else {
                 TypedExprKind::InSubquery {
                     expr: Box::new(inner_sub),
+                    subquery: subquery.clone(),
+                    negated: *negated,
+                }
+            }
+        }
+        TypedExprKind::TupleInSubquery {
+            exprs,
+            subquery,
+            negated,
+        } => {
+            let sub_exprs: Vec<TypedExpr> = exprs
+                .iter()
+                .map(|e| substitute_outer_refs_in_expr(e, outer_row))
+                .collect();
+            if is_correlated_query(subquery) {
+                let sub = substitute_outer_refs_in_query(subquery, outer_row);
+                TypedExprKind::TupleInSubquery {
+                    exprs: sub_exprs,
+                    subquery: Box::new(sub),
+                    negated: *negated,
+                }
+            } else {
+                TypedExprKind::TupleInSubquery {
+                    exprs: sub_exprs,
                     subquery: subquery.clone(),
                     negated: *negated,
                 }

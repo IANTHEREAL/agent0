@@ -90,6 +90,7 @@ pub(crate) fn is_fold_candidate(expr: &TypedExpr) -> bool {
         | TypedExprKind::ScalarSubquery(_)
         | TypedExprKind::Exists { .. }
         | TypedExprKind::InSubquery { .. }
+        | TypedExprKind::TupleInSubquery { .. }
         | TypedExprKind::AnyAll { .. }
         | TypedExprKind::ArraySubquery(_)
         | TypedExprKind::Default

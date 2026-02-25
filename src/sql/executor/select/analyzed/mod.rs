@@ -29,7 +29,7 @@ mod expr_runtime;
 mod materialize;
 mod materialize_catalog;
 mod pipeline;
-mod postprocess;
+pub(crate) mod postprocess;
 mod pre_materialize;
 mod subquery;
 
