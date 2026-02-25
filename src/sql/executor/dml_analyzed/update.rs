@@ -232,7 +232,7 @@ impl Executor {
         // Bump mod_count for auto-ANALYZE tracking.
         if cnt > 0 {
             self.stats_cache()
-                .bump_mod_count(db_id, schema.table_id, cnt as u64);
+                .bump_mod_count(db_id, schema.table_id, cnt);
             self.maybe_enqueue_auto_analyze(db_id, schema.table_id, t);
         }
 

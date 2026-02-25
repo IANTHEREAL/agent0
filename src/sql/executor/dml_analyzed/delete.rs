@@ -107,12 +107,10 @@ impl Executor {
                         .await?;
                     typed_value_to_bool(val)?
                 }
+            } else if let Some(ref using_rows) = using_combined_rows {
+                !using_rows.is_empty()
             } else {
-                if let Some(ref using_rows) = using_combined_rows {
-                    !using_rows.is_empty()
-                } else {
-                    true
-                }
+                true
             };
 
             if should_delete {
@@ -180,7 +178,7 @@ impl Executor {
         // Bump mod_count for auto-ANALYZE tracking.
         if cnt > 0 {
             self.stats_cache()
-                .bump_mod_count(db_id, schema.table_id, cnt as u64);
+                .bump_mod_count(db_id, schema.table_id, cnt);
             self.maybe_enqueue_auto_analyze(db_id, schema.table_id, t);
         }
 

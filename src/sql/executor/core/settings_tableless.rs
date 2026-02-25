@@ -219,9 +219,7 @@ pub(super) fn try_execute_set_config_select(
     };
 
     if applied {
-        let current = session
-            .show_setting_value(&var_name)
-            .unwrap_or_else(|| "".to_string());
+        let current = session.show_setting_value(&var_name).unwrap_or_default();
         return Ok(Some(ExecuteResult::Select {
             columns: vec![alias.unwrap_or_else(|| "set_config".to_string())],
             column_types: Some(vec![DataType::Text]),

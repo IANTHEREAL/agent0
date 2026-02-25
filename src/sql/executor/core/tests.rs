@@ -12,6 +12,7 @@ use sqlparser::ast::{
 
 #[test]
 fn test_execute_statement_on_txn_signature_stays_boxed() {
+    #[allow(clippy::type_complexity)]
     let _execute_statement_on_txn: for<'a> fn(
         &'a super::Executor,
         &'a mut tikv_client::Transaction,

@@ -48,7 +48,7 @@ pub(crate) fn parse_timezone_offset_seconds(zone: &str) -> Result<i32> {
         return Ok(0);
     }
     if zone_for_match.eq_ignore_ascii_case("EUROPE/PARIS") {
-        return Ok(1 * 3600);
+        return Ok(3600);
     }
     if zone_for_match.eq_ignore_ascii_case("ASIA/SHANGHAI")
         || zone_for_match.eq_ignore_ascii_case("PRC")
@@ -102,7 +102,7 @@ fn parse_offset_string_seconds(s: &str) -> Option<i32> {
         }
     };
 
-    if hours < 0 || mins < 0 || mins >= 60 {
+    if hours < 0 || !(0..60).contains(&mins) {
         return None;
     }
 

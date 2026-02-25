@@ -167,7 +167,7 @@ pub(super) fn substitute_outer_refs_in_query(
             left,
             right,
         } => AnalyzedQueryBody::SetOperation {
-            op: op.clone(),
+            op: *op,
             all: *all,
             left: Box::new(substitute_outer_refs_in_query(left, outer_row)),
             right: Box::new(substitute_outer_refs_in_query(right, outer_row)),
@@ -261,7 +261,7 @@ fn substitute_outer_refs_in_table_ref(
             condition,
             left_col_start,
         } => AnalyzedTableRefKind::Join {
-            join_type: join_type.clone(),
+            join_type: *join_type,
             left: Box::new(substitute_outer_refs_in_table_ref(left, outer_row)),
             right: Box::new(substitute_outer_refs_in_table_ref(right, outer_row)),
             condition: match condition {

@@ -46,7 +46,7 @@ impl PlpgsqlContext {
             .keys()
             .find(|k| k.to_lowercase() == name_lower)
             .cloned()
-            .unwrap_or_else(|| name_lower);
+            .unwrap_or(name_lower);
         self.variables.insert(key, value);
     }
 }

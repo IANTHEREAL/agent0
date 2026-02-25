@@ -290,8 +290,8 @@ fn decode_text_value(
             .map(|u| Value::Uuid(*u.as_bytes()))
             .map_err(|e| err(e.to_string())),
         t if *t == Type::BYTEA => {
-            if trimmed.starts_with("\\x") {
-                hex::decode(&trimmed[2..])
+            if let Some(hex_str) = trimmed.strip_prefix("\\x") {
+                hex::decode(hex_str)
                     .map(Value::Bytes)
                     .map_err(|e| err(e.to_string()))
             } else {

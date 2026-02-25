@@ -463,7 +463,7 @@ async fn execute_request(
             let next_url = redirect_target(&url, loc)?;
 
             match resp.status().as_u16() {
-                301 | 302 | 303 => {
+                301..=303 => {
                     method = Method::GET;
                     body = None;
                     content_type = None;
@@ -823,14 +823,8 @@ mod tests {
 
     #[test]
     fn test_quota_constants() {
-        assert!(
-            RESERVED_FOR_INTERACTIVE > 0,
-            "Must reserve some capacity for interactive"
-        );
-        assert!(
-            RESERVED_FOR_INTERACTIVE < MAX_INFLIGHT_REQUESTS_PER_TENANT_PER_NODE,
-            "Reserved pool cannot be the entire capacity"
-        );
+        const { assert!(RESERVED_FOR_INTERACTIVE > 0) };
+        const { assert!(RESERVED_FOR_INTERACTIVE < MAX_INFLIGHT_REQUESTS_PER_TENANT_PER_NODE) };
         assert_eq!(
             RESERVED_FOR_INTERACTIVE
                 + (MAX_INFLIGHT_REQUESTS_PER_TENANT_PER_NODE - RESERVED_FOR_INTERACTIVE),

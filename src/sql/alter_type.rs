@@ -239,7 +239,7 @@ fn parse_simple_ident(input: &str, idx: &mut usize) -> Result<String> {
 /// Parse a single-quoted string literal (with '' escaping).
 fn parse_string_literal(input: &str, idx: &mut usize) -> Result<String> {
     skip_ws(input, idx);
-    if *idx >= input.len() || input[*idx..].chars().next() != Some('\'') {
+    if *idx >= input.len() || !input[*idx..].starts_with('\'') {
         return Err(anyhow!("Expected string literal"));
     }
     *idx += 1; // skip opening quote

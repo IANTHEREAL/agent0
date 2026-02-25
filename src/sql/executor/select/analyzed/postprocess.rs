@@ -405,9 +405,9 @@ pub(super) fn sort_projected_rows(
 /// This provides one-level query children only. The caller performs DFS by
 /// recursively materializing each child query, guaranteeing each subtree is
 /// visited exactly once.
-pub(super) fn collect_immediate_nested_analyzed_queries<'a>(
-    query: &'a AnalyzedQuery,
-) -> Vec<&'a AnalyzedQuery> {
+pub(super) fn collect_immediate_nested_analyzed_queries(
+    query: &AnalyzedQuery,
+) -> Vec<&AnalyzedQuery> {
     let mut out = Vec::new();
     collect_immediate_from_query_body(&query.body, &mut out);
     for ob in &query.order_by {

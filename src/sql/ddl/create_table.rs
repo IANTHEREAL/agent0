@@ -746,7 +746,7 @@ pub(crate) fn has_legacy_name_conflict<'a>(
         }
         // PK check — effective name = pk_constraint_name or {short}_pkey
         if !tbl_schema.pk_indices.is_empty() {
-            let short = table_name.splitn(2, '.').nth(1).unwrap_or(table_name);
+            let short = table_name.split_once('.').map_or(table_name, |(_, s)| s);
             let default_pk;
             let pk_name = match tbl_schema.pk_constraint_name.as_deref() {
                 Some(n) => n,

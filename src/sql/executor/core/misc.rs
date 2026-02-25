@@ -179,18 +179,16 @@ pub(super) fn split_sql_statements(sql: &str) -> Vec<&str> {
                             create_procedure_saw_as = true;
                         }
                     }
-                } else {
-                    if token.eq_ignore_ascii_case(b"CASE") {
-                        create_procedure_case_depth += 1;
-                    } else if token.eq_ignore_ascii_case(b"BEGIN") {
-                        create_procedure_begin_depth += 1;
-                    } else if token.eq_ignore_ascii_case(b"END") {
-                        if create_procedure_case_depth > 0 {
-                            create_procedure_case_depth -= 1;
-                        } else {
-                            create_procedure_begin_depth =
-                                create_procedure_begin_depth.saturating_sub(1);
-                        }
+                } else if token.eq_ignore_ascii_case(b"CASE") {
+                    create_procedure_case_depth += 1;
+                } else if token.eq_ignore_ascii_case(b"BEGIN") {
+                    create_procedure_begin_depth += 1;
+                } else if token.eq_ignore_ascii_case(b"END") {
+                    if create_procedure_case_depth > 0 {
+                        create_procedure_case_depth -= 1;
+                    } else {
+                        create_procedure_begin_depth =
+                            create_procedure_begin_depth.saturating_sub(1);
                     }
                 }
 

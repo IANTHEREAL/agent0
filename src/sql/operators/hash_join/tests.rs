@@ -196,7 +196,7 @@ fn test_hash_table_empty_probe() {
     let table = JoinHashTable::new(vec![0]);
 
     let hash = hash_join_key(&[Value::Int32(1)]);
-    assert!(table.buckets.get(&hash).is_none());
+    assert!(!table.buckets.contains_key(&hash));
 }
 
 #[test]

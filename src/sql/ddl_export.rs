@@ -247,7 +247,7 @@ pub async fn export_all_ddl(
     }
 
     let mut matviews = store.list_materialized_views(txn, db_id).await?;
-    matviews.sort_by(|a, b| a.full_name().cmp(&b.full_name()));
+    matviews.sort_by_key(|v| v.full_name());
     for matview in matviews {
         rows.push(DdlExportRow {
             object_type: "materialized_view".to_string(),

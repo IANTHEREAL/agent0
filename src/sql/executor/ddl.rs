@@ -25,7 +25,7 @@ fn pick_drop_index_target(
     if let Some(schema) = explicit_schema {
         let mut found: Option<&String> = None;
         for table in matching_tables {
-            let table_schema = table.splitn(2, '.').next().unwrap_or("");
+            let table_schema = table.split('.').next().unwrap_or("");
             if table_schema != schema {
                 continue;
             }
@@ -46,7 +46,7 @@ fn pick_drop_index_target(
     for schema in schemas {
         let mut found: Option<&String> = None;
         for table in matching_tables {
-            let table_schema = table.splitn(2, '.').next().unwrap_or("");
+            let table_schema = table.split('.').next().unwrap_or("");
             if table_schema != schema {
                 continue;
             }
@@ -160,7 +160,7 @@ async fn try_streaming_ctas_for_read_parquet(
     use futures::StreamExt;
     let mapped_stream = row_stream.map(move |values_result| {
         let _ = &_permit; // keep permit alive across stream consumption
-        values_result.map(|values| crate::model::Row::new(values))
+        values_result.map(crate::model::Row::new)
     });
 
     let boxed: futures::stream::BoxStream<'static, anyhow::Result<crate::model::Row>> =
@@ -437,8 +437,8 @@ impl Executor {
 
             let mut matching_tables = Vec::new();
             for table_name in &tables {
-                let table_schema = table_name.splitn(2, '.').next().unwrap_or("");
-                if !schema_filter.iter().any(|s| *s == table_schema) {
+                let table_schema = table_name.split('.').next().unwrap_or("");
+                if !schema_filter.contains(&table_schema) {
                     continue;
                 }
                 let schema = match self.store().get_schema(txn, db_id, table_name).await? {

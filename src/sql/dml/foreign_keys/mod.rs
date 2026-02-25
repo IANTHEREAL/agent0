@@ -346,7 +346,7 @@ pub async fn validate_foreign_keys(
                 && fk_values
                     .iter()
                     .zip(&self_ref_vals)
-                    .all(|(a, b)| compare_values(a, b).map_or(false, |c| c == 0))
+                    .all(|(a, b)| compare_values(a, b).is_ok_and(|c| c == 0))
             {
                 continue;
             }

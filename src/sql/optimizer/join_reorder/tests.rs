@@ -150,6 +150,7 @@ fn make_table_stats(
     })
 }
 
+#[allow(clippy::type_complexity)]
 fn ctx_with_stats(entries: Vec<(&str, usize, Vec<(&str, f64)>)>) -> PlanningContext {
     let mut ctx = PlanningContext::empty();
     for (name, rows, cols) in entries {

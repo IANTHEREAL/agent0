@@ -250,10 +250,8 @@ fn build_histogram(
     }
 
     // Test orderability with actual values (no hardcoded type blacklist).
-    if non_mcv.len() >= 2 {
-        if compare_values(&non_mcv[0].0, &non_mcv[1].0).is_err() {
-            return Vec::new(); // unorderable type — skip histogram
-        }
+    if non_mcv.len() >= 2 && compare_values(&non_mcv[0].0, &non_mcv[1].0).is_err() {
+        return Vec::new(); // unorderable type — skip histogram
     }
 
     // Sort by value using compare_values.
@@ -400,7 +398,7 @@ impl Executor {
                 let all_tables = self.store.list_tables(txn, db_id).await?;
                 for full_name in &all_tables {
                     // Skip system schemas.
-                    let schema_name = full_name.splitn(2, '.').next().unwrap_or("");
+                    let schema_name = full_name.split('.').next().unwrap_or("");
                     if SKIP_SCHEMAS.contains(&schema_name) {
                         continue;
                     }
@@ -772,7 +770,7 @@ mod tests {
 
         // (b) All values are MCV (<=10 distinct) → histogram empty.
         let values_b: Vec<Value> = (1..=5)
-            .flat_map(|i| std::iter::repeat(Value::Int32(i)).take(10))
+            .flat_map(|i| std::iter::repeat_n(Value::Int32(i), 10))
             .collect();
         let stats_b = stats_from_values(&values_b);
         assert!(stats_b.histogram_bounds.is_empty());
@@ -796,7 +794,7 @@ mod tests {
         // With 11 light values (freq 1 each) + 1 heavy (freq 1000), MCV takes
         // the top 10 by frequency. Value 1 is always top. Then 10 of the 11
         // light values. 1 light value remains → histogram has 1 entry.
-        assert!(stats_c.histogram_bounds.len() >= 1);
+        assert!(!stats_c.histogram_bounds.is_empty());
     }
 
     #[test]

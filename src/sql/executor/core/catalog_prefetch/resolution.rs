@@ -291,7 +291,7 @@ fn infer_returns_table_schema(ret_lower: &str) -> Option<TableSchema> {
 
     let mut cols = Vec::new();
     for part in inner.split(',') {
-        let tokens: Vec<&str> = part.trim().split_whitespace().collect();
+        let tokens: Vec<&str> = part.split_whitespace().collect();
         if tokens.len() < 2 {
             return None;
         }

@@ -159,6 +159,7 @@ impl Executor {
     ///
     /// This is used by prepared execution where we no longer have the original
     /// SQL AST but still need deterministic CTE materialization.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn build_cte_context_from_analyzed_with_base<'a>(
         &'a self,
         txn: &'a mut Transaction,
@@ -262,6 +263,7 @@ impl Executor {
     ///
     /// Traverses subqueries in FROM/join trees, typed expressions, set-operation
     /// branches, and query-level ORDER BY/LIMIT/OFFSET.
+    #[allow(clippy::type_complexity)]
     fn build_nested_ctes_from_analyzed_query_with_base<'a>(
         &'a self,
         txn: &'a mut Transaction,
@@ -637,15 +639,15 @@ fn query_needs_pre_materialization(analyzed: &AnalyzedQuery) -> bool {
                 || select
                     .where_clause
                     .as_ref()
-                    .is_some_and(|w| needs_pre_materialization(w))
+                    .is_some_and(needs_pre_materialization)
                 || select
                     .having
                     .as_ref()
-                    .is_some_and(|h| needs_pre_materialization(h))
-                || select.group_by.iter().any(|e| needs_pre_materialization(e))
+                    .is_some_and(needs_pre_materialization)
+                || select.group_by.iter().any(needs_pre_materialization)
                 || matches!(
                     &select.distinct,
-                    AnalyzedDistinct::DistinctOn(exprs) if exprs.iter().any(|e| needs_pre_materialization(e))
+                    AnalyzedDistinct::DistinctOn(exprs) if exprs.iter().any(needs_pre_materialization)
                 )
                 || select.from.iter().any(table_ref_needs_pre_materialization)
         }
@@ -654,7 +656,7 @@ fn query_needs_pre_materialization(analyzed: &AnalyzedQuery) -> bool {
         }
         AnalyzedQueryBody::Values(rows) => rows
             .iter()
-            .any(|row| row.iter().any(|e| needs_pre_materialization(e))),
+            .any(|row| row.iter().any(needs_pre_materialization)),
     }
 }
 
@@ -678,7 +680,12 @@ fn table_ref_needs_pre_materialization(tr: &AnalyzedTableRef) -> bool {
 /// Compile-time guards for #907: these three functions MUST return
 /// `Pin<Box<dyn Future<...>>>`, not opaque `impl Future` (from `async fn`).
 /// Reverting any of them to `async fn` makes this a type error at `cargo build`.
-#[allow(dead_code, unreachable_code, unused_variables)] // framework: development diagnostic path
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    clippy::let_underscore_future
+)]
 mod _stack_overflow_signature_guards_907 {
     use super::*;
 

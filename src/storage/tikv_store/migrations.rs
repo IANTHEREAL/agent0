@@ -192,10 +192,8 @@ fn derive_relation_bindings_from_legacy_deps(
             }
 
             if slot_idx == ambiguous_slots.len() {
-                let Some(candidate_bindings) = assigned
-                    .iter()
-                    .map(|v| v.clone())
-                    .collect::<Option<Vec<String>>>()
+                let Some(candidate_bindings) =
+                    assigned.iter().cloned().collect::<Option<Vec<String>>>()
                 else {
                     return;
                 };

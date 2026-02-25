@@ -124,7 +124,7 @@ pub(crate) fn resolve_ddl_object_name(
     ResolvedName::new(schema, obj)
 }
 
-fn search_path_schemas<'a>(search_path: &'a [String]) -> Vec<&'a str> {
+fn search_path_schemas(search_path: &[String]) -> Vec<&str> {
     let mut schemas: Vec<&str> = search_path
         .iter()
         .map(|s| s.as_str())

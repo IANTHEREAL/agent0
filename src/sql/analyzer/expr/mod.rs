@@ -185,13 +185,12 @@ impl<'a> Analyzer<'a> {
             } => {
                 let e = self.analyze_expr(expr)?;
                 let p = self.analyze_expr(pattern)?;
-                let esc = match escape_char {
-                    Some(c) => Some(Box::new(TypedExpr::new(
+                let esc = escape_char.map(|c| {
+                    Box::new(TypedExpr::new(
                         TypedExprKind::Constant(Value::Text(c.to_string())),
                         DataType::Text,
-                    ))),
-                    None => None,
-                };
+                    ))
+                });
                 Ok(TypedExpr::new(
                     TypedExprKind::SimilarTo {
                         expr: Box::new(e),
@@ -353,12 +352,12 @@ impl<'a> Analyzer<'a> {
                 {
                     let left_json_access = Expr::JsonAccess {
                         left: left.clone(),
-                        operator: operator.clone(),
+                        operator: *operator,
                         right: chained_left.clone(),
                     };
                     let reassociated = Expr::JsonAccess {
                         left: Box::new(left_json_access),
-                        operator: chained_op.clone(),
+                        operator: *chained_op,
                         right: chained_right.clone(),
                     };
                     return self.analyze_expr(&reassociated);
@@ -382,7 +381,7 @@ impl<'a> Analyzer<'a> {
                     if let Some(chained_json_op) = Self::binary_op_to_json_access_op(bin_op) {
                         let left_json_access = Expr::JsonAccess {
                             left: left.clone(),
-                            operator: operator.clone(),
+                            operator: *operator,
                             right: bin_left.clone(),
                         };
                         let reassociated = Expr::JsonAccess {
@@ -395,7 +394,7 @@ impl<'a> Analyzer<'a> {
 
                     let json_access = Expr::JsonAccess {
                         left: left.clone(),
-                        operator: operator.clone(),
+                        operator: *operator,
                         right: bin_left.clone(),
                     };
                     let outer = Expr::BinaryOp {
@@ -413,7 +412,7 @@ impl<'a> Analyzer<'a> {
                 {
                     let json_access = Expr::JsonAccess {
                         left: left.clone(),
-                        operator: operator.clone(),
+                        operator: *operator,
                         right: in_expr.clone(),
                     };
                     let outer = Expr::InList {
@@ -711,21 +710,20 @@ impl<'a> Analyzer<'a> {
                 // General case: `x = ANY(array_col)` where array_col is a column reference
                 // or other non-literal array expression.
                 // Convert to: ARRAY_POSITION(array_col, x) IS NOT NULL
-                if matches!(compare_op, BinaryOperator::Eq) {
-                    if matches!(right_expr.data_type, DataType::Array(_))
-                        || matches!(&right_expr.data_type, DataType::UserDefined(s) if s == "int2vector")
-                    {
-                        let array_pos =
-                            self.make_function_call("ARRAY_POSITION", vec![right_expr, left_expr])?;
-                        return Ok(TypedExpr::new(
-                            TypedExprKind::IsTest {
-                                expr: Box::new(array_pos),
-                                test: IsTestKind::Null,
-                                negated: true, // IS NOT NULL
-                            },
-                            DataType::Boolean,
-                        ));
-                    }
+                if matches!(compare_op, BinaryOperator::Eq)
+                    && (matches!(right_expr.data_type, DataType::Array(_))
+                        || matches!(&right_expr.data_type, DataType::UserDefined(s) if s == "int2vector"))
+                {
+                    let array_pos =
+                        self.make_function_call("ARRAY_POSITION", vec![right_expr, left_expr])?;
+                    return Ok(TypedExpr::new(
+                        TypedExprKind::IsTest {
+                            expr: Box::new(array_pos),
+                            test: IsTestKind::Null,
+                            negated: true, // IS NOT NULL
+                        },
+                        DataType::Boolean,
+                    ));
                 }
 
                 Err(AnalyzerError::Unsupported(format!(

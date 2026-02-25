@@ -41,6 +41,7 @@ pub(super) enum PlpgsqlStatement {
 
 /// Parse the DECLARE block, returning variable defaults, types, and the remaining body
 /// starting from BEGIN.
+#[allow(clippy::type_complexity)]
 pub(super) fn parse_declare_block(
     body: &str,
 ) -> Result<(
@@ -118,66 +119,62 @@ fn find_matching_end(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
 
     while i < bytes.len() {
-        if ascii_keyword_at(bytes, i, b"BEGIN") {
-            if i == 0 || !bytes[i - 1].is_ascii_alphanumeric() {
-                if i + 5 == bytes.len() || !bytes[i + 5].is_ascii_alphanumeric() {
-                    depth += 1;
-                    i += 5;
-                    continue;
-                }
-            }
+        if ascii_keyword_at(bytes, i, b"BEGIN")
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            && (i + 5 == bytes.len() || !bytes[i + 5].is_ascii_alphanumeric())
+        {
+            depth += 1;
+            i += 5;
+            continue;
         }
-        if ascii_keyword_at(bytes, i, b"IF") {
-            if (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
-                && (i + 2 == bytes.len() || !bytes[i + 2].is_ascii_alphanumeric())
-            {
-                depth += 1;
-                i += 2;
-                continue;
-            }
+        if ascii_keyword_at(bytes, i, b"IF")
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            && (i + 2 == bytes.len() || !bytes[i + 2].is_ascii_alphanumeric())
+        {
+            depth += 1;
+            i += 2;
+            continue;
         }
-        if ascii_keyword_at(bytes, i, b"END LOOP") {
-            if i == 0 || !bytes[i - 1].is_ascii_alphanumeric() {
+        if ascii_keyword_at(bytes, i, b"END LOOP")
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+        {
+            depth -= 1;
+            i += 8;
+            continue;
+        }
+        if ascii_keyword_at(bytes, i, b"LOOP")
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            && (i + 4 == bytes.len() || !bytes[i + 4].is_ascii_alphanumeric())
+        {
+            depth += 1;
+            i += 4;
+            continue;
+        }
+        if ascii_keyword_at(bytes, i, b"END IF")
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+        {
+            depth -= 1;
+            i += 6;
+            continue;
+        }
+        if ascii_keyword_at(bytes, i, b"END")
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            && (i + 3 == bytes.len()
+                || !bytes[i + 3].is_ascii_alphanumeric()
+                || (i + 4 <= bytes.len() && bytes[i + 3] == b';'))
+        {
+            let mut rest_pos = i + 3;
+            while rest_pos < bytes.len() && bytes[rest_pos].is_ascii_whitespace() {
+                rest_pos += 1;
+            }
+            if !ascii_keyword_at(bytes, rest_pos, b"IF") {
                 depth -= 1;
-                i += 8;
-                continue;
-            }
-        }
-        if ascii_keyword_at(bytes, i, b"LOOP") {
-            if (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
-                && (i + 4 == bytes.len() || !bytes[i + 4].is_ascii_alphanumeric())
-            {
-                depth += 1;
-                i += 4;
-                continue;
-            }
-        }
-        if ascii_keyword_at(bytes, i, b"END IF") {
-            if i == 0 || !bytes[i - 1].is_ascii_alphanumeric() {
-                depth -= 1;
-                i += 6;
-                continue;
-            }
-        }
-        if ascii_keyword_at(bytes, i, b"END") {
-            if (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
-                && (i + 3 == bytes.len()
-                    || !bytes[i + 3].is_ascii_alphanumeric()
-                    || (i + 4 <= bytes.len() && bytes[i + 3] == b';'))
-            {
-                let mut rest_pos = i + 3;
-                while rest_pos < bytes.len() && bytes[rest_pos].is_ascii_whitespace() {
-                    rest_pos += 1;
+                if depth == 0 {
+                    return Some(i);
                 }
-                if !ascii_keyword_at(bytes, rest_pos, b"IF") {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i);
-                    }
-                }
-                i += 3;
-                continue;
             }
+            i += 3;
+            continue;
         }
         i += 1;
     }
@@ -507,26 +504,25 @@ fn parse_for_statement<'a>(
     let mut end_loop_pos = None;
     i = loop_pos + 4;
     while i < bytes.len() {
-        if ascii_keyword_at(bytes, i, b"END LOOP") {
-            if i == 0 || !bytes[i - 1].is_ascii_alphanumeric() {
-                depth -= 1;
-                if depth == 0 {
-                    end_loop_pos = Some(i);
-                    break;
-                }
-                i += 8;
-                continue;
+        if ascii_keyword_at(bytes, i, b"END LOOP")
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+        {
+            depth -= 1;
+            if depth == 0 {
+                end_loop_pos = Some(i);
+                break;
             }
+            i += 8;
+            continue;
         }
 
-        if ascii_keyword_at(bytes, i, b"LOOP") {
-            if (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
-                && (i + 4 == bytes.len() || !bytes[i + 4].is_ascii_alphanumeric())
-            {
-                depth += 1;
-                i += 4;
-                continue;
-            }
+        if ascii_keyword_at(bytes, i, b"LOOP")
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            && (i + 4 == bytes.len() || !bytes[i + 4].is_ascii_alphanumeric())
+        {
+            depth += 1;
+            i += 4;
+            continue;
         }
 
         i += 1;
@@ -684,11 +680,7 @@ fn find_if_blocks(s: &str) -> Result<(&str, &str, &str)> {
 
     let rest_start = end_if_pos + 6;
     let rest = s[rest_start..].trim_start();
-    let rest = if rest.starts_with(';') {
-        &rest[1..]
-    } else {
-        rest
-    };
+    let rest = rest.strip_prefix(';').unwrap_or(rest);
 
     Ok((then_block.trim(), else_block.trim(), rest))
 }

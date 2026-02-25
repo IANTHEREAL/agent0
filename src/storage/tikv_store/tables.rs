@@ -268,7 +268,7 @@ impl TikvStore {
 
             // Release relation-name reservation keys for indexes and PK
             // so the names become available for reuse.
-            let schema_name = table_name.splitn(2, '.').next().unwrap_or("public");
+            let schema_name = table_name.split('.').next().unwrap_or("public");
             for idx in &schema.indexes {
                 let idx_full = format!("{}.{}", schema_name, idx.name);
                 self.release_relation_name(txn, db_id, &idx_full).await?;

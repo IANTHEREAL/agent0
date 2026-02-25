@@ -1142,7 +1142,7 @@ fn test_infer_wildcard_multiway_natural_join_dedups_columns() {
             test_column("c1", DataType::Text),
         ],
     );
-    let sources = vec![
+    let sources = [
         SourceSchema {
             _alias: "a".to_string(),
             schema: schema_a,
@@ -1197,7 +1197,7 @@ fn test_infer_wildcard_multiway_using_join_dedups_columns() {
             test_column("c1", DataType::Text),
         ],
     );
-    let sources = vec![
+    let sources = [
         SourceSchema {
             _alias: "a".to_string(),
             schema: schema_a,
@@ -1232,7 +1232,7 @@ fn test_infer_wildcard_natural_join_common_cols_is_case_sensitive() {
 
     let schema_a = test_schema("a", vec![test_column("Foo", DataType::Int32)]);
     let schema_b = test_schema("b", vec![test_column("foo", DataType::Int32)]);
-    let sources = vec![
+    let sources = [
         SourceSchema {
             _alias: "a".to_string(),
             schema: schema_a,

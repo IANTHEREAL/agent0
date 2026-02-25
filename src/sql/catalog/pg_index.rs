@@ -70,9 +70,7 @@ impl VirtualTable for PgIndex {
                             col_indices.push((pos + 1) as i64);
                         }
                     }
-                    for _ in &idx.expressions {
-                        col_indices.push(0);
-                    }
+                    col_indices.extend(std::iter::repeat_n(0, idx.expressions.len()));
                     let indkey =
                         Value::Array(col_indices.iter().map(|i| Value::Int64(*i)).collect());
 

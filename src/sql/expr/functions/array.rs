@@ -215,7 +215,7 @@ pub fn string_to_array(args: Vec<Value>) -> Result<Value> {
     } else {
         text.split(&delimiter)
             .map(|s| {
-                if null_str.as_ref().map_or(false, |ns| s == ns) {
+                if null_str.as_ref().is_some_and(|ns| s == ns) {
                     Value::Null
                 } else {
                     Value::Text(s.to_string())

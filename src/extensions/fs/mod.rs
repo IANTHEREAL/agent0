@@ -221,8 +221,7 @@ pub(crate) async fn infer_table_function_schema(
             exclude,
         } => {
             let matching_files =
-                glob::expand_glob(&*backend, pattern, MAX_FILES_PER_GLOB, exclude.as_deref())
-                    .await?;
+                glob::expand_glob(backend, pattern, MAX_FILES_PER_GLOB, exclude.as_deref()).await?;
 
             if matching_files.is_empty() {
                 return Ok(decoders::decode_raw_text(&[], pattern, 0).schema);
@@ -352,9 +351,8 @@ pub(crate) async fn execute_table_function(
             let mut all_rows: Vec<Row> = Vec::new();
             let mut result_schema: Option<TableSchema> = None;
             let mut total_bytes_read: usize = 0;
-            let mut files_read_count: usize = 0;
 
-            for file_path in &matching_files {
+            for (files_read_count, file_path) in matching_files.iter().enumerate() {
                 if total_bytes_read >= MAX_TOTAL_BYTES {
                     warn!(
                         "fs9: bytes budget exhausted ({} MB), {} of {} matched files were scanned",
@@ -367,7 +365,6 @@ pub(crate) async fn execute_table_function(
 
                 let data = backend.read_file(file_path, MAX_BYTES_PER_FILE).await?;
                 total_bytes_read = total_bytes_read.saturating_add(data.len());
-                files_read_count += 1;
 
                 let fmt = decoders::detect_format(file_path, format.as_deref());
 

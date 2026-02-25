@@ -39,7 +39,7 @@ impl VirtualTable for PgViews {
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {
         let mut views = ctx.store.list_views(ctx.txn, ctx.db_id).await?;
-        views.sort_by(|a, b| a.full_name().cmp(&b.full_name()));
+        views.sort_by_key(|v| v.full_name());
 
         let mut rows = Vec::new();
         for view_def in views {

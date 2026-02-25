@@ -204,7 +204,7 @@ pub async fn execute_drop_index(
         store.update_schema(txn, db_id, schema.clone()).await?;
 
         // Release the reservation key for the dropped index name.
-        let owning_schema = _table_name.splitn(2, '.').next().unwrap_or("public");
+        let owning_schema = _table_name.split('.').next().unwrap_or("public");
         let idx_full = format!("{}.{}", owning_schema, idx_name);
         store.release_relation_name(txn, db_id, &idx_full).await?;
 

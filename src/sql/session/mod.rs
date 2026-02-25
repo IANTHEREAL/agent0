@@ -154,7 +154,7 @@ impl Session {
             session_user: Some(username.clone()),
             session_user_is_superuser: is_superuser,
             current_user: Some(username),
-            is_superuser: is_superuser,
+            is_superuser,
             current_database_id: database_id,
             current_database_name: Arc::from(database_name),
             connection_id,

@@ -2,7 +2,6 @@
 ///
 /// This module provides pure argument parsing without side effects.
 /// It does not read environment variables or call process::exit.
-
 /// Parsed CLI arguments. All fields are Option so we can distinguish
 /// "not provided" from "provided" for merge with env vars.
 #[derive(Debug, Clone, PartialEq)]

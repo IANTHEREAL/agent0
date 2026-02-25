@@ -20,6 +20,7 @@ pub(crate) use self::predicate::collect_typed_eq_predicates;
 use crate::model::Value;
 
 #[derive(Debug, Clone)]
+#[allow(clippy::enum_variant_names)]
 pub enum ScanType {
     FullTableScan,
     IndexScan {

@@ -739,8 +739,8 @@ impl Executor {
         let mut found_table: Option<String> = None;
         let mut is_pk = false;
         for table_name in &tables {
-            let table_schema = table_name.splitn(2, '.').next().unwrap_or("");
-            if !schema_filter.iter().any(|s| *s == table_schema) {
+            let table_schema = table_name.split('.').next().unwrap_or("");
+            if !schema_filter.contains(&table_schema) {
                 continue;
             }
             let schema = match self.store().get_schema(txn, db_id, table_name).await? {
@@ -773,7 +773,7 @@ impl Executor {
             found_table.ok_or_else(|| anyhow!("relation \"{}\" does not exist", idx_name))?;
 
         // Schema-wide namespace uniqueness check for the new name.
-        let owning_schema = table_name.splitn(2, '.').next().unwrap_or("public");
+        let owning_schema = table_name.split('.').next().unwrap_or("public");
         ddl::check_relation_name_available(
             &self.store(),
             txn,

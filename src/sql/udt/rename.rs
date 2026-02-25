@@ -160,7 +160,7 @@ pub async fn alter_type_rename(
         .await?
         .ok_or_else(|| anyhow!("type \"{}\" does not exist", old_full))?;
 
-    let schema_part = old_full.splitn(2, '.').next().unwrap_or("public");
+    let schema_part = old_full.split('.').next().unwrap_or("public");
     let new_full = format!("{}.{}", schema_part, new_name);
 
     // Check that nothing else (table or type) already owns the new name.

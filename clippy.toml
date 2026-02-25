@@ -1,0 +1,3 @@
+# db9-server clippy configuration
+# See: https://github.com/c4pt0r/db9-server/issues/411
+too-many-arguments-threshold = 14

@@ -325,11 +325,11 @@ fn strsim_damerau_levenshtein(a: &str, b: &str) -> usize {
         return la;
     }
     let mut d = vec![vec![0usize; lb + 1]; la + 1];
-    for i in 0..=la {
-        d[i][0] = i;
+    for (i, row) in d.iter_mut().enumerate().take(la + 1) {
+        row[0] = i;
     }
-    for j in 0..=lb {
-        d[0][j] = j;
+    for (j, val) in d[0].iter_mut().enumerate().take(lb + 1) {
+        *val = j;
     }
     for i in 1..=la {
         for j in 1..=lb {

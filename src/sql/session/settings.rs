@@ -337,7 +337,7 @@ impl SessionSettings {
         }
     }
 
-    pub(crate) fn canonical_setting_name<'a>(name: &'a str) -> &'a str {
+    pub(crate) fn canonical_setting_name(name: &str) -> &str {
         match name {
             "transaction.isolation.level" => "transaction_isolation",
             "db9.max_sort_bytes" => "db9.max_sort_bytes",
@@ -416,9 +416,7 @@ impl SessionSettings {
             return Ok(0);
         }
 
-        let multiplier: f64 = if unit.is_empty() {
-            1.0
-        } else if unit.eq_ignore_ascii_case("ms") {
+        let multiplier: f64 = if unit.is_empty() || unit.eq_ignore_ascii_case("ms") {
             1.0
         } else if unit.eq_ignore_ascii_case("s") {
             1_000.0
@@ -871,14 +869,14 @@ impl SessionSettings {
         }
 
         // 2. User-SET extra_settings not in registry
-        for (name, _) in &self.extra_settings {
+        for name in self.extra_settings.keys() {
             result
                 .entry(name.clone())
                 .or_insert_with(|| (self.show_value(name).unwrap_or_default(), String::new()));
         }
 
         // 3. Local overrides not already covered
-        for (name, _) in &self.local_overrides {
+        for name in self.local_overrides.keys() {
             result
                 .entry(name.clone())
                 .or_insert_with(|| (self.show_value(name).unwrap_or_default(), String::new()));
@@ -890,7 +888,7 @@ impl SessionSettings {
     pub(crate) fn statement_timeout(&self) -> Option<Duration> {
         if let Some(v) = self.local_overrides.get("statement_timeout") {
             match Self::parse_timeout_millis(v) {
-                Ok(ms) if ms == 0 => return None,
+                Ok(0) => return None,
                 Ok(ms) => return Some(Duration::from_millis(ms)),
                 Err(e) => {
                     tracing::error!(
@@ -912,7 +910,7 @@ impl SessionSettings {
     pub(crate) fn lock_timeout(&self) -> Option<Duration> {
         if let Some(v) = self.local_overrides.get("lock_timeout") {
             match Self::parse_timeout_millis(v) {
-                Ok(ms) if ms == 0 => return None,
+                Ok(0) => return None,
                 Ok(ms) => return Some(Duration::from_millis(ms)),
                 Err(e) => {
                     tracing::error!(error = %e, value = v, "invalid local lock_timeout override");
@@ -933,7 +931,7 @@ impl SessionSettings {
             .get("idle_in_transaction_session_timeout")
         {
             match Self::parse_timeout_millis(v) {
-                Ok(ms) if ms == 0 => return None,
+                Ok(0) => return None,
                 Ok(ms) => return Some(Duration::from_millis(ms)),
                 Err(e) => {
                     tracing::error!(

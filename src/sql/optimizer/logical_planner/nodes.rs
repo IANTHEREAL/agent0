@@ -367,13 +367,11 @@ pub(crate) fn expr_has_aggregate(expr: &TypedExpr) -> bool {
             when_clauses,
             else_result,
         } => {
-            operand.as_ref().map_or(false, |e| expr_has_aggregate(e))
+            operand.as_ref().is_some_and(|e| expr_has_aggregate(e))
                 || when_clauses
                     .iter()
                     .any(|(w, t)| expr_has_aggregate(w) || expr_has_aggregate(t))
-                || else_result
-                    .as_ref()
-                    .map_or(false, |e| expr_has_aggregate(e))
+                || else_result.as_ref().is_some_and(|e| expr_has_aggregate(e))
         }
         TypedExprKind::AnyAll { expr, .. } => expr_has_aggregate(expr),
         TypedExprKind::Coalesce(args) => args.iter().any(expr_has_aggregate),

@@ -281,7 +281,7 @@ fn generate_series_date_sub_day_step_across_dst_start_does_not_error() {
         hours.push(tz.timestamp_millis_opt(*ms).single().unwrap().hour());
     }
     assert_eq!(hours.iter().filter(|&&h| h == 2).count(), 0);
-    assert!(hours.iter().any(|&h| h == 3));
+    assert!(hours.contains(&3));
 }
 
 #[test]

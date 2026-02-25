@@ -377,10 +377,9 @@ fn query_has_volatile_or_catalog(query: &AnalyzedQuery) -> bool {
 
     match &query.body {
         AnalyzedQueryBody::Select(select) => subquery_tree_has_volatile_or_catalog(select),
-        AnalyzedQueryBody::Values(rows) => rows
-            .iter()
-            .flatten()
-            .any(|e| expr_has_volatile_or_catalog_deep(e)),
+        AnalyzedQueryBody::Values(rows) => {
+            rows.iter().flatten().any(expr_has_volatile_or_catalog_deep)
+        }
         AnalyzedQueryBody::SetOperation { left, right, .. } => {
             query_has_volatile_or_catalog(left) || query_has_volatile_or_catalog(right)
         }

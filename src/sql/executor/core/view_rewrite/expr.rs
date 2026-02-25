@@ -296,20 +296,21 @@ pub(crate) fn expand_views_in_expr<'a>(
                             ))
                             .await?;
                         }
-                        ast::FunctionArg::Named { arg, .. } => {
-                            if let ast::FunctionArgExpr::Expr(e) = arg {
-                                Box::pin(expand_views_in_expr(
-                                    store,
-                                    txn,
-                                    db_id,
-                                    search_path,
-                                    e,
-                                    visible_ctes,
-                                    stack,
-                                    stack_set,
-                                ))
-                                .await?;
-                            }
+                        ast::FunctionArg::Named {
+                            arg: ast::FunctionArgExpr::Expr(e),
+                            ..
+                        } => {
+                            Box::pin(expand_views_in_expr(
+                                store,
+                                txn,
+                                db_id,
+                                search_path,
+                                e,
+                                visible_ctes,
+                                stack,
+                                stack_set,
+                            ))
+                            .await?;
                         }
                         _ => {}
                     }
@@ -681,10 +682,11 @@ pub(crate) fn expr_requires_view_expansion(expr: &Expr) -> bool {
                 for arg in &func.args {
                     match arg {
                         ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => stack.push(e),
-                        ast::FunctionArg::Named { arg, .. } => {
-                            if let ast::FunctionArgExpr::Expr(e) = arg {
-                                stack.push(e);
-                            }
+                        ast::FunctionArg::Named {
+                            arg: ast::FunctionArgExpr::Expr(e),
+                            ..
+                        } => {
+                            stack.push(e);
                         }
                         _ => {}
                     }

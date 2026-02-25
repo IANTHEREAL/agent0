@@ -97,7 +97,7 @@ fn test_encode_table_data_range_v2() {
 fn test_encode_pk_values_single() {
     let values = vec![Value::Int32(42)];
     let encoded = encode_pk_values(&values);
-    let types = vec![DataType::Int32];
+    let types = [DataType::Int32];
     let mut offset = 0;
     let (decoded, consumed) = decode_value_memcomparable(&encoded[offset..], &types[0]).unwrap();
     offset += consumed;
@@ -109,7 +109,7 @@ fn test_encode_pk_values_single() {
 fn test_encode_pk_values_composite() {
     let values = vec![Value::Int32(1), Value::Text("test".to_string())];
     let encoded = encode_pk_values(&values);
-    let types = vec![DataType::Int32, DataType::Text];
+    let types = [DataType::Int32, DataType::Text];
     let mut offset = 0;
     let (v1, c1) = decode_value_memcomparable(&encoded[offset..], &types[0]).unwrap();
     offset += c1;
@@ -280,7 +280,7 @@ fn test_decode_memcomparable_numeric() {
         scale: None,
     };
     for value in values {
-        let encoded = encode_pk_values(&[value.clone()]);
+        let encoded = encode_pk_values(std::slice::from_ref(&value));
         let (decoded, consumed) = decode_value_memcomparable(&encoded, &ty).unwrap();
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded, value);

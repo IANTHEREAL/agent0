@@ -17,6 +17,7 @@ use std::sync::Arc;
 use tikv_client::Transaction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 enum SequenceFunction {
     NextVal,
     CurrVal,

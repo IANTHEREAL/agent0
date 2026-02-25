@@ -473,16 +473,16 @@ impl Executor {
                     .await?;
                 }
                 match analyzed {
-                    crate::sql::analyzer::types::AnalyzedStatement::Insert(ins) => {
-                        self.execute_analyzed_insert(txn, db_id, sequence_values, search_path, &ins)
+                    crate::sql::analyzer::types::AnalyzedStatement::Insert(ref ins) => {
+                        self.execute_analyzed_insert(txn, db_id, sequence_values, search_path, ins)
                             .await
                     }
-                    crate::sql::analyzer::types::AnalyzedStatement::Update(upd) => {
-                        self.execute_analyzed_update(txn, db_id, sequence_values, search_path, &upd)
+                    crate::sql::analyzer::types::AnalyzedStatement::Update(ref upd) => {
+                        self.execute_analyzed_update(txn, db_id, sequence_values, search_path, upd)
                             .await
                     }
-                    crate::sql::analyzer::types::AnalyzedStatement::Delete(del) => {
-                        self.execute_analyzed_delete(txn, db_id, sequence_values, search_path, &del)
+                    crate::sql::analyzer::types::AnalyzedStatement::Delete(ref del) => {
+                        self.execute_analyzed_delete(txn, db_id, sequence_values, search_path, del)
                             .await
                     }
                     crate::sql::analyzer::types::AnalyzedStatement::Query(_) => {

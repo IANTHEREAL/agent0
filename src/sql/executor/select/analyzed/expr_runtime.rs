@@ -111,7 +111,7 @@ impl<'a> ExprRuntime<'a> {
             .collect();
         let has_srf = !srf_indices.is_empty();
 
-        let any_async = exprs.iter().any(|e| needs_async(e));
+        let any_async = exprs.iter().any(needs_async);
         if any_async {
             let mut projected = Vec::with_capacity(rows.len());
             for row in &rows {

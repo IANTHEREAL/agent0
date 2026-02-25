@@ -179,8 +179,8 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Result<Value> {
                 })
             }),
         DataType::Bytes => {
-            if unescaped.starts_with("\\x") {
-                Ok(hex::decode(&unescaped[2..])
+            if let Some(hex_str) = unescaped.strip_prefix("\\x") {
+                Ok(hex::decode(hex_str)
                     .map(Value::Bytes)
                     .unwrap_or(Value::Bytes(unescaped.into_bytes())))
             } else {
@@ -359,7 +359,7 @@ pub fn parse_time_string(s: &str) -> Option<i64> {
         (0, 0)
     };
 
-    if hours < 0 || hours > 23 || minutes < 0 || minutes > 59 || seconds < 0 || seconds > 59 {
+    if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) || !(0..=59).contains(&seconds) {
         return None;
     }
 

@@ -67,7 +67,7 @@ pub use value_encoding::{decode_pk_from_index_suffix, decode_value_memcomparable
 
 // Re-export internal constants needed by tests.
 #[cfg(test)]
-pub(self) use metadata_keys::{
+use metadata_keys::{
     WORKER_BG_RESULT_PREFIX, WORKER_CLAIM_PREFIX, WORKER_QUEUE_PREFIX, WORKER_REGISTRY_PREFIX,
 };
 

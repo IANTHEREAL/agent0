@@ -57,7 +57,7 @@ impl Executor {
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         schema: &TableSchema,
-        row_vals: &mut Vec<Value>,
+        row_vals: &mut [Value],
         target_columns: &[usize],
     ) -> Result<()> {
         dml::fill_missing_columns(

@@ -72,7 +72,7 @@ pub(crate) fn eval_srf(
             }
         }
         SrfKind::RegexpSplitToTable => {
-            let (Some(arg0), Some(arg1)) = (args.get(0), args.get(1)) else {
+            let (Some(arg0), Some(arg1)) = (args.first(), args.get(1)) else {
                 return Err(anyhow!(
                     "regexp_split_to_table requires at least 2 arguments"
                 ));
@@ -125,7 +125,7 @@ pub(crate) fn eval_srf(
             }
         }
         SrfKind::RegexpMatches => {
-            let (Some(arg0), Some(arg1)) = (args.get(0), args.get(1)) else {
+            let (Some(arg0), Some(arg1)) = (args.first(), args.get(1)) else {
                 return Err(anyhow!("regexp_matches requires at least 2 arguments"));
             };
 

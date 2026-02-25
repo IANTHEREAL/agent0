@@ -136,7 +136,7 @@ pub(crate) fn decode_escape(s: &str) -> Result<Vec<u8>> {
                 let mut j = i + 1;
                 while j < input.len() && digits < 3 {
                     let d = input[j];
-                    if !(b'0'..=b'9').contains(&d) {
+                    if !d.is_ascii_digit() {
                         break;
                     }
                     if d > b'7' {

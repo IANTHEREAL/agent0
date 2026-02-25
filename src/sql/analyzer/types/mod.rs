@@ -461,6 +461,7 @@ pub struct AnalyzedQuery {
 /// Each variant produces rows with a schema matching
 /// `AnalyzedQuery::output_schema`.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum AnalyzedQueryBody {
     /// A SELECT statement.
     Select(AnalyzedSelect),
@@ -687,6 +688,7 @@ pub enum SetOpKind {
 /// Queries are analyzed via `analyze_query()` and produce `AnalyzedQuery` directly;
 /// this enum adds DML variants that share the same typed-expression infrastructure.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum AnalyzedStatement {
     /// A SELECT / set operation.
     #[allow(dead_code)] // framework: dispatched via pattern match
@@ -730,6 +732,7 @@ pub enum AnalyzedInsertSource {
 
 /// Analyzed ON CONFLICT clause.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum AnalyzedOnConflict {
     /// DO NOTHING — skip conflicting rows.
     DoNothing,

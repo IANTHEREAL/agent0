@@ -79,7 +79,7 @@ async fn update_row_indexes(
                         schema.table_id,
                         index.id,
                         &old_gin_hashes,
-                        &pk_values,
+                        pk_values,
                     )
                     .await?;
             }
@@ -91,7 +91,7 @@ async fn update_row_indexes(
                         schema.table_id,
                         index.id,
                         &new_gin_hashes,
-                        &pk_values,
+                        pk_values,
                     )
                     .await?;
             }
@@ -112,7 +112,7 @@ async fn update_row_indexes(
                     schema.table_id,
                     index.id,
                     &old_idx,
-                    &pk_values,
+                    pk_values,
                     index.unique,
                 )
                 .await?;
@@ -128,7 +128,7 @@ async fn update_row_indexes(
                     schema.table_id,
                     index.id,
                     &new_idx,
-                    &pk_values,
+                    pk_values,
                     index.unique,
                 )
                 .await;

@@ -54,7 +54,7 @@ pub(super) async fn alter_table_add_primary_key(
         .map(normalize_ident)
         .unwrap_or_else(|| format!("{}_pkey", table_object_name));
     // Reserve the PK constraint name in the schema-wide namespace.
-    let owning_schema = full_table_name.splitn(2, '.').next().unwrap_or("public");
+    let owning_schema = full_table_name.split('.').next().unwrap_or("public");
     check_relation_name_available(
         store,
         txn,
@@ -102,7 +102,7 @@ pub(super) async fn alter_table_add_unique_constraint(
         .unwrap_or_else(|| format!("{}_{}_key", table_object_name, col_names.join("_")));
 
     // Schema-wide namespace uniqueness check.
-    let owning_schema = full_table_name.splitn(2, '.').next().unwrap_or("public");
+    let owning_schema = full_table_name.split('.').next().unwrap_or("public");
     check_relation_name_available(store, txn, db_id, owning_schema, &index_name, false, None)
         .await?;
 
@@ -456,7 +456,7 @@ pub(super) async fn alter_table_drop_constraint(
             }
             schema.pk_indices.clear();
             // Release the PK constraint name reservation.
-            let owning_schema = full_table_name.splitn(2, '.').next().unwrap_or("public");
+            let owning_schema = full_table_name.split('.').next().unwrap_or("public");
             let pk_full = format!("{}.{}", owning_schema, constraint_name);
             store.release_relation_name(txn, db_id, &pk_full).await?;
             schema.pk_constraint_name = None;
@@ -510,7 +510,7 @@ pub(super) async fn alter_table_drop_constraint(
         schema.indexes.remove(pos);
 
         // Release the constraint/index name reservation.
-        let owning_schema = full_table_name.splitn(2, '.').next().unwrap_or("public");
+        let owning_schema = full_table_name.split('.').next().unwrap_or("public");
         let idx_full = format!("{}.{}", owning_schema, constraint_name);
         store.release_relation_name(txn, db_id, &idx_full).await?;
 

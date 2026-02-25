@@ -16,7 +16,7 @@ fn format_float8_pg_text(v: f64) -> String {
     }
 
     let abs = v.abs();
-    if abs != 0.0 && (abs < 1e-6 || abs >= 1e15) {
+    if abs != 0.0 && (!(1e-6..1e15).contains(&abs)) {
         // PostgreSQL-style scientific notation for very small/large magnitudes.
         return format!("{:e}", v);
     }

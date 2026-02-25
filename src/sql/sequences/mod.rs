@@ -256,7 +256,7 @@ pub(crate) fn find_owned_sequence_full_name(
     let mut matches = sequences.iter().filter(|seq| {
         seq.owned_by
             .as_ref()
-            .map_or(false, |(owned_table, owned_col)| {
+            .is_some_and(|(owned_table, owned_col)| {
                 owned_table == table_full_name && owned_col == column_name
             })
     });
@@ -348,7 +348,7 @@ fn parse_sequence_name_token(token: &str) -> Result<(Option<String>, String)> {
     }
 }
 
-fn extract_arg_expr<'a>(args: &'a [FunctionArg], idx: usize) -> Result<&'a Expr> {
+fn extract_arg_expr(args: &[FunctionArg], idx: usize) -> Result<&Expr> {
     match args.get(idx) {
         Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))) => Ok(expr),
         Some(_) => Err(SqlError::Unsupported("Unsupported function argument".into()).into()),

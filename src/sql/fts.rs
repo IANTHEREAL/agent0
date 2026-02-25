@@ -564,7 +564,7 @@ fn parse_tsvector_entry(entry: &str) -> Option<(String, (u32, char))> {
 fn compute_rank(tsvector: &str, tsquery: &str) -> f64 {
     let tsvector_words = extract_tsvector_words(tsvector);
     let query_terms: Vec<String> = tsquery
-        .split(|c: char| matches!(c, '&' | '|' | '!'))
+        .split(|c: char| ['&', '|', '!'].contains(&c))
         .map(|s| s.trim().trim_matches('\'').to_lowercase())
         .filter(|s| !s.is_empty())
         .collect();

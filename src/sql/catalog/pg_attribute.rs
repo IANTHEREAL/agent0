@@ -101,7 +101,7 @@ impl VirtualTable for PgAttribute {
                         DataType::Numeric {
                             precision: Some(p),
                             scale: Some(s),
-                        } => ((*p as i64) << 16) | (*s as i64) + 4,
+                        } => ((*p as i64) << 16) | ((*s as i64) + 4),
                         _ => -1,
                     };
 

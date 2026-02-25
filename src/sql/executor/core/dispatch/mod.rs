@@ -229,7 +229,7 @@ impl Executor {
                         if let Some(pos) = rest_upper.find(" TO ") {
                             (&rest_clean[..pos], &rest_clean[pos + 4..])
                         } else {
-                            return Err(anyhow!("syntax error in ALTER SYSTEM SET").into());
+                            return Err(anyhow!("syntax error in ALTER SYSTEM SET"));
                         }
                     };
 
@@ -245,8 +245,7 @@ impl Executor {
                         _ => {
                             return Err(anyhow!(
                                 "ALTER SYSTEM SET is only supported for statement_timeout and idle_in_transaction_session_timeout"
-                            )
-                            .into());
+                            ));
                         }
                     }
 

@@ -208,7 +208,7 @@ fn test_having_filter_uses_legacy() {
     // Aggregate rows = 50, HAVING rows = 50/3 = 16
     assert_eq!(
         physical.cost.rows,
-        (50 / 3).max(1),
+        50_usize / 3,
         "HAVING: got {}",
         physical.cost.rows
     );
@@ -736,11 +736,7 @@ fn test_gate5_having_isolation() {
         data_type: DataType::Boolean,
     });
     let having_phys = PhysicalPlanner::plan(&having, &ctx);
-    assert_eq!(
-        having_phys.cost.rows,
-        (50 / 3).max(1),
-        "HAVING uses legacy /3"
-    );
+    assert_eq!(having_phys.cost.rows, 50_usize / 3, "HAVING uses legacy /3");
 }
 
 #[test]

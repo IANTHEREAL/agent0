@@ -257,7 +257,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                             name: func.name.clone(),
                             args: resolved_args,
                             filter: resolved_filter,
-                            null_treatment: func.null_treatment.clone(),
+                            null_treatment: func.null_treatment,
                             over: func.over.clone(),
                             distinct: func.distinct,
                             special: func.special,
@@ -296,7 +296,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                 ),
             }),
             Expr::UnaryOp { op, expr } => Ok(Expr::UnaryOp {
-                op: op.clone(),
+                op: *op,
                 expr: Box::new(
                     replace_sequence_functions(
                         store,
@@ -607,7 +607,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     )
                     .await?,
                 ),
-                trim_where: trim_where.clone(),
+                trim_where: *trim_where,
                 trim_what: match trim_what {
                     Some(e) => Some(Box::new(
                         replace_sequence_functions(

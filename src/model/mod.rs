@@ -146,7 +146,7 @@ impl IntervalValue {
 
     /// Convert to total milliseconds (approximate, for legacy compat)
     /// Uses 30 days per month approximation
-    pub fn to_millis_approx(&self) -> i64 {
+    pub fn to_millis_approx(self) -> i64 {
         (self.months as i64) * 30 * 24 * 60 * 60 * 1000 + self.millis
     }
 }
@@ -766,6 +766,7 @@ mod tests {
     }
 }
 
+#[allow(clippy::items_after_test_module)]
 fn default_owner() -> String {
     "postgres".to_string()
 }

@@ -75,7 +75,7 @@ pub fn octet_length(args: Vec<Value>) -> Result<Value> {
 
 pub fn bit_length(args: Vec<Value>) -> Result<Value> {
     match args.into_iter().next() {
-        Some(Value::Text(s)) => Ok(Value::Int32((s.as_bytes().len() * 8) as i32)),
+        Some(Value::Text(s)) => Ok(Value::Int32((s.len() * 8) as i32)),
         Some(Value::Bytes(b)) => Ok(Value::Int32((b.len() * 8) as i32)),
         _ => Ok(Value::Null),
     }

@@ -338,7 +338,7 @@ fn add_interval_to_timestamp(ts_millis: i64, iv: &crate::model::IntervalValue) -
     if iv.millis != 0 {
         let delta = Duration::try_milliseconds(iv.millis)
             .ok_or_else(|| anyhow!("Interval out of range"))?;
-        result = result + delta;
+        result += delta;
     }
 
     Ok(result.timestamp_millis())
@@ -473,26 +473,24 @@ fn jsonb_subtract(left: Value, right: Value) -> Result<Value> {
             }
             _ => {}
         },
-        Value::Int32(idx) => match &mut json_val {
-            serde_json::Value::Array(arr) => {
+        Value::Int32(idx) => {
+            if let serde_json::Value::Array(arr) = &mut json_val {
                 let len = arr.len() as i32;
                 let idx = if idx < 0 { len + idx } else { idx };
                 if idx >= 0 && (idx as usize) < arr.len() {
                     arr.remove(idx as usize);
                 }
             }
-            _ => {}
-        },
-        Value::Int64(idx) => match &mut json_val {
-            serde_json::Value::Array(arr) => {
+        }
+        Value::Int64(idx) => {
+            if let serde_json::Value::Array(arr) = &mut json_val {
                 let len = arr.len() as i64;
                 let idx = if idx < 0 { len + idx } else { idx };
                 if idx >= 0 && (idx as usize) < arr.len() {
                     arr.remove(idx as usize);
                 }
             }
-            _ => {}
-        },
+        }
         other => {
             return Err(anyhow!(
                 "unsupported right operand for jsonb subtraction: {:?}",

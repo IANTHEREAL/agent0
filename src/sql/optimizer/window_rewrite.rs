@@ -195,7 +195,7 @@ pub fn rewrite_for_post_window(
             kind: TypedExprKind::Cast {
                 expr: Box::new(rewrite_for_post_window(inner, input_col_count, counter)),
                 target_type: target_type.clone(),
-                cast_context: cast_context.clone(),
+                cast_context: *cast_context,
             },
             data_type: expr.data_type.clone(),
         },

@@ -459,6 +459,7 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Analyze VALUES rows and unify each column's type across all rows.
+    #[allow(clippy::type_complexity)]
     fn analyze_values_rows(
         &mut self,
         rows: &[Vec<Expr>],

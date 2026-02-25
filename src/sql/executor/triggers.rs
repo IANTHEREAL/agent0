@@ -125,17 +125,8 @@ fn find_keyword_outside_quotes_and_dollar(haystack: &str, keyword: &str) -> Opti
         if i + kw.len() <= bytes.len() {
             let before_ok = i == 0 || !is_ident_char(bytes[i - 1]);
             let after_ok = i + kw.len() == bytes.len() || !is_ident_char(bytes[i + kw.len()]);
-            if before_ok && after_ok {
-                let mut matched = true;
-                for (j, kw_b) in kw.iter().enumerate() {
-                    if bytes[i + j].to_ascii_uppercase() != kw_b.to_ascii_uppercase() {
-                        matched = false;
-                        break;
-                    }
-                }
-                if matched {
-                    return Some(i);
-                }
+            if before_ok && after_ok && bytes[i..i + kw.len()].eq_ignore_ascii_case(kw) {
+                return Some(i);
             }
         }
 

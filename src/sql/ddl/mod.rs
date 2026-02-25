@@ -286,7 +286,7 @@ pub(super) fn assign_generated_check_constraint_names(
     pk_exists: bool,
     indexes: &[IndexDef],
     foreign_keys: &[ForeignKeyConstraint],
-    checks: &mut Vec<CheckConstraint>,
+    checks: &mut [CheckConstraint],
 ) {
     let mut used_names: HashSet<String> = HashSet::new();
     if pk_exists {
@@ -338,7 +338,7 @@ pub(super) fn extract_first_column_from_check_expr(expr: &str) -> Option<String>
     ];
     for word in expr.split(|c: char| !c.is_alphanumeric() && c != '_') {
         let w = word.trim();
-        if w.is_empty() || w.chars().next().map_or(true, |c| c.is_ascii_digit()) {
+        if w.is_empty() || w.chars().next().is_none_or(|c| c.is_ascii_digit()) {
             continue;
         }
         if KEYWORDS.contains(&w.to_lowercase().as_str()) {

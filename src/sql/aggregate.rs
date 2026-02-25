@@ -113,25 +113,17 @@ impl Aggregator {
                 }
             }
             Aggregator::Max(current) => {
-                if !matches!(val, Value::Null) {
-                    if matches!(current, Value::Null) {
-                        *current = val.clone();
-                    } else {
-                        if compare_values(val, current)? > 0 {
-                            *current = val.clone();
-                        }
-                    }
+                if !matches!(val, Value::Null)
+                    && (matches!(current, Value::Null) || compare_values(val, current)? > 0)
+                {
+                    *current = val.clone();
                 }
             }
             Aggregator::Min(current) => {
-                if !matches!(val, Value::Null) {
-                    if matches!(current, Value::Null) {
-                        *current = val.clone();
-                    } else {
-                        if compare_values(val, current)? < 0 {
-                            *current = val.clone();
-                        }
-                    }
+                if !matches!(val, Value::Null)
+                    && (matches!(current, Value::Null) || compare_values(val, current)? < 0)
+                {
+                    *current = val.clone();
                 }
             }
             Aggregator::Avg {

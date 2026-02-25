@@ -1,6 +1,7 @@
 //! Unit tests for session settings.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::observability;
     use crate::sql::advisory_locks::{global_lock_manager, AdvisoryLockMode, AdvisoryLockScope};

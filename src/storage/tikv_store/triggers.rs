@@ -95,6 +95,7 @@ impl TikvStore {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     pub(crate) fn plan_trigger_rename_ops(
         db_id: u64,
         old_table: &str,

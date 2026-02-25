@@ -236,6 +236,7 @@ impl<'a> Analyzer<'a> {
         Ok(Some((col.column_name.clone(), expr, col.data_type.clone())))
     }
 
+    #[allow(clippy::type_complexity)]
     pub(in crate::sql::analyzer) fn analyze_projection(
         &mut self,
         items: &[SelectItem],

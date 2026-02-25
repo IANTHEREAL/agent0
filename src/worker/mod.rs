@@ -177,8 +177,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_init_system_store_disabled_short_circuits() {
-        let mut cfg = WorkerConfig::default();
-        cfg.enabled = false;
+        let cfg = WorkerConfig {
+            enabled: false,
+            ..Default::default()
+        };
         let store = init_system_store(vec!["127.0.0.1:1".to_string()], &cfg)
             .await
             .expect("disabled worker should not attempt system-store init");
@@ -187,9 +189,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_init_system_store_enabled_failure_refuses_fallback() {
-        let mut cfg = WorkerConfig::default();
-        cfg.enabled = true;
-        cfg.system_keyspace = "_sys_worker".to_string();
+        let cfg = WorkerConfig {
+            enabled: true,
+            system_keyspace: "_sys_worker".to_string(),
+            ..Default::default()
+        };
 
         let err = match init_system_store(vec!["127.0.0.1:1".to_string()], &cfg).await {
             Ok(_) => panic!(

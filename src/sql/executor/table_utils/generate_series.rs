@@ -298,14 +298,12 @@ pub(crate) fn generate_series_values_limited(
                                 ));
                             }
                         }
-                    } else {
-                        if current > *e {
-                            let next = current + step_val;
-                            if next == current {
-                                return Err(anyhow!(
-                                    "generate_series step is too small to make progress for float8"
-                                ));
-                            }
+                    } else if current > *e {
+                        let next = current + step_val;
+                        if next == current {
+                            return Err(anyhow!(
+                                "generate_series step is too small to make progress for float8"
+                            ));
                         }
                     }
 
@@ -314,10 +312,8 @@ pub(crate) fn generate_series_values_limited(
                         if prev >= *e {
                             return Ok((Vec::new(), DataType::Float64));
                         }
-                    } else {
-                        if prev <= *e {
-                            return Ok((Vec::new(), DataType::Float64));
-                        }
+                    } else if prev <= *e {
+                        return Ok((Vec::new(), DataType::Float64));
                     }
 
                     current = step_val.mul_add(offset as f64, current);
@@ -325,10 +321,8 @@ pub(crate) fn generate_series_values_limited(
                         if current > *e + f64::EPSILON {
                             return Ok((Vec::new(), DataType::Float64));
                         }
-                    } else {
-                        if current < *e - f64::EPSILON {
-                            return Ok((Vec::new(), DataType::Float64));
-                        }
+                    } else if current < *e - f64::EPSILON {
+                        return Ok((Vec::new(), DataType::Float64));
                     }
                 }
             }
@@ -399,7 +393,7 @@ pub(crate) fn generate_series_values_limited(
         }
         (Value::Timestamp(s), Value::Timestamp(e)) => {
             let step_interval = match step {
-                Value::Interval(iv) => iv.clone(),
+                Value::Interval(iv) => *iv,
                 _ => {
                     return Err(anyhow!(
                         "generate_series with timestamps requires interval step"
@@ -462,7 +456,7 @@ pub(crate) fn generate_series_values_limited(
         }
         (Value::Date(s), Value::Date(e)) => {
             let step_interval = match step {
-                Value::Interval(iv) => iv.clone(),
+                Value::Interval(iv) => *iv,
                 _ => return Err(anyhow!("generate_series with dates requires interval step")),
             };
             if step_interval.months == 0 && step_interval.millis == 0 {

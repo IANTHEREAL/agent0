@@ -53,8 +53,8 @@ fn parse_extension_name_token(token: &str) -> Result<String> {
         return Err(anyhow!("Missing extension name"));
     }
     let name = token
-        .split('.')
-        .last()
+        .rsplit('.')
+        .next()
         .ok_or_else(|| anyhow!("Missing extension name"))?
         .trim_matches('"')
         .to_lowercase();

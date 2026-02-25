@@ -176,12 +176,12 @@ pub(in crate::protocol::handler) fn utility_describe_fields(sql: &str) -> Vec<Fi
 /// UNKNOWN slots filled from inferred DataType -> Type.
 fn merge_parameter_types(client_types: &[Type], finalized: &[DataType]) -> Vec<Type> {
     let mut result = Vec::with_capacity(finalized.len());
-    for i in 0..finalized.len() {
+    for (i, fin_type) in finalized.iter().enumerate() {
         let client = client_types.get(i).cloned().unwrap_or(Type::UNKNOWN);
         if client != Type::UNKNOWN {
             result.push(client); // preserve client INT2/FLOAT4
         } else {
-            result.push(datatype_to_pgtype(Some(&finalized[i])));
+            result.push(datatype_to_pgtype(Some(fin_type)));
         }
     }
     result

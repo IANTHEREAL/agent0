@@ -13,6 +13,7 @@ use super::core::Executor;
 use crate::sql::expr::bridge::eval_const_ast_expr;
 
 impl Executor {
+    #[allow(clippy::type_complexity)]
     pub(crate) fn try_execute_user_table_function<'a>(
         &'a self,
         txn: &'a mut Transaction,
@@ -105,15 +106,11 @@ fn eval_function_args(args: &[FunctionArg]) -> Result<Vec<Value>> {
     let mut values = Vec::with_capacity(args.len());
     for arg in args {
         let expr = match arg {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
-            FunctionArg::Named { arg, .. } => match arg {
-                FunctionArgExpr::Expr(e) => e,
-                _ => {
-                    return Err(
-                        SqlError::Unsupported("Unsupported function argument type".into()).into(),
-                    )
-                }
-            },
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+            | FunctionArg::Named {
+                arg: FunctionArgExpr::Expr(e),
+                ..
+            } => e,
             _ => {
                 return Err(
                     SqlError::Unsupported("Unsupported function argument type".into()).into(),
@@ -288,7 +285,7 @@ fn parse_returns_table_columns(ret_lower: &str) -> Option<Vec<(String, crate::mo
 
     let mut cols = Vec::new();
     for part in inner.split(',') {
-        let tokens: Vec<&str> = part.trim().split_whitespace().collect();
+        let tokens: Vec<&str> = part.split_whitespace().collect();
         if tokens.len() < 2 {
             return None;
         }

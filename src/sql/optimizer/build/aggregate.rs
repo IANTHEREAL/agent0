@@ -210,13 +210,11 @@ fn contains_aggregate(expr: &TypedExpr) -> bool {
             when_clauses,
             else_result,
         } => {
-            operand.as_ref().map_or(false, |o| contains_aggregate(o))
+            operand.as_ref().is_some_and(|o| contains_aggregate(o))
                 || when_clauses
                     .iter()
                     .any(|(w, t)| contains_aggregate(w) || contains_aggregate(t))
-                || else_result
-                    .as_ref()
-                    .map_or(false, |e| contains_aggregate(e))
+                || else_result.as_ref().is_some_and(|e| contains_aggregate(e))
         }
         TypedExprKind::AnyAll { expr, .. } => contains_aggregate(expr),
         TypedExprKind::Coalesce(args) => args.iter().any(contains_aggregate),
@@ -449,7 +447,7 @@ pub(crate) fn rewrite_post_aggregate_expr(
         }),
         TypedExprKind::UnaryOp { op, operand } => Ok(TypedExpr {
             kind: TypedExprKind::UnaryOp {
-                op: op.clone(),
+                op: *op,
                 operand: Box::new(rewrite_post_aggregate_expr(
                     operand,
                     group_by,

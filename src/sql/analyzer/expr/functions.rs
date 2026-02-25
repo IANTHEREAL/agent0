@@ -567,6 +567,7 @@ impl<'a> Analyzer<'a> {
 
     // -- Helper: window spec --
 
+    #[allow(clippy::type_complexity)]
     pub(super) fn analyze_window_spec(
         &mut self,
         func: &Function,

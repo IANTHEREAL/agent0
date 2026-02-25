@@ -65,7 +65,7 @@ pub fn for_each_child<'a>(expr: &'a TypedExpr, f: &mut impl FnMut(&'a TypedExpr)
         }
         TypedExprKind::InList { expr, list, .. } => {
             f(expr);
-            list.iter().for_each(|e| f(e));
+            list.iter().for_each(f);
         }
         TypedExprKind::Like {
             expr,
@@ -104,7 +104,7 @@ pub fn for_each_child<'a>(expr: &'a TypedExpr, f: &mut impl FnMut(&'a TypedExpr)
         TypedExprKind::Coalesce(args)
         | TypedExprKind::MinMax { args, .. }
         | TypedExprKind::ArrayLiteral(args)
-        | TypedExprKind::Row(args) => args.iter().for_each(|e| f(e)),
+        | TypedExprKind::Row(args) => args.iter().for_each(f),
 
         TypedExprKind::NullIf(a, b) => {
             f(a);
@@ -122,7 +122,7 @@ pub fn for_each_child<'a>(expr: &'a TypedExpr, f: &mut impl FnMut(&'a TypedExpr)
             filter,
             ..
         } => {
-            args.iter().for_each(|e| f(e));
+            args.iter().for_each(&mut *f);
             order_by.iter().for_each(|ob| f(&ob.expr));
             if let Some(fl) = filter {
                 f(fl);
@@ -135,8 +135,8 @@ pub fn for_each_child<'a>(expr: &'a TypedExpr, f: &mut impl FnMut(&'a TypedExpr)
             window_frame,
             ..
         } => {
-            args.iter().for_each(|e| f(e));
-            partition_by.iter().for_each(|e| f(e));
+            args.iter().for_each(&mut *f);
+            partition_by.iter().for_each(&mut *f);
             order_by.iter().for_each(|ob| f(&ob.expr));
             if let Some(frame) = window_frame {
                 for_each_frame_bound_child(&frame.start, f);
@@ -247,7 +247,7 @@ pub fn map_children(
             negated,
         } => TypedExprKind::InList {
             expr: Box::new(f(inner)),
-            list: list.iter().map(|e| f(e)).collect(),
+            list: list.iter().map(f).collect(),
             negated: *negated,
         },
         TypedExprKind::Like {
@@ -283,12 +283,10 @@ pub fn map_children(
             when_clauses: when_clauses.iter().map(|(w, t)| (f(w), f(t))).collect(),
             else_result: else_result.as_ref().map(|e| Box::new(f(e))),
         },
-        TypedExprKind::Coalesce(args) => {
-            TypedExprKind::Coalesce(args.iter().map(|e| f(e)).collect())
-        }
+        TypedExprKind::Coalesce(args) => TypedExprKind::Coalesce(args.iter().map(f).collect()),
         TypedExprKind::NullIf(a, b) => TypedExprKind::NullIf(Box::new(f(a)), Box::new(f(b))),
         TypedExprKind::MinMax { args, is_greatest } => TypedExprKind::MinMax {
-            args: args.iter().map(|e| f(e)).collect(),
+            args: args.iter().map(f).collect(),
             is_greatest: *is_greatest,
         },
         TypedExprKind::FunctionCall {
@@ -298,7 +296,7 @@ pub fn map_children(
             filter,
         } => TypedExprKind::FunctionCall {
             func: func.clone(),
-            args: args.iter().map(|e| f(e)).collect(),
+            args: args.iter().map(&mut *f).collect(),
             order_by: map_order_by(order_by, f),
             filter: filter.as_ref().map(|fl| Box::new(f(fl))),
         },
@@ -310,7 +308,7 @@ pub fn map_children(
             filter,
         } => TypedExprKind::AggregateCall {
             func: func.clone(),
-            args: args.iter().map(|e| f(e)).collect(),
+            args: args.iter().map(&mut *f).collect(),
             distinct: *distinct,
             order_by: map_order_by(order_by, f),
             filter: filter.as_ref().map(|fl| Box::new(f(fl))),
@@ -323,8 +321,8 @@ pub fn map_children(
             window_frame,
         } => TypedExprKind::WindowCall {
             func: func.clone(),
-            args: args.iter().map(|e| f(e)).collect(),
-            partition_by: partition_by.iter().map(|e| f(e)).collect(),
+            args: args.iter().map(&mut *f).collect(),
+            partition_by: partition_by.iter().map(&mut *f).collect(),
             order_by: map_order_by(order_by, f),
             window_frame: map_window_frame(window_frame, f),
         },
@@ -349,7 +347,7 @@ pub fn map_children(
             is_all: *is_all,
         },
         TypedExprKind::ArrayLiteral(args) => {
-            TypedExprKind::ArrayLiteral(args.iter().map(|e| f(e)).collect())
+            TypedExprKind::ArrayLiteral(args.iter().map(&mut *f).collect())
         }
         TypedExprKind::ArrayIndex { array, index } => TypedExprKind::ArrayIndex {
             array: Box::new(f(array)),
@@ -364,7 +362,7 @@ pub fn map_children(
             path: Box::new(f(path)),
             operator: *operator,
         },
-        TypedExprKind::Row(args) => TypedExprKind::Row(args.iter().map(|e| f(e)).collect()),
+        TypedExprKind::Row(args) => TypedExprKind::Row(args.iter().map(f).collect()),
         TypedExprKind::Collate {
             expr,
             collation,

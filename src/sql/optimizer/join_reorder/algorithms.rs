@@ -353,11 +353,11 @@ fn build_edge_graph(edges: &[JoinEdge], n: usize) -> Vec<u64> {
 
 /// Check if two subsets are connected by at least one edge.
 fn subsets_connected(s1: u64, s2: u64, edge_graph: &[u64]) -> bool {
-    for i in 0..64 {
+    for (i, edges) in edge_graph.iter().enumerate() {
         if s1 & (1u64 << i) == 0 {
             continue;
         }
-        if edge_graph[i] & s2 != 0 {
+        if edges & s2 != 0 {
             return true;
         }
     }
@@ -605,8 +605,8 @@ fn first_subset_of_size(universe: u64, target_size: usize) -> Option<u64> {
     }
     // First subset = lowest `target_size` bits
     let mut result = 0u64;
-    for i in 0..target_size {
-        result |= 1u64 << bits[i];
+    for bit in bits.iter().take(target_size) {
+        result |= 1u64 << bit;
     }
     Some(result)
 }

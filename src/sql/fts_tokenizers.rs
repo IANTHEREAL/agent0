@@ -62,7 +62,7 @@ fn tokenize_jieba(text: &str) -> Vec<String> {
 
     // Lazy initialization: create jieba instance once and cache it
     static JIEBA: OnceLock<Jieba> = OnceLock::new();
-    let jieba = JIEBA.get_or_init(|| Jieba::new());
+    let jieba = JIEBA.get_or_init(Jieba::new);
 
     // Cut text into words (no HMM for better performance)
     jieba

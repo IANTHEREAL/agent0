@@ -125,6 +125,7 @@ impl Executor {
     /// This excludes the root query's own WITH clause (callers typically materialize
     /// root WITH separately) and only processes nested Query nodes. The merged map
     /// is additive over `base_ctes`, preserving outer-scope CTE visibility.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn build_nested_with_cte_context_with_base<'a>(
         &'a self,
         txn: &'a mut Transaction,
@@ -610,11 +611,11 @@ mod tests {
         // 2. normalize_ident each alias
         // 3. Zip with output_schema types
         // 4. Feed into build_cte_table_schema
-        let alias_columns = vec![
+        let alias_columns = [
             Ident::new("MyCol"),              // unquoted → should fold to "mycol"
             Ident::with_quote('"', "Quoted"), // quoted → should preserve "Quoted"
         ];
-        let output_schema = vec![
+        let output_schema = [
             ("original_a".to_string(), DataType::Int32),
             ("original_b".to_string(), DataType::Text),
         ];

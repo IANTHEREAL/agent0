@@ -125,8 +125,7 @@ impl PhysicalPlan {
                     self.schema
                         .columns
                         .iter()
-                        .enumerate()
-                        .map(|(_i, (name, dt))| crate::model::ColumnDef {
+                        .map(|(name, dt)| crate::model::ColumnDef {
                             name: name.clone(),
                             data_type: dt.clone(),
                             nullable: true,

@@ -207,10 +207,8 @@ impl Executor {
             row_group_num += 1;
             let batch = batch_result
                 .map_err(|e| anyhow!("COPY {}, row group {}: {}", short_table, row_group_num, e))?;
-            let mut row_in_group: usize = 0;
-
-            for pq_values in batch {
-                row_in_group += 1;
+            for (row_in_group_idx, pq_values) in batch.into_iter().enumerate() {
+                let row_in_group = row_in_group_idx + 1;
                 // Map parquet values to table columns
                 let mut row_values = vec![Value::Null; table_schema.columns.len()];
                 let mut provided_indices: Vec<usize> = Vec::new();
