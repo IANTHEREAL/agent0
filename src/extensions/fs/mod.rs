@@ -11,6 +11,7 @@ pub(crate) mod backend;
 pub(crate) mod decoders;
 pub(crate) mod glob;
 pub(crate) mod streaming;
+pub(crate) mod embedded;
 
 pub(crate) enum Fs9Mode {
     Directory {
@@ -168,7 +169,7 @@ pub(crate) async fn infer_table_function_schema(
         .into());
     }
 
-    let backend = backend::get_backend(tenant);
+    let backend = backend::get_backend(tenant).await;
     let backend = backend.as_ref();
 
     match mode {
@@ -263,7 +264,7 @@ pub(crate) async fn execute_table_function(
         .into());
     }
 
-    let backend = backend::get_backend(tenant);
+    let backend = backend::get_backend(tenant).await;
     let backend = backend.as_ref();
 
     match mode {
@@ -409,7 +410,7 @@ pub(crate) async fn execute_fs9_events(
 ) -> Result<(TableSchema, Vec<Row>)> {
     use crate::types::Value;
 
-    let bk = backend::get_backend(tenant);
+    let bk = backend::get_backend(tenant).await;
     let http_backend = match bk.as_any().downcast_ref::<backend::Fs9HttpBackend>() {
         Some(b) => b,
         None => {
@@ -490,7 +491,7 @@ pub(crate) async fn start_file_stream(
         .into());
     }
 
-    let backend = backend::get_backend(tenant);
+    let backend = backend::get_backend(tenant).await;
     let info = backend.stat(path).await?;
     if info.is_dir {
         return Ok(None);
@@ -658,7 +659,7 @@ async fn start_glob_stream_with_budget(
         .into());
     }
 
-    let backend = backend::get_backend(tenant);
+    let backend = backend::get_backend(tenant).await;
 
     let first_path = match glob::find_first_match(&*backend, pattern, exclude).await? {
         Some(p) => p,

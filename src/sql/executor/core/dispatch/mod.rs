@@ -341,6 +341,7 @@ impl Executor {
                 let stmt_exec: Result<Vec<ExecuteResult>> = wrap_with_runtime_context(
                     &rt_settings,
                     self.tenant_keyspace(),
+                    self.store.transaction_client(),
                     async {
                         match stmt {
                             // Transaction Control

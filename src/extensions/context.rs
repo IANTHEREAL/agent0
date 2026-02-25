@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
 use std::cell::Cell;
 use std::future::Future;
+use std::sync::Arc;
+use tikv_client::TransactionClient;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionKind {
@@ -8,12 +10,13 @@ pub enum ExecutionKind {
     Cron,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ExtensionContextOpts {
     pub(crate) is_superuser: bool,
     pub(crate) allow_local_fs: bool,
     pub(crate) tenant_keyspace: String,
     pub(crate) execution_kind: ExecutionKind,
+    pub(crate) tikv_client: Option<Arc<TransactionClient>>,
 }
 
 impl ExtensionContextOpts {
@@ -23,6 +26,7 @@ impl ExtensionContextOpts {
             allow_local_fs: is_superuser,
             tenant_keyspace: tenant_keyspace.to_string(),
             execution_kind: ExecutionKind::Interactive,
+            tikv_client: None,
         }
     }
 
@@ -32,17 +36,24 @@ impl ExtensionContextOpts {
             allow_local_fs: false,
             tenant_keyspace: tenant_keyspace.to_string(),
             execution_kind: ExecutionKind::Cron,
+            tikv_client: None,
         }
+}
+
+    pub(crate) fn with_tikv_client(mut self, client: Option<Arc<TransactionClient>>) -> Self {
+        self.tikv_client = client;
+        self
     }
 }
 
-#[derive(Debug)]
+
 pub(crate) struct ExtensionContext {
     pub(crate) is_superuser: bool,
     pub(crate) allow_local_fs: bool,
     pub(crate) tenant_keyspace: String,
     execution_kind: ExecutionKind,
     http_requests: Cell<u32>,
+    tikv_client: Option<Arc<TransactionClient>>,
 }
 
 tokio::task_local! {
@@ -74,6 +85,7 @@ pub(crate) async fn with_context_opts<R>(
         tenant_keyspace: opts.tenant_keyspace,
         execution_kind: opts.execution_kind,
         http_requests: Cell::new(0),
+        tikv_client: opts.tikv_client,
     };
 
     // See `sql::query_context::with_query_context` for rationale.
@@ -103,6 +115,10 @@ pub(crate) fn tenant_keyspace() -> Option<String> {
 pub(crate) fn execution_kind() -> ExecutionKind {
     CTX.try_with(|ctx| ctx.execution_kind)
         .unwrap_or(ExecutionKind::Interactive)
+}
+
+pub(crate) fn tikv_client() -> Option<Arc<TransactionClient>> {
+    CTX.try_with(|ctx| ctx.tikv_client.clone()).ok().flatten()
 }
 
 pub(crate) fn try_consume_http_request(max_per_statement: u32) -> Result<()> {

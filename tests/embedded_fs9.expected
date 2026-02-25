@@ -1,0 +1,63 @@
+fs9_write
+22
+(1 row)
+fs9_read
+Hello, embedded world!
+(1 row)
+fs9_exists
+t
+(1 row)
+fs9_exists
+f
+(1 row)
+fs9_size
+22
+(1 row)
+has_mtime
+t
+(1 row)
+fs9_write
+15
+(1 row)
+fs9_read
+Updated content
+(1 row)
+fs9_size
+15
+(1 row)
+fs9_mkdir
+t
+(1 row)
+fs9_exists
+t
+(1 row)
+fs9_write
+19
+(1 row)
+fs9_read
+Nested file content
+(1 row)
+fs9_remove
+1
+(1 row)
+fs9_exists
+f
+(1 row)
+fs9_remove
+1
+(1 row)
+fs9_remove
+1
+(1 row)
+fs9_remove
+1
+(1 row)
+null_read
+NULL
+(1 row)
+null_write_path
+NULL
+(1 row)
+null_write_content
+NULL
+(1 row)

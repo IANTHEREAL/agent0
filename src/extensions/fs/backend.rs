@@ -58,6 +58,10 @@ pub(crate) trait FsBackend: Send + Sync {
     /// Create a directory. If recursive is true, creates parent directories as needed.
     async fn mkdir(&self, path: &str, recursive: bool) -> Result<()>;
 
+    /// Write data to a file, creating parent directories as needed.
+    /// Returns the number of bytes written.
+    async fn write_file(&self, path: &str, data: &[u8]) -> Result<usize>;
+
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
@@ -256,6 +260,21 @@ impl FsBackend for LocalFsBackend {
                 .map_err(|err| anyhow!("fs9_mkdir: cannot create directory '{path}': {err}"))?;
         }
         Ok(())
+    }
+
+    async fn write_file(&self, path: &str, data: &[u8]) -> Result<usize> {
+        let file_path = std::path::Path::new(path);
+        if let Some(parent) = file_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|err| anyhow!("fs9_write: {err}"))?;
+            }
+        }
+        tokio::fs::write(file_path, data)
+            .await
+            .map_err(|err| anyhow!("fs9_write: {err}"))?;
+        Ok(data.len())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -499,6 +518,23 @@ impl FsBackend for Fs9HttpBackend {
         Ok(())
     }
 
+    async fn write_file(&self, path: &str, data: &[u8]) -> Result<usize> {
+        let url = format!("{}/api/v1/upload?path={}", self.base_url, path);
+        let resp = self
+            .client
+            .put(&url)
+            .bearer_auth(&self.token)
+            .header("content-type", "application/octet-stream")
+            .body(data.to_vec())
+            .send()
+            .await
+            .map_err(|e| anyhow!("fs9_write: cannot reach fs9-server: {e}"))?;
+        let resp = self.check_error(resp, path).await?;
+        // Consume the response body to prevent connection leaks
+        let _ = resp.bytes().await;
+        Ok(data.len())
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -522,38 +558,45 @@ impl Fs9HttpBackend {
 // Backend factory
 // ---------------------------------------------------------------------------
 
-/// Returns `true` when the remote fs9-server backend is configured.
+/// Returns `true` when a non-local backend is available: either a remote
+/// fs9-server is configured or a TiKV client is present for embedded mode.
 pub(crate) fn is_remote_configured() -> bool {
-    std::env::var("FS9_SERVER_URL").is_ok() && std::env::var("FS9_JWT_SECRET").is_ok()
+    (std::env::var("FS9_SERVER_URL").is_ok() && std::env::var("FS9_JWT_SECRET").is_ok())
+        || crate::extensions::context::tikv_client().is_some()
 }
 
 /// Build a backend for the given tenant keyspace.
 ///
-/// When `FS9_SERVER_URL` and `FS9_JWT_SECRET` are set, returns an `Fs9HttpBackend`
-/// that calls the remote fs9-server with a minted JWT. Otherwise falls back to
-/// the local filesystem backend.
-pub(crate) fn get_backend(tenant_keyspace: &str) -> Box<dyn FsBackend> {
-    let (base_url, secret) = match (
+/// Priority: remote fs9-server > embedded TiKV > local filesystem.
+pub(crate) async fn get_backend(tenant_keyspace: &str) -> Box<dyn FsBackend> {
+    // Priority 1: Remote fs9-server
+    if let (Ok(url), Ok(secret)) = (
         std::env::var("FS9_SERVER_URL"),
         std::env::var("FS9_JWT_SECRET"),
     ) {
-        (Ok(url), Ok(secret)) => (url, secret),
-        _ => return Box::new(LocalFsBackend::new()),
-    };
-
-    let tenant_id = tenant_keyspace
-        .strip_prefix("db9_tenant_")
-        .unwrap_or(tenant_keyspace);
-
-    let token = match mint_jwt(tenant_id, &secret) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("fs9: failed to mint JWT for tenant '{}': {}", tenant_id, e);
-            return Box::new(LocalFsBackend::new());
+        let tenant_id = tenant_keyspace
+            .strip_prefix("db9_tenant_")
+            .unwrap_or(tenant_keyspace);
+        match mint_jwt(tenant_id, &secret) {
+            Ok(token) => return Box::new(Fs9HttpBackend::new(url, token)),
+            Err(e) => {
+                tracing::error!("fs9: failed to mint JWT for tenant '{}': {}", tenant_id, e);
+            }
         }
-    };
+    }
 
-    Box::new(Fs9HttpBackend::new(base_url, token))
+    // Priority 2: Embedded TiKV backend
+    if let Some(client) = crate::extensions::context::tikv_client() {
+        match super::embedded::EmbeddedFsBackend::new(client).await {
+            Ok(backend) => return Box::new(backend),
+            Err(e) => {
+                tracing::error!("fs9: failed to init embedded backend: {}", e);
+            }
+        }
+    }
+
+    // Priority 3: Local filesystem fallback
+    Box::new(LocalFsBackend::new())
 }
 
 fn mint_jwt(tenant_id: &str, secret: &str) -> Result<String> {

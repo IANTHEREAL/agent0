@@ -94,11 +94,11 @@ fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
 }
 
-/// Get the remote fs9 backend using the tenant keyspace from extension context.
+/// Get the fs9 backend using the tenant keyspace from extension context.
 fn get_remote_backend() -> Result<Box<dyn backend::FsBackend>> {
     let tenant = crate::extensions::context::tenant_keyspace()
         .ok_or_else(|| anyhow!("fs9: tenant keyspace not available in extension context"))?;
-    Ok(backend::get_backend(&tenant))
+    Ok(run_async(backend::get_backend(&tenant)))
 }
 
 // ---------------------------------------------------------------------------
@@ -116,27 +116,7 @@ fn fs9_read_remote(path: &str) -> Result<Value> {
 
 fn fs9_write_remote(path: &str, content: &[u8]) -> Result<Value> {
     let bk = get_remote_backend()?;
-    let http = bk
-        .as_any()
-        .downcast_ref::<backend::Fs9HttpBackend>()
-        .ok_or_else(|| anyhow!("fs9_write: remote backend is not Fs9HttpBackend"))?;
-    let len = content.len();
-    let url = format!("{}/api/v1/upload?path={}", http.base_url(), path);
-    let resp = run_async(
-        http.client()
-            .put(&url)
-            .bearer_auth(http.token())
-            .header("content-type", "application/octet-stream")
-            .body(content.to_vec())
-            .send(),
-    )
-    .map_err(|e| anyhow!("fs9_write: cannot reach fs9-server: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = run_async(resp.text()).unwrap_or_default();
-        return Err(anyhow!("fs9_write: remote error ({status}): {body}"));
-    }
+    let len = run_async(bk.write_file(path, content))?;
     Ok(Value::Int64(len as i64))
 }
 
@@ -243,7 +223,7 @@ fn fs9_write_local(path: &str, content: &[u8]) -> Result<Value> {
     let file_path = Path::new(path);
     if let Some(parent) = file_path.parent() {
         if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|err| anyhow!("fs9_write: {err}"))?;
+            fs::create_dir_all(parent).map_err(|err| anyhow!("fs9_write: {err}"))?
         }
     }
 
