@@ -128,7 +128,14 @@ fn fs9_exists_remote(path: &str) -> Result<Value> {
     let bk = get_remote_backend()?;
     match run_async(bk.stat(path)) {
         Ok(_) => Ok(Value::Boolean(true)),
-        Err(e) if { let msg = e.to_string(); msg.contains("not found") || msg.contains("NotFound") || msg.contains("404") } => Ok(Value::Boolean(false)),
+        Err(e)
+            if {
+                let msg = e.to_string();
+                msg.contains("not found") || msg.contains("NotFound") || msg.contains("404")
+            } =>
+        {
+            Ok(Value::Boolean(false))
+        }
         Err(e) => Err(e),
     }
 }
@@ -477,7 +484,11 @@ pub fn fs9_mkdir(args: Vec<Value>) -> Result<Value> {
 
 pub fn fs9_read_at(args: Vec<Value>) -> Result<Value> {
     ensure_permissions()?;
-    let path = match expect_text_arg("fs9_read_at", args.first().cloned().unwrap_or(Value::Null), 0)? {
+    let path = match expect_text_arg(
+        "fs9_read_at",
+        args.first().cloned().unwrap_or(Value::Null),
+        0,
+    )? {
         Some(p) => p,
         None => return Ok(Value::Null),
     };
@@ -532,7 +543,11 @@ pub fn fs9_read_at(args: Vec<Value>) -> Result<Value> {
 
 pub fn fs9_write_at(args: Vec<Value>) -> Result<Value> {
     ensure_permissions()?;
-    let path = match expect_text_arg("fs9_write_at", args.first().cloned().unwrap_or(Value::Null), 0)? {
+    let path = match expect_text_arg(
+        "fs9_write_at",
+        args.first().cloned().unwrap_or(Value::Null),
+        0,
+    )? {
         Some(p) => p,
         None => return Ok(Value::Null),
     };
@@ -557,7 +572,11 @@ pub fn fs9_write_at(args: Vec<Value>) -> Result<Value> {
             ))
         }
     };
-    let data = match expect_text_arg("fs9_write_at", args.get(2).cloned().unwrap_or(Value::Null), 2)? {
+    let data = match expect_text_arg(
+        "fs9_write_at",
+        args.get(2).cloned().unwrap_or(Value::Null),
+        2,
+    )? {
         Some(d) => d,
         None => return Ok(Value::Null),
     };
@@ -571,11 +590,16 @@ pub fn fs9_write_at(args: Vec<Value>) -> Result<Value> {
 
 pub fn fs9_append(args: Vec<Value>) -> Result<Value> {
     ensure_permissions()?;
-    let path = match expect_text_arg("fs9_append", args.first().cloned().unwrap_or(Value::Null), 0)? {
+    let path = match expect_text_arg(
+        "fs9_append",
+        args.first().cloned().unwrap_or(Value::Null),
+        0,
+    )? {
         Some(p) => p,
         None => return Ok(Value::Null),
     };
-    let data = match expect_text_arg("fs9_append", args.get(1).cloned().unwrap_or(Value::Null), 1)? {
+    let data = match expect_text_arg("fs9_append", args.get(1).cloned().unwrap_or(Value::Null), 1)?
+    {
         Some(d) => d,
         None => return Ok(Value::Null),
     };
@@ -589,7 +613,11 @@ pub fn fs9_append(args: Vec<Value>) -> Result<Value> {
 
 pub fn fs9_truncate(args: Vec<Value>) -> Result<Value> {
     ensure_permissions()?;
-    let path = match expect_text_arg("fs9_truncate", args.first().cloned().unwrap_or(Value::Null), 0)? {
+    let path = match expect_text_arg(
+        "fs9_truncate",
+        args.first().cloned().unwrap_or(Value::Null),
+        0,
+    )? {
         Some(p) => p,
         None => return Ok(Value::Null),
     };

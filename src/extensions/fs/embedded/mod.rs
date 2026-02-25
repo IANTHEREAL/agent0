@@ -1,6 +1,6 @@
-pub(crate) mod types;
 pub(crate) mod keys;
 pub(crate) mod pagefs;
+pub(crate) mod types;
 
 use crate::extensions::fs::backend::{FsBackend, FsFileInfo};
 use anyhow::{anyhow, Result};

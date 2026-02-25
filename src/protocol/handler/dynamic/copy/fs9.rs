@@ -562,8 +562,9 @@ impl DynamicPgHandler {
         let tenant_ks = executor.tenant_keyspace().to_string();
         let is_super = session.is_superuser();
         let tikv_client = executor.store().transaction_client();
-        let ext_opts = crate::extensions::context::ExtensionContextOpts::statement(is_super, &tenant_ks)
-            .with_tikv_client(tikv_client);
+        let ext_opts =
+            crate::extensions::context::ExtensionContextOpts::statement(is_super, &tenant_ks)
+                .with_tikv_client(tikv_client);
         let result = crate::sql::query_context::with_scoped_query_context(&qctx, async {
             crate::extensions::context::with_context_opts(ext_opts, async {
                 executor

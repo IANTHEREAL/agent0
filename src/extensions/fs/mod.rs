@@ -9,9 +9,9 @@ use tracing::warn;
 
 pub(crate) mod backend;
 pub(crate) mod decoders;
+pub(crate) mod embedded;
 pub(crate) mod glob;
 pub(crate) mod streaming;
-pub(crate) mod embedded;
 
 pub(crate) enum Fs9Mode {
     Directory {

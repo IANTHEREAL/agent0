@@ -90,8 +90,11 @@ impl EmbeddedPageFs {
             }
         }
 
-        let file_len = usize::try_from(inode.size)
-            .map_err(|_| anyhow!(EmbeddedFsError::internal("file size exceeds addressable memory")))?;
+        let file_len = usize::try_from(inode.size).map_err(|_| {
+            anyhow!(EmbeddedFsError::internal(
+                "file size exceeds addressable memory"
+            ))
+        })?;
         if data.len() > file_len {
             data.truncate(file_len);
         }
@@ -102,7 +105,12 @@ impl EmbeddedPageFs {
         Ok(data)
     }
 
-    pub(crate) async fn read_file_at(&self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
+    pub(crate) async fn read_file_at(
+        &self,
+        path: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>> {
         let mut txn = self.begin().await?;
         let (inode_id, mut inode) = resolve_path(&mut txn, path).await?;
         if inode.is_directory() {
@@ -119,8 +127,11 @@ impl EmbeddedPageFs {
         let requested_len = u64::try_from(length)
             .map_err(|_| anyhow!(EmbeddedFsError::internal("requested length exceeds u64")))?;
         let actual_len_u64 = requested_len.min(inode.size - offset);
-        let actual_len = usize::try_from(actual_len_u64)
-            .map_err(|_| anyhow!(EmbeddedFsError::internal("requested length exceeds addressable memory")))?;
+        let actual_len = usize::try_from(actual_len_u64).map_err(|_| {
+            anyhow!(EmbeddedFsError::internal(
+                "requested length exceeds addressable memory"
+            ))
+        })?;
 
         let file_end = offset
             .checked_add(actual_len_u64)
@@ -151,10 +162,10 @@ impl EmbeddedPageFs {
 
     pub(crate) async fn write_file(&self, path: &str, data: &[u8]) -> Result<usize> {
         let mut txn = self.begin().await?;
-        
+
         // Auto-create parent directories (matching FsBackend trait contract)
         ensure_parents(&mut txn, path).await?;
-        
+
         let (parent_inode, name) = resolve_parent(&mut txn, path).await?;
 
         let inode_id;
@@ -192,7 +203,12 @@ impl EmbeddedPageFs {
         Ok(data.len())
     }
 
-    pub(crate) async fn write_file_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<usize> {
+    pub(crate) async fn write_file_at(
+        &self,
+        path: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -274,21 +290,22 @@ impl EmbeddedPageFs {
         ensure_parents(&mut txn, path).await?;
         let (parent_inode, name) = resolve_parent(&mut txn, path).await?;
 
-        let current_size = if let Some(existing_inode_id) = lookup(&mut txn, parent_inode, &name).await? {
-            let inode = load_inode(&mut txn, existing_inode_id)
-                .await?
-                .ok_or_else(|| anyhow!(EmbeddedFsError::not_found(path)))?;
-            if inode.is_directory() {
-                return Err(anyhow!(EmbeddedFsError::is_directory(path)));
-            }
-            inode.size
-        } else {
-            let new_inode_id = alloc_inode(&mut txn).await?;
-            let inode = Inode::new_file(new_inode_id, 0o644);
-            save_inode(&mut txn, &inode).await?;
-            link(&mut txn, parent_inode, &name, new_inode_id).await?;
-            0
-        };
+        let current_size =
+            if let Some(existing_inode_id) = lookup(&mut txn, parent_inode, &name).await? {
+                let inode = load_inode(&mut txn, existing_inode_id)
+                    .await?
+                    .ok_or_else(|| anyhow!(EmbeddedFsError::not_found(path)))?;
+                if inode.is_directory() {
+                    return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+                }
+                inode.size
+            } else {
+                let new_inode_id = alloc_inode(&mut txn).await?;
+                let inode = Inode::new_file(new_inode_id, 0o644);
+                save_inode(&mut txn, &inode).await?;
+                link(&mut txn, parent_inode, &name, new_inode_id).await?;
+                0
+            };
 
         txn.commit().await?;
         self.write_file_at(path, current_size, data).await
@@ -504,7 +521,12 @@ async fn lookup(txn: &mut Transaction, parent_inode: u64, name: &str) -> Result<
     }
 }
 
-async fn link(txn: &mut Transaction, parent_inode: u64, name: &str, child_inode: u64) -> Result<()> {
+async fn link(
+    txn: &mut Transaction,
+    parent_inode: u64,
+    name: &str,
+    child_inode: u64,
+) -> Result<()> {
     txn.put(
         keys::dir_entry_key(parent_inode, name),
         child_inode.to_be_bytes().to_vec(),
@@ -545,12 +567,18 @@ async fn read_page(txn: &mut Transaction, inode_id: u64, page_num: u64) -> Resul
     Ok(data)
 }
 
-async fn write_page(txn: &mut Transaction, inode_id: u64, page_num: u64, data: &[u8]) -> Result<()> {
+async fn write_page(
+    txn: &mut Transaction,
+    inode_id: u64,
+    page_num: u64,
+    data: &[u8],
+) -> Result<()> {
     let mut page_data = data.to_vec();
     if page_data.len() < PAGE_SIZE {
         page_data.resize(PAGE_SIZE, 0);
     }
-    txn.put(keys::page_key(inode_id, page_num), page_data).await?;
+    txn.put(keys::page_key(inode_id, page_num), page_data)
+        .await?;
     Ok(())
 }
 
@@ -602,24 +630,28 @@ async fn resolve_path(txn: &mut Transaction, path: &str) -> Result<(u64, Inode)>
 
 async fn ensure_parents(txn: &mut Transaction, path: &str) -> Result<()> {
     let normalized = normalize_path(path);
-    
+
     // If path is root or empty, parent is root which always exists
     if normalized == "/" {
         return Ok(());
     }
-    
+
     let (parent_path, _) = normalized.rsplit_once('/').unwrap_or(("", &normalized));
-    let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
-    
+    let parent_path = if parent_path.is_empty() {
+        "/"
+    } else {
+        parent_path
+    };
+
     // If parent is root, it always exists
     if parent_path == "/" {
         return Ok(());
     }
-    
+
     // Walk the parent path components from root, creating any missing directories
     let parts: Vec<&str> = parent_path.split('/').filter(|s| !s.is_empty()).collect();
     let mut current_inode = ROOT_INODE;
-    
+
     for part in parts {
         if let Some(next_inode_id) = lookup(txn, current_inode, part).await? {
             let next_inode = load_inode(txn, next_inode_id)
@@ -729,7 +761,6 @@ async fn remove_inode_recursive(txn: &mut Transaction, inode_id: u64, inode: Ino
     Ok(removed)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,7 +804,7 @@ mod tests {
 
     #[test]
     fn test_pages_needed_exact_page() {
-        assert_eq!(pages_needed(16384), 1);  // PAGE_SIZE = 16 * 1024
+        assert_eq!(pages_needed(16384), 1); // PAGE_SIZE = 16 * 1024
     }
 
     #[test]
@@ -788,7 +819,7 @@ mod tests {
 
     #[test]
     fn test_pages_needed_large() {
-        assert_eq!(pages_needed(1_000_000), 62);  // ceil(1000000 / 16384)
+        assert_eq!(pages_needed(1_000_000), 62); // ceil(1000000 / 16384)
     }
 
     #[test]
@@ -833,12 +864,18 @@ mod tests {
 
     #[test]
     fn test_write_at_page_range_partial_first() {
-        assert_eq!(page_range((PAGE_SIZE / 2) as u64, PAGE_SIZE as u64), Some((0, 1)));
+        assert_eq!(
+            page_range((PAGE_SIZE / 2) as u64, PAGE_SIZE as u64),
+            Some((0, 1))
+        );
     }
 
     #[test]
     fn test_write_at_page_range_full_pages() {
-        assert_eq!(page_range(PAGE_SIZE as u64, (PAGE_SIZE * 2) as u64), Some((1, 2)));
+        assert_eq!(
+            page_range(PAGE_SIZE as u64, (PAGE_SIZE * 2) as u64),
+            Some((1, 2))
+        );
     }
 
     #[test]
@@ -859,17 +896,26 @@ mod tests {
     #[test]
     fn test_page_range_large_offset() {
         let base = 1_000_000u64 * PAGE_SIZE as u64;
-        assert_eq!(page_range(base + 7, (PAGE_SIZE as u64 * 2) + 1), Some((1_000_000, 1_000_002)));
+        assert_eq!(
+            page_range(base + 7, (PAGE_SIZE as u64 * 2) + 1),
+            Some((1_000_000, 1_000_002))
+        );
     }
 
     #[test]
     fn test_page_range_u64_max_single_byte() {
-        assert_eq!(page_range(u64::MAX, 1), Some((u64::MAX / PAGE_SIZE as u64, u64::MAX / PAGE_SIZE as u64)));
+        assert_eq!(
+            page_range(u64::MAX, 1),
+            Some((u64::MAX / PAGE_SIZE as u64, u64::MAX / PAGE_SIZE as u64))
+        );
     }
 
     #[test]
     fn test_page_byte_range_single_byte_at_page_start() {
-        assert_eq!(page_byte_range(2, (PAGE_SIZE as u64) * 2, (PAGE_SIZE as u64) * 2 + 1), (0, 1));
+        assert_eq!(
+            page_byte_range(2, (PAGE_SIZE as u64) * 2, (PAGE_SIZE as u64) * 2 + 1),
+            (0, 1)
+        );
     }
 
     #[test]
@@ -930,7 +976,10 @@ mod tests {
         let last_page = u64::MAX / PAGE_SIZE as u64;
         let page_start = last_page * PAGE_SIZE as u64;
         let file_end = page_start + 17;
-        assert_eq!(page_byte_range(last_page, page_start + 5, file_end), (5, 17));
+        assert_eq!(
+            page_byte_range(last_page, page_start + 5, file_end),
+            (5, 17)
+        );
     }
 
     #[test]
@@ -947,7 +996,7 @@ mod tests {
     fn test_scan_end_key_simple() {
         let prefix = b"_fs_D";
         let end = scan_end_key(prefix);
-        assert_eq!(end, b"_fs_E");  // 'D' + 1 = 'E'
+        assert_eq!(end, b"_fs_E"); // 'D' + 1 = 'E'
     }
 
     #[test]

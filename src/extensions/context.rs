@@ -38,14 +38,13 @@ impl ExtensionContextOpts {
             execution_kind: ExecutionKind::Cron,
             tikv_client: None,
         }
-}
+    }
 
     pub(crate) fn with_tikv_client(mut self, client: Option<Arc<TransactionClient>>) -> Self {
         self.tikv_client = client;
         self
     }
 }
-
 
 pub(crate) struct ExtensionContext {
     pub(crate) is_superuser: bool,

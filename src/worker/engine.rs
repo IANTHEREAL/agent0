@@ -766,8 +766,7 @@ impl WorkerEngine {
             vec!["public".to_string()]
         };
         let ext_ctx = if entry.task_type == TaskType::Cron {
-            ExtensionContextOpts::cron(&entry.keyspace)
-                .with_tikv_client(store.transaction_client())
+            ExtensionContextOpts::cron(&entry.keyspace).with_tikv_client(store.transaction_client())
         } else {
             ExtensionContextOpts {
                 is_superuser: true,

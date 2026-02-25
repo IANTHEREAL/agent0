@@ -164,8 +164,11 @@ pub(in crate::sql::executor::core) fn wrap_with_runtime_context<'a, T: Send + 'a
             session_context::with_search_path(
                 sp,
                 crate::extensions::context::with_context_opts(
-                    crate::extensions::context::ExtensionContextOpts::statement(su, tenant_keyspace)
-                        .with_tikv_client(tikv_client),
+                    crate::extensions::context::ExtensionContextOpts::statement(
+                        su,
+                        tenant_keyspace,
+                    )
+                    .with_tikv_client(tikv_client),
                     fut,
                 ),
             ),

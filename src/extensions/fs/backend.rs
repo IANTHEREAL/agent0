@@ -637,7 +637,9 @@ impl FsBackend for Fs9HttpBackend {
     }
 
     async fn write_file_at(&self, _path: &str, _offset: u64, _data: &[u8]) -> Result<usize> {
-        Err(anyhow!("fs9: write_file_at not supported on remote backend"))
+        Err(anyhow!(
+            "fs9: write_file_at not supported on remote backend"
+        ))
     }
 
     async fn append_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
