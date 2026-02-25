@@ -3,7 +3,6 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
@@ -14,11 +13,15 @@ use crate::db;
 use crate::device_code::DeviceCodeStatus;
 use crate::error::AppError;
 use crate::models::*;
-use crate::services::pd_client::PdClient;
 use crate::services::pg_client::PgClient;
+use crate::services::tenant::{
+    deprovision_tenant, generate_customer_password, generate_tenant_id, make_keyspace,
+    provision_database, AuditConfig, DeprovisionConfig, DeprovisionRequest, Fs9BootstrapConfig,
+    ProvisionConfig, ProvisionRequest, RollbackPolicy, SchemaBootstrapConfig,
+};
 use crate::{
     tenant_state, AppState, DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USER, DEFAULT_PG_PORT,
-    KEYSPACE_PREFIX, OBSERVABILITY_USER, TENANT_ID_LEN,
+    OBSERVABILITY_USER,
 };
 
 const SYSTEM_USER_PREFIX: &str = "_db9_sys_";
@@ -75,26 +78,6 @@ pub fn router() -> Router<AppState> {
 }
 
 // ── Helper functions ────────────────────────────────────────────
-
-fn generate_tenant_id() -> String {
-    let mut rng = rand::thread_rng();
-    let charset = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    (0..TENANT_ID_LEN)
-        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
-        .collect()
-}
-
-fn make_keyspace(id: &str) -> String {
-    format!("{}{id}", KEYSPACE_PREFIX)
-}
-
-fn generate_password() -> String {
-    let mut rng = rand::thread_rng();
-    let charset = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_=+.~";
-    (0..16)
-        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
-        .collect()
-}
 
 fn build_connection_string(
     tenant_id: &str,
@@ -634,163 +617,62 @@ pub async fn create_database(
     let tenant_id = generate_tenant_id();
     let keyspace = make_keyspace(&tenant_id);
     let admin_user = DEFAULT_ADMIN_USER.to_string();
-    let password = req.admin_password.clone().unwrap_or_else(generate_password);
-
-    if db::get_tenant_by_id(&state.db, &tenant_id).await?.is_some() {
-        return Err(AppError::conflict("ID collision, please retry"));
-    }
-
-    let now = chrono::Utc::now().to_rfc3339();
-    db::insert_tenant(
-        &state.db,
-        &tenant_id,
-        &keyspace,
-        tenant_state::CREATING,
-        &now,
-    )
-    .await?;
-
-    let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
-    if !pd.create_keyspace(&keyspace).await {
-        db::update_tenant_state(
-            &state.db,
-            &tenant_id,
-            tenant_state::CREATE_FAILED,
-            Some("Failed to create keyspace in PD"),
-        )
-        .await?;
-        db::insert_audit_log(
-            &state.db,
-            "CREATE",
-            "DATABASE",
-            &tenant_id,
-            Some(&tenant_id),
-            Some(&auth.customer_id),
-            false,
-            Some("Failed to create keyspace in PD"),
-            None,
-        )
-        .await
-        .ok();
-        return Err(AppError::internal("Failed to create database"));
-    }
-
-    // ── FS9 integration (best-effort) ────────────────────────────
-    if let Some(ref fs9) = state.fs9_client {
-        let fs_keyspace = format!("db9_fs_{}", tenant_id);
-
-        // Create filesystem keyspace in PD
-        if !pd.create_keyspace(&fs_keyspace).await {
-            tracing::warn!(
-                tenant_id,
-                fs_keyspace,
-                "Failed to create fs keyspace in PD (non-fatal)"
-            );
-        }
-
-        // Create fs9 namespace
-        if let Err(e) = fs9.create_namespace(&tenant_id).await {
-            tracing::warn!(tenant_id, error = %e, "Failed to create fs9 namespace (non-fatal)");
-        } else {
-            // Create a user in the namespace so a token can be issued.
-            // fs9-server auto-provisions the pagefs mount via default_pagefs config.
-            let fs9_user_id = match fs9.create_user(&tenant_id, &auth.customer_id).await {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    tracing::warn!(tenant_id, error = %e, "Failed to create fs9 user (non-fatal)");
-                    None
-                }
-            };
-
-            // Generate and store fs9 token
-            if let Some(user_id) = fs9_user_id {
-                match fs9.generate_token(&user_id, &tenant_id).await {
-                    Ok(token) => {
-                        db::upsert_credential(
-                            &state.db,
-                            &tenant_id,
-                            "fs9_token",
-                            &auth.customer_id,
-                            &token,
-                            state.config.credential_key.as_deref(),
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        tracing::warn!(tenant_id, error = %e, "Failed to generate fs9 token (non-fatal)");
-                    }
-                }
-            }
-        }
-    }
-
-    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
-    if !pg
-        .bootstrap_admin_password(&tenant_id, &admin_user, DEFAULT_ADMIN_PASSWORD, &password)
-        .await
-    {
-        db::update_tenant_state(
-            &state.db,
-            &tenant_id,
-            tenant_state::CREATE_FAILED,
-            Some("Keyspace created but password bootstrap failed"),
-        )
-        .await?;
-        db::insert_audit_log(
-            &state.db,
-            "CREATE",
-            "DATABASE",
-            &tenant_id,
-            Some(&tenant_id),
-            Some(&auth.customer_id),
-            false,
-            Some("Password bootstrap failed"),
-            None,
-        )
-        .await
-        .ok();
-        return Err(AppError::internal(
-            "Failed to initialize database. Please retry.",
-        ));
-    }
-
-    // Install default extensions (non-fatal)
-    pg.bootstrap_default_extensions(&tenant_id, &admin_user, &password)
-        .await;
-
-    db::update_tenant_state(&state.db, &tenant_id, tenant_state::ACTIVE, None).await?;
-    db::set_tenant_customer_id(&state.db, &tenant_id, &auth.customer_id).await?;
-
-    db::upsert_credential(
-        &state.db,
-        &tenant_id,
-        "admin",
-        &admin_user,
-        &password,
-        state.config.credential_key.as_deref(),
-    )
-    .await?;
-
+    let password = req
+        .admin_password
+        .clone()
+        .unwrap_or_else(generate_customer_password);
     let tags_json = req
         .region
         .as_ref()
         .map(|r| serde_json::to_string(&vec![r]).unwrap_or_else(|_| "[]".into()));
-    db::update_tenant_metadata(&state.db, &tenant_id, Some(&req.name), tags_json.as_deref())
-        .await?;
-
-    db::insert_audit_log(
+    let fs9_cfg = state
+        .fs9_client
+        .as_deref()
+        .map(|fs9_client| Fs9BootstrapConfig {
+            fs9_client,
+            token_owner: &auth.customer_id,
+            credential_key: state.config.credential_key.as_deref(),
+        });
+    let created_at = provision_database(
         &state.db,
-        "CREATE",
-        "DATABASE",
-        &tenant_id,
-        Some(&tenant_id),
-        Some(&auth.customer_id),
-        true,
-        None,
-        None,
+        &ProvisionRequest {
+            tenant_id: &tenant_id,
+            keyspace: &keyspace,
+            admin_user: &admin_user,
+            current_admin_password: DEFAULT_ADMIN_PASSWORD,
+            desired_admin_password: &password,
+        },
+        ProvisionConfig {
+            pd_endpoints: &state.config.pd_endpoints,
+            http_client: &state.http_client,
+            pg_host: &state.config.pg_host,
+            pg_port: state.config.pg_port,
+            rollback: RollbackPolicy::PropagateDbError,
+            id_collision_message: "ID collision, please retry",
+            pd_create_failed_state_reason: "Failed to create keyspace in PD",
+            pd_create_failed_audit_reason: Some("Failed to create keyspace in PD"),
+            pd_create_failed_error_message: "Failed to create database",
+            password_failed_state_reason: "Keyspace created but password bootstrap failed",
+            password_failed_audit_reason: Some("Password bootstrap failed"),
+            password_failed_error_message: "Failed to initialize database. Please retry.",
+            audit: Some(AuditConfig {
+                operation_type: "CREATE",
+                resource_type: "DATABASE",
+                operator: Some(&auth.customer_id),
+            }),
+            bootstrap_default_extensions: true,
+            schema_bootstrap: None,
+            set_customer_id: Some(&auth.customer_id),
+            store_admin_credential: true,
+            credential_key: state.config.credential_key.as_deref(),
+            metadata_notes: Some(&req.name),
+            metadata_tags_json: tags_json.as_deref(),
+            fs9: fs9_cfg,
+            write_success_audit: true,
+        },
     )
-    .await
-    .ok();
+    .await?
+    .created_at;
 
     let endpoints = state.config.parse_public_endpoints();
     let (host, port) = endpoints
@@ -810,7 +692,7 @@ pub async fn create_database(
             endpoints: None,
             admin_user: Some(admin_user),
             admin_password: Some(password),
-            created_at: now,
+            created_at,
             connection_string: Some(connection_string),
         }),
     ))
@@ -915,54 +797,30 @@ pub async fn delete_database(
         .await?
         .ok_or_else(|| AppError::not_found("Database not found"))?;
 
-    db::update_tenant_state(&state.db, &database_id, tenant_state::DISABLING, None).await?;
-
-    let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
-    if !pd.disable_keyspace(&tenant.keyspace).await {
-        db::update_tenant_state(
-            &state.db,
-            &database_id,
-            tenant_state::ACTIVE,
-            Some("Failed to disable keyspace in PD"),
-        )
-        .await?;
-        db::insert_audit_log(
-            &state.db,
-            "DELETE",
-            "DATABASE",
-            &database_id,
-            Some(&database_id),
-            Some(&auth.customer_id),
-            false,
-            Some("Failed to disable keyspace"),
-            None,
-        )
-        .await
-        .ok();
-        return Err(AppError::internal("Failed to disable database"));
-    }
-
-    db::update_tenant_state(
+    deprovision_tenant(
         &state.db,
-        &database_id,
-        tenant_state::DISABLED,
-        Some("Deleted by customer"),
+        &DeprovisionRequest {
+            tenant_id: &database_id,
+            keyspace: &tenant.keyspace,
+        },
+        DeprovisionConfig {
+            pd_endpoints: &state.config.pd_endpoints,
+            http_client: &state.http_client,
+            rollback: RollbackPolicy::PropagateDbError,
+            rollback_to_active_reason: "Failed to disable keyspace in PD",
+            disabling_state_reason: None,
+            disable_failed_audit_reason: Some("Failed to disable keyspace"),
+            disable_failed_error_message: "Failed to disable database",
+            disabled_state_reason: "Deleted by customer",
+            audit: Some(AuditConfig {
+                operation_type: "DELETE",
+                resource_type: "DATABASE",
+                operator: Some(&auth.customer_id),
+            }),
+            write_success_audit: true,
+        },
     )
     .await?;
-
-    db::insert_audit_log(
-        &state.db,
-        "DELETE",
-        "DATABASE",
-        &database_id,
-        Some(&database_id),
-        Some(&auth.customer_id),
-        true,
-        None,
-        None,
-    )
-    .await
-    .ok();
 
     Ok(Json(MessageResponse {
         message: "Database disabled".to_string(),
@@ -992,7 +850,7 @@ pub async fn reset_database_password(
         AppError::conflict("No stored admin credential for this database. Cannot reset password.")
     })?;
 
-    let new_password = generate_password();
+    let new_password = generate_customer_password();
 
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
     let success = pg
@@ -1100,7 +958,7 @@ pub async fn get_database_observability(
             })?;
 
             let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
-            let obs_password = generate_password();
+            let obs_password = generate_customer_password();
 
             let created = pg
                 .create_user(
@@ -1559,90 +1417,52 @@ pub async fn branch_database(
     let tenant_id = generate_tenant_id();
     let keyspace = make_keyspace(&tenant_id);
     let admin_user = DEFAULT_ADMIN_USER.to_string();
-    let password = generate_password();
-
-    if db::get_tenant_by_id(&state.db, &tenant_id).await?.is_some() {
-        return Err(AppError::conflict("ID collision, please retry"));
-    }
-
-    let now = chrono::Utc::now().to_rfc3339();
-    db::insert_tenant(
-        &state.db,
-        &tenant_id,
-        &keyspace,
-        tenant_state::CREATING,
-        &now,
-    )
-    .await?;
-
-    let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
-    if !pd.create_keyspace(&keyspace).await {
-        db::update_tenant_state(
-            &state.db,
-            &tenant_id,
-            tenant_state::CREATE_FAILED,
-            Some("Failed to create keyspace in PD"),
-        )
-        .await?;
-        return Err(AppError::internal("Failed to create branch database"));
-    }
-
-    if !pg
-        .bootstrap_admin_password(&tenant_id, &admin_user, DEFAULT_ADMIN_PASSWORD, &password)
-        .await
-    {
-        db::update_tenant_state(
-            &state.db,
-            &tenant_id,
-            tenant_state::CREATE_FAILED,
-            Some("Keyspace created but password bootstrap failed"),
-        )
-        .await?;
-        return Err(AppError::internal(
-            "Failed to initialize branch database. Please retry.",
-        ));
-    }
-
-    if !ddl_script.is_empty() {
-        if let Err(err) = pg
-            .run_sql_structured(&tenant_id, &admin_user, &password, &ddl_script)
-            .await
-        {
-            db::update_tenant_state(
-                &state.db,
-                &tenant_id,
-                tenant_state::CREATE_FAILED,
-                Some("Schema bootstrap failed"),
-            )
-            .await?;
-            return Err(AppError::bad_gateway(format!(
-                "Failed to apply branch schema: {err}"
-            )));
-        }
-    }
-
-    pg.bootstrap_default_extensions(&tenant_id, &admin_user, &password)
-        .await;
-
-    db::update_tenant_state(&state.db, &tenant_id, tenant_state::ACTIVE, None).await?;
-    db::set_tenant_customer_id(&state.db, &tenant_id, &auth.customer_id).await?;
-
-    db::upsert_credential(
-        &state.db,
-        &tenant_id,
-        "admin",
-        &admin_user,
-        &password,
-        state.config.credential_key.as_deref(),
-    )
-    .await?;
-
+    let password = generate_customer_password();
     let source_region = parse_region_from_tags(&source_tenant.tags);
     let tags_json = source_region
         .as_ref()
         .map(|r| serde_json::to_string(&vec![r]).unwrap_or_else(|_| "[]".into()));
     let notes = format!("{} [branch-of:{}]", req.name.trim(), database_id);
-    db::update_tenant_metadata(&state.db, &tenant_id, Some(&notes), tags_json.as_deref()).await?;
+    let created_at = provision_database(
+        &state.db,
+        &ProvisionRequest {
+            tenant_id: &tenant_id,
+            keyspace: &keyspace,
+            admin_user: &admin_user,
+            current_admin_password: DEFAULT_ADMIN_PASSWORD,
+            desired_admin_password: &password,
+        },
+        ProvisionConfig {
+            pd_endpoints: &state.config.pd_endpoints,
+            http_client: &state.http_client,
+            pg_host: &state.config.pg_host,
+            pg_port: state.config.pg_port,
+            rollback: RollbackPolicy::PropagateDbError,
+            id_collision_message: "ID collision, please retry",
+            pd_create_failed_state_reason: "Failed to create keyspace in PD",
+            pd_create_failed_audit_reason: None,
+            pd_create_failed_error_message: "Failed to create branch database",
+            password_failed_state_reason: "Keyspace created but password bootstrap failed",
+            password_failed_audit_reason: None,
+            password_failed_error_message: "Failed to initialize branch database. Please retry.",
+            audit: None,
+            bootstrap_default_extensions: true,
+            schema_bootstrap: Some(SchemaBootstrapConfig {
+                sql: &ddl_script,
+                failed_state_reason: "Schema bootstrap failed",
+                failed_error_prefix: "Failed to apply branch schema",
+            }),
+            set_customer_id: Some(&auth.customer_id),
+            store_admin_credential: true,
+            credential_key: state.config.credential_key.as_deref(),
+            metadata_notes: Some(&notes),
+            metadata_tags_json: tags_json.as_deref(),
+            fs9: None,
+            write_success_audit: false,
+        },
+    )
+    .await?
+    .created_at;
 
     let endpoints = state.config.parse_public_endpoints();
     let (host, port) = endpoints
@@ -1662,7 +1482,7 @@ pub async fn branch_database(
             endpoints: None,
             admin_user: Some(admin_user),
             admin_password: Some(password),
-            created_at: now,
+            created_at,
             connection_string: Some(connection_string),
         }),
     ))

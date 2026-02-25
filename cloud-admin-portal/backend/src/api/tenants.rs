@@ -2,17 +2,22 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use base64::Engine;
-use rand::Rng;
 
 use crate::auth::{ApiKeyAuth, TenantSessionExtractor};
 use crate::db;
 use crate::error::AppError;
 use crate::models::*;
-use crate::services::pd_client::PdClient;
 use crate::services::pg_client::PgClient;
+use crate::services::tenant::{
+    bootstrap_tenant_password, deprovision_tenant, disable_keyspace_with_rollback,
+    generate_admin_password, generate_tenant_id, make_keyspace, prepare_tenant_keyspace,
+    provision_tenant, AuditConfig, BootstrapPasswordOutcome, DeprovisionConfig, DeprovisionRequest,
+    DisableKeyspaceOutcome, PrepareKeyspaceOutcome, ProvisionConfig, ProvisionRequest,
+    RollbackPolicy,
+};
 use crate::{
     tenant_state, AppState, DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USER, DEFAULT_PG_PORT,
-    OBSERVABILITY_USER, TENANT_ID_LEN,
+    OBSERVABILITY_USER,
 };
 
 fn encode_cursor(created_at: &str, id: &str) -> String {
@@ -30,26 +35,6 @@ fn decode_cursor(cursor: &str) -> Option<(String, String)> {
     } else {
         None
     }
-}
-
-fn generate_tenant_id() -> String {
-    let mut rng = rand::thread_rng();
-    let charset = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    (0..TENANT_ID_LEN)
-        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
-        .collect()
-}
-
-fn make_keyspace(id: &str) -> String {
-    format!("{}{id}", crate::KEYSPACE_PREFIX)
-}
-
-fn generate_password() -> String {
-    let mut rng = rand::thread_rng();
-    let charset = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*";
-    (0..16)
-        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
-        .collect()
 }
 
 // ── List tenants ─────────────────────────────────────────────────
@@ -101,95 +86,50 @@ pub async fn create_tenant(
     let admin_user = request
         .admin_user
         .unwrap_or_else(|| DEFAULT_ADMIN_USER.to_string());
-    let password = request.admin_password.unwrap_or_else(generate_password);
-
-    // Check for ID collision
-    if db::get_tenant_by_id(&state.db, &tenant_id).await?.is_some() {
-        return Err(AppError::conflict("ID collision, please retry"));
-    }
-
-    let now = chrono::Utc::now().to_rfc3339();
-    db::insert_tenant(
+    let password = request
+        .admin_password
+        .unwrap_or_else(generate_admin_password);
+    let created_at = provision_tenant(
         &state.db,
-        &tenant_id,
-        &keyspace,
-        tenant_state::CREATING,
-        &now,
+        &ProvisionRequest {
+            tenant_id: &tenant_id,
+            keyspace: &keyspace,
+            admin_user: &admin_user,
+            current_admin_password: DEFAULT_ADMIN_PASSWORD,
+            desired_admin_password: &password,
+        },
+        ProvisionConfig {
+            pd_endpoints: &state.config.pd_endpoints,
+            http_client: &state.http_client,
+            pg_host: &state.config.pg_host,
+            pg_port: state.config.pg_port,
+            rollback: RollbackPolicy::PropagateDbError,
+            id_collision_message: "ID collision, please retry",
+            pd_create_failed_state_reason: "Failed to create keyspace in PD",
+            pd_create_failed_audit_reason: Some("Failed to create keyspace in PD"),
+            pd_create_failed_error_message: "Failed to create keyspace in TiKV",
+            password_failed_state_reason: "Keyspace created but password bootstrap failed",
+            password_failed_audit_reason: Some("Password bootstrap failed"),
+            password_failed_error_message:
+                "Failed to set admin password. Keyspace created but password unchanged.",
+            audit: Some(AuditConfig {
+                operation_type: "CREATE",
+                resource_type: "TENANT",
+                operator: None,
+            }),
+            bootstrap_default_extensions: true,
+            schema_bootstrap: None,
+            set_customer_id: None,
+            store_admin_credential: false,
+            credential_key: None,
+            metadata_notes: None,
+            metadata_tags_json: None,
+            fs9: None,
+            write_success_audit: true,
+        },
     )
-    .await?;
-
-    let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
-    if !pd.create_keyspace(&keyspace).await {
-        db::update_tenant_state(
-            &state.db,
-            &tenant_id,
-            tenant_state::CREATE_FAILED,
-            Some("Failed to create keyspace in PD"),
-        )
-        .await?;
-        db::insert_audit_log(
-            &state.db,
-            "CREATE",
-            "TENANT",
-            &tenant_id,
-            Some(&tenant_id),
-            None,
-            false,
-            Some("Failed to create keyspace in PD"),
-            None,
-        )
-        .await
-        .ok();
-        return Err(AppError::internal("Failed to create keyspace in TiKV"));
-    }
-
-    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
-    if !pg
-        .bootstrap_admin_password(&tenant_id, &admin_user, DEFAULT_ADMIN_PASSWORD, &password)
-        .await
-    {
-        db::update_tenant_state(
-            &state.db,
-            &tenant_id,
-            tenant_state::CREATE_FAILED,
-            Some("Keyspace created but password bootstrap failed"),
-        )
-        .await?;
-        db::insert_audit_log(
-            &state.db,
-            "CREATE",
-            "TENANT",
-            &tenant_id,
-            Some(&tenant_id),
-            None,
-            false,
-            Some("Password bootstrap failed"),
-            None,
-        )
-        .await
-        .ok();
-        return Err(AppError::internal(
-            "Failed to set admin password. Keyspace created but password unchanged.",
-        ));
-    }
-
-    pg.bootstrap_default_extensions(&tenant_id, &admin_user, &password)
-        .await;
-
-    db::update_tenant_state(&state.db, &tenant_id, tenant_state::ACTIVE, None).await?;
-    db::insert_audit_log(
-        &state.db,
-        "CREATE",
-        "TENANT",
-        &tenant_id,
-        Some(&tenant_id),
-        None,
-        true,
-        None,
-        None,
-    )
-    .await
-    .ok();
+    .await?
+    .created_at;
 
     let endpoints = state.config.parse_public_endpoints();
     let (host, port) = endpoints
@@ -207,7 +147,7 @@ pub async fn create_tenant(
             admin_user: admin_user.clone(),
             admin_password: password.clone(),
             connection_string,
-            created_at: now,
+            created_at,
         }),
     ))
 }
@@ -262,53 +202,30 @@ pub async fn delete_tenant(
         .await?
         .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
 
-    db::update_tenant_state(&state.db, &tenant_id, tenant_state::DISABLING, None).await?;
-
-    let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
-    if !pd.disable_keyspace(&tenant.keyspace).await {
-        db::update_tenant_state(
-            &state.db,
-            &tenant_id,
-            tenant_state::ACTIVE,
-            Some("Failed to disable keyspace in PD"),
-        )
-        .await?;
-        db::insert_audit_log(
-            &state.db,
-            "DELETE",
-            "TENANT",
-            &tenant_id,
-            Some(&tenant_id),
-            None,
-            false,
-            Some("Failed to disable keyspace"),
-            None,
-        )
-        .await
-        .ok();
-        return Err(AppError::internal("Failed to disable tenant"));
-    }
-
-    db::update_tenant_state(
+    deprovision_tenant(
         &state.db,
-        &tenant_id,
-        tenant_state::DISABLED,
-        Some("Deleted via API"),
+        &DeprovisionRequest {
+            tenant_id: &tenant_id,
+            keyspace: &tenant.keyspace,
+        },
+        DeprovisionConfig {
+            pd_endpoints: &state.config.pd_endpoints,
+            http_client: &state.http_client,
+            rollback: RollbackPolicy::PropagateDbError,
+            rollback_to_active_reason: "Failed to disable keyspace in PD",
+            disabling_state_reason: None,
+            disable_failed_audit_reason: Some("Failed to disable keyspace"),
+            disable_failed_error_message: "Failed to disable tenant",
+            disabled_state_reason: "Deleted via API",
+            audit: Some(AuditConfig {
+                operation_type: "DELETE",
+                resource_type: "TENANT",
+                operator: None,
+            }),
+            write_success_audit: true,
+        },
     )
     .await?;
-    db::insert_audit_log(
-        &state.db,
-        "DELETE",
-        "TENANT",
-        &tenant_id,
-        Some(&tenant_id),
-        None,
-        true,
-        None,
-        None,
-    )
-    .await
-    .ok();
 
     Ok(Json(MessageResponse {
         message: format!("Tenant '{tenant_id}' disabled"),
@@ -326,53 +243,30 @@ pub async fn remove_tenant(
         .await?
         .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
 
-    db::update_tenant_state(&state.db, &tenant_id, tenant_state::DISABLING, None).await?;
-
-    let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
-    if !pd.disable_keyspace(&tenant.keyspace).await {
-        db::update_tenant_state(
-            &state.db,
-            &tenant_id,
-            tenant_state::ACTIVE,
-            Some("Failed to disable keyspace in PD"),
-        )
-        .await?;
-        db::insert_audit_log(
-            &state.db,
-            "DELETE",
-            "TENANT",
-            &tenant_id,
-            Some(&tenant_id),
-            None,
-            false,
-            Some("Failed to disable keyspace"),
-            None,
-        )
-        .await
-        .ok();
-        return Err(AppError::internal("Failed to disable keyspace in TiKV"));
-    }
-
-    db::update_tenant_state(
+    deprovision_tenant(
         &state.db,
-        &tenant_id,
-        tenant_state::DISABLED,
-        Some("Removed via portal"),
+        &DeprovisionRequest {
+            tenant_id: &tenant_id,
+            keyspace: &tenant.keyspace,
+        },
+        DeprovisionConfig {
+            pd_endpoints: &state.config.pd_endpoints,
+            http_client: &state.http_client,
+            rollback: RollbackPolicy::PropagateDbError,
+            rollback_to_active_reason: "Failed to disable keyspace in PD",
+            disabling_state_reason: None,
+            disable_failed_audit_reason: Some("Failed to disable keyspace"),
+            disable_failed_error_message: "Failed to disable keyspace in TiKV",
+            disabled_state_reason: "Removed via portal",
+            audit: Some(AuditConfig {
+                operation_type: "DELETE",
+                resource_type: "TENANT",
+                operator: None,
+            }),
+            write_success_audit: true,
+        },
     )
     .await?;
-    db::insert_audit_log(
-        &state.db,
-        "DELETE",
-        "TENANT",
-        &tenant_id,
-        Some(&tenant_id),
-        None,
-        true,
-        None,
-        None,
-    )
-    .await
-    .ok();
 
     Ok(Json(MessageResponse {
         message: format!("Tenant '{tenant_id}' removed from portal"),
@@ -594,7 +488,7 @@ pub async fn bootstrap_observability(
         return Err(AppError::unauthorized("Invalid tenant credentials"));
     }
 
-    let obs_password = generate_password();
+    let obs_password = generate_admin_password();
 
     let created = pg
         .create_user(
@@ -667,68 +561,67 @@ pub async fn batch_create_tenants(
         let password = request
             .admin_password
             .clone()
-            .unwrap_or_else(generate_password);
+            .unwrap_or_else(generate_admin_password);
 
-        if db::get_tenant_by_id(&state.db, &tenant_id).await?.is_some() {
-            failed.push(BatchItemError {
-                id: tenant_id,
-                error: "ID collision".into(),
-            });
-            continue;
-        }
-
-        let now = chrono::Utc::now().to_rfc3339();
-        if let Err(e) = db::insert_tenant(
+        let pd = crate::services::pd_client::PdClient::new(
+            &state.config.pd_endpoints,
+            &state.http_client,
+        );
+        let created_at = match prepare_tenant_keyspace(
             &state.db,
+            &pd,
             &tenant_id,
             &keyspace,
-            tenant_state::CREATING,
-            &now,
+            "PD keyspace creation failed",
+            RollbackPolicy::BestEffort,
         )
-        .await
+        .await?
         {
-            failed.push(BatchItemError {
-                id: tenant_id,
-                error: format!("DB insert failed: {e}"),
-            });
-            continue;
-        }
-
-        let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
-        if !pd.create_keyspace(&keyspace).await {
-            db::update_tenant_state(
-                &state.db,
-                &tenant_id,
-                tenant_state::CREATE_FAILED,
-                Some("PD keyspace creation failed"),
-            )
-            .await
-            .ok();
-            failed.push(BatchItemError {
-                id: tenant_id,
-                error: "Failed to create keyspace in PD".into(),
-            });
-            continue;
-        }
+            PrepareKeyspaceOutcome::Ready { created_at } => created_at,
+            PrepareKeyspaceOutcome::Collision => {
+                failed.push(BatchItemError {
+                    id: tenant_id,
+                    error: "ID collision".into(),
+                });
+                continue;
+            }
+            PrepareKeyspaceOutcome::PdCreateFailed => {
+                failed.push(BatchItemError {
+                    id: tenant_id,
+                    error: "Failed to create keyspace in PD".into(),
+                });
+                continue;
+            }
+            PrepareKeyspaceOutcome::DbInsertFailed(e) => {
+                failed.push(BatchItemError {
+                    id: tenant_id,
+                    error: format!("DB insert failed: {e}"),
+                });
+                continue;
+            }
+        };
 
         let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
-        if !pg
-            .bootstrap_admin_password(&tenant_id, &admin_user, DEFAULT_ADMIN_PASSWORD, &password)
-            .await
+        match bootstrap_tenant_password(
+            &pg,
+            &state.db,
+            &tenant_id,
+            &admin_user,
+            DEFAULT_ADMIN_PASSWORD,
+            &password,
+            "Password bootstrap failed",
+            RollbackPolicy::BestEffort,
+        )
+        .await?
         {
-            db::update_tenant_state(
-                &state.db,
-                &tenant_id,
-                tenant_state::CREATE_FAILED,
-                Some("Password bootstrap failed"),
-            )
-            .await
-            .ok();
-            failed.push(BatchItemError {
-                id: tenant_id,
-                error: "Password bootstrap failed".into(),
-            });
-            continue;
+            BootstrapPasswordOutcome::Success => {}
+            BootstrapPasswordOutcome::PasswordBootstrapFailed => {
+                failed.push(BatchItemError {
+                    id: tenant_id,
+                    error: "Password bootstrap failed".into(),
+                });
+                continue;
+            }
         }
 
         db::update_tenant_state(&state.db, &tenant_id, tenant_state::ACTIVE, None)
@@ -761,7 +654,7 @@ pub async fn batch_create_tenants(
             admin_user: admin_user.clone(),
             admin_password: password,
             connection_string,
-            created_at: now,
+            created_at,
         });
     }
 
@@ -817,21 +710,28 @@ pub async fn batch_delete_tenants(
             .await
             .ok();
 
-        let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
-        if !pd.disable_keyspace(&tenant.keyspace).await {
-            db::update_tenant_state(
-                &state.db,
-                tenant_id,
-                tenant_state::ACTIVE,
-                Some("Failed to disable keyspace in PD"),
-            )
-            .await
-            .ok();
-            failed.push(BatchItemError {
-                id: tenant_id.clone(),
-                error: "Failed to disable keyspace in PD".into(),
-            });
-            continue;
+        let pd = crate::services::pd_client::PdClient::new(
+            &state.config.pd_endpoints,
+            &state.http_client,
+        );
+        match disable_keyspace_with_rollback(
+            &pd,
+            &state.db,
+            tenant_id,
+            &tenant.keyspace,
+            "Failed to disable keyspace in PD",
+            RollbackPolicy::BestEffort,
+        )
+        .await?
+        {
+            DisableKeyspaceOutcome::Disabled => {}
+            DisableKeyspaceOutcome::PdDisableFailed => {
+                failed.push(BatchItemError {
+                    id: tenant_id.clone(),
+                    error: "Failed to disable keyspace in PD".into(),
+                });
+                continue;
+            }
         }
 
         db::update_tenant_state(
