@@ -211,7 +211,7 @@ impl Executor {
                 }
             }
 
-                if sql_upper.starts_with("ALTER SYSTEM SET ") {
+                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::AlterSystemSet)) {
                     if !session.is_superuser() {
                         return Err(SqlError::PermissionDenied {
                             object_type: "system".to_string(),

@@ -42,6 +42,8 @@ pub(crate) enum RawSqlKind {
     /// sqlparser which does not support standalone `RESET`).  `RESET ROLE` is
     /// excluded: it is rewritten to `SET ROLE NONE` in the parser layer.
     Reset,
+    /// `ALTER SYSTEM SET <guc> = <value>` — server-level config change.
+    AlterSystemSet,
     /// `ANALYZE [table]` — collects table statistics for the query planner.
     /// All syntax validation (VERBOSE, quoted identifiers, trailing junk) is
     /// handled by `parse_analyze_table_name()` in the handler, not here.
@@ -193,6 +195,9 @@ pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
     }
     if sql_upper.starts_with("DROP TRIGGER") {
         return Some(RawSqlKind::DropTrigger);
+    }
+    if sql_upper.starts_with("ALTER SYSTEM SET ") {
+        return Some(RawSqlKind::AlterSystemSet);
     }
     if (sql_upper.starts_with("ALTER TABLE")
         || sql_upper.starts_with("ALTER SEQUENCE")
@@ -396,6 +401,20 @@ mod tests {
             Some(RawSqlKind::AlterType)
         );
         assert_eq!(classify("SELCT 1"), None);
+        // ALTER SYSTEM SET classification
+        assert_eq!(
+            classify("ALTER SYSTEM SET STATEMENT_TIMEOUT = '5S'"),
+            Some(RawSqlKind::AlterSystemSet)
+        );
+        assert_eq!(
+            classify("ALTER SYSTEM SET IDLE_IN_TRANSACTION_SESSION_TIMEOUT TO '10S'"),
+            Some(RawSqlKind::AlterSystemSet)
+        );
+        // ALTER SYSTEM without SET does NOT match AlterSystemSet
+        assert!(!matches!(
+            classify("ALTER SYSTEM RESET ALL"),
+            Some(RawSqlKind::AlterSystemSet)
+        ));
         // RESET <guc> and RESET ALL are classified as Reset
         assert_eq!(classify("RESET TIMEZONE"), Some(RawSqlKind::Reset));
         assert_eq!(classify("RESET ALL"), Some(RawSqlKind::Reset));
@@ -483,6 +502,16 @@ mod tests {
 
         // Embedded comments between RESET and GUC name
         assert_eq!(classify("RESET /*x*/ ALL"), Some(RawSqlKind::Reset));
+    }
+
+    #[test]
+    fn alter_system_set_accepted_as_raw_utility() {
+        assert!(should_accept_sql_without_sqlparser(
+            "ALTER SYSTEM SET STATEMENT_TIMEOUT = '5S'"
+        ));
+        assert!(should_accept_sql_without_sqlparser(
+            "ALTER SYSTEM SET IDLE_IN_TRANSACTION_SESSION_TIMEOUT TO '10S'"
+        ));
     }
 
     #[test]
