@@ -34,6 +34,7 @@ mod filter;
 mod hash_join;
 mod hash_semi_join;
 mod join;
+pub(crate) mod key_encoding;
 mod limit;
 mod project;
 mod scan;

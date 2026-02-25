@@ -26,8 +26,8 @@ use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::expr::compare_order_by_values;
 use crate::sql::expr::operators::sort_by_fallible;
 use crate::sql::expr::typed_eval::eval_typed_expr;
+use crate::sql::operators::key_encoding::encode_values_key;
 use crate::sql::query_context::QueryContext;
-use crate::sql::value_key::serialize_values_for_key;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
 /// Information about a single window function in the projection.
@@ -171,7 +171,7 @@ impl WindowOperator {
                 for expr in &wf.partition_by {
                     key.push(eval_typed_expr(expr, row, query_ctx)?);
                 }
-                let key_bytes = serialize_values_for_key(&key)?;
+                let key_bytes = encode_values_key(&key);
                 partitions.entry(key_bytes).or_default().push(row_idx);
             }
 
