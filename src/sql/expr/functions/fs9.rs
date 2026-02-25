@@ -57,6 +57,10 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("FS9_MTIME", fs9_mtime);
     map.insert("FS9_REMOVE", fs9_remove);
     map.insert("FS9_MKDIR", fs9_mkdir);
+    map.insert("FS9_READ_AT", fs9_read_at);
+    map.insert("FS9_WRITE_AT", fs9_write_at);
+    map.insert("FS9_APPEND", fs9_append);
+    map.insert("FS9_TRUNCATE", fs9_truncate);
 }
 
 /// Check permissions. In remote mode, only superuser is required (remote backend
@@ -469,6 +473,150 @@ pub fn fs9_mkdir(args: Vec<Value>) -> Result<Value> {
     } else {
         fs9_mkdir_local(&path, recursive)
     }
+}
+
+pub fn fs9_read_at(args: Vec<Value>) -> Result<Value> {
+    ensure_permissions()?;
+    let path = match expect_text_arg("fs9_read_at", args.first().cloned().unwrap_or(Value::Null), 0)? {
+        Some(p) => p,
+        None => return Ok(Value::Null),
+    };
+    let offset = match args.get(1).unwrap_or(&Value::Null) {
+        Value::Int64(v) => {
+            if *v < 0 {
+                return Err(anyhow!("fs9_read_at: offset must be non-negative"));
+            }
+            *v as u64
+        }
+        Value::Int32(v) => {
+            if *v < 0 {
+                return Err(anyhow!("fs9_read_at: offset must be non-negative"));
+            }
+            *v as u64
+        }
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(anyhow!(
+                "fs9_read_at: expected integer for offset, got {:?}",
+                other
+            ))
+        }
+    };
+    let length = match args.get(2).unwrap_or(&Value::Null) {
+        Value::Int64(v) => {
+            if *v < 0 {
+                return Err(anyhow!("fs9_read_at: length must be non-negative"));
+            }
+            *v as usize
+        }
+        Value::Int32(v) => {
+            if *v < 0 {
+                return Err(anyhow!("fs9_read_at: length must be non-negative"));
+            }
+            *v as usize
+        }
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(anyhow!(
+                "fs9_read_at: expected integer for length, got {:?}",
+                other
+            ))
+        }
+    };
+    let bk = get_remote_backend()?;
+    let bytes = run_async(bk.read_file_at(&path, offset, length))?;
+    let _budget = reserve_read_budget(bytes.len())?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Ok(Value::Text(text))
+}
+
+pub fn fs9_write_at(args: Vec<Value>) -> Result<Value> {
+    ensure_permissions()?;
+    let path = match expect_text_arg("fs9_write_at", args.first().cloned().unwrap_or(Value::Null), 0)? {
+        Some(p) => p,
+        None => return Ok(Value::Null),
+    };
+    let offset = match args.get(1).unwrap_or(&Value::Null) {
+        Value::Int64(v) => {
+            if *v < 0 {
+                return Err(anyhow!("fs9_write_at: offset must be non-negative"));
+            }
+            *v as u64
+        }
+        Value::Int32(v) => {
+            if *v < 0 {
+                return Err(anyhow!("fs9_write_at: offset must be non-negative"));
+            }
+            *v as u64
+        }
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(anyhow!(
+                "fs9_write_at: expected integer for offset, got {:?}",
+                other
+            ))
+        }
+    };
+    let data = match expect_text_arg("fs9_write_at", args.get(2).cloned().unwrap_or(Value::Null), 2)? {
+        Some(d) => d,
+        None => return Ok(Value::Null),
+    };
+    if data.len() > crate::extensions::fs::MAX_BYTES_PER_FILE {
+        return Err(anyhow!("fs9_write_at: data exceeds maximum file size"));
+    }
+    let bk = get_remote_backend()?;
+    let written = run_async(bk.write_file_at(&path, offset, data.as_bytes()))?;
+    Ok(Value::Int64(written as i64))
+}
+
+pub fn fs9_append(args: Vec<Value>) -> Result<Value> {
+    ensure_permissions()?;
+    let path = match expect_text_arg("fs9_append", args.first().cloned().unwrap_or(Value::Null), 0)? {
+        Some(p) => p,
+        None => return Ok(Value::Null),
+    };
+    let data = match expect_text_arg("fs9_append", args.get(1).cloned().unwrap_or(Value::Null), 1)? {
+        Some(d) => d,
+        None => return Ok(Value::Null),
+    };
+    if data.len() > crate::extensions::fs::MAX_BYTES_PER_FILE {
+        return Err(anyhow!("fs9_append: data exceeds maximum file size"));
+    }
+    let bk = get_remote_backend()?;
+    let written = run_async(bk.append_file(&path, data.as_bytes()))?;
+    Ok(Value::Int64(written as i64))
+}
+
+pub fn fs9_truncate(args: Vec<Value>) -> Result<Value> {
+    ensure_permissions()?;
+    let path = match expect_text_arg("fs9_truncate", args.first().cloned().unwrap_or(Value::Null), 0)? {
+        Some(p) => p,
+        None => return Ok(Value::Null),
+    };
+    let size = match args.get(1).unwrap_or(&Value::Null) {
+        Value::Int64(v) => {
+            if *v < 0 {
+                return Err(anyhow!("fs9_truncate: size must be non-negative"));
+            }
+            *v as u64
+        }
+        Value::Int32(v) => {
+            if *v < 0 {
+                return Err(anyhow!("fs9_truncate: size must be non-negative"));
+            }
+            *v as u64
+        }
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(anyhow!(
+                "fs9_truncate: expected integer for size, got {:?}",
+                other
+            ))
+        }
+    };
+    let bk = get_remote_backend()?;
+    run_async(bk.truncate(&path, size))?;
+    Ok(Value::Boolean(true))
 }
 
 #[cfg(test)]

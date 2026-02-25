@@ -277,6 +277,22 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         "FS9_MTIME",
         FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
     );
+    r.register(
+        "FS9_READ_AT",
+        FunctionSignature::fixed(DataType::Text).with_args(3, Some(3)),
+    );
+    r.register(
+        "FS9_WRITE_AT",
+        FunctionSignature::fixed(DataType::Int64).with_args(3, Some(3)),
+    );
+    r.register(
+        "FS9_APPEND",
+        FunctionSignature::fixed(DataType::Int64).with_args(2, Some(2)),
+    );
+    r.register(
+        "FS9_TRUNCATE",
+        FunctionSignature::fixed(DataType::Boolean).with_args(2, Some(2)),
+    );
 
     // Background SQL functions
     r.register(

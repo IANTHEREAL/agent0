@@ -81,6 +81,22 @@ impl FsBackend for EmbeddedFsBackend {
         self.pagefs.write_file(path, data).await
     }
 
+    async fn read_file_at(&self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
+        self.pagefs.read_file_at(path, offset, length).await
+    }
+
+    async fn write_file_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<usize> {
+        self.pagefs.write_file_at(path, offset, data).await
+    }
+
+    async fn append_file(&self, path: &str, data: &[u8]) -> Result<usize> {
+        self.pagefs.append_file(path, data).await
+    }
+
+    async fn truncate(&self, path: &str, size: u64) -> Result<()> {
+        self.pagefs.truncate(path, size).await
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

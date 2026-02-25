@@ -102,6 +102,53 @@ impl EmbeddedPageFs {
         Ok(data)
     }
 
+    pub(crate) async fn read_file_at(&self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
+        let mut txn = self.begin().await?;
+        let (inode_id, mut inode) = resolve_path(&mut txn, path).await?;
+        if inode.is_directory() {
+            return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+        }
+
+        if offset >= inode.size || length == 0 {
+            inode.touch_atime();
+            save_inode(&mut txn, &inode).await?;
+            txn.commit().await?;
+            return Ok(Vec::new());
+        }
+
+        let requested_len = u64::try_from(length)
+            .map_err(|_| anyhow!(EmbeddedFsError::internal("requested length exceeds u64")))?;
+        let actual_len_u64 = requested_len.min(inode.size - offset);
+        let actual_len = usize::try_from(actual_len_u64)
+            .map_err(|_| anyhow!(EmbeddedFsError::internal("requested length exceeds addressable memory")))?;
+
+        let file_end = offset
+            .checked_add(actual_len_u64)
+            .ok_or_else(|| anyhow!(EmbeddedFsError::internal("read range overflow")))?;
+
+        let mut data = Vec::with_capacity(actual_len);
+        if let Some((start_page, end_page)) = page_range(offset, actual_len_u64) {
+            for page_num in start_page..=end_page {
+                let page_data = match read_page(&mut txn, inode_id, page_num).await? {
+                    Some(mut page) => {
+                        if page.len() < PAGE_SIZE {
+                            page.resize(PAGE_SIZE, 0);
+                        }
+                        page
+                    }
+                    None => vec![0u8; PAGE_SIZE],
+                };
+                let (start, end) = page_byte_range(page_num, offset, file_end);
+                data.extend_from_slice(&page_data[start..end]);
+            }
+        }
+
+        inode.touch_atime();
+        save_inode(&mut txn, &inode).await?;
+        txn.commit().await?;
+        Ok(data)
+    }
+
     pub(crate) async fn write_file(&self, path: &str, data: &[u8]) -> Result<usize> {
         let mut txn = self.begin().await?;
         
@@ -143,6 +190,156 @@ impl EmbeddedPageFs {
 
         txn.commit().await?;
         Ok(data.len())
+    }
+
+    pub(crate) async fn write_file_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let mut txn = self.begin().await?;
+
+        ensure_parents(&mut txn, path).await?;
+
+        let (parent_inode, name) = resolve_parent(&mut txn, path).await?;
+
+        let inode_id;
+        let mut inode;
+
+        if let Some(existing_inode_id) = lookup(&mut txn, parent_inode, &name).await? {
+            let existing_inode = load_inode(&mut txn, existing_inode_id)
+                .await?
+                .ok_or_else(|| anyhow!(EmbeddedFsError::not_found(path)))?;
+
+            if existing_inode.is_directory() {
+                return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+            }
+
+            inode_id = existing_inode_id;
+            inode = existing_inode;
+        } else {
+            let new_inode_id = alloc_inode(&mut txn).await?;
+            inode_id = new_inode_id;
+            inode = Inode::new_file(new_inode_id, 0o644);
+            save_inode(&mut txn, &inode).await?;
+            link(&mut txn, parent_inode, &name, new_inode_id).await?;
+        }
+
+        let write_len = u64::try_from(data.len())
+            .map_err(|_| anyhow!(EmbeddedFsError::internal("write length exceeds u64")))?;
+        let write_end = offset
+            .checked_add(write_len)
+            .ok_or_else(|| anyhow!(EmbeddedFsError::internal("write range overflow")))?;
+
+        if let Some((start_page, end_page)) = page_range(offset, write_len) {
+            let mut data_offset = 0usize;
+            for page_num in start_page..=end_page {
+                let (page_start, page_end) = page_byte_range(page_num, offset, write_end);
+                let chunk_len = page_end - page_start;
+                let next_offset = data_offset + chunk_len;
+                let chunk = &data[data_offset..next_offset];
+
+                let is_partial = page_start != 0 || page_end != PAGE_SIZE;
+                if is_partial {
+                    let mut page_data = match read_page(&mut txn, inode_id, page_num).await? {
+                        Some(mut page) => {
+                            if page.len() < PAGE_SIZE {
+                                page.resize(PAGE_SIZE, 0);
+                            }
+                            page
+                        }
+                        None => vec![0u8; PAGE_SIZE],
+                    };
+                    page_data[page_start..page_end].copy_from_slice(chunk);
+                    write_page(&mut txn, inode_id, page_num, &page_data).await?;
+                } else {
+                    write_page(&mut txn, inode_id, page_num, chunk).await?;
+                }
+
+                data_offset = next_offset;
+            }
+        }
+
+        inode.size = inode.size.max(write_end);
+        inode.page_count = pages_needed(inode.size);
+        inode.touch_mtime();
+        save_inode(&mut txn, &inode).await?;
+
+        txn.commit().await?;
+        Ok(data.len())
+    }
+
+    pub(crate) async fn append_file(&self, path: &str, data: &[u8]) -> Result<usize> {
+        let mut txn = self.begin().await?;
+        ensure_parents(&mut txn, path).await?;
+        let (parent_inode, name) = resolve_parent(&mut txn, path).await?;
+
+        let current_size = if let Some(existing_inode_id) = lookup(&mut txn, parent_inode, &name).await? {
+            let inode = load_inode(&mut txn, existing_inode_id)
+                .await?
+                .ok_or_else(|| anyhow!(EmbeddedFsError::not_found(path)))?;
+            if inode.is_directory() {
+                return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+            }
+            inode.size
+        } else {
+            let new_inode_id = alloc_inode(&mut txn).await?;
+            let inode = Inode::new_file(new_inode_id, 0o644);
+            save_inode(&mut txn, &inode).await?;
+            link(&mut txn, parent_inode, &name, new_inode_id).await?;
+            0
+        };
+
+        txn.commit().await?;
+        self.write_file_at(path, current_size, data).await
+    }
+
+    pub(crate) async fn truncate(&self, path: &str, size: u64) -> Result<()> {
+        let mut txn = self.begin().await?;
+        let (inode_id, mut inode) = resolve_path(&mut txn, path).await?;
+        if inode.is_directory() {
+            return Err(anyhow!(EmbeddedFsError::is_directory(path)));
+        }
+
+        if size == inode.size {
+            inode.touch_atime();
+            save_inode(&mut txn, &inode).await?;
+            txn.commit().await?;
+            return Ok(());
+        }
+
+        let new_page_count = pages_needed(size);
+        if size > inode.size {
+            inode.size = size;
+            inode.page_count = new_page_count;
+            inode.touch_mtime();
+            save_inode(&mut txn, &inode).await?;
+            txn.commit().await?;
+            return Ok(());
+        }
+
+        for page_num in new_page_count..inode.page_count {
+            txn.delete(keys::page_key(inode_id, page_num)).await?;
+        }
+
+        let tail_offset = (size % PAGE_SIZE as u64) as usize;
+        if new_page_count > 0 && tail_offset != 0 {
+            let last_page_num = new_page_count - 1;
+            if let Some(mut page_data) = read_page(&mut txn, inode_id, last_page_num).await? {
+                if page_data.len() < PAGE_SIZE {
+                    page_data.resize(PAGE_SIZE, 0);
+                }
+                page_data[tail_offset..].fill(0);
+                write_page(&mut txn, inode_id, last_page_num, &page_data).await?;
+            }
+        }
+
+        inode.size = size;
+        inode.page_count = new_page_count;
+        inode.touch_mtime();
+        save_inode(&mut txn, &inode).await?;
+        txn.commit().await?;
+        Ok(())
     }
 
     pub(crate) async fn remove(&self, path: &str) -> Result<()> {
@@ -480,6 +677,38 @@ fn pages_needed(size: u64) -> u64 {
     }
 }
 
+/// Compute the page range [start_page, end_page] for a byte range [offset, offset+length).
+/// Returns None if length is 0.
+#[allow(dead_code)]
+fn page_range(offset: u64, length: u64) -> Option<(u64, u64)> {
+    if length == 0 {
+        return None;
+    }
+    let start = offset / PAGE_SIZE as u64;
+    let end_byte = offset.saturating_add(length - 1);
+    let end = end_byte / PAGE_SIZE as u64;
+    Some((start, end))
+}
+
+/// Compute the byte range within a page that a [file_offset, file_offset+length) range touches.
+/// Returns (start_in_page, end_in_page) where the range is [start_in_page, end_in_page).
+#[allow(dead_code)]
+fn page_byte_range(page_num: u64, file_offset: u64, file_end: u64) -> (usize, usize) {
+    let page_start = page_num * PAGE_SIZE as u64;
+    let page_end = page_start.saturating_add(PAGE_SIZE as u64);
+    let start = if file_offset > page_start {
+        (file_offset - page_start) as usize
+    } else {
+        0
+    };
+    let end = if file_end < page_end {
+        (file_end - page_start) as usize
+    } else {
+        PAGE_SIZE
+    };
+    (start, end)
+}
+
 async fn remove_inode_recursive(txn: &mut Transaction, inode_id: u64, inode: Inode) -> Result<u64> {
     if !inode.is_directory() {
         delete_pages(txn, inode_id).await?;
@@ -560,6 +789,157 @@ mod tests {
     #[test]
     fn test_pages_needed_large() {
         assert_eq!(pages_needed(1_000_000), 62);  // ceil(1000000 / 16384)
+    }
+
+    #[test]
+    fn test_pages_needed_last_byte_of_page() {
+        assert_eq!(pages_needed((PAGE_SIZE - 1) as u64), 1);
+    }
+
+    #[test]
+    fn test_pages_needed_three_pages_minus_one() {
+        assert_eq!(pages_needed((PAGE_SIZE as u64 * 3) - 1), 3);
+    }
+
+    #[test]
+    fn test_pages_needed_three_pages_plus_one() {
+        assert_eq!(pages_needed((PAGE_SIZE as u64 * 3) + 1), 4);
+    }
+
+    #[test]
+    fn test_pages_needed_u64_max() {
+        assert_eq!(pages_needed(u64::MAX), u64::MAX.div_ceil(PAGE_SIZE as u64));
+    }
+
+    #[test]
+    fn test_page_range_zero_length() {
+        assert_eq!(page_range(0, 0), None);
+    }
+
+    #[test]
+    fn test_read_at_page_range_single_page() {
+        assert_eq!(page_range(123, 456), Some((0, 0)));
+    }
+
+    #[test]
+    fn test_read_at_page_range_cross_boundary() {
+        assert_eq!(page_range((PAGE_SIZE - 2) as u64, 4), Some((0, 1)));
+    }
+
+    #[test]
+    fn test_read_at_page_range_exact_page() {
+        assert_eq!(page_range(PAGE_SIZE as u64, PAGE_SIZE as u64), Some((1, 1)));
+    }
+
+    #[test]
+    fn test_write_at_page_range_partial_first() {
+        assert_eq!(page_range((PAGE_SIZE / 2) as u64, PAGE_SIZE as u64), Some((0, 1)));
+    }
+
+    #[test]
+    fn test_write_at_page_range_full_pages() {
+        assert_eq!(page_range(PAGE_SIZE as u64, (PAGE_SIZE * 2) as u64), Some((1, 2)));
+    }
+
+    #[test]
+    fn test_page_range_single_byte_page_start() {
+        assert_eq!(page_range((PAGE_SIZE * 3) as u64, 1), Some((3, 3)));
+    }
+
+    #[test]
+    fn test_page_range_single_byte_page_end() {
+        assert_eq!(page_range((PAGE_SIZE - 1) as u64, 1), Some((0, 0)));
+    }
+
+    #[test]
+    fn test_page_range_three_pages_plus_tail() {
+        assert_eq!(page_range(10, (PAGE_SIZE as u64 * 3) + 5), Some((0, 3)));
+    }
+
+    #[test]
+    fn test_page_range_large_offset() {
+        let base = 1_000_000u64 * PAGE_SIZE as u64;
+        assert_eq!(page_range(base + 7, (PAGE_SIZE as u64 * 2) + 1), Some((1_000_000, 1_000_002)));
+    }
+
+    #[test]
+    fn test_page_range_u64_max_single_byte() {
+        assert_eq!(page_range(u64::MAX, 1), Some((u64::MAX / PAGE_SIZE as u64, u64::MAX / PAGE_SIZE as u64)));
+    }
+
+    #[test]
+    fn test_page_byte_range_single_byte_at_page_start() {
+        assert_eq!(page_byte_range(2, (PAGE_SIZE as u64) * 2, (PAGE_SIZE as u64) * 2 + 1), (0, 1));
+    }
+
+    #[test]
+    fn test_page_byte_range_single_byte_in_middle() {
+        let start = (PAGE_SIZE as u64) * 4 + 1234;
+        assert_eq!(page_byte_range(4, start, start + 1), (1234, 1235));
+    }
+
+    #[test]
+    fn test_page_byte_range_single_byte_at_page_end() {
+        let end = (PAGE_SIZE as u64) * 5;
+        assert_eq!(page_byte_range(4, end - 1, end), (PAGE_SIZE - 1, PAGE_SIZE));
+    }
+
+    #[test]
+    fn test_page_byte_range_exact_full_page() {
+        let start = PAGE_SIZE as u64;
+        let end = start + PAGE_SIZE as u64;
+        assert_eq!(page_byte_range(1, start, end), (0, PAGE_SIZE));
+    }
+
+    #[test]
+    fn test_page_byte_range_first_page_of_cross_boundary() {
+        let start = (PAGE_SIZE - 10) as u64;
+        let end = start + 100;
+        assert_eq!(page_byte_range(0, start, end), (PAGE_SIZE - 10, PAGE_SIZE));
+    }
+
+    #[test]
+    fn test_page_byte_range_second_page_of_cross_boundary() {
+        let start = (PAGE_SIZE - 10) as u64;
+        let end = start + 100;
+        assert_eq!(page_byte_range(1, start, end), (0, 90));
+    }
+
+    #[test]
+    fn test_page_byte_range_middle_page_three_pages() {
+        let start = (PAGE_SIZE as u64) * 2 + 50;
+        let end = start + (PAGE_SIZE as u64 * 3) + 10;
+        assert_eq!(page_byte_range(4, start, end), (0, PAGE_SIZE));
+    }
+
+    #[test]
+    fn test_page_byte_range_last_page_three_pages() {
+        let start = (PAGE_SIZE as u64) * 2 + 50;
+        let end = start + (PAGE_SIZE as u64 * 3) + 10;
+        assert_eq!(page_byte_range(5, start, end), (0, 60));
+    }
+
+    #[test]
+    fn test_page_byte_range_large_offset() {
+        let base = (PAGE_SIZE as u64) * 2_000_000;
+        assert_eq!(page_byte_range(2_000_000, base + 7, base + 20), (7, 20));
+    }
+
+    #[test]
+    fn test_page_byte_range_u64_max_page() {
+        let last_page = u64::MAX / PAGE_SIZE as u64;
+        let page_start = last_page * PAGE_SIZE as u64;
+        let file_end = page_start + 17;
+        assert_eq!(page_byte_range(last_page, page_start + 5, file_end), (5, 17));
+    }
+
+    #[test]
+    fn test_truncate_page_count() {
+        assert_eq!(pages_needed(0), 0);
+        assert_eq!(pages_needed(1), 1);
+        assert_eq!(pages_needed((PAGE_SIZE as u64) - 1), 1);
+        assert_eq!(pages_needed(PAGE_SIZE as u64), 1);
+        assert_eq!(pages_needed((PAGE_SIZE as u64) + 1), 2);
     }
 
     // scan_end_key tests

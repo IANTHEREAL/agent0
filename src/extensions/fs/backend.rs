@@ -5,7 +5,7 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use tokio::io::{AsyncBufRead, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 
 use serde::Deserialize;
 
@@ -61,6 +61,21 @@ pub(crate) trait FsBackend: Send + Sync {
     /// Write data to a file, creating parent directories as needed.
     /// Returns the number of bytes written.
     async fn write_file(&self, path: &str, data: &[u8]) -> Result<usize>;
+
+    /// Read bytes from a file starting at the given offset.
+    /// Returns up to `length` bytes. Returns empty vec if offset >= file size.
+    async fn read_file_at(&self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>>;
+
+    /// Write data at a specific offset in a file (pwrite semantics).
+    /// Returns the number of bytes written.
+    async fn write_file_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<usize>;
+
+    /// Append data to the end of a file.
+    /// Returns the number of bytes written.
+    async fn append_file(&self, path: &str, data: &[u8]) -> Result<usize>;
+
+    /// Truncate or extend a file to the specified size.
+    async fn truncate(&self, path: &str, size: u64) -> Result<()>;
 
     fn as_any(&self) -> &dyn std::any::Any;
 }
@@ -275,6 +290,88 @@ impl FsBackend for LocalFsBackend {
             .await
             .map_err(|err| anyhow!("fs9_write: {err}"))?;
         Ok(data.len())
+    }
+
+    async fn read_file_at(&self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
+        let info = self.stat(path).await?;
+        if info.is_dir {
+            return Err(anyhow!("fs9: is a directory: {path}"));
+        }
+        if !info.is_file {
+            return Err(anyhow!("fs9: not a regular file: {path}"));
+        }
+
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .map_err(|err| anyhow!("fs9: cannot read file '{path}': {err}"))?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|err| anyhow!("fs9: cannot read file '{path}': {err}"))?;
+
+        let mut buf = Vec::new();
+        let mut limited = file.take(length as u64);
+        limited
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|err| anyhow!("fs9: cannot read file '{path}': {err}"))?;
+        Ok(buf)
+    }
+
+    async fn write_file_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<usize> {
+        let file_path = std::path::Path::new(path);
+        if let Some(parent) = file_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|err| anyhow!("fs9_write: {err}"))?;
+            }
+        }
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(file_path)
+            .await
+            .map_err(|err| anyhow!("fs9_write: {err}"))?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|err| anyhow!("fs9_write: {err}"))?;
+        file.write_all(data)
+            .await
+            .map_err(|err| anyhow!("fs9_write: {err}"))?;
+        Ok(data.len())
+    }
+
+    async fn append_file(&self, path: &str, data: &[u8]) -> Result<usize> {
+        let file_path = std::path::Path::new(path);
+        if let Some(parent) = file_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|err| anyhow!("fs9_write: {err}"))?;
+            }
+        }
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(file_path)
+            .await
+            .map_err(|err| anyhow!("fs9_write: {err}"))?;
+        file.write_all(data)
+            .await
+            .map_err(|err| anyhow!("fs9_write: {err}"))?;
+        Ok(data.len())
+    }
+
+    async fn truncate(&self, path: &str, size: u64) -> Result<()> {
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|err| anyhow!("fs9: cannot truncate '{path}': {err}"))?;
+        file.set_len(size)
+            .await
+            .map_err(|err| anyhow!("fs9: cannot truncate '{path}': {err}"))?;
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -533,6 +630,22 @@ impl FsBackend for Fs9HttpBackend {
         // Consume the response body to prevent connection leaks
         let _ = resp.bytes().await;
         Ok(data.len())
+    }
+
+    async fn read_file_at(&self, _path: &str, _offset: u64, _length: usize) -> Result<Vec<u8>> {
+        Err(anyhow!("fs9: read_file_at not supported on remote backend"))
+    }
+
+    async fn write_file_at(&self, _path: &str, _offset: u64, _data: &[u8]) -> Result<usize> {
+        Err(anyhow!("fs9: write_file_at not supported on remote backend"))
+    }
+
+    async fn append_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+        Err(anyhow!("fs9: append_file not supported on remote backend"))
+    }
+
+    async fn truncate(&self, _path: &str, _size: u64) -> Result<()> {
+        Err(anyhow!("fs9: truncate not supported on remote backend"))
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
