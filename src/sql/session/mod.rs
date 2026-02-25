@@ -37,6 +37,10 @@ pub struct Session {
     pub(crate) store: Arc<TikvStore>,
     pub(crate) observability: Arc<TenantObservability>,
     pub(crate) state: TransactionState,
+    #[cfg(test)]
+    test_force_in_transaction: bool,
+    #[cfg(test)]
+    test_force_failed_transaction: bool,
     pub(crate) savepoints: Arc<SavepointState>,
     last_sequence_values: HashMap<String, i64>,
     settings: SessionSettings,
@@ -103,6 +107,10 @@ impl Session {
             store,
             observability,
             state: TransactionState::Idle,
+            #[cfg(test)]
+            test_force_in_transaction: false,
+            #[cfg(test)]
+            test_force_failed_transaction: false,
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: HashMap::new(),
             settings: SessionSettings::new_with_defaults(
@@ -145,6 +153,10 @@ impl Session {
             store,
             observability,
             state: TransactionState::Idle,
+            #[cfg(test)]
+            test_force_in_transaction: false,
+            #[cfg(test)]
+            test_force_failed_transaction: false,
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: HashMap::new(),
             settings: SessionSettings::new_with_defaults(
@@ -280,8 +292,18 @@ impl Session {
         self.sql_prepared_statements.clear();
     }
 
+    #[cfg(test)]
+    pub(crate) fn force_test_transaction_state(&mut self, in_transaction: bool, failed: bool) {
+        self.test_force_in_transaction = in_transaction;
+        self.test_force_failed_transaction = in_transaction && failed;
+    }
+
     /// Check if currently in a transaction block
     pub fn is_in_transaction(&self) -> bool {
+        #[cfg(test)]
+        if self.test_force_in_transaction {
+            return true;
+        }
         matches!(
             self.state,
             TransactionState::Active(_) | TransactionState::Failed(_)
@@ -289,10 +311,19 @@ impl Session {
     }
 
     pub fn is_transaction_failed(&self) -> bool {
+        #[cfg(test)]
+        if self.test_force_failed_transaction {
+            return true;
+        }
         matches!(self.state, TransactionState::Failed(_))
     }
 
     pub(crate) fn mark_transaction_failed(&mut self) {
+        #[cfg(test)]
+        if self.test_force_in_transaction {
+            self.test_force_failed_transaction = true;
+            return;
+        }
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(txn) => self.state = TransactionState::Failed(txn),
             other => self.state = other,
@@ -300,6 +331,11 @@ impl Session {
     }
 
     pub(crate) fn clear_failed_transaction(&mut self) {
+        #[cfg(test)]
+        if self.test_force_in_transaction {
+            self.test_force_failed_transaction = false;
+            return;
+        }
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Failed(txn) => self.state = TransactionState::Active(txn),
             other => self.state = other,
