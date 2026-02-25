@@ -28,6 +28,7 @@ START_ENV=1
 VERBOSE=0
 STOP_ON_ERROR=0
 SKIP_ORM=0
+SKIP_BUILD=0
 
 usage() {
   cat <<'EOF'
@@ -50,6 +51,7 @@ Options:
   --manifest <path>   Override regression manifest path (default: scripts/regression_gate.list)
   --skip-orm          Skip ORM regression pack
   --skip-unit         Skip `cargo test`
+  --skip-build        Skip `cargo build --release` (expects pre-built binary at target/release/db9-server)
   -v, --verbose       Pass `--verbose` to integration_test.py
   -x, --stop-on-error Pass `--stop-on-error` to integration_test.py
   -h, --help          Show help
@@ -154,6 +156,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-unit)
       RUN_UNIT=0
+      shift
+      ;;
+    --skip-build)
+      SKIP_BUILD=1
       shift
       ;;
     -v|--verbose)
@@ -488,8 +494,17 @@ if [[ "$START_ENV" -eq 1 ]]; then
   fi
 
   echo ""
-  echo "[3/$TOTAL_STEPS] Building db9-server..."
-  (cd "$ROOT_DIR" && cargo build --release --quiet)
+  if [[ "${SKIP_BUILD:-0}" -eq 1 ]]; then
+    if [[ -x "$ROOT_DIR/target/release/db9-server" ]]; then
+      echo "[3/$TOTAL_STEPS] Using pre-built db9-server binary"
+    else
+      echo "ERROR: --skip-build specified but no binary at target/release/db9-server" >&2
+      exit 1
+    fi
+  else
+    echo "[3/$TOTAL_STEPS] Building db9-server..."
+    (cd "$ROOT_DIR" && cargo build --release --quiet)
+  fi
   echo ""
 
 	  echo "Starting db9-server on ${PG_HOST}:${PG_PORT} (PD_ENDPOINTS=${PD_ENDPOINTS})..."

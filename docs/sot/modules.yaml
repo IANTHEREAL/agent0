@@ -270,10 +270,7 @@ modules:
       - 'feature semantics (authoritative: the corresponding module SoT doc)'
       - 'adding/removing/tuning gates without DR/ADR (see #368 hard rule)'
     code_entrypoints:
-      - path: .github/workflows/regression-gate.yml
-      - path: .github/workflows/orm-tests.yml
-      - path: .github/workflows/gorm-smoke.yml
-      - path: .github/workflows/sqlalchemy-smoke.yml
+      - path: .github/workflows/ci.yml
       - path: .github/workflows/doc-lint.yml
       - path: scripts/regression_gate.sh
       - path: run_tests.sh
@@ -281,12 +278,13 @@ modules:
       - path: scripts/e2e_tests.sh
       - path: scripts/doc_lint.py
     gate_tests:
-      - ci:.github/workflows/orm-tests.yml/lint
-      - ci:.github/workflows/orm-tests.yml/test
-      - ci:.github/workflows/regression-gate.yml/regression-gate
+      - ci:.github/workflows/ci.yml/lint
+      - ci:.github/workflows/ci.yml/unit-tests
+      - ci:.github/workflows/ci.yml/regression-gate
+      - ci:.github/workflows/ci.yml/integration-tests
+      - ci:.github/workflows/ci.yml/gorm-smoke
+      - ci:.github/workflows/ci.yml/sqlalchemy-smoke
       - ci:.github/workflows/doc-lint.yml/doc-lint
-      - ci:.github/workflows/gorm-smoke.yml/gorm-smoke
-      - ci:.github/workflows/sqlalchemy-smoke.yml/sqlalchemy-smoke
     owners: [TBD]
     status: PARTIAL
     coverage_gaps:
