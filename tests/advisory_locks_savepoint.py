@@ -16,10 +16,12 @@ Follows the pattern of tests/34_concurrent_transactions.py.
 
 import argparse
 import os
+import queue
 import subprocess
 import sys
 import threading
 import time
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from typing import List
 
@@ -33,34 +35,35 @@ class TestResult:
 
 
 class AdvisoryLockSavepointTests:
-    def __init__(self, host: str, port: int, user: str, password: str):
+    def __init__(self, host: str, port: int, user: str, password: str, database: str):
         self.host = host
         self.port = port
         self.user = user
         self.password = password
+        self.database = database
         self.results: List[TestResult] = []
 
     def run_sql(self, sql: str) -> str:
         """Run a single SQL statement and return the result."""
         env = os.environ.copy()
         env["PGPASSWORD"] = self.password
-        result = subprocess.run(
-            ["psql", "-h", self.host, "-p", str(self.port),
-             "-U", self.user, "-d", "postgres", "-t", "-A", "-c", sql],
-            capture_output=True, text=True, env=env, timeout=30
-        )
+        try:
+            result = subprocess.run(
+                ["psql", "-h", self.host, "-p", str(self.port),
+                 "-U", self.user, "-d", self.database, "-v", "ON_ERROR_STOP=1", "-t", "-A", "-c", sql],
+                capture_output=True, text=True, env=env, timeout=30
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"psql timed out after 30s: {sql[:100]}") from e
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"psql failed (exit {result.returncode}): {result.stderr.strip()}")
         return result.stdout.strip()
 
-    def run_sql_script(self, sql: str) -> str:
-        """Run a multi-statement SQL script and return the output."""
-        env = os.environ.copy()
-        env["PGPASSWORD"] = self.password
-        result = subprocess.run(
-            ["psql", "-h", self.host, "-p", str(self.port),
-             "-U", self.user, "-d", "postgres", "-t", "-A"],
-            input=sql, capture_output=True, text=True, env=env, timeout=30
-        )
-        return result.stdout.strip()
+    def wait_for_advisory_release(self, key: int):
+        """Block until another session releases a session advisory lock."""
+        self.run_sql(
+            f"SELECT pg_advisory_lock({key}); SELECT pg_advisory_unlock({key});")
 
     def run_test(self, name: str, test_func) -> TestResult:
         start = time.time()
@@ -82,6 +85,95 @@ class AdvisoryLockSavepointTests:
             print(f"    {result.message}")
         return result
 
+    def run_interactive_session(self, commands_and_barriers):
+        """Run psql interactively, sending commands separated by barriers.
+
+        commands_and_barriers is a list of (sql_string, event_to_set, event_to_wait).
+        - sql_string: SQL to send
+        - event_to_set: threading.Event to set after server confirms execution (or None)
+        - event_to_wait: threading.Event to wait on before sending (or None)
+
+        Uses sentinel queries to confirm each command has been processed by the
+        server, replacing sleep-based timing with deterministic synchronization.
+        """
+        env = os.environ.copy()
+        env["PGPASSWORD"] = self.password
+        proc = subprocess.Popen(
+            ["psql", "-h", self.host, "-p", str(self.port),
+             "-U", self.user, "-d", self.database, "-v", "ON_ERROR_STOP=1", "-t", "-A"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, env=env
+        )
+
+        collected = []
+        stdout_q = queue.Queue()
+        stderr_lines = []
+
+        def drain_stdout():
+            for line in proc.stdout:
+                collected.append(line)
+                stdout_q.put(line)
+            stdout_q.put(None)
+
+        def drain_stderr():
+            for line in proc.stderr:
+                stderr_lines.append(line)
+
+        reader = threading.Thread(target=drain_stdout, daemon=True)
+        err_reader = threading.Thread(target=drain_stderr, daemon=True)
+        reader.start()
+        err_reader.start()
+
+        try:
+            for i, (sql, evt_set, evt_wait) in enumerate(commands_and_barriers):
+                if evt_wait is not None:
+                    if not evt_wait.wait(timeout=10):
+                        raise RuntimeError(
+                            f"Timed out waiting for event before: {sql}")
+                sentinel = f"__sentinel_{i}__"
+                proc.stdin.write(sql + "\n")
+                proc.stdin.write(f"SELECT '{sentinel}';\n")
+                proc.stdin.flush()
+                # Block on stdout queue until sentinel appears.
+                deadline = time.time() + 10
+                while True:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        raise RuntimeError(
+                            f"Timed out waiting for server to process: {sql}")
+                    try:
+                        line = stdout_q.get(timeout=remaining)
+                    except queue.Empty as e:
+                        raise RuntimeError(
+                            f"Timed out waiting for server to process: {sql}") from e
+                    if line is None:
+                        stderr_text = "".join(stderr_lines).strip()
+                        raise RuntimeError(
+                            "interactive psql exited before command completed "
+                            f"(exit {proc.returncode}): {stderr_text}")
+                    if sentinel in line:
+                        break
+                if evt_set is not None:
+                    evt_set.set()
+            proc.stdin.close()
+            proc.wait(timeout=30)
+            stderr_text = "".join(stderr_lines).strip()
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"interactive psql failed (exit {proc.returncode}): {stderr_text}")
+            if "ERROR:" in stderr_text:
+                raise RuntimeError(
+                    f"interactive psql reported error on stderr: {stderr_text}")
+        except Exception:
+            proc.kill()
+            proc.wait(timeout=5)
+            raise
+        finally:
+            reader.join(timeout=5)
+            err_reader.join(timeout=5)
+
+        return "".join(collected).strip()
+
     # ------------------------------------------------------------------
     # 2S-1: Basic xact lock released on ROLLBACK TO SAVEPOINT
     #   Session A acquires xact lock 6000 inside a savepoint, then rolls
@@ -89,103 +181,37 @@ class AdvisoryLockSavepointTests:
     # ------------------------------------------------------------------
     def test_2s1_basic_rollback_releases(self):
         key = 6000
-        barrier_a_locked = threading.Event()
-        barrier_a_rolled_back = threading.Event()
+        sync_key = 6100
+        barrier_a_ready = threading.Event()
+        barrier_b_observed_held = threading.Event()
+        barrier_b_probed = threading.Event()
         b_before = [None]
         b_after = [None]
 
-        def session_a():
-            self.run_sql_script(f"""\
-BEGIN;
-SAVEPOINT s1;
-SELECT pg_advisory_xact_lock({key});
-""")
-            barrier_a_locked.set()
-            # Wait for B to observe the held lock
-            barrier_a_rolled_back.wait(timeout=10)
-            # Actually we roll back first, then let B re-check
-            # Re-sequence: A locks -> B observes held -> A rollback -> B observes free
-            # So we need B to observe *before* rollback. Let's fix the flow.
-
-        # Corrected flow: use explicit step-by-step coordination
-        def session_a_corrected():
-            env = os.environ.copy()
-            env["PGPASSWORD"] = self.password
-            # Step 1: BEGIN + SAVEPOINT + acquire lock
-            self.run_sql_script(f"""\
-BEGIN;
-SAVEPOINT s1;
-SELECT pg_advisory_xact_lock({key});
-""")
-            barrier_a_locked.set()
-            # Wait for session B to observe the held lock
-            assert barrier_a_rolled_back.wait(timeout=10), "Timed out waiting for B to observe held lock"
-            # Step 2: ROLLBACK TO SAVEPOINT in a new psql (same session won't work)
-            # psql runs each invocation in a separate connection, so we need
-            # a single long-running script. Use a different approach.
-
-        # Since psql creates a new connection each invocation, we need to run
-        # the entire session A flow in a single script. We use a helper that
-        # writes commands to psql's stdin incrementally.
-        def run_interactive_session(commands_and_barriers):
-            """Run psql interactively, sending commands separated by barriers.
-
-            commands_and_barriers is a list of (sql_string, event_to_set, event_to_wait).
-            - sql_string: SQL to send
-            - event_to_set: threading.Event to set after sending (or None)
-            - event_to_wait: threading.Event to wait on before sending (or None)
-
-            Returns all stdout.
-            """
-            env = os.environ.copy()
-            env["PGPASSWORD"] = self.password
-            proc = subprocess.Popen(
-                ["psql", "-h", self.host, "-p", str(self.port),
-                 "-U", self.user, "-d", "postgres", "-t", "-A"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, env=env
-            )
-            for sql, evt_set, evt_wait in commands_and_barriers:
-                if evt_wait is not None:
-                    assert evt_wait.wait(timeout=10), f"Timed out waiting for event before: {sql}"
-                proc.stdin.write(sql + "\n")
-                proc.stdin.flush()
-                # Give the server a moment to process
-                time.sleep(0.3)
-                if evt_set is not None:
-                    evt_set.set()
-            stdout, _ = proc.communicate(timeout=30)
-            return stdout.strip()
-
-        barrier_b_observed_held = threading.Event()
-        barrier_b_probed = threading.Event()
-
         def session_a_thread():
-            run_interactive_session([
+            self.run_interactive_session([
                 (f"BEGIN;", None, None),
                 (f"SAVEPOINT s1;", None, None),
-                (f"SELECT pg_advisory_xact_lock({key});", barrier_a_locked, None),
-                # Wait for B to observe the held lock
-                (f"ROLLBACK TO SAVEPOINT s1;", barrier_a_rolled_back, barrier_b_observed_held),
+                (f"SELECT pg_advisory_xact_lock({key});", None, None),
+                (f"SELECT pg_advisory_lock({sync_key});", barrier_a_ready, None),
+                # Wait for B to observe held state before rollback.
+                (f"ROLLBACK TO SAVEPOINT s1;", None, barrier_b_observed_held),
+                (f"SELECT pg_advisory_unlock({sync_key});", None, None),
                 # Wait for B to probe post-rollback state before committing
                 (f"COMMIT;", None, barrier_b_probed),
             ])
 
         def session_b_thread():
-            # Wait for A to acquire the lock
-            assert barrier_a_locked.wait(timeout=10), "Timed out waiting for A to lock"
-            time.sleep(0.2)
+            # Wait for A to acquire xact lock + sync lock.
+            assert barrier_a_ready.wait(timeout=10), "Timed out waiting for A to lock"
             # Observe: lock is held by A
             b_before[0] = self.run_sql(f"SELECT pg_try_advisory_xact_lock({key});")
             barrier_b_observed_held.set()
-            # Wait for A to ROLLBACK TO SAVEPOINT
-            assert barrier_a_rolled_back.wait(timeout=10), "Timed out waiting for A to rollback"
-            time.sleep(0.2)
+            # Block until A releases the sync lock after rollback.
+            self.wait_for_advisory_release(sync_key)
             # Observe: lock should now be free
             b_after[0] = self.run_sql(f"SELECT pg_try_advisory_xact_lock({key});")
             barrier_b_probed.set()
-            # Clean up B's lock
-            self.run_sql("ROLLBACK;")
 
         t_a = threading.Thread(target=session_a_thread)
         t_b = threading.Thread(target=session_b_thread)
@@ -207,50 +233,30 @@ SELECT pg_advisory_xact_lock({key});
     def test_2s2_lock_before_savepoint_survives(self):
         key_before = 6001
         key_after = 6002
-        barrier_a_locked = threading.Event()
-        barrier_a_rolled_back = threading.Event()
+        sync_key = 6101
+        barrier_a_ready = threading.Event()
         barrier_b_checked = threading.Event()
+        barrier_b_probed = threading.Event()
         b_key_before_after_rollback = [None]
         b_key_after_after_rollback = [None]
 
-        def run_interactive_session(commands_and_barriers):
-            env = os.environ.copy()
-            env["PGPASSWORD"] = self.password
-            proc = subprocess.Popen(
-                ["psql", "-h", self.host, "-p", str(self.port),
-                 "-U", self.user, "-d", "postgres", "-t", "-A"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, env=env
-            )
-            for sql, evt_set, evt_wait in commands_and_barriers:
-                if evt_wait is not None:
-                    assert evt_wait.wait(timeout=10), f"Timed out waiting for event"
-                proc.stdin.write(sql + "\n")
-                proc.stdin.flush()
-                time.sleep(0.3)
-                if evt_set is not None:
-                    evt_set.set()
-            stdout, _ = proc.communicate(timeout=30)
-            return stdout.strip()
-
-        barrier_b_probed = threading.Event()
-
         def session_a_thread():
-            run_interactive_session([
+            self.run_interactive_session([
                 (f"BEGIN;", None, None),
                 (f"SELECT pg_advisory_xact_lock({key_before});", None, None),
                 (f"SAVEPOINT s1;", None, None),
-                (f"SELECT pg_advisory_xact_lock({key_after});", barrier_a_locked, None),
-                (f"ROLLBACK TO SAVEPOINT s1;", barrier_a_rolled_back, barrier_b_checked),
+                (f"SELECT pg_advisory_xact_lock({key_after});", None, None),
+                (f"SELECT pg_advisory_lock({sync_key});", barrier_a_ready, None),
+                (f"ROLLBACK TO SAVEPOINT s1;", None, barrier_b_checked),
+                (f"SELECT pg_advisory_unlock({sync_key});", None, None),
                 # Wait for B to probe post-rollback state before committing
                 (f"COMMIT;", None, barrier_b_probed),
             ])
 
         def session_b_thread():
-            assert barrier_a_locked.wait(timeout=10)
+            assert barrier_a_ready.wait(timeout=10)
             barrier_b_checked.set()
-            assert barrier_a_rolled_back.wait(timeout=10)
-            time.sleep(0.2)
+            self.wait_for_advisory_release(sync_key)
             # key_before should still be held by A (acquired before savepoint)
             b_key_before_after_rollback[0] = self.run_sql(
                 f"SELECT pg_try_advisory_xact_lock({key_before});")
@@ -258,7 +264,6 @@ SELECT pg_advisory_xact_lock({key});
             b_key_after_after_rollback[0] = self.run_sql(
                 f"SELECT pg_try_advisory_xact_lock({key_after});")
             barrier_b_probed.set()
-            self.run_sql("ROLLBACK;")
 
         t_a = threading.Thread(target=session_a_thread)
         t_b = threading.Thread(target=session_b_thread)
@@ -280,55 +285,34 @@ SELECT pg_advisory_xact_lock({key});
     def test_2s3_nested_savepoints(self):
         key_s1 = 6003
         key_s2 = 6004  # Using 6004 instead of conflicting with other cases
-        barrier_a_locked = threading.Event()
-        barrier_a_rolled_back = threading.Event()
+        sync_key = 6102
+        barrier_a_ready = threading.Event()
         barrier_b_checked = threading.Event()
+        barrier_b_probed = threading.Event()
         b_s1_after = [None]
         b_s2_after = [None]
 
-        def run_interactive_session(commands_and_barriers):
-            env = os.environ.copy()
-            env["PGPASSWORD"] = self.password
-            proc = subprocess.Popen(
-                ["psql", "-h", self.host, "-p", str(self.port),
-                 "-U", self.user, "-d", "postgres", "-t", "-A"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, env=env
-            )
-            for sql, evt_set, evt_wait in commands_and_barriers:
-                if evt_wait is not None:
-                    assert evt_wait.wait(timeout=10), f"Timed out waiting for event"
-                proc.stdin.write(sql + "\n")
-                proc.stdin.flush()
-                time.sleep(0.3)
-                if evt_set is not None:
-                    evt_set.set()
-            stdout, _ = proc.communicate(timeout=30)
-            return stdout.strip()
-
-        barrier_b_probed = threading.Event()
-
         def session_a_thread():
-            run_interactive_session([
+            self.run_interactive_session([
                 (f"BEGIN;", None, None),
                 (f"SAVEPOINT s1;", None, None),
                 (f"SELECT pg_advisory_xact_lock({key_s1});", None, None),
                 (f"SAVEPOINT s2;", None, None),
-                (f"SELECT pg_advisory_xact_lock({key_s2});", barrier_a_locked, None),
-                (f"ROLLBACK TO SAVEPOINT s1;", barrier_a_rolled_back, barrier_b_checked),
+                (f"SELECT pg_advisory_xact_lock({key_s2});", None, None),
+                (f"SELECT pg_advisory_lock({sync_key});", barrier_a_ready, None),
+                (f"ROLLBACK TO SAVEPOINT s1;", None, barrier_b_checked),
+                (f"SELECT pg_advisory_unlock({sync_key});", None, None),
                 # Wait for B to probe post-rollback state before committing
                 (f"COMMIT;", None, barrier_b_probed),
             ])
 
         def session_b_thread():
-            assert barrier_a_locked.wait(timeout=10)
+            assert barrier_a_ready.wait(timeout=10)
             barrier_b_checked.set()
-            assert barrier_a_rolled_back.wait(timeout=10)
-            time.sleep(0.2)
+            self.wait_for_advisory_release(sync_key)
             b_s1_after[0] = self.run_sql(f"SELECT pg_try_advisory_xact_lock({key_s1});")
             b_s2_after[0] = self.run_sql(f"SELECT pg_try_advisory_xact_lock({key_s2});")
             barrier_b_probed.set()
-            self.run_sql("ROLLBACK;")
 
         t_a = threading.Thread(target=session_a_thread)
         t_b = threading.Thread(target=session_b_thread)
@@ -350,32 +334,11 @@ SELECT pg_advisory_xact_lock({key});
     def test_2s4_release_preserves_locks(self):
         key = 6005
         barrier_a_released_sp = threading.Event()
+        barrier_b_probed = threading.Event()
         b_after_release = [None]
 
-        def run_interactive_session(commands_and_barriers):
-            env = os.environ.copy()
-            env["PGPASSWORD"] = self.password
-            proc = subprocess.Popen(
-                ["psql", "-h", self.host, "-p", str(self.port),
-                 "-U", self.user, "-d", "postgres", "-t", "-A"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, env=env
-            )
-            for sql, evt_set, evt_wait in commands_and_barriers:
-                if evt_wait is not None:
-                    assert evt_wait.wait(timeout=10), f"Timed out waiting for event"
-                proc.stdin.write(sql + "\n")
-                proc.stdin.flush()
-                time.sleep(0.3)
-                if evt_set is not None:
-                    evt_set.set()
-            stdout, _ = proc.communicate(timeout=30)
-            return stdout.strip()
-
-        barrier_b_probed = threading.Event()
-
         def session_a_thread():
-            run_interactive_session([
+            self.run_interactive_session([
                 (f"BEGIN;", None, None),
                 (f"SAVEPOINT s1;", None, None),
                 (f"SELECT pg_advisory_xact_lock({key});", None, None),
@@ -386,11 +349,9 @@ SELECT pg_advisory_xact_lock({key});
 
         def session_b_thread():
             assert barrier_a_released_sp.wait(timeout=10)
-            time.sleep(0.2)
             # Lock should still be held (RELEASE merges to parent, doesn't free)
             b_after_release[0] = self.run_sql(f"SELECT pg_try_advisory_xact_lock({key});")
             barrier_b_probed.set()
-            self.run_sql("ROLLBACK;")
 
         t_a = threading.Thread(target=session_a_thread)
         t_b = threading.Thread(target=session_b_thread)
@@ -420,7 +381,6 @@ SELECT pg_advisory_xact_lock({key});
 
         for name, func in tests:
             self.run_test(name, func)
-            time.sleep(0.2)
 
         print("\n" + "=" * 60)
         passed = sum(1 for r in self.results if r.passed)
@@ -434,6 +394,9 @@ SELECT pg_advisory_xact_lock({key});
 def main():
     parser = argparse.ArgumentParser(
         description="Two-session advisory lock savepoint tests")
+    parser.add_argument("--dsn",
+                        default=os.environ.get("PG_DSN"),
+                        help="PostgreSQL DSN, e.g. postgres://user:pass@host:port/db")
     parser.add_argument("--host",
                         default=os.environ.get("PG_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int,
@@ -442,10 +405,31 @@ def main():
                         default=os.environ.get("PG_USER", "tenant_a.admin"))
     parser.add_argument("--password",
                         default=os.environ.get("PG_PASSWORD", "secret"))
+    parser.add_argument("--database",
+                        default=os.environ.get("PG_DATABASE", "postgres"))
     args = parser.parse_args()
 
+    host = args.host
+    port = args.port
+    user = args.user
+    password = args.password
+    database = args.database
+
+    if args.dsn:
+        parsed = urlparse(args.dsn)
+        if parsed.scheme not in ("postgres", "postgresql"):
+            raise ValueError(f"Unsupported DSN scheme: {parsed.scheme}")
+        host = parsed.hostname or host
+        port = parsed.port or port
+        if parsed.username:
+            user = parsed.username
+        if parsed.password is not None:
+            password = parsed.password
+        if parsed.path and parsed.path != "/":
+            database = parsed.path.lstrip("/")
+
     tests = AdvisoryLockSavepointTests(
-        args.host, args.port, args.user, args.password)
+        host, port, user, password, database)
     success = tests.run_all()
     sys.exit(0 if success else 1)
 
