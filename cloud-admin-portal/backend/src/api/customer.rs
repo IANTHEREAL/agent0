@@ -675,56 +675,6 @@ pub async fn create_database(
         return Err(AppError::internal("Failed to create database"));
     }
 
-    // ── FS9 integration (best-effort) ────────────────────────────
-    if let Some(ref fs9) = state.fs9_client {
-        let fs_keyspace = format!("db9_fs_{}", tenant_id);
-
-        // Create filesystem keyspace in PD
-        if !pd.create_keyspace(&fs_keyspace).await {
-            tracing::warn!(
-                tenant_id,
-                fs_keyspace,
-                "Failed to create fs keyspace in PD (non-fatal)"
-            );
-        }
-
-        // Create fs9 namespace
-        if let Err(e) = fs9.create_namespace(&tenant_id).await {
-            tracing::warn!(tenant_id, error = %e, "Failed to create fs9 namespace (non-fatal)");
-        } else {
-            // Create a user in the namespace so a token can be issued.
-            // fs9-server auto-provisions the pagefs mount via default_pagefs config.
-            let fs9_user_id = match fs9.create_user(&tenant_id, &auth.customer_id).await {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    tracing::warn!(tenant_id, error = %e, "Failed to create fs9 user (non-fatal)");
-                    None
-                }
-            };
-
-            // Generate and store fs9 token
-            if let Some(user_id) = fs9_user_id {
-                match fs9.generate_token(&user_id, &tenant_id).await {
-                    Ok(token) => {
-                        db::upsert_credential(
-                            &state.db,
-                            &tenant_id,
-                            "fs9_token",
-                            &auth.customer_id,
-                            &token,
-                            state.config.credential_key.as_deref(),
-                        )
-                        .await
-                        .ok();
-                    }
-                    Err(e) => {
-                        tracing::warn!(tenant_id, error = %e, "Failed to generate fs9 token (non-fatal)");
-                    }
-                }
-            }
-        }
-    }
-
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
     if !pg
         .bootstrap_admin_password(&tenant_id, &admin_user, DEFAULT_ADMIN_PASSWORD, &password)

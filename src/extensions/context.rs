@@ -13,7 +13,6 @@ pub enum ExecutionKind {
 #[derive(Clone)]
 pub(crate) struct ExtensionContextOpts {
     pub(crate) is_superuser: bool,
-    pub(crate) allow_local_fs: bool,
     pub(crate) tenant_keyspace: String,
     pub(crate) execution_kind: ExecutionKind,
     pub(crate) tikv_client: Option<Arc<TransactionClient>>,
@@ -23,7 +22,6 @@ impl ExtensionContextOpts {
     pub(crate) fn statement(is_superuser: bool, tenant_keyspace: &str) -> Self {
         Self {
             is_superuser,
-            allow_local_fs: is_superuser,
             tenant_keyspace: tenant_keyspace.to_string(),
             execution_kind: ExecutionKind::Interactive,
             tikv_client: None,
@@ -33,7 +31,6 @@ impl ExtensionContextOpts {
     pub(crate) fn cron(tenant_keyspace: &str) -> Self {
         Self {
             is_superuser: true,
-            allow_local_fs: false,
             tenant_keyspace: tenant_keyspace.to_string(),
             execution_kind: ExecutionKind::Cron,
             tikv_client: None,
@@ -48,7 +45,6 @@ impl ExtensionContextOpts {
 
 pub(crate) struct ExtensionContext {
     pub(crate) is_superuser: bool,
-    pub(crate) allow_local_fs: bool,
     pub(crate) tenant_keyspace: String,
     execution_kind: ExecutionKind,
     http_requests: Cell<u32>,
@@ -80,7 +76,6 @@ pub(crate) async fn with_context_opts<R>(
 ) -> R {
     let ctx = ExtensionContext {
         is_superuser: opts.is_superuser,
-        allow_local_fs: opts.allow_local_fs,
         tenant_keyspace: opts.tenant_keyspace,
         execution_kind: opts.execution_kind,
         http_requests: Cell::new(0),
@@ -101,10 +96,6 @@ pub(crate) async fn with_context_opts<R>(
 
 pub(crate) fn is_superuser() -> bool {
     CTX.try_with(|ctx| ctx.is_superuser).unwrap_or(false)
-}
-
-pub(crate) fn allow_local_fs() -> bool {
-    CTX.try_with(|ctx| ctx.allow_local_fs).unwrap_or(false)
 }
 
 pub(crate) fn tenant_keyspace() -> Option<String> {

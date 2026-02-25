@@ -1,6 +1,5 @@
 pub mod audit;
 pub mod customer;
-pub mod fs9_proxy;
 pub mod system;
 pub mod tenants;
 pub mod users;

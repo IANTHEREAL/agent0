@@ -516,64 +516,6 @@ impl Executor {
             return Ok(Some(ExtensionTableFunctionResult::Batch(schema, rows)));
         }
 
-        if func_upper == "FS9_EVENTS" {
-            let installed = self.store().get_extension(txn, db_id, "fs9").await?;
-            let Some(installed) = installed else {
-                return Err(anyhow!("extension \"fs9\" is not installed"));
-            };
-            if !installed.enabled {
-                return Err(anyhow!("extension \"fs9\" is disabled"));
-            }
-
-            let mut limit: usize = 100;
-            let mut offset: usize = 0;
-            let mut path_filter: Option<String> = None;
-            let mut type_filter: Option<String> = None;
-
-            for (i, arg) in args.iter().enumerate() {
-                match arg {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                        let val = eval_const_ast_expr(e)?;
-                        match i {
-                            0 => match val {
-                                Value::Int64(n) => limit = n.max(0) as usize,
-                                Value::Null => {}
-                                _ => return Err(anyhow!("fs9_events: limit must be INT")),
-                            },
-                            1 => match val {
-                                Value::Int64(n) => offset = n.max(0) as usize,
-                                Value::Null => {}
-                                _ => return Err(anyhow!("fs9_events: offset must be INT")),
-                            },
-                            2 => match val {
-                                Value::Text(s) => path_filter = Some(s),
-                                Value::Null => {}
-                                _ => return Err(anyhow!("fs9_events: path must be TEXT")),
-                            },
-                            3 => match val {
-                                Value::Text(s) => type_filter = Some(s),
-                                Value::Null => {}
-                                _ => return Err(anyhow!("fs9_events: type must be TEXT")),
-                            },
-                            _ => return Err(anyhow!("fs9_events: too many arguments (max 4)")),
-                        }
-                    }
-                    _ => return Err(anyhow!("fs9_events: only positional arguments supported")),
-                }
-            }
-
-            let (mut schema, rows) = fs::execute_fs9_events(
-                self.tenant_keyspace(),
-                limit,
-                offset,
-                path_filter.as_deref(),
-                type_filter.as_deref(),
-            )
-            .await?;
-            apply_table_function_alias(&mut schema, alias)?;
-            return Ok(Some(ExtensionTableFunctionResult::Batch(schema, rows)));
-        }
-
         #[cfg(feature = "parquet")]
         if func_name.eq_ignore_ascii_case("read_parquet") {
             let installed = self.store().get_extension(txn, db_id, "parquet").await?;

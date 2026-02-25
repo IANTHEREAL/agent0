@@ -770,7 +770,6 @@ impl WorkerEngine {
         } else {
             ExtensionContextOpts {
                 is_superuser: true,
-                allow_local_fs: false,
                 tenant_keyspace: entry.keyspace.clone(),
                 execution_kind: crate::extensions::context::ExecutionKind::Interactive,
                 tikv_client: store.transaction_client(),

@@ -96,10 +96,6 @@ impl FsBackend for EmbeddedFsBackend {
     async fn truncate(&self, path: &str, size: u64) -> Result<()> {
         self.pagefs.truncate(path, size).await
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 fn inode_to_file_info(path: &str, inode: &Inode) -> FsFileInfo {

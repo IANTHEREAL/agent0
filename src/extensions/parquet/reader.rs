@@ -36,10 +36,11 @@ async fn create_fs9_reader(url: &str) -> Result<super::fs9_reader::Fs9ParquetRea
     let tenant = crate::extensions::context::tenant_keyspace().ok_or_else(|| {
         anyhow!("read_parquet: tenant keyspace not available in extension context")
     })?;
-    // Enforce fs9 local-filesystem permission (same gate as fs9 table function)
-    let use_remote = crate::extensions::fs::backend::is_remote_configured();
-    if !use_remote && !crate::extensions::context::allow_local_fs() {
-        anyhow::bail!("read_parquet: fs9 local filesystem access denied (requires superuser)");
+    if !crate::extensions::fs::backend::is_backend_available() {
+        anyhow::bail!("fs9: TiKV storage backend not available");
+    }
+    if !crate::extensions::context::is_superuser() {
+        anyhow::bail!("fs9: permission denied");
     }
     let backend = crate::extensions::fs::backend::get_backend(&tenant).await;
     let data = backend

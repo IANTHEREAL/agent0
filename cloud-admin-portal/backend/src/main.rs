@@ -96,23 +96,6 @@ async fn main() {
     let sessions = Arc::new(SessionManager::new(config.session_ttl_hours));
     let config = Arc::new(config);
 
-    let fs9_client = match (&config.fs9_meta_url, &config.fs9_meta_key) {
-        (Some(url), Some(key)) => {
-            tracing::info!("FS9 integration enabled: {}", url);
-            Some(Arc::new(
-                db9_admin::services::fs9_client::Fs9Client::new(
-                    url.clone(),
-                    key.clone(),
-                    http_client.clone(),
-                ),
-            ))
-        }
-        _ => {
-            tracing::info!("FS9 integration disabled (FS9_META_URL or FS9_META_KEY not set)");
-            None
-        }
-    };
-
     let device_codes = Arc::new(DeviceCodeStore::new(600));
     let state = AppState {
         db: pool.clone(),
@@ -120,7 +103,6 @@ async fn main() {
         sessions,
         device_codes,
         http_client: http_client.clone(),
-        fs9_client,
     };
 
     // ── Reconciler ───────────────────────────────────────────────
@@ -212,19 +194,6 @@ async fn main() {
     // ── Router ───────────────────────────────────────────────────
     let app = Router::new()
         .nest("/api", api::router())
-        // FS9 reverse-proxy: /fs9/{db_id}  and  /fs9/{db_id}/{*rest}
-        .route(
-            "/fs9/:db_id",
-            axum::routing::any(api::fs9_proxy::fs9_proxy),
-        )
-        .route(
-            "/fs9/:db_id/",
-            axum::routing::any(api::fs9_proxy::fs9_proxy),
-        )
-        .route(
-            "/fs9/:db_id/*rest",
-            axum::routing::any(api::fs9_proxy::fs9_proxy),
-        )
         .layer(cors)
         .with_state(state);
 

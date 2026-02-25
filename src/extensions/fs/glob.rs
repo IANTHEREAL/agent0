@@ -211,14 +211,119 @@ pub(crate) fn path_matches_exclude(path: &str, exclude_set: &globset::GlobSet) -
 
 #[cfg(test)]
 mod tests {
+    use anyhow::{anyhow, Result};
+    use async_trait::async_trait;
     use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::extensions::fs::backend::LocalFsBackend;
+    use tokio::io::AsyncBufRead;
+
+    use crate::extensions::fs::backend::{FsBackend, FsFileInfo};
 
     use super::*;
+
+    struct TestLocalBackend;
+
+    fn to_file_info(path: &str, metadata: std::fs::Metadata) -> Result<FsFileInfo> {
+        let is_dir = metadata.is_dir();
+        let is_file = metadata.is_file();
+        let mtime = metadata
+            .modified()
+            .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?
+            .as_secs();
+
+        Ok(FsFileInfo {
+            path: path.to_string(),
+            is_dir,
+            is_file,
+            is_symlink: false,
+            size: metadata.len(),
+            mode: if is_dir { 0o755 } else { 0o644 },
+            mtime,
+        })
+    }
+
+    #[async_trait]
+    impl FsBackend for TestLocalBackend {
+        async fn stat(&self, path: &str) -> Result<FsFileInfo> {
+            let metadata = std::fs::metadata(path)
+                .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?;
+            to_file_info(path, metadata)
+        }
+
+        async fn readdir(&self, path: &str) -> Result<Vec<FsFileInfo>> {
+            let metadata = std::fs::metadata(path)
+                .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?;
+            if !metadata.is_dir() {
+                return Err(anyhow!("fs9: not a directory: {path}"));
+            }
+
+            let mut out = Vec::new();
+            for entry in std::fs::read_dir(path)
+                .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?
+            {
+                let entry = entry.map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?;
+                let entry_path = entry.path().to_string_lossy().to_string();
+                let entry_meta = std::fs::metadata(entry.path())
+                    .map_err(|err| anyhow!("fs9: cannot stat '{entry_path}': {err}"))?;
+                let mut info = to_file_info(&entry_path, entry_meta)?;
+                info.is_symlink = Path::new(&entry_path).is_symlink();
+                out.push(info);
+            }
+
+            out.sort_by(|a, b| a.path.cmp(&b.path));
+            Ok(out)
+        }
+
+        async fn read_file(&self, _path: &str, _max_bytes: usize) -> Result<Vec<u8>> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn read_file_stream(
+            &self,
+            _path: &str,
+            _max_bytes: usize,
+        ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn remove(&self, _path: &str) -> Result<()> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn remove_recursive(&self, _path: &str) -> Result<u64> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn mkdir(&self, _path: &str, _recursive: bool) -> Result<()> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn write_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn read_file_at(&self, _path: &str, _offset: u64, _length: usize) -> Result<Vec<u8>> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn write_file_at(&self, _path: &str, _offset: u64, _data: &[u8]) -> Result<usize> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn append_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn truncate(&self, _path: &str, _size: u64) -> Result<()> {
+            anyhow::bail!("not implemented for test backend")
+        }
+    }
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -258,7 +363,7 @@ mod tests {
         fs::write(dir.join("b.csv"), b"h\n2").expect("write b.csv");
         fs::write(dir.join("c.txt"), b"text").expect("write c.txt");
 
-        let backend = LocalFsBackend::new();
+        let backend = TestLocalBackend;
         let pattern = format!("{}/*.csv", dir.display());
         let first = find_first_match(&backend, &pattern, None)
             .await
@@ -283,7 +388,7 @@ mod tests {
         fs::create_dir_all(&sub).expect("create subdir");
         fs::write(sub.join("nested.csv"), b"h\n2").expect("write nested.csv");
 
-        let backend = LocalFsBackend::new();
+        let backend = TestLocalBackend;
 
         let shallow = format!("{}/*.csv", dir.display());
         let files = expand_glob(&backend, &shallow, 100, None)
@@ -329,7 +434,7 @@ mod tests {
         fs::write(dir.join("b.csv"), b"h\n2").expect("write b.csv");
         fs::write(dir.join("c.txt"), b"text").expect("write c.txt");
 
-        let backend = LocalFsBackend::new();
+        let backend = TestLocalBackend;
         let pattern = format!("{}/*.csv", dir.display());
         let files = expand_glob(&backend, &pattern, 100, None)
             .await
@@ -349,7 +454,7 @@ mod tests {
         fs::create_dir_all(&sub).expect("create subdir");
         fs::write(sub.join("nested.csv"), b"h\n2").expect("write nested.csv");
 
-        let backend = LocalFsBackend::new();
+        let backend = TestLocalBackend;
         let pattern = format!("{}/**/*.csv", dir.display());
         let files = expand_glob(&backend, &pattern, 100, None)
             .await
@@ -362,7 +467,7 @@ mod tests {
     #[tokio::test]
     async fn test_expand_glob_empty() {
         let dir = unique_base("glob-empty");
-        let backend = LocalFsBackend::new();
+        let backend = TestLocalBackend;
         let pattern = format!("{}/*.nonexistent", dir.display());
         let files = expand_glob(&backend, &pattern, 100, None)
             .await
@@ -379,7 +484,7 @@ mod tests {
             fs::write(dir.join(format!("f{i}.csv")), b"h\n1").expect("write csv file");
         }
 
-        let backend = LocalFsBackend::new();
+        let backend = TestLocalBackend;
         let pattern = format!("{}/*.csv", dir.display());
         let files = expand_glob(&backend, &pattern, 3, None)
             .await
@@ -395,7 +500,7 @@ mod tests {
         fs::write(dir.join("visible.csv"), b"h\n1").expect("write visible.csv");
         fs::write(dir.join(".hidden.csv"), b"h\n2").expect("write hidden.csv");
 
-        let backend = LocalFsBackend::new();
+        let backend = TestLocalBackend;
         let pattern = format!("{}/*.csv", dir.display());
         let files = expand_glob(&backend, &pattern, 100, None)
             .await
@@ -412,7 +517,7 @@ mod tests {
         fs::write(dir.join("a.txt"), b"a").expect("write a.txt");
         fs::write(dir.join("b.csv"), b"b").expect("write b.csv");
 
-        let backend = LocalFsBackend::new();
+        let backend = TestLocalBackend;
         let pattern = format!("{}/*.*", dir.display());
         let files = expand_glob(&backend, &pattern, 100, Some("*.txt"))
             .await
@@ -430,7 +535,7 @@ mod tests {
         fs::write(dir.join("a.txt"), b"a").expect("write a.txt");
         fs::write(dir.join("b.csv"), b"b").expect("write b.csv");
 
-        let backend = LocalFsBackend::new();
+        let backend = TestLocalBackend;
         let pattern = format!("{}/*.*", dir.display());
         let files = expand_glob(&backend, &pattern, 100, Some("*.json"))
             .await
@@ -447,7 +552,7 @@ mod tests {
         fs::write(dir.join("a.txt"), b"a").expect("write a.txt");
         fs::write(dir.join("b.csv"), b"b").expect("write b.csv");
 
-        let backend = LocalFsBackend::new();
+        let backend = TestLocalBackend;
         let pattern = format!("{}/*.*", dir.display());
         let files = expand_glob(&backend, &pattern, 100, Some("*.*"))
             .await

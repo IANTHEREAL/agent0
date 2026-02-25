@@ -1,8 +1,6 @@
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
-use crate::extensions::context;
-use crate::sql::error::SqlError;
 use crate::types::{ColumnDef, DataType, Row, TableSchema};
 use std::collections::HashSet;
 use tracing::warn;
@@ -85,68 +83,10 @@ fn fs9_file_schema(name: &str) -> TableSchema {
     }
 }
 
-fn fs9_events_schema() -> TableSchema {
-    TableSchema {
-        table_id: 0,
-        name: "fs9_events".to_string(),
-        columns: vec![
-            ColumnDef {
-                name: "timestamp".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                collation: None,
-            },
-            ColumnDef {
-                name: "event_type".to_string(),
-                data_type: DataType::Text,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                collation: None,
-            },
-            ColumnDef {
-                name: "path".to_string(),
-                data_type: DataType::Text,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                collation: None,
-            },
-            ColumnDef {
-                name: "count".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                collation: None,
-            },
-        ],
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        version: 1,
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        from_alias: None,
-    }
-}
-
 pub(crate) fn table_function_schema(func_name: &str) -> Option<TableSchema> {
     let name = func_name.trim().to_ascii_lowercase();
     match name.as_str() {
         "fs9" => Some(fs9_file_schema(&name)),
-        "fs9_events" => Some(fs9_events_schema()),
         _ => None,
     }
 }
@@ -160,15 +100,6 @@ pub(crate) async fn infer_table_function_schema(
     tenant: &str,
     mode: &Fs9Mode,
 ) -> Result<TableSchema> {
-    let use_remote = backend::is_remote_configured();
-    if !use_remote && !context::allow_local_fs() {
-        return Err(SqlError::PermissionDenied {
-            object_type: "extension".into(),
-            object_name: "fs9".into(),
-        }
-        .into());
-    }
-
     let backend = backend::get_backend(tenant).await;
     let backend = backend.as_ref();
 
@@ -255,15 +186,6 @@ pub(crate) async fn execute_table_function(
     tenant: &str,
     mode: Fs9Mode,
 ) -> Result<(TableSchema, Vec<Row>)> {
-    let use_remote = backend::is_remote_configured();
-    if !use_remote && !context::allow_local_fs() {
-        return Err(SqlError::PermissionDenied {
-            object_type: "extension".into(),
-            object_name: "fs9".into(),
-        }
-        .into());
-    }
-
     let backend = backend::get_backend(tenant).await;
     let backend = backend.as_ref();
 
@@ -401,80 +323,6 @@ pub(crate) async fn execute_table_function(
     }
 }
 
-pub(crate) async fn execute_fs9_events(
-    tenant: &str,
-    limit: usize,
-    offset: usize,
-    path_filter: Option<&str>,
-    type_filter: Option<&str>,
-) -> Result<(TableSchema, Vec<Row>)> {
-    use crate::types::Value;
-
-    let bk = backend::get_backend(tenant).await;
-    let http_backend = match bk.as_any().downcast_ref::<backend::Fs9HttpBackend>() {
-        Some(b) => b,
-        None => {
-            return Err(anyhow!(
-                "fs9_events: requires remote fs9-server (FS9_SERVER_URL)"
-            ))
-        }
-    };
-
-    let mut url = format!(
-        "{}/api/v1/events?limit={}&offset={}",
-        http_backend.base_url(),
-        limit,
-        offset,
-    );
-    if let Some(p) = path_filter {
-        url.push_str(&format!("&path={p}"));
-    }
-    if let Some(t) = type_filter {
-        url.push_str(&format!("&type={t}"));
-    }
-
-    let resp = http_backend
-        .client()
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", http_backend.token()))
-        .send()
-        .await
-        .map_err(|e| anyhow!("fs9_events: cannot reach fs9-server: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("fs9_events: remote error ({status}): {body}"));
-    }
-
-    #[derive(serde::Deserialize)]
-    struct EventRow {
-        timestamp: u64,
-        event_type: String,
-        path: String,
-        count: u64,
-    }
-
-    let events: Vec<EventRow> = resp
-        .json()
-        .await
-        .map_err(|e| anyhow!("fs9_events: invalid response: {e}"))?;
-
-    let rows: Vec<Row> = events
-        .into_iter()
-        .map(|e| Row {
-            values: vec![
-                Value::Int64(e.timestamp as i64),
-                Value::Text(e.event_type),
-                Value::Text(e.path),
-                Value::Int64(e.count as i64),
-            ],
-        })
-        .collect();
-
-    Ok((fs9_events_schema(), rows))
-}
-
 pub(crate) async fn start_file_stream(
     tenant: &str,
     path: &str,
@@ -482,15 +330,6 @@ pub(crate) async fn start_file_stream(
     delimiter: Option<char>,
     header: Option<bool>,
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
-    let use_remote = backend::is_remote_configured();
-    if !use_remote && !context::allow_local_fs() {
-        return Err(SqlError::PermissionDenied {
-            object_type: "extension".into(),
-            object_name: "fs9".into(),
-        }
-        .into());
-    }
-
     let backend = backend::get_backend(tenant).await;
     let info = backend.stat(path).await?;
     if info.is_dir {
@@ -650,17 +489,28 @@ async fn start_glob_stream_with_budget(
     exclude: Option<&str>,
     max_total_bytes: usize,
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
-    let use_remote = backend::is_remote_configured();
-    if !use_remote && !context::allow_local_fs() {
-        return Err(SqlError::PermissionDenied {
-            object_type: "extension".into(),
-            object_name: "fs9".into(),
-        }
-        .into());
-    }
-
     let backend = backend::get_backend(tenant).await;
+    start_glob_stream_with_budget_for_backend(
+        backend,
+        pattern,
+        format,
+        delimiter,
+        header,
+        exclude,
+        max_total_bytes,
+    )
+    .await
+}
 
+async fn start_glob_stream_with_budget_for_backend(
+    backend: Box<dyn backend::FsBackend>,
+    pattern: &str,
+    format: Option<&str>,
+    delimiter: Option<char>,
+    header: Option<bool>,
+    exclude: Option<&str>,
+    max_total_bytes: usize,
+) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
     let first_path = match glob::find_first_match(&*backend, pattern, exclude).await? {
         Some(p) => p,
         None => return Ok(None),
@@ -839,6 +689,28 @@ async fn start_glob_stream_with_budget(
     Ok(Some((schema, rx)))
 }
 
+#[cfg(test)]
+async fn start_glob_stream_with_budget_for_test_backend(
+    backend: Box<dyn backend::FsBackend>,
+    pattern: &str,
+    format: Option<&str>,
+    delimiter: Option<char>,
+    header: Option<bool>,
+    exclude: Option<&str>,
+    max_total_bytes: usize,
+) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
+    start_glob_stream_with_budget_for_backend(
+        backend,
+        pattern,
+        format,
+        delimiter,
+        header,
+        exclude,
+        max_total_bytes,
+    )
+    .await
+}
+
 async fn list_directory_entries(
     backend: &dyn backend::FsBackend,
     path: &str,
@@ -903,18 +775,131 @@ async fn list_directory_entries(
 
 #[cfg(test)]
 mod tests {
+    use anyhow::{anyhow, Result};
+    use async_trait::async_trait;
     use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use tokio::io::AsyncBufRead;
+
     use tokio::time::{timeout, Duration};
 
-    use super::{
-        backend, list_directory_entries, start_glob_stream, start_glob_stream_with_budget,
-    };
-    use crate::extensions::context;
+    use super::{list_directory_entries, start_glob_stream_with_budget_for_test_backend};
+    use crate::extensions::fs::backend::{FsBackend, FsFileInfo};
     use crate::types::Value;
+
+    struct TestLocalBackend;
+
+    fn to_file_info(path: &str, metadata: std::fs::Metadata) -> Result<FsFileInfo> {
+        let is_dir = metadata.is_dir();
+        let is_file = metadata.is_file();
+        let mtime = metadata
+            .modified()
+            .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?
+            .as_secs();
+
+        Ok(FsFileInfo {
+            path: path.to_string(),
+            is_dir,
+            is_file,
+            is_symlink: false,
+            size: metadata.len(),
+            mode: if is_dir { 0o755 } else { 0o644 },
+            mtime,
+        })
+    }
+
+    #[async_trait]
+    impl FsBackend for TestLocalBackend {
+        async fn stat(&self, path: &str) -> Result<FsFileInfo> {
+            let metadata = std::fs::metadata(path)
+                .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?;
+            to_file_info(path, metadata)
+        }
+
+        async fn readdir(&self, path: &str) -> Result<Vec<FsFileInfo>> {
+            let metadata = std::fs::metadata(path)
+                .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?;
+            if !metadata.is_dir() {
+                return Err(anyhow!("fs9: not a directory: {path}"));
+            }
+
+            let mut out = Vec::new();
+            for entry in std::fs::read_dir(path)
+                .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?
+            {
+                let entry = entry.map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?;
+                let entry_path = entry.path().to_string_lossy().to_string();
+                let entry_meta = std::fs::metadata(entry.path())
+                    .map_err(|err| anyhow!("fs9: cannot stat '{entry_path}': {err}"))?;
+                let mut info = to_file_info(&entry_path, entry_meta)?;
+                info.is_symlink = Path::new(&entry_path).is_symlink();
+                out.push(info);
+            }
+            out.sort_by(|a, b| a.path.cmp(&b.path));
+            Ok(out)
+        }
+
+        async fn read_file(&self, _path: &str, _max_bytes: usize) -> Result<Vec<u8>> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn read_file_stream(
+            &self,
+            path: &str,
+            max_bytes: usize,
+        ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>> {
+            let data = std::fs::read(path)
+                .map_err(|err| anyhow!("fs9: cannot read file '{path}': {err}"))?;
+            if data.len() > max_bytes {
+                return Err(anyhow!(
+                    "fs9: file too large: {} bytes exceeds limit {}",
+                    data.len(),
+                    max_bytes
+                ));
+            }
+            Ok(Box::new(tokio::io::BufReader::new(std::io::Cursor::new(
+                data,
+            ))))
+        }
+
+        async fn remove(&self, _path: &str) -> Result<()> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn remove_recursive(&self, _path: &str) -> Result<u64> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn mkdir(&self, _path: &str, _recursive: bool) -> Result<()> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn write_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn read_file_at(&self, _path: &str, _offset: u64, _length: usize) -> Result<Vec<u8>> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn write_file_at(&self, _path: &str, _offset: u64, _data: &[u8]) -> Result<usize> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn append_file(&self, _path: &str, _data: &[u8]) -> Result<usize> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn truncate(&self, _path: &str, _size: u64) -> Result<()> {
+            anyhow::bail!("not implemented for test backend")
+        }
+    }
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -936,16 +921,20 @@ mod tests {
         let _ = fs::remove_dir_all(path);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn recursive_directory_listing_skips_symlink_dirs() {
+        #[cfg(not(unix))]
+        {
+            return;
+        }
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
 
         let dir = unique_base("symlink-loop");
         fs::create_dir_all(dir.join("subdir")).expect("create subdir");
         symlink(&dir, dir.join("loop")).expect("create symlink loop");
 
-        let backend = backend::LocalFsBackend::new();
+        let backend = TestLocalBackend;
         let dir_str = dir.to_string_lossy().to_string();
         let fut = list_directory_entries(&backend, &dir_str, true, None);
         let entries = timeout(Duration::from_secs(1), fut)
@@ -968,13 +957,18 @@ mod tests {
         fs::write(dir.join("c.txt"), "delta\nepsilon\n").expect("write c.txt");
 
         let pattern = format!("{}/*.txt", dir.display());
-        let (schema, mut rx) = context::with_context(true, "", async {
-            start_glob_stream("", &pattern, None, None, None, None)
-                .await
-                .expect("start glob stream")
-                .expect("expected streaming result")
-        })
-        .await;
+        let (schema, mut rx) = start_glob_stream_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            &pattern,
+            None,
+            None,
+            None,
+            None,
+            super::MAX_TOTAL_BYTES,
+        )
+        .await
+        .expect("start glob stream")
+        .expect("expected streaming result");
 
         assert_eq!(schema.columns[1].name, "line");
 
@@ -999,13 +993,18 @@ mod tests {
         let pattern = format!("{}/*.txt", dir.display());
         let budget = "line1\nline2\nline3\n".len();
 
-        let (_schema, mut rx) = context::with_context(true, "", async {
-            start_glob_stream_with_budget("", &pattern, None, None, None, None, budget)
-                .await
-                .expect("start glob stream")
-                .expect("expected streaming result")
-        })
-        .await;
+        let (_schema, mut rx) = start_glob_stream_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            &pattern,
+            None,
+            None,
+            None,
+            None,
+            budget,
+        )
+        .await
+        .expect("start glob stream")
+        .expect("expected streaming result");
 
         let mut lines = Vec::new();
         while let Some(row) = rx.recv().await {

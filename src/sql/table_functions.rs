@@ -7,6 +7,14 @@ use crate::types::TableSchema;
 use crate::sql::expr::bridge::eval_const_ast_expr;
 #[cfg(test)]
 use crate::types::Value;
+#[cfg(test)]
+use anyhow::{anyhow, Result as AnyResult};
+#[cfg(test)]
+use async_trait::async_trait;
+#[cfg(test)]
+use std::time::UNIX_EPOCH;
+#[cfg(test)]
+use tokio::io::AsyncBufRead;
 
 /// Build a stable signature key for a table-valued function call in FROM.
 ///
@@ -185,8 +193,126 @@ pub(crate) async fn infer_fs9_table_function_schema(
         None => return Some(fallback),
     };
 
-    use crate::extensions::fs::backend::FsBackend;
-    let backend = crate::extensions::fs::backend::local_backend();
+    struct TestLocalBackend;
+
+    fn to_file_info(
+        path: &str,
+        metadata: std::fs::Metadata,
+    ) -> AnyResult<crate::extensions::fs::backend::FsFileInfo> {
+        let is_dir = metadata.is_dir();
+        let is_file = metadata.is_file();
+        let mtime = metadata
+            .modified()
+            .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?
+            .as_secs();
+
+        Ok(crate::extensions::fs::backend::FsFileInfo {
+            path: path.to_string(),
+            is_dir,
+            is_file,
+            is_symlink: false,
+            size: metadata.len(),
+            mode: if is_dir { 0o755 } else { 0o644 },
+            mtime,
+        })
+    }
+
+    #[async_trait]
+    impl crate::extensions::fs::backend::FsBackend for TestLocalBackend {
+        async fn stat(&self, path: &str) -> AnyResult<crate::extensions::fs::backend::FsFileInfo> {
+            let metadata = std::fs::metadata(path)
+                .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?;
+            to_file_info(path, metadata)
+        }
+
+        async fn readdir(
+            &self,
+            path: &str,
+        ) -> AnyResult<Vec<crate::extensions::fs::backend::FsFileInfo>> {
+            let metadata = std::fs::metadata(path)
+                .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?;
+            if !metadata.is_dir() {
+                return Err(anyhow!("fs9: not a directory: {path}"));
+            }
+
+            let mut out = Vec::new();
+            for entry in std::fs::read_dir(path)
+                .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?
+            {
+                let entry = entry.map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?;
+                let entry_path = entry.path().to_string_lossy().to_string();
+                let entry_meta = std::fs::metadata(entry.path())
+                    .map_err(|err| anyhow!("fs9: cannot stat '{entry_path}': {err}"))?;
+                let mut info = to_file_info(&entry_path, entry_meta)?;
+                info.is_symlink = entry.path().is_symlink();
+                out.push(info);
+            }
+            out.sort_by(|a, b| a.path.cmp(&b.path));
+            Ok(out)
+        }
+
+        async fn read_file(&self, path: &str, max_bytes: usize) -> AnyResult<Vec<u8>> {
+            let data = std::fs::read(path)
+                .map_err(|err| anyhow!("fs9: cannot read file '{path}': {err}"))?;
+            if data.len() > max_bytes {
+                return Err(anyhow!(
+                    "fs9: file too large: {} bytes exceeds limit {}",
+                    data.len(),
+                    max_bytes
+                ));
+            }
+            Ok(data)
+        }
+
+        async fn read_file_stream(
+            &self,
+            _path: &str,
+            _max_bytes: usize,
+        ) -> AnyResult<Box<dyn AsyncBufRead + Unpin + Send>> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn remove(&self, _path: &str) -> AnyResult<()> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn remove_recursive(&self, _path: &str) -> AnyResult<u64> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn mkdir(&self, _path: &str, _recursive: bool) -> AnyResult<()> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn write_file(&self, _path: &str, _data: &[u8]) -> AnyResult<usize> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn read_file_at(
+            &self,
+            _path: &str,
+            _offset: u64,
+            _length: usize,
+        ) -> AnyResult<Vec<u8>> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn write_file_at(&self, _path: &str, _offset: u64, _data: &[u8]) -> AnyResult<usize> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn append_file(&self, _path: &str, _data: &[u8]) -> AnyResult<usize> {
+            anyhow::bail!("not implemented for test backend")
+        }
+
+        async fn truncate(&self, _path: &str, _size: u64) -> AnyResult<()> {
+            anyhow::bail!("not implemented for test backend")
+        }
+    }
+
+    let backend: Box<dyn crate::extensions::fs::backend::FsBackend> = Box::new(TestLocalBackend);
 
     match mode {
         crate::extensions::fs::Fs9Mode::Directory { .. } => {
@@ -241,7 +367,7 @@ pub(crate) async fn infer_fs9_table_function_schema(
             exclude,
         } => {
             let files = match crate::extensions::fs::glob::expand_glob(
-                backend,
+                &*backend,
                 &pattern,
                 crate::extensions::fs::MAX_FILES_PER_GLOB,
                 exclude.as_deref(),

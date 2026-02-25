@@ -226,16 +226,24 @@ impl DynamicPgHandler {
             }
         };
 
-        // Enforce fs9 local-filesystem permission (same gate as fs9 table function)
-        let use_remote = crate::extensions::fs::backend::is_remote_configured();
-        if !use_remote && !session.is_superuser() {
+        if !crate::extensions::fs::backend::is_backend_available() {
+            if started_txn {
+                let _ = session.rollback().await;
+            }
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                "58030".to_string(),
+                "fs9: TiKV storage backend not available".to_string(),
+            ))));
+        }
+        if !session.is_superuser() {
             if started_txn {
                 let _ = session.rollback().await;
             }
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_string(),
                 "42501".to_string(),
-                "COPY FROM fs9: local filesystem access denied (requires superuser)".to_string(),
+                "fs9: permission denied".to_string(),
             ))));
         }
 
