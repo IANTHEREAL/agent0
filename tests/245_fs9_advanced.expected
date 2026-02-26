@@ -1,0 +1,840 @@
+CREATE EXTENSION
+ setup_cleanup_existing 
+------------------------
+ 0
+(1 row)
+
+ setup_root_created 
+--------------------
+ t
+(1 row)
+
+ c1_write_20000 
+----------------
+          20000
+(1 row)
+
+ c1_big_len 
+------------
+      20000
+(1 row)
+
+ c1_read_cross_boundary_len 
+----------------------------
+                         40
+(1 row)
+
+    c1_read_cross_boundary_md5    
+----------------------------------
+ 9ae05632bc1fe081894255f7e616f4c1
+(1 row)
+
+ c1_write_at_cross_boundary 
+----------------------------
+                         40
+(1 row)
+
+ c1_after_write_at_cross_boundary_md5 
+--------------------------------------
+ ab8d1589a95c484ddc203cf3c78da369
+(1 row)
+
+ c1_write_50000 
+----------------
+          50000
+(1 row)
+
+ c1_read_spans_3plus_pages_len 
+-------------------------------
+                         40000
+(1 row)
+
+  c1_read_spans_3plus_pages_md5   
+----------------------------------
+ c7409a93574fcba007eb50186abcdcfc
+(1 row)
+
+ c1_write_at_exact_boundary 
+----------------------------
+                         32
+(1 row)
+
+  c1_exact_boundary_segment_md5   
+----------------------------------
+ f0d07aa6ca8fbee5c28c8a84dc9da6e5
+(1 row)
+
+ c1_read_beyond_file_len 
+-------------------------
+                   20000
+(1 row)
+
+ c1_cleanup 
+------------
+ 3
+(1 row)
+
+ c2_write_1_page 
+-----------------
+           16384
+(1 row)
+
+ c2_size_1_page 
+----------------
+          16384
+(1 row)
+
+ c2_write_2_pages 
+------------------
+            32768
+(1 row)
+
+ c2_size_2_pages 
+-----------------
+           32768
+(1 row)
+
+ c2_write_3_pages_partial 
+--------------------------
+                    50000
+(1 row)
+
+ c2_size_3_pages_partial 
+-------------------------
+                   50000
+(1 row)
+
+         c2_read_tail_md5         
+----------------------------------
+ d106043b6fe9a623355e0098f5de7e1f
+(1 row)
+
+ c2_write_large_for_shrink 
+---------------------------
+                     50000
+(1 row)
+
+ c2_overwrite_smaller 
+----------------------
+                 1234
+(1 row)
+
+ c2_size_after_shrink 
+----------------------
+                 1234
+(1 row)
+
+ c2_write_small 
+----------------
+             10
+(1 row)
+
+ c2_overwrite_larger 
+---------------------
+               40000
+(1 row)
+
+ c2_size_after_grow 
+--------------------
+              40000
+(1 row)
+
+ c2_cleanup 
+------------
+ 6
+(1 row)
+
+ c3_create_empty 
+-----------------
+               0
+(1 row)
+
+ c3_append_empty_file 
+----------------------
+                    5
+(1 row)
+
+ c3_after_first_append 
+-----------------------
+ first
+(1 row)
+
+ c3_append_second 
+------------------
+                7
+(1 row)
+
+ c3_append_third 
+-----------------
+               6
+(1 row)
+
+ c3_after_sequential_appends 
+-----------------------------
+ first-second-third
+(1 row)
+
+ c3_boundary_seed 
+------------------
+            16380
+(1 row)
+
+ c3_append_cross_boundary 
+--------------------------
+                       20
+(1 row)
+
+ c3_boundary_size_after_append 
+-------------------------------
+                         16400
+(1 row)
+
+ c3_truncate_then_append_step1 
+-------------------------------
+ t
+(1 row)
+
+ c3_append_after_truncate 
+--------------------------
+                       15
+(1 row)
+
+ c3_after_truncate_append 
+--------------------------
+ first_after_truncate
+(1 row)
+
+ c3_append_large_chunk 
+-----------------------
+                 20000
+(1 row)
+
+ c3_large_append_size 
+----------------------
+                20000
+(1 row)
+
+ c3_cleanup 
+------------
+ 4
+(1 row)
+
+ c4_seed 
+---------
+   20000
+(1 row)
+
+ c4_truncate_zero 
+------------------
+ t
+(1 row)
+
+ c4_size_after_zero 
+--------------------
+                  0
+(1 row)
+
+ c4_reseed 
+-----------
+      1200
+(1 row)
+
+ c4_truncate_noop 
+------------------
+ t
+(1 row)
+
+ c4_size_after_noop 
+--------------------
+               1200
+(1 row)
+
+ c4_truncate_smaller 
+---------------------
+ t
+(1 row)
+
+ c4_size_after_smaller 
+-----------------------
+                   500
+(1 row)
+
+     c4_truncated_content_md5     
+----------------------------------
+ ba7beb03972aa4763fe653cb7fbbc515
+(1 row)
+
+ c4_seed_two_pages 
+-------------------
+             32768
+(1 row)
+
+ c4_truncate_to_one_page 
+-------------------------
+ t
+(1 row)
+
+ c4_size_after_boundary_truncate 
+---------------------------------
+                           16384
+(1 row)
+
+  c4_nonexistent_truncate_behavior   
+-------------------------------------
+ error_expected_nonexistent_truncate
+(1 row)
+
+ c4_gap_seed 
+-------------
+         100
+(1 row)
+
+ c4_gap_truncate 
+-----------------
+ t
+(1 row)
+
+ c4_write_beyond_truncated_size 
+--------------------------------
+                              2
+(1 row)
+
+ c4_gap_size_after_write_at 
+----------------------------
+                         42
+(1 row)
+
+ c4_gap_region_len 
+-------------------
+                20
+(1 row)
+
+        c4_gap_region_md5         
+----------------------------------
+ 441018525208457705bf09a8ee3c1093
+(1 row)
+
+ c4_cleanup 
+------------
+ 4
+(1 row)
+
+ c5_write_empty 
+----------------
+              0
+(1 row)
+
+ c5_empty_read_len 
+-------------------
+                 0
+(1 row)
+
+ c5_write_single_byte 
+----------------------
+                    1
+(1 row)
+
+ c5_single_byte_read 
+---------------------
+ Z
+(1 row)
+
+ c5_read_len_zero 
+------------------
+                0
+(1 row)
+
+ c5_read_offset_beyond_end 
+---------------------------
+                         0
+(1 row)
+
+ c5_writeat0_seed 
+------------------
+                5
+(1 row)
+
+ c5_write_at_zero 
+------------------
+                3
+(1 row)
+
+ c5_after_write_at_zero 
+------------------------
+ XYZde
+(1 row)
+
+ c5_end_seed 
+-------------
+           4
+(1 row)
+
+ c5_write_at_end 
+-----------------
+               2
+(1 row)
+
+ c5_after_write_at_end 
+-----------------------
+ tail++
+(1 row)
+
+ c5_recursive_mkdir 
+--------------------
+ t
+(1 row)
+
+ c5_recursive_mkdir_exists 
+---------------------------
+ t
+(1 row)
+
+ c5_cleanup 
+------------
+ 8
+(1 row)
+
+ c6_write_csv 
+--------------
+           56
+(1 row)
+
+ name  |   city    
+-------+-----------
+ Alice | Seoul
+ Bob   | Tokyo
+ Carol | Singapore
+(3 rows)
+
+ c6_write_jsonl 
+----------------
+             77
+(1 row)
+
+ _line_number |              line              
+--------------+--------------------------------
+            1 | {"ok": true, "evt": "start"}
+            2 | {"ok": false, "evt": "middle"}
+            3 | {"ok": true, "evt": "end"}
+(3 rows)
+
+ c6_write_glob_a 
+-----------------
+               8
+(1 row)
+
+ c6_write_glob_b 
+-----------------
+               8
+(1 row)
+
+ k | v  |          _path          
+---+----+-------------------------
+ 1 | aa | /test_adv/c6/glob/a.csv
+ 2 | bb | /test_adv/c6/glob/b.csv
+(2 rows)
+
+           path            | type 
+---------------------------+------
+ /test_adv/c6/events.jsonl | file
+ /test_adv/c6/glob         | dir
+ /test_adv/c6/users.csv    | file
+(3 rows)
+
+ c6_write_empty_text 
+---------------------
+                   0
+(1 row)
+
+ c6_table_function_empty_rows 
+------------------------------
+                            0
+(1 row)
+
+ c6_write_special_csv 
+----------------------
+                   38
+(1 row)
+
+ id |  txt_visible   
+----+----------------
+ 1  | hello,world
+ 2  | line1<NL>line2
+(2 rows)
+
+ c6_cleanup 
+------------
+ 8
+(1 row)
+
+ c7_mkdir_deep 
+---------------
+ t
+(1 row)
+
+ c7_write_a 
+------------
+          1
+(1 row)
+
+ c7_write_b 
+------------
+          1
+(1 row)
+
+ c7_write_c 
+------------
+          1
+(1 row)
+
+ c7_write_d 
+------------
+          1
+(1 row)
+
+ c7_recursive_remove_count 
+---------------------------
+ 8
+(1 row)
+
+ c7_root_exists_after_remove 
+-----------------------------
+ f
+(1 row)
+
+      c7_nonrecursive_mkdir_behavior      
+------------------------------------------
+ error_expected_nonrecursive_nested_mkdir
+(1 row)
+
+ c7_cleanup 
+------------
+ 1
+(1 row)
+
+psql:tests/245_fs9_advanced.sql:174: ERROR:  embedded_fs: NotFound: /test_adv/c8/no_such_file.txt
+psql:tests/245_fs9_advanced.sql:177: ERROR:  embedded_fs: NotFound: /test_adv/c8/no_such_file.txt
+psql:tests/245_fs9_advanced.sql:180: ERROR:  embedded_fs: NotFound: /test_adv/c8/no_such_file.txt
+psql:tests/245_fs9_advanced.sql:183: ERROR:  embedded_fs: NotFound: /test_adv/c8/no_such_file.txt
+psql:tests/245_fs9_advanced.sql:186: ERROR:  fs9_read_at: offset must be non-negative
+psql:tests/245_fs9_advanced.sql:189: ERROR:  fs9_truncate: size must be non-negative
+ c8_write_at_auto_creates 
+--------------------------
+                        3
+(1 row)
+
+ c8_auto_created_exists 
+------------------------
+ t
+(1 row)
+
+ c8_auto_created_size 
+----------------------
+                    8
+(1 row)
+
+ c8_append_auto_creates 
+------------------------
+                      5
+(1 row)
+
+ c8_auto_appended_exists 
+-------------------------
+ t
+(1 row)
+
+ c8_auto_appended_content 
+--------------------------
+ hello
+(1 row)
+
+ c8_cleanup 
+------------
+ 3
+(1 row)
+
+ c9_write_pattern 
+------------------
+             4000
+(1 row)
+
+          c9_pattern_md5          
+----------------------------------
+ 4c66d7f2428540edf5e5b2aab0940063
+(1 row)
+
+     c9_expected_pattern_md5      
+----------------------------------
+ 4c66d7f2428540edf5e5b2aab0940063
+(1 row)
+
+ c9_middle_seed 
+----------------
+            100
+(1 row)
+
+ c9_middle_patch 
+-----------------
+               3
+(1 row)
+
+     c9_prefix_untouched_md5      
+----------------------------------
+ 82caa281669010542c0c462f6747b5be
+(1 row)
+
+ c9_middle_patch_read 
+----------------------
+ XYZ
+(1 row)
+
+     c9_suffix_untouched_md5      
+----------------------------------
+ 068c28b3a794c65e525552d8e2b1001a
+(1 row)
+
+ c9_multi_seed 
+---------------
+            30
+(1 row)
+
+ c9_multi_patch_1 
+------------------
+                2
+(1 row)
+
+ c9_multi_patch_2 
+------------------
+                2
+(1 row)
+
+ c9_multi_patch_3 
+------------------
+                2
+(1 row)
+
+     c9_multi_after_patches     
+--------------------------------
+ AA........BB........CC........
+(1 row)
+
+ c9_append_seed 
+----------------
+              5
+(1 row)
+
+ c9_append_write 
+-----------------
+              10
+(1 row)
+
+ c9_appended_region 
+--------------------
+ _tail_dat
+(1 row)
+
+ c9_write_control_chars 
+------------------------
+                      7
+(1 row)
+
+ c9_control_len 
+----------------
+              7
+(1 row)
+
+          c9_control_md5          
+----------------------------------
+ 38d43cc060a0c5f204eb81feaa80293e
+(1 row)
+
+ c9_cleanup 
+------------
+ 6
+(1 row)
+
+ c10_init 
+----------
+      100
+(1 row)
+
+ c10_head 
+----------
+        4
+(1 row)
+
+ c10_tail 
+----------
+        4
+(1 row)
+
+ c10_middle 
+------------
+          6
+(1 row)
+
+ c10_head_check 
+----------------
+ HEAD
+(1 row)
+
+ c10_middle_check 
+------------------
+ MIDDLE
+(1 row)
+
+ c10_tail_check 
+----------------
+ TAIL
+(1 row)
+
+ c10_total_len 
+---------------
+           100
+(1 row)
+
+ c10_cycle_write 
+-----------------
+               7
+(1 row)
+
+ c10_cycle_append1 
+-------------------
+                 9
+(1 row)
+
+ c10_cycle_trunc 
+-----------------
+ t
+(1 row)
+
+ c10_cycle_append2 
+-------------------
+                 3
+(1 row)
+
+ c10_cycle_result 
+------------------
+ initial_v2
+(1 row)
+
+ c10_write_100k 
+----------------
+         102400
+(1 row)
+
+ c10_100k_size 
+---------------
+        102400
+(1 row)
+
+ c10_100k_integrity 
+--------------------
+ t
+(1 row)
+
+ c10_patch_100k 
+----------------
+           1000
+(1 row)
+
+ c10_prefix_intact 
+-------------------
+ t
+(1 row)
+
+ c10_patch_correct 
+-------------------
+ t
+(1 row)
+
+ c10_suffix_intact 
+-------------------
+ t
+(1 row)
+
+ c10_batch_mkdir 
+-----------------
+ t
+(1 row)
+
+ c10_f01 
+---------
+       6
+(1 row)
+
+ c10_f02 
+---------
+       6
+(1 row)
+
+ c10_f03 
+---------
+       6
+(1 row)
+
+ c10_f04 
+---------
+       6
+(1 row)
+
+ c10_f05 
+---------
+       6
+(1 row)
+
+ c10_f06 
+---------
+       3
+(1 row)
+
+ c10_f07 
+---------
+       3
+(1 row)
+
+ c10_f08 
+---------
+       3
+(1 row)
+
+ c10_f09 
+---------
+       3
+(1 row)
+
+ c10_f10 
+---------
+       3
+(1 row)
+
+ c10_txt_count 
+---------------
+             5
+(1 row)
+
+ c10_csv_count 
+---------------
+             0
+(1 row)
+
+ c10_all_count 
+---------------
+            10
+(1 row)
+
+ c10_dir_entry_count 
+---------------------
+                  10
+(1 row)
+
+ c10_cleanup 
+-------------
+ 15
+(1 row)
+
+ final_cleanup 
+---------------
+ 1
+(1 row)
+
