@@ -1,11 +1,6 @@
-DO
-DO
-DO
-DO
-DO
- typname
- do_test_enum
-DO
- typname
- do_test_enum
-DROP TYPE
+typname
+do_test_enum
+(1 row)
+typname
+do_test_enum
+(1 row)

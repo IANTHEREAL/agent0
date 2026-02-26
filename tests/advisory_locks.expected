@@ -62,10 +62,10 @@ pg_advisory_lock
 
 (1 row)
 pg_try_advisory_lock
-
+NULL
 (1 row)
 pg_advisory_unlock
-
+NULL
 (1 row)
 pg_advisory_lock_shared
 

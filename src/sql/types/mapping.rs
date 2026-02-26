@@ -154,17 +154,17 @@ fn numeric_precision_and_scale(info: &ExactNumberInfo) -> (Option<u32>, Option<u
 }
 
 fn validate_numeric_spec(precision: Option<u32>, scale: Option<u32>) -> Result<()> {
+    // PostgreSQL typmod boundary: NUMERIC precision can be up to 1000.
+    // Runtime arithmetic is still bounded by the internal decimal implementation.
+    const PG_NUMERIC_MAX_PRECISION: u32 = 1000;
+
     if let Some(p) = precision {
-        if p > 28 {
+        if p > PG_NUMERIC_MAX_PRECISION {
             return Err(anyhow!(
-                "NUMERIC precision {} exceeds supported maximum 28",
-                p
+                "NUMERIC precision {} exceeds supported maximum {}",
+                p,
+                PG_NUMERIC_MAX_PRECISION
             ));
-        }
-    }
-    if let Some(s) = scale {
-        if s > 28 {
-            return Err(anyhow!("NUMERIC scale {} exceeds supported maximum 28", s));
         }
     }
     if let (Some(p), Some(s)) = (precision, scale) {

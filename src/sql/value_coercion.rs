@@ -7,6 +7,8 @@ use anyhow::{anyhow, Result};
 use rust_decimal::Decimal;
 use std::str::FromStr;
 
+const MAX_RUNTIME_NUMERIC_SCALE: u32 = Decimal::MAX_SCALE;
+
 use sqlparser::ast::Expr;
 
 use crate::model::{ColumnDef, DataType, Value};
@@ -252,7 +254,7 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Result<Value> {
                 })
             })?;
             if let Some(s) = scale {
-                d.rescale(*s);
+                d.rescale((*s).min(MAX_RUNTIME_NUMERIC_SCALE));
             }
             Ok(Value::Numeric(d))
         }

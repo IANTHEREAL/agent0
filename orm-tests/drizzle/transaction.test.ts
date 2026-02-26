@@ -163,33 +163,24 @@ describe('Drizzle Transactions & Isolation [db9-server]', () => {
       );
     });
 
-    it('should reject serializable isolation (not supported by TiKV)', async () => {
-      let error: Error | null = null;
-      try {
-        await db.transaction(
-          async (tx) => {
-            await tx.insert(drizzleUsers).values({
-              email: 'serial@example.com',
-              name: 'Serializable',
-              age: 25,
-            });
-          },
-          { isolationLevel: 'serializable' }
-        );
-      } catch (err) {
-        error = err as Error;
-      }
-
-      // TiKV does not support SERIALIZABLE; the server must reject it honestly.
-      expect(error).not.toBeNull();
-      expect(error!.message).toMatch(/SERIALIZABLE/i);
+    it('should accept serializable request by downgrading to TiKV-compatible isolation', async () => {
+      await db.transaction(
+        async (tx) => {
+          await tx.insert(drizzleUsers).values({
+            email: 'serial@example.com',
+            name: 'Serializable',
+            age: 25,
+          });
+        },
+        { isolationLevel: 'serializable' }
+      );
 
       const users = await db
         .select()
         .from(drizzleUsers)
         .where(eq(drizzleUsers.email, 'serial@example.com'));
 
-      expect(users).toHaveLength(0);
+      expect(users).toHaveLength(1);
     });
   });
 

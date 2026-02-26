@@ -590,10 +590,15 @@ impl SessionSettings {
                         Ok("repeatable read".to_string())
                     }
                     "repeatable read" => Ok("repeatable read".to_string()),
-                    "serializable" => Err(SqlError::Unsupported(
-                        "SERIALIZABLE isolation level is not supported".into(),
-                    )
-                    .into()),
+                    "serializable" => {
+                        tracing::warn!(
+                            requested = "serializable",
+                            actual = "repeatable read",
+                            "TiKV cannot provide PostgreSQL SERIALIZABLE semantics; \
+                             the requested isolation level has been downgraded"
+                        );
+                        Ok("repeatable read".to_string())
+                    }
                     _ => Err(SqlError::InvalidParameterValue {
                         message: format!(
                             "invalid value for parameter \"transaction_isolation\": \"{}\"",

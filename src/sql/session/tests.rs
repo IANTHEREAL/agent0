@@ -284,14 +284,13 @@ mod tests {
             Some("off")
         );
 
-        // SERIALIZABLE must be rejected
+        // SERIALIZABLE is accepted but downgraded to REPEATABLE READ
         assert!(settings
             .set_known_setting("transaction_isolation", "serializable".to_string())
-            .is_err());
+            .unwrap());
         assert!(settings
             .set_known_setting("transaction_isolation", "SERIALIZABLE".to_string())
-            .is_err());
-        // Value should remain unchanged after rejection
+            .unwrap());
         assert_eq!(
             settings.show_value("transaction_isolation").as_deref(),
             Some("repeatable read")

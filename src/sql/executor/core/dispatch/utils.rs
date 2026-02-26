@@ -8,7 +8,7 @@ use std::pin::Pin;
 /// Validate and apply transaction modes (isolation level, access mode) from
 /// `BEGIN ISOLATION LEVEL ...` or `START TRANSACTION ...` statements.
 ///
-/// Rejects SERIALIZABLE (TiKV cannot provide true serializable guarantees)
+/// Downgrades SERIALIZABLE to REPEATABLE READ (TiKV snapshot isolation)
 /// and stores accepted modes in the session for `SHOW` readback.
 pub(in crate::sql::executor::core) fn validate_transaction_modes(
     session: &mut Session,
@@ -21,13 +21,16 @@ pub(in crate::sql::executor::core) fn validate_transaction_modes(
                     TransactionIsolationLevel::ReadUncommitted
                     | TransactionIsolationLevel::ReadCommitted => "read committed",
                     TransactionIsolationLevel::RepeatableRead => "repeatable read",
-                    TransactionIsolationLevel::Serializable => {
-                        return Err(SqlError::Unsupported(
-                            "SERIALIZABLE isolation level is not supported".into(),
-                        )
-                        .into());
-                    }
+                    TransactionIsolationLevel::Serializable => "repeatable read",
                 };
+                if matches!(level, TransactionIsolationLevel::Serializable) {
+                    tracing::warn!(
+                        requested = "serializable",
+                        actual = "repeatable read",
+                        "TiKV cannot provide PostgreSQL SERIALIZABLE semantics; \
+                         BEGIN/START TRANSACTION request has been downgraded"
+                    );
+                }
                 session.set_known_setting("transaction_isolation", level_str.to_string())?;
             }
             TransactionMode::AccessMode(access_mode) => {

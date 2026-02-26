@@ -38,12 +38,13 @@ mod decimal_serde {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Decimal, D::Error> {
         let parts = DecimalParts::deserialize(deserializer)?;
+        let scale = parts.scale.min(Decimal::MAX_SCALE);
         Ok(Decimal::from_parts(
             parts.lo,
             parts.mid,
             parts.hi,
             parts.negative,
-            parts.scale,
+            scale,
         ))
     }
 }
@@ -69,9 +70,10 @@ pub enum DataType {
     UserDefined(String),
     Date, // Date without time zone (days since 1970-01-01)
     /// NUMERIC/DECIMAL with optional precision and scale
-    /// Currently backed by `rust_decimal` (max 28 digits, scale 0-28).
-    /// precision: total number of digits (<= 28, default unlimited)
-    /// scale: digits after decimal point (0-28, default 0)
+    /// DDL typmod accepts PostgreSQL-compatible precision metadata.
+    /// Runtime arithmetic/coercion is currently backed by `rust_decimal` (effective scale <= 28).
+    /// precision: total number of digits (typmod metadata)
+    /// scale: digits after decimal point (typmod metadata)
     Numeric {
         precision: Option<u32>,
         scale: Option<u32>,

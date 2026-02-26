@@ -12,6 +12,7 @@ use crate::model::{DataType, FunctionDef, Value};
 use crate::sql::error::SqlError;
 use crate::sql::names;
 use crate::sql::parse_sql;
+use crate::sql::raw_sql::{classify, RawSqlKind};
 use crate::sql::quoting;
 use crate::sql::sequences;
 use crate::sql::ExecuteResult;
@@ -73,6 +74,7 @@ pub fn execute_plpgsql_function<'a>(
                     search_path,
                     &ctx,
                     &expr_str,
+                    executor,
                 )
                 .await?
             } else {
@@ -126,6 +128,7 @@ fn execute_statements<'a>(
                         search_path,
                         ctx,
                         expr_str,
+                        executor,
                     )
                     .await;
                 }
@@ -139,6 +142,7 @@ fn execute_statements<'a>(
                         search_path,
                         ctx,
                         expr_str,
+                        executor,
                     )
                     .await?;
                     ctx.set_var(var_name, value);
@@ -153,6 +157,7 @@ fn execute_statements<'a>(
                         search_path,
                         ctx,
                         condition,
+                        executor,
                     )
                     .await?;
                     let is_true = match cond_value {
@@ -216,6 +221,21 @@ fn execute_statements<'a>(
                     let expanded = substitute_variables(ctx, sql);
                     let exec = executor
                         .ok_or_else(|| anyhow!("SQL statement requires execution context"))?;
+
+                    let raw_trimmed = expanded.trim().trim_end_matches(';').trim();
+                    let raw_upper = raw_trimmed.to_ascii_uppercase();
+                    if matches!(classify(&raw_upper), Some(RawSqlKind::CreateTypeEnum)) {
+                        let _ = exec
+                            .execute_create_type_enum_on_txn(
+                                txn,
+                                db_id,
+                                search_path,
+                                raw_trimmed,
+                            )
+                            .await?;
+                        continue;
+                    }
+
                     let stmts = parse_sql(&expanded)?;
                     for stmt in stmts {
                         exec.execute_statement_on_txn(
@@ -368,6 +388,7 @@ fn execute_statements<'a>(
                         search_path,
                         ctx,
                         start_expr,
+                        executor,
                     )
                     .await?;
                     let end_val = evaluate_expression(
@@ -378,6 +399,7 @@ fn execute_statements<'a>(
                         search_path,
                         ctx,
                         end_expr,
+                        executor,
                     )
                     .await?;
 
@@ -400,6 +422,7 @@ fn execute_statements<'a>(
                             search_path,
                             ctx,
                             step_str,
+                            executor,
                         )
                         .await?;
                         match step_val {
@@ -482,9 +505,27 @@ async fn evaluate_expression(
     search_path: &[String],
     ctx: &PlpgsqlContext,
     expr_str: &str,
+    executor: Option<&Executor>,
 ) -> Result<Value> {
     let expanded = substitute_variables(ctx, expr_str);
     let sql = format!("SELECT {}", expanded);
+
+    if let Some(exec) = executor {
+        let stmts = parse_sql(&sql)?;
+        if let Some(stmt) = stmts.first() {
+            let result = exec
+                .execute_statement_on_txn(txn, db_id, sequence_values, search_path, stmt, None)
+                .await?;
+            if let ExecuteResult::Select { rows, .. } = result {
+                if let Some(first_row) = rows.first() {
+                    return Ok(first_row.values.first().cloned().unwrap_or(Value::Null));
+                }
+                return Ok(Value::Null);
+            }
+            return Ok(Value::Null);
+        }
+    }
+
     if let Ok(stmts) = parse_sql(&sql) {
         if let Some(sqlparser::ast::Statement::Query(query)) = stmts.into_iter().next() {
             if let sqlparser::ast::SetExpr::Select(select) = *query.body {

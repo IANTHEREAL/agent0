@@ -11,6 +11,8 @@ use anyhow::{anyhow, Result};
 use rust_decimal::Decimal;
 use std::str::FromStr;
 
+const MAX_RUNTIME_NUMERIC_SCALE: u32 = Decimal::MAX_SCALE;
+
 /// Controls which type conversions are allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CastContext {
@@ -428,21 +430,21 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 value: s,
             })?;
             if let Some(s) = scale {
-                d.rescale(*s);
+                d.rescale((*s).min(MAX_RUNTIME_NUMERIC_SCALE));
             }
             Ok(Value::Numeric(d))
         }
         (Value::Int32(n), DataType::Numeric { scale, .. }) => {
             let mut d = Decimal::from(n);
             if let Some(s) = scale {
-                d.rescale(*s);
+                d.rescale((*s).min(MAX_RUNTIME_NUMERIC_SCALE));
             }
             Ok(Value::Numeric(d))
         }
         (Value::Int64(n), DataType::Numeric { scale, .. }) => {
             let mut d = Decimal::from(n);
             if let Some(s) = scale {
-                d.rescale(*s);
+                d.rescale((*s).min(MAX_RUNTIME_NUMERIC_SCALE));
             }
             Ok(Value::Numeric(d))
         }
@@ -452,14 +454,14 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 value: f.to_string(),
             })?;
             if let Some(s) = scale {
-                d.rescale(*s);
+                d.rescale((*s).min(MAX_RUNTIME_NUMERIC_SCALE));
             }
             Ok(Value::Numeric(d))
         }
         (Value::Numeric(d), DataType::Numeric { scale, .. }) => {
             let mut d = d;
             if let Some(s) = scale {
-                d.rescale(*s);
+                d.rescale((*s).min(MAX_RUNTIME_NUMERIC_SCALE));
             }
             Ok(Value::Numeric(d))
         }

@@ -7,10 +7,37 @@ use super::super::udt;
 use super::super::{ExecuteResult, ExecuteResults, Session};
 use super::core::Executor;
 
+fn strip_leading_sql_comments(input: &str) -> &str {
+    let mut s = input;
+    loop {
+        let trimmed = s.trim_start();
+
+        if let Some(rest) = trimmed.strip_prefix("--") {
+            if let Some(newline) = rest.find('\n') {
+                s = &rest[newline + 1..];
+                continue;
+            }
+            return "";
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("/*") {
+            if let Some(end) = rest.find("*/") {
+                s = &rest[end + 2..];
+                continue;
+            }
+            return "";
+        }
+
+        return trimmed;
+    }
+}
+
 fn trim_sql_end(sql: &str) -> &str {
-    sql.trim()
+    let trimmed = sql
+        .trim()
         .trim_end_matches(';')
-        .trim_end_matches(|c: char| c.is_whitespace())
+        .trim_end_matches(|c: char| c.is_whitespace());
+    strip_leading_sql_comments(trimmed)
 }
 
 fn consume_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
@@ -250,9 +277,11 @@ fn split_names_list(input: &str) -> Result<Vec<&str>> {
 }
 
 impl Executor {
-    pub(crate) async fn execute_create_type_enum_cmd(
+    pub(crate) async fn execute_create_type_enum_on_txn(
         &self,
-        session: &mut Session,
+        txn: &mut Transaction,
+        db_id: u64,
+        search_path: &[String],
         sql: &str,
     ) -> Result<ExecuteResult> {
         let sql = trim_sql_end(sql);
@@ -271,6 +300,19 @@ impl Executor {
 
         let type_name = parse_object_name_token(type_token)?;
         let (labels, _tail) = parse_enum_labels(rest)?;
+        let resolved = names::resolve_ddl_object_name(&type_name, search_path)?;
+        let store = self.store();
+        if !store.schema_exists(txn, db_id, &resolved.schema).await? {
+            return Err(anyhow!("schema '{}' does not exist", resolved.schema));
+        }
+        udt::create_enum_type(&store, txn, db_id, resolved.schema, resolved.name, labels).await
+    }
+
+    pub(crate) async fn execute_create_type_enum_cmd(
+        &self,
+        session: &mut Session,
+        sql: &str,
+    ) -> Result<ExecuteResult> {
         let search_path: Vec<String> = session.search_path().to_vec();
 
         let is_autocommit = !session.is_in_transaction();
@@ -281,12 +323,8 @@ impl Executor {
         let result = async {
             let db_id = session.current_database_id();
             let txn: &mut Transaction = session.get_mut_txn().expect("Transaction must be active");
-            let resolved = names::resolve_ddl_object_name(&type_name, &search_path)?;
-            let store = self.store();
-            if !store.schema_exists(txn, db_id, &resolved.schema).await? {
-                return Err(anyhow!("schema '{}' does not exist", resolved.schema));
-            }
-            udt::create_enum_type(&store, txn, db_id, resolved.schema, resolved.name, labels).await
+            self.execute_create_type_enum_on_txn(txn, db_id, &search_path, sql)
+                .await
         }
         .await;
 
@@ -534,5 +572,11 @@ mod tests {
 
         let names = split_names_list("role, \"Role\", myschema.role").unwrap();
         assert_eq!(names, vec!["role", "\"Role\"", "myschema.role"]);
+    }
+
+    #[test]
+    fn test_trim_sql_end_strips_leading_comments() {
+        let sql = "  -- CreateEnum\n/* marker */\nCREATE TYPE \"T\" AS ENUM ('a');  ";
+        assert_eq!(trim_sql_end(sql), "CREATE TYPE \"T\" AS ENUM ('a')");
     }
 }
