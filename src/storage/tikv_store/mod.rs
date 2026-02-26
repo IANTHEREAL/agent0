@@ -475,24 +475,37 @@ impl TikvStore {
         Ok(records)
     }
 
-    pub async fn next_schema_oid(&self, txn: &mut Transaction, db_id: u64) -> Result<u32> {
-        const FIRST_USER_SCHEMA_OID: u32 = 20000;
-
-        let key = self.key(&encode_next_schema_oid_key_v2(db_id));
+    async fn next_oid_u32(
+        &self,
+        txn: &mut Transaction,
+        key: Vec<u8>,
+        first_value: u32,
+        entity_name: &str,
+    ) -> Result<u32> {
         let current = txn.get(key.clone()).await?;
         let next_val = match current {
             Some(data) => {
                 let oid = u32::from_be_bytes(
                     data.try_into()
-                        .map_err(|_| anyhow!("Invalid schema OID format"))?,
+                        .map_err(|_| anyhow!("Invalid {} OID format", entity_name))?,
                 );
                 oid.checked_add(1)
-                    .ok_or_else(|| anyhow!("Schema OID overflow"))?
+                    .ok_or_else(|| anyhow!("{} OID overflow", entity_name))?
             }
-            None => FIRST_USER_SCHEMA_OID,
+            None => first_value,
         };
         txn_put(txn, key, next_val.to_be_bytes().to_vec()).await?;
         Ok(next_val)
+    }
+
+    pub async fn next_schema_oid(&self, txn: &mut Transaction, db_id: u64) -> Result<u32> {
+        self.next_oid_u32(
+            txn,
+            self.key(&encode_next_schema_oid_key_v2(db_id)),
+            20000,
+            "schema",
+        )
+        .await
     }
 
     /// Get the next table ID (auto-increment)
@@ -515,83 +528,43 @@ impl TikvStore {
     }
 
     pub async fn next_type_oid(&self, txn: &mut Transaction, db_id: u64) -> Result<u32> {
-        const FIRST_USER_TYPE_OID: u32 = 20000;
-
-        let key = self.key(&encode_next_type_oid_key_v2(db_id));
-        let current = txn.get(key.clone()).await?;
-        let next_val = match current {
-            Some(data) => {
-                let oid = u32::from_be_bytes(
-                    data.try_into()
-                        .map_err(|_| anyhow!("Invalid type OID format"))?,
-                );
-                oid.checked_add(1)
-                    .ok_or_else(|| anyhow!("Type OID overflow"))?
-            }
-            None => FIRST_USER_TYPE_OID,
-        };
-        txn_put(txn, key, next_val.to_be_bytes().to_vec()).await?;
-        Ok(next_val)
+        self.next_oid_u32(
+            txn,
+            self.key(&encode_next_type_oid_key_v2(db_id)),
+            20000,
+            "type",
+        )
+        .await
     }
 
     pub async fn next_function_oid(&self, txn: &mut Transaction, db_id: u64) -> Result<u32> {
-        const FIRST_FUNCTION_OID: u32 = 1;
-
-        let key = self.key(&encode_next_function_oid_key_v2(db_id));
-        let current = txn.get(key.clone()).await?;
-        let next_val = match current {
-            Some(data) => {
-                let oid = u32::from_be_bytes(
-                    data.try_into()
-                        .map_err(|_| anyhow!("Invalid function OID format"))?,
-                );
-                oid.checked_add(1)
-                    .ok_or_else(|| anyhow!("Function OID overflow"))?
-            }
-            None => FIRST_FUNCTION_OID,
-        };
-        txn_put(txn, key, next_val.to_be_bytes().to_vec()).await?;
-        Ok(next_val)
+        self.next_oid_u32(
+            txn,
+            self.key(&encode_next_function_oid_key_v2(db_id)),
+            1,
+            "function",
+        )
+        .await
     }
 
     pub async fn next_trigger_oid(&self, txn: &mut Transaction, db_id: u64) -> Result<u32> {
-        const FIRST_TRIGGER_OID: u32 = 1;
-
-        let key = self.key(&encode_next_trigger_oid_key_v2(db_id));
-        let current = txn.get(key.clone()).await?;
-        let next_val = match current {
-            Some(data) => {
-                let oid = u32::from_be_bytes(
-                    data.try_into()
-                        .map_err(|_| anyhow!("Invalid trigger OID format"))?,
-                );
-                oid.checked_add(1)
-                    .ok_or_else(|| anyhow!("Trigger OID overflow"))?
-            }
-            None => FIRST_TRIGGER_OID,
-        };
-        txn_put(txn, key, next_val.to_be_bytes().to_vec()).await?;
-        Ok(next_val)
+        self.next_oid_u32(
+            txn,
+            self.key(&encode_next_trigger_oid_key_v2(db_id)),
+            1,
+            "trigger",
+        )
+        .await
     }
 
     pub async fn next_view_oid(&self, txn: &mut Transaction, db_id: u64) -> Result<u32> {
-        const FIRST_VIEW_OID: u32 = 1;
-
-        let key = self.key(&encode_next_view_oid_key_v2(db_id));
-        let current = txn.get(key.clone()).await?;
-        let next_val = match current {
-            Some(data) => {
-                let oid = u32::from_be_bytes(
-                    data.try_into()
-                        .map_err(|_| anyhow!("Invalid view OID format"))?,
-                );
-                oid.checked_add(1)
-                    .ok_or_else(|| anyhow!("View OID overflow"))?
-            }
-            None => FIRST_VIEW_OID,
-        };
-        txn_put(txn, key, next_val.to_be_bytes().to_vec()).await?;
-        Ok(next_val)
+        self.next_oid_u32(
+            txn,
+            self.key(&encode_next_view_oid_key_v2(db_id)),
+            1,
+            "view",
+        )
+        .await
     }
 }
 
