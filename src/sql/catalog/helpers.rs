@@ -79,6 +79,19 @@ pub fn int2vector_col(name: &str) -> ColumnDef {
     }
 }
 
+pub fn oidvector_col(name: &str) -> ColumnDef {
+    ColumnDef {
+        name: name.to_string(),
+        data_type: DataType::UserDefined("oidvector".to_string()),
+        nullable: true,
+        primary_key: false,
+        unique: false,
+        is_serial: false,
+        default_expr: None,
+        collation: None,
+    }
+}
+
 pub fn int_array_col(name: &str) -> ColumnDef {
     ColumnDef {
         name: name.to_string(),
@@ -126,6 +139,12 @@ pub fn split_schema_and_name(full: &str) -> (String, String) {
         Ok((schema, name)) => (schema, name),
         Err(_) => ("public".to_string(), full.to_string()),
     }
+}
+
+/// UNIQUE constraints are represented by a backing unique index that has the
+/// constraint bit set. Plain CREATE UNIQUE INDEX entries are not constraints.
+pub fn is_unique_constraint_index(idx: &IndexDef) -> bool {
+    idx.unique && idx.is_constraint
 }
 
 pub fn access_method_oid(method: Option<&str>) -> i64 {
@@ -251,5 +270,34 @@ pub fn format_epoch_ms(epoch_ms: i64) -> String {
     match chrono::DateTime::from_timestamp(secs, nanos) {
         Some(dt) => dt.format("%Y-%m-%d %H:%M:%S%.3f+00").to_string(),
         None => epoch_ms.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_unique_constraint_index;
+    use crate::model::IndexDef;
+    use crate::worker::types::IndexState;
+
+    #[test]
+    fn unique_constraint_filter_requires_constraint_bit() {
+        let plain_unique_index = IndexDef {
+            name: "uq_idx".to_string(),
+            id: 1,
+            columns: vec!["a".to_string()],
+            unique: true,
+            is_constraint: false,
+            method: Some("btree".to_string()),
+            predicate: None,
+            expressions: vec![],
+            state: IndexState::Ready,
+        };
+        assert!(!is_unique_constraint_index(&plain_unique_index));
+
+        let unique_constraint_backing_index = IndexDef {
+            is_constraint: true,
+            ..plain_unique_index
+        };
+        assert!(is_unique_constraint_index(&unique_constraint_backing_index));
     }
 }

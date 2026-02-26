@@ -427,6 +427,7 @@ mod tests {
             id: 1,
             columns: vec!["email".to_string()],
             unique: true,
+            is_constraint: false,
             method: Some("btree".to_string()),
             predicate: Some("email IS NOT NULL".to_string()),
             expressions: vec![],

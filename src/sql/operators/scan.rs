@@ -592,6 +592,7 @@ mod tests {
             id: 42,
             columns: index_columns.into_iter().map(|c| c.to_string()).collect(),
             unique: false,
+            is_constraint: false,
             method: None,
             predicate: None,
             expressions: vec![],

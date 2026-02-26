@@ -12,6 +12,7 @@ pub(crate) const OID_TID: i64 = 27;
 pub(crate) const OID_XID: i64 = 28;
 pub(crate) const OID_CID: i64 = 29;
 pub(crate) const OID_JSON: i64 = 114;
+pub(crate) const OID_ANYARRAY: i64 = 2277;
 pub(crate) const OID_FLOAT4: i64 = 700;
 pub(crate) const OID_FLOAT8: i64 = 701;
 pub(crate) const OID_BPCHAR: i64 = 1042;

@@ -1310,6 +1310,7 @@ fn make_schema_with_index() -> TableSchema {
         id: 100,
         columns: vec!["id".to_string()],
         unique: true,
+        is_constraint: false,
         method: Some("btree".to_string()),
         predicate: None,
         expressions: vec![],

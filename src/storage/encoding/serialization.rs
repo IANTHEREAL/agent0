@@ -51,8 +51,7 @@ pub fn serialize_schema_v2(schema: &TableSchema) -> Result<Vec<u8>> {
 
 pub fn deserialize_schema(data: &[u8]) -> Result<TableSchema> {
     if let Some(payload) = data.strip_prefix(SCHEMA_MAGIC_V2) {
-        return rmp_serde::from_slice(payload)
-            .context("Failed to deserialize V2 MessagePack schema");
+        return deserialize_v2_msgpack(payload);
     }
     if let Some(payload) = data.strip_prefix(SCHEMA_MAGIC_V1) {
         return deserialize_v1_bincode(payload);
@@ -60,13 +59,114 @@ pub fn deserialize_schema(data: &[u8]) -> Result<TableSchema> {
     anyhow::bail!("Schema data missing magic header (expected DB9_SCHEMA_V2 or V1)")
 }
 
+#[derive(serde::Deserialize)]
+struct V2Schema {
+    pub name: String,
+    pub table_id: u64,
+    pub columns: Vec<crate::model::ColumnDef>,
+    pub version: u64,
+    #[serde(default)]
+    pub pk_constraint_name: Option<String>,
+    pub pk_indices: Vec<usize>,
+    pub indexes: Vec<V2IndexDef>,
+    #[serde(default)]
+    pub check_constraints: Vec<crate::model::CheckConstraint>,
+    #[serde(default)]
+    pub foreign_keys: Vec<crate::model::ForeignKeyConstraint>,
+    #[serde(default = "default_v2_owner")]
+    pub owner: String,
+    #[serde(default)]
+    pub from_alias: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct V2IndexDef {
+    pub name: String,
+    pub id: u64,
+    pub columns: Vec<String>,
+    pub unique: bool,
+    #[serde(default)]
+    pub is_constraint: Option<bool>,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub predicate: Option<String>,
+    #[serde(default)]
+    pub expressions: Vec<String>,
+    #[serde(default)]
+    pub state: crate::worker::types::IndexState,
+}
+
+impl From<V2Schema> for TableSchema {
+    fn from(s: V2Schema) -> Self {
+        let V2Schema {
+            name,
+            table_id,
+            columns,
+            version,
+            pk_constraint_name,
+            pk_indices,
+            indexes,
+            check_constraints,
+            foreign_keys,
+            owner,
+            from_alias,
+        } = s;
+
+        let decoded_indexes: Vec<crate::model::IndexDef> = indexes
+            .into_iter()
+            .map(|idx| {
+                let is_constraint = idx
+                    .is_constraint
+                    .unwrap_or_else(|| legacy_index_constraint_default(idx.unique, &idx.columns));
+                crate::model::IndexDef {
+                    name: idx.name,
+                    id: idx.id,
+                    columns: idx.columns,
+                    unique: idx.unique,
+                    is_constraint,
+                    method: idx.method,
+                    predicate: idx.predicate,
+                    expressions: idx.expressions,
+                    state: idx.state,
+                }
+            })
+            .collect();
+
+        TableSchema {
+            name,
+            table_id,
+            columns,
+            version,
+            pk_constraint_name,
+            pk_indices,
+            indexes: decoded_indexes,
+            check_constraints,
+            foreign_keys,
+            owner,
+            from_alias,
+        }
+    }
+}
+
+fn deserialize_v2_msgpack(payload: &[u8]) -> Result<TableSchema> {
+    let decoded: V2Schema =
+        rmp_serde::from_slice(payload).context("Failed to deserialize V2 MessagePack schema")?;
+    Ok(decoded.into())
+}
+
+fn default_v2_owner() -> String {
+    "postgres".to_string()
+}
+
 // ===== V1 bincode (frozen — read only) =====
 //
-// | Era | ColumnDef.collation | IndexDef.state |
-// |-----|---------------------|----------------|
-// |  3  | ✓                   | ✓              |
-// |  2  | ✗                   | ✓              |
-// |  1  | ✗                   | ✗              |
+// | Era | ColumnDef.collation | IndexDef.state | IndexDef.is_constraint |
+// |-----|---------------------|----------------|------------------------|
+// |  4  | ✓                   | ✓              | ✓                      |
+// |  3  | ✓                   | ✓              | ✗ (inferred)           |
+// |  2  | ✗                   | ✓              | ✗ (inferred)           |
+// |  1  | ✗                   | ✗              | ✗ (inferred)           |
 
 fn warn_v1_once(era: u8) {
     static W1: Once = Once::new();
@@ -81,7 +181,7 @@ fn warn_v1_once(era: u8) {
         tracing::warn!(
             sunset_date = LEGACY_SUNSET_DATE,
             era,
-            "V1 bincode schema active; will be rewritten as V2 msgpack on next DDL"
+            "V1 bincode schema active; will be rewritten as V2 msgpack on next DDL (legacy unique indexes default to UNIQUE constraints when legacy metadata is ambiguous)"
         );
     });
 }
@@ -90,6 +190,10 @@ fn deserialize_v1_bincode(payload: &[u8]) -> Result<TableSchema> {
     if let Ok(s) = bincode::deserialize::<TableSchema>(payload) {
         warn_v1_once(3);
         return Ok(s);
+    }
+    if let Ok(s) = bincode::deserialize::<V1Era3Schema>(payload) {
+        warn_v1_once(3);
+        return Ok(s.into());
     }
     if let Ok(s) = bincode::deserialize::<V1Era2Schema>(payload) {
         warn_v1_once(2);
@@ -100,7 +204,7 @@ fn deserialize_v1_bincode(payload: &[u8]) -> Result<TableSchema> {
         return Ok(s.into());
     }
     anyhow::bail!(
-        "Failed to deserialize V1 bincode schema (tried era-3, era-2/pre-collation, era-1/pre-index-state)"
+        "Failed to deserialize V1 bincode schema (tried era-4/current, era-3/pre-index-constraint-bit, era-2/pre-collation, era-1/pre-index-state)"
     )
 }
 
@@ -145,7 +249,111 @@ struct V1IndexDef {
     pub expressions: Vec<String>,
 }
 
+// Era 3: has IndexDef.state + ColumnDef.collation, no IndexDef.is_constraint
+#[derive(serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+struct V1Era3IndexDef {
+    pub name: String,
+    pub id: u64,
+    pub columns: Vec<String>,
+    pub unique: bool,
+    pub method: Option<String>,
+    pub predicate: Option<String>,
+    pub expressions: Vec<String>,
+    pub state: crate::worker::types::IndexState,
+}
+
+#[derive(serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+struct V1Era3Schema {
+    pub name: String,
+    pub table_id: u64,
+    pub columns: Vec<crate::model::ColumnDef>,
+    pub version: u64,
+    pub pk_constraint_name: Option<String>,
+    pub pk_indices: Vec<usize>,
+    pub indexes: Vec<V1Era3IndexDef>,
+    pub check_constraints: Vec<crate::model::CheckConstraint>,
+    pub foreign_keys: Vec<crate::model::ForeignKeyConstraint>,
+    pub owner: String,
+    pub from_alias: Option<String>,
+}
+
+impl From<V1Era3Schema> for TableSchema {
+    fn from(s: V1Era3Schema) -> Self {
+        use crate::model::IndexDef;
+        let V1Era3Schema {
+            name,
+            table_id,
+            columns,
+            version,
+            pk_constraint_name,
+            pk_indices,
+            indexes,
+            check_constraints,
+            foreign_keys,
+            owner,
+            from_alias,
+        } = s;
+        let decoded_indexes: Vec<IndexDef> = indexes
+            .into_iter()
+            .map(|idx| {
+                let V1Era3IndexDef {
+                    name: idx_name,
+                    id,
+                    columns,
+                    unique,
+                    method,
+                    predicate,
+                    expressions,
+                    state,
+                } = idx;
+                let is_constraint = legacy_index_constraint_default(unique, &columns);
+                IndexDef {
+                    name: idx_name,
+                    id,
+                    columns,
+                    unique,
+                    is_constraint,
+                    method,
+                    predicate,
+                    expressions,
+                    state,
+                }
+            })
+            .collect();
+
+        TableSchema {
+            name,
+            table_id,
+            columns,
+            version,
+            pk_constraint_name,
+            pk_indices,
+            indexes: decoded_indexes,
+            check_constraints,
+            foreign_keys,
+            owner,
+            from_alias,
+        }
+    }
+}
+
 // Era 2: has IndexDef.state, no ColumnDef.collation
+#[derive(serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+struct V1Era2IndexDef {
+    pub name: String,
+    pub id: u64,
+    pub columns: Vec<String>,
+    pub unique: bool,
+    pub method: Option<String>,
+    pub predicate: Option<String>,
+    pub expressions: Vec<String>,
+    pub state: crate::worker::types::IndexState,
+}
+
+// Era 2: has IndexDef.state, no ColumnDef.collation and no IndexDef.is_constraint
 #[derive(serde::Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 struct V1Era2Schema {
@@ -155,7 +363,7 @@ struct V1Era2Schema {
     pub version: u64,
     pub pk_constraint_name: Option<String>,
     pub pk_indices: Vec<usize>,
-    pub indexes: Vec<crate::model::IndexDef>,
+    pub indexes: Vec<V1Era2IndexDef>,
     pub check_constraints: Vec<crate::model::CheckConstraint>,
     pub foreign_keys: Vec<crate::model::ForeignKeyConstraint>,
     pub owner: String,
@@ -163,17 +371,60 @@ struct V1Era2Schema {
 
 impl From<V1Era2Schema> for TableSchema {
     fn from(s: V1Era2Schema) -> Self {
+        use crate::model::IndexDef;
+        let V1Era2Schema {
+            name,
+            table_id,
+            columns,
+            version,
+            pk_constraint_name,
+            pk_indices,
+            indexes,
+            check_constraints,
+            foreign_keys,
+            owner,
+        } = s;
+        let decoded_columns: Vec<crate::model::ColumnDef> =
+            columns.into_iter().map(Into::into).collect();
+        let decoded_indexes: Vec<IndexDef> = indexes
+            .into_iter()
+            .map(|idx| {
+                let V1Era2IndexDef {
+                    name: idx_name,
+                    id,
+                    columns,
+                    unique,
+                    method,
+                    predicate,
+                    expressions,
+                    state,
+                } = idx;
+                let is_constraint = legacy_index_constraint_default(unique, &columns);
+                IndexDef {
+                    name: idx_name,
+                    id,
+                    columns,
+                    unique,
+                    is_constraint,
+                    method,
+                    predicate,
+                    expressions,
+                    state,
+                }
+            })
+            .collect();
+
         TableSchema {
-            name: s.name,
-            table_id: s.table_id,
-            columns: s.columns.into_iter().map(Into::into).collect(),
-            version: s.version,
-            pk_constraint_name: s.pk_constraint_name,
-            pk_indices: s.pk_indices,
-            indexes: s.indexes,
-            check_constraints: s.check_constraints,
-            foreign_keys: s.foreign_keys,
-            owner: s.owner,
+            name,
+            table_id,
+            columns: decoded_columns,
+            version,
+            pk_constraint_name,
+            pk_indices,
+            indexes: decoded_indexes,
+            check_constraints,
+            foreign_keys,
+            owner,
             from_alias: None,
         }
     }
@@ -199,34 +450,69 @@ impl From<V1Era1Schema> for TableSchema {
     fn from(s: V1Era1Schema) -> Self {
         use crate::model::IndexDef;
         use crate::worker::types::IndexState;
+        let V1Era1Schema {
+            name,
+            table_id,
+            columns,
+            version,
+            pk_constraint_name,
+            pk_indices,
+            indexes,
+            check_constraints,
+            foreign_keys,
+            owner,
+        } = s;
+        let decoded_columns: Vec<crate::model::ColumnDef> =
+            columns.into_iter().map(Into::into).collect();
+        let decoded_indexes: Vec<IndexDef> = indexes
+            .into_iter()
+            .map(|idx| {
+                let V1IndexDef {
+                    name: idx_name,
+                    id,
+                    columns,
+                    unique,
+                    method,
+                    predicate,
+                    expressions,
+                } = idx;
+                let is_constraint = legacy_index_constraint_default(unique, &columns);
+                IndexDef {
+                    name: idx_name,
+                    id,
+                    columns,
+                    unique,
+                    is_constraint,
+                    method,
+                    predicate,
+                    expressions,
+                    state: IndexState::Ready,
+                }
+            })
+            .collect();
 
         TableSchema {
-            name: s.name,
-            table_id: s.table_id,
-            columns: s.columns.into_iter().map(Into::into).collect(),
-            version: s.version,
-            pk_constraint_name: s.pk_constraint_name,
-            pk_indices: s.pk_indices,
-            indexes: s
-                .indexes
-                .into_iter()
-                .map(|idx| IndexDef {
-                    name: idx.name,
-                    id: idx.id,
-                    columns: idx.columns,
-                    unique: idx.unique,
-                    method: idx.method,
-                    predicate: idx.predicate,
-                    expressions: idx.expressions,
-                    state: IndexState::Ready,
-                })
-                .collect(),
-            check_constraints: s.check_constraints,
-            foreign_keys: s.foreign_keys,
-            owner: s.owner,
+            name,
+            table_id,
+            columns: decoded_columns,
+            version,
+            pk_constraint_name,
+            pk_indices,
+            indexes: decoded_indexes,
+            check_constraints,
+            foreign_keys,
+            owner,
             from_alias: None,
         }
     }
+}
+
+fn legacy_index_constraint_default(unique: bool, index_columns: &[String]) -> bool {
+    // Legacy eras (1/2/3) and old V2 payloads do not persist `is_constraint`.
+    // Preserve historical behavior to avoid silently dropping compatibility:
+    // any legacy UNIQUE index with key columns remains visible as a UNIQUE
+    // constraint until rewritten with explicit `is_constraint`.
+    unique && !index_columns.is_empty()
 }
 
 pub fn serialize_row(row: &Row) -> Result<Vec<u8>> {
@@ -294,6 +580,7 @@ mod tests {
                 id: 1,
                 columns: vec!["name".into()],
                 unique: false,
+                is_constraint: false,
                 method: Some("btree".into()),
                 predicate: None,
                 expressions: vec![],
@@ -342,6 +629,146 @@ mod tests {
     }
 
     #[test]
+    fn v1_bincode_era3_without_is_constraint_defaults_compatibly() {
+        #[derive(serde::Serialize)]
+        struct LegacyIndexDef {
+            name: String,
+            id: u64,
+            columns: Vec<String>,
+            unique: bool,
+            method: Option<String>,
+            predicate: Option<String>,
+            expressions: Vec<String>,
+            state: IndexState,
+        }
+
+        #[derive(serde::Serialize)]
+        struct LegacyEra3Schema {
+            name: String,
+            table_id: u64,
+            columns: Vec<ColumnDef>,
+            version: u64,
+            pk_constraint_name: Option<String>,
+            pk_indices: Vec<usize>,
+            indexes: Vec<LegacyIndexDef>,
+            check_constraints: Vec<crate::model::CheckConstraint>,
+            foreign_keys: Vec<crate::model::ForeignKeyConstraint>,
+            owner: String,
+            from_alias: Option<String>,
+        }
+
+        let legacy = LegacyEra3Schema {
+            name: "public.legacy".into(),
+            table_id: 9,
+            columns: vec![ColumnDef {
+                name: "id".into(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: true,
+                unique: true,
+                is_serial: false,
+                default_expr: None,
+                collation: None,
+            }],
+            version: 1,
+            pk_constraint_name: Some("legacy_pkey".into()),
+            pk_indices: vec![0],
+            indexes: vec![LegacyIndexDef {
+                name: "legacy_id_key".into(),
+                id: 1,
+                columns: vec!["id".into()],
+                unique: true,
+                method: Some("btree".into()),
+                predicate: None,
+                expressions: vec![],
+                state: IndexState::Ready,
+            }],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: "admin".into(),
+            from_alias: None,
+        };
+
+        let payload = bincode::serialize(&legacy).unwrap();
+        let mut data = Vec::from(SCHEMA_MAGIC_V1);
+        data.extend_from_slice(&payload);
+
+        let decoded = deserialize_schema(&data).unwrap();
+        assert_eq!(decoded.name, "public.legacy");
+        assert!(decoded.indexes[0].is_constraint);
+    }
+
+    #[test]
+    fn v1_bincode_era3_plain_unique_index_defaults_to_constraint_for_backward_compat() {
+        #[derive(serde::Serialize)]
+        struct LegacyIndexDef {
+            name: String,
+            id: u64,
+            columns: Vec<String>,
+            unique: bool,
+            method: Option<String>,
+            predicate: Option<String>,
+            expressions: Vec<String>,
+            state: IndexState,
+        }
+
+        #[derive(serde::Serialize)]
+        struct LegacyEra3Schema {
+            name: String,
+            table_id: u64,
+            columns: Vec<ColumnDef>,
+            version: u64,
+            pk_constraint_name: Option<String>,
+            pk_indices: Vec<usize>,
+            indexes: Vec<LegacyIndexDef>,
+            check_constraints: Vec<crate::model::CheckConstraint>,
+            foreign_keys: Vec<crate::model::ForeignKeyConstraint>,
+            owner: String,
+            from_alias: Option<String>,
+        }
+
+        let legacy = LegacyEra3Schema {
+            name: "public.legacy".into(),
+            table_id: 9,
+            columns: vec![ColumnDef {
+                name: "id".into(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: true,
+                unique: true,
+                is_serial: false,
+                default_expr: None,
+                collation: None,
+            }],
+            version: 1,
+            pk_constraint_name: Some("legacy_pkey".into()),
+            pk_indices: vec![0],
+            indexes: vec![LegacyIndexDef {
+                name: "legacy_id_uix".into(),
+                id: 1,
+                columns: vec!["id".into()],
+                unique: true,
+                method: Some("btree".into()),
+                predicate: None,
+                expressions: vec![],
+                state: IndexState::Ready,
+            }],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: "admin".into(),
+            from_alias: None,
+        };
+
+        let payload = bincode::serialize(&legacy).unwrap();
+        let mut data = Vec::from(SCHEMA_MAGIC_V1);
+        data.extend_from_slice(&payload);
+
+        let decoded = deserialize_schema(&data).unwrap();
+        assert_eq!(decoded.name, "public.legacy");
+        assert!(decoded.indexes[0].is_constraint);
+    }
+
+    #[test]
     fn v1_bincode_era2_compat() {
         let era2 = V1Era2Schema {
             name: "public.old_table".into(),
@@ -358,7 +785,16 @@ mod tests {
             version: 1,
             pk_constraint_name: None,
             pk_indices: vec![],
-            indexes: vec![],
+            indexes: vec![V1Era2IndexDef {
+                name: "old_table_col1_key".into(),
+                id: 1,
+                columns: vec!["col1".into()],
+                unique: true,
+                method: Some("btree".into()),
+                predicate: None,
+                expressions: vec![],
+                state: IndexState::Ready,
+            }],
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: "admin".into(),
@@ -369,6 +805,9 @@ mod tests {
         let decoded = deserialize_schema(&data).unwrap();
         assert_eq!(decoded.name, "public.old_table");
         assert_eq!(decoded.columns[0].collation, None);
+        assert_eq!(decoded.indexes.len(), 1);
+        assert_eq!(decoded.indexes[0].name, "old_table_col1_key");
+        assert!(decoded.indexes[0].is_constraint);
     }
 
     #[test]
@@ -407,6 +846,7 @@ mod tests {
         let decoded = deserialize_schema(&data).unwrap();
         assert_eq!(decoded.name, "public.ancient");
         assert_eq!(decoded.indexes[0].state, IndexState::Ready);
+        assert!(decoded.indexes[0].is_constraint);
         assert_eq!(decoded.columns[0].collation, None);
     }
 
@@ -439,6 +879,113 @@ mod tests {
         data.extend_from_slice(&payload);
         let decoded = deserialize_schema(&data).unwrap();
         assert!(decoded.check_constraints.is_empty());
+    }
+
+    #[test]
+    fn v2_missing_index_constraint_bit_uses_legacy_backward_compat_default() {
+        let schema = TableSchema {
+            name: "public.legacy".into(),
+            table_id: 11,
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+                ColumnDef {
+                    name: "email".into(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![
+                IndexDef {
+                    name: "legacy_id_uix".into(),
+                    id: 1,
+                    columns: vec!["id".into()],
+                    unique: true,
+                    is_constraint: false,
+                    method: Some("btree".into()),
+                    predicate: None,
+                    expressions: vec![],
+                    state: IndexState::Ready,
+                },
+                IndexDef {
+                    name: "legacy_email_key".into(),
+                    id: 2,
+                    columns: vec!["email".into()],
+                    unique: true,
+                    is_constraint: true,
+                    method: Some("btree".into()),
+                    predicate: None,
+                    expressions: vec![],
+                    state: IndexState::Ready,
+                },
+                IndexDef {
+                    name: "legacy_lower_email_uix".into(),
+                    id: 3,
+                    columns: vec![],
+                    unique: true,
+                    is_constraint: false,
+                    method: Some("btree".into()),
+                    predicate: None,
+                    expressions: vec!["lower(email)".into()],
+                    state: IndexState::Ready,
+                },
+            ],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: "postgres".into(),
+            from_alias: None,
+        };
+
+        let mut json = serde_json::to_value(&schema).unwrap();
+        let indexes = json
+            .as_object_mut()
+            .unwrap()
+            .get_mut("indexes")
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap();
+        for index in indexes {
+            index.as_object_mut().unwrap().remove("is_constraint");
+        }
+
+        let payload = rmp_serde::to_vec_named(json.as_object().unwrap()).unwrap();
+        let mut data = Vec::from(SCHEMA_MAGIC_V2);
+        data.extend_from_slice(&payload);
+
+        let decoded = deserialize_schema(&data).unwrap();
+        let plain = decoded
+            .indexes
+            .iter()
+            .find(|idx| idx.name == "legacy_id_uix")
+            .unwrap();
+        let constraint = decoded
+            .indexes
+            .iter()
+            .find(|idx| idx.name == "legacy_email_key")
+            .unwrap();
+        let expression = decoded
+            .indexes
+            .iter()
+            .find(|idx| idx.name == "legacy_lower_email_uix")
+            .unwrap();
+        assert!(plain.is_constraint);
+        assert!(constraint.is_constraint);
+        assert!(!expression.is_constraint);
     }
 
     #[test]

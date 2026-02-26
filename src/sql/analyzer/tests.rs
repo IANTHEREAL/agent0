@@ -637,6 +637,81 @@ fn analyze_advisory_lock_two_arg_rejects_bigint_bigint() {
     ));
 }
 
+#[test]
+fn analyze_generate_subscripts_coerces_dim_and_reverse() {
+    let expr = analyze_expr_with_users("generate_subscripts(ARRAY[1,2], '1', 'true')").unwrap();
+    assert_eq!(expr.data_type, DataType::Int32);
+    match &expr.kind {
+        TypedExprKind::FunctionCall { func, args, .. } => {
+            assert_eq!(func.name, "GENERATE_SUBSCRIPTS");
+            assert_eq!(args.len(), 3);
+            assert_eq!(args[1].data_type, DataType::Int32);
+            assert_eq!(args[2].data_type, DataType::Boolean);
+            assert!(matches!(
+                args[1].kind,
+                TypedExprKind::Cast {
+                    target_type: DataType::Int32,
+                    cast_context: crate::sql::types::CastContext::Implicit,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                args[2].kind,
+                TypedExprKind::Cast {
+                    target_type: DataType::Boolean,
+                    cast_context: crate::sql::types::CastContext::Implicit,
+                    ..
+                }
+            ));
+        }
+        _ => panic!("expected FunctionCall"),
+    }
+}
+
+#[test]
+fn analyze_generate_subscripts_rejects_non_array_first_arg() {
+    let err = analyze_expr_with_users("generate_subscripts(1, 1)").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound {
+            ref name,
+            arg_types
+        } if name == "GENERATE_SUBSCRIPTS" && arg_types == vec![DataType::Int32, DataType::Int32]
+    ));
+}
+
+#[test]
+fn analyze_pg_get_indexdef_coerces_column_no_and_pretty() {
+    let expr = analyze_expr_with_users("pg_get_indexdef(1, '1', 'true')").unwrap();
+    assert_eq!(expr.data_type, DataType::Text);
+    match &expr.kind {
+        TypedExprKind::FunctionCall { func, args, .. } => {
+            assert_eq!(func.name, "PG_GET_INDEXDEF");
+            assert_eq!(args.len(), 3);
+            assert_eq!(args[0].data_type, DataType::Int64);
+            assert_eq!(args[1].data_type, DataType::Int32);
+            assert_eq!(args[2].data_type, DataType::Boolean);
+            assert!(matches!(
+                args[1].kind,
+                TypedExprKind::Cast {
+                    target_type: DataType::Int32,
+                    cast_context: crate::sql::types::CastContext::Implicit,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                args[2].kind,
+                TypedExprKind::Cast {
+                    target_type: DataType::Boolean,
+                    cast_context: crate::sql::types::CastContext::Implicit,
+                    ..
+                }
+            ));
+        }
+        _ => panic!("expected FunctionCall"),
+    }
+}
+
 // ── Syntax sugar normalization ──────────────────────────────
 
 #[test]

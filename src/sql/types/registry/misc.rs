@@ -72,6 +72,11 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         .with_args(1, Some(1)),
     );
 
+    r.register(
+        "GENERATE_SUBSCRIPTS",
+        FunctionSignature::fixed(DataType::Int32).with_args(2, Some(3)),
+    );
+
     // Sequence functions
     r.register(
         "NEXTVAL",

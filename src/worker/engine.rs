@@ -993,6 +993,7 @@ mod tests {
             id: 1,
             columns: vec!["c1".to_string()],
             unique: false,
+            is_constraint: false,
             method: None,
             predicate: None,
             expressions: vec![],

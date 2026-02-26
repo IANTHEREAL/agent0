@@ -194,8 +194,38 @@ def test_sqlalchemy_inspector_reflection_smoke(schema, db):
 
         inspector = inspect(db.engine)
 
+        # 1. has_table
         assert inspector.has_table(parent_table, schema=pg_schema)
         assert inspector.has_table(child_table, schema=pg_schema)
+
+        # 2. get_pk_constraint
+        pk = inspector.get_pk_constraint(child_table, schema=pg_schema)
+        assert pk["constrained_columns"] == ["id"]
+        assert pk["name"] is not None
+
+        # 3. get_unique_constraints
+        ucs = inspector.get_unique_constraints(child_table, schema=pg_schema)
+        uc_names = {uc["name"] for uc in ucs}
+        assert child_parent_slug_uq in uc_names
+        uc = next(uc for uc in ucs if uc["name"] == child_parent_slug_uq)
+        assert uc["column_names"] == ["parent_id", "slug"]
+
+        # 4. get_foreign_keys
+        fks = inspector.get_foreign_keys(child_table, schema=pg_schema)
+        assert len(fks) == 1
+        fk = fks[0]
+        assert fk["constrained_columns"] == ["parent_id"]
+        assert fk["referred_table"] == parent_table
+        assert fk["referred_columns"] == ["id"]
+
+        # 5. get_indexes
+        idxs = inspector.get_indexes(child_table, schema=pg_schema)
+        idx_names = {idx["name"] for idx in idxs}
+        assert child_created_at_idx in idx_names
+
+        # 6. get_sequence_names
+        seqs = inspector.get_sequence_names(schema=pg_schema)
+        assert isinstance(seqs, list)
     finally:
         with db.engine.begin() as conn:
             conn.exec_driver_sql(f"DROP TABLE IF EXISTS {_qname(pg_schema, child_table)} CASCADE")

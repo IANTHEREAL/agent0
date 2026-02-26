@@ -94,6 +94,7 @@ fn test_index(name: &str) -> IndexDef {
         id: 1,
         columns: vec!["col1".to_string()],
         unique: false,
+        is_constraint: false,
         method: None,
         predicate: None,
         expressions: vec![],

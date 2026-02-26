@@ -164,6 +164,7 @@ pub async fn execute_create_index(
         id: index_id,
         columns: idx_cols,
         unique,
+        is_constraint: false,
         method,
         predicate: predicate_str,
         expressions: idx_exprs,

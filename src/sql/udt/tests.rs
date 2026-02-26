@@ -81,6 +81,7 @@ fn enum_literal_rewrite_preserves_unrelated_text_literals() {
         id: 1,
         columns: vec![],
         unique: false,
+        is_constraint: false,
         method: None,
         predicate: Some("state = 'active' AND txt <> 'active'".to_string()),
         expressions: vec!["CASE WHEN state = 'active' THEN 1 ELSE 0 END".to_string()],

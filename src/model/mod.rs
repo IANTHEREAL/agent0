@@ -405,6 +405,8 @@ pub struct IndexDef {
     pub id: u64,
     pub columns: Vec<String>,
     pub unique: bool,
+    #[serde(default = "default_index_is_constraint")]
+    pub is_constraint: bool,
     #[serde(default)]
     pub method: Option<String>,
     #[serde(default)]
@@ -413,6 +415,13 @@ pub struct IndexDef {
     pub expressions: Vec<String>,
     #[serde(default)]
     pub state: IndexState,
+}
+
+fn default_index_is_constraint() -> bool {
+    // Backward-compatibility for persisted schemas created before `is_constraint`
+    // existed: those schemas treated every unique index as a UNIQUE constraint
+    // in `pg_constraint`.
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

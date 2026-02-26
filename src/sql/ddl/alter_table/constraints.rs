@@ -7,7 +7,7 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::ObjectName;
 use tikv_client::Transaction;
 
-use crate::model::{CheckConstraint, DataType, ForeignKeyConstraint, Value};
+use crate::model::{CheckConstraint, DataType, ForeignKeyConstraint, IndexDef, Value};
 use crate::sql::dml::{resolve_fk_ref_lookup, FkRefLookup};
 use crate::sql::error::SqlError;
 use crate::sql::names;
@@ -118,6 +118,7 @@ pub(super) async fn alter_table_add_unique_constraint(
         name: index_name,
         columns: col_names,
         unique: true,
+        is_constraint: true,
         method: None,
         predicate: None,
         expressions: Vec::new(),
@@ -407,7 +408,24 @@ pub(super) async fn alter_table_add_check_constraint(
     Ok(())
 }
 
-/// DROP CONSTRAINT: try PK, FK, CHECK, unique-index in order. Returns
+fn find_unique_constraint_index(
+    schema: &crate::model::TableSchema,
+    constraint_name: &str,
+) -> Option<usize> {
+    schema
+        .indexes
+        .iter()
+        .position(|idx| idx.name == constraint_name && idx.unique && idx.is_constraint)
+}
+
+fn has_single_column_unique_constraint(indexes: &[IndexDef], col_name: &str) -> bool {
+    indexes.iter().any(|idx| {
+        idx.unique && idx.is_constraint && idx.columns.len() == 1 && idx.columns[0] == col_name
+    })
+}
+
+/// DROP CONSTRAINT: try PK, FK, CHECK, unique-constraint backing index in
+/// order. Returns
 /// `Some(result)` when the constraint was found and handled (caller should
 /// early-return), `None` when `if_exists` is true and no match was found.
 pub(super) async fn alter_table_drop_constraint(
@@ -490,20 +508,8 @@ pub(super) async fn alter_table_drop_constraint(
         }));
     }
 
-    if let Some(pos) = schema
-        .indexes
-        .iter()
-        .position(|i| i.name == constraint_name)
-    {
+    if let Some(pos) = find_unique_constraint_index(schema, &constraint_name) {
         let index = schema.indexes[pos].clone();
-        if !index.unique {
-            if !if_exists {
-                return Err(anyhow!("Constraint '{}' does not exist", constraint_name));
-            }
-            return Ok(Some(ExecuteResult::AlterTable {
-                table_name: result_table_name.to_string(),
-            }));
-        }
 
         let (start, end) = index_prefix_range(db_id, schema.table_id, index.id);
         delete_range(txn, start, end).await?;
@@ -516,10 +522,7 @@ pub(super) async fn alter_table_drop_constraint(
 
         if index.columns.len() == 1 {
             let col_name = &index.columns[0];
-            let still_unique = schema
-                .indexes
-                .iter()
-                .any(|idx| idx.unique && idx.columns.len() == 1 && idx.columns[0] == *col_name);
+            let still_unique = has_single_column_unique_constraint(&schema.indexes, col_name);
             if !still_unique {
                 if let Some(col_idx) = schema.column_index(col_name) {
                     schema.columns[col_idx].unique = false;
@@ -538,4 +541,47 @@ pub(super) async fn alter_table_drop_constraint(
         return Err(anyhow!("Constraint '{}' does not exist", constraint_name));
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_unique_constraint_index, has_single_column_unique_constraint};
+    use crate::model::IndexDef;
+    use crate::worker::types::IndexState;
+
+    fn index(name: &str, columns: &[&str], unique: bool, is_constraint: bool) -> IndexDef {
+        IndexDef {
+            name: name.to_string(),
+            id: 1,
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            unique,
+            is_constraint,
+            method: None,
+            predicate: None,
+            expressions: vec![],
+            state: IndexState::Ready,
+        }
+    }
+
+    #[test]
+    fn drop_constraint_lookup_ignores_plain_unique_index() {
+        let mut schema = crate::model::TableSchema::new("public.t".to_string(), 1, vec![], vec![]);
+        schema.indexes.push(index("t_a_key", &["a"], true, false));
+
+        assert_eq!(find_unique_constraint_index(&schema, "t_a_key"), None);
+    }
+
+    #[test]
+    fn drop_constraint_lookup_matches_constraint_backing_index() {
+        let mut schema = crate::model::TableSchema::new("public.t".to_string(), 1, vec![], vec![]);
+        schema.indexes.push(index("t_a_key", &["a"], true, true));
+
+        assert_eq!(find_unique_constraint_index(&schema, "t_a_key"), Some(0));
+    }
+
+    #[test]
+    fn single_column_unique_constraint_check_ignores_plain_unique_indexes() {
+        let indexes = vec![index("t_a_uix", &["a"], true, false)];
+        assert!(!has_single_column_unique_constraint(&indexes, "a"));
+    }
 }

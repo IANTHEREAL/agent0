@@ -1,5 +1,6 @@
 use super::helpers::{
-    access_method_oid, bool_col, int_col, int_val, schema_oid, text_col, text_val,
+    access_method_oid, bool_col, int_col, int_val, null_val, schema_oid, text_array_col, text_col,
+    text_val,
 };
 use super::{ScanContext, VirtualTable};
 use crate::model::{Row, TableSchema, Value};
@@ -36,6 +37,7 @@ impl VirtualTable for PgClass {
                 bool_col("relispopulated"),
                 text_col("relreplident"),
                 bool_col("relispartition"),
+                text_array_col("reloptions"),
             ],
             version: 1,
             pk_constraint_name: None,
@@ -74,6 +76,7 @@ impl VirtualTable for PgClass {
                     Value::Boolean(true),
                     text_val("d"),
                     Value::Boolean(false),
+                    null_val(), // reloptions
                 ]));
 
                 for idx in &schema.indexes {
@@ -91,6 +94,7 @@ impl VirtualTable for PgClass {
                         Value::Boolean(true),
                         text_val("d"),
                         Value::Boolean(false),
+                        null_val(), // reloptions
                     ]));
                 }
 
@@ -113,6 +117,7 @@ impl VirtualTable for PgClass {
                         Value::Boolean(true),
                         text_val("d"),
                         Value::Boolean(false),
+                        null_val(), // reloptions
                     ]));
                 }
             }
@@ -135,6 +140,7 @@ impl VirtualTable for PgClass {
                 Value::Boolean(true),
                 text_val("d"),
                 Value::Boolean(false),
+                null_val(), // reloptions
             ]));
         }
 
@@ -159,6 +165,7 @@ impl VirtualTable for PgClass {
                 Value::Boolean(true),
                 text_val("d"),
                 Value::Boolean(false),
+                null_val(), // reloptions
             ]));
         }
 

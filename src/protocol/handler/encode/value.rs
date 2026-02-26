@@ -24,6 +24,14 @@ fn format_float8_pg_text(v: f64) -> String {
     v.to_string()
 }
 
+fn is_pg_vector_catalog_type(col_type: Option<&DataType>) -> bool {
+    matches!(
+        col_type,
+        Some(DataType::UserDefined(name))
+            if name.eq_ignore_ascii_case("int2vector") || name.eq_ignore_ascii_case("oidvector")
+    )
+}
+
 pub(in crate::protocol::handler) fn encode_value(
     encoder: &mut DataRowEncoder,
     value: &Value,
@@ -107,8 +115,8 @@ fn encode_value_text(
                 let composite = format!("({})", fields.join(","));
                 return encoder.encode_field(&composite);
             }
-            // int2vector: encode as space-separated text "1 2 3"
-            if matches!(col_type, Some(DataType::UserDefined(s)) if s == "int2vector") {
+            // int2vector/oidvector: encode as space-separated text "1 2 3"
+            if is_pg_vector_catalog_type(col_type) {
                 let mut parts = Vec::with_capacity(elems.len());
                 for v in elems {
                     match v {
@@ -116,8 +124,7 @@ fn encode_value_text(
                         Value::Int32(i) => parts.push(i.to_string()),
                         other => {
                             return Err(PgWireError::ApiError(
-                                format!("int2vector element must be integer, got {:?}", other)
-                                    .into(),
+                                format!("vector element must be integer, got {:?}", other).into(),
                             ))
                         }
                     }

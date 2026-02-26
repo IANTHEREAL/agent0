@@ -15,6 +15,7 @@ pub(crate) enum SrfKind {
     RegexpSplitToTable,
     RegexpMatches,
     EvalFunctionArray,
+    GenerateSubscripts,
 }
 
 pub(crate) fn detect_srf(expr: &TypedExpr) -> Option<SrfKind> {
@@ -30,6 +31,7 @@ pub(crate) fn detect_srf(expr: &TypedExpr) -> Option<SrfKind> {
         | "JSONB_ARRAY_ELEMENTS_TEXT"
         | "JSONB_EACH"
         | "JSONB_EACH_TEXT" => Some(SrfKind::EvalFunctionArray),
+        "GENERATE_SUBSCRIPTS" => Some(SrfKind::GenerateSubscripts),
         _ => None,
     }
 }
@@ -46,6 +48,29 @@ fn regexp_captures_to_values(caps: &regex::Captures<'_>) -> Vec<Value> {
         caps.get(0)
             .map(|m| vec![Value::Text(m.as_str().to_string())])
             .unwrap_or_default()
+    }
+}
+
+fn value_to_i64_strict(v: &Value, arg_name: &str) -> Result<i64> {
+    match v {
+        Value::Int32(n) => Ok(*n as i64),
+        Value::Int64(n) => Ok(*n),
+        other => Err(anyhow!(
+            "generate_subscripts: {} argument must be integer, got {}",
+            arg_name,
+            other
+        )),
+    }
+}
+
+fn value_to_bool_strict(v: &Value, arg_name: &str) -> Result<bool> {
+    match v {
+        Value::Boolean(b) => Ok(*b),
+        other => Err(anyhow!(
+            "generate_subscripts: {} argument must be boolean, got {}",
+            arg_name,
+            other
+        )),
     }
 }
 
@@ -185,6 +210,69 @@ pub(crate) fn eval_srf(
                 Value::Null => Ok(Vec::new()),
                 other => Ok(vec![other]),
             }
+        }
+        SrfKind::GenerateSubscripts => {
+            // generate_subscripts(array, dim [, reverse])
+            // db9 only supports 1D arrays; PG returns empty for dim != 1.
+            let Some(arg0) = args.first() else {
+                return Ok(Vec::new());
+            };
+            // PostgreSQL vector catalog types use 0-based subscripts.
+            let lower_bound = match &arg0.data_type {
+                DataType::UserDefined(name)
+                    if name.eq_ignore_ascii_case("int2vector")
+                        || name.eq_ignore_ascii_case("oidvector") =>
+                {
+                    0_i32
+                }
+                _ => 1_i32,
+            };
+
+            let arr_val = eval_typed_expr(arg0, input, query_ctx)?;
+            let len = match &arr_val {
+                Value::Array(arr) => arr.len(),
+                Value::Null => return Ok(Vec::new()),
+                _ => {
+                    return Err(anyhow!(
+                        "generate_subscripts: first argument must be an array"
+                    ))
+                }
+            };
+            if len == 0 {
+                return Ok(Vec::new());
+            }
+
+            // PostgreSQL strict function semantics: ANY NULL argument → return no rows (empty set)
+            let dim = if let Some(dim_expr) = args.get(1) {
+                let dim_val = eval_typed_expr(dim_expr, input, query_ctx)?;
+                if dim_val == Value::Null {
+                    return Ok(Vec::new()); // NULL dim → empty set
+                }
+                value_to_i64_strict(&dim_val, "dimension")?
+            } else {
+                1 // Default when not provided
+            };
+            if dim != 1 {
+                return Ok(Vec::new());
+            }
+
+            let reverse = if let Some(arg2) = args.get(2) {
+                let reverse_val = eval_typed_expr(arg2, input, query_ctx)?;
+                if reverse_val == Value::Null {
+                    return Ok(Vec::new()); // NULL reverse → empty set
+                }
+                value_to_bool_strict(&reverse_val, "reverse")?
+            } else {
+                false
+            };
+            let start = lower_bound;
+            let end = lower_bound + (len as i32) - 1;
+            let indices: Vec<Value> = if reverse {
+                (start..=end).rev().map(Value::Int32).collect()
+            } else {
+                (start..=end).map(Value::Int32).collect()
+            };
+            Ok(indices)
         }
     }
 }
@@ -423,8 +511,10 @@ impl PhysicalOperator for ProjectOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ColumnDef;
-    use crate::sql::analyzer::types::{BinaryOp as TypedBinaryOp, TypedExpr, TypedExprKind};
+    use crate::model::{ColumnDef, Value};
+    use crate::sql::analyzer::types::{
+        BinaryOp as TypedBinaryOp, FunctionKind, ResolvedFunction, TypedExpr, TypedExprKind,
+    };
     use crate::sql::expr::typed_eval::eval_typed_expr;
     use crate::sql::query_context::QueryContext;
 
@@ -495,6 +585,22 @@ mod tests {
             .map(|expr| eval_typed_expr(expr, input, &query_ctx).unwrap())
             .collect();
         Row::new(values)
+    }
+
+    fn function_call(name: &str, args: Vec<TypedExpr>, return_type: DataType) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::FunctionCall {
+                func: ResolvedFunction {
+                    name: name.to_string(),
+                    kind: FunctionKind::Builtin,
+                    return_type: return_type.clone(),
+                },
+                args,
+                order_by: vec![],
+                filter: None,
+            },
+            data_type: return_type,
+        }
     }
 
     #[test]
@@ -607,7 +713,6 @@ mod tests {
     #[test]
     fn test_project_row_null_propagation() {
         use super::super::scan::TableScanOperator;
-        use crate::model::Value;
 
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
@@ -627,5 +732,163 @@ mod tests {
         assert_eq!(result.values.len(), 2);
         assert_eq!(result.values[0], Value::Int32(1));
         assert_eq!(result.values[1], Value::Null);
+    }
+
+    #[test]
+    fn generate_subscripts_uses_zero_based_ordinals_for_int2vector() {
+        let expr = function_call(
+            "GENERATE_SUBSCRIPTS",
+            vec![
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Array(vec![
+                        Value::Int64(1),
+                        Value::Int64(0),
+                    ])),
+                    data_type: DataType::UserDefined("int2vector".to_string()),
+                },
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Int32(1)),
+                    data_type: DataType::Int32,
+                },
+            ],
+            DataType::Int32,
+        );
+
+        let out = eval_srf(
+            SrfKind::GenerateSubscripts,
+            &expr,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap();
+        assert_eq!(out, vec![Value::Int32(0), Value::Int32(1)]);
+    }
+
+    #[test]
+    fn generate_subscripts_uses_zero_based_ordinals_for_oidvector() {
+        let expr = function_call(
+            "GENERATE_SUBSCRIPTS",
+            vec![
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Array(vec![
+                        Value::Int64(100),
+                        Value::Int64(101),
+                    ])),
+                    data_type: DataType::UserDefined("oidvector".to_string()),
+                },
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Int32(1)),
+                    data_type: DataType::Int32,
+                },
+            ],
+            DataType::Int32,
+        );
+
+        let out = eval_srf(
+            SrfKind::GenerateSubscripts,
+            &expr,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap();
+        assert_eq!(out, vec![Value::Int32(0), Value::Int32(1)]);
+    }
+
+    #[test]
+    fn generate_subscripts_keeps_one_based_ordinals_for_regular_arrays() {
+        let expr = function_call(
+            "GENERATE_SUBSCRIPTS",
+            vec![
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Array(vec![
+                        Value::Int32(10),
+                        Value::Int32(20),
+                    ])),
+                    data_type: DataType::Array(Box::new(DataType::Int32)),
+                },
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Int32(1)),
+                    data_type: DataType::Int32,
+                },
+            ],
+            DataType::Int32,
+        );
+
+        let out = eval_srf(
+            SrfKind::GenerateSubscripts,
+            &expr,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap();
+        assert_eq!(out, vec![Value::Int32(1), Value::Int32(2)]);
+    }
+
+    #[test]
+    fn generate_subscripts_rejects_non_integer_dim() {
+        let expr = function_call(
+            "GENERATE_SUBSCRIPTS",
+            vec![
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Array(vec![
+                        Value::Int32(10),
+                        Value::Int32(20),
+                    ])),
+                    data_type: DataType::Array(Box::new(DataType::Int32)),
+                },
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Text("x".to_string())),
+                    data_type: DataType::Text,
+                },
+            ],
+            DataType::Int32,
+        );
+
+        let err = eval_srf(
+            SrfKind::GenerateSubscripts,
+            &expr,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("generate_subscripts: dimension argument must be integer"));
+    }
+
+    #[test]
+    fn generate_subscripts_rejects_non_boolean_reverse() {
+        let expr = function_call(
+            "GENERATE_SUBSCRIPTS",
+            vec![
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Array(vec![
+                        Value::Int32(10),
+                        Value::Int32(20),
+                    ])),
+                    data_type: DataType::Array(Box::new(DataType::Int32)),
+                },
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Int32(1)),
+                    data_type: DataType::Int32,
+                },
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Int32(1)),
+                    data_type: DataType::Int32,
+                },
+            ],
+            DataType::Int32,
+        );
+
+        let err = eval_srf(
+            SrfKind::GenerateSubscripts,
+            &expr,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("generate_subscripts: reverse argument must be boolean"));
     }
 }

@@ -886,7 +886,12 @@ impl<'a> Analyzer<'a> {
                 // Convert to: ARRAY_POSITION(array_col, x) IS NOT NULL
                 if matches!(compare_op, BinaryOperator::Eq)
                     && (matches!(right_expr.data_type, DataType::Array(_))
-                        || matches!(&right_expr.data_type, DataType::UserDefined(s) if s == "int2vector"))
+                        || matches!(
+                            &right_expr.data_type,
+                            DataType::UserDefined(s)
+                                if s.eq_ignore_ascii_case("int2vector")
+                                    || s.eq_ignore_ascii_case("oidvector")
+                        ))
                 {
                     let array_pos =
                         self.make_function_call("ARRAY_POSITION", vec![right_expr, left_expr])?;

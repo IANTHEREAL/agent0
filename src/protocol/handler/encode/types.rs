@@ -26,6 +26,8 @@ pub(in crate::protocol::handler) fn pgtype_to_datatype(pg: &Type) -> Option<Data
             scale: None,
         }),
         Type::NAME => Some(DataType::Name),
+        Type::INT2_VECTOR => Some(DataType::UserDefined("int2vector".to_string())),
+        Type::OID_VECTOR => Some(DataType::UserDefined("oidvector".to_string())),
         Type::INT4_ARRAY => Some(DataType::Array(Box::new(DataType::Int32))),
         Type::INT8_ARRAY => Some(DataType::Array(Box::new(DataType::Int64))),
         Type::TEXT_ARRAY => Some(DataType::Array(Box::new(DataType::Text))),
@@ -74,11 +76,31 @@ pub(in crate::protocol::handler) fn datatype_to_pgtype(dt: Option<&DataType>) ->
         },
         Some(DataType::Tsvector) => Type::TS_VECTOR,
         Some(DataType::Tsquery) => Type::TSQUERY,
-        Some(DataType::UserDefined(s)) if s == "int2vector" => Type::INT2_VECTOR,
+        Some(DataType::UserDefined(s)) if s.eq_ignore_ascii_case("int2vector") => Type::INT2_VECTOR,
+        Some(DataType::UserDefined(s)) if s.eq_ignore_ascii_case("oidvector") => Type::OID_VECTOR,
         Some(DataType::Varchar(_)) => Type::VARCHAR,
         Some(DataType::Vector(_))
         | Some(DataType::Text)
         | Some(DataType::UserDefined(_))
         | None => Type::TEXT,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{datatype_to_pgtype, pgtype_to_datatype};
+    use crate::model::DataType;
+    use pgwire::api::Type;
+
+    #[test]
+    fn datatype_to_pgtype_maps_oidvector() {
+        let ty = datatype_to_pgtype(Some(&DataType::UserDefined("oidvector".to_string())));
+        assert_eq!(ty, Type::OID_VECTOR);
+    }
+
+    #[test]
+    fn pgtype_to_datatype_maps_oidvector() {
+        let dt = pgtype_to_datatype(&Type::OID_VECTOR);
+        assert_eq!(dt, Some(DataType::UserDefined("oidvector".to_string())));
     }
 }

@@ -21,6 +21,7 @@ mod pg_extension;
 mod pg_index;
 mod pg_indexes;
 mod pg_namespace;
+mod pg_opclass;
 mod pg_proc;
 mod pg_range;
 mod pg_roles;
@@ -95,6 +96,7 @@ impl CatalogRegistry {
         registry.register(Box::new(pg_index::PgIndex));
         registry.register(Box::new(pg_indexes::PgIndexes));
         registry.register(Box::new(pg_namespace::PgNamespace));
+        registry.register(Box::new(pg_opclass::PgOpclass));
         registry.register(Box::new(pg_proc::PgProc));
         registry.register(Box::new(pg_range::PgRange));
         registry.register(Box::new(pg_roles::PgRoles));
@@ -300,7 +302,7 @@ mod tests {
         let t = catalog.get("pg_class").unwrap();
         assert_eq!(t.name(), "pg_class");
         assert_eq!(t.schema_name(), "pg_catalog");
-        assert_eq!(t.schema().columns.len(), 12);
+        assert_eq!(t.schema().columns.len(), 13);
     }
 
     #[test]
@@ -309,7 +311,7 @@ mod tests {
         let t = catalog.get("pg_index").unwrap();
         assert_eq!(t.name(), "pg_index");
         assert_eq!(t.schema_name(), "pg_catalog");
-        assert_eq!(t.schema().columns.len(), 12);
+        assert_eq!(t.schema().columns.len(), 16);
     }
 
     #[test]
@@ -363,7 +365,7 @@ mod tests {
         let t = catalog.get("pg_constraint").unwrap();
         assert_eq!(t.name(), "pg_constraint");
         assert_eq!(t.schema_name(), "pg_catalog");
-        assert_eq!(t.schema().columns.len(), 14);
+        assert_eq!(t.schema().columns.len(), 15);
     }
 
     #[test]

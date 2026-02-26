@@ -878,11 +878,73 @@ impl Executor {
         };
 
         let oid_val = eval_typed_expr(arg0, row, qctx)?;
+
+        // 3-arg form: pg_get_indexdef(index_oid, column_no, pretty)
+        // Returns the column name or expression at the given 1-based ordinal.
+        if args.len() >= 3 {
+            let Some(col_no_arg) = args.get(1) else {
+                return Err(anyhow!(
+                    "pg_get_indexdef(oid, column_no, pretty) missing column_no argument"
+                ));
+            };
+            let Some(pretty_arg) = args.get(2) else {
+                return Err(anyhow!(
+                    "pg_get_indexdef(oid, column_no, pretty) missing pretty argument"
+                ));
+            };
+            let col_no_val = eval_typed_expr(col_no_arg, row, qctx)?;
+            let pretty_val = eval_typed_expr(pretty_arg, row, qctx)?;
+
+            // PostgreSQL edge case semantics for col_no:
+            // - NULL col_no → return NULL
+            // - col_no < 0 → return empty string ''
+            // - col_no = 0 → return full index definition
+            // - col_no > num_columns → return empty string ''
+            // Function is strict in all 3 args: any NULL arg returns NULL.
+            if matches!(oid_val, Value::Null)
+                || matches!(col_no_val, Value::Null)
+                || matches!(pretty_val, Value::Null)
+            {
+                return Ok(Value::Null);
+            }
+
+            let Some(oid) = value_to_i64(&oid_val) else {
+                return Ok(Value::Null);
+            };
+            let col_no = value_to_i64_strict(&col_no_val, "column_no")?;
+            let _pretty = value_to_bool_strict(&pretty_val, "pretty")?;
+
+            if col_no < 0 {
+                let store = self.store();
+                let exists = index_oid_exists_by_oid(&store, txn, db_id, oid).await?;
+                return if exists {
+                    Ok(Value::Text("".to_string())) // existing index + col_no < 0 → empty string
+                } else {
+                    Ok(Value::Null) // unknown index OID → NULL
+                };
+            } else if col_no == 0 {
+                // col_no=0 means return full definition (same as 1-arg form)
+                let store = self.store();
+                let indexdef = lookup_indexdef_by_oid(&store, txn, db_id, oid).await?;
+                return Ok(indexdef.map(Value::Text).unwrap_or(Value::Null));
+            } else {
+                let store = self.store();
+                let col_def =
+                    lookup_index_column_by_oid(&store, txn, db_id, oid, col_no as usize).await?;
+
+                match col_def {
+                    Some(Some(def)) => return Ok(Value::Text(def)),
+                    Some(None) => return Ok(Value::Text(String::new())), // out of range → empty string
+                    None => return Ok(Value::Null),                      // unknown index OID
+                }
+            }
+        }
+
         let Some(oid) = value_to_i64(&oid_val) else {
             return Ok(Value::Text("CREATE INDEX".to_string()));
         };
 
-        // Prefer row-level indexdef if present and matches the OID.
+        // 1-arg form: prefer row-level indexdef if present and matches the OID.
         if let Some(schema) = schema {
             if let (Some(relid_idx), Some(def_idx)) = (
                 schema
@@ -1017,6 +1079,36 @@ fn value_to_i64(v: &Value) -> Option<i64> {
     }
 }
 
+fn value_to_i64_strict(v: &Value, arg_name: &str) -> Result<i64> {
+    match v {
+        Value::Int32(n) => Ok(*n as i64),
+        Value::Int64(n) => Ok(*n),
+        Value::Text(s) => s.trim().parse::<i64>().map_err(|_| {
+            anyhow!(
+                "pg_get_indexdef(oid, column_no, pretty): {} must be integer-compatible, got {:?}",
+                arg_name,
+                v
+            )
+        }),
+        _ => Err(anyhow!(
+            "pg_get_indexdef(oid, column_no, pretty): {} must be integer-compatible, got {:?}",
+            arg_name,
+            v
+        )),
+    }
+}
+
+fn value_to_bool_strict(v: &Value, arg_name: &str) -> Result<bool> {
+    match v {
+        Value::Boolean(b) => Ok(*b),
+        _ => Err(anyhow!(
+            "pg_get_indexdef(oid, column_no, pretty): {} must be boolean, got {:?}",
+            arg_name,
+            v
+        )),
+    }
+}
+
 async fn lookup_indexdef_by_oid(
     store: &Arc<crate::storage::TikvStore>,
     txn: &mut Transaction,
@@ -1064,6 +1156,89 @@ async fn lookup_indexdef_by_oid(
     Ok(None)
 }
 
+/// Lookup a single column name/expression from an index by OID and 1-based ordinal.
+/// Used by `pg_get_indexdef(oid, column_no, pretty_bool)`.
+/// Returns:
+/// - `None` when index OID is not found
+/// - `Some(None)` when index exists but ordinal is out of range
+/// - `Some(Some(...))` when the ordinal resolves to a column/expression
+async fn lookup_index_column_by_oid(
+    store: &Arc<crate::storage::TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    oid: i64,
+    col_no: usize, // 1-based
+) -> Result<Option<Option<String>>> {
+    use crate::sql::catalog_oids;
+
+    let user_tables = store.list_tables(txn, db_id).await?;
+
+    for full_table_name in user_tables {
+        let Some(schema) = store.get_schema(txn, db_id, &full_table_name).await? else {
+            continue;
+        };
+
+        for idx in &schema.indexes {
+            let index_oid = catalog_oids::pg_class_index_oid(schema.table_id, idx.id)?;
+            if index_oid == oid {
+                // Build ordered list: regular columns then expression columns
+                let mut elements: Vec<String> = idx.columns.clone();
+                elements.extend(idx.expressions.iter().cloned());
+                let element = elements.get(col_no - 1).cloned();
+                return Ok(Some(element));
+            }
+        }
+
+        if !schema.pk_indices.is_empty() {
+            let pk_oid = catalog_oids::pg_class_pk_index_oid(schema.table_id)?;
+            if pk_oid == oid {
+                let pk_cols: Vec<String> = schema
+                    .pk_indices
+                    .iter()
+                    .filter_map(|i| schema.columns.get(*i).map(|c| c.name.clone()))
+                    .collect();
+                let element = pk_cols.get(col_no - 1).cloned();
+                return Ok(Some(element));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+async fn index_oid_exists_by_oid(
+    store: &Arc<crate::storage::TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    oid: i64,
+) -> Result<bool> {
+    use crate::sql::catalog_oids;
+
+    let user_tables = store.list_tables(txn, db_id).await?;
+
+    for full_table_name in user_tables {
+        let Some(schema) = store.get_schema(txn, db_id, &full_table_name).await? else {
+            continue;
+        };
+
+        for idx in &schema.indexes {
+            let index_oid = catalog_oids::pg_class_index_oid(schema.table_id, idx.id)?;
+            if index_oid == oid {
+                return Ok(true);
+            }
+        }
+
+        if !schema.pk_indices.is_empty() {
+            let pk_oid = catalog_oids::pg_class_pk_index_oid(schema.table_id)?;
+            if pk_oid == oid {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
 async fn lookup_typname_by_oid(
     store: &Arc<crate::storage::TikvStore>,
     txn: &mut Transaction,
@@ -1084,7 +1259,8 @@ async fn lookup_typname_by_oid(
 
 #[cfg(test)]
 mod tests {
-    use super::advisory_lock_timeout;
+    use super::{advisory_lock_timeout, value_to_bool_strict, value_to_i64_strict};
+    use crate::model::Value;
     use std::collections::HashMap;
     use std::time::Duration;
 
@@ -1117,5 +1293,33 @@ mod tests {
             advisory_lock_timeout(Some(Duration::from_millis(250)), Some(&settings)),
             Some(Duration::from_millis(250))
         );
+    }
+
+    #[test]
+    fn test_value_to_i64_strict_accepts_integer_text() {
+        assert_eq!(
+            value_to_i64_strict(&Value::Text("42".to_string()), "column_no").unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn test_value_to_i64_strict_rejects_non_integer_text() {
+        assert!(value_to_i64_strict(&Value::Text("not_an_int".to_string()), "column_no").is_err());
+    }
+
+    #[test]
+    fn test_value_to_i64_strict_rejects_float64() {
+        assert!(value_to_i64_strict(&Value::Float64(1.9), "column_no").is_err());
+    }
+
+    #[test]
+    fn test_value_to_bool_strict_accepts_boolean() {
+        assert!(value_to_bool_strict(&Value::Boolean(true), "pretty").unwrap());
+    }
+
+    #[test]
+    fn test_value_to_bool_strict_rejects_int32() {
+        assert!(value_to_bool_strict(&Value::Int32(1), "pretty").is_err());
     }
 }

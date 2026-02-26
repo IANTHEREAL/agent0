@@ -1,6 +1,6 @@
 use super::helpers::{
-    bool_col, int_array_col, int_col, int_val, null_val, schema_oid, split_schema_and_name,
-    text_col, text_val,
+    bool_col, int_array_col, int_col, int_val, is_unique_constraint_index, null_val, schema_oid,
+    split_schema_and_name, text_col, text_val,
 };
 use super::{ScanContext, VirtualTable};
 use crate::model::{ForeignKeyAction, Row, TableSchema, Value};
@@ -60,6 +60,7 @@ impl VirtualTable for PgConstraint {
                 bool_col("condeferrable"),
                 bool_col("condeferred"),
                 text_col("constraintdef"),
+                int_col("conindid"),
             ],
             version: 1,
             pk_constraint_name: None,
@@ -113,6 +114,7 @@ impl VirtualTable for PgConstraint {
                     .filter_map(|idx| schema.columns.get(*idx).map(|c| c.name.clone()))
                     .collect();
                 let constraintdef = format!("PRIMARY KEY ({})", pk_cols.join(", "));
+                let conindid = catalog_oids::pg_class_pk_index_oid(schema.table_id).unwrap_or(0);
 
                 rows.push(Row::new(vec![
                     int_val(constraint_oid),
@@ -129,12 +131,13 @@ impl VirtualTable for PgConstraint {
                     Value::Boolean(false),
                     Value::Boolean(false),
                     text_val(&constraintdef),
+                    int_val(conindid),
                 ]));
                 constraint_oid += 1;
             }
 
             for idx in &schema.indexes {
-                if !idx.unique {
+                if !is_unique_constraint_index(idx) {
                     continue;
                 }
                 let mut conkey = Vec::new();
@@ -144,6 +147,8 @@ impl VirtualTable for PgConstraint {
                     }
                 }
                 let constraintdef = format!("UNIQUE ({})", idx.columns.join(", "));
+                let conindid =
+                    catalog_oids::pg_class_index_oid(schema.table_id, idx.id).unwrap_or(0);
 
                 rows.push(Row::new(vec![
                     int_val(constraint_oid),
@@ -160,6 +165,7 @@ impl VirtualTable for PgConstraint {
                     Value::Boolean(false),
                     Value::Boolean(false),
                     text_val(&constraintdef),
+                    int_val(conindid),
                 ]));
                 constraint_oid += 1;
             }
@@ -190,6 +196,7 @@ impl VirtualTable for PgConstraint {
                     Value::Boolean(false),
                     Value::Boolean(false),
                     text_val(&constraintdef),
+                    int_val(0),
                 ]));
                 constraint_oid += 1;
             }
@@ -220,10 +227,19 @@ impl VirtualTable for PgConstraint {
                     }
                 }
 
+                // PostgreSQL format: no space before `(` after table name in REFERENCES.
+                // SQLAlchemy FK regex requires `REFERENCES <table>(<cols>)`.
+                // Preserve schema prefix for cross-schema FKs (PG behaviour).
+                let (ref_schema_name, ref_short_name) = split_schema_and_name(&ref_table);
+                let ref_display = if ref_schema_name != table_schema {
+                    format!("{}.{}", ref_schema_name, ref_short_name)
+                } else {
+                    ref_short_name.to_string()
+                };
                 let mut constraintdef = format!(
-                    "FOREIGN KEY ({}) REFERENCES {} ({})",
+                    "FOREIGN KEY ({}) REFERENCES {}({})",
                     fk.columns.join(", "),
-                    ref_table,
+                    ref_display,
                     fk.ref_columns.join(", ")
                 );
                 if let Some(action) = fk_action_sql(&fk.on_delete) {
@@ -248,11 +264,38 @@ impl VirtualTable for PgConstraint {
                     Value::Boolean(false),
                     Value::Boolean(false),
                     text_val(&constraintdef),
+                    int_val(0),
                 ]));
                 constraint_oid += 1;
             }
         }
 
         Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_unique_constraint_index;
+    use crate::model::IndexDef;
+    use crate::worker::types::IndexState;
+
+    #[test]
+    fn unique_indexes_only_surface_as_constraints_with_constraint_bit() {
+        let mut idx = IndexDef {
+            name: "uq_idx".to_string(),
+            id: 1,
+            columns: vec!["a".to_string()],
+            unique: true,
+            is_constraint: false,
+            method: Some("btree".to_string()),
+            predicate: None,
+            expressions: vec![],
+            state: IndexState::Ready,
+        };
+        assert!(!is_unique_constraint_index(&idx));
+
+        idx.is_constraint = true;
+        assert!(is_unique_constraint_index(&idx));
     }
 }

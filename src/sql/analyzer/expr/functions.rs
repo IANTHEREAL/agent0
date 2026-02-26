@@ -405,6 +405,8 @@ impl<'a> Analyzer<'a> {
                 self.coerce_args_to_vector(args, 2)
             }
             "VECTOR_DIMS" | "VECTOR_NORM" => self.coerce_args_to_vector(args, 1),
+            "GENERATE_SUBSCRIPTS" => self.coerce_generate_subscripts_signature(func_name, args),
+            "PG_GET_INDEXDEF" => self.coerce_pg_get_indexdef_signature(args),
             _ if is_two_arg_advisory_lock_function(func_name) => {
                 self.coerce_advisory_lock_two_arg_signature(func_name, args)
             }
@@ -460,6 +462,68 @@ impl<'a> Analyzer<'a> {
         args.into_iter()
             .map(|arg| self.coerce_if_needed(arg, &target))
             .collect()
+    }
+
+    fn coerce_generate_subscripts_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.len() < 2 || args.len() > 3 {
+            return Ok(args);
+        }
+
+        let arg_types: Vec<DataType> = args.iter().map(|a| a.data_type.clone()).collect();
+        let first_arg = &args[0];
+        let first_is_array_like = matches!(&first_arg.data_type, DataType::Array(_))
+            || matches!(
+                &first_arg.data_type,
+                DataType::UserDefined(name)
+                    if name.eq_ignore_ascii_case("int2vector")
+                        || name.eq_ignore_ascii_case("oidvector")
+            )
+            || self.is_unresolved_param(first_arg)
+            || first_arg.is_null_constant();
+
+        if !first_is_array_like {
+            return Err(AnalyzerError::FunctionNotFound {
+                name: func_name.to_string(),
+                arg_types,
+            });
+        }
+
+        let mut coerced = Vec::with_capacity(args.len());
+        for (idx, arg) in args.into_iter().enumerate() {
+            match idx {
+                0 => coerced.push(arg),
+                1 => coerced.push(self.coerce_if_needed(arg, &DataType::Int32)?),
+                2 => coerced.push(self.coerce_if_needed(arg, &DataType::Boolean)?),
+                _ => unreachable!("arity already validated"),
+            }
+        }
+
+        Ok(coerced)
+    }
+
+    fn coerce_pg_get_indexdef_signature(
+        &mut self,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.is_empty() || args.len() > 3 {
+            return Ok(args);
+        }
+
+        let mut coerced = Vec::with_capacity(args.len());
+        for (idx, arg) in args.into_iter().enumerate() {
+            let target = match idx {
+                0 => DataType::Int64,
+                1 => DataType::Int32,
+                2 => DataType::Boolean,
+                _ => unreachable!("arity already validated"),
+            };
+            coerced.push(self.coerce_if_needed(arg, &target)?);
+        }
+        Ok(coerced)
     }
 
     /// Create a resolved scalar FunctionCall from a function name and analyzed args.

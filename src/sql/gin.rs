@@ -555,6 +555,7 @@ mod tests {
             id: 1,
             columns: vec!["payload".to_string()],
             unique: false,
+            is_constraint: false,
             method: Some("gin".to_string()),
             predicate: None,
             expressions: vec![],

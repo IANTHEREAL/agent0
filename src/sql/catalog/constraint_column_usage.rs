@@ -1,4 +1,4 @@
-use super::helpers::{split_schema_and_name, text_col, text_val};
+use super::helpers::{is_unique_constraint_index, split_schema_and_name, text_col, text_val};
 use super::{ScanContext, VirtualTable};
 use crate::model::{Row, TableSchema};
 use anyhow::Result;
@@ -70,7 +70,7 @@ impl VirtualTable for ConstraintColumnUsage {
                 }
 
                 for idx in &table_def.indexes {
-                    if idx.unique {
+                    if is_unique_constraint_index(idx) {
                         for col_name in &idx.columns {
                             rows.push(Row::new(vec![
                                 text_val(ctx.database_name),
