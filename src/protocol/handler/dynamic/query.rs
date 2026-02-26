@@ -28,7 +28,7 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use super::super::encode::pgtype_to_datatype;
 use super::super::encode::{datatype_to_pgtype, effective_result_format, result_to_response};
@@ -58,6 +58,27 @@ pub(in crate::protocol::handler) fn is_data_statement(sql: &str) -> bool {
                 | Statement::Delete { .. }
         ),
         _ => false, // unparseable -> accepted by should_accept_sql_without_sqlparser -> utility
+    }
+}
+
+/// Returns true for transaction-control statements that must never be
+/// rate-limited: BEGIN, COMMIT, END, ROLLBACK, ROLLBACK TO SAVEPOINT,
+/// SAVEPOINT, RELEASE SAVEPOINT, SET TRANSACTION.  Blocking these would
+/// prevent transaction cleanup and violate PostgreSQL recovery semantics.
+pub(in crate::protocol::handler) fn is_transaction_control(sql: &str) -> bool {
+    match crate::sql::parse_sql(sql) {
+        Ok(stmts) if !stmts.is_empty() => stmts.iter().all(|s| {
+            matches!(
+                s,
+                Statement::StartTransaction { .. }
+                    | Statement::Commit { .. }
+                    | Statement::Rollback { .. }
+                    | Statement::Savepoint { .. }
+                    | Statement::ReleaseSavepoint { .. }
+                    | Statement::SetTransaction { .. }
+            )
+        }),
+        _ => false,
     }
 }
 
@@ -190,6 +211,36 @@ pub(in crate::protocol::handler) fn merge_parameter_types(
     result
 }
 
+impl DynamicPgHandler {
+    /// Check per-tenant QPS rate limit. Returns an error if the limit is exceeded.
+    fn check_rate_limit(&self) -> PgWireResult<()> {
+        if let Some(handle) = self.tenant_handle.get() {
+            if let Some(limiter) = handle.rate_limiter() {
+                if !limiter.try_acquire() {
+                    let keyspace = handle.keyspace();
+                    crate::observability::registry()
+                        .tenant(keyspace)
+                        .record_rate_limited();
+                    warn!(
+                        keyspace = keyspace,
+                        limit = limiter.rate(),
+                        "Query rate-limited for tenant"
+                    );
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "53300".to_string(),
+                        format!(
+                            "too many queries for tenant (rate limit: {} QPS)",
+                            limiter.rate()
+                        ),
+                    ))));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl SimpleQueryHandler for DynamicPgHandler {
     async fn on_query<C>(
@@ -216,6 +267,13 @@ impl SimpleQueryHandler for DynamicPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         debug!("Received query: {}", query);
+
+        // Transaction-control statements (BEGIN, COMMIT, ROLLBACK, SAVEPOINT, …)
+        // are exempt from rate limiting -- blocking them would prevent transaction
+        // cleanup and violate PostgreSQL recovery semantics.
+        if !is_transaction_control(query) {
+            self.check_rate_limit()?;
+        }
 
         let state = self.auth();
         let executor = &state.executor;
@@ -808,9 +866,15 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        let prepared = &portal.statement.statement;
+
+        // Transaction-control statements bypass rate limiting (see simple-query path).
+        if !is_transaction_control(&prepared.sql) {
+            self.check_rate_limit()?;
+        }
+
         let state = self.auth();
         let executor = &state.executor;
-        let prepared = &portal.statement.statement;
 
         debug!("Extended query: {}", prepared.sql);
 
@@ -952,5 +1016,120 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             .collect();
 
         Ok(DescribePortalResponse::new(fields))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transaction_control_detected() {
+        // All transaction-control variants must be recognized.
+        assert!(is_transaction_control("BEGIN"));
+        assert!(is_transaction_control("begin"));
+        assert!(is_transaction_control("START TRANSACTION"));
+        assert!(is_transaction_control("COMMIT"));
+        assert!(is_transaction_control("END"));
+        assert!(is_transaction_control("ROLLBACK"));
+        assert!(is_transaction_control("SAVEPOINT sp1"));
+        assert!(is_transaction_control("ROLLBACK TO SAVEPOINT sp1"));
+        assert!(is_transaction_control("RELEASE SAVEPOINT sp1"));
+        assert!(is_transaction_control(
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+        ));
+    }
+
+    #[test]
+    fn data_statements_not_transaction_control() {
+        assert!(!is_transaction_control("SELECT 1"));
+        assert!(!is_transaction_control("INSERT INTO t VALUES (1)"));
+        assert!(!is_transaction_control("UPDATE t SET x = 1"));
+        assert!(!is_transaction_control("DELETE FROM t"));
+    }
+
+    #[test]
+    fn utility_statements_not_transaction_control() {
+        assert!(!is_transaction_control("CREATE TABLE t (id int)"));
+        assert!(!is_transaction_control("SET search_path TO public"));
+        assert!(!is_transaction_control("SHOW server_version"));
+    }
+
+    /// Regression: multi-statement batches that mix transaction-control with
+    /// non-transaction statements must NOT be exempt from rate limiting.
+    #[test]
+    fn mixed_batch_not_exempt() {
+        // Transaction-control + data statement → rate-limited
+        assert!(!is_transaction_control("BEGIN; SELECT 1"));
+        assert!(!is_transaction_control("COMMIT; INSERT INTO t VALUES (1)"));
+        assert!(!is_transaction_control("ROLLBACK; UPDATE t SET x = 1"));
+        // Data statement + transaction-control → rate-limited
+        assert!(!is_transaction_control("SELECT 1; COMMIT"));
+        assert!(!is_transaction_control("INSERT INTO t VALUES (1); BEGIN"));
+    }
+
+    /// Pure transaction-control batches remain exempt.
+    #[test]
+    fn pure_transaction_control_batch_exempt() {
+        assert!(is_transaction_control("BEGIN; SAVEPOINT sp1"));
+        assert!(is_transaction_control(
+            "ROLLBACK TO SAVEPOINT sp1; ROLLBACK"
+        ));
+        assert!(is_transaction_control("COMMIT; BEGIN"));
+    }
+
+    /// Verify that transaction-control statements bypass rate limiting even
+    /// when the token bucket is completely exhausted.
+    #[test]
+    fn transaction_control_bypasses_exhausted_rate_limiter() {
+        use crate::pool::{TenantHandle, TikvClientPool};
+        use std::sync::Arc;
+
+        // Build a handler with a rate limiter that has 1 QPS capacity.
+        let pool = Arc::new(TikvClientPool::new(vec![]));
+        let server_config = crate::config::ServerConfig::default().shared();
+        let handler = DynamicPgHandler::new_with_pool(pool, None, server_config);
+
+        // Install a tenant handle whose rate limiter is immediately drained.
+        let tenant = TenantHandle::new_with_rate_limit(1);
+        tenant.rate_limiter().unwrap().drain();
+        assert!(
+            handler.tenant_handle.set(tenant).is_ok(),
+            "tenant_handle already set"
+        );
+
+        // check_rate_limit must reject when the bucket is empty.
+        let err = handler.check_rate_limit().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rate limit"),
+            "expected rate-limit error: {msg}"
+        );
+
+        // Transaction-control SQL passes through the exemption guard:
+        // `if !is_transaction_control(query) { self.check_rate_limit()?; }`
+        // Since is_transaction_control returns true, check_rate_limit is never called.
+        for sql in &[
+            "BEGIN",
+            "COMMIT",
+            "END",
+            "ROLLBACK",
+            "ROLLBACK TO SAVEPOINT sp1",
+            "SAVEPOINT sp1",
+            "RELEASE SAVEPOINT sp1",
+        ] {
+            assert!(
+                is_transaction_control(sql),
+                "{sql} must be recognized as transaction control"
+            );
+        }
+
+        // Non-transaction SQL is still blocked.
+        assert!(!is_transaction_control("SELECT 1"));
+        let err = handler.check_rate_limit().unwrap_err();
+        assert!(
+            err.to_string().contains("rate limit"),
+            "SELECT should still be rate-limited"
+        );
     }
 }

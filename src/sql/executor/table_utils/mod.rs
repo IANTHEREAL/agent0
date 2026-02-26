@@ -84,6 +84,7 @@ impl Executor {
                 Value::Int64(i64::try_from(snap.statement_count).unwrap_or(i64::MAX)),
                 Value::Int64(i64::try_from(snap.txn_commit_count).unwrap_or(i64::MAX)),
                 Value::Int64(i64::try_from(snap.error_count).unwrap_or(i64::MAX)),
+                Value::Int64(i64::try_from(snap.rate_limited_count).unwrap_or(i64::MAX)),
                 Value::Float64(snap.qps),
                 Value::Float64(snap.tps),
                 Value::Float64(snap.latency_avg_ms),

@@ -4,7 +4,7 @@ use crate::storage::TikvStore;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
 use tracing::{debug, info};
@@ -22,6 +22,71 @@ fn now_epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Read the per-tenant QPS limit from environment once. 0 = disabled.
+fn tenant_qps_limit() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("DB9_TENANT_QPS_LIMIT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Simple token bucket rate limiter.
+///
+/// Allows up to `rate` requests per second with burst capacity equal to `rate`.
+pub(crate) struct TokenBucket {
+    state: std::sync::Mutex<TokenBucketState>,
+    rate: u64,
+}
+
+struct TokenBucketState {
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
+
+impl TokenBucket {
+    fn new(rate: u64) -> Self {
+        Self {
+            state: std::sync::Mutex::new(TokenBucketState {
+                tokens: rate as f64,
+                last_refill: std::time::Instant::now(),
+            }),
+            rate,
+        }
+    }
+
+    /// Try to consume one token. Returns `true` if the request is allowed.
+    pub(crate) fn try_acquire(&self) -> bool {
+        let mut state = self.state.lock().expect("token bucket lock");
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(state.last_refill).as_secs_f64();
+        let capacity = self.rate as f64;
+        state.tokens = (state.tokens + elapsed * capacity).min(capacity);
+        state.last_refill = now;
+        if state.tokens >= 1.0 {
+            state.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The configured rate (queries per second).
+    pub(crate) fn rate(&self) -> u64 {
+        self.rate
+    }
+
+    /// Drain all tokens so the next `try_acquire` returns false.
+    #[cfg(test)]
+    pub(crate) fn drain(&self) {
+        let mut state = self.state.lock().expect("token bucket lock");
+        state.tokens = 0.0;
+        state.last_refill = std::time::Instant::now();
+    }
+}
+
 /// Per-tenant metadata inside the pool.
 #[allow(dead_code)] // test: fields accessed by pool lifecycle tests
 pub(crate) struct TenantEntry {
@@ -34,10 +99,13 @@ pub(crate) struct TenantEntry {
     keyspace: String,
     trigger_cache: Arc<TriggerBodyCache>,
     stats_cache: Arc<TableStatsCache>,
+    /// Per-tenant QPS rate limiter. `None` when rate limiting is disabled (limit = 0).
+    rate_limiter: Option<TokenBucket>,
 }
 
 impl TenantEntry {
     fn new(store: Arc<TikvStore>, keyspace: String) -> Self {
+        let qps_limit = tenant_qps_limit();
         Self {
             store,
             active_connections: AtomicU32::new(0),
@@ -45,6 +113,11 @@ impl TenantEntry {
             keyspace,
             trigger_cache: Arc::new(TriggerBodyCache::new()),
             stats_cache: Arc::new(TableStatsCache::new()),
+            rate_limiter: if qps_limit > 0 {
+                Some(TokenBucket::new(qps_limit))
+            } else {
+                None
+            },
         }
     }
 
@@ -78,6 +151,34 @@ impl TenantHandle {
 
     pub fn stats_cache(&self) -> &Arc<TableStatsCache> {
         &self.entry.stats_cache
+    }
+
+    pub fn rate_limiter(&self) -> Option<&TokenBucket> {
+        self.entry.rate_limiter.as_ref()
+    }
+
+    pub fn keyspace(&self) -> &str {
+        &self.entry.keyspace
+    }
+
+    /// Create a TenantHandle with a rate limiter set to the given QPS limit.
+    /// The bucket starts full (all tokens available).
+    #[cfg(test)]
+    pub(crate) fn new_with_rate_limit(qps_limit: u64) -> Self {
+        let entry = Arc::new(TenantEntry {
+            store: TikvStore::new_stub(),
+            active_connections: AtomicU32::new(1),
+            last_idle_at: AtomicU64::new(0),
+            keyspace: "test_ks".to_string(),
+            trigger_cache: Arc::new(TriggerBodyCache::new()),
+            stats_cache: Arc::new(TableStatsCache::new()),
+            rate_limiter: if qps_limit > 0 {
+                Some(TokenBucket::new(qps_limit))
+            } else {
+                None
+            },
+        });
+        Self { entry }
     }
 }
 
@@ -376,6 +477,7 @@ mod tests {
             keyspace: keyspace.to_string(),
             trigger_cache: Arc::new(TriggerBodyCache::new()),
             stats_cache: Arc::new(TableStatsCache::new()),
+            rate_limiter: None,
         })
     }
 
@@ -602,5 +704,35 @@ mod tests {
 
         assert_eq!(pool.active_tenant_count().await, 2);
         assert_eq!(pool.tenant_count().await, 3);
+    }
+
+    #[test]
+    fn test_token_bucket_allows_up_to_capacity() {
+        let bucket = TokenBucket::new(10);
+        for _ in 0..10 {
+            assert!(bucket.try_acquire());
+        }
+        // 11th request within the same instant should be denied
+        assert!(!bucket.try_acquire());
+    }
+
+    #[test]
+    fn test_token_bucket_refills_over_time() {
+        let bucket = TokenBucket::new(10);
+        // Exhaust all tokens
+        for _ in 0..10 {
+            assert!(bucket.try_acquire());
+        }
+        assert!(!bucket.try_acquire());
+
+        // Wait 200ms → ~2 tokens should refill
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(bucket.try_acquire());
+    }
+
+    #[test]
+    fn test_token_bucket_rate_accessor() {
+        let bucket = TokenBucket::new(42);
+        assert_eq!(bucket.rate(), 42);
     }
 }

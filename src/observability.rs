@@ -143,6 +143,7 @@ pub struct SummarySnapshot {
     pub statement_count: u64,
     pub txn_commit_count: u64,
     pub error_count: u64,
+    pub rate_limited_count: u64,
     pub qps: f64,
     pub tps: f64,
     pub latency_avg_ms: f64,
@@ -164,6 +165,7 @@ pub struct QuerySampleGroup {
 pub struct TenantObservability {
     config: ObservabilityConfig,
     active_connections: AtomicU64,
+    rate_limited_count: AtomicU64,
     // Box to avoid stack overflow: RollingWindow is ~130KB (60 buckets × 264 AtomicU64 bins each)
     window: Box<RollingWindow>,
     samples: Mutex<VecDeque<SampleEvent>>,
@@ -174,6 +176,7 @@ impl TenantObservability {
         Self {
             config,
             active_connections: AtomicU64::new(0),
+            rate_limited_count: AtomicU64::new(0),
             window: Box::new(RollingWindow::new()),
             samples: Mutex::new(VecDeque::new()),
         }
@@ -184,6 +187,10 @@ impl TenantObservability {
         ConnectionGuard {
             tenant: self.clone(),
         }
+    }
+
+    pub fn record_rate_limited(&self) {
+        self.rate_limited_count.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_commit(&self) {
@@ -262,6 +269,7 @@ impl TenantObservability {
             statement_count,
             txn_commit_count,
             error_count,
+            rate_limited_count: self.rate_limited_count.load(Ordering::Relaxed),
             qps,
             tps,
             latency_avg_ms: snap.latency_avg_ms,

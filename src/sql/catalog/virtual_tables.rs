@@ -41,6 +41,7 @@ pub fn virtual_table_schema(name: &str) -> Option<TableSchema> {
             col("statement_count", DataType::Int64),
             col("txn_commit_count", DataType::Int64),
             col("error_count", DataType::Int64),
+            col("rate_limited_count", DataType::Int64),
             col("qps", DataType::Float64),
             col("tps", DataType::Float64),
             col("latency_avg_ms", DataType::Float64),
