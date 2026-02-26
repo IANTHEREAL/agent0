@@ -16,7 +16,7 @@ use sqlparser::ast::{self as ast, BinaryOperator, Expr, TrimWhereField};
 
 use crate::model::{DataType, Value};
 use crate::sql::types::cast::CastContext;
-use crate::sql::types::coercion::comparison_target_type;
+use crate::sql::types::coercion::{common_type, comparison_target_type, unify_types};
 use crate::sql::types::mapping::sql_datatype_to_internal;
 
 use super::error::AnalyzerError;
@@ -26,6 +26,204 @@ use super::Analyzer;
 use coercion::extract_array_literal_elems;
 
 impl<'a> Analyzer<'a> {
+    fn is_text_like_type(data_type: &DataType) -> bool {
+        matches!(
+            data_type,
+            DataType::Text | DataType::Name | DataType::Varchar(_)
+        )
+    }
+
+    fn is_untyped_text_literal(expr: &TypedExpr) -> bool {
+        matches!(
+            (&expr.kind, &expr.data_type),
+            (TypedExprKind::Constant(Value::Text(_)), DataType::Text)
+        )
+    }
+
+    fn any_rhs_elem_is_semantically_unknown(&self, expr: &TypedExpr) -> bool {
+        expr.is_null_constant()
+            || Self::is_untyped_text_literal(expr)
+            || self.is_unresolved_param(expr)
+    }
+
+    fn implicit_text_array_coercion_source(expr: &TypedExpr) -> Option<&TypedExpr> {
+        match &expr.kind {
+            TypedExprKind::Cast {
+                expr: inner,
+                target_type,
+                cast_context: CastContext::Implicit,
+            } if Self::is_text_like_type(target_type)
+                && !Self::is_text_like_type(&inner.data_type) =>
+            {
+                Some(inner.as_ref())
+            }
+            _ => None,
+        }
+    }
+
+    fn has_explicit_text_like_array_cast(expr: &TypedExpr) -> bool {
+        match &expr.kind {
+            TypedExprKind::Cast {
+                expr: inner,
+                target_type,
+                cast_context: CastContext::Explicit,
+            } => {
+                matches!(target_type, DataType::Array(elem) if Self::is_text_like_type(elem))
+                    || Self::has_explicit_text_like_array_cast(inner)
+            }
+            TypedExprKind::Cast { expr: inner, .. } => {
+                Self::has_explicit_text_like_array_cast(inner)
+            }
+            _ => false,
+        }
+    }
+
+    /// ARRAY literal typing contract:
+    /// - Treat untyped string literals / NULL / unresolved params as semantically UNKNOWN
+    /// - If concrete explicit text-like members and concrete non-text members are both
+    ///   present, fail ARRAY type resolution (PG parity)
+    /// - If UNKNOWNs caused widening to text-like but concrete members are non-text,
+    ///   recover element type from the concrete non-text members
+    /// - Respect explicit text-like members/casts (do not recover past them)
+    fn array_literal_elem_type(&self, elems: &[TypedExpr]) -> Result<DataType, AnalyzerError> {
+        let refs: Vec<&TypedExpr> = elems.iter().collect();
+        let mut elem_type = self.unify_expr_types(&refs, "ARRAY")?;
+
+        if Self::is_text_like_type(&elem_type) {
+            let mut concrete_non_text = Vec::new();
+            let mut has_concrete_text_like = false;
+
+            for elem in elems {
+                if self.any_rhs_elem_is_semantically_unknown(elem) {
+                    continue;
+                }
+
+                if Self::is_text_like_type(&elem.data_type) {
+                    has_concrete_text_like = true;
+                } else {
+                    concrete_non_text.push(elem.data_type.clone());
+                }
+            }
+
+            if has_concrete_text_like && !concrete_non_text.is_empty() {
+                return Err(AnalyzerError::TypesCannotBeMatched {
+                    types: elems.iter().map(|e| e.data_type.clone()).collect(),
+                    context: "ARRAY".to_string(),
+                });
+            }
+
+            if !has_concrete_text_like && !concrete_non_text.is_empty() {
+                elem_type = unify_types(&concrete_non_text).ok_or_else(|| {
+                    AnalyzerError::TypesCannotBeMatched {
+                        types: elems.iter().map(|e| e.data_type.clone()).collect(),
+                        context: "ARRAY".to_string(),
+                    }
+                })?;
+            }
+        }
+
+        Ok(elem_type)
+    }
+
+    /// For `ANY/ALL` over non-empty literal arrays, recover RHS element type for
+    /// operator resolution from concrete non-text members when array-level
+    /// unification widened to text due UNKNOWN literals.
+    ///
+    /// Example (PostgreSQL): `1 = ANY(ARRAY[1, '2'])` resolves as integer
+    /// comparison, while `1 = ANY(ARRAY['1', '2'])` remains integer vs text error.
+    fn comparison_target_type_for_any_literal_array(
+        &self,
+        left_expr: &TypedExpr,
+        elems: &[TypedExpr],
+        fallback_elem_type: &DataType,
+        allow_text_recovery: bool,
+    ) -> Option<DataType> {
+        let mut rhs_elem_type = fallback_elem_type.clone();
+
+        if allow_text_recovery && !elems.is_empty() && Self::is_text_like_type(fallback_elem_type) {
+            let mut concrete_non_text = Vec::new();
+            let mut has_non_unknown_text_like = false;
+
+            for elem in elems {
+                if self.any_rhs_elem_is_semantically_unknown(elem) {
+                    continue;
+                }
+
+                if let Some(inner) = Self::implicit_text_array_coercion_source(elem) {
+                    concrete_non_text.push(inner.data_type.clone());
+                    continue;
+                }
+
+                if Self::is_text_like_type(&elem.data_type) {
+                    has_non_unknown_text_like = true;
+                } else {
+                    concrete_non_text.push(elem.data_type.clone());
+                }
+            }
+
+            if !has_non_unknown_text_like && !concrete_non_text.is_empty() {
+                rhs_elem_type = unify_types(&concrete_non_text)?;
+            }
+        }
+
+        self.comparison_target_type_for_any(left_expr, &rhs_elem_type)
+    }
+
+    fn unknown_lhs_target_for_text_like_any(right_type: &DataType) -> DataType {
+        match right_type {
+            // PG keeps NAME when unknown-like LHS compares against NAME[]
+            // (e.g. `$1 = ANY(ARRAY[]::name[])`).
+            DataType::Name => DataType::Name,
+            // PG resolves unknown-like LHS to TEXT for text/varchar families,
+            // including typmod-bearing varchar(n) element types.
+            DataType::Text | DataType::Varchar(_) => DataType::Text,
+            _ => right_type.clone(),
+        }
+    }
+
+    /// `ANY/ALL` coercion contract:
+    /// - untyped NULL adopts the RHS element type
+    /// - for text-like -> non-text, only UNKNOWN text literals / unresolved params may coerce
+    /// - for unknown-like LHS vs text-like RHS, infer NAME only for NAME; otherwise TEXT
+    /// - text-like vs text-like otherwise uses normal string common-type resolution
+    pub(super) fn comparison_target_type_for_any(
+        &self,
+        left_expr: &TypedExpr,
+        right_type: &DataType,
+    ) -> Option<DataType> {
+        if left_expr.is_null_constant() {
+            return Some(right_type.clone());
+        }
+
+        let lhs_text_like = Self::is_text_like_type(&left_expr.data_type);
+        let rhs_text_like = Self::is_text_like_type(right_type);
+
+        if lhs_text_like && !rhs_text_like {
+            return if Self::is_untyped_text_literal(left_expr)
+                || self.is_unresolved_param(left_expr)
+            {
+                Some(right_type.clone())
+            } else {
+                None
+            };
+        }
+
+        if lhs_text_like && rhs_text_like {
+            // PG: unknown/text-seeded LHS in scalar-array comparison should
+            // infer NAME only for NAME RHS; text/varchar RHS infer TEXT.
+            if Self::is_untyped_text_literal(left_expr) || self.is_unresolved_param(left_expr) {
+                return Some(Self::unknown_lhs_target_for_text_like_any(right_type));
+            }
+            return common_type(&left_expr.data_type, right_type);
+        }
+
+        if !lhs_text_like && rhs_text_like {
+            return None;
+        }
+
+        comparison_target_type(&left_expr.data_type, right_type)
+    }
+
     /// Analyze an expression, producing a fully-typed IR node.
     ///
     /// This is the core single-pass analysis: name resolution and type checking
@@ -312,8 +510,7 @@ impl<'a> Analyzer<'a> {
                     // (PostgreSQL: `SELECT ARRAY[]::text[]` requires cast for empty)
                     DataType::Text
                 } else {
-                    let refs: Vec<&TypedExpr> = elems.iter().collect();
-                    self.unify_expr_types(&refs, "ARRAY")?
+                    self.array_literal_elem_type(&elems)?
                 };
 
                 // Insert implicit casts for elements that don't match the unified type.
@@ -767,23 +964,12 @@ impl<'a> Analyzer<'a> {
                                 DataType::Array(inner) => inner.as_ref().clone(),
                                 _ => left_expr.data_type.clone(),
                             };
-                            // Use comparison semantics (not unify_types which has a
-                            // Text universal fallback). Reject text↔non-text mismatches
-                            // since no comparison operator exists (PG parity).
-                            let lhs_text = is_text_like(&left_expr.data_type);
-                            let rhs_text = is_text_like(&elem_type);
-                            let common = if lhs_text != rhs_text {
-                                None
-                            } else {
-                                comparison_target_type(&left_expr.data_type, &elem_type)
-                            };
-                            let common =
-                                common.ok_or_else(|| AnalyzerError::TypesCannotBeMatched {
-                                    types: vec![
-                                        left_expr.data_type.clone(),
-                                        right_expr.data_type.clone(),
-                                    ],
-                                    context: "ANY".to_string(),
+                            let common = self
+                                .comparison_target_type_for_any(&left_expr, &elem_type)
+                                .ok_or_else(|| AnalyzerError::OperatorTypeMismatch {
+                                    operator: compare_op.to_string(),
+                                    left: left_expr.data_type.to_string().to_lowercase(),
+                                    right: elem_type.to_string().to_lowercase(),
                                 })?;
                             let left_coerced = self.coerce_if_needed(left_expr, &common)?;
                             return Ok(TypedExpr::new(
@@ -795,10 +981,24 @@ impl<'a> Analyzer<'a> {
                                 DataType::Boolean,
                             ));
                         }
-                        let mut in_refs: Vec<&TypedExpr> = vec![&left_expr];
-                        let elem_refs: Vec<&TypedExpr> = elems.iter().collect();
-                        in_refs.extend(elem_refs);
-                        let common = self.unify_expr_types(&in_refs, "ANY")?;
+                        let elem_type = match &right_expr.data_type {
+                            DataType::Array(inner) => inner.as_ref().clone(),
+                            _ => left_expr.data_type.clone(),
+                        };
+                        let allow_text_recovery =
+                            !Self::has_explicit_text_like_array_cast(&right_expr);
+                        let common = self
+                            .comparison_target_type_for_any_literal_array(
+                                &left_expr,
+                                &elems,
+                                &elem_type,
+                                allow_text_recovery,
+                            )
+                            .ok_or_else(|| AnalyzerError::OperatorTypeMismatch {
+                                operator: compare_op.to_string(),
+                                left: left_expr.data_type.to_string().to_lowercase(),
+                                right: elem_type.to_string().to_lowercase(),
+                            })?;
                         let left_coerced = self.coerce_if_needed(left_expr, &common)?;
                         let list = elems
                             .into_iter()
@@ -829,23 +1029,12 @@ impl<'a> Analyzer<'a> {
                                 DataType::Array(inner) => inner.as_ref().clone(),
                                 _ => left_expr.data_type.clone(),
                             };
-                            // Use comparison semantics (not unify_types which has a
-                            // Text universal fallback). Reject text↔non-text mismatches
-                            // since no comparison operator exists (PG parity).
-                            let lhs_text = is_text_like(&left_expr.data_type);
-                            let rhs_text = is_text_like(&elem_type);
-                            let common = if lhs_text != rhs_text {
-                                None
-                            } else {
-                                comparison_target_type(&left_expr.data_type, &elem_type)
-                            };
-                            let common =
-                                common.ok_or_else(|| AnalyzerError::TypesCannotBeMatched {
-                                    types: vec![
-                                        left_expr.data_type.clone(),
-                                        right_expr.data_type.clone(),
-                                    ],
-                                    context: "ANY".to_string(),
+                            let common = self
+                                .comparison_target_type_for_any(&left_expr, &elem_type)
+                                .ok_or_else(|| AnalyzerError::OperatorTypeMismatch {
+                                    operator: compare_op.to_string(),
+                                    left: left_expr.data_type.to_string().to_lowercase(),
+                                    right: elem_type.to_string().to_lowercase(),
                                 })?;
                             let left_coerced = self.coerce_if_needed(left_expr, &common)?;
                             let op = self.any_all_compare_op(compare_op)?;
@@ -859,10 +1048,24 @@ impl<'a> Analyzer<'a> {
                                 DataType::Boolean,
                             ));
                         }
-                        let mut in_refs: Vec<&TypedExpr> = vec![&left_expr];
-                        let elem_refs: Vec<&TypedExpr> = elems.iter().collect();
-                        in_refs.extend(elem_refs);
-                        let common = self.unify_expr_types(&in_refs, "ANY")?;
+                        let elem_type = match &right_expr.data_type {
+                            DataType::Array(inner) => inner.as_ref().clone(),
+                            _ => left_expr.data_type.clone(),
+                        };
+                        let allow_text_recovery =
+                            !Self::has_explicit_text_like_array_cast(&right_expr);
+                        let common = self
+                            .comparison_target_type_for_any_literal_array(
+                                &left_expr,
+                                &elems,
+                                &elem_type,
+                                allow_text_recovery,
+                            )
+                            .ok_or_else(|| AnalyzerError::OperatorTypeMismatch {
+                                operator: compare_op.to_string(),
+                                left: left_expr.data_type.to_string().to_lowercase(),
+                                right: elem_type.to_string().to_lowercase(),
+                            })?;
                         let left_coerced = self.coerce_if_needed(left_expr, &common)?;
                         let coerced_elems = elems
                             .into_iter()
@@ -1075,11 +1278,4 @@ impl<'a> Analyzer<'a> {
             ))),
         }
     }
-}
-
-/// Returns `true` for text-like types that form a single comparison category.
-/// Used to reject text↔non-text comparisons in empty-array ANY/= ANY paths
-/// (PostgreSQL has no cross-category comparison operators for these).
-fn is_text_like(dt: &DataType) -> bool {
-    matches!(dt, DataType::Text | DataType::Varchar(_) | DataType::Name)
 }

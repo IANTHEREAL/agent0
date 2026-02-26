@@ -225,6 +225,10 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
             negated,
         } => {
             let val = eval_typed_expr(inner, row, qctx)?;
+            // ANY/ALL over empty array is vacuously false/true regardless of LHS.
+            if list.is_empty() {
+                return Ok(Value::Boolean(*negated));
+            }
             if val == Value::Null {
                 return Ok(Value::Null);
             }

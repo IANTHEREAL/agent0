@@ -453,10 +453,19 @@ impl<'a> Analyzer<'a> {
         let right_type = analyzed.output_schema[0].1.clone();
         if left_expr.is_null_constant() {
             left_expr = TypedExpr::null(right_type.clone());
-        } else if left_expr.data_type != right_type {
-            if let Some(target) = comparison_target_type(&left_expr.data_type, &right_type) {
-                left_expr = self.coerce_if_needed(left_expr, &target)?;
-            }
+        } else if left_expr.data_type != right_type || self.is_unresolved_param(&left_expr) {
+            // Unresolved `$n` parameters are initially seeded as Text.
+            // Even when RHS is also Text, we must still run through
+            // coerce_if_needed() so resolve_param_type() records the inferred
+            // type and finalize_param_types() doesn't raise 42P18.
+            let Some(target) = self.comparison_target_type_for_any(&left_expr, &right_type) else {
+                return Err(AnalyzerError::OperatorTypeMismatch {
+                    operator: compare_op.to_string(),
+                    left: left_expr.data_type.to_string().to_lowercase(),
+                    right: right_type.to_string().to_lowercase(),
+                });
+            };
+            left_expr = self.coerce_if_needed(left_expr, &target)?;
         }
 
         let op = self.any_all_compare_op(compare_op)?;

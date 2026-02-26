@@ -502,6 +502,260 @@ fn analyze_ne_any_empty_array_uses_scalar_array_cmp() {
     }
 }
 
+#[test]
+fn analyze_any_empty_array_coerces_untyped_text_literal() {
+    let typed = analyze_expr_with_users("'1' = ANY(ARRAY[]::int[])").unwrap();
+    assert_eq!(typed.data_type, DataType::Boolean);
+    match &typed.kind {
+        TypedExprKind::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            assert!(list.is_empty());
+            assert!(!negated);
+            assert_eq!(expr.data_type, DataType::Int32);
+            assert!(matches!(expr.kind, TypedExprKind::Cast { .. }));
+        }
+        _ => panic!("expected InList, got {:?}", typed.kind),
+    }
+}
+
+#[test]
+fn analyze_any_empty_array_rejects_explicit_text_cast() {
+    let err = analyze_expr_with_users("'1'::text = ANY(ARRAY[]::int[])").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
+            if operator == "=" && left == "text" && right == "integer"
+    ));
+}
+
+#[test]
+fn analyze_any_empty_array_rejects_explicit_name_cast() {
+    let err = analyze_expr_with_users("'1'::name = ANY(ARRAY[]::int[])").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
+            if operator == "=" && left == "name" && right == "integer"
+    ));
+}
+
+#[test]
+fn analyze_any_empty_array_rejects_text_column() {
+    let err = analyze_expr_with_users("name = ANY(ARRAY[]::int[])").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
+            if operator == "=" && left == "text" && right == "integer"
+    ));
+}
+
+#[test]
+fn analyze_any_non_empty_array_coerces_untyped_text_literal() {
+    let typed = analyze_expr_with_users("'1' = ANY(ARRAY[1, 2])").unwrap();
+    assert_eq!(typed.data_type, DataType::Boolean);
+    match &typed.kind {
+        TypedExprKind::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            assert_eq!(list.len(), 2);
+            assert!(!negated);
+            assert_eq!(expr.data_type, DataType::Int32);
+            assert!(matches!(expr.kind, TypedExprKind::Cast { .. }));
+            assert!(list.iter().all(|e| e.data_type == DataType::Int32));
+        }
+        _ => panic!("expected InList, got {:?}", typed.kind),
+    }
+}
+
+#[test]
+fn analyze_any_non_empty_array_accepts_untyped_null_literal() {
+    let typed = analyze_expr_with_users("NULL = ANY(ARRAY[1, 2])").unwrap();
+    assert_eq!(typed.data_type, DataType::Boolean);
+    match &typed.kind {
+        TypedExprKind::InList { expr, list, .. } => {
+            assert_eq!(expr.data_type, DataType::Int32);
+            assert!(expr.is_null_constant());
+            assert_eq!(list.len(), 2);
+            assert!(list.iter().all(|e| e.data_type == DataType::Int32));
+        }
+        _ => panic!("expected InList, got {:?}", typed.kind),
+    }
+}
+
+#[test]
+fn analyze_any_non_empty_array_mixed_unknown_rhs_literals_use_typed_comparison() {
+    let typed = analyze_expr_with_users("1 = ANY(ARRAY[1, '2'])").unwrap();
+    assert_eq!(typed.data_type, DataType::Boolean);
+    match &typed.kind {
+        TypedExprKind::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            assert!(!negated);
+            assert_eq!(expr.data_type, DataType::Int32);
+            assert_eq!(list.len(), 2);
+            assert!(list.iter().all(|e| e.data_type == DataType::Int32));
+        }
+        _ => panic!("expected InList, got {:?}", typed.kind),
+    }
+}
+
+#[test]
+fn analyze_any_non_empty_array_mixed_explicit_text_like_rhs_literals_rejected() {
+    // PG parity: explicit text-like RHS members are concrete. Mixing them with
+    // concrete non-text members must fail ARRAY type resolution.
+    let err = analyze_expr_with_users("'1' = ANY(ARRAY[1, '2'::varchar])").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::TypesCannotBeMatched { ref context, .. } if context == "ARRAY"
+    ));
+}
+
+#[test]
+fn analyze_array_literal_rejects_incompatible_non_text_recovery_types() {
+    // PG parity: UNKNOWN text literal must not force text[] when concrete
+    // non-text members are themselves incompatible.
+    let err = analyze_expr_with_users("ARRAY['x', 1, now()]").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::TypesCannotBeMatched { ref context, .. } if context == "ARRAY"
+    ));
+}
+
+#[test]
+fn analyze_ne_any_non_empty_array_accepts_untyped_null_literal() {
+    let typed = analyze_expr_with_users("NULL <> ANY(ARRAY[1, 2])").unwrap();
+    assert_eq!(typed.data_type, DataType::Boolean);
+    match &typed.kind {
+        TypedExprKind::ScalarArrayCmp {
+            expr,
+            elems,
+            op,
+            use_or,
+        } => {
+            assert_eq!(expr.data_type, DataType::Int32);
+            assert!(expr.is_null_constant());
+            assert_eq!(elems.len(), 2);
+            assert!(elems.iter().all(|e| e.data_type == DataType::Int32));
+            assert_eq!(*op, BinaryOp::NotEq);
+            assert!(*use_or);
+        }
+        _ => panic!("expected ScalarArrayCmp, got {:?}", typed.kind),
+    }
+}
+
+#[test]
+fn analyze_ne_any_non_empty_array_mixed_unknown_rhs_literals_use_typed_comparison() {
+    let typed = analyze_expr_with_users("1 <> ANY(ARRAY[1, '2'])").unwrap();
+    assert_eq!(typed.data_type, DataType::Boolean);
+    match &typed.kind {
+        TypedExprKind::ScalarArrayCmp {
+            expr,
+            elems,
+            op,
+            use_or,
+        } => {
+            assert_eq!(expr.data_type, DataType::Int32);
+            assert_eq!(elems.len(), 2);
+            assert!(elems.iter().all(|e| e.data_type == DataType::Int32));
+            assert_eq!(*op, BinaryOp::NotEq);
+            assert!(*use_or);
+        }
+        _ => panic!("expected ScalarArrayCmp, got {:?}", typed.kind),
+    }
+}
+
+#[test]
+fn analyze_any_non_empty_array_all_unknown_text_literals_reject_non_text_lhs() {
+    let err = analyze_expr_with_users("1 = ANY(ARRAY['1', '2'])").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
+            if operator == "=" && left == "integer" && right == "text"
+    ));
+}
+
+#[test]
+fn analyze_any_non_empty_array_accepts_text_name_comparison() {
+    let typed = analyze_expr_with_users("'x'::text = ANY(ARRAY['x'::name])").unwrap();
+    assert_eq!(typed.data_type, DataType::Boolean);
+    match &typed.kind {
+        TypedExprKind::InList { expr, list, .. } => {
+            assert_eq!(expr.data_type, DataType::Text);
+            assert_eq!(list.len(), 1);
+            assert!(list.iter().all(|e| e.data_type == DataType::Text));
+        }
+        _ => panic!("expected InList, got {:?}", typed.kind),
+    }
+}
+
+#[test]
+fn analyze_any_non_empty_array_rejects_explicit_text_cast() {
+    let err = analyze_expr_with_users("'1'::text = ANY(ARRAY[1, 2])").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
+            if operator == "=" && left == "text" && right == "integer"
+    ));
+}
+
+#[test]
+fn analyze_any_non_empty_array_rejects_explicit_name_cast() {
+    let err = analyze_expr_with_users("'1'::name = ANY(ARRAY[1, 2])").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
+            if operator == "=" && left == "name" && right == "integer"
+    ));
+}
+
+#[test]
+fn analyze_any_non_empty_array_rejects_text_column() {
+    let err = analyze_expr_with_users("name = ANY(ARRAY[1, 2])").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
+            if operator == "=" && left == "text" && right == "integer"
+    ));
+}
+
+#[test]
+fn analyze_any_non_empty_array_respects_explicit_text_array_cast() {
+    // PG parity: explicit RHS text-like array cast must be honored; no
+    // literal-member recovery to integer is allowed.
+    let err = analyze_expr_with_users("1 = ANY((ARRAY[1, '2'])::varchar[])").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
+            if operator == "=" && left == "integer" && right == "text"
+    ));
+}
+
+#[test]
+fn analyze_ne_any_non_empty_array_respects_explicit_text_array_cast() {
+    let err = analyze_expr_with_users("1 <> ANY((ARRAY[1, '2'])::varchar[])").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
+            if operator == "<>" && left == "integer" && right == "text"
+    ));
+}
+
+#[test]
+fn analyze_ne_any_non_empty_array_rejects_explicit_text_cast() {
+    let err = analyze_expr_with_users("'1'::text <> ANY(ARRAY[1, 2])").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
+            if operator == "<>" && left == "text" && right == "integer"
+    ));
+}
+
 // ── LIKE ────────────────────────────────────────────────────
 
 #[test]
@@ -3111,4 +3365,190 @@ fn any_with_cast_parameter_works() {
 
     let param_types = analyzer.finalize_param_types().unwrap();
     assert_eq!(param_types, vec![DataType::Array(Box::new(DataType::Text))]);
+}
+
+#[test]
+fn any_with_mixed_unknown_array_and_unresolved_parameter_infers_integer() {
+    // PG parity regression: mixed UNKNOWN/non-UNKNOWN array members should not
+    // lock `$1` to Text before scalar-array comparison typing.
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let query = parse_query("SELECT 1 = ANY(ARRAY[1, '2', $1])");
+    let _result = analyzer.analyze_query(&query).unwrap();
+
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(param_types, vec![DataType::Int32]);
+}
+
+#[test]
+fn array_literal_with_mixed_unknown_and_unresolved_parameter_infers_integer() {
+    // PG parity: plain ARRAY literal should infer $1 from concrete non-text
+    // members instead of deferring to finalize(42P18).
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT ARRAY[1, '2', $1]");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(param_types, vec![DataType::Int32]);
+    let AnalyzedStatement::Query(query) = result else {
+        panic!("expected query statement");
+    };
+    assert_eq!(
+        query.output_schema[0].1,
+        DataType::Array(Box::new(DataType::Int32))
+    );
+}
+
+#[test]
+fn any_with_mixed_unknown_array_and_explicit_text_parameter_is_rejected() {
+    // PG parity: explicit text-like RHS members are concrete, so the ARRAY
+    // itself is invalid before scalar-array comparison typing.
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let query = parse_query("SELECT 1 = ANY(ARRAY[1, '2', $1::text])");
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::TypesCannotBeMatched { ref context, .. } if context == "ARRAY"
+    ));
+}
+
+#[test]
+fn any_with_unresolved_parameter_and_varchar_array_infers_text() {
+    // PG parity: unknown-typed LHS against varchar(n)[] resolves to TEXT,
+    // not varchar(n).
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let query = parse_query("SELECT $1 = ANY(ARRAY['a']::varchar(3)[])");
+    let _result = analyzer.analyze_query(&query).unwrap();
+
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(param_types, vec![DataType::Text]);
+}
+
+#[test]
+fn any_subquery_with_unresolved_parameter_infers_scalar_type() {
+    // Unknown-typed bind params on the LHS of ANY(subquery) should be inferred
+    // from the subquery output type (PG parity).
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let query =
+        parse_query("SELECT id FROM users WHERE $1 = ANY (ARRAY(SELECT user_id FROM orders))");
+    let _result = analyzer.analyze_query(&query).unwrap();
+
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(param_types, vec![DataType::Int32]);
+}
+
+#[test]
+fn any_subquery_with_unresolved_parameter_and_text_rhs_infers_text() {
+    // Regression: when both sides are nominally Text, unresolved parameters
+    // must still be recorded as inferred to avoid 42P18 at finalize.
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let query = parse_query("SELECT id FROM users WHERE $1 = ANY (ARRAY(SELECT name FROM users))");
+    let _result = analyzer.analyze_query(&query).unwrap();
+
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(param_types, vec![DataType::Text]);
+}
+
+#[test]
+fn any_subquery_with_unresolved_parameter_and_varchar_rhs_infers_text() {
+    // PG parity: ANY/ALL text-like inference should not lock unresolved params
+    // to varchar typmods.
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let query = parse_query("SELECT $1 = ANY (ARRAY(SELECT 'a'::varchar(3)))");
+    let _result = analyzer.analyze_query(&query).unwrap();
+
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(param_types, vec![DataType::Text]);
+}
+
+#[test]
+fn any_subquery_with_unresolved_parameter_and_name_rhs_infers_name() {
+    // Text-seeded unresolved LHS parameter should adopt RHS Name type in
+    // ANY(subquery) context (PG parity).
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let query = parse_query("SELECT $1 = ANY (ARRAY(SELECT 'x'::name))");
+    let _result = analyzer.analyze_query(&query).unwrap();
+
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(param_types, vec![DataType::Name]);
+}
+
+#[test]
+fn all_subquery_with_unresolved_parameter_and_text_rhs_infers_text() {
+    // Same inference contract as ANY(subquery): unresolved LHS params must be
+    // inferred from RHS type even when both seed as Text.
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let query = parse_query("SELECT id FROM users WHERE $1 = ALL (ARRAY(SELECT name FROM users))");
+    let _result = analyzer.analyze_query(&query).unwrap();
+
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(param_types, vec![DataType::Text]);
+}
+
+#[test]
+fn any_subquery_accepts_text_name_comparison() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT id FROM users WHERE 'x'::text = ANY (ARRAY(SELECT 'x'::name))");
+    let result = analyzer.analyze_query(&query).unwrap();
+    let sel = expect_select(&result);
+    let where_expr = sel.where_clause.as_ref().expect("missing WHERE");
+    match &where_expr.kind {
+        TypedExprKind::AnyAll {
+            expr,
+            op,
+            subquery,
+            is_all,
+        } => {
+            assert_eq!(expr.data_type, DataType::Text);
+            assert_eq!(*op, BinaryOp::Eq);
+            assert!(!*is_all);
+            assert_eq!(subquery.output_schema[0].1, DataType::Name);
+        }
+        other => panic!("expected AnyAll, got {:?}", std::mem::discriminant(other)),
+    }
+}
+
+#[test]
+fn any_empty_array_with_unresolved_parameter_infers_element_type() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let query = parse_query("SELECT id FROM users WHERE $1 = ANY(ARRAY[]::int[])");
+    let _result = analyzer.analyze_query(&query).unwrap();
+
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(param_types, vec![DataType::Int32]);
+}
+
+#[test]
+fn any_empty_name_array_with_unresolved_parameter_infers_name() {
+    // Repro: `$1 = ANY(ARRAY[]::name[])` should infer `$1` as Name, not Text.
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let query = parse_query("SELECT $1 = ANY(ARRAY[]::name[])");
+    let _result = analyzer.analyze_query(&query).unwrap();
+
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(param_types, vec![DataType::Name]);
+}
+
+#[test]
+fn any_subquery_with_text_typed_parameter_is_rejected() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[Some(DataType::Text)]);
+    let query =
+        parse_query("SELECT id FROM users WHERE $1 = ANY (ARRAY(SELECT user_id FROM orders))");
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::OperatorTypeMismatch { ref operator, ref left, ref right }
+            if operator == "=" && left == "text" && right == "integer"
+    ));
 }

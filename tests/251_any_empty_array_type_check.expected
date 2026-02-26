@@ -1,0 +1,36 @@
+ERROR:  invalid input syntax for type integer: "hello"
+LINE 1: SELECT 'hello' <> ANY(ARRAY[]::int[]) AS res;
+               ^
+ERROR:  division by zero
+ERROR:  invalid input syntax for type integer: "hello"
+LINE 1: SELECT 'hello' = ANY(ARRAY[]::int[]) AS res;
+               ^
+ERROR:  division by zero
+res
+f
+(1 row)
+res
+f
+(1 row)
+ERROR:  operator does not exist: text = integer
+LINE 1: SELECT '1'::text = ANY(ARRAY[]::int[]) AS res;
+                         ^
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+ERROR:  operator does not exist: name = integer
+LINE 1: SELECT '1'::name = ANY(ARRAY[]::int[]) AS res;
+                         ^
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+ERROR:  operator does not exist: text <> integer
+LINE 1: SELECT '1'::text <> ANY(ARRAY[]::int[]) AS res;
+                         ^
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+ERROR:  operator does not exist: name <> integer
+LINE 1: SELECT '1'::name <> ANY(ARRAY[]::int[]) AS res;
+                         ^
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+res
+f
+(1 row)
+res
+f
+(1 row)
