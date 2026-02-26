@@ -8,6 +8,7 @@ use tokio::net::TcpStream;
 #[cfg(any(feature = "_ring", feature = "_aws-lc-rs"))]
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use tokio_util::codec::{Decoder, Encoder, Framed};
+use tokio_util::sync::CancellationToken;
 
 use crate::api::auth::StartupHandler;
 use crate::api::copy::CopyHandler;
@@ -674,6 +675,7 @@ async fn do_process_socket<S, A, Q, EQ, C, E>(
     extended_query_handler: Arc<EQ>,
     copy_handler: Arc<C>,
     error_handler: Arc<E>,
+    cancel_token: Option<CancellationToken>,
 ) -> Result<(), IOError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
@@ -683,7 +685,32 @@ where
     C: CopyHandler,
     E: ErrorHandler,
 {
-    while let Some(Ok(msg)) = socket.next().await {
+    loop {
+        let msg = match &cancel_token {
+            Some(token) => tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    let err = PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "FATAL".into(),
+                        "25P03".into(),
+                        "terminating connection due to idle-in-transaction timeout".into(),
+                    )));
+                    process_error(socket, err, false).await?;
+                    break;
+                }
+                msg = socket.next() => match msg {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => return Err(e.into()),
+                    None => break,
+                },
+            },
+            None => match socket.next().await {
+                Some(Ok(m)) => m,
+                Some(Err(_)) => break,
+                None => break,
+            },
+        };
+
         let is_extended_query = match socket.state() {
             PgWireConnectionState::CopyInProgress(is_extended_query) => is_extended_query,
             _ => msg.is_extended_query(),
@@ -731,6 +758,7 @@ pub async fn process_socket<H>(
     tcp_socket: TcpStream,
     #[cfg(any(feature = "_ring", feature = "_aws-lc-rs"))] tls_acceptor: Option<Arc<TlsAcceptor>>,
     handlers: H,
+    cancel_token: Option<CancellationToken>,
 ) -> Result<(), IOError>
 where
     H: PgWireServerHandlers,
@@ -763,6 +791,7 @@ where
             extended_query_handler,
             copy_handler,
             error_handler,
+            cancel_token,
         )
         .await
     } else {
@@ -790,6 +819,7 @@ where
                 extended_query_handler,
                 copy_handler,
                 error_handler,
+                cancel_token,
             )
             .await
         }

@@ -360,10 +360,12 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
             default_keyspace,
             server_config.clone(),
         );
+        let cancel_token = factory.cancel_token();
 
         tokio::spawn(async move {
             let _permit = permit; // held for connection lifetime
-            if let Err(e) = process_socket(socket, tls_acceptor, factory).await {
+            if let Err(e) = process_socket(socket, tls_acceptor, factory, Some(cancel_token)).await
+            {
                 tracing::error!("Connection error: {}", e);
             }
         });

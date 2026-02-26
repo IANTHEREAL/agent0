@@ -129,7 +129,7 @@ pub async fn main() {
         let tls_acceptor_ref = tls_acceptor.clone();
         let factory_ref = factory.clone();
         tokio::spawn(async move {
-            process_socket(incoming_socket.0, Some(tls_acceptor_ref), factory_ref).await
+            process_socket(incoming_socket.0, Some(tls_acceptor_ref), factory_ref, None).await
         });
     }
 }

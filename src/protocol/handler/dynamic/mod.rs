@@ -27,6 +27,7 @@ use crate::config::SharedServerConfig;
 use crate::pool::TikvClientPool;
 use crate::sql::{Executor, Session};
 use pgwire::api::{NoopErrorHandler, PgWireServerHandlers};
+use pgwire::tokio::CancellationToken;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -40,7 +41,7 @@ use crate::pool::TenantHandle;
 /// `finish_authentication()`, called only after `init_executor()` succeeds.
 pub(super) struct AuthenticatedState {
     pub executor: Arc<Executor>,
-    pub session: Mutex<Session>,
+    pub session: Arc<Mutex<Session>>,
 }
 
 pub struct DynamicPgHandler {
@@ -55,6 +56,7 @@ pub struct DynamicPgHandler {
     pub(super) query_parser: Arc<Db9QueryParser>,
     pub(super) connection_id: i64,
     pub(super) server_config: SharedServerConfig,
+    pub(super) cancel_token: CancellationToken,
 }
 
 impl DynamicPgHandler {
@@ -62,6 +64,7 @@ impl DynamicPgHandler {
         client_pool: Arc<TikvClientPool>,
         default_keyspace: Option<String>,
         server_config: SharedServerConfig,
+        cancel_token: CancellationToken,
     ) -> Self {
         Self {
             client_pool: Some(client_pool),
@@ -75,6 +78,7 @@ impl DynamicPgHandler {
             query_parser: Arc::new(Db9QueryParser::new()),
             connection_id: CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             server_config,
+            cancel_token,
         }
     }
 
@@ -95,6 +99,7 @@ impl DynamicPgHandler {
 
 impl Drop for DynamicPgHandler {
     fn drop(&mut self) {
+        self.cancel_token.cancel(); // stop idle-in-transaction watchdog
         crate::sql::advisory_locks::global_lock_manager()
             .release_all_for_connection(self.connection_id);
     }
@@ -102,6 +107,7 @@ impl Drop for DynamicPgHandler {
 
 pub struct DynamicHandlerFactory {
     handler: Arc<DynamicPgHandler>,
+    cancel_token: CancellationToken,
 }
 
 impl DynamicHandlerFactory {
@@ -110,13 +116,20 @@ impl DynamicHandlerFactory {
         default_keyspace: Option<String>,
         server_config: SharedServerConfig,
     ) -> Self {
+        let cancel_token = CancellationToken::new();
         Self {
             handler: Arc::new(DynamicPgHandler::new_with_pool(
                 client_pool,
                 default_keyspace,
                 server_config,
+                cancel_token.clone(),
             )),
+            cancel_token,
         }
+    }
+
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token.clone()
     }
 }
 

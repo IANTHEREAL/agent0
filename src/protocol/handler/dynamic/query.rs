@@ -1088,7 +1088,12 @@ mod tests {
         // Build a handler with a rate limiter that has 1 QPS capacity.
         let pool = Arc::new(TikvClientPool::new(vec![]));
         let server_config = crate::config::ServerConfig::default().shared();
-        let handler = DynamicPgHandler::new_with_pool(pool, None, server_config);
+        let handler = DynamicPgHandler::new_with_pool(
+            pool,
+            None,
+            server_config,
+            pgwire::tokio::CancellationToken::new(),
+        );
 
         // Install a tenant handle whose rate limiter is immediately drained.
         let tenant = TenantHandle::new_with_rate_limit(1);

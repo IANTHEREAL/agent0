@@ -413,6 +413,24 @@ impl Session {
         }
     }
 
+    /// Returns the remaining duration before idle-in-transaction timeout fires,
+    /// given the configured timeout `t`. Returns `None` if no command has
+    /// completed yet in the current transaction (no deadline to compute).
+    pub(crate) fn idle_in_transaction_remaining(&self, timeout: Duration) -> Option<Duration> {
+        let last = self.last_command_complete_at?;
+        let elapsed = last.elapsed();
+        if elapsed >= timeout {
+            Some(Duration::ZERO)
+        } else {
+            Some(timeout - elapsed)
+        }
+    }
+
+    /// Read-only access to session settings (for the idle-in-transaction watchdog).
+    pub(crate) fn settings(&self) -> &SessionSettings {
+        &self.settings
+    }
+
     /// Set the shared server configuration reference.
     pub fn set_server_config(&mut self, config: SharedServerConfig) {
         self.server_config = Some(config);

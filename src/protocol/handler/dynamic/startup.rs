@@ -170,7 +170,7 @@ impl DynamicPgHandler {
         self.auth_state
             .set(AuthenticatedState {
                 executor,
-                session: tokio::sync::Mutex::new(session),
+                session: Arc::new(tokio::sync::Mutex::new(session)),
             })
             .map_err(|_| {
                 fatal_internal(
@@ -428,6 +428,18 @@ impl StartupHandler for DynamicPgHandler {
                                 actual_user,
                                 keyspace.as_deref().unwrap_or("default"),
                             );
+
+                            // Spawn idle-in-transaction watchdog task.
+                            // Periodically checks if the session has been idle in a
+                            // transaction too long. On timeout: rollback + cancel the
+                            // connection so the pgwire loop sends FATAL 25P03.
+                            {
+                                let session_lock = Arc::clone(&self.auth().session);
+                                let cancel = self.cancel_token.clone();
+                                tokio::spawn(async move {
+                                    idle_in_transaction_watchdog(session_lock, cancel).await;
+                                });
+                            }
                         } else {
                             let error_info = ErrorInfo::new(
                                 "FATAL".to_owned(),
@@ -451,6 +463,75 @@ impl StartupHandler for DynamicPgHandler {
             _ => {}
         }
         Ok(())
+    }
+}
+
+/// Per-connection watchdog that terminates the session when it has been
+/// idle in a transaction beyond the configured timeout.
+///
+/// Runs as a `tokio::spawn`-ed task with `'static` ownership of the session
+/// `Arc` and cancel token. Exits when:
+///   - Timeout detected (rollback + cancel token)
+///   - Connection closed normally (cancel token already cancelled from Drop)
+async fn idle_in_transaction_watchdog(
+    session_lock: Arc<tokio::sync::Mutex<crate::sql::Session>>,
+    cancel: pgwire::tokio::CancellationToken,
+) {
+    use std::time::Duration;
+
+    // Minimum sleep to avoid busy-looping.
+    const MIN_SLEEP: Duration = Duration::from_millis(100);
+    // Maximum sleep when timeout is disabled (slow poll).
+    const DISABLED_SLEEP: Duration = Duration::from_secs(5);
+    // Cap for not-in-transaction polling so we quickly detect BEGIN.
+    const IDLE_POLL_CAP: Duration = Duration::from_millis(500);
+
+    loop {
+        // Compute how long to sleep before the next check.
+        let sleep_dur = {
+            let session = session_lock.lock().await;
+            let timeout = session.settings().idle_in_transaction_session_timeout();
+            match timeout {
+                Some(t) if session.is_in_transaction() => {
+                    // In a transaction — sleep until the deadline (capped to 1s
+                    // for responsiveness).
+                    if let Some(remaining) = session.idle_in_transaction_remaining(t) {
+                        remaining.max(MIN_SLEEP).min(t.min(Duration::from_secs(1)))
+                    } else {
+                        // No command completed yet — check at half-timeout.
+                        (t / 2).max(MIN_SLEEP).min(t.min(Duration::from_secs(1)))
+                    }
+                }
+                Some(t) => {
+                    // Timeout enabled but not in a transaction — short poll so
+                    // we detect BEGIN quickly and avoid timeout overshoot.
+                    t.min(IDLE_POLL_CAP).max(MIN_SLEEP)
+                }
+                None => DISABLED_SLEEP, // disabled (0) — slow poll
+            }
+        };
+
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(sleep_dur) => {}
+        }
+
+        // Atomically check + rollback under a single lock guard (P1 fix).
+        let should_cancel = {
+            let mut session = session_lock.lock().await;
+            if session.check_idle_in_transaction_timeout().is_err() {
+                let _ = session.rollback().await;
+                true
+            } else {
+                false
+            }
+        };
+
+        if should_cancel {
+            cancel.cancel();
+            break;
+        }
     }
 }
 
@@ -495,5 +576,96 @@ mod tests {
         assert!(is_authenticated);
         assert!(!is_superuser);
         assert_eq!(connection_limit, 5);
+    }
+
+    /// Watchdog terminates a session that has been idle in a transaction
+    /// beyond the configured timeout (FATAL 25P03 scenario).
+    #[tokio::test]
+    async fn watchdog_cancels_idle_in_transaction_session() {
+        use super::idle_in_transaction_watchdog;
+        use crate::storage::TikvStore;
+        use pgwire::tokio::CancellationToken;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let store = TikvStore::new_stub();
+        let observability = crate::observability::registry().tenant("watchdog_idle_in_txn_test");
+        let mut session = crate::sql::Session::new_with_database(
+            store,
+            observability,
+            999_001,
+            1,
+            "testdb".to_string(),
+            0,   // no statement timeout
+            500, // 500ms idle-in-transaction timeout
+        );
+
+        // Simulate: BEGIN; SELECT 1; (then go idle)
+        session.force_test_transaction_state(true, false);
+        session.record_command_complete();
+
+        let session_lock = Arc::new(tokio::sync::Mutex::new(session));
+        let cancel = CancellationToken::new();
+
+        tokio::spawn({
+            let session_lock = Arc::clone(&session_lock);
+            let cancel = cancel.clone();
+            async move {
+                idle_in_transaction_watchdog(session_lock, cancel).await;
+            }
+        });
+
+        // The watchdog should cancel within ~600ms (500ms timeout + polling).
+        // Give generous headroom to avoid flaky CI.
+        tokio::select! {
+            _ = cancel.cancelled() => { /* expected */ }
+            _ = tokio::time::sleep(Duration::from_secs(3)) => {
+                panic!("watchdog did not cancel the session within 3 s");
+            }
+        }
+    }
+
+    /// Watchdog exits cleanly when the connection is closed (cancel token
+    /// cancelled externally) without the session being idle too long.
+    #[tokio::test]
+    async fn watchdog_exits_on_connection_close() {
+        use super::idle_in_transaction_watchdog;
+        use crate::storage::TikvStore;
+        use pgwire::tokio::CancellationToken;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let store = TikvStore::new_stub();
+        let observability = crate::observability::registry().tenant("watchdog_conn_close_test");
+        let session = crate::sql::Session::new_with_database(
+            store,
+            observability,
+            999_002,
+            1,
+            "testdb".to_string(),
+            0,
+            1000, // 1s timeout (should never fire)
+        );
+
+        let session_lock = Arc::new(tokio::sync::Mutex::new(session));
+        let cancel = CancellationToken::new();
+
+        let handle = tokio::spawn({
+            let session_lock = Arc::clone(&session_lock);
+            let cancel = cancel.clone();
+            async move {
+                idle_in_transaction_watchdog(session_lock, cancel).await;
+            }
+        });
+
+        // Simulate connection close after 100ms.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+
+        // Watchdog task should finish promptly.
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("watchdog did not exit within 2 s")
+            .expect("watchdog task panicked");
     }
 }

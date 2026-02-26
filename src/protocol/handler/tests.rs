@@ -1958,7 +1958,12 @@ fn test_prepared_stmt_analyzed(
 fn test_dynamic_handler() -> DynamicPgHandler {
     let pool = Arc::new(crate::pool::TikvClientPool::new(vec![]));
     let server_config = crate::config::ServerConfig::default().shared();
-    DynamicPgHandler::new_with_pool(pool, None, server_config)
+    DynamicPgHandler::new_with_pool(
+        pool,
+        None,
+        server_config,
+        pgwire::tokio::CancellationToken::new(),
+    )
 }
 
 fn extract_query_schema(resp: Response<'static>) -> Vec<(String, Type)> {
