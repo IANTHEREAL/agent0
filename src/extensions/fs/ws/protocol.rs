@@ -12,7 +12,6 @@ pub(crate) const STREAMING_THRESHOLD: usize = 1024 * 1024;
 pub(crate) const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 pub(crate) const AUTH_TIMEOUT_SECS: u64 = 10;
 pub(crate) const IDLE_TIMEOUT_SECS: u64 = 300;
-pub(crate) const MAX_INFLIGHT_REQUESTS: usize = 10;
 pub(crate) const DEFAULT_MAX_CONNECTIONS_PER_TENANT: u32 = 50;
 pub(crate) const MAX_JSON_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const DEFAULT_WS_PORT: u16 = 5480;
@@ -150,10 +149,6 @@ impl WsRequest {
             | Self::Append { id, .. }
             | Self::Truncate { id, .. } => id,
         }
-    }
-
-    pub(crate) fn request_id(&self) -> &str {
-        self.id()
     }
 }
 

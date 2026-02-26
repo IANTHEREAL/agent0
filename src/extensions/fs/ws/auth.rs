@@ -10,7 +10,7 @@ use crate::pool::{TenantHandle, TikvClientPool};
 use crate::protocol::parse_tenant_username;
 
 pub(crate) struct WsSession {
-    pub(crate) tenant_handle: TenantHandle,
+    pub(crate) _tenant_handle: TenantHandle,
     pub(crate) backend: Box<dyn FsBackend>,
     pub(crate) user: String,
     pub(crate) keyspace: String,
@@ -108,7 +108,7 @@ pub(crate) async fn handle_auth(
     })?;
 
     Ok(WsSession {
-        tenant_handle,
+        _tenant_handle: tenant_handle,
         backend: Box::new(backend),
         user: actual_user,
         keyspace,
@@ -121,6 +121,7 @@ pub(crate) struct WsConnectionTracker {
 }
 
 pub(crate) struct WsConnectionGuard {
+    #[allow(dead_code)]
     keyspace: String,
     counter: Arc<AtomicU32>,
 }
