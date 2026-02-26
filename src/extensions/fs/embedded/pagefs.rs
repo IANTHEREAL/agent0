@@ -452,6 +452,71 @@ impl EmbeddedPageFs {
         txn.commit().await?;
         Ok(())
     }
+
+    pub(crate) async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
+        let old_normalized = normalize_path(old_path);
+        let new_normalized = normalize_path(new_path);
+
+        if old_normalized == "/" {
+            return Err(anyhow!(EmbeddedFsError::PermissionDenied(
+                "cannot rename root".to_string(),
+            )));
+        }
+
+        // No-op if paths are identical
+        if old_normalized == new_normalized {
+            return Ok(());
+        }
+
+        // Prevent directory cycle: renaming a dir into its own subtree
+        // would corrupt the directory tree (POSIX returns EINVAL for this).
+        // Safe to use string prefix here because both paths are already
+        // normalized (no trailing slash) and validate_path rejected "..".
+        if new_normalized.starts_with(&format!("{old_normalized}/")) {
+            return Err(anyhow!(EmbeddedFsError::PermissionDenied(format!(
+                "cannot rename {old_normalized} into its own subdirectory {new_normalized}"
+            ),)));
+        }
+
+        let mut txn = self.begin().await?;
+
+        // Resolve the source
+        let (old_inode_id, old_inode) = resolve_path(&mut txn, &old_normalized).await?;
+        let (old_parent_inode, old_name) = resolve_parent(&mut txn, &old_normalized).await?;
+
+        // Ensure parent directories of destination exist
+        ensure_parents(&mut txn, &new_normalized).await?;
+        let (new_parent_inode, new_name) = resolve_parent(&mut txn, &new_normalized).await?;
+
+        // Check if destination already exists
+        if let Some(existing_inode_id) = lookup(&mut txn, new_parent_inode, &new_name).await? {
+            let existing_inode = load_inode(&mut txn, existing_inode_id)
+                .await?
+                .ok_or_else(|| anyhow!(EmbeddedFsError::not_found(&new_normalized)))?;
+
+            if existing_inode.is_directory() {
+                // Don't replace existing directories
+                return Err(anyhow!(EmbeddedFsError::already_exists(&new_normalized)));
+            }
+
+            if old_inode.is_directory() {
+                // Can't overwrite a file with a directory
+                return Err(anyhow!(EmbeddedFsError::not_directory(&new_normalized)));
+            }
+
+            // Source is file, dest is file: replace (delete dest's data)
+            delete_pages(&mut txn, existing_inode_id).await?;
+            delete_inode(&mut txn, existing_inode_id).await?;
+            unlink(&mut txn, new_parent_inode, &new_name).await?;
+        }
+
+        // Unlink from old parent, link to new parent
+        unlink(&mut txn, old_parent_inode, &old_name).await?;
+        link(&mut txn, new_parent_inode, &new_name, old_inode_id).await?;
+
+        txn.commit().await?;
+        Ok(())
+    }
 }
 
 fn scan_end_key(prefix: &[u8]) -> Vec<u8> {

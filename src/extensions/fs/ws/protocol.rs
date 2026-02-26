@@ -132,6 +132,11 @@ pub(crate) enum WsRequest {
         path: String,
         size: u64,
     },
+    Rename {
+        id: String,
+        old_path: String,
+        new_path: String,
+    },
 }
 
 impl WsRequest {
@@ -147,7 +152,8 @@ impl WsRequest {
             | Self::Write { id, .. }
             | Self::Pwrite { id, .. }
             | Self::Append { id, .. }
-            | Self::Truncate { id, .. } => id,
+            | Self::Truncate { id, .. }
+            | Self::Rename { id, .. } => id,
         }
     }
 }
@@ -482,5 +488,24 @@ mod tests {
         assert_eq!(dst.size, 123);
         assert_eq!(dst.mode, 0o100644);
         assert_eq!(dst.mtime, "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_request_deserialize_rename() {
+        let payload =
+            r#"{"id":"10","op":"rename","old_path":"/data/a.csv","new_path":"/data/b.csv"}"#;
+        let req: WsRequest = serde_json::from_str(payload).expect("rename request should parse");
+        match req {
+            WsRequest::Rename {
+                id,
+                old_path,
+                new_path,
+            } => {
+                assert_eq!(id, "10");
+                assert_eq!(old_path, "/data/a.csv");
+                assert_eq!(new_path, "/data/b.csv");
+            }
+            _ => panic!("expected rename request"),
+        }
     }
 }

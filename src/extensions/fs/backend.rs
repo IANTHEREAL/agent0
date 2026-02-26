@@ -32,6 +32,7 @@ pub(crate) trait FsBackend: Send + Sync {
     async fn write_file_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<usize>;
     async fn append_file(&self, path: &str, data: &[u8]) -> Result<usize>;
     async fn truncate(&self, path: &str, size: u64) -> Result<()>;
+    async fn rename(&self, old_path: &str, new_path: &str) -> Result<()>;
 }
 
 pub(crate) fn is_backend_available() -> bool {

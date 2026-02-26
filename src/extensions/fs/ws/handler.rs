@@ -73,6 +73,11 @@ pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> 
             encoding,
         } => handle_append(session, id, path, content, encoding).await,
         WsRequest::Truncate { id, path, size } => handle_truncate(session, id, path, *size).await,
+        WsRequest::Rename {
+            id,
+            old_path,
+            new_path,
+        } => handle_rename(session, id, old_path, new_path).await,
     }
 }
 
@@ -319,6 +324,29 @@ async fn handle_truncate(session: &WsSession, id: &str, path: &str, size: u64) -
     }
 
     let result = session.backend.truncate(path, size).await;
+    match result {
+        Ok(()) => WsResponse::success_empty(id),
+        Err(err) => {
+            let (code, msg) = map_fs_error(&err);
+            WsResponse::error(id, code, msg)
+        }
+    }
+}
+
+async fn handle_rename(
+    session: &WsSession,
+    id: &str,
+    old_path: &str,
+    new_path: &str,
+) -> WsResponse {
+    if let Err((code, msg)) = validate_path(old_path) {
+        return WsResponse::error(id, code, msg);
+    }
+    if let Err((code, msg)) = validate_path(new_path) {
+        return WsResponse::error(id, code, msg);
+    }
+
+    let result = session.backend.rename(old_path, new_path).await;
     match result {
         Ok(()) => WsResponse::success_empty(id),
         Err(err) => {
