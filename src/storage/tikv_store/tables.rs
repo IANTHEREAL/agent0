@@ -17,6 +17,37 @@ fn is_row_lock_conflict(err: &tikv_client::Error) -> bool {
     }
 }
 
+/// Execute one batch of a paginated TiKV scan.
+///
+/// Returns the collected pairs for this page and the start key for the *next*
+/// page. `next_start` is `None` when the result is smaller than `batch_size`,
+/// indicating that the scan is exhausted and no further pages exist.
+async fn scan_one_page(
+    txn: &mut Transaction,
+    start_key: Vec<u8>,
+    end_key: Vec<u8>,
+    batch_size: u32,
+) -> Result<(Vec<tikv_client::KvPair>, Option<Vec<u8>>)> {
+    let range: BoundRange = (start_key..end_key).into();
+    let raw = txn.scan(range, batch_size).await?;
+    let mut pairs: Vec<tikv_client::KvPair> = Vec::new();
+    let mut last_key: Option<Vec<u8>> = None;
+    for pair in raw {
+        let k: &[u8] = pair.key().as_ref().into();
+        last_key = Some(k.to_vec());
+        pairs.push(pair);
+    }
+    let next_start = if (pairs.len() as u32) < batch_size {
+        None
+    } else {
+        last_key.map(|mut lk| {
+            lk.push(0x00);
+            lk
+        })
+    };
+    Ok((pairs, next_start))
+}
+
 impl TikvStore {
     /// Build pessimistic lock keys for the given rows.
     ///
@@ -440,29 +471,15 @@ impl TikvStore {
             }
             let remaining = total_limit - rows.len();
             let batch_size = std::cmp::min(TABLE_SCAN_BATCH_SIZE as usize, remaining) as u32;
-            let range: BoundRange = (start_key.clone()..end_key.clone()).into();
-            let pairs = txn.scan(range, batch_size).await?;
-            let mut batch_count = 0u32;
-            let mut last_key: Option<Vec<u8>> = None;
-
+            let (pairs, next_start) =
+                scan_one_page(txn, start_key.clone(), end_key.clone(), batch_size).await?;
             for pair in pairs {
-                let key_ref: &[u8] = pair.key().as_ref().into();
-                last_key = Some(key_ref.to_vec());
                 let row = deserialize_row(pair.value())?;
                 rows.push(row);
-                batch_count += 1;
             }
-
-            if batch_count < batch_size {
-                break;
-            }
-
-            // Advance past the last key for the next batch.
-            if let Some(mut lk) = last_key {
-                lk.push(0x00);
-                start_key = lk;
-            } else {
-                break;
+            match next_start {
+                Some(k) => start_key = k,
+                None => break,
             }
         }
 
@@ -570,30 +587,16 @@ impl TikvStore {
         let mut total_rows = 0usize;
 
         loop {
-            let range: BoundRange = (start_key.clone()..end_key.clone()).into();
-            let pairs = txn.scan(range, batch_size).await?;
-            let mut batch_count = 0u32;
-            let mut last_key: Option<Vec<u8>> = None;
-
+            let (pairs, next_start) =
+                scan_one_page(txn, start_key.clone(), end_key.clone(), batch_size).await?;
             for pair in pairs {
                 let row = deserialize_row(pair.value())?;
                 process(&row)?;
-                let key_ref: &[u8] = pair.key().as_ref().into();
-                last_key = Some(key_ref.to_vec());
                 total_rows += 1;
-                batch_count += 1;
             }
-
-            if batch_count < batch_size {
-                break;
-            }
-
-            // Advance past the last key for the next batch.
-            if let Some(mut lk) = last_key {
-                lk.push(0x00);
-                start_key = lk;
-            } else {
-                break;
+            match next_start {
+                Some(k) => start_key = k,
+                None => break,
             }
         }
 
@@ -744,24 +747,19 @@ impl TikvStore {
         let end_key = self.key(raw_end);
         let mut start_key = self.key(raw_start);
         loop {
-            let range: BoundRange = (start_key.clone()..end_key.clone()).into();
-            let pairs = txn.scan(range, TABLE_SCAN_BATCH_SIZE).await?;
-            let mut batch_count = 0u32;
-            let mut last_key: Option<Vec<u8>> = None;
+            let (pairs, next_start) = scan_one_page(
+                txn,
+                start_key.clone(),
+                end_key.clone(),
+                TABLE_SCAN_BATCH_SIZE,
+            )
+            .await?;
             for pair in pairs {
-                let key_ref: &[u8] = pair.key().as_ref().into();
-                last_key = Some(key_ref.to_vec());
                 txn_delete(txn, pair.into_key().into()).await?;
-                batch_count += 1;
             }
-            if batch_count < TABLE_SCAN_BATCH_SIZE {
-                break;
-            }
-            if let Some(mut lk) = last_key {
-                lk.push(0x00);
-                start_key = lk;
-            } else {
-                break;
+            match next_start {
+                Some(k) => start_key = k,
+                None => break,
             }
         }
         Ok(())
