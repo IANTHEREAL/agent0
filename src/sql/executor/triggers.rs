@@ -523,6 +523,28 @@ fn parse_do_block_body(sql: &str) -> Result<String> {
     Ok(body)
 }
 
+/// Runs `$body` (a `Result<T>` expression, typically `async { … }.await`) inside an
+/// autocommit transaction when no explicit transaction is currently active.
+/// If the session already has an active transaction the body runs as-is and the
+/// surrounding transaction state is left untouched.
+macro_rules! autocommit_ddl {
+    ($session:expr, $body:expr) => {{
+        let is_autocommit = !$session.is_in_transaction();
+        if is_autocommit {
+            $session.begin().await?;
+        }
+        let result = $body;
+        if is_autocommit {
+            if result.is_ok() {
+                $session.commit().await?;
+            } else {
+                $session.rollback().await?;
+            }
+        }
+        result
+    }};
+}
+
 impl Executor {
     pub(crate) async fn execute_do_block_cmd(
         &self,
@@ -543,42 +565,30 @@ impl Executor {
             owner: session.current_user().unwrap_or("postgres").to_string(),
         };
 
-        let is_autocommit = !session.is_in_transaction();
-        if is_autocommit {
-            session.begin().await?;
-        }
+        autocommit_ddl!(
+            session,
+            async {
+                let db_id = session.current_database_id();
+                let (txn, sequence_values, search_path) = session
+                    .get_mut_txn_sequence_values_and_search_path()
+                    .expect("Transaction must be active");
 
-        let result = async {
-            let db_id = session.current_database_id();
-            let (txn, sequence_values, search_path) = session
-                .get_mut_txn_sequence_values_and_search_path()
-                .expect("Transaction must be active");
+                plpgsql::execute_plpgsql_function(
+                    &self.store(),
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    &func_def,
+                    vec![],
+                    Some(self),
+                )
+                .await?;
 
-            plpgsql::execute_plpgsql_function(
-                &self.store(),
-                txn,
-                db_id,
-                sequence_values,
-                search_path,
-                &func_def,
-                vec![],
-                Some(self),
-            )
-            .await?;
-
-            Ok(ExecuteResult::CommandComplete { tag: "DO" })
-        }
-        .await;
-
-        if is_autocommit {
-            if result.is_ok() {
-                session.commit().await?;
-            } else {
-                session.rollback().await?;
+                Ok(ExecuteResult::CommandComplete { tag: "DO" })
             }
-        }
-
-        result
+            .await
+        )
     }
 
     pub(crate) async fn execute_create_function_cmd(
@@ -592,48 +602,36 @@ impl Executor {
             plpgsql::validate_plpgsql_body(&def.body)?;
         }
 
-        let is_autocommit = !session.is_in_transaction();
-        if is_autocommit {
-            session.begin().await?;
-        }
+        autocommit_ddl!(
+            session,
+            async {
+                let db_id = session.current_database_id();
+                let (txn, _sequence_values, search_path) = session
+                    .get_mut_txn_sequence_values_and_search_path()
+                    .expect("Transaction must be active");
+                let resolved = names::resolve_ddl_object_name(&name, search_path)?;
+                if !self
+                    .store()
+                    .schema_exists(txn, db_id, &resolved.schema)
+                    .await?
+                {
+                    return Err(anyhow!("schema '{}' does not exist", resolved.schema));
+                }
+                def.schema = resolved.schema.clone();
+                def.name = resolved.name.clone();
 
-        let result = async {
-            let db_id = session.current_database_id();
-            let (txn, _sequence_values, search_path) = session
-                .get_mut_txn_sequence_values_and_search_path()
-                .expect("Transaction must be active");
-            let resolved = names::resolve_ddl_object_name(&name, search_path)?;
-            if !self
-                .store()
-                .schema_exists(txn, db_id, &resolved.schema)
-                .await?
-            {
-                return Err(anyhow!("schema '{}' does not exist", resolved.schema));
+                if or_replace {
+                    self.store().replace_function(txn, db_id, def).await?;
+                    self.trigger_cache().invalidate_db(db_id);
+                } else {
+                    self.store().create_function(txn, db_id, def).await?;
+                }
+                Ok(ExecuteResult::CreateFunction {
+                    func_name: resolved.full,
+                })
             }
-            def.schema = resolved.schema.clone();
-            def.name = resolved.name.clone();
-
-            if or_replace {
-                self.store().replace_function(txn, db_id, def).await?;
-                self.trigger_cache().invalidate_db(db_id);
-            } else {
-                self.store().create_function(txn, db_id, def).await?;
-            }
-            Ok(ExecuteResult::CreateFunction {
-                func_name: resolved.full,
-            })
-        }
-        .await;
-
-        if is_autocommit {
-            if result.is_ok() {
-                session.commit().await?;
-            } else {
-                session.rollback().await?;
-            }
-        }
-
-        result
+            .await
+        )
     }
 
     pub(crate) async fn execute_drop_function_cmd(
@@ -647,63 +645,51 @@ impl Executor {
             names,
         } = parse_drop_function_sql(sql)?;
 
-        let is_autocommit = !session.is_in_transaction();
-        if is_autocommit {
-            session.begin().await?;
-        }
+        autocommit_ddl!(
+            session,
+            async {
+                let db_id = session.current_database_id();
+                let (txn, _sequence_values, search_path) = session
+                    .get_mut_txn_sequence_values_and_search_path()
+                    .expect("Transaction must be active");
 
-        let result = async {
-            let db_id = session.current_database_id();
-            let (txn, _sequence_values, search_path) = session
-                .get_mut_txn_sequence_values_and_search_path()
-                .expect("Transaction must be active");
-
-            let mut last_name = None;
-            let mut any_dropped = false;
-            for name in names {
-                let resolved = names::resolve_existing_function_name(
-                    self.store().as_ref(),
-                    txn,
-                    db_id,
-                    &name,
-                    search_path,
-                )
-                .await?;
-                let func_full_name = match resolved {
-                    Some(resolved) => resolved.full,
-                    None => names::resolve_ddl_object_name(&name, search_path)?.full,
-                };
-                last_name = Some(func_full_name.clone());
-                let dropped = self
-                    .store()
-                    .drop_function(txn, db_id, &func_full_name, cascade)
+                let mut last_name = None;
+                let mut any_dropped = false;
+                for name in names {
+                    let resolved = names::resolve_existing_function_name(
+                        self.store().as_ref(),
+                        txn,
+                        db_id,
+                        &name,
+                        search_path,
+                    )
                     .await?;
-                if !dropped && !if_exists {
-                    let bare = func_full_name.rsplit('.').next().unwrap_or(&func_full_name);
-                    return Err(anyhow!("function {}() does not exist", bare));
+                    let func_full_name = match resolved {
+                        Some(resolved) => resolved.full,
+                        None => names::resolve_ddl_object_name(&name, search_path)?.full,
+                    };
+                    last_name = Some(func_full_name.clone());
+                    let dropped = self
+                        .store()
+                        .drop_function(txn, db_id, &func_full_name, cascade)
+                        .await?;
+                    if !dropped && !if_exists {
+                        let bare = func_full_name.rsplit('.').next().unwrap_or(&func_full_name);
+                        return Err(anyhow!("function {}() does not exist", bare));
+                    }
+                    any_dropped |= dropped;
                 }
-                any_dropped |= dropped;
+
+                if any_dropped {
+                    self.trigger_cache().invalidate_db(db_id);
+                }
+
+                Ok(ExecuteResult::DropFunction {
+                    func_name: last_name.unwrap_or_else(|| "unknown".to_string()),
+                })
             }
-
-            if any_dropped {
-                self.trigger_cache().invalidate_db(db_id);
-            }
-
-            Ok(ExecuteResult::DropFunction {
-                func_name: last_name.unwrap_or_else(|| "unknown".to_string()),
-            })
-        }
-        .await;
-
-        if is_autocommit {
-            if result.is_ok() {
-                session.commit().await?;
-            } else {
-                session.rollback().await?;
-            }
-        }
-
-        result
+            .await
+        )
     }
 
     pub(crate) async fn execute_create_trigger_cmd(
@@ -713,70 +699,58 @@ impl Executor {
     ) -> Result<ExecuteResult> {
         let (trigger_name, timing, events, table, function) = parse_create_trigger_sql(sql)?;
 
-        let is_autocommit = !session.is_in_transaction();
-        if is_autocommit {
-            session.begin().await?;
-        }
+        autocommit_ddl!(
+            session,
+            async {
+                let db_id = session.current_database_id();
+                let (txn, _sequence_values, search_path) = session
+                    .get_mut_txn_sequence_values_and_search_path()
+                    .expect("Transaction must be active");
 
-        let result = async {
-            let db_id = session.current_database_id();
-            let (txn, _sequence_values, search_path) = session
-                .get_mut_txn_sequence_values_and_search_path()
-                .expect("Transaction must be active");
+                let table_resolved = names::resolve_existing_table_name(
+                    self.store().as_ref(),
+                    txn,
+                    db_id,
+                    &table,
+                    search_path,
+                )
+                .await?
+                .ok_or_else(|| SqlError::RelationNotFound(table.to_string()))?;
 
-            let table_resolved = names::resolve_existing_table_name(
-                self.store().as_ref(),
-                txn,
-                db_id,
-                &table,
-                search_path,
-            )
-            .await?
-            .ok_or_else(|| SqlError::RelationNotFound(table.to_string()))?;
+                let func_resolved = names::resolve_existing_function_name(
+                    self.store().as_ref(),
+                    txn,
+                    db_id,
+                    &function,
+                    search_path,
+                )
+                .await?;
+                let func_full_name = match func_resolved {
+                    Some(resolved) => resolved.full,
+                    None => {
+                        let (_schema, bare_name) = names::split_object_name(&function)?;
+                        return Err(anyhow!("function {}() does not exist", bare_name));
+                    }
+                };
 
-            let func_resolved = names::resolve_existing_function_name(
-                self.store().as_ref(),
-                txn,
-                db_id,
-                &function,
-                search_path,
-            )
-            .await?;
-            let func_full_name = match func_resolved {
-                Some(resolved) => resolved.full,
-                None => {
-                    let (_schema, bare_name) = names::split_object_name(&function)?;
-                    return Err(anyhow!("function {}() does not exist", bare_name));
-                }
-            };
+                let def = TriggerDef {
+                    oid: 0,
+                    schema: table_resolved.schema.clone(),
+                    name: trigger_name.clone(),
+                    table: table_resolved.full.clone(),
+                    timing,
+                    events,
+                    function: func_full_name,
+                };
 
-            let def = TriggerDef {
-                oid: 0,
-                schema: table_resolved.schema.clone(),
-                name: trigger_name.clone(),
-                table: table_resolved.full.clone(),
-                timing,
-                events,
-                function: func_full_name,
-            };
-
-            self.store().create_trigger(txn, db_id, def).await?;
-            Ok(ExecuteResult::CreateTrigger {
-                trigger_name,
-                table_name: table_resolved.full,
-            })
-        }
-        .await;
-
-        if is_autocommit {
-            if result.is_ok() {
-                session.commit().await?;
-            } else {
-                session.rollback().await?;
+                self.store().create_trigger(txn, db_id, def).await?;
+                Ok(ExecuteResult::CreateTrigger {
+                    trigger_name,
+                    table_name: table_resolved.full,
+                })
             }
-        }
-
-        result
+            .await
+        )
     }
 
     pub(crate) async fn execute_drop_trigger_cmd(
@@ -786,70 +760,58 @@ impl Executor {
     ) -> Result<ExecuteResult> {
         let (if_exists, trigger_name, table) = parse_drop_trigger_sql(sql)?;
 
-        let is_autocommit = !session.is_in_transaction();
-        if is_autocommit {
-            session.begin().await?;
-        }
+        autocommit_ddl!(
+            session,
+            async {
+                let db_id = session.current_database_id();
+                let (txn, _sequence_values, search_path) = session
+                    .get_mut_txn_sequence_values_and_search_path()
+                    .expect("Transaction must be active");
 
-        let result = async {
-            let db_id = session.current_database_id();
-            let (txn, _sequence_values, search_path) = session
-                .get_mut_txn_sequence_values_and_search_path()
-                .expect("Transaction must be active");
-
-            let table_resolved = names::resolve_existing_table_name(
-                self.store().as_ref(),
-                txn,
-                db_id,
-                &table,
-                search_path,
-            )
-            .await?;
-            let table_resolved = match table_resolved {
-                Some(resolved) => resolved,
-                None => {
-                    if if_exists {
-                        // PostgreSQL requires the relation to exist for DROP TRIGGER, but db9-server
-                        // treats `IF EXISTS` as a fully idempotent no-op to support common
-                        // migration patterns and keep scripts deterministic.
-                        let resolved = names::resolve_ddl_object_name(&table, search_path)?;
-                        return Ok(ExecuteResult::DropTrigger {
-                            trigger_name,
-                            table_name: resolved.full,
-                        });
-                    }
-                    return Err(SqlError::RelationNotFound(table.to_string()).into());
-                }
-            };
-
-            let dropped = self
-                .store()
-                .drop_trigger(txn, db_id, &table_resolved.full, &trigger_name)
+                let table_resolved = names::resolve_existing_table_name(
+                    self.store().as_ref(),
+                    txn,
+                    db_id,
+                    &table,
+                    search_path,
+                )
                 .await?;
-            if !dropped && !if_exists {
-                return Err(anyhow!(
-                    "Trigger '{}' does not exist on '{}'",
+                let table_resolved = match table_resolved {
+                    Some(resolved) => resolved,
+                    None => {
+                        if if_exists {
+                            // PostgreSQL requires the relation to exist for DROP TRIGGER, but db9-server
+                            // treats `IF EXISTS` as a fully idempotent no-op to support common
+                            // migration patterns and keep scripts deterministic.
+                            let resolved = names::resolve_ddl_object_name(&table, search_path)?;
+                            return Ok(ExecuteResult::DropTrigger {
+                                trigger_name,
+                                table_name: resolved.full,
+                            });
+                        }
+                        return Err(SqlError::RelationNotFound(table.to_string()).into());
+                    }
+                };
+
+                let dropped = self
+                    .store()
+                    .drop_trigger(txn, db_id, &table_resolved.full, &trigger_name)
+                    .await?;
+                if !dropped && !if_exists {
+                    return Err(anyhow!(
+                        "Trigger '{}' does not exist on '{}'",
+                        trigger_name,
+                        table_resolved.full
+                    ));
+                }
+
+                Ok(ExecuteResult::DropTrigger {
                     trigger_name,
-                    table_resolved.full
-                ));
+                    table_name: table_resolved.full,
+                })
             }
-
-            Ok(ExecuteResult::DropTrigger {
-                trigger_name,
-                table_name: table_resolved.full,
-            })
-        }
-        .await;
-
-        if is_autocommit {
-            if result.is_ok() {
-                session.commit().await?;
-            } else {
-                session.rollback().await?;
-            }
-        }
-
-        result
+            .await
+        )
     }
 }
 
