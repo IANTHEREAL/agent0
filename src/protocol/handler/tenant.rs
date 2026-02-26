@@ -1,4 +1,4 @@
-const KEYSPACE_PREFIX: &str = "tipg_tenant_";
+const KEYSPACE_PREFIX: &str = "db9_tenant_";
 
 /// Parse username in format "tenant_id.user" or "tenant_id:user" into (keyspace, actual_user).
 /// The tenant_id is mapped to a TiKV keyspace by prepending KEYSPACE_PREFIX.
