@@ -244,6 +244,65 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
         }
     }
 
+    // fs9 WebSocket server
+    {
+        let ws_port: u16 = env::var("FS9_WS_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(extensions::fs::ws::protocol::DEFAULT_WS_PORT);
+
+        if ws_port > 0 {
+            let ws_listen_addr = env::var("FS9_WS_LISTEN_ADDR")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| extensions::fs::ws::protocol::DEFAULT_WS_LISTEN_ADDR.to_string());
+
+            let ws_is_loopback = is_loopback_listen_addr(&ws_listen_addr);
+
+            // Security: refuse non-loopback without TLS unless explicitly insecure
+            if !ws_is_loopback && tls_acceptor.is_none() && !(insecure_mode || dev_mode) {
+                warn!(
+                    "fs9 WebSocket disabled: non-loopback FS9_WS_LISTEN_ADDR={} without TLS. Enable TLS or set DB9_INSECURE=1/DB9_DEV=1.",
+                    ws_listen_addr
+                );
+            } else if require_tls && tls_acceptor.is_none() {
+                warn!(
+                    "fs9 WebSocket disabled: PG_REQUIRE_TLS=1 but TLS is not configured. Set PG_TLS_CERT and PG_TLS_KEY."
+                );
+            } else {
+                // Build WebSocket-specific TLS (no ALPN, reuse same cert/key)
+                let ws_tls: Option<Arc<TlsAcceptor>> = if tls_acceptor.is_some() {
+                    match (env::var("PG_TLS_CERT").ok(), env::var("PG_TLS_KEY").ok()) {
+                        (Some(cert), Some(key)) => match tls::setup_ws_tls(&cert, &key) {
+                            Ok(acceptor) => Some(Arc::new(acceptor)),
+                            Err(e) => {
+                                warn!("fs9 WebSocket TLS setup failed: {}. Running without TLS.", e);
+                                None
+                            }
+                        },
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                match TcpListener::bind((ws_listen_addr.as_str(), ws_port)).await {
+                    Ok(ws_listener) => {
+                        info!("fs9 WebSocket listening on {}:{}", ws_listen_addr, ws_port);
+                        let pool = client_pool.clone();
+                        tokio::spawn(async move {
+                            extensions::fs::ws::start_ws_server(ws_listener, pool, ws_tls).await;
+                        });
+                    }
+                    Err(e) => {
+                        warn!("fs9 WebSocket failed to bind {}:{}: {}", ws_listen_addr, ws_port, e);
+                    }
+                }
+            }
+        }
+    }
+
     let listener = TcpListener::bind((pg_listen_addr.as_str(), pg_port)).await?;
     info!("PostgreSQL server listening on {}", listener.local_addr()?);
     let connect_host: &str = if pg_listen_addr == "0.0.0.0" {
