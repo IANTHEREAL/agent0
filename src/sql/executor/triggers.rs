@@ -4,6 +4,7 @@ use super::super::{ExecuteResult, Session};
 use super::core::Executor;
 use crate::model::{FunctionDef, TriggerDef};
 use crate::sql::error::SqlError;
+use crate::sql::scanner::SqlCharScanner;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::ObjectName;
 
@@ -58,70 +59,11 @@ fn find_keyword_outside_quotes_and_dollar(haystack: &str, keyword: &str) -> Opti
         return None;
     }
 
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut dollar_delim: Option<Vec<u8>> = None;
-
-    let mut i = 0;
-    while i < bytes.len() {
-        if let Some(delim) = dollar_delim.as_ref() {
-            let delim_len = delim.len();
-            let matches =
-                i + delim_len <= bytes.len() && &bytes[i..i + delim_len] == delim.as_slice();
-            if matches {
-                dollar_delim = None;
-                i += delim_len;
-            } else {
-                i += 1;
-            }
+    for ctx in SqlCharScanner::new(haystack) {
+        if ctx.in_string() || ctx.in_comment() {
             continue;
         }
-
-        let b = bytes[i];
-        if in_single {
-            if b == b'\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2;
-                    continue;
-                }
-                in_single = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_double {
-            if b == b'"' {
-                in_double = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        match b {
-            b'\'' => {
-                in_single = true;
-                i += 1;
-                continue;
-            }
-            b'"' => {
-                in_double = true;
-                i += 1;
-                continue;
-            }
-            b'$' => {
-                if let Some(end) = bytes[i + 1..].iter().position(|&c| c == b'$') {
-                    let tag_end = i + 1 + end;
-                    let tag = &bytes[i + 1..tag_end];
-                    if tag.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_') {
-                        dollar_delim = Some(bytes[i..=tag_end].to_vec());
-                        i = tag_end + 1;
-                        continue;
-                    }
-                }
-            }
-            _ => {}
-        }
-
+        let i = ctx.pos;
         if i + kw.len() <= bytes.len() {
             let before_ok = i == 0 || !is_ident_char(bytes[i - 1]);
             let after_ok = i + kw.len() == bytes.len() || !is_ident_char(bytes[i + kw.len()]);
@@ -129,8 +71,6 @@ fn find_keyword_outside_quotes_and_dollar(haystack: &str, keyword: &str) -> Opti
                 return Some(i);
             }
         }
-
-        i += 1;
     }
 
     None
@@ -142,130 +82,46 @@ fn find_matching_paren(s: &str, open_pos: usize) -> Option<usize> {
         return None;
     }
 
-    let mut depth = 0usize;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut i = open_pos;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_single {
-            if b == b'\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2;
-                    continue;
-                }
-                in_single = false;
-            }
-            i += 1;
+    // Scanner starts at open_pos. The '(' there increments paren_depth to 1.
+    // We look for ')' that brings it back to 0.
+    let mut saw_open = false;
+    for ctx in SqlCharScanner::with_offset(s, open_pos) {
+        if ctx.in_string() || ctx.in_comment() {
+            saw_open = true; // past the opening paren
             continue;
         }
-        if in_double {
-            if b == b'"' {
-                in_double = false;
-            }
-            i += 1;
+        if ctx.byte == b'(' && !saw_open {
+            saw_open = true;
             continue;
         }
-
-        match b {
-            b'\'' => in_single = true,
-            b'"' => in_double = true,
-            b'(' => depth += 1,
-            b')' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
+        // ')' is emitted at pre-decrement depth; when outer ')' closes the
+        // opening '(' at depth 1, the emitted paren_depth == 1.
+        if ctx.byte == b')' && ctx.paren_depth == 1 {
+            return Some(ctx.pos);
         }
-        i += 1;
     }
     None
 }
 
 fn split_top_level_commas(s: &str) -> Vec<&str> {
-    let bytes = s.as_bytes();
     let mut parts = Vec::new();
     let mut start = 0usize;
-    let mut depth = 0usize;
-    let mut in_single = false;
-    let mut in_double = false;
 
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_single {
-            if b == b'\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2;
-                    continue;
-                }
-                in_single = false;
-            }
-            i += 1;
-            continue;
+    for ctx in SqlCharScanner::new(s) {
+        if ctx.is_code() && ctx.paren_depth == 0 && ctx.byte == b',' {
+            parts.push(&s[start..ctx.pos]);
+            start = ctx.pos + 1;
         }
-        if in_double {
-            if b == b'"' {
-                in_double = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        match b {
-            b'\'' => in_single = true,
-            b'"' => in_double = true,
-            b'(' => depth += 1,
-            b')' => depth = depth.saturating_sub(1),
-            b',' if depth == 0 => {
-                parts.push(&s[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
     }
     parts.push(&s[start..]);
     parts
 }
 
 fn strip_default_clause(arg: &str) -> &str {
-    let bytes = arg.as_bytes();
-    let mut depth = 0usize;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_single {
-            if b == b'\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2;
-                    continue;
-                }
-                in_single = false;
-            }
-            i += 1;
-            continue;
+    for ctx in SqlCharScanner::new(arg) {
+        if ctx.is_code() && ctx.paren_depth == 0 && ctx.byte == b'=' {
+            return arg[..ctx.pos].trim_end();
         }
-        if in_double {
-            if b == b'"' {
-                in_double = false;
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'\'' => in_single = true,
-            b'"' => in_double = true,
-            b'(' => depth += 1,
-            b')' => depth = depth.saturating_sub(1),
-            b'=' if depth == 0 => return arg[..i].trim_end(),
-            _ => {}
-        }
-        i += 1;
     }
 
     if let Some(pos) = find_keyword_outside_quotes_and_dollar(arg, "DEFAULT") {

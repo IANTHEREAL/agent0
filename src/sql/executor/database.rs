@@ -80,68 +80,56 @@ fn parse_value_as_string(token: &str) -> Result<String> {
 }
 
 fn tokenize_sql(input: &str) -> Vec<&str> {
-    let bytes = input.as_bytes();
+    use crate::sql::scanner::SqlCharScanner;
+
     let mut tokens = Vec::new();
-    let mut i = 0usize;
+    let mut token_start: Option<usize> = None;
+    let mut prev_in_string = false;
 
-    while i < bytes.len() {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
+    for ctx in SqlCharScanner::new(input) {
+        if ctx.in_string() {
+            if token_start.is_none() {
+                token_start = Some(ctx.pos);
+            }
+            prev_in_string = true;
+            continue;
         }
 
-        let start = i;
-        match bytes[i] {
-            b'\'' => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\'' {
-                        i += 1;
-                        if i < bytes.len() && bytes[i] == b'\'' {
-                            // Escaped quote: consume both.
-                            i += 1;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-                tokens.push(&input[start..i]);
+        // Just exited a string — emit it as a token.
+        if prev_in_string {
+            if let Some(start) = token_start {
+                tokens.push(&input[start..ctx.pos]);
+                token_start = None;
             }
-            b'"' => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'"' {
-                        i += 1;
-                        if i < bytes.len() && bytes[i] == b'"' {
-                            // Escaped quote: consume both.
-                            i += 1;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-                tokens.push(&input[start..i]);
-            }
-            b'(' | b')' | b',' | b';' | b'=' => {
-                i += 1;
-                tokens.push(&input[start..i]);
-            }
-            _ => {
-                i += 1;
-                while i < bytes.len() {
-                    let b = bytes[i];
-                    if b.is_ascii_whitespace() || matches!(b, b'(' | b')' | b',' | b';' | b'=') {
-                        break;
-                    }
-                    i += 1;
-                }
-                tokens.push(&input[start..i]);
-            }
+            prev_in_string = false;
         }
+
+        let b = ctx.byte;
+        if b.is_ascii_whitespace() {
+            if let Some(start) = token_start {
+                tokens.push(&input[start..ctx.pos]);
+                token_start = None;
+            }
+            continue;
+        }
+
+        if matches!(b, b'(' | b')' | b',' | b';' | b'=') {
+            if let Some(start) = token_start {
+                tokens.push(&input[start..ctx.pos]);
+                token_start = None;
+            }
+            tokens.push(&input[ctx.pos..ctx.pos + 1]);
+            continue;
+        }
+
+        if token_start.is_none() {
+            token_start = Some(ctx.pos);
+        }
+    }
+
+    // Flush remaining token.
+    if let Some(start) = token_start {
+        tokens.push(&input[start..]);
     }
 
     tokens
