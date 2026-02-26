@@ -18,19 +18,18 @@ fn is_row_lock_conflict(err: &tikv_client::Error) -> bool {
 }
 
 impl TikvStore {
-    /// Acquire pessimistic (exclusive) locks on the given rows.
+    /// Build pessimistic lock keys for the given rows.
     ///
-    /// Used for both FOR UPDATE and FOR SHARE.  TiKV only supports exclusive
-    /// pessimistic locks — there is no shared row-level lock — so FOR SHARE
-    /// is effectively upgraded to FOR UPDATE.
-    pub async fn lock_rows(
+    /// Validates that the table exists and has a primary key, then maps each
+    /// row to its TiKV data key.  Returns an error if the table is missing or
+    /// has no primary key.
+    async fn build_row_lock_keys(
         &self,
         txn: &mut Transaction,
         db_id: u64,
         table_name: &str,
         rows: &[Row],
-        lock_timeout: Option<std::time::Duration>,
-    ) -> Result<()> {
+    ) -> Result<Vec<Vec<u8>>> {
         let schema = self
             .get_schema(txn, db_id, table_name)
             .await?
@@ -49,6 +48,25 @@ impl TikvStore {
                 self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key))
             })
             .collect();
+        Ok(keys)
+    }
+
+    /// Acquire pessimistic (exclusive) locks on the given rows.
+    ///
+    /// Used for both FOR UPDATE and FOR SHARE.  TiKV only supports exclusive
+    /// pessimistic locks — there is no shared row-level lock — so FOR SHARE
+    /// is effectively upgraded to FOR UPDATE.
+    pub async fn lock_rows(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_name: &str,
+        rows: &[Row],
+        lock_timeout: Option<std::time::Duration>,
+    ) -> Result<()> {
+        let keys = self
+            .build_row_lock_keys(txn, db_id, table_name, rows)
+            .await?;
         match lock_timeout {
             Some(timeout) => match tokio::time::timeout(timeout, txn.lock_keys(keys)).await {
                 Ok(Ok(())) => Ok(()),
@@ -78,27 +96,10 @@ impl TikvStore {
             return Ok(Vec::new());
         }
 
-        let schema = self
-            .get_schema(txn, db_id, table_name)
-            .await?
-            .ok_or_else(|| anyhow!("Table not found"))?;
-        if schema.pk_indices.is_empty() {
-            return Err(anyhow!(
-                "cannot lock rows: table '{}' has no primary key",
-                table_name
-            ));
-        }
-
+        let keys = self
+            .build_row_lock_keys(txn, db_id, table_name, rows)
+            .await?;
         let max_locks = max_locks.unwrap_or(usize::MAX);
-
-        let keys: Vec<Vec<u8>> = rows
-            .iter()
-            .map(|row| {
-                let pk_values = schema.get_pk_values(row);
-                let row_key = encode_pk_values(&pk_values);
-                self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key))
-            })
-            .collect();
 
         // Try-lock each key with NOWAIT directly in the caller's txn.
         // - Keys already held by this txn succeed (no self-lock false positive).
@@ -137,25 +138,9 @@ impl TikvStore {
             return Ok(());
         }
 
-        let schema = self
-            .get_schema(txn, db_id, table_name)
-            .await?
-            .ok_or_else(|| anyhow!("Table not found"))?;
-        if schema.pk_indices.is_empty() {
-            return Err(anyhow!(
-                "cannot lock rows: table '{}' has no primary key",
-                table_name
-            ));
-        }
-
-        let keys: Vec<Vec<u8>> = rows
-            .iter()
-            .map(|row| {
-                let pk_values = schema.get_pk_values(row);
-                let row_key = encode_pk_values(&pk_values);
-                self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key))
-            })
-            .collect();
+        let keys = self
+            .build_row_lock_keys(txn, db_id, table_name, rows)
+            .await?;
 
         // Lock directly in the caller's txn with NOWAIT semantics.
         // - Self-locks succeed (same TiKV txn recognises its own locks).
