@@ -10,6 +10,8 @@ RUN dpkg --add-architecture arm64 && \
     g++-aarch64-linux-gnu \
     libc6-dev-arm64-cross \
     libssl-dev:arm64 \
+    libclang-dev \
+    libicu-dev:arm64 \
     && rm -rf /var/lib/apt/lists/*
 
 # Add arm64 target
@@ -22,7 +24,9 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     OPENSSL_DIR=/usr \
     OPENSSL_INCLUDE_DIR=/usr/include/aarch64-linux-gnu \
     OPENSSL_LIB_DIR=/usr/lib/aarch64-linux-gnu \
-    PKG_CONFIG_ALLOW_CROSS=1
+    PKG_CONFIG_ALLOW_CROSS=1 \
+    PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig \
+    PKG_CONFIG_SYSROOT_DIR=/
 
 WORKDIR /app
 
@@ -47,6 +51,7 @@ FROM --platform=linux/arm64 debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
     libssl3 \
     ca-certificates \
+    libicu72 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/aarch64-unknown-linux-gnu/release/db9-server /usr/local/bin/db9-server
