@@ -12,8 +12,8 @@ use crate::model::{DataType, FunctionDef, Value};
 use crate::sql::error::SqlError;
 use crate::sql::names;
 use crate::sql::parse_sql;
-use crate::sql::raw_sql::{classify, RawSqlKind};
 use crate::sql::quoting;
+use crate::sql::raw_sql::{classify, RawSqlKind};
 use crate::sql::sequences;
 use crate::sql::ExecuteResult;
 use crate::sql::Executor;
@@ -226,12 +226,7 @@ fn execute_statements<'a>(
                     let raw_upper = raw_trimmed.to_ascii_uppercase();
                     if matches!(classify(&raw_upper), Some(RawSqlKind::CreateTypeEnum)) {
                         let _ = exec
-                            .execute_create_type_enum_on_txn(
-                                txn,
-                                db_id,
-                                search_path,
-                                raw_trimmed,
-                            )
+                            .execute_create_type_enum_on_txn(txn, db_id, search_path, raw_trimmed)
                             .await?;
                         continue;
                     }
