@@ -169,6 +169,63 @@ impl TikvStore {
         Ok(())
     }
 
+    /// Apply legacy-OID migration and zero-value defaults to a sequence definition in place.
+    ///
+    /// Steps:
+    /// 1. If `def.oid == 0`, attempt an autocommit OID backfill.  On success the backfilled
+    ///    definition is written to storage by `autocommit_backfill_sequence_oid`; `start_value`
+    ///    and `cache_size` defaults are applied to the in-memory copy and we return early.
+    /// 2. If the backfill returned `None` (race lost to another writer) or `def.oid` was already
+    ///    non-zero, we fall through to the caller's transaction: allocate an OID if still missing,
+    ///    fix the two defaults, and write the updated definition back within `txn`.
+    async fn ensure_sequence_defaults(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        def: &mut SequenceDef,
+    ) -> Result<()> {
+        if def.oid == 0 {
+            if let Some(backfilled) = self
+                .autocommit_backfill_sequence_oid(db_id, &def.full_name())
+                .await?
+            {
+                *def = backfilled;
+                if def.start_value == 0 {
+                    def.start_value = def.min_value;
+                }
+                if def.cache_size == 0 {
+                    def.cache_size = 1;
+                }
+                return Ok(());
+            }
+        }
+
+        let mut needs_update = false;
+        if def.oid == 0 {
+            def.oid = self.next_sequence_oid(txn, db_id).await?;
+            needs_update = true;
+        }
+        if def.start_value == 0 {
+            def.start_value = def.min_value;
+            needs_update = true;
+        }
+        if def.cache_size == 0 {
+            def.cache_size = 1;
+            needs_update = true;
+        }
+        if needs_update {
+            let data =
+                bincode::serialize(def).context("Failed to serialize sequence definition")?;
+            txn_put(
+                txn,
+                self.key(&encode_sequence_def_key_v2(db_id, &def.full_name())),
+                data,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     pub async fn get_sequence(
         &self,
         txn: &mut Transaction,
@@ -180,45 +237,7 @@ impl TikvStore {
             Some(data) => {
                 let mut def: SequenceDef = bincode::deserialize(&data)
                     .context("Failed to deserialize sequence definition")?;
-                if def.oid == 0 {
-                    if let Some(backfilled) = self
-                        .autocommit_backfill_sequence_oid(db_id, full_name)
-                        .await?
-                    {
-                        let mut def = backfilled;
-                        if def.start_value == 0 {
-                            def.start_value = def.min_value;
-                        }
-                        if def.cache_size == 0 {
-                            def.cache_size = 1;
-                        }
-                        return Ok(Some(def));
-                    }
-                }
-
-                let mut needs_update = false;
-                if def.oid == 0 {
-                    def.oid = self.next_sequence_oid(txn, db_id).await?;
-                    needs_update = true;
-                }
-                if def.start_value == 0 {
-                    def.start_value = def.min_value;
-                    needs_update = true;
-                }
-                if def.cache_size == 0 {
-                    def.cache_size = 1;
-                    needs_update = true;
-                }
-                if needs_update {
-                    let data = bincode::serialize(&def)
-                        .context("Failed to serialize sequence definition")?;
-                    txn_put(
-                        txn,
-                        self.key(&encode_sequence_def_key_v2(db_id, full_name)),
-                        data,
-                    )
-                    .await?;
-                }
+                self.ensure_sequence_defaults(txn, db_id, &mut def).await?;
                 Ok(Some(def))
             }
             None => Ok(None),
@@ -313,45 +332,7 @@ impl TikvStore {
         for pair in pairs {
             let mut def: SequenceDef =
                 bincode::deserialize(pair.value()).context("Failed to deserialize sequence")?;
-            if def.oid == 0 {
-                if let Some(backfilled) = self
-                    .autocommit_backfill_sequence_oid(db_id, &def.full_name())
-                    .await?
-                {
-                    let mut def = backfilled;
-                    if def.start_value == 0 {
-                        def.start_value = def.min_value;
-                    }
-                    if def.cache_size == 0 {
-                        def.cache_size = 1;
-                    }
-                    sequences.push(def);
-                    continue;
-                }
-            }
-
-            let mut needs_update = false;
-            if def.oid == 0 {
-                def.oid = self.next_sequence_oid(txn, db_id).await?;
-                needs_update = true;
-            }
-            if def.start_value == 0 {
-                def.start_value = def.min_value;
-                needs_update = true;
-            }
-            if def.cache_size == 0 {
-                def.cache_size = 1;
-                needs_update = true;
-            }
-            if needs_update {
-                let data = bincode::serialize(&def).context("Failed to serialize sequence")?;
-                txn_put(
-                    txn,
-                    self.key(&encode_sequence_def_key_v2(db_id, &def.full_name())),
-                    data,
-                )
-                .await?;
-            }
+            self.ensure_sequence_defaults(txn, db_id, &mut def).await?;
             sequences.push(def);
         }
         Ok(sequences)
