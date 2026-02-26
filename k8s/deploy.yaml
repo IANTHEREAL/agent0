@@ -37,7 +37,10 @@ spec:
         image: 093162653901.dkr.ecr.us-west-2.amazonaws.com/pg-tikv:latest
         ports:
         - containerPort: 5433
+        - containerPort: 5480
         env:
+        - name: FS9_WS_LISTEN_ADDR
+          value: "0.0.0.0"
         - name: PD_ENDPOINTS
           value: "serverless-cluster-pd.tidb-serverless.svc.cluster.local:2379"
         - name: PG_PORT
@@ -89,6 +92,11 @@ spec:
   selector:
     app: db9-server
   ports:
-  - port: 5433
+  - name: pgwire
+    port: 5433
     targetPort: 5433
+    protocol: TCP
+  - name: fs9-ws
+    port: 5480
+    targetPort: 5480
     protocol: TCP
