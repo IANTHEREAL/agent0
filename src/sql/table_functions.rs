@@ -6,6 +6,8 @@ use crate::sql::names;
 #[cfg(test)]
 use crate::model::Value;
 #[cfg(test)]
+use crate::sql::expr::bridge::eval_const_ast_expr;
+#[cfg(test)]
 use anyhow::{anyhow, Result as AnyResult};
 #[cfg(test)]
 use async_trait::async_trait;
@@ -13,8 +15,55 @@ use async_trait::async_trait;
 use std::time::UNIX_EPOCH;
 #[cfg(test)]
 use tokio::io::AsyncBufRead;
+
 #[cfg(test)]
-use crate::sql::expr::bridge::eval_const_ast_expr;
+fn basic_fs9_schema() -> TableSchema {
+    use crate::model::{ColumnDef, DataType};
+    TableSchema {
+        table_id: 0,
+        name: "fs9".to_string(),
+        columns: vec![
+            ColumnDef {
+                name: "_line_number".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+                collation: None,
+            },
+            ColumnDef {
+                name: "line".to_string(),
+                data_type: DataType::Text,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+                collation: None,
+            },
+            ColumnDef {
+                name: "_path".to_string(),
+                data_type: DataType::Text,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+                collation: None,
+            },
+        ],
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![],
+        version: 1,
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
+        from_alias: None,
+    }
+}
 
 /// Build a stable signature key for a table-valued function call in FROM.
 ///
@@ -183,14 +232,13 @@ pub(crate) async fn infer_fs9_table_function_schema(
     args: &[FunctionArg],
     is_superuser: bool,
 ) -> Option<TableSchema> {
-    let fallback = crate::extensions::fs::table_function_schema("fs9")?;
     if !is_superuser {
-        return Some(fallback);
+        return Some(basic_fs9_schema());
     }
 
     let mode = match try_parse_fs9_mode_from_args(args) {
         Some(mode) => mode,
-        None => return Some(fallback),
+        None => return Some(basic_fs9_schema()),
     };
 
     struct TestLocalBackend;
@@ -200,7 +248,7 @@ pub(crate) async fn infer_fs9_table_function_schema(
         metadata: std::fs::Metadata,
     ) -> AnyResult<crate::extensions::fs::backend::FsFileInfo> {
         let is_dir = metadata.is_dir();
-        let is_file = metadata.is_file();
+        let _is_file = metadata.is_file();
         let mtime = metadata
             .modified()
             .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?
@@ -211,7 +259,7 @@ pub(crate) async fn infer_fs9_table_function_schema(
         Ok(crate::extensions::fs::backend::FsFileInfo {
             path: path.to_string(),
             is_dir,
-            is_file,
+            // is_file field removed from FsFileInfo
             is_symlink: false,
             size: metadata.len(),
             mode: if is_dir { 0o755 } else { 0o644 },
@@ -346,7 +394,7 @@ pub(crate) async fn infer_fs9_table_function_schema(
                         .await
                     {
                         Ok(data) => data,
-                        Err(_) => return Some(fallback),
+                        Err(_) => return Some(basic_fs9_schema()),
                     };
                     let decoded =
                         crate::extensions::fs::decoders::decode_csv(&data, &path, delim, header, 0)
@@ -375,7 +423,7 @@ pub(crate) async fn infer_fs9_table_function_schema(
             .await
             {
                 Ok(files) => files,
-                Err(_) => return Some(fallback),
+                Err(_) => return Some(basic_fs9_schema()),
             };
 
             if files.is_empty() {
@@ -386,7 +434,7 @@ pub(crate) async fn infer_fs9_table_function_schema(
 
             let first = files.first().cloned().unwrap_or_default();
             if first.is_empty() {
-                return Some(fallback);
+                return Some(basic_fs9_schema());
             }
 
             let fmt = crate::extensions::fs::decoders::detect_format(&first, format.as_deref());
@@ -402,7 +450,7 @@ pub(crate) async fn infer_fs9_table_function_schema(
                         .await
                     {
                         Ok(data) => data,
-                        Err(_) => return Some(fallback),
+                        Err(_) => return Some(basic_fs9_schema()),
                     };
                     let decoded = crate::extensions::fs::decoders::decode_csv(
                         &data, &first, delim, header, 0,

@@ -102,7 +102,6 @@ fn inode_to_file_info(path: &str, inode: &Inode) -> FsFileInfo {
     FsFileInfo {
         path: path.to_string(),
         is_dir: inode.inode_type == InodeType::Directory,
-        is_file: inode.inode_type == InodeType::File,
         is_symlink: false,
         size: inode.size,
         mode: inode.mode,

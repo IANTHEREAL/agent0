@@ -8,7 +8,6 @@ use crate::extensions::fs::embedded::EmbeddedFsBackend;
 pub(crate) struct FsFileInfo {
     pub path: String,
     pub is_dir: bool,
-    pub is_file: bool,
     pub is_symlink: bool,
     pub size: u64,
     pub mode: u32,

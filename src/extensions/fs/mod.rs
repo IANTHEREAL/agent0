@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
-use crate::model::{ColumnDef, DataType, Row, TableSchema};
+use crate::model::{Row, TableSchema};
 use std::collections::HashSet;
 use tracing::warn;
 
@@ -35,61 +35,6 @@ pub(crate) enum Fs9Mode {
 pub(crate) const MAX_BYTES_PER_FILE: usize = 10 * 1024 * 1024;
 pub(crate) const MAX_FILES_PER_GLOB: usize = 10_000;
 pub(crate) const MAX_TOTAL_BYTES: usize = 100 * 1024 * 1024;
-
-fn fs9_file_schema(name: &str) -> TableSchema {
-    TableSchema {
-        table_id: 0,
-        name: name.to_string(),
-        columns: vec![
-            ColumnDef {
-                name: "_line_number".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                collation: None,
-            },
-            ColumnDef {
-                name: "line".to_string(),
-                data_type: DataType::Text,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                collation: None,
-            },
-            ColumnDef {
-                name: "_path".to_string(),
-                data_type: DataType::Text,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-                collation: None,
-            },
-        ],
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        version: 1,
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        from_alias: None,
-    }
-}
-
-pub(crate) fn table_function_schema(func_name: &str) -> Option<TableSchema> {
-    let name = func_name.trim().to_ascii_lowercase();
-    match name.as_str() {
-        "fs9" => Some(fs9_file_schema(&name)),
-        _ => None,
-    }
-}
 
 /// Infer the output schema for an `fs9(...)` table function call without decoding all rows.
 ///
@@ -792,7 +737,7 @@ mod tests {
 
     fn to_file_info(path: &str, metadata: std::fs::Metadata) -> Result<FsFileInfo> {
         let is_dir = metadata.is_dir();
-        let is_file = metadata.is_file();
+        let _is_file = metadata.is_file();
         let mtime = metadata
             .modified()
             .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?
@@ -803,7 +748,7 @@ mod tests {
         Ok(FsFileInfo {
             path: path.to_string(),
             is_dir,
-            is_file,
+            // is_file field removed from FsFileInfo
             is_symlink: false,
             size: metadata.len(),
             mode: if is_dir { 0o755 } else { 0o644 },

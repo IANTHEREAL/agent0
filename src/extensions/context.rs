@@ -58,6 +58,7 @@ tokio::task_local! {
 /// Run `future` with a per-statement extension execution context.
 ///
 /// This is task-local to avoid threading session state through all executor layers.
+#[cfg(test)]
 pub(crate) async fn with_context<R>(
     is_superuser: bool,
     tenant_keyspace: &str,

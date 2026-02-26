@@ -227,7 +227,7 @@ mod tests {
 
     fn to_file_info(path: &str, metadata: std::fs::Metadata) -> Result<FsFileInfo> {
         let is_dir = metadata.is_dir();
-        let is_file = metadata.is_file();
+        let _is_file = metadata.is_file();
         let mtime = metadata
             .modified()
             .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?
@@ -238,7 +238,7 @@ mod tests {
         Ok(FsFileInfo {
             path: path.to_string(),
             is_dir,
-            is_file,
+            // is_file field removed from FsFileInfo
             is_symlink: false,
             size: metadata.len(),
             mode: if is_dir { 0o755 } else { 0o644 },

@@ -441,7 +441,6 @@ mod tests {
             FsFileInfo {
                 path: "/tmp/a.txt".to_string(),
                 is_dir: false,
-                is_file: true,
                 is_symlink: false,
                 size: 100,
                 mode: 0o644,
@@ -450,7 +449,6 @@ mod tests {
             FsFileInfo {
                 path: "/tmp/subdir".to_string(),
                 is_dir: true,
-                is_file: false,
                 is_symlink: false,
                 size: 0,
                 mode: 0o755,
