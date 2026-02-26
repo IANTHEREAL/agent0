@@ -5,6 +5,7 @@
 //! - Predicate analysis
 //! - Access path selection
 
+mod cost_model;
 mod index_selection;
 mod predicate;
 mod scan_type;

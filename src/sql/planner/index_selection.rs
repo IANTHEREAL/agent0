@@ -4,6 +4,7 @@
 //! for a given typed filter expression. Supports expression-index matching and
 //! partial-index predicate implication.
 
+use super::cost_model::CostModel;
 use super::scan_type::{
     coerce_index_predicate_value, estimate_selectivity, extract_typed_conjuncts,
     normalize_expr_for_match, normalize_expr_string, parse_predicate_expr,
@@ -101,7 +102,7 @@ fn is_planner_usable_index(index: &IndexDef) -> bool {
 
 /// Compute index scan cost from estimated matching rows.
 fn index_scan_cost(estimated_rows: usize) -> f64 {
-    1.0 + estimated_rows as f64 * 0.5
+    CostModel::BASE_COST + estimated_rows as f64 * CostModel::ROW_COST
 }
 
 fn evaluate_index(
@@ -237,7 +238,11 @@ fn evaluate_index(
 
     if range_start.is_some() || range_end.is_some() {
         let two_sided = range_start.is_some() && range_end.is_some();
-        let selectivity = if two_sided { 0.1 } else { 0.3 };
+        let selectivity = if two_sided {
+            CostModel::TWO_SIDED_RANGE_SELECTIVITY
+        } else {
+            CostModel::ONE_SIDED_RANGE_SELECTIVITY
+        };
         let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
         let cost = index_scan_cost(estimated_rows);
 

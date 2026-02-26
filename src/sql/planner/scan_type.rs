@@ -5,6 +5,7 @@
 
 use sqlparser::ast::Expr;
 
+use super::cost_model::CostModel;
 use crate::model::{IndexDef, TableSchema, Value};
 
 // ---- TypedExpr expression-index and partial-index support ----
@@ -177,10 +178,10 @@ pub(super) fn coerce_index_predicate_value(
 
 pub(super) fn estimate_selectivity(index: &IndexDef, matched_cols: usize, full_match: bool) -> f64 {
     let base_selectivity = if index.unique && full_match {
-        1.0 / 1000000.0
+        CostModel::UNIQUE_INDEX_SELECTIVITY
     } else {
-        0.1_f64.powi(matched_cols as i32)
+        CostModel::NON_UNIQUE_SELECTIVITY_BASE.powi(matched_cols as i32)
     };
 
-    base_selectivity.max(0.0001)
+    base_selectivity.max(CostModel::MIN_SELECTIVITY_FLOOR)
 }
