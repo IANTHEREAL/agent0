@@ -34,16 +34,22 @@ ALTER TABLE t225_stats ALTER COLUMN name TYPE TEXT;
 -- E3: EXPLAIN should still show rows=5
 EXPLAIN SELECT * FROM t225_stats;
 
--- Phase 4: Structural ALTER TABLE ADD COLUMN — stats cleared
-ALTER TABLE t225_stats ADD COLUMN new_col INT;
+-- Phase 4: No-op ADD COLUMN IF NOT EXISTS on existing column — stats preserved (#1061)
+ALTER TABLE t225_stats ADD COLUMN IF NOT EXISTS extra INT;
 
--- E4: EXPLAIN should show rows=1000 (heuristic default, stats gone)
+-- E4: EXPLAIN should still show rows=5
 EXPLAIN SELECT * FROM t225_stats;
 
--- Phase 5: Re-ANALYZE restores stats (now 5 rows again)
+-- Phase 5: Structural ALTER TABLE ADD COLUMN — stats cleared
+ALTER TABLE t225_stats ADD COLUMN new_col INT;
+
+-- E5: EXPLAIN should show rows=1000 (heuristic default, stats gone)
+EXPLAIN SELECT * FROM t225_stats;
+
+-- Phase 6: Re-ANALYZE restores stats (now 5 rows again)
 ANALYZE t225_stats;
 
--- E5: EXPLAIN should show rows=5 again
+-- E6: EXPLAIN should show rows=5 again
 EXPLAIN SELECT * FROM t225_stats;
 
 DROP TABLE t225_stats;

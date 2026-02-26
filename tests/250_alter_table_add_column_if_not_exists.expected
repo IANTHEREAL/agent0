@@ -1,0 +1,12 @@
+DROP TABLE
+CREATE TABLE
+INSERT 2
+ALTER TABLE
+id,name,extra
+1,a,
+2,b,
+ALTER TABLE
+id,name,extra
+1,a,
+2,b,
+DROP TABLE

@@ -79,7 +79,7 @@ pub async fn execute_alter_table(
             if_not_exists,
             ..
         } => {
-            alter_table_add_column(
+            invalidate_stats = alter_table_add_column(
                 store,
                 txn,
                 db_id,
@@ -89,7 +89,6 @@ pub async fn execute_alter_table(
                 *if_not_exists,
             )
             .await?;
-            invalidate_stats = true;
         }
         AlterTableOperation::AddConstraint(constraint) => match constraint {
             TableConstraint::Unique {

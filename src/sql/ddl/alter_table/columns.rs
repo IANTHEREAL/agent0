@@ -24,7 +24,8 @@ use super::super::{
 use super::{should_invalidate_stats_for_drop_column, should_invalidate_stats_for_type_change};
 
 /// ADD COLUMN: resolve type, validate NOT NULL + DEFAULT, append column, create
-/// implicit sequence if serial.
+/// implicit sequence if serial.  Returns `true` when the schema was actually
+/// mutated, `false` for a silent `IF NOT EXISTS` no-op.
 pub(super) async fn alter_table_add_column(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -33,11 +34,11 @@ pub(super) async fn alter_table_add_column(
     schema: &mut crate::model::TableSchema,
     column_def: &sqlparser::ast::ColumnDef,
     if_not_exists: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let col_name = normalize_ident(&column_def.name);
     if schema.column_index(&col_name).is_some() {
         if if_not_exists {
-            return Ok(());
+            return Ok(false);
         }
         return Err(anyhow!("Column exists"));
     }
@@ -102,7 +103,7 @@ pub(super) async fn alter_table_add_column(
     }
     schema.version += 1;
     store.update_schema(txn, db_id, schema.clone()).await?;
-    Ok(())
+    Ok(true)
 }
 
 /// DROP COLUMN: validate dependencies, rewrite rows, remove column from schema.

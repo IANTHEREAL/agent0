@@ -13,8 +13,11 @@ rows=5
 # E3: After no-op ALTER COLUMN TYPE same type — stats preserved (rows=5)
 rows=5
 
-# E4: After structural ADD COLUMN — stats cleared (rows=1000)
+# E4: After no-op ADD COLUMN IF NOT EXISTS on existing column — stats preserved (#1061)
+rows=5
+
+# E5: After structural ADD COLUMN — stats cleared (rows=1000)
 rows=1000
 
-# E5: After re-ANALYZE — stats restored (rows=5)
+# E6: After re-ANALYZE — stats restored (rows=5)
 rows=5
