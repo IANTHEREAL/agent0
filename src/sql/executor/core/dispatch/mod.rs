@@ -379,6 +379,7 @@ mod tests {
             store.clone(),
             keyspace,
             observability.clone(),
+            crate::pool::TenantMemoryAccountant::unlimited("dispatch_test".to_string()),
             trigger_cache,
             stats_cache,
         );

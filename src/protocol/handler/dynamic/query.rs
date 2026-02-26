@@ -253,7 +253,8 @@ impl SimpleQueryHandler for DynamicPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        on_query_with_tx_status_fix(self, client, query).await
+        let memory_accountant = Some(self.auth().executor.tenant_memory_accountant().clone());
+        on_query_with_tx_status_fix(self, memory_accountant, client, query).await
     }
 
     async fn do_query<'a, C>(
@@ -728,7 +729,15 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        on_execute_with_tx_status_fix(self, &self.suspended_portals, client, message).await
+        let memory_accountant = Some(self.auth().executor.tenant_memory_accountant().clone());
+        on_execute_with_tx_status_fix(
+            self,
+            &self.suspended_portals,
+            memory_accountant,
+            client,
+            message,
+        )
+        .await
     }
 
     async fn on_bind<C>(
@@ -747,6 +756,8 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             .as_deref()
             .unwrap_or(pgwire::api::DEFAULT_NAME);
         {
+            // Rebind removal point: dropping old suspended state releases any
+            // portal-owned reservation that was handed off at suspend time.
             let mut guard = self.suspended_portals.lock().await;
             guard.remove(portal_name);
         }
@@ -803,6 +814,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             }
             pgwire::messages::extendedquery::TARGET_TYPE_BYTE_PORTAL => {
                 client.portal_store().rm_portal(name);
+                // Explicit close-removal release point for portal-owned reservations.
                 let mut guard = self.suspended_portals.lock().await;
                 guard.remove(name);
             }

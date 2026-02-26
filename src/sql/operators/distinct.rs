@@ -6,8 +6,10 @@ use async_trait::async_trait;
 use super::key_encoding::encode_values_key;
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::model::{Row, TableSchema};
+use crate::pool::try_grow_statement_memory_scope;
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::expr::typed_eval::eval_typed_expr;
+use crate::sql::memory::estimate_key_size;
 
 #[derive(Debug)]
 pub struct DistinctOperator {
@@ -50,7 +52,9 @@ impl PhysicalOperator for DistinctOperator {
 
         while let Some(row) = self.child.next(ctx).await? {
             let key = Self::row_to_key(&row);
+            let key_bytes = estimate_key_size(key.as_slice());
             if self.seen.insert(key) {
+                try_grow_statement_memory_scope("operators.distinct.hashset", key_bytes)?;
                 return Ok(Some(row));
             }
         }
@@ -133,7 +137,9 @@ impl PhysicalOperator for DistinctOnOperator {
 
         while let Some(row) = self.child.next(ctx).await? {
             let key = self.compute_key(&row, ctx.query_ctx)?;
+            let key_bytes = estimate_key_size(key.as_slice());
             if self.seen.insert(key) {
+                try_grow_statement_memory_scope("operators.distinct_on.hashset", key_bytes)?;
                 return Ok(Some(row));
             }
         }

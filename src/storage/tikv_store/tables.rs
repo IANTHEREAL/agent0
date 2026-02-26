@@ -1,6 +1,22 @@
 use super::*;
 use crate::sql::error::SqlError;
 
+fn is_row_lock_conflict(err: &tikv_client::Error) -> bool {
+    match err {
+        // Classic lock conflict shape.
+        tikv_client::Error::KeyError(key_err) => {
+            key_err.locked.is_some() || key_err.conflict.is_some() || key_err.deadlock.is_some()
+        }
+        tikv_client::Error::PessimisticLockError { inner, .. } => is_row_lock_conflict(inner),
+        tikv_client::Error::UndeterminedError(inner) => is_row_lock_conflict(inner),
+        tikv_client::Error::ExtractedErrors(errors)
+        | tikv_client::Error::MultipleKeyErrors(errors) => {
+            !errors.is_empty() && errors.iter().all(is_row_lock_conflict)
+        }
+        _ => err.is_lock_conflict(),
+    }
+}
+
 impl TikvStore {
     /// Acquire pessimistic (exclusive) locks on the given rows.
     ///
@@ -95,7 +111,7 @@ impl TikvStore {
             }
             match txn.lock_keys_nowait(vec![key]).await {
                 Ok(()) => available_indices.push(idx),
-                Err(e) if e.is_lock_conflict() => continue,
+                Err(e) if is_row_lock_conflict(&e) => continue,
                 Err(e) => return Err(anyhow!(e)),
             }
         }
@@ -147,10 +163,12 @@ impl TikvStore {
         // - Non-lock errors propagate without being misclassified as 55P03.
         match txn.lock_keys_nowait(keys).await {
             Ok(()) => Ok(()),
-            Err(e) if e.is_lock_conflict() => Err(crate::sql::error::SqlError::LockNotAvailable {
-                relation: table_name.to_string(),
+            Err(e) if is_row_lock_conflict(&e) => {
+                Err(crate::sql::error::SqlError::LockNotAvailable {
+                    relation: table_name.to_string(),
+                }
+                .into())
             }
-            .into()),
             Err(e) => Err(anyhow!(e)),
         }
     }

@@ -1,8 +1,11 @@
 use super::types::datatype_to_pgtype;
 use super::value::encode_value;
 use crate::model::DataType;
+use crate::pool::try_shrink_statement_memory_scope;
+use crate::sql::memory::estimate_row_size;
 use crate::sql::ExecuteResult;
 use futures::stream;
+use futures::StreamExt;
 use pgwire::api::portal::Format;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::Type;
@@ -106,18 +109,26 @@ pub(in crate::protocol::handler) fn result_to_response_with_format(
                 crate::model::infer_column_types_from_rows(&rows, columns.len())
             };
 
-            let mut data_rows: Vec<PgWireResult<DataRow>> = Vec::new();
-            for row in rows {
-                let mut encoder = DataRowEncoder::new(fields.clone());
-                for (i, value) in row.values.iter().enumerate() {
-                    let col_type = internal_types.get(i);
-                    let format = field_formats.get(i).copied().unwrap_or(FieldFormat::Text);
-                    encode_value(&mut encoder, value, col_type, tz, format)?;
-                }
-                data_rows.push(encoder.finish());
-            }
-
-            let row_stream = stream::iter(data_rows);
+            let internal_types = Arc::new(internal_types);
+            let field_formats = Arc::new(field_formats);
+            let row_fields = fields.clone();
+            // Stream row encoding directly to avoid building a second full in-memory
+            // `Vec<DataRow>` buffer on top of executor row storage.
+            let row_stream = stream::iter(rows).map(move |row| {
+                let row_bytes = estimate_row_size(&row);
+                let mut encoder = DataRowEncoder::new(row_fields.clone());
+                let encoded = (|| {
+                    for (i, value) in row.values.iter().enumerate() {
+                        let col_type = internal_types.get(i);
+                        let format = field_formats.get(i).copied().unwrap_or(FieldFormat::Text);
+                        encode_value(&mut encoder, value, col_type, tz, format)?;
+                    }
+                    encoder.finish()
+                })();
+                // One row was fully consumed from executor materialization.
+                try_shrink_statement_memory_scope(row_bytes);
+                encoded
+            });
             let results = QueryResponse::new(fields, row_stream);
 
             Ok(Response::Query(results))

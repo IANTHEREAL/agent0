@@ -3,7 +3,7 @@ use crate::sql::triggers::TriggerBodyCache;
 use crate::storage::TikvStore;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
@@ -31,6 +31,278 @@ fn tenant_qps_limit() -> u64 {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(0)
     })
+}
+
+/// Read the per-tenant aggregate memory quota from environment once.
+/// `0` means unlimited.
+fn tenant_memory_quota_bytes() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("DB9_TENANT_MEMORY_QUOTA_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Per-tenant aggregate memory accounting domain.
+///
+/// All interactive/worker statements for the same keyspace share one
+/// `TenantMemoryAccountant` so quota is enforced across concurrent sessions.
+#[derive(Clone, Debug)]
+pub struct TenantMemoryAccountant {
+    #[allow(dead_code)] // observability/test helper
+    keyspace: Arc<str>,
+    used_bytes: Arc<AtomicUsize>,
+    quota_bytes: usize,
+}
+
+impl TenantMemoryAccountant {
+    fn new_with_quota(keyspace: String, quota_bytes: usize) -> Self {
+        Self {
+            keyspace: Arc::from(keyspace),
+            used_bytes: Arc::new(AtomicUsize::new(0)),
+            quota_bytes,
+        }
+    }
+
+    /// Build an unlimited accountant (used by non-pooled startup paths).
+    pub fn unlimited(keyspace: String) -> Self {
+        Self::new_with_quota(keyspace, 0)
+    }
+
+    #[allow(dead_code)] // test helper
+    pub fn quota_bytes(&self) -> usize {
+        self.quota_bytes
+    }
+
+    #[allow(dead_code)] // test helper
+    pub fn used_bytes(&self) -> usize {
+        self.used_bytes.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)] // test helper
+    pub fn keyspace(&self) -> &str {
+        &self.keyspace
+    }
+
+    fn try_charge(
+        &self,
+        component: &str,
+        bytes: usize,
+    ) -> std::result::Result<(), crate::sql::error::SqlError> {
+        if bytes == 0 {
+            return Ok(());
+        }
+
+        loop {
+            let used = self.used_bytes.load(Ordering::Relaxed);
+            let Some(new_used) = used.checked_add(bytes) else {
+                return Err(crate::sql::error::SqlError::TenantMemoryQuotaExceeded {
+                    component: component.to_string(),
+                    requested_bytes: bytes,
+                    used_bytes: used,
+                    quota_bytes: self.quota_bytes,
+                });
+            };
+
+            if self.quota_bytes > 0 && new_used > self.quota_bytes {
+                return Err(crate::sql::error::SqlError::TenantMemoryQuotaExceeded {
+                    component: component.to_string(),
+                    requested_bytes: bytes,
+                    used_bytes: used,
+                    quota_bytes: self.quota_bytes,
+                });
+            }
+
+            if self
+                .used_bytes
+                .compare_exchange_weak(used, new_used, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+
+        loop {
+            let used = self.used_bytes.load(Ordering::Relaxed);
+            let new_used = used.saturating_sub(bytes);
+            if self
+                .used_bytes
+                .compare_exchange_weak(used, new_used, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Build a zero-byte reservation owner that can grow over statement/runtime
+    /// lifetime and auto-release on drop.
+    pub fn reservation(&self) -> TenantMemoryReservation {
+        TenantMemoryReservation {
+            accountant: self.clone(),
+            charged_bytes: 0,
+        }
+    }
+}
+
+/// RAII reservation over tenant aggregate memory budget.
+///
+/// The reservation can grow/shrink over time and always releases any remaining
+/// bytes on drop.
+#[derive(Debug)]
+pub struct TenantMemoryReservation {
+    accountant: TenantMemoryAccountant,
+    charged_bytes: usize,
+}
+
+impl TenantMemoryReservation {
+    #[allow(dead_code)] // test helper
+    pub fn charged_bytes(&self) -> usize {
+        self.charged_bytes
+    }
+
+    pub fn grow(
+        &mut self,
+        component: &str,
+        delta: usize,
+    ) -> std::result::Result<(), crate::sql::error::SqlError> {
+        if delta == 0 {
+            return Ok(());
+        }
+        self.accountant.try_charge(component, delta)?;
+        self.charged_bytes = self.charged_bytes.saturating_add(delta);
+        Ok(())
+    }
+
+    #[allow(dead_code)] // test helper
+    pub fn shrink(&mut self, delta: usize) {
+        let to_release = delta.min(self.charged_bytes);
+        if to_release == 0 {
+            return;
+        }
+        self.charged_bytes -= to_release;
+        self.accountant.release(to_release);
+    }
+
+    /// Split `bytes` from this reservation into a new owner.
+    ///
+    /// Used when ownership transfers from statement scope to suspended portal
+    /// buffer lifetime.
+    pub fn split(&mut self, bytes: usize) -> Option<TenantMemoryReservation> {
+        if bytes > self.charged_bytes {
+            return None;
+        }
+        self.charged_bytes -= bytes;
+        Some(TenantMemoryReservation {
+            accountant: self.accountant.clone(),
+            charged_bytes: bytes,
+        })
+    }
+}
+
+impl Drop for TenantMemoryReservation {
+    fn drop(&mut self) {
+        if self.charged_bytes > 0 {
+            self.accountant.release(self.charged_bytes);
+            self.charged_bytes = 0;
+        }
+    }
+}
+
+struct StatementMemoryScope {
+    reservation: std::sync::Mutex<TenantMemoryReservation>,
+}
+
+tokio::task_local! {
+    static STATEMENT_MEMORY_SCOPE: Arc<StatementMemoryScope>;
+}
+
+/// Run a future under a statement-scoped memory reservation owner.
+///
+/// The scope starts with 0 charged bytes and can grow via
+/// `try_grow_statement_memory_scope()`. Any remaining bytes are auto-released
+/// when the scope future completes.
+pub async fn run_with_statement_memory_scope<Fut>(
+    accountant: Option<TenantMemoryAccountant>,
+    fut: Fut,
+) -> Fut::Output
+where
+    Fut: std::future::Future,
+{
+    if let Some(accountant) = accountant {
+        let scope = Arc::new(StatementMemoryScope {
+            reservation: std::sync::Mutex::new(accountant.reservation()),
+        });
+        STATEMENT_MEMORY_SCOPE.scope(scope, fut).await
+    } else {
+        fut.await
+    }
+}
+
+/// Charge bytes against the current statement scope.
+///
+/// Returns `Ok(())` when no statement scope is active (e.g. tests calling
+/// operator helpers directly).
+pub fn try_grow_statement_memory_scope(
+    component: &str,
+    bytes: usize,
+) -> std::result::Result<(), crate::sql::error::SqlError> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    if let Ok(scope) = STATEMENT_MEMORY_SCOPE.try_with(Arc::clone) {
+        let mut guard = scope
+            .reservation
+            .lock()
+            .expect("statement memory reservation lock");
+        guard.grow(component, bytes)
+    } else {
+        Ok(())
+    }
+}
+
+/// Release bytes from the current statement scope.
+///
+/// No-op when no statement scope is active.
+pub fn try_shrink_statement_memory_scope(bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    if let Ok(scope) = STATEMENT_MEMORY_SCOPE.try_with(Arc::clone) {
+        let mut guard = scope
+            .reservation
+            .lock()
+            .expect("statement memory reservation lock");
+        guard.shrink(bytes);
+    }
+}
+
+/// Split bytes out of the current statement scope into an independent owner.
+///
+/// Used to hand off memory ownership from statement lifetime to suspended
+/// portal lifetime.
+pub fn split_statement_memory_scope(bytes: usize) -> Option<TenantMemoryReservation> {
+    if bytes == 0 {
+        return None;
+    }
+    STATEMENT_MEMORY_SCOPE
+        .try_with(|scope| {
+            let mut guard = scope
+                .reservation
+                .lock()
+                .expect("statement memory reservation lock");
+            guard.split(bytes)
+        })
+        .ok()
+        .flatten()
 }
 
 /// Simple token bucket rate limiter.
@@ -101,6 +373,8 @@ pub(crate) struct TenantEntry {
     stats_cache: Arc<TableStatsCache>,
     /// Per-tenant QPS rate limiter. `None` when rate limiting is disabled (limit = 0).
     rate_limiter: Option<TokenBucket>,
+    /// Shared per-tenant aggregate memory ledger/quota.
+    memory_accountant: TenantMemoryAccountant,
     /// Per-user active connection counts for `rolconnlimit` enforcement.
     user_connections: std::sync::Mutex<HashMap<String, u32>>,
 }
@@ -108,11 +382,12 @@ pub(crate) struct TenantEntry {
 impl TenantEntry {
     fn new(store: Arc<TikvStore>, keyspace: String) -> Self {
         let qps_limit = tenant_qps_limit();
+        let memory_quota = tenant_memory_quota_bytes();
         Self {
             store,
             active_connections: AtomicU32::new(0),
             last_idle_at: AtomicU64::new(0),
-            keyspace,
+            keyspace: keyspace.clone(),
             trigger_cache: Arc::new(TriggerBodyCache::new()),
             stats_cache: Arc::new(TableStatsCache::new()),
             rate_limiter: if qps_limit > 0 {
@@ -120,6 +395,7 @@ impl TenantEntry {
             } else {
                 None
             },
+            memory_accountant: TenantMemoryAccountant::new_with_quota(keyspace, memory_quota),
             user_connections: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -164,6 +440,11 @@ impl TenantEntry {
         let map = self.user_connections.lock().expect("user_connections lock");
         map.get(username).copied().unwrap_or(0)
     }
+
+    #[allow(dead_code)] // test: used in pool tests
+    pub(crate) fn memory_accountant(&self) -> TenantMemoryAccountant {
+        self.memory_accountant.clone()
+    }
 }
 
 /// RAII handle representing one connection's hold on a tenant's TikvStore.
@@ -198,6 +479,10 @@ impl TenantHandle {
         &self.entry.keyspace
     }
 
+    pub fn memory_accountant(&self) -> TenantMemoryAccountant {
+        self.entry.memory_accountant.clone()
+    }
+
     /// Bind this handle to a user and acquire a per-user connection slot.
     /// Returns an error message if the user's `connection_limit` is exceeded.
     /// `connection_limit < 0` means unlimited (PostgreSQL `rolconnlimit = -1`).
@@ -220,6 +505,12 @@ impl TenantHandle {
     /// The bucket starts full (all tokens available).
     #[cfg(test)]
     pub(crate) fn new_with_rate_limit(qps_limit: u64) -> Self {
+        Self::new_with_limits(qps_limit, 0)
+    }
+
+    /// Create a TenantHandle with explicit QPS+memory limits.
+    #[cfg(test)]
+    pub(crate) fn new_with_limits(qps_limit: u64, memory_quota_bytes: usize) -> Self {
         let entry = Arc::new(TenantEntry {
             store: TikvStore::new_stub(),
             active_connections: AtomicU32::new(1),
@@ -232,6 +523,10 @@ impl TenantHandle {
             } else {
                 None
             },
+            memory_accountant: TenantMemoryAccountant::new_with_quota(
+                "test_ks".to_string(),
+                memory_quota_bytes,
+            ),
             user_connections: std::sync::Mutex::new(HashMap::new()),
         });
         Self {
@@ -548,6 +843,7 @@ mod tests {
             trigger_cache: Arc::new(TriggerBodyCache::new()),
             stats_cache: Arc::new(TableStatsCache::new()),
             rate_limiter: None,
+            memory_accountant: TenantMemoryAccountant::new_with_quota(keyspace.to_string(), 0),
             user_connections: std::sync::Mutex::new(HashMap::new()),
         })
     }
@@ -874,5 +1170,89 @@ mod tests {
         // Dropping original releases the user slot.
         drop(h1);
         assert_eq!(entry.user_connections_for("user_x"), 0);
+    }
+
+    #[test]
+    fn tenant_memory_accountant_unlimited_mode() {
+        let accountant = TenantMemoryAccountant::new_with_quota("ks_unlimited".to_string(), 0);
+        let mut reservation = accountant.reservation();
+        reservation
+            .grow("test.unlimited", 10 * 1024 * 1024)
+            .expect("unlimited quota must allow reservation");
+        assert_eq!(reservation.charged_bytes(), 10 * 1024 * 1024);
+        assert_eq!(accountant.used_bytes(), 10 * 1024 * 1024);
+        drop(reservation);
+        assert_eq!(accountant.used_bytes(), 0);
+    }
+
+    #[test]
+    fn tenant_memory_reservation_no_underflow_or_overrelease() {
+        let accountant = TenantMemoryAccountant::new_with_quota("ks_underflow".to_string(), 1024);
+        let mut reservation = accountant.reservation();
+        reservation
+            .grow("test.underflow", 512)
+            .expect("initial grow should pass");
+        reservation.shrink(2048); // deliberate over-release attempt
+        assert_eq!(reservation.charged_bytes(), 0);
+        assert_eq!(accountant.used_bytes(), 0);
+    }
+
+    #[test]
+    fn tenant_memory_accountant_concurrent_charge_release_correctness() {
+        let accountant = TenantMemoryAccountant::new_with_quota("ks_concurrent".to_string(), 0);
+        let mut workers = Vec::new();
+        for _ in 0..16 {
+            let acc = accountant.clone();
+            workers.push(std::thread::spawn(move || {
+                for _ in 0..2000 {
+                    let mut r = acc.reservation();
+                    r.grow("test.concurrent", 64)
+                        .expect("unlimited quota should allow charge");
+                }
+            }));
+        }
+        for w in workers {
+            w.join().expect("thread join");
+        }
+        assert_eq!(accountant.used_bytes(), 0);
+    }
+
+    #[test]
+    fn tenant_memory_accountant_is_shared_across_concurrent_handles() {
+        // Simulate two concurrent sessions on the same tenant handle domain.
+        let h1 = TenantHandle::new_with_limits(0, 100);
+        let h2 = h1.clone();
+        let acc_a = h1.memory_accountant();
+        let acc_b = h2.memory_accountant();
+
+        let mut sess_a = acc_a.reservation();
+        sess_a
+            .grow("session_a", 80)
+            .expect("session A reservation should pass");
+
+        let mut sess_b = acc_b.reservation();
+        let err = sess_b
+            .grow("session_b", 30)
+            .expect_err("combined usage should exceed tenant quota");
+        assert_eq!(err.sqlstate(), "53200");
+
+        // Once session A releases, session B should be able to proceed.
+        drop(sess_a);
+        sess_b
+            .grow("session_b", 30)
+            .expect("reservation should succeed after A release");
+    }
+
+    #[tokio::test]
+    async fn statement_scope_runtime_shrink_tracks_live_bytes() {
+        let accountant = TenantMemoryAccountant::new_with_quota("ks_scope".to_string(), 128);
+        run_with_statement_memory_scope(Some(accountant.clone()), async {
+            try_grow_statement_memory_scope("scope.grow", 100).expect("grow should succeed");
+            assert_eq!(accountant.used_bytes(), 100);
+            try_shrink_statement_memory_scope(40);
+            assert_eq!(accountant.used_bytes(), 60);
+        })
+        .await;
+        assert_eq!(accountant.used_bytes(), 0);
     }
 }

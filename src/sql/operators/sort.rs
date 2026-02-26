@@ -3,46 +3,14 @@ use async_trait::async_trait;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::model::{Row, TableSchema, Value};
+use crate::pool::{try_grow_statement_memory_scope, try_shrink_statement_memory_scope};
 use crate::sql::analyzer::types::TypedOrderByExpr;
 use crate::sql::collation::ResolvedCollation;
 use crate::sql::expr::collation_aware::extract_resolved_collation;
 use crate::sql::expr::compare_order_by_values_collated;
 use crate::sql::expr::operators::sort_by_fallible;
 use crate::sql::expr::typed_eval::eval_typed_expr;
-
-fn estimated_value_size(value: &Value) -> usize {
-    match value {
-        Value::Null | Value::Boolean(_) => 0,
-        Value::Int32(_) => 4,
-        Value::Int64(_) => 8,
-        Value::Float64(_) => 8,
-        Value::Text(s) => s.len(),
-        Value::Bytes(b) => b.len(),
-        Value::Timestamp(_) => 8,
-        Value::Interval(_) => std::mem::size_of::<crate::model::IntervalValue>(),
-        Value::Uuid(_) => 16,
-        Value::Array(arr) => {
-            std::mem::size_of::<Vec<Value>>()
-                + arr.iter().map(estimated_value_size).sum::<usize>()
-                + arr.len() * std::mem::size_of::<Value>()
-        }
-        Value::Vector(vec) => {
-            std::mem::size_of::<Vec<f64>>() + vec.len() * std::mem::size_of::<f64>()
-        }
-        Value::Json(s) | Value::Jsonb(s) => s.len(),
-        Value::Time(_) => 8,
-        Value::Date(_) => 4,
-        Value::Numeric(_) => 16,
-        Value::Tsvector(s) | Value::Tsquery(s) => s.len(),
-    }
-}
-
-fn estimated_row_size(row: &Row) -> usize {
-    std::mem::size_of::<Row>()
-        + std::mem::size_of::<Vec<Value>>()
-        + row.values.len() * std::mem::size_of::<Value>()
-        + row.values.iter().map(estimated_value_size).sum::<usize>()
-}
+use crate::sql::memory::{estimate_row_size, estimate_values_size};
 
 fn enforce_sort_memory_limit(
     total_bytes: &mut usize,
@@ -53,7 +21,7 @@ fn enforce_sort_memory_limit(
         return Ok(());
     }
 
-    *total_bytes = total_bytes.saturating_add(estimated_row_size(row));
+    *total_bytes = total_bytes.saturating_add(estimate_row_size(row));
     if *total_bytes > max_sort_bytes {
         return Err(anyhow!(
             "ORDER BY sort memory limit exceeded: estimated {} bytes exceeds db9.max_sort_bytes={} bytes. Reduce result set with WHERE/LIMIT or increase db9.max_sort_bytes",
@@ -65,6 +33,10 @@ fn enforce_sort_memory_limit(
     Ok(())
 }
 
+fn estimate_sort_keys_size(keys: &[Value]) -> usize {
+    estimate_values_size(keys)
+}
+
 #[derive(Debug)]
 pub struct SortOperator {
     child: BoxedOperator,
@@ -72,6 +44,7 @@ pub struct SortOperator {
     /// Resolved collation per ORDER BY key (extracted at construction time).
     collations: Vec<Option<ResolvedCollation>>,
     sorted_rows: Vec<Row>,
+    sorted_rows_charged_bytes: usize,
     position: usize,
     opened: bool,
 }
@@ -87,6 +60,7 @@ impl SortOperator {
             order_by,
             collations,
             sorted_rows: Vec::new(),
+            sorted_rows_charged_bytes: 0,
             position: 0,
             opened: false,
         }
@@ -129,18 +103,33 @@ impl PhysicalOperator for SortOperator {
     }
 
     async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        if self.sorted_rows_charged_bytes > 0 {
+            try_shrink_statement_memory_scope(self.sorted_rows_charged_bytes);
+            self.sorted_rows_charged_bytes = 0;
+        }
+        self.sorted_rows.clear();
+
         self.child.open(ctx).await?;
 
         let max_sort_bytes = crate::session_context::current_max_sort_bytes();
         let mut total_bytes = 0usize;
+        let mut rows_charged_bytes = 0usize;
+        let mut keyed_rows_charged_bytes = 0usize;
         let mut rows = Vec::new();
         while let Some(row) = self.child.next(ctx).await? {
             enforce_sort_memory_limit(&mut total_bytes, &row, max_sort_bytes)?;
+            let row_bytes = estimate_row_size(&row);
+            try_grow_statement_memory_scope("operators.sort.rows", row_bytes)?;
+            rows_charged_bytes = rows_charged_bytes.saturating_add(row_bytes);
             rows.push(row);
         }
         let mut keyed_rows: Vec<(Vec<Value>, Row)> = Vec::with_capacity(rows.len());
         for row in rows {
             let keys = self.compute_sort_keys(&row, ctx)?;
+            let keyed_row_bytes =
+                estimate_sort_keys_size(&keys) + std::mem::size_of::<(Vec<Value>, Row)>();
+            try_grow_statement_memory_scope("operators.sort.keyed_rows", keyed_row_bytes)?;
+            keyed_rows_charged_bytes = keyed_rows_charged_bytes.saturating_add(keyed_row_bytes);
             keyed_rows.push((keys, row));
         }
         sort_by_fallible(&mut keyed_rows, |(keys_a, _), (keys_b, _)| {
@@ -148,7 +137,11 @@ impl PhysicalOperator for SortOperator {
         })?;
         let rows = keyed_rows.into_iter().map(|(_, row)| row).collect();
 
+        // Runtime scope for keyed rows ends after extraction into owned sorted rows.
+        try_shrink_statement_memory_scope(keyed_rows_charged_bytes);
+
         self.sorted_rows = rows;
+        self.sorted_rows_charged_bytes = rows_charged_bytes;
         self.position = 0;
         self.opened = true;
         Ok(())
@@ -169,10 +162,12 @@ impl PhysicalOperator for SortOperator {
     }
 
     async fn close(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.child.close(ctx).await?;
+        let child_close_result = self.child.close(ctx).await;
+        try_shrink_statement_memory_scope(self.sorted_rows_charged_bytes);
+        self.sorted_rows_charged_bytes = 0;
         self.sorted_rows.clear();
         self.opened = false;
-        Ok(())
+        child_close_result
     }
 
     fn children(&self) -> Vec<&dyn PhysicalOperator> {
@@ -455,14 +450,14 @@ mod tests {
             Value::Json("{\"k\":\"v\"}".repeat(128)),
         ]);
 
-        assert!(estimated_row_size(&big) > estimated_row_size(&small));
+        assert!(estimate_row_size(&big) > estimate_row_size(&small));
     }
 
     #[test]
     fn test_sort_memory_limit_within_limit() {
         let row = Row::new(vec![Value::Text("abc".to_string())]);
         let mut total_bytes = 0usize;
-        let limit = estimated_row_size(&row) + 1;
+        let limit = estimate_row_size(&row) + 1;
 
         enforce_sort_memory_limit(&mut total_bytes, &row, limit).unwrap();
         assert!(total_bytes <= limit);
@@ -472,7 +467,7 @@ mod tests {
     fn test_sort_memory_limit_exceeded() {
         let row = Row::new(vec![Value::Text("x".repeat(1024))]);
         let mut total_bytes = 0usize;
-        let limit = estimated_row_size(&row) - 1;
+        let limit = estimate_row_size(&row) - 1;
 
         let err = enforce_sort_memory_limit(&mut total_bytes, &row, limit).unwrap_err();
         let msg = err.to_string();

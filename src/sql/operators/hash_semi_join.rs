@@ -15,6 +15,7 @@ use super::hash_join::{
 };
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::model::{ColumnDef, Row, TableSchema};
+use crate::pool::try_grow_statement_memory_scope;
 
 #[derive(Debug)]
 enum SemiJoinState {
@@ -107,7 +108,8 @@ impl PhysicalOperator for HashSemiJoinOperator {
             self.right_child.estimated_rows().unwrap_or(0),
         );
         while let Some(row) = self.right_child.next(ctx).await? {
-            hash_table.insert(row);
+            let delta = hash_table.insert(row);
+            try_grow_statement_memory_scope("operators.hash_semi_join.build", delta)?;
         }
         hash_table.finalize();
 

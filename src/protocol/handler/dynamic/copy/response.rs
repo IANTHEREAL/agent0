@@ -1,6 +1,6 @@
 //! COPY TO STDOUT response building.
 
-use super::super::super::errors::{error_info, user_error};
+use super::super::super::errors::{error_info, sqlstate_for_executor_error, user_error};
 use super::super::DynamicPgHandler;
 use crate::sql::ExecuteResult;
 use futures::{Sink, SinkExt};
@@ -9,6 +9,10 @@ use pgwire::api::ClientInfo;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 use std::fmt::Debug;
+
+fn map_copy_to_executor_error(err: anyhow::Error) -> PgWireError {
+    user_error(sqlstate_for_executor_error(&err), err.to_string())
+}
 
 impl DynamicPgHandler {
     #[allow(clippy::result_large_err)]
@@ -63,7 +67,7 @@ impl DynamicPgHandler {
             .execute(&mut session, &select_sql)
             .await
             .map(|r| r.last())
-            .map_err(|e| user_error("XX000", e.to_string()))?;
+            .map_err(map_copy_to_executor_error)?;
 
         let (copy_resp, col_names, rows) = Self::copy_out_response_from_select_result(result)
             .map_err(|e| PgWireError::UserError(Box::new(e)))?;
@@ -86,7 +90,7 @@ impl DynamicPgHandler {
                 &mut buf,
                 copy_opts,
             )
-            .map_err(|e| user_error("XX000", e.to_string()))?;
+            .map_err(map_copy_to_executor_error)?;
             let data = pgwire::messages::copy::CopyData::new(bytes::Bytes::copy_from_slice(&buf));
             client.send(PgWireBackendMessage::CopyData(data)).await?;
         }
@@ -94,7 +98,7 @@ impl DynamicPgHandler {
         for row in &rows {
             buf.clear();
             crate::protocol::copy_format::encode_row_with_options(&row.values, &mut buf, copy_opts)
-                .map_err(|e| user_error("XX000", e.to_string()))?;
+                .map_err(map_copy_to_executor_error)?;
             let data = pgwire::messages::copy::CopyData::new(bytes::Bytes::copy_from_slice(&buf));
             client.send(PgWireBackendMessage::CopyData(data)).await?;
         }
@@ -109,5 +113,27 @@ impl DynamicPgHandler {
             .await?;
 
         Ok(vec![])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::error::SqlError;
+
+    #[test]
+    fn copy_to_executor_error_mapping_preserves_tenant_quota_sqlstate() {
+        let err: anyhow::Error = SqlError::TenantMemoryQuotaExceeded {
+            component: "copy_to".to_string(),
+            requested_bytes: 256,
+            used_bytes: 1024,
+            quota_bytes: 1024,
+        }
+        .into();
+        let mapped = map_copy_to_executor_error(err);
+        match mapped {
+            PgWireError::UserError(info) => assert_eq!(info.code, "53200"),
+            other => panic!("expected user error, got {other:?}"),
+        }
     }
 }

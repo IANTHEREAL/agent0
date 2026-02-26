@@ -15,6 +15,10 @@ use tokio::sync::Mutex;
 
 use super::datatype_to_pgtype;
 use super::prepared::{PreparedExec, PreparedStatement};
+use crate::pool::{
+    run_with_statement_memory_scope, split_statement_memory_scope, try_grow_statement_memory_scope,
+    TenantMemoryAccountant, TenantMemoryReservation,
+};
 
 fn is_empty_simple_query(query: &str) -> bool {
     let trimmed = query.trim();
@@ -36,6 +40,7 @@ pub(in crate::protocol::handler) fn update_tx_status_after_execution(
 
 pub(in crate::protocol::handler) async fn on_query_with_tx_status_fix<H, C>(
     handler: &H,
+    statement_memory_accountant: Option<TenantMemoryAccountant>,
     client: &mut C,
     query: pgwire::messages::simplequery::Query,
 ) -> PgWireResult<()>
@@ -45,80 +50,88 @@ where
     C::Error: Debug,
     PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
 {
-    if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
-        return Err(PgWireError::NotReadyForQuery);
-    }
+    run_with_statement_memory_scope(statement_memory_accountant, async {
+        if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+            return Err(PgWireError::NotReadyForQuery);
+        }
 
-    let mut transaction_status = client.transaction_status();
-    client.set_state(PgWireConnectionState::QueryInProgress);
-    let query_string = query.query;
+        let mut transaction_status = client.transaction_status();
+        client.set_state(PgWireConnectionState::QueryInProgress);
+        let query_string = query.query;
 
-    if is_empty_simple_query(&query_string) {
-        client
-            .feed(PgWireBackendMessage::EmptyQueryResponse(
-                EmptyQueryResponse::new(),
-            ))
-            .await?;
-    } else {
-        let resp = <H as SimpleQueryHandler>::do_query(handler, client, &query_string).await?;
-        for r in resp {
-            match r {
-                Response::EmptyQuery => {
-                    client
-                        .feed(PgWireBackendMessage::EmptyQueryResponse(
-                            EmptyQueryResponse::new(),
-                        ))
-                        .await?;
-                }
-                Response::Query(results) => {
-                    pgwire::api::query::send_query_response(client, results, true).await?;
-                }
-                Response::Execution(tag) => {
-                    transaction_status = update_tx_status_after_execution(transaction_status, &tag);
-                    pgwire::api::query::send_execution_response(client, tag).await?;
-                }
-                Response::TransactionStart(tag) => {
-                    pgwire::api::query::send_execution_response(client, tag).await?;
-                    transaction_status = transaction_status.to_in_transaction_state();
-                }
-                Response::TransactionEnd(tag) => {
-                    pgwire::api::query::send_execution_response(client, tag).await?;
-                    transaction_status = transaction_status.to_idle_state();
-                }
-                Response::Error(e) => {
-                    client
-                        .feed(PgWireBackendMessage::ErrorResponse((*e).into()))
-                        .await?;
-                    transaction_status = transaction_status.to_error_state();
-                }
-                Response::CopyIn(result) => {
-                    pgwire::api::copy::send_copy_in_response(client, result).await?;
-                    client.set_state(PgWireConnectionState::CopyInProgress(false));
-                }
-                Response::CopyOut(result) => {
-                    pgwire::api::copy::send_copy_out_response(client, result).await?;
-                    client.set_state(PgWireConnectionState::CopyInProgress(false));
-                }
-                Response::CopyBoth(result) => {
-                    pgwire::api::copy::send_copy_both_response(client, result).await?;
-                    client.set_state(PgWireConnectionState::CopyInProgress(false));
+        if is_empty_simple_query(&query_string) {
+            client
+                .feed(PgWireBackendMessage::EmptyQueryResponse(
+                    EmptyQueryResponse::new(),
+                ))
+                .await?;
+        } else {
+            // Memory reservations created during execution/response construction must
+            // remain live through wire send. Keeping statement scope wrapped around
+            // this send loop guarantees that contract.
+            let resp = <H as SimpleQueryHandler>::do_query(handler, client, &query_string).await?;
+            for r in resp {
+                match r {
+                    Response::EmptyQuery => {
+                        client
+                            .feed(PgWireBackendMessage::EmptyQueryResponse(
+                                EmptyQueryResponse::new(),
+                            ))
+                            .await?;
+                    }
+                    Response::Query(results) => {
+                        pgwire::api::query::send_query_response(client, results, true).await?;
+                    }
+                    Response::Execution(tag) => {
+                        transaction_status =
+                            update_tx_status_after_execution(transaction_status, &tag);
+                        pgwire::api::query::send_execution_response(client, tag).await?;
+                    }
+                    Response::TransactionStart(tag) => {
+                        pgwire::api::query::send_execution_response(client, tag).await?;
+                        transaction_status = transaction_status.to_in_transaction_state();
+                    }
+                    Response::TransactionEnd(tag) => {
+                        pgwire::api::query::send_execution_response(client, tag).await?;
+                        transaction_status = transaction_status.to_idle_state();
+                    }
+                    Response::Error(e) => {
+                        client
+                            .feed(PgWireBackendMessage::ErrorResponse((*e).into()))
+                            .await?;
+                        transaction_status = transaction_status.to_error_state();
+                    }
+                    Response::CopyIn(result) => {
+                        pgwire::api::copy::send_copy_in_response(client, result).await?;
+                        client.set_state(PgWireConnectionState::CopyInProgress(false));
+                    }
+                    Response::CopyOut(result) => {
+                        pgwire::api::copy::send_copy_out_response(client, result).await?;
+                        client.set_state(PgWireConnectionState::CopyInProgress(false));
+                    }
+                    Response::CopyBoth(result) => {
+                        pgwire::api::copy::send_copy_both_response(client, result).await?;
+                        client.set_state(PgWireConnectionState::CopyInProgress(false));
+                    }
                 }
             }
         }
-    }
 
-    if !matches!(client.state(), PgWireConnectionState::CopyInProgress(_)) {
-        client.set_state(PgWireConnectionState::ReadyForQuery);
-        client.set_transaction_status(transaction_status);
-        pgwire::api::query::send_ready_for_query(client, transaction_status).await?;
-    }
+        if !matches!(client.state(), PgWireConnectionState::CopyInProgress(_)) {
+            client.set_state(PgWireConnectionState::ReadyForQuery);
+            client.set_transaction_status(transaction_status);
+            pgwire::api::query::send_ready_for_query(client, transaction_status).await?;
+        }
 
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 pub(in crate::protocol::handler) async fn on_execute_with_tx_status_fix<H, C>(
     handler: &H,
     suspended_portals: &Mutex<HashMap<String, SuspendedPortalState>>,
+    statement_memory_accountant: Option<TenantMemoryAccountant>,
     client: &mut C,
     message: pgwire::messages::extendedquery::Execute,
 ) -> PgWireResult<()>
@@ -130,117 +143,141 @@ where
     C::Error: Debug,
     PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
 {
-    if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
-        return Err(PgWireError::NotReadyForQuery);
-    }
-    let mut transaction_status = client.transaction_status();
-
-    client.set_state(PgWireConnectionState::QueryInProgress);
-
-    let portal_name = message.name.as_deref().unwrap_or(pgwire::api::DEFAULT_NAME);
-    let max_rows = if message.max_rows <= 0 {
-        0
-    } else {
-        message.max_rows as usize
-    };
-
-    if let Some(portal) = client.portal_store().get_portal(portal_name) {
-        if let Some((command_tag, chunk, still_suspended, total_rows_sent)) =
-            take_suspended_rows(suspended_portals, portal_name, max_rows).await
-        {
-            for row in chunk {
-                client.feed(PgWireBackendMessage::DataRow(row)).await?;
-            }
-
-            if still_suspended {
-                client
-                    .send(PgWireBackendMessage::PortalSuspended(
-                        pgwire::messages::extendedquery::PortalSuspended::new(),
-                    ))
-                    .await?;
-            } else {
-                let tag = Tag::new(&command_tag).with_rows(total_rows_sent);
-                client
-                    .send(PgWireBackendMessage::CommandComplete(tag.into()))
-                    .await?;
-            }
-        } else {
-            match <H as ExtendedQueryHandler>::do_query(handler, client, portal.as_ref(), max_rows)
-                .await?
-            {
-                Response::EmptyQuery => {
-                    client
-                        .feed(PgWireBackendMessage::EmptyQueryResponse(
-                            EmptyQueryResponse::new(),
-                        ))
-                        .await?;
-                }
-                Response::Query(results) => {
-                    let send_describe =
-                        should_send_row_description_for_portal(portal.as_ref(), &results);
-                    if max_rows == 0 {
-                        pgwire::api::query::send_query_response(client, results, send_describe)
-                            .await?;
-                    } else {
-                        send_limited_query_response(
-                            client,
-                            suspended_portals,
-                            portal_name,
-                            results,
-                            max_rows,
-                            send_describe,
-                        )
-                        .await?;
-                    }
-                }
-                Response::Execution(tag) => {
-                    transaction_status = update_tx_status_after_execution(transaction_status, &tag);
-                    pgwire::api::query::send_execution_response(client, tag).await?;
-                }
-                Response::TransactionStart(tag) => {
-                    pgwire::api::query::send_execution_response(client, tag).await?;
-                    transaction_status = transaction_status.to_in_transaction_state();
-                }
-                Response::TransactionEnd(tag) => {
-                    pgwire::api::query::send_execution_response(client, tag).await?;
-                    transaction_status = transaction_status.to_idle_state();
-                }
-                Response::Error(err) => {
-                    client
-                        .send(PgWireBackendMessage::ErrorResponse((*err).into()))
-                        .await?;
-                    transaction_status = transaction_status.to_error_state();
-                }
-                Response::CopyIn(result) => {
-                    client.set_state(PgWireConnectionState::CopyInProgress(true));
-                    pgwire::api::copy::send_copy_in_response(client, result).await?;
-                }
-                Response::CopyOut(result) => {
-                    client.set_state(PgWireConnectionState::CopyInProgress(true));
-                    pgwire::api::copy::send_copy_out_response(client, result).await?;
-                }
-                Response::CopyBoth(result) => {
-                    client.set_state(PgWireConnectionState::CopyInProgress(true));
-                    pgwire::api::copy::send_copy_both_response(client, result).await?;
-                }
-            }
+    run_with_statement_memory_scope(statement_memory_accountant, async {
+        if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+            return Err(PgWireError::NotReadyForQuery);
         }
+        let mut transaction_status = client.transaction_status();
 
-        if !matches!(client.state(), PgWireConnectionState::CopyInProgress(_)) {
-            client.set_state(PgWireConnectionState::ReadyForQuery);
-            client.set_transaction_status(transaction_status);
+        client.set_state(PgWireConnectionState::QueryInProgress);
+
+        let portal_name = message.name.as_deref().unwrap_or(pgwire::api::DEFAULT_NAME);
+        let max_rows = if message.max_rows <= 0 {
+            0
+        } else {
+            message.max_rows as usize
         };
 
-        Ok(())
-    } else {
-        Err(PgWireError::PortalNotFound(portal_name.to_owned()))
-    }
+        if let Some(portal) = client.portal_store().get_portal(portal_name) {
+            if let Some((
+                command_tag,
+                chunk,
+                still_suspended,
+                total_rows_sent,
+                drained_reservation,
+            )) = take_suspended_rows(suspended_portals, portal_name, max_rows).await
+            {
+                // Hold drained reservation through wire send for this Execute.
+                let _drained_reservation = drained_reservation;
+                for row in chunk {
+                    client.feed(PgWireBackendMessage::DataRow(row)).await?;
+                }
+
+                if still_suspended {
+                    client
+                        .send(PgWireBackendMessage::PortalSuspended(
+                            pgwire::messages::extendedquery::PortalSuspended::new(),
+                        ))
+                        .await?;
+                } else {
+                    let tag = Tag::new(&command_tag).with_rows(total_rows_sent);
+                    client
+                        .send(PgWireBackendMessage::CommandComplete(tag.into()))
+                        .await?;
+                }
+            } else {
+                // Scope wraps both execution and downstream send so reservations
+                // remain alive until wire emission completes.
+                match <H as ExtendedQueryHandler>::do_query(
+                    handler,
+                    client,
+                    portal.as_ref(),
+                    max_rows,
+                )
+                .await?
+                {
+                    Response::EmptyQuery => {
+                        client
+                            .feed(PgWireBackendMessage::EmptyQueryResponse(
+                                EmptyQueryResponse::new(),
+                            ))
+                            .await?;
+                    }
+                    Response::Query(results) => {
+                        let send_describe =
+                            should_send_row_description_for_portal(portal.as_ref(), &results);
+                        if max_rows == 0 {
+                            pgwire::api::query::send_query_response(client, results, send_describe)
+                                .await?;
+                        } else {
+                            send_limited_query_response(
+                                client,
+                                suspended_portals,
+                                portal_name,
+                                results,
+                                max_rows,
+                                send_describe,
+                            )
+                            .await?;
+                        }
+                    }
+                    Response::Execution(tag) => {
+                        transaction_status =
+                            update_tx_status_after_execution(transaction_status, &tag);
+                        pgwire::api::query::send_execution_response(client, tag).await?;
+                    }
+                    Response::TransactionStart(tag) => {
+                        pgwire::api::query::send_execution_response(client, tag).await?;
+                        transaction_status = transaction_status.to_in_transaction_state();
+                    }
+                    Response::TransactionEnd(tag) => {
+                        pgwire::api::query::send_execution_response(client, tag).await?;
+                        transaction_status = transaction_status.to_idle_state();
+                    }
+                    Response::Error(err) => {
+                        client
+                            .send(PgWireBackendMessage::ErrorResponse((*err).into()))
+                            .await?;
+                        transaction_status = transaction_status.to_error_state();
+                    }
+                    Response::CopyIn(result) => {
+                        client.set_state(PgWireConnectionState::CopyInProgress(true));
+                        pgwire::api::copy::send_copy_in_response(client, result).await?;
+                    }
+                    Response::CopyOut(result) => {
+                        client.set_state(PgWireConnectionState::CopyInProgress(true));
+                        pgwire::api::copy::send_copy_out_response(client, result).await?;
+                    }
+                    Response::CopyBoth(result) => {
+                        client.set_state(PgWireConnectionState::CopyInProgress(true));
+                        pgwire::api::copy::send_copy_both_response(client, result).await?;
+                    }
+                }
+            }
+
+            if !matches!(client.state(), PgWireConnectionState::CopyInProgress(_)) {
+                client.set_state(PgWireConnectionState::ReadyForQuery);
+                client.set_transaction_status(transaction_status);
+            };
+
+            Ok(())
+        } else {
+            Err(PgWireError::PortalNotFound(portal_name.to_owned()))
+        }
+    })
+    .await
 }
 
 #[derive(Debug)]
 pub(in crate::protocol::handler) struct SuspendedPortalState {
     command_tag: String,
     remaining_rows: VecDeque<DataRow>,
+    /// Ownership handoff target for suspended remainder bytes.
+    /// Created at suspend-buffer creation and released by:
+    /// - drain (split to current execute scope),
+    /// - explicit state removal (Close/rebind),
+    /// - final state drop when remainder becomes empty.
+    buffer_reservation: Option<TenantMemoryReservation>,
     rows_sent_so_far: usize,
 }
 
@@ -276,7 +313,13 @@ async fn take_suspended_rows(
     suspended_portals: &Mutex<HashMap<String, SuspendedPortalState>>,
     portal_name: &str,
     max_rows: usize,
-) -> Option<(String, Vec<DataRow>, bool, usize)> {
+) -> Option<(
+    String,
+    Vec<DataRow>,
+    bool,
+    usize,
+    Option<TenantMemoryReservation>,
+)> {
     let mut guard = suspended_portals.lock().await;
     let state = guard.get_mut(portal_name)?;
 
@@ -287,8 +330,10 @@ async fn take_suspended_rows(
     };
 
     let mut chunk = Vec::with_capacity(to_take);
+    let mut drained_bytes = 0usize;
     for _ in 0..to_take {
         if let Some(row) = state.remaining_rows.pop_front() {
+            drained_bytes = drained_bytes.saturating_add(row.data.len());
             chunk.push(row);
         }
     }
@@ -297,12 +342,25 @@ async fn take_suspended_rows(
     let still_suspended = !state.remaining_rows.is_empty();
     let command_tag = state.command_tag.clone();
     let total_rows_sent = state.rows_sent_so_far;
+    // Explicit drain ownership transfer:
+    // move drained bytes from portal-owned reservation to this Execute's
+    // temporary owner (kept alive in caller through wire send).
+    let drained_reservation = state
+        .buffer_reservation
+        .as_mut()
+        .and_then(|r| r.split(drained_bytes));
 
     if !still_suspended {
         guard.remove(portal_name);
     }
 
-    Some((command_tag, chunk, still_suspended, total_rows_sent))
+    Some((
+        command_tag,
+        chunk,
+        still_suspended,
+        total_rows_sent,
+        drained_reservation,
+    ))
 }
 
 async fn send_limited_query_response<C>(
@@ -345,6 +403,16 @@ where
             rows_sent += 1;
             client.feed(PgWireBackendMessage::DataRow(row)).await?;
         } else {
+            // Statement-scope charge while buffering remainder.
+            if let Err(e) =
+                try_grow_statement_memory_scope("protocol.portal.suspend_buffer", row.data.len())
+            {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    e.sqlstate().to_owned(),
+                    e.to_string(),
+                ))));
+            }
             buffered_bytes = buffered_bytes.saturating_add(row.data.len());
             remainder.push_back(row);
             if remainder.len() > max_buffered_rows || buffered_bytes > max_buffered_bytes {
@@ -371,11 +439,15 @@ where
                 ),
             ))));
         }
+        // Ownership handoff point: split buffered bytes out of the current
+        // statement scope and attach to suspended portal state.
+        let buffer_reservation = split_statement_memory_scope(buffered_bytes);
         guard.insert(
             portal_name.to_owned(),
             SuspendedPortalState {
                 command_tag,
                 remaining_rows: remainder,
+                buffer_reservation,
                 rows_sent_so_far: rows_sent,
             },
         );

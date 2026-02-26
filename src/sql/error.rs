@@ -96,6 +96,16 @@ pub enum SqlError {
     #[error("canceling statement due to lock timeout")]
     LockTimeout,
 
+    #[error(
+        "tenant memory quota exceeded in {component}: requested {requested_bytes} bytes, used {used_bytes} bytes, quota {quota_bytes} bytes"
+    )]
+    TenantMemoryQuotaExceeded {
+        component: String,
+        requested_bytes: usize,
+        used_bytes: usize,
+        quota_bytes: usize,
+    },
+
     #[error("could not obtain lock on row in relation \"{relation}\"")]
     LockNotAvailable { relation: String },
 
@@ -234,6 +244,7 @@ impl SqlError {
             Self::StatementTimeout => "57014",
             Self::IdleInTransactionTimeout => "25P03",
             Self::LockTimeout => "55P03",
+            Self::TenantMemoryQuotaExceeded { .. } => "53200",
             Self::LockNotAvailable { .. } => "55P03",
             Self::AdvisoryLockLimitExceeded { .. } => "54000",
             Self::AdvisoryLockCounterOverflow => "54000",

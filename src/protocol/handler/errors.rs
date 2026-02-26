@@ -5,10 +5,37 @@ fn is_ident_char(b: u8) -> bool {
     matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
 }
 
+fn is_tikv_lock_conflict(err: &anyhow::Error) -> bool {
+    fn is_conflict(err: &tikv_client::Error) -> bool {
+        match err {
+            tikv_client::Error::KeyError(key_err) => {
+                key_err.locked.is_some() || key_err.conflict.is_some() || key_err.deadlock.is_some()
+            }
+            tikv_client::Error::PessimisticLockError { inner, .. } => is_conflict(inner),
+            tikv_client::Error::UndeterminedError(inner) => is_conflict(inner),
+            tikv_client::Error::ExtractedErrors(errors)
+            | tikv_client::Error::MultipleKeyErrors(errors) => {
+                !errors.is_empty() && errors.iter().all(is_conflict)
+            }
+            _ => err.is_lock_conflict(),
+        }
+    }
+
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<tikv_client::Error>()
+            .is_some_and(is_conflict)
+    })
+}
+
 pub(super) fn sqlstate_for_executor_error(err: &anyhow::Error) -> &'static str {
-    err.downcast_ref::<SqlError>()
-        .map(|e| e.sqlstate())
-        .unwrap_or("XX000")
+    if let Some(sql_err) = err.downcast_ref::<SqlError>() {
+        return sql_err.sqlstate();
+    }
+    if is_tikv_lock_conflict(err) {
+        return "55P03";
+    }
+    "XX000"
 }
 
 fn find_unqualified_identifier_position(query: &str, ident: &str) -> Option<usize> {

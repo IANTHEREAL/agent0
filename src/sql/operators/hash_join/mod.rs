@@ -32,6 +32,7 @@ use async_trait::async_trait;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::model::{ColumnDef, Row, TableSchema, Value};
+use crate::pool::try_grow_statement_memory_scope;
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::expr::classify::needs_async;
 use crate::sql::expr::typed_eval::eval_typed_expr;
@@ -244,7 +245,8 @@ impl PhysicalOperator for HashJoinOperator {
         );
 
         while let Some(row) = self.build_child.next(ctx).await? {
-            hash_table.insert(row);
+            let delta = hash_table.insert(row);
+            try_grow_statement_memory_scope("operators.hash_join.build", delta)?;
             if hash_table.memory_bytes() > self.config.max_memory_bytes {
                 tracing::warn!(
                     "Hash join exceeded memory limit: {} > {}",

@@ -62,6 +62,8 @@ pub use table_function::*;
 pub use window::*;
 
 use crate::model::{Row, TableSchema};
+use crate::pool::try_grow_statement_memory_scope;
+use crate::sql::memory::estimate_row_size;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::fmt::Debug;
@@ -157,6 +159,7 @@ pub async fn collect_all(
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
     while let Some(row) = op.next(ctx).await? {
+        try_grow_statement_memory_scope("operators.collect_all.rows", estimate_row_size(&row))?;
         rows.push(row);
     }
     Ok(rows)

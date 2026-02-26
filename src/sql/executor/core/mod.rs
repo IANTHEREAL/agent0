@@ -66,6 +66,7 @@ use super::triggers::strip_leading_sql_comments;
 use crate::auth::AuthManager;
 use crate::model::{DataType, Row, TableSchema, Value};
 use crate::observability::TenantObservability;
+use crate::pool::TenantMemoryAccountant;
 use crate::session_context;
 use crate::sql::error::SqlError;
 use crate::sql::optimizer::statistics::TableStatistics;
@@ -99,6 +100,7 @@ pub struct Executor {
     auth_manager: AuthManager,
     tenant_keyspace: String,
     observability: Arc<TenantObservability>,
+    tenant_memory_accountant: TenantMemoryAccountant,
     trigger_cache: Arc<TriggerBodyCache>,
     stats_cache: Arc<TableStatsCache>,
     /// Keyspaces whose trigger workers need activation after the current
@@ -114,6 +116,7 @@ impl Executor {
         store: Arc<TikvStore>,
         tenant_keyspace: String,
         observability: Arc<TenantObservability>,
+        tenant_memory_accountant: TenantMemoryAccountant,
         trigger_cache: Arc<TriggerBodyCache>,
         stats_cache: Arc<TableStatsCache>,
     ) -> Self {
@@ -122,6 +125,7 @@ impl Executor {
             auth_manager: AuthManager::new(),
             tenant_keyspace,
             observability,
+            tenant_memory_accountant,
             trigger_cache,
             stats_cache,
             pending_trigger_activations: Mutex::new(HashSet::new()),
@@ -139,6 +143,10 @@ impl Executor {
 
     pub fn observability(&self) -> &Arc<TenantObservability> {
         &self.observability
+    }
+
+    pub fn tenant_memory_accountant(&self) -> &TenantMemoryAccountant {
+        &self.tenant_memory_accountant
     }
 
     pub fn auth_manager(&self) -> &AuthManager {

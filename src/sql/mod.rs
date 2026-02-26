@@ -28,6 +28,7 @@ pub(crate) mod index_consistency;
 mod index_helpers;
 mod information_schema;
 pub(crate) mod jsonb;
+pub(crate) mod memory;
 mod names;
 pub mod operators;
 pub mod optimizer;

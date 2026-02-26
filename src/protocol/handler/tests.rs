@@ -1,5 +1,6 @@
 use super::*;
 use crate::model::{Row, Value};
+use crate::pool::TenantHandle;
 use crate::sql::analyzer::catalog::MockCatalog;
 use crate::sql::analyzer::{Analyzer, Catalog};
 use crate::sql::error::SqlError;
@@ -215,6 +216,10 @@ fn test_sqlstate_for_executor_error() {
     let other = anyhow::anyhow!("boom");
     assert_eq!(sqlstate_for_executor_error(&other), "XX000");
 
+    // TiKV lock conflicts surfaced as anyhow should map to lock-not-available.
+    let tikv_lock = anyhow::Error::new(tikv_client::Error::ResolveLockError(Vec::new()));
+    assert_eq!(sqlstate_for_executor_error(&tikv_lock), "55P03");
+
     // SqlError downcast path: each variant gets correct SQLSTATE
     let cases: Vec<(SqlError, &str)> = vec![
         (
@@ -281,6 +286,15 @@ fn test_sqlstate_for_executor_error() {
                 message: "operator is not unique: unknown + unknown".into(),
             },
             "42725",
+        ),
+        (
+            SqlError::TenantMemoryQuotaExceeded {
+                component: "test".into(),
+                requested_bytes: 16,
+                used_bytes: 32,
+                quota_bytes: 40,
+            },
+            "53200",
         ),
     ];
 
@@ -829,6 +843,22 @@ fn decode_single_text_field(row: &DataRow) -> String {
     String::from_utf8(bytes.to_vec()).expect("utf8")
 }
 
+fn install_test_portal(
+    client: &mut TestClient,
+    statement: Arc<StoredStatement<String>>,
+    portal_name: &str,
+) {
+    let bind = pgwire::messages::extendedquery::Bind::new(
+        Some(portal_name.to_owned()),
+        Some(statement.id.clone()),
+        vec![],
+        vec![],
+        vec![],
+    );
+    let portal = Portal::try_new(&bind, statement).expect("portal");
+    client.portal_store().put_portal(Arc::new(portal)).unwrap();
+}
+
 #[tokio::test]
 async fn execute_honors_max_rows_and_suspends_portal() {
     let handler = StubExtendedQueryHandler::new();
@@ -858,6 +888,7 @@ async fn execute_honors_max_rows_and_suspends_portal() {
     on_execute_with_tx_status_fix(
         &handler,
         &suspended,
+        None,
         &mut client,
         pgwire::messages::extendedquery::Execute::new(Some("portal".to_owned()), 2),
     )
@@ -880,6 +911,7 @@ async fn execute_honors_max_rows_and_suspends_portal() {
     on_execute_with_tx_status_fix(
         &handler,
         &suspended,
+        None,
         &mut client,
         pgwire::messages::extendedquery::Execute::new(Some("portal".to_owned()), 2),
     )
@@ -902,6 +934,7 @@ async fn execute_honors_max_rows_and_suspends_portal() {
     on_execute_with_tx_status_fix(
         &handler,
         &suspended,
+        None,
         &mut client,
         pgwire::messages::extendedquery::Execute::new(Some("portal".to_owned()), 2),
     )
@@ -956,6 +989,7 @@ async fn execute_errors_when_suspended_portal_count_exceeds_limit() {
         on_execute_with_tx_status_fix(
             &handler,
             &suspended,
+            None,
             &mut client,
             pgwire::messages::extendedquery::Execute::new(Some(portal_name.clone()), 1),
         )
@@ -987,6 +1021,7 @@ async fn execute_errors_when_suspended_portal_count_exceeds_limit() {
     let err = on_execute_with_tx_status_fix(
         &handler,
         &suspended,
+        None,
         &mut client,
         pgwire::messages::extendedquery::Execute::new(Some(portal_name.clone()), 1),
     )
@@ -1033,6 +1068,7 @@ async fn execute_max_rows_zero_returns_all_rows() {
     on_execute_with_tx_status_fix(
         &handler,
         &suspended,
+        None,
         &mut client,
         pgwire::messages::extendedquery::Execute::new(Some("portal".to_owned()), 0),
     )
@@ -1083,6 +1119,7 @@ async fn execute_errors_when_suspension_buffer_exceeds_limit() {
     let err = on_execute_with_tx_status_fix(
         &handler,
         &suspended,
+        None,
         &mut client,
         pgwire::messages::extendedquery::Execute::new(Some("portal".to_owned()), max_rows as i32),
     )
@@ -1113,6 +1150,170 @@ async fn execute_errors_when_suspension_buffer_exceeds_limit() {
         .sent
         .iter()
         .any(|m| matches!(m, PgWireBackendMessage::CommandComplete(_))));
+}
+
+#[tokio::test]
+async fn suspended_portal_reservation_handoff_releases_on_drain_and_remove() {
+    let handler = StubExtendedQueryHandler::new_with_rows(6);
+    let suspended = Mutex::new(HashMap::<String, SuspendedPortalState>::new());
+    let handle = TenantHandle::new_with_limits(0, 1_000_000);
+    let accountant = handle.memory_accountant();
+
+    let statement = Arc::new(StoredStatement::new(
+        "stmt".to_owned(),
+        "SELECT 1".to_owned(),
+        vec![],
+    ));
+    let mut client = TestClient::new();
+    client.set_state(PgWireConnectionState::ReadyForQuery);
+    install_test_portal(&mut client, statement.clone(), "portal_drain");
+
+    on_execute_with_tx_status_fix(
+        &handler,
+        &suspended,
+        Some(accountant.clone()),
+        &mut client,
+        pgwire::messages::extendedquery::Execute::new(Some("portal_drain".to_owned()), 2),
+    )
+    .await
+    .expect("first execute should suspend");
+    assert!(
+        accountant.used_bytes() > 0,
+        "suspended portal must retain tenant-memory reservation"
+    );
+
+    on_execute_with_tx_status_fix(
+        &handler,
+        &suspended,
+        Some(accountant.clone()),
+        &mut client,
+        pgwire::messages::extendedquery::Execute::new(Some("portal_drain".to_owned()), 0),
+    )
+    .await
+    .expect("drain execute should complete portal");
+    assert_eq!(
+        accountant.used_bytes(),
+        0,
+        "drain must release portal-owned reservation"
+    );
+
+    install_test_portal(&mut client, statement, "portal_remove");
+    on_execute_with_tx_status_fix(
+        &handler,
+        &suspended,
+        Some(accountant.clone()),
+        &mut client,
+        pgwire::messages::extendedquery::Execute::new(Some("portal_remove".to_owned()), 1),
+    )
+    .await
+    .expect("second suspend");
+    assert!(accountant.used_bytes() > 0);
+
+    {
+        let mut guard = suspended.lock().await;
+        guard.remove("portal_remove");
+    }
+    assert_eq!(
+        accountant.used_bytes(),
+        0,
+        "Close/rebind-style state removal must release reservation"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_sessions_share_tenant_memory_quota() {
+    // Measure one suspension footprint first so we can pick a deterministic
+    // quota that allows session A but rejects session B while A is active.
+    let baseline_handler = StubExtendedQueryHandler::new_with_rows(6);
+    let baseline_suspended = Mutex::new(HashMap::<String, SuspendedPortalState>::new());
+    let baseline_handle = TenantHandle::new_with_limits(0, 0); // unlimited
+    let baseline_accountant = baseline_handle.memory_accountant();
+    let statement = Arc::new(StoredStatement::new(
+        "stmt".to_owned(),
+        "SELECT 1".to_owned(),
+        vec![],
+    ));
+    let mut baseline_client = TestClient::new();
+    baseline_client.set_state(PgWireConnectionState::ReadyForQuery);
+    install_test_portal(&mut baseline_client, statement.clone(), "baseline_portal");
+    on_execute_with_tx_status_fix(
+        &baseline_handler,
+        &baseline_suspended,
+        Some(baseline_accountant.clone()),
+        &mut baseline_client,
+        pgwire::messages::extendedquery::Execute::new(Some("baseline_portal".to_owned()), 1),
+    )
+    .await
+    .expect("baseline suspend");
+    let baseline_usage = baseline_accountant.used_bytes();
+    assert!(baseline_usage > 0);
+    {
+        let mut guard = baseline_suspended.lock().await;
+        guard.clear();
+    }
+    assert_eq!(baseline_accountant.used_bytes(), 0);
+
+    let quota = baseline_usage + (baseline_usage / 2).max(1);
+    let tenant_handle = TenantHandle::new_with_limits(0, quota);
+    let accountant = tenant_handle.memory_accountant();
+
+    let handler = StubExtendedQueryHandler::new_with_rows(6);
+    let suspended_a = Mutex::new(HashMap::<String, SuspendedPortalState>::new());
+    let suspended_b = Mutex::new(HashMap::<String, SuspendedPortalState>::new());
+
+    let mut client_a = TestClient::new();
+    client_a.set_state(PgWireConnectionState::ReadyForQuery);
+    install_test_portal(&mut client_a, statement.clone(), "portal_a");
+    on_execute_with_tx_status_fix(
+        &handler,
+        &suspended_a,
+        Some(accountant.clone()),
+        &mut client_a,
+        pgwire::messages::extendedquery::Execute::new(Some("portal_a".to_owned()), 1),
+    )
+    .await
+    .expect("session A should suspend successfully");
+    let used_after_a = accountant.used_bytes();
+    assert!(used_after_a > 0);
+
+    let mut client_b = TestClient::new();
+    client_b.set_state(PgWireConnectionState::ReadyForQuery);
+    install_test_portal(&mut client_b, statement.clone(), "portal_b");
+    let err = on_execute_with_tx_status_fix(
+        &handler,
+        &suspended_b,
+        Some(accountant.clone()),
+        &mut client_b,
+        pgwire::messages::extendedquery::Execute::new(Some("portal_b".to_owned()), 1),
+    )
+    .await
+    .expect_err("session B should be rejected while A holds memory");
+    match err {
+        PgWireError::UserError(info) => assert_eq!(info.code, "53200"),
+        other => panic!("expected quota user error, got {other:?}"),
+    }
+
+    {
+        let mut guard = suspended_a.lock().await;
+        guard.remove("portal_a");
+    }
+    assert_eq!(
+        accountant.used_bytes(),
+        0,
+        "after A release, aggregate used bytes should return to zero"
+    );
+
+    client_b.set_state(PgWireConnectionState::ReadyForQuery);
+    client_b.sent.clear();
+    on_execute_with_tx_status_fix(
+        &handler,
+        &suspended_b,
+        Some(accountant.clone()),
+        &mut client_b,
+        pgwire::messages::extendedquery::Execute::new(Some("portal_b".to_owned()), 1),
+    )
+    .await
+    .expect("session B should succeed after A releases memory");
 }
 
 #[test]

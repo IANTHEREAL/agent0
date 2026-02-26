@@ -62,7 +62,9 @@ impl DynamicPgHandler {
             let _ = self.connection_guard.set(tenant_obs.connection_open());
         }
 
-        let (store, trigger_cache, stats_cache) = if let Some(pool) = &self.client_pool {
+        let (store, trigger_cache, stats_cache, memory_accountant) = if let Some(pool) =
+            &self.client_pool
+        {
             let mut handle = pool
                 .acquire(Some(effective_keyspace.clone()))
                 .await
@@ -81,8 +83,9 @@ impl DynamicPgHandler {
             let s = handle.store().clone();
             let tc = handle.trigger_cache().clone();
             let sc = handle.stats_cache().clone();
+            let ma = handle.memory_accountant();
             let _ = self.tenant_handle.set(handle);
-            (s, tc, sc)
+            (s, tc, sc, ma)
         } else {
             use crate::sql::stats::TableStatsCache;
             use crate::sql::triggers::TriggerBodyCache;
@@ -96,6 +99,7 @@ impl DynamicPgHandler {
                 Arc::new(s),
                 Arc::new(TriggerBodyCache::new()),
                 Arc::new(TableStatsCache::new()),
+                crate::pool::TenantMemoryAccountant::unlimited(effective_keyspace.clone()),
             )
         };
 
@@ -103,6 +107,7 @@ impl DynamicPgHandler {
             store.clone(),
             effective_keyspace.clone(),
             tenant_obs.clone(),
+            memory_accountant,
             trigger_cache,
             stats_cache,
         ));

@@ -24,6 +24,14 @@ use crate::sql::types::CastContext;
 use anyhow::{anyhow, Result};
 use tikv_client::Transaction;
 
+fn has_skip_locked_clause(locks: &[sqlparser::ast::LockClause]) -> bool {
+    locks.iter().any(|l| {
+        l.nonblock
+            .as_ref()
+            .is_some_and(|nb| *nb == sqlparser::ast::NonBlock::SkipLocked)
+    })
+}
+
 impl Executor {
     /// Apply row-level locks (FOR UPDATE/SHARE) to rows.
     #[allow(clippy::too_many_arguments)]
@@ -43,14 +51,7 @@ impl Executor {
         }
 
         // Extract lock properties.
-        let has_skip_locked = locks
-            .iter()
-            .any(|l| l.lock_type == sqlparser::ast::LockType::Update)
-            && locks.iter().any(|l| {
-                l.nonblock
-                    .as_ref()
-                    .is_some_and(|nb| *nb == sqlparser::ast::NonBlock::SkipLocked)
-            });
+        let has_skip_locked = has_skip_locked_clause(locks);
         let has_nowait = locks.iter().any(|l| {
             l.nonblock
                 .as_ref()
@@ -575,5 +576,43 @@ fn coerce_any_all_rhs_for_comparison(
             },
             target_type,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_skip_locked_clause;
+    use sqlparser::ast::{LockClause, LockType, NonBlock};
+
+    #[test]
+    fn has_skip_locked_clause_matches_share_and_update() {
+        let share_skip = LockClause {
+            lock_type: LockType::Share,
+            of: None,
+            nonblock: Some(NonBlock::SkipLocked),
+        };
+        let update_skip = LockClause {
+            lock_type: LockType::Update,
+            of: None,
+            nonblock: Some(NonBlock::SkipLocked),
+        };
+        assert!(has_skip_locked_clause(&[share_skip]));
+        assert!(has_skip_locked_clause(&[update_skip]));
+    }
+
+    #[test]
+    fn has_skip_locked_clause_false_when_absent() {
+        let share_plain = LockClause {
+            lock_type: LockType::Share,
+            of: None,
+            nonblock: None,
+        };
+        let update_nowait = LockClause {
+            lock_type: LockType::Update,
+            of: None,
+            nonblock: Some(NonBlock::Nowait),
+        };
+        assert!(!has_skip_locked_clause(&[share_plain]));
+        assert!(!has_skip_locked_clause(&[update_nowait]));
     }
 }

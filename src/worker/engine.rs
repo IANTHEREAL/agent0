@@ -722,6 +722,7 @@ impl WorkerEngine {
         let current_user: Arc<str> = Arc::from(entry.username.clone());
         let timezone: Arc<str> = Arc::from("UTC");
         let tx_start_ms = chrono::Utc::now().timestamp_millis();
+        let statement_memory_accountant = handle.memory_accountant();
 
         // BgDdl tasks (e.g. CREATE INDEX CONCURRENTLY backfill) are exempt from
         // statement_timeout — they legitimately run for extended periods.
@@ -756,6 +757,7 @@ impl WorkerEngine {
             store.clone(),
             entry.keyspace.clone(),
             observability::registry().tenant(&entry.keyspace),
+            handle.memory_accountant(),
             handle.trigger_cache().clone(),
             handle.stats_cache().clone(),
         );
@@ -791,18 +793,22 @@ impl WorkerEngine {
                     timezone.clone(),
                 );
 
-                // Wrap each statement in its own extension context to reset http_requests counter
-                let fut = with_context_opts(
-                    ext_ctx.clone(),
-                    query_context::with_scoped_query_context(
-                        &qctx,
-                        exec.execute_statement_on_txn(
-                            &mut txn,
-                            entry.db_id,
-                            &mut sequence_values,
-                            &search_path,
-                            stmt,
-                            None,
+                // Wrap each statement in its own extension context to reset
+                // http_requests counter and isolate statement memory lifecycle.
+                let fut = crate::pool::run_with_statement_memory_scope(
+                    Some(statement_memory_accountant.clone()),
+                    with_context_opts(
+                        ext_ctx.clone(),
+                        query_context::with_scoped_query_context(
+                            &qctx,
+                            exec.execute_statement_on_txn(
+                                &mut txn,
+                                entry.db_id,
+                                &mut sequence_values,
+                                &search_path,
+                                stmt,
+                                None,
+                            ),
                         ),
                     ),
                 );

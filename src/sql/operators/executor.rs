@@ -5,7 +5,9 @@ use tikv_client::Transaction;
 
 use super::{BoxedOperator, ExecutionContext};
 use crate::model::Row;
+use crate::pool::try_grow_statement_memory_scope;
 use crate::sql::executor::Executor;
+use crate::sql::memory::estimate_row_size;
 use crate::sql::query_context::QueryContext;
 use crate::storage::TikvStore;
 
@@ -39,6 +41,7 @@ pub async fn execute_operator_tree(
 
     let mut rows = Vec::new();
     while let Some(row) = operator.next(&mut ctx).await? {
+        try_grow_statement_memory_scope("operators.executor.root_rows", estimate_row_size(&row))?;
         rows.push(row);
     }
 
@@ -73,6 +76,7 @@ pub async fn execute_operator_tree_with_ctes(
 
     let mut rows = Vec::new();
     while let Some(row) = operator.next(&mut ctx).await? {
+        try_grow_statement_memory_scope("operators.executor.root_rows", estimate_row_size(&row))?;
         rows.push(row);
     }
 

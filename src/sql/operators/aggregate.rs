@@ -6,10 +6,14 @@ use async_trait::async_trait;
 use super::key_encoding::{encode_value_key, encode_values_key};
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
+use crate::pool::{try_grow_statement_memory_scope, try_shrink_statement_memory_scope};
 use crate::sql::analyzer::types::{TypedExpr, TypedOrderByExpr};
 use crate::sql::expr::compare_order_by_values;
 use crate::sql::expr::operators::sort_by_fallible;
 use crate::sql::expr::typed_eval::eval_typed_expr;
+use crate::sql::memory::{
+    estimate_key_size, estimate_row_size, estimate_value_size, estimate_values_payload_size,
+};
 use crate::sql::Aggregator;
 
 #[derive(Debug, Clone)]
@@ -115,12 +119,14 @@ impl PhysicalOperator for HashAggregateOperator {
         self.child.open(ctx).await?;
 
         let input_rows = collect_all(self.child.as_mut(), ctx).await?;
+        let input_rows_charged_bytes: usize = input_rows.iter().map(estimate_row_size).sum();
 
         struct GroupState {
             group_values: Vec<Value>,
             aggregators: Vec<Aggregator>,
             seen_distinct: Vec<HashSet<Vec<u8>>>,
             ordered_agg_buffers: Vec<Option<Vec<(Vec<Value>, Value)>>>,
+            charged_bytes: usize,
         }
 
         let mut groups: HashMap<Vec<u8>, GroupState> = HashMap::new();
@@ -145,10 +151,10 @@ impl PhysicalOperator for HashAggregateOperator {
                         Self::create_aggregator(agg_expr, rt)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let seen_distinct = (0..self.aggregate_exprs.len())
+                let seen_distinct: Vec<HashSet<Vec<u8>>> = (0..self.aggregate_exprs.len())
                     .map(|_| HashSet::new())
                     .collect();
-                let ordered_agg_buffers = self
+                let ordered_agg_buffers: Vec<Option<Vec<(Vec<Value>, Value)>>> = self
                     .aggregate_exprs
                     .iter()
                     .map(|agg_expr| {
@@ -159,6 +165,16 @@ impl PhysicalOperator for HashAggregateOperator {
                         }
                     })
                     .collect();
+                let group_overhead_bytes = std::mem::size_of::<(Vec<u8>, GroupState)>()
+                    + key_bytes.len()
+                    + estimate_values_payload_size(&group_key_values)
+                    + std::mem::size_of_val(aggregators.as_slice())
+                    + std::mem::size_of_val(seen_distinct.as_slice())
+                    + std::mem::size_of_val(ordered_agg_buffers.as_slice());
+                try_grow_statement_memory_scope(
+                    "operators.hash_aggregate.groups",
+                    group_overhead_bytes,
+                )?;
                 groups.insert(
                     key_bytes.clone(),
                     GroupState {
@@ -166,6 +182,7 @@ impl PhysicalOperator for HashAggregateOperator {
                         aggregators,
                         seen_distinct,
                         ordered_agg_buffers,
+                        charged_bytes: group_overhead_bytes,
                     },
                 );
             }
@@ -190,9 +207,15 @@ impl PhysicalOperator for HashAggregateOperator {
 
                 if agg_expr.distinct {
                     let val_bytes = encode_value_key(&val);
+                    let distinct_entry_bytes = estimate_key_size(val_bytes.as_slice());
                     if !state.seen_distinct[i].insert(val_bytes) {
                         continue;
                     }
+                    try_grow_statement_memory_scope(
+                        "operators.hash_aggregate.seen_distinct",
+                        distinct_entry_bytes,
+                    )?;
+                    state.charged_bytes = state.charged_bytes.saturating_add(distinct_entry_bytes);
                 }
 
                 if let Some(buf) = state.ordered_agg_buffers[i].as_mut() {
@@ -201,12 +224,24 @@ impl PhysicalOperator for HashAggregateOperator {
                         let key = eval_typed_expr(&o.expr, row, ctx.query_ctx)?;
                         keys.push(key);
                     }
+                    let ordered_entry_bytes = std::mem::size_of::<(Vec<Value>, Value)>()
+                        + estimate_values_payload_size(&keys)
+                        + estimate_value_size(&val);
+                    try_grow_statement_memory_scope(
+                        "operators.hash_aggregate.ordered_buffer",
+                        ordered_entry_bytes,
+                    )?;
+                    state.charged_bytes = state.charged_bytes.saturating_add(ordered_entry_bytes);
                     buf.push((keys, val));
                 } else {
                     state.aggregators[i].update(&val)?;
                 }
             }
         }
+        // `collect_all` rows are no longer retained after grouping.
+        // Drop first so runtime accounting matches live allocations.
+        drop(input_rows);
+        try_shrink_statement_memory_scope(input_rows_charged_bytes);
 
         self.result_rows.clear();
 
@@ -217,13 +252,19 @@ impl PhysicalOperator for HashAggregateOperator {
                 let agg = Self::create_aggregator(agg_expr, rt)?;
                 values.push(agg.result());
             }
-            self.result_rows.push(Row::new(values));
+            let out_row = Row::new(values);
+            try_grow_statement_memory_scope(
+                "operators.hash_aggregate.result_rows",
+                estimate_row_size(&out_row),
+            )?;
+            self.result_rows.push(out_row);
         } else {
             for (_, state) in groups {
                 let GroupState {
                     group_values,
                     aggregators,
                     mut ordered_agg_buffers,
+                    charged_bytes,
                     ..
                 } = state;
                 let mut values = group_values;
@@ -256,7 +297,14 @@ impl PhysicalOperator for HashAggregateOperator {
                         values.push(agg.result());
                     }
                 }
-                self.result_rows.push(Row::new(values));
+                let out_row = Row::new(values);
+                try_grow_statement_memory_scope(
+                    "operators.hash_aggregate.result_rows",
+                    estimate_row_size(&out_row),
+                )?;
+                self.result_rows.push(out_row);
+                drop(ordered_agg_buffers);
+                try_shrink_statement_memory_scope(charged_bytes);
             }
         }
 
@@ -281,6 +329,8 @@ impl PhysicalOperator for HashAggregateOperator {
 
     async fn close(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
         self.child.close(ctx).await?;
+        let retained_bytes: usize = self.result_rows.iter().map(estimate_row_size).sum();
+        try_shrink_statement_memory_scope(retained_bytes);
         self.result_rows.clear();
         self.opened = false;
         Ok(())
