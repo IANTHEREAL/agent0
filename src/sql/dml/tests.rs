@@ -1,7 +1,7 @@
 //! Unit tests for the DML sub-modules.
 
 use super::*;
-use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
 use std::collections::HashMap;
 
 fn enum_schema() -> TableSchema {

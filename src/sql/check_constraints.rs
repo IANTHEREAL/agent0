@@ -1,8 +1,8 @@
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::expr::compile::compile_row_expr_for_table;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::query_context::QueryContext;
-use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -84,7 +84,7 @@ pub fn validate_compiled_check_constraints(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CheckConstraint, ColumnDef, DataType};
+    use crate::model::{CheckConstraint, ColumnDef, DataType};
     use std::sync::Arc;
 
     fn check_schema() -> TableSchema {

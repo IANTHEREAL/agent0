@@ -10,7 +10,7 @@ use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuil
 
 use super::http_reader::{fetch_parquet_file_size, parquet_http_client, HttpParquetReader};
 use super::types::{arrow_array_to_value, arrow_type_to_pg_type};
-use crate::types::{ColumnDef, TableSchema, Value};
+use crate::model::{ColumnDef, TableSchema, Value};
 
 const DEFAULT_BATCH_SIZE: usize = 8192;
 
@@ -226,7 +226,7 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
 
-    use crate::types::DataType;
+    use crate::model::DataType;
 
     struct InMemoryParquetReader {
         data: Bytes,

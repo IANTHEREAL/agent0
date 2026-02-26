@@ -43,7 +43,7 @@ pub use scope::Scope;
 pub use scope::ScopeStack;
 pub use types::*;
 
-use crate::types::DataType;
+use crate::model::DataType;
 
 /// The Analyzer: transforms raw SQL AST into Typed IR.
 ///

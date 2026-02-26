@@ -195,7 +195,7 @@ pub fn rewrite_for_post_window(
             kind: TypedExprKind::Cast {
                 expr: Box::new(rewrite_for_post_window(inner, input_col_count, counter)),
                 target_type: target_type.clone(),
-                cast_context: cast_context.clone(),
+                cast_context: *cast_context,
             },
             data_type: expr.data_type.clone(),
         },
@@ -391,8 +391,8 @@ pub fn rewrite_for_post_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::DataType;
     use crate::sql::analyzer::types::{FunctionKind, IsTestKind, JsonAccessOp, ResolvedFunction};
-    use crate::types::DataType;
 
     // ── helpers ─────────────────────────────────────────────
 
@@ -426,14 +426,14 @@ mod tests {
 
     fn const_int() -> TypedExpr {
         TypedExpr {
-            kind: TypedExprKind::Constant(crate::types::Value::Int64(1)),
+            kind: TypedExprKind::Constant(crate::model::Value::Int64(1)),
             data_type: DataType::Int64,
         }
     }
 
     fn const_text() -> TypedExpr {
         TypedExpr {
-            kind: TypedExprKind::Constant(crate::types::Value::Text("a".to_string())),
+            kind: TypedExprKind::Constant(crate::model::Value::Text("a".to_string())),
             data_type: DataType::Text,
         }
     }

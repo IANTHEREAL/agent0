@@ -216,7 +216,7 @@ Writing conventions:
     - `snapshot_query_samples()`: aggregate by `fingerprint(fnv1a_64(normalized_sql))`, compute avg/p99/max and last_seen
 
 **Types**
-- `src/types/*` (Unknown): `Value/Row/TableSchema/DataType` etc (cross-cutting correctness + encoding)
+- `src/model/*` (Unknown): `Value/Row/TableSchema/DataType` etc (cross-cutting correctness + encoding)
 
 ### 1.2 Cloud Admin Portal (`cloud-admin-portal/`)
 
@@ -573,7 +573,7 @@ Next deep-dive questions (placeholders; later tasks will add evidence one by one
   2) DDL/DML KV write paths + constraint anchor points: `src/sql/ddl.rs` / `src/sql/dml.rs` / `src/sql/executor_*_ops.rs` + `src/storage/tikv_store.rs`
   3) Privilege model anchor points: `src/auth/*` + `src/sql/rbac.rs` + `src/protocol/handler.rs` (superuser/observer/tenant routing)
   4) Trigger queue + worker: `src/sql/triggers.rs` / `src/sql/trigger_queue.rs` / `src/sql/trigger_worker.rs` (plus sys tables: `src/sql/executor_join.rs`)
-  5) Expression/type-system hotspots (`correctness`): `src/sql/expr.rs` / `src/sql/helpers.rs` / `src/types/*`
+  5) Expression/type-system hotspots (`correctness`): `src/sql/expr.rs` / `src/sql/helpers.rs` / `src/model/*`
 
 ---
 

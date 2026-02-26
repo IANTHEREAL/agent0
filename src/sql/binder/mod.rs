@@ -96,7 +96,7 @@ impl Binder {
         name: &sqlparser::ast::ObjectName,
         alias: Option<&sqlparser::ast::Ident>,
     ) {
-        let parts: Vec<String> = name.0.iter().map(|id| names::normalize_ident(id)).collect();
+        let parts: Vec<String> = name.0.iter().map(names::normalize_ident).collect();
 
         // Only unqualified (1-part) names can be shadowed by CTEs.
         // Schema-qualified names (`FROM schema.table`) are never CTE references.

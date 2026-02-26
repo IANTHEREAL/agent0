@@ -14,7 +14,7 @@ impl DynamicPgHandler {
     #[allow(clippy::result_large_err)]
     fn copy_out_response_from_select_result(
         result: ExecuteResult,
-    ) -> Result<(CopyResponse, Vec<String>, Vec<crate::types::Row>), ErrorInfo> {
+    ) -> Result<(CopyResponse, Vec<String>, Vec<crate::model::Row>), ErrorInfo> {
         match result {
             ExecuteResult::Select { columns, rows, .. } => {
                 let col_count = columns.len();
@@ -77,9 +77,9 @@ impl DynamicPgHandler {
         // Emit HEADER row if requested, encoding through format-specific logic
         // so column names containing delimiter/quote/newline are handled correctly.
         if copy_opts.header {
-            let header_values: Vec<crate::types::Value> = col_names
+            let header_values: Vec<crate::model::Value> = col_names
                 .iter()
-                .map(|name| crate::types::Value::Text(name.clone()))
+                .map(|name| crate::model::Value::Text(name.clone()))
                 .collect();
             crate::protocol::copy_format::encode_row_with_options(
                 &header_values,

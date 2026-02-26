@@ -2,8 +2,8 @@
 
 #[cfg(test)]
 mod owned_sequence_lookup_tests {
+    use crate::model::{SequenceBacking, SequenceDef, SequenceState};
     use crate::sql::sequences::find_owned_sequence_full_name;
-    use crate::types::{SequenceBacking, SequenceDef, SequenceState};
 
     fn make_sequence(full_name: &str, owned_by: Option<(&str, &str)>) -> SequenceDef {
         let (schema, name) = full_name.split_once('.').unwrap_or(("public", full_name));

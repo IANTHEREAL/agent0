@@ -1,5 +1,5 @@
+use crate::model::Value;
 use crate::sql::error::SqlError;
-use crate::types::Value;
 use anyhow::{anyhow, Result};
 use chrono::Datelike;
 use std::collections::HashMap;
@@ -98,7 +98,7 @@ fn eval_date_trunc(args: Vec<Value>) -> Result<Value> {
     };
     let ts = match iter.next() {
         Some(Value::Timestamp(t)) => t,
-        Some(Value::Date(days)) => crate::types::date::date_days_to_timestamp_millis(days)?,
+        Some(Value::Date(days)) => crate::model::date::date_days_to_timestamp_millis(days)?,
         Some(Value::Text(s)) => match crate::sql::expr::parse_timestamp_string(&s)? {
             Value::Timestamp(ts) => ts,
             _ => return Ok(Value::Null),
@@ -157,9 +157,9 @@ fn eval_date(args: Vec<Value>) -> Result<Value> {
     match args.into_iter().next() {
         Some(Value::Date(d)) => Ok(Value::Date(d)),
         Some(Value::Timestamp(ts)) => {
-            crate::types::date::timestamp_millis_to_date_days(ts).map(Value::Date)
+            crate::model::date::timestamp_millis_to_date_days(ts).map(Value::Date)
         }
-        Some(Value::Text(s)) => crate::types::date::parse_date_days(&s).map(Value::Date),
+        Some(Value::Text(s)) => crate::model::date::parse_date_days(&s).map(Value::Date),
         Some(Value::Null) | None => Ok(Value::Null),
         Some(other) => Err(anyhow!("DATE() cannot convert {:?} to date", other)),
     }
@@ -182,7 +182,7 @@ fn eval_to_char(args: Vec<Value>) -> Result<Value> {
             .ok_or_else(|| anyhow!("invalid timestamp"))?
             .naive_utc(),
         Value::Date(days) => {
-            let ts = crate::types::date::date_days_to_timestamp_millis(*days)?;
+            let ts = crate::model::date::date_days_to_timestamp_millis(*days)?;
             chrono::DateTime::from_timestamp_millis(ts)
                 .ok_or_else(|| anyhow!("invalid date"))?
                 .naive_utc()
@@ -239,7 +239,7 @@ fn eval_age(args: Vec<Value>) -> Result<Value> {
     let anchor = add_months(start_ts, months)?;
     let millis = (end_ts - anchor).num_milliseconds();
 
-    Ok(Value::Interval(crate::types::IntervalValue::new(
+    Ok(Value::Interval(crate::model::IntervalValue::new(
         sign * months,
         (sign as i64) * millis,
     )))
@@ -251,7 +251,7 @@ fn value_to_naive_datetime(v: &Value) -> Result<chrono::NaiveDateTime> {
             .ok_or_else(|| anyhow!("invalid timestamp"))
             .map(|dt| dt.naive_utc()),
         Value::Date(days) => {
-            let ts = crate::types::date::date_days_to_timestamp_millis(*days)?;
+            let ts = crate::model::date::date_days_to_timestamp_millis(*days)?;
             chrono::DateTime::from_timestamp_millis(ts)
                 .ok_or_else(|| anyhow!("invalid date"))
                 .map(|dt| dt.naive_utc())

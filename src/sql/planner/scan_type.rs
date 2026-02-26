@@ -5,7 +5,7 @@
 
 use sqlparser::ast::Expr;
 
-use crate::types::{IndexDef, TableSchema, Value};
+use crate::model::{IndexDef, TableSchema, Value};
 
 // ---- TypedExpr expression-index and partial-index support ----
 

@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 
-use crate::types::Value;
+use crate::model::Value;
 
 // Re-export the public API surface.
 #[allow(unused_imports)]
@@ -26,7 +26,7 @@ pub(crate) use utils::replace_identifier;
 /// and accumulated RAISE NOTICE messages.
 pub struct PlpgsqlContext {
     pub variables: HashMap<String, Value>,
-    pub variable_types: HashMap<String, crate::types::DataType>,
+    pub variable_types: HashMap<String, crate::model::DataType>,
     pub notices: Vec<String>,
 }
 
@@ -46,7 +46,7 @@ impl PlpgsqlContext {
             .keys()
             .find(|k| k.to_lowercase() == name_lower)
             .cloned()
-            .unwrap_or_else(|| name_lower);
+            .unwrap_or(name_lower);
         self.variables.insert(key, value);
     }
 }

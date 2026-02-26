@@ -10,7 +10,7 @@ use super::scan_type::{
     typed_expr_to_canonical_sql,
 };
 use super::{AccessPath, PredicateInfo, PredicateOp, ScanType};
-use crate::types::{IndexDef, TableSchema, Value};
+use crate::model::{IndexDef, TableSchema, Value};
 use crate::worker::types::IndexState;
 
 /// Choose the best B-tree access path for a typed filter expression.
@@ -141,9 +141,7 @@ fn evaluate_index(
         ));
     }
 
-    let Some(next_col) = index.columns.get(prefix_values.len()) else {
-        return None;
-    };
+    let next_col = index.columns.get(prefix_values.len())?;
 
     if let Some(in_pred) = predicates.iter().find(|p| {
         p.op == PredicateOp::In

@@ -5,9 +5,9 @@
 //! `Query`, and rewriting `TableFactor::Table` nodes that reference views
 //! into `TableFactor::Derived` subqueries.
 
+use crate::model::ViewDef;
 use crate::sql::names;
 use crate::storage::TikvStore;
-use crate::types::ViewDef;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{self, Query, TableFactor, TableWithJoins};
 use sqlparser::dialect::PostgreSqlDialect;

@@ -68,6 +68,14 @@ fn test_parse_insert() {
 }
 
 #[test]
+fn test_parse_update_from_comma_with_newline_before_set() {
+    let sql = "UPDATE \"flow_version\" fv\nSET \"updatedBy\" = NULL\nFROM \"flow\" f JOIN \"project\" p ON p.\"id\" = f.\"projectId\", \"user\" u\nWHERE fv.\"flowId\" = f.\"id\"";
+    let stmts = parse_sql(sql).unwrap();
+    assert_eq!(stmts.len(), 1);
+    assert!(matches!(stmts[0], Statement::Update { .. }));
+}
+
+#[test]
 fn test_parse_insert_select_returning_wildcard() {
     let stmts = parse_sql(
         "INSERT INTO insert_test (id, name, value)

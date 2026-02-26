@@ -98,17 +98,16 @@ pub async fn execute_alter_role(
                     sqlparser::ast::RoleOption::CreateDB(v) => user.can_create_db = *v,
                     sqlparser::ast::RoleOption::CreateRole(v) => user.can_create_role = *v,
                     sqlparser::ast::RoleOption::Login(v) => user.can_login = *v,
-                    sqlparser::ast::RoleOption::Password(p) => {
-                        if let SqlPassword::Password(expr) = p {
-                            if let Expr::Value(SqlValue::SingleQuotedString(s)) = expr {
-                                user.set_password(s);
-                            }
-                        }
+                    sqlparser::ast::RoleOption::Password(SqlPassword::Password(Expr::Value(
+                        SqlValue::SingleQuotedString(s),
+                    ))) => {
+                        user.set_password(s);
                     }
-                    sqlparser::ast::RoleOption::ConnectionLimit(expr) => {
-                        if let Expr::Value(SqlValue::Number(n, _)) = expr {
-                            user.connection_limit = n.parse().unwrap_or(-1);
-                        }
+                    sqlparser::ast::RoleOption::ConnectionLimit(Expr::Value(SqlValue::Number(
+                        n,
+                        _,
+                    ))) => {
+                        user.connection_limit = n.parse().unwrap_or(-1);
                     }
                     _ => {}
                 }
@@ -297,7 +296,7 @@ fn parse_privileges(privileges: &Privileges) -> Vec<Privilege> {
                 sqlparser::ast::Action::Select { .. } => Some(Privilege::Select),
                 sqlparser::ast::Action::Insert { .. } => Some(Privilege::Insert),
                 sqlparser::ast::Action::Update { .. } => Some(Privilege::Update),
-                sqlparser::ast::Action::Delete { .. } => Some(Privilege::Delete),
+                sqlparser::ast::Action::Delete => Some(Privilege::Delete),
                 sqlparser::ast::Action::Truncate => Some(Privilege::Truncate),
                 sqlparser::ast::Action::References { .. } => Some(Privilege::References),
                 sqlparser::ast::Action::Trigger => Some(Privilege::Trigger),
@@ -555,8 +554,7 @@ pub async fn execute_revoke(
             auth_manager.update_user(txn, user).await?;
         } else if let Some(mut role) = auth_manager.get_role(txn, &username).await? {
             role.privileges.retain(|p| {
-                !(privs.contains(&p.privilege)
-                    && expanded_objects.iter().any(|obj| p.object == *obj))
+                !(privs.contains(&p.privilege) && expanded_objects.contains(&p.object))
             });
             auth_manager.update_role(txn, role).await?;
         } else {

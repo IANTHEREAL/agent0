@@ -1,18 +1,32 @@
-//! Simple-query dispatch: `execute` entry point, statement parsing,
-//! per-statement observability recording, and the `execute_single` loop.
+//! Simple-query dispatch: `execute` entry point, the `execute_single` state
+//! machine, and the `dispatch_raw!` macro.
+//!
+//! `execute_single` orchestrates three phases:
+//! 1. **Scaffold** ([`scaffold::DispatchContext`]) — pre-compute trimmed SQL,
+//!    classification, and observability flags.
+//! 2. **Failed-txn precheck** (I1) — reject disallowed statements early.
+//! 3. **Raw dispatch** ([`raw`]) — handle statements that bypass `sqlparser`.
+//! 4. **AST dispatch** ([`ast`]) — parse SQL and dispatch each AST statement.
 
+mod ast;
 mod guc;
 mod prepared;
+mod raw;
 mod roles;
+mod scaffold;
 mod transaction;
 mod utils;
 
 use super::*;
-use guc::{build_show_all_result, execute_set_variable};
-use transaction::check_observability_statement_permission;
-use utils::{validate_transaction_modes, wrap_with_runtime_context, RuntimeSettings};
+use scaffold::DispatchContext;
 
 /// Dispatch a raw-SQL command: time it, record observability, handle txn failure.
+///
+/// Retained for unit tests that verify the instrumented-dispatch contract
+/// (mark-failed, record-statement, return shape) in isolation. Production
+/// code uses the equivalent helpers in `raw.rs` (`finish_raw_single` /
+/// `finish_raw_multi`).
+#[cfg(test)]
 macro_rules! dispatch_raw {
     ($self:expr, $session:expr, $sql_obs:expr, $cmd:expr) => {{
         let start = Instant::now();
@@ -68,6 +82,17 @@ impl Executor {
         Ok(ExecuteResults(results))
     }
 
+    /// Dispatch a single SQL statement through the phased state machine.
+    ///
+    /// Phases (in order):
+    /// 1. Scaffold — build [`DispatchContext`] (timestamps, query context, savepoints).
+    /// 2. Failed-txn precheck (I1) — reject if transaction is failed and statement
+    ///    is not ROLLBACK/COMMIT/END.
+    /// 3. Raw instrumented dispatch — non-observability raw-SQL handlers with
+    ///    `dispatch_raw!` side effects.
+    /// 4. Raw passthrough dispatch (I2) — ALTER SYSTEM SET / RESET without
+    ///    `dispatch_raw!` side effects.
+    /// 5. AST dispatch (I3) — parse SQL and execute each statement.
     async fn execute_single(&self, session: &mut Session, sql: &str) -> Result<ExecuteResults> {
         let statement_ts = statement_time::now_timestamp_millis();
         // For explicit transactions, use the stored transaction start time;
@@ -78,450 +103,42 @@ impl Executor {
         crate::sql::query_context::with_scoped_query_context(
             &qctx,
             crate::txn::with_savepoints(savepoints, async {
-                let sql_stripped = strip_leading_sql_comments(sql);
-                let sql_trimmed = sql_stripped.trim_start();
-                let is_observability_user =
-                    session.current_user() == Some(OBSERVABILITY_USER) && !session.is_superuser();
-                let starts_with = |prefix: &str| starts_with_ignore_ascii_case(sql_trimmed, prefix);
-                let sql_upper = sql_trimmed.trim().to_ascii_uppercase();
-                let sql_for_observability = sql_trimmed.to_string();
-                let raw_kind = crate::sql::raw_sql::classify(&sql_upper);
+                let ctx = DispatchContext::new(sql, session);
 
+                // ── Phase 1: Failed-txn precheck (I1) ──────────────────
                 if session.is_transaction_failed()
-                    && !sql_trimmed.trim().is_empty()
-                    && !starts_with("ROLLBACK")
-                    && !starts_with("COMMIT")
-                    && !starts_with("END")
+                    && !ctx.sql_trimmed.trim().is_empty()
+                    && !ctx.starts_with("ROLLBACK")
+                    && !ctx.starts_with("COMMIT")
+                    && !ctx.starts_with("END")
                 {
-                    if !is_observability_user {
+                    if !ctx.is_observability_user {
                         self.observability.record_statement(
                             Duration::from_millis(0),
                             false,
-                            || sql_trimmed.to_string(),
+                            || ctx.sql_trimmed.clone(),
                         );
                     }
                     return Err(SqlError::InFailedTransaction.into());
                 }
 
-                if !is_observability_user {
-                    if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::CreateDatabase)) {
-                        dispatch_raw!(multi: self, session, sql_trimmed,
-                            self.execute_create_database_cmd(session, sql).await);
-                    }
-                    if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::DropDatabase)) {
-                        dispatch_raw!(multi: self, session, sql_trimmed,
-                            self.execute_drop_database_cmd(session, sql).await);
-                    }
-                    if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::AlterDatabase)) {
-                        dispatch_raw!(multi: self, session, sql_trimmed,
-                            self.execute_alter_database_cmd(session, sql).await);
-                    }
-                    if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::CreateExtension)) {
-                        dispatch_raw!(self, session, sql_trimmed,
-                            self.execute_create_extension_cmd(session, sql).await);
-                    }
-                    if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::DropExtension)) {
-                        dispatch_raw!(self, session, sql_trimmed,
-                            self.execute_drop_extension_cmd(session, sql).await);
-                    }
-                    if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::CommentOn)) {
-                        dispatch_raw!(self, session, sql_trimmed,
-                            self.execute_comment_on_cmd(session, sql).await);
-                    }
-                    if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::CreateFunction)) {
-                        dispatch_raw!(self, session, sql_trimmed,
-                            self.execute_create_function_cmd(session, sql).await);
-                    }
-                    if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::DropFunction)) {
-                        dispatch_raw!(self, session, sql_trimmed,
-                            self.execute_drop_function_cmd(session, sql).await);
-                    }
-                    if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::CreateTrigger)) {
-                        dispatch_raw!(self, session, sql_trimmed,
-                            self.execute_create_trigger_cmd(session, sql).await);
-                    }
-                    if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::DropTrigger)) {
-                        dispatch_raw!(self, session, sql_trimmed,
-                            self.execute_drop_trigger_cmd(session, sql).await);
-                    }
-                }
-
-            if !is_observability_user {
-                if let Some(reason) = get_skip_reason(&sql_upper) {
-                    return Err(SqlError::Unsupported(reason).into());
-                }
-            }
-
-            if !is_observability_user {
-                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::AlterOwnerTo)) {
-                    dispatch_raw!(self, session, sql_trimmed,
-                        self.execute_alter_owner_cmd(session, sql).await);
-                }
-                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::AlterDefaultPrivileges)) {
-                    dispatch_raw!(self, session, sql_trimmed,
-                        self.execute_alter_default_privileges_cmd(session, sql).await);
-                }
-                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::AlterSequenceOwnedBy)) {
-                    dispatch_raw!(self, session, sql_trimmed,
-                        self.execute_alter_sequence_owned_by_cmd(session, sql).await);
-                }
-                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::RefreshMaterializedView)) {
-                    dispatch_raw!(self, session, sql_trimmed,
-                        self.execute_refresh_materialized_view_cmd(session, sql).await);
-                }
-                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::DropMaterializedView)) {
-                    dispatch_raw!(self, session, sql_trimmed,
-                        self.execute_drop_materialized_view_cmd(session, sql).await);
-                }
-                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::Call)) {
-                    dispatch_raw!(self, session, sql_trimmed,
-                        self.execute_call_cmd(session, sql).await);
-                }
-                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::DropProcedure)) {
-                    dispatch_raw!(self, session, sql_trimmed,
-                        self.execute_drop_procedure_cmd(session, sql).await);
-                }
-                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::CreateProcedure)) {
-                    dispatch_raw!(self, session, sql_trimmed,
-                        self.execute_create_procedure_cmd(session, sql).await);
-                }
-                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::CreateTypeEnum)) {
-                    dispatch_raw!(self, session, sql_trimmed,
-                        self.execute_create_type_enum_cmd(session, sql).await);
-                }
-                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::AlterType)) {
-                    dispatch_raw!(multi: self, session, sql_trimmed,
-                        self.execute_alter_type_cmd(session, sql).await);
-                }
-                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::DropType)) {
-                    dispatch_raw!(self, session, sql_trimmed,
-                        self.execute_drop_type_cmd(session, sql).await);
-                }
-                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::CreateCollation)) {
-                    dispatch_raw!(self, session, sql_trimmed,
-                        self.execute_create_collation_cmd(session, sql).await);
-                }
-                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::DropCollation)) {
-                    dispatch_raw!(self, session, sql_trimmed,
-                        self.execute_drop_collation_cmd(session, sql).await);
-                }
-                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::Analyze)) {
-                    dispatch_raw!(self, session, sql_trimmed,
-                        self.execute_analyze_cmd(session, sql_trimmed).await);
-                }
-            }
-
-                if sql_upper.starts_with("ALTER SYSTEM SET ") {
-                    if !session.is_superuser() {
-                        return Err(SqlError::PermissionDenied {
-                            object_type: "system".to_string(),
-                            object_name: "ALTER SYSTEM SET".to_string(),
-                        }
-                        .into());
-                    }
-
-                    let rest = sql_trimmed.get(17..).unwrap_or("").trim();
-                    let rest_clean = rest.trim_end_matches(';').trim();
-                    let (name, raw_value) = if let Some(pos) = rest_clean.find('=') {
-                        (&rest_clean[..pos], &rest_clean[pos + 1..])
-                    } else {
-                        let rest_upper = rest_clean.to_ascii_uppercase();
-                        if let Some(pos) = rest_upper.find(" TO ") {
-                            (&rest_clean[..pos], &rest_clean[pos + 4..])
-                        } else {
-                            return Err(anyhow!("syntax error in ALTER SYSTEM SET").into());
-                        }
-                    };
-
-                    let name_lower = name.trim().to_lowercase();
-                    let value_clean = raw_value
-                        .trim()
-                        .trim_matches('\'')
-                        .trim_matches('"')
-                        .trim();
-
-                    match name_lower.as_str() {
-                        "statement_timeout" | "idle_in_transaction_session_timeout" => {}
-                        _ => {
-                            return Err(anyhow!(
-                                "ALTER SYSTEM SET is only supported for statement_timeout and idle_in_transaction_session_timeout"
-                            )
-                            .into());
-                        }
-                    }
-
-                    let ms = crate::sql::session::SessionSettings::parse_timeout_value(value_clean)?;
-
-                    let server_config = session
-                        .server_config()
-                        .ok_or_else(|| anyhow!("server configuration not available"))?;
-
+                // ── Phase 2: Raw instrumented dispatch ─────────────────
+                if !ctx.is_observability_user {
+                    if let Some(result) =
+                        self.try_dispatch_raw_instrumented(session, sql, &ctx).await
                     {
-                        let mut cfg = server_config.write().unwrap();
-                        match name_lower.as_str() {
-                            "statement_timeout" => cfg.statement_timeout_ms = ms,
-                            "idle_in_transaction_session_timeout" => {
-                                cfg.idle_in_transaction_session_timeout_ms = ms
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
-
-                    return Ok(ExecuteResults::single(ExecuteResult::CommandComplete {
-                        tag: "ALTER SYSTEM",
-                    }));
-                }
-
-                // RESET <guc> / RESET ALL — handled directly from raw SQL, bypassing
-                // sqlparser entirely. This avoids sentinel-value collisions that arise
-                // from rewriting RESET to SET.
-                if matches!(
-                    raw_kind,
-                    Some(crate::sql::raw_sql::RawSqlKind::Reset)
-                ) {
-                    let after_kw = sql_trimmed.get(5..).unwrap_or("");
-                    let name = crate::sql::raw_sql::extract_reset_name(after_kw)
-                        .ok_or_else(|| anyhow!("syntax error at or near \"RESET\""))?;
-                    if name.eq_ignore_ascii_case("ALL") {
-                        session.reset_all_settings();
-                    } else {
-                        session.reset_setting(&name.to_lowercase());
-                    }
-                    return Ok(ExecuteResults::single(ExecuteResult::CommandComplete {
-                        tag: "RESET",
-                    }));
-                }
-
-            let statements = match parse_sql(sql) {
-                Ok(stmts) => stmts,
-                Err(e) => {
-                    if !is_observability_user {
-                        if let Some(reason) = get_unsupported_reason(&sql_upper) {
-                            return Err(SqlError::Unsupported(reason).into());
-                        }
-                        // Parse error counts as a statement attempt (for error rate / p99, etc).
-                        self.observability.record_statement(
-                            Duration::from_millis(0),
-                            false,
-                            || sql_trimmed.to_string(),
-                        );
-                    }
-                    if session.is_in_transaction() {
-                        session.mark_transaction_failed();
-                    }
-                    return Err(e);
-                }
-            };
-
-            if statements.is_empty() {
-                return Ok(ExecuteResults::single(ExecuteResult::Empty));
-            }
-
-            let mut results: Vec<ExecuteResult> = Vec::with_capacity(statements.len());
-
-            for stmt in &statements {
-                debug!("Executing statement: {:?}", stmt);
-                let is_observability_query = is_observability_user
-                    && (is_observability_system_query(stmt) || is_observability_tableless_query(stmt));
-                if is_observability_user {
-                    if let Some(handled) = check_observability_statement_permission(
-                        self,
-                        session,
-                        stmt,
-                        is_observability_query,
-                    )
-                    .await?
-                    {
-                        results.extend(handled);
-                        continue;
+                        return result;
                     }
                 }
-                let start = Instant::now();
-                let rt_settings = RuntimeSettings::from_session(session);
-                let stmt_exec: Result<Vec<ExecuteResult>> = wrap_with_runtime_context(
-                    &rt_settings,
-                    self.tenant_keyspace(),
-                    self.store.transaction_client(),
-                    async {
-                        match stmt {
-                            // Transaction Control
-                            Statement::StartTransaction { modes, .. } => {
-                                validate_transaction_modes(session, modes)?;
-                                session.begin().await?;
-                                Ok(vec![ExecuteResult::TransactionStart { tag: "BEGIN" }])
-                            }
-                            Statement::Commit { .. } => {
-                                let tag = if session.is_transaction_failed() {
-                                    "ROLLBACK"
-                                } else {
-                                    "COMMIT"
-                                };
-                                session.commit().await?;
-                                if tag == "COMMIT" {
-                                    self.flush_trigger_activations();
-                                } else {
-                                    self.clear_trigger_activations();
-                                }
-                                Ok(vec![ExecuteResult::TransactionEnd { tag }])
-                            }
-                            Statement::Savepoint { name } => {
-                                session.create_savepoint(normalize_ident(name)).await?;
-                                Ok(vec![ExecuteResult::CommandComplete { tag: "SAVEPOINT" }])
-                            }
-                            Statement::ReleaseSavepoint { name } => {
-                                let sp = normalize_ident(name);
-                                session.release_savepoint(&sp).await?;
-                                Ok(vec![ExecuteResult::CommandComplete { tag: "RELEASE" }])
-                            }
-                            Statement::Rollback {
-                                savepoint: Some(name),
-                                ..
-                            } => {
-                                let sp = normalize_ident(name);
-                                session.rollback_to_savepoint(&sp).await?;
-                                Ok(vec![ExecuteResult::CommandComplete { tag: "ROLLBACK" }])
-                            }
-                            Statement::Rollback {
-                                savepoint: None, ..
-                            } => {
-                                session.rollback().await?;
-                                self.clear_trigger_activations();
-                                Ok(vec![ExecuteResult::TransactionEnd { tag: "ROLLBACK" }])
-                            }
-                            Statement::SetRole { role_name, .. } => {
-                                self.execute_set_role(session, role_name).await
-                            }
-                            Statement::SetVariable {
-                                local,
-                                variable,
-                                value,
-                                ..
-                            } => execute_set_variable(session, *local, variable, value),
-                            Statement::SetTimeZone { local, value, .. } => {
-                                let value = set_variable_value_to_string(std::slice::from_ref(
-                                    value,
-                                ))?;
-                                if *local && !session.is_in_transaction() {
-                                    crate::sql::session::SessionSettings::validate_and_normalize_value(
-                                        "timezone",
-                                        &value,
-                                    )?;
-                                    return Ok(vec![
-                                        ExecuteResult::Notice {
-                                            message:
-                                                "SET LOCAL can only be used in transaction blocks"
-                                                    .to_string(),
-                                            severity: "WARNING".to_string(),
-                                        },
-                                        ExecuteResult::CommandComplete { tag: "SET" },
-                                    ]);
-                                }
 
-                                if *local {
-                                    session.set_local_setting("timezone", value)?;
-                                } else {
-                                    session.set_known_setting("timezone", value)?;
-                                }
-                                Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }])
-                            }
-                            Statement::SetNames { charset_name, collation_name } => {
-                                if collation_name.is_some() {
-                                    return Err(SqlError::Unsupported(
-                                        "SET NAMES with COLLATE is not supported".into()
-                                    ).into());
-                                }
-                                session.set_known_setting("client_encoding", charset_name.clone())?;
-                                Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }])
-                            }
-                            Statement::SetTransaction { modes, snapshot, session: _ } => {
-                                if snapshot.is_some() {
-                                    return Err(SqlError::Unsupported(
-                                        "SET TRANSACTION SNAPSHOT is not supported".into()
-                                    ).into());
-                                }
-                                validate_transaction_modes(session, modes)?;
-                                Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }])
-                            }
-                            Statement::ShowVariable { variable } => {
-                                let var_name = variable
-                                    .iter()
-                                    .map(normalize_ident)
-                                    .collect::<Vec<_>>()
-                                    .join(".")
-                                    .to_lowercase();
-
-                                if var_name == "all" {
-                                    return Ok(vec![build_show_all_result(
-                                        session,
-                                        session_context::current_timezone(),
-                                    )]);
-                                }
-
-                                let value = session.show_setting_value(&var_name).ok_or_else(|| {
-                                    anyhow!("unrecognized configuration parameter \"{}\"", var_name)
-                                })?;
-
-                                Ok(vec![ExecuteResult::Select {
-                                    columns: vec![var_name],
-                                    column_types: Some(vec![DataType::Text]),
-                                    rows: vec![Row::new(vec![Value::Text(value)])],
-                                    timezone: session_context::current_timezone(),
-                                }])
-                            }
-                            Statement::Prepare {
-                                name,
-                                data_types,
-                                statement,
-                            } => {
-                                self.execute_sql_prepare_statement(
-                                    session,
-                                    name,
-                                    data_types,
-                                    statement.as_ref(),
-                                )
-                                .await
-                            }
-                            Statement::Execute { name, parameters } => {
-                                self.execute_sql_execute_statement(session, name, parameters)
-                                    .await
-                            }
-                            Statement::Deallocate { name, .. } => {
-                                self.execute_sql_deallocate_statement(session, name)
-                            }
-                            // DDL/DML - delegated to session transaction management
-                            stmt => {
-                                self.execute_ddl_dml_with_autocommit(
-                                    session,
-                                    stmt,
-                                    is_observability_query,
-                                )
-                                .await
-                            }
-                        }
-                    })
-                .await;
-
-                if stmt_exec.is_err() && session.is_in_transaction() {
-                    session.mark_transaction_failed();
+                // ── Phase 3: Raw passthrough dispatch (I2) ─────────────
+                if let Some(result) = self.try_dispatch_raw_passthrough(session, &ctx) {
+                    return result;
                 }
 
-                if !is_observability_query {
-                    self.observability
-                        .record_statement(start.elapsed(), stmt_exec.is_ok(), || {
-                            sql_for_observability.clone()
-                        });
-                }
-
-                results.extend(stmt_exec?);
-            }
-
-            // Parser ASTs for large statements (e.g. deep OR chains) can be
-            // deeply recursive; drop them on a grown stack to avoid worker
-            // stack overflow after successful execution.
-            crate::sql::stack_safety::drop_on_grown_stack(statements);
-
-            Ok(ExecuteResults(results))
-                }),
+                // ── Phase 4: Parse + AST dispatch (I3) ─────────────────
+                self.dispatch_parsed_statements(session, sql, &ctx).await
+            }),
         )
         .await
     }
@@ -531,6 +148,9 @@ impl Executor {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[derive(Default)]
@@ -693,5 +313,296 @@ mod tests {
 
         let records = exec.observability.records.borrow();
         assert_eq!(records.as_slice(), &[(true, "CREATE DATABASE x".into())]);
+    }
+
+    #[derive(Clone, Copy)]
+    struct ObsCounts {
+        statements: u64,
+        errors: u64,
+    }
+
+    fn obs_counts(obs: &Arc<crate::observability::TenantObservability>) -> ObsCounts {
+        let summary = obs.snapshot_summary();
+        ObsCounts {
+            statements: summary.statement_count,
+            errors: summary.error_count,
+        }
+    }
+
+    fn assert_obs_delta(
+        obs: &Arc<crate::observability::TenantObservability>,
+        before: ObsCounts,
+        statements_delta: u64,
+        errors_delta: u64,
+    ) {
+        let after = obs_counts(obs);
+        assert_eq!(after.statements, before.statements + statements_delta);
+        assert_eq!(after.errors, before.errors + errors_delta);
+    }
+
+    static NEXT_TEST_FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn run_async_on_large_stack<F>(future: F) -> F::Output
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        std::thread::Builder::new()
+            .name("dispatch-test-runtime".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build test runtime");
+                runtime.block_on(future)
+            })
+            .expect("spawn large-stack test thread")
+            .join()
+            .expect("join large-stack test thread")
+    }
+
+    fn make_executor_and_session(
+        observability_user: bool,
+    ) -> (
+        Executor,
+        Session,
+        Arc<crate::observability::TenantObservability>,
+    ) {
+        let fixture_id = NEXT_TEST_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let keyspace = format!("dispatch_execute_single_fixture_{fixture_id}");
+        let store = crate::storage::TikvStore::new_stub();
+        let observability = crate::observability::registry().tenant(&keyspace);
+        let trigger_cache = Arc::new(crate::sql::triggers::TriggerBodyCache::new());
+        let stats_cache = Arc::new(crate::sql::stats::TableStatsCache::new());
+        let executor = Executor::new(
+            store.clone(),
+            keyspace,
+            observability.clone(),
+            trigger_cache,
+            stats_cache,
+        );
+        let user = if observability_user {
+            OBSERVABILITY_USER.to_string()
+        } else {
+            format!("app_user_{fixture_id}")
+        };
+        let connection_id = i32::try_from(fixture_id).unwrap_or(i32::MAX);
+        let session = Session::new_with_user_and_database(
+            store,
+            observability.clone(),
+            user,
+            false,
+            connection_id,
+            1,
+            "postgres".to_string(),
+            0,
+            0,
+        );
+        (executor, session, observability)
+    }
+
+    // ── Characterization tests: invariant I1 ────────────────────────
+    // Failed-transaction precheck: only ROLLBACK/COMMIT/END pass gate.
+
+    async fn assert_failed_txn_gate_allows(sql: &str) {
+        let (exec, mut session, _) = make_executor_and_session(false);
+        session.force_test_transaction_state(true, true);
+        let out = exec.execute_single(&mut session, sql).await;
+        assert!(out.is_ok(), "failed-txn gate should allow {sql}");
+    }
+
+    /// T1: failed-txn precheck allows ROLLBACK.
+    #[test]
+    fn t1_failed_txn_precheck_gate_allows_rollback() {
+        run_async_on_large_stack(async {
+            assert_failed_txn_gate_allows("ROLLBACK").await;
+        });
+    }
+
+    /// T1: failed-txn precheck allows COMMIT.
+    #[test]
+    fn t1_failed_txn_precheck_gate_allows_commit() {
+        run_async_on_large_stack(async {
+            assert_failed_txn_gate_allows("COMMIT").await;
+        });
+    }
+
+    /// T1: failed-txn precheck allows END.
+    #[test]
+    fn t1_failed_txn_precheck_gate_allows_end() {
+        run_async_on_large_stack(async {
+            assert_failed_txn_gate_allows("END TRANSACTION").await;
+        });
+    }
+
+    /// T1 (continued): other statements are blocked by the precheck.
+    #[test]
+    fn t1_failed_txn_precheck_gate_blocks_other_statements() {
+        run_async_on_large_stack(async {
+            for sql in ["SELECT 1", "INSERT INTO t VALUES (1)", "BEGIN", "SET x = 1"] {
+                let (exec, mut session, _) = make_executor_and_session(false);
+                session.force_test_transaction_state(true, true);
+                let err = exec
+                    .execute_single(&mut session, sql)
+                    .await
+                    .expect_err("failed-txn gate should reject non-ROLLBACK/COMMIT/END");
+                assert!(
+                    err.to_string().contains("current transaction is aborted"),
+                    "unexpected error for {sql}: {err}"
+                );
+            }
+        });
+    }
+
+    /// T2: failed-txn precheck records a failure for non-observability user.
+    #[test]
+    fn t2_failed_txn_precheck_records_failure_for_non_observability_user() {
+        run_async_on_large_stack(async {
+            let (exec, mut session, obs) = make_executor_and_session(false);
+            session.force_test_transaction_state(true, true);
+            let before = obs_counts(&obs);
+
+            let err = exec
+                .execute_single(&mut session, "SELECT blocked")
+                .await
+                .expect_err("failed-txn gate should reject");
+            assert!(err.to_string().contains("current transaction is aborted"));
+            assert_obs_delta(&obs, before, 1, 1);
+        });
+    }
+
+    /// T2 (continued): observability user does not get precheck observability record.
+    #[test]
+    fn t2_failed_txn_precheck_no_record_for_observability_user() {
+        run_async_on_large_stack(async {
+            let (exec, mut session, obs) = make_executor_and_session(true);
+            session.force_test_transaction_state(true, true);
+            let before = obs_counts(&obs);
+
+            let err = exec
+                .execute_single(&mut session, "SELECT blocked")
+                .await
+                .expect_err("failed-txn gate should reject");
+            assert!(err.to_string().contains("current transaction is aborted"));
+            assert_obs_delta(&obs, before, 0, 0);
+        });
+    }
+
+    // ── Characterization tests: invariant I2 ────────────────────────
+    // ALTER SYSTEM SET / RESET bypass dispatch_raw! instrumentation.
+
+    /// T3: ALTER SYSTEM SET is classified as passthrough (not instrumented).
+    #[test]
+    fn t3_alter_system_set_classified_as_passthrough() {
+        let kind = crate::sql::raw_sql::classify("ALTER SYSTEM SET STATEMENT_TIMEOUT = '5S'");
+        assert_eq!(kind, Some(crate::sql::raw_sql::RawSqlKind::AlterSystemSet));
+        // Verify it does NOT match any first-block or second-block kind.
+        // The passthrough handler catches AlterSystemSet, not the instrumented path.
+    }
+
+    /// T4: RESET success goes through passthrough dispatch (no raw instrumentation).
+    #[test]
+    fn t4_reset_success_passthrough_without_raw_instrumentation() {
+        run_async_on_large_stack(async {
+            let (exec, mut session, obs) = make_executor_and_session(false);
+            session.force_test_transaction_state(true, false);
+            let before = obs_counts(&obs);
+
+            let out = exec
+                .execute_single(&mut session, "RESET TIMEZONE")
+                .await
+                .expect("RESET should succeed");
+            assert!(matches!(
+                out.0.as_slice(),
+                [ExecuteResult::CommandComplete { tag: "RESET" }]
+            ));
+            assert!(!session.is_transaction_failed());
+            assert_obs_delta(&obs, before, 0, 0);
+        });
+    }
+
+    /// T5: ALTER SYSTEM SET / RESET errors do NOT use instrumented dispatch.
+    /// Verify that finish_raw_single (the instrumented path) records
+    /// observability, confirming the passthrough path differs.
+    #[test]
+    fn t5_instrumented_path_records_but_passthrough_does_not() {
+        let exec = FakeExecutor::default();
+        let mut session = FakeSession {
+            in_transaction: true,
+            marked_failed: false,
+        };
+        // Instrumented path: records observability and marks failed.
+        run_dispatch_raw_single(&exec, &mut session, "DROP TYPE t", Err(anyhow!("boom")))
+            .expect_err("should fail");
+        assert!(session.marked_failed, "instrumented path marks txn failed");
+        let records = exec.observability.records.borrow();
+        assert_eq!(records.len(), 1, "instrumented path records observability");
+        drop(records);
+
+        // By contrast, passthrough (ALTER SYSTEM SET / RESET) would NOT
+        // call record_statement or mark_transaction_failed through the
+        // raw helper. This is the structural guarantee of I2.
+    }
+
+    // ── Characterization tests: invariant I3 ────────────────────────
+    // Parse-error remap ordering.
+
+    /// T6: unsupported remap short-circuits parse-error record and mark-failed.
+    /// SQL matching `get_unsupported_reason` returns Unsupported immediately.
+    #[test]
+    fn t6_unsupported_remap_short_circuits() {
+        run_async_on_large_stack(async {
+            let (exec, mut session, obs) = make_executor_and_session(false);
+            session.force_test_transaction_state(true, false);
+            let before = obs_counts(&obs);
+
+            let err = exec
+                .execute_single(&mut session, "CREATE DOMAIN foo")
+                .await
+                .expect_err("CREATE DOMAIN should be remapped to unsupported");
+            assert_eq!(err.to_string(), "CREATE DOMAIN not supported");
+            assert!(!session.is_transaction_failed());
+            assert_obs_delta(&obs, before, 0, 0);
+        });
+    }
+
+    /// T7: ordinary parse error retains record-then-mark ordering.
+    /// Non-observability user: record zero-duration failure, then mark failed.
+    #[test]
+    fn t7_ordinary_parse_error_records_then_marks() {
+        run_async_on_large_stack(async {
+            let (exec, mut session, obs) = make_executor_and_session(false);
+            session.force_test_transaction_state(true, false);
+            let before = obs_counts(&obs);
+
+            let err = exec
+                .execute_single(&mut session, "SELCT typo")
+                .await
+                .expect_err("ordinary parse error should fail");
+            assert!(
+                !err.to_string().contains("not supported"),
+                "ordinary parse error should not be remapped to unsupported"
+            );
+            assert!(session.is_transaction_failed());
+            assert_obs_delta(&obs, before, 1, 1);
+        });
+    }
+
+    /// T7 (continued): observability user parse error — no record, but
+    /// mark-failed still applies when in a transaction.
+    #[test]
+    fn t7_observability_user_parse_error_no_record_but_marks_failed() {
+        run_async_on_large_stack(async {
+            let (exec, mut session, obs) = make_executor_and_session(true);
+            session.force_test_transaction_state(true, false);
+            let before = obs_counts(&obs);
+
+            exec.execute_single(&mut session, "SELCT typo")
+                .await
+                .expect_err("observability user parse error should fail");
+            assert!(session.is_transaction_failed());
+            assert_obs_delta(&obs, before, 0, 0);
+        });
     }
 }

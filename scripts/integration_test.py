@@ -20,6 +20,7 @@ import os
 import time
 import argparse
 import re
+import difflib
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
@@ -28,10 +29,15 @@ from urllib.parse import urlparse
 
 PROJECT_DIR = Path(__file__).parent.parent
 
-GREEN = "\033[0;32m"
-YELLOW = "\033[1;33m"
-RED = "\033[0;31m"
-NC = "\033[0m"
+ANSI_GREEN = "\033[0;32m"
+ANSI_YELLOW = "\033[1;33m"
+ANSI_RED = "\033[0;31m"
+ANSI_NC = "\033[0m"
+
+GREEN = ANSI_GREEN
+YELLOW = ANSI_YELLOW
+RED = ANSI_RED
+NC = ANSI_NC
 
 
 class TestResult(Enum):
@@ -74,6 +80,8 @@ class TestConfig:
     verbose: bool = False
     stop_on_error: bool = False
     clean_start_external: bool = True
+    color: str = "auto"
+    color_enabled: bool = True
     test_files: List[Path] = field(default_factory=list)
 
 
@@ -100,18 +108,55 @@ class TestStats:
 
 
 config = TestConfig()
+ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+
+
+def set_color_enabled(enabled: bool):
+    global GREEN, YELLOW, RED, NC
+    if enabled:
+        GREEN = ANSI_GREEN
+        YELLOW = ANSI_YELLOW
+        RED = ANSI_RED
+        NC = ANSI_NC
+    else:
+        GREEN = ""
+        YELLOW = ""
+        RED = ""
+        NC = ""
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text)
+
+
+def color_output_enabled(mode: str) -> bool:
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("TERM", "").lower() == "dumb":
+        return False
+    return sys.stdout.isatty()
+
+
+def maybe_strip_ansi(text: str) -> str:
+    if config.color_enabled:
+        return text
+    return strip_ansi(text)
 
 
 def log_info(msg: str):
-    print(f"{GREEN}[INFO]{NC} {msg}")
+    print(f"{GREEN}[INFO]{NC} {maybe_strip_ansi(msg)}")
 
 
 def log_warn(msg: str):
-    print(f"{YELLOW}[WARN]{NC} {msg}")
+    print(f"{YELLOW}[WARN]{NC} {maybe_strip_ansi(msg)}")
 
 
 def log_error(msg: str):
-    print(f"{RED}[ERROR]{NC} {msg}")
+    print(f"{RED}[ERROR]{NC} {maybe_strip_ansi(msg)}")
 
 
 def log_test(name: str, result: TestResult, details: str = ""):
@@ -122,7 +167,29 @@ def log_test(name: str, result: TestResult, details: str = ""):
         TestResult.ERROR: RED,
     }[result]
     suffix = f" - {details}" if details else ""
-    print(f"{color}[{result.value}]{NC} {name}{suffix}")
+    print(f"{color}[{result.value}]{NC} {maybe_strip_ansi(name)}{maybe_strip_ansi(suffix)}")
+
+
+def print_unified_diff(expected_lines: List[str], actual_lines: List[str], expected_label: str, actual_label: str):
+    diff = list(
+        difflib.unified_diff(
+            expected_lines,
+            actual_lines,
+            fromfile=expected_label,
+            tofile=actual_label,
+            lineterm="",
+        )
+    )
+    if not diff:
+        return
+
+    max_lines = None if config.verbose else 200
+    visible = diff if max_lines is None else diff[:max_lines]
+    print("  --- unified diff ---")
+    for line in visible:
+        print(maybe_strip_ansi(line))
+    if max_lines is not None and len(diff) > max_lines:
+        print(f"  ... ({len(diff) - max_lines} more diff lines, rerun with --verbose for full diff)")
 
 
 def psql_args() -> List[str]:
@@ -599,7 +666,12 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
         )
         if result.returncode != 0:
             log_test(sql_file.name, TestResult.FAILED, "load script failed")
-            print(f"  {RED}Load error: {result.stdout[:200]}{result.stderr[:200]}{NC}")
+            print(
+                f"  {RED}Load error: "
+                f"{maybe_strip_ansi((result.stdout or '')[:200])}"
+                f"{maybe_strip_ansi((result.stderr or '')[:200])}"
+                f"{NC}"
+            )
             return TestResult.FAILED
 
     output, _ = run_sql_file(sql_file, mode=mode, client_min_messages=client_min_messages)
@@ -647,11 +719,17 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
                     log_test(sql_file.name, TestResult.PASSED)
                     return TestResult.PASSED
             log_test(sql_file.name, TestResult.FAILED, "output differs from expected")
+            print_unified_diff(
+                normalized_expected,
+                normalized_output,
+                f"{expected_file} (expected)",
+                f"{out_file} (actual)",
+            )
             if config.verbose:
-                print(f"--- Expected ({expected_file}):")
-                print(expected[:500])
-                print(f"--- Actual ({out_file}):")
-                print(output[:500])
+                print(f"--- Expected raw ({expected_file}):")
+                print(maybe_strip_ansi(expected[:500]))
+                print(f"--- Actual raw ({out_file}):")
+                print(maybe_strip_ansi(output[:500]))
             return TestResult.FAILED
 
     errors_ok = True
@@ -1515,6 +1593,12 @@ Examples:
     )
     parser.add_argument("tests", nargs="*", help="SQL test files or directories")
     parser.add_argument("--dsn", default=default_dsn, help="PostgreSQL connection DSN")
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="Color output mode (default: auto; honors NO_COLOR and TERM=dumb)",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Show SQL output")
     parser.add_argument("--stop-on-error", "-x", action="store_true", help="Stop on first error")
     parser.add_argument(
@@ -1525,11 +1609,15 @@ Examples:
 
     args = parser.parse_args()
 
+    color_enabled = color_output_enabled(args.color)
+
     return TestConfig(
         db=DbConfig.from_dsn(args.dsn),
         verbose=args.verbose,
         stop_on_error=args.stop_on_error,
         clean_start_external=not args.no_clean_start,
+        color=args.color,
+        color_enabled=color_enabled,
         test_files=[Path(t) for t in args.tests] if args.tests else [],
     )
 
@@ -1537,6 +1625,7 @@ Examples:
 def main():
     global config
     config = parse_args()
+    set_color_enabled(config.color_enabled)
 
     log_info("db9-server Integration Test Runner")
     log_info("================================")

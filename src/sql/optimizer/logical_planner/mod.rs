@@ -35,12 +35,12 @@ use super::logical_plan::{LogicalNode, LogicalPlan, PlanSchema};
 use super::window_rewrite::{
     collect_window_calls_from_expr, contains_window, rewrite_for_post_window,
 };
+use crate::model::DataType;
 use crate::sql::analyzer::types::{
     AnalyzedDistinct, AnalyzedProjection, AnalyzedQueryBody, AnalyzedSelect, TypedExpr,
     TypedExprKind, TypedOrderByExpr,
 };
 use crate::sql::analyzer::AnalyzedQuery;
-use crate::types::DataType;
 use anyhow::Result;
 
 /// Builds a [`LogicalPlan`] from an [`AnalyzedQuery`].

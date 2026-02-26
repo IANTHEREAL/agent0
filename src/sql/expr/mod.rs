@@ -14,8 +14,8 @@ pub mod typed_fold;
 pub mod typed_rewrite;
 pub mod typed_visit;
 
+use crate::model::Value;
 use crate::sql::error::SqlError;
-use crate::types::Value;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::JsonOperator;
 
@@ -167,7 +167,7 @@ pub(crate) fn similar_to_match(s: &str, pattern: &str, escape_char: Option<char>
 }
 
 pub(crate) fn parse_interval_string(s: &str) -> Result<Value> {
-    use crate::types::IntervalValue;
+    use crate::model::IntervalValue;
     let s = s.trim().to_lowercase();
     let mut total_months: i32 = 0;
     let mut total_ms: i64 = 0;

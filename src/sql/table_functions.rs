@@ -1,12 +1,10 @@
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, ObjectName};
 
+use crate::model::TableSchema;
 use crate::sql::names;
-use crate::types::TableSchema;
 
 #[cfg(test)]
-use crate::sql::expr::bridge::eval_const_ast_expr;
-#[cfg(test)]
-use crate::types::Value;
+use crate::model::Value;
 #[cfg(test)]
 use anyhow::{anyhow, Result as AnyResult};
 #[cfg(test)]
@@ -15,6 +13,8 @@ use async_trait::async_trait;
 use std::time::UNIX_EPOCH;
 #[cfg(test)]
 use tokio::io::AsyncBufRead;
+#[cfg(test)]
+use crate::sql::expr::bridge::eval_const_ast_expr;
 
 /// Build a stable signature key for a table-valued function call in FROM.
 ///

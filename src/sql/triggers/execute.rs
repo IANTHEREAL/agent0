@@ -1,8 +1,8 @@
 //! Trigger body execution (PL/pgSQL subset).
 
 use super::rewrite::substitute_row_references;
+use crate::model::{Row, TableSchema};
 use crate::sql::executor::Executor;
-use crate::types::{Row, TableSchema};
 use anyhow::Result;
 use std::collections::HashMap;
 use tikv_client::Transaction;
@@ -28,10 +28,10 @@ pub(crate) async fn execute_trigger_body_standalone(
 
     let mut new_values = match new_row {
         Some(r) => r.values.clone(),
-        None => vec![crate::types::Value::Null; schema.columns.len()],
+        None => vec![crate::model::Value::Null; schema.columns.len()],
     };
     if new_values.len() < schema.columns.len() {
-        new_values.resize(schema.columns.len(), crate::types::Value::Null);
+        new_values.resize(schema.columns.len(), crate::model::Value::Null);
     }
 
     let Some((begin_pos, end_pos)) = plpgsql_outer_block_range(body) else {
@@ -106,7 +106,7 @@ pub(crate) async fn execute_trigger_statement_standalone(
     sequence_values: &mut HashMap<String, i64>,
     schema: &TableSchema,
     old_row: Option<&Row>,
-    new_values: &mut [crate::types::Value],
+    new_values: &mut [crate::model::Value],
     stmt: &str,
     search_path: &[String],
 ) -> Result<bool> {
@@ -420,8 +420,8 @@ fn parse_new_assignment(stmt: &str) -> Option<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
+    use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
     use crate::sql::triggers::rewrite::value_to_sql_literal;
-    use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
     use super::{parse_new_assignment, plpgsql_outer_block_range, substitute_row_references};
 

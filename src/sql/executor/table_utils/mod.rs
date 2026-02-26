@@ -11,9 +11,9 @@ pub(crate) use generate_series::{generate_series_values_limited, max_generate_se
 use super::super::ddl_export;
 use super::super::information_schema::VirtualTableFilter;
 use super::core::Executor;
+use crate::model::{ColumnDef, DataType, MigrationRecord, Row, TableSchema, Value};
 use crate::sql::catalog::virtual_tables::virtual_table_schema;
 use crate::sql::error::SqlError;
-use crate::types::{ColumnDef, DataType, MigrationRecord, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr};

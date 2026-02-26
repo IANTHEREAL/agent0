@@ -11,6 +11,11 @@ use db9_admin::config::Config;
 use db9_admin::session::SessionManager;
 use db9_admin::{api, db, AppState};
 
+fn test_credential_key() -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode([0xABu8; 32])
+}
+
 // ── Setup ────────────────────────────────────────────────────────
 
 async fn setup() -> (Router, AppState) {
@@ -34,7 +39,7 @@ async fn setup() -> (Router, AppState) {
         reconciler_sync_keyspaces: false,
         session_ttl_hours: 1,
         audit_retention_days: 90,
-        credential_key: None,
+        credential_key: Some(test_credential_key()),
         fs9_meta_url: None,
         fs9_meta_key: None,
         fs9_jwt_secret: None,
@@ -367,9 +372,16 @@ async fn reset_password_with_credential_but_no_pgclient() {
 
     // Seed tenant + credential so the handler reaches the PgClient step
     let tenant_id = seed_customer_tenant(&state, &customer_id).await;
-    db::upsert_credential(&state.db, &tenant_id, "admin", "admin", "oldpass123", None)
-        .await
-        .unwrap();
+    db::upsert_credential(
+        &state.db,
+        &tenant_id,
+        "admin",
+        "admin",
+        "oldpass123",
+        Some(&test_credential_key()),
+    )
+    .await
+    .unwrap();
 
     let app = api::router().with_state(state.clone());
     let uri = format!("/customer/databases/{tenant_id}/reset-password");
@@ -424,9 +436,16 @@ async fn test_sql_with_tenant_but_no_pgclient() {
     let token = register_and_login(&state, &email, "SecurePass1!").await;
     let customer_id = get_customer_id(&state, &token).await;
     let tenant_id = seed_customer_tenant(&state, &customer_id).await;
-    db::upsert_credential(&state.db, &tenant_id, "admin", "admin", "oldpass123", None)
-        .await
-        .unwrap();
+    db::upsert_credential(
+        &state.db,
+        &tenant_id,
+        "admin",
+        "admin",
+        "oldpass123",
+        Some(&test_credential_key()),
+    )
+    .await
+    .unwrap();
 
     let app = api::router().with_state(state.clone());
     let uri = format!("/customer/databases/{tenant_id}/sql");
@@ -518,9 +537,16 @@ async fn test_dump_with_tenant_but_no_pgclient() {
     let token = register_and_login(&state, &email, "SecurePass1!").await;
     let customer_id = get_customer_id(&state, &token).await;
     let tenant_id = seed_customer_tenant(&state, &customer_id).await;
-    db::upsert_credential(&state.db, &tenant_id, "admin", "admin", "oldpass123", None)
-        .await
-        .unwrap();
+    db::upsert_credential(
+        &state.db,
+        &tenant_id,
+        "admin",
+        "admin",
+        "oldpass123",
+        Some(&test_credential_key()),
+    )
+    .await
+    .unwrap();
 
     let app = api::router().with_state(state.clone());
     let uri = format!("/customer/databases/{tenant_id}/dump");
@@ -655,9 +681,16 @@ async fn test_branch_with_tenant_but_no_pgclient() {
     let token = register_and_login(&state, &email, "SecurePass1!").await;
     let customer_id = get_customer_id(&state, &token).await;
     let tenant_id = seed_customer_tenant(&state, &customer_id).await;
-    db::upsert_credential(&state.db, &tenant_id, "admin", "admin", "oldpass123", None)
-        .await
-        .unwrap();
+    db::upsert_credential(
+        &state.db,
+        &tenant_id,
+        "admin",
+        "admin",
+        "oldpass123",
+        Some(&test_credential_key()),
+    )
+    .await
+    .unwrap();
 
     let app = api::router().with_state(state.clone());
     let uri = format!("/customer/databases/{tenant_id}/branch");

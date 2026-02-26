@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use sqlparser::ast::Expr;
 
-use crate::types::{ColumnDef, DataType, Value};
+use crate::model::{ColumnDef, DataType, Value};
 
 /// Coerce a value to match the expected column type
 pub fn coerce_value_for_column(val: Value, col: &ColumnDef) -> Result<Value> {
@@ -162,7 +162,7 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Result<Value> {
                 value: unescaped.clone(),
             })
         }),
-        DataType::Date => crate::types::date::parse_date_days(trimmed)
+        DataType::Date => crate::model::date::parse_date_days(trimmed)
             .map(Value::Date)
             .map_err(|_| {
                 anyhow::Error::from(SqlError::InvalidInputSyntax {
@@ -179,8 +179,8 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Result<Value> {
                 })
             }),
         DataType::Bytes => {
-            if unescaped.starts_with("\\x") {
-                Ok(hex::decode(&unescaped[2..])
+            if let Some(hex_str) = unescaped.strip_prefix("\\x") {
+                Ok(hex::decode(hex_str)
                     .map(Value::Bytes)
                     .unwrap_or(Value::Bytes(unescaped.into_bytes())))
             } else {
@@ -359,7 +359,7 @@ pub fn parse_time_string(s: &str) -> Option<i64> {
         (0, 0)
     };
 
-    if hours < 0 || hours > 23 || minutes < 0 || minutes > 59 || seconds < 0 || seconds > 59 {
+    if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) || !(0..=59).contains(&seconds) {
         return None;
     }
 
@@ -385,7 +385,7 @@ pub fn value_to_sql_expr(v: &Value) -> Expr {
             let millis = ts.rem_euclid(1000) as u32;
             let nanos = millis * 1_000_000;
             if chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, nanos).is_some() {
-                let formatted = crate::types::timestamp::format_timestamp_millis(*ts, false)
+                let formatted = crate::model::timestamp::format_timestamp_millis(*ts, false)
                     .unwrap_or_else(|_| ts.to_string());
                 Expr::TypedString {
                     data_type: sqlparser::ast::DataType::Timestamp(
@@ -423,11 +423,11 @@ pub fn value_to_sql_expr(v: &Value) -> Expr {
             })
         }
         Value::Vector(vec) => Expr::Value(SqlValue::SingleQuotedString(
-            crate::types::format_vector_pg_text(vec),
+            crate::model::format_vector_pg_text(vec),
         )),
         Value::Json(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
         Value::Jsonb(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
-        Value::Date(days) => match crate::types::date::format_date_days(*days) {
+        Value::Date(days) => match crate::model::date::format_date_days(*days) {
             Ok(s) => Expr::TypedString {
                 data_type: sqlparser::ast::DataType::Date,
                 value: s,
@@ -454,7 +454,7 @@ pub fn value_to_sql_expr(v: &Value) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ColumnDef, IntervalValue};
+    use crate::model::{ColumnDef, IntervalValue};
     use sqlparser::ast::BinaryOperator;
 
     fn test_col(name: &str, data_type: DataType) -> ColumnDef {
@@ -546,7 +546,7 @@ mod tests {
 
         assert_eq!(
             diff,
-            Value::Interval(crate::types::IntervalValue::from_millis(1_000))
+            Value::Interval(crate::model::IntervalValue::from_millis(1_000))
         );
     }
 

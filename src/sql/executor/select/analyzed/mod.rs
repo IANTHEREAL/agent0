@@ -6,6 +6,7 @@
 //!
 //! Handles FOR UPDATE/SHARE row locking and SELECT INTO natively.
 
+use crate::model::{DataType, Row, TableSchema};
 use crate::sql::analyzer::types::{
     AnalyzedDistinct, AnalyzedQueryBody, AnalyzedTableRef, AnalyzedTableRefKind, JoinCondition,
     TypedExpr, TypedExprKind, TypedOrderByExpr,
@@ -15,7 +16,6 @@ use crate::sql::executor::core::Executor;
 use crate::sql::expr::classify::needs_pre_materialization;
 use crate::sql::expr::typed_eval::eval_const_usize;
 use crate::sql::ExecuteResult;
-use crate::types::{DataType, Row, TableSchema};
 
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Query, SetExpr};
@@ -29,7 +29,7 @@ mod expr_runtime;
 mod materialize;
 mod materialize_catalog;
 mod pipeline;
-mod postprocess;
+pub(crate) mod postprocess;
 mod pre_materialize;
 mod subquery;
 
@@ -101,7 +101,7 @@ impl Executor {
             };
 
             // ── Single execution path: CBO optimizer pipeline ──────────
-            let result = self
+            let (result, _) = self
                 .execute_via_optimizer(
                     txn,
                     db_id,
@@ -110,6 +110,8 @@ impl Executor {
                     Cow::Owned(analyzed),
                     &prepared_ctes,
                     &query.locks,
+                    None,
+                    false,
                 )
                 .await?;
 
@@ -142,16 +144,20 @@ impl Executor {
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Pin<Box<dyn Future<Output = Result<ExecuteResult>> + Send + 'a>> {
         Box::pin(async move {
-            self.execute_via_optimizer(
-                txn,
-                db_id,
-                sequence_values,
-                search_path,
-                Cow::Borrowed(analyzed),
-                ctes,
-                &[],
-            )
-            .await
+            let (result, _) = self
+                .execute_via_optimizer(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    Cow::Borrowed(analyzed),
+                    ctes,
+                    &[],
+                    None,
+                    false,
+                )
+                .await?;
+            Ok(result)
         })
     }
 
@@ -159,6 +165,7 @@ impl Executor {
     ///
     /// This is used by prepared execution where we no longer have the original
     /// SQL AST but still need deterministic CTE materialization.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn build_cte_context_from_analyzed_with_base<'a>(
         &'a self,
         txn: &'a mut Transaction,
@@ -207,7 +214,7 @@ impl Executor {
                         let inferred_types: Vec<DataType> = if let Some(types) = column_types {
                             types
                         } else {
-                            crate::types::infer_column_types_from_rows(&rows, col_names.len())
+                            crate::model::infer_column_types_from_rows(&rows, col_names.len())
                         };
                         let schema = TableSchema {
                             table_id: 0,
@@ -215,7 +222,7 @@ impl Executor {
                             columns: col_names
                                 .iter()
                                 .enumerate()
-                                .map(|(idx, n)| crate::types::ColumnDef {
+                                .map(|(idx, n)| crate::model::ColumnDef {
                                     name: n.clone(),
                                     // Index guard: unreachable when types and columns are aligned.
                                     data_type: inferred_types
@@ -262,6 +269,7 @@ impl Executor {
     ///
     /// Traverses subqueries in FROM/join trees, typed expressions, set-operation
     /// branches, and query-level ORDER BY/LIMIT/OFFSET.
+    #[allow(clippy::type_complexity)]
     fn build_nested_ctes_from_analyzed_query_with_base<'a>(
         &'a self,
         txn: &'a mut Transaction,
@@ -307,6 +315,7 @@ impl Executor {
     /// execution path (~8 `.await` points holding `AnalyzedQuery`,
     /// `PlanningContext`, `BuildContext`, `Vec<Row>`, etc.). Boxing it keeps
     /// async frame sizes bounded for all callers (#907).
+    #[allow(clippy::type_complexity)]
     pub(crate) fn execute_via_optimizer<'a>(
         &'a self,
         txn: &'a mut Transaction,
@@ -316,7 +325,19 @@ impl Executor {
         analyzed: Cow<'a, AnalyzedQuery>,
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
         locks: &'a [sqlparser::ast::LockClause],
-    ) -> Pin<Box<dyn Future<Output = Result<ExecuteResult>> + Send + 'a>> {
+        cached_plan: Option<&'a crate::sql::optimizer::physical_plan::PhysicalPlan>,
+        capture_plan: bool,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<(
+                        ExecuteResult,
+                        Option<crate::sql::optimizer::physical_plan::PhysicalPlan>,
+                    )>,
+                > + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
             use crate::sql::expr::classify::needs_async;
             use crate::sql::optimizer::{BuildContext, PlanningContext};
@@ -401,7 +422,7 @@ impl Executor {
                                 // Fallback: NULL constant (value will be replaced in
                                 // post-processing, but aggregate rewrite must still work).
                                 proj.expr = TypedExpr {
-                                    kind: TypedExprKind::Constant(crate::types::Value::Null),
+                                    kind: TypedExprKind::Constant(crate::model::Value::Null),
                                     data_type: proj.expr.data_type.clone(),
                                 };
                             }
@@ -483,10 +504,20 @@ impl Executor {
             )
             .await?;
 
-            // ── Step 5: AnalyzedQuery → PhysicalPlan ──
-            let physical = crate::sql::stack_safety::with_grown_stack(|| {
-                crate::sql::optimizer::optimize(&analyzed, &planning_ctx)
-            })?;
+            // ── Step 5: AnalyzedQuery → PhysicalPlan (or use cached) ──
+            let (physical, captured_plan) = if let Some(cached) = cached_plan {
+                (cached.clone(), None)
+            } else {
+                let optimized = crate::sql::stack_safety::with_grown_stack(|| {
+                    crate::sql::optimizer::optimize(&analyzed, &planning_ctx)
+                })?;
+                let captured = if capture_plan {
+                    Some(optimized.clone())
+                } else {
+                    None
+                };
+                (optimized, captured)
+            };
 
             // ── Step 6: PhysicalPlan → BoxedOperator ──
             let mut operator = crate::sql::stack_safety::with_grown_stack(|| {
@@ -605,12 +636,15 @@ impl Executor {
                 .map(|(_, dt, _)| dt.clone())
                 .collect();
 
-            Ok(ExecuteResult::Select {
-                columns,
-                column_types: Some(column_types),
-                rows,
-                timezone: crate::session_context::current_timezone(),
-            })
+            Ok((
+                ExecuteResult::Select {
+                    columns,
+                    column_types: Some(column_types),
+                    rows,
+                    timezone: crate::session_context::current_timezone(),
+                },
+                captured_plan,
+            ))
         })
     }
 }
@@ -620,7 +654,7 @@ impl Executor {
 /// This mirrors the scope of `pre_materialize_query_body` (pipeline.rs) to
 /// determine whether a `Cow::Borrowed` query must be cloned. For `Cow::Owned`
 /// callers this check is unnecessary (to_mut() on Owned is free).
-fn query_needs_pre_materialization(analyzed: &AnalyzedQuery) -> bool {
+pub(crate) fn query_needs_pre_materialization(analyzed: &AnalyzedQuery) -> bool {
     if analyzed
         .order_by
         .iter()
@@ -637,15 +671,15 @@ fn query_needs_pre_materialization(analyzed: &AnalyzedQuery) -> bool {
                 || select
                     .where_clause
                     .as_ref()
-                    .is_some_and(|w| needs_pre_materialization(w))
+                    .is_some_and(needs_pre_materialization)
                 || select
                     .having
                     .as_ref()
-                    .is_some_and(|h| needs_pre_materialization(h))
-                || select.group_by.iter().any(|e| needs_pre_materialization(e))
+                    .is_some_and(needs_pre_materialization)
+                || select.group_by.iter().any(needs_pre_materialization)
                 || matches!(
                     &select.distinct,
-                    AnalyzedDistinct::DistinctOn(exprs) if exprs.iter().any(|e| needs_pre_materialization(e))
+                    AnalyzedDistinct::DistinctOn(exprs) if exprs.iter().any(needs_pre_materialization)
                 )
                 || select.from.iter().any(table_ref_needs_pre_materialization)
         }
@@ -654,7 +688,7 @@ fn query_needs_pre_materialization(analyzed: &AnalyzedQuery) -> bool {
         }
         AnalyzedQueryBody::Values(rows) => rows
             .iter()
-            .any(|row| row.iter().any(|e| needs_pre_materialization(e))),
+            .any(|row| row.iter().any(needs_pre_materialization)),
     }
 }
 
@@ -678,7 +712,13 @@ fn table_ref_needs_pre_materialization(tr: &AnalyzedTableRef) -> bool {
 /// Compile-time guards for #907: these three functions MUST return
 /// `Pin<Box<dyn Future<...>>>`, not opaque `impl Future` (from `async fn`).
 /// Reverting any of them to `async fn` makes this a type error at `cargo build`.
-#[allow(dead_code, unreachable_code, unused_variables)] // framework: development diagnostic path
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    clippy::let_underscore_future,
+    clippy::type_complexity
+)]
 mod _stack_overflow_signature_guards_907 {
     use super::*;
 
@@ -689,8 +729,27 @@ mod _stack_overflow_signature_guards_907 {
         analyzed: AnalyzedQuery,
     ) {
         let ctes = HashMap::new();
-        let _: Pin<Box<dyn Future<Output = Result<ExecuteResult>> + Send + '_>> =
-            e.execute_via_optimizer(txn, 0, seq, &[], Cow::Owned(analyzed), &ctes, &[]);
+        let _: Pin<
+            Box<
+                dyn Future<
+                        Output = Result<(
+                            ExecuteResult,
+                            Option<crate::sql::optimizer::physical_plan::PhysicalPlan>,
+                        )>,
+                    > + Send
+                    + '_,
+            >,
+        > = e.execute_via_optimizer(
+            txn,
+            0,
+            seq,
+            &[],
+            Cow::Owned(analyzed),
+            &ctes,
+            &[],
+            None,
+            false,
+        );
     }
 
     fn _guard_execute_subquery(
@@ -719,6 +778,7 @@ mod _stack_overflow_signature_guards_907 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Value;
     use crate::sql::analyzer::types::{
         AnalyzedDistinct, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind,
         BinaryOp as TypedBinaryOp,
@@ -726,7 +786,6 @@ mod tests {
     use crate::sql::expr::typed_eval::eval_typed_expr;
     use crate::sql::query_context::QueryContext;
     use crate::sql::types::CastContext;
-    use crate::types::Value;
     use std::sync::Arc;
 
     fn test_qctx() -> QueryContext {

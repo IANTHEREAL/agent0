@@ -5,9 +5,9 @@
 
 use sqlparser::ast::{self as ast, Expr};
 
+use crate::model::DataType;
 use crate::sql::types::cast::CastContext;
 use crate::sql::types::coercion::{common_type, unify_types};
-use crate::types::DataType;
 
 use crate::sql::analyzer::error::AnalyzerError;
 use crate::sql::analyzer::types::*;
@@ -19,11 +19,8 @@ impl<'a> Analyzer<'a> {
     /// True if expr is a Parameter not yet resolved from context or client OID.
     pub(in crate::sql::analyzer) fn is_unresolved_param(&self, expr: &TypedExpr) -> bool {
         if let TypedExprKind::Parameter { index } = &expr.kind {
-            self.param_types.get(*index).map_or(true, |v| v.is_none())
-                && self
-                    .inferred_params
-                    .get(*index)
-                    .map_or(true, |v| v.is_none())
+            self.param_types.get(*index).is_none_or(|v| v.is_none())
+                && self.inferred_params.get(*index).is_none_or(|v| v.is_none())
         } else {
             false
         }
@@ -48,17 +45,15 @@ impl<'a> Analyzer<'a> {
         }
 
         if let Some(existing) = self.inferred_params.get(index).cloned().flatten() {
-            if existing != *data_type {
-                if common_type(&existing, data_type).is_none() {
-                    return Err(AnalyzerError::InconsistentParameterTypes {
-                        index: index + 1,
-                        first: existing,
-                        second: data_type.clone(),
-                    });
-                }
-                // Keep the first inferred type stable. Widening here can
-                // desynchronize already-built TypedExpr::Parameter node types
-                // from finalize_param_types() output.
+            // Keep the first inferred type stable. Widening here can
+            // desynchronize already-built TypedExpr::Parameter node types
+            // from finalize_param_types() output.
+            if existing != *data_type && common_type(&existing, data_type).is_none() {
+                return Err(AnalyzerError::InconsistentParameterTypes {
+                    index: index + 1,
+                    first: existing,
+                    second: data_type.clone(),
+                });
             }
         } else if let Some(slot) = self.inferred_params.get_mut(index) {
             *slot = Some(data_type.clone());

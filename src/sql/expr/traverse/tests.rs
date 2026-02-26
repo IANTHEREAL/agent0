@@ -1,8 +1,12 @@
 //\! Tests for TypedExpr tree traversal primitives.
 
 use super::*;
+use crate::model::{DataType, Value};
 use crate::sql::analyzer::types::{BinaryOp, FunctionKind, ResolvedFunction, WindowFrameUnits};
-use crate::types::{DataType, Value};
+use anyhow::Result;
+use futures::executor::block_on;
+use std::future::Future;
+use std::pin::Pin;
 
 fn int_const(v: i32) -> TypedExpr {
     TypedExpr::new(TypedExprKind::Constant(Value::Int32(v)), DataType::Int32)
@@ -28,6 +32,46 @@ fn binary_add(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         },
         DataType::Int32,
     )
+}
+
+struct IdentityAsyncTransform;
+
+impl AsyncExprTransform for IdentityAsyncTransform {
+    fn transform_expr<'a>(
+        &'a mut self,
+        expr: &'a TypedExpr,
+    ) -> Pin<Box<dyn Future<Output = Result<TypedExpr>> + Send + 'a>> {
+        Box::pin(async move {
+            let kind = map_children_async(expr, self).await?;
+            Ok(TypedExpr {
+                kind,
+                data_type: expr.data_type.clone(),
+            })
+        })
+    }
+}
+
+struct RecordingAsyncTransform {
+    visited: Vec<i32>,
+}
+
+impl AsyncExprTransform for RecordingAsyncTransform {
+    fn transform_expr<'a>(
+        &'a mut self,
+        expr: &'a TypedExpr,
+    ) -> Pin<Box<dyn Future<Output = Result<TypedExpr>> + Send + 'a>> {
+        Box::pin(async move {
+            if let TypedExprKind::Constant(Value::Int32(v)) = &expr.kind {
+                self.visited.push(*v);
+                return Ok(expr.clone());
+            }
+            let kind = map_children_async(expr, self).await?;
+            Ok(TypedExpr {
+                kind,
+                data_type: expr.data_type.clone(),
+            })
+        })
+    }
 }
 
 #[test]
@@ -188,4 +232,42 @@ fn for_each_child_function_order_by_and_filter() {
         }
     });
     assert_eq!(children, vec!["x", "y", "z"]);
+}
+
+#[test]
+fn map_children_async_round_trip_identity() {
+    let expr = TypedExpr::new(
+        TypedExprKind::Case {
+            operand: Some(Box::new(col_ref(0, "x"))),
+            when_clauses: vec![(int_const(1), binary_add(int_const(2), int_const(3)))],
+            else_result: Some(Box::new(int_const(4))),
+        },
+        DataType::Int32,
+    );
+
+    let mut transform = IdentityAsyncTransform;
+    let rebuilt = block_on(transform.transform_expr(&expr)).unwrap();
+    assert!(matches!(rebuilt.kind, TypedExprKind::Case { .. }));
+    if let TypedExprKind::Case {
+        operand,
+        when_clauses,
+        else_result,
+    } = rebuilt.kind
+    {
+        assert!(operand.is_some());
+        assert_eq!(when_clauses.len(), 1);
+        assert!(else_result.is_some());
+    }
+}
+
+#[test]
+fn map_children_async_left_to_right_order() {
+    let expr = binary_add(int_const(1), binary_add(int_const(2), int_const(3)));
+    let mut transform = RecordingAsyncTransform {
+        visited: Vec::new(),
+    };
+
+    let rebuilt = block_on(transform.transform_expr(&expr)).unwrap();
+    assert!(matches!(rebuilt.kind, TypedExprKind::BinaryOp { .. }));
+    assert_eq!(transform.visited, vec![1, 2, 3]);
 }

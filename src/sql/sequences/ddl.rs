@@ -1,9 +1,9 @@
 //! CREATE/DROP SEQUENCE DDL handlers.
 
+use crate::model::{SequenceBacking, SequenceDef, SequenceState};
 use crate::sql::error::SqlError;
 use crate::sql::names;
 use crate::storage::TikvStore;
-use crate::types::{SequenceBacking, SequenceDef, SequenceState};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{MinMaxValue, ObjectName, SequenceOptions};
 use std::sync::Arc;

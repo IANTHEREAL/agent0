@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use super::{PredicateInfo, PredicateOp};
-use crate::types::Value;
+use crate::model::Value;
 
 /// Extract [`PredicateInfo`] from a [`TypedExpr`] tree.
 ///

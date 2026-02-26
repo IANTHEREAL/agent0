@@ -1,7 +1,7 @@
 //! Tests for `generate_series` value generation.
 
 use super::generate_series::*;
-use crate::types::{DataType, Value};
+use crate::model::{DataType, Value};
 use chrono::{Offset, TimeZone, Timelike};
 use std::sync::Arc;
 
@@ -194,7 +194,7 @@ fn generate_series_timestamp_overflow_does_not_loop() {
     let (values, ty) = generate_series_values(
         &Value::Timestamp(1),
         &Value::Timestamp(1),
-        &Value::Interval(crate::types::IntervalValue::from_millis(i64::MAX)),
+        &Value::Interval(crate::model::IntervalValue::from_millis(i64::MAX)),
     )
     .unwrap();
     assert_eq!(ty, DataType::Timestamp);
@@ -203,14 +203,14 @@ fn generate_series_timestamp_overflow_does_not_loop() {
 
 #[test]
 fn generate_series_date_overflow_does_not_loop() {
-    let step = Value::Interval(crate::types::IntervalValue::from_millis(i64::MAX));
+    let step = Value::Interval(crate::model::IntervalValue::from_millis(i64::MAX));
     let (values, ty) = generate_series_values(&Value::Date(1), &Value::Date(1), &step).unwrap();
     assert_eq!(ty, DataType::TimestampTz);
 
-    let tz = crate::types::timestamp::TimeZoneSpec::parse(
+    let tz = crate::model::timestamp::TimeZoneSpec::parse(
         crate::session_context::current_timezone().as_ref(),
     );
-    let date = crate::types::date::date_days_to_naive_date(1).unwrap();
+    let date = crate::model::date::date_days_to_naive_date(1).unwrap();
     let naive = date.and_hms_opt(0, 0, 0).unwrap();
     let expected = tz.timestamp_millis_from_local_datetime(naive).unwrap();
     assert_eq!(values, vec![Value::Timestamp(expected)]);
@@ -218,9 +218,9 @@ fn generate_series_date_overflow_does_not_loop() {
 
 #[test]
 fn generate_series_date_sub_day_step_includes_intermediate() {
-    let start_days = crate::types::date::parse_date_days("2024-01-01").unwrap();
-    let stop_days = crate::types::date::parse_date_days("2024-01-02").unwrap();
-    let step = Value::Interval(crate::types::IntervalValue::from_millis(
+    let start_days = crate::model::date::parse_date_days("2024-01-01").unwrap();
+    let stop_days = crate::model::date::parse_date_days("2024-01-02").unwrap();
+    let step = Value::Interval(crate::model::IntervalValue::from_millis(
         12 * 60 * 60 * 1000,
     ));
 
@@ -261,9 +261,9 @@ fn generate_series_date_sub_day_step_includes_intermediate() {
 
 #[test]
 fn generate_series_date_sub_day_step_across_dst_start_does_not_error() {
-    let start_days = crate::types::date::parse_date_days("2024-03-10").unwrap();
-    let stop_days = crate::types::date::parse_date_days("2024-03-11").unwrap();
-    let step = Value::Interval(crate::types::IntervalValue::from_millis(60 * 60 * 1000));
+    let start_days = crate::model::date::parse_date_days("2024-03-10").unwrap();
+    let stop_days = crate::model::date::parse_date_days("2024-03-11").unwrap();
+    let step = Value::Interval(crate::model::IntervalValue::from_millis(60 * 60 * 1000));
 
     let (values, ty) = with_session_timezone("America/Los_Angeles", || {
         generate_series_values(&Value::Date(start_days), &Value::Date(stop_days), &step).unwrap()
@@ -281,14 +281,14 @@ fn generate_series_date_sub_day_step_across_dst_start_does_not_error() {
         hours.push(tz.timestamp_millis_opt(*ms).single().unwrap().hour());
     }
     assert_eq!(hours.iter().filter(|&&h| h == 2).count(), 0);
-    assert!(hours.iter().any(|&h| h == 3));
+    assert!(hours.contains(&3));
 }
 
 #[test]
 fn generate_series_date_sub_day_step_across_dst_end_does_not_error() {
-    let start_days = crate::types::date::parse_date_days("2024-11-03").unwrap();
-    let stop_days = crate::types::date::parse_date_days("2024-11-04").unwrap();
-    let step = Value::Interval(crate::types::IntervalValue::from_millis(60 * 60 * 1000));
+    let start_days = crate::model::date::parse_date_days("2024-11-03").unwrap();
+    let stop_days = crate::model::date::parse_date_days("2024-11-04").unwrap();
+    let step = Value::Interval(crate::model::IntervalValue::from_millis(60 * 60 * 1000));
 
     let (values, ty) = with_session_timezone("America/Los_Angeles", || {
         generate_series_values(&Value::Date(start_days), &Value::Date(stop_days), &step).unwrap()
@@ -318,9 +318,9 @@ fn generate_series_date_sub_day_step_across_dst_end_does_not_error() {
 
 #[test]
 fn generate_series_date_interval_does_not_truncate_remainder() {
-    let start_days = crate::types::date::parse_date_days("2024-01-01").unwrap();
-    let stop_days = crate::types::date::parse_date_days("2024-01-03").unwrap();
-    let step = Value::Interval(crate::types::IntervalValue::from_millis(
+    let start_days = crate::model::date::parse_date_days("2024-01-01").unwrap();
+    let stop_days = crate::model::date::parse_date_days("2024-01-03").unwrap();
+    let step = Value::Interval(crate::model::IntervalValue::from_millis(
         36 * 60 * 60 * 1000,
     ));
 
@@ -349,9 +349,9 @@ fn generate_series_date_interval_does_not_truncate_remainder() {
 
 #[test]
 fn generate_series_date_month_step_across_dst_start_keeps_local_midnight() {
-    let start_days = crate::types::date::parse_date_days("2024-03-01").unwrap();
-    let stop_days = crate::types::date::parse_date_days("2024-05-01").unwrap();
-    let step = Value::Interval(crate::types::IntervalValue::from_months(1));
+    let start_days = crate::model::date::parse_date_days("2024-03-01").unwrap();
+    let stop_days = crate::model::date::parse_date_days("2024-05-01").unwrap();
+    let step = Value::Interval(crate::model::IntervalValue::from_months(1));
 
     let (values, ty) = with_session_timezone("America/Los_Angeles", || {
         generate_series_values(&Value::Date(start_days), &Value::Date(stop_days), &step).unwrap()
@@ -392,9 +392,9 @@ fn generate_series_date_month_step_across_dst_start_keeps_local_midnight() {
 
 #[test]
 fn generate_series_date_day_step_across_dst_start_keeps_local_midnight() {
-    let start_days = crate::types::date::parse_date_days("2024-03-09").unwrap();
-    let stop_days = crate::types::date::parse_date_days("2024-03-11").unwrap();
-    let step = Value::Interval(crate::types::IntervalValue::from_millis(
+    let start_days = crate::model::date::parse_date_days("2024-03-09").unwrap();
+    let stop_days = crate::model::date::parse_date_days("2024-03-11").unwrap();
+    let step = Value::Interval(crate::model::IntervalValue::from_millis(
         24 * 60 * 60 * 1000,
     ));
 
@@ -437,9 +437,9 @@ fn generate_series_date_day_step_across_dst_start_keeps_local_midnight() {
 
 #[test]
 fn generate_series_date_day_step_across_dst_end_keeps_local_midnight() {
-    let start_days = crate::types::date::parse_date_days("2024-11-02").unwrap();
-    let stop_days = crate::types::date::parse_date_days("2024-11-04").unwrap();
-    let step = Value::Interval(crate::types::IntervalValue::from_millis(
+    let start_days = crate::model::date::parse_date_days("2024-11-02").unwrap();
+    let stop_days = crate::model::date::parse_date_days("2024-11-04").unwrap();
+    let step = Value::Interval(crate::model::IntervalValue::from_millis(
         24 * 60 * 60 * 1000,
     ));
 
@@ -482,9 +482,9 @@ fn generate_series_date_day_step_across_dst_end_keeps_local_midnight() {
 
 #[test]
 fn generate_series_date_mixed_sign_month_day_step_progress_guard_errors() {
-    let start_days = crate::types::date::parse_date_days("2024-01-01").unwrap();
-    let stop_days = crate::types::date::parse_date_days("2024-01-03").unwrap();
-    let step = Value::Interval(crate::types::IntervalValue::new(
+    let start_days = crate::model::date::parse_date_days("2024-01-01").unwrap();
+    let stop_days = crate::model::date::parse_date_days("2024-01-03").unwrap();
+    let step = Value::Interval(crate::model::IntervalValue::new(
         1,
         -31_i64 * 24 * 60 * 60 * 1000,
     ));

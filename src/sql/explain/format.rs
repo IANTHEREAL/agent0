@@ -46,10 +46,10 @@ pub(super) fn format_json_literal_for_explain(raw: &str) -> String {
 }
 
 fn format_typed_constant_for_explain(
-    value: &crate::types::Value,
-    data_type: &crate::types::DataType,
+    value: &crate::model::Value,
+    data_type: &crate::model::DataType,
 ) -> String {
-    use crate::types::{DataType, Value};
+    use crate::model::{DataType, Value};
 
     match (value, data_type) {
         (Value::Text(s), DataType::Jsonb) => {
@@ -87,11 +87,11 @@ pub(crate) fn format_typed_expr(expr: &TypedExpr) -> String {
         TypedExprKind::BinaryOp { left, op, right } => {
             let right_text = if matches!(op, TypedBinaryOp::JsonContains) {
                 match &right.kind {
-                    TypedExprKind::Constant(crate::types::Value::Text(s)) => {
+                    TypedExprKind::Constant(crate::model::Value::Text(s)) => {
                         let json = format_json_literal_for_explain(s);
                         format!("{}::jsonb", quote_sql_literal(&json))
                     }
-                    TypedExprKind::Constant(crate::types::Value::Jsonb(s)) => {
+                    TypedExprKind::Constant(crate::model::Value::Jsonb(s)) => {
                         let json = format_json_literal_for_explain(s);
                         format!("{}::jsonb", quote_sql_literal(&json))
                     }

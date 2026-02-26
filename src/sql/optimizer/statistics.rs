@@ -4,7 +4,7 @@
 //! by `ANALYZE` and used by the physical planner to produce accurate cost
 //! estimates (row counts, selectivities).
 
-use crate::types::Value;
+use crate::model::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

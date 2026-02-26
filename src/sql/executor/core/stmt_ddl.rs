@@ -739,8 +739,8 @@ impl Executor {
         let mut found_table: Option<String> = None;
         let mut is_pk = false;
         for table_name in &tables {
-            let table_schema = table_name.splitn(2, '.').next().unwrap_or("");
-            if !schema_filter.iter().any(|s| *s == table_schema) {
+            let table_schema = table_name.split('.').next().unwrap_or("");
+            if !schema_filter.contains(&table_schema) {
                 continue;
             }
             let schema = match self.store().get_schema(txn, db_id, table_name).await? {
@@ -773,7 +773,7 @@ impl Executor {
             found_table.ok_or_else(|| anyhow!("relation \"{}\" does not exist", idx_name))?;
 
         // Schema-wide namespace uniqueness check for the new name.
-        let owning_schema = table_name.splitn(2, '.').next().unwrap_or("public");
+        let owning_schema = table_name.split('.').next().unwrap_or("public");
         ddl::check_relation_name_available(
             &self.store(),
             txn,
@@ -814,6 +814,69 @@ impl Executor {
         Ok(ExecuteResult::AlterIndex {
             index_name: new_idx_name,
         })
+    }
+
+    /// Handle `ALTER INDEX IF EXISTS <name> RENAME TO <name>`.
+    ///
+    /// Intercepted via `RawSqlKind::AlterIndexIfExists` because sqlparser 0.40
+    /// cannot parse `IF EXISTS` after `ALTER INDEX`. Extracts index names from
+    /// raw SQL via regex and delegates to existing rename logic, suppressing
+    /// "index not found" when `IF EXISTS` applies.
+    pub(crate) async fn execute_alter_index_if_exists_rename(
+        &self,
+        session: &mut Session,
+        sql: &str,
+    ) -> Result<ExecuteResult> {
+        let re = regex::Regex::new(
+            r#"(?i)ALTER\s+INDEX\s+IF\s+EXISTS\s+("(?:[^"]+)"|[^\s]+)\s+RENAME\s+TO\s+("(?:[^"]+)"|[^\s;]+)"#,
+        )?;
+        let caps = re.captures(sql.trim()).ok_or_else(|| {
+            anyhow!("syntax error: expected ALTER INDEX IF EXISTS <name> RENAME TO <name>")
+        })?;
+        let old_raw = caps.get(1).unwrap().as_str();
+        let new_raw = caps.get(2).unwrap().as_str();
+        let old_name = old_raw.trim_matches('"');
+        let new_name = new_raw.trim_matches('"');
+
+        let is_autocommit = !session.is_in_transaction();
+        if is_autocommit {
+            session.begin().await?;
+        }
+
+        let result = async {
+            let db_id = session.current_database_id();
+            let search_path: Vec<String> = session.search_path().to_vec();
+            let old_obj =
+                sqlparser::ast::ObjectName(vec![sqlparser::ast::Ident::with_quote('"', old_name)]);
+            let new_obj =
+                sqlparser::ast::ObjectName(vec![sqlparser::ast::Ident::with_quote('"', new_name)]);
+            let txn = session.get_mut_txn().expect("txn must be active");
+            match self
+                .execute_alter_index_rename(txn, db_id, &search_path, &old_obj, &new_obj)
+                .await
+            {
+                Ok(result) => Ok(result),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("does not exist") {
+                        Ok(ExecuteResult::CommandComplete { tag: "ALTER INDEX" })
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+        }
+        .await;
+
+        if is_autocommit {
+            if result.is_ok() {
+                session.commit().await?;
+            } else {
+                session.rollback().await?;
+            }
+        }
+
+        result
     }
 }
 

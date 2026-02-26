@@ -42,10 +42,18 @@ pub(crate) enum RawSqlKind {
     /// sqlparser which does not support standalone `RESET`).  `RESET ROLE` is
     /// excluded: it is rewritten to `SET ROLE NONE` in the parser layer.
     Reset,
+    /// `ALTER SYSTEM SET <guc> = <value>` — server-level config change.
+    AlterSystemSet,
+    /// `DO $$ ... $$` — anonymous PL/pgSQL block.
+    Do,
     /// `ANALYZE [table]` — collects table statistics for the query planner.
     /// All syntax validation (VERBOSE, quoted identifiers, trailing junk) is
     /// handled by `parse_analyze_table_name()` in the handler, not here.
     Analyze,
+    /// `ALTER INDEX IF EXISTS <name> RENAME TO <name>` — sqlparser 0.40 can't
+    /// parse `IF EXISTS` after `ALTER INDEX`. Intercepted here and dispatched
+    /// to a raw-SQL handler that extracts index names manually.
+    AlterIndexIfExists,
     /// Statements that we accept past Parse so the executor can return a stable
     /// "not supported" error (instead of a syntax error).
     UnsupportedExecutorSkips,
@@ -194,6 +202,9 @@ pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
     if sql_upper.starts_with("DROP TRIGGER") {
         return Some(RawSqlKind::DropTrigger);
     }
+    if sql_upper.starts_with("ALTER SYSTEM SET ") {
+        return Some(RawSqlKind::AlterSystemSet);
+    }
     if (sql_upper.starts_with("ALTER TABLE")
         || sql_upper.starts_with("ALTER SEQUENCE")
         || sql_upper.starts_with("ALTER FUNCTION"))
@@ -230,11 +241,23 @@ pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
     if sql_upper.starts_with("DROP TYPE") {
         return Some(RawSqlKind::DropType);
     }
+    if sql_upper.starts_with("ALTER INDEX IF EXISTS") {
+        return Some(RawSqlKind::AlterIndexIfExists);
+    }
     if sql_upper.starts_with("CREATE COLLATION") {
         return Some(RawSqlKind::CreateCollation);
     }
     if sql_upper.starts_with("DROP COLLATION") {
         return Some(RawSqlKind::DropCollation);
+    }
+
+    // DO block: keyword boundary ensures we don't match DOCUMENT, DOUBLE, etc.
+    if sql_upper.len() > 2
+        && sql_upper.starts_with("DO")
+        && !sql_upper.as_bytes()[2].is_ascii_alphanumeric()
+        && sql_upper.as_bytes()[2] != b'_'
+    {
+        return Some(RawSqlKind::Do);
     }
 
     // ANALYZE — keyword boundary only; all syntax validation lives in the handler.
@@ -395,7 +418,26 @@ mod tests {
             classify("ALTER TYPE role RENAME TO new_role"),
             Some(RawSqlKind::AlterType)
         );
+        // ALTER INDEX IF EXISTS classification (#885)
+        assert_eq!(
+            classify("ALTER INDEX IF EXISTS \"IDX_OLD\" RENAME TO \"IDX_NEW\""),
+            Some(RawSqlKind::AlterIndexIfExists)
+        );
         assert_eq!(classify("SELCT 1"), None);
+        // ALTER SYSTEM SET classification
+        assert_eq!(
+            classify("ALTER SYSTEM SET STATEMENT_TIMEOUT = '5S'"),
+            Some(RawSqlKind::AlterSystemSet)
+        );
+        assert_eq!(
+            classify("ALTER SYSTEM SET IDLE_IN_TRANSACTION_SESSION_TIMEOUT TO '10S'"),
+            Some(RawSqlKind::AlterSystemSet)
+        );
+        // ALTER SYSTEM without SET does NOT match AlterSystemSet
+        assert!(!matches!(
+            classify("ALTER SYSTEM RESET ALL"),
+            Some(RawSqlKind::AlterSystemSet)
+        ));
         // RESET <guc> and RESET ALL are classified as Reset
         assert_eq!(classify("RESET TIMEZONE"), Some(RawSqlKind::Reset));
         assert_eq!(classify("RESET ALL"), Some(RawSqlKind::Reset));
@@ -483,6 +525,30 @@ mod tests {
 
         // Embedded comments between RESET and GUC name
         assert_eq!(classify("RESET /*x*/ ALL"), Some(RawSqlKind::Reset));
+    }
+
+    #[test]
+    fn classify_do_block() {
+        assert_eq!(classify("DO $$ BEGIN END $$"), Some(RawSqlKind::Do));
+        assert_eq!(classify("DO$$ BEGIN END $$"), Some(RawSqlKind::Do));
+        assert_eq!(classify("DO\n$$ BEGIN END $$"), Some(RawSqlKind::Do));
+        assert_eq!(
+            classify("DO LANGUAGE PLPGSQL $$ BEGIN END $$"),
+            Some(RawSqlKind::Do)
+        );
+        // Must NOT match words that start with DO
+        assert_eq!(classify("DOUBLE PRECISION"), None);
+        assert_eq!(classify("DOCUMENT"), None);
+    }
+
+    #[test]
+    fn alter_system_set_accepted_as_raw_utility() {
+        assert!(should_accept_sql_without_sqlparser(
+            "ALTER SYSTEM SET STATEMENT_TIMEOUT = '5S'"
+        ));
+        assert!(should_accept_sql_without_sqlparser(
+            "ALTER SYSTEM SET IDLE_IN_TRANSACTION_SESSION_TIMEOUT TO '10S'"
+        ));
     }
 
     #[test]

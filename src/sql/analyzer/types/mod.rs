@@ -6,8 +6,8 @@
 
 mod display;
 
+use crate::model::{DataType, Value};
 use crate::sql::types::CastContext;
-use crate::types::{DataType, Value};
 
 // ── Core IR node ────────────────────────────────────────────
 
@@ -91,6 +91,15 @@ pub enum TypedExprKind {
     IsTest {
         expr: Box<TypedExpr>,
         test: IsTestKind,
+        negated: bool,
+    },
+
+    /// `expr IS [NOT] DISTINCT FROM expr`.
+    /// PostgreSQL semantics: `IS DISTINCT FROM` is like `!=` but treats NULLs
+    /// as equal (NULL IS NOT DISTINCT FROM NULL → true).
+    IsDistinctFrom {
+        left: Box<TypedExpr>,
+        right: Box<TypedExpr>,
         negated: bool,
     },
 
@@ -188,6 +197,14 @@ pub enum TypedExprKind {
     /// `expr [NOT] IN (SELECT ...)`.
     InSubquery {
         expr: Box<TypedExpr>,
+        subquery: Box<AnalyzedQuery>,
+        negated: bool,
+    },
+
+    /// `(expr, ...) [NOT] IN (SELECT ...)` — tuple IN subquery.
+    /// PostgreSQL three-valued NULL logic for NOT IN.
+    TupleInSubquery {
+        exprs: Vec<TypedExpr>,
         subquery: Box<AnalyzedQuery>,
         negated: bool,
     },
@@ -461,6 +478,7 @@ pub struct AnalyzedQuery {
 /// Each variant produces rows with a schema matching
 /// `AnalyzedQuery::output_schema`.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum AnalyzedQueryBody {
     /// A SELECT statement.
     Select(AnalyzedSelect),
@@ -687,6 +705,7 @@ pub enum SetOpKind {
 /// Queries are analyzed via `analyze_query()` and produce `AnalyzedQuery` directly;
 /// this enum adds DML variants that share the same typed-expression infrastructure.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum AnalyzedStatement {
     /// A SELECT / set operation.
     #[allow(dead_code)] // framework: dispatched via pattern match
@@ -730,6 +749,7 @@ pub enum AnalyzedInsertSource {
 
 /// Analyzed ON CONFLICT clause.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum AnalyzedOnConflict {
     /// DO NOTHING — skip conflicting rows.
     DoNothing,

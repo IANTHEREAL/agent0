@@ -1,7 +1,7 @@
 use super::helpers::{text_col, text_val};
 use super::{ScanContext, VirtualTable};
 use crate::auth::{Privilege, PrivilegeObject, Role, User};
-use crate::types::{Row, TableSchema, Value};
+use crate::model::{Row, TableSchema, Value};
 use anyhow::Result;
 use async_trait::async_trait;
 use tikv_client::BoundRange;

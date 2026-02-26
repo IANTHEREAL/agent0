@@ -201,7 +201,7 @@ impl<'a> Analyzer<'a> {
                 right: Box::new(self.rewrite_expr_for_group_set(right, grouped_keys)?),
             }),
             Expr::UnaryOp { op, expr } => Ok(Expr::UnaryOp {
-                op: op.clone(),
+                op: *op,
                 expr: Box::new(self.rewrite_expr_for_group_set(expr, grouped_keys)?),
             }),
             Expr::Nested(inner) => Ok(Expr::Nested(Box::new(

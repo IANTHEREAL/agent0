@@ -157,9 +157,7 @@ async fn walk_dir(
 }
 
 fn glob_prefix_dir(pattern: &str) -> &str {
-    let first_meta = pattern
-        .find(|c: char| c == '*' || c == '?' || c == '[')
-        .unwrap_or(pattern.len());
+    let first_meta = pattern.find(['*', '?', '[']).unwrap_or(pattern.len());
     let prefix = &pattern[..first_meta];
     match prefix.rfind('/') {
         Some(pos) => &pattern[..=pos],

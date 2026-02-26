@@ -6,11 +6,11 @@
   - pgwire OID: DATE = 1082.
 
 ## Types + helpers
-- `src/types/mod.rs`
+- `src/model/mod.rs`
   - `DataType::Date` (appended; bincode compatibility).
   - `Value::Date(i32)` (appended).
   - `impl fmt::Display for Value` formats date via `crate::types::date::format_date_days(...)`.
-- `src/types/date.rs`
+- `src/model/date.rs`
   - `parse_date_days(s: &str) -> Result<i32>` parses `YYYY-MM-DD` into days since epoch.
   - `format_date_days(days: i32) -> Result<String>` formats days as `YYYY-MM-DD`.
   - `timestamp_millis_to_date_days(ts_millis: i64) -> Result<i32>` truncates UTC timestamp (ms) to date days.

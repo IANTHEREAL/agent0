@@ -4,10 +4,10 @@
 //! via the Analyzer, then evaluate them with the typed evaluator. This replaces
 //! the legacy `eval_expr` / `eval_join_expr` path for DML and utility code.
 
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::expr::compile::{compile_const_expr, compile_row_expr_for_table};
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::query_context::QueryContext;
-use crate::types::{Row, TableSchema, Value};
 use anyhow::Result;
 
 /// Evaluate a constant AST expression (no row context).

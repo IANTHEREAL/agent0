@@ -5,7 +5,7 @@ use crate::sql::analyzer::types::{
     AnalyzedSelect, ResolvedFunction, TypedExpr, TypedExprKind, TypedOrderByExpr,
 };
 use crate::sql::operators::{AggregateExpr, WindowFunctionExpr};
-use crate::types::{DataType, Value};
+use crate::model::{DataType, Value};
 use std::collections::HashMap;
 
 // Re-export window utilities from the canonical location in the optimizer.

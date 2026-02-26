@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tikv_client::Transaction;
 
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::gin::extract_gin_token_hashes_from_row;
 use crate::sql::index_consistency::{
@@ -12,7 +13,6 @@ use crate::sql::index_consistency::{
 };
 use crate::sql::index_helpers;
 use crate::storage::TikvStore;
-use crate::types::{Row, TableSchema, Value};
 use crate::worker::types::IndexState;
 
 use super::defaults::coerce_row_values;
@@ -79,7 +79,7 @@ async fn update_row_indexes(
                         schema.table_id,
                         index.id,
                         &old_gin_hashes,
-                        &pk_values,
+                        pk_values,
                     )
                     .await?;
             }
@@ -91,7 +91,7 @@ async fn update_row_indexes(
                         schema.table_id,
                         index.id,
                         &new_gin_hashes,
-                        &pk_values,
+                        pk_values,
                     )
                     .await?;
             }
@@ -112,7 +112,7 @@ async fn update_row_indexes(
                     schema.table_id,
                     index.id,
                     &old_idx,
-                    &pk_values,
+                    pk_values,
                     index.unique,
                 )
                 .await?;
@@ -128,7 +128,7 @@ async fn update_row_indexes(
                     schema.table_id,
                     index.id,
                     &new_idx,
-                    &pk_values,
+                    pk_values,
                     index.unique,
                 )
                 .await;

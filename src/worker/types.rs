@@ -67,19 +67,13 @@ impl TaskType {
 // IndexState Enum
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum IndexState {
+    #[default]
     Ready,
     Building,
     Invalid,
-    /// DML maintains the index but planner must not read from it yet.
     WriteOnly,
-}
-
-impl Default for IndexState {
-    fn default() -> Self {
-        IndexState::Ready
-    }
 }
 
 // ============================================================================

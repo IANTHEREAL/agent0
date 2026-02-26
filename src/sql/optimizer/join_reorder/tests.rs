@@ -4,6 +4,7 @@ use super::predicates::{
     classify_predicates, flatten_recursive, is_pure_equi_join_pred, lift_typed_expr, BaseRelation,
 };
 use super::*;
+use crate::model::DataType;
 use crate::sql::analyzer::types::{BinaryOp, JoinCondition, JoinType, TypedExpr, TypedExprKind};
 use crate::sql::optimizer::logical_plan::PlanSchema;
 use crate::sql::optimizer::physical_plan::{PhysicalNode, PhysicalPlan};
@@ -11,7 +12,6 @@ use crate::sql::optimizer::physical_planner::PhysicalPlanner;
 use crate::sql::optimizer::physical_planner::PlanningContext;
 use crate::sql::optimizer::rewrite::{collect_column_indices, split_conjunction};
 use crate::sql::optimizer::statistics::{ColumnStatistics, TableStatistics};
-use crate::types::DataType;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -41,7 +41,7 @@ fn correlated_col_ref(index: usize, name: &str) -> TypedExpr {
 
 fn const_int(v: i64) -> TypedExpr {
     TypedExpr {
-        kind: TypedExprKind::Constant(crate::types::Value::Int64(v)),
+        kind: TypedExprKind::Constant(crate::model::Value::Int64(v)),
         data_type: DataType::Int64,
     }
 }
@@ -150,6 +150,7 @@ fn make_table_stats(
     })
 }
 
+#[allow(clippy::type_complexity)]
 fn ctx_with_stats(entries: Vec<(&str, usize, Vec<(&str, f64)>)>) -> PlanningContext {
     let mut ctx = PlanningContext::empty();
     for (name, rows, cols) in entries {

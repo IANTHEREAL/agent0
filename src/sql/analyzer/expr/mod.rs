@@ -14,9 +14,9 @@ mod operators;
 
 use sqlparser::ast::{self as ast, BinaryOperator, Expr, TrimWhereField};
 
+use crate::model::{DataType, Value};
 use crate::sql::types::cast::CastContext;
 use crate::sql::types::mapping::sql_datatype_to_internal;
-use crate::types::{DataType, Value};
 
 use super::error::AnalyzerError;
 use super::types::*;
@@ -185,13 +185,12 @@ impl<'a> Analyzer<'a> {
             } => {
                 let e = self.analyze_expr(expr)?;
                 let p = self.analyze_expr(pattern)?;
-                let esc = match escape_char {
-                    Some(c) => Some(Box::new(TypedExpr::new(
+                let esc = escape_char.map(|c| {
+                    Box::new(TypedExpr::new(
                         TypedExprKind::Constant(Value::Text(c.to_string())),
                         DataType::Text,
-                    ))),
-                    None => None,
-                };
+                    ))
+                });
                 Ok(TypedExpr::new(
                     TypedExprKind::SimilarTo {
                         expr: Box::new(e),
@@ -245,6 +244,28 @@ impl<'a> Analyzer<'a> {
                 subquery,
                 negated,
             } => {
+                // Tuple form: (col1, col2, ...) [NOT] IN (SELECT ...)
+                if let Expr::Tuple(tuple_exprs) = expr.as_ref() {
+                    let analyzed_exprs: Vec<TypedExpr> = tuple_exprs
+                        .iter()
+                        .map(|e| self.analyze_expr(e))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let analyzed = self.analyze_query(subquery)?;
+                    if analyzed.output_schema.len() != analyzed_exprs.len() {
+                        return Err(AnalyzerError::ScalarSubqueryMultipleColumns {
+                            got: analyzed.output_schema.len(),
+                        });
+                    }
+                    return Ok(TypedExpr::new(
+                        TypedExprKind::TupleInSubquery {
+                            exprs: analyzed_exprs,
+                            subquery: Box::new(analyzed),
+                            negated: *negated,
+                        },
+                        DataType::Boolean,
+                    ));
+                }
+
                 let e = self.analyze_expr(expr)?;
                 let analyzed = self.analyze_query(subquery)?;
                 if analyzed.output_schema.len() != 1 {
@@ -353,12 +374,12 @@ impl<'a> Analyzer<'a> {
                 {
                     let left_json_access = Expr::JsonAccess {
                         left: left.clone(),
-                        operator: operator.clone(),
+                        operator: *operator,
                         right: chained_left.clone(),
                     };
                     let reassociated = Expr::JsonAccess {
                         left: Box::new(left_json_access),
-                        operator: chained_op.clone(),
+                        operator: *chained_op,
                         right: chained_right.clone(),
                     };
                     return self.analyze_expr(&reassociated);
@@ -382,7 +403,7 @@ impl<'a> Analyzer<'a> {
                     if let Some(chained_json_op) = Self::binary_op_to_json_access_op(bin_op) {
                         let left_json_access = Expr::JsonAccess {
                             left: left.clone(),
-                            operator: operator.clone(),
+                            operator: *operator,
                             right: bin_left.clone(),
                         };
                         let reassociated = Expr::JsonAccess {
@@ -395,7 +416,7 @@ impl<'a> Analyzer<'a> {
 
                     let json_access = Expr::JsonAccess {
                         left: left.clone(),
-                        operator: operator.clone(),
+                        operator: *operator,
                         right: bin_left.clone(),
                     };
                     let outer = Expr::BinaryOp {
@@ -413,7 +434,7 @@ impl<'a> Analyzer<'a> {
                 {
                     let json_access = Expr::JsonAccess {
                         left: left.clone(),
-                        operator: operator.clone(),
+                        operator: *operator,
                         right: in_expr.clone(),
                     };
                     let outer = Expr::InList {
@@ -421,6 +442,78 @@ impl<'a> Analyzer<'a> {
                         list: list.clone(),
                         negated: *negated,
                     };
+                    return self.analyze_expr(&outer);
+                }
+                if let Expr::IsNull(inner) = right.as_ref() {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: *operator,
+                        right: inner.clone(),
+                    };
+                    let outer = Expr::IsNull(Box::new(json_access));
+                    return self.analyze_expr(&outer);
+                }
+                if let Expr::IsNotNull(inner) = right.as_ref() {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: *operator,
+                        right: inner.clone(),
+                    };
+                    let outer = Expr::IsNotNull(Box::new(json_access));
+                    return self.analyze_expr(&outer);
+                }
+                if let Expr::IsTrue(inner) = right.as_ref() {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: *operator,
+                        right: inner.clone(),
+                    };
+                    let outer = Expr::IsTrue(Box::new(json_access));
+                    return self.analyze_expr(&outer);
+                }
+                if let Expr::IsNotTrue(inner) = right.as_ref() {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: *operator,
+                        right: inner.clone(),
+                    };
+                    let outer = Expr::IsNotTrue(Box::new(json_access));
+                    return self.analyze_expr(&outer);
+                }
+                if let Expr::IsFalse(inner) = right.as_ref() {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: *operator,
+                        right: inner.clone(),
+                    };
+                    let outer = Expr::IsFalse(Box::new(json_access));
+                    return self.analyze_expr(&outer);
+                }
+                if let Expr::IsNotFalse(inner) = right.as_ref() {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: *operator,
+                        right: inner.clone(),
+                    };
+                    let outer = Expr::IsNotFalse(Box::new(json_access));
+                    return self.analyze_expr(&outer);
+                }
+                if let Expr::IsUnknown(inner) = right.as_ref() {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: *operator,
+                        right: inner.clone(),
+                    };
+                    let outer = Expr::IsUnknown(Box::new(json_access));
+                    return self.analyze_expr(&outer);
+                }
+                if let Expr::IsNotUnknown(inner) = right.as_ref() {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: *operator,
+                        right: inner.clone(),
+                    };
+                    let outer = Expr::IsNotUnknown(Box::new(json_access));
                     return self.analyze_expr(&outer);
                 }
 
@@ -711,26 +804,53 @@ impl<'a> Analyzer<'a> {
                 // General case: `x = ANY(array_col)` where array_col is a column reference
                 // or other non-literal array expression.
                 // Convert to: ARRAY_POSITION(array_col, x) IS NOT NULL
+                if matches!(compare_op, BinaryOperator::Eq)
+                    && (matches!(right_expr.data_type, DataType::Array(_))
+                        || matches!(&right_expr.data_type, DataType::UserDefined(s) if s == "int2vector"))
+                {
+                    let array_pos =
+                        self.make_function_call("ARRAY_POSITION", vec![right_expr, left_expr])?;
+                    return Ok(TypedExpr::new(
+                        TypedExprKind::IsTest {
+                            expr: Box::new(array_pos),
+                            test: IsTestKind::Null,
+                            negated: true, // IS NOT NULL
+                        },
+                        DataType::Boolean,
+                    ));
+                }
+
+                // Infer array type for unresolved parameters in = ANY() context.
+                // Prisma schema engine sends `WHERE col = ANY($1)` with OID=0;
+                // PostgreSQL infers $1 as array(col_type) from context.
                 if matches!(compare_op, BinaryOperator::Eq) {
-                    if matches!(right_expr.data_type, DataType::Array(_))
-                        || matches!(&right_expr.data_type, DataType::UserDefined(s) if s == "int2vector")
-                    {
-                        let array_pos =
-                            self.make_function_call("ARRAY_POSITION", vec![right_expr, left_expr])?;
-                        return Ok(TypedExpr::new(
-                            TypedExprKind::IsTest {
-                                expr: Box::new(array_pos),
-                                test: IsTestKind::Null,
-                                negated: true, // IS NOT NULL
-                            },
-                            DataType::Boolean,
-                        ));
+                    if let TypedExprKind::Parameter { index } = &right_expr.kind {
+                        if self.is_unresolved_param(&right_expr) {
+                            let array_type = DataType::Array(Box::new(left_expr.data_type.clone()));
+                            self.resolve_param_type(*index, &array_type)?;
+                            let right_fixed = TypedExpr::new(
+                                TypedExprKind::Parameter { index: *index },
+                                array_type,
+                            );
+                            let array_pos = self.make_function_call(
+                                "ARRAY_POSITION",
+                                vec![right_fixed, left_expr],
+                            )?;
+                            return Ok(TypedExpr::new(
+                                TypedExprKind::IsTest {
+                                    expr: Box::new(array_pos),
+                                    test: IsTestKind::Null,
+                                    negated: true,
+                                },
+                                DataType::Boolean,
+                            ));
+                        }
                     }
                 }
 
                 Err(AnalyzerError::Unsupported(format!(
-                    "ANY with non-array operand or non-equality operator: {:?}",
-                    compare_op,
+                    "ANY: right operand type {:?}, compare_op {:?}",
+                    right_expr.data_type, compare_op,
                 )))
             }
 
@@ -834,6 +954,32 @@ impl<'a> Analyzer<'a> {
                         resolved,
                     },
                     result_type,
+                ))
+            }
+
+            // -- IS [NOT] DISTINCT FROM --
+            Expr::IsDistinctFrom(left, right) => {
+                let l = self.analyze_expr(left)?;
+                let r = self.analyze_expr(right)?;
+                Ok(TypedExpr::new(
+                    TypedExprKind::IsDistinctFrom {
+                        left: Box::new(l),
+                        right: Box::new(r),
+                        negated: false,
+                    },
+                    DataType::Boolean,
+                ))
+            }
+            Expr::IsNotDistinctFrom(left, right) => {
+                let l = self.analyze_expr(left)?;
+                let r = self.analyze_expr(right)?;
+                Ok(TypedExpr::new(
+                    TypedExprKind::IsDistinctFrom {
+                        left: Box::new(l),
+                        right: Box::new(r),
+                        negated: true,
+                    },
+                    DataType::Boolean,
                 ))
             }
 

@@ -1,8 +1,8 @@
 use super::*;
+use crate::model::{Row, Value};
 use crate::sql::analyzer::catalog::MockCatalog;
 use crate::sql::analyzer::{Analyzer, Catalog};
 use crate::sql::error::SqlError;
-use crate::types::{Row, Value};
 use async_trait::async_trait;
 use bytes::Buf;
 use bytes::Bytes;
@@ -175,7 +175,7 @@ fn encode_value_to_string(value: &Value, col_type: Option<&DataType>) -> String 
     )];
     let fields = Arc::new(fields);
     let mut encoder = DataRowEncoder::new(fields);
-    let tz = crate::types::timestamp::TimeZoneSpec::parse("UTC");
+    let tz = crate::model::timestamp::TimeZoneSpec::parse("UTC");
     encode_value(&mut encoder, value, col_type, tz, FieldFormat::Text).unwrap();
     let row = encoder.finish().unwrap();
 
@@ -1142,7 +1142,7 @@ fn test_infer_wildcard_multiway_natural_join_dedups_columns() {
             test_column("c1", DataType::Text),
         ],
     );
-    let sources = vec![
+    let sources = [
         SourceSchema {
             _alias: "a".to_string(),
             schema: schema_a,
@@ -1197,7 +1197,7 @@ fn test_infer_wildcard_multiway_using_join_dedups_columns() {
             test_column("c1", DataType::Text),
         ],
     );
-    let sources = vec![
+    let sources = [
         SourceSchema {
             _alias: "a".to_string(),
             schema: schema_a,
@@ -1232,7 +1232,7 @@ fn test_infer_wildcard_natural_join_common_cols_is_case_sensitive() {
 
     let schema_a = test_schema("a", vec![test_column("Foo", DataType::Int32)]);
     let schema_b = test_schema("b", vec![test_column("foo", DataType::Int32)]);
-    let sources = vec![
+    let sources = [
         SourceSchema {
             _alias: "a".to_string(),
             schema: schema_a,
@@ -2375,7 +2375,7 @@ fn test_encode_value_date_binary_uses_unix_epoch_days() {
         FieldFormat::Binary,
     )]);
     let mut encoder = DataRowEncoder::new(fields);
-    let tz = crate::types::timestamp::TimeZoneSpec::parse("UTC");
+    let tz = crate::model::timestamp::TimeZoneSpec::parse("UTC");
     encode_value(
         &mut encoder,
         &Value::Date(0),
@@ -2402,8 +2402,8 @@ fn test_encode_value_interval_binary_preserves_days_and_remainder() {
         FieldFormat::Binary,
     )]);
     let mut encoder = DataRowEncoder::new(fields);
-    let tz = crate::types::timestamp::TimeZoneSpec::parse("UTC");
-    let iv = crate::types::IntervalValue::new(2, 2 * 86_400_000 + 3 * 3_600_000 + 123);
+    let tz = crate::model::timestamp::TimeZoneSpec::parse("UTC");
+    let iv = crate::model::IntervalValue::new(2, 2 * 86_400_000 + 3 * 3_600_000 + 123);
     encode_value(
         &mut encoder,
         &Value::Interval(iv),
@@ -2773,7 +2773,7 @@ fn test_encode_jsonb_text_canonical() {
 
 #[test]
 fn test_encode_jsonb_binary_canonical() {
-    use crate::types::DataType;
+    use crate::model::DataType;
     use pgwire::api::results::FieldInfo;
     let fields = Arc::new(vec![FieldInfo::new(
         "j".to_string(),
@@ -2783,7 +2783,7 @@ fn test_encode_jsonb_binary_canonical() {
         FieldFormat::Binary,
     )]);
     let mut encoder = DataRowEncoder::new(fields);
-    let tz = crate::types::timestamp::TimeZoneSpec::parse("UTC");
+    let tz = crate::model::timestamp::TimeZoneSpec::parse("UTC");
     encode_value(
         &mut encoder,
         &Value::Jsonb(r#"{"b":1,"a":2}"#.to_string()),

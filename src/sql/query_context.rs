@@ -10,8 +10,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use crate::model::Value;
 use crate::sql::advisory_locks::AdvisoryLockMode;
-use crate::types::Value;
 
 tokio::task_local! {
     static CONNECTION_ID: i32;
@@ -19,7 +19,7 @@ tokio::task_local! {
     static CURRENT_USER_NAME: Arc<str>;
     static CURRENT_TIMEZONE: Arc<str>;
     static QUERY_PARAMS: Vec<Option<Value>>;
-    static QUERY_PARAM_TYPES: Vec<Option<crate::types::DataType>>;
+    static QUERY_PARAM_TYPES: Vec<Option<crate::model::DataType>>;
     static SETTINGS_SNAPSHOT: Arc<HashMap<String, String>>;
     static XACT_ADVISORY_LOCK_USED: Arc<AtomicBool>;
     static XACT_ADVISORY_SAVEPOINT_TRACKER: Arc<StdMutex<XactAdvisorySavepointTracker>>;
@@ -129,7 +129,7 @@ pub struct QueryContext {
     /// Finalized parameter types from Parse-time analysis.
     /// Threaded to execute-time Analyzer so re-analysis uses the same type hints.
     /// Empty vec for simple-query path or when no types were finalized.
-    pub param_types: Vec<Option<crate::types::DataType>>,
+    pub param_types: Vec<Option<crate::model::DataType>>,
     /// Snapshot of all session settings at statement start.
     /// Used by `current_setting()` in expression contexts.
     pub settings_snapshot: Option<Arc<HashMap<String, String>>>,
@@ -187,7 +187,7 @@ impl QueryContext {
         QUERY_PARAMS.try_with(|p| p.clone()).unwrap_or_default()
     }
 
-    pub(crate) fn current_query_param_types() -> Vec<Option<crate::types::DataType>> {
+    pub(crate) fn current_query_param_types() -> Vec<Option<crate::model::DataType>> {
         QUERY_PARAM_TYPES
             .try_with(|t| t.clone())
             .unwrap_or_default()

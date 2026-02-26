@@ -4,7 +4,7 @@
 //! dispatching on `StoredStatement.parameter_types` (wire `Type`) for
 //! correct binary decode width (e.g. INT2 = 2 bytes, FLOAT4 = 4 bytes).
 
-use crate::types::Value;
+use crate::model::Value;
 use pgwire::api::portal::Portal;
 use pgwire::api::results::FieldFormat;
 use pgwire::api::Type;
@@ -177,7 +177,7 @@ fn decode_binary(bytes: &[u8], pg_type: &Type, index: usize) -> PgWireResult<Val
             let total_ms = us / 1000
                 + (days as i64) * 24 * 60 * 60 * 1000
                 + (months as i64) * 30 * 24 * 60 * 60 * 1000;
-            Ok(Value::Interval(crate::types::IntervalValue::from_millis(
+            Ok(Value::Interval(crate::model::IntervalValue::from_millis(
                 total_ms,
             )))
         }
@@ -283,15 +283,15 @@ fn decode_text_value(
             crate::sql::expr::parse_timestamp_string(trimmed)
                 .map_err(|_| err(format!("\"{}\"", trimmed)))
         }
-        t if *t == Type::DATE => crate::types::date::parse_date_days(trimmed)
+        t if *t == Type::DATE => crate::model::date::parse_date_days(trimmed)
             .map(Value::Date)
             .map_err(|_| err(format!("\"{}\"", trimmed))),
         t if *t == Type::UUID => uuid::Uuid::parse_str(trimmed)
             .map(|u| Value::Uuid(*u.as_bytes()))
             .map_err(|e| err(e.to_string())),
         t if *t == Type::BYTEA => {
-            if trimmed.starts_with("\\x") {
-                hex::decode(&trimmed[2..])
+            if let Some(hex_str) = trimmed.strip_prefix("\\x") {
+                hex::decode(hex_str)
                     .map(Value::Bytes)
                     .map_err(|e| err(e.to_string()))
             } else {
@@ -321,8 +321,20 @@ fn decode_text_value(
         t if *t == Type::INT4_ARRAY
             || *t == Type::INT8_ARRAY
             || *t == Type::TEXT_ARRAY
+            || *t == Type::VARCHAR_ARRAY
+            || *t == Type::NAME_ARRAY
             || *t == Type::FLOAT8_ARRAY
-            || *t == Type::BOOL_ARRAY =>
+            || *t == Type::BOOL_ARRAY
+            || *t == Type::TIMESTAMP_ARRAY
+            || *t == Type::TIMESTAMPTZ_ARRAY
+            || *t == Type::DATE_ARRAY
+            || *t == Type::INTERVAL_ARRAY
+            || *t == Type::UUID_ARRAY
+            || *t == Type::BYTEA_ARRAY
+            || *t == Type::JSON_ARRAY
+            || *t == Type::JSONB_ARRAY
+            || *t == Type::TIME_ARRAY
+            || *t == Type::NUMERIC_ARRAY =>
         {
             crate::sql::value_coercion::parse_pg_array(trimmed)
                 .map(Value::Array)
@@ -347,5 +359,29 @@ mod tests {
     fn decode_text_numeric_still_accepts_surrounding_whitespace() {
         let v = decode_text(b"  42  ", &Type::INT4, 0).unwrap();
         assert_eq!(v, Value::Int32(42));
+    }
+
+    #[test]
+    fn decode_text_varchar_array_decodes_as_array() {
+        let v = decode_text(b"{alice,bob}", &Type::VARCHAR_ARRAY, 0).unwrap();
+        assert_eq!(
+            v,
+            Value::Array(vec![
+                Value::Text("alice".to_string()),
+                Value::Text("bob".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn decode_text_name_array_decodes_as_array() {
+        let v = decode_text(b"{public,tenant}", &Type::NAME_ARRAY, 0).unwrap();
+        assert_eq!(
+            v,
+            Value::Array(vec![
+                Value::Text("public".to_string()),
+                Value::Text("tenant".to_string()),
+            ])
+        );
     }
 }

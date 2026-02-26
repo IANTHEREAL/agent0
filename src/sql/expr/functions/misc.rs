@@ -1,4 +1,4 @@
-use crate::types::Value;
+use crate::model::Value;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
@@ -32,9 +32,7 @@ pub fn nullif(args: Vec<Value>) -> Result<Value> {
 pub fn greatest(args: Vec<Value>) -> Result<Value> {
     let mut max = Value::Null;
     for val in args {
-        if matches!(max, Value::Null) {
-            max = val;
-        } else if crate::sql::expr::compare_values(&val, &max)? > 0 {
+        if matches!(max, Value::Null) || crate::sql::expr::compare_values(&val, &max)? > 0 {
             max = val;
         }
     }
@@ -44,9 +42,7 @@ pub fn greatest(args: Vec<Value>) -> Result<Value> {
 pub fn least(args: Vec<Value>) -> Result<Value> {
     let mut min = Value::Null;
     for val in args {
-        if matches!(min, Value::Null) {
-            min = val;
-        } else if crate::sql::expr::compare_values(&val, &min)? < 0 {
+        if matches!(min, Value::Null) || crate::sql::expr::compare_values(&val, &min)? < 0 {
             min = val;
         }
     }

@@ -61,10 +61,7 @@ fn is_eligible_inner(analyzed: &AnalyzedQuery, inherited_cte_names: &HashSet<Str
     // Reject window functions in DISTINCT ON — PostgreSQL does not allow
     // window functions outside SELECT list and ORDER BY.
     if let AnalyzedDistinct::DistinctOn(on_exprs) = &select.distinct {
-        if on_exprs
-            .iter()
-            .any(|e| super::window_rewrite::contains_window(e))
-        {
+        if on_exprs.iter().any(super::window_rewrite::contains_window) {
             return false;
         }
     }
@@ -72,16 +69,15 @@ fn is_eligible_inner(analyzed: &AnalyzedQuery, inherited_cte_names: &HashSet<Str
     // Reject aggregate queries whose ORDER BY / HAVING / DISTINCT ON cannot be rewritten
     // to post-aggregate column positions.  This is a compile-time feasibility
     // check so that optimize() never needs a runtime fallback path.
-    if !select.group_by.is_empty()
+    if (!select.group_by.is_empty()
         || select
             .projection
             .iter()
             .any(|p| expr_has_aggregate(&p.expr))
-        || select.having.is_some()
+        || select.having.is_some())
+        && !can_rewrite_post_aggregate(select, analyzed)
     {
-        if !can_rewrite_post_aggregate(select, analyzed) {
-            return false;
-        }
+        return false;
     }
 
     true
@@ -141,11 +137,11 @@ fn can_rewrite_post_aggregate(select: &AnalyzedSelect, query: &AnalyzedQuery) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::DataType;
     use crate::sql::analyzer::types::{
         AnalyzedCte, AnalyzedProjection, AnalyzedTableRef, AnalyzedTableRefKind, FunctionKind,
         IsTestKind, JsonAccessOp, ResolvedFunction, TableRefSchema, TypedExpr, TypedExprKind,
     };
-    use crate::types::DataType;
 
     // ── helpers ─────────────────────────────────────────────
 
@@ -179,14 +175,14 @@ mod tests {
 
     fn const_int() -> TypedExpr {
         TypedExpr {
-            kind: TypedExprKind::Constant(crate::types::Value::Int64(1)),
+            kind: TypedExprKind::Constant(crate::model::Value::Int64(1)),
             data_type: DataType::Int64,
         }
     }
 
     fn const_text() -> TypedExpr {
         TypedExpr {
-            kind: TypedExprKind::Constant(crate::types::Value::Text("a".to_string())),
+            kind: TypedExprKind::Constant(crate::model::Value::Text("a".to_string())),
             data_type: DataType::Text,
         }
     }

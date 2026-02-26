@@ -197,7 +197,7 @@ fn parse_fixed_offset(s: &str) -> Option<FixedOffset> {
         }
     };
 
-    if hours < 0 || mins < 0 || mins >= 60 {
+    if hours < 0 || mins < 0 || !(0..60).contains(&mins) {
         return None;
     }
 

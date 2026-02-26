@@ -1,13 +1,13 @@
 //! Unit tests for the build module.
 
 use super::*;
+use crate::model::{ColumnDef, DataType, Value};
 use crate::sql::analyzer::types::{
     AnalyzedProjection, BinaryOp as TypedBinaryOp, JoinCondition, SetOpKind, TypedExpr,
     TypedExprKind, TypedOrderByExpr,
 };
 use crate::sql::optimizer::logical_plan::PlanSchema;
 use crate::sql::optimizer::physical_plan::{PhysicalCost, PhysicalNode, PhysicalPlan};
-use crate::types::{ColumnDef, DataType, Value};
 
 fn test_table_schema() -> TableSchema {
     TableSchema::new(

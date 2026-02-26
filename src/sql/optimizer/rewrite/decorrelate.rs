@@ -10,11 +10,11 @@
 
 use super::super::logical_plan::{LogicalNode, LogicalPlan, PlanSchema};
 use super::{conjuncts_to_predicate, split_conjunction, LogicalRewriteRule};
+use crate::model::DataType;
 use crate::sql::analyzer::types::{
     AnalyzedDistinct, AnalyzedQuery, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRefKind,
     BinaryOp, JoinCondition, JoinType, TypedExpr, TypedExprKind,
 };
-use crate::types::DataType;
 
 // ── Rewrite rule ────────────────────────────────────────────────
 
@@ -308,6 +308,7 @@ fn expr_has_volatile_or_catalog_deep(expr: &TypedExpr) -> bool {
         }
         TypedExprKind::Exists { subquery, .. }
         | TypedExprKind::InSubquery { subquery, .. }
+        | TypedExprKind::TupleInSubquery { subquery, .. }
         | TypedExprKind::AnyAll { subquery, .. } => query_has_volatile_or_catalog(subquery),
         _ => false,
     })
@@ -377,10 +378,9 @@ fn query_has_volatile_or_catalog(query: &AnalyzedQuery) -> bool {
 
     match &query.body {
         AnalyzedQueryBody::Select(select) => subquery_tree_has_volatile_or_catalog(select),
-        AnalyzedQueryBody::Values(rows) => rows
-            .iter()
-            .flatten()
-            .any(|e| expr_has_volatile_or_catalog_deep(e)),
+        AnalyzedQueryBody::Values(rows) => {
+            rows.iter().flatten().any(expr_has_volatile_or_catalog_deep)
+        }
         AnalyzedQueryBody::SetOperation { left, right, .. } => {
             query_has_volatile_or_catalog(left) || query_has_volatile_or_catalog(right)
         }
@@ -443,6 +443,7 @@ fn expr_has_outer_refs_beyond(expr: &TypedExpr, min_depth: u32) -> bool {
         }
         TypedExprKind::Exists { subquery, .. }
         | TypedExprKind::InSubquery { subquery, .. }
+        | TypedExprKind::TupleInSubquery { subquery, .. }
         | TypedExprKind::AnyAll { subquery, .. } => {
             query_has_outer_refs_beyond(subquery, min_depth + 1)
         }

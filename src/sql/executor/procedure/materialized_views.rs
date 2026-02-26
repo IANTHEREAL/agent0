@@ -10,7 +10,7 @@ use super::super::super::value_coercion::infer_data_type;
 use super::super::super::{parse_sql, ExecuteResult, Session};
 use super::super::core::Executor;
 use super::{is_unquoted_keyword, parse_object_name, tokenize_non_whitespace};
-use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{ObjectName, Statement};
 use sqlparser::tokenizer::Token;

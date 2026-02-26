@@ -15,7 +15,7 @@
 //! This difference matches PostgreSQL semantics (see `select_common_type` vs
 //! `select_common_typmod` in the PostgreSQL source).
 
-use crate::types::DataType;
+use crate::model::DataType;
 
 pub fn type_precedence(dt: &DataType) -> i32 {
     match dt {

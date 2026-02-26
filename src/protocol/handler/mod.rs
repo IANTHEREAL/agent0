@@ -1,5 +1,5 @@
+use crate::model::DataType;
 use crate::sql::{ExecuteResult, Session};
-use crate::types::DataType;
 use futures::{Sink, SinkExt};
 use pgwire::api::portal::Format;
 use pgwire::api::results::Response;
@@ -17,7 +17,7 @@ use std::sync::atomic::AtomicI32;
 
 // These imports are used by tests (via `use super::*`) and by dynamic.rs.
 #[allow(unused_imports)]
-use crate::types::{ColumnDef, TableSchema};
+use crate::model::{ColumnDef, TableSchema};
 #[allow(unused_imports)]
 use sqlparser::ast::{
     FunctionArg, FunctionArgExpr, Ident, ObjectName, Query, Select, SelectItem, SetExpr, Statement,
@@ -78,7 +78,7 @@ fn normalize_copy_ident(token: &str) -> String {
 }
 
 fn resolve_copy_columns(
-    schema: &crate::types::TableSchema,
+    schema: &crate::model::TableSchema,
     columns: &[String],
     relation_name: &str,
 ) -> PgWireResult<(Vec<String>, Vec<Option<DataType>>)> {

@@ -14,6 +14,7 @@ pub(crate) use settings::SessionSettings;
 use crate::config::SharedServerConfig;
 use crate::observability::TenantObservability;
 use crate::sql::error::SqlError;
+use crate::sql::executor::core::plan_cache::PreparedPlanCache;
 use crate::sql::executor::core::prepared_stmt::PreparedStatement as SqlPreparedStatement;
 use crate::sql::query_context::{QueryContext, XactAdvisorySavepointTracker};
 use crate::storage::TikvStore;
@@ -37,6 +38,10 @@ pub struct Session {
     pub(crate) store: Arc<TikvStore>,
     pub(crate) observability: Arc<TenantObservability>,
     pub(crate) state: TransactionState,
+    #[cfg(test)]
+    test_force_in_transaction: bool,
+    #[cfg(test)]
+    test_force_failed_transaction: bool,
     pub(crate) savepoints: Arc<SavepointState>,
     last_sequence_values: HashMap<String, i64>,
     settings: SessionSettings,
@@ -62,13 +67,15 @@ pub struct Session {
     /// Pending parameter values from extended-query Bind for the next Execute.
     /// Set by the protocol handler before calling `execute()`, consumed by
     /// `query_context_for_statement()` so they flow into `QUERY_PARAMS`.
-    pending_params: Vec<Option<crate::types::Value>>,
+    pending_params: Vec<Option<crate::model::Value>>,
     /// Pending parameter types from Parse-time analysis for the next Execute.
     /// Set by the protocol handler, consumed by `query_context_for_statement()`
     /// so they flow into `QUERY_PARAM_TYPES`.
-    pending_param_types: Vec<Option<crate::types::DataType>>,
+    pending_param_types: Vec<Option<crate::model::DataType>>,
     /// SQL PREPARE/EXECUTE statement cache (session-scoped, PostgreSQL semantics).
     sql_prepared_statements: HashMap<String, SqlPreparedStatement>,
+    /// Session-local plan cache for prepared statements (bounded LRU).
+    plan_cache: PreparedPlanCache,
     /// True when current transaction used xact-scoped advisory lock functions.
     pub(crate) has_xact_advisory_locks: Arc<AtomicBool>,
     /// Savepoint-scoped tracker for xact advisory lock acquisitions.
@@ -99,16 +106,25 @@ impl Session {
         default_statement_timeout_ms: u64,
         default_idle_in_txn_timeout_ms: u64,
     ) -> Self {
+        let settings = SessionSettings::new_with_defaults(
+            default_statement_timeout_ms,
+            default_idle_in_txn_timeout_ms,
+        );
+        let plan_cache = PreparedPlanCache::new(
+            settings.prepared_plan_cache_size(),
+            settings.prepared_plan_cache_min_exec(),
+        );
         Self {
             store,
             observability,
             state: TransactionState::Idle,
+            #[cfg(test)]
+            test_force_in_transaction: false,
+            #[cfg(test)]
+            test_force_failed_transaction: false,
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: HashMap::new(),
-            settings: SessionSettings::new_with_defaults(
-                default_statement_timeout_ms,
-                default_idle_in_txn_timeout_ms,
-            ),
+            settings,
             session_user: None,
             session_user_is_superuser: false,
             current_user: None,
@@ -122,6 +138,7 @@ impl Session {
             pending_params: vec![],
             pending_param_types: vec![],
             sql_prepared_statements: HashMap::new(),
+            plan_cache,
             has_xact_advisory_locks: Arc::new(AtomicBool::new(false)),
             xact_advisory_savepoint_tracker: Arc::new(StdMutex::new(
                 XactAdvisorySavepointTracker::default(),
@@ -141,20 +158,29 @@ impl Session {
         default_statement_timeout_ms: u64,
         default_idle_in_txn_timeout_ms: u64,
     ) -> Self {
+        let settings = SessionSettings::new_with_defaults(
+            default_statement_timeout_ms,
+            default_idle_in_txn_timeout_ms,
+        );
+        let plan_cache = PreparedPlanCache::new(
+            settings.prepared_plan_cache_size(),
+            settings.prepared_plan_cache_min_exec(),
+        );
         Self {
             store,
             observability,
             state: TransactionState::Idle,
+            #[cfg(test)]
+            test_force_in_transaction: false,
+            #[cfg(test)]
+            test_force_failed_transaction: false,
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: HashMap::new(),
-            settings: SessionSettings::new_with_defaults(
-                default_statement_timeout_ms,
-                default_idle_in_txn_timeout_ms,
-            ),
+            settings,
             session_user: Some(username.clone()),
             session_user_is_superuser: is_superuser,
             current_user: Some(username),
-            is_superuser: is_superuser,
+            is_superuser,
             current_database_id: database_id,
             current_database_name: Arc::from(database_name),
             connection_id,
@@ -164,6 +190,7 @@ impl Session {
             pending_params: vec![],
             pending_param_types: vec![],
             sql_prepared_statements: HashMap::new(),
+            plan_cache,
             has_xact_advisory_locks: Arc::new(AtomicBool::new(false)),
             xact_advisory_savepoint_tracker: Arc::new(StdMutex::new(
                 XactAdvisorySavepointTracker::default(),
@@ -250,14 +277,14 @@ impl Session {
     /// Set parameter values for the next statement execution.
     /// Called by the protocol handler after decoding Bind parameters.
     /// Consumed (drained) by `query_context_for_statement()`.
-    pub fn set_pending_params(&mut self, params: Vec<Option<crate::types::Value>>) {
+    pub fn set_pending_params(&mut self, params: Vec<Option<crate::model::Value>>) {
         self.pending_params = params;
     }
 
     /// Set parameter types for the next statement execution.
     /// Called by the protocol handler to thread Parse-time types to Execute-time Analyzer.
     /// Consumed (drained) by `query_context_for_statement()`.
-    pub fn set_pending_param_types(&mut self, types: Vec<Option<crate::types::DataType>>) {
+    pub fn set_pending_param_types(&mut self, types: Vec<Option<crate::model::DataType>>) {
         self.pending_param_types = types;
     }
 
@@ -280,8 +307,34 @@ impl Session {
         self.sql_prepared_statements.clear();
     }
 
+    pub(crate) fn plan_cache(&mut self) -> &mut PreparedPlanCache {
+        &mut self.plan_cache
+    }
+
+    /// Invalidate all cached plans that depend on the given table_id.
+    /// Called after DDL that changes a table's schema.
+    #[allow(dead_code)]
+    pub(crate) fn invalidate_plan_cache_for_table(&mut self, table_id: u64) {
+        self.plan_cache.invalidate_by_table_id(table_id);
+    }
+
+    /// Clear the entire plan cache. Called on transaction rollback.
+    pub(crate) fn clear_plan_cache(&mut self) {
+        self.plan_cache.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_test_transaction_state(&mut self, in_transaction: bool, failed: bool) {
+        self.test_force_in_transaction = in_transaction;
+        self.test_force_failed_transaction = in_transaction && failed;
+    }
+
     /// Check if currently in a transaction block
     pub fn is_in_transaction(&self) -> bool {
+        #[cfg(test)]
+        if self.test_force_in_transaction {
+            return true;
+        }
         matches!(
             self.state,
             TransactionState::Active(_) | TransactionState::Failed(_)
@@ -289,10 +342,19 @@ impl Session {
     }
 
     pub fn is_transaction_failed(&self) -> bool {
+        #[cfg(test)]
+        if self.test_force_failed_transaction {
+            return true;
+        }
         matches!(self.state, TransactionState::Failed(_))
     }
 
     pub(crate) fn mark_transaction_failed(&mut self) {
+        #[cfg(test)]
+        if self.test_force_in_transaction {
+            self.test_force_failed_transaction = true;
+            return;
+        }
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(txn) => self.state = TransactionState::Failed(txn),
             other => self.state = other,
@@ -300,6 +362,11 @@ impl Session {
     }
 
     pub(crate) fn clear_failed_transaction(&mut self) {
+        #[cfg(test)]
+        if self.test_force_in_transaction {
+            self.test_force_failed_transaction = false;
+            return;
+        }
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Failed(txn) => self.state = TransactionState::Active(txn),
             other => self.state = other,
@@ -390,11 +457,15 @@ impl Session {
     }
 
     pub(crate) fn set_known_setting(&mut self, name: &str, value: String) -> Result<bool> {
-        self.settings.set_known_setting(name, value)
+        let changed = self.settings.set_known_setting(name, value)?;
+        self.sync_plan_cache_settings();
+        Ok(changed)
     }
 
     pub(crate) fn set_local_setting(&mut self, name: &str, value: String) -> Result<bool> {
-        self.settings.set_local_override(name, value)
+        let changed = self.settings.set_local_override(name, value)?;
+        self.sync_plan_cache_settings();
+        Ok(changed)
     }
 
     pub(crate) fn set_local_search_path(&mut self, search_path: Vec<String>) {
@@ -403,14 +474,17 @@ impl Session {
 
     pub(crate) fn clear_local_overrides(&mut self) {
         self.settings.clear_local_overrides();
+        self.sync_plan_cache_settings();
     }
 
     pub(crate) fn reset_setting(&mut self, name: &str) {
         self.settings.reset_setting(name);
+        self.sync_plan_cache_settings();
     }
 
     pub(crate) fn reset_all_settings(&mut self) {
         self.settings.reset_all_settings();
+        self.sync_plan_cache_settings();
     }
 
     /// Snapshot all session settings into a flat map for `current_setting()` in
@@ -483,5 +557,12 @@ impl Session {
 
     pub(crate) fn max_sort_bytes(&self) -> usize {
         self.settings.max_sort_bytes()
+    }
+
+    fn sync_plan_cache_settings(&mut self) {
+        self.plan_cache.reconfigure(
+            self.settings.prepared_plan_cache_size(),
+            self.settings.prepared_plan_cache_min_exec(),
+        );
     }
 }

@@ -55,8 +55,8 @@ pub(crate) fn extract_constant_usize(
     expr: &crate::sql::analyzer::types::TypedExpr,
 ) -> Option<usize> {
     match &expr.kind {
-        TypedExprKind::Constant(crate::types::Value::Int32(v)) => Some(*v as usize),
-        TypedExprKind::Constant(crate::types::Value::Int64(v)) => Some(*v as usize),
+        TypedExprKind::Constant(crate::model::Value::Int32(v)) => Some(*v as usize),
+        TypedExprKind::Constant(crate::model::Value::Int64(v)) => Some(*v as usize),
         _ => None,
     }
 }
@@ -122,6 +122,14 @@ fn collect_expr_subquery_table_refs<'a>(
             ..
         } => {
             collect_expr_subquery_table_refs(inner, refs);
+            collect_body_refs(&subquery.body, refs);
+        }
+        TypedExprKind::TupleInSubquery {
+            exprs, subquery, ..
+        } => {
+            for inner in exprs {
+                collect_expr_subquery_table_refs(inner, refs);
+            }
             collect_body_refs(&subquery.body, refs);
         }
         TypedExprKind::ScalarSubquery(q) | TypedExprKind::ArraySubquery(q) => {

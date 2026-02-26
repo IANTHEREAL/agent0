@@ -94,7 +94,7 @@ SELECT datname FROM pg_database;
 #### 1.1 DatabaseDef 结构
 
 ```rust
-// src/types/mod.rs
+// src/model/mod.rs
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseDef {
@@ -364,7 +364,7 @@ pub fn encode_table_index_range_v2(db_id: u64, table_id: u64) -> (Vec<u8>, Vec<u
 #### 3.1 DatabaseDef 结构更新
 
 ```rust
-// src/types/mod.rs
+// src/model/mod.rs
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseDef {

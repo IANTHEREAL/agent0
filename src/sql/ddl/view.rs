@@ -9,13 +9,13 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tikv_client::Transaction;
 
+use crate::model::{DataType, Row, TableSchema};
 use crate::sql::analyzer::{Analyzer, CatalogSnapshot};
 use crate::sql::dml;
 use crate::sql::error::SqlError;
 use crate::sql::names;
 use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
-use crate::types::{DataType, Row, TableSchema};
 
 use super::create_table::check_relation_name_available;
 use super::{

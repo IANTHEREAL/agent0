@@ -31,10 +31,10 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
+use crate::model::{ColumnDef, Row, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::expr::classify::needs_async;
 use crate::sql::expr::typed_eval::eval_typed_expr;
-use crate::types::{ColumnDef, Row, TableSchema, Value};
 
 async fn eval_join_filter(
     filter: Option<&TypedExpr>,
@@ -300,11 +300,11 @@ impl PhysicalOperator for HashJoinOperator {
             let total_len = build_col_count + probe_col_count;
             let mut values = Vec::with_capacity(total_len);
             if left_is_build {
-                values.extend(std::iter::repeat(Value::Null).take(build_col_count));
+                values.extend(std::iter::repeat_n(Value::Null, build_col_count));
                 values.extend(probe_row.values.iter().cloned());
             } else {
                 values.extend(probe_row.values.iter().cloned());
-                values.extend(std::iter::repeat(Value::Null).take(build_col_count));
+                values.extend(std::iter::repeat_n(Value::Null, build_col_count));
             }
             Row::new(values)
         };
@@ -314,9 +314,9 @@ impl PhysicalOperator for HashJoinOperator {
             let mut values = Vec::with_capacity(total_len);
             if left_is_build {
                 values.extend(build_row.values.iter().cloned());
-                values.extend(std::iter::repeat(Value::Null).take(probe_col_count));
+                values.extend(std::iter::repeat_n(Value::Null, probe_col_count));
             } else {
-                values.extend(std::iter::repeat(Value::Null).take(probe_col_count));
+                values.extend(std::iter::repeat_n(Value::Null, probe_col_count));
                 values.extend(build_row.values.iter().cloned());
             }
             Row::new(values)

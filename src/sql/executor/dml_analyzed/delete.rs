@@ -6,14 +6,15 @@ use super::super::super::triggers::queue::TriggerOp;
 use super::super::super::ExecuteResult;
 use super::super::core::Executor;
 use super::{
-    build_returning_columns_from_analyzed, build_returning_types_from_analyzed, combine_rows,
-    cross_product_rows, eval_returning_typed, typed_value_to_bool,
+    append_ctid_to_rows, build_returning_columns_from_analyzed,
+    build_returning_types_from_analyzed, combine_rows, cross_product_rows, eval_returning_typed,
+    typed_value_to_bool,
 };
+use crate::model::{Row, TableSchema};
 use crate::sql::analyzer::types::AnalyzedDelete;
 use crate::sql::dml::pk_to_hash_key;
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
-use crate::types::{Row, TableSchema};
 use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
 use tikv_client::Transaction;
@@ -44,7 +45,8 @@ impl Executor {
         let qctx = QueryContext::from_task_locals();
         let folded_where = del.where_clause.as_ref().map(|e| fold_typed_expr(e, &qctx));
         let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
-        let rows = self.scan_and_fill(txn, db_id, t, &schema).await?;
+        let mut rows = self.scan_and_fill(txn, db_id, t, &schema).await?;
+        append_ctid_to_rows(&mut rows);
         let mut cnt = 0;
         let mut ret_rows = Vec::new();
         let ret_cols = build_returning_columns_from_analyzed(&del.returning, &schema);
@@ -107,12 +109,10 @@ impl Executor {
                         .await?;
                     typed_value_to_bool(val)?
                 }
+            } else if let Some(ref using_rows) = using_combined_rows {
+                !using_rows.is_empty()
             } else {
-                if let Some(ref using_rows) = using_combined_rows {
-                    !using_rows.is_empty()
-                } else {
-                    true
-                }
+                true
             };
 
             if should_delete {
@@ -180,7 +180,7 @@ impl Executor {
         // Bump mod_count for auto-ANALYZE tracking.
         if cnt > 0 {
             self.stats_cache()
-                .bump_mod_count(db_id, schema.table_id, cnt as u64);
+                .bump_mod_count(db_id, schema.table_id, cnt);
             self.maybe_enqueue_auto_analyze(db_id, schema.table_id, t);
         }
 

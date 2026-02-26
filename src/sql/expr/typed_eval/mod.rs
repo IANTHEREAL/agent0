@@ -17,12 +17,12 @@ mod helpers;
 #[cfg(test)]
 mod tests;
 
+use crate::model::{Row, Value};
 use crate::sql::analyzer::types::*;
 use crate::sql::expr::operators::compare_values;
 use crate::sql::expr::typed_fold::is_fold_candidate;
 use crate::sql::query_context::QueryContext;
 use crate::sql::types::cast;
-use crate::types::{Row, Value};
 use anyhow::{anyhow, Result};
 
 use arithmetic::{eval_binary, eval_unary};
@@ -174,6 +174,28 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
                 IsTestKind::Unknown => val == Value::Null,
             };
             Ok(Value::Boolean(if *negated { !result } else { result }))
+        }
+
+        TypedExprKind::IsDistinctFrom {
+            left,
+            right,
+            negated,
+        } => {
+            let l = eval_typed_expr(left, row, qctx)?;
+            let r = eval_typed_expr(right, row, qctx)?;
+            // IS NOT DISTINCT FROM: NULL=NULL→true, one-NULL→false, else a=b
+            let not_distinct = match (&l, &r) {
+                (Value::Null, Value::Null) => true,
+                (Value::Null, _) | (_, Value::Null) => false,
+                _ => compare_values(&l, &r)? == 0,
+            };
+            // negated=true means IS NOT DISTINCT FROM (returns not_distinct)
+            // negated=false means IS DISTINCT FROM (returns !not_distinct)
+            Ok(Value::Boolean(if *negated {
+                not_distinct
+            } else {
+                !not_distinct
+            }))
         }
 
         TypedExprKind::Between {
@@ -436,6 +458,7 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
         | TypedExprKind::ArraySubquery(_)
         | TypedExprKind::Exists { .. }
         | TypedExprKind::InSubquery { .. }
+        | TypedExprKind::TupleInSubquery { .. }
         | TypedExprKind::AnyAll { .. } => Err(anyhow!(
             "subquery expressions must be resolved at executor level"
         )),

@@ -2,11 +2,11 @@
 
 use anyhow::{anyhow, Result};
 
+use crate::model::DataType;
 use crate::sql::analyzer::types::{JoinCondition, JoinType, TypedExpr, TypedExprKind};
 use crate::sql::expr::classify::has_correlated_ref;
 use crate::sql::operators::JoinType as OpJoinType;
 use crate::sql::optimizer::physical_plan::{PhysicalNode, PhysicalPlan};
-use crate::types::DataType;
 
 /// Convert analyzer JoinType to operator JoinType.
 pub(super) fn convert_join_type(jt: &JoinType) -> OpJoinType {

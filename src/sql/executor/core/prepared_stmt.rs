@@ -4,8 +4,8 @@
 //! even though they are used by the protocol handler.
 
 use crate::auth::Privilege;
+use crate::model::DataType;
 use crate::sql::analyzer::types::{AnalyzedOnConflict, AnalyzedQuery, AnalyzedStatement};
-use crate::types::DataType;
 use sqlparser::ast::LockClause;
 
 /// Execution plan variant for a prepared statement.
@@ -44,9 +44,13 @@ pub struct PreparedStatement {
     pub output_schema: Vec<(String, DataType)>,
     /// Finalized parameter types from Parse-time analysis.
     pub param_data_types: Vec<DataType>,
-    /// Parse-time base-table schema versions used for drift detection.
-    /// `(table_full_name, schema_version)`.
-    pub table_versions: Vec<(String, u64)>,
+    /// Parse-time base-table schema dependencies for drift detection.
+    /// `(table_full_name, table_id, schema_version)`.
+    ///
+    /// `table_id` enables correct invalidation across DROP+CREATE of the
+    /// same table name. `schema_version` detects DDL mutations (including
+    /// CREATE/DROP INDEX).
+    pub table_versions: Vec<(String, u64, u64)>,
 }
 
 impl PreparedStatement {

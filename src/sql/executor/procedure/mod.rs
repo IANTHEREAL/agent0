@@ -86,9 +86,7 @@ pub(super) fn parse_call_arguments(args_str: &str) -> Result<Vec<String>> {
                 current_arg.push('(');
             }
             Token::RParen => {
-                if depth > 0 {
-                    depth -= 1;
-                }
+                depth = depth.saturating_sub(1);
                 current_arg.push(')');
             }
             Token::LBracket => {
@@ -96,9 +94,7 @@ pub(super) fn parse_call_arguments(args_str: &str) -> Result<Vec<String>> {
                 current_arg.push('[');
             }
             Token::RBracket => {
-                if depth > 0 {
-                    depth -= 1;
-                }
+                depth = depth.saturating_sub(1);
                 current_arg.push(']');
             }
             Token::LBrace => {
@@ -106,9 +102,7 @@ pub(super) fn parse_call_arguments(args_str: &str) -> Result<Vec<String>> {
                 current_arg.push('{');
             }
             Token::RBrace => {
-                if depth > 0 {
-                    depth -= 1;
-                }
+                depth = depth.saturating_sub(1);
                 current_arg.push('}');
             }
             Token::Whitespace(ws) => {
@@ -190,9 +184,8 @@ pub(super) fn substitute_parameters_in_statement(
                         || dt_lower.contains("numeric")
                         || dt_lower.contains("decimal")
                         || dt_lower.contains("double")
+                        || (value.starts_with('\'') && value.ends_with('\''))
                     {
-                        value.clone()
-                    } else if value.starts_with('\'') && value.ends_with('\'') {
                         value.clone()
                     } else {
                         format!("'{}'", value)

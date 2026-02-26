@@ -10,10 +10,10 @@ use anyhow::anyhow;
 use anyhow::Result;
 use tikv_client::Transaction;
 
+use crate::model::{DataType, ForeignKeyConstraint, Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::expr::compare_values;
 use crate::storage::TikvStore;
-use crate::types::{DataType, ForeignKeyConstraint, Row, TableSchema, Value};
 use crate::worker::types::IndexState;
 
 // ── Re-exports from submodules ──────────────────────────────────────────────
@@ -346,7 +346,7 @@ pub async fn validate_foreign_keys(
                 && fk_values
                     .iter()
                     .zip(&self_ref_vals)
-                    .all(|(a, b)| compare_values(a, b).map_or(false, |c| c == 0))
+                    .all(|(a, b)| compare_values(a, b).is_ok_and(|c| c == 0))
             {
                 continue;
             }

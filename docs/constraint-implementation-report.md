@@ -261,7 +261,7 @@ SELECT * FROM orders ORDER BY id;
 ### 5.1 新增类型
 
 ```rust
-// src/types/mod.rs
+// src/model/mod.rs
 
 pub struct ForeignKeyConstraint {
     pub name: String,
@@ -294,7 +294,7 @@ pub enum ForeignKeyAction {
 
 | 文件 | 修改内容 |
 |------|----------|
-| `src/types/mod.rs` | 新增 ForeignKeyConstraint, ForeignKeyAction 类型 |
+| `src/model/mod.rs` | 新增 ForeignKeyConstraint, ForeignKeyAction 类型 |
 | `src/sql/helpers.rs` | 添加 DoublePrecision 类型映射 |
 | `src/sql/ddl.rs` | CHECK、UNIQUE、FK 约束解析 |
 | `src/sql/dml.rs` | FK 验证和级联操作实现 |
@@ -404,4 +404,4 @@ Lines modified: ~50
 主要变更集中在：
 - `src/sql/dml.rs`: +200 行（FK 验证和级联操作）
 - `src/sql/ddl.rs`: +80 行（约束解析）
-- `src/types/mod.rs`: +30 行（新类型定义）
+- `src/model/mod.rs`: +30 行（新类型定义）

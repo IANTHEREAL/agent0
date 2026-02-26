@@ -10,13 +10,13 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::{AlterColumnOperation, AlterTableOperation, TableConstraint};
 use tikv_client::Transaction;
 
+use crate::model::{DataType, Value};
 use crate::sql::error::SqlError;
 use crate::sql::names;
 use crate::sql::names::normalize_ident;
 use crate::sql::projection::fill_row_defaults;
 use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
-use crate::types::{DataType, Value};
 
 use super::{
     assign_generated_check_constraint_names, check_expr_references_column, constraint_name_exists,
@@ -74,8 +74,21 @@ pub async fn execute_alter_table(
     let collations = store.list_collations(txn, db_id).await?;
 
     match operation {
-        AlterTableOperation::AddColumn { column_def, .. } => {
-            alter_table_add_column(store, txn, db_id, search_path, &mut schema, column_def).await?;
+        AlterTableOperation::AddColumn {
+            column_def,
+            if_not_exists,
+            ..
+        } => {
+            alter_table_add_column(
+                store,
+                txn,
+                db_id,
+                search_path,
+                &mut schema,
+                column_def,
+                *if_not_exists,
+            )
+            .await?;
             invalidate_stats = true;
         }
         AlterTableOperation::AddConstraint(constraint) => match constraint {

@@ -83,8 +83,8 @@ impl TikvStore {
         }
         // Update the def's name field to match the new name.
         def.name = new_full
-            .splitn(2, '.')
-            .nth(1)
+            .split_once('.')
+            .map(|(_, rest)| rest)
             .unwrap_or(new_full)
             .to_string();
         let data = bincode::serialize(&def).context("Failed to serialize type definition")?;

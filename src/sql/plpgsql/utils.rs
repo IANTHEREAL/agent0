@@ -1,7 +1,7 @@
 //! PL/pgSQL utility functions: RAISE formatting, variable substitution, type keyword checking,
 //! identifier replacement, and exit signal management.
 
-use crate::types::{DataType, Value};
+use crate::model::{DataType, Value};
 
 use super::PlpgsqlContext;
 use crate::sql::quoting;

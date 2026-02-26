@@ -7,6 +7,7 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::{Expr, OrderByExpr};
 use tikv_client::Transaction;
 
+use crate::model::{DataType, IndexDef, Row, TableSchema};
 use crate::sql::error::SqlError;
 use crate::sql::gin::{extract_gin_token_hashes_from_row, supported_gin_index_column};
 use crate::sql::index_consistency::{
@@ -19,7 +20,6 @@ use crate::sql::projection::fill_row_defaults;
 use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
 use crate::txn::txn_delete;
-use crate::types::{DataType, IndexDef, Row, TableSchema};
 use crate::worker::types::{IndexState, TaskQueueEntry, TaskType, TASK_TYPE_BG_DDL};
 
 use super::create_table::check_relation_name_available;
@@ -55,7 +55,7 @@ pub async fn execute_create_index(
     // Schema-wide namespace uniqueness check (tables, views, matviews,
     // sequences, indexes, PK constraints). Also reserves the name via a
     // transactional KV key for concurrency safety.
-    let owning_schema = tbl_name.splitn(2, '.').next().unwrap_or("public");
+    let owning_schema = tbl_name.split('.').next().unwrap_or("public");
     if !check_relation_name_available(
         store,
         txn,
@@ -176,6 +176,8 @@ pub async fn execute_create_index(
 
     if concurrently {
         schema.indexes.push(new_index);
+        // Bump schema version so plan-cache drift detection catches index changes.
+        schema.version += 1;
         store.update_schema(txn, db_id, schema.clone()).await?;
 
         if let Some(system_store) = crate::worker::get_system_store() {
@@ -293,63 +295,34 @@ pub async fn execute_create_index(
                     }
                 }
             }
-        } else if supported_gin_index_column(&schema, &new_index).is_some() {
-            if !rows.is_empty() {
-                if schema.pk_indices.is_empty() {
-                    let pk_types: Vec<DataType> = vec![DataType::Uuid];
-                    let (start, end) =
-                        crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
-                    let data_key_prefix = start.clone();
-                    let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
-                    while let Some(batch) = scanner.next_batch(txn).await? {
-                        for pair in batch {
-                            let key: &[u8] = pair.key().as_ref().into();
-                            let pk_bytes = key
-                                .strip_prefix(data_key_prefix.as_slice())
+        } else if supported_gin_index_column(&schema, &new_index).is_some() && !rows.is_empty() {
+            if schema.pk_indices.is_empty() {
+                let pk_types: Vec<DataType> = vec![DataType::Uuid];
+                let (start, end) =
+                    crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+                let data_key_prefix = start.clone();
+                let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
+                while let Some(batch) = scanner.next_batch(txn).await? {
+                    for pair in batch {
+                        let key: &[u8] = pair.key().as_ref().into();
+                        let pk_bytes =
+                            key.strip_prefix(data_key_prefix.as_slice())
                                 .ok_or_else(|| {
                                     anyhow!(
                                         "corrupted row key while backfilling index '{}'",
                                         idx_name_str
                                     )
                                 })?;
-                            let pk_values =
-                                crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
+                        let pk_values =
+                            crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
 
-                            let mut row = crate::storage::deserialize_row(pair.value())?;
-                            fill_row_defaults(&mut row, &schema)?;
+                        let mut row = crate::storage::deserialize_row(pair.value())?;
+                        fill_row_defaults(&mut row, &schema)?;
 
-                            let hashes =
-                                extract_gin_token_hashes_from_row(&schema, &new_index, &row)?;
-                            if hashes.is_empty() {
-                                continue;
-                            }
-                            store
-                                .create_gin_index_entries(
-                                    txn,
-                                    db_id,
-                                    schema.table_id,
-                                    index_id,
-                                    &hashes,
-                                    &pk_values,
-                                )
-                                .await?;
-                            current_batch_writes += 1;
-                            maybe_rotate_backfill_txn(
-                                store,
-                                txn,
-                                &mut current_batch_writes,
-                                &mut has_committed_batches,
-                            )
-                            .await?;
-                        }
-                    }
-                } else {
-                    for row in rows {
                         let hashes = extract_gin_token_hashes_from_row(&schema, &new_index, &row)?;
                         if hashes.is_empty() {
                             continue;
                         }
-                        let pk_values = schema.get_pk_values(&row);
                         store
                             .create_gin_index_entries(
                                 txn,
@@ -370,10 +343,38 @@ pub async fn execute_create_index(
                         .await?;
                     }
                 }
+            } else {
+                for row in rows {
+                    let hashes = extract_gin_token_hashes_from_row(&schema, &new_index, &row)?;
+                    if hashes.is_empty() {
+                        continue;
+                    }
+                    let pk_values = schema.get_pk_values(&row);
+                    store
+                        .create_gin_index_entries(
+                            txn,
+                            db_id,
+                            schema.table_id,
+                            index_id,
+                            &hashes,
+                            &pk_values,
+                        )
+                        .await?;
+                    current_batch_writes += 1;
+                    maybe_rotate_backfill_txn(
+                        store,
+                        txn,
+                        &mut current_batch_writes,
+                        &mut has_committed_batches,
+                    )
+                    .await?;
+                }
             }
         }
 
         schema.indexes.push(new_index.clone());
+        // Bump schema version so plan-cache drift detection catches index changes.
+        schema.version += 1;
         store.update_schema(txn, db_id, schema.clone()).await?;
         Ok(())
     }

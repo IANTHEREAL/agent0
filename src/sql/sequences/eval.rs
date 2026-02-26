@@ -1,8 +1,8 @@
 //! `eval_expr_with_sequences` -- entry point for evaluating expressions that may
 //! contain sequence functions or user-defined functions.
 
+use crate::model::{Row, TableSchema};
 use crate::storage::TikvStore;
-use crate::types::{Row, TableSchema};
 use anyhow::Result;
 use sqlparser::ast::Expr;
 use std::collections::HashMap;
@@ -20,7 +20,7 @@ pub(crate) async fn eval_expr_with_sequences(
     expr: &Expr,
     row: Option<&Row>,
     schema: Option<&TableSchema>,
-) -> Result<crate::types::Value> {
+) -> Result<crate::model::Value> {
     if !expr_needs_async_eval(expr) {
         return eval_seq_expr(expr, row, schema);
     }

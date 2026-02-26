@@ -72,6 +72,7 @@ fn outer_has_subquery_exprs(select: &AnalyzedSelect, order_by: &[TypedOrderByExp
                 | TypedExprKind::ArraySubquery(_)
                 | TypedExprKind::Exists { .. }
                 | TypedExprKind::InSubquery { .. }
+                | TypedExprKind::TupleInSubquery { .. }
                 | TypedExprKind::AnyAll { .. }
         )
     };

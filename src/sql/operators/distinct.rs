@@ -3,11 +3,11 @@ use std::collections::HashSet;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
+use super::key_encoding::encode_values_key;
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
+use crate::model::{Row, TableSchema};
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::expr::typed_eval::eval_typed_expr;
-use crate::sql::value_key::serialize_values_for_key;
-use crate::types::{Row, TableSchema};
 
 #[derive(Debug)]
 pub struct DistinctOperator {
@@ -25,8 +25,8 @@ impl DistinctOperator {
         }
     }
 
-    fn row_to_key(row: &Row) -> Result<Vec<u8>> {
-        serialize_values_for_key(&row.values)
+    fn row_to_key(row: &Row) -> Vec<u8> {
+        encode_values_key(&row.values)
     }
 }
 
@@ -49,7 +49,7 @@ impl PhysicalOperator for DistinctOperator {
         }
 
         while let Some(row) = self.child.next(ctx).await? {
-            let key = Self::row_to_key(&row)?;
+            let key = Self::row_to_key(&row);
             if self.seen.insert(key) {
                 return Ok(Some(row));
             }
@@ -109,7 +109,7 @@ impl DistinctOnOperator {
         for expr in &self.on_exprs {
             key_values.push(eval_typed_expr(expr, row, query_ctx)?);
         }
-        serialize_values_for_key(&key_values)
+        Ok(encode_values_key(&key_values))
     }
 }
 
@@ -169,9 +169,9 @@ impl PhysicalOperator for DistinctOnOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ColumnDef, DataType, Value};
     use crate::sql::analyzer::types::TypedExprKind;
     use crate::sql::operators::scan::TableScanOperator;
-    use crate::types::{ColumnDef, DataType, Value};
 
     fn test_schema() -> TableSchema {
         TableSchema {
@@ -249,8 +249,8 @@ mod tests {
         let row1 = Row::new(vec![Value::Numeric(d1)]);
         let row2 = Row::new(vec![Value::Numeric(d2)]);
         assert_eq!(
-            DistinctOperator::row_to_key(&row1).unwrap(),
-            DistinctOperator::row_to_key(&row2).unwrap()
+            DistinctOperator::row_to_key(&row1),
+            DistinctOperator::row_to_key(&row2)
         );
     }
 }

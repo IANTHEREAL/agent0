@@ -2,7 +2,7 @@ use anyhow::Result;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 use tokio::sync::mpsc;
 
-use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
 
 fn make_column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
     ColumnDef {

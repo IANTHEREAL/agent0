@@ -1,8 +1,8 @@
 //! Collation-aware comparison utilities
 
+use crate::model::Value;
 use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
 use crate::sql::collation::{compare_with_resolved_collation, ResolvedCollation};
-use crate::types::Value;
 use anyhow::Result;
 
 /// Extract collation name from a typed expression, if any (legacy — for display/debug).

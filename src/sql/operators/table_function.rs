@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use super::{ExecutionContext, PhysicalOperator};
-use crate::types::{Row, TableSchema};
+use crate::model::{Row, TableSchema};
 
 pub struct TableFunctionScanOperator {
     schema: TableSchema,
@@ -85,7 +85,7 @@ impl PhysicalOperator for TableFunctionScanOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ColumnDef, DataType, Value};
+    use crate::model::{ColumnDef, DataType, Value};
 
     fn test_schema() -> TableSchema {
         TableSchema {

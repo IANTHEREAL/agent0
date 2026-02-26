@@ -5,13 +5,14 @@ use super::{
     starts_with_ignore_ascii_case, try_parse_const_bool, try_parse_const_text,
     unwrap_top_level_cast,
 };
-use crate::types::Value;
+use crate::model::Value;
 use sqlparser::ast::{
     DataType, DateTimeField, Expr, Ident, Interval, ObjectName, Value as SqlValue,
 };
 
 #[test]
 fn test_execute_statement_on_txn_signature_stays_boxed() {
+    #[allow(clippy::type_complexity)]
     let _execute_statement_on_txn: for<'a> fn(
         &'a super::Executor,
         &'a mut tikv_client::Transaction,
@@ -293,7 +294,7 @@ fn test_unwrap_top_level_cast() {
 fn test_cast_current_setting_value_integer() {
     let v = cast_current_setting_value(
         Value::Text("160000".to_string()),
-        &crate::types::DataType::Int32,
+        &crate::model::DataType::Int32,
     )
     .unwrap();
     assert_eq!(v, Value::Int32(160000));

@@ -78,6 +78,7 @@ src/sql/
 │   │   ├── hash_table.rs      # In-memory hash table
 │   │   └── tests.rs
 │   ├── hash_semi_join.rs      # HashSemiJoin: semi/anti-join for EXISTS decorrelation
+│   ├── key_encoding.rs        # In-memory value key encoding (GROUP BY, DISTINCT, etc.)
 │   ├── aggregate.rs           # HashAggregate: GROUP BY with incremental aggregation
 │   ├── sort.rs                # Sort: ORDER BY (full materialization)
 │   ├── distinct.rs            # Distinct: UNION/DISTINCT deduplication
@@ -368,8 +369,7 @@ src/sql/
 ├── table_functions.rs         # Table function runtime
 ├── timezone.rs                # Timezone handling
 ├── udt.rs                     # User-defined type helpers
-├── value_coercion.rs          # Value-level type coercion
-└── value_key.rs               # Value key encoding helpers
+└── value_coercion.rs          # Value-level type coercion
 ```
 
 ## Where to Look

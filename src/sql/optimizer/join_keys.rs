@@ -121,7 +121,7 @@ fn combine_and_terms(mut terms: Vec<TypedExpr>) -> Option<TypedExpr> {
             op: BinaryOp::And,
             right: Box::new(next),
         },
-        data_type: crate::types::DataType::Boolean,
+        data_type: crate::model::DataType::Boolean,
     }))
 }
 
@@ -202,8 +202,8 @@ fn peel_column_ref(expr: &TypedExpr) -> Option<(u32, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::DataType;
     use crate::sql::analyzer::types::{ResolvedUsingColumn, TypedExpr, TypedExprKind};
-    use crate::types::DataType;
 
     fn col_ref(idx: usize) -> TypedExpr {
         TypedExpr {

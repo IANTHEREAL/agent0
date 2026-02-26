@@ -4,10 +4,10 @@
 //! statistics collected by ANALYZE. Only called when stats are available;
 //! the physical planner falls back to legacy heuristics when no stats exist.
 
+use crate::model::Value;
 use crate::sql::analyzer::types::{BinaryOp, IsTestKind, TypedExpr, TypedExprKind, UnaryOp};
 use crate::sql::expr::compare_values;
 use crate::sql::optimizer::statistics::{ColumnStatistics, TableStatistics};
-use crate::types::Value;
 use std::cmp::Ordering;
 
 // ── PostgreSQL default selectivities ─────────────────────────
@@ -208,17 +208,13 @@ fn range_selectivity_for_op(col_stats: &ColumnStatistics, value: &Value, op: &Bi
         BinaryOp::Lt => range_selectivity(col_stats, value, true),
         BinaryOp::LtEq => {
             // sel(col <= x) = sel(col < x) + sel(col = x)
-            let lt_sel = range_selectivity(col_stats, value, true);
             // We don't have row_count here but eq_sel is small relative to range
             // Approximate: for <= we use the same histogram fraction since equi-depth
             // buckets treat boundary as inclusive
-            lt_sel // Approximate: histogram mid-bucket already covers <=
+            range_selectivity(col_stats, value, true)
         }
         BinaryOp::Gt => range_selectivity(col_stats, value, false),
-        BinaryOp::GtEq => {
-            let gt_sel = range_selectivity(col_stats, value, false);
-            gt_sel
-        }
+        BinaryOp::GtEq => range_selectivity(col_stats, value, false),
         _ => DEFAULT_INEQ_SEL,
     }
 }

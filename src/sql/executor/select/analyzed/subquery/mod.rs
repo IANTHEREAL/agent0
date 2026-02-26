@@ -4,13 +4,13 @@
 //! outer-reference substitution (`substitute_outer_refs_in_query`,
 //! `substitute_outer_refs_in_expr`).
 
+use crate::model::{Row, Value};
 use crate::sql::analyzer::types::{
     AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind, JoinCondition,
     TypedExpr, TypedExprKind, TypedFunctionArg, TypedOrderByExpr,
 };
 use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::expr::traverse::{map_children, visit_any};
-use crate::types::{Row, Value};
 
 /// Check if an AnalyzedQuery references outer scope columns (correlated).
 ///
@@ -47,6 +47,7 @@ fn has_outer_ref_beyond(expr: &TypedExpr, min_depth: u32) -> bool {
         }
         TypedExprKind::Exists { subquery, .. }
         | TypedExprKind::InSubquery { subquery, .. }
+        | TypedExprKind::TupleInSubquery { subquery, .. }
         | TypedExprKind::AnyAll { subquery, .. } => {
             query_has_outer_ref_beyond(subquery, min_depth + 1)
         }
@@ -167,7 +168,7 @@ pub(super) fn substitute_outer_refs_in_query(
             left,
             right,
         } => AnalyzedQueryBody::SetOperation {
-            op: op.clone(),
+            op: *op,
             all: *all,
             left: Box::new(substitute_outer_refs_in_query(left, outer_row)),
             right: Box::new(substitute_outer_refs_in_query(right, outer_row)),
@@ -261,7 +262,7 @@ fn substitute_outer_refs_in_table_ref(
             condition,
             left_col_start,
         } => AnalyzedTableRefKind::Join {
-            join_type: join_type.clone(),
+            join_type: *join_type,
             left: Box::new(substitute_outer_refs_in_table_ref(left, outer_row)),
             right: Box::new(substitute_outer_refs_in_table_ref(right, outer_row)),
             condition: match condition {
@@ -366,6 +367,30 @@ pub(super) fn substitute_outer_refs_in_expr(expr: &TypedExpr, outer_row: &Row) -
             } else {
                 TypedExprKind::InSubquery {
                     expr: Box::new(inner_sub),
+                    subquery: subquery.clone(),
+                    negated: *negated,
+                }
+            }
+        }
+        TypedExprKind::TupleInSubquery {
+            exprs,
+            subquery,
+            negated,
+        } => {
+            let sub_exprs: Vec<TypedExpr> = exprs
+                .iter()
+                .map(|e| substitute_outer_refs_in_expr(e, outer_row))
+                .collect();
+            if is_correlated_query(subquery) {
+                let sub = substitute_outer_refs_in_query(subquery, outer_row);
+                TypedExprKind::TupleInSubquery {
+                    exprs: sub_exprs,
+                    subquery: Box::new(sub),
+                    negated: *negated,
+                }
+            } else {
+                TypedExprKind::TupleInSubquery {
+                    exprs: sub_exprs,
                     subquery: subquery.clone(),
                     negated: *negated,
                 }

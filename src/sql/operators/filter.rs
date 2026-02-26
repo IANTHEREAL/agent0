@@ -2,12 +2,12 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::expr::classify::needs_async;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 #[cfg(test)]
 use crate::sql::query_context::QueryContext;
-use crate::types::{Row, TableSchema, Value};
 
 #[derive(Debug)]
 pub struct FilterOperator {
@@ -121,8 +121,8 @@ impl PhysicalOperator for FilterOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ColumnDef, DataType};
     use crate::sql::analyzer::types::{BinaryOp, IsTestKind, TypedExprKind};
-    use crate::types::{ColumnDef, DataType};
 
     fn test_schema() -> TableSchema {
         TableSchema {

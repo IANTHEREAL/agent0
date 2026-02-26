@@ -1,4 +1,4 @@
-use crate::types::DataType;
+use crate::model::DataType;
 
 use super::*;
 

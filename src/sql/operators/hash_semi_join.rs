@@ -14,7 +14,7 @@ use super::hash_join::{
     hash_row_key_for_join, row_key_has_null_for_join, row_keys_equal_for_join, JoinHashTable,
 };
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::types::{ColumnDef, Row, TableSchema};
+use crate::model::{ColumnDef, Row, TableSchema};
 
 #[derive(Debug)]
 enum SemiJoinState {

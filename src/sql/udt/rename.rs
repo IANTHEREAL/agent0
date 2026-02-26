@@ -11,11 +11,11 @@ use sqlparser::parser::Parser;
 use tikv_client::Transaction;
 
 use super::helpers::{expr_has_unqualified_type_cast, query_has_unqualified_type_cast};
+use crate::model::{DataType, TableSchema, UserTypeKind};
 use crate::sql::names;
 use crate::sql::names::normalize_ident;
 use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
-use crate::types::{DataType, TableSchema, UserTypeKind};
 
 /// Fetch the enum type definition, returning an error if it doesn't exist or
 /// is not an enum.
@@ -24,7 +24,7 @@ pub(super) async fn get_enum_type(
     txn: &mut Transaction,
     db_id: u64,
     full_name: &str,
-) -> Result<crate::types::UserTypeDef> {
+) -> Result<crate::model::UserTypeDef> {
     let def = store
         .get_type(txn, db_id, full_name)
         .await?
@@ -160,7 +160,7 @@ pub async fn alter_type_rename(
         .await?
         .ok_or_else(|| anyhow!("type \"{}\" does not exist", old_full))?;
 
-    let schema_part = old_full.splitn(2, '.').next().unwrap_or("public");
+    let schema_part = old_full.split('.').next().unwrap_or("public");
     let new_full = format!("{}.{}", schema_part, new_name);
 
     // Check that nothing else (table or type) already owns the new name.

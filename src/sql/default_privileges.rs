@@ -135,7 +135,7 @@ pub async fn apply_default_privileges_revoke(
     grantees: &[String],
 ) -> Result<()> {
     let mut grants = get_default_table_privileges(txn, role, db_id, schema).await?;
-    let revoke_all = privileges.iter().any(|p| *p == Privilege::All);
+    let revoke_all = privileges.contains(&Privilege::All);
     if revoke_all {
         grants.retain(|g| !grantees.contains(&g.grantee));
     } else {

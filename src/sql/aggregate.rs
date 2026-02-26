@@ -7,11 +7,11 @@ use rust_decimal::Decimal;
 #[cfg(test)]
 use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr};
 
+use crate::model::{DataType, Value};
 use crate::sql::expr::compare_values;
 #[cfg(test)]
 use crate::sql::names::function_name_upper;
 use crate::sql::pg_numeric::pg_numeric_div;
-use crate::types::{DataType, Value};
 
 #[cfg(test)]
 #[derive(Debug, Clone)]
@@ -113,25 +113,17 @@ impl Aggregator {
                 }
             }
             Aggregator::Max(current) => {
-                if !matches!(val, Value::Null) {
-                    if matches!(current, Value::Null) {
-                        *current = val.clone();
-                    } else {
-                        if compare_values(val, current)? > 0 {
-                            *current = val.clone();
-                        }
-                    }
+                if !matches!(val, Value::Null)
+                    && (matches!(current, Value::Null) || compare_values(val, current)? > 0)
+                {
+                    *current = val.clone();
                 }
             }
             Aggregator::Min(current) => {
-                if !matches!(val, Value::Null) {
-                    if matches!(current, Value::Null) {
-                        *current = val.clone();
-                    } else {
-                        if compare_values(val, current)? < 0 {
-                            *current = val.clone();
-                        }
-                    }
+                if !matches!(val, Value::Null)
+                    && (matches!(current, Value::Null) || compare_values(val, current)? < 0)
+                {
+                    *current = val.clone();
                 }
             }
             Aggregator::Avg {

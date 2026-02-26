@@ -3,14 +3,14 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
+use super::key_encoding::{encode_value_key, encode_values_key};
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
+use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::{TypedExpr, TypedOrderByExpr};
 use crate::sql::expr::compare_order_by_values;
 use crate::sql::expr::operators::sort_by_fallible;
 use crate::sql::expr::typed_eval::eval_typed_expr;
-use crate::sql::value_key::{serialize_value_for_key, serialize_values_for_key};
 use crate::sql::Aggregator;
-use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
 #[derive(Debug, Clone)]
 pub struct AggregateExpr {
@@ -132,8 +132,7 @@ impl PhysicalOperator for HashAggregateOperator {
                 group_key_values.push(val);
             }
 
-            let key_bytes = serialize_values_for_key(&group_key_values)
-                .map_err(|e| anyhow!("Failed to serialize group key: {}", e))?;
+            let key_bytes = encode_values_key(&group_key_values);
 
             if !groups.contains_key(&key_bytes) {
                 let aggregators: Vec<Aggregator> = self
@@ -190,8 +189,7 @@ impl PhysicalOperator for HashAggregateOperator {
                 };
 
                 if agg_expr.distinct {
-                    let val_bytes = serialize_value_for_key(&val)
-                        .map_err(|e| anyhow!("Failed to serialize DISTINCT value: {}", e))?;
+                    let val_bytes = encode_value_key(&val);
                     if !state.seen_distinct[i].insert(val_bytes) {
                         continue;
                     }

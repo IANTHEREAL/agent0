@@ -338,7 +338,7 @@ impl TenantObservability {
         if every <= 1 {
             return true;
         }
-        fast_rand_u64() % every == 0
+        fast_rand_u64().is_multiple_of(every)
     }
 }
 
@@ -627,7 +627,7 @@ fn latency_us_to_bin(latency_us: u64) -> usize {
     if latency_us == 0 {
         return 0;
     }
-    let exp = (63 - latency_us.leading_zeros()) as u32;
+    let exp = 63 - latency_us.leading_zeros();
     let exp = exp.min(MAX_EXP);
     let base = 1u64 << exp;
     let offset = latency_us.saturating_sub(base);

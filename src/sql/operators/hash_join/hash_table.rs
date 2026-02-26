@@ -7,7 +7,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use crate::types::{Row, Value};
+use crate::model::{Row, Value};
 
 /// Compute a 64-bit hash for a slice of join-key values.
 ///

@@ -6,9 +6,9 @@
 
 use sqlparser::ast::{Select, SelectItem};
 
+use crate::model::{ColumnDef, DataType, TableSchema};
 use crate::sql::collation::ResolvedCollation;
 use crate::sql::expr::collation_aware::extract_resolved_collation;
-use crate::types::{ColumnDef, DataType, TableSchema};
 
 use super::super::error::AnalyzerError;
 use super::super::scope::Scope;
@@ -236,6 +236,7 @@ impl<'a> Analyzer<'a> {
         Ok(Some((col.column_name.clone(), expr, col.data_type.clone())))
     }
 
+    #[allow(clippy::type_complexity)]
     pub(in crate::sql::analyzer) fn analyze_projection(
         &mut self,
         items: &[SelectItem],

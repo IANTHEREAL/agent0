@@ -324,7 +324,7 @@ impl Executor {
             // Resolve the type name using search path.  The raw token from the
             // parser preserves any double-quotes so parse_object_name_token
             // builds the correct QuoteStyle for case-sensitive resolution.
-            let type_obj = parse_object_name_token(&cmd.type_name())?;
+            let type_obj = parse_object_name_token(cmd.type_name())?;
             let resolved = names::resolve_existing_type_name(
                 store.as_ref(),
                 txn,

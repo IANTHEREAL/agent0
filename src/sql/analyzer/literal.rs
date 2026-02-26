@@ -6,7 +6,7 @@
 
 use sqlparser::ast::{self as ast, Expr};
 
-use crate::types::{DataType, IntervalValue, Value};
+use crate::model::{DataType, IntervalValue, Value};
 
 use super::error::AnalyzerError;
 use super::Analyzer;

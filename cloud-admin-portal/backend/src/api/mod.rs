@@ -56,5 +56,14 @@ pub fn router() -> Router<AppState> {
         .route("/info", get(system::api_info))
         // Audit
         .route("/audit-logs", get(audit::query_audit_logs))
+        // Credential migration
+        .route(
+            "/admin/credential-migration-status",
+            get(system::credential_migration_status),
+        )
+        .route(
+            "/admin/migrate-credentials",
+            post(system::migrate_credentials),
+        )
         .nest("/customer", customer_router)
 }

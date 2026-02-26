@@ -225,7 +225,7 @@ fn merge_where(
                     op: crate::sql::analyzer::types::BinaryOp::And,
                     right: Box::new(outer),
                 },
-                crate::types::DataType::Boolean,
+                crate::model::DataType::Boolean,
             ))
         }
     }
@@ -239,6 +239,6 @@ fn wrap_is_true(expr: TypedExpr) -> TypedExpr {
             test: IsTestKind::True,
             negated: false,
         },
-        crate::types::DataType::Boolean,
+        crate::model::DataType::Boolean,
     )
 }

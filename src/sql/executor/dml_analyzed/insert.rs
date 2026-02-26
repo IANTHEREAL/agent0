@@ -10,12 +10,12 @@ use super::{
     build_returning_columns_from_analyzed, build_returning_types_from_analyzed, combine_rows,
     eval_returning_typed, is_default_typed_expr, typed_value_to_bool,
 };
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::analyzer::types::{AnalyzedInsert, AnalyzedInsertSource, AnalyzedOnConflict};
 use crate::sql::check_constraints;
 use crate::sql::dml::ConflictBehavior;
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
-use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tikv_client::Transaction;

@@ -1,11 +1,11 @@
 //! Table, view, and function resolution through the search path, plus view
 //! schema inference via the Analyzer.
 
+use crate::model::{ColumnDef, Row, TableSchema, ViewDef};
 use crate::sql::analyzer::{Analyzer, CatalogSnapshot};
 use crate::sql::names;
 use crate::sql::table_functions::infer_system_virtual_table_function_schema;
 use crate::storage::TikvStore;
-use crate::types::{ColumnDef, Row, TableSchema, ViewDef};
 use anyhow::Result;
 use sqlparser::ast::{ObjectName, Query};
 use std::collections::{HashMap, HashSet};
@@ -237,7 +237,7 @@ pub(super) async fn try_resolve_function_def(
     db_id: u64,
     search_path: &[String],
     name: &ObjectName,
-) -> Result<Option<(String, crate::types::FunctionDef)>> {
+) -> Result<Option<(String, crate::model::FunctionDef)>> {
     let resolved =
         match names::resolve_existing_function_name(store, txn, db_id, name, search_path).await {
             Ok(v) => v,
@@ -282,7 +282,7 @@ async fn infer_setof_table_schema(
 }
 
 fn infer_returns_table_schema(ret_lower: &str) -> Option<TableSchema> {
-    use crate::types::DataType;
+    use crate::model::DataType;
 
     let inner = ret_lower
         .strip_prefix("table")
@@ -291,7 +291,7 @@ fn infer_returns_table_schema(ret_lower: &str) -> Option<TableSchema> {
 
     let mut cols = Vec::new();
     for part in inner.split(',') {
-        let tokens: Vec<&str> = part.trim().split_whitespace().collect();
+        let tokens: Vec<&str> = part.split_whitespace().collect();
         if tokens.len() < 2 {
             return None;
         }

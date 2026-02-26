@@ -45,16 +45,36 @@ pub(in crate::sql::executor::core) fn validate_transaction_modes(
 }
 
 impl Executor {
+    /// Detect schema drift by checking `(table_id, schema_version)` pairs.
+    ///
+    /// Returns the first mismatch as `(table_name, expected_version, current_version)`.
+    /// Uses `table_id` for lookup when available (non-zero), falling back to
+    /// name-based lookup for backwards compatibility.
     pub(in crate::sql::executor::core) async fn first_schema_drift_on_txn(
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        table_versions: &[(String, u64)],
+        table_versions: &[(String, u64, u64)],
     ) -> Result<Option<(String, u64, Option<u64>)>> {
-        for (table_name, expected_version) in table_versions {
+        for (table_name, table_id, expected_version) in table_versions {
             let current_schema = self.store().get_schema(txn, db_id, table_name).await?;
-            let current_version = current_schema.map(|s| s.version);
-            if current_version != Some(*expected_version) {
+            let has_drift = match current_schema.as_ref() {
+                // Backward-compat fallback for historical dependencies that did
+                // not record `table_id` (0 sentinel). New dependencies always
+                // carry `(table_id, schema_version)`.
+                Some(schema) if *table_id == 0 => schema.version != *expected_version,
+                Some(schema) => schema.table_id != *table_id || schema.version != *expected_version,
+                None => true,
+            };
+
+            if has_drift {
+                let current_version = current_schema.and_then(|schema| {
+                    if *table_id == 0 || schema.table_id == *table_id {
+                        Some(schema.version)
+                    } else {
+                        None
+                    }
+                });
                 return Ok(Some((
                     table_name.clone(),
                     *expected_version,

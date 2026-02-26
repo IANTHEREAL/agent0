@@ -3,7 +3,7 @@
 //! The encoding preserves lexicographic sort order so that TiKV range scans
 //! return rows in the correct SQL ORDER BY sequence.
 
-use crate::types::{DataType, Value};
+use crate::model::{DataType, Value};
 use anyhow::{Context, Result};
 use memcomparable::Deserializer;
 use rust_decimal::Decimal;
@@ -190,7 +190,7 @@ pub fn decode_value_memcomparable(data: &[u8], data_type: &DataType) -> Result<(
             let months: i32 = serde::Deserialize::deserialize(&mut deserializer)?;
             let millis: i64 = serde::Deserialize::deserialize(&mut deserializer)?;
             (
-                Value::Interval(crate::types::IntervalValue::new(months, millis)),
+                Value::Interval(crate::model::IntervalValue::new(months, millis)),
                 deserializer.position(),
             )
         }

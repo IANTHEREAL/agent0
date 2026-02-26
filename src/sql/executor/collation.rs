@@ -150,7 +150,7 @@ fn parse_create_collation(sql: &str) -> Result<(CollationDef, bool)> {
         if !rest.starts_with('=') {
             return Err(anyhow!("Expected '=' after option name"));
         }
-        rest = &rest[1..].trim_start();
+        rest = rest[1..].trim_start();
 
         // Parse option value (string literal or identifier)
         let opt_value = if rest.starts_with('\'') {
@@ -268,7 +268,7 @@ impl Executor {
                 Err(e) => {
                     if if_not_exists
                         && e.downcast_ref::<SqlError>()
-                            .map_or(false, |se| matches!(se, SqlError::DuplicateObject(_)))
+                            .is_some_and(|se| matches!(se, SqlError::DuplicateObject(_)))
                     {
                         Ok(ExecuteResult::CommandComplete {
                             tag: "CREATE COLLATION",

@@ -115,7 +115,7 @@ fn test_schema_with_pk(table_name: &str, pk_name: Option<&str>) -> (String, Tabl
 
 #[test]
 fn test_legacy_scan_detects_index_conflict() {
-    let schemas = vec![test_schema_with_index("public.t1", "idx_shared")];
+    let schemas = [test_schema_with_index("public.t1", "idx_shared")];
     assert!(create_table::has_legacy_name_conflict(
         schemas.iter().map(|(n, s)| (n.as_str(), s)),
         "public",
@@ -126,7 +126,7 @@ fn test_legacy_scan_detects_index_conflict() {
 
 #[test]
 fn test_legacy_scan_detects_explicit_pk() {
-    let schemas = vec![test_schema_with_pk("public.t1", Some("my_pk"))];
+    let schemas = [test_schema_with_pk("public.t1", Some("my_pk"))];
     assert!(create_table::has_legacy_name_conflict(
         schemas.iter().map(|(n, s)| (n.as_str(), s)),
         "public",
@@ -138,7 +138,7 @@ fn test_legacy_scan_detects_explicit_pk() {
 #[test]
 fn test_legacy_scan_detects_default_pk() {
     // pk_constraint_name = None, pk_indices = [0] -> effective name = "t1_pkey"
-    let schemas = vec![test_schema_with_pk("public.t1", None)];
+    let schemas = [test_schema_with_pk("public.t1", None)];
     assert!(create_table::has_legacy_name_conflict(
         schemas.iter().map(|(n, s)| (n.as_str(), s)),
         "public",
@@ -149,7 +149,7 @@ fn test_legacy_scan_detects_default_pk() {
 
 #[test]
 fn test_legacy_scan_ignores_other_schema() {
-    let schemas = vec![test_schema_with_index("other.t1", "idx_shared")];
+    let schemas = [test_schema_with_index("other.t1", "idx_shared")];
     assert!(!create_table::has_legacy_name_conflict(
         schemas.iter().map(|(n, s)| (n.as_str(), s)),
         "public",
@@ -160,7 +160,7 @@ fn test_legacy_scan_ignores_other_schema() {
 
 #[test]
 fn test_legacy_scan_no_conflict() {
-    let schemas = vec![test_schema_with_index("public.t1", "idx_a")];
+    let schemas = [test_schema_with_index("public.t1", "idx_a")];
     assert!(!create_table::has_legacy_name_conflict(
         schemas.iter().map(|(n, s)| (n.as_str(), s)),
         "public",
@@ -171,7 +171,7 @@ fn test_legacy_scan_no_conflict() {
 
 #[test]
 fn test_legacy_scan_multi_table() {
-    let schemas = vec![
+    let schemas = [
         test_schema_with_index("public.t1", "idx_shared"),
         test_schema_with_index("public.t2", "idx_other"),
     ];
@@ -188,7 +188,7 @@ fn test_legacy_scan_excludes_owning_table() {
     // When exclude_table matches, the table's own PK should not trigger a conflict.
     // This is the CREATE TABLE scenario: the table was just created with its PK,
     // and the legacy scan must skip it to avoid a false self-conflict.
-    let schemas = vec![test_schema_with_pk("public.t1", Some("t1_pkey"))];
+    let schemas = [test_schema_with_pk("public.t1", Some("t1_pkey"))];
     assert!(!create_table::has_legacy_name_conflict(
         schemas.iter().map(|(n, s)| (n.as_str(), s)),
         "public",
@@ -200,7 +200,7 @@ fn test_legacy_scan_excludes_owning_table() {
 #[test]
 fn test_legacy_scan_exclude_does_not_suppress_other_table() {
     // Excluding t1 should NOT suppress a conflict found on t2.
-    let schemas = vec![
+    let schemas = [
         test_schema_with_index("public.t1", "idx_shared"),
         test_schema_with_index("public.t2", "idx_shared"),
     ];
@@ -232,7 +232,7 @@ fn set_data_type_stats_invalidation_matches_type_change() {
 
 #[test]
 fn coerce_jsonb_to_text_produces_canonical_output() {
-    let col = crate::types::ColumnDef {
+    let col = crate::model::ColumnDef {
         name: "data".to_string(),
         data_type: DataType::Text,
         nullable: true,
@@ -249,7 +249,7 @@ fn coerce_jsonb_to_text_produces_canonical_output() {
 
 #[test]
 fn coerce_json_to_text_preserves_raw_format() {
-    let col = crate::types::ColumnDef {
+    let col = crate::model::ColumnDef {
         name: "data".to_string(),
         data_type: DataType::Text,
         nullable: true,

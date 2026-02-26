@@ -18,7 +18,7 @@
 //!
 //! V1 bincode is frozen; three sub-eras are handled for read compat.
 
-use crate::types::{FunctionDef, Row, TableSchema};
+use crate::model::{FunctionDef, Row, TableSchema};
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
@@ -110,7 +110,7 @@ fn deserialize_v1_bincode(payload: &[u8]) -> Result<TableSchema> {
 #[cfg_attr(test, derive(serde::Serialize))]
 struct V1ColumnDef {
     pub name: String,
-    pub data_type: crate::types::DataType,
+    pub data_type: crate::model::DataType,
     pub nullable: bool,
     pub primary_key: bool,
     pub unique: bool,
@@ -118,9 +118,9 @@ struct V1ColumnDef {
     pub default_expr: Option<String>,
 }
 
-impl From<V1ColumnDef> for crate::types::ColumnDef {
+impl From<V1ColumnDef> for crate::model::ColumnDef {
     fn from(old: V1ColumnDef) -> Self {
-        crate::types::ColumnDef {
+        crate::model::ColumnDef {
             name: old.name,
             data_type: old.data_type,
             nullable: old.nullable,
@@ -155,9 +155,9 @@ struct V1Era2Schema {
     pub version: u64,
     pub pk_constraint_name: Option<String>,
     pub pk_indices: Vec<usize>,
-    pub indexes: Vec<crate::types::IndexDef>,
-    pub check_constraints: Vec<crate::types::CheckConstraint>,
-    pub foreign_keys: Vec<crate::types::ForeignKeyConstraint>,
+    pub indexes: Vec<crate::model::IndexDef>,
+    pub check_constraints: Vec<crate::model::CheckConstraint>,
+    pub foreign_keys: Vec<crate::model::ForeignKeyConstraint>,
     pub owner: String,
 }
 
@@ -190,14 +190,14 @@ struct V1Era1Schema {
     pub pk_constraint_name: Option<String>,
     pub pk_indices: Vec<usize>,
     pub indexes: Vec<V1IndexDef>,
-    pub check_constraints: Vec<crate::types::CheckConstraint>,
-    pub foreign_keys: Vec<crate::types::ForeignKeyConstraint>,
+    pub check_constraints: Vec<crate::model::CheckConstraint>,
+    pub foreign_keys: Vec<crate::model::ForeignKeyConstraint>,
     pub owner: String,
 }
 
 impl From<V1Era1Schema> for TableSchema {
     fn from(s: V1Era1Schema) -> Self {
-        use crate::types::IndexDef;
+        use crate::model::IndexDef;
         use crate::worker::types::IndexState;
 
         TableSchema {
@@ -257,7 +257,7 @@ pub fn deserialize_function_def(data: &[u8]) -> Result<FunctionDef> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ColumnDef, DataType, IndexDef};
+    use crate::model::{ColumnDef, DataType, IndexDef};
     use crate::worker::types::IndexState;
 
     fn sample_schema() -> TableSchema {

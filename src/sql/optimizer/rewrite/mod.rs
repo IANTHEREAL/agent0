@@ -13,11 +13,11 @@ use std::collections::HashSet;
 
 use super::join_keys;
 use super::logical_plan::{LogicalNode, LogicalPlan, PlanSchema};
+use crate::model::DataType;
 use crate::sql::analyzer::types::{
     reindex_typed_expr, BinaryOp, JoinCondition, JoinType, TypedExpr, TypedExprKind,
 };
 use crate::sql::expr::classify::{has_correlated_ref, has_unresolved_subquery, is_volatile};
-use crate::types::DataType;
 
 mod decorrelate;
 

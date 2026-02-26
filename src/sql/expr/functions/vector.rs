@@ -1,4 +1,4 @@
-use crate::types::Value;
+use crate::model::Value;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
@@ -91,7 +91,7 @@ fn cosine_distance(vec1: &[f64], vec2: &[f64]) -> Result<f64> {
     }
 
     let cosine_similarity = dot_product / (norm1.sqrt() * norm2.sqrt());
-    let cosine_similarity = cosine_similarity.max(-1.0).min(1.0);
+    let cosine_similarity = cosine_similarity.clamp(-1.0, 1.0);
 
     Ok(1.0 - cosine_similarity)
 }

@@ -1,5 +1,5 @@
+use crate::model::Value;
 use crate::storage::TikvStore;
-use crate::types::Value;
 use crate::worker::get_system_store;
 use crate::worker::types::{TaskQueueEntry, TaskType, TASK_TYPE_BG_SQL};
 use anyhow::{anyhow, Result};

@@ -34,6 +34,7 @@ mod filter;
 mod hash_join;
 mod hash_semi_join;
 mod join;
+pub(crate) mod key_encoding;
 mod limit;
 mod project;
 mod scan;
@@ -60,7 +61,7 @@ pub use sort::*;
 pub use table_function::*;
 pub use window::*;
 
-use crate::types::{Row, TableSchema};
+use crate::model::{Row, TableSchema};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::fmt::Debug;

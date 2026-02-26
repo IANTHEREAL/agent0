@@ -11,6 +11,11 @@ use db9_admin::config::Config;
 use db9_admin::session::SessionManager;
 use db9_admin::{api, db, AppState};
 
+fn test_credential_key() -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode([0xABu8; 32])
+}
+
 async fn setup() -> (Router, AppState) {
     let db_id = uuid::Uuid::new_v4().to_string();
     let url = format!("sqlite:///tmp/db9_test_{db_id}.db?mode=rwc");
@@ -32,7 +37,7 @@ async fn setup() -> (Router, AppState) {
         reconciler_sync_keyspaces: false,
         session_ttl_hours: 1,
         audit_retention_days: 90,
-        credential_key: None,
+        credential_key: Some(test_credential_key()),
         fs9_meta_url: None,
         fs9_meta_key: None,
         fs9_jwt_secret: None,

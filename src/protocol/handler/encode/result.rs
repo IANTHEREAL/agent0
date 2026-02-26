@@ -1,7 +1,7 @@
 use super::types::datatype_to_pgtype;
 use super::value::encode_value;
+use crate::model::DataType;
 use crate::sql::ExecuteResult;
-use crate::types::DataType;
 use futures::stream;
 use pgwire::api::portal::Format;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
@@ -62,7 +62,7 @@ pub(in crate::protocol::handler) fn result_to_response_with_format(
             rows,
             timezone,
         } => {
-            let tz = crate::types::timestamp::TimeZoneSpec::parse(timezone.as_ref());
+            let tz = crate::model::timestamp::TimeZoneSpec::parse(timezone.as_ref());
             let inferred_types: Vec<Type> = if let Some(types) = column_types.as_ref() {
                 types
                     .iter()
@@ -87,9 +87,7 @@ pub(in crate::protocol::handler) fn result_to_response_with_format(
                 .map(|(i, pg_type)| effective_result_format(pg_type, result_format.format_for(i)))
                 .collect();
 
-            let fixed_columns: Vec<String> = columns;
-
-            let fields: Vec<FieldInfo> = fixed_columns
+            let fields: Vec<FieldInfo> = columns
                 .iter()
                 .enumerate()
                 .map(|(i, name)| {
@@ -105,7 +103,7 @@ pub(in crate::protocol::handler) fn result_to_response_with_format(
                 types.clone()
             } else {
                 // INTENTIONAL: wire protocol encoding — Text OID is universally safe
-                crate::types::infer_column_types_from_rows(&rows, fixed_columns.len())
+                crate::model::infer_column_types_from_rows(&rows, columns.len())
             };
 
             let mut data_rows: Vec<PgWireResult<DataRow>> = Vec::new();

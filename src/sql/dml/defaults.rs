@@ -8,6 +8,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tikv_client::Transaction;
 
+use crate::model::{DataType, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::expr::compile::compile_const_expr;
 use crate::sql::expr::static_eval::{eval_static_typed_expr, needs_async_materialization};
@@ -16,7 +17,6 @@ use crate::sql::query_context::QueryContext;
 use crate::sql::sequences;
 use crate::sql::value_coercion::coerce_value_for_column;
 use crate::storage::TikvStore;
-use crate::types::{DataType, TableSchema, Value};
 
 async fn eval_default_expr_maybe_sequence(
     store: &Arc<TikvStore>,
@@ -70,7 +70,7 @@ async fn eval_column_default_or_null_inner(
     search_path: &[String],
     schema: &TableSchema,
     column_idx: usize,
-    sequence_defs: Option<&[crate::types::SequenceDef]>,
+    sequence_defs: Option<&[crate::model::SequenceDef]>,
 ) -> Result<Value> {
     let column = schema
         .columns
@@ -165,7 +165,7 @@ pub async fn fill_missing_columns(
     sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
     schema: &TableSchema,
-    row_vals: &mut Vec<Value>,
+    row_vals: &mut [Value],
     indices: &[usize],
 ) -> Result<()> {
     let sequence_defs = if schema
@@ -208,14 +208,14 @@ fn format_value_for_detail(v: &Value) -> String {
     }
 }
 
-pub fn coerce_row_values(schema: &TableSchema, row_vals: &mut Vec<Value>) -> Result<()> {
+pub fn coerce_row_values(schema: &TableSchema, row_vals: &mut [Value]) -> Result<()> {
     for (i, c) in schema.columns.iter().enumerate() {
         let coerced = coerce_value_for_column(row_vals[i].clone(), c)?;
         if coerced == Value::Null && !c.nullable {
             let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
             let row_str = row_vals
                 .iter()
-                .map(|v| format_value_for_detail(v))
+                .map(format_value_for_detail)
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(SqlError::NotNullViolation {
@@ -232,7 +232,7 @@ pub fn coerce_row_values(schema: &TableSchema, row_vals: &mut Vec<Value>) -> Res
     Ok(())
 }
 
-pub fn coerce_row_values_allow_null(schema: &TableSchema, row_vals: &mut Vec<Value>) -> Result<()> {
+pub fn coerce_row_values_allow_null(schema: &TableSchema, row_vals: &mut [Value]) -> Result<()> {
     for (i, c) in schema.columns.iter().enumerate() {
         row_vals[i] = coerce_value_for_column(row_vals[i].clone(), c)?;
     }

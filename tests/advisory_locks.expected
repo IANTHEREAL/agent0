@@ -109,3 +109,57 @@ pg_advisory_lock
 pg_advisory_unlock
 t
 (1 row)
+pg_advisory_xact_lock
+
+(1 row)
+pg_try_advisory_xact_lock
+t
+(1 row)
+pg_advisory_xact_lock
+
+(1 row)
+pg_advisory_xact_lock
+
+(1 row)
+pg_try_advisory_xact_lock
+t
+(1 row)
+pg_try_advisory_xact_lock
+t
+(1 row)
+pg_advisory_xact_lock
+
+(1 row)
+pg_advisory_xact_lock
+
+(1 row)
+pg_try_advisory_xact_lock
+t
+(1 row)
+pg_try_advisory_xact_lock
+t
+(1 row)
+pg_advisory_xact_lock_shared
+
+(1 row)
+pg_try_advisory_xact_lock
+t
+(1 row)
+pg_try_advisory_xact_lock
+t
+(1 row)
+pg_try_advisory_xact_lock
+t
+(1 row)
+pg_advisory_xact_lock
+
+(1 row)
+pg_try_advisory_xact_lock
+t
+(1 row)
+pg_advisory_lock
+
+(1 row)
+pg_advisory_unlock
+t
+(1 row)

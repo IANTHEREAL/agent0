@@ -19,8 +19,8 @@ use super::statistics::TableStatistics;
 use super::{
     extract_constant_usize, join_keys, selectivity, DEFAULT_ESTIMATED_ROWS, DEFAULT_JOIN_SEL,
 };
+use crate::model::TableSchema;
 use crate::sql::analyzer::types::{JoinCondition, JoinType};
-use crate::types::TableSchema;
 use std::collections::HashMap;
 use std::sync::Arc;
 

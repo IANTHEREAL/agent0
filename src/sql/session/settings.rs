@@ -66,6 +66,18 @@ pub(crate) const KNOWN_GUCS: &[GucMeta] = &[
         static_default: None,
     },
     GucMeta {
+        name: "db9.prepared_plan_cache_min_exec",
+        immutable: false,
+        description: "",
+        static_default: Some("5"),
+    },
+    GucMeta {
+        name: "db9.prepared_plan_cache_size",
+        immutable: false,
+        description: "",
+        static_default: Some("128"),
+    },
+    GucMeta {
         name: "db9.use_optimizer",
         immutable: true,
         description: "",
@@ -266,6 +278,11 @@ pub(crate) struct SessionSettings {
     /// Default: 256 MB. 0 = unlimited.
     max_sort_bytes: usize,
 
+    /// Plan cache capacity (max cached plans per session). Default: 128.
+    prepared_plan_cache_size: usize,
+    /// Plan cache promotion threshold (executions before caching). Default: 5.
+    prepared_plan_cache_min_exec: u64,
+
     // pg_dump startup variables we keep for readback (`SHOW`) and later timeout enforcement.
     pub(crate) statement_timeout_ms: u64,
     pub(crate) default_statement_timeout_ms: u64,
@@ -337,7 +354,7 @@ impl SessionSettings {
         }
     }
 
-    pub(crate) fn canonical_setting_name<'a>(name: &'a str) -> &'a str {
+    pub(crate) fn canonical_setting_name(name: &str) -> &str {
         match name {
             "transaction.isolation.level" => "transaction_isolation",
             "db9.max_sort_bytes" => "db9.max_sort_bytes",
@@ -360,6 +377,8 @@ impl SessionSettings {
         Self {
             search_path: Self::default_search_path(),
             max_sort_bytes: DEFAULT_MAX_SORT_BYTES,
+            prepared_plan_cache_size: 128,
+            prepared_plan_cache_min_exec: 5,
             statement_timeout_ms: default_statement_timeout_ms,
             default_statement_timeout_ms,
             idle_in_transaction_session_timeout_ms: default_idle_in_txn_timeout_ms,
@@ -416,9 +435,7 @@ impl SessionSettings {
             return Ok(0);
         }
 
-        let multiplier: f64 = if unit.is_empty() {
-            1.0
-        } else if unit.eq_ignore_ascii_case("ms") {
+        let multiplier: f64 = if unit.is_empty() || unit.eq_ignore_ascii_case("ms") {
             1.0
         } else if unit.eq_ignore_ascii_case("s") {
             1_000.0
@@ -518,6 +535,15 @@ impl SessionSettings {
                 let bytes = Self::parse_byte_size(value)?;
                 Ok(bytes.to_string())
             }
+            "db9.prepared_plan_cache_size" | "db9.prepared_plan_cache_min_exec" => {
+                let v: u64 = value
+                    .trim()
+                    .parse()
+                    .map_err(|_| SqlError::InvalidParameterValue {
+                        message: format!("invalid value for parameter \"{}\": \"{}\"", name, value),
+                    })?;
+                Ok(v.to_string())
+            }
             "db9.use_optimizer" => {
                 let normalized = value.trim().to_lowercase();
                 match normalized.as_str() {
@@ -536,7 +562,7 @@ impl SessionSettings {
                 }
             }
             "timezone" => {
-                crate::types::timestamp::TimeZoneSpec::try_parse(value)?;
+                crate::model::timestamp::TimeZoneSpec::try_parse(value)?;
                 Ok(value.to_string())
             }
             "client_encoding" => {
@@ -613,6 +639,12 @@ impl SessionSettings {
             }
             "db9.max_sort_bytes" => {
                 self.max_sort_bytes = Self::parse_byte_size(&normalized)?;
+            }
+            "db9.prepared_plan_cache_size" => {
+                self.prepared_plan_cache_size = normalized.parse().unwrap_or(128);
+            }
+            "db9.prepared_plan_cache_min_exec" => {
+                self.prepared_plan_cache_min_exec = normalized.parse().unwrap_or(5);
             }
             "db9.use_optimizer" => {}
             "timezone" => self.timezone = Some(normalized.clone()),
@@ -719,6 +751,8 @@ impl SessionSettings {
                     self.default_idle_in_transaction_session_timeout_ms
             }
             "db9.max_sort_bytes" => self.max_sort_bytes = DEFAULT_MAX_SORT_BYTES,
+            "db9.prepared_plan_cache_size" => self.prepared_plan_cache_size = 128,
+            "db9.prepared_plan_cache_min_exec" => self.prepared_plan_cache_min_exec = 5,
             "db9.use_optimizer" => {}
             "timezone" => self.timezone = None,
             "application_name" => self.application_name = None,
@@ -790,6 +824,10 @@ impl SessionSettings {
                 self.idle_in_transaction_session_timeout_ms,
             )),
             "db9.max_sort_bytes" => Some(self.max_sort_bytes.to_string()),
+            "db9.prepared_plan_cache_size" => Some(self.prepared_plan_cache_size.to_string()),
+            "db9.prepared_plan_cache_min_exec" => {
+                Some(self.prepared_plan_cache_min_exec.to_string())
+            }
             "db9.use_optimizer" => Some("on".to_string()),
             "timezone" => Some(self.timezone.as_deref().unwrap_or("UTC").to_string()),
             "application_name" => Some(self.application_name.as_deref().unwrap_or("").to_string()),
@@ -871,14 +909,14 @@ impl SessionSettings {
         }
 
         // 2. User-SET extra_settings not in registry
-        for (name, _) in &self.extra_settings {
+        for name in self.extra_settings.keys() {
             result
                 .entry(name.clone())
                 .or_insert_with(|| (self.show_value(name).unwrap_or_default(), String::new()));
         }
 
         // 3. Local overrides not already covered
-        for (name, _) in &self.local_overrides {
+        for name in self.local_overrides.keys() {
             result
                 .entry(name.clone())
                 .or_insert_with(|| (self.show_value(name).unwrap_or_default(), String::new()));
@@ -890,7 +928,7 @@ impl SessionSettings {
     pub(crate) fn statement_timeout(&self) -> Option<Duration> {
         if let Some(v) = self.local_overrides.get("statement_timeout") {
             match Self::parse_timeout_millis(v) {
-                Ok(ms) if ms == 0 => return None,
+                Ok(0) => return None,
                 Ok(ms) => return Some(Duration::from_millis(ms)),
                 Err(e) => {
                     tracing::error!(
@@ -912,7 +950,7 @@ impl SessionSettings {
     pub(crate) fn lock_timeout(&self) -> Option<Duration> {
         if let Some(v) = self.local_overrides.get("lock_timeout") {
             match Self::parse_timeout_millis(v) {
-                Ok(ms) if ms == 0 => return None,
+                Ok(0) => return None,
                 Ok(ms) => return Some(Duration::from_millis(ms)),
                 Err(e) => {
                     tracing::error!(error = %e, value = v, "invalid local lock_timeout override");
@@ -933,7 +971,7 @@ impl SessionSettings {
             .get("idle_in_transaction_session_timeout")
         {
             match Self::parse_timeout_millis(v) {
-                Ok(ms) if ms == 0 => return None,
+                Ok(0) => return None,
                 Ok(ms) => return Some(Duration::from_millis(ms)),
                 Err(e) => {
                     tracing::error!(
@@ -970,6 +1008,40 @@ impl SessionSettings {
         self.max_sort_bytes
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn prepared_plan_cache_size(&self) -> usize {
+        if let Some(v) = self.local_overrides.get("db9.prepared_plan_cache_size") {
+            match v.parse::<usize>() {
+                Ok(size) => return size,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        value = v,
+                        "invalid local db9.prepared_plan_cache_size override"
+                    );
+                }
+            }
+        }
+        self.prepared_plan_cache_size
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn prepared_plan_cache_min_exec(&self) -> u64 {
+        if let Some(v) = self.local_overrides.get("db9.prepared_plan_cache_min_exec") {
+            match v.parse::<u64>() {
+                Ok(min_exec) => return min_exec,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        value = v,
+                        "invalid local db9.prepared_plan_cache_min_exec override"
+                    );
+                }
+            }
+        }
+        self.prepared_plan_cache_min_exec
+    }
+
     /// All keys that `show_value()` and `default_value()` handle explicitly.
     ///
     /// Kept adjacent to `show_value()` so that adding a new built-in GUC
@@ -987,6 +1059,8 @@ impl SessionSettings {
         "lock_timeout",
         "idle_in_transaction_session_timeout",
         "db9.max_sort_bytes",
+        "db9.prepared_plan_cache_size",
+        "db9.prepared_plan_cache_min_exec",
         "db9.use_optimizer",
         "timezone",
         "application_name",

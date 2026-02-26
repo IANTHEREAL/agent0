@@ -1,5 +1,5 @@
 use super::*;
-use crate::types::{ColumnDef, DataType, Value};
+use crate::model::{ColumnDef, DataType, Value};
 
 /// A simple test operator that yields predefined rows.
 #[derive(Debug)]

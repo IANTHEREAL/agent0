@@ -1,9 +1,9 @@
 //! Tests for the typed expression evaluator.
 
 use super::*;
+use crate::model::DataType;
 use crate::sql::error::SqlError;
 use crate::sql::types::CastContext;
-use crate::types::DataType;
 use std::sync::Arc;
 
 fn make_row(vals: Vec<Value>) -> Row {
@@ -122,7 +122,7 @@ fn typed_builtin_current_date_uses_query_context() {
 
     let expr = func_call("CURRENT_DATE", vec![], DataType::Date);
     let expected =
-        crate::types::date::timestamp_millis_to_date_days(qctx.transaction_timestamp_ms).unwrap();
+        crate::model::date::timestamp_millis_to_date_days(qctx.transaction_timestamp_ms).unwrap();
     assert_eq!(
         eval_typed_expr(&expr, &row, &qctx).unwrap(),
         Value::Date(expected)
@@ -1510,7 +1510,7 @@ fn test_interval_add_timestamp() {
             left: Box::new(const_expr(Value::Timestamp(1_000_000), DataType::Timestamp)),
             op: BinaryOp::Add,
             right: Box::new(const_expr(
-                Value::Interval(crate::types::IntervalValue::new(0, 3_600_000)),
+                Value::Interval(crate::model::IntervalValue::new(0, 3_600_000)),
                 DataType::Interval,
             )),
         },
@@ -1535,7 +1535,7 @@ fn test_interval_sub_timestamp() {
             )),
             op: BinaryOp::Sub,
             right: Box::new(const_expr(
-                Value::Interval(crate::types::IntervalValue::new(0, 3_600_000)),
+                Value::Interval(crate::model::IntervalValue::new(0, 3_600_000)),
                 DataType::Interval,
             )),
         },
@@ -1555,12 +1555,12 @@ fn test_interval_add_intervals() {
     let expr = TypedExpr::new(
         TypedExprKind::BinaryOp {
             left: Box::new(const_expr(
-                Value::Interval(crate::types::IntervalValue::new(0, 3_600_000)),
+                Value::Interval(crate::model::IntervalValue::new(0, 3_600_000)),
                 DataType::Interval,
             )),
             op: BinaryOp::Add,
             right: Box::new(const_expr(
-                Value::Interval(crate::types::IntervalValue::new(0, 7_200_000)),
+                Value::Interval(crate::model::IntervalValue::new(0, 7_200_000)),
                 DataType::Interval,
             )),
         },
@@ -1568,7 +1568,7 @@ fn test_interval_add_intervals() {
     );
     assert_eq!(
         eval_typed_expr(&expr, &row, &qctx).unwrap(),
-        Value::Interval(crate::types::IntervalValue::new(0, 10_800_000))
+        Value::Interval(crate::model::IntervalValue::new(0, 10_800_000))
     );
 }
 
@@ -1590,7 +1590,7 @@ fn test_timestamp_diff() {
     );
     assert_eq!(
         eval_typed_expr(&expr, &row, &qctx).unwrap(),
-        Value::Interval(crate::types::IntervalValue::from_millis(7_000_000))
+        Value::Interval(crate::model::IntervalValue::from_millis(7_000_000))
     );
 }
 
@@ -1605,7 +1605,7 @@ fn test_date_add_interval() {
             left: Box::new(const_expr(Value::Date(0), DataType::Date)),
             op: BinaryOp::Add,
             right: Box::new(const_expr(
-                Value::Interval(crate::types::IntervalValue::new(0, 3_600_000)),
+                Value::Interval(crate::model::IntervalValue::new(0, 3_600_000)),
                 DataType::Interval,
             )),
         },

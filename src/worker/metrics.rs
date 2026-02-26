@@ -98,7 +98,7 @@ impl WorkerMetrics {
     /// Sample queue depth and active jobs on each tick.
     pub fn sample_tick(&self, queue_depth: u64, active_jobs: u32) {
         self.last_tick_queue_depth
-            .store(queue_depth as u64, Ordering::Relaxed);
+            .store(queue_depth, Ordering::Relaxed);
         self.last_tick_active_jobs
             .store(active_jobs as u64, Ordering::Relaxed);
     }

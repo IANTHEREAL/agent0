@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tikv_client::Transaction;
 
+use crate::model::{Row, TableSchema};
 use crate::sql::executor::Executor;
 use crate::sql::query_context::QueryContext;
 use crate::storage::TikvStore;
-use crate::types::{Row, TableSchema};
 
 pub struct ExecutionContext<'a> {
     pub executor: &'a Executor,

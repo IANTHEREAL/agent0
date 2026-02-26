@@ -3,7 +3,7 @@
 //! Both the executor (data materialization) and the protocol handler
 //! (type inference) use these definitions, eliminating duplicate schemas.
 
-use crate::types::{ColumnDef, DataType, TableSchema};
+use crate::model::{ColumnDef, DataType, TableSchema};
 
 fn col(name: &str, data_type: DataType) -> ColumnDef {
     ColumnDef {

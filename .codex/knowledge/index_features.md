@@ -15,7 +15,7 @@
   - `predicate: Option<Expr>` (partial index WHERE clause)
 
 ## Core types and storage model
-- `src/types/mod.rs`
+- `src/model/mod.rs`
   - `IndexDef` is persisted inside `TableSchema.indexes` and now includes:
     - `name: String`, `id: u64`, `columns: Vec<String>`, `unique: bool`
     - `method: Option<String>` (`None` => btree)

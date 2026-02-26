@@ -5,9 +5,9 @@ use std::collections::HashSet;
 use anyhow::Result;
 use tikv_client::Transaction;
 
+use crate::model::{ForeignKeyAction, Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::projection::eval_default_expr;
-use crate::types::{ForeignKeyAction, Row, TableSchema, Value};
 
 use super::super::update::execute_update_row;
 use super::{

@@ -649,7 +649,7 @@ struct Token {
 
 #### Phase 1: Type System (2 days)
 
-**File**: `src/types/mod.rs`
+**File**: `src/model/mod.rs`
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1031,7 +1031,7 @@ DROP FUNCTION test_if;
 | F2: ARRAY protocol | `src/protocol/handler.rs` | - |
 | F3: GIN for ARRAY | `src/sql/gin.rs`, `src/sql/planner.rs`, `src/sql/dml.rs` | - |
 | F4: Trigger errors | `src/sql/triggers.rs` | - |
-| F5: FTS | `src/types/mod.rs`, `src/protocol/handler.rs`, `src/sql/expr/operators.rs` | `src/sql/expr/functions/fts.rs` |
+| F5: FTS | `src/model/mod.rs`, `src/protocol/handler.rs`, `src/sql/expr/operators.rs` | `src/sql/expr/functions/fts.rs` |
 | F6: PL/pgSQL | `src/sql/plpgsql.rs`, `src/sql/triggers.rs` | - |
 
 ---

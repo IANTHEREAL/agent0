@@ -136,6 +136,7 @@ impl Session {
         // TODO(#601-followup): Regular SET (non-LOCAL) is not restored on savepoint rollback.
         // PostgreSQL restores it; tracking that session-state undo separately from SET LOCAL.
         self.settings.rollback_settings_to_savepoint(name);
+        self.sync_plan_cache_settings();
         self.release_rolled_back_xact_advisory_locks(rolled_back_xact_locks);
         self.clear_failed_transaction();
         Ok(())
@@ -222,11 +223,16 @@ impl Session {
                     Ok(_) => {
                         self.clear_local_overrides();
                         self.release_xact_advisory_locks_if_needed();
+                        // Clear plan cache: DDL within the rolled-back transaction
+                        // may have been optimistically invalidated, but the DDL
+                        // itself was reverted — stale entries must not survive.
+                        self.clear_plan_cache();
                         Ok(())
                     }
                     Err(e) => {
                         self.state = TransactionState::Failed(txn);
                         self.release_xact_advisory_locks_if_needed();
+                        self.clear_plan_cache();
                         Err(anyhow!(e))
                     }
                 }
@@ -238,11 +244,13 @@ impl Session {
                     Ok(_) => {
                         self.clear_local_overrides();
                         self.release_xact_advisory_locks_if_needed();
+                        self.clear_plan_cache();
                         Ok(())
                     }
                     Err(e) => {
                         self.state = TransactionState::Failed(txn);
                         self.release_xact_advisory_locks_if_needed();
+                        self.clear_plan_cache();
                         Err(anyhow!(e))
                     }
                 }

@@ -3,7 +3,6 @@
 /// These functions are intentionally small and allocation-light, and they mirror
 /// the behavior used throughout the project (single quotes doubled inside
 /// string literals; identifiers quoted when required).
-
 pub(crate) fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }

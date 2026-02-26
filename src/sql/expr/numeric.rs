@@ -14,22 +14,22 @@ pub enum NumericValue {
 }
 
 impl NumericValue {
-    pub fn from_value(v: &crate::types::Value) -> Option<Self> {
+    pub fn from_value(v: &crate::model::Value) -> Option<Self> {
         match v {
-            crate::types::Value::Int32(n) => Some(NumericValue::Int32(*n)),
-            crate::types::Value::Int64(n) => Some(NumericValue::Int64(*n)),
-            crate::types::Value::Float64(n) => Some(NumericValue::Float64(*n)),
-            crate::types::Value::Numeric(n) => Some(NumericValue::Decimal(*n)),
+            crate::model::Value::Int32(n) => Some(NumericValue::Int32(*n)),
+            crate::model::Value::Int64(n) => Some(NumericValue::Int64(*n)),
+            crate::model::Value::Float64(n) => Some(NumericValue::Float64(*n)),
+            crate::model::Value::Numeric(n) => Some(NumericValue::Decimal(*n)),
             _ => None,
         }
     }
 
-    pub fn into_value(self) -> crate::types::Value {
+    pub fn into_value(self) -> crate::model::Value {
         match self {
-            NumericValue::Int32(n) => crate::types::Value::Int32(n),
-            NumericValue::Int64(n) => crate::types::Value::Int64(n),
-            NumericValue::Float64(n) => crate::types::Value::Float64(n),
-            NumericValue::Decimal(n) => crate::types::Value::Numeric(n),
+            NumericValue::Int32(n) => crate::model::Value::Int32(n),
+            NumericValue::Int64(n) => crate::model::Value::Int64(n),
+            NumericValue::Float64(n) => crate::model::Value::Float64(n),
+            NumericValue::Decimal(n) => crate::model::Value::Numeric(n),
         }
     }
 

@@ -56,6 +56,11 @@ pub fn for_each_child<'a>(expr: &'a TypedExpr, f: &mut impl FnMut(&'a TypedExpr)
         | TypedExprKind::Cast { expr: operand, .. }
         | TypedExprKind::IsTest { expr: operand, .. } => f(operand),
 
+        TypedExprKind::IsDistinctFrom { left, right, .. } => {
+            f(left);
+            f(right);
+        }
+
         TypedExprKind::Between {
             expr, low, high, ..
         } => {
@@ -65,7 +70,7 @@ pub fn for_each_child<'a>(expr: &'a TypedExpr, f: &mut impl FnMut(&'a TypedExpr)
         }
         TypedExprKind::InList { expr, list, .. } => {
             f(expr);
-            list.iter().for_each(|e| f(e));
+            list.iter().for_each(f);
         }
         TypedExprKind::Like {
             expr,
@@ -104,7 +109,7 @@ pub fn for_each_child<'a>(expr: &'a TypedExpr, f: &mut impl FnMut(&'a TypedExpr)
         TypedExprKind::Coalesce(args)
         | TypedExprKind::MinMax { args, .. }
         | TypedExprKind::ArrayLiteral(args)
-        | TypedExprKind::Row(args) => args.iter().for_each(|e| f(e)),
+        | TypedExprKind::Row(args) => args.iter().for_each(f),
 
         TypedExprKind::NullIf(a, b) => {
             f(a);
@@ -122,7 +127,7 @@ pub fn for_each_child<'a>(expr: &'a TypedExpr, f: &mut impl FnMut(&'a TypedExpr)
             filter,
             ..
         } => {
-            args.iter().for_each(|e| f(e));
+            args.iter().for_each(&mut *f);
             order_by.iter().for_each(|ob| f(&ob.expr));
             if let Some(fl) = filter {
                 f(fl);
@@ -135,8 +140,8 @@ pub fn for_each_child<'a>(expr: &'a TypedExpr, f: &mut impl FnMut(&'a TypedExpr)
             window_frame,
             ..
         } => {
-            args.iter().for_each(|e| f(e));
-            partition_by.iter().for_each(|e| f(e));
+            args.iter().for_each(&mut *f);
+            partition_by.iter().for_each(&mut *f);
             order_by.iter().for_each(|ob| f(&ob.expr));
             if let Some(frame) = window_frame {
                 for_each_frame_bound_child(&frame.start, f);
@@ -146,6 +151,8 @@ pub fn for_each_child<'a>(expr: &'a TypedExpr, f: &mut impl FnMut(&'a TypedExpr)
             }
         }
         TypedExprKind::InSubquery { expr, .. } | TypedExprKind::AnyAll { expr, .. } => f(expr),
+
+        TypedExprKind::TupleInSubquery { exprs, .. } => exprs.iter().for_each(f),
 
         TypedExprKind::ArrayIndex { array, index } => {
             f(array);
@@ -170,6 +177,319 @@ fn for_each_frame_bound_child<'a>(bound: &'a WindowFrameBound, f: &mut impl FnMu
     }
 }
 
+macro_rules! sync_map_one {
+    ($f:expr, $child:expr) => {
+        $f($child)
+    };
+}
+
+macro_rules! sync_map_vec {
+    ($f:expr, $items:expr) => {
+        $items.iter().map(&mut *$f).collect()
+    };
+}
+
+macro_rules! sync_map_pairs {
+    ($f:expr, $pairs:expr) => {
+        $pairs.iter().map(|(w, t)| ($f(w), $f(t))).collect()
+    };
+}
+
+macro_rules! sync_map_opt_box {
+    ($f:expr, $opt:expr) => {
+        $opt.as_ref().map(|e| Box::new($f(e)))
+    };
+}
+
+macro_rules! sync_map_order_by {
+    ($f:expr, $order_by:expr) => {
+        map_order_by($order_by, $f)
+    };
+}
+
+macro_rules! sync_map_window_frame {
+    ($f:expr, $window_frame:expr) => {
+        map_window_frame($window_frame, $f)
+    };
+}
+
+macro_rules! async_map_one {
+    ($t:expr, $child:expr) => {
+        $t.transform_expr($child).await?
+    };
+}
+
+macro_rules! async_map_vec {
+    ($t:expr, $items:expr) => {{
+        let mut mapped = Vec::with_capacity($items.len());
+        for item in $items.iter() {
+            mapped.push($t.transform_expr(item).await?);
+        }
+        mapped
+    }};
+}
+
+macro_rules! async_map_pairs {
+    ($t:expr, $pairs:expr) => {{
+        let mut mapped = Vec::with_capacity($pairs.len());
+        for (when_expr, then_expr) in $pairs.iter() {
+            mapped.push((
+                $t.transform_expr(when_expr).await?,
+                $t.transform_expr(then_expr).await?,
+            ));
+        }
+        mapped
+    }};
+}
+
+macro_rules! async_map_opt_box {
+    ($t:expr, $opt:expr) => {{
+        match $opt {
+            Some(e) => Some(Box::new($t.transform_expr(e).await?)),
+            None => None,
+        }
+    }};
+}
+
+macro_rules! async_map_order_by {
+    ($t:expr, $order_by:expr) => {
+        map_order_by_async($order_by, $t).await?
+    };
+}
+
+macro_rules! async_map_window_frame {
+    ($t:expr, $window_frame:expr) => {
+        map_window_frame_async($window_frame, $t).await?
+    };
+}
+
+macro_rules! map_children_match {
+    (
+        $expr:expr,
+        $mapper:expr,
+        $map_one:ident,
+        $map_vec:ident,
+        $map_pairs:ident,
+        $map_opt_box:ident,
+        $map_order_by:ident,
+        $map_window_frame:ident
+    ) => {
+        match &$expr.kind {
+            // Leaves: clone as-is
+            TypedExprKind::Constant(v) => TypedExprKind::Constant(v.clone()),
+            TypedExprKind::ColumnRef {
+                scope_depth,
+                column_index,
+                column_name,
+            } => TypedExprKind::ColumnRef {
+                scope_depth: *scope_depth,
+                column_index: *column_index,
+                column_name: column_name.clone(),
+            },
+            TypedExprKind::ScalarSubquery(q) => TypedExprKind::ScalarSubquery(q.clone()),
+            TypedExprKind::ArraySubquery(q) => TypedExprKind::ArraySubquery(q.clone()),
+            TypedExprKind::Exists { subquery, negated } => TypedExprKind::Exists {
+                subquery: subquery.clone(),
+                negated: *negated,
+            },
+            TypedExprKind::Default => TypedExprKind::Default,
+            TypedExprKind::Parameter { index } => TypedExprKind::Parameter { index: *index },
+
+            // Composite nodes: transform children
+            TypedExprKind::BinaryOp { left, op, right } => TypedExprKind::BinaryOp {
+                left: Box::new($map_one!($mapper, left)),
+                op: op.clone(),
+                right: Box::new($map_one!($mapper, right)),
+            },
+            TypedExprKind::UnaryOp { op, operand } => TypedExprKind::UnaryOp {
+                op: *op,
+                operand: Box::new($map_one!($mapper, operand)),
+            },
+            TypedExprKind::Cast {
+                expr: inner,
+                target_type,
+                cast_context,
+            } => TypedExprKind::Cast {
+                expr: Box::new($map_one!($mapper, inner)),
+                target_type: target_type.clone(),
+                cast_context: *cast_context,
+            },
+            TypedExprKind::IsTest {
+                expr: inner,
+                test,
+                negated,
+            } => TypedExprKind::IsTest {
+                expr: Box::new($map_one!($mapper, inner)),
+                test: *test,
+                negated: *negated,
+            },
+            TypedExprKind::IsDistinctFrom {
+                left,
+                right,
+                negated,
+            } => TypedExprKind::IsDistinctFrom {
+                left: Box::new($map_one!($mapper, left)),
+                right: Box::new($map_one!($mapper, right)),
+                negated: *negated,
+            },
+            TypedExprKind::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => TypedExprKind::Between {
+                expr: Box::new($map_one!($mapper, inner)),
+                low: Box::new($map_one!($mapper, low)),
+                high: Box::new($map_one!($mapper, high)),
+                negated: *negated,
+            },
+            TypedExprKind::InList {
+                expr: inner,
+                list,
+                negated,
+            } => TypedExprKind::InList {
+                expr: Box::new($map_one!($mapper, inner)),
+                list: $map_vec!($mapper, list),
+                negated: *negated,
+            },
+            TypedExprKind::Like {
+                expr: inner,
+                pattern,
+                escape,
+                case_insensitive,
+                negated,
+            } => TypedExprKind::Like {
+                expr: Box::new($map_one!($mapper, inner)),
+                pattern: Box::new($map_one!($mapper, pattern)),
+                escape: $map_opt_box!($mapper, escape),
+                case_insensitive: *case_insensitive,
+                negated: *negated,
+            },
+            TypedExprKind::SimilarTo {
+                expr: inner,
+                pattern,
+                escape,
+                negated,
+            } => TypedExprKind::SimilarTo {
+                expr: Box::new($map_one!($mapper, inner)),
+                pattern: Box::new($map_one!($mapper, pattern)),
+                escape: $map_opt_box!($mapper, escape),
+                negated: *negated,
+            },
+            TypedExprKind::Case {
+                operand,
+                when_clauses,
+                else_result,
+            } => TypedExprKind::Case {
+                operand: $map_opt_box!($mapper, operand),
+                when_clauses: $map_pairs!($mapper, when_clauses),
+                else_result: $map_opt_box!($mapper, else_result),
+            },
+            TypedExprKind::Coalesce(args) => TypedExprKind::Coalesce($map_vec!($mapper, args)),
+            TypedExprKind::NullIf(a, b) => TypedExprKind::NullIf(
+                Box::new($map_one!($mapper, a)),
+                Box::new($map_one!($mapper, b)),
+            ),
+            TypedExprKind::MinMax { args, is_greatest } => TypedExprKind::MinMax {
+                args: $map_vec!($mapper, args),
+                is_greatest: *is_greatest,
+            },
+            TypedExprKind::FunctionCall {
+                func,
+                args,
+                order_by,
+                filter,
+            } => TypedExprKind::FunctionCall {
+                func: func.clone(),
+                args: $map_vec!($mapper, args),
+                order_by: $map_order_by!($mapper, order_by),
+                filter: $map_opt_box!($mapper, filter),
+            },
+            TypedExprKind::AggregateCall {
+                func,
+                args,
+                distinct,
+                order_by,
+                filter,
+            } => TypedExprKind::AggregateCall {
+                func: func.clone(),
+                args: $map_vec!($mapper, args),
+                distinct: *distinct,
+                order_by: $map_order_by!($mapper, order_by),
+                filter: $map_opt_box!($mapper, filter),
+            },
+            TypedExprKind::WindowCall {
+                func,
+                args,
+                partition_by,
+                order_by,
+                window_frame,
+            } => TypedExprKind::WindowCall {
+                func: func.clone(),
+                args: $map_vec!($mapper, args),
+                partition_by: $map_vec!($mapper, partition_by),
+                order_by: $map_order_by!($mapper, order_by),
+                window_frame: $map_window_frame!($mapper, window_frame),
+            },
+            TypedExprKind::InSubquery {
+                expr: inner,
+                subquery,
+                negated,
+            } => TypedExprKind::InSubquery {
+                expr: Box::new($map_one!($mapper, inner)),
+                subquery: subquery.clone(),
+                negated: *negated,
+            },
+            TypedExprKind::TupleInSubquery {
+                exprs,
+                subquery,
+                negated,
+            } => TypedExprKind::TupleInSubquery {
+                exprs: $map_vec!($mapper, exprs),
+                subquery: subquery.clone(),
+                negated: *negated,
+            },
+            TypedExprKind::AnyAll {
+                expr: inner,
+                op,
+                subquery,
+                is_all,
+            } => TypedExprKind::AnyAll {
+                expr: Box::new($map_one!($mapper, inner)),
+                op: op.clone(),
+                subquery: subquery.clone(),
+                is_all: *is_all,
+            },
+            TypedExprKind::ArrayLiteral(args) => {
+                TypedExprKind::ArrayLiteral($map_vec!($mapper, args))
+            }
+            TypedExprKind::ArrayIndex { array, index } => TypedExprKind::ArrayIndex {
+                array: Box::new($map_one!($mapper, array)),
+                index: Box::new($map_one!($mapper, index)),
+            },
+            TypedExprKind::JsonAccess {
+                expr: inner,
+                path,
+                operator,
+            } => TypedExprKind::JsonAccess {
+                expr: Box::new($map_one!($mapper, inner)),
+                path: Box::new($map_one!($mapper, path)),
+                operator: *operator,
+            },
+            TypedExprKind::Row(args) => TypedExprKind::Row($map_vec!($mapper, args)),
+            TypedExprKind::Collate {
+                expr,
+                collation,
+                resolved,
+            } => TypedExprKind::Collate {
+                expr: Box::new($map_one!($mapper, expr)),
+                collation: collation.clone(),
+                resolved: resolved.clone(),
+            },
+        }
+    };
+}
+
 // ── Primitive 2: map_children ───────────────────────────────
 
 /// Transform each immediate `TypedExpr` child via `f`, rebuilding the `TypedExprKind`.
@@ -181,200 +501,16 @@ pub fn map_children(
     expr: &TypedExpr,
     f: &mut impl FnMut(&TypedExpr) -> TypedExpr,
 ) -> TypedExprKind {
-    match &expr.kind {
-        // Leaves: clone as-is
-        TypedExprKind::Constant(v) => TypedExprKind::Constant(v.clone()),
-        TypedExprKind::ColumnRef {
-            scope_depth,
-            column_index,
-            column_name,
-        } => TypedExprKind::ColumnRef {
-            scope_depth: *scope_depth,
-            column_index: *column_index,
-            column_name: column_name.clone(),
-        },
-        TypedExprKind::ScalarSubquery(q) => TypedExprKind::ScalarSubquery(q.clone()),
-        TypedExprKind::ArraySubquery(q) => TypedExprKind::ArraySubquery(q.clone()),
-        TypedExprKind::Exists { subquery, negated } => TypedExprKind::Exists {
-            subquery: subquery.clone(),
-            negated: *negated,
-        },
-        TypedExprKind::Default => TypedExprKind::Default,
-        TypedExprKind::Parameter { index } => TypedExprKind::Parameter { index: *index },
-
-        // Composite nodes: transform children
-        TypedExprKind::BinaryOp { left, op, right } => TypedExprKind::BinaryOp {
-            left: Box::new(f(left)),
-            op: op.clone(),
-            right: Box::new(f(right)),
-        },
-        TypedExprKind::UnaryOp { op, operand } => TypedExprKind::UnaryOp {
-            op: *op,
-            operand: Box::new(f(operand)),
-        },
-        TypedExprKind::Cast {
-            expr: inner,
-            target_type,
-            cast_context,
-        } => TypedExprKind::Cast {
-            expr: Box::new(f(inner)),
-            target_type: target_type.clone(),
-            cast_context: *cast_context,
-        },
-        TypedExprKind::IsTest {
-            expr: inner,
-            test,
-            negated,
-        } => TypedExprKind::IsTest {
-            expr: Box::new(f(inner)),
-            test: *test,
-            negated: *negated,
-        },
-        TypedExprKind::Between {
-            expr: inner,
-            low,
-            high,
-            negated,
-        } => TypedExprKind::Between {
-            expr: Box::new(f(inner)),
-            low: Box::new(f(low)),
-            high: Box::new(f(high)),
-            negated: *negated,
-        },
-        TypedExprKind::InList {
-            expr: inner,
-            list,
-            negated,
-        } => TypedExprKind::InList {
-            expr: Box::new(f(inner)),
-            list: list.iter().map(|e| f(e)).collect(),
-            negated: *negated,
-        },
-        TypedExprKind::Like {
-            expr: inner,
-            pattern,
-            escape,
-            case_insensitive,
-            negated,
-        } => TypedExprKind::Like {
-            expr: Box::new(f(inner)),
-            pattern: Box::new(f(pattern)),
-            escape: escape.as_ref().map(|e| Box::new(f(e))),
-            case_insensitive: *case_insensitive,
-            negated: *negated,
-        },
-        TypedExprKind::SimilarTo {
-            expr: inner,
-            pattern,
-            escape,
-            negated,
-        } => TypedExprKind::SimilarTo {
-            expr: Box::new(f(inner)),
-            pattern: Box::new(f(pattern)),
-            escape: escape.as_ref().map(|e| Box::new(f(e))),
-            negated: *negated,
-        },
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => TypedExprKind::Case {
-            operand: operand.as_ref().map(|e| Box::new(f(e))),
-            when_clauses: when_clauses.iter().map(|(w, t)| (f(w), f(t))).collect(),
-            else_result: else_result.as_ref().map(|e| Box::new(f(e))),
-        },
-        TypedExprKind::Coalesce(args) => {
-            TypedExprKind::Coalesce(args.iter().map(|e| f(e)).collect())
-        }
-        TypedExprKind::NullIf(a, b) => TypedExprKind::NullIf(Box::new(f(a)), Box::new(f(b))),
-        TypedExprKind::MinMax { args, is_greatest } => TypedExprKind::MinMax {
-            args: args.iter().map(|e| f(e)).collect(),
-            is_greatest: *is_greatest,
-        },
-        TypedExprKind::FunctionCall {
-            func,
-            args,
-            order_by,
-            filter,
-        } => TypedExprKind::FunctionCall {
-            func: func.clone(),
-            args: args.iter().map(|e| f(e)).collect(),
-            order_by: map_order_by(order_by, f),
-            filter: filter.as_ref().map(|fl| Box::new(f(fl))),
-        },
-        TypedExprKind::AggregateCall {
-            func,
-            args,
-            distinct,
-            order_by,
-            filter,
-        } => TypedExprKind::AggregateCall {
-            func: func.clone(),
-            args: args.iter().map(|e| f(e)).collect(),
-            distinct: *distinct,
-            order_by: map_order_by(order_by, f),
-            filter: filter.as_ref().map(|fl| Box::new(f(fl))),
-        },
-        TypedExprKind::WindowCall {
-            func,
-            args,
-            partition_by,
-            order_by,
-            window_frame,
-        } => TypedExprKind::WindowCall {
-            func: func.clone(),
-            args: args.iter().map(|e| f(e)).collect(),
-            partition_by: partition_by.iter().map(|e| f(e)).collect(),
-            order_by: map_order_by(order_by, f),
-            window_frame: map_window_frame(window_frame, f),
-        },
-        TypedExprKind::InSubquery {
-            expr: inner,
-            subquery,
-            negated,
-        } => TypedExprKind::InSubquery {
-            expr: Box::new(f(inner)),
-            subquery: subquery.clone(),
-            negated: *negated,
-        },
-        TypedExprKind::AnyAll {
-            expr: inner,
-            op,
-            subquery,
-            is_all,
-        } => TypedExprKind::AnyAll {
-            expr: Box::new(f(inner)),
-            op: op.clone(),
-            subquery: subquery.clone(),
-            is_all: *is_all,
-        },
-        TypedExprKind::ArrayLiteral(args) => {
-            TypedExprKind::ArrayLiteral(args.iter().map(|e| f(e)).collect())
-        }
-        TypedExprKind::ArrayIndex { array, index } => TypedExprKind::ArrayIndex {
-            array: Box::new(f(array)),
-            index: Box::new(f(index)),
-        },
-        TypedExprKind::JsonAccess {
-            expr: inner,
-            path,
-            operator,
-        } => TypedExprKind::JsonAccess {
-            expr: Box::new(f(inner)),
-            path: Box::new(f(path)),
-            operator: *operator,
-        },
-        TypedExprKind::Row(args) => TypedExprKind::Row(args.iter().map(|e| f(e)).collect()),
-        TypedExprKind::Collate {
-            expr,
-            collation,
-            resolved,
-        } => TypedExprKind::Collate {
-            expr: Box::new(f(expr)),
-            collation: collation.clone(),
-            resolved: resolved.clone(),
-        },
-    }
+    map_children_match!(
+        expr,
+        f,
+        sync_map_one,
+        sync_map_vec,
+        sync_map_pairs,
+        sync_map_opt_box,
+        sync_map_order_by,
+        sync_map_window_frame
+    )
 }
 
 fn map_order_by(
@@ -460,278 +596,16 @@ pub(crate) fn map_children_async<'a, T: AsyncExprTransform>(
     t: &'a mut T,
 ) -> Pin<Box<dyn Future<Output = Result<TypedExprKind>> + Send + 'a>> {
     Box::pin(async move {
-        Ok(match &expr.kind {
-            // Leaves: clone as-is
-            TypedExprKind::Constant(v) => TypedExprKind::Constant(v.clone()),
-            TypedExprKind::ColumnRef {
-                scope_depth,
-                column_index,
-                column_name,
-            } => TypedExprKind::ColumnRef {
-                scope_depth: *scope_depth,
-                column_index: *column_index,
-                column_name: column_name.clone(),
-            },
-            TypedExprKind::ScalarSubquery(q) => TypedExprKind::ScalarSubquery(q.clone()),
-            TypedExprKind::ArraySubquery(q) => TypedExprKind::ArraySubquery(q.clone()),
-            TypedExprKind::Exists { subquery, negated } => TypedExprKind::Exists {
-                subquery: subquery.clone(),
-                negated: *negated,
-            },
-            TypedExprKind::Default => TypedExprKind::Default,
-            TypedExprKind::Parameter { index } => TypedExprKind::Parameter { index: *index },
-
-            // Composite: await each child sequentially
-            TypedExprKind::BinaryOp { left, op, right } => TypedExprKind::BinaryOp {
-                left: Box::new(t.transform_expr(left).await?),
-                op: op.clone(),
-                right: Box::new(t.transform_expr(right).await?),
-            },
-            TypedExprKind::UnaryOp { op, operand } => TypedExprKind::UnaryOp {
-                op: *op,
-                operand: Box::new(t.transform_expr(operand).await?),
-            },
-            TypedExprKind::Cast {
-                expr: inner,
-                target_type,
-                cast_context,
-            } => TypedExprKind::Cast {
-                expr: Box::new(t.transform_expr(inner).await?),
-                target_type: target_type.clone(),
-                cast_context: *cast_context,
-            },
-            TypedExprKind::IsTest {
-                expr: inner,
-                test,
-                negated,
-            } => TypedExprKind::IsTest {
-                expr: Box::new(t.transform_expr(inner).await?),
-                test: *test,
-                negated: *negated,
-            },
-            TypedExprKind::Between {
-                expr: inner,
-                low,
-                high,
-                negated,
-            } => TypedExprKind::Between {
-                expr: Box::new(t.transform_expr(inner).await?),
-                low: Box::new(t.transform_expr(low).await?),
-                high: Box::new(t.transform_expr(high).await?),
-                negated: *negated,
-            },
-            TypedExprKind::InList {
-                expr: inner,
-                list,
-                negated,
-            } => {
-                let e = t.transform_expr(inner).await?;
-                let mut new_list = Vec::with_capacity(list.len());
-                for item in list {
-                    new_list.push(t.transform_expr(item).await?);
-                }
-                TypedExprKind::InList {
-                    expr: Box::new(e),
-                    list: new_list,
-                    negated: *negated,
-                }
-            }
-            TypedExprKind::Like {
-                expr: inner,
-                pattern,
-                escape,
-                case_insensitive,
-                negated,
-            } => TypedExprKind::Like {
-                expr: Box::new(t.transform_expr(inner).await?),
-                pattern: Box::new(t.transform_expr(pattern).await?),
-                escape: match escape {
-                    Some(e) => Some(Box::new(t.transform_expr(e).await?)),
-                    None => None,
-                },
-                case_insensitive: *case_insensitive,
-                negated: *negated,
-            },
-            TypedExprKind::SimilarTo {
-                expr: inner,
-                pattern,
-                escape,
-                negated,
-            } => TypedExprKind::SimilarTo {
-                expr: Box::new(t.transform_expr(inner).await?),
-                pattern: Box::new(t.transform_expr(pattern).await?),
-                escape: match escape {
-                    Some(e) => Some(Box::new(t.transform_expr(e).await?)),
-                    None => None,
-                },
-                negated: *negated,
-            },
-            TypedExprKind::Case {
-                operand,
-                when_clauses,
-                else_result,
-            } => {
-                let new_operand = match operand {
-                    Some(e) => Some(Box::new(t.transform_expr(e).await?)),
-                    None => None,
-                };
-                let mut new_whens = Vec::with_capacity(when_clauses.len());
-                for (w, then) in when_clauses {
-                    new_whens.push((t.transform_expr(w).await?, t.transform_expr(then).await?));
-                }
-                let new_else = match else_result {
-                    Some(e) => Some(Box::new(t.transform_expr(e).await?)),
-                    None => None,
-                };
-                TypedExprKind::Case {
-                    operand: new_operand,
-                    when_clauses: new_whens,
-                    else_result: new_else,
-                }
-            }
-            TypedExprKind::Coalesce(args) => {
-                let mut new = Vec::with_capacity(args.len());
-                for a in args {
-                    new.push(t.transform_expr(a).await?);
-                }
-                TypedExprKind::Coalesce(new)
-            }
-            TypedExprKind::NullIf(a, b) => TypedExprKind::NullIf(
-                Box::new(t.transform_expr(a).await?),
-                Box::new(t.transform_expr(b).await?),
-            ),
-            TypedExprKind::MinMax { args, is_greatest } => {
-                let mut new = Vec::with_capacity(args.len());
-                for a in args {
-                    new.push(t.transform_expr(a).await?);
-                }
-                TypedExprKind::MinMax {
-                    args: new,
-                    is_greatest: *is_greatest,
-                }
-            }
-            TypedExprKind::FunctionCall {
-                func,
-                args,
-                order_by,
-                filter,
-            } => {
-                let mut new_args = Vec::with_capacity(args.len());
-                for a in args {
-                    new_args.push(t.transform_expr(a).await?);
-                }
-                TypedExprKind::FunctionCall {
-                    func: func.clone(),
-                    args: new_args,
-                    order_by: map_order_by_async(order_by, t).await?,
-                    filter: match filter {
-                        Some(fl) => Some(Box::new(t.transform_expr(fl).await?)),
-                        None => None,
-                    },
-                }
-            }
-            TypedExprKind::AggregateCall {
-                func,
-                args,
-                distinct,
-                order_by,
-                filter,
-            } => {
-                let mut new_args = Vec::with_capacity(args.len());
-                for a in args {
-                    new_args.push(t.transform_expr(a).await?);
-                }
-                TypedExprKind::AggregateCall {
-                    func: func.clone(),
-                    args: new_args,
-                    distinct: *distinct,
-                    order_by: map_order_by_async(order_by, t).await?,
-                    filter: match filter {
-                        Some(fl) => Some(Box::new(t.transform_expr(fl).await?)),
-                        None => None,
-                    },
-                }
-            }
-            TypedExprKind::WindowCall {
-                func,
-                args,
-                partition_by,
-                order_by,
-                window_frame,
-            } => {
-                let mut new_args = Vec::with_capacity(args.len());
-                for a in args {
-                    new_args.push(t.transform_expr(a).await?);
-                }
-                let mut new_pb = Vec::with_capacity(partition_by.len());
-                for p in partition_by {
-                    new_pb.push(t.transform_expr(p).await?);
-                }
-                TypedExprKind::WindowCall {
-                    func: func.clone(),
-                    args: new_args,
-                    partition_by: new_pb,
-                    order_by: map_order_by_async(order_by, t).await?,
-                    window_frame: map_window_frame_async(window_frame, t).await?,
-                }
-            }
-            TypedExprKind::InSubquery {
-                expr: inner,
-                subquery,
-                negated,
-            } => TypedExprKind::InSubquery {
-                expr: Box::new(t.transform_expr(inner).await?),
-                subquery: subquery.clone(),
-                negated: *negated,
-            },
-            TypedExprKind::AnyAll {
-                expr: inner,
-                op,
-                subquery,
-                is_all,
-            } => TypedExprKind::AnyAll {
-                expr: Box::new(t.transform_expr(inner).await?),
-                op: op.clone(),
-                subquery: subquery.clone(),
-                is_all: *is_all,
-            },
-            TypedExprKind::ArrayLiteral(args) => {
-                let mut new = Vec::with_capacity(args.len());
-                for a in args {
-                    new.push(t.transform_expr(a).await?);
-                }
-                TypedExprKind::ArrayLiteral(new)
-            }
-            TypedExprKind::ArrayIndex { array, index } => TypedExprKind::ArrayIndex {
-                array: Box::new(t.transform_expr(array).await?),
-                index: Box::new(t.transform_expr(index).await?),
-            },
-            TypedExprKind::JsonAccess {
-                expr: inner,
-                path,
-                operator,
-            } => TypedExprKind::JsonAccess {
-                expr: Box::new(t.transform_expr(inner).await?),
-                path: Box::new(t.transform_expr(path).await?),
-                operator: *operator,
-            },
-            TypedExprKind::Row(args) => {
-                let mut new = Vec::with_capacity(args.len());
-                for a in args {
-                    new.push(t.transform_expr(a).await?);
-                }
-                TypedExprKind::Row(new)
-            }
-            TypedExprKind::Collate {
-                expr,
-                collation,
-                resolved,
-            } => TypedExprKind::Collate {
-                expr: Box::new(t.transform_expr(expr).await?),
-                collation: collation.clone(),
-                resolved: resolved.clone(),
-            },
-        })
+        Ok(map_children_match!(
+            expr,
+            t,
+            async_map_one,
+            async_map_vec,
+            async_map_pairs,
+            async_map_opt_box,
+            async_map_order_by,
+            async_map_window_frame
+        ))
     })
 }
 

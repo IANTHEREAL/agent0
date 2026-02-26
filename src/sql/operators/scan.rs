@@ -2,8 +2,8 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use super::{ExecutionContext, PhysicalOperator};
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::projection::fill_row_defaults;
-use crate::types::{Row, TableSchema, Value};
 
 const OPERATOR_BATCH_FETCH_SIZE: usize = 256;
 
@@ -174,7 +174,7 @@ impl IndexScanBase {
     }
 
     /// Resolve the index metadata and compute PK types from the schema.
-    fn resolve_index_meta(&self) -> Result<(&crate::types::IndexDef, Vec<crate::types::DataType>)> {
+    fn resolve_index_meta(&self) -> Result<(&crate::model::IndexDef, Vec<crate::model::DataType>)> {
         let index = self
             .schema
             .indexes
@@ -183,7 +183,7 @@ impl IndexScanBase {
             .ok_or_else(|| anyhow!("Index {} not found", self.index_name))?;
 
         let pk_types: Vec<_> = if self.schema.pk_indices.is_empty() {
-            vec![crate::types::DataType::Uuid]
+            vec![crate::model::DataType::Uuid]
         } else {
             self.schema
                 .pk_indices
@@ -198,8 +198,8 @@ impl IndexScanBase {
     /// Resolve index column types (needed by scan_index_prefix and scan_index_range).
     fn resolve_index_column_types(
         &self,
-        index: &crate::types::IndexDef,
-    ) -> Result<Vec<crate::types::DataType>> {
+        index: &crate::model::IndexDef,
+    ) -> Result<Vec<crate::model::DataType>> {
         index
             .columns
             .iter()
@@ -546,7 +546,7 @@ impl PhysicalOperator for InListScanOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ColumnDef, DataType, IndexDef};
+    use crate::model::{ColumnDef, DataType, IndexDef};
 
     fn test_schema() -> TableSchema {
         TableSchema {

@@ -3,10 +3,10 @@
 //! Contains `eval_binary` (with short-circuit AND/OR), `eval_unary`,
 //! bitwise operations, shift operations, and the BinaryOp → sqlparser mapping.
 
+use crate::model::{Row, Value};
 use crate::sql::analyzer::types::*;
 use crate::sql::error::SqlError;
 use crate::sql::expr::operators::eval_binary_op;
-use crate::types::{Row, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::BinaryOperator;
 
@@ -294,7 +294,7 @@ pub(super) fn eval_shift_op(
 
     match left {
         Value::Int32(l) => {
-            if shift < 0 || shift >= 32 {
+            if !(0..32).contains(&shift) {
                 return Err(SqlError::NumericValueOutOfRange {
                     message: format!("shift count {} out of range for integer", shift),
                 }
@@ -309,7 +309,7 @@ pub(super) fn eval_shift_op(
             Ok(Value::Int32(result))
         }
         Value::Int64(l) => {
-            if shift < 0 || shift >= 64 {
+            if !(0..64).contains(&shift) {
                 return Err(SqlError::NumericValueOutOfRange {
                     message: format!("shift count {} out of range for bigint", shift),
                 }

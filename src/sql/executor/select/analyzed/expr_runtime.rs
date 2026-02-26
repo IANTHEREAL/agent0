@@ -8,6 +8,7 @@
 //! The executor calls `ExprRuntime` methods instead of hand-writing per-row loops.
 //! Operators are NOT affected — they continue calling `eval_typed_expr` directly.
 
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::typed_eval::eval_typed_expr;
@@ -16,7 +17,6 @@ use crate::sql::operators::{
     SrfKind,
 };
 use crate::sql::query_context::QueryContext;
-use crate::types::{Row, TableSchema, Value};
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -111,7 +111,7 @@ impl<'a> ExprRuntime<'a> {
             .collect();
         let has_srf = !srf_indices.is_empty();
 
-        let any_async = exprs.iter().any(|e| needs_async(e));
+        let any_async = exprs.iter().any(needs_async);
         if any_async {
             let mut projected = Vec::with_capacity(rows.len());
             for row in &rows {

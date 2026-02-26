@@ -1,14 +1,15 @@
 //! Unit tests for the query rewriter (subquery flattening).
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
+    use crate::model::{DataType, Value};
     use crate::sql::analyzer::types::{
         AnalyzedDistinct, AnalyzedProjection, AnalyzedQuery, AnalyzedQueryBody, AnalyzedSelect,
         AnalyzedTableRef, AnalyzedTableRefKind, BinaryOp, TableRefSchema, TypedExpr, TypedExprKind,
         TypedOrderByExpr,
     };
     use crate::sql::rewriter::rewrite_query;
-    use crate::types::{DataType, Value};
 
     // -- Test helpers --
 
@@ -96,7 +97,7 @@ mod tests {
 
     fn is_table_from(query: &AnalyzedQuery, expected_table: &str) -> bool {
         if let AnalyzedQueryBody::Select(ref s) = query.body {
-            if let Some(ref from) = s.from.first() {
+            if let Some(from) = s.from.first() {
                 if let AnalyzedTableRefKind::Table { ref name, .. } = from.kind {
                     return name == expected_table;
                 }
@@ -107,7 +108,7 @@ mod tests {
 
     fn is_subquery_from(query: &AnalyzedQuery) -> bool {
         if let AnalyzedQueryBody::Select(ref s) = query.body {
-            if let Some(ref from) = s.from.first() {
+            if let Some(from) = s.from.first() {
                 return matches!(from.kind, AnalyzedTableRefKind::Subquery(_));
             }
         }

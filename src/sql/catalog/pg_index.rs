@@ -2,8 +2,8 @@ use super::helpers::{
     bool_col, int2vector_col, int_col, int_val, null_val, split_schema_and_name, text_col,
 };
 use super::{ScanContext, VirtualTable};
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::catalog_oids;
-use crate::types::{Row, TableSchema, Value};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -70,9 +70,7 @@ impl VirtualTable for PgIndex {
                             col_indices.push((pos + 1) as i64);
                         }
                     }
-                    for _ in &idx.expressions {
-                        col_indices.push(0);
-                    }
+                    col_indices.extend(std::iter::repeat_n(0, idx.expressions.len()));
                     let indkey =
                         Value::Array(col_indices.iter().map(|i| Value::Int64(*i)).collect());
 

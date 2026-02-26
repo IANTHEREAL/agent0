@@ -3,9 +3,9 @@
 use anyhow::{anyhow, Result};
 
 use super::utils::{collect_agg_exprs_from, find_matching_group_by};
+use crate::model::DataType;
 use crate::sql::analyzer::types::{TypedExpr, TypedExprKind, TypedOrderByExpr};
 use crate::sql::operators::{AggregateExpr, BoxedOperator, HashAggregateOperator, ProjectOperator};
-use crate::types::DataType;
 
 /// Check whether an `AggregateExpr` matches the identity of an `AggregateCall`.
 ///
@@ -40,7 +40,7 @@ pub(crate) fn aggregate_identity_matches(
     // 4. delimiter (string_agg second argument)
     let call_delimiter = if func.name.eq_ignore_ascii_case("string_agg") {
         args.get(1).and_then(|a| {
-            if let TypedExprKind::Constant(crate::types::Value::Text(s)) = &a.kind {
+            if let TypedExprKind::Constant(crate::model::Value::Text(s)) = &a.kind {
                 Some(s.clone())
             } else {
                 None
@@ -210,13 +210,11 @@ fn contains_aggregate(expr: &TypedExpr) -> bool {
             when_clauses,
             else_result,
         } => {
-            operand.as_ref().map_or(false, |o| contains_aggregate(o))
+            operand.as_ref().is_some_and(|o| contains_aggregate(o))
                 || when_clauses
                     .iter()
                     .any(|(w, t)| contains_aggregate(w) || contains_aggregate(t))
-                || else_result
-                    .as_ref()
-                    .map_or(false, |e| contains_aggregate(e))
+                || else_result.as_ref().is_some_and(|e| contains_aggregate(e))
         }
         TypedExprKind::AnyAll { expr, .. } => contains_aggregate(expr),
         TypedExprKind::Coalesce(args) => args.iter().any(contains_aggregate),
@@ -449,7 +447,7 @@ pub(crate) fn rewrite_post_aggregate_expr(
         }),
         TypedExprKind::UnaryOp { op, operand } => Ok(TypedExpr {
             kind: TypedExprKind::UnaryOp {
-                op: op.clone(),
+                op: *op,
                 operand: Box::new(rewrite_post_aggregate_expr(
                     operand,
                     group_by,

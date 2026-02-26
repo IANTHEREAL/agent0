@@ -3,7 +3,7 @@
 //! These functions build TiKV keys for user data rows and index entries,
 //! using the database-scoped prefix from `encode_database_data_prefix()`.
 
-use crate::types::Value;
+use crate::model::Value;
 
 use super::value_encoding::encode_value_memcomparable;
 use super::{

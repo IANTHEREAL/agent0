@@ -4,8 +4,8 @@
 //! `CatalogSnapshot` implementation is built by pre-fetching all referenced
 //! relations from TiKV before analysis begins (async fetch → sync analysis).
 
+use crate::model::{ColumnDef, DataType, FunctionDef, TableSchema, UserTypeDef, ViewDef};
 use crate::sql::collation::CollationDef;
-use crate::types::{ColumnDef, DataType, FunctionDef, TableSchema, UserTypeDef, ViewDef};
 use std::collections::{HashMap, HashSet};
 
 // ── Catalog trait ───────────────────────────────────────────
@@ -196,9 +196,13 @@ impl CatalogSnapshot {
         result
     }
 
-    /// Return deduplicated `(qualified_name, schema_version)` for all real
-    /// (non-virtual) base tables in the snapshot.
-    pub fn base_table_versions(&self) -> Vec<(String, u64)> {
+    /// Return deduplicated `(qualified_name, table_id, schema_version)` for all
+    /// real (non-virtual) base tables in the snapshot.
+    ///
+    /// The `table_id` is stable across schema mutations and used by the plan
+    /// cache for invalidation (not name-only matching, which breaks across
+    /// DROP+CREATE of the same table name).
+    pub fn base_table_versions(&self) -> Vec<(String, u64, u64)> {
         let mut seen = HashSet::new();
         let mut result = Vec::new();
         for (qualified_name, schema) in self.tables.values() {
@@ -213,7 +217,7 @@ impl CatalogSnapshot {
                 continue;
             }
             if seen.insert(qualified_name.as_str()) {
-                result.push((qualified_name.clone(), schema.version));
+                result.push((qualified_name.clone(), schema.table_id, schema.version));
             }
         }
         result

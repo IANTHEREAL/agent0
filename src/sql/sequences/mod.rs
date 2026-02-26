@@ -15,13 +15,13 @@ pub(crate) use eval::eval_expr_with_sequences;
 #[allow(unused_imports)]
 pub(crate) use replace::replace_sequence_functions;
 
+use crate::model::{
+    DataType, Row, SequenceBacking, SequenceDef, SequenceState, TableSchema, Value,
+};
 use crate::sql::error::SqlError;
 use crate::sql::names;
 use crate::sql::names::{function_name_upper, normalize_ident};
 use crate::storage::TikvStore;
-use crate::types::{
-    DataType, Row, SequenceBacking, SequenceDef, SequenceState, TableSchema, Value,
-};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, ObjectName};
 use std::sync::Arc;
@@ -256,7 +256,7 @@ pub(crate) fn find_owned_sequence_full_name(
     let mut matches = sequences.iter().filter(|seq| {
         seq.owned_by
             .as_ref()
-            .map_or(false, |(owned_table, owned_col)| {
+            .is_some_and(|(owned_table, owned_col)| {
                 owned_table == table_full_name && owned_col == column_name
             })
     });
@@ -278,10 +278,10 @@ pub(crate) fn find_owned_sequence_full_name(
 
 fn eval_i64(expr: &Expr) -> Result<i64> {
     match super::expr::bridge::eval_const_ast_expr(expr)? {
-        crate::types::Value::Int32(n) => Ok(n as i64),
-        crate::types::Value::Int64(n) => Ok(n),
-        crate::types::Value::Float64(n) => Ok(n as i64),
-        crate::types::Value::Text(s) => s
+        crate::model::Value::Int32(n) => Ok(n as i64),
+        crate::model::Value::Int64(n) => Ok(n),
+        crate::model::Value::Float64(n) => Ok(n as i64),
+        crate::model::Value::Text(s) => s
             .trim()
             .parse::<i64>()
             .map_err(|_| anyhow!("Expected integer, got {}", s)),
@@ -348,7 +348,7 @@ fn parse_sequence_name_token(token: &str) -> Result<(Option<String>, String)> {
     }
 }
 
-fn extract_arg_expr<'a>(args: &'a [FunctionArg], idx: usize) -> Result<&'a Expr> {
+fn extract_arg_expr(args: &[FunctionArg], idx: usize) -> Result<&Expr> {
     match args.get(idx) {
         Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))) => Ok(expr),
         Some(_) => Err(SqlError::Unsupported("Unsupported function argument".into()).into()),
@@ -378,9 +378,9 @@ pub(crate) async fn resolve_sequence_full_name_from_value(
     txn: &mut Transaction,
     db_id: u64,
     search_path: &[String],
-    v: crate::types::Value,
+    v: crate::model::Value,
 ) -> Result<String> {
-    let crate::types::Value::Text(s) = v else {
+    let crate::model::Value::Text(s) = v else {
         return Err(anyhow!("Sequence name must be text/regclass"));
     };
 

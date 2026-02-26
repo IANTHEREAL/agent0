@@ -8,8 +8,8 @@ use super::names;
 use super::names::normalize_ident;
 use super::types::sql_datatype_to_internal_strict;
 use super::ExecuteResult;
+use crate::model::{UserTypeDef, UserTypeKind};
 use crate::storage::TikvStore;
-use crate::types::{UserTypeDef, UserTypeKind};
 
 mod enum_rewrite;
 mod enum_values;
@@ -130,7 +130,7 @@ pub async fn drop_types(
                 if let Some(col) = schema
                     .columns
                     .iter()
-                    .find(|c| matches!(&c.data_type, crate::types::DataType::UserDefined(t) if t == full_name))
+                    .find(|c| matches!(&c.data_type, crate::model::DataType::UserDefined(t) if t == full_name))
                 {
                     let bare_type = full_name.rsplit('.').next().unwrap_or(full_name);
                     let bare_table = table_name.rsplit('.').next().unwrap_or(table_name);

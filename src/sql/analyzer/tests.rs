@@ -5,11 +5,11 @@
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
+use crate::model::DataType;
 use crate::sql::analyzer::catalog::MockCatalog;
 use crate::sql::analyzer::scope::Scope;
 use crate::sql::analyzer::types::*;
 use crate::sql::analyzer::{Analyzer, AnalyzerError};
-use crate::types::DataType;
 
 /// Extract the `AnalyzedSelect` from a query, panicking if it's not a SELECT.
 fn expect_select(query: &AnalyzedQuery) -> &AnalyzedSelect {
@@ -46,7 +46,7 @@ fn parse_query(sql: &str) -> sqlparser::ast::Query {
 
 fn text_literal_value(expr: &TypedExpr) -> Option<&str> {
     match &expr.kind {
-        TypedExprKind::Constant(crate::types::Value::Text(s)) => Some(s.as_str()),
+        TypedExprKind::Constant(crate::model::Value::Text(s)) => Some(s.as_str()),
         TypedExprKind::Cast { expr, .. } => text_literal_value(expr),
         _ => None,
     }
@@ -143,7 +143,7 @@ fn analyze_integer_literal() {
     assert_eq!(expr.data_type, DataType::Int32);
     assert!(matches!(
         expr.kind,
-        TypedExprKind::Constant(crate::types::Value::Int32(42))
+        TypedExprKind::Constant(crate::model::Value::Int32(42))
     ));
 }
 
@@ -301,8 +301,38 @@ fn analyze_json_access_comparison_precedence_stays_binary_comparison() {
 
     assert!(matches!(
         right.kind,
-        TypedExprKind::Constant(crate::types::Value::Text(ref s)) if s == "senior"
+        TypedExprKind::Constant(crate::model::Value::Text(ref s)) if s == "senior"
     ));
+}
+
+#[test]
+fn analyze_json_access_is_null_precedence_stays_is_test_over_json_access() {
+    let expr = analyze_expr_with_users(
+        "'{\"settings\":{}}'::jsonb -> 'settings' ->> 'inputUiInfo' IS NULL",
+    )
+    .unwrap();
+    assert_eq!(expr.data_type, DataType::Boolean);
+
+    let inner = match &expr.kind {
+        TypedExprKind::IsTest {
+            expr,
+            test,
+            negated,
+        } => {
+            assert_eq!(*test, IsTestKind::Null);
+            assert!(!negated);
+            expr
+        }
+        other => panic!("expected IsTest, got {:?}", other),
+    };
+
+    match &inner.kind {
+        TypedExprKind::JsonAccess { path, operator, .. } => {
+            assert_eq!(*operator, JsonAccessOp::LongArrow);
+            assert_eq!(text_literal_value(path), Some("inputUiInfo"));
+        }
+        other => panic!("expected JsonAccess under IS NULL, got {:?}", other),
+    }
 }
 
 // ── Unary operators ─────────────────────────────────────────
@@ -619,7 +649,7 @@ fn analyze_date_literal() {
     assert_eq!(expr.data_type, DataType::Date);
     assert!(matches!(
         expr.kind,
-        TypedExprKind::Constant(crate::types::Value::Date(_))
+        TypedExprKind::Constant(crate::model::Value::Date(_))
     ));
 }
 
@@ -1424,6 +1454,54 @@ fn analyze_in_subquery_single_column_ok() {
     let mut analyzer = Analyzer::new(&catalog);
     let query = parse_query("SELECT id FROM users WHERE id IN (SELECT order_id FROM orders)");
     assert!(analyzer.analyze_query(&query).is_ok());
+}
+
+#[test]
+fn analyze_tuple_in_subquery_builds_tuple_variant() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query(
+        "SELECT id FROM users WHERE (id, name) IN (SELECT user_id, status FROM orders)",
+    );
+    let analyzed = analyzer.analyze_query(&query).unwrap();
+    let select = expect_select(&analyzed);
+    let where_expr = select.where_clause.as_ref().expect("missing WHERE clause");
+    match &where_expr.kind {
+        TypedExprKind::TupleInSubquery {
+            exprs,
+            subquery,
+            negated,
+        } => {
+            assert_eq!(exprs.len(), 2);
+            assert_eq!(subquery.output_schema.len(), 2);
+            assert!(!negated);
+        }
+        other => panic!(
+            "expected TupleInSubquery, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+}
+
+#[test]
+fn analyze_is_distinct_from_builds_typed_variant() {
+    let expr = analyze_expr_with_users("id IS DISTINCT FROM age").unwrap();
+    match &expr.kind {
+        TypedExprKind::IsDistinctFrom { negated, .. } => assert!(!negated),
+        other => panic!(
+            "expected IsDistinctFrom, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+
+    let expr = analyze_expr_with_users("id IS NOT DISTINCT FROM age").unwrap();
+    match &expr.kind {
+        TypedExprKind::IsDistinctFrom { negated, .. } => assert!(*negated),
+        other => panic!(
+            "expected IsDistinctFrom, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
 }
 
 #[test]
@@ -2814,4 +2892,61 @@ fn using_merged_column_carries_collation() {
         Some("de".to_string()),
         "Explicit SELECT a with USING join must carry collation"
     );
+}
+
+// ── ANY($1) parameter inference (Prisma compat, #1059) ──────
+
+#[test]
+fn any_with_unresolved_text_parameter_infers_array_type() {
+    // Prisma schema engine sends `WHERE nspname = ANY($1)` with OID=0.
+    // The analyzer must infer $1 as Array(Text) from the left operand type.
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let query = parse_query("SELECT name FROM users WHERE name = ANY($1)");
+    let _result = analyzer.analyze_query(&query).unwrap();
+
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(param_types, vec![DataType::Array(Box::new(DataType::Text))]);
+}
+
+#[test]
+fn any_with_unresolved_int_parameter_infers_int_array() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let query = parse_query("SELECT id FROM users WHERE id = ANY($1)");
+    let _result = analyzer.analyze_query(&query).unwrap();
+
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(
+        param_types,
+        vec![DataType::Array(Box::new(DataType::Int32))]
+    );
+}
+
+#[test]
+fn any_with_typed_array_parameter_still_works() {
+    // Client provides OID for text[] — should still work.
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(
+        &catalog,
+        1,
+        &[Some(DataType::Array(Box::new(DataType::Text)))],
+    );
+    let query = parse_query("SELECT name FROM users WHERE name = ANY($1)");
+    let _result = analyzer.analyze_query(&query).unwrap();
+
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(param_types, vec![DataType::Array(Box::new(DataType::Text))]);
+}
+
+#[test]
+fn any_with_cast_parameter_works() {
+    // `$1::text[]` — explicit SQL cast should work (existing path).
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let query = parse_query("SELECT name FROM users WHERE name = ANY($1::text[])");
+    let _result = analyzer.analyze_query(&query).unwrap();
+
+    let param_types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(param_types, vec![DataType::Array(Box::new(DataType::Text))]);
 }

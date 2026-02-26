@@ -11,7 +11,7 @@
   - `get_unsupported_reason()` pre-rejected `CREATE TRIGGER` with `"CREATE TRIGGER not supported"`.
 
 ## Types (metadata structs)
-- `src/types/mod.rs`
+- `src/model/mod.rs`
   - `FunctionDef { oid, schema, name, arg_types: Vec<String>, return_type: String, language: String, body: String }`
   - `TriggerDef { oid, schema, name, table, timing, events: Vec<String>, function }`
 

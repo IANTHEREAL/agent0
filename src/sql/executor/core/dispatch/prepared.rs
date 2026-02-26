@@ -30,6 +30,17 @@ pub(in crate::sql::executor::core) enum PreparedObservabilityMode {
     Observability,
 }
 
+fn is_plan_cache_eligible(exec: &PreparedExec) -> bool {
+    match exec {
+        PreparedExec::AnalyzedQuery {
+            analyzed,
+            has_recursive_cte: false,
+            ..
+        } => !crate::sql::executor::select::analyzed::query_needs_pre_materialization(analyzed),
+        _ => false,
+    }
+}
+
 impl Executor {
     /// Execute a prepared analyzed statement without re-parsing SQL text.
     ///
@@ -42,7 +53,7 @@ impl Executor {
         exec: &PreparedExec,
         params: Vec<Option<Value>>,
         param_data_types: &[DataType],
-        table_versions: &[(String, u64)],
+        table_versions: &[(String, u64, u64)],
     ) -> Result<ExecuteResults> {
         if matches!(exec, PreparedExec::RawSqlUtility) {
             unreachable!("RawSqlUtility should not be routed to execute_prepared")
@@ -69,8 +80,15 @@ impl Executor {
         }
 
         let qctx = self.build_prepared_query_context(session, params, param_data_types);
-        self.execute_prepared_with_framework(session, sql, exec, table_versions, &qctx)
-            .await
+        self.execute_prepared_with_framework(
+            session,
+            sql,
+            exec,
+            param_data_types,
+            table_versions,
+            &qctx,
+        )
+        .await
     }
 
     fn build_prepared_query_context(
@@ -94,7 +112,8 @@ impl Executor {
         session: &mut Session,
         sql: &str,
         exec: &PreparedExec,
-        table_versions: &[(String, u64)],
+        param_data_types: &[DataType],
+        table_versions: &[(String, u64, u64)],
         qctx: &Arc<crate::sql::query_context::QueryContext>,
     ) -> Result<ExecuteResults> {
         let savepoints = session.savepoints();
@@ -131,6 +150,7 @@ impl Executor {
                                 session,
                                 sql,
                                 exec,
+                                param_data_types,
                                 table_versions,
                                 qctx.as_ref(),
                                 is_observability_query,
@@ -169,7 +189,8 @@ impl Executor {
         session: &'a mut Session,
         sql: &'a str,
         exec: &'a PreparedExec,
-        table_versions: &'a [(String, u64)],
+        param_data_types: &'a [DataType],
+        table_versions: &'a [(String, u64, u64)],
         qctx: &'a crate::sql::query_context::QueryContext,
         is_observability_query: bool,
     ) -> Pin<Box<dyn Future<Output = Result<ExecuteResults>> + Send + 'a>> {
@@ -180,6 +201,7 @@ impl Executor {
                 session,
                 sql,
                 exec,
+                param_data_types,
                 table_versions,
                 qctx,
                 is_observability_query,
@@ -198,7 +220,8 @@ impl Executor {
         session: &mut Session,
         sql: &str,
         exec: &PreparedExec,
-        table_versions: &[(String, u64)],
+        param_data_types: &[DataType],
+        table_versions: &[(String, u64, u64)],
         qctx: &crate::sql::query_context::QueryContext,
         is_observability_query: bool,
     ) -> Result<ExecuteResults> {
@@ -216,7 +239,9 @@ impl Executor {
                 .execute_prepared_attempt(
                     session,
                     db_id,
+                    sql,
                     exec,
+                    param_data_types,
                     table_versions,
                     current_role.as_deref(),
                 )
@@ -303,39 +328,233 @@ impl Executor {
         &self,
         session: &mut Session,
         db_id: u64,
+        sql: &str,
         exec: &PreparedExec,
-        table_versions: &[(String, u64)],
+        param_data_types: &[DataType],
+        table_versions: &[(String, u64, u64)],
         current_role: Option<&str>,
     ) -> Result<PreparedTxnResult> {
+        use crate::sql::executor::core::plan_cache::{
+            PlanCacheEntry, PlanCacheKey, PlanDependency,
+        };
+
+        // ── Plan cache: build key + lookup ──
+        let resolved_table_ids: Vec<u64> = table_versions
+            .iter()
+            .map(|(_, table_id, _)| *table_id)
+            .collect();
+        let cache_key = PlanCacheKey::new(
+            sql.to_string(),
+            param_data_types,
+            db_id,
+            session.search_path(),
+            &resolved_table_ids,
+        );
+
+        // Check eligibility: analyzed SELECT only, and never cache plans that
+        // require pre-materialization (subquery/async constants).
+        let cache_eligible = is_plan_cache_eligible(exec);
+
+        // Record execution and check cache.
+        let (cached_entry, should_promote) = if cache_eligible {
+            let exec_count = session.plan_cache().record_execution(&cache_key);
+            let min_exec = session.plan_cache().min_exec();
+            let cached = session.plan_cache().get(&cache_key).cloned();
+            let should_promote = cached.is_none() && exec_count >= min_exec;
+            (cached, should_promote)
+        } else {
+            (None, false)
+        };
+
+        // Extract cached plan/dependency metadata for hit-time drift validation.
+        let cached_physical = cached_entry.as_ref().map(|e| e.physical_plan.clone());
+        let cached_dependency_versions: Option<Vec<(String, u64, u64)>> =
+            cached_entry.as_ref().map(|entry| {
+                entry
+                    .dependencies
+                    .iter()
+                    .map(|dep| (dep.table_name.clone(), dep.table_id, dep.schema_version))
+                    .collect()
+            });
+
         let timeout = session.statement_timeout();
+        let table_versions_for_cache: Vec<(String, u64, u64)> = table_versions.to_vec();
         let fut = async {
             let (txn, sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
+
+            let mut invalidate_cached_hit = false;
+            let mut cached_physical_for_exec = cached_physical.as_ref();
+
+            if let Some(cache_deps) = cached_dependency_versions.as_ref() {
+                if self
+                    .first_schema_drift_on_txn(txn, db_id, cache_deps)
+                    .await?
+                    .is_some()
+                {
+                    // Cache hit exists but entry dependencies are stale.
+                    invalidate_cached_hit = true;
+                    cached_physical_for_exec = None;
+                }
+            }
+
             if let Some((table_name, expected, current)) = self
                 .first_schema_drift_on_txn(txn, db_id, table_versions)
                 .await?
             {
-                return Ok::<PreparedTxnResult, anyhow::Error>(PreparedTxnResult::SchemaDrift {
-                    table_name,
-                    expected,
-                    current,
-                });
+                return Ok::<(PreparedTxnResult, _, bool), anyhow::Error>((
+                    PreparedTxnResult::SchemaDrift {
+                        table_name,
+                        expected,
+                        current,
+                    },
+                    None,
+                    invalidate_cached_hit,
+                ));
             }
-            let result = self
-                .execute_prepared_on_txn(
+
+            let capture_plan = should_promote || invalidate_cached_hit;
+            let (result, new_plan) = self
+                .execute_prepared_on_txn_with_plan(
                     txn,
                     db_id,
                     sequence_values,
                     search_path,
                     exec,
                     current_role,
+                    cached_physical_for_exec,
+                    capture_plan,
                 )
                 .await?;
-            Ok::<PreparedTxnResult, anyhow::Error>(PreparedTxnResult::Executed(result))
+            Ok::<(PreparedTxnResult, _, bool), anyhow::Error>((
+                PreparedTxnResult::Executed(result),
+                new_plan,
+                invalidate_cached_hit,
+            ))
         };
 
-        apply_statement_timeout(timeout, fut).await
+        let result = apply_statement_timeout(timeout, fut).await;
+
+        // ── Plan cache: invalidate stale hit entries before potential reinsert ──
+        if let Ok((_, _, invalidate_cached_hit)) = &result {
+            if *invalidate_cached_hit {
+                session.plan_cache().invalidate(&cache_key);
+            }
+        }
+
+        // ── Plan cache: promote new plan into cache ──
+        if let Ok((PreparedTxnResult::Executed(_), Some(new_physical), invalidate_cached_hit)) =
+            &result
+        {
+            if should_promote || *invalidate_cached_hit {
+                let deps: Vec<PlanDependency> = table_versions_for_cache
+                    .iter()
+                    .map(|(name, table_id, version)| PlanDependency {
+                        table_name: name.clone(),
+                        table_id: *table_id,
+                        schema_version: *version,
+                    })
+                    .collect();
+                session.plan_cache().insert(
+                    cache_key,
+                    PlanCacheEntry {
+                        physical_plan: new_physical.clone(),
+                        dependencies: deps,
+                    },
+                );
+            }
+        }
+
+        result.map(|(txn_result, _, _)| txn_result)
+    }
+
+    /// Execute a prepared statement on a transaction, optionally using a
+    /// pre-computed physical plan from the cache.
+    ///
+    /// When `capture_plan` is true and no cached plan was used, returns the
+    /// newly optimized `PhysicalPlan` for the caller to promote into the cache.
+    pub(in crate::sql::executor::core) async fn execute_prepared_on_txn_with_plan(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
+        exec: &PreparedExec,
+        current_role: Option<&str>,
+        cached_plan: Option<&crate::sql::optimizer::physical_plan::PhysicalPlan>,
+        capture_plan: bool,
+    ) -> Result<(
+        ExecuteResult,
+        Option<crate::sql::optimizer::physical_plan::PhysicalPlan>,
+    )> {
+        match exec {
+            PreparedExec::AnalyzedQuery {
+                analyzed,
+                locks,
+                select_into,
+                required_privileges,
+                ..
+            } => {
+                for (table_name, privilege) in required_privileges {
+                    self.require_table_privilege(
+                        txn,
+                        current_role,
+                        (*privilege).clone(),
+                        table_name,
+                    )
+                    .await?;
+                }
+
+                let prepared_ctes = self
+                    .build_cte_context_from_analyzed_with_base(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        analyzed,
+                        &HashMap::new(),
+                    )
+                    .await?;
+
+                let (result, new_plan) = self
+                    .execute_via_optimizer(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        std::borrow::Cow::Borrowed(analyzed),
+                        &prepared_ctes,
+                        locks,
+                        cached_plan,
+                        capture_plan,
+                    )
+                    .await?;
+
+                if let Some(target_name) = select_into.as_ref().map(|into| into.name.clone()) {
+                    let result = self
+                        .create_table_from_result(txn, db_id, search_path, &target_name, result)
+                        .await?;
+                    return Ok((result, new_plan));
+                }
+
+                Ok((result, new_plan))
+            }
+            _ => {
+                // Non-query variants don't use plan cache.
+                let result = self
+                    .execute_prepared_on_txn(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        exec,
+                        current_role,
+                    )
+                    .await?;
+                Ok((result, None))
+            }
+        }
     }
 
     fn enforce_observability_prepared_policy(
@@ -444,7 +663,7 @@ impl Executor {
                     )
                     .await?;
 
-                let result = self
+                let (result, _) = self
                     .execute_via_optimizer(
                         txn,
                         db_id,
@@ -453,6 +672,8 @@ impl Executor {
                         std::borrow::Cow::Borrowed(analyzed),
                         &prepared_ctes,
                         locks,
+                        None,
+                        false,
                     )
                     .await?;
 
@@ -478,16 +699,16 @@ impl Executor {
                     .await?;
                 }
                 match analyzed {
-                    crate::sql::analyzer::types::AnalyzedStatement::Insert(ins) => {
-                        self.execute_analyzed_insert(txn, db_id, sequence_values, search_path, &ins)
+                    crate::sql::analyzer::types::AnalyzedStatement::Insert(ref ins) => {
+                        self.execute_analyzed_insert(txn, db_id, sequence_values, search_path, ins)
                             .await
                     }
-                    crate::sql::analyzer::types::AnalyzedStatement::Update(upd) => {
-                        self.execute_analyzed_update(txn, db_id, sequence_values, search_path, &upd)
+                    crate::sql::analyzer::types::AnalyzedStatement::Update(ref upd) => {
+                        self.execute_analyzed_update(txn, db_id, sequence_values, search_path, upd)
                             .await
                     }
-                    crate::sql::analyzer::types::AnalyzedStatement::Delete(del) => {
-                        self.execute_analyzed_delete(txn, db_id, sequence_values, search_path, &del)
+                    crate::sql::analyzer::types::AnalyzedStatement::Delete(ref del) => {
+                        self.execute_analyzed_delete(txn, db_id, sequence_values, search_path, del)
                             .await
                     }
                     crate::sql::analyzer::types::AnalyzedStatement::Query(_) => {
@@ -615,124 +836,94 @@ impl Executor {
     }
 
     /// Execute a SQL-level `EXECUTE name (params)`.
-    pub(super) async fn execute_sql_execute_statement(
-        &self,
-        session: &mut Session,
-        name: &sqlparser::ast::Ident,
-        parameters: &[Expr],
-    ) -> Result<Vec<ExecuteResult>> {
-        let prepared_name = normalize_ident(name);
-        let prepared = session
-            .get_sql_prepared_statement_cloned(&prepared_name)
-            .ok_or_else(|| {
-                SqlError::UndefinedObject(format!(
-                    "prepared statement \"{}\" does not exist",
-                    prepared_name
-                ))
-            })?;
+    ///
+    /// Unified through `execute_prepared_with_framework` so that SQL EXECUTE
+    /// benefits from schema drift detection, plan cache, and observability —
+    /// the same pipeline as pgwire Extended Query Execute.
+    ///
+    /// Returns `Pin<Box<dyn Future + Send>>` (instead of `async fn`) to break
+    /// the recursive type created by `execute → execute_single →
+    /// execute_sql_execute_statement → self.execute()` for the recursive CTE
+    /// fallback path.
+    pub(super) fn execute_sql_execute_statement<'a>(
+        &'a self,
+        session: &'a mut Session,
+        name: &'a sqlparser::ast::Ident,
+        parameters: &'a [Expr],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ExecuteResult>>> + Send + 'a>> {
+        Box::pin(async move {
+            let prepared_name = normalize_ident(name);
+            let prepared = session
+                .get_sql_prepared_statement_cloned(&prepared_name)
+                .ok_or_else(|| {
+                    SqlError::UndefinedObject(format!(
+                        "prepared statement \"{}\" does not exist",
+                        prepared_name
+                    ))
+                })?;
 
-        if parameters.len() != prepared.param_data_types.len() {
-            return Err(SqlError::InvalidParameterUsage {
-                index: prepared.param_data_types.len().max(1),
-                context: format!(
-                    "prepared statement \"{}\" expects {} parameters, but {} were given",
-                    prepared_name,
-                    prepared.param_data_types.len(),
-                    parameters.len()
-                ),
-            }
-            .into());
-        }
-
-        let mut param_values: Vec<Option<Value>> = Vec::with_capacity(parameters.len());
-        for expr in parameters {
-            param_values.push(Some(eval_const_ast_expr(expr)?));
-        }
-
-        let statement_ts = statement_time::now_timestamp_millis();
-        let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
-        let mut qctx = session.query_context_for_statement(statement_ts, transaction_ts);
-        qctx.params = param_values;
-        if !prepared.param_data_types.is_empty() {
-            qctx.param_types = prepared
-                .param_data_types
-                .iter()
-                .cloned()
-                .map(Some)
-                .collect();
-        }
-        let qctx = Arc::new(qctx);
-        let savepoints = session.savepoints();
-
-        crate::sql::query_context::with_scoped_query_context(
-            qctx.as_ref(),
-            crate::txn::with_savepoints(savepoints, async {
-                let is_autocommit = !session.is_in_transaction();
-                let db_id = session.current_database_id();
-                let max_attempts = if is_autocommit { 10usize } else { 1usize };
-
-                for attempt in 0..max_attempts {
-                    if is_autocommit {
-                        session.begin().await?;
-                    }
-
-                    let timeout = session.statement_timeout();
-                    let current_role = session.current_user().map(|u| u.to_string());
-                    let fut = async {
-                        let (txn, sequence_values, search_path) = session
-                            .get_mut_txn_sequence_values_and_search_path()
-                            .expect("Transaction must be active");
-                        self.execute_prepared_on_txn(
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            &prepared.exec,
-                            current_role.as_deref(),
-                        )
-                        .await
-                    };
-
-                    let res = apply_statement_timeout(timeout, fut).await;
-
-                    if res
-                        .as_ref()
-                        .err()
-                        .is_some_and(|e| e.is::<StatementTimeoutError>())
-                        && !is_autocommit
-                    {
-                        session.rollback().await?;
-                        self.clear_trigger_activations();
-                    }
-
-                    if is_autocommit {
-                        match res {
-                            Ok(result) => {
-                                session.commit().await?;
-                                self.flush_trigger_activations();
-                                return Ok(vec![result]);
-                            }
-                            Err(err) => {
-                                session.rollback().await?;
-                                self.clear_trigger_activations();
-                                let should_retry =
-                                    attempt + 1 < max_attempts && is_retryable_tikv_error(&err);
-                                if should_retry {
-                                    autocommit_backoff(attempt).await;
-                                    continue;
-                                }
-                                return Err(err);
-                            }
-                        }
-                    } else {
-                        return Ok(vec![res?]);
-                    }
+            if parameters.len() != prepared.param_data_types.len() {
+                return Err(SqlError::InvalidParameterUsage {
+                    index: prepared.param_data_types.len().max(1),
+                    context: format!(
+                        "prepared statement \"{}\" expects {} parameters, but {} were given",
+                        prepared_name,
+                        prepared.param_data_types.len(),
+                        parameters.len()
+                    ),
                 }
+                .into());
+            }
 
-                unreachable!("retry loop must return")
-            }),
-        )
-        .await
+            let mut param_values: Vec<Option<Value>> = Vec::with_capacity(parameters.len());
+            for expr in parameters {
+                param_values.push(Some(eval_const_ast_expr(expr)?));
+            }
+
+            // Recursive CTE fallback: re-parse through the text path.
+            if matches!(
+                prepared.exec,
+                PreparedExec::AnalyzedQuery {
+                    has_recursive_cte: true,
+                    ..
+                }
+            ) {
+                warn!("SQL EXECUTE: recursive CTE detected; falling back to SQL parse/analyze");
+                if !param_values.is_empty() {
+                    session.set_pending_params(param_values);
+                }
+                if !prepared.param_data_types.is_empty() {
+                    session.set_pending_param_types(
+                        prepared
+                            .param_data_types
+                            .iter()
+                            .cloned()
+                            .map(Some)
+                            .collect(),
+                    );
+                }
+                return self
+                    .execute(session, &prepared.sql)
+                    .await
+                    .map(|r| r.into_vec());
+            }
+
+            let qctx = self.build_prepared_query_context(
+                session,
+                param_values,
+                &prepared.param_data_types,
+            );
+            self.execute_prepared_with_framework(
+                session,
+                &prepared.sql,
+                &prepared.exec,
+                &prepared.param_data_types,
+                &prepared.table_versions,
+                &qctx,
+            )
+            .await
+            .map(|r| r.into_vec())
+        })
     }
 
     /// Execute a SQL-level `DEALLOCATE name` or `DEALLOCATE ALL`.
@@ -756,5 +947,84 @@ impl Executor {
         }
 
         Ok(vec![ExecuteResult::CommandComplete { tag: "DEALLOCATE" }])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Value;
+    use crate::sql::analyzer::types::{
+        AnalyzedDistinct, AnalyzedProjection, AnalyzedQueryBody, AnalyzedSelect, TypedExpr,
+        TypedExprKind,
+    };
+    use crate::sql::analyzer::AnalyzedQuery;
+
+    fn const_int(v: i32) -> TypedExpr {
+        TypedExpr::new(TypedExprKind::Constant(Value::Int32(v)), DataType::Int32)
+    }
+
+    fn values_query() -> AnalyzedQuery {
+        AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Values(vec![vec![const_int(1)]]),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("v".to_string(), DataType::Int32, None)],
+        }
+    }
+
+    fn query_with_scalar_subquery_projection() -> AnalyzedQuery {
+        let subquery = values_query();
+        AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection: vec![AnalyzedProjection {
+                    expr: TypedExpr::new(
+                        TypedExprKind::ScalarSubquery(Box::new(subquery)),
+                        DataType::Int32,
+                    ),
+                    output_name: "x".to_string(),
+                }],
+                from: vec![],
+                where_clause: None,
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("x".to_string(), DataType::Int32, None)],
+        }
+    }
+
+    fn analyzed_query_exec(analyzed: AnalyzedQuery, has_recursive_cte: bool) -> PreparedExec {
+        PreparedExec::AnalyzedQuery {
+            analyzed,
+            locks: vec![],
+            select_into: None,
+            required_privileges: vec![],
+            has_recursive_cte,
+        }
+    }
+
+    #[test]
+    fn plan_cache_eligible_for_simple_analyzed_query() {
+        let exec = analyzed_query_exec(values_query(), false);
+        assert!(is_plan_cache_eligible(&exec));
+    }
+
+    #[test]
+    fn plan_cache_ineligible_for_recursive_cte_query() {
+        let exec = analyzed_query_exec(values_query(), true);
+        assert!(!is_plan_cache_eligible(&exec));
+    }
+
+    #[test]
+    fn plan_cache_ineligible_when_query_needs_pre_materialization() {
+        let exec = analyzed_query_exec(query_with_scalar_subquery_projection(), false);
+        assert!(!is_plan_cache_eligible(&exec));
     }
 }

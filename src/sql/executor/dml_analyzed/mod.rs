@@ -10,12 +10,12 @@ mod update;
 
 use super::super::dml;
 use super::core::Executor;
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::analyzer::types::{AnalyzedProjection, TypedExpr, TypedExprKind};
 use crate::sql::expr::static_eval::needs_async_materialization;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
-use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tikv_client::Transaction;
@@ -24,25 +24,193 @@ use tikv_client::Transaction;
 
 impl Executor {
     /// Resolve an AnalyzedTableRef to a table name + schema + rows.
-    pub(super) async fn resolve_and_scan_table_ref(
-        &self,
-        txn: &mut Transaction,
+    ///
+    /// Supports Table, Subquery (derived tables, VALUES), and Join variants.
+    /// Uses Box::pin for the Join recursive case.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn resolve_and_scan_table_ref<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
         db_id: u64,
-        _search_path: &[String],
-        table_ref: &crate::sql::analyzer::types::AnalyzedTableRef,
-    ) -> Result<(String, TableSchema, Vec<Row>)> {
-        use crate::sql::analyzer::types::AnalyzedTableRefKind;
-        match &table_ref.kind {
-            AnalyzedTableRefKind::Table { name, .. } => {
-                let schema = self
-                    .store()
-                    .get_schema(txn, db_id, name)
-                    .await?
-                    .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?;
-                let rows = self.scan_and_fill(txn, db_id, name, &schema).await?;
-                Ok((name.clone(), schema, rows))
+        search_path: &'a [String],
+        table_ref: &'a crate::sql::analyzer::types::AnalyzedTableRef,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(String, TableSchema, Vec<Row>)>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            use crate::sql::analyzer::types::AnalyzedTableRefKind;
+            match &table_ref.kind {
+                AnalyzedTableRefKind::Table { name, .. } => {
+                    let schema = self
+                        .store()
+                        .get_schema(txn, db_id, name)
+                        .await?
+                        .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?;
+                    let mut rows = self.scan_and_fill(txn, db_id, name, &schema).await?;
+                    append_ctid_to_rows(&mut rows);
+                    Ok((name.clone(), schema, rows))
+                }
+                AnalyzedTableRefKind::Subquery(query) => {
+                    let alias = table_ref
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| "__subquery".to_string());
+                    let mut seq_vals: HashMap<String, i64> = HashMap::new();
+                    let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
+                    let result = self
+                        .execute_subquery(
+                            txn,
+                            db_id,
+                            &mut seq_vals,
+                            search_path,
+                            query,
+                            &empty_ctes,
+                        )
+                        .await?;
+                    match result {
+                        crate::sql::ExecuteResult::Select { rows, .. } => {
+                            use crate::sql::executor::select::analyzed::postprocess::build_output_schema;
+                            let schema = build_output_schema(query);
+                            Ok((alias, schema, rows))
+                        }
+                        _ => Err(anyhow!("Expected SELECT result from subquery in FROM")),
+                    }
+                }
+                AnalyzedTableRefKind::Join {
+                    left,
+                    right,
+                    join_type,
+                    condition,
+                    left_col_start,
+                } => {
+                    let alias = table_ref
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| "__join".to_string());
+                    let (_l_name, l_schema, l_rows) = self
+                        .resolve_and_scan_table_ref(txn, db_id, search_path, left)
+                        .await?;
+                    let (_r_name, r_schema, r_rows) = self
+                        .resolve_and_scan_table_ref(txn, db_id, search_path, right)
+                        .await?;
+
+                    let qctx = QueryContext::from_task_locals();
+                    let mut joined_rows = Vec::new();
+
+                    use crate::sql::analyzer::types::JoinType;
+                    match join_type {
+                        JoinType::Inner | JoinType::Cross => {
+                            for lr in &l_rows {
+                                for rr in &r_rows {
+                                    let combined = combine_rows(lr, rr);
+                                    if self.join_condition_matches(
+                                        condition,
+                                        &combined,
+                                        *left_col_start,
+                                        &qctx,
+                                    )? {
+                                        joined_rows.push(combined);
+                                    }
+                                }
+                            }
+                        }
+                        JoinType::Left => {
+                            let r_cols = r_schema.columns.len();
+                            for lr in &l_rows {
+                                let mut found = false;
+                                for rr in &r_rows {
+                                    let combined = combine_rows(lr, rr);
+                                    if self.join_condition_matches(
+                                        condition,
+                                        &combined,
+                                        *left_col_start,
+                                        &qctx,
+                                    )? {
+                                        joined_rows.push(combined);
+                                        found = true;
+                                    }
+                                }
+                                if !found {
+                                    let null_right = Row::new(vec![Value::Null; r_cols]);
+                                    joined_rows.push(combine_rows(lr, &null_right));
+                                }
+                            }
+                        }
+                        _ => {
+                            // RIGHT/FULL joins uncommon in DML FROM; fallback to inner join
+                            for lr in &l_rows {
+                                for rr in &r_rows {
+                                    let combined = combine_rows(lr, rr);
+                                    if self.join_condition_matches(
+                                        condition,
+                                        &combined,
+                                        *left_col_start,
+                                        &qctx,
+                                    )? {
+                                        joined_rows.push(combined);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Build combined schema
+                    let mut combined_cols: Vec<crate::model::ColumnDef> = Vec::new();
+                    for col in &l_schema.columns {
+                        combined_cols.push(col.clone());
+                    }
+                    for col in &r_schema.columns {
+                        combined_cols.push(col.clone());
+                    }
+                    let combined_schema = TableSchema::new(alias.clone(), 0, combined_cols, vec![]);
+
+                    Ok((alias, combined_schema, joined_rows))
+                }
+                _ => Err(anyhow!("unsupported table reference in DML USING/FROM")),
             }
-            _ => Err(anyhow!("unsupported table reference in DML USING/FROM")),
+        })
+    }
+
+    /// Check if a join condition matches for a combined row.
+    ///
+    /// `left_col_start` is the global scope offset where this join's left
+    /// child columns begin.  The analyzer resolves ON-condition column
+    /// references against the full scope (which may include preceding tables
+    /// such as the UPDATE target), but the `combined` row only contains
+    /// columns from the join's own left + right sides.  We prepend
+    /// `left_col_start` NULL placeholders so column indices line up.
+    fn join_condition_matches(
+        &self,
+        condition: &crate::sql::analyzer::types::JoinCondition,
+        combined: &Row,
+        left_col_start: usize,
+        qctx: &QueryContext,
+    ) -> Result<bool> {
+        use crate::sql::analyzer::types::JoinCondition;
+        match condition {
+            JoinCondition::On(expr) => {
+                let eval_row = if left_col_start > 0 {
+                    let mut padded = Vec::with_capacity(left_col_start + combined.values.len());
+                    padded.resize(left_col_start, Value::Null);
+                    padded.extend_from_slice(&combined.values);
+                    Row::new(padded)
+                } else {
+                    combined.clone()
+                };
+                let val = eval_typed_expr(expr, &eval_row, qctx)?;
+                typed_value_to_bool(val)
+            }
+            JoinCondition::None => Ok(true),
+            JoinCondition::Using(cols) => {
+                for col in cols {
+                    let lv = combined.values.get(col.left_index).unwrap_or(&Value::Null);
+                    let rv = combined.values.get(col.right_index).unwrap_or(&Value::Null);
+                    if lv != rv {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
         }
     }
 
@@ -57,7 +225,7 @@ impl Executor {
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         schema: &TableSchema,
-        row_vals: &mut Vec<Value>,
+        row_vals: &mut [Value],
         target_columns: &[usize],
     ) -> Result<()> {
         dml::fill_missing_columns(
@@ -267,7 +435,7 @@ pub(super) fn build_returning_columns_from_analyzed(
 pub(super) fn build_returning_types_from_analyzed(
     returning: &Option<Vec<AnalyzedProjection>>,
     _schema: &TableSchema,
-) -> Vec<crate::types::DataType> {
+) -> Vec<crate::model::DataType> {
     match returning {
         Some(projs) => projs.iter().map(|p| p.expr.data_type.clone()).collect(),
         None => vec![],
@@ -299,4 +467,14 @@ pub(super) fn cross_product_rows(table_rows: &[Vec<Row>]) -> Vec<Row> {
 /// Check if a TypedExpr is a DEFAULT placeholder.
 pub(super) fn is_default_typed_expr(expr: &TypedExpr) -> bool {
     matches!(expr.kind, TypedExprKind::Default)
+}
+
+/// Append a monotonic ctid ordinal (0-based Int64) to each row.
+///
+/// The ctid value is appended as the last element, matching the synthetic
+/// ctid column position registered in the analyzer scope by `add_table`.
+pub(super) fn append_ctid_to_rows(rows: &mut [Row]) {
+    for (i, row) in rows.iter_mut().enumerate() {
+        row.values.push(Value::Int64(i as i64));
+    }
 }

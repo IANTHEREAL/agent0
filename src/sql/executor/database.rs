@@ -391,9 +391,8 @@ fn parse_alter_database_sql(sql: &str) -> Result<AlterDatabaseCommand> {
             .copied()
             .unwrap_or("")
             .eq_ignore_ascii_case("TO")
+            || tokens.get(pos).copied() == Some("=")
         {
-            pos += 1;
-        } else if tokens.get(pos).copied() == Some("=") {
             pos += 1;
         }
         let owner_token = tokens

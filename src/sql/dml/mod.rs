@@ -18,7 +18,7 @@ mod tests;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::types::{Row, Value};
+use crate::model::{Row, Value};
 
 pub type EnumLabelCache = HashMap<String, HashSet<String>>;
 

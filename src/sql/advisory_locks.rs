@@ -280,6 +280,7 @@ pub(crate) fn is_advisory_lock_function(name: &str) -> bool {
 }
 
 impl AdvisoryLockManager {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::with_max_locks_per_connection(Some(DEFAULT_MAX_ADVISORY_LOCKS_PER_CONNECTION))
     }
@@ -302,9 +303,7 @@ impl AdvisoryLockManager {
         key: i64,
         conn_id: i32,
     ) -> Option<usize> {
-        let Some(limit) = self.max_locks_per_connection else {
-            return None;
-        };
+        let limit = self.max_locks_per_connection?;
         let lk = (keyspace.clone(), key);
         let already_holds_key = state
             .connection_keys
@@ -520,6 +519,7 @@ impl AdvisoryLockManager {
     /// Legacy boolean helper for internal call sites/tests.
     /// SQL-facing callers should use `try_acquire_checked` so lock-cap
     /// violations are reported as errors instead of `false`.
+    #[allow(dead_code)]
     pub(crate) fn try_acquire(
         &self,
         keyspace: &Arc<str>,

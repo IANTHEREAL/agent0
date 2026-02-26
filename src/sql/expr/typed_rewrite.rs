@@ -2,13 +2,13 @@
 //!
 //! Rewrites typed expression trees for executor-time materialization tasks.
 
+use crate::model::Value;
 use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
 use crate::sql::expr::static_eval::eval_static_typed_expr;
 use crate::sql::expr::traverse::{map_children_async, AsyncExprTransform};
 use crate::sql::query_context::QueryContext;
 use crate::sql::sequences;
 use crate::storage::TikvStore;
-use crate::types::Value;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::future::Future;
@@ -17,6 +17,7 @@ use std::sync::Arc;
 use tikv_client::Transaction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 enum SequenceFunction {
     NextVal,
     CurrVal,

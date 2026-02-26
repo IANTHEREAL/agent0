@@ -8,6 +8,7 @@
 //! - Nested query collection for CTE materialization
 //! - AnyAll comparison type coercion helpers
 
+use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::{
     AnalyzedDistinct, AnalyzedQueryBody, AnalyzedSelect, AnalyzedTableRef, AnalyzedTableRefKind,
     JoinCondition, TypedExpr, TypedExprKind, TypedFunctionArg, TypedOrderByExpr,
@@ -19,7 +20,6 @@ use crate::sql::expr::typed_eval::eval_const_usize;
 use crate::sql::optimizer::BuildContext;
 use crate::sql::types::coercion::comparison_target_type;
 use crate::sql::types::CastContext;
-use crate::types::{DataType, Row, TableSchema, Value};
 
 use anyhow::{anyhow, Result};
 use tikv_client::Transaction;
@@ -286,7 +286,7 @@ pub(super) fn create_passthrough_projection(
 }
 
 /// Build a TableSchema from column name/type/collation triples.
-pub(super) fn build_schema_from_columns(
+pub(crate) fn build_schema_from_columns(
     name: &str,
     columns: &[(
         String,
@@ -299,7 +299,7 @@ pub(super) fn build_schema_from_columns(
         0,
         columns
             .iter()
-            .map(|(col_name, dt, _coll)| crate::types::ColumnDef {
+            .map(|(col_name, dt, _coll)| crate::model::ColumnDef {
                 name: col_name.clone(),
                 data_type: dt.clone(),
                 nullable: true,
@@ -315,7 +315,7 @@ pub(super) fn build_schema_from_columns(
 }
 
 /// Build a TableSchema from the analyzed query's output schema.
-pub(super) fn build_output_schema(analyzed: &AnalyzedQuery) -> TableSchema {
+pub(crate) fn build_output_schema(analyzed: &AnalyzedQuery) -> TableSchema {
     build_schema_from_columns("__output", &analyzed.output_schema)
 }
 
@@ -405,9 +405,9 @@ pub(super) fn sort_projected_rows(
 /// This provides one-level query children only. The caller performs DFS by
 /// recursively materializing each child query, guaranteeing each subtree is
 /// visited exactly once.
-pub(super) fn collect_immediate_nested_analyzed_queries<'a>(
-    query: &'a AnalyzedQuery,
-) -> Vec<&'a AnalyzedQuery> {
+pub(super) fn collect_immediate_nested_analyzed_queries(
+    query: &AnalyzedQuery,
+) -> Vec<&AnalyzedQuery> {
     let mut out = Vec::new();
     collect_immediate_from_query_body(&query.body, &mut out);
     for ob in &query.order_by {
@@ -517,6 +517,14 @@ fn collect_immediate_from_typed_expr<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a 
             ..
         } => {
             collect_immediate_from_typed_expr(lhs, out);
+            out.push(subquery);
+        }
+        TypedExprKind::TupleInSubquery {
+            exprs, subquery, ..
+        } => {
+            for e in exprs {
+                collect_immediate_from_typed_expr(e, out);
+            }
             out.push(subquery);
         }
         _ => {

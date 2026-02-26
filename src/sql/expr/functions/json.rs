@@ -1,4 +1,4 @@
-use crate::types::Value;
+use crate::model::Value;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
@@ -64,7 +64,7 @@ pub(crate) fn value_to_json(val: &Value) -> serde_json::Value {
         ),
         Value::Time(micros) => serde_json::Value::Number(serde_json::Number::from(*micros)),
         Value::Date(days) => serde_json::Value::String(
-            crate::types::date::format_date_days(*days).unwrap_or_else(|_| days.to_string()),
+            crate::model::date::format_date_days(*days).unwrap_or_else(|_| days.to_string()),
         ),
         Value::Numeric(d) => {
             let s = d.to_string();

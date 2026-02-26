@@ -178,7 +178,7 @@ mod tests {
 
         let edge_claim = cutoff;
         assert!(
-            !(edge_claim < cutoff),
+            edge_claim >= cutoff,
             "claim exactly at cutoff boundary is not orphaned"
         );
     }
@@ -199,11 +199,15 @@ mod tests {
 
     #[test]
     fn test_effective_cron_orphan_timeout_respects_worker_timeout() {
-        let mut cron_cfg = CronConfig::default();
-        cron_cfg.orphan_timeout_sec = 300;
+        let cron_cfg = CronConfig {
+            orphan_timeout_sec: 300,
+            ..Default::default()
+        };
 
-        let mut worker_cfg = WorkerConfig::default();
-        worker_cfg.cron_job_timeout_ms = 1_800_000;
+        let worker_cfg = WorkerConfig {
+            cron_job_timeout_ms: 1_800_000,
+            ..Default::default()
+        };
 
         assert_eq!(
             effective_cron_orphan_timeout_sec(&cron_cfg, &worker_cfg),
@@ -213,11 +217,15 @@ mod tests {
 
     #[test]
     fn test_effective_cron_orphan_timeout_keeps_larger_cron_value() {
-        let mut cron_cfg = CronConfig::default();
-        cron_cfg.orphan_timeout_sec = 7_200;
+        let cron_cfg = CronConfig {
+            orphan_timeout_sec: 7_200,
+            ..Default::default()
+        };
 
-        let mut worker_cfg = WorkerConfig::default();
-        worker_cfg.cron_job_timeout_ms = 1_800_000;
+        let worker_cfg = WorkerConfig {
+            cron_job_timeout_ms: 1_800_000,
+            ..Default::default()
+        };
 
         assert_eq!(
             effective_cron_orphan_timeout_sec(&cron_cfg, &worker_cfg),

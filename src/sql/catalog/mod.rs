@@ -38,8 +38,8 @@ mod table_privileges;
 mod tables;
 pub(crate) mod virtual_tables;
 
+use crate::model::{Row, TableSchema};
 use crate::storage::TikvStore;
-use crate::types::{Row, TableSchema};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;

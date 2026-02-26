@@ -17,11 +17,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{DataType, Value};
     use crate::sql::analyzer::types::{
         FunctionKind, ResolvedFunction, TypedExprKind, WindowFrame, WindowFrameBound,
         WindowFrameUnits,
     };
-    use crate::types::{DataType, Value};
 
     #[test]
     fn expr_any_visits_window_frame_bound_expr() {

@@ -1,6 +1,7 @@
 //! Unit tests for session settings.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::observability;
     use crate::sql::advisory_locks::{global_lock_manager, AdvisoryLockMode, AdvisoryLockScope};
@@ -955,5 +956,61 @@ mod tests {
             acquired,
             "idle command completion should release xact-scoped lock"
         );
+    }
+
+    #[test]
+    fn test_plan_cache_runtime_follows_session_gucs() {
+        let store = TikvStore::new_stub();
+        let observability = observability::registry().tenant("tenant_plan_cache_guc");
+        let mut session = Session::new_with_database(
+            store,
+            observability,
+            190101,
+            1,
+            "postgres".to_string(),
+            0,
+            0,
+        );
+
+        assert_eq!(session.plan_cache().capacity(), 128);
+        assert_eq!(session.plan_cache().min_exec(), 5);
+
+        session
+            .set_known_setting("db9.prepared_plan_cache_size", "16".to_string())
+            .expect("set cache size");
+        session
+            .set_known_setting("db9.prepared_plan_cache_min_exec", "2".to_string())
+            .expect("set cache min_exec");
+
+        assert_eq!(session.plan_cache().capacity(), 16);
+        assert_eq!(session.plan_cache().min_exec(), 2);
+    }
+
+    #[test]
+    fn test_plan_cache_runtime_follows_set_local_and_clear() {
+        let store = TikvStore::new_stub();
+        let observability = observability::registry().tenant("tenant_plan_cache_local");
+        let mut session = Session::new_with_database(
+            store,
+            observability,
+            190102,
+            1,
+            "postgres".to_string(),
+            0,
+            0,
+        );
+
+        session
+            .set_local_setting("db9.prepared_plan_cache_size", "8".to_string())
+            .expect("set local cache size");
+        session
+            .set_local_setting("db9.prepared_plan_cache_min_exec", "1".to_string())
+            .expect("set local cache min_exec");
+        assert_eq!(session.plan_cache().capacity(), 8);
+        assert_eq!(session.plan_cache().min_exec(), 1);
+
+        session.clear_local_overrides();
+        assert_eq!(session.plan_cache().capacity(), 128);
+        assert_eq!(session.plan_cache().min_exec(), 5);
     }
 }

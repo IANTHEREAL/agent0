@@ -5,11 +5,11 @@
 //! `pg_sleep`, user-defined functions, cron/bg_sql scalar functions, and
 //! recursive traversal of composite expression nodes.
 
+use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::{FunctionKind, TypedExpr, TypedExprKind};
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::query_context::QueryContext;
-use crate::types::{DataType, Row, TableSchema, Value};
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -310,6 +310,7 @@ impl Executor {
                 | TypedExprKind::ArraySubquery(_)
                 | TypedExprKind::Exists { .. }
                 | TypedExprKind::InSubquery { .. }
+                | TypedExprKind::TupleInSubquery { .. }
                 | TypedExprKind::AnyAll { .. } => Ok(expr.clone()),
 
                 // Recurse through composite nodes.
@@ -384,7 +385,7 @@ impl Executor {
                             .await?,
                         ),
                         target_type: target_type.clone(),
-                        cast_context: cast_context.clone(),
+                        cast_context: *cast_context,
                     },
                     data_type: expr.data_type.clone(),
                 }),
@@ -935,10 +936,8 @@ impl Executor {
                 .iter()
                 .position(|c| c.name.eq_ignore_ascii_case("typname"))
             {
-                if let Some(v) = row.values.get(idx) {
-                    if let Value::Text(s) = v {
-                        return Ok(Value::Text(s.clone()));
-                    }
+                if let Some(Value::Text(s)) = row.values.get(idx) {
+                    return Ok(Value::Text(s.clone()));
                 }
             }
         }

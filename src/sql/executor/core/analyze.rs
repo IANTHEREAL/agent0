@@ -9,11 +9,11 @@
 
 use super::*;
 use crate::auth::Privilege;
+use crate::model::TableSchema;
 use crate::sql::error::SqlError;
 use crate::sql::expr::operators::compare_values;
+use crate::sql::operators::key_encoding::{canonicalize_value, encode_value_key};
 use crate::sql::optimizer::statistics::{ColumnStatistics, TableStatistics};
-use crate::sql::value_key::serialize_value_for_key;
-use crate::types::TableSchema;
 
 /// Maximum number of most-common-values to retain per column.
 const MCV_LIMIT: usize = 10;
@@ -145,9 +145,10 @@ struct ColumnAccumulator {
     null_count: usize,
     non_null_count: usize,
     total_width: usize,
-    /// Canonical key bytes → frequency count.  `n_distinct` is derived from
-    /// `value_counts.len()`.
-    value_counts: HashMap<Vec<u8>, usize>,
+    /// Canonical key bytes → (representative Value, frequency count).
+    /// The representative Value is stored on first observation — no
+    /// deserialization needed at finalization time.
+    value_counts: HashMap<Vec<u8>, (Value, usize)>,
 }
 
 impl ColumnAccumulator {
@@ -160,16 +161,18 @@ impl ColumnAccumulator {
         }
     }
 
-    fn observe(&mut self, value: &Value) -> Result<()> {
+    fn observe(&mut self, value: &Value) {
         if matches!(value, Value::Null) {
             self.null_count += 1;
         } else {
             self.non_null_count += 1;
-            let key_bytes = serialize_value_for_key(value)?;
+            let key_bytes = encode_value_key(value);
             self.total_width += key_bytes.len();
-            *self.value_counts.entry(key_bytes).or_insert(0) += 1;
+            self.value_counts
+                .entry(key_bytes)
+                .and_modify(|(_val, count)| *count += 1)
+                .or_insert_with(|| (canonicalize_value(value), 1));
         }
-        Ok(())
     }
 }
 
@@ -190,25 +193,23 @@ fn finalize_column(acc: &ColumnAccumulator, row_count: usize) -> ColumnStatistic
     };
 
     // MCV: top values by frequency, tie-broken by canonical key bytes ascending.
-    let mut entries: Vec<(&Vec<u8>, &usize)> = acc.value_counts.iter().collect();
+    let mut entries: Vec<(&Vec<u8>, &(Value, usize))> = acc.value_counts.iter().collect();
     entries.sort_by(|a, b| {
-        b.1.cmp(a.1) // descending frequency
+        b.1 .1
+            .cmp(&a.1 .1) // descending frequency
             .then_with(|| a.0.cmp(b.0)) // ascending key bytes for determinism
     });
 
     let mcv_count = entries.len().min(MCV_LIMIT);
-    let mcv_entries: Vec<(&Vec<u8>, &usize)> = entries[..mcv_count].to_vec();
+    let mcv_entries = &entries[..mcv_count];
 
     let mut most_common_vals = Vec::with_capacity(mcv_count);
     let mut most_common_freqs = Vec::with_capacity(mcv_count);
     let mcv_keys: HashSet<&Vec<u8>> = mcv_entries.iter().map(|(k, _)| *k).collect();
 
-    for (key_bytes, count) in &mcv_entries {
-        // Deserialize back to Value for storage.
-        if let Ok(val) = bincode::deserialize::<Value>(key_bytes) {
-            most_common_vals.push(val);
-            most_common_freqs.push(**count as f64 / row_count as f64);
-        }
+    for (_, (val, count)) in mcv_entries {
+        most_common_vals.push(val.clone());
+        most_common_freqs.push(*count as f64 / row_count as f64);
     }
 
     // Histogram: equi-depth bounds from non-MCV values.
@@ -231,19 +232,17 @@ fn finalize_column(acc: &ColumnAccumulator, row_count: usize) -> ColumnStatistic
 /// - No non-MCV values remain after MCV exclusion
 /// - The column's values are not orderable (compare_values fails)
 fn build_histogram(
-    value_counts: &HashMap<Vec<u8>, usize>,
+    value_counts: &HashMap<Vec<u8>, (Value, usize)>,
     mcv_keys: &HashSet<&Vec<u8>>,
     _row_count: usize,
 ) -> Vec<Value> {
-    // Collect non-MCV entries: (deserialized Value, frequency).
+    // Collect non-MCV entries: (Value, frequency).
     let mut non_mcv: Vec<(Value, usize)> = Vec::new();
-    for (key_bytes, count) in value_counts {
+    for (key_bytes, (val, count)) in value_counts {
         if mcv_keys.contains(key_bytes) {
             continue;
         }
-        if let Ok(val) = bincode::deserialize::<Value>(key_bytes) {
-            non_mcv.push((val, *count));
-        }
+        non_mcv.push((val.clone(), *count));
     }
 
     if non_mcv.is_empty() {
@@ -251,10 +250,8 @@ fn build_histogram(
     }
 
     // Test orderability with actual values (no hardcoded type blacklist).
-    if non_mcv.len() >= 2 {
-        if compare_values(&non_mcv[0].0, &non_mcv[1].0).is_err() {
-            return Vec::new(); // unorderable type — skip histogram
-        }
+    if non_mcv.len() >= 2 && compare_values(&non_mcv[0].0, &non_mcv[1].0).is_err() {
+        return Vec::new(); // unorderable type — skip histogram
     }
 
     // Sort by value using compare_values.
@@ -316,7 +313,7 @@ async fn analyze_table(
         .scan_analyze_batch(txn, db_id, schema.table_id, ANALYZE_BATCH_SIZE, |row| {
             for (i, value) in row.values.iter().enumerate() {
                 if i < accumulators.len() {
-                    accumulators[i].observe(value)?;
+                    accumulators[i].observe(value);
                 }
             }
             Ok(())
@@ -401,7 +398,7 @@ impl Executor {
                 let all_tables = self.store.list_tables(txn, db_id).await?;
                 for full_name in &all_tables {
                     // Skip system schemas.
-                    let schema_name = full_name.splitn(2, '.').next().unwrap_or("");
+                    let schema_name = full_name.split('.').next().unwrap_or("");
                     if SKIP_SCHEMAS.contains(&schema_name) {
                         continue;
                     }
@@ -461,14 +458,14 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Value;
     use crate::sql::optimizer::statistics::ColumnStatistics;
-    use crate::types::Value;
 
     /// Helper: build a ColumnAccumulator from a slice of Values, then finalize.
     fn stats_from_values(values: &[Value]) -> ColumnStatistics {
         let mut acc = ColumnAccumulator::new();
         for v in values {
-            acc.observe(v).unwrap();
+            acc.observe(v);
         }
         finalize_column(&acc, values.len())
     }
@@ -773,7 +770,7 @@ mod tests {
 
         // (b) All values are MCV (<=10 distinct) → histogram empty.
         let values_b: Vec<Value> = (1..=5)
-            .flat_map(|i| std::iter::repeat(Value::Int32(i)).take(10))
+            .flat_map(|i| std::iter::repeat_n(Value::Int32(i), 10))
             .collect();
         let stats_b = stats_from_values(&values_b);
         assert!(stats_b.histogram_bounds.is_empty());
@@ -797,7 +794,7 @@ mod tests {
         // With 11 light values (freq 1 each) + 1 heavy (freq 1000), MCV takes
         // the top 10 by frequency. Value 1 is always top. Then 10 of the 11
         // light values. 1 light value remains → histogram has 1 entry.
-        assert!(stats_c.histogram_bounds.len() >= 1);
+        assert!(!stats_c.histogram_bounds.is_empty());
     }
 
     #[test]

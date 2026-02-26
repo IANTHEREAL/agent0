@@ -355,8 +355,8 @@ pub(crate) fn find_left_expr_start(tokens: &[Token], op_idx: usize) -> usize {
 pub(crate) fn find_right_expr_end(tokens: &[Token], op_idx: usize) -> usize {
     let mut depth_paren = 0i32;
     let mut depth_bracket = 0i32;
-    for idx in op_idx + 1..tokens.len() {
-        let tok = &tokens[idx];
+    for (i, tok) in tokens[op_idx + 1..].iter().enumerate() {
+        let idx = op_idx + 1 + i;
         if matches!(tok.kind, TokenKind::Whitespace | TokenKind::Comment) {
             continue;
         }

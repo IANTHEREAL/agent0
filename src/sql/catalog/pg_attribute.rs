@@ -1,8 +1,8 @@
 use super::helpers::{bool_col, int_col, int_val, name_col, text_col, text_val};
 use super::{ScanContext, VirtualTable};
+use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::catalog_oids;
 use crate::sql::pg_types;
-use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -101,7 +101,7 @@ impl VirtualTable for PgAttribute {
                         DataType::Numeric {
                             precision: Some(p),
                             scale: Some(s),
-                        } => ((*p as i64) << 16) | (*s as i64) + 4,
+                        } => ((*p as i64) << 16) | ((*s as i64) + 4),
                         _ => -1,
                     };
 

@@ -268,7 +268,7 @@ impl TikvStore {
 
             // Release relation-name reservation keys for indexes and PK
             // so the names become available for reuse.
-            let schema_name = table_name.splitn(2, '.').next().unwrap_or("public");
+            let schema_name = table_name.split('.').next().unwrap_or("public");
             for idx in &schema.indexes {
                 let idx_full = format!("{}.{}", schema_name, idx.name);
                 self.release_relation_name(txn, db_id, &idx_full).await?;
@@ -333,10 +333,10 @@ impl TikvStore {
             let pk_val_strs: Vec<String> = pk_values
                 .iter()
                 .map(|v| match v {
-                    crate::types::Value::Int32(n) => n.to_string(),
-                    crate::types::Value::Int64(n) => n.to_string(),
-                    crate::types::Value::Text(s) => s.clone(),
-                    crate::types::Value::Uuid(bytes) => uuid::Uuid::from_bytes(*bytes).to_string(),
+                    crate::model::Value::Int32(n) => n.to_string(),
+                    crate::model::Value::Int64(n) => n.to_string(),
+                    crate::model::Value::Text(s) => s.clone(),
+                    crate::model::Value::Uuid(bytes) => uuid::Uuid::from_bytes(*bytes).to_string(),
                     other => format!("{}", other),
                 })
                 .collect();

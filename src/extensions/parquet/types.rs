@@ -12,7 +12,7 @@ use arrow_schema::{DataType as ArrowDataType, TimeUnit};
 use rust_decimal::Decimal;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
-use crate::types::{DataType, Value};
+use crate::model::{DataType, Value};
 
 const MILLIS_PER_DAY: i64 = 86_400_000;
 

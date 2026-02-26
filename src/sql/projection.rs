@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::types::{Row, TableSchema, Value};
+use crate::model::{Row, TableSchema, Value};
 
 use super::expr::bridge::eval_const_ast_expr;
 
@@ -67,7 +67,7 @@ pub fn get_expr_name(expr: &Expr) -> String {
 }
 
 #[cfg(test)]
-use crate::types::DataType;
+use crate::model::DataType;
 #[cfg(test)]
 use sqlparser::ast::Expr;
 
@@ -109,8 +109,8 @@ pub fn eval_default_expr(expr_str: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ColumnDef;
     use crate::sql::analyzer::{Analyzer, NullCatalog, Scope};
-    use crate::types::ColumnDef;
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
 

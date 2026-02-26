@@ -31,12 +31,12 @@ use super::sequences;
 use super::types::sql_datatype_to_internal_strict;
 use super::value_coercion::coerce_value_for_column;
 
-use crate::storage::TikvStore;
-use crate::txn::txn_delete;
-use crate::types::{
+use crate::model::{
     CheckConstraint, ColumnDef, DataType, ForeignKeyAction, ForeignKeyConstraint, IndexDef, Row,
     TableSchema, Value,
 };
+use crate::storage::TikvStore;
+use crate::txn::txn_delete;
 
 // ── Re-exports (preserve pub(crate) surface) ───────────────────────────────
 
@@ -148,10 +148,10 @@ pub(super) async fn resolve_column_data_type(
                     let full_name = resolved_type.full;
                     match store.get_type(txn, db_id, &full_name).await? {
                         Some(def) => match def.kind {
-                            crate::types::UserTypeKind::Enum { .. } => {
+                            crate::model::UserTypeKind::Enum { .. } => {
                                 Ok((DataType::UserDefined(full_name), false))
                             }
-                            crate::types::UserTypeKind::Composite { .. } => {
+                            crate::model::UserTypeKind::Composite { .. } => {
                                 Ok((DataType::UserDefined(full_name), false))
                             }
                         },
@@ -286,7 +286,7 @@ pub(super) fn assign_generated_check_constraint_names(
     pk_exists: bool,
     indexes: &[IndexDef],
     foreign_keys: &[ForeignKeyConstraint],
-    checks: &mut Vec<CheckConstraint>,
+    checks: &mut [CheckConstraint],
 ) {
     let mut used_names: HashSet<String> = HashSet::new();
     if pk_exists {
@@ -338,7 +338,7 @@ pub(super) fn extract_first_column_from_check_expr(expr: &str) -> Option<String>
     ];
     for word in expr.split(|c: char| !c.is_alphanumeric() && c != '_') {
         let w = word.trim();
-        if w.is_empty() || w.chars().next().map_or(true, |c| c.is_ascii_digit()) {
+        if w.is_empty() || w.chars().next().is_none_or(|c| c.is_ascii_digit()) {
             continue;
         }
         if KEYWORDS.contains(&w.to_lowercase().as_str()) {

@@ -45,7 +45,7 @@
 
 ### 4) 类型系统限制：缺少“复合类型值”
 
-`Value` 只支持标量/数组（数组元素也是 `Value`），不支持 record/tuple 值（`src/types/mod.rs:228`）。
+`Value` 只支持标量/数组（数组元素也是 `Value`），不支持 record/tuple 值（`src/model/mod.rs:228`）。
 
 因此类似 `pgsql-http` 的 `http_header[]`（数组元素为复合类型 `(field,value)`）在现有 Value 模型下无法自然表达。
 
@@ -218,7 +218,7 @@ SQL Client | pgwire / Executor  |
 - `headers`：`JSONB`（形如 `[{ \"field\": \"...\", \"value\": \"...\" }, ...]`，保留重复 header）
 - `content`：`TEXT`（UTF-8）
 
-理由：当前 `Value` 不支持 `http_header[]` 的“数组元素为 tuple”的表达（见 `src/types/mod.rs:228`），用 JSONB 最直接且兼容 SQL 侧解析。
+理由：当前 `Value` 不支持 `http_header[]` 的“数组元素为 tuple”的表达（见 `src/model/mod.rs:228`），用 JSONB 最直接且兼容 SQL 侧解析。
 
 ---
 

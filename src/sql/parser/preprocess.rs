@@ -314,6 +314,282 @@ fn preprocess_reset_role(sql: &str) -> Option<String> {
     }
 }
 
+/// Rewrite `SELECT FROM` (empty projection) to `SELECT TRUE AS _exists FROM`.
+///
+/// Classification: parse-compat shim.
+/// Context: All Activepieces occurrences are inside `EXISTS(SELECT FROM ...)` where
+/// the injected column is unobservable. sqlparser 0.40 requires ≥1 SELECT item.
+/// Exit condition: remove when sqlparser-rs supports empty SELECT lists.
+fn preprocess_select_from(sql: &str) -> Option<String> {
+    let re = Regex::new(r"(?i)\bSELECT\s+FROM\b").ok()?;
+    if !re.is_match(sql) {
+        return None;
+    }
+    Some(
+        re.replace_all(sql, "SELECT TRUE AS _exists FROM")
+            .into_owned(),
+    )
+}
+
+/// Rewrite `<type> array` (PostgreSQL array type syntax) to `<type>[]`.
+///
+/// Classification: parse-normalization shim.
+/// PostgreSQL accepts both `character varying array` and `character varying[]`
+/// identically. sqlparser 0.40 only accepts the bracket form.
+/// Exit condition: remove when sqlparser-rs supports `TYPE ARRAY` syntax.
+fn preprocess_type_array(sql: &str) -> Option<String> {
+    let re = Regex::new(
+        r"(?i)\b(character\s+varying|varchar|integer|bigint|smallint|text|boolean|numeric|uuid|jsonb?|timestamp(?:\s+with(?:out)?\s+time\s+zone)?|double\s+precision|real)\s+array\b"
+    ).ok()?;
+    if !re.is_match(sql) {
+        return None;
+    }
+    Some(re.replace_all(sql, "${1}[]").into_owned())
+}
+
+/// Strip `NOT VALID` constraint modifier from ALTER TABLE ADD CONSTRAINT.
+///
+/// Classification: parse-compat shim.
+/// Semantic effect: constraint is validated immediately (stricter than PG which
+/// defers validation). Safe for Activepieces where data invariants hold at
+/// migration time. Known limitation for general dirty-data migrations.
+/// Exit condition: remove when sqlparser-rs supports `NOT VALID`.
+fn preprocess_not_valid(sql: &str) -> Option<String> {
+    let re = Regex::new(r"(?i)\bNOT\s+VALID\b").ok()?;
+    if !re.is_match(sql) {
+        return None;
+    }
+    Some(re.replace_all(sql, "").into_owned())
+}
+
+/// Strip `CONCURRENTLY` from `DROP INDEX CONCURRENTLY`.
+///
+/// Classification: parse-compat shim.
+/// In db9, all index drops are transactional via TiKV — `CONCURRENTLY` is
+/// semantically a no-op.
+/// Exit condition: remove when sqlparser-rs supports DROP INDEX CONCURRENTLY.
+fn preprocess_drop_index_concurrently(sql: &str) -> Option<String> {
+    let re = Regex::new(r"(?i)\bDROP\s+INDEX\s+CONCURRENTLY\b").ok()?;
+    if !re.is_match(sql) {
+        return None;
+    }
+    Some(re.replace_all(sql, "DROP INDEX").into_owned())
+}
+
+/// Rewrite `UPDATE ... FROM <table> JOIN ..., <table2> WHERE ...` comma-separated
+/// FROM tables to `CROSS JOIN`.
+///
+/// Classification: parse-compat shim.
+/// sqlparser 0.40's `parse_update` calls `parse_table_and_joins` once for FROM,
+/// which parses up to the first comma then fails. PostgreSQL comma-separated FROM
+/// elements are semantically equivalent to CROSS JOIN.
+/// Exit condition: remove when sqlparser-rs supports multi-table UPDATE FROM.
+fn preprocess_update_from_comma(sql: &str) -> Option<String> {
+    let re_update = Regex::new(r"(?i)\bUPDATE\b").ok()?;
+    let re_from = Regex::new(r"(?i)\bFROM\b").ok()?;
+    if !re_update.is_match(sql) || !re_from.is_match(sql) {
+        return None;
+    }
+
+    // Find SET keyword in UPDATE statement, then FROM at depth 0 after SET list.
+    let update_pos = find_keyword_at_depth0(sql, "UPDATE")?;
+    let update_end = update_pos + "UPDATE".len();
+    let after_update = &sql[update_end..];
+    let set_rel = find_keyword_at_depth0(after_update, "SET")?;
+    let set_pos = update_end + set_rel;
+    let set_end = set_pos + "SET".len();
+
+    let from_search = &sql[set_end..];
+    let from_rel = find_keyword_at_depth0(from_search, "FROM")?;
+    let from_pos = set_end + from_rel + "FROM".len();
+
+    // Find WHERE keyword at depth 0 after FROM
+    let after_from = &sql[from_pos..];
+    let where_pos = find_keyword_at_depth0(after_from, "WHERE")?;
+
+    let from_clause = &sql[from_pos..from_pos + where_pos];
+
+    // Check if there are any commas at depth 0
+    if !has_comma_at_depth0(from_clause) {
+        return None;
+    }
+
+    // Replace commas at depth 0 with CROSS JOIN
+    let rewritten = replace_commas_at_depth0(from_clause);
+    let mut result = String::with_capacity(sql.len() + 20);
+    result.push_str(&sql[..from_pos]);
+    result.push_str(&rewritten);
+    result.push_str(&sql[from_pos + where_pos..]);
+    Some(result)
+}
+
+/// Find the byte offset of a keyword at parenthesis depth 0.
+fn find_keyword_at_depth0(s: &str, keyword: &str) -> Option<usize> {
+    let mut depth: i32 = 0;
+    let upper = s.to_uppercase();
+    let kw_len = keyword.len();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == b'\'' {
+                            i += 1; // escaped quote
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            }
+            _ => {
+                if depth == 0
+                    && i + kw_len <= upper.len()
+                    && upper[i..i + kw_len].eq_ignore_ascii_case(keyword)
+                    && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_')
+                    && (i + kw_len >= bytes.len()
+                        || !bytes[i + kw_len].is_ascii_alphanumeric() && bytes[i + kw_len] != b'_')
+                {
+                    return Some(i);
+                }
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Check if there is a comma at parenthesis depth 0 in the string.
+fn has_comma_at_depth0(s: &str) -> bool {
+    let mut depth: i32 = 0;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == b'\'' {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            }
+            b',' if depth == 0 => return true,
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    false
+}
+
+/// Replace commas at parenthesis depth 0 with ` CROSS JOIN `.
+fn replace_commas_at_depth0(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 20);
+    let mut depth: i32 = 0;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => {
+                depth += 1;
+                result.push('(');
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                result.push(')');
+                i += 1;
+            }
+            b'\'' => {
+                result.push('\'');
+                i += 1;
+                while i < bytes.len() {
+                    result.push(bytes[i] as char);
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == b'\'' {
+                            result.push('\'');
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'"' => {
+                result.push('"');
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    result.push('"');
+                    i += 1;
+                }
+            }
+            b',' if depth == 0 => {
+                result.push_str(" CROSS JOIN ");
+                i += 1;
+            }
+            _ => {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+    }
+    result
+}
+
 /// SQL preprocessor shim registry (all parse-time compatibility only).
 ///
 /// Shim inventory:
@@ -349,6 +625,26 @@ fn preprocess_reset_role(sql: &str) -> Option<String> {
 ///   What: `AT TIME ZONE $n` -> `AT TIME ZONE 'UTC'` (parse-time only).
 ///   Why: sqlparser-rs expects string literal in this position.
 ///   Exit condition: expression/placeholder support after `AT TIME ZONE`.
+/// - `preprocess_select_from`
+///   What: `SELECT FROM` -> `SELECT TRUE AS _exists FROM`.
+///   Why: sqlparser 0.40 requires ≥1 SELECT item.
+///   Exit condition: empty SELECT list support.
+/// - `preprocess_type_array`
+///   What: `<type> array` -> `<type>[]`.
+///   Why: sqlparser 0.40 only accepts bracket form.
+///   Exit condition: `TYPE ARRAY` syntax support.
+/// - `preprocess_not_valid`
+///   What: strip `NOT VALID` from constraints.
+///   Why: sqlparser 0.40 has no NOT VALID support.
+///   Exit condition: NOT VALID support added.
+/// - `preprocess_drop_index_concurrently`
+///   What: strip `CONCURRENTLY` from DROP INDEX.
+///   Why: sqlparser 0.40 doesn't handle CONCURRENTLY in DROP INDEX.
+///   Exit condition: DROP INDEX CONCURRENTLY support.
+/// - `preprocess_update_from_comma`
+///   What: comma-separated UPDATE FROM tables -> CROSS JOIN.
+///   Why: sqlparser 0.40 only parses single table_and_joins in UPDATE FROM.
+///   Exit condition: multi-table UPDATE FROM support.
 pub(super) fn preprocess_sql(sql: &str) -> String {
     let mut result = sql.to_string();
 
@@ -364,6 +660,23 @@ pub(super) fn preprocess_sql(sql: &str) -> String {
     }
     if let Some(materialized) = preprocess_cte_materialized(&result) {
         result = materialized;
+    }
+
+    // Activepieces migration compat shims (#885)
+    if let Some(rewritten) = preprocess_select_from(&result) {
+        result = rewritten;
+    }
+    if let Some(rewritten) = preprocess_type_array(&result) {
+        result = rewritten;
+    }
+    if let Some(rewritten) = preprocess_not_valid(&result) {
+        result = rewritten;
+    }
+    if let Some(rewritten) = preprocess_drop_index_concurrently(&result) {
+        result = rewritten;
+    }
+    if let Some(rewritten) = preprocess_update_from_comma(&result) {
+        result = rewritten;
     }
 
     // Parse-compat rewrites only: these normalize syntax for sqlparser-rs
@@ -383,4 +696,103 @@ pub(super) fn preprocess_sql(sql: &str) -> String {
     result = rewrite_at_time_zone_placeholders(&result);
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preprocess_select_from_rewrites_empty_projection() {
+        let input =
+            "SELECT exists (SELECT FROM information_schema.tables WHERE table_name = 'flow')";
+        let result = preprocess_select_from(input).unwrap();
+        assert!(result.contains("SELECT TRUE AS _exists FROM information_schema.tables"));
+    }
+
+    #[test]
+    fn preprocess_select_from_ignores_normal_select() {
+        assert!(preprocess_select_from("SELECT 1 FROM t").is_none());
+        assert!(preprocess_select_from("SELECT * FROM t").is_none());
+    }
+
+    #[test]
+    fn preprocess_type_array_rewrites_character_varying() {
+        let input = r#"ALTER TABLE "flow_run" ADD "tags" character varying array"#;
+        let result = preprocess_type_array(input).unwrap();
+        assert!(result.contains("character varying[]"));
+        assert!(!result.to_lowercase().ends_with("array"));
+    }
+
+    #[test]
+    fn preprocess_type_array_rewrites_multiple_types() {
+        let input = r#""events" text array NOT NULL, "ids" uuid array"#;
+        let result = preprocess_type_array(input).unwrap();
+        assert!(result.contains("text[]"));
+        assert!(result.contains("uuid[]"));
+    }
+
+    #[test]
+    fn preprocess_type_array_ignores_bracket_form() {
+        assert!(preprocess_type_array(r#"ADD "tags" varchar[]"#).is_none());
+    }
+
+    #[test]
+    fn preprocess_not_valid_strips() {
+        let input =
+            "ADD CONSTRAINT fk FOREIGN KEY (x) REFERENCES t(id) ON DELETE CASCADE NOT VALID";
+        let result = preprocess_not_valid(input).unwrap();
+        assert!(!result.contains("NOT VALID"));
+        assert!(result.contains("ON DELETE CASCADE"));
+    }
+
+    #[test]
+    fn preprocess_not_valid_ignores_when_absent() {
+        assert!(
+            preprocess_not_valid("ADD CONSTRAINT fk FOREIGN KEY (x) REFERENCES t(id)").is_none()
+        );
+    }
+
+    #[test]
+    fn preprocess_drop_index_concurrently_strips() {
+        let input = r#"DROP INDEX CONCURRENTLY "idx_run_logs_file_id""#;
+        let result = preprocess_drop_index_concurrently(input).unwrap();
+        assert_eq!(result, r#"DROP INDEX "idx_run_logs_file_id""#);
+    }
+
+    #[test]
+    fn preprocess_drop_index_concurrently_with_if_exists() {
+        let input = r#"DROP INDEX CONCURRENTLY IF EXISTS "idx_audit""#;
+        let result = preprocess_drop_index_concurrently(input).unwrap();
+        assert_eq!(result, r#"DROP INDEX IF EXISTS "idx_audit""#);
+    }
+
+    #[test]
+    fn preprocess_update_from_comma_rewrites() {
+        let input = r#"UPDATE "flow_version" fv SET "updatedBy" = NULL FROM "flow" f JOIN "project" p ON p."id" = f."projectId", "user" u WHERE fv."flowId" = f."id""#;
+        let result = preprocess_update_from_comma(input).unwrap();
+        assert!(result.contains("CROSS JOIN"));
+        assert!(!result.contains(r#", "user""#));
+    }
+
+    #[test]
+    fn preprocess_update_from_comma_rewrites_with_newline_before_set() {
+        let input = "UPDATE \"flow_version\" fv\nSET \"updatedBy\" = NULL\nFROM \"flow\" f JOIN \"project\" p ON p.\"id\" = f.\"projectId\", \"user\" u\nWHERE fv.\"flowId\" = f.\"id\"";
+        let result = preprocess_update_from_comma(input).unwrap();
+        assert!(result.contains("CROSS JOIN"));
+        assert!(!result.contains(", \"user\" u"));
+    }
+
+    #[test]
+    fn preprocess_update_from_comma_ignores_no_comma() {
+        let input = r#"UPDATE t SET x = 1 FROM s WHERE t.id = s.id"#;
+        assert!(preprocess_update_from_comma(input).is_none());
+    }
+
+    #[test]
+    fn preprocess_update_from_comma_ignores_nested_commas() {
+        // Commas inside subquery parens should not be rewritten
+        let input = r#"UPDATE t SET x = 1 FROM (SELECT a, b FROM s) sub WHERE t.id = sub.a"#;
+        assert!(preprocess_update_from_comma(input).is_none());
+    }
 }

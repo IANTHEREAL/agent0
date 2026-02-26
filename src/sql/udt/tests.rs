@@ -2,8 +2,8 @@ use super::*;
 
 use std::collections::{HashMap, HashSet};
 
+use crate::model::{CheckConstraint, ColumnDef, DataType, IndexDef, TableSchema};
 use crate::sql::analyzer::Catalog;
-use crate::types::{CheckConstraint, ColumnDef, DataType, IndexDef, TableSchema};
 use crate::worker::types::IndexState;
 
 use enum_rewrite::{

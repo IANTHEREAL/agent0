@@ -1,9 +1,9 @@
 //! Tests for selectivity estimation.
 
 use super::*;
+use crate::model::DataType;
 use crate::sql::analyzer::types::TypedExprKind;
 use crate::sql::types::CastContext;
-use crate::types::DataType;
 use std::collections::HashMap;
 
 // ── Test helpers ─────────────────────────────────────

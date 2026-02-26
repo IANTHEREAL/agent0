@@ -12,10 +12,10 @@
   - Workaround: custom command parsing/execution hook before `parse_sql()` (see `src/sql/executor_udt_cmd.rs` + `src/sql/executor.rs`).
 - `bincode` (serde + bincode v1.3) schema evolution limitation:
   - Adding fields to existing serialized structs like `ColumnDef` breaks deserialization of stored `TableSchema` (observed `UnexpectedEof` when trying to add `ColumnDef.udt_name`).
-  - Workaround: preserve declared UDT name via a new `DataType::UserDefined(String)` enum variant appended to `DataType` (see `src/types/mod.rs`).
+  - Workaround: preserve declared UDT name via a new `DataType::UserDefined(String)` enum variant appended to `DataType` (see `src/model/mod.rs`).
 
 ## Schema representation (declared type name retention)
-- `src/types/mod.rs`
+- `src/model/mod.rs`
   - `DataType::UserDefined(String)` (full name `schema.name`, e.g. `public.role`) appended to the `DataType` enum (comment warns not to reorder variants).
   - `ColumnDef` was **not** modified (bincode compatibility).
 
@@ -25,7 +25,7 @@
     - `_sys_next_type_oid` (`encode_next_type_oid_key()`): persisted u32 counter for user type OIDs.
     - `_sys_type_{schema}.{name}` (`encode_type_key(full_name)`): stored `UserTypeDef` (bincode).
     - `encode_type_prefix()` for scanning all types.
-- `src/types/mod.rs`
+- `src/model/mod.rs`
   - `UserTypeKind`:
     - `Enum { labels: Vec<String> }`
     - `Composite { fields: Vec<(String, DataType)> }`

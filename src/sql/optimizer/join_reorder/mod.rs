@@ -303,7 +303,7 @@ fn try_reorder_join_group(plan: LogicalPlan, ctx: &PlanningContext) -> LogicalPl
     }
 
     // Run DP or greedy
-    let result = if n <= DPCCP_MAX_RELS {
+    if n <= DPCCP_MAX_RELS {
         dpccp_optimize(
             &rels,
             &classification.edges,
@@ -319,9 +319,7 @@ fn try_reorder_join_group(plan: LogicalPlan, ctx: &PlanningContext) -> LogicalPl
             ctx,
             &root_schema,
         )
-    };
-
-    result
+    }
 }
 
 /// Reorder only children of a plan node (when the root can't be reordered).

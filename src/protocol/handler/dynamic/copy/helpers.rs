@@ -1,7 +1,7 @@
 //! Shared error/parse helpers for COPY protocol handling.
 
+use crate::model::{DataType, Value};
 use crate::sql::Executor;
-use crate::types::{DataType, Value};
 use pgwire::error::{PgWireError, PgWireResult};
 
 use super::super::super::copy::copy_row_column_mismatch_error;

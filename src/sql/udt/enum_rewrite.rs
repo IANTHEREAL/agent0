@@ -16,10 +16,10 @@ use super::helpers::{
     is_comparison_op,
 };
 use super::rename::parse_stored_query;
+use crate::model::{ColumnDef, DataType, TableSchema};
 use crate::sql::analyzer::{Analyzer, CatalogSnapshot};
 use crate::sql::names::normalize_ident;
 use crate::storage::TikvStore;
-use crate::types::{ColumnDef, DataType, TableSchema};
 
 #[derive(Default, Clone)]
 pub(super) struct RelationColumnInfo {
@@ -461,12 +461,12 @@ fn register_derived_aliases_from_table_factor(
 ) -> Result<()> {
     match factor {
         TableFactor::Derived {
-            subquery, alias, ..
+            subquery,
+            alias: Some(alias),
+            ..
         } => {
-            if let Some(alias) = alias {
-                let info = analyze_query_output_enum_columns(subquery, snapshot, enum_full_name)?;
-                scope.register_relation(normalize_ident(&alias.name), &info);
-            }
+            let info = analyze_query_output_enum_columns(subquery, snapshot, enum_full_name)?;
+            scope.register_relation(normalize_ident(&alias.name), &info);
         }
         TableFactor::NestedJoin {
             table_with_joins, ..

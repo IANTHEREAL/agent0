@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use crate::types::DataType;
+use crate::model::DataType;
 
 mod aggregate_window;
 mod json;

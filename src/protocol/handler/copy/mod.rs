@@ -1,5 +1,5 @@
+use crate::model::DataType;
 use crate::sql::query_context::QueryContext;
-use crate::types::DataType;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 pub(in crate::protocol::handler) fn copy_from_stdin_line_too_long_error() -> PgWireError {
