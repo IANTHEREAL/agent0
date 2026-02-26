@@ -233,7 +233,7 @@ fn range_selectivity(col_stats: &ColumnStatistics, value: &Value, is_less_than: 
         return DEFAULT_INEQ_SEL;
     }
 
-    // Find position via binary search
+    // Estimate fraction of values below `value` using histogram.
     let fraction = match histogram_fraction(bounds, value) {
         Some(f) => f,
         None => return DEFAULT_INEQ_SEL, // incomparable types
@@ -266,26 +266,23 @@ fn histogram_fraction(bounds: &[Value], value: &Value) -> Option<f64> {
         return Some(1.0);
     }
 
-    // Linear search for the bucket containing value
-    for i in 0..num_buckets {
-        let cmp_low = try_compare(value, &bounds[i])?;
+    // Binary search for first bound >= value (O(log n))
+    // histogram_bounds are always sorted, so partition_point is correct.
+    let pos = bounds.partition_point(|b| matches!(try_compare(b, value), Some(Ordering::Less)));
 
-        if cmp_low == Ordering::Equal {
-            // Exactly at bucket boundary i
-            return Some(i as f64 / num_buckets as f64);
+    // pos is within [1, num_buckets] due to boundary checks above.
+    // bounds[pos] is the first bound that is >= value.
+    match try_compare(&bounds[pos], value) {
+        Some(Ordering::Equal) => {
+            // Exactly at bucket boundary pos
+            Some(pos as f64 / num_buckets as f64)
         }
-        if cmp_low == Ordering::Greater {
-            let cmp_high = try_compare(value, &bounds[i + 1])?;
-            if cmp_high == Ordering::Less {
-                // Strictly inside bucket i — mid-bucket assumption
-                return Some((i as f64 + 0.5) / num_buckets as f64);
-            }
-            // If cmp_high == Equal, the next iteration catches it via cmp_low == Equal
+        Some(Ordering::Greater) => {
+            // Strictly inside bucket [pos-1, pos] — mid-bucket assumption
+            Some((pos as f64 - 0.5) / num_buckets as f64)
         }
+        _ => None, // incomparable or unexpected — fall back
     }
-
-    // Shouldn't reach here if bounds are sorted, but fallback
-    Some(0.5)
 }
 
 // ── BETWEEN ──────────────────────────────────────────────────
