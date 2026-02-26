@@ -47,6 +47,7 @@ pub use dynamic::DynamicHandlerFactory;
 pub use dynamic::DynamicPgHandler;
 pub use query_parser::Db9QueryParser;
 pub use server_params::PgServerParameterProvider;
+pub(crate) use tenant::parse_tenant_username;
 
 /// Custom metadata key for storing the extracted keyspace
 const METADATA_KEYSPACE: &str = "keyspace";
