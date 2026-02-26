@@ -4,6 +4,7 @@ use std::sync::RwLock;
 
 const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_MAX_CONNECTIONS: u32 = 1000;
 
 pub(crate) fn env_bool(key: &str) -> bool {
     std::env::var(key)
@@ -28,6 +29,7 @@ pub(crate) fn env_string(key: &str) -> Option<String> {
 pub struct ServerConfig {
     pub statement_timeout_ms: u64,
     pub idle_in_transaction_session_timeout_ms: u64,
+    pub max_connections: u32,
 }
 
 impl Default for ServerConfig {
@@ -35,6 +37,7 @@ impl Default for ServerConfig {
         Self {
             statement_timeout_ms: DEFAULT_STATEMENT_TIMEOUT_MS,
             idle_in_transaction_session_timeout_ms: DEFAULT_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
 }
@@ -51,6 +54,13 @@ impl ServerConfig {
                 .parse::<u64>()
                 .ok()
                 .unwrap_or(cfg.idle_in_transaction_session_timeout_ms);
+        }
+        if let Ok(v) = env::var("DB9_MAX_CONNECTIONS") {
+            cfg.max_connections = v
+                .parse::<u32>()
+                .ok()
+                .filter(|&n| n > 0)
+                .unwrap_or(cfg.max_connections);
         }
 
         cfg
@@ -79,6 +89,7 @@ mod tests {
         let cfg = ServerConfig::default();
         assert_eq!(cfg.statement_timeout_ms, 60_000);
         assert_eq!(cfg.idle_in_transaction_session_timeout_ms, 60_000);
+        assert_eq!(cfg.max_connections, 1000);
     }
 
     #[test]
@@ -88,6 +99,7 @@ mod tests {
         let keys = [
             "DB9_STATEMENT_TIMEOUT_MS",
             "DB9_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS",
+            "DB9_MAX_CONNECTIONS",
         ];
 
         let saved: Vec<(String, Option<String>)> = keys
@@ -104,6 +116,7 @@ mod tests {
         let cfg = ServerConfig::from_env();
         assert_eq!(cfg.statement_timeout_ms, 60_000);
         assert_eq!(cfg.idle_in_transaction_session_timeout_ms, 60_000);
+        assert_eq!(cfg.max_connections, 1000);
 
         for (key, value) in saved {
             match value {
@@ -212,10 +225,80 @@ mod tests {
     }
 
     #[test]
+    fn test_max_connections_env_override() {
+        let _guard = test_lock().lock().unwrap();
+
+        let key = "DB9_MAX_CONNECTIONS";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "50");
+        }
+        let cfg = ServerConfig::from_env();
+        assert_eq!(cfg.max_connections, 50);
+
+        match saved {
+            Some(v) => unsafe {
+                env::set_var(key, v);
+            },
+            None => unsafe {
+                env::remove_var(key);
+            },
+        }
+    }
+
+    #[test]
+    fn test_max_connections_zero_falls_back_to_default() {
+        let _guard = test_lock().lock().unwrap();
+
+        let key = "DB9_MAX_CONNECTIONS";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "0");
+        }
+        let cfg = ServerConfig::from_env();
+        assert_eq!(cfg.max_connections, 1000);
+
+        match saved {
+            Some(v) => unsafe {
+                env::set_var(key, v);
+            },
+            None => unsafe {
+                env::remove_var(key);
+            },
+        }
+    }
+
+    #[test]
+    fn test_max_connections_invalid_falls_back_to_default() {
+        let _guard = test_lock().lock().unwrap();
+
+        let key = "DB9_MAX_CONNECTIONS";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "not_a_number");
+        }
+        let cfg = ServerConfig::from_env();
+        assert_eq!(cfg.max_connections, 1000);
+
+        match saved {
+            Some(v) => unsafe {
+                env::set_var(key, v);
+            },
+            None => unsafe {
+                env::remove_var(key);
+            },
+        }
+    }
+
+    #[test]
     fn test_shared_config() {
         let cfg = ServerConfig {
             statement_timeout_ms: 30_000,
             idle_in_transaction_session_timeout_ms: 45_000,
+            max_connections: 500,
         };
         let shared = cfg.shared();
 

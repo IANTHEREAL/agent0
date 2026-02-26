@@ -23,6 +23,7 @@ use std::env;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::{Semaphore, TryAcquireError};
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -325,8 +326,30 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
         connect_host, pg_port
     );
 
+    let max_connections = server_config.read().unwrap().max_connections;
+    let conn_semaphore = Arc::new(Semaphore::new(max_connections as usize));
+    info!("Max connections: {}", max_connections);
+
     loop {
-        let (socket, _peer_addr) = listener.accept().await?;
+        let (socket, peer_addr) = listener.accept().await?;
+
+        let permit = match conn_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                warn!(
+                    "Connection limit reached (max {}), rejecting {}",
+                    max_connections, peer_addr
+                );
+                tokio::spawn(async move {
+                    reject_over_limit(socket).await;
+                });
+                continue;
+            }
+            Err(TryAcquireError::Closed) => {
+                tracing::error!("Connection semaphore closed unexpectedly");
+                break Ok(());
+            }
+        };
 
         let tls_acceptor = tls_acceptor.clone();
         let client_pool = client_pool.clone();
@@ -339,6 +362,7 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
         );
 
         tokio::spawn(async move {
+            let _permit = permit; // held for connection lifetime
             if let Err(e) = process_socket(socket, tls_acceptor, factory).await {
                 tracing::error!("Connection error: {}", e);
             }
@@ -355,5 +379,124 @@ fn is_loopback_listen_addr(addr: &str) -> bool {
     match trimmed.parse::<IpAddr>() {
         Ok(ip) => ip.is_loopback(),
         Err(_) => false,
+    }
+}
+
+/// Send a pgwire FATAL ErrorResponse (SQLSTATE 53300 "too_many_connections")
+/// and close the socket. Matches PostgreSQL's rejection behavior.
+async fn reject_over_limit(mut socket: tokio::net::TcpStream) {
+    use tokio::io::AsyncWriteExt;
+
+    // pgwire ErrorResponse: 'E' | Int32 len | (Byte1 field_type + CString)... | '\0'
+    let fields: &[(&[u8], &[u8])] = &[
+        (b"S", b"FATAL"),
+        (b"V", b"FATAL"),
+        (b"C", b"53300"),
+        (b"M", b"sorry, too many clients already"),
+    ];
+
+    let mut body = Vec::new();
+    for (tag, value) in fields {
+        body.extend_from_slice(tag);
+        body.extend_from_slice(value);
+        body.push(0);
+    }
+    body.push(0); // terminator
+
+    let len = (body.len() as u32 + 4).to_be_bytes();
+    let mut msg = Vec::with_capacity(1 + 4 + body.len());
+    msg.push(b'E');
+    msg.extend_from_slice(&len);
+    msg.extend_from_slice(&body);
+
+    let _ = socket.write_all(&msg).await;
+    let _ = socket.shutdown().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn test_semaphore_admission_control() {
+        let max_connections: u32 = 2;
+        let semaphore = Arc::new(Semaphore::new(max_connections as usize));
+
+        // Acquire two permits — should succeed immediately.
+        let permit1 = semaphore.clone().acquire_owned().await.unwrap();
+        let permit2 = semaphore.clone().acquire_owned().await.unwrap();
+        assert_eq!(semaphore.available_permits(), 0);
+
+        // Third acquire must block (use try_acquire to verify).
+        assert!(semaphore.clone().try_acquire_owned().is_err());
+
+        // Dropping one permit frees a slot.
+        drop(permit1);
+        assert_eq!(semaphore.available_permits(), 1);
+        let _permit3 = semaphore.clone().acquire_owned().await.unwrap();
+        assert_eq!(semaphore.available_permits(), 0);
+
+        drop(permit2);
+        drop(_permit3);
+        assert_eq!(semaphore.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_accept_loop_rejects_over_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let max_connections: u32 = 2;
+        let semaphore = Arc::new(Semaphore::new(max_connections as usize));
+
+        let sem = semaphore.clone();
+        let handle = tokio::spawn(async move {
+            let mut handles = Vec::new();
+            // Accept exactly 3 connections: 2 get permits, 3rd gets rejected.
+            for _ in 0..3 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let permit = match sem.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        // Over limit — send PG error and close (matches production).
+                        reject_over_limit(socket).await;
+                        continue;
+                    }
+                };
+                handles.push(tokio::spawn(async move {
+                    let _permit = permit;
+                    let _socket = socket;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                }));
+            }
+            handles
+        });
+
+        // Open 3 client connections.
+        let _c1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _c2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut c3 = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // Give the server a moment to process all 3 accepts.
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Only 2 permits should be held.
+        assert_eq!(semaphore.available_permits(), 0);
+
+        // The 3rd connection should receive a pgwire FATAL ErrorResponse
+        // with SQLSTATE 53300 ("too_many_connections").
+        let mut buf = [0u8; 256];
+        let n = c3.read(&mut buf).await.unwrap();
+        assert!(n > 0, "expected error response from server");
+        assert_eq!(buf[0], b'E', "expected pgwire ErrorResponse");
+        assert!(
+            buf[..n].windows(5).any(|w| w == b"53300"),
+            "expected SQLSTATE 53300 in error response"
+        );
+
+        let handles = handle.await.unwrap();
+        for h in handles {
+            h.abort();
+        }
     }
 }
