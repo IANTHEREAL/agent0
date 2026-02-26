@@ -250,6 +250,53 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
             }
         }
 
+        // ScalarArrayCmp: `expr op ANY/ALL(ARRAY[...])`.
+        // Evaluates expr exactly once, then applies op to each element.
+        TypedExprKind::ScalarArrayCmp {
+            expr: inner,
+            elems,
+            op,
+            use_or,
+        } => {
+            let lhs = eval_typed_expr(inner, row, qctx)?;
+            let mut has_null = false;
+            if *use_or {
+                // ANY semantics: TRUE if any comparison is TRUE
+                for elem_expr in elems {
+                    let rhs = eval_typed_expr(elem_expr, row, qctx)?;
+                    if lhs == Value::Null || rhs == Value::Null {
+                        has_null = true;
+                        continue;
+                    }
+                    if scalar_array_cmp_one(&lhs, &rhs, op)? {
+                        return Ok(Value::Boolean(true));
+                    }
+                }
+                if has_null {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Boolean(false))
+                }
+            } else {
+                // ALL semantics: TRUE only if all comparisons are TRUE
+                for elem_expr in elems {
+                    let rhs = eval_typed_expr(elem_expr, row, qctx)?;
+                    if lhs == Value::Null || rhs == Value::Null {
+                        has_null = true;
+                        continue;
+                    }
+                    if !scalar_array_cmp_one(&lhs, &rhs, op)? {
+                        return Ok(Value::Boolean(false));
+                    }
+                }
+                if has_null {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Boolean(true))
+                }
+            }
+        }
+
         TypedExprKind::Like {
             expr: inner,
             pattern,
@@ -505,4 +552,18 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
             eval_typed_expr(inner, row, qctx)
         }
     }
+}
+
+/// Evaluate a single comparison for ScalarArrayCmp.
+fn scalar_array_cmp_one(lhs: &Value, rhs: &Value, op: &BinaryOp) -> Result<bool> {
+    let cmp = compare_values(lhs, rhs)?;
+    Ok(match op {
+        BinaryOp::Eq => cmp == 0,
+        BinaryOp::NotEq => cmp != 0,
+        BinaryOp::Lt => cmp < 0,
+        BinaryOp::LtEq => cmp <= 0,
+        BinaryOp::Gt => cmp > 0,
+        BinaryOp::GtEq => cmp >= 0,
+        _ => return Err(anyhow!("unsupported operator in ScalarArrayCmp: {:?}", op)),
+    })
 }

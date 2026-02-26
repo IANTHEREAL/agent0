@@ -183,6 +183,20 @@ pub(super) fn remap_column_refs(
                 .collect(),
             negated,
         },
+        TypedExprKind::ScalarArrayCmp {
+            expr: inner,
+            elems,
+            op,
+            use_or,
+        } => TypedExprKind::ScalarArrayCmp {
+            expr: Box::new(remap_column_refs(*inner, column_map, base_names)),
+            elems: elems
+                .into_iter()
+                .map(|e| remap_column_refs(e, column_map, base_names))
+                .collect(),
+            op,
+            use_or,
+        },
         TypedExprKind::Like {
             expr: inner,
             pattern,

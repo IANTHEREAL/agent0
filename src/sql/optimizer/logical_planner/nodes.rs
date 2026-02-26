@@ -333,9 +333,10 @@ pub(crate) fn expr_has_aggregate(expr: &TypedExpr) -> bool {
         TypedExprKind::Between {
             expr, low, high, ..
         } => expr_has_aggregate(expr) || expr_has_aggregate(low) || expr_has_aggregate(high),
-        TypedExprKind::InList { expr, list, .. } => {
-            expr_has_aggregate(expr) || list.iter().any(expr_has_aggregate)
-        }
+        TypedExprKind::InList { expr, list, .. }
+        | TypedExprKind::ScalarArrayCmp {
+            expr, elems: list, ..
+        } => expr_has_aggregate(expr) || list.iter().any(expr_has_aggregate),
         TypedExprKind::Like {
             expr,
             pattern,

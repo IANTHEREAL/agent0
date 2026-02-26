@@ -159,7 +159,10 @@ impl<'a> Analyzer<'a> {
                     || Self::contains_aggregate_call(low)
                     || Self::contains_aggregate_call(high)
             }
-            TypedExprKind::InList { expr, list, .. } => {
+            TypedExprKind::InList { expr, list, .. }
+            | TypedExprKind::ScalarArrayCmp {
+                expr, elems: list, ..
+            } => {
                 Self::contains_aggregate_call(expr)
                     || list.iter().any(Self::contains_aggregate_call)
             }
@@ -350,7 +353,10 @@ impl<'a> Analyzer<'a> {
                     })
             }
 
-            TypedExprKind::InList { expr, list, .. } => {
+            TypedExprKind::InList { expr, list, .. }
+            | TypedExprKind::ScalarArrayCmp {
+                expr, elems: list, ..
+            } => {
                 Self::find_ungrouped_column(expr, grouped_columns, grouped_expr_keys, in_aggregate)
                     .or_else(|| {
                         list.iter().find_map(|e| {

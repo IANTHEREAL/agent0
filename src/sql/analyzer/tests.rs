@@ -466,6 +466,42 @@ fn analyze_in_list_coerces_types() {
     }
 }
 
+// ── ScalarArrayCmp (<> ANY) ──────────────────────────────────
+
+#[test]
+fn analyze_ne_any_array_uses_scalar_array_cmp() {
+    // `age <> ANY(ARRAY[1, 2, 3])` should produce ScalarArrayCmp, not InList
+    let expr = analyze_expr_with_users("age <> ANY(ARRAY[1, 2, 3])").unwrap();
+    assert_eq!(expr.data_type, DataType::Boolean);
+    match &expr.kind {
+        TypedExprKind::ScalarArrayCmp {
+            elems, op, use_or, ..
+        } => {
+            assert_eq!(elems.len(), 3);
+            assert_eq!(*op, BinaryOp::NotEq);
+            assert!(*use_or); // ANY = OR semantics
+        }
+        _ => panic!("expected ScalarArrayCmp, got {:?}", expr.kind),
+    }
+}
+
+#[test]
+fn analyze_ne_any_empty_array_uses_scalar_array_cmp() {
+    // `age <> ANY(ARRAY[]::int[])` should produce ScalarArrayCmp with empty elems
+    let expr = analyze_expr_with_users("age <> ANY(ARRAY[]::int[])").unwrap();
+    assert_eq!(expr.data_type, DataType::Boolean);
+    match &expr.kind {
+        TypedExprKind::ScalarArrayCmp {
+            elems, op, use_or, ..
+        } => {
+            assert!(elems.is_empty());
+            assert_eq!(*op, BinaryOp::NotEq);
+            assert!(*use_or);
+        }
+        _ => panic!("expected ScalarArrayCmp, got {:?}", expr.kind),
+    }
+}
+
 // ── LIKE ────────────────────────────────────────────────────
 
 #[test]

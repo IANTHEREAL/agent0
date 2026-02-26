@@ -40,7 +40,7 @@ impl TypedExpr {
     }
 }
 
-// ── Expression kinds (22 variants) ──────────────────────────
+// ── Expression kinds (23 variants) ──────────────────────────
 
 /// The expression kind — each variant represents a distinct semantic concept
 /// requiring different evaluation logic.
@@ -116,6 +116,22 @@ pub enum TypedExprKind {
         expr: Box<TypedExpr>,
         list: Vec<TypedExpr>,
         negated: bool,
+    },
+
+    /// `expr op ANY/ALL(ARRAY[...])` — scalar-array comparison.
+    ///
+    /// PostgreSQL `ScalarArrayOpExpr` equivalent. Evaluates `expr` exactly once,
+    /// then applies `op` to each element. Results are combined with OR (ANY) or
+    /// AND (ALL).
+    ///
+    /// Empty array: evaluates `expr` (for side effects / errors), then returns
+    /// FALSE (ANY) or TRUE (ALL) per SQL standard.
+    ScalarArrayCmp {
+        expr: Box<TypedExpr>,
+        elems: Vec<TypedExpr>,
+        op: BinaryOp,
+        /// true = ANY (OR semantics), false = ALL (AND semantics)
+        use_or: bool,
     },
 
     /// `expr [NOT] [I]LIKE pattern [ESCAPE escape]`.

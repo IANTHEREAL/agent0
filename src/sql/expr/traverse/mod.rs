@@ -68,7 +68,10 @@ pub fn for_each_child<'a>(expr: &'a TypedExpr, f: &mut impl FnMut(&'a TypedExpr)
             f(low);
             f(high);
         }
-        TypedExprKind::InList { expr, list, .. } => {
+        TypedExprKind::InList { expr, list, .. }
+        | TypedExprKind::ScalarArrayCmp {
+            expr, elems: list, ..
+        } => {
             f(expr);
             list.iter().for_each(f);
         }
@@ -351,6 +354,17 @@ macro_rules! map_children_match {
                 expr: Box::new($map_one!($mapper, inner)),
                 list: $map_vec!($mapper, list),
                 negated: *negated,
+            },
+            TypedExprKind::ScalarArrayCmp {
+                expr: inner,
+                elems,
+                op,
+                use_or,
+            } => TypedExprKind::ScalarArrayCmp {
+                expr: Box::new($map_one!($mapper, inner)),
+                elems: $map_vec!($mapper, elems),
+                op: op.clone(),
+                use_or: *use_or,
             },
             TypedExprKind::Like {
                 expr: inner,

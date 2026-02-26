@@ -176,9 +176,10 @@ fn contains_aggregate(expr: &TypedExpr) -> bool {
         TypedExprKind::Between {
             expr, low, high, ..
         } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
-        TypedExprKind::InList { expr, list, .. } => {
-            contains_aggregate(expr) || list.iter().any(contains_aggregate)
-        }
+        TypedExprKind::InList { expr, list, .. }
+        | TypedExprKind::ScalarArrayCmp {
+            expr, elems: list, ..
+        } => contains_aggregate(expr) || list.iter().any(contains_aggregate),
         TypedExprKind::Like {
             expr,
             pattern,
@@ -361,6 +362,30 @@ pub(crate) fn rewrite_post_aggregate_expr(
                     })
                     .collect::<Result<Vec<_>>>()?,
                 negated: *negated,
+            },
+            data_type: expr.data_type.clone(),
+        }),
+        TypedExprKind::ScalarArrayCmp {
+            expr: inner,
+            elems,
+            op,
+            use_or,
+        } => Ok(TypedExpr {
+            kind: TypedExprKind::ScalarArrayCmp {
+                expr: Box::new(rewrite_post_aggregate_expr(
+                    inner,
+                    group_by,
+                    group_by_count,
+                    aggregate_exprs,
+                )?),
+                elems: elems
+                    .iter()
+                    .map(|e| {
+                        rewrite_post_aggregate_expr(e, group_by, group_by_count, aggregate_exprs)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                op: op.clone(),
+                use_or: *use_or,
             },
             data_type: expr.data_type.clone(),
         }),

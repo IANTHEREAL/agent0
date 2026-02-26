@@ -105,7 +105,10 @@ pub fn collect_window_calls_from_expr(
             collect_window_calls_from_expr(low, output_name, result);
             collect_window_calls_from_expr(high, output_name, result);
         }
-        TypedExprKind::InList { expr, list, .. } => {
+        TypedExprKind::InList { expr, list, .. }
+        | TypedExprKind::ScalarArrayCmp {
+            expr, elems: list, ..
+        } => {
             collect_window_calls_from_expr(expr, output_name, result);
             for e in list {
                 collect_window_calls_from_expr(e, output_name, result);
@@ -302,6 +305,24 @@ pub fn rewrite_for_post_window(
                     .map(|e| rewrite_for_post_window(e, input_col_count, counter))
                     .collect(),
                 negated: *negated,
+            },
+            data_type: expr.data_type.clone(),
+        },
+
+        TypedExprKind::ScalarArrayCmp {
+            expr: inner,
+            elems,
+            op,
+            use_or,
+        } => TypedExpr {
+            kind: TypedExprKind::ScalarArrayCmp {
+                expr: Box::new(rewrite_for_post_window(inner, input_col_count, counter)),
+                elems: elems
+                    .iter()
+                    .map(|e| rewrite_for_post_window(e, input_col_count, counter))
+                    .collect(),
+                op: op.clone(),
+                use_or: *use_or,
             },
             data_type: expr.data_type.clone(),
         },

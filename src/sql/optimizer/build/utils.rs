@@ -92,7 +92,10 @@ pub(crate) fn collect_agg_exprs_from(
             collect_agg_exprs_from(low, output_name, agg_exprs, agg_names, agg_types);
             collect_agg_exprs_from(high, output_name, agg_exprs, agg_names, agg_types);
         }
-        TypedExprKind::InList { expr, list, .. } => {
+        TypedExprKind::InList { expr, list, .. }
+        | TypedExprKind::ScalarArrayCmp {
+            expr, elems: list, ..
+        } => {
             collect_agg_exprs_from(expr, output_name, agg_exprs, agg_names, agg_types);
             for item in list {
                 collect_agg_exprs_from(item, output_name, agg_exprs, agg_names, agg_types);

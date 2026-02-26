@@ -505,6 +505,50 @@ impl Executor {
                         data_type: expr.data_type.clone(),
                     })
                 }
+                TypedExprKind::ScalarArrayCmp {
+                    expr: inner,
+                    elems,
+                    op,
+                    use_or,
+                } => {
+                    let inner = self
+                        .materialize_catalog_functions(
+                            inner,
+                            row,
+                            schema,
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            qctx,
+                        )
+                        .await?;
+                    let mut new_elems = Vec::with_capacity(elems.len());
+                    for item in elems {
+                        new_elems.push(
+                            self.materialize_catalog_functions(
+                                item,
+                                row,
+                                schema,
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                qctx,
+                            )
+                            .await?,
+                        );
+                    }
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::ScalarArrayCmp {
+                            expr: Box::new(inner),
+                            elems: new_elems,
+                            op: op.clone(),
+                            use_or: *use_or,
+                        },
+                        data_type: expr.data_type.clone(),
+                    })
+                }
                 TypedExprKind::Like {
                     expr: inner,
                     pattern,

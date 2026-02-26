@@ -76,6 +76,16 @@ impl fmt::Display for TypedExpr {
                     items.join(", ")
                 )
             }
+            TypedExprKind::ScalarArrayCmp {
+                expr,
+                elems,
+                op,
+                use_or,
+            } => {
+                let items: Vec<String> = elems.iter().map(|e| format!("{}", e)).collect();
+                let kw = if *use_or { "ANY" } else { "ALL" };
+                write!(f, "({} {} {}(ARRAY[{}]))", expr, op, kw, items.join(", "))
+            }
             TypedExprKind::Like {
                 expr,
                 pattern,

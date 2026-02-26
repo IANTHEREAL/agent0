@@ -16,6 +16,7 @@ use sqlparser::ast::{self as ast, BinaryOperator, Expr, TrimWhereField};
 
 use crate::model::{DataType, Value};
 use crate::sql::types::cast::CastContext;
+use crate::sql::types::coercion::comparison_target_type;
 use crate::sql::types::mapping::sql_datatype_to_internal;
 
 use super::error::AnalyzerError;
@@ -758,6 +759,42 @@ impl<'a> Analyzer<'a> {
                 // Optimize: `x = ANY(ARRAY[a, b, c])` -> `x IN (a, b, c)`
                 if matches!(compare_op, BinaryOperator::Eq) {
                     if let Some(elems) = extract_array_literal_elems(&right_expr) {
+                        // Empty array: type-check LHS against the array element type,
+                        // then return InList so the LHS is still evaluated at runtime
+                        // (catches errors like 1/0). Result is FALSE (= ANY of empty set).
+                        if elems.is_empty() {
+                            let elem_type = match &right_expr.data_type {
+                                DataType::Array(inner) => inner.as_ref().clone(),
+                                _ => left_expr.data_type.clone(),
+                            };
+                            // Use comparison semantics (not unify_types which has a
+                            // Text universal fallback). Reject text↔non-text mismatches
+                            // since no comparison operator exists (PG parity).
+                            let lhs_text = is_text_like(&left_expr.data_type);
+                            let rhs_text = is_text_like(&elem_type);
+                            let common = if lhs_text != rhs_text {
+                                None
+                            } else {
+                                comparison_target_type(&left_expr.data_type, &elem_type)
+                            };
+                            let common =
+                                common.ok_or_else(|| AnalyzerError::TypesCannotBeMatched {
+                                    types: vec![
+                                        left_expr.data_type.clone(),
+                                        right_expr.data_type.clone(),
+                                    ],
+                                    context: "ANY".to_string(),
+                                })?;
+                            let left_coerced = self.coerce_if_needed(left_expr, &common)?;
+                            return Ok(TypedExpr::new(
+                                TypedExprKind::InList {
+                                    expr: Box::new(left_coerced),
+                                    list: vec![],
+                                    negated: false,
+                                },
+                                DataType::Boolean,
+                            ));
+                        }
                         let mut in_refs: Vec<&TypedExpr> = vec![&left_expr];
                         let elem_refs: Vec<&TypedExpr> = elems.iter().collect();
                         in_refs.extend(elem_refs);
@@ -778,23 +815,66 @@ impl<'a> Analyzer<'a> {
                     }
                 }
 
-                // Optimize: `x <> ANY(ARRAY[a, b, c])` -> `x NOT IN (a, b, c)`
+                // `x <> ANY(ARRAY[a, b, c])` -> ScalarArrayCmp (OR of inequalities).
+                // NOT the same as NOT IN which uses AND semantics.
+                // ScalarArrayCmp evaluates LHS exactly once and handles empty arrays
+                // correctly (LHS is still evaluated for side effects).
                 if matches!(compare_op, BinaryOperator::NotEq) {
                     if let Some(elems) = extract_array_literal_elems(&right_expr) {
+                        // Empty array: derive element type from right_expr.data_type
+                        // to enforce type compatibility. ScalarArrayCmp with empty
+                        // elems already evaluates LHS and returns FALSE at runtime.
+                        if elems.is_empty() {
+                            let elem_type = match &right_expr.data_type {
+                                DataType::Array(inner) => inner.as_ref().clone(),
+                                _ => left_expr.data_type.clone(),
+                            };
+                            // Use comparison semantics (not unify_types which has a
+                            // Text universal fallback). Reject text↔non-text mismatches
+                            // since no comparison operator exists (PG parity).
+                            let lhs_text = is_text_like(&left_expr.data_type);
+                            let rhs_text = is_text_like(&elem_type);
+                            let common = if lhs_text != rhs_text {
+                                None
+                            } else {
+                                comparison_target_type(&left_expr.data_type, &elem_type)
+                            };
+                            let common =
+                                common.ok_or_else(|| AnalyzerError::TypesCannotBeMatched {
+                                    types: vec![
+                                        left_expr.data_type.clone(),
+                                        right_expr.data_type.clone(),
+                                    ],
+                                    context: "ANY".to_string(),
+                                })?;
+                            let left_coerced = self.coerce_if_needed(left_expr, &common)?;
+                            let op = self.any_all_compare_op(compare_op)?;
+                            return Ok(TypedExpr::new(
+                                TypedExprKind::ScalarArrayCmp {
+                                    expr: Box::new(left_coerced),
+                                    elems: vec![],
+                                    op,
+                                    use_or: true,
+                                },
+                                DataType::Boolean,
+                            ));
+                        }
                         let mut in_refs: Vec<&TypedExpr> = vec![&left_expr];
                         let elem_refs: Vec<&TypedExpr> = elems.iter().collect();
                         in_refs.extend(elem_refs);
                         let common = self.unify_expr_types(&in_refs, "ANY")?;
                         let left_coerced = self.coerce_if_needed(left_expr, &common)?;
-                        let list = elems
+                        let coerced_elems = elems
                             .into_iter()
                             .map(|e| self.coerce_if_needed(e, &common))
                             .collect::<Result<_, _>>()?;
+                        let op = self.any_all_compare_op(compare_op)?;
                         return Ok(TypedExpr::new(
-                            TypedExprKind::InList {
+                            TypedExprKind::ScalarArrayCmp {
                                 expr: Box::new(left_coerced),
-                                list,
-                                negated: true,
+                                elems: coerced_elems,
+                                op,
+                                use_or: true,
                             },
                             DataType::Boolean,
                         ));
@@ -990,4 +1070,11 @@ impl<'a> Analyzer<'a> {
             ))),
         }
     }
+}
+
+/// Returns `true` for text-like types that form a single comparison category.
+/// Used to reject text↔non-text comparisons in empty-array ANY/= ANY paths
+/// (PostgreSQL has no cross-category comparison operators for these).
+fn is_text_like(dt: &DataType) -> bool {
+    matches!(dt, DataType::Text | DataType::Varchar(_) | DataType::Name)
 }

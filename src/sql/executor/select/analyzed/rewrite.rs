@@ -345,6 +345,24 @@ pub(super) fn rewrite_for_post_aggregate(
             data_type: expr.data_type.clone(),
         },
 
+        TypedExprKind::ScalarArrayCmp {
+            expr: inner,
+            elems,
+            op,
+            use_or,
+        } => TypedExpr {
+            kind: TypedExprKind::ScalarArrayCmp {
+                expr: Box::new(rewrite_for_post_aggregate(inner, analysis)),
+                elems: elems
+                    .iter()
+                    .map(|e| rewrite_for_post_aggregate(e, analysis))
+                    .collect(),
+                op: op.clone(),
+                use_or: *use_or,
+            },
+            data_type: expr.data_type.clone(),
+        },
+
         TypedExprKind::Like {
             expr: inner,
             pattern,

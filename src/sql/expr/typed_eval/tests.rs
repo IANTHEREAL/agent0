@@ -638,6 +638,140 @@ fn test_in_list_with_null() {
     assert_eq!(eval_typed_expr(&in_null, &row, &qctx).unwrap(), Value::Null);
 }
 
+// ── ScalarArrayCmp ──────────────────────────────────────
+
+#[test]
+fn test_scalar_array_cmp_ne_any() {
+    let row = empty_row();
+    let qctx = test_qctx();
+
+    // 1 <> ANY(ARRAY[1, 2, 3]) → TRUE (1<>2 is true)
+    let ne_any = TypedExpr::new(
+        TypedExprKind::ScalarArrayCmp {
+            expr: Box::new(const_expr(Value::Int64(1), DataType::Int64)),
+            elems: vec![
+                const_expr(Value::Int64(1), DataType::Int64),
+                const_expr(Value::Int64(2), DataType::Int64),
+                const_expr(Value::Int64(3), DataType::Int64),
+            ],
+            op: BinaryOp::NotEq,
+            use_or: true,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&ne_any, &row, &qctx).unwrap(),
+        Value::Boolean(true)
+    );
+
+    // 1 <> ANY(ARRAY[1, 1, 1]) → FALSE (all equal)
+    let ne_any_false = TypedExpr::new(
+        TypedExprKind::ScalarArrayCmp {
+            expr: Box::new(const_expr(Value::Int64(1), DataType::Int64)),
+            elems: vec![
+                const_expr(Value::Int64(1), DataType::Int64),
+                const_expr(Value::Int64(1), DataType::Int64),
+                const_expr(Value::Int64(1), DataType::Int64),
+            ],
+            op: BinaryOp::NotEq,
+            use_or: true,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&ne_any_false, &row, &qctx).unwrap(),
+        Value::Boolean(false)
+    );
+}
+
+#[test]
+fn test_scalar_array_cmp_empty_array() {
+    let row = empty_row();
+    let qctx = test_qctx();
+
+    // 1 <> ANY(ARRAY[]::int[]) → FALSE (empty array, ANY = FALSE)
+    // LHS is still evaluated (important for side-effect correctness)
+    let ne_any_empty = TypedExpr::new(
+        TypedExprKind::ScalarArrayCmp {
+            expr: Box::new(const_expr(Value::Int64(1), DataType::Int64)),
+            elems: vec![],
+            op: BinaryOp::NotEq,
+            use_or: true,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&ne_any_empty, &row, &qctx).unwrap(),
+        Value::Boolean(false)
+    );
+}
+
+#[test]
+fn test_scalar_array_cmp_null_in_array() {
+    let row = empty_row();
+    let qctx = test_qctx();
+
+    // 1 <> ANY(ARRAY[1, NULL]) → NULL (1<>1 is FALSE, 1<>NULL is NULL → FALSE OR NULL = NULL)
+    let ne_any_null = TypedExpr::new(
+        TypedExprKind::ScalarArrayCmp {
+            expr: Box::new(const_expr(Value::Int64(1), DataType::Int64)),
+            elems: vec![
+                const_expr(Value::Int64(1), DataType::Int64),
+                const_expr(Value::Null, DataType::Int64),
+            ],
+            op: BinaryOp::NotEq,
+            use_or: true,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&ne_any_null, &row, &qctx).unwrap(),
+        Value::Null
+    );
+
+    // 1 <> ANY(ARRAY[2, NULL]) → TRUE (1<>2 is TRUE, short-circuit)
+    let ne_any_null_true = TypedExpr::new(
+        TypedExprKind::ScalarArrayCmp {
+            expr: Box::new(const_expr(Value::Int64(1), DataType::Int64)),
+            elems: vec![
+                const_expr(Value::Int64(2), DataType::Int64),
+                const_expr(Value::Null, DataType::Int64),
+            ],
+            op: BinaryOp::NotEq,
+            use_or: true,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&ne_any_null_true, &row, &qctx).unwrap(),
+        Value::Boolean(true)
+    );
+}
+
+#[test]
+fn test_scalar_array_cmp_null_lhs() {
+    let row = empty_row();
+    let qctx = test_qctx();
+
+    // NULL <> ANY(ARRAY[1, 2]) → NULL
+    let ne_any_null_lhs = TypedExpr::new(
+        TypedExprKind::ScalarArrayCmp {
+            expr: Box::new(const_expr(Value::Null, DataType::Int64)),
+            elems: vec![
+                const_expr(Value::Int64(1), DataType::Int64),
+                const_expr(Value::Int64(2), DataType::Int64),
+            ],
+            op: BinaryOp::NotEq,
+            use_or: true,
+        },
+        DataType::Boolean,
+    );
+    assert_eq!(
+        eval_typed_expr(&ne_any_null_lhs, &row, &qctx).unwrap(),
+        Value::Null
+    );
+}
+
 // ── Like ────────────────────────────────────────────────
 
 #[test]
