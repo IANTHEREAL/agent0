@@ -36,6 +36,7 @@ impl Executor {
         txn: &mut Transaction,
         db_id: u64,
         deferred_limit: &Option<(Option<TypedExpr>, Option<TypedExpr>)>,
+        lock_timeout: Option<std::time::Duration>,
     ) -> Result<Vec<Row>> {
         if locks.is_empty() {
             return Ok(rows);
@@ -129,7 +130,7 @@ impl Executor {
                     .await?;
             } else {
                 self.store()
-                    .lock_rows(txn, db_id, &table_name, &rows_to_lock)
+                    .lock_rows(txn, db_id, &table_name, &rows_to_lock, lock_timeout)
                     .await?;
             }
             Ok(rows_to_lock)

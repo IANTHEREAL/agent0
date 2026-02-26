@@ -94,7 +94,7 @@ pub enum SqlError {
     IdleInTransactionTimeout,
 
     #[error("canceling statement due to lock timeout")]
-    AdvisoryLockTimeout,
+    LockTimeout,
 
     #[error("could not obtain lock on row in relation \"{relation}\"")]
     LockNotAvailable { relation: String },
@@ -233,7 +233,7 @@ impl SqlError {
             Self::DivisionByZero => "22012",
             Self::StatementTimeout => "57014",
             Self::IdleInTransactionTimeout => "25P03",
-            Self::AdvisoryLockTimeout => "55P03",
+            Self::LockTimeout => "55P03",
             Self::LockNotAvailable { .. } => "55P03",
             Self::AdvisoryLockLimitExceeded { .. } => "54000",
             Self::AdvisoryLockCounterOverflow => "54000",
@@ -431,7 +431,7 @@ mod tests {
         );
         assert_eq!(SqlError::DivisionByZero.sqlstate(), "22012");
         assert_eq!(SqlError::StatementTimeout.sqlstate(), "57014");
-        assert_eq!(SqlError::AdvisoryLockTimeout.sqlstate(), "55P03");
+        assert_eq!(SqlError::LockTimeout.sqlstate(), "55P03");
         assert_eq!(SqlError::InFailedTransaction.sqlstate(), "25P02");
         assert_eq!(
             SqlError::PermissionDenied {

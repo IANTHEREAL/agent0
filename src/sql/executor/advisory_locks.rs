@@ -62,7 +62,7 @@ pub(crate) async fn execute_advisory_lock_function(
 
 fn map_acquire_error(err: AcquireError) -> anyhow::Error {
     match err {
-        AcquireError::Timeout => SqlError::AdvisoryLockTimeout.into(),
+        AcquireError::Timeout => SqlError::LockTimeout.into(),
         AcquireError::LockLimitExceeded { limit } => {
             SqlError::AdvisoryLockLimitExceeded { limit }.into()
         }
@@ -333,7 +333,7 @@ mod tests {
         let sql = err
             .downcast_ref::<SqlError>()
             .expect("timeout should map to SqlError");
-        assert!(matches!(sql, SqlError::AdvisoryLockTimeout));
+        assert!(matches!(sql, SqlError::LockTimeout));
         assert_eq!(sql.sqlstate(), "55P03");
     }
 

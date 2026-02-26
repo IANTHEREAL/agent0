@@ -533,6 +533,7 @@ impl Executor {
 
             // 8a: FOR UPDATE/SHARE locking (before projection, raw rows have PK).
             if has_locks {
+                let lock_timeout = crate::sql::query_context::QueryContext::current_lock_timeout();
                 rows = self
                     .apply_row_locks(
                         rows,
@@ -542,6 +543,7 @@ impl Executor {
                         txn,
                         db_id,
                         &deferred_limit,
+                        lock_timeout,
                     )
                     .await?;
             }

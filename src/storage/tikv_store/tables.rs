@@ -13,6 +13,7 @@ impl TikvStore {
         db_id: u64,
         table_name: &str,
         rows: &[Row],
+        lock_timeout: Option<std::time::Duration>,
     ) -> Result<()> {
         let schema = self
             .get_schema(txn, db_id, table_name)
@@ -32,7 +33,14 @@ impl TikvStore {
                 self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key))
             })
             .collect();
-        txn.lock_keys(keys).await.map_err(|e| anyhow!(e))
+        match lock_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, txn.lock_keys(keys)).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(anyhow!(e)),
+                Err(_elapsed) => Err(SqlError::LockTimeout.into()),
+            },
+            None => txn.lock_keys(keys).await.map_err(|e| anyhow!(e)),
+        }
     }
 
     /// Lock rows with SKIP LOCKED semantics.  Returns the indices (into `rows`)

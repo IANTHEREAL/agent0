@@ -272,6 +272,26 @@ impl QueryContext {
         qctx
     }
 
+    /// Read the current `lock_timeout` from the task-local settings snapshot.
+    ///
+    /// Returns `None` when no timeout is configured (value 0 or missing).
+    /// This is a lightweight alternative to `from_task_locals()` when only
+    /// the lock timeout is needed.
+    pub(crate) fn current_lock_timeout() -> Option<Duration> {
+        SETTINGS_SNAPSHOT
+            .try_with(|s| {
+                s.get("lock_timeout").and_then(|raw| {
+                    match crate::sql::session::SessionSettings::parse_timeout_value(raw) {
+                        Ok(0) => None,
+                        Ok(ms) => Some(Duration::from_millis(ms)),
+                        Err(_) => None,
+                    }
+                })
+            })
+            .ok()
+            .flatten()
+    }
+
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
         Self::new(
@@ -446,6 +466,32 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(locked.stack.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn current_lock_timeout_reads_from_task_local() {
+        // No snapshot → None
+        assert_eq!(QueryContext::current_lock_timeout(), None);
+
+        // With lock_timeout = "500"
+        let mut snapshot = HashMap::new();
+        snapshot.insert("lock_timeout".to_string(), "500".to_string());
+        let result = SETTINGS_SNAPSHOT
+            .scope(Arc::new(snapshot), async {
+                QueryContext::current_lock_timeout()
+            })
+            .await;
+        assert_eq!(result, Some(Duration::from_millis(500)));
+
+        // With lock_timeout = "0" → None (disabled)
+        let mut snapshot = HashMap::new();
+        snapshot.insert("lock_timeout".to_string(), "0".to_string());
+        let result = SETTINGS_SNAPSHOT
+            .scope(Arc::new(snapshot), async {
+                QueryContext::current_lock_timeout()
+            })
+            .await;
+        assert_eq!(result, None);
     }
 
     #[test]
