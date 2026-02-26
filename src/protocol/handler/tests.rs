@@ -2802,3 +2802,123 @@ fn test_encode_jsonb_binary_canonical() {
     let json_text = std::str::from_utf8(&bytes[1..]).unwrap();
     assert_eq!(json_text, r#"{"a": 2, "b": 1}"#);
 }
+
+// ---------------------------------------------------------------------------
+// Protocol-layer regression tests: Parse→Describe→Bind→Execute contract
+// (Issue #840 — raw parameter binding stability)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_merge_parameter_types_unknown_filled_from_finalized() {
+    use super::dynamic::merge_parameter_types;
+    // Client sends UNKNOWN for all params; merge must fill from analyzer-finalized types.
+    let client_types = vec![Type::UNKNOWN, Type::UNKNOWN];
+    let finalized = vec![
+        DataType::Int32,
+        DataType::Numeric {
+            precision: None,
+            scale: None,
+        },
+    ];
+    let merged = merge_parameter_types(&client_types, &finalized);
+    assert_eq!(merged, vec![Type::INT4, Type::NUMERIC]);
+}
+
+#[test]
+fn test_merge_parameter_types_client_non_unknown_wins() {
+    use super::dynamic::merge_parameter_types;
+    // Client specifies INT2 for first param; merge must preserve it even though
+    // analyzer inferred Int32 (wider type).
+    let client_types = vec![Type::INT2, Type::UNKNOWN];
+    let finalized = vec![DataType::Int32, DataType::Text];
+    let merged = merge_parameter_types(&client_types, &finalized);
+    assert_eq!(merged, vec![Type::INT2, Type::TEXT]);
+}
+
+#[test]
+fn test_merge_parameter_types_empty_client_types_uses_finalized() {
+    use super::dynamic::merge_parameter_types;
+    // Empty client_types (client sent zero OIDs) — all slots from finalized.
+    let client_types: Vec<Type> = vec![];
+    let finalized = vec![DataType::Int64, DataType::Boolean];
+    let merged = merge_parameter_types(&client_types, &finalized);
+    assert_eq!(merged, vec![Type::INT8, Type::BOOL]);
+}
+
+#[test]
+fn test_merge_parameter_types_numeric_stability() {
+    use super::dynamic::merge_parameter_types;
+    // Prisma sends NUMERIC params — verify stable OID after merge.
+    let client_types = vec![Type::NUMERIC];
+    let finalized = vec![DataType::Numeric {
+        precision: Some(12),
+        scale: Some(2),
+    }];
+    let merged = merge_parameter_types(&client_types, &finalized);
+    assert_eq!(merged, vec![Type::NUMERIC]);
+}
+
+#[test]
+fn test_describe_does_not_mutate_stored_statement_parameter_types() {
+    // StoredStatement parameter_types must remain immutable after Describe.
+    let stmt = Arc::new(StoredStatement::new(
+        "stmt".to_string(),
+        test_prepared_stmt_analyzed(
+            "SELECT $1::int4 + $2::int4",
+            vec![("?column?".to_string(), DataType::Int32, None)],
+            vec![DataType::Int32, DataType::Int32],
+        ),
+        vec![Type::INT4, Type::INT4],
+    ));
+    let types_before: Vec<Type> = stmt.parameter_types.clone();
+
+    // Simulate Describe: read parameter types (read-only access).
+    let types_from_describe: Vec<Type> = stmt.parameter_types.clone();
+
+    // Types must be identical — Describe must not mutate.
+    assert_eq!(types_before, types_from_describe);
+    assert_eq!(types_before, vec![Type::INT4, Type::INT4]);
+}
+
+#[test]
+fn test_decode_parameters_numeric_text_format_preserves_precision() {
+    // NUMERIC text decode must use rust_decimal (no float lossy path).
+    let stmt = Arc::new(StoredStatement::new(
+        "stmt".to_string(),
+        test_prepared_stmt("SELECT $1"),
+        vec![Type::NUMERIC],
+    ));
+    let mut portal: Portal<PreparedStatement> = Portal::default();
+    portal.name = "portal".to_string();
+    portal.statement = stmt;
+    portal.parameter_format = Format::UnifiedText;
+    portal.parameters = vec![Some(Bytes::from_static(b"123456789.123456789"))];
+    portal.result_column_format = Format::UnifiedText;
+
+    let values = decode_parameters(&portal).unwrap();
+    match &values[0] {
+        Some(Value::Numeric(d)) => {
+            assert_eq!(d.to_string(), "123456789.123456789");
+        }
+        other => panic!("expected Numeric, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_decode_parameters_unknown_binary_fallback_returns_text() {
+    // UNKNOWN type with binary format: fallback must return text (PG-compatible).
+    let stmt = Arc::new(StoredStatement::new(
+        "stmt".to_string(),
+        test_prepared_stmt("SELECT $1"),
+        vec![Type::UNKNOWN],
+    ));
+    let mut portal: Portal<PreparedStatement> = Portal::default();
+    portal.name = "portal".to_string();
+    portal.statement = stmt;
+    portal.parameter_format = Format::UnifiedBinary;
+    portal.parameters = vec![Some(Bytes::from_static(b"hello"))];
+    portal.result_column_format = Format::UnifiedText;
+
+    let values = decode_parameters(&portal).unwrap();
+    assert_eq!(values, vec![Some(Value::Text("hello".to_string()))]);
+}

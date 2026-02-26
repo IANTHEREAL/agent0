@@ -22,18 +22,28 @@ use crate::model::{Row, Value};
 
 pub type EnumLabelCache = HashMap<String, HashSet<String>>;
 
+/// Resolved target selector for `ON CONFLICT DO UPDATE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictTarget {
+    /// `ON CONFLICT (col1, col2, ...)`
+    Columns(Vec<String>),
+    /// `ON CONFLICT ON CONSTRAINT constraint_name`
+    Constraint(String),
+}
+
 /// How `execute_insert_row` should handle unique-key conflicts.
 ///
 /// Replaces the previous `&Option<OnInsert>` parameter, removing the dependency
 /// on raw sqlparser AST types from the typed execution path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConflictBehavior {
     /// No ON CONFLICT -- unique violations produce an error.
     Error,
     /// ON CONFLICT DO NOTHING -- skip the conflicting row.
     DoNothing,
     /// ON CONFLICT DO UPDATE -- return the conflicting row for caller-side update.
-    DoUpdate,
+    /// Contains an optional conflict target to restrict which conflict is matched.
+    DoUpdate { target: Option<ConflictTarget> },
 }
 
 pub enum InsertRowResult {

@@ -16,7 +16,9 @@ mod startup;
 // via `super::dynamic::*`.
 // These are used by test code via `super::dynamic::*`
 #[allow(unused_imports)]
-pub(super) use query::{is_data_statement, reject_unanalyzed_if_needed, utility_describe_fields};
+pub(super) use query::{
+    is_data_statement, merge_parameter_types, reject_unanalyzed_if_needed, utility_describe_fields,
+};
 
 use super::portal::SuspendedPortalState;
 use super::Db9QueryParser;

@@ -1,0 +1,13 @@
+DROP TABLE
+CREATE TABLE
+INSERT 3
+name
+Alice
+name
+Alice
+name,role
+Alice,admin
+Bob,user
+name
+Alice
+DROP TABLE

@@ -1,0 +1,10 @@
+DROP TABLE
+CREATE TABLE
+INSERT 5
+grp,s,a,mn,mx,c
+a,40,20,10,30,2
+grp,s,a,mn,mx,c
+b,,,,0
+s,a,mn,mx,c
+,,,,0
+DROP TABLE

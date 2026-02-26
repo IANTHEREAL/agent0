@@ -747,6 +747,16 @@ pub enum AnalyzedInsertSource {
     DefaultValues,
 }
 
+/// Resolved conflict target for ON CONFLICT.
+#[derive(Debug, Clone)]
+pub enum AnalyzedConflictTarget {
+    /// ON CONFLICT (col1, col2, ...) — resolve to column names.
+    Columns(Vec<String>),
+    /// ON CONFLICT ON CONSTRAINT constraint_name.
+    #[allow(dead_code)] // framework: constraint-targeted upsert
+    Constraint(String),
+}
+
 /// Analyzed ON CONFLICT clause.
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
@@ -755,6 +765,9 @@ pub enum AnalyzedOnConflict {
     DoNothing,
     /// DO UPDATE SET — update conflicting rows.
     DoUpdate {
+        /// Resolved conflict target (columns or constraint name).
+        /// Required by PostgreSQL for DO UPDATE.
+        target: Option<AnalyzedConflictTarget>,
         /// Assignments: (column_index, typed value expression).
         /// Expressions may reference the "excluded" pseudo-table.
         assignments: Vec<(usize, TypedExpr)>,

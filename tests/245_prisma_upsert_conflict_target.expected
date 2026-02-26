@@ -1,0 +1,14 @@
+DROP TABLE
+CREATE TABLE
+INSERT 1
+INSERT 0 1
+email,name,age
+alice@example.com,Alice Updated,30
+INSERT 1
+email,name,age
+alice@example.com,Alice Updated,30
+bob@example.com,Bob,35
+INSERT 0 1
+id,email,name,age
+*,alice@example.com,Alice Returned,40
+DROP TABLE

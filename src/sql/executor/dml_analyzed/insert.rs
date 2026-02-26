@@ -11,9 +11,11 @@ use super::{
     eval_returning_typed, is_default_typed_expr, typed_value_to_bool,
 };
 use crate::model::{Row, TableSchema, Value};
-use crate::sql::analyzer::types::{AnalyzedInsert, AnalyzedInsertSource, AnalyzedOnConflict};
+use crate::sql::analyzer::types::{
+    AnalyzedConflictTarget, AnalyzedInsert, AnalyzedInsertSource, AnalyzedOnConflict,
+};
 use crate::sql::check_constraints;
-use crate::sql::dml::ConflictBehavior;
+use crate::sql::dml::{ConflictBehavior, ConflictTarget};
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
 use anyhow::{anyhow, Result};
@@ -210,7 +212,18 @@ impl Executor {
 
             let conflict_behavior = match &ins.on_conflict {
                 Some(AnalyzedOnConflict::DoNothing) => ConflictBehavior::DoNothing,
-                Some(AnalyzedOnConflict::DoUpdate { .. }) => ConflictBehavior::DoUpdate,
+                Some(AnalyzedOnConflict::DoUpdate { target, .. }) => {
+                    let target = match target {
+                        Some(AnalyzedConflictTarget::Columns(cols)) => {
+                            Some(ConflictTarget::Columns(cols.clone()))
+                        }
+                        Some(AnalyzedConflictTarget::Constraint(name)) => {
+                            Some(ConflictTarget::Constraint(name.clone()))
+                        }
+                        None => None,
+                    };
+                    ConflictBehavior::DoUpdate { target }
+                }
                 None => ConflictBehavior::Error,
             };
             let result = dml::execute_insert_row(
@@ -262,6 +275,7 @@ impl Executor {
                             AnalyzedOnConflict::DoUpdate {
                                 assignments,
                                 where_clause: _,
+                                target: _,
                             } => {
                                 // Build combined row: [existing, excluded].
                                 let combined = combine_rows(&existing_row, &excluded_row);

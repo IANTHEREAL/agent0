@@ -103,8 +103,7 @@ describe('Prisma CRUD Semantics [db9-server]', () => {
       expect(user.isActive).toBe(true);
     });
 
-    // skip: INSERT ON CONFLICT (upsert) not fully supported — tracked in #840
-    it.skip('should handle upsert', async () => {
+    it('should handle upsert', async () => {
       await prisma.prismaUser.create({
         data: {
           email: 'upsert@example.com',

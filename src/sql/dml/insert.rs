@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use tikv_client::Transaction;
 
-use crate::model::{DataType, Row, TableSchema, Value};
+use crate::model::{DataType, IndexDef, Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::gin::extract_gin_token_hashes_from_row;
 use crate::sql::index_consistency::{
@@ -17,7 +17,93 @@ use crate::storage::TikvStore;
 use crate::worker::types::IndexState;
 
 use super::defaults::coerce_row_values;
-use super::{ConflictBehavior, EnumLabelCache, InsertRowResult};
+use super::{ConflictBehavior, ConflictTarget, EnumLabelCache, InsertRowResult};
+
+/// Check if an index matches the ON CONFLICT target.
+/// If target is None, any unique index matches (legacy behavior).
+fn index_matches_conflict_target(
+    index: &IndexDef,
+    _schema: &TableSchema,
+    target: Option<&ConflictTarget>,
+) -> bool {
+    match target {
+        None => true,
+        Some(ConflictTarget::Columns(targets)) => {
+            if !index.unique {
+                return false;
+            }
+            // Match if the index columns are exactly the target columns (order-independent).
+            if index.columns.len() != targets.len() {
+                return false;
+            }
+            targets.iter().all(|t| index.columns.iter().any(|c| c == t))
+        }
+        Some(ConflictTarget::Constraint(name)) => index.unique && index.name == *name,
+    }
+}
+
+/// Check if the primary key matches the ON CONFLICT target.
+/// If target is None, PK matches (legacy behavior).
+fn pk_matches_conflict_target(schema: &TableSchema, target: Option<&ConflictTarget>) -> bool {
+    match target {
+        None => true,
+        Some(ConflictTarget::Columns(targets)) => {
+            let pk_col_names: Vec<&str> = schema
+                .pk_indices
+                .iter()
+                .map(|&idx| schema.columns[idx].name.as_str())
+                .collect();
+            if pk_col_names.len() != targets.len() {
+                return false;
+            }
+            targets.iter().all(|t| pk_col_names.contains(&t.as_str()))
+        }
+        Some(ConflictTarget::Constraint(name)) => schema
+            .pk_constraint_name
+            .as_deref()
+            .is_some_and(|pk_name| pk_name == *name),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UniqueConflictPolicy {
+    SkipRow,
+    Upsert,
+    DeferUniqueViolation,
+    RaiseUniqueViolation,
+}
+
+fn unique_conflict_policy(
+    on_conflict: &ConflictBehavior,
+    index: &IndexDef,
+    schema: &TableSchema,
+) -> UniqueConflictPolicy {
+    match on_conflict {
+        ConflictBehavior::DoNothing => UniqueConflictPolicy::SkipRow,
+        ConflictBehavior::DoUpdate { target } => {
+            if index_matches_conflict_target(index, schema, target.as_ref()) {
+                UniqueConflictPolicy::Upsert
+            } else {
+                UniqueConflictPolicy::DeferUniqueViolation
+            }
+        }
+        ConflictBehavior::Error => UniqueConflictPolicy::RaiseUniqueViolation,
+    }
+}
+
+fn build_unique_violation_error(index: &IndexDef, idx_values: &[Value]) -> SqlError {
+    let cols = index.columns.join(", ");
+    let vals: Vec<String> = idx_values.iter().map(|v| format!("{}", v)).collect();
+    SqlError::UniqueViolation {
+        constraint: index.name.clone(),
+        message: format!(
+            "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
+            index.name,
+            cols,
+            vals.join(", ")
+        ),
+    }
+}
 
 pub async fn build_enum_label_cache(
     store: &Arc<TikvStore>,
@@ -27,8 +113,16 @@ pub async fn build_enum_label_cache(
 ) -> Result<EnumLabelCache> {
     let mut required_types: HashSet<&str> = HashSet::new();
     for col in &schema.columns {
-        if let DataType::UserDefined(udt_name) = &col.data_type {
-            required_types.insert(udt_name.as_str());
+        match &col.data_type {
+            DataType::UserDefined(udt_name) => {
+                required_types.insert(udt_name.as_str());
+            }
+            DataType::Array(inner) => {
+                if let DataType::UserDefined(udt_name) = inner.as_ref() {
+                    required_types.insert(udt_name.as_str());
+                }
+            }
+            _ => {}
         }
     }
     if required_types.is_empty() {
@@ -62,8 +156,14 @@ pub(crate) fn validate_enum_values(
     }
 
     for (idx, col) in schema.columns.iter().enumerate() {
-        let DataType::UserDefined(udt_name) = &col.data_type else {
-            continue;
+        // Extract the UDT name from scalar enum or array-of-enum columns.
+        let udt_name = match &col.data_type {
+            DataType::UserDefined(name) => name,
+            DataType::Array(inner) => match inner.as_ref() {
+                DataType::UserDefined(name) => name,
+                _ => continue,
+            },
+            _ => continue,
         };
 
         let value = row
@@ -81,8 +181,10 @@ pub(crate) fn validate_enum_values(
         };
 
         let bare_type = udt_name.rsplit('.').next().unwrap_or(udt_name);
-        match value {
-            Value::Text(s) => {
+
+        match (&col.data_type, value) {
+            // Scalar enum: validate single label.
+            (DataType::UserDefined(_), Value::Text(s)) => {
                 if !labels.contains(s) {
                     return Err(anyhow!(
                         "invalid input value for enum {}: \"{}\"",
@@ -91,7 +193,31 @@ pub(crate) fn validate_enum_values(
                     ));
                 }
             }
-            other => {
+            // Enum array: validate each element label.
+            (DataType::Array(_), Value::Array(elements)) => {
+                for elem in elements {
+                    match elem {
+                        Value::Null => {} // NULL elements are valid in PG
+                        Value::Text(s) => {
+                            if !labels.contains(s) {
+                                return Err(anyhow!(
+                                    "invalid input value for enum {}: \"{}\"",
+                                    bare_type,
+                                    s
+                                ));
+                            }
+                        }
+                        other => {
+                            return Err(anyhow!(
+                                "invalid input value for enum {}: {}",
+                                bare_type,
+                                other
+                            ));
+                        }
+                    }
+                }
+            }
+            (_, other) => {
                 return Err(anyhow!(
                     "invalid input value for enum {}: {}",
                     bare_type,
@@ -138,6 +264,7 @@ pub async fn execute_insert_row(
     match insert_result {
         Ok(pk_values) => {
             let mut created_index_entries: Vec<(u64, Vec<Value>, bool)> = Vec::new();
+            let mut deferred_unique_violation: Option<SqlError> = None;
             for index in &schema.indexes {
                 if matches!(index.state, IndexState::Invalid)
                     || (matches!(index.state, IndexState::Building) && !index.unique)
@@ -194,8 +321,8 @@ pub async fn execute_insert_row(
                                 UniqueConflictResolution::RealConflict => {}
                             }
                         }
-                        match on_conflict {
-                            ConflictBehavior::DoNothing => {
+                        match unique_conflict_policy(&on_conflict, index, schema) {
+                            UniqueConflictPolicy::SkipRow => {
                                 rollback_inserted_index_entries(
                                     store,
                                     txn,
@@ -210,7 +337,7 @@ pub async fn execute_insert_row(
                                     .await?;
                                 return Ok(InsertRowResult::Skipped);
                             }
-                            ConflictBehavior::DoUpdate => {
+                            UniqueConflictPolicy::Upsert => {
                                 let pks = store
                                     .scan_index(
                                         txn,
@@ -263,23 +390,24 @@ pub async fn execute_insert_row(
                                     excluded_row: row,
                                 });
                             }
-                            ConflictBehavior::Error => {
-                                let cols = index.columns.join(", ");
-                                let vals: Vec<String> =
-                                    idx_values.iter().map(|v| format!("{}", v)).collect();
-                                return Err(SqlError::UniqueViolation {
-                                    constraint: index.name.clone(),
-                                    message: format!(
-                                        "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
-                                        index.name, cols, vals.join(", ")
-                                    ),
-                                }.into());
+                            UniqueConflictPolicy::DeferUniqueViolation => {
+                                if deferred_unique_violation.is_none() {
+                                    deferred_unique_violation =
+                                        Some(build_unique_violation_error(index, &idx_values));
+                                }
+                                continue;
+                            }
+                            UniqueConflictPolicy::RaiseUniqueViolation => {
+                                return Err(build_unique_violation_error(index, &idx_values).into());
                             }
                         }
                     }
                     return Err(e);
                 }
                 created_index_entries.push((index.id, idx_values, index.unique));
+            }
+            if let Some(err) = deferred_unique_violation {
+                return Err(err.into());
             }
             // Materialize supported GIN indexes only after B-Tree indexes succeed, so
             // ON CONFLICT paths don't need additional cleanup.
@@ -312,9 +440,11 @@ pub async fn execute_insert_row(
                 return Err(e);
             }
             let pk_values = schema.get_pk_values(&row);
-            match on_conflict {
+            match &on_conflict {
                 ConflictBehavior::DoNothing => Ok(InsertRowResult::Skipped),
-                ConflictBehavior::DoUpdate => {
+                ConflictBehavior::DoUpdate { target }
+                    if pk_matches_conflict_target(schema, target.as_ref()) =>
+                {
                     let existing_rows = store
                         .batch_get_rows(
                             txn,
@@ -334,7 +464,7 @@ pub async fn execute_insert_row(
                         excluded_row: row,
                     })
                 }
-                ConflictBehavior::Error => Err(e),
+                ConflictBehavior::Error | ConflictBehavior::DoUpdate { .. } => Err(e),
             }
         }
         Err(e) => Err(e),
@@ -363,4 +493,177 @@ async fn rollback_inserted_index_entries(
             .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ColumnDef, DataType};
+    use std::collections::HashMap;
+
+    fn test_schema() -> TableSchema {
+        TableSchema {
+            name: "public.t_conflict".to_string(),
+            table_id: 1,
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+                ColumnDef {
+                    name: "email".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: true,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: Some("t_conflict_pkey".to_string()),
+            pk_indices: vec![0],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: "postgres".to_string(),
+            from_alias: None,
+        }
+    }
+
+    fn unique_index(name: &str, columns: &[&str]) -> IndexDef {
+        IndexDef {
+            name: name.to_string(),
+            id: 1,
+            columns: columns.iter().map(|c| (*c).to_string()).collect(),
+            unique: true,
+            method: None,
+            predicate: None,
+            expressions: vec![],
+            state: IndexState::Ready,
+        }
+    }
+
+    fn enum_array_schema() -> TableSchema {
+        TableSchema {
+            name: "public.t_enum_arr".to_string(),
+            table_id: 2,
+            columns: vec![ColumnDef {
+                name: "moods".to_string(),
+                data_type: DataType::Array(Box::new(DataType::UserDefined("public.mood".into()))),
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+                collation: None,
+            }],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: "postgres".to_string(),
+            from_alias: None,
+        }
+    }
+
+    fn enum_array_cache() -> EnumLabelCache {
+        let mut cache = HashMap::new();
+        cache.insert(
+            "public.mood".to_string(),
+            ["happy", "sad", "neutral"]
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        cache
+    }
+
+    #[test]
+    fn index_target_matches_constraint_name() {
+        let schema = test_schema();
+        let index = unique_index("uq_t_conflict_email", &["email"]);
+        let target = ConflictTarget::Constraint("uq_t_conflict_email".to_string());
+        assert!(index_matches_conflict_target(
+            &index,
+            &schema,
+            Some(&target)
+        ));
+    }
+
+    #[test]
+    fn index_target_rejects_other_constraint_name() {
+        let schema = test_schema();
+        let index = unique_index("uq_t_conflict_email", &["email"]);
+        let target = ConflictTarget::Constraint("other_constraint".to_string());
+        assert!(!index_matches_conflict_target(
+            &index,
+            &schema,
+            Some(&target)
+        ));
+    }
+
+    #[test]
+    fn pk_target_matches_pk_constraint_name() {
+        let schema = test_schema();
+        let target = ConflictTarget::Constraint("t_conflict_pkey".to_string());
+        assert!(pk_matches_conflict_target(&schema, Some(&target)));
+    }
+
+    #[test]
+    fn do_update_non_target_conflict_is_deferred_until_target_checked() {
+        let schema = test_schema();
+        let on_conflict = ConflictBehavior::DoUpdate {
+            target: Some(ConflictTarget::Columns(vec!["email".to_string()])),
+        };
+        let first = unique_index("uq_t_conflict_other", &["id"]);
+        let second = unique_index("uq_t_conflict_email", &["email"]);
+
+        let mut deferred = false;
+        let mut selected_upsert = false;
+        for idx in [&first, &second] {
+            match unique_conflict_policy(&on_conflict, idx, &schema) {
+                UniqueConflictPolicy::DeferUniqueViolation => deferred = true,
+                UniqueConflictPolicy::Upsert => {
+                    selected_upsert = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(deferred);
+        assert!(selected_upsert);
+    }
+
+    #[test]
+    fn enum_array_cast_keeps_invalid_variant_and_validation_errors() {
+        let schema = enum_array_schema();
+        let cache = enum_array_cache();
+        let mut row_vals = vec![Value::Text("{happy,angry,sad}".to_string())];
+
+        coerce_row_values(&schema, &mut row_vals).unwrap();
+
+        let Value::Array(values) = &row_vals[0] else {
+            panic!("enum array assignment cast did not produce Value::Array");
+        };
+        assert_eq!(values.len(), 3);
+        assert!(values
+            .iter()
+            .any(|v| matches!(v, Value::Text(s) if s == "angry")));
+
+        let err = validate_enum_values(&schema, &Row::new(row_vals), &cache).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid input value for enum mood: \"angry\""));
+    }
 }

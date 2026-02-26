@@ -147,6 +147,35 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    /// Resolve ON CONFLICT target to analyzed form.
+    fn resolve_conflict_target(
+        &self,
+        target: &Option<ast::ConflictTarget>,
+        schema: &crate::model::TableSchema,
+        table_name_for_errors: &str,
+    ) -> Result<Option<AnalyzedConflictTarget>, AnalyzerError> {
+        match target {
+            None => Ok(None),
+            Some(ast::ConflictTarget::Columns(idents)) => {
+                let col_names: Vec<String> = idents
+                    .iter()
+                    .map(|ident| {
+                        let col_name = normalize_ident(ident);
+                        // Validate the column exists.
+                        self.find_column_index(schema, &col_name, table_name_for_errors)?;
+                        Ok(col_name)
+                    })
+                    .collect::<Result<Vec<_>, AnalyzerError>>()?;
+                Ok(Some(AnalyzedConflictTarget::Columns(col_names)))
+            }
+            Some(ast::ConflictTarget::OnConstraint(name)) => {
+                let (_schema, constraint_name) = split_object_name(name)
+                    .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                Ok(Some(AnalyzedConflictTarget::Constraint(constraint_name)))
+            }
+        }
+    }
+
     /// Analyze ON CONFLICT clause.
     fn analyze_on_conflict(
         &mut self,
@@ -160,6 +189,13 @@ impl<'a> Analyzer<'a> {
             OnInsert::OnConflict(oc) => match &oc.action {
                 ast::OnConflictAction::DoNothing => Ok(AnalyzedOnConflict::DoNothing),
                 ast::OnConflictAction::DoUpdate(do_update) => {
+                    // Resolve conflict target.
+                    let target = self.resolve_conflict_target(
+                        &oc.conflict_target,
+                        schema,
+                        table_name_for_errors,
+                    )?;
+
                     // Build scope with both target table and "excluded" pseudo-table.
                     let mut scope = Scope::new();
                     scope.add_table(table_scope_name, table_cols);
@@ -190,6 +226,7 @@ impl<'a> Analyzer<'a> {
                     self.scopes.pop();
 
                     Ok(AnalyzedOnConflict::DoUpdate {
+                        target,
                         assignments,
                         where_clause,
                     })
@@ -220,6 +257,7 @@ impl<'a> Analyzer<'a> {
                 self.scopes.pop();
 
                 Ok(AnalyzedOnConflict::DoUpdate {
+                    target: None,
                     assignments: analyzed_assignments,
                     where_clause: None,
                 })

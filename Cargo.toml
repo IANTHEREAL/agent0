@@ -28,7 +28,7 @@ rustls-pki-types = "1.0"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 bincode = "1.3"
 rmp-serde = "1"
 memcomparable = "0.2"
@@ -50,6 +50,7 @@ reqwest = { version = "0.12", features = ["json"] }
 itoa = "1.0"
 ryu = "1.0"
 rust_decimal = { version = "1.33", features = ["serde", "db-postgres", "maths"] }
+bigdecimal = "0.4"
 base64 = "0.22"
 md5 = "0.7"
 stacker = "0.1"

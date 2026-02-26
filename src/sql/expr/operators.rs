@@ -12,8 +12,12 @@
 use crate::model::Value;
 use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
+use bigdecimal::BigDecimal;
 use dashmap::DashMap;
+use serde_json::value::RawValue;
 use sqlparser::ast::BinaryOperator;
+use std::collections::BTreeMap;
+use std::str::FromStr;
 
 use super::numeric;
 
@@ -670,6 +674,175 @@ fn compare_float64_pg(left: f64, right: f64) -> std::cmp::Ordering {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum JsonbComparableValue {
+    Null,
+    String(String),
+    Number(String),
+    Bool(bool),
+    Array(Vec<JsonbComparableValue>),
+    Object(Vec<(String, JsonbComparableValue)>),
+}
+
+fn parse_jsonb_comparable_value(raw: &str) -> Result<JsonbComparableValue> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("Invalid JSONB: empty input"));
+    }
+
+    match trimmed.as_bytes()[0] {
+        b'n' => {
+            if trimmed == "null" {
+                Ok(JsonbComparableValue::Null)
+            } else {
+                Err(anyhow!("Invalid JSONB: {}", trimmed))
+            }
+        }
+        b't' => {
+            if trimmed == "true" {
+                Ok(JsonbComparableValue::Bool(true))
+            } else {
+                Err(anyhow!("Invalid JSONB: {}", trimmed))
+            }
+        }
+        b'f' => {
+            if trimmed == "false" {
+                Ok(JsonbComparableValue::Bool(false))
+            } else {
+                Err(anyhow!("Invalid JSONB: {}", trimmed))
+            }
+        }
+        b'"' => {
+            let s: String =
+                serde_json::from_str(trimmed).map_err(|e| anyhow!("Invalid JSONB: {}", e))?;
+            Ok(JsonbComparableValue::String(s))
+        }
+        b'[' => {
+            let values: Vec<Box<RawValue>> =
+                serde_json::from_str(trimmed).map_err(|e| anyhow!("Invalid JSONB: {}", e))?;
+            let mut out = Vec::with_capacity(values.len());
+            for v in values {
+                out.push(parse_jsonb_comparable_value(v.get())?);
+            }
+            Ok(JsonbComparableValue::Array(out))
+        }
+        b'{' => {
+            let values: BTreeMap<String, Box<RawValue>> =
+                serde_json::from_str(trimmed).map_err(|e| anyhow!("Invalid JSONB: {}", e))?;
+            let mut out = Vec::with_capacity(values.len());
+            for (k, v) in values {
+                out.push((k, parse_jsonb_comparable_value(v.get())?));
+            }
+            Ok(JsonbComparableValue::Object(out))
+        }
+        b'-' | b'0'..=b'9' => {
+            let _: serde_json::Number =
+                serde_json::from_str(trimmed).map_err(|e| anyhow!("Invalid JSONB: {}", e))?;
+            Ok(JsonbComparableValue::Number(trimmed.to_string()))
+        }
+        _ => Err(anyhow!("Invalid JSONB: {}", trimmed)),
+    }
+}
+
+/// PostgreSQL jsonb type ordering priority.
+/// PG order: Null < String < Number < Boolean < Array < Object.
+fn jsonb_type_priority(v: &JsonbComparableValue) -> u8 {
+    match v {
+        JsonbComparableValue::Null => 0,
+        JsonbComparableValue::String(_) => 1,
+        JsonbComparableValue::Number(_) => 2,
+        JsonbComparableValue::Bool(_) => 3,
+        JsonbComparableValue::Array(_) => 4,
+        JsonbComparableValue::Object(_) => 5,
+    }
+}
+
+/// Compare JSON numbers with integer precision preserved whenever possible.
+fn compare_jsonb_number(left: &str, right: &str) -> i8 {
+    if let (Ok(li), Ok(ri)) = (left.parse::<i64>(), right.parse::<i64>()) {
+        return li.cmp(&ri) as i8;
+    }
+
+    if let (Ok(lu), Ok(ru)) = (left.parse::<u64>(), right.parse::<u64>()) {
+        return lu.cmp(&ru) as i8;
+    }
+
+    if let (Ok(li), Ok(ru)) = (left.parse::<i64>(), right.parse::<u64>()) {
+        return if li < 0 {
+            -1
+        } else {
+            (li as u64).cmp(&ru) as i8
+        };
+    }
+
+    if let (Ok(lu), Ok(ri)) = (left.parse::<u64>(), right.parse::<i64>()) {
+        return if ri < 0 {
+            1
+        } else {
+            lu.cmp(&(ri as u64)) as i8
+        };
+    }
+
+    match (BigDecimal::from_str(left), BigDecimal::from_str(right)) {
+        (Ok(ld), Ok(rd)) => ld.cmp(&rd) as i8,
+        // Unreachable in practice because parse_jsonb_comparable_value validates number syntax.
+        _ => left.cmp(right) as i8,
+    }
+}
+
+/// Compare two JSONB values using PostgreSQL ordering semantics.
+fn compare_jsonb_value(left: &JsonbComparableValue, right: &JsonbComparableValue) -> i8 {
+    let lp = jsonb_type_priority(left);
+    let rp = jsonb_type_priority(right);
+    if lp != rp {
+        return lp.cmp(&rp) as i8;
+    }
+    match (left, right) {
+        (JsonbComparableValue::Null, JsonbComparableValue::Null) => 0,
+        (JsonbComparableValue::Bool(l), JsonbComparableValue::Bool(r)) => l.cmp(r) as i8,
+        (JsonbComparableValue::Number(l), JsonbComparableValue::Number(r)) => {
+            compare_jsonb_number(l, r)
+        }
+        (JsonbComparableValue::String(l), JsonbComparableValue::String(r)) => l.cmp(r) as i8,
+        (JsonbComparableValue::Array(l), JsonbComparableValue::Array(r)) => {
+            // Element-wise, then length.
+            for (le, re) in l.iter().zip(r.iter()) {
+                let c = compare_jsonb_value(le, re);
+                if c != 0 {
+                    return c;
+                }
+            }
+            l.len().cmp(&r.len()) as i8
+        }
+        (JsonbComparableValue::Object(l), JsonbComparableValue::Object(r)) => {
+            // PG: compare pair count, then key-by-key (sorted), then values.
+            match l.len().cmp(&r.len()) {
+                std::cmp::Ordering::Equal => {}
+                o => return o as i8,
+            }
+            for ((lk, lv), (rk, rv)) in l.iter().zip(r.iter()) {
+                match lk.cmp(rk) {
+                    std::cmp::Ordering::Equal => {}
+                    o => return o as i8,
+                }
+                let c = compare_jsonb_value(lv, rv);
+                if c != 0 {
+                    return c;
+                }
+            }
+            0
+        }
+        _ => 0, // same type, already handled
+    }
+}
+
+/// Compare two JSONB string values using PostgreSQL ordering semantics.
+fn compare_jsonb_pg(left: &str, right: &str) -> Result<i8> {
+    let lv = parse_jsonb_comparable_value(left)?;
+    let rv = parse_jsonb_comparable_value(right)?;
+    Ok(compare_jsonb_value(&lv, &rv))
+}
+
 /// Compare two values of the same type. Returns -1, 0, or 1.
 fn compare_same_type(left: &Value, right: &Value) -> Result<i8> {
     match (left, right) {
@@ -694,6 +867,7 @@ fn compare_same_type(left: &Value, right: &Value) -> Result<i8> {
             }
             Ok(l.len().cmp(&r.len()) as i8)
         }
+        (Value::Jsonb(l), Value::Jsonb(r)) => compare_jsonb_pg(l, r),
         _ => Err(anyhow!("Cannot compare values: {:?} vs {:?}", left, right)),
     }
 }
@@ -708,11 +882,6 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
         (Value::Json(_), _) | (_, Value::Json(_)) => {
             return Err(anyhow!(
                 "could not identify a comparison function for type json"
-            ))
-        }
-        (Value::Jsonb(_), _) | (_, Value::Jsonb(_)) => {
-            return Err(anyhow!(
-                "could not identify an ordering operator for type jsonb"
             ))
         }
         (Value::Vector(_), _) | (_, Value::Vector(_)) => {
@@ -946,6 +1115,32 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Cannot compare values"));
+    }
+
+    #[test]
+    fn test_compare_jsonb_numeric_values_preserve_integer_precision() {
+        let greater = Value::Jsonb("9007199254740993".into()); // 2^53 + 1
+        let smaller = Value::Jsonb("9007199254740992".into()); // 2^53
+        assert_eq!(compare_values(&greater, &smaller).unwrap(), 1);
+        assert_eq!(compare_values(&smaller, &greater).unwrap(), -1);
+
+        // Exercises mixed i64/u64 branch.
+        let i64_max = Value::Jsonb("9223372036854775807".into());
+        let i64_max_plus_one = Value::Jsonb("9223372036854775808".into());
+        assert_eq!(compare_values(&i64_max_plus_one, &i64_max).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_compare_jsonb_numeric_values_preserve_high_precision_decimals() {
+        let greater = Value::Jsonb("12345678901234567890.12345678901234567891".into());
+        let smaller = Value::Jsonb("12345678901234567890.12345678901234567890".into());
+        assert_eq!(compare_values(&greater, &smaller).unwrap(), 1);
+        assert_eq!(compare_values(&smaller, &greater).unwrap(), -1);
+
+        // `f64` would collapse both of these to the same value.
+        let close_a = Value::Jsonb("9007199254740992.0000000000000000001".into());
+        let close_b = Value::Jsonb("9007199254740992.0000000000000000002".into());
+        assert_eq!(compare_values(&close_a, &close_b).unwrap(), -1);
     }
 
     #[test]

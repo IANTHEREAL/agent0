@@ -1883,6 +1883,29 @@ fn analyze_insert_on_conflict_do_update() {
 }
 
 #[test]
+fn analyze_insert_on_conflict_on_constraint_target() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement(
+        "INSERT INTO users (id, name) VALUES (1, 'alice') \
+         ON CONFLICT ON CONSTRAINT users_pkey DO UPDATE SET name = EXCLUDED.name",
+    );
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    match result {
+        AnalyzedStatement::Insert(ins) => match &ins.on_conflict {
+            Some(AnalyzedOnConflict::DoUpdate { target, .. }) => {
+                assert!(matches!(
+                    target,
+                    Some(AnalyzedConflictTarget::Constraint(name)) if name == "users_pkey"
+                ));
+            }
+            other => panic!("expected DoUpdate, got {:?}", other),
+        },
+        _ => panic!("expected AnalyzedStatement::Insert"),
+    }
+}
+
+#[test]
 fn analyze_insert_on_conflict_do_update_excluded_plus_expr() {
     // Mirrors test 119 Case 1: SET parent_id = EXCLUDED.parent_id + 1
     let catalog = MockCatalog::builder()
@@ -2044,13 +2067,13 @@ fn analyze_update_jsonb_into_int_column_errors() {
 
 #[test]
 fn conflict_behavior_from_analyzed_on_conflict() {
-    use crate::sql::dml::ConflictBehavior;
+    use crate::sql::dml::{ConflictBehavior, ConflictTarget};
 
     // None → Error
     let none: Option<AnalyzedOnConflict> = None;
     let behavior = match &none {
         Some(AnalyzedOnConflict::DoNothing) => ConflictBehavior::DoNothing,
-        Some(AnalyzedOnConflict::DoUpdate { .. }) => ConflictBehavior::DoUpdate,
+        Some(AnalyzedOnConflict::DoUpdate { .. }) => ConflictBehavior::DoUpdate { target: None },
         None => ConflictBehavior::Error,
     };
     assert_eq!(behavior, ConflictBehavior::Error);
@@ -2059,10 +2082,38 @@ fn conflict_behavior_from_analyzed_on_conflict() {
     let do_nothing = Some(AnalyzedOnConflict::DoNothing);
     let behavior = match &do_nothing {
         Some(AnalyzedOnConflict::DoNothing) => ConflictBehavior::DoNothing,
-        Some(AnalyzedOnConflict::DoUpdate { .. }) => ConflictBehavior::DoUpdate,
+        Some(AnalyzedOnConflict::DoUpdate { .. }) => ConflictBehavior::DoUpdate { target: None },
         None => ConflictBehavior::Error,
     };
     assert_eq!(behavior, ConflictBehavior::DoNothing);
+
+    let do_update = Some(AnalyzedOnConflict::DoUpdate {
+        target: Some(AnalyzedConflictTarget::Constraint("users_pkey".to_string())),
+        assignments: vec![],
+        where_clause: None,
+    });
+    let behavior = match &do_update {
+        Some(AnalyzedOnConflict::DoNothing) => ConflictBehavior::DoNothing,
+        Some(AnalyzedOnConflict::DoUpdate { target, .. }) => {
+            let target = match target {
+                Some(AnalyzedConflictTarget::Columns(cols)) => {
+                    Some(ConflictTarget::Columns(cols.clone()))
+                }
+                Some(AnalyzedConflictTarget::Constraint(name)) => {
+                    Some(ConflictTarget::Constraint(name.clone()))
+                }
+                None => None,
+            };
+            ConflictBehavior::DoUpdate { target }
+        }
+        None => ConflictBehavior::Error,
+    };
+    assert_eq!(
+        behavior,
+        ConflictBehavior::DoUpdate {
+            target: Some(ConflictTarget::Constraint("users_pkey".to_string()))
+        }
+    );
 }
 
 // ── Parameter analysis tests ─────────────────────────────────

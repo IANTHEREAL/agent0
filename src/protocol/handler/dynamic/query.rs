@@ -174,7 +174,10 @@ pub(in crate::protocol::handler) fn utility_describe_fields(sql: &str) -> Vec<Fi
 /// Merge finalized analyzer types into wire types.
 /// Client-specified non-UNKNOWN OIDs win (preserves INT2/FLOAT4 fidelity).
 /// UNKNOWN slots filled from inferred DataType -> Type.
-fn merge_parameter_types(client_types: &[Type], finalized: &[DataType]) -> Vec<Type> {
+pub(in crate::protocol::handler) fn merge_parameter_types(
+    client_types: &[Type],
+    finalized: &[DataType],
+) -> Vec<Type> {
     let mut result = Vec::with_capacity(finalized.len());
     for (i, fin_type) in finalized.iter().enumerate() {
         let client = client_types.get(i).cloned().unwrap_or(Type::UNKNOWN);
