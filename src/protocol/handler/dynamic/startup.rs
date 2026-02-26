@@ -32,6 +32,8 @@ use super::super::{
 pub(in crate::protocol::handler) struct AuthResult {
     pub is_authenticated: bool,
     pub is_superuser: bool,
+    /// PostgreSQL `rolconnlimit`. Negative means unlimited.
+    pub connection_limit: i32,
 }
 
 impl DynamicPgHandler {
@@ -41,6 +43,7 @@ impl DynamicPgHandler {
         username: Option<String>,
         is_superuser: bool,
         database: String,
+        connection_limit: i32,
     ) -> PgWireResult<()> {
         let fatal_internal = |message: String| -> PgWireError {
             PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -60,10 +63,21 @@ impl DynamicPgHandler {
         }
 
         let (store, trigger_cache, stats_cache) = if let Some(pool) = &self.client_pool {
-            let handle = pool
+            let mut handle = pool
                 .acquire(Some(effective_keyspace.clone()))
                 .await
                 .map_err(|e| fatal_internal(format!("Failed to get client from pool: {}", e)))?;
+            if let Some(ref user) = username {
+                handle
+                    .try_bind_user(user.clone(), connection_limit)
+                    .map_err(|msg| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "FATAL".to_owned(),
+                            "53300".to_owned(),
+                            msg,
+                        )))
+                    })?;
+            }
             let s = handle.store().clone();
             let tc = handle.trigger_cache().clone();
             let sc = handle.stats_cache().clone();
@@ -200,6 +214,7 @@ impl DynamicPgHandler {
                     return Ok(AuthResult {
                         is_authenticated: false,
                         is_superuser: false,
+                        connection_limit: -1,
                     });
                 }
             }
@@ -212,6 +227,7 @@ impl DynamicPgHandler {
                     return Ok(AuthResult {
                         is_authenticated: false,
                         is_superuser: false,
+                        connection_limit: -1,
                     });
                 }
             }
@@ -240,6 +256,7 @@ impl DynamicPgHandler {
                 Ok(AuthResult {
                     is_authenticated: true,
                     is_superuser: user.is_superuser,
+                    connection_limit: user.connection_limit,
                 })
             }
             Ok(None) => {
@@ -247,6 +264,7 @@ impl DynamicPgHandler {
                 Ok(AuthResult {
                     is_authenticated: false,
                     is_superuser: false,
+                    connection_limit: -1,
                 })
             }
             Err(e) => {
@@ -356,6 +374,7 @@ impl StartupHandler for DynamicPgHandler {
                     Ok(AuthResult {
                         is_authenticated,
                         is_superuser,
+                        connection_limit,
                     }) => {
                         if is_authenticated {
                             self.init_executor(
@@ -363,6 +382,7 @@ impl StartupHandler for DynamicPgHandler {
                                 Some(actual_user.clone()),
                                 is_superuser,
                                 database,
+                                connection_limit,
                             )
                             .await?;
 
@@ -443,6 +463,7 @@ mod tests {
         let r = AuthResult {
             is_authenticated: true,
             is_superuser: true,
+            connection_limit: -1,
         };
         assert!(r.is_authenticated);
         assert!(r.is_superuser);
@@ -453,6 +474,7 @@ mod tests {
         let r = AuthResult {
             is_authenticated: false,
             is_superuser: false,
+            connection_limit: -1,
         };
         assert!(!r.is_authenticated);
         assert!(!r.is_superuser);
@@ -463,12 +485,15 @@ mod tests {
         let r = AuthResult {
             is_authenticated: true,
             is_superuser: false,
+            connection_limit: 5,
         };
         let AuthResult {
             is_authenticated,
             is_superuser,
+            connection_limit,
         } = r;
         assert!(is_authenticated);
         assert!(!is_superuser);
+        assert_eq!(connection_limit, 5);
     }
 }

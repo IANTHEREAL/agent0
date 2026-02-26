@@ -101,6 +101,8 @@ pub(crate) struct TenantEntry {
     stats_cache: Arc<TableStatsCache>,
     /// Per-tenant QPS rate limiter. `None` when rate limiting is disabled (limit = 0).
     rate_limiter: Option<TokenBucket>,
+    /// Per-user active connection counts for `rolconnlimit` enforcement.
+    user_connections: std::sync::Mutex<HashMap<String, u32>>,
 }
 
 impl TenantEntry {
@@ -118,6 +120,31 @@ impl TenantEntry {
             } else {
                 None
             },
+            user_connections: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Try to acquire a per-user connection slot.
+    /// `limit < 0` means unlimited (PostgreSQL `rolconnlimit = -1`).
+    /// Returns `true` if the slot was acquired, `false` if the limit is reached.
+    fn try_acquire_user_slot(&self, username: &str, limit: i32) -> bool {
+        let mut map = self.user_connections.lock().expect("user_connections lock");
+        let count = map.entry(username.to_string()).or_insert(0);
+        if limit >= 0 && (*count as i32) >= limit {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    /// Release a per-user connection slot.
+    fn release_user_slot(&self, username: &str) {
+        let mut map = self.user_connections.lock().expect("user_connections lock");
+        if let Some(count) = map.get_mut(username) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(username);
+            }
         }
     }
 
@@ -130,6 +157,13 @@ impl TenantEntry {
     pub(crate) fn active_connections(&self) -> u32 {
         self.active_connections.load(Ordering::Relaxed)
     }
+
+    /// Per-user connection count snapshot (for tests).
+    #[allow(dead_code)] // test: used in pool tests
+    pub(crate) fn user_connections_for(&self, username: &str) -> u32 {
+        let map = self.user_connections.lock().expect("user_connections lock");
+        map.get(username).copied().unwrap_or(0)
+    }
 }
 
 /// RAII handle representing one connection's hold on a tenant's TikvStore.
@@ -138,6 +172,9 @@ impl TenantEntry {
 /// reaches zero, the tenant becomes eligible for eviction after the idle timeout.
 pub struct TenantHandle {
     entry: Arc<TenantEntry>,
+    /// If set, this handle owns a per-user connection slot that will be
+    /// released on drop. Clones do NOT inherit user slots.
+    user_slot: Option<String>,
 }
 
 impl TenantHandle {
@@ -161,6 +198,24 @@ impl TenantHandle {
         &self.entry.keyspace
     }
 
+    /// Bind this handle to a user and acquire a per-user connection slot.
+    /// Returns an error message if the user's `connection_limit` is exceeded.
+    /// `connection_limit < 0` means unlimited (PostgreSQL `rolconnlimit = -1`).
+    pub fn try_bind_user(&mut self, username: String, connection_limit: i32) -> Result<(), String> {
+        if self.user_slot.is_some() {
+            return Ok(()); // Already bound.
+        }
+        if self
+            .entry
+            .try_acquire_user_slot(&username, connection_limit)
+        {
+            self.user_slot = Some(username);
+            Ok(())
+        } else {
+            Err(format!("too many connections for role \"{}\"", username))
+        }
+    }
+
     /// Create a TenantHandle with a rate limiter set to the given QPS limit.
     /// The bucket starts full (all tokens available).
     #[cfg(test)]
@@ -177,8 +232,12 @@ impl TenantHandle {
             } else {
                 None
             },
+            user_connections: std::sync::Mutex::new(HashMap::new()),
         });
-        Self { entry }
+        Self {
+            entry,
+            user_slot: None,
+        }
     }
 }
 
@@ -190,12 +249,18 @@ impl Clone for TenantHandle {
         self.entry.last_idle_at.store(0, Ordering::Relaxed);
         Self {
             entry: self.entry.clone(),
+            // Clones do NOT inherit the user connection slot — only the
+            // original handle owns (and releases) the per-user slot.
+            user_slot: None,
         }
     }
 }
 
 impl Drop for TenantHandle {
     fn drop(&mut self) {
+        if let Some(ref username) = self.user_slot {
+            self.entry.release_user_slot(username);
+        }
         let prev = self
             .entry
             .active_connections
@@ -261,6 +326,7 @@ impl TikvClientPool {
                 entry.last_idle_at.store(0, Ordering::Relaxed);
                 return Ok(TenantHandle {
                     entry: entry.clone(),
+                    user_slot: None,
                 });
             }
         }
@@ -285,6 +351,7 @@ impl TikvClientPool {
                 entry.last_idle_at.store(0, Ordering::Relaxed);
                 return Ok(TenantHandle {
                     entry: entry.clone(),
+                    user_slot: None,
                 });
             }
         }
@@ -299,7 +366,10 @@ impl TikvClientPool {
             tenants.insert(key, entry.clone());
         }
 
-        Ok(TenantHandle { entry })
+        Ok(TenantHandle {
+            entry,
+            user_slot: None,
+        })
     }
 
     /// Get a TikvStore without a connection-scoped handle.
@@ -478,6 +548,7 @@ mod tests {
             trigger_cache: Arc::new(TriggerBodyCache::new()),
             stats_cache: Arc::new(TableStatsCache::new()),
             rate_limiter: None,
+            user_connections: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -495,6 +566,7 @@ mod tests {
         entry.last_idle_at.store(0, Ordering::Relaxed);
         TenantHandle {
             entry: entry.clone(),
+            user_slot: None,
         }
     }
 
@@ -734,5 +806,73 @@ mod tests {
     fn test_token_bucket_rate_accessor() {
         let bucket = TokenBucket::new(42);
         assert_eq!(bucket.rate(), 42);
+    }
+
+    #[tokio::test]
+    async fn test_per_user_connection_limit_enforcement() {
+        let pool = TikvClientPool::new(vec![]);
+        let entry = pool.inject_entry("limit_ks").await;
+
+        // user_a with limit=1: first connection succeeds.
+        let mut h1 = make_handle(&entry);
+        assert!(h1.try_bind_user("user_a".to_string(), 1).is_ok());
+        assert_eq!(entry.user_connections_for("user_a"), 1);
+
+        // user_a at limit → second connection rejected.
+        let mut h2 = make_handle(&entry);
+        assert!(h2.try_bind_user("user_a".to_string(), 1).is_err());
+        assert_eq!(entry.user_connections_for("user_a"), 1);
+        drop(h2); // Never bound, no user slot to release.
+
+        // user_b with limit=-1 (unlimited) → connects fine on same tenant.
+        let mut h3 = make_handle(&entry);
+        assert!(h3.try_bind_user("user_b".to_string(), -1).is_ok());
+        assert_eq!(entry.user_connections_for("user_b"), 1);
+        drop(h3);
+        assert_eq!(entry.user_connections_for("user_b"), 0);
+
+        // user_a disconnects → user_a can reconnect.
+        drop(h1);
+        assert_eq!(entry.user_connections_for("user_a"), 0);
+
+        let mut h4 = make_handle(&entry);
+        assert!(h4.try_bind_user("user_a".to_string(), 1).is_ok());
+        assert_eq!(entry.user_connections_for("user_a"), 1);
+        drop(h4);
+    }
+
+    #[tokio::test]
+    async fn test_per_user_limit_zero_rejects_all() {
+        let pool = TikvClientPool::new(vec![]);
+        let entry = pool.inject_entry("zero_ks").await;
+
+        // connection_limit=0 should reject immediately.
+        let mut h = make_handle(&entry);
+        assert!(h.try_bind_user("blocked_user".to_string(), 0).is_err());
+        assert_eq!(entry.user_connections_for("blocked_user"), 0);
+        drop(h);
+    }
+
+    #[tokio::test]
+    async fn test_per_user_clone_does_not_inherit_slot() {
+        let pool = TikvClientPool::new(vec![]);
+        let entry = pool.inject_entry("clone_user_ks").await;
+
+        let mut h1 = make_handle(&entry);
+        assert!(h1.try_bind_user("user_x".to_string(), 1).is_ok());
+        assert_eq!(entry.user_connections_for("user_x"), 1);
+
+        // Clone does NOT inherit the user slot.
+        let h2 = h1.clone();
+        assert_eq!(entry.user_connections_for("user_x"), 1);
+        assert_eq!(entry.active_connections(), 2); // h1 + clone
+
+        // Dropping clone does not release user slot.
+        drop(h2);
+        assert_eq!(entry.user_connections_for("user_x"), 1);
+
+        // Dropping original releases the user slot.
+        drop(h1);
+        assert_eq!(entry.user_connections_for("user_x"), 0);
     }
 }
