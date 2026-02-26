@@ -4,12 +4,13 @@
 # Keep it small, deterministic, and fast (<5min typical).
 #
 # Format:
-#   - Section headers: [sql] / [orm]
+#   - Section headers: [sql] / [python] / [orm]
 #   - One path per line (relative to repo root)
 #   - Blank lines and `#` comments are ignored
 #
 # Notes:
 #   - SQL entries are passed to `scripts/integration_test.py`
+#   - Python entries are standalone multi-session test scripts run with `--dsn`
 #   - ORM entries are passed as Vitest filters to `npm test` in `orm-tests/`
 
 [sql]
@@ -55,6 +56,9 @@ tests/230_idle_in_transaction_timeout.sql
 tests/232_statement_timeout_guc_regression.sql
 tests/234_returns_table_sql_function.sql
 tests/235_lateral_correlated_no_from.sql
+
+[python]
+tests/advisory_locks_savepoint.py
 
 [orm]
 orm-tests/pg-client/

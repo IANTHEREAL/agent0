@@ -111,6 +111,7 @@ parse_manifest() {
 
   SQL_TESTS=()
   ORM_TESTS=()
+  PYTHON_TESTS=()
 
   while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
     local line
@@ -125,7 +126,8 @@ parse_manifest() {
     case "$section" in
       sql) SQL_TESTS+=("$line") ;;
       orm) ORM_TESTS+=("$line") ;;
-      *) echo "ERROR: invalid manifest entry (outside [sql]/[orm]): $line" >&2; return 2 ;;
+      python) PYTHON_TESTS+=("$line") ;;
+      *) echo "ERROR: invalid manifest entry (outside [sql]/[orm]/[python]): $line" >&2; return 2 ;;
     esac
   done <"$manifest"
 
@@ -184,6 +186,7 @@ done
 
 SQL_TESTS=()
 ORM_TESTS=()
+PYTHON_TESTS=()
 if [[ -f "$MANIFEST_PATH" ]]; then
   parse_manifest "$MANIFEST_PATH"
 else
@@ -209,6 +212,13 @@ for test_file in "${REGRESSION_TESTS[@]}"; do
   if [[ ! -f "$ROOT_DIR/$test_file" ]]; then
     echo "ERROR: missing regression test file: $test_file" >&2
     echo "Tip: make sure the regression guards are backported to your branch before release." >&2
+    exit 2
+  fi
+done
+
+for test_file in "${PYTHON_TESTS[@]}"; do
+  if [[ ! -f "$ROOT_DIR/$test_file" ]]; then
+    echo "ERROR: missing Python test file: $test_file" >&2
     exit 2
   fi
 done
@@ -424,6 +434,7 @@ REPORT_DIR="$ROOT_DIR/test-reports/regression-gate-$REPORT_TS"
 mkdir -p "$REPORT_DIR"
 UNIT_LOG="$REPORT_DIR/unit.log"
 SQL_LOG="$REPORT_DIR/sql.log"
+PYTHON_LOG="$REPORT_DIR/python.log"
 ORM_LOG="$REPORT_DIR/orm.log"
 
 if [[ "$START_ENV" -eq 1 ]]; then
@@ -458,8 +469,11 @@ echo "Report dir: $REPORT_DIR"
 echo ""
 
 TOTAL_STEPS=5
+if [[ "${#PYTHON_TESTS[@]}" -gt 0 ]]; then
+  TOTAL_STEPS=$((TOTAL_STEPS + 1))
+fi
 if [[ "$SKIP_ORM" -eq 0 && "${#ORM_TESTS[@]}" -gt 0 ]]; then
-  TOTAL_STEPS=6
+  TOTAL_STEPS=$((TOTAL_STEPS + 1))
 fi
 
 if [[ "$RUN_UNIT" -eq 1 ]]; then
@@ -592,8 +606,34 @@ if [[ "$SQL_EXIT" -ne 0 ]]; then
   exit 1
 fi
 
+NEXT_STEP=6
+
+if [[ "${#PYTHON_TESTS[@]}" -gt 0 ]]; then
+  echo "[$NEXT_STEP/$TOTAL_STEPS] Running Python multi-session tests (${#PYTHON_TESTS[@]} files)..."
+  PYTHON_EXIT=0
+  for py_test in "${PYTHON_TESTS[@]}"; do
+    echo "  -> $py_test"
+    set +e
+    python3 "$ROOT_DIR/$py_test" --dsn "$REGRESSION_DSN" 2>&1 | tee -a "$PYTHON_LOG"
+    PY_RC=${PIPESTATUS[0]}
+    set -e
+    if [[ "$PY_RC" -ne 0 ]]; then
+      PYTHON_EXIT=1
+      if [[ "$STOP_ON_ERROR" -eq 1 ]]; then
+        break
+      fi
+    fi
+  done
+  echo ""
+  if [[ "$PYTHON_EXIT" -ne 0 ]]; then
+    echo "❌ Regression gate failed (Python exit=$PYTHON_EXIT). See: $PYTHON_LOG"
+    exit 1
+  fi
+  NEXT_STEP=$((NEXT_STEP + 1))
+fi
+
 if [[ "$SKIP_ORM" -eq 1 || "${#ORM_TESTS[@]}" -eq 0 ]]; then
-  echo "✅ Regression gate passed (SQL-only)"
+  echo "✅ Regression gate passed"
   exit 0
 fi
 
@@ -602,7 +642,7 @@ if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
   exit 2
 fi
 
-echo "[6/$TOTAL_STEPS] Running ORM regression pack (${#ORM_TESTS[@]} item(s))..."
+echo "[$NEXT_STEP/$TOTAL_STEPS] Running ORM regression pack (${#ORM_TESTS[@]} item(s))..."
 ORM_FILTERS=()
 for item in "${ORM_TESTS[@]}"; do
   if [[ "$item" == orm-tests/* ]]; then

@@ -153,3 +153,76 @@ ROLLBACK TO SAVEPOINT s1;
 -- Session lock 5040 survives savepoint rollback (session locks ignore txn semantics)
 SELECT pg_advisory_unlock(5040);
 COMMIT;
+
+-- ============================================================
+-- Mid-savepoint assertion tests (keys 5050–5069)
+-- Probes lock state DURING the transaction using pg_advisory_unlock
+-- return values and pg_try_advisory_xact_lock re-acquisition.
+-- ============================================================
+
+-- Case 7: Xact lock scope validation — pg_advisory_unlock returns false for xact locks
+-- even when they are held, confirming scope separation.
+BEGIN;
+SELECT pg_advisory_xact_lock(5050);
+SAVEPOINT s1;
+SELECT pg_advisory_xact_lock(5051);
+-- Mid-savepoint: pg_advisory_unlock returns false for xact-scoped locks
+SELECT pg_advisory_unlock(5050);
+SELECT pg_advisory_unlock(5051);
+ROLLBACK TO SAVEPOINT s1;
+-- After rollback: 5051 released, 5050 still held
+-- Re-acquire 5051 to exercise the released-lock path
+SELECT pg_try_advisory_xact_lock(5051);
+-- pg_advisory_unlock still returns false (xact scope, not session)
+SELECT pg_advisory_unlock(5050);
+SELECT pg_advisory_unlock(5051);
+COMMIT;
+-- Post-commit: all released
+BEGIN;
+SELECT pg_try_advisory_xact_lock(5050);
+SELECT pg_try_advisory_xact_lock(5051);
+COMMIT;
+
+-- Case 8: Session-level mid-savepoint probe via pg_advisory_unlock return value.
+-- pg_advisory_unlock returns true when a session lock is held, false when not.
+-- This provides a genuine observable assertion mid-transaction.
+BEGIN;
+SELECT pg_advisory_lock(5060);
+SAVEPOINT s1;
+SELECT pg_advisory_lock(5061);
+-- Mid-savepoint: verify both session locks are held
+SELECT pg_advisory_unlock(5060);
+SELECT pg_advisory_lock(5060);
+SELECT pg_advisory_unlock(5061);
+SELECT pg_advisory_lock(5061);
+ROLLBACK TO SAVEPOINT s1;
+-- Session locks survive savepoint rollback — a buggy impl that releases
+-- session locks on rollback would return false here
+SELECT pg_advisory_unlock(5060);
+SELECT pg_advisory_unlock(5061);
+COMMIT;
+
+-- Case 9: Mixed xact + session locks on same key — savepoint interaction
+BEGIN;
+SELECT pg_advisory_xact_lock(5070);
+SELECT pg_advisory_lock(5070);
+SAVEPOINT s1;
+SELECT pg_advisory_xact_lock(5071);
+SELECT pg_advisory_lock(5071);
+-- Mid-savepoint: session locks for both keys are held
+SELECT pg_advisory_unlock(5070);
+SELECT pg_advisory_lock(5070);
+SELECT pg_advisory_unlock(5071);
+SELECT pg_advisory_lock(5071);
+ROLLBACK TO SAVEPOINT s1;
+-- After rollback: xact lock 5071 released, session locks survive
+-- pg_advisory_unlock returns true for session lock on 5071 (still held)
+SELECT pg_advisory_unlock(5071);
+-- pg_advisory_unlock returns true for session lock on 5070 (still held)
+SELECT pg_advisory_unlock(5070);
+COMMIT;
+-- Post-commit: xact locks released; session locks were cleaned up above
+BEGIN;
+SELECT pg_try_advisory_xact_lock(5070);
+SELECT pg_try_advisory_xact_lock(5071);
+COMMIT;
