@@ -842,6 +842,9 @@ mod tests {
         async fn truncate(&self, _path: &str, _size: u64) -> Result<()> {
             anyhow::bail!("not implemented for test backend")
         }
+        async fn rename(&self, _old_path: &str, _new_path: &str) -> Result<()> {
+            anyhow::bail!("not implemented for test backend")
+        }
     }
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);

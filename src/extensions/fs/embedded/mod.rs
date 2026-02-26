@@ -96,6 +96,10 @@ impl FsBackend for EmbeddedFsBackend {
     async fn truncate(&self, path: &str, size: u64) -> Result<()> {
         self.pagefs.truncate(path, size).await
     }
+
+    async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
+        self.pagefs.rename(old_path, new_path).await
+    }
 }
 
 fn inode_to_file_info(path: &str, inode: &Inode) -> FsFileInfo {
