@@ -53,7 +53,7 @@ pub struct DynamicPgHandler {
     pub(super) copy_context: Mutex<Option<CopyContext>>,
     pub(super) suspended_portals: Mutex<HashMap<String, SuspendedPortalState>>,
     pub(super) query_parser: Arc<Db9QueryParser>,
-    pub(super) connection_id: i32,
+    pub(super) connection_id: i64,
     pub(super) server_config: SharedServerConfig,
 }
 

@@ -14,7 +14,7 @@ use crate::model::Value;
 use crate::sql::advisory_locks::AdvisoryLockMode;
 
 tokio::task_local! {
-    static CONNECTION_ID: i32;
+    static CONNECTION_ID: i64;
     static CURRENT_DATABASE_NAME: Arc<str>;
     static CURRENT_USER_NAME: Arc<str>;
     static CURRENT_TIMEZONE: Arc<str>;
@@ -110,8 +110,9 @@ impl XactAdvisorySavepointTracker {
 
 #[derive(Debug, Clone)]
 pub struct QueryContext {
-    /// pg_backend_pid()
-    pub connection_id: i32,
+    /// Internal 64-bit connection identity.
+    /// `pg_backend_pid()` exposes this as int4 for PostgreSQL wire compatibility.
+    pub connection_id: i64,
     /// current_database()
     pub database_name: Arc<str>,
     /// current_user / session_user — the authenticated role for this session
@@ -144,7 +145,7 @@ pub struct QueryContext {
 
 impl QueryContext {
     pub fn new(
-        connection_id: i32,
+        connection_id: i64,
         database_name: Arc<str>,
         current_user: Arc<str>,
         statement_timestamp_ms: i64,
@@ -167,7 +168,7 @@ impl QueryContext {
         }
     }
 
-    pub(crate) fn current_connection_id() -> Option<i32> {
+    pub(crate) fn current_connection_id() -> Option<i64> {
         CONNECTION_ID.try_with(|id| *id).ok()
     }
 
@@ -285,7 +286,7 @@ impl QueryContext {
 }
 
 pub(crate) async fn with_query_context<R, Fut>(
-    connection_id: i32,
+    connection_id: i64,
     database_name: Arc<str>,
     current_user: Arc<str>,
     timezone: Arc<str>,

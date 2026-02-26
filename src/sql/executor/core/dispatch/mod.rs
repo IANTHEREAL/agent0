@@ -387,7 +387,7 @@ mod tests {
         } else {
             format!("app_user_{fixture_id}")
         };
-        let connection_id = i32::try_from(fixture_id).unwrap_or(i32::MAX);
+        let connection_id = i64::try_from(fixture_id).unwrap_or(i64::MAX);
         let session = Session::new_with_user_and_database(
             store,
             observability.clone(),

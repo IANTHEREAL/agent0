@@ -90,7 +90,9 @@ pub(super) fn eval_function_call(
             return Ok(Value::Date(days));
         }
         "PG_BACKEND_PID" => {
-            return Ok(Value::Int32(qctx.connection_id));
+            // PostgreSQL exposes pg_backend_pid() as int4.
+            // Internal connection identity is i64; cast intentionally truncates.
+            return Ok(Value::Int32(qctx.connection_id as i32));
         }
         "CURRENT_DATABASE" => {
             return Ok(Value::Text(qctx.database_name.as_ref().to_string()));

@@ -893,7 +893,7 @@ mod tests {
     #[test]
     fn test_record_command_complete_releases_xact_locks_when_idle() {
         struct ConnectionCleanup {
-            conn_ids: [i32; 2],
+            conn_ids: [i64; 2],
         }
 
         impl Drop for ConnectionCleanup {

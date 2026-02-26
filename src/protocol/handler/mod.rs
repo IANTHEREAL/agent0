@@ -13,7 +13,7 @@ use pgwire::messages::response::NoticeResponse;
 use pgwire::messages::PgWireBackendMessage;
 use std::collections::HashSet;
 use std::fmt::Debug;
-use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicI64;
 
 // These imports are used by tests (via `use super::*`) and by dynamic.rs.
 #[allow(unused_imports)]
@@ -56,8 +56,11 @@ const METADATA_ACTUAL_USER: &str = "actual_user";
 /// Custom metadata key for storing authenticated superuser status ("on"/"off")
 const METADATA_AUTH_IS_SUPERUSER: &str = "auth_is_superuser";
 
-/// Global atomic counter for generating unique connection IDs
-static CONNECTION_ID_COUNTER: AtomicI32 = AtomicI32::new(1);
+/// Global atomic counter for generating unique connection IDs.
+///
+/// Contract: internal connection identity is 64-bit to avoid practical
+/// wraparound/collision risk for advisory lock ownership.
+static CONNECTION_ID_COUNTER: AtomicI64 = AtomicI64::new(1);
 
 async fn rollback_autocommit_or_mark_failed(session: &mut Session, started_txn: bool) {
     if started_txn {

@@ -40,7 +40,7 @@ fn parse_lock_key(args: &[Value]) -> Result<Option<i64>> {
 
 pub(crate) async fn execute_advisory_lock_function(
     keyspace: &Arc<str>,
-    conn_id: i32,
+    conn_id: i64,
     func_name: &str,
     args: &[Value],
     lock_timeout: Option<Duration>,
@@ -73,7 +73,7 @@ fn map_acquire_error(err: AcquireError) -> anyhow::Error {
 async fn execute_advisory_lock_function_with_manager(
     manager: &AdvisoryLockManager,
     keyspace: &Arc<str>,
-    conn_id: i32,
+    conn_id: i64,
     func_name: &str,
     args: &[Value],
     lock_timeout: Option<Duration>,

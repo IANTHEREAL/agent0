@@ -53,8 +53,9 @@ pub struct Session {
     is_superuser: bool,
     current_database_id: u64,
     current_database_name: Arc<str>,
-    /// Connection ID for pg_backend_pid() support
-    connection_id: i32,
+    /// Internal 64-bit connection identity.
+    /// `pg_backend_pid()` remains int4 by truncating this value at function boundary.
+    connection_id: i64,
     /// Timestamp (epoch millis) when the current explicit transaction started.
     /// None when not in an explicit transaction block.
     pub(crate) transaction_timestamp_ms: Option<i64>,
@@ -100,7 +101,7 @@ impl Session {
     pub fn new_with_database(
         store: Arc<TikvStore>,
         observability: Arc<TenantObservability>,
-        connection_id: i32,
+        connection_id: i64,
         database_id: u64,
         database_name: String,
         default_statement_timeout_ms: u64,
@@ -152,7 +153,7 @@ impl Session {
         observability: Arc<TenantObservability>,
         username: String,
         is_superuser: bool,
-        connection_id: i32,
+        connection_id: i64,
         database_id: u64,
         database_name: String,
         default_statement_timeout_ms: u64,
@@ -220,7 +221,7 @@ impl Session {
         self.is_superuser = self.session_user_is_superuser;
     }
 
-    pub fn connection_id(&self) -> i32 {
+    pub fn connection_id(&self) -> i64 {
         self.connection_id
     }
 

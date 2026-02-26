@@ -149,6 +149,26 @@ fn typed_builtin_pg_backend_pid_uses_query_context() {
 }
 
 #[test]
+fn typed_builtin_pg_backend_pid_truncates_internal_connection_id() {
+    let row = empty_row();
+    let internal_connection_id = i64::from(i32::MAX) + 77;
+    let qctx = QueryContext::new(
+        internal_connection_id,
+        Arc::from("postgres"),
+        Arc::from("postgres"),
+        1_700_000_000_000,
+        1_700_000_000_000,
+        Arc::from("UTC"),
+    );
+
+    let expr = func_call("PG_BACKEND_PID", vec![], DataType::Int32);
+    assert_eq!(
+        eval_typed_expr(&expr, &row, &qctx).unwrap(),
+        Value::Int32(internal_connection_id as i32)
+    );
+}
+
+#[test]
 fn typed_builtin_current_database_uses_query_context() {
     let row = empty_row();
     let qctx = QueryContext::new(

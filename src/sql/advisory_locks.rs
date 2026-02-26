@@ -91,8 +91,8 @@ fn parse_max_advisory_locks_from_env() -> Option<usize> {
 }
 
 struct LockState {
-    exclusive_holders: HashMap<i32, HolderInfo>,
-    shared_holders: HashMap<i32, HolderInfo>,
+    exclusive_holders: HashMap<i64, HolderInfo>,
+    shared_holders: HashMap<i64, HolderInfo>,
 }
 
 impl LockState {
@@ -103,7 +103,7 @@ impl LockState {
         }
     }
 
-    fn can_grant(&self, conn_id: i32, mode: AdvisoryLockMode) -> bool {
+    fn can_grant(&self, conn_id: i64, mode: AdvisoryLockMode) -> bool {
         match mode {
             AdvisoryLockMode::Exclusive => {
                 let other_excl = self
@@ -128,7 +128,7 @@ impl LockState {
 
     fn grant(
         &mut self,
-        conn_id: i32,
+        conn_id: i64,
         mode: AdvisoryLockMode,
         scope: AdvisoryLockScope,
     ) -> Result<(), AcquireError> {
@@ -154,7 +154,7 @@ impl LockState {
         Ok(())
     }
 
-    fn release_one_session(&mut self, conn_id: i32, mode: AdvisoryLockMode) -> bool {
+    fn release_one_session(&mut self, conn_id: i64, mode: AdvisoryLockMode) -> bool {
         let holders = match mode {
             AdvisoryLockMode::Exclusive => &mut self.exclusive_holders,
             AdvisoryLockMode::Shared => &mut self.shared_holders,
@@ -171,7 +171,7 @@ impl LockState {
         false
     }
 
-    fn release_one_xact(&mut self, conn_id: i32, mode: AdvisoryLockMode) -> bool {
+    fn release_one_xact(&mut self, conn_id: i64, mode: AdvisoryLockMode) -> bool {
         let holders = match mode {
             AdvisoryLockMode::Exclusive => &mut self.exclusive_holders,
             AdvisoryLockMode::Shared => &mut self.shared_holders,
@@ -188,7 +188,7 @@ impl LockState {
         false
     }
 
-    fn release_all_session_for_connection(&mut self, conn_id: i32) {
+    fn release_all_session_for_connection(&mut self, conn_id: i64) {
         for holders in [&mut self.exclusive_holders, &mut self.shared_holders] {
             if let Some(info) = holders.get_mut(&conn_id) {
                 info.session_count = 0;
@@ -199,7 +199,7 @@ impl LockState {
         }
     }
 
-    fn release_xact_for_connection(&mut self, conn_id: i32) {
+    fn release_xact_for_connection(&mut self, conn_id: i64) {
         for holders in [&mut self.exclusive_holders, &mut self.shared_holders] {
             if let Some(info) = holders.get_mut(&conn_id) {
                 info.xact_count = 0;
@@ -210,12 +210,12 @@ impl LockState {
         }
     }
 
-    fn release_all_for_connection(&mut self, conn_id: i32) {
+    fn release_all_for_connection(&mut self, conn_id: i64) {
         self.exclusive_holders.remove(&conn_id);
         self.shared_holders.remove(&conn_id);
     }
 
-    fn has_session_for_connection(&self, conn_id: i32) -> bool {
+    fn has_session_for_connection(&self, conn_id: i64) -> bool {
         self.exclusive_holders
             .get(&conn_id)
             .is_some_and(|info| info.session_count > 0)
@@ -225,7 +225,7 @@ impl LockState {
                 .is_some_and(|info| info.session_count > 0)
     }
 
-    fn has_xact_for_connection(&self, conn_id: i32) -> bool {
+    fn has_xact_for_connection(&self, conn_id: i64) -> bool {
         self.exclusive_holders
             .get(&conn_id)
             .is_some_and(|info| info.xact_count > 0)
@@ -239,7 +239,7 @@ impl LockState {
         self.exclusive_holders.is_empty() && self.shared_holders.is_empty()
     }
 
-    fn holds_connection(&self, conn_id: i32) -> bool {
+    fn holds_connection(&self, conn_id: i64) -> bool {
         self.exclusive_holders
             .get(&conn_id)
             .is_some_and(|info| info.total() > 0)
@@ -261,7 +261,7 @@ struct ManagerState {
     // waiters cannot miss wakeups when a lock entry is removed/recreated.
     key_notifiers: HashMap<LockKey, Arc<Notify>>,
     // Reverse index: connection -> distinct lock keys currently held.
-    connection_keys: HashMap<i32, HashSet<LockKey>>,
+    connection_keys: HashMap<i64, HashSet<LockKey>>,
 }
 
 #[derive(Clone, Copy)]
@@ -311,7 +311,7 @@ impl AdvisoryLockManager {
         &self,
         keyspace: &Arc<str>,
         key: i64,
-        conn_id: i32,
+        conn_id: i64,
         mode: AdvisoryLockMode,
         count: u32,
     ) {
@@ -343,7 +343,7 @@ impl AdvisoryLockManager {
         state: &ManagerState,
         keyspace: &Arc<str>,
         key: i64,
-        conn_id: i32,
+        conn_id: i64,
     ) -> Option<usize> {
         let limit = self.max_locks_per_connection?;
         let lk = (keyspace.clone(), key);
@@ -362,7 +362,7 @@ impl AdvisoryLockManager {
         }
     }
 
-    fn add_connection_key(state: &mut ManagerState, conn_id: i32, lk: &LockKey) {
+    fn add_connection_key(state: &mut ManagerState, conn_id: i64, lk: &LockKey) {
         let inserted = state
             .connection_keys
             .entry(conn_id)
@@ -375,7 +375,7 @@ impl AdvisoryLockManager {
         );
     }
 
-    fn remove_connection_key(state: &mut ManagerState, conn_id: i32, lk: &LockKey) {
+    fn remove_connection_key(state: &mut ManagerState, conn_id: i64, lk: &LockKey) {
         let mut should_remove_conn = false;
         if let Some(keys) = state.connection_keys.get_mut(&conn_id) {
             let removed = keys.remove(lk);
@@ -400,7 +400,7 @@ impl AdvisoryLockManager {
     fn try_grant_lock(
         state: &mut ManagerState,
         lk: &LockKey,
-        conn_id: i32,
+        conn_id: i64,
         mode: AdvisoryLockMode,
         scope: AdvisoryLockScope,
     ) -> Result<bool, AcquireError> {
@@ -464,7 +464,7 @@ impl AdvisoryLockManager {
 
     fn release_from_key_for_connection(
         lock_state: &mut LockState,
-        conn_id: i32,
+        conn_id: i64,
         kind: BulkReleaseKind,
     ) -> bool {
         match kind {
@@ -495,7 +495,7 @@ impl AdvisoryLockManager {
         }
     }
 
-    fn release_keys_for_connection(&self, conn_id: i32, kind: BulkReleaseKind) {
+    fn release_keys_for_connection(&self, conn_id: i64, kind: BulkReleaseKind) {
         let mut state = self.state.lock().unwrap();
         let Some(keys_set) = state.connection_keys.get(&conn_id) else {
             return;
@@ -566,7 +566,7 @@ impl AdvisoryLockManager {
         &self,
         keyspace: &Arc<str>,
         key: i64,
-        conn_id: i32,
+        conn_id: i64,
         mode: AdvisoryLockMode,
         scope: AdvisoryLockScope,
     ) -> bool {
@@ -578,7 +578,7 @@ impl AdvisoryLockManager {
         &self,
         keyspace: &Arc<str>,
         key: i64,
-        conn_id: i32,
+        conn_id: i64,
         mode: AdvisoryLockMode,
         scope: AdvisoryLockScope,
     ) -> Result<bool, AcquireError> {
@@ -594,7 +594,7 @@ impl AdvisoryLockManager {
         &self,
         keyspace: &Arc<str>,
         key: i64,
-        conn_id: i32,
+        conn_id: i64,
         mode: AdvisoryLockMode,
         scope: AdvisoryLockScope,
         timeout: Option<Duration>,
@@ -649,7 +649,7 @@ impl AdvisoryLockManager {
         &self,
         keyspace: &Arc<str>,
         key: i64,
-        conn_id: i32,
+        conn_id: i64,
         mode: AdvisoryLockMode,
     ) -> bool {
         let lk = (keyspace.clone(), key);
@@ -686,7 +686,7 @@ impl AdvisoryLockManager {
         &self,
         keyspace: &Arc<str>,
         key: i64,
-        conn_id: i32,
+        conn_id: i64,
         mode: AdvisoryLockMode,
     ) -> bool {
         let lk = (keyspace.clone(), key);
@@ -721,19 +721,19 @@ impl AdvisoryLockManager {
 
     /// Release all session-scoped locks for a connection (pg_advisory_unlock_all).
     /// Touches only keys currently held by this connection.
-    pub fn release_all_session_locks(&self, conn_id: i32) {
+    pub fn release_all_session_locks(&self, conn_id: i64) {
         self.release_keys_for_connection(conn_id, BulkReleaseKind::Session);
     }
 
     /// Release all xact-scoped locks for a connection (COMMIT/ROLLBACK).
     /// Touches only keys currently held by this connection.
-    pub fn release_xact_locks(&self, conn_id: i32) {
+    pub fn release_xact_locks(&self, conn_id: i64) {
         self.release_keys_for_connection(conn_id, BulkReleaseKind::Transaction);
     }
 
     /// Release everything for a connection (session disconnect).
     /// Touches only keys currently held by this connection.
-    pub fn release_all_for_connection(&self, conn_id: i32) {
+    pub fn release_all_for_connection(&self, conn_id: i64) {
         self.release_keys_for_connection(conn_id, BulkReleaseKind::All);
     }
 }
@@ -769,6 +769,41 @@ mod tests {
             &k,
             1,
             200,
+            AdvisoryLockMode::Exclusive,
+            AdvisoryLockScope::Session
+        ));
+    }
+
+    #[test]
+    fn test_distinct_large_connection_ids_do_not_collide() {
+        let mgr = AdvisoryLockManager::new();
+        let k = ks("t_conn_id_64");
+        let conn_a = i64::from(i32::MAX) + 1;
+        let conn_b = conn_a + (1_i64 << 32);
+
+        assert!(mgr.try_acquire(
+            &k,
+            1,
+            conn_a,
+            AdvisoryLockMode::Exclusive,
+            AdvisoryLockScope::Session
+        ));
+        assert!(
+            !mgr.try_acquire(
+                &k,
+                1,
+                conn_b,
+                AdvisoryLockMode::Exclusive,
+                AdvisoryLockScope::Session
+            ),
+            "different i64 connection ids must never be treated as the same holder"
+        );
+
+        mgr.release_all_for_connection(conn_a);
+        assert!(mgr.try_acquire(
+            &k,
+            1,
+            conn_b,
             AdvisoryLockMode::Exclusive,
             AdvisoryLockScope::Session
         ));
@@ -1732,7 +1767,7 @@ mod tests {
         mgr: &AdvisoryLockManager,
         keyspace: &Arc<str>,
         key: i64,
-        conn_id: i32,
+        conn_id: i64,
         mode: AdvisoryLockMode,
         count: u32,
     ) {
@@ -1752,7 +1787,7 @@ mod tests {
         mgr: &AdvisoryLockManager,
         keyspace: &Arc<str>,
         key: i64,
-        conn_id: i32,
+        conn_id: i64,
         mode: AdvisoryLockMode,
         count: u32,
     ) {
