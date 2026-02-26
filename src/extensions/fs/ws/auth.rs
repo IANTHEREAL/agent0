@@ -25,38 +25,46 @@ pub(crate) async fn handle_auth(
     let (parsed_keyspace, actual_user) = parse_tenant_username(username);
     let keyspace = parsed_keyspace.unwrap_or_else(|| "default".to_string());
 
-    let tenant_handle = pool
-        .acquire(Some(keyspace.clone()))
-        .await
-        .map_err(|err| WsResponse::error(id, WsErrorCode::Eio, format!("pool acquire failed: {err}")))?;
+    let tenant_handle = pool.acquire(Some(keyspace.clone())).await.map_err(|err| {
+        WsResponse::error(id, WsErrorCode::Eio, format!("pool acquire failed: {err}"))
+    })?;
 
     let store = tenant_handle.store().clone();
     let auth_manager = AuthManager::new();
 
     {
-        let mut bootstrap_txn = store
-            .begin()
-            .await
-            .map_err(|err| WsResponse::error(id, WsErrorCode::Eio, format!("txn begin failed: {err}")))?;
+        let mut bootstrap_txn = store.begin().await.map_err(|err| {
+            WsResponse::error(id, WsErrorCode::Eio, format!("txn begin failed: {err}"))
+        })?;
         auth_manager
             .bootstrap(&mut bootstrap_txn)
             .await
-            .map_err(|err| WsResponse::error(id, WsErrorCode::Eio, format!("auth bootstrap failed: {err}")))?;
-        bootstrap_txn
-            .commit()
-            .await
-            .map_err(|err| WsResponse::error(id, WsErrorCode::Eio, format!("txn commit failed: {err}")))?;
+            .map_err(|err| {
+                WsResponse::error(
+                    id,
+                    WsErrorCode::Eio,
+                    format!("auth bootstrap failed: {err}"),
+                )
+            })?;
+        bootstrap_txn.commit().await.map_err(|err| {
+            WsResponse::error(id, WsErrorCode::Eio, format!("txn commit failed: {err}"))
+        })?;
     }
 
-    let mut auth_txn = store
-        .begin()
-        .await
-        .map_err(|err| WsResponse::error(id, WsErrorCode::Eio, format!("txn begin failed: {err}")))?;
+    let mut auth_txn = store.begin().await.map_err(|err| {
+        WsResponse::error(id, WsErrorCode::Eio, format!("txn begin failed: {err}"))
+    })?;
 
     let user = auth_manager
         .authenticate(&mut auth_txn, &actual_user, password)
         .await
-        .map_err(|err| WsResponse::error(id, WsErrorCode::Eio, format!("authentication query failed: {err}")))?;
+        .map_err(|err| {
+            WsResponse::error(
+                id,
+                WsErrorCode::Eio,
+                format!("authentication query failed: {err}"),
+            )
+        })?;
 
     let user = match user {
         Some(user) => user,
@@ -79,10 +87,9 @@ pub(crate) async fn handle_auth(
         ));
     }
 
-    auth_txn
-        .commit()
-        .await
-        .map_err(|err| WsResponse::error(id, WsErrorCode::Eio, format!("txn commit failed: {err}")))?;
+    auth_txn.commit().await.map_err(|err| {
+        WsResponse::error(id, WsErrorCode::Eio, format!("txn commit failed: {err}"))
+    })?;
 
     let client = store.transaction_client().ok_or_else(|| {
         WsResponse::error(
@@ -92,9 +99,13 @@ pub(crate) async fn handle_auth(
         )
     })?;
 
-    let backend = EmbeddedFsBackend::new(client)
-        .await
-        .map_err(|err| WsResponse::error(id, WsErrorCode::Eio, format!("failed to initialize fs backend: {err}")))?;
+    let backend = EmbeddedFsBackend::new(client).await.map_err(|err| {
+        WsResponse::error(
+            id,
+            WsErrorCode::Eio,
+            format!("failed to initialize fs backend: {err}"),
+        )
+    })?;
 
     Ok(WsSession {
         tenant_handle,
@@ -151,12 +162,7 @@ impl WsConnectionTracker {
             }
 
             if counter
-                .compare_exchange_weak(
-                    current,
-                    current + 1,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
                 return Ok(WsConnectionGuard {
@@ -185,12 +191,7 @@ impl Drop for WsConnectionGuard {
 
             if self
                 .counter
-                .compare_exchange_weak(
-                    current,
-                    current - 1,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange_weak(current, current - 1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
                 break;

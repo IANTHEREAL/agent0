@@ -120,7 +120,10 @@ fn decode_binary_array(bytes: &[u8], pg_type: &Type, index: usize) -> PgWireResu
     for _ in 0..len {
         let elem_len = read_i32(bytes, &mut pos)?;
         if elem_len < -1 {
-            return Err(err(format!("invalid binary array element length {}", elem_len)));
+            return Err(err(format!(
+                "invalid binary array element length {}",
+                elem_len
+            )));
         }
         if elem_len == -1 {
             values.push(Value::Null);
@@ -380,9 +383,7 @@ fn decode_binary(bytes: &[u8], pg_type: &Type, index: usize) -> PgWireResult<Val
                 serde_json::from_str(s).map_err(|e| err(e.to_string()))?;
             Ok(Value::Jsonb(parsed.to_string()))
         }
-        t if *t == Type::NUMERIC => {
-            decode_binary_numeric(bytes, t, index)
-        }
+        t if *t == Type::NUMERIC => decode_binary_numeric(bytes, t, index),
         t if *t == Type::INTERVAL => {
             // PostgreSQL interval binary: 8 bytes µs + 4 bytes days + 4 bytes months
             if bytes.len() != 16 {
@@ -647,7 +648,13 @@ mod tests {
         );
     }
 
-    fn build_numeric_bin(ndigits: i16, weight: i16, sign: i16, dscale: i16, digits: &[i16]) -> Vec<u8> {
+    fn build_numeric_bin(
+        ndigits: i16,
+        weight: i16,
+        sign: i16,
+        dscale: i16,
+        digits: &[i16],
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&ndigits.to_be_bytes());
         out.extend_from_slice(&weight.to_be_bytes());

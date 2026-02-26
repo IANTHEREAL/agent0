@@ -1,6 +1,6 @@
-pub(crate) mod protocol;
 pub(crate) mod auth;
 pub(crate) mod handler;
+pub(crate) mod protocol;
 pub(crate) mod stream;
 
 use std::net::SocketAddr;
@@ -19,13 +19,14 @@ use tokio_tungstenite::tungstenite::{Error as WsIoError, Message};
 use tokio_tungstenite::{accept_async, WebSocketStream};
 use tracing::{debug, info, warn};
 
-use crate::extensions::fs::MAX_BYTES_PER_FILE;
 use crate::extensions::fs::ws::auth::{WsConnectionTracker, WsSession};
 use crate::extensions::fs::ws::protocol::{
-    AUTH_TIMEOUT_SECS, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_CONNECTIONS_PER_TENANT,
-    IDLE_TIMEOUT_SECS, MAX_JSON_FRAME_BYTES, STREAMING_THRESHOLD, StreamEnd, StreamStartResponse,
-    StreamWriteReady, WsErrorCode, WsRequest, WsResponse, map_fs_error, validate_path,
+    map_fs_error, validate_path, StreamEnd, StreamStartResponse, StreamWriteReady, WsErrorCode,
+    WsRequest, WsResponse, AUTH_TIMEOUT_SECS, DEFAULT_CHUNK_SIZE,
+    DEFAULT_MAX_CONNECTIONS_PER_TENANT, IDLE_TIMEOUT_SECS, MAX_JSON_FRAME_BYTES,
+    STREAMING_THRESHOLD,
 };
+use crate::extensions::fs::MAX_BYTES_PER_FILE;
 use crate::pool::TikvClientPool;
 
 const KEYSPACE_PREFIX: &str = "db9_tenant_";
@@ -35,9 +36,7 @@ pub(crate) async fn start_ws_server(
     pool: Arc<TikvClientPool>,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
 ) {
-    let tracker = Arc::new(WsConnectionTracker::new(
-        DEFAULT_MAX_CONNECTIONS_PER_TENANT,
-    ));
+    let tracker = Arc::new(WsConnectionTracker::new(DEFAULT_MAX_CONNECTIONS_PER_TENANT));
 
     loop {
         let (stream, peer_addr) = match listener.accept().await {
@@ -52,7 +51,9 @@ pub(crate) async fn start_ws_server(
         let tls_acceptor = tls_acceptor.clone();
         let tracker = tracker.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, peer_addr, pool, tls_acceptor, tracker).await {
+            if let Err(err) =
+                handle_connection(stream, peer_addr, pool, tls_acceptor, tracker).await
+            {
                 warn!("fs9 ws connection {peer_addr} ended with error: {err}");
             }
         });
@@ -115,11 +116,7 @@ where
         }
     };
 
-    let auth_message = match timeout(
-        Duration::from_secs(AUTH_TIMEOUT_SECS),
-        ws_stream.next(),
-    )
-    .await
+    let auth_message = match timeout(Duration::from_secs(AUTH_TIMEOUT_SECS), ws_stream.next()).await
     {
         Ok(Some(Ok(msg))) => msg,
         Ok(Some(Err(err))) => return Err(err),
@@ -327,13 +324,14 @@ where
                         length,
                         streaming,
                     } if *streaming => {
-                        let data = match streaming_read_data(&session, id, path, *offset, *length).await {
-                            Ok(data) => data,
-                            Err(resp) => {
-                                send_response(&mut ws_stream, &resp).await?;
-                                continue;
-                            }
-                        };
+                        let data =
+                            match streaming_read_data(&session, id, path, *offset, *length).await {
+                                Ok(data) => data,
+                                Err(resp) => {
+                                    send_response(&mut ws_stream, &resp).await?;
+                                    continue;
+                                }
+                            };
 
                         if data.len() >= STREAMING_THRESHOLD {
                             let stream_id = stream::next_stream_id();
@@ -386,7 +384,8 @@ where
                         ..
                     } if *streaming => {
                         if let Err((code, msg)) = validate_path(path) {
-                            send_response(&mut ws_stream, &WsResponse::error(id, code, msg)).await?;
+                            send_response(&mut ws_stream, &WsResponse::error(id, code, msg))
+                                .await?;
                             continue;
                         }
 
@@ -524,7 +523,11 @@ fn parse_auth_request(message: Message) -> Result<WsRequest, WsResponse> {
                 ));
             }
             serde_json::from_str::<WsRequest>(&text).map_err(|err| {
-                WsResponse::error("", WsErrorCode::Eproto, format!("invalid auth request: {err}"))
+                WsResponse::error(
+                    "",
+                    WsErrorCode::Eproto,
+                    format!("invalid auth request: {err}"),
+                )
             })
         }
         Message::Close(_) => Err(WsResponse::error(

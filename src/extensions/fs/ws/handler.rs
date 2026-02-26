@@ -1,16 +1,18 @@
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use serde_json::json;
 
-use crate::extensions::fs::MAX_BYTES_PER_FILE;
 use crate::extensions::fs::ws::auth::WsSession;
 use crate::extensions::fs::ws::protocol::{
-    FileInfoResponse, WsErrorCode, WsRequest, WsResponse, map_fs_error, validate_path,
+    map_fs_error, validate_path, FileInfoResponse, WsErrorCode, WsRequest, WsResponse,
 };
+use crate::extensions::fs::MAX_BYTES_PER_FILE;
 
 pub(crate) async fn handle_request(session: &WsSession, request: &WsRequest) -> WsResponse {
     match request {
-        WsRequest::Auth { id, .. } => WsResponse::error(id, WsErrorCode::Eproto, "already authenticated"),
+        WsRequest::Auth { id, .. } => {
+            WsResponse::error(id, WsErrorCode::Eproto, "already authenticated")
+        }
         WsRequest::Stat { id, path } => handle_stat(session, id, path).await,
         WsRequest::Readdir { id, path } => handle_readdir(session, id, path).await,
         WsRequest::Mkdir {
@@ -107,7 +109,8 @@ async fn handle_readdir(session: &WsSession, id: &str, path: &str) -> WsResponse
     let result = session.backend.readdir(path).await;
     match result {
         Ok(entries) => {
-            let entries: Vec<FileInfoResponse> = entries.into_iter().map(FileInfoResponse::from).collect();
+            let entries: Vec<FileInfoResponse> =
+                entries.into_iter().map(FileInfoResponse::from).collect();
             WsResponse::success(id, json!({ "entries": entries }))
         }
         Err(err) => {

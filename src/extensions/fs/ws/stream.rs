@@ -1,4 +1,4 @@
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Global stream ID counter (monotonically increasing)
@@ -60,7 +60,7 @@ mod tests {
         let chunk = b"hello world";
         let frame = encode_binary_frame(stream_id, chunk);
         assert_eq!(frame.len(), 8 + chunk.len());
-        
+
         let (decoded_id, decoded_chunk) = decode_binary_frame(&frame).unwrap();
         assert_eq!(decoded_id, stream_id);
         assert_eq!(decoded_chunk, chunk);

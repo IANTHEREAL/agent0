@@ -256,7 +256,9 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| extensions::fs::ws::protocol::DEFAULT_WS_LISTEN_ADDR.to_string());
+                .unwrap_or_else(|| {
+                    extensions::fs::ws::protocol::DEFAULT_WS_LISTEN_ADDR.to_string()
+                });
 
             let ws_is_loopback = is_loopback_listen_addr(&ws_listen_addr);
 
@@ -277,7 +279,10 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
                         (Some(cert), Some(key)) => match tls::setup_ws_tls(&cert, &key) {
                             Ok(acceptor) => Some(Arc::new(acceptor)),
                             Err(e) => {
-                                warn!("fs9 WebSocket TLS setup failed: {}. Running without TLS.", e);
+                                warn!(
+                                    "fs9 WebSocket TLS setup failed: {}. Running without TLS.",
+                                    e
+                                );
                                 None
                             }
                         },
@@ -296,7 +301,10 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
                         });
                     }
                     Err(e) => {
-                        warn!("fs9 WebSocket failed to bind {}:{}: {}", ws_listen_addr, ws_port, e);
+                        warn!(
+                            "fs9 WebSocket failed to bind {}:{}: {}",
+                            ws_listen_addr, ws_port, e
+                        );
                     }
                 }
             }
