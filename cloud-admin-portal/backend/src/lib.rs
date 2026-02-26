@@ -32,7 +32,6 @@ use sqlx::AnyPool;
 
 use config::Config;
 use device_code::DeviceCodeStore;
-use services::fs9_client::Fs9Client;
 use session::SessionManager;
 
 #[derive(Clone)]
@@ -42,5 +41,4 @@ pub struct AppState {
     pub sessions: Arc<SessionManager>,
     pub device_codes: Arc<DeviceCodeStore>,
     pub http_client: reqwest::Client,
-    pub fs9_client: Option<Arc<Fs9Client>>,
 }

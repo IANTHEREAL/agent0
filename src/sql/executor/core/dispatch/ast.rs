@@ -60,8 +60,11 @@ impl Executor {
             }
             let start = Instant::now();
             let rt_settings = RuntimeSettings::from_session(session);
-            let stmt_exec: Result<Vec<ExecuteResult>> =
-                wrap_with_runtime_context(&rt_settings, self.tenant_keyspace(), async {
+            let stmt_exec: Result<Vec<ExecuteResult>> = wrap_with_runtime_context(
+                &rt_settings,
+                self.tenant_keyspace(),
+                self.store.transaction_client(),
+                async {
                     match stmt {
                         // Transaction Control
                         Statement::StartTransaction { modes, .. } => {
@@ -222,8 +225,9 @@ impl Executor {
                             .await
                         }
                     }
-                })
-                .await;
+                },
+            )
+            .await;
 
             if stmt_exec.is_err() && session.is_in_transaction() {
                 session.mark_transaction_failed();

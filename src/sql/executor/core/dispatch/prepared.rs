@@ -207,7 +207,12 @@ impl Executor {
                 is_observability_query,
             ));
 
-        wrap_with_runtime_context(&rt_settings, self.tenant_keyspace(), execute_future)
+        wrap_with_runtime_context(
+            &rt_settings,
+            self.tenant_keyspace(),
+            self.store.transaction_client(),
+            execute_future,
+        )
     }
 
     async fn execute_prepared_autocommit(

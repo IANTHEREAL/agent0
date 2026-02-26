@@ -4,6 +4,8 @@
 use super::super::*;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use tikv_client::TransactionClient;
 
 /// Validate and apply transaction modes (isolation level, access mode) from
 /// `BEGIN ISOLATION LEVEL ...` or `START TRANSACTION ...` statements.
@@ -171,6 +173,7 @@ impl RuntimeSettings {
 pub(in crate::sql::executor::core) fn wrap_with_runtime_context<'a, T: Send + 'a>(
     settings: &RuntimeSettings,
     tenant_keyspace: &'a str,
+    tikv_client: Option<Arc<TransactionClient>>,
     fut: impl Future<Output = T> + Send + 'a,
 ) -> Pin<Box<dyn Future<Output = T> + Send + 'a>> {
     let tz = settings.timezone.clone();
@@ -183,7 +186,14 @@ pub(in crate::sql::executor::core) fn wrap_with_runtime_context<'a, T: Send + 'a
             msb,
             session_context::with_search_path(
                 sp,
-                crate::extensions::context::with_context(su, tenant_keyspace, fut),
+                crate::extensions::context::with_context_opts(
+                    crate::extensions::context::ExtensionContextOpts::statement(
+                        su,
+                        tenant_keyspace,
+                    )
+                    .with_tikv_client(tikv_client),
+                    fut,
+                ),
             ),
         ),
     ))

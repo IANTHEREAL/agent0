@@ -124,7 +124,6 @@ pub async fn create_tenant(
             credential_key: None,
             metadata_notes: None,
             metadata_tags_json: None,
-            fs9: None,
             write_success_audit: true,
         },
     )

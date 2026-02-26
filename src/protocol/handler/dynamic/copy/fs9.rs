@@ -226,23 +226,31 @@ impl DynamicPgHandler {
             }
         };
 
-        // Enforce fs9 local-filesystem permission (same gate as fs9 table function)
-        let use_remote = crate::extensions::fs::backend::is_remote_configured();
-        if !use_remote && !session.is_superuser() {
+        if !crate::extensions::fs::backend::is_backend_available() {
+            if started_txn {
+                let _ = session.rollback().await;
+            }
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                "58030".to_string(),
+                "fs9: TiKV storage backend not available".to_string(),
+            ))));
+        }
+        if !session.is_superuser() {
             if started_txn {
                 let _ = session.rollback().await;
             }
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_string(),
                 "42501".to_string(),
-                "COPY FROM fs9: local filesystem access denied (requires superuser)".to_string(),
+                "fs9: permission denied".to_string(),
             ))));
         }
 
         // Read file bytes from fs9 backend
         let bare_path = crate::extensions::parquet::reader::strip_fs9_scheme(&filename);
         let tenant = executor.tenant_keyspace().to_string();
-        let backend = crate::extensions::fs::backend::get_backend(&tenant);
+        let backend = crate::extensions::fs::backend::get_backend(&tenant).await;
         let file_data = match backend
             .read_file(
                 bare_path,
@@ -561,8 +569,12 @@ impl DynamicPgHandler {
         // Extension context is required for fs9:// URL dispatch in open_batch_stream.
         let tenant_ks = executor.tenant_keyspace().to_string();
         let is_super = session.is_superuser();
+        let tikv_client = executor.store().transaction_client();
+        let ext_opts =
+            crate::extensions::context::ExtensionContextOpts::statement(is_super, &tenant_ks)
+                .with_tikv_client(tikv_client);
         let result = crate::sql::query_context::with_scoped_query_context(&qctx, async {
-            crate::extensions::context::with_context(is_super, &tenant_ks, async {
+            crate::extensions::context::with_context_opts(ext_opts, async {
                 executor
                     .execute_copy_from_parquet(&mut session, &table_name, &url)
                     .await

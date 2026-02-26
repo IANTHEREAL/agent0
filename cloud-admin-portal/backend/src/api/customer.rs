@@ -16,8 +16,8 @@ use crate::models::*;
 use crate::services::pg_client::PgClient;
 use crate::services::tenant::{
     deprovision_tenant, generate_customer_password, generate_tenant_id, make_keyspace,
-    provision_database, AuditConfig, DeprovisionConfig, DeprovisionRequest, Fs9BootstrapConfig,
-    ProvisionConfig, ProvisionRequest, RollbackPolicy, SchemaBootstrapConfig,
+    provision_database, AuditConfig, DeprovisionConfig, DeprovisionRequest, ProvisionConfig,
+    ProvisionRequest, RollbackPolicy, SchemaBootstrapConfig,
 };
 use crate::{
     tenant_state, AppState, DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USER, DEFAULT_PG_PORT,
@@ -625,14 +625,6 @@ pub async fn create_database(
         .region
         .as_ref()
         .map(|r| serde_json::to_string(&vec![r]).unwrap_or_else(|_| "[]".into()));
-    let fs9_cfg = state
-        .fs9_client
-        .as_deref()
-        .map(|fs9_client| Fs9BootstrapConfig {
-            fs9_client,
-            token_owner: &auth.customer_id,
-            credential_key: state.config.credential_key.as_deref(),
-        });
     let created_at = provision_database(
         &state.db,
         &ProvisionRequest {
@@ -667,7 +659,6 @@ pub async fn create_database(
             credential_key: state.config.credential_key.as_deref(),
             metadata_notes: Some(&req.name),
             metadata_tags_json: tags_json.as_deref(),
-            fs9: fs9_cfg,
             write_success_audit: true,
         },
     )
@@ -1457,7 +1448,6 @@ pub async fn branch_database(
             credential_key: state.config.credential_key.as_deref(),
             metadata_notes: Some(&notes),
             metadata_tags_json: tags_json.as_deref(),
-            fs9: None,
             write_success_audit: false,
         },
     )

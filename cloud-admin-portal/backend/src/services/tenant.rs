@@ -3,7 +3,6 @@ use sqlx::AnyPool;
 
 use crate::db;
 use crate::error::AppError;
-use crate::services::fs9_client::Fs9Client;
 use crate::services::pd_client::PdClient;
 use crate::services::pg_client::PgClient;
 use crate::{tenant_state, KEYSPACE_PREFIX, TENANT_ID_LEN};
@@ -48,13 +47,6 @@ pub struct ProvisionRequest<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct Fs9BootstrapConfig<'a> {
-    pub fs9_client: &'a Fs9Client,
-    pub token_owner: &'a str,
-    pub credential_key: Option<&'a str>,
-}
-
-#[derive(Clone, Copy)]
 pub struct SchemaBootstrapConfig<'a> {
     pub sql: &'a str,
     pub failed_state_reason: &'a str,
@@ -83,7 +75,6 @@ pub struct ProvisionConfig<'a> {
     pub credential_key: Option<&'a str>,
     pub metadata_notes: Option<&'a str>,
     pub metadata_tags_json: Option<&'a str>,
-    pub fs9: Option<Fs9BootstrapConfig<'a>>,
     pub write_success_audit: bool,
 }
 
@@ -298,68 +289,6 @@ async fn write_audit(
     }
 }
 
-async fn run_fs9_bootstrap(
-    db_pool: &AnyPool,
-    pd: &PdClient,
-    tenant_id: &str,
-    cfg: Fs9BootstrapConfig<'_>,
-) -> Result<(), AppError> {
-    let fs_keyspace = format!("db9_fs_{tenant_id}");
-    if !pd.create_keyspace(&fs_keyspace).await {
-        tracing::warn!(
-            tenant_id = tenant_id,
-            fs_keyspace = fs_keyspace.as_str(),
-            "Failed to create fs keyspace in PD (non-fatal)"
-        );
-    }
-
-    if let Err(error) = cfg.fs9_client.create_namespace(tenant_id).await {
-        tracing::warn!(
-            tenant_id = tenant_id,
-            error = %error,
-            "Failed to create fs9 namespace (non-fatal)"
-        );
-        return Ok(());
-    }
-
-    let fs9_user_id = match cfg.fs9_client.create_user(tenant_id, cfg.token_owner).await {
-        Ok(id) => Some(id),
-        Err(error) => {
-            tracing::warn!(
-                tenant_id = tenant_id,
-                error = %error,
-                "Failed to create fs9 user (non-fatal)"
-            );
-            None
-        }
-    };
-
-    if let Some(user_id) = fs9_user_id {
-        match cfg.fs9_client.generate_token(&user_id, tenant_id).await {
-            Ok(token) => {
-                db::upsert_credential(
-                    db_pool,
-                    tenant_id,
-                    "fs9_token",
-                    cfg.token_owner,
-                    &token,
-                    cfg.credential_key,
-                )
-                .await?;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    tenant_id = tenant_id,
-                    error = %error,
-                    "Failed to generate fs9 token (non-fatal)"
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
 pub async fn provision_tenant(
     db_pool: &AnyPool,
     req: &ProvisionRequest<'_>,
@@ -388,10 +317,6 @@ pub async fn provision_tenant(
         }
         PrepareKeyspaceOutcome::DbInsertFailed(err) => return Err(err.into()),
     };
-
-    if let Some(fs9_cfg) = cfg.fs9 {
-        run_fs9_bootstrap(db_pool, &pd, req.tenant_id, fs9_cfg).await?;
-    }
 
     let pg = PgClient::new(cfg.pg_host, cfg.pg_port);
     match bootstrap_tenant_password(
@@ -712,7 +637,6 @@ mod tests {
                 credential_key: None,
                 metadata_notes: None,
                 metadata_tags_json: None,
-                fs9: None,
                 write_success_audit: true,
             },
         )

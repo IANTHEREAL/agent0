@@ -766,13 +766,13 @@ impl WorkerEngine {
             vec!["public".to_string()]
         };
         let ext_ctx = if entry.task_type == TaskType::Cron {
-            ExtensionContextOpts::cron(&entry.keyspace)
+            ExtensionContextOpts::cron(&entry.keyspace).with_tikv_client(store.transaction_client())
         } else {
             ExtensionContextOpts {
                 is_superuser: true,
-                allow_local_fs: false,
                 tenant_keyspace: entry.keyspace.clone(),
                 execution_kind: crate::extensions::context::ExecutionKind::Interactive,
+                tikv_client: store.transaction_client(),
             }
         };
 

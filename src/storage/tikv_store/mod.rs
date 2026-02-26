@@ -98,6 +98,12 @@ impl TikvStore {
             .expect("TikvStore: no client (test stub used in production code path?)")
     }
 
+    /// Returns a shared reference to the TransactionClient, if available.
+    /// Used by the embedded filesystem to create its own transactions.
+    pub fn transaction_client(&self) -> Option<Arc<TransactionClient>> {
+        self.client.clone()
+    }
+
     pub async fn new_with_keyspace(
         pd_endpoints: Vec<String>,
         keyspace: Option<String>,
