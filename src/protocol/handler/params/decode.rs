@@ -223,9 +223,7 @@ fn decode_binary_numeric(bytes: &[u8], pg_type: &Type, index: usize) -> PgWireRe
     if integer_group_count <= 0 {
         // Number is in (0, 1): all transmitted groups are fractional, but we may need
         // to prepend extra zero groups based on weight.
-        for _ in 0..(-integer_group_count as usize) {
-            fractional_groups.push(0);
-        }
+        fractional_groups.resize((-integer_group_count) as usize, 0);
         fractional_groups.extend(digits.iter().copied());
     } else {
         let int_groups = integer_group_count as usize;
@@ -234,9 +232,7 @@ fn decode_binary_numeric(bytes: &[u8], pg_type: &Type, index: usize) -> PgWireRe
             fractional_groups.extend(digits[int_groups..].iter().copied());
         } else {
             integer_groups.extend(digits.iter().copied());
-            for _ in 0..(int_groups - ndigits) {
-                integer_groups.push(0);
-            }
+            integer_groups.resize(int_groups, 0);
         }
     }
 
