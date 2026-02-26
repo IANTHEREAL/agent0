@@ -120,7 +120,11 @@ fn evaluate_index(
 
     for col in &index.columns {
         if let Some(pred) = eq_predicate_map.get(col.as_str()) {
-            prefix_values.push(coerce_index_predicate_value(schema, col, &pred.value));
+            prefix_values.push(coerce_index_predicate_value(
+                schema,
+                col,
+                pred.value.as_ref().expect("Eq predicate must have a value"),
+            ));
         } else {
             break;
         }
@@ -185,12 +189,24 @@ fn evaluate_index(
 
     let (range_start, start_inclusive) = if let Some(pred) = lower_inclusive {
         (
-            Some(coerce_index_predicate_value(schema, next_col, &pred.value)),
+            Some(coerce_index_predicate_value(
+                schema,
+                next_col,
+                pred.value
+                    .as_ref()
+                    .expect("Ge/Le predicate must have a value"),
+            )),
             true,
         )
     } else if let Some(pred) = lower_exclusive {
         (
-            Some(coerce_index_predicate_value(schema, next_col, &pred.value)),
+            Some(coerce_index_predicate_value(
+                schema,
+                next_col,
+                pred.value
+                    .as_ref()
+                    .expect("Gt/Lt predicate must have a value"),
+            )),
             false,
         )
     } else {
@@ -199,12 +215,20 @@ fn evaluate_index(
 
     let (range_end, end_inclusive) = if let Some(pred) = upper_inclusive {
         (
-            Some(coerce_index_predicate_value(schema, next_col, &pred.value)),
+            Some(coerce_index_predicate_value(
+                schema,
+                next_col,
+                pred.value.as_ref().expect("Le predicate must have a value"),
+            )),
             true,
         )
     } else if let Some(pred) = upper_exclusive {
         (
-            Some(coerce_index_predicate_value(schema, next_col, &pred.value)),
+            Some(coerce_index_predicate_value(
+                schema,
+                next_col,
+                pred.value.as_ref().expect("Lt predicate must have a value"),
+            )),
             false,
         )
     } else {

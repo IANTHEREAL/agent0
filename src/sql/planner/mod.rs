@@ -59,7 +59,7 @@ pub struct AccessPath {
 pub struct PredicateInfo {
     pub column: String,
     pub op: PredicateOp,
-    pub value: Value,
+    pub value: Option<Value>,
     pub in_values: Vec<Value>,
 }
 

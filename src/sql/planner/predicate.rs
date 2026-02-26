@@ -122,7 +122,7 @@ pub(super) fn collect_typed_predicates(
                     predicates.push(PredicateInfo {
                         column: column_name.to_lowercase(),
                         op,
-                        value: Value::Null,
+                        value: Some(Value::Null),
                         in_values: vec![],
                     });
                 }
@@ -148,7 +148,7 @@ pub(super) fn collect_typed_predicates(
                     predicates.push(PredicateInfo {
                         column: column_name.to_lowercase(),
                         op: PredicateOp::In,
-                        value: values[0].clone(),
+                        value: None,
                         in_values: values,
                     });
                 }
@@ -169,7 +169,7 @@ pub(super) fn extract_typed_simple_predicate(
             return Some(PredicateInfo {
                 column: column_name.to_lowercase(),
                 op,
-                value: val.clone(),
+                value: Some(val.clone()),
                 in_values: vec![],
             });
         }
