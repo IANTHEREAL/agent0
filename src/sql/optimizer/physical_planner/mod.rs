@@ -97,6 +97,48 @@ impl PhysicalPlanner {
         }
     }
 
+    /// Compute raw equi-join selectivity from pre-resolved column-name pairs.
+    ///
+    /// `key_col_pairs` is a slice of `(left_col_name, right_col_name)` for each
+    /// equi-join key, resolved from the schema before calling.  When either side
+    /// lacks statistics the function falls back to `DEFAULT_JOIN_SEL`.  The
+    /// `has_residual` flag indicates that a non-equi residual predicate is also
+    /// present; when `true` an additional `DEFAULT_JOIN_SEL` factor is applied.
+    ///
+    /// Returns a raw `f64` — callers apply join-type row lower-bounds or
+    /// selectivity clamping as needed.
+    fn compute_equi_join_sel(
+        left_stats: Option<&TableStatistics>,
+        right_stats: Option<&TableStatistics>,
+        key_col_pairs: &[(Option<&str>, Option<&str>)],
+        has_residual: bool,
+    ) -> f64 {
+        let equi_sel = match (left_stats, right_stats) {
+            (Some(ls), Some(rs)) => {
+                let mut sel = 1.0_f64;
+                for &(left_col_name, right_col_name) in key_col_pairs {
+                    let left_ndv = left_col_name
+                        .and_then(|n| selectivity::get_column_stats(ls, n))
+                        .map(|c| selectivity::n_distinct_raw(c, ls.row_count));
+                    let right_ndv = right_col_name
+                        .and_then(|n| selectivity::get_column_stats(rs, n))
+                        .map(|c| selectivity::n_distinct_raw(c, rs.row_count));
+                    sel *= match (left_ndv, right_ndv) {
+                        (Some(l), Some(r)) => 1.0 / l.max(r).max(1.0),
+                        _ => DEFAULT_JOIN_SEL,
+                    };
+                }
+                sel
+            }
+            _ => DEFAULT_JOIN_SEL,
+        };
+        if has_residual {
+            equi_sel * DEFAULT_JOIN_SEL
+        } else {
+            equi_sel
+        }
+    }
+
     /// Estimate join output rows.
     ///
     /// Strategy:
@@ -121,41 +163,25 @@ impl PhysicalPlanner {
         {
             let left_stats = Self::resolve_stats(left_logical, ctx);
             let right_stats = Self::resolve_stats(right_logical, ctx);
-
-            let equi_sel = match (left_stats, right_stats) {
-                (Some(ls), Some(rs)) => {
-                    let mut sel = 1.0;
-                    for (&lk, &rk) in left_keys.iter().zip(right_keys.iter()) {
-                        let left_col_name =
-                            left_logical.schema.columns.get(lk).map(|(n, _)| n.as_str());
-                        let right_col_name = right_logical
-                            .schema
-                            .columns
-                            .get(rk)
-                            .map(|(n, _)| n.as_str());
-
-                        let left_ndv = left_col_name
-                            .and_then(|n| selectivity::get_column_stats(ls, n))
-                            .map(|c| selectivity::n_distinct_raw(c, ls.row_count));
-                        let right_ndv = right_col_name
-                            .and_then(|n| selectivity::get_column_stats(rs, n))
-                            .map(|c| selectivity::n_distinct_raw(c, rs.row_count));
-
-                        sel *= match (left_ndv, right_ndv) {
-                            (Some(l), Some(r)) => 1.0 / l.max(r).max(1.0),
-                            _ => DEFAULT_JOIN_SEL,
-                        };
-                    }
-                    sel
-                }
-                _ => DEFAULT_JOIN_SEL,
-            };
-
-            if residual_filter.is_some() {
-                equi_sel * DEFAULT_JOIN_SEL
-            } else {
-                equi_sel
-            }
+            let key_col_pairs: Vec<(Option<&str>, Option<&str>)> = left_keys
+                .iter()
+                .zip(right_keys.iter())
+                .map(|(&lk, &rk)| {
+                    let lname = left_logical.schema.columns.get(lk).map(|(n, _)| n.as_str());
+                    let rname = right_logical
+                        .schema
+                        .columns
+                        .get(rk)
+                        .map(|(n, _)| n.as_str());
+                    (lname, rname)
+                })
+                .collect();
+            Self::compute_equi_join_sel(
+                left_stats,
+                right_stats,
+                &key_col_pairs,
+                residual_filter.is_some(),
+            )
         } else {
             1.0 // Non-equi or cross — Cartesian
         };
@@ -185,31 +211,25 @@ impl PhysicalPlanner {
         {
             let left_stats = Self::resolve_stats(left, ctx);
             let right_stats = Self::resolve_stats(right, ctx);
-            let equi_sel = match (left_stats, right_stats) {
-                (Some(ls), Some(rs)) => {
-                    let mut sel = 1.0;
-                    for (&lk, &rk) in left_keys.iter().zip(right_keys.iter()) {
-                        let left_col_name = left.schema.columns.get(lk).map(|(n, _)| n.as_str());
-                        let right_col_name = right.schema.columns.get(rk).map(|(n, _)| n.as_str());
-                        let left_ndv = left_col_name
-                            .and_then(|n| selectivity::get_column_stats(ls, n))
-                            .map(|c| selectivity::n_distinct_raw(c, ls.row_count));
-                        let right_ndv = right_col_name
-                            .and_then(|n| selectivity::get_column_stats(rs, n))
-                            .map(|c| selectivity::n_distinct_raw(c, rs.row_count));
-                        sel *= match (left_ndv, right_ndv) {
-                            (Some(l), Some(r)) => 1.0 / l.max(r).max(1.0),
-                            _ => DEFAULT_JOIN_SEL,
-                        };
-                    }
-                    sel
-                }
-                _ => DEFAULT_JOIN_SEL,
-            };
+            let key_col_pairs: Vec<(Option<&str>, Option<&str>)> = left_keys
+                .iter()
+                .zip(right_keys.iter())
+                .map(|(&lk, &rk)| {
+                    let lname = left.schema.columns.get(lk).map(|(n, _)| n.as_str());
+                    let rname = right.schema.columns.get(rk).map(|(n, _)| n.as_str());
+                    (lname, rname)
+                })
+                .collect();
+            let raw_sel = Self::compute_equi_join_sel(
+                left_stats,
+                right_stats,
+                &key_col_pairs,
+                residual_filter.is_some(),
+            );
             if residual_filter.is_some() {
-                (equi_sel * DEFAULT_JOIN_SEL).clamp(0.0, 1.0)
+                raw_sel.clamp(0.0, 1.0)
             } else {
-                equi_sel
+                raw_sel
             }
         } else {
             DEFAULT_JOIN_SEL
