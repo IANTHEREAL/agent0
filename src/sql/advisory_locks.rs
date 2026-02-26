@@ -27,6 +27,7 @@ pub(crate) enum AdvisoryLockScope {
 pub(crate) enum AcquireError {
     Timeout,
     LockLimitExceeded { limit: usize },
+    CounterOverflow,
 }
 
 impl std::fmt::Display for AcquireError {
@@ -38,6 +39,9 @@ impl std::fmt::Display for AcquireError {
                 "too many advisory locks held by this session (limit: {})",
                 limit
             ),
+            Self::CounterOverflow => {
+                write!(f, "advisory lock reentrant acquisition count overflow")
+            }
         }
     }
 }
@@ -52,7 +56,7 @@ struct HolderInfo {
 
 impl HolderInfo {
     fn total(&self) -> u32 {
-        self.session_count + self.xact_count
+        self.session_count.saturating_add(self.xact_count)
     }
 
     fn is_empty(&self) -> bool {
@@ -122,16 +126,32 @@ impl LockState {
         }
     }
 
-    fn grant(&mut self, conn_id: i32, mode: AdvisoryLockMode, scope: AdvisoryLockScope) {
+    fn grant(
+        &mut self,
+        conn_id: i32,
+        mode: AdvisoryLockMode,
+        scope: AdvisoryLockScope,
+    ) -> Result<(), AcquireError> {
         let holders = match mode {
             AdvisoryLockMode::Exclusive => &mut self.exclusive_holders,
             AdvisoryLockMode::Shared => &mut self.shared_holders,
         };
         let info = holders.entry(conn_id).or_default();
         match scope {
-            AdvisoryLockScope::Session => info.session_count += 1,
-            AdvisoryLockScope::Transaction => info.xact_count += 1,
+            AdvisoryLockScope::Session => {
+                info.session_count = info
+                    .session_count
+                    .checked_add(1)
+                    .ok_or(AcquireError::CounterOverflow)?;
+            }
+            AdvisoryLockScope::Transaction => {
+                info.xact_count = info
+                    .xact_count
+                    .checked_add(1)
+                    .ok_or(AcquireError::CounterOverflow)?;
+            }
         }
+        Ok(())
     }
 
     fn release_one_session(&mut self, conn_id: i32, mode: AdvisoryLockMode) -> bool {
@@ -285,6 +305,28 @@ impl AdvisoryLockManager {
         Self::with_max_locks_per_connection(Some(DEFAULT_MAX_ADVISORY_LOCKS_PER_CONNECTION))
     }
 
+    /// Test helper: force a session counter to a specific value for overflow testing.
+    #[cfg(test)]
+    pub fn force_session_count_for_test(
+        &self,
+        keyspace: &Arc<str>,
+        key: i64,
+        conn_id: i32,
+        mode: AdvisoryLockMode,
+        count: u32,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        let lk = (keyspace.clone(), key);
+        let lock_state = state.locks.entry(lk.clone()).or_insert_with(LockState::new);
+        let holders = match mode {
+            AdvisoryLockMode::Exclusive => &mut lock_state.exclusive_holders,
+            AdvisoryLockMode::Shared => &mut lock_state.shared_holders,
+        };
+        let info = holders.entry(conn_id).or_default();
+        info.session_count = count;
+        state.connection_keys.entry(conn_id).or_default().insert(lk);
+    }
+
     pub fn with_max_locks_per_connection(max_locks_per_connection: Option<usize>) -> Self {
         Self {
             state: Mutex::new(ManagerState::default()),
@@ -361,7 +403,7 @@ impl AdvisoryLockManager {
         conn_id: i32,
         mode: AdvisoryLockMode,
         scope: AdvisoryLockScope,
-    ) -> bool {
+    ) -> Result<bool, AcquireError> {
         let held_before = state
             .connection_keys
             .get(&conn_id)
@@ -376,15 +418,15 @@ impl AdvisoryLockManager {
                 lk.1
             );
             if !lock_state.can_grant(conn_id, mode) {
-                return false;
+                return Ok(false);
             }
-            lock_state.grant(conn_id, mode, scope);
+            lock_state.grant(conn_id, mode, scope)?;
             !held_before
         };
         if increment_count {
             Self::add_connection_key(state, conn_id, lk);
         }
-        true
+        Ok(true)
     }
 
     fn notifier_for_key(state: &mut ManagerState, lk: &LockKey) -> Arc<Notify> {
@@ -545,7 +587,7 @@ impl AdvisoryLockManager {
             return Err(AcquireError::LockLimitExceeded { limit });
         }
         let lk = (keyspace.clone(), key);
-        Ok(Self::try_grant_lock(&mut state, &lk, conn_id, mode, scope))
+        Self::try_grant_lock(&mut state, &lk, conn_id, mode, scope)
     }
 
     pub async fn acquire(
@@ -567,7 +609,7 @@ impl AdvisoryLockManager {
                     {
                         return Err(AcquireError::LockLimitExceeded { limit });
                     }
-                    if Self::try_grant_lock(&mut state, &lk, conn_id, mode, scope) {
+                    if Self::try_grant_lock(&mut state, &lk, conn_id, mode, scope)? {
                         return Ok(());
                     }
                     Self::notifier_for_key(&mut state, &lk)
@@ -582,7 +624,7 @@ impl AdvisoryLockManager {
                     {
                         return Err(AcquireError::LockLimitExceeded { limit });
                     }
-                    if Self::try_grant_lock(&mut state, &lk, conn_id, mode, scope) {
+                    if Self::try_grant_lock(&mut state, &lk, conn_id, mode, scope)? {
                         return Ok(());
                     }
                 }
@@ -1683,6 +1725,167 @@ mod tests {
         let state = mgr.state.lock().unwrap();
         assert!(!state.locks.contains_key(&lk));
         assert!(!state.key_notifiers.contains_key(&lk));
+    }
+
+    /// Helper: force a counter to a specific value for overflow testing.
+    fn force_session_count(
+        mgr: &AdvisoryLockManager,
+        keyspace: &Arc<str>,
+        key: i64,
+        conn_id: i32,
+        mode: AdvisoryLockMode,
+        count: u32,
+    ) {
+        let mut state = mgr.state.lock().unwrap();
+        let lk = (keyspace.clone(), key);
+        let lock_state = state.locks.entry(lk.clone()).or_insert_with(LockState::new);
+        let holders = match mode {
+            AdvisoryLockMode::Exclusive => &mut lock_state.exclusive_holders,
+            AdvisoryLockMode::Shared => &mut lock_state.shared_holders,
+        };
+        let info = holders.entry(conn_id).or_default();
+        info.session_count = count;
+        state.connection_keys.entry(conn_id).or_default().insert(lk);
+    }
+
+    fn force_xact_count(
+        mgr: &AdvisoryLockManager,
+        keyspace: &Arc<str>,
+        key: i64,
+        conn_id: i32,
+        mode: AdvisoryLockMode,
+        count: u32,
+    ) {
+        let mut state = mgr.state.lock().unwrap();
+        let lk = (keyspace.clone(), key);
+        let lock_state = state.locks.entry(lk.clone()).or_insert_with(LockState::new);
+        let holders = match mode {
+            AdvisoryLockMode::Exclusive => &mut lock_state.exclusive_holders,
+            AdvisoryLockMode::Shared => &mut lock_state.shared_holders,
+        };
+        let info = holders.entry(conn_id).or_default();
+        info.xact_count = count;
+        state.connection_keys.entry(conn_id).or_default().insert(lk);
+    }
+
+    #[test]
+    fn test_session_counter_overflow_returns_error() {
+        let mgr = AdvisoryLockManager::new();
+        let k = ks("t_overflow_session");
+
+        // Set session_count to MAX - 1 so the next acquire brings it to MAX.
+        force_session_count(&mgr, &k, 1, 100, AdvisoryLockMode::Exclusive, u32::MAX - 1);
+
+        // One more acquire should succeed (counter goes to MAX).
+        let result = mgr.try_acquire_checked(
+            &k,
+            1,
+            100,
+            AdvisoryLockMode::Exclusive,
+            AdvisoryLockScope::Session,
+        );
+        assert_eq!(result, Ok(true));
+
+        // Next acquire should fail with CounterOverflow.
+        let result = mgr.try_acquire_checked(
+            &k,
+            1,
+            100,
+            AdvisoryLockMode::Exclusive,
+            AdvisoryLockScope::Session,
+        );
+        assert_eq!(result, Err(AcquireError::CounterOverflow));
+    }
+
+    #[test]
+    fn test_xact_counter_overflow_returns_error() {
+        let mgr = AdvisoryLockManager::new();
+        let k = ks("t_overflow_xact");
+
+        // Set xact_count to MAX - 1.
+        force_xact_count(&mgr, &k, 1, 100, AdvisoryLockMode::Exclusive, u32::MAX - 1);
+
+        // One more acquire should succeed (counter goes to MAX).
+        let result = mgr.try_acquire_checked(
+            &k,
+            1,
+            100,
+            AdvisoryLockMode::Exclusive,
+            AdvisoryLockScope::Transaction,
+        );
+        assert_eq!(result, Ok(true));
+
+        // Next acquire should fail with CounterOverflow.
+        let result = mgr.try_acquire_checked(
+            &k,
+            1,
+            100,
+            AdvisoryLockMode::Exclusive,
+            AdvisoryLockScope::Transaction,
+        );
+        assert_eq!(result, Err(AcquireError::CounterOverflow));
+    }
+
+    #[test]
+    fn test_session_counter_overflow_shared_mode() {
+        let mgr = AdvisoryLockManager::new();
+        let k = ks("t_overflow_session_shared");
+
+        force_session_count(&mgr, &k, 1, 100, AdvisoryLockMode::Shared, u32::MAX - 1);
+
+        let result = mgr.try_acquire_checked(
+            &k,
+            1,
+            100,
+            AdvisoryLockMode::Shared,
+            AdvisoryLockScope::Session,
+        );
+        assert_eq!(result, Ok(true));
+
+        let result = mgr.try_acquire_checked(
+            &k,
+            1,
+            100,
+            AdvisoryLockMode::Shared,
+            AdvisoryLockScope::Session,
+        );
+        assert_eq!(result, Err(AcquireError::CounterOverflow));
+    }
+
+    #[test]
+    fn test_xact_counter_overflow_shared_mode() {
+        let mgr = AdvisoryLockManager::new();
+        let k = ks("t_overflow_xact_shared");
+
+        force_xact_count(&mgr, &k, 1, 100, AdvisoryLockMode::Shared, u32::MAX - 1);
+
+        let result = mgr.try_acquire_checked(
+            &k,
+            1,
+            100,
+            AdvisoryLockMode::Shared,
+            AdvisoryLockScope::Transaction,
+        );
+        assert_eq!(result, Ok(true));
+
+        let result = mgr.try_acquire_checked(
+            &k,
+            1,
+            100,
+            AdvisoryLockMode::Shared,
+            AdvisoryLockScope::Transaction,
+        );
+        assert_eq!(result, Err(AcquireError::CounterOverflow));
+    }
+
+    #[test]
+    fn test_total_does_not_overflow() {
+        let info = HolderInfo {
+            session_count: u32::MAX,
+            xact_count: 1,
+        };
+        // saturating_add should clamp to MAX instead of wrapping.
+        assert_eq!(info.total(), u32::MAX);
     }
 
     #[tokio::test]

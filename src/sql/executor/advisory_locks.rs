@@ -66,6 +66,7 @@ fn map_acquire_error(err: AcquireError) -> anyhow::Error {
         AcquireError::LockLimitExceeded { limit } => {
             SqlError::AdvisoryLockLimitExceeded { limit }.into()
         }
+        AcquireError::CounterOverflow => SqlError::AdvisoryLockCounterOverflow.into(),
     }
 }
 
@@ -518,5 +519,40 @@ mod tests {
         assert!(err
             .to_string()
             .contains("advisory lock classid must be integer"));
+    }
+
+    #[tokio::test]
+    async fn test_counter_overflow_maps_to_sqlstate_54000() {
+        let manager = AdvisoryLockManager::new();
+        let keyspace: Arc<str> = Arc::from("tenant_overflow_e2e");
+
+        // Force session_count to MAX so next acquire overflows
+        manager.force_session_count_for_test(
+            &keyspace,
+            1,
+            100,
+            crate::sql::advisory_locks::AdvisoryLockMode::Exclusive,
+            u32::MAX,
+        );
+
+        let result = execute_advisory_lock_function_with_manager(
+            &manager,
+            &keyspace,
+            100,
+            "pg_advisory_lock",
+            &[Value::Int64(1)],
+            Some(Duration::from_millis(100)),
+            None,
+            None,
+        )
+        .await
+        .expect("function should be recognized");
+
+        let err = result.expect_err("should fail with counter overflow");
+        let sql = err
+            .downcast_ref::<SqlError>()
+            .expect("overflow should map to SqlError");
+        assert!(matches!(sql, SqlError::AdvisoryLockCounterOverflow));
+        assert_eq!(sql.sqlstate(), "54000");
     }
 }

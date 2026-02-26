@@ -102,6 +102,9 @@ pub enum SqlError {
     #[error("too many advisory locks held by this session (limit: {limit})")]
     AdvisoryLockLimitExceeded { limit: usize },
 
+    #[error("advisory lock reentrant acquisition count overflow")]
+    AdvisoryLockCounterOverflow,
+
     #[error("current transaction is aborted, commands ignored until end of transaction block")]
     InFailedTransaction,
 
@@ -233,6 +236,7 @@ impl SqlError {
             Self::AdvisoryLockTimeout => "55P03",
             Self::LockNotAvailable { .. } => "55P03",
             Self::AdvisoryLockLimitExceeded { .. } => "54000",
+            Self::AdvisoryLockCounterOverflow => "54000",
             Self::InFailedTransaction => "25P02",
             Self::PermissionDenied { .. } => "42501",
             Self::DuplicateRelation(_) => "42P07",
