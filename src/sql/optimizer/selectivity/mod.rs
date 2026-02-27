@@ -214,7 +214,11 @@ fn range_selectivity_for_op(col_stats: &ColumnStatistics, value: &Value, op: &Bi
             range_selectivity(col_stats, value, true)
         }
         BinaryOp::Gt => range_selectivity(col_stats, value, false),
-        BinaryOp::GtEq => range_selectivity(col_stats, value, false),
+        BinaryOp::GtEq => {
+            // Approximate: sel(col >= x) ≈ sel(col > x); the equality term is small
+            // relative to the range fraction in equi-depth histograms.
+            range_selectivity(col_stats, value, false)
+        }
         _ => DEFAULT_INEQ_SEL,
     }
 }
