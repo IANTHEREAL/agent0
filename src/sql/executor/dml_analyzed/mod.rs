@@ -478,3 +478,129 @@ pub(super) fn append_ctid_to_rows(rows: &mut [Row]) {
         row.values.push(Value::Int64(i as i64));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::DataType;
+    use crate::sql::analyzer::types::TypedExprKind;
+
+    fn col_ref(idx: usize, name: &str, dt: DataType) -> TypedExpr {
+        TypedExpr::new(
+            TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: idx,
+                column_name: name.to_string(),
+            },
+            dt,
+        )
+    }
+
+    #[test]
+    fn combine_rows_concatenates_values() {
+        let left = Row::new(vec![Value::Int32(1), Value::Text("a".to_string())]);
+        let right = Row::new(vec![Value::Boolean(true)]);
+        let combined = combine_rows(&left, &right);
+        assert_eq!(
+            combined.values,
+            vec![
+                Value::Int32(1),
+                Value::Text("a".to_string()),
+                Value::Boolean(true)
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_product_rows_builds_cartesian_product() {
+        let a1 = Row::new(vec![Value::Text("a1".to_string())]);
+        let a2 = Row::new(vec![Value::Text("a2".to_string())]);
+        let b1 = Row::new(vec![Value::Text("b1".to_string())]);
+        let b2 = Row::new(vec![Value::Text("b2".to_string())]);
+        let rows = cross_product_rows(&[vec![a1, a2], vec![b1, b2]]);
+        let got: Vec<Vec<Value>> = rows.into_iter().map(|r| r.values).collect();
+        assert_eq!(
+            got,
+            vec![
+                vec![Value::Text("a1".to_string()), Value::Text("b1".to_string())],
+                vec![Value::Text("a1".to_string()), Value::Text("b2".to_string())],
+                vec![Value::Text("a2".to_string()), Value::Text("b1".to_string())],
+                vec![Value::Text("a2".to_string()), Value::Text("b2".to_string())],
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_product_rows_handles_empty_input() {
+        assert!(cross_product_rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn typed_value_to_bool_handles_bool_and_null() {
+        assert_eq!(typed_value_to_bool(Value::Boolean(true)).unwrap(), true);
+        assert_eq!(typed_value_to_bool(Value::Boolean(false)).unwrap(), false);
+        assert_eq!(typed_value_to_bool(Value::Null).unwrap(), false);
+    }
+
+    #[test]
+    fn typed_value_to_bool_rejects_non_boolean() {
+        let err = typed_value_to_bool(Value::Int32(1)).unwrap_err();
+        assert!(err.to_string().contains("WHERE must be boolean"));
+    }
+
+    #[test]
+    fn returning_schema_helpers_use_analyzed_projection_metadata() {
+        let projections = vec![
+            AnalyzedProjection {
+                output_name: "id".to_string(),
+                expr: col_ref(0, "id", DataType::Int32),
+            },
+            AnalyzedProjection {
+                output_name: "name".to_string(),
+                expr: col_ref(1, "name", DataType::Text),
+            },
+        ];
+        let schema = TableSchema::new("t".to_string(), 1, vec![], vec![]);
+
+        let cols = build_returning_columns_from_analyzed(&Some(projections.clone()), &schema);
+        let tys = build_returning_types_from_analyzed(&Some(projections), &schema);
+        assert_eq!(cols, vec!["id".to_string(), "name".to_string()]);
+        assert_eq!(tys, vec![DataType::Int32, DataType::Text]);
+    }
+
+    #[test]
+    fn eval_returning_typed_evaluates_projection_expressions() {
+        let returning = vec![
+            AnalyzedProjection {
+                output_name: "id".to_string(),
+                expr: col_ref(0, "id", DataType::Int32),
+            },
+            AnalyzedProjection {
+                output_name: "const_name".to_string(),
+                expr: TypedExpr::new(
+                    TypedExprKind::Constant(Value::Text("alice".to_string())),
+                    DataType::Text,
+                ),
+            },
+        ];
+        let row = Row::new(vec![Value::Int32(7), Value::Text("ignored".to_string())]);
+        let out = eval_returning_typed(&returning, &row, &QueryContext::from_task_locals())
+            .expect("returning eval should succeed");
+        assert_eq!(
+            out.values,
+            vec![Value::Int32(7), Value::Text("alice".to_string())]
+        );
+    }
+
+    #[test]
+    fn is_default_typed_expr_detects_default_variant() {
+        assert!(is_default_typed_expr(&TypedExpr::new(
+            TypedExprKind::Default,
+            DataType::Text
+        )));
+        assert!(!is_default_typed_expr(&TypedExpr::new(
+            TypedExprKind::Constant(Value::Null),
+            DataType::Text
+        )));
+    }
+}

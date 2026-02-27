@@ -203,3 +203,138 @@ impl PhysicalOperator for HashSemiJoinOperator {
         Some(format!("anti={}", self.anti,))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{DataType, Value};
+    use async_trait::async_trait;
+
+    #[derive(Debug)]
+    struct TestOp {
+        schema: TableSchema,
+    }
+
+    #[async_trait]
+    impl PhysicalOperator for TestOp {
+        fn schema(&self) -> &TableSchema {
+            &self.schema
+        }
+        async fn open(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
+            Ok(())
+        }
+        async fn next(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
+            let _ = Value::Null;
+            Ok(None)
+        }
+        async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "TestOp"
+        }
+    }
+
+    fn make_schema(name: &str, cols: &[(&str, DataType, bool)]) -> TableSchema {
+        TableSchema {
+            name: name.to_string(),
+            table_id: 1,
+            columns: cols
+                .iter()
+                .map(|(n, dt, nullable)| ColumnDef {
+                    name: (*n).to_string(),
+                    data_type: dt.clone(),
+                    nullable: *nullable,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                })
+                .collect(),
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+            from_alias: None,
+        }
+    }
+
+    #[test]
+    fn constructor_uses_left_schema_as_output_schema() {
+        let left_schema = make_schema(
+            "left",
+            &[("id", DataType::Int64, false), ("name", DataType::Text, true)],
+        );
+        let right_schema = make_schema("right", &[("id", DataType::Int64, false)]);
+
+        let op = HashSemiJoinOperator::new(
+            Box::new(TestOp { schema: left_schema }),
+            Box::new(TestOp {
+                schema: right_schema,
+            }),
+            false,
+            vec![0],
+            vec![0],
+        );
+
+        assert_eq!(op.schema().name, "hash_semi_join");
+        assert_eq!(op.schema().columns.len(), 2);
+        assert_eq!(op.schema().columns[0].name, "id");
+        assert_eq!(op.schema().columns[1].name, "name");
+    }
+
+    #[test]
+    fn name_and_explain_info_follow_anti_flag() {
+        let left_schema = make_schema("left", &[("id", DataType::Int64, false)]);
+        let right_schema = make_schema("right", &[("id", DataType::Int64, false)]);
+
+        let semi = HashSemiJoinOperator::new(
+            Box::new(TestOp {
+                schema: left_schema.clone(),
+            }),
+            Box::new(TestOp {
+                schema: right_schema.clone(),
+            }),
+            false,
+            vec![0],
+            vec![0],
+        );
+        assert_eq!(semi.name(), "HashSemiJoin");
+        assert_eq!(semi.explain_info().as_deref(), Some("anti=false"));
+
+        let anti = HashSemiJoinOperator::new(
+            Box::new(TestOp { schema: left_schema }),
+            Box::new(TestOp {
+                schema: right_schema,
+            }),
+            true,
+            vec![0],
+            vec![0],
+        );
+        assert_eq!(anti.name(), "HashAntiJoin");
+        assert_eq!(anti.explain_info().as_deref(), Some("anti=true"));
+    }
+
+    #[test]
+    fn children_and_children_mut_expose_both_inputs() {
+        let left_schema = make_schema("left", &[("id", DataType::Int64, false)]);
+        let right_schema = make_schema("right", &[("id", DataType::Int64, false)]);
+
+        let mut op = HashSemiJoinOperator::new(
+            Box::new(TestOp { schema: left_schema }),
+            Box::new(TestOp {
+                schema: right_schema,
+            }),
+            false,
+            vec![0],
+            vec![0],
+        );
+
+        assert_eq!(op.children().len(), 2);
+        assert_eq!(op.children_mut().len(), 2);
+    }
+}

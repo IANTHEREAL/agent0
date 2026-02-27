@@ -566,3 +566,77 @@ pub async fn execute_revoke(
 
     Ok(ExecuteResult::Revoke)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    fn parse_grant(sql: &str) -> (Privileges, GrantObjects) {
+        let dialect = PostgreSqlDialect {};
+        let ast = Parser::parse_sql(&dialect, sql).unwrap();
+        match ast.into_iter().next().unwrap() {
+            sqlparser::ast::Statement::Grant {
+                privileges, objects, ..
+            } => (privileges, objects),
+            other => panic!("expected GRANT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_privileges_all_maps_to_privilege_all() {
+        let (privileges, _) = parse_grant("GRANT ALL PRIVILEGES ON TABLE t TO u");
+        let out = parse_privileges(&privileges);
+        assert_eq!(out, vec![Privilege::All]);
+    }
+
+    #[test]
+    fn parse_privileges_actions_maps_supported_actions() {
+        let (privileges, _) = parse_grant(
+            "GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, CONNECT, CREATE, EXECUTE, USAGE ON TABLE t TO u",
+        );
+        let out = parse_privileges(&privileges);
+        assert!(out.contains(&Privilege::Select));
+        assert!(out.contains(&Privilege::Insert));
+        assert!(out.contains(&Privilege::Update));
+        assert!(out.contains(&Privilege::Delete));
+        assert!(out.contains(&Privilege::Truncate));
+        assert!(out.contains(&Privilege::References));
+        assert!(out.contains(&Privilege::Trigger));
+        assert!(out.contains(&Privilege::Connect));
+        assert!(out.contains(&Privilege::CreateTable));
+        assert!(out.contains(&Privilege::Execute));
+        assert!(out.contains(&Privilege::Usage));
+    }
+
+    #[test]
+    fn expand_authorization_privileges_expands_all() {
+        let out = expand_privileges_for_authorization(&[Privilege::All, Privilege::Select]);
+        assert!(out.len() > 2);
+        assert!(out.contains(&Privilege::Select));
+        assert!(out.contains(&Privilege::Insert));
+        assert!(out.contains(&Privilege::Delete));
+    }
+
+    #[test]
+    fn parse_grant_objects_keeps_tables_schemas_and_all_tables_in_schema() {
+        let (_, tables_obj) = parse_grant("GRANT SELECT ON TABLE public.t1, t2 TO u");
+        match tables_obj {
+            GrantObjects::Tables(items) => assert_eq!(items.len(), 2),
+            _ => panic!("expected table objects"),
+        }
+
+        let (_, schemas_obj) = parse_grant("GRANT USAGE ON SCHEMA public, app TO u");
+        match schemas_obj {
+            GrantObjects::Schemas(items) => assert_eq!(items.len(), 2),
+            _ => panic!("expected schema objects"),
+        }
+
+        let (_, all_obj) = parse_grant("GRANT SELECT ON ALL TABLES IN SCHEMA public TO u");
+        match all_obj {
+            GrantObjects::AllTablesInSchema { schemas } => assert_eq!(schemas.len(), 1),
+            _ => panic!("expected all-tables-in-schema objects"),
+        }
+    }
+}

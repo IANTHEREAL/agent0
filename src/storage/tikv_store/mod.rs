@@ -573,6 +573,44 @@ mod sequence_tests {
     use super::*;
 
     #[test]
+    fn test_standalone_nextval_rejects_zero_increment() {
+        let mut state = SequenceState {
+            last_value: 1,
+            is_called: true,
+        };
+
+        let err = nextval_standalone("public.s", 0, 1, 10, false, &mut state)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid INCREMENT 0"));
+    }
+
+    #[test]
+    fn test_standalone_nextval_supports_negative_increment_and_wrap() {
+        let mut state = SequenceState {
+            last_value: 1,
+            is_called: true,
+        };
+
+        let wrapped = nextval_standalone("public.s", -1, 1, 5, true, &mut state).unwrap();
+        assert_eq!(wrapped, 5);
+        assert_eq!(state.last_value, 5);
+    }
+
+    #[test]
+    fn test_standalone_setval_rejects_out_of_bounds() {
+        let mut state = SequenceState {
+            last_value: 1,
+            is_called: true,
+        };
+
+        let err = setval_standalone("public.s", 1, 5, &mut state, 0, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("out of bounds"));
+    }
+
+    #[test]
     fn test_standalone_nextval_is_called_semantics() {
         let mut state = SequenceState {
             last_value: 1,
@@ -634,6 +672,19 @@ mod sequence_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("reached maximum value"));
+    }
+
+    #[test]
+    fn test_standalone_non_cycle_errors_on_min_bound_for_desc_sequence() {
+        let mut state = SequenceState {
+            last_value: 1,
+            is_called: true,
+        };
+
+        let err = nextval_standalone("public.s", -1, 1, 10, false, &mut state)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reached minimum value"));
     }
 }
 
@@ -817,5 +868,33 @@ mod trigger_rename_tests {
         .to_string();
         assert!(err.contains("would overwrite trigger"));
         assert!(err.contains("public.t"));
+    }
+}
+
+#[cfg(test)]
+mod util_tests {
+    use super::*;
+
+    #[test]
+    fn scan_limit_to_u32_handles_none_zero_and_overflow() {
+        assert_eq!(scan_limit_to_u32(None), u32::MAX);
+        assert_eq!(scan_limit_to_u32(Some(0)), 0);
+        assert_eq!(scan_limit_to_u32(Some(42)), 42);
+        assert_eq!(scan_limit_to_u32(Some((u32::MAX as usize) + 10)), u32::MAX);
+    }
+
+    #[test]
+    fn column_comment_table_prefix_v2_shape_is_stable() {
+        let db_id = 42;
+        let table = "public.orders";
+        let prefix = column_comment_table_prefix_v2(db_id, table);
+
+        let mut expected = encode_comment_prefix_v2(db_id);
+        expected.push(b'c');
+        expected.push(0);
+        expected.extend_from_slice(table.as_bytes());
+        expected.push(0);
+
+        assert_eq!(prefix, expected);
     }
 }

@@ -133,3 +133,83 @@ async fn execute_bg_result(keyspace: &str, db_id: u64, args: &[Value]) -> Result
         Ok(Value::Text("not found".to_string()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_bg_sql_function_is_case_insensitive() {
+        assert!(is_bg_sql_function("pg_background_launch"));
+        assert!(is_bg_sql_function("PG_BACKGROUND_RESULT"));
+        assert!(!is_bg_sql_function("pg_sleep"));
+    }
+
+    #[test]
+    fn try_execute_bg_sql_function_routes_known_names() {
+        let launch = try_execute_bg_sql_function("pg_background_launch", &[])
+            .expect("known function should be handled")
+            .unwrap_err()
+            .to_string();
+        assert!(launch.contains("must be evaluated during execution"));
+
+        let result = try_execute_bg_sql_function("PG_BACKGROUND_RESULT", &[])
+            .expect("known function should be handled")
+            .unwrap_err()
+            .to_string();
+        assert!(result.contains("must be evaluated during execution"));
+
+        assert!(try_execute_bg_sql_function("unknown_func", &[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_bg_launch_validates_arguments() {
+        let err = execute_bg_launch(1, "u", "ks", &[]).await.unwrap_err().to_string();
+        assert!(err.contains("requires exactly 1 argument"));
+
+        let err = execute_bg_launch(1, "u", "ks", &[Value::Null])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sql must not be NULL"));
+
+        let err = execute_bg_launch(1, "u", "ks", &[Value::Int32(1)])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sql must be text"));
+    }
+
+    #[tokio::test]
+    async fn execute_bg_result_validates_arguments() {
+        let err = execute_bg_result("ks", 1, &[]).await.unwrap_err().to_string();
+        assert!(err.contains("requires exactly 1 argument"));
+
+        let err = execute_bg_result("ks", 1, &[Value::Null])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("task_id must not be NULL"));
+
+        let err = execute_bg_result("ks", 1, &[Value::Text("x".to_string())])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("task_id must be bigint"));
+    }
+
+    #[tokio::test]
+    async fn execute_bg_launch_and_result_report_worker_unavailable() {
+        let err = execute_bg_launch(1, "u", "ks", &[Value::Text("select 1".to_string())])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("worker engine not available"));
+
+        let err = execute_bg_result("ks", 1, &[Value::Int32(1)])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("worker engine not available"));
+    }
+}

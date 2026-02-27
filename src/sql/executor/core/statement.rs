@@ -4,6 +4,62 @@ use super::*;
 use crate::auth::{Privilege, PrivilegeObject};
 use crate::sql::error::SqlError;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatementDispatchKind {
+    Ddl,
+    Dml,
+    Query,
+    Rbac,
+    UnsupportedSet,
+    UnsupportedComment,
+    UnsupportedCopy,
+    UnsupportedOther,
+}
+
+fn classify_statement(stmt: &Statement) -> StatementDispatchKind {
+    match stmt {
+        // DDL
+        Statement::CreateTable { .. }
+        | Statement::CreateIndex { .. }
+        | Statement::Drop { .. }
+        | Statement::Truncate { .. }
+        | Statement::AlterTable { .. }
+        | Statement::CreateType { .. }
+        | Statement::CreateSchema { .. }
+        | Statement::CreateFunction { .. }
+        | Statement::CreateProcedure { .. }
+        | Statement::CreateSequence { .. }
+        | Statement::CreateView { .. }
+        | Statement::AlterIndex { .. }
+        | Statement::DropFunction { .. } => StatementDispatchKind::Ddl,
+
+        // DML
+        Statement::Insert { .. } | Statement::Delete { .. } | Statement::Update { .. } => {
+            StatementDispatchKind::Dml
+        }
+
+        // Query
+        Statement::Query(_) | Statement::ShowTables { .. } | Statement::Explain { .. } => {
+            StatementDispatchKind::Query
+        }
+
+        // RBAC
+        Statement::CreateRole { .. }
+        | Statement::AlterRole { .. }
+        | Statement::Grant { .. }
+        | Statement::Revoke { .. } => StatementDispatchKind::Rbac,
+
+        // Explicit unsupported statements
+        Statement::SetVariable { .. }
+        | Statement::SetTimeZone { .. }
+        | Statement::SetNames { .. }
+        | Statement::SetTransaction { .. } => StatementDispatchKind::UnsupportedSet,
+        Statement::Comment { .. } => StatementDispatchKind::UnsupportedComment,
+        Statement::Copy { .. } => StatementDispatchKind::UnsupportedCopy,
+        _ => StatementDispatchKind::UnsupportedOther,
+    }
+}
+
 impl Executor {
     pub(crate) async fn require_privilege(
         &self,
@@ -96,21 +152,8 @@ impl Executor {
         stmt: &Statement,
         current_role: Option<&str>,
     ) -> Result<ExecuteResult> {
-        match stmt {
-            // DDL
-            Statement::CreateTable { .. }
-            | Statement::CreateIndex { .. }
-            | Statement::Drop { .. }
-            | Statement::Truncate { .. }
-            | Statement::AlterTable { .. }
-            | Statement::CreateType { .. }
-            | Statement::CreateSchema { .. }
-            | Statement::CreateFunction { .. }
-            | Statement::CreateProcedure { .. }
-            | Statement::CreateSequence { .. }
-            | Statement::CreateView { .. }
-            | Statement::AlterIndex { .. }
-            | Statement::DropFunction { .. } => {
+        match classify_statement(stmt) {
+            StatementDispatchKind::Ddl => {
                 Box::pin(self.execute_ddl_statement(
                     txn,
                     db_id,
@@ -122,8 +165,7 @@ impl Executor {
                 .await
             }
 
-            // DML
-            Statement::Insert { .. } | Statement::Delete { .. } | Statement::Update { .. } => {
+            StatementDispatchKind::Dml => {
                 Box::pin(self.execute_dml_statement(
                     txn,
                     db_id,
@@ -135,8 +177,7 @@ impl Executor {
                 .await
             }
 
-            // Query
-            Statement::Query(_) | Statement::ShowTables { .. } | Statement::Explain { .. } => {
+            StatementDispatchKind::Query => {
                 Box::pin(self.execute_query_statement(
                     txn,
                     db_id,
@@ -148,11 +189,7 @@ impl Executor {
                 .await
             }
 
-            // RBAC
-            Statement::CreateRole { .. }
-            | Statement::AlterRole { .. }
-            | Statement::Grant { .. }
-            | Statement::Revoke { .. } => {
+            StatementDispatchKind::Rbac => {
                 Box::pin(self.execute_rbac_statement(
                     txn,
                     db_id,
@@ -164,20 +201,170 @@ impl Executor {
                 .await
             }
 
-            // Errors (no .await, zero future cost — stay inline)
-            Statement::SetVariable { .. }
-            | Statement::SetTimeZone { .. }
-            | Statement::SetNames { .. }
-            | Statement::SetTransaction { .. } => {
+            StatementDispatchKind::UnsupportedSet => {
                 Err(SqlError::Unsupported("SET is not supported in this context".into()).into())
             }
-            Statement::Comment { .. } => {
+            StatementDispatchKind::UnsupportedComment => {
                 Err(SqlError::Unsupported("COMMENT is not supported in this context".into()).into())
             }
-            Statement::Copy { .. } => {
+            StatementDispatchKind::UnsupportedCopy => {
                 Err(SqlError::Unsupported("COPY is not supported in this context".into()).into())
             }
-            _ => Err(SqlError::Unsupported(format!("Unsupported statement: {:?}", stmt)).into()),
+            StatementDispatchKind::UnsupportedOther => {
+                Err(SqlError::Unsupported(format!("Unsupported statement: {:?}", stmt)).into())
+            }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_statement, StatementDispatchKind};
+    use crate::sql::parse_sql;
+    use sqlparser::ast::Statement;
+
+    fn first_stmt(sql: &str) -> Statement {
+        let mut stmts = parse_sql(sql).expect("parse sql");
+        stmts.remove(0)
+    }
+
+
+    #[test]
+    fn classify_statement_routes_major_categories() {
+        assert_eq!(
+            classify_statement(&first_stmt("CREATE TABLE t(id INT)")),
+            StatementDispatchKind::Ddl
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("INSERT INTO t VALUES (1)")),
+            StatementDispatchKind::Dml
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("SELECT 1")),
+            StatementDispatchKind::Query
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("CREATE ROLE r")),
+            StatementDispatchKind::Rbac
+        );
+    }
+
+    #[test]
+    fn classify_statement_routes_explicit_unsupported_cases() {
+        assert_eq!(
+            classify_statement(&first_stmt("SET application_name = 'x'")),
+            StatementDispatchKind::UnsupportedSet
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("COMMENT ON TABLE t IS 'x'")),
+            StatementDispatchKind::UnsupportedComment
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("COPY t FROM '/tmp/input.csv'")),
+            StatementDispatchKind::UnsupportedCopy
+        );
+    }
+
+    #[test]
+    fn classify_statement_covers_alternate_supported_variants() {
+        assert_eq!(
+            classify_statement(&first_stmt("CREATE INDEX idx_t_id ON t(id)")),
+            StatementDispatchKind::Ddl
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("UPDATE t SET id = 2")),
+            StatementDispatchKind::Dml
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("DELETE FROM t")),
+            StatementDispatchKind::Dml
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("EXPLAIN SELECT 1")),
+            StatementDispatchKind::Query
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("GRANT SELECT ON t TO r")),
+            StatementDispatchKind::Rbac
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("REVOKE SELECT ON t FROM r")),
+            StatementDispatchKind::Rbac
+        );
+    }
+
+    #[test]
+    fn classify_statement_covers_more_ddl_and_unsupported_variants() {
+        assert_eq!(
+            classify_statement(&first_stmt("CREATE VIEW v AS SELECT 1")),
+            StatementDispatchKind::Ddl
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("TRUNCATE TABLE t")),
+            StatementDispatchKind::Ddl
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("ALTER TABLE t ADD COLUMN c INT")),
+            StatementDispatchKind::Ddl
+        );
+        assert_eq!(
+            classify_statement(&first_stmt(
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+            )),
+            StatementDispatchKind::UnsupportedSet
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("SET TIME ZONE 'UTC'")),
+            StatementDispatchKind::UnsupportedSet
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("BEGIN")),
+            StatementDispatchKind::UnsupportedOther
+        );
+    }
+
+    #[test]
+    fn classify_statement_covers_more_ddl_variants() {
+        assert_eq!(
+            classify_statement(&first_stmt("CREATE SCHEMA s1")),
+            StatementDispatchKind::Ddl
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("CREATE SEQUENCE seq1")),
+            StatementDispatchKind::Ddl
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("ALTER INDEX idx_t_id RENAME TO idx_t_id2")),
+            StatementDispatchKind::Ddl
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("TRUNCATE t")),
+            StatementDispatchKind::Ddl
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("DROP TABLE IF EXISTS t")),
+            StatementDispatchKind::Ddl
+        );
+    }
+
+    #[test]
+    fn classify_statement_covers_more_query_and_rbac_variants() {
+        assert_eq!(
+            classify_statement(&first_stmt("SHOW TABLES")),
+            StatementDispatchKind::Query
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("EXPLAIN ANALYZE SELECT 1")),
+            StatementDispatchKind::Query
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("ALTER ROLE r WITH LOGIN")),
+            StatementDispatchKind::Rbac
+        );
+        assert_eq!(
+            classify_statement(&first_stmt("GRANT SELECT ON TABLE t TO r")),
+            StatementDispatchKind::Rbac
+        );
+    }
+
 }

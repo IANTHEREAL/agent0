@@ -562,3 +562,39 @@ impl TikvStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nextval_standalone_rejects_i64_overflow() {
+        let mut state = SequenceState {
+            last_value: i64::MAX,
+            is_called: true,
+        };
+
+        let err = nextval_standalone("public.s", 1, 1, i64::MAX, false, &mut state)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("overflow"));
+    }
+
+    #[test]
+    fn setval_standalone_accepts_bounds() {
+        let mut state = SequenceState {
+            last_value: 0,
+            is_called: false,
+        };
+
+        let min = setval_standalone("public.s", 1, 10, &mut state, 1, true).unwrap();
+        assert_eq!(min, 1);
+        assert_eq!(state.last_value, 1);
+        assert!(state.is_called);
+
+        let max = setval_standalone("public.s", 1, 10, &mut state, 10, false).unwrap();
+        assert_eq!(max, 10);
+        assert_eq!(state.last_value, 10);
+        assert!(!state.is_called);
+    }
+}

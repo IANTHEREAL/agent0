@@ -224,3 +224,133 @@ pub(in crate::sql::executor::core) async fn autocommit_backoff(attempt: usize) {
     let backoff_ms = base_ms + jitter_ms;
     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_session(is_superuser: bool) -> Session {
+        let store = crate::storage::TikvStore::new_stub();
+        let obs = crate::observability::registry().tenant("ut_dispatch_utils");
+        Session::new_with_user_and_database(
+            store,
+            obs,
+            "tester".to_string(),
+            is_superuser,
+            1,
+            1,
+            "postgres".to_string(),
+            0,
+            0,
+        )
+    }
+
+    #[test]
+    fn validate_transaction_modes_accepts_supported_modes() {
+        let mut session = test_session(true);
+        validate_transaction_modes(
+            &mut session,
+            &[
+                TransactionMode::IsolationLevel(TransactionIsolationLevel::ReadCommitted),
+                TransactionMode::AccessMode(TransactionAccessMode::ReadOnly),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            session.show_setting_value("transaction_isolation").as_deref(),
+            Some("repeatable read")
+        );
+        assert_eq!(
+            session
+                .show_setting_value("default_transaction_read_only")
+                .as_deref(),
+            Some("on")
+        );
+    }
+
+    #[test]
+    fn validate_transaction_modes_downgrades_serializable_to_repeatable_read() {
+        let mut session = test_session(false);
+        validate_transaction_modes(
+            &mut session,
+            &[TransactionMode::IsolationLevel(
+                TransactionIsolationLevel::Serializable,
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            session.show_setting_value("transaction_isolation").as_deref(),
+            Some("repeatable read")
+        );
+    }
+
+    #[test]
+    fn runtime_settings_reads_session_snapshot() {
+        let mut session = test_session(true);
+        session
+            .set_known_setting("timezone", "Asia/Shanghai".to_string())
+            .unwrap();
+        session
+            .set_known_setting("search_path", "public, pg_catalog".to_string())
+            .unwrap();
+        session
+            .set_known_setting("max_sort_bytes", "4096".to_string())
+            .unwrap();
+
+        let settings = RuntimeSettings::from_session(&session);
+        assert_eq!(settings.timezone.as_ref(), "Asia/Shanghai");
+        assert_eq!(settings.max_sort_bytes, session.max_sort_bytes());
+        assert!(settings.search_path.iter().any(|s| s == "public"));
+        assert!(settings.is_superuser);
+    }
+
+    #[tokio::test]
+    async fn wrap_runtime_context_sets_task_locals() {
+        let settings = RuntimeSettings {
+            is_superuser: false,
+            timezone: Arc::from("UTC"),
+            max_sort_bytes: 1234,
+            search_path: Arc::new(vec!["$user".to_string(), "public".to_string()]),
+        };
+        let out = wrap_with_runtime_context(&settings, "tenant_a", None, async {
+            let tz = crate::session_context::current_timezone();
+            let msb = crate::session_context::current_max_sort_bytes();
+            let first_schema = crate::session_context::current_search_path_first_schema();
+            let tenant = crate::extensions::context::tenant_keyspace().unwrap_or_default();
+            (tz, msb, first_schema, tenant)
+        })
+        .await;
+
+        assert_eq!(out.0.as_ref(), "UTC");
+        assert_eq!(out.1, 1234);
+        assert_eq!(out.2, "public");
+        assert_eq!(out.3, "tenant_a");
+    }
+
+    #[tokio::test]
+    async fn apply_statement_timeout_handles_timeout_and_success() {
+        let ok = apply_statement_timeout(Some(Duration::from_millis(50)), async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            Ok::<_, anyhow::Error>(7)
+        })
+        .await
+        .unwrap();
+        assert_eq!(ok, 7);
+
+        let err = apply_statement_timeout(Some(Duration::from_millis(1)), async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok::<_, anyhow::Error>(1)
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("statement timeout"));
+    }
+
+    #[tokio::test]
+    async fn autocommit_backoff_returns() {
+        autocommit_backoff(0).await;
+        autocommit_backoff(8).await;
+    }
+}

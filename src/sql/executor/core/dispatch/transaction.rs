@@ -271,3 +271,143 @@ impl Executor {
         unreachable!("retry loop must return")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{check_observability_statement_permission, is_plan_cache_invalidating_ddl};
+    use crate::sql::parse_sql;
+    use crate::sql::{ExecuteResult, Executor, Session};
+    use sqlparser::ast::Statement;
+
+    fn parse_stmt(sql: &str) -> Statement {
+        let mut stmts = parse_sql(sql).expect("parse");
+        stmts.remove(0)
+    }
+
+    fn make_executor_and_session() -> (Executor, Session) {
+        let store = crate::storage::TikvStore::new_stub();
+        let keyspace = "dispatch_transaction_tests".to_string();
+        let observability = crate::observability::registry().tenant(&keyspace);
+        let trigger_cache = std::sync::Arc::new(crate::sql::triggers::TriggerBodyCache::new());
+        let stats_cache = std::sync::Arc::new(crate::sql::stats::TableStatsCache::new());
+        let executor = Executor::new(
+            store.clone(),
+            keyspace,
+            observability.clone(),
+            crate::pool::TenantMemoryAccountant::unlimited(
+                "dispatch_transaction_tests".to_string(),
+            ),
+            trigger_cache,
+            stats_cache,
+        );
+        let session = Session::new_with_user_and_database(
+            store,
+            observability,
+            "observer".to_string(),
+            false,
+            1,
+            1,
+            "postgres".to_string(),
+            0,
+            0,
+        );
+        (executor, session)
+    }
+
+    #[tokio::test]
+    async fn observability_permission_allows_set_to_fall_through() {
+        let (executor, mut session) = make_executor_and_session();
+        let stmt = parse_stmt("SET statement_timeout = 1000");
+        let out =
+            check_observability_statement_permission(&executor, &mut session, &stmt, false).await;
+        assert!(out.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn observability_permission_show_all_returns_select() {
+        let (executor, mut session) = make_executor_and_session();
+        let stmt = parse_stmt("SHOW ALL");
+        let out =
+            check_observability_statement_permission(&executor, &mut session, &stmt, false).await;
+        let results = out.unwrap().expect("show all handled");
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ExecuteResult::Select { .. }));
+    }
+
+    #[tokio::test]
+    async fn observability_permission_show_known_variable_returns_select() {
+        let (executor, mut session) = make_executor_and_session();
+        session
+            .set_known_setting("statement_timeout", "1200".to_string())
+            .unwrap();
+        let stmt = parse_stmt("SHOW statement_timeout");
+        let out =
+            check_observability_statement_permission(&executor, &mut session, &stmt, false).await;
+        let results = out.unwrap().expect("show handled");
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            ExecuteResult::Select { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+            }
+            other => panic!("expected select, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn observability_permission_denies_non_observability_query() {
+        let (executor, mut session) = make_executor_and_session();
+        session.force_test_transaction_state(true, false);
+        let stmt = parse_stmt("SELECT 1");
+        let err = check_observability_statement_permission(&executor, &mut session, &stmt, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("permission denied"));
+        assert!(session.is_transaction_failed());
+    }
+
+    #[tokio::test]
+    async fn observability_permission_show_unknown_errors_and_marks_failed() {
+        let (executor, mut session) = make_executor_and_session();
+        session.force_test_transaction_state(true, false);
+        let stmt = parse_stmt("SHOW totally_unknown_setting");
+        let err = check_observability_statement_permission(&executor, &mut session, &stmt, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unrecognized configuration parameter"));
+        assert!(session.is_transaction_failed());
+    }
+
+    #[tokio::test]
+    async fn observability_permission_allows_observability_query_flag() {
+        let (executor, mut session) = make_executor_and_session();
+        let stmt = parse_stmt("SELECT 1");
+        let out =
+            check_observability_statement_permission(&executor, &mut session, &stmt, true).await;
+        assert!(out.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn observability_permission_denies_unsupported_statement() {
+        let (executor, mut session) = make_executor_and_session();
+        session.force_test_transaction_state(true, false);
+        let stmt = parse_stmt("CREATE TABLE t(id INT)");
+        let err = check_observability_statement_permission(&executor, &mut session, &stmt, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("permission denied"));
+        assert!(session.is_transaction_failed());
+    }
+
+    #[test]
+    fn plan_cache_invalidating_ddl_classifier_matches_contract() {
+        assert!(is_plan_cache_invalidating_ddl(&parse_stmt("CREATE TABLE t(id INT)")));
+        assert!(is_plan_cache_invalidating_ddl(&parse_stmt("CREATE INDEX i ON t(id)")));
+        assert!(is_plan_cache_invalidating_ddl(&parse_stmt("ALTER TABLE t ADD COLUMN c INT")));
+        assert!(is_plan_cache_invalidating_ddl(&parse_stmt("TRUNCATE TABLE t")));
+        assert!(is_plan_cache_invalidating_ddl(&parse_stmt("DROP TABLE t")));
+        assert!(!is_plan_cache_invalidating_ddl(&parse_stmt("SELECT 1")));
+    }
+}

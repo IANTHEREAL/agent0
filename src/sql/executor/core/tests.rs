@@ -400,3 +400,74 @@ fn test_ephemeral_table_id_detection() {
     assert!(!super::is_ephemeral_table_id(1));
     assert!(!super::is_ephemeral_table_id(42));
 }
+
+#[test]
+fn test_executor_getters_and_trigger_buffers() {
+    let store = crate::storage::TikvStore::new_stub();
+    let keyspace = "core_tests_executor_getters".to_string();
+    let observability = crate::observability::registry().tenant(&keyspace);
+    let trigger_cache = std::sync::Arc::new(crate::sql::triggers::TriggerBodyCache::new());
+    let stats_cache = std::sync::Arc::new(crate::sql::stats::TableStatsCache::new());
+    let executor = super::Executor::new(
+        store.clone(),
+        keyspace.clone(),
+        observability.clone(),
+        crate::pool::TenantMemoryAccountant::unlimited("core_tests".to_string()),
+        trigger_cache.clone(),
+        stats_cache.clone(),
+    );
+
+    assert_eq!(executor.tenant_keyspace(), keyspace);
+    assert!(std::sync::Arc::ptr_eq(&executor.store(), &store));
+    assert!(std::sync::Arc::ptr_eq(executor.observability(), &observability));
+    assert!(std::sync::Arc::ptr_eq(executor.trigger_cache(), &trigger_cache));
+    assert!(std::sync::Arc::ptr_eq(executor.stats_cache(), &stats_cache));
+    let _ = executor.auth_manager();
+    let _ = executor.tenant_memory_accountant();
+
+    assert_eq!(executor.pending_async_triggers.lock().unwrap().len(), 0);
+    executor.push_pending_async_trigger(super::PendingAsyncTrigger {
+        keyspace: "ks".to_string(),
+        db_id: 1,
+        command: "SELECT 1".to_string(),
+    });
+    assert_eq!(executor.pending_async_triggers.lock().unwrap().len(), 1);
+
+    executor.clear_trigger_activations();
+    assert_eq!(executor.pending_async_triggers.lock().unwrap().len(), 0);
+}
+
+#[test]
+fn test_flush_trigger_activations_clears_buffers_even_without_system_store() {
+    let store = crate::storage::TikvStore::new_stub();
+    let keyspace = "core_tests_flush_trigger".to_string();
+    let observability = crate::observability::registry().tenant(&keyspace);
+    let trigger_cache = std::sync::Arc::new(crate::sql::triggers::TriggerBodyCache::new());
+    let stats_cache = std::sync::Arc::new(crate::sql::stats::TableStatsCache::new());
+    let executor = super::Executor::new(
+        store,
+        keyspace,
+        observability,
+        crate::pool::TenantMemoryAccountant::unlimited("core_tests".to_string()),
+        trigger_cache,
+        stats_cache,
+    );
+
+    executor
+        .pending_trigger_activations
+        .lock()
+        .unwrap()
+        .insert("ks1".to_string());
+    executor.push_pending_async_trigger(super::PendingAsyncTrigger {
+        keyspace: "ks1".to_string(),
+        db_id: 1,
+        command: "SELECT 1".to_string(),
+    });
+    assert_eq!(executor.pending_async_triggers.lock().unwrap().len(), 1);
+    assert_eq!(executor.pending_trigger_activations.lock().unwrap().len(), 1);
+
+    executor.flush_trigger_activations();
+
+    assert_eq!(executor.pending_async_triggers.lock().unwrap().len(), 0);
+    assert_eq!(executor.pending_trigger_activations.lock().unwrap().len(), 0);
+}

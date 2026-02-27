@@ -35,6 +35,7 @@ __pycache__/
 
 # Runtime data
 data/
+artifacts/
 
 # Environment
 .env

@@ -872,3 +872,19 @@ pub async fn check_relation_name_available(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::short_relation_name;
+
+    #[test]
+    fn short_relation_name_extracts_tail_for_qualified_names() {
+        assert_eq!(short_relation_name("public.orders"), "orders");
+        assert_eq!(short_relation_name("tenant_a.orders"), "orders");
+    }
+
+    #[test]
+    fn short_relation_name_keeps_unqualified_name() {
+        assert_eq!(short_relation_name("orders"), "orders");
+    }
+}

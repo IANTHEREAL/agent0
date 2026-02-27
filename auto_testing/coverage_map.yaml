@@ -1,0 +1,123 @@
+meta:
+  version: 2
+  commit_cadence: 20
+  owner: test-autopilot
+  fail_if_unmapped_change: true
+
+coverage_dimensions:
+  line:
+    collector: collect_line_coverage
+    targets_by_mode:
+      pr:
+        changed_module_min: 0.55
+      main_push:
+        changed_module_min: 0.60
+      cadence:
+        global_min: 0.60
+      nightly:
+        global_min: 0.62
+    lanes: ["ut", "fast_gate"]
+
+  pg_protocol_statement:
+    collector: collect_statement_protocol_coverage
+    matrix:
+      statements: ["SELECT", "INSERT", "UPDATE", "DELETE", "CREATE_TABLE", "ALTER_TABLE", "DROP_TABLE", "CREATE_INDEX", "COPY", "BEGIN_COMMIT_ROLLBACK"]
+      protocol_phases: ["simple_query", "parse_bind_execute", "describe", "sync", "error_path"]
+    required_min_ratio_by_mode:
+      pr: 0.65
+      main_push: 0.75
+      cadence: 0.80
+      nightly: 0.85
+    lanes: ["sql_builtin", "protocol_smoke", "sql_corpus"]
+
+  scenario:
+    collector: collect_scenario_coverage
+    matrix:
+      drivers: ["psql", "node-pg", "python-psycopg", "gorm"]
+      orm: ["typeorm", "prisma", "sequelize", "knex", "drizzle", "kysely", "sqlalchemy", "dify_sqlalchemy"]
+      capabilities: ["ddl_lifecycle", "crud_basic", "transaction", "prepared_statement", "json_and_array", "join_and_subquery", "vector"]
+    required_min_ratio_by_mode:
+      pr: 0.55
+      main_push: 0.65
+      cadence: 0.70
+      nightly: 0.75
+    lanes: ["orm_all", "e2e_sqlalchemy", "e2e_dify", "e2e_gorm"]
+
+lanes:
+  ut:
+    run: ["cargo test"]
+    timeout_sec: 1800
+    retry: 0
+    fail_fast: false
+  fast_gate:
+    run: ["bash scripts/regression_gate.sh"]
+    timeout_sec: 1800
+    retry: 0
+    fail_fast: true
+  sql_builtin:
+    run: ["python3 scripts/integration_test.py --dsn ${DSN}"]
+    timeout_sec: 900
+    retry: 0
+    fail_fast: false
+  sql_corpus:
+    run: ["python3 scripts/integration_test.py --dsn ${DSN} tests/"]
+    timeout_sec: 3600
+    retry: 0
+    fail_fast: false
+  protocol_smoke:
+    run: ["python3 scripts/extended_protocol_smoke.py --dsn ${DSN}"]
+    timeout_sec: 300
+    retry: 1
+    fail_fast: true
+  orm_all:
+    run: ["cd orm-tests && PG_DSN=${DSN} npm test"]
+    timeout_sec: 2400
+    retry: 0
+    fail_fast: false
+  e2e_sqlalchemy:
+    run: ["PG_DSN=${DSN} bash scripts/e2e_tests.sh sqlalchemy_smoke"]
+    timeout_sec: 1200
+    retry: 0
+    fail_fast: false
+  e2e_dify:
+    run: ["PG_DSN=${DSN} bash scripts/e2e_tests.sh dify_sqlalchemy_compat"]
+    timeout_sec: 1200
+    retry: 0
+    fail_fast: false
+  e2e_gorm:
+    run: ["PG_DSN=${DSN} bash scripts/e2e_tests.sh gorm_smoke"]
+    timeout_sec: 1200
+    retry: 0
+    fail_fast: false
+  e2e_full:
+    run: ["cd deploy/e2e && ./setup.sh"]
+    timeout_sec: 5400
+    retry: 0
+    fail_fast: true
+
+rules_priority: ["path_specific_first", "merge_include_union", "apply_exclude_last"]
+rules:
+  - when_changed: ["src/sql/**"]
+    include: ["ut", "fast_gate", "sql_builtin"]
+    exclude: []
+  - when_changed: ["src/protocol/**"]
+    include: ["ut", "fast_gate", "protocol_smoke"]
+    exclude: []
+  - when_changed: ["src/storage/**", "src/txn/**"]
+    include: ["ut", "fast_gate", "sql_builtin"]
+    exclude: []
+  - when_changed: ["tests/**"]
+    include: ["fast_gate", "sql_corpus"]
+    exclude: []
+  - when_changed: ["orm-tests/**"]
+    include: ["ut", "orm_all"]
+    exclude: []
+  - when_changed: ["cloud-admin-portal/**", "deploy/e2e/**", "fs9/**", "db9/**"]
+    include: ["e2e_full"]
+    exclude: []
+
+mode_defaults:
+  pr: ["ut", "fast_gate"]
+  main_push: ["ut", "fast_gate", "sql_builtin"]
+  cadence: ["ut", "fast_gate", "sql_corpus", "orm_all", "e2e_sqlalchemy", "e2e_dify", "e2e_gorm"]
+  nightly: ["ut", "sql_corpus", "orm_all", "e2e_sqlalchemy", "e2e_dify", "e2e_gorm"]

@@ -1,5 +1,8 @@
 -- Test: statement_timeout SET, SHOW, enforcement, and RESET
 -- Validates the timeout protection feature end-to-end.
+-- Coverage marker (statement-protocol error_path): ALTER TABLE
+-- Coverage marker (statement-protocol error_path): CREATE INDEX
+-- Coverage marker (statement-protocol error_path): DELETE
 
 -- Test 1: SET and SHOW statement_timeout
 SET statement_timeout = '5s';

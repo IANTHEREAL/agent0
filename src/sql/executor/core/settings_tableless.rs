@@ -325,3 +325,139 @@ pub(super) fn try_execute_current_setting_select(
         timezone: session_context::current_timezone(),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::parse_sql;
+    use crate::storage::TikvStore;
+
+    fn parse_query(sql: &str) -> Query {
+        let mut stmts = parse_sql(sql).expect("parse sql");
+        let stmt = stmts.remove(0);
+        let sqlparser::ast::Statement::Query(q) = stmt else {
+            panic!("expected query");
+        };
+        *q
+    }
+
+    fn make_session() -> Session {
+        let store = TikvStore::new_stub();
+        let observability = crate::observability::registry().tenant("settings_tableless_tests");
+        Session::new_with_database(store, observability, 1, 1, "postgres".to_string(), 0, 0)
+    }
+
+    #[test]
+    fn unwrap_top_level_cast_strips_nested_cast_layers() {
+        let expr = Expr::Cast {
+            expr: Box::new(Expr::TryCast {
+                expr: Box::new(Expr::Nested(Box::new(Expr::Value(
+                    sqlparser::ast::Value::SingleQuotedString("x".to_string()),
+                )))),
+                data_type: sqlparser::ast::DataType::Text,
+                format: None,
+            }),
+            data_type: sqlparser::ast::DataType::Int(None),
+            format: None,
+        };
+
+        let (inner, cast_to) = unwrap_top_level_cast(&expr);
+        assert!(matches!(inner, Expr::Value(_)));
+        assert!(cast_to.is_some());
+    }
+
+    #[test]
+    fn cast_current_setting_value_parses_common_types_and_errors() {
+        assert_eq!(
+            cast_current_setting_value(Value::Text("42".to_string()), &DataType::Int32).unwrap(),
+            Value::Int32(42)
+        );
+        assert_eq!(
+            cast_current_setting_value(Value::Text("43".to_string()), &DataType::Int64).unwrap(),
+            Value::Int64(43)
+        );
+        assert_eq!(
+            cast_current_setting_value(Value::Text("on".to_string()), &DataType::Boolean).unwrap(),
+            Value::Boolean(true)
+        );
+        assert!(
+            cast_current_setting_value(Value::Text("abc".to_string()), &DataType::Boolean)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn function_name_detection_accepts_pg_catalog_and_bare_names() {
+        let set_name = sqlparser::ast::ObjectName(vec![sqlparser::ast::Ident::new("set_config")]);
+        let set_qualified = sqlparser::ast::ObjectName(vec![
+            sqlparser::ast::Ident::new("pg_catalog"),
+            sqlparser::ast::Ident::new("set_config"),
+        ]);
+        assert!(is_set_config_function(&set_name));
+        assert!(is_set_config_function(&set_qualified));
+
+        let current_name =
+            sqlparser::ast::ObjectName(vec![sqlparser::ast::Ident::new("current_setting")]);
+        let current_qualified = sqlparser::ast::ObjectName(vec![
+            sqlparser::ast::Ident::new("pg_catalog"),
+            sqlparser::ast::Ident::new("current_setting"),
+        ]);
+        assert!(is_current_setting_function(&current_name));
+        assert!(is_current_setting_function(&current_qualified));
+    }
+
+    #[test]
+    fn set_config_fast_path_returns_select_result() {
+        let mut session = make_session();
+        let query = parse_query("SELECT set_config('statement_timeout', '1000', false)");
+        let result = try_execute_set_config_select(&mut session, &query)
+            .unwrap()
+            .expect("should fast-path");
+
+        let ExecuteResult::Select { rows, .. } = result else {
+            panic!("expected select result");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values.len(), 1);
+        assert_eq!(
+            session.show_setting_value("statement_timeout").as_deref(),
+            Some("1000ms")
+        );
+    }
+
+    #[test]
+    fn current_setting_fast_path_handles_present_and_missing_ok() {
+        let mut session = make_session();
+        session
+            .set_known_setting("statement_timeout", "2500".to_string())
+            .unwrap();
+
+        let query = parse_query("SELECT current_setting('statement_timeout')");
+        let result = try_execute_current_setting_select(&mut session, &query)
+            .unwrap()
+            .expect("should fast-path");
+        let ExecuteResult::Select { rows, .. } = result else {
+            panic!("expected select");
+        };
+        assert_eq!(rows[0].values, vec![Value::Text("2500ms".to_string())]);
+
+        let query = parse_query("SELECT current_setting('no_such_setting', true)");
+        let result = try_execute_current_setting_select(&mut session, &query)
+            .unwrap()
+            .expect("should fast-path with missing_ok");
+        let ExecuteResult::Select { rows, .. } = result else {
+            panic!("expected select");
+        };
+        assert_eq!(rows[0].values, vec![Value::Null]);
+    }
+
+    #[test]
+    fn current_setting_fast_path_errors_when_missing_and_not_missing_ok() {
+        let mut session = make_session();
+        let query = parse_query("SELECT current_setting('definitely_missing_setting')");
+        let err = try_execute_current_setting_select(&mut session, &query)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unrecognized configuration parameter"));
+    }
+}

@@ -485,3 +485,24 @@ pub async fn execute_refresh_materialized_view(
         view_name: name.to_string(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::derive_view_deps;
+
+    #[test]
+    fn derive_view_deps_sorts_and_dedups() {
+        let deps = derive_view_deps(&[
+            "public.b".to_string(),
+            "public.a".to_string(),
+            "public.b".to_string(),
+        ]);
+        assert_eq!(deps, vec!["public.a".to_string(), "public.b".to_string()]);
+    }
+
+    #[test]
+    fn derive_view_deps_handles_empty_input() {
+        let deps = derive_view_deps(&[]);
+        assert!(deps.is_empty());
+    }
+}

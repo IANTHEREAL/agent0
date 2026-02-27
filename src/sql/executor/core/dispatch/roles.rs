@@ -77,3 +77,93 @@ impl Executor {
         Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_executor() -> Executor {
+        let store = crate::storage::TikvStore::new_stub();
+        let keyspace = "dispatch_roles_tests".to_string();
+        let observability = crate::observability::registry().tenant(&keyspace);
+        let trigger_cache = std::sync::Arc::new(crate::sql::triggers::TriggerBodyCache::new());
+        let stats_cache = std::sync::Arc::new(crate::sql::stats::TableStatsCache::new());
+        Executor::new(
+            store,
+            keyspace,
+            observability,
+            crate::pool::TenantMemoryAccountant::unlimited("dispatch_roles_tests".to_string()),
+            trigger_cache,
+            stats_cache,
+        )
+    }
+
+    #[tokio::test]
+    async fn set_role_none_resets_to_session_user() {
+        let executor = make_executor();
+        let store = crate::storage::TikvStore::new_stub();
+        let obs = crate::observability::registry().tenant("dispatch_roles_tests_none");
+        let mut session = Session::new_with_user_and_database(
+            store,
+            obs,
+            "app_user".to_string(),
+            false,
+            1,
+            1,
+            "postgres".to_string(),
+            0,
+            0,
+        );
+        session.set_current_role("other".to_string(), false);
+        let out = executor.execute_set_role(&mut session, &None).await.unwrap();
+        assert!(matches!(
+            out.as_slice(),
+            [ExecuteResult::CommandComplete { tag: "SET" }]
+        ));
+        assert_eq!(session.current_user(), Some("app_user"));
+    }
+
+    #[tokio::test]
+    async fn set_role_default_keyword_resets_role() {
+        let executor = make_executor();
+        let store = crate::storage::TikvStore::new_stub();
+        let obs = crate::observability::registry().tenant("dispatch_roles_tests_default");
+        let mut session = Session::new_with_user_and_database(
+            store,
+            obs,
+            "app_user".to_string(),
+            false,
+            1,
+            1,
+            "postgres".to_string(),
+            0,
+            0,
+        );
+        session.set_current_role("other".to_string(), false);
+        let role_ident = sqlparser::ast::Ident::new("default");
+        let out = executor
+            .execute_set_role(&mut session, &Some(role_ident))
+            .await
+            .unwrap();
+        assert!(matches!(
+            out.as_slice(),
+            [ExecuteResult::CommandComplete { tag: "SET" }]
+        ));
+        assert_eq!(session.current_user(), Some("app_user"));
+    }
+
+    #[tokio::test]
+    async fn set_role_errors_when_session_user_missing() {
+        let executor = make_executor();
+        let store = crate::storage::TikvStore::new_stub();
+        let obs = crate::observability::registry().tenant("dispatch_roles_tests_missing");
+        let mut session = Session::new_with_database(store, obs, 1, 1, "postgres".to_string(), 0, 0);
+
+        let err = executor
+            .execute_set_role(&mut session, &Some(sqlparser::ast::Ident::new("role_x")))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Missing session user"));
+    }
+}

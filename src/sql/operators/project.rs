@@ -891,4 +891,318 @@ mod tests {
             .to_string()
             .contains("generate_subscripts: reverse argument must be boolean"));
     }
+
+    #[test]
+    fn detect_srf_covers_supported_and_unsupported_functions() {
+        let unnest = function_call("UNNEST", vec![], DataType::Text);
+        assert!(matches!(detect_srf(&unnest), Some(SrfKind::Unnest)));
+
+        let obj_keys = function_call("jsonb_object_keys", vec![], DataType::Text);
+        assert!(matches!(detect_srf(&obj_keys), Some(SrfKind::EvalFunctionArray)));
+
+        let unknown = function_call("now", vec![], DataType::Timestamp);
+        assert!(detect_srf(&unknown).is_none());
+    }
+
+    #[test]
+    fn eval_srf_unnest_handles_missing_scalar_and_null() {
+        let no_args = function_call("UNNEST", vec![], DataType::Text);
+        let out = eval_srf(
+            SrfKind::Unnest,
+            &no_args,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap();
+        assert!(out.is_empty());
+
+        let scalar = function_call(
+            "UNNEST",
+            vec![TypedExpr {
+                kind: TypedExprKind::Constant(Value::Int32(5)),
+                data_type: DataType::Int32,
+            }],
+            DataType::Int32,
+        );
+        let out = eval_srf(
+            SrfKind::Unnest,
+            &scalar,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap();
+        assert_eq!(out, vec![Value::Int32(5)]);
+
+        let null_arg = function_call(
+            "UNNEST",
+            vec![TypedExpr {
+                kind: TypedExprKind::Constant(Value::Null),
+                data_type: DataType::Array(Box::new(DataType::Int32)),
+            }],
+            DataType::Int32,
+        );
+        let out = eval_srf(
+            SrfKind::Unnest,
+            &null_arg,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn eval_srf_regexp_split_validates_arguments_and_flags() {
+        let missing_args = function_call("REGEXP_SPLIT_TO_TABLE", vec![], DataType::Text);
+        let err = eval_srf(
+            SrfKind::RegexpSplitToTable,
+            &missing_args,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("regexp_split_to_table requires at least 2 arguments")
+        );
+
+        let ci = function_call(
+            "REGEXP_SPLIT_TO_TABLE",
+            vec![
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Text("AbC".to_string())),
+                    data_type: DataType::Text,
+                },
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Text("b".to_string())),
+                    data_type: DataType::Text,
+                },
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Text("i".to_string())),
+                    data_type: DataType::Text,
+                },
+            ],
+            DataType::Text,
+        );
+        let out = eval_srf(
+            SrfKind::RegexpSplitToTable,
+            &ci,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                Value::Text("A".to_string()),
+                Value::Text("C".to_string())
+            ]
+        );
+
+        let invalid = function_call(
+            "REGEXP_SPLIT_TO_TABLE",
+            vec![
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Text("abc".to_string())),
+                    data_type: DataType::Text,
+                },
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Text("[".to_string())),
+                    data_type: DataType::Text,
+                },
+            ],
+            DataType::Text,
+        );
+        let err = eval_srf(
+            SrfKind::RegexpSplitToTable,
+            &invalid,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Invalid regex pattern"));
+    }
+
+    #[test]
+    fn eval_srf_regexp_matches_supports_global_and_capture_groups() {
+        let global = function_call(
+            "REGEXP_MATCHES",
+            vec![
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Text("ab12cd34".to_string())),
+                    data_type: DataType::Text,
+                },
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Text("([a-z]+)(\\d+)".to_string())),
+                    data_type: DataType::Text,
+                },
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Text("g".to_string())),
+                    data_type: DataType::Text,
+                },
+            ],
+            DataType::Array(Box::new(DataType::Text)),
+        );
+        let out = eval_srf(
+            SrfKind::RegexpMatches,
+            &global,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[0],
+            Value::Array(vec![
+                Value::Text("ab".to_string()),
+                Value::Text("12".to_string())
+            ])
+        );
+        assert_eq!(
+            out[1],
+            Value::Array(vec![
+                Value::Text("cd".to_string()),
+                Value::Text("34".to_string())
+            ])
+        );
+
+        let no_match = function_call(
+            "REGEXP_MATCHES",
+            vec![
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Text("abc".to_string())),
+                    data_type: DataType::Text,
+                },
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Text("\\d+".to_string())),
+                    data_type: DataType::Text,
+                },
+            ],
+            DataType::Array(Box::new(DataType::Text)),
+        );
+        let out = eval_srf(
+            SrfKind::RegexpMatches,
+            &no_match,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn eval_srf_eval_function_array_non_function_expr_returns_empty() {
+        let scalar = TypedExpr {
+            kind: TypedExprKind::Constant(Value::Text("k".to_string())),
+            data_type: DataType::Text,
+        };
+        let out = eval_srf(
+            SrfKind::EvalFunctionArray,
+            &scalar,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap();
+        assert!(out.is_empty());
+
+        let null = TypedExpr {
+            kind: TypedExprKind::Constant(Value::Null),
+            data_type: DataType::Text,
+        };
+        let out = eval_srf(
+            SrfKind::EvalFunctionArray,
+            &null,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn generate_subscripts_reverse_and_null_argument_semantics() {
+        let reverse = function_call(
+            "GENERATE_SUBSCRIPTS",
+            vec![
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Array(vec![
+                        Value::Int32(10),
+                        Value::Int32(20),
+                        Value::Int32(30),
+                    ])),
+                    data_type: DataType::Array(Box::new(DataType::Int32)),
+                },
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Int32(1)),
+                    data_type: DataType::Int32,
+                },
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Boolean(true)),
+                    data_type: DataType::Boolean,
+                },
+            ],
+            DataType::Int32,
+        );
+        let out = eval_srf(
+            SrfKind::GenerateSubscripts,
+            &reverse,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![Value::Int32(3), Value::Int32(2), Value::Int32(1)]
+        );
+
+        let null_dim = function_call(
+            "GENERATE_SUBSCRIPTS",
+            vec![
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Array(vec![Value::Int32(10)])),
+                    data_type: DataType::Array(Box::new(DataType::Int32)),
+                },
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Null),
+                    data_type: DataType::Int32,
+                },
+            ],
+            DataType::Int32,
+        );
+        let out = eval_srf(
+            SrfKind::GenerateSubscripts,
+            &null_dim,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap();
+        assert!(out.is_empty());
+
+        let null_reverse = function_call(
+            "GENERATE_SUBSCRIPTS",
+            vec![
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Array(vec![Value::Int32(10)])),
+                    data_type: DataType::Array(Box::new(DataType::Int32)),
+                },
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Int32(1)),
+                    data_type: DataType::Int32,
+                },
+                TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Null),
+                    data_type: DataType::Boolean,
+                },
+            ],
+            DataType::Int32,
+        );
+        let out = eval_srf(
+            SrfKind::GenerateSubscripts,
+            &null_reverse,
+            &Row::new(vec![]),
+            &QueryContext::from_task_locals(),
+        )
+        .unwrap();
+        assert!(out.is_empty());
+    }
 }

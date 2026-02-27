@@ -1,0 +1,98 @@
+version: 1
+name: tipg_test_workflow
+description: Machine-readable workflow composed of core testing skills.
+
+entrypoint:
+  skill: tipg-test-autopilot
+
+skills:
+  tipg-test-autopilot:
+    spec: auto_testing/skills/core/tipg-test-autopilot.md
+    trigger:
+      on_events: ["feature_completed", "fix_completed", "manual_run"]
+    inputs:
+      required: ["base_sha", "head_sha", "mode"]
+      optional: ["DSN"]
+      files: ["auto_testing/coverage_map.yaml"]
+    outputs:
+      files:
+        - "artifacts/test_report.json"
+        - "artifacts/test_report.md"
+        - "artifacts/coverage/gap_list.json"
+        - "artifacts/coverage/line_coverage.json"
+        - "artifacts/coverage/statement_protocol_coverage.json"
+        - "artifacts/coverage/scenario_coverage.json"
+        - "artifacts/coverage/area_coverage.json"
+        - "artifacts/coverage/critical_path_coverage.json"
+        - "artifacts/agent_backlog.json"
+    next:
+      - when: "changed_files contains tests or expected files"
+        skill: tipg-pg-oracle-check
+      - when: "any lane failed OR merge_allowed=false"
+        skill: tipg-failure-triage
+      - when: "all lanes passed"
+        skill: tipg-pr-readiness-gate
+
+  tipg-pg-oracle-check:
+    spec: auto_testing/skills/core/tipg-pg-oracle-check.md
+    trigger:
+      on_events: ["sql_test_changed"]
+    inputs:
+      required: ["pg_dsn", "tipg_dsn", "changed_test_cases"]
+    outputs:
+      files:
+        - "artifacts/oracle/oracle_diff.json"
+        - "artifacts/oracle/oracle_diff.md"
+    next:
+      - when: "oracle check done"
+        skill: tipg-pr-readiness-gate
+
+  tipg-failure-triage:
+    spec: auto_testing/skills/core/tipg-failure-triage.md
+    trigger:
+      on_events: ["lane_failed", "coverage_gate_failed"]
+    inputs:
+      required:
+        - "artifacts/test_report.json"
+        - "artifacts/logs/*.log"
+        - "artifacts/coverage/gap_list.json"
+        - "artifacts/coverage/critical_path_coverage.json"
+    outputs:
+      files:
+        - "artifacts/triage/failure_triage.json"
+        - "artifacts/triage/failure_triage.md"
+    next:
+      - when: "triage finished"
+        skill: tipg-pr-readiness-gate
+
+  tipg-pr-readiness-gate:
+    spec: auto_testing/skills/core/tipg-pr-readiness-gate.md
+    trigger:
+      on_events: ["post_test", "post_oracle_check", "post_triage"]
+    inputs:
+      required:
+        - "artifacts/test_report.json"
+        - "artifacts/coverage/*.json"
+        - "artifacts/agent_backlog.json"
+      optional:
+        - "artifacts/oracle/oracle_diff.json"
+        - "artifacts/triage/failure_triage.json"
+    outputs:
+      files:
+        - "artifacts/gate/pr_readiness_gate.json"
+        - "artifacts/gate/pr_readiness_gate.md"
+    terminal: true
+
+policies:
+  fail_fast_lanes_from_map: true
+  source_of_truth:
+    - "auto_testing/coverage_map.yaml"
+    - "auto_testing/area_map.yaml"
+    - "auto_testing/path_map.yaml"
+    - "auto_testing/gap_action_map.yaml"
+  merge_blockers:
+    - "required lane failed"
+    - "coverage threshold not met"
+    - "critical path uncovered"
+    - "unmapped changed files when fail_if_unmapped_change=true"
+    - "unresolved P0 tasks in artifacts/agent_backlog.json"

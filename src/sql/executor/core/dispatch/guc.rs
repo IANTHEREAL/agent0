@@ -98,3 +98,109 @@ pub(super) fn build_show_all_result(session: &Session, timezone: Arc<str>) -> Ex
         timezone,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{build_show_all_result, execute_set_variable};
+    use crate::model::DataType;
+    use crate::sql::parse_sql;
+    use crate::sql::{ExecuteResult, Session};
+    use sqlparser::ast::{Expr, ObjectName, SetExpr, Statement, Value as SqlValue};
+
+    fn make_session() -> Session {
+        let store = crate::storage::TikvStore::new_stub();
+        let obs = crate::observability::registry().tenant("dispatch_guc_tests");
+        Session::new_with_database(store, obs, 1, 1, "postgres".to_string(), 0, 0)
+    }
+
+    fn parse_set(sql: &str) -> (bool, ObjectName, Vec<Expr>) {
+        let mut stmts = parse_sql(sql).expect("parse");
+        let stmt = stmts.remove(0);
+        let Statement::SetVariable {
+            local,
+            variable,
+            value,
+            ..
+        } = stmt
+        else {
+            panic!("expected set variable");
+        };
+        (local, variable, value)
+    }
+
+    #[test]
+    fn execute_set_variable_updates_known_setting() {
+        let mut session = make_session();
+        let (local, variable, value) = parse_set("SET statement_timeout = 1500");
+        let out = execute_set_variable(&mut session, local, &variable, &value).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            session.show_setting_value("statement_timeout").as_deref(),
+            Some("1500ms")
+        );
+    }
+
+    #[test]
+    fn execute_set_variable_search_path_local_outside_txn_returns_warning_notice() {
+        let mut session = make_session();
+        let variable = ObjectName(vec![sqlparser::ast::Ident::new("search_path")]);
+        let value = vec![Expr::Value(SqlValue::SingleQuotedString(
+            "public, pg_catalog".to_string(),
+        ))];
+
+        let out = execute_set_variable(&mut session, true, &variable, &value).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], ExecuteResult::Notice { .. }));
+        assert!(matches!(
+            out[1],
+            ExecuteResult::CommandComplete { tag: "SET" }
+        ));
+    }
+
+    #[test]
+    fn execute_set_variable_rejects_unsupported_search_path_expr() {
+        let mut session = make_session();
+        let variable = ObjectName(vec![sqlparser::ast::Ident::new("search_path")]);
+        let value = vec![Expr::BinaryOp {
+            left: Box::new(Expr::Value(SqlValue::Number("1".to_string(), false))),
+            op: sqlparser::ast::BinaryOperator::Plus,
+            right: Box::new(Expr::Value(SqlValue::Number("2".to_string(), false))),
+        }];
+
+        let err = execute_set_variable(&mut session, false, &variable, &value)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Unsupported search_path value"));
+    }
+
+    #[test]
+    fn build_show_all_result_emits_select_shape() {
+        let mut session = make_session();
+        let (local, variable, value) = parse_set("SET statement_timeout = 1000");
+        let _ = execute_set_variable(&mut session, local, &variable, &value).unwrap();
+
+        let out = build_show_all_result(&session, std::sync::Arc::from("UTC"));
+        let ExecuteResult::Select {
+            columns,
+            column_types,
+            rows,
+            ..
+        } = out
+        else {
+            panic!("expected select");
+        };
+        assert_eq!(columns, vec!["name", "setting", "description"]);
+        assert_eq!(column_types, Some(vec![DataType::Text, DataType::Text, DataType::Text]));
+        assert!(!rows.is_empty());
+    }
+
+    #[test]
+    fn set_tableless_helpers_do_not_trigger_on_non_select_statement() {
+        let mut stmts = parse_sql("VALUES (1)").expect("parse");
+        let stmt = stmts.remove(0);
+        let Statement::Query(q) = stmt else {
+            panic!("expected query");
+        };
+        assert!(!matches!(q.body.as_ref(), SetExpr::Select(_)));
+    }
+}

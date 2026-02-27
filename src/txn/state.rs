@@ -80,3 +80,68 @@ impl SavepointState {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SavepointState;
+
+    #[tokio::test]
+    async fn active_flag_tracks_create_release_and_reset() {
+        let state = SavepointState::new();
+        assert!(!state.is_active());
+
+        state.create("sp1".to_string()).await.unwrap();
+        assert!(state.is_active());
+
+        state.release("sp1").await.unwrap();
+        assert!(!state.is_active());
+
+        state.create("sp2".to_string()).await.unwrap();
+        assert!(state.is_active());
+        state.reset().await.unwrap();
+        assert!(!state.is_active());
+    }
+
+    #[tokio::test]
+    async fn should_record_key_changes_after_first_record_in_savepoint() {
+        let state = SavepointState::new();
+        state.create("sp".to_string()).await.unwrap();
+
+        assert!(state.should_record_key(b"k1").await.unwrap());
+        state
+            .record_prev_value(b"k1".to_vec(), Some(vec![1]))
+            .await
+            .unwrap();
+        assert!(!state.should_record_key(b"k1").await.unwrap());
+        assert!(state.should_record_key(b"k2").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn rollback_to_keeps_target_savepoint_active_and_clears_target_undo() {
+        let state = SavepointState::new();
+        state.create("a".to_string()).await.unwrap();
+        state.record_prev_value(b"k1".to_vec(), None).await.unwrap();
+        state.create("b".to_string()).await.unwrap();
+        state
+            .record_prev_value(b"k2".to_vec(), Some(vec![2]))
+            .await
+            .unwrap();
+
+        let prepared = state.prepare_rollback_to("a").await.unwrap();
+        assert_eq!(prepared.target_undo.len(), 1);
+        assert_eq!(prepared.popped.len(), 1);
+        assert!(state.is_active());
+        assert!(state.should_record_key(b"k1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn record_and_should_record_noop_when_inactive() {
+        let state = SavepointState::new();
+        assert!(!state.should_record_key(b"k").await.unwrap());
+        state
+            .record_prev_value(b"k".to_vec(), Some(vec![7]))
+            .await
+            .unwrap();
+        assert!(!state.should_record_key(b"k").await.unwrap());
+    }
+}

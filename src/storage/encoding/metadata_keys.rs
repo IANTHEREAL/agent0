@@ -393,7 +393,7 @@ pub fn encode_worker_queue_scan_end(priority: u8, fire_time_ms: i64) -> Vec<u8> 
 #[cfg(test)]
 pub fn decode_worker_queue_fire_time(key: &[u8]) -> Option<i64> {
     use memcomparable::Deserializer;
-    if key.len() < WORKER_QUEUE_PREFIX.len() + 1 {
+    if key.len() < WORKER_QUEUE_PREFIX.len() + 1 + 8 {
         return None;
     }
     let offset = WORKER_QUEUE_PREFIX.len() + 1;
@@ -605,4 +605,72 @@ pub(crate) fn encode_comment_column_key_v2(
     key.push(0);
     key.extend_from_slice(column_name.as_bytes());
     key
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_queue_fire_time_roundtrip_positive_and_negative() {
+        let key_pos = encode_worker_queue_key(3, 1234567890, "tenant_a", 42, 7);
+        let key_neg = encode_worker_queue_key(3, -987654321, "tenant_a", 42, 7);
+        assert_eq!(decode_worker_queue_fire_time(&key_pos), Some(1234567890));
+        assert_eq!(decode_worker_queue_fire_time(&key_neg), Some(-987654321));
+    }
+
+    #[test]
+    fn decode_worker_queue_fire_time_rejects_short_keys() {
+        let too_short = vec![0u8; WORKER_QUEUE_PREFIX.len()];
+        assert_eq!(decode_worker_queue_fire_time(&too_short), None);
+        let no_payload = {
+            let mut k = WORKER_QUEUE_PREFIX.to_vec();
+            k.push(1);
+            k
+        };
+        assert_eq!(decode_worker_queue_fire_time(&no_payload), None);
+    }
+
+    #[test]
+    fn worker_registry_key_encodes_keyspace_length_and_db_id() {
+        let key = encode_worker_registry_key("ks", 9);
+        assert!(key.starts_with(WORKER_REGISTRY_PREFIX));
+
+        let len_offset = WORKER_REGISTRY_PREFIX.len();
+        let len = u16::from_be_bytes([key[len_offset], key[len_offset + 1]]) as usize;
+        assert_eq!(len, 2);
+        assert_eq!(&key[len_offset + 2..len_offset + 2 + len], b"ks");
+        assert_eq!(key[len_offset + 2 + len], b'_');
+        assert_eq!(
+            &key[len_offset + 2 + len + 1..len_offset + 2 + len + 1 + 8],
+            &9u64.to_be_bytes()
+        );
+    }
+
+    #[test]
+    fn worker_queue_scan_end_matches_key_prefix_for_same_priority_and_fire_time() {
+        let fire_time = 1000_i64;
+        let prefix = encode_worker_queue_scan_end(5, fire_time);
+        let key = encode_worker_queue_key(5, fire_time, "k", 1, 2);
+        assert!(key.starts_with(&prefix));
+
+        let later = encode_worker_queue_scan_end(5, fire_time + 1);
+        assert!(prefix < later);
+    }
+
+    #[test]
+    fn comment_column_key_contains_table_and_column_with_zero_separators() {
+        let key = encode_comment_column_key_v2(1, "public.t", "c1");
+        let prefix = encode_comment_prefix_v2(1);
+        assert!(key.starts_with(&prefix));
+        let payload = &key[prefix.len()..];
+
+        // Format: 'c' + 0 + table + 0 + column
+        assert_eq!(payload[0], b'c');
+        assert_eq!(payload[1], 0);
+        let rest = &payload[2..];
+        let split_at = rest.iter().position(|b| *b == 0).expect("separator exists");
+        assert_eq!(&rest[..split_at], b"public.t");
+        assert_eq!(&rest[split_at + 1..], b"c1");
+    }
 }

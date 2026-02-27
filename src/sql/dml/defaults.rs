@@ -238,3 +238,82 @@ pub fn coerce_row_values_allow_null(schema: &TableSchema, row_vals: &mut [Value]
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ColumnDef;
+
+    fn test_schema(nullable_second: bool) -> TableSchema {
+        TableSchema {
+            name: "public.t".to_string(),
+            table_id: 1,
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: true,
+                    unique: true,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+                ColumnDef {
+                    name: "v".to_string(),
+                    data_type: DataType::Text,
+                    nullable: nullable_second,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: Some("t_pkey".to_string()),
+            pk_indices: vec![0],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: "postgres".to_string(),
+            from_alias: None,
+        }
+    }
+
+    #[test]
+    fn format_detail_value_renders_null_lowercase() {
+        assert_eq!(format_value_for_detail(&Value::Null), "null");
+        assert_eq!(
+            format_value_for_detail(&Value::Text("abc".to_string())),
+            "abc"
+        );
+    }
+
+    #[test]
+    fn coerce_row_values_applies_type_coercion() {
+        let schema = test_schema(true);
+        let mut row_vals = vec![Value::Text("7".to_string()), Value::Int32(9)];
+        coerce_row_values(&schema, &mut row_vals).unwrap();
+        assert_eq!(row_vals[0], Value::Int32(7));
+        assert_eq!(row_vals[1], Value::Text("9".to_string()));
+    }
+
+    #[test]
+    fn coerce_row_values_reports_not_null_violation_with_detail() {
+        let schema = test_schema(false);
+        let mut row_vals = vec![Value::Int32(1), Value::Null];
+        let err = coerce_row_values(&schema, &mut row_vals).unwrap_err().to_string();
+        assert!(err.contains("violates not-null constraint"));
+        assert!(err.contains("Failing row contains (1, null)"));
+    }
+
+    #[test]
+    fn coerce_row_values_allow_null_keeps_null() {
+        let schema = test_schema(true);
+        let mut row_vals = vec![Value::Text("1".to_string()), Value::Null];
+        coerce_row_values_allow_null(&schema, &mut row_vals).unwrap();
+        assert_eq!(row_vals[0], Value::Int32(1));
+        assert_eq!(row_vals[1], Value::Null);
+    }
+}

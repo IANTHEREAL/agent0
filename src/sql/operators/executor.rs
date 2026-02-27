@@ -84,3 +84,18 @@ pub async fn execute_operator_tree_with_ctes(
 
     Ok(rows)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::build_query_ctx_from_task_locals;
+
+    #[test]
+    fn build_query_ctx_uses_test_fallback_when_task_locals_absent() {
+        let ctx = build_query_ctx_from_task_locals();
+        assert_eq!(ctx.connection_id, 0);
+        assert_eq!(ctx.database_name.as_ref(), "postgres");
+        assert_eq!(ctx.current_user.as_ref(), "postgres");
+        assert_eq!(ctx.timezone.as_ref(), "UTC");
+        assert!(ctx.params.is_empty());
+    }
+}

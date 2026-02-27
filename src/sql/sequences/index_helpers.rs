@@ -81,3 +81,50 @@ pub(crate) async fn lookup_indexdef_by_oid(
 
     Ok(None)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::types::IndexState;
+
+    fn sample_index() -> IndexDef {
+        IndexDef {
+            name: "idx_t_a".to_string(),
+            id: 1,
+            columns: vec!["a".to_string(), "b".to_string()],
+            unique: true,
+            is_constraint: false,
+            method: Some("hash".to_string()),
+            predicate: Some("a > 0".to_string()),
+            expressions: vec!["lower(c)".to_string()],
+            state: IndexState::Ready,
+        }
+    }
+
+    #[test]
+    fn format_columns_includes_expressions() {
+        let idx = sample_index();
+        assert_eq!(format_index_columns(&idx), "a, b, (lower(c))");
+    }
+
+    #[test]
+    fn format_indexdef_includes_unique_method_and_predicate() {
+        let idx = sample_index();
+        let ddl = format_indexdef("public", "t", &idx);
+        assert_eq!(
+            ddl,
+            "CREATE UNIQUE INDEX idx_t_a ON public.t USING hash (a, b, (lower(c))) WHERE a > 0"
+        );
+    }
+
+    #[test]
+    fn format_indexdef_defaults_to_btree() {
+        let mut idx = sample_index();
+        idx.unique = false;
+        idx.method = None;
+        idx.predicate = None;
+        idx.expressions.clear();
+        let ddl = format_indexdef("s", "t", &idx);
+        assert_eq!(ddl, "CREATE INDEX idx_t_a ON s.t USING btree (a, b)");
+    }
+}

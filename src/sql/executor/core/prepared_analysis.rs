@@ -341,7 +341,13 @@ fn query_contains_recursive_cte(query: &Query) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::query_contains_recursive_cte;
+    use super::{query_contains_recursive_cte, returning_schema};
+    use crate::model::{DataType, Value};
+    use crate::sql::{
+        analyzer::types::AnalyzedProjection,
+        analyzer::TypedExpr,
+        analyzer::TypedExprKind,
+    };
     use crate::sql::parse_sql;
     use sqlparser::ast::Statement;
 
@@ -375,5 +381,34 @@ mod tests {
             "SELECT * FROM (WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 2) SELECT * FROM t) s",
         );
         assert!(query_contains_recursive_cte(&query));
+    }
+
+    #[test]
+    fn returning_schema_is_empty_when_no_returning() {
+        let schema = returning_schema(&None);
+        assert!(schema.is_empty());
+    }
+
+    #[test]
+    fn returning_schema_preserves_projection_names_and_types() {
+        let projections = vec![
+            AnalyzedProjection {
+                expr: TypedExpr::new(TypedExprKind::Constant(Value::Int32(1)), DataType::Int32),
+                output_name: "id".to_string(),
+            },
+            AnalyzedProjection {
+                expr: TypedExpr::new(TypedExprKind::Constant(Value::Null), DataType::Text),
+                output_name: "name".to_string(),
+            },
+        ];
+
+        let schema = returning_schema(&Some(projections));
+        assert_eq!(
+            schema,
+            vec![
+                ("id".to_string(), DataType::Int32),
+                ("name".to_string(), DataType::Text)
+            ]
+        );
     }
 }

@@ -376,3 +376,19 @@ impl TikvStore {
         Ok(true)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TikvStore;
+
+    #[test]
+    fn builtin_schema_detection_matches_contract() {
+        assert!(TikvStore::is_builtin_schema("public"));
+        assert!(TikvStore::is_builtin_schema("pg_catalog"));
+        assert!(TikvStore::is_builtin_schema("information_schema"));
+        assert!(TikvStore::is_builtin_schema("extensions"));
+
+        assert!(!TikvStore::is_builtin_schema("app"));
+        assert!(!TikvStore::is_builtin_schema("public_v2"));
+    }
+}

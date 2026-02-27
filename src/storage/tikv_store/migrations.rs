@@ -623,6 +623,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_full_name_rejects_invalid_shapes() {
+        assert!(parse_full_name("public.t").is_ok());
+        assert!(parse_full_name("public").is_err());
+        assert!(parse_full_name(".t").is_err());
+        assert!(parse_full_name("public.").is_err());
+        assert!(parse_full_name("a.b.c").is_err());
+    }
+
+    #[test]
+    fn parse_stored_query_requires_single_query_statement() {
+        assert!(parse_stored_query("SELECT 1").is_ok());
+        assert!(parse_stored_query("CREATE TABLE t(id INT)").is_err());
+        assert!(parse_stored_query("SELECT 1; SELECT 2").is_err());
+    }
+
+    #[test]
+    fn derive_bindings_allows_constant_query_with_empty_deps() {
+        let bindings =
+            derive_relation_bindings_from_legacy_deps("view", "public.v", "SELECT 1", &[])
+                .unwrap();
+        assert!(bindings.is_empty());
+    }
+
+    #[test]
+    fn derive_bindings_errors_on_invalid_legacy_dep_shape() {
+        let err = derive_relation_bindings_from_legacy_deps(
+            "view",
+            "public.v",
+            "SELECT 1 FROM t",
+            &["not_a_full_name".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("invalid legacy dep"));
+    }
+
+    #[test]
+    fn derive_bindings_errors_when_legacy_deps_empty_for_relation_query() {
+        let err = derive_relation_bindings_from_legacy_deps(
+            "view",
+            "public.v",
+            "SELECT 1 FROM public.t",
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("legacy deps are empty"));
+    }
+
     /// Apply the marker action to the simulated in-memory marker state (true = marker present).
     fn apply_marker_action(
         _marker_present: bool,

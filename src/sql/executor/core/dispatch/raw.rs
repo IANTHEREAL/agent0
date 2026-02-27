@@ -357,3 +357,213 @@ impl Executor {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ServerConfig;
+    use crate::sql::executor::core::dispatch::scaffold::DispatchContext;
+
+    fn make_executor_and_session(
+        is_superuser: bool,
+        with_server_config: bool,
+    ) -> (Executor, Session) {
+        let store = crate::storage::TikvStore::new_stub();
+        let keyspace = format!("raw_dispatch_tests_{}", if is_superuser { "su" } else { "nsu" });
+        let observability = crate::observability::registry().tenant(&keyspace);
+        let trigger_cache = std::sync::Arc::new(crate::sql::triggers::TriggerBodyCache::new());
+        let stats_cache = std::sync::Arc::new(crate::sql::stats::TableStatsCache::new());
+        let executor = Executor::new(
+            store.clone(),
+            keyspace,
+            observability.clone(),
+            crate::pool::TenantMemoryAccountant::unlimited("raw_dispatch_tests".to_string()),
+            trigger_cache,
+            stats_cache,
+        );
+        let mut session = Session::new_with_user_and_database(
+            store,
+            observability,
+            "tester".to_string(),
+            is_superuser,
+            1,
+            1,
+            "postgres".to_string(),
+            0,
+            0,
+        );
+        if with_server_config {
+            session.set_server_config(ServerConfig::default().shared());
+        }
+        (executor, session)
+    }
+
+    fn assert_command_tag(results: ExecuteResults, expected_tag: &'static str) {
+        match results.last() {
+            ExecuteResult::CommandComplete { tag } => assert_eq!(tag, expected_tag),
+            other => panic!("expected command complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alter_system_set_requires_superuser() {
+        let (executor, mut session) = make_executor_and_session(false, true);
+        let err = executor
+            .execute_alter_system_set(&mut session, "ALTER SYSTEM SET statement_timeout = '5s'")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("permission denied"));
+    }
+
+    #[test]
+    fn alter_system_set_rejects_invalid_syntax_and_unknown_guc() {
+        let (executor, mut session) = make_executor_and_session(true, true);
+        let syntax_err = executor
+            .execute_alter_system_set(&mut session, "ALTER SYSTEM SET")
+            .unwrap_err()
+            .to_string();
+        assert!(syntax_err.contains("syntax error"));
+
+        let unsupported_err = executor
+            .execute_alter_system_set(&mut session, "ALTER SYSTEM SET work_mem = '4MB'")
+            .unwrap_err()
+            .to_string();
+        assert!(unsupported_err.contains("only supported for"));
+    }
+
+    #[test]
+    fn alter_system_set_updates_server_config_for_supported_gucs() {
+        let (executor, mut session) = make_executor_and_session(true, true);
+
+        let r1 = executor
+            .execute_alter_system_set(
+                &mut session,
+                "ALTER SYSTEM SET statement_timeout = '1500ms'",
+            )
+            .unwrap();
+        assert_command_tag(r1, "ALTER SYSTEM");
+
+        let r2 = executor
+            .execute_alter_system_set(
+                &mut session,
+                "ALTER SYSTEM SET idle_in_transaction_session_timeout TO '2s'",
+            )
+            .unwrap();
+        assert_command_tag(r2, "ALTER SYSTEM");
+
+        let cfg = session.server_config().unwrap().read().unwrap().clone();
+        assert_eq!(cfg.statement_timeout_ms, 1500);
+        assert_eq!(cfg.idle_in_transaction_session_timeout_ms, 2000);
+    }
+
+    #[test]
+    fn alter_system_set_requires_server_config_handle() {
+        let (executor, mut session) = make_executor_and_session(true, false);
+        let err = executor
+            .execute_alter_system_set(&mut session, "ALTER SYSTEM SET statement_timeout = 100")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("server configuration not available"));
+    }
+
+    #[test]
+    fn execute_reset_handles_single_and_all() {
+        let (_, mut session) = make_executor_and_session(true, false);
+        session
+            .set_known_setting("statement_timeout", "2500".to_string())
+            .unwrap();
+        assert_eq!(
+            session.show_setting_value("statement_timeout").as_deref(),
+            Some("2500ms")
+        );
+
+        let single = Executor::execute_reset(&mut session, "RESET statement_timeout").unwrap();
+        assert_command_tag(single, "RESET");
+        assert_eq!(
+            session.show_setting_value("statement_timeout").as_deref(),
+            Some("0")
+        );
+
+        session
+            .set_known_setting("statement_timeout", "3000".to_string())
+            .unwrap();
+        let all = Executor::execute_reset(&mut session, "RESET ALL").unwrap();
+        assert_command_tag(all, "RESET");
+    }
+
+    #[test]
+    fn execute_reset_rejects_invalid_syntax() {
+        let (_, mut session) = make_executor_and_session(true, false);
+        let err = Executor::execute_reset(&mut session, "RESET")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("syntax error"));
+    }
+
+    #[test]
+    fn alter_system_set_rejects_invalid_timeout_literal() {
+        let (executor, mut session) = make_executor_and_session(true, true);
+        let err = executor
+            .execute_alter_system_set(
+                &mut session,
+                "ALTER SYSTEM SET statement_timeout = 'not_a_timeout'",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.to_lowercase().contains("timeout"));
+    }
+
+    #[test]
+    fn finish_raw_helpers_mark_failed_only_when_in_transaction() {
+        let (executor, mut session) = make_executor_and_session(true, false);
+        session.force_test_transaction_state(true, false);
+
+        let err_single = executor.finish_raw_single(
+            &mut session,
+            "SELECT 1",
+            Instant::now(),
+            Err(anyhow!("boom")),
+        );
+        assert!(err_single.is_err());
+        assert!(session.is_transaction_failed());
+
+        session.force_test_transaction_state(false, false);
+        let err_multi = executor.finish_raw_multi(
+            &mut session,
+            "SELECT 1",
+            Instant::now(),
+            Err(anyhow!("boom2")),
+        );
+        assert!(err_multi.is_err());
+        assert!(!session.is_transaction_failed());
+    }
+
+    #[test]
+    fn passthrough_dispatch_routes_reset_and_alter_system_set() {
+        let (executor, mut session) = make_executor_and_session(true, true);
+
+        let alter_ctx = DispatchContext::new(
+            "ALTER SYSTEM SET statement_timeout = '1200ms'",
+            &session,
+        );
+        let alter = executor
+            .try_dispatch_raw_passthrough(&mut session, &alter_ctx)
+            .expect("should dispatch alter system")
+            .unwrap();
+        assert_command_tag(alter, "ALTER SYSTEM");
+
+        let reset_ctx = DispatchContext::new("RESET statement_timeout", &session);
+        let reset = executor
+            .try_dispatch_raw_passthrough(&mut session, &reset_ctx)
+            .expect("should dispatch reset")
+            .unwrap();
+        assert_command_tag(reset, "RESET");
+
+        let other_ctx = DispatchContext::new("SELECT 1", &session);
+        assert!(
+            executor
+                .try_dispatch_raw_passthrough(&mut session, &other_ctx)
+                .is_none()
+        );
+    }
+}

@@ -1,0 +1,1046 @@
+{
+  "status": "ok",
+  "orms": [
+    "typeorm",
+    "prisma",
+    "sequelize",
+    "knex",
+    "drizzle",
+    "kysely",
+    "sqlalchemy",
+    "dify_sqlalchemy",
+    "gorm"
+  ],
+  "capabilities": [
+    "ddl_lifecycle",
+    "crud_basic",
+    "transaction",
+    "prepared_statement",
+    "json_and_array",
+    "join_and_subquery",
+    "vector"
+  ],
+  "covered_cells": [
+    {
+      "orm": "dify_sqlalchemy",
+      "capability": "crud_basic"
+    },
+    {
+      "orm": "drizzle",
+      "capability": "crud_basic"
+    },
+    {
+      "orm": "drizzle",
+      "capability": "ddl_lifecycle"
+    },
+    {
+      "orm": "drizzle",
+      "capability": "join_and_subquery"
+    },
+    {
+      "orm": "drizzle",
+      "capability": "json_and_array"
+    },
+    {
+      "orm": "drizzle",
+      "capability": "transaction"
+    },
+    {
+      "orm": "drizzle",
+      "capability": "vector"
+    },
+    {
+      "orm": "gorm",
+      "capability": "crud_basic"
+    },
+    {
+      "orm": "knex",
+      "capability": "crud_basic"
+    },
+    {
+      "orm": "knex",
+      "capability": "ddl_lifecycle"
+    },
+    {
+      "orm": "knex",
+      "capability": "join_and_subquery"
+    },
+    {
+      "orm": "knex",
+      "capability": "json_and_array"
+    },
+    {
+      "orm": "knex",
+      "capability": "prepared_statement"
+    },
+    {
+      "orm": "knex",
+      "capability": "transaction"
+    },
+    {
+      "orm": "knex",
+      "capability": "vector"
+    },
+    {
+      "orm": "kysely",
+      "capability": "crud_basic"
+    },
+    {
+      "orm": "kysely",
+      "capability": "ddl_lifecycle"
+    },
+    {
+      "orm": "kysely",
+      "capability": "join_and_subquery"
+    },
+    {
+      "orm": "kysely",
+      "capability": "transaction"
+    },
+    {
+      "orm": "prisma",
+      "capability": "crud_basic"
+    },
+    {
+      "orm": "prisma",
+      "capability": "ddl_lifecycle"
+    },
+    {
+      "orm": "prisma",
+      "capability": "join_and_subquery"
+    },
+    {
+      "orm": "prisma",
+      "capability": "json_and_array"
+    },
+    {
+      "orm": "prisma",
+      "capability": "prepared_statement"
+    },
+    {
+      "orm": "prisma",
+      "capability": "transaction"
+    },
+    {
+      "orm": "prisma",
+      "capability": "vector"
+    },
+    {
+      "orm": "sequelize",
+      "capability": "crud_basic"
+    },
+    {
+      "orm": "sequelize",
+      "capability": "ddl_lifecycle"
+    },
+    {
+      "orm": "sequelize",
+      "capability": "join_and_subquery"
+    },
+    {
+      "orm": "sequelize",
+      "capability": "json_and_array"
+    },
+    {
+      "orm": "sequelize",
+      "capability": "transaction"
+    },
+    {
+      "orm": "sequelize",
+      "capability": "vector"
+    },
+    {
+      "orm": "sqlalchemy",
+      "capability": "crud_basic"
+    },
+    {
+      "orm": "typeorm",
+      "capability": "crud_basic"
+    },
+    {
+      "orm": "typeorm",
+      "capability": "ddl_lifecycle"
+    },
+    {
+      "orm": "typeorm",
+      "capability": "join_and_subquery"
+    },
+    {
+      "orm": "typeorm",
+      "capability": "json_and_array"
+    },
+    {
+      "orm": "typeorm",
+      "capability": "prepared_statement"
+    },
+    {
+      "orm": "typeorm",
+      "capability": "transaction"
+    },
+    {
+      "orm": "typeorm",
+      "capability": "vector"
+    }
+  ],
+  "uncovered_cells": [
+    {
+      "orm": "dify_sqlalchemy",
+      "capability": "ddl_lifecycle"
+    },
+    {
+      "orm": "dify_sqlalchemy",
+      "capability": "join_and_subquery"
+    },
+    {
+      "orm": "dify_sqlalchemy",
+      "capability": "json_and_array"
+    },
+    {
+      "orm": "dify_sqlalchemy",
+      "capability": "prepared_statement"
+    },
+    {
+      "orm": "dify_sqlalchemy",
+      "capability": "transaction"
+    },
+    {
+      "orm": "dify_sqlalchemy",
+      "capability": "vector"
+    },
+    {
+      "orm": "drizzle",
+      "capability": "prepared_statement"
+    },
+    {
+      "orm": "gorm",
+      "capability": "ddl_lifecycle"
+    },
+    {
+      "orm": "gorm",
+      "capability": "join_and_subquery"
+    },
+    {
+      "orm": "gorm",
+      "capability": "json_and_array"
+    },
+    {
+      "orm": "gorm",
+      "capability": "prepared_statement"
+    },
+    {
+      "orm": "gorm",
+      "capability": "transaction"
+    },
+    {
+      "orm": "gorm",
+      "capability": "vector"
+    },
+    {
+      "orm": "kysely",
+      "capability": "json_and_array"
+    },
+    {
+      "orm": "kysely",
+      "capability": "prepared_statement"
+    },
+    {
+      "orm": "kysely",
+      "capability": "vector"
+    },
+    {
+      "orm": "sequelize",
+      "capability": "prepared_statement"
+    },
+    {
+      "orm": "sqlalchemy",
+      "capability": "ddl_lifecycle"
+    },
+    {
+      "orm": "sqlalchemy",
+      "capability": "join_and_subquery"
+    },
+    {
+      "orm": "sqlalchemy",
+      "capability": "json_and_array"
+    },
+    {
+      "orm": "sqlalchemy",
+      "capability": "prepared_statement"
+    },
+    {
+      "orm": "sqlalchemy",
+      "capability": "transaction"
+    },
+    {
+      "orm": "sqlalchemy",
+      "capability": "vector"
+    }
+  ],
+  "covered": 40,
+  "total": 63,
+  "ratio": 0.6349,
+  "evidence": [
+    {
+      "orm": "dify_sqlalchemy",
+      "capability": "crud_basic",
+      "sources": [
+        "e2e/dify_sqlalchemy_compat"
+      ]
+    },
+    {
+      "orm": "drizzle",
+      "capability": "crud_basic",
+      "sources": [
+        " > Drizzle Advanced SQL Features [pg-tikv] > foreign key constraints > should enforce foreign key on INSERT",
+        " > Drizzle Advanced SQL Features [pg-tikv] > subqueries > should support scalar subquery in SELECT",
+        " > Drizzle CRUD Semantics [pg-tikv] > DELETE operations > should cascade delete related entities",
+        " > Drizzle CRUD Semantics [pg-tikv] > DELETE operations > should delete by id",
+        " > Drizzle CRUD Semantics [pg-tikv] > DELETE operations > should delete with condition",
+        " > Drizzle CRUD Semantics [pg-tikv] > INSERT operations > should apply default values",
+        " > Drizzle CRUD Semantics [pg-tikv] > INSERT operations > should handle JSONB insert",
+        " > Drizzle CRUD Semantics [pg-tikv] > INSERT operations > should handle ON CONFLICT (upsert)",
+        " > Drizzle CRUD Semantics [pg-tikv] > INSERT operations > should handle UUID insert",
+        " > Drizzle CRUD Semantics [pg-tikv] > INSERT operations > should insert batch rows",
+        " > Drizzle CRUD Semantics [pg-tikv] > INSERT operations > should insert single row",
+        " > Drizzle CRUD Semantics [pg-tikv] > INSERT operations > should return inserted row with RETURNING",
+        " > Drizzle CRUD Semantics [pg-tikv] > SELECT operations > should select specific columns",
+        " > Drizzle CRUD Semantics [pg-tikv] > SELECT operations > should select with COUNT aggregate",
+        " > Drizzle CRUD Semantics [pg-tikv] > SELECT operations > should select with GROUP BY",
+        " > Drizzle CRUD Semantics [pg-tikv] > SELECT operations > should select with LIMIT and OFFSET",
+        " > Drizzle CRUD Semantics [pg-tikv] > SELECT operations > should select with ORDER BY",
+        " > Drizzle CRUD Semantics [pg-tikv] > SELECT operations > should select with SUM aggregate",
+        " > Drizzle CRUD Semantics [pg-tikv] > SELECT operations > should select with WHERE condition",
+        " > Drizzle CRUD Semantics [pg-tikv] > UPDATE operations > should update JSONB field",
+        " > Drizzle CRUD Semantics [pg-tikv] > UPDATE operations > should update partial fields",
+        " > Drizzle CRUD Semantics [pg-tikv] > UPDATE operations > should update with RETURNING",
+        " > Drizzle CRUD Semantics [pg-tikv] > UPDATE operations > should update with condition",
+        " > Drizzle CRUD Semantics [pg-tikv] > filter operations > should handle and and or",
+        " > Drizzle CRUD Semantics [pg-tikv] > filter operations > should handle gt, gte, lt, lte",
+        " > Drizzle CRUD Semantics [pg-tikv] > filter operations > should handle ilike",
+        " > Drizzle CRUD Semantics [pg-tikv] > filter operations > should handle inArray",
+        " > Drizzle CRUD Semantics [pg-tikv] > filter operations > should handle isNull and isNotNull",
+        " > Drizzle CRUD Semantics [pg-tikv] > filter operations > should handle like",
+        " > Drizzle Vector Operations [pg-tikv] > Vector CRUD > should delete vector",
+        " > Drizzle Vector Operations [pg-tikv] > Vector CRUD > should insert multiple vectors",
+        " > Drizzle Vector Operations [pg-tikv] > Vector CRUD > should insert vector",
+        " > Drizzle Vector Operations [pg-tikv] > Vector CRUD > should query vectors",
+        " > Drizzle Vector Operations [pg-tikv] > Vector CRUD > should update vector"
+      ]
+    },
+    {
+      "orm": "drizzle",
+      "capability": "ddl_lifecycle",
+      "sources": [
+        " > Drizzle Advanced SQL Features [pg-tikv] > views > should create and query a view"
+      ]
+    },
+    {
+      "orm": "drizzle",
+      "capability": "join_and_subquery",
+      "sources": [
+        " > Drizzle Advanced SQL Features [pg-tikv] > CTE (WITH clause) > should support multiple CTEs",
+        " > Drizzle Advanced SQL Features [pg-tikv] > CTE (WITH clause) > should support simple CTE",
+        " > Drizzle Advanced SQL Features [pg-tikv] > recursive CTE > should support recursive CTE for hierarchy",
+        " > Drizzle Advanced SQL Features [pg-tikv] > recursive CTE > should support recursive CTE with depth limit",
+        " > Drizzle Advanced SQL Features [pg-tikv] > subqueries > should support scalar subquery in SELECT",
+        " > Drizzle Advanced SQL Features [pg-tikv] > subqueries > should support subquery in WHERE with IN",
+        " > Drizzle Advanced SQL Features [pg-tikv] > subqueries > should support subquery with EXISTS",
+        " > Drizzle Advanced SQL Features [pg-tikv] > views > should create and query a view",
+        " > Drizzle Advanced SQL Features [pg-tikv] > window functions > should support AVG() OVER",
+        " > Drizzle Advanced SQL Features [pg-tikv] > window functions > should support DENSE_RANK() with PARTITION BY",
+        " > Drizzle Advanced SQL Features [pg-tikv] > window functions > should support LEAD() and LAG()",
+        " > Drizzle Advanced SQL Features [pg-tikv] > window functions > should support RANK() with ties",
+        " > Drizzle Advanced SQL Features [pg-tikv] > window functions > should support ROW_NUMBER()",
+        " > Drizzle Advanced SQL Features [pg-tikv] > window functions > should support SUM() OVER partition total",
+        " > Drizzle Connection & Protocol Compatibility [pg-tikv] > connection establishment > should execute query after connection",
+        " > Drizzle Vector Operations [pg-tikv] > Vector CRUD > should query vectors"
+      ]
+    },
+    {
+      "orm": "drizzle",
+      "capability": "json_and_array",
+      "sources": [
+        " > Drizzle Advanced SQL Features [pg-tikv] > JSONB operations > should extract JSONB field with ->",
+        " > Drizzle Advanced SQL Features [pg-tikv] > JSONB operations > should extract text with ->>",
+        " > Drizzle Advanced SQL Features [pg-tikv] > JSONB operations > should use JSONB containment @>",
+        " > Drizzle CRUD Semantics [pg-tikv] > INSERT operations > should handle JSONB insert",
+        " > Drizzle CRUD Semantics [pg-tikv] > UPDATE operations > should update JSONB field",
+        " > Drizzle CRUD Semantics [pg-tikv] > filter operations > should handle inArray"
+      ]
+    },
+    {
+      "orm": "drizzle",
+      "capability": "transaction",
+      "sources": [
+        " > Drizzle Transactions & Isolation [pg-tikv] > isolation levels > should handle read committed isolation",
+        " > Drizzle Transactions & Isolation [pg-tikv] > isolation levels > should handle repeatable read isolation",
+        " > Drizzle Transactions & Isolation [pg-tikv] > isolation levels > should reject serializable isolation (not supported by TiKV)",
+        " > Drizzle Transactions & Isolation [pg-tikv] > transaction callback > should commit transaction",
+        " > Drizzle Transactions & Isolation [pg-tikv] > transaction callback > should handle multiple operations in transaction",
+        " > Drizzle Transactions & Isolation [pg-tikv] > transaction callback > should rollback transaction on error",
+        " > Drizzle Transactions & Isolation [pg-tikv] > transaction visibility > should isolate uncommitted changes"
+      ]
+    },
+    {
+      "orm": "drizzle",
+      "capability": "vector",
+      "sources": [
+        " > Drizzle Vector Operations [pg-tikv] > Vector CRUD > should delete vector",
+        " > Drizzle Vector Operations [pg-tikv] > Vector CRUD > should insert multiple vectors",
+        " > Drizzle Vector Operations [pg-tikv] > Vector CRUD > should insert vector",
+        " > Drizzle Vector Operations [pg-tikv] > Vector CRUD > should query vectors",
+        " > Drizzle Vector Operations [pg-tikv] > Vector CRUD > should update vector",
+        " > Drizzle Vector Operations [pg-tikv] > Vector Distance Functions > should calculate L2 distance",
+        " > Drizzle Vector Operations [pg-tikv] > Vector Distance Functions > should calculate cosine distance",
+        " > Drizzle Vector Operations [pg-tikv] > Vector Distance Functions > should calculate inner product",
+        " > Drizzle Vector Operations [pg-tikv] > Vector Distance Functions > should order by distance for nearest neighbors",
+        " > Drizzle Vector Operations [pg-tikv] > Vector Distance Functions > should perform similarity search",
+        " > Drizzle Vector Operations [pg-tikv] > Vector Type Casting > should cast string to vector",
+        " > Drizzle Vector Operations [pg-tikv] > Vector Utility Functions > should calculate vector norm",
+        " > Drizzle Vector Operations [pg-tikv] > Vector Utility Functions > should get vector dimensions"
+      ]
+    },
+    {
+      "orm": "gorm",
+      "capability": "crud_basic",
+      "sources": [
+        "e2e/gorm_smoke"
+      ]
+    },
+    {
+      "orm": "knex",
+      "capability": "crud_basic",
+      "sources": [
+        " > Knex Advanced SQL Features [pg-tikv] > foreign key constraints > should enforce foreign key on INSERT",
+        " > Knex CRUD Semantics [pg-tikv] > DELETE operations > should cascade delete related entities",
+        " > Knex CRUD Semantics [pg-tikv] > DELETE operations > should delete by id",
+        " > Knex CRUD Semantics [pg-tikv] > DELETE operations > should delete with condition",
+        " > Knex CRUD Semantics [pg-tikv] > INSERT operations > should apply default values",
+        " > Knex CRUD Semantics [pg-tikv] > INSERT operations > should handle JSONB insert",
+        " > Knex CRUD Semantics [pg-tikv] > INSERT operations > should handle ON CONFLICT (upsert)",
+        " > Knex CRUD Semantics [pg-tikv] > INSERT operations > should handle UUID insert",
+        " > Knex CRUD Semantics [pg-tikv] > INSERT operations > should insert batch rows",
+        " > Knex CRUD Semantics [pg-tikv] > INSERT operations > should insert single row",
+        " > Knex CRUD Semantics [pg-tikv] > INSERT operations > should return inserted row with RETURNING",
+        " > Knex CRUD Semantics [pg-tikv] > SELECT operations > should select specific columns",
+        " > Knex CRUD Semantics [pg-tikv] > SELECT operations > should select with COUNT aggregate",
+        " > Knex CRUD Semantics [pg-tikv] > SELECT operations > should select with GROUP BY",
+        " > Knex CRUD Semantics [pg-tikv] > SELECT operations > should select with LIMIT and OFFSET",
+        " > Knex CRUD Semantics [pg-tikv] > SELECT operations > should select with ORDER BY",
+        " > Knex CRUD Semantics [pg-tikv] > SELECT operations > should select with SUM aggregate",
+        " > Knex CRUD Semantics [pg-tikv] > SELECT operations > should select with WHERE condition",
+        " > Knex CRUD Semantics [pg-tikv] > UPDATE operations > should update JSONB field",
+        " > Knex CRUD Semantics [pg-tikv] > UPDATE operations > should update partial fields",
+        " > Knex CRUD Semantics [pg-tikv] > UPDATE operations > should update with RETURNING",
+        " > Knex CRUD Semantics [pg-tikv] > UPDATE operations > should update with condition",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > subqueries > should handle subquery in SELECT",
+        " > Knex Vector Operations [pg-tikv] > Vector CRUD > should insert multiple vectors",
+        " > Knex Vector Operations [pg-tikv] > Vector CRUD > should insert vectors",
+        " > Knex Vector Operations [pg-tikv] > Vector CRUD > should query vectors"
+      ]
+    },
+    {
+      "orm": "knex",
+      "capability": "ddl_lifecycle",
+      "sources": [
+        " > Knex Advanced SQL Features [pg-tikv] > views > should create and query a view"
+      ]
+    },
+    {
+      "orm": "knex",
+      "capability": "join_and_subquery",
+      "sources": [
+        " > Knex Advanced SQL Features [pg-tikv] > CTE (WITH clause) > should support multiple CTEs",
+        " > Knex Advanced SQL Features [pg-tikv] > CTE (WITH clause) > should support recursive CTE via raw SQL",
+        " > Knex Advanced SQL Features [pg-tikv] > CTE (WITH clause) > should support simple CTE",
+        " > Knex Advanced SQL Features [pg-tikv] > recursive CTE > should support recursive CTE for hierarchy",
+        " > Knex Advanced SQL Features [pg-tikv] > subqueries > should support scalar subquery",
+        " > Knex Advanced SQL Features [pg-tikv] > subqueries > should support subquery in WHERE",
+        " > Knex Advanced SQL Features [pg-tikv] > views > should create and query a view",
+        " > Knex Advanced SQL Features [pg-tikv] > window functions > should support AVG() OVER",
+        " > Knex Advanced SQL Features [pg-tikv] > window functions > should support DENSE_RANK() with PARTITION BY",
+        " > Knex Advanced SQL Features [pg-tikv] > window functions > should support LEAD() and LAG()",
+        " > Knex Advanced SQL Features [pg-tikv] > window functions > should support RANK() with ties",
+        " > Knex Advanced SQL Features [pg-tikv] > window functions > should support ROW_NUMBER()",
+        " > Knex Advanced SQL Features [pg-tikv] > window functions > should support SUM() OVER partition total",
+        " > Knex Advanced SQL Features [pg-tikv] > window functions > should support running SUM() OVER",
+        " > Knex Connection & Protocol Compatibility [pg-tikv] > connection establishment > should execute query after connection",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > CASE expressions > should handle CASE WHEN via raw",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > CTE (WITH clause) > should execute CTE query",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > DISTINCT operations > should handle DISTINCT",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > DISTINCT operations > should handle DISTINCT ON",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > JSONB operations > should query JSONB with -> operator",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > JSONB operations > should query JSONB with ->> operator",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > JSONB operations > should query JSONB with @> operator",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > LIKE and ILIKE > should handle ILIKE (case-insensitive)",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > LIKE and ILIKE > should handle LIKE (case-sensitive)",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > NULL handling > should handle COALESCE",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > NULL handling > should handle IS NOT NULL",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > NULL handling > should handle IS NULL",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > WHERE clauses > should handle nested where",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > WHERE clauses > should handle orWhere",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > WHERE clauses > should handle whereBetween",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > WHERE clauses > should handle whereIn",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > WHERE clauses > should handle whereNotIn",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > joins > should handle INNER JOIN",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > joins > should handle LEFT JOIN",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > raw queries with bindings > should bind named parameters",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > raw queries with bindings > should bind positional parameters",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > subqueries > should handle subquery in SELECT",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > subqueries > should handle subquery in WHERE",
+        " > Knex Vector Operations [pg-tikv] > Vector CRUD > should query vectors"
+      ]
+    },
+    {
+      "orm": "knex",
+      "capability": "json_and_array",
+      "sources": [
+        " > Knex Advanced SQL Features [pg-tikv] > JSONB operations > should extract JSONB field with ->",
+        " > Knex Advanced SQL Features [pg-tikv] > JSONB operations > should extract text with ->>",
+        " > Knex Advanced SQL Features [pg-tikv] > JSONB operations > should use JSONB containment @>",
+        " > Knex CRUD Semantics [pg-tikv] > INSERT operations > should handle JSONB insert",
+        " > Knex CRUD Semantics [pg-tikv] > UPDATE operations > should update JSONB field",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > JSONB operations > should query JSONB with -> operator",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > JSONB operations > should query JSONB with ->> operator",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > JSONB operations > should query JSONB with @> operator"
+      ]
+    },
+    {
+      "orm": "knex",
+      "capability": "prepared_statement",
+      "sources": [
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > raw queries with bindings > should bind named parameters",
+        " > Knex Query Generation & SQL Compatibility [pg-tikv] > raw queries with bindings > should bind positional parameters"
+      ]
+    },
+    {
+      "orm": "knex",
+      "capability": "transaction",
+      "sources": [
+        " > Knex Transactions & Isolation [pg-tikv] > isolation levels > should handle READ COMMITTED isolation",
+        " > Knex Transactions & Isolation [pg-tikv] > isolation levels > should handle REPEATABLE READ isolation",
+        " > Knex Transactions & Isolation [pg-tikv] > isolation levels > should reject SERIALIZABLE isolation (not supported by TiKV)",
+        " > Knex Transactions & Isolation [pg-tikv] > manual transaction > should manually commit transaction",
+        " > Knex Transactions & Isolation [pg-tikv] > manual transaction > should manually rollback transaction",
+        " > Knex Transactions & Isolation [pg-tikv] > transaction callback > should commit transaction",
+        " > Knex Transactions & Isolation [pg-tikv] > transaction callback > should handle multiple operations in transaction",
+        " > Knex Transactions & Isolation [pg-tikv] > transaction callback > should rollback transaction on error",
+        " > Knex Transactions & Isolation [pg-tikv] > transaction visibility > should not see uncommitted changes outside transaction"
+      ]
+    },
+    {
+      "orm": "knex",
+      "capability": "vector",
+      "sources": [
+        " > Knex Vector Operations [pg-tikv] > Vector CRUD > should insert multiple vectors",
+        " > Knex Vector Operations [pg-tikv] > Vector CRUD > should insert vectors",
+        " > Knex Vector Operations [pg-tikv] > Vector CRUD > should query vectors",
+        " > Knex Vector Operations [pg-tikv] > Vector Distance Functions > should calculate L2 distance",
+        " > Knex Vector Operations [pg-tikv] > Vector Distance Functions > should calculate cosine distance",
+        " > Knex Vector Operations [pg-tikv] > Vector Distance Functions > should calculate inner product",
+        " > Knex Vector Operations [pg-tikv] > Vector Distance Functions > should perform similarity search",
+        " > Knex Vector Operations [pg-tikv] > Vector Type Casting > should cast string to vector",
+        " > Knex Vector Operations [pg-tikv] > Vector Utility Functions > should calculate vector norm",
+        " > Knex Vector Operations [pg-tikv] > Vector Utility Functions > should get vector dimensions"
+      ]
+    },
+    {
+      "orm": "kysely",
+      "capability": "crud_basic",
+      "sources": [
+        " > Kysely - CRUD Operations > Delete Operations > should delete multiple records",
+        " > Kysely - CRUD Operations > Delete Operations > should delete single record",
+        " > Kysely - CRUD Operations > Delete Operations > should delete with returning",
+        " > Kysely - CRUD Operations > Insert Operations > should handle on conflict",
+        " > Kysely - CRUD Operations > Insert Operations > should insert multiple records",
+        " > Kysely - CRUD Operations > Insert Operations > should insert single record",
+        " > Kysely - CRUD Operations > Insert Operations > should insert with default values",
+        " > Kysely - CRUD Operations > Select Operations > should filter NULL values",
+        " > Kysely - CRUD Operations > Select Operations > should filter with AND conditions",
+        " > Kysely - CRUD Operations > Select Operations > should filter with IN",
+        " > Kysely - CRUD Operations > Select Operations > should filter with LIKE",
+        " > Kysely - CRUD Operations > Select Operations > should filter with OR conditions",
+        " > Kysely - CRUD Operations > Select Operations > should filter with comparison operators",
+        " > Kysely - CRUD Operations > Select Operations > should filter with where",
+        " > Kysely - CRUD Operations > Select Operations > should limit and offset results",
+        " > Kysely - CRUD Operations > Select Operations > should order results",
+        " > Kysely - CRUD Operations > Select Operations > should select all records",
+        " > Kysely - CRUD Operations > Select Operations > should select specific columns",
+        " > Kysely - CRUD Operations > Update Operations > should update multiple records",
+        " > Kysely - CRUD Operations > Update Operations > should update single record",
+        " > Kysely - CRUD Operations > Update Operations > should update with expression",
+        " > Kysely - E-commerce Scenario > should update order status",
+        " > Kysely - Raw SQL > should use raw in select",
+        " > Kysely - Subqueries > should use subquery in select"
+      ]
+    },
+    {
+      "orm": "kysely",
+      "capability": "ddl_lifecycle",
+      "sources": [
+        " > Kysely - E-commerce Scenario > should create order with items"
+      ]
+    },
+    {
+      "orm": "kysely",
+      "capability": "join_and_subquery",
+      "sources": [
+        " > Kysely - Joins > should join multiple tables",
+        " > Kysely - Joins > should join with aggregation",
+        " > Kysely - Joins > should perform inner join",
+        " > Kysely - Joins > should perform left join",
+        " > Kysely - Subqueries > should use subquery in select",
+        " > Kysely - Subqueries > should use subquery in where"
+      ]
+    },
+    {
+      "orm": "kysely",
+      "capability": "transaction",
+      "sources": [
+        " > Kysely - Transactions > should commit transaction",
+        " > Kysely - Transactions > should rollback transaction on error"
+      ]
+    },
+    {
+      "orm": "prisma",
+      "capability": "crud_basic",
+      "sources": [
+        " > Prisma Advanced SQL Features [pg-tikv] > foreign key constraints > should enforce foreign key on INSERT",
+        " > Prisma Advanced SQL Features [pg-tikv] > subqueries > should support scalar subquery in SELECT",
+        " > Prisma CRUD Semantics [pg-tikv] > DELETE operations > should cascade delete related entities",
+        " > Prisma CRUD Semantics [pg-tikv] > DELETE operations > should delete by id",
+        " > Prisma CRUD Semantics [pg-tikv] > DELETE operations > should delete with condition",
+        " > Prisma CRUD Semantics [pg-tikv] > INSERT operations > should apply default values",
+        " > Prisma CRUD Semantics [pg-tikv] > INSERT operations > should handle JSONB insert",
+        " > Prisma CRUD Semantics [pg-tikv] > INSERT operations > should handle UUID insert",
+        " > Prisma CRUD Semantics [pg-tikv] > INSERT operations > should insert batch rows with createMany",
+        " > Prisma CRUD Semantics [pg-tikv] > INSERT operations > should insert single row with create",
+        " > Prisma CRUD Semantics [pg-tikv] > SELECT operations > should select specific fields",
+        " > Prisma CRUD Semantics [pg-tikv] > SELECT operations > should select with WHERE condition",
+        " > Prisma CRUD Semantics [pg-tikv] > SELECT operations > should select with aggregate functions",
+        " > Prisma CRUD Semantics [pg-tikv] > SELECT operations > should select with count aggregate",
+        " > Prisma CRUD Semantics [pg-tikv] > SELECT operations > should select with groupBy",
+        " > Prisma CRUD Semantics [pg-tikv] > SELECT operations > should select with orderBy",
+        " > Prisma CRUD Semantics [pg-tikv] > SELECT operations > should select with take and skip (LIMIT/OFFSET)",
+        " > Prisma CRUD Semantics [pg-tikv] > UPDATE operations > should update JSONB field",
+        " > Prisma CRUD Semantics [pg-tikv] > UPDATE operations > should update many with condition",
+        " > Prisma CRUD Semantics [pg-tikv] > UPDATE operations > should update partial fields",
+        " > Prisma Vector Operations [pg-tikv] > Vector CRUD > should delete vector",
+        " > Prisma Vector Operations [pg-tikv] > Vector CRUD > should insert multiple vectors",
+        " > Prisma Vector Operations [pg-tikv] > Vector CRUD > should insert vector",
+        " > Prisma Vector Operations [pg-tikv] > Vector CRUD > should query vectors",
+        " > Prisma Vector Operations [pg-tikv] > Vector CRUD > should update vector"
+      ]
+    },
+    {
+      "orm": "prisma",
+      "capability": "ddl_lifecycle",
+      "sources": [
+        " > Prisma Advanced SQL Features [pg-tikv] > views > should create and query a view",
+        " > Prisma CRUD Semantics [pg-tikv] > INSERT operations > should insert batch rows with createMany",
+        " > Prisma CRUD Semantics [pg-tikv] > INSERT operations > should insert single row with create"
+      ]
+    },
+    {
+      "orm": "prisma",
+      "capability": "join_and_subquery",
+      "sources": [
+        " > Prisma Advanced SQL Features [pg-tikv] > CTE (WITH clause) > should support multiple CTEs",
+        " > Prisma Advanced SQL Features [pg-tikv] > CTE (WITH clause) > should support simple CTE",
+        " > Prisma Advanced SQL Features [pg-tikv] > recursive CTE > should support recursive CTE for hierarchy",
+        " > Prisma Advanced SQL Features [pg-tikv] > recursive CTE > should support recursive CTE with depth limit",
+        " > Prisma Advanced SQL Features [pg-tikv] > subqueries > should support scalar subquery in SELECT",
+        " > Prisma Advanced SQL Features [pg-tikv] > subqueries > should support subquery in WHERE with IN",
+        " > Prisma Advanced SQL Features [pg-tikv] > subqueries > should support subquery with EXISTS",
+        " > Prisma Advanced SQL Features [pg-tikv] > views > should create and query a view",
+        " > Prisma Advanced SQL Features [pg-tikv] > window functions > should support AVG() OVER",
+        " > Prisma Advanced SQL Features [pg-tikv] > window functions > should support DENSE_RANK() with PARTITION BY",
+        " > Prisma Advanced SQL Features [pg-tikv] > window functions > should support LEAD() and LAG()",
+        " > Prisma Advanced SQL Features [pg-tikv] > window functions > should support RANK() with ties",
+        " > Prisma Advanced SQL Features [pg-tikv] > window functions > should support ROW_NUMBER()",
+        " > Prisma Advanced SQL Features [pg-tikv] > window functions > should support SUM() OVER partition total",
+        " > Prisma Connection & Protocol Compatibility [pg-tikv] > connection establishment > should execute raw query after connection",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > NULL handling > should handle IS NOT NULL",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > NULL handling > should handle IS NULL",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > cursor pagination > should handle cursor-based pagination",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > distinct > should handle distinct",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > filter operations > should handle contains filter (LIKE)",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > filter operations > should handle contains with mode insensitive (ILIKE)",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > filter operations > should handle endsWith filter",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > filter operations > should handle equals filter",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > filter operations > should handle gt/gte/lt/lte filters",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > filter operations > should handle in filter",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > filter operations > should handle not equals filter",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > filter operations > should handle notIn filter",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > filter operations > should handle startsWith filter",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > logical operators > should handle AND",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > logical operators > should handle NOT",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > logical operators > should handle OR",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > logical operators > should handle nested logical operators",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > raw query with parameters > should bind parameters in raw query",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > raw query with parameters > should handle Prisma.sql for dynamic queries",
+        " > Prisma Vector Operations [pg-tikv] > Vector CRUD > should query vectors"
+      ]
+    },
+    {
+      "orm": "prisma",
+      "capability": "json_and_array",
+      "sources": [
+        " > Prisma Advanced SQL Features [pg-tikv] > JSONB operations > should extract JSONB field with ->",
+        " > Prisma Advanced SQL Features [pg-tikv] > JSONB operations > should extract text with ->>",
+        " > Prisma Advanced SQL Features [pg-tikv] > JSONB operations > should use JSONB containment @>",
+        " > Prisma CRUD Semantics [pg-tikv] > INSERT operations > should handle JSONB insert",
+        " > Prisma CRUD Semantics [pg-tikv] > UPDATE operations > should update JSONB field"
+      ]
+    },
+    {
+      "orm": "prisma",
+      "capability": "prepared_statement",
+      "sources": [
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > raw query with parameters > should bind parameters in raw query",
+        " > Prisma Query Generation & SQL Compatibility [pg-tikv] > raw query with parameters > should handle Prisma.sql for dynamic queries"
+      ]
+    },
+    {
+      "orm": "prisma",
+      "capability": "transaction",
+      "sources": [
+        " > Prisma Transactions & Isolation [pg-tikv] > batch transactions > should execute batch transaction",
+        " > Prisma Transactions & Isolation [pg-tikv] > batch transactions > should rollback batch transaction on any failure",
+        " > Prisma Transactions & Isolation [pg-tikv] > interactive transactions > should commit interactive transaction",
+        " > Prisma Transactions & Isolation [pg-tikv] > interactive transactions > should handle multiple operations in transaction",
+        " > Prisma Transactions & Isolation [pg-tikv] > interactive transactions > should rollback interactive transaction on error",
+        " > Prisma Transactions & Isolation [pg-tikv] > transaction options > should handle READ COMMITTED isolation",
+        " > Prisma Transactions & Isolation [pg-tikv] > transaction options > should handle REPEATABLE READ isolation",
+        " > Prisma Transactions & Isolation [pg-tikv] > transaction options > should handle transaction with max wait",
+        " > Prisma Transactions & Isolation [pg-tikv] > transaction options > should handle transaction with timeout"
+      ]
+    },
+    {
+      "orm": "prisma",
+      "capability": "vector",
+      "sources": [
+        " > Prisma Vector Operations [pg-tikv] > Vector CRUD > should delete vector",
+        " > Prisma Vector Operations [pg-tikv] > Vector CRUD > should insert multiple vectors",
+        " > Prisma Vector Operations [pg-tikv] > Vector CRUD > should insert vector",
+        " > Prisma Vector Operations [pg-tikv] > Vector CRUD > should query vectors",
+        " > Prisma Vector Operations [pg-tikv] > Vector CRUD > should update vector",
+        " > Prisma Vector Operations [pg-tikv] > Vector Distance Functions > should calculate L2 distance",
+        " > Prisma Vector Operations [pg-tikv] > Vector Distance Functions > should calculate cosine distance",
+        " > Prisma Vector Operations [pg-tikv] > Vector Distance Functions > should calculate inner product",
+        " > Prisma Vector Operations [pg-tikv] > Vector Distance Functions > should order by distance for nearest neighbors",
+        " > Prisma Vector Operations [pg-tikv] > Vector Distance Functions > should perform similarity search",
+        " > Prisma Vector Operations [pg-tikv] > Vector Type Casting > should cast string to vector",
+        " > Prisma Vector Operations [pg-tikv] > Vector Utility Functions > should get vector dimensions"
+      ]
+    },
+    {
+      "orm": "sequelize",
+      "capability": "crud_basic",
+      "sources": [
+        " > Sequelize Advanced SQL Features [pg-tikv] > foreign key constraints > should enforce foreign key on INSERT",
+        " > Sequelize Advanced SQL Features [pg-tikv] > subqueries > should support scalar subquery in SELECT",
+        " > Sequelize CRUD Semantics [pg-tikv] > DELETE operations > should cascade delete related entities",
+        " > Sequelize CRUD Semantics [pg-tikv] > DELETE operations > should delete by id",
+        " > Sequelize CRUD Semantics [pg-tikv] > DELETE operations > should delete with condition",
+        " > Sequelize CRUD Semantics [pg-tikv] > INSERT operations > should apply default values",
+        " > Sequelize CRUD Semantics [pg-tikv] > INSERT operations > should handle JSONB insert",
+        " > Sequelize CRUD Semantics [pg-tikv] > INSERT operations > should handle UUID insert",
+        " > Sequelize CRUD Semantics [pg-tikv] > INSERT operations > should insert batch rows with bulkCreate",
+        " > Sequelize CRUD Semantics [pg-tikv] > INSERT operations > should insert single row with create",
+        " > Sequelize CRUD Semantics [pg-tikv] > INSERT operations > should upsert existing record",
+        " > Sequelize CRUD Semantics [pg-tikv] > INSERT operations > should upsert new record",
+        " > Sequelize CRUD Semantics [pg-tikv] > SELECT operations > should select specific attributes",
+        " > Sequelize CRUD Semantics [pg-tikv] > SELECT operations > should select with COUNT aggregate",
+        " > Sequelize CRUD Semantics [pg-tikv] > SELECT operations > should select with GROUP BY",
+        " > Sequelize CRUD Semantics [pg-tikv] > SELECT operations > should select with LIMIT and OFFSET",
+        " > Sequelize CRUD Semantics [pg-tikv] > SELECT operations > should select with ORDER BY",
+        " > Sequelize CRUD Semantics [pg-tikv] > SELECT operations > should select with SUM aggregate",
+        " > Sequelize CRUD Semantics [pg-tikv] > SELECT operations > should select with WHERE condition",
+        " > Sequelize CRUD Semantics [pg-tikv] > UPDATE operations > should update JSONB field",
+        " > Sequelize CRUD Semantics [pg-tikv] > UPDATE operations > should update instance",
+        " > Sequelize CRUD Semantics [pg-tikv] > UPDATE operations > should update partial fields",
+        " > Sequelize CRUD Semantics [pg-tikv] > UPDATE operations > should update with condition",
+        " > Sequelize CRUD Semantics [pg-tikv] > operator queries > should handle Op.and and Op.or",
+        " > Sequelize CRUD Semantics [pg-tikv] > operator queries > should handle Op.gt, Op.gte, Op.lt, Op.lte",
+        " > Sequelize CRUD Semantics [pg-tikv] > operator queries > should handle Op.iLike",
+        " > Sequelize CRUD Semantics [pg-tikv] > operator queries > should handle Op.in",
+        " > Sequelize CRUD Semantics [pg-tikv] > operator queries > should handle Op.is (NULL check)",
+        " > Sequelize CRUD Semantics [pg-tikv] > operator queries > should handle Op.like",
+        " > Sequelize Vector Operations [pg-tikv] > Vector CRUD > should insert multiple vectors",
+        " > Sequelize Vector Operations [pg-tikv] > Vector CRUD > should insert vector",
+        " > Sequelize Vector Operations [pg-tikv] > Vector CRUD > should query vectors",
+        " > Sequelize Vector Operations [pg-tikv] > Vector CRUD > should update vector"
+      ]
+    },
+    {
+      "orm": "sequelize",
+      "capability": "ddl_lifecycle",
+      "sources": [
+        " > Sequelize Advanced SQL Features [pg-tikv] > views > should create and query a view",
+        " > Sequelize CRUD Semantics [pg-tikv] > INSERT operations > should insert batch rows with bulkCreate",
+        " > Sequelize CRUD Semantics [pg-tikv] > INSERT operations > should insert single row with create"
+      ]
+    },
+    {
+      "orm": "sequelize",
+      "capability": "join_and_subquery",
+      "sources": [
+        " > Sequelize Advanced SQL Features [pg-tikv] > CTE (WITH clause) > should support multiple CTEs",
+        " > Sequelize Advanced SQL Features [pg-tikv] > CTE (WITH clause) > should support simple CTE",
+        " > Sequelize Advanced SQL Features [pg-tikv] > recursive CTE > should support recursive CTE for hierarchy",
+        " > Sequelize Advanced SQL Features [pg-tikv] > recursive CTE > should support recursive CTE with depth limit",
+        " > Sequelize Advanced SQL Features [pg-tikv] > subqueries > should support scalar subquery in SELECT",
+        " > Sequelize Advanced SQL Features [pg-tikv] > subqueries > should support subquery in WHERE with IN",
+        " > Sequelize Advanced SQL Features [pg-tikv] > subqueries > should support subquery with EXISTS",
+        " > Sequelize Advanced SQL Features [pg-tikv] > views > should create and query a view",
+        " > Sequelize Advanced SQL Features [pg-tikv] > window functions > should support AVG() OVER",
+        " > Sequelize Advanced SQL Features [pg-tikv] > window functions > should support DENSE_RANK() with PARTITION BY",
+        " > Sequelize Advanced SQL Features [pg-tikv] > window functions > should support LEAD() and LAG()",
+        " > Sequelize Advanced SQL Features [pg-tikv] > window functions > should support RANK() with ties",
+        " > Sequelize Advanced SQL Features [pg-tikv] > window functions > should support ROW_NUMBER()",
+        " > Sequelize Advanced SQL Features [pg-tikv] > window functions > should support SUM() OVER partition total",
+        " > Sequelize Connection & Protocol Compatibility [pg-tikv] > connection establishment > should execute raw query after connection",
+        " > Sequelize Relations & Joins [pg-tikv] > join types > should perform INNER JOIN (include with required)",
+        " > Sequelize Relations & Joins [pg-tikv] > join types > should perform LEFT JOIN (include without required)",
+        " > Sequelize Relations & Joins [pg-tikv] > many-to-many relations > should add to many-to-many relation",
+        " > Sequelize Relations & Joins [pg-tikv] > many-to-many relations > should load many-to-many relation",
+        " > Sequelize Relations & Joins [pg-tikv] > many-to-many relations > should query through many-to-many relation",
+        " > Sequelize Relations & Joins [pg-tikv] > many-to-many relations > should remove from many-to-many relation",
+        " > Sequelize Relations & Joins [pg-tikv] > many-to-one relations > should load many-to-one relation",
+        " > Sequelize Relations & Joins [pg-tikv] > nested includes > should load multiple levels of relations",
+        " > Sequelize Relations & Joins [pg-tikv] > one-to-many relations > should eager load one-to-many relation",
+        " > Sequelize Relations & Joins [pg-tikv] > one-to-many relations > should lazy load relation",
+        " > Sequelize Relations & Joins [pg-tikv] > one-to-many relations > should load relation with include condition",
+        " > Sequelize Vector Operations [pg-tikv] > Vector CRUD > should query vectors"
+      ]
+    },
+    {
+      "orm": "sequelize",
+      "capability": "json_and_array",
+      "sources": [
+        " > Sequelize Advanced SQL Features [pg-tikv] > JSONB operations > should extract JSONB field with ->",
+        " > Sequelize Advanced SQL Features [pg-tikv] > JSONB operations > should extract text with ->>",
+        " > Sequelize Advanced SQL Features [pg-tikv] > JSONB operations > should use JSONB containment @>",
+        " > Sequelize CRUD Semantics [pg-tikv] > INSERT operations > should handle JSONB insert",
+        " > Sequelize CRUD Semantics [pg-tikv] > UPDATE operations > should update JSONB field"
+      ]
+    },
+    {
+      "orm": "sequelize",
+      "capability": "transaction",
+      "sources": [
+        " > Sequelize Transactions & Isolation [pg-tikv] > isolation levels > should handle READ COMMITTED isolation",
+        " > Sequelize Transactions & Isolation [pg-tikv] > isolation levels > should handle REPEATABLE READ isolation",
+        " > Sequelize Transactions & Isolation [pg-tikv] > isolation levels > should reject SERIALIZABLE isolation (not supported by TiKV)",
+        " > Sequelize Transactions & Isolation [pg-tikv] > managed transactions > should commit transaction",
+        " > Sequelize Transactions & Isolation [pg-tikv] > managed transactions > should handle multiple operations in transaction",
+        " > Sequelize Transactions & Isolation [pg-tikv] > managed transactions > should rollback transaction on error",
+        " > Sequelize Transactions & Isolation [pg-tikv] > transaction visibility > should not see uncommitted changes outside transaction",
+        " > Sequelize Transactions & Isolation [pg-tikv] > unmanaged transactions > should manually commit transaction",
+        " > Sequelize Transactions & Isolation [pg-tikv] > unmanaged transactions > should manually rollback transaction"
+      ]
+    },
+    {
+      "orm": "sequelize",
+      "capability": "vector",
+      "sources": [
+        " > Sequelize Vector Operations [pg-tikv] > Vector CRUD > should insert multiple vectors",
+        " > Sequelize Vector Operations [pg-tikv] > Vector CRUD > should insert vector",
+        " > Sequelize Vector Operations [pg-tikv] > Vector CRUD > should query vectors",
+        " > Sequelize Vector Operations [pg-tikv] > Vector CRUD > should update vector",
+        " > Sequelize Vector Operations [pg-tikv] > Vector Distance Functions > should calculate L2 distance",
+        " > Sequelize Vector Operations [pg-tikv] > Vector Distance Functions > should calculate cosine distance",
+        " > Sequelize Vector Operations [pg-tikv] > Vector Distance Functions > should calculate inner product",
+        " > Sequelize Vector Operations [pg-tikv] > Vector Distance Functions > should perform similarity search",
+        " > Sequelize Vector Operations [pg-tikv] > Vector Type Casting > should cast string to vector",
+        " > Sequelize Vector Operations [pg-tikv] > Vector Utility Functions > should calculate vector norm",
+        " > Sequelize Vector Operations [pg-tikv] > Vector Utility Functions > should get vector dimensions"
+      ]
+    },
+    {
+      "orm": "sqlalchemy",
+      "capability": "crud_basic",
+      "sources": [
+        "e2e/sqlalchemy_smoke"
+      ]
+    },
+    {
+      "orm": "typeorm",
+      "capability": "crud_basic",
+      "sources": [
+        " > TypeORM Advanced SQL Features [pg-tikv] > foreign key constraints > should enforce foreign key on INSERT",
+        " > TypeORM Advanced SQL Features [pg-tikv] > foreign key constraints > should reject delete when referenced",
+        " > TypeORM Advanced SQL Features [pg-tikv] > subqueries > should support scalar subquery in SELECT",
+        " > TypeORM CRUD Semantics [pg-tikv] > DELETE operations > should cascade delete related entities",
+        " > TypeORM CRUD Semantics [pg-tikv] > DELETE operations > should delete by id",
+        " > TypeORM CRUD Semantics [pg-tikv] > DELETE operations > should delete with condition",
+        " > TypeORM CRUD Semantics [pg-tikv] > INSERT operations > should apply default values",
+        " > TypeORM CRUD Semantics [pg-tikv] > INSERT operations > should handle JSONB insert",
+        " > TypeORM CRUD Semantics [pg-tikv] > INSERT operations > should handle ON CONFLICT (upsert)",
+        " > TypeORM CRUD Semantics [pg-tikv] > INSERT operations > should handle UUID insert",
+        " > TypeORM CRUD Semantics [pg-tikv] > INSERT operations > should insert batch rows",
+        " > TypeORM CRUD Semantics [pg-tikv] > INSERT operations > should insert single row",
+        " > TypeORM CRUD Semantics [pg-tikv] > INSERT operations > should return inserted row with RETURNING",
+        " > TypeORM CRUD Semantics [pg-tikv] > SELECT operations > should select specific columns",
+        " > TypeORM CRUD Semantics [pg-tikv] > SELECT operations > should select with COUNT aggregate",
+        " > TypeORM CRUD Semantics [pg-tikv] > SELECT operations > should select with GROUP BY",
+        " > TypeORM CRUD Semantics [pg-tikv] > SELECT operations > should select with LIMIT and OFFSET",
+        " > TypeORM CRUD Semantics [pg-tikv] > SELECT operations > should select with ORDER BY",
+        " > TypeORM CRUD Semantics [pg-tikv] > SELECT operations > should select with SUM aggregate",
+        " > TypeORM CRUD Semantics [pg-tikv] > SELECT operations > should select with WHERE condition",
+        " > TypeORM CRUD Semantics [pg-tikv] > UPDATE operations > should update JSONB field",
+        " > TypeORM CRUD Semantics [pg-tikv] > UPDATE operations > should update partial fields",
+        " > TypeORM CRUD Semantics [pg-tikv] > UPDATE operations > should update with RETURNING",
+        " > TypeORM CRUD Semantics [pg-tikv] > UPDATE operations > should update with condition",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > subqueries > should handle subquery in SELECT",
+        " > TypeORM Vector Operations [pg-tikv] > Vector CRUD > should delete vector",
+        " > TypeORM Vector Operations [pg-tikv] > Vector CRUD > should insert multiple vectors",
+        " > TypeORM Vector Operations [pg-tikv] > Vector CRUD > should insert vector",
+        " > TypeORM Vector Operations [pg-tikv] > Vector CRUD > should query vectors",
+        " > TypeORM Vector Operations [pg-tikv] > Vector CRUD > should update vector"
+      ]
+    },
+    {
+      "orm": "typeorm",
+      "capability": "ddl_lifecycle",
+      "sources": [
+        " > TypeORM Advanced SQL Features [pg-tikv] > views > should create and query a view",
+        " > TypeORM Schema & Metadata Compatibility [pg-tikv] > indexes and constraints > should create foreign key constraint",
+        " > TypeORM Schema & Metadata Compatibility [pg-tikv] > indexes and constraints > should create indexes",
+        " > TypeORM Schema & Metadata Compatibility [pg-tikv] > indexes and constraints > should create primary key",
+        " > TypeORM Schema & Metadata Compatibility [pg-tikv] > indexes and constraints > should create unique constraint",
+        " > TypeORM Schema & Metadata Compatibility [pg-tikv] > schema introspection > should introspect entity metadata correctly",
+        " > TypeORM Schema & Metadata Compatibility [pg-tikv] > schema introspection > should introspect relations correctly",
+        " > TypeORM Schema & Metadata Compatibility [pg-tikv] > synchronize idempotency > should handle synchronize idempotently (second init succeeds)",
+        " > TypeORM Schema & Metadata Compatibility [pg-tikv] > table and column types > should create columns with correct data types",
+        " > TypeORM Schema & Metadata Compatibility [pg-tikv] > table and column types > should create columns with default values",
+        " > TypeORM Schema & Metadata Compatibility [pg-tikv] > table and column types > should create nullable columns correctly",
+        " > TypeORM Schema & Metadata Compatibility [pg-tikv] > table and column types > should create tables with synchronize"
+      ]
+    },
+    {
+      "orm": "typeorm",
+      "capability": "join_and_subquery",
+      "sources": [
+        " > TypeORM Advanced SQL Features [pg-tikv] > CTE (WITH clause) > should support CTE with aggregation",
+        " > TypeORM Advanced SQL Features [pg-tikv] > CTE (WITH clause) > should support multiple CTEs",
+        " > TypeORM Advanced SQL Features [pg-tikv] > CTE (WITH clause) > should support simple CTE",
+        " > TypeORM Advanced SQL Features [pg-tikv] > JSONB operations > should query JSONB array",
+        " > TypeORM Advanced SQL Features [pg-tikv] > recursive CTE > should support recursive CTE for hierarchy",
+        " > TypeORM Advanced SQL Features [pg-tikv] > recursive CTE > should support recursive CTE with depth limit",
+        " > TypeORM Advanced SQL Features [pg-tikv] > subqueries > should support scalar subquery in SELECT",
+        " > TypeORM Advanced SQL Features [pg-tikv] > subqueries > should support subquery in FROM (derived table)",
+        " > TypeORM Advanced SQL Features [pg-tikv] > subqueries > should support subquery in WHERE with IN",
+        " > TypeORM Advanced SQL Features [pg-tikv] > subqueries > should support subquery with EXISTS",
+        " > TypeORM Advanced SQL Features [pg-tikv] > views > should create and query a view",
+        " > TypeORM Advanced SQL Features [pg-tikv] > window functions > should support AVG() OVER",
+        " > TypeORM Advanced SQL Features [pg-tikv] > window functions > should support COUNT() OVER",
+        " > TypeORM Advanced SQL Features [pg-tikv] > window functions > should support DENSE_RANK()",
+        " > TypeORM Advanced SQL Features [pg-tikv] > window functions > should support LEAD() and LAG()",
+        " > TypeORM Advanced SQL Features [pg-tikv] > window functions > should support RANK() with ties",
+        " > TypeORM Advanced SQL Features [pg-tikv] > window functions > should support ROW_NUMBER()",
+        " > TypeORM Advanced SQL Features [pg-tikv] > window functions > should support SUM() OVER with PARTITION BY",
+        " > TypeORM Advanced SQL Features [pg-tikv] > window functions > should support running SUM() OVER with ORDER BY",
+        " > TypeORM Connection & Protocol Compatibility [pg-tikv] > connection establishment > should execute raw query after connection",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > CASE expressions > should handle CASE WHEN",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > CTE (WITH clause) > should execute CTE query",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > DISTINCT operations > should handle DISTINCT",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > DISTINCT operations > should handle DISTINCT ON",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > JSONB operations > should query JSONB with -> operator",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > JSONB operations > should query JSONB with ->> operator",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > JSONB operations > should query JSONB with @> operator",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > LIKE and ILIKE > should handle ILIKE (case-insensitive)",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > LIKE and ILIKE > should handle LIKE (case-sensitive)",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > NULL handling > should handle COALESCE",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > NULL handling > should handle IS NOT NULL",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > NULL handling > should handle IS NULL",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > array operations > should handle IN clause",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > array operations > should handle NOT IN clause",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > parameter binding > should bind named parameters via QueryBuilder",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > parameter binding > should bind positional parameters ($1, $2)",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > subqueries > should handle subquery in SELECT",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > subqueries > should handle subquery in WHERE",
+        " > TypeORM Relations & Joins [pg-tikv] > join types > should perform INNER JOIN",
+        " > TypeORM Relations & Joins [pg-tikv] > join types > should perform LEFT JOIN",
+        " > TypeORM Relations & Joins [pg-tikv] > many-to-many relations > should add to many-to-many relation",
+        " > TypeORM Relations & Joins [pg-tikv] > many-to-many relations > should load many-to-many relation",
+        " > TypeORM Relations & Joins [pg-tikv] > many-to-many relations > should query through many-to-many relation",
+        " > TypeORM Relations & Joins [pg-tikv] > many-to-many relations > should remove from many-to-many relation",
+        " > TypeORM Relations & Joins [pg-tikv] > many-to-one relations > should load many-to-one relation",
+        " > TypeORM Relations & Joins [pg-tikv] > nested relations > should load multiple levels of relations",
+        " > TypeORM Relations & Joins [pg-tikv] > one-to-many relations > should eager load one-to-many relation",
+        " > TypeORM Relations & Joins [pg-tikv] > one-to-many relations > should filter on related entity",
+        " > TypeORM Relations & Joins [pg-tikv] > one-to-many relations > should load relation with QueryBuilder",
+        " > TypeORM SQL Features [pg-tikv] > Conditional expressions > should support IN with subquery",
+        " > TypeORM Vector Operations [pg-tikv] > Vector CRUD > should query vectors"
+      ]
+    },
+    {
+      "orm": "typeorm",
+      "capability": "json_and_array",
+      "sources": [
+        " > TypeORM Advanced SQL Features [pg-tikv] > JSONB operations > should extract JSONB field with ->",
+        " > TypeORM Advanced SQL Features [pg-tikv] > JSONB operations > should extract JSONB text with ->>",
+        " > TypeORM Advanced SQL Features [pg-tikv] > JSONB operations > should query JSONB array",
+        " > TypeORM Advanced SQL Features [pg-tikv] > JSONB operations > should use JSONB containment @>",
+        " > TypeORM CRUD Semantics [pg-tikv] > INSERT operations > should handle JSONB insert",
+        " > TypeORM CRUD Semantics [pg-tikv] > UPDATE operations > should update JSONB field",
+        " > TypeORM Error Semantics [pg-tikv] > data type errors > should throw error on invalid JSON",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > JSONB operations > should query JSONB with -> operator",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > JSONB operations > should query JSONB with ->> operator",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > JSONB operations > should query JSONB with @> operator",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > array operations > should handle IN clause",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > array operations > should handle NOT IN clause",
+        " > TypeORM SQL Features [pg-tikv] > ARRAY operations > should support ARRAY_LENGTH",
+        " > TypeORM SQL Features [pg-tikv] > ARRAY operations > should support array concatenation",
+        " > TypeORM SQL Features [pg-tikv] > ARRAY operations > should support array contains ALL",
+        " > TypeORM SQL Features [pg-tikv] > ARRAY operations > should support array contains ANY",
+        " > TypeORM TypeScript Type Fidelity [pg-tikv] > JSON types > should preserve array in JSON",
+        " > TypeORM TypeScript Type Fidelity [pg-tikv] > JSON types > should preserve null in JSON",
+        " > TypeORM TypeScript Type Fidelity [pg-tikv] > JSON types > should preserve object structure"
+      ]
+    },
+    {
+      "orm": "typeorm",
+      "capability": "prepared_statement",
+      "sources": [
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > parameter binding > should bind named parameters via QueryBuilder",
+        " > TypeORM Query Generation & SQL Compatibility [pg-tikv] > parameter binding > should bind positional parameters ($1, $2)"
+      ]
+    },
+    {
+      "orm": "typeorm",
+      "capability": "transaction",
+      "sources": [
+        " > TypeORM Transactions & Isolation [pg-tikv] > explicit transactions > should commit transaction",
+        " > TypeORM Transactions & Isolation [pg-tikv] > explicit transactions > should handle transaction with multiple operations",
+        " > TypeORM Transactions & Isolation [pg-tikv] > explicit transactions > should rollback transaction",
+        " > TypeORM Transactions & Isolation [pg-tikv] > transaction isolation > should handle READ COMMITTED isolation",
+        " > TypeORM Transactions & Isolation [pg-tikv] > transaction isolation > should handle REPEATABLE READ isolation",
+        " > TypeORM Transactions & Isolation [pg-tikv] > transaction isolation > should reject SERIALIZABLE isolation (not supported by TiKV)",
+        " > TypeORM Transactions & Isolation [pg-tikv] > transaction manager > should auto-rollback on error in transaction manager",
+        " > TypeORM Transactions & Isolation [pg-tikv] > transaction manager > should use transaction manager wrapper"
+      ]
+    },
+    {
+      "orm": "typeorm",
+      "capability": "vector",
+      "sources": [
+        " > TypeORM Vector Operations [pg-tikv] > Vector CRUD > should delete vector",
+        " > TypeORM Vector Operations [pg-tikv] > Vector CRUD > should insert multiple vectors",
+        " > TypeORM Vector Operations [pg-tikv] > Vector CRUD > should insert vector",
+        " > TypeORM Vector Operations [pg-tikv] > Vector CRUD > should query vectors",
+        " > TypeORM Vector Operations [pg-tikv] > Vector CRUD > should update vector",
+        " > TypeORM Vector Operations [pg-tikv] > Vector Distance Functions > should calculate L2 distance",
+        " > TypeORM Vector Operations [pg-tikv] > Vector Distance Functions > should calculate cosine distance",
+        " > TypeORM Vector Operations [pg-tikv] > Vector Distance Functions > should calculate inner product",
+        " > TypeORM Vector Operations [pg-tikv] > Vector Distance Functions > should order by distance for nearest neighbors",
+        " > TypeORM Vector Operations [pg-tikv] > Vector Distance Functions > should perform similarity search",
+        " > TypeORM Vector Operations [pg-tikv] > Vector Type Casting > should cast string to vector",
+        " > TypeORM Vector Operations [pg-tikv] > Vector Utility Functions > should calculate vector norm",
+        " > TypeORM Vector Operations [pg-tikv] > Vector Utility Functions > should get vector dimensions"
+      ]
+    }
+  ]
+}

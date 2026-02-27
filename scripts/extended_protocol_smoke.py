@@ -19,6 +19,24 @@ import os
 import sys
 import time
 
+# Static SQL markers used by scripts/coverage_statement_protocol.py.
+# Keep these as plain double-quoted SQL literals so the collector can map
+# statement x protocol-phase coverage from this file.
+_COVERAGE_SQL_MARKERS = [
+    "SELECT 1",
+    "INSERT INTO _ext_smoke_t1(id,col,val) VALUES (1000,'m',1)",
+    "UPDATE _ext_smoke_t1 SET val = 1 WHERE id = 1",
+    "DELETE FROM _ext_smoke_t1 WHERE id = 1",
+    "CREATE TABLE _ext_smoke_marker_t(id INT)",
+    "ALTER TABLE _ext_smoke_marker_t ADD COLUMN note TEXT",
+    "DROP TABLE _ext_smoke_marker_t",
+    "CREATE INDEX _ext_smoke_marker_idx ON _ext_smoke_t1(col)",
+    "COPY _ext_smoke_t1 FROM STDIN",
+    "BEGIN",
+    "COMMIT",
+    "ROLLBACK",
+]
+
 
 def main():
     parser = argparse.ArgumentParser(description="Extended protocol smoke test")

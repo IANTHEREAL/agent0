@@ -1,0 +1,21 @@
+actions:
+  line_gap:
+    when: "line module coverage below threshold"
+    suggest_tests:
+      - "Add Rust unit tests for affected module (cargo test <module>)."
+      - "Add SQL integration tests under tests/*.sql for the related behavior."
+    rerun_lanes: ["ut", "sql_builtin"]
+
+  statement_gap:
+    when: "statement x protocol_phase uncovered"
+    suggest_tests:
+      - "Add focused cases in scripts/extended_protocol_smoke.py."
+      - "Add statement-focused SQL cases under tests/*.sql."
+    rerun_lanes: ["protocol_smoke", "sql_corpus"]
+
+  scenario_gap:
+    when: "orm/driver x capability uncovered"
+    suggest_tests:
+      - "Add orm-tests/<orm>/*.test.ts coverage for the capability."
+      - "Add e2e/<suite> coverage if app-level chain is required."
+    rerun_lanes: ["orm_all", "e2e_sqlalchemy", "e2e_dify", "e2e_gorm"]

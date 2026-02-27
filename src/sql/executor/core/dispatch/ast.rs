@@ -282,3 +282,296 @@ impl Executor {
         Err(parse_error)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::executor::core::dispatch::scaffold::DispatchContext;
+
+    fn make_executor_and_session() -> (Executor, Session) {
+        let store = crate::storage::TikvStore::new_stub();
+        let keyspace = "dispatch_ast_tests".to_string();
+        let observability = crate::observability::registry().tenant(&keyspace);
+        let trigger_cache = std::sync::Arc::new(crate::sql::triggers::TriggerBodyCache::new());
+        let stats_cache = std::sync::Arc::new(crate::sql::stats::TableStatsCache::new());
+        let executor = Executor::new(
+            store.clone(),
+            keyspace,
+            observability.clone(),
+            crate::pool::TenantMemoryAccountant::unlimited("dispatch_ast_tests".to_string()),
+            trigger_cache,
+            stats_cache,
+        );
+        let session = Session::new_with_user_and_database(
+            store,
+            observability,
+            "tester".to_string(),
+            true,
+            1,
+            1,
+            "postgres".to_string(),
+            0,
+            0,
+        );
+        (executor, session)
+    }
+
+    #[test]
+    fn handle_parse_error_unsupported_short_circuits_failed_txn_mark() {
+        let (executor, mut session) = make_executor_and_session();
+        session.force_test_transaction_state(true, false);
+        let ctx = DispatchContext::new("CREATE DOMAIN d AS TEXT", &session);
+        let err = executor
+            .handle_parse_error(&mut session, &ctx, anyhow!("parse failure"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.to_lowercase().contains("supported")
+                || err.to_lowercase().contains("domain")
+        );
+        assert!(!session.is_transaction_failed());
+    }
+
+    #[test]
+    fn handle_parse_error_marks_failed_transaction_for_regular_parse_errors() {
+        let (executor, mut session) = make_executor_and_session();
+        session.force_test_transaction_state(true, false);
+        let ctx = DispatchContext::new("SELECT (", &session);
+        let err = executor
+            .handle_parse_error(&mut session, &ctx, anyhow!("parse failure"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("parse failure"));
+        assert!(session.is_transaction_failed());
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_empty_sql_returns_empty_result() {
+        let (executor, mut session) = make_executor_and_session();
+        let ctx = DispatchContext::new("   ", &session);
+        let out = executor
+            .dispatch_parsed_statements(&mut session, "   ", &ctx)
+            .await
+            .unwrap()
+            .into_vec();
+        assert!(matches!(out.as_slice(), [ExecuteResult::Empty]));
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_show_all_returns_select() {
+        let (executor, mut session) = make_executor_and_session();
+        let sql = "SHOW ALL";
+        let ctx = DispatchContext::new(sql, &session);
+        let out = executor
+            .dispatch_parsed_statements(&mut session, sql, &ctx)
+            .await
+            .unwrap()
+            .into_vec();
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], ExecuteResult::Select { .. }));
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_set_names_with_collate_errors() {
+        let (executor, mut session) = make_executor_and_session();
+        let sql = "SET NAMES 'UTF8' COLLATE 'C'";
+        let ctx = DispatchContext::new(sql, &session);
+        let err = executor
+            .dispatch_parsed_statements(&mut session, sql, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!err.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_set_names_without_collate_succeeds() {
+        let (executor, mut session) = make_executor_and_session();
+        let sql = "SET NAMES TO 'UTF8'";
+        let ctx = DispatchContext::new(sql, &session);
+        let out = executor
+            .dispatch_parsed_statements(&mut session, sql, &ctx)
+            .await
+            .unwrap()
+            .into_vec();
+        assert!(matches!(
+            out.as_slice(),
+            [ExecuteResult::CommandComplete { tag: "SET" }]
+        ));
+        assert_eq!(
+            session.show_setting_value("client_encoding").as_deref(),
+            Some("UTF8")
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_set_local_timezone_outside_txn_returns_warning() {
+        let (executor, mut session) = make_executor_and_session();
+        let sql = "SET LOCAL TIME ZONE 'UTC'";
+        let ctx = DispatchContext::new(sql, &session);
+        let out = executor
+            .dispatch_parsed_statements(&mut session, sql, &ctx)
+            .await
+            .unwrap()
+            .into_vec();
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], ExecuteResult::Notice { .. }));
+        assert!(matches!(
+            out[1],
+            ExecuteResult::CommandComplete { tag: "SET" }
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_set_local_timezone_inside_txn_sets_local_only() {
+        let (executor, mut session) = make_executor_and_session();
+        session.force_test_transaction_state(true, false);
+        let sql = "SET LOCAL TIME ZONE 'UTC'";
+        let ctx = DispatchContext::new(sql, &session);
+        let out = executor
+            .dispatch_parsed_statements(&mut session, sql, &ctx)
+            .await
+            .unwrap()
+            .into_vec();
+        assert!(matches!(
+            out.as_slice(),
+            [ExecuteResult::CommandComplete { tag: "SET" }]
+        ));
+        assert_eq!(
+            session.show_setting_value("timezone").as_deref(),
+            Some("UTC")
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_set_timezone_and_show_round_trip() {
+        let (executor, mut session) = make_executor_and_session();
+
+        let set_sql = "SET TIME ZONE 'Asia/Shanghai'";
+        let set_ctx = DispatchContext::new(set_sql, &session);
+        let set_out = executor
+            .dispatch_parsed_statements(&mut session, set_sql, &set_ctx)
+            .await
+            .unwrap()
+            .into_vec();
+        assert!(matches!(
+            set_out.as_slice(),
+            [ExecuteResult::CommandComplete { tag: "SET" }]
+        ));
+
+        let show_sql = "SHOW TIMEZONE";
+        let show_ctx = DispatchContext::new(show_sql, &session);
+        let show_out = executor
+            .dispatch_parsed_statements(&mut session, show_sql, &show_ctx)
+            .await
+            .unwrap()
+            .into_vec();
+        assert_eq!(show_out.len(), 1);
+        match &show_out[0] {
+            ExecuteResult::Select { rows, .. } => assert_eq!(rows.len(), 1),
+            other => panic!("expected select, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_set_transaction_snapshot_errors() {
+        let (executor, mut session) = make_executor_and_session();
+        let sql = "SET TRANSACTION SNAPSHOT '0001'";
+        let ctx = DispatchContext::new(sql, &session);
+        let err = executor
+            .dispatch_parsed_statements(&mut session, sql, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("SNAPSHOT"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_set_transaction_mode_succeeds() {
+        let (executor, mut session) = make_executor_and_session();
+        let sql = "SET TRANSACTION READ ONLY";
+        let ctx = DispatchContext::new(sql, &session);
+        let out = executor
+            .dispatch_parsed_statements(&mut session, sql, &ctx)
+            .await
+            .unwrap()
+            .into_vec();
+        assert!(matches!(
+            out.as_slice(),
+            [ExecuteResult::CommandComplete { tag: "SET" }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_show_unknown_setting_errors() {
+        let (executor, mut session) = make_executor_and_session();
+        let sql = "SHOW definitely_unknown_setting";
+        let ctx = DispatchContext::new(sql, &session);
+        let err = executor
+            .dispatch_parsed_statements(&mut session, sql, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unrecognized configuration parameter"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_execute_missing_prepared_errors() {
+        let (executor, mut session) = make_executor_and_session();
+        let sql = "EXECUTE missing_stmt(1)";
+        let ctx = DispatchContext::new(sql, &session);
+        let err = executor
+            .dispatch_parsed_statements(&mut session, sql, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_deallocate_missing_prepared_errors() {
+        let (executor, mut session) = make_executor_and_session();
+        let sql = "DEALLOCATE missing_stmt";
+        let ctx = DispatchContext::new(sql, &session);
+        let err = executor
+            .dispatch_parsed_statements(&mut session, sql, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_deallocate_all_succeeds() {
+        let (executor, mut session) = make_executor_and_session();
+        let sql = "DEALLOCATE ALL";
+        let ctx = DispatchContext::new(sql, &session);
+        let out = executor
+            .dispatch_parsed_statements(&mut session, sql, &ctx)
+            .await
+            .unwrap()
+            .into_vec();
+        assert!(matches!(
+            out.as_slice(),
+            [ExecuteResult::CommandComplete { tag: "DEALLOCATE" }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_multiple_statements_return_ordered_results() {
+        let (executor, mut session) = make_executor_and_session();
+        let sql = "SET application_name = 'app1'; SHOW application_name";
+        let ctx = DispatchContext::new(sql, &session);
+        let out = executor
+            .dispatch_parsed_statements(&mut session, sql, &ctx)
+            .await
+            .unwrap()
+            .into_vec();
+        assert_eq!(out.len(), 2);
+        assert!(matches!(
+            out[0],
+            ExecuteResult::CommandComplete { tag: "SET" }
+        ));
+        assert!(matches!(out[1], ExecuteResult::Select { .. }));
+    }
+}

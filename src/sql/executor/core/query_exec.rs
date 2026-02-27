@@ -34,3 +34,14 @@ impl Executor {
         .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Executor;
+
+    #[test]
+    fn execute_query_signature_is_stable() {
+        let _f = Executor::execute_query;
+        let _ = _f;
+    }
+}

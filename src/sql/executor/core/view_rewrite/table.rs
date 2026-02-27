@@ -262,3 +262,64 @@ pub(crate) fn expand_views_in_table_with_joins<'a>(
         Ok(())
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_object_name, parse_view_query};
+    use sqlparser::ast::{Ident, ObjectName};
+
+    #[test]
+    fn normalize_object_name_joins_parts_with_dot() {
+        let name = ObjectName(vec![Ident::new("Public"), Ident::new("MyView")]);
+        assert_eq!(normalize_object_name(&name), "public.myview");
+    }
+
+    #[test]
+    fn parse_view_query_accepts_single_select() {
+        let q = parse_view_query("public.v1", "SELECT 1 AS x").expect("query parsed");
+        assert!(q.limit.is_none());
+    }
+
+    #[test]
+    fn parse_view_query_rejects_non_query_statement() {
+        let err = parse_view_query("public.v1", "CREATE TABLE t(id INT)")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not contain a SELECT query"));
+    }
+
+    #[test]
+    fn parse_view_query_rejects_empty_text() {
+        let err = parse_view_query("public.v1", "").unwrap_err().to_string();
+        assert!(err.contains("empty query text") || err.contains("failed to parse view"));
+    }
+
+    #[test]
+    fn normalize_object_name_handles_single_and_multi_part_names() {
+        let single = ObjectName(vec![Ident::new("MyView")]);
+        assert_eq!(normalize_object_name(&single), "myview");
+
+        let triple = ObjectName(vec![
+            Ident::new("Db"),
+            Ident::new("MixedSchema"),
+            Ident::new("QuotedName"),
+        ]);
+        assert_eq!(normalize_object_name(&triple), "db.mixedschema.quotedname");
+    }
+
+    #[test]
+    fn parse_view_query_prefers_first_statement_when_multiple_present() {
+        let q =
+            parse_view_query("public.v1", "SELECT 1 AS x; SELECT 2 AS y").expect("query parsed");
+        assert!(q.limit.is_none());
+    }
+
+    #[test]
+    fn parse_view_query_reports_view_name_on_parse_error() {
+        let err = parse_view_query("public.broken_view", "SELECT (")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("public.broken_view"));
+        assert!(err.contains("failed to parse view"));
+    }
+}

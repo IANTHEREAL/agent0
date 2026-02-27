@@ -265,3 +265,222 @@ fn coerce_json_to_text_preserves_raw_format() {
     // JSON preserves the original string verbatim
     assert_eq!(result, Value::Text(r#"{"b":1,"a":2}"#.to_string()));
 }
+
+#[test]
+fn assign_generated_check_names_avoids_existing_constraint_names() {
+    let mut checks = vec![
+        CheckConstraint {
+            name: None,
+            expr: "age > 0".to_string(),
+        },
+        CheckConstraint {
+            name: None,
+            expr: "age < 200".to_string(),
+        },
+        CheckConstraint {
+            name: Some("already_named".to_string()),
+            expr: "score >= 0".to_string(),
+        },
+    ];
+    assign_generated_check_constraint_names(
+        "users",
+        true,
+        &[IndexDef {
+            name: "users_age_check".to_string(),
+            id: 1,
+            columns: vec![],
+            unique: false,
+            is_constraint: false,
+            method: None,
+            predicate: None,
+            expressions: vec![],
+            state: IndexState::Ready,
+        }],
+        &[ForeignKeyConstraint {
+            name: "users_age_check1".to_string(),
+            columns: vec![],
+            ref_table: "public.p".to_string(),
+            ref_columns: vec![],
+            on_delete: ForeignKeyAction::NoAction,
+            on_update: ForeignKeyAction::NoAction,
+        }],
+        &mut checks,
+    );
+
+    let c0 = checks[0].name.clone().unwrap();
+    let c1 = checks[1].name.clone().unwrap();
+    assert_ne!(c0, c1);
+    assert!(c0.starts_with("users_age_check"));
+    assert!(c1.starts_with("users_age_check"));
+    assert_eq!(checks[2].name.as_deref(), Some("already_named"));
+}
+
+#[test]
+fn extract_first_column_skips_keywords_types_and_literals() {
+    assert_eq!(
+        extract_first_column_from_check_expr("age > 0 AND name <> ''"),
+        Some("age".to_string())
+    );
+    assert_eq!(
+        extract_first_column_from_check_expr("CHECK (text IS NOT NULL)"),
+        None
+    );
+    assert_eq!(
+        extract_first_column_from_check_expr("123 > 0 OR true"),
+        None
+    );
+}
+
+#[test]
+fn check_constraint_effective_name_and_find_index_work_for_generated_names() {
+    let schema = TableSchema {
+        name: "public.t".to_string(),
+        table_id: 1,
+        columns: vec![],
+        version: 1,
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![
+            CheckConstraint {
+                name: None,
+                expr: "age > 0".to_string(),
+            },
+            CheckConstraint {
+                name: Some("explicit_ck".to_string()),
+                expr: "score > 0".to_string(),
+            },
+        ],
+        foreign_keys: vec![],
+        owner: "postgres".to_string(),
+        from_alias: None,
+    };
+
+    assert_eq!(
+        check_constraint_effective_name("t", 0, &schema.check_constraints[0]),
+        "t_age_check"
+    );
+    assert_eq!(find_check_constraint_index(&schema, "t", "t_age_check"), Some(0));
+    assert_eq!(find_check_constraint_index(&schema, "t", "explicit_ck"), Some(1));
+    assert_eq!(find_check_constraint_index(&schema, "t", "missing"), None);
+}
+
+#[test]
+fn constraint_name_exists_checks_pk_fk_index_and_checks() {
+    let schema = TableSchema {
+        name: "public.t".to_string(),
+        table_id: 1,
+        columns: vec![],
+        version: 1,
+        pk_constraint_name: Some("t_pkey".to_string()),
+        pk_indices: vec![0],
+        indexes: vec![IndexDef {
+            name: "idx_t_a".to_string(),
+            id: 1,
+            columns: vec!["a".to_string()],
+            unique: false,
+            is_constraint: false,
+            method: None,
+            predicate: None,
+            expressions: vec![],
+            state: IndexState::Ready,
+        }],
+        check_constraints: vec![CheckConstraint {
+            name: None,
+            expr: "age > 0".to_string(),
+        }],
+        foreign_keys: vec![ForeignKeyConstraint {
+            name: "fk_t_p".to_string(),
+            columns: vec![],
+            ref_table: "public.p".to_string(),
+            ref_columns: vec![],
+            on_delete: ForeignKeyAction::NoAction,
+            on_update: ForeignKeyAction::NoAction,
+        }],
+        owner: "postgres".to_string(),
+        from_alias: None,
+    };
+
+    assert!(constraint_name_exists(&schema, "t", "t_pkey"));
+    assert!(constraint_name_exists(&schema, "t", "idx_t_a"));
+    assert!(constraint_name_exists(&schema, "t", "fk_t_p"));
+    assert!(constraint_name_exists(&schema, "t", "t_age_check"));
+    assert!(!constraint_name_exists(&schema, "t", "not_exist"));
+}
+
+#[test]
+fn parse_referential_action_maps_all_variants() {
+    use sqlparser::ast::ReferentialAction;
+    assert_eq!(
+        parse_referential_action(&Some(ReferentialAction::Cascade)),
+        ForeignKeyAction::Cascade
+    );
+    assert_eq!(
+        parse_referential_action(&Some(ReferentialAction::SetNull)),
+        ForeignKeyAction::SetNull
+    );
+    assert_eq!(
+        parse_referential_action(&Some(ReferentialAction::SetDefault)),
+        ForeignKeyAction::SetDefault
+    );
+    assert_eq!(
+        parse_referential_action(&Some(ReferentialAction::Restrict)),
+        ForeignKeyAction::Restrict
+    );
+    assert_eq!(
+        parse_referential_action(&Some(ReferentialAction::NoAction)),
+        ForeignKeyAction::NoAction
+    );
+    assert_eq!(parse_referential_action(&None), ForeignKeyAction::NoAction);
+}
+
+#[test]
+fn was_cascade_dropped_resolves_qualified_and_search_path_names() {
+    use sqlparser::ast::{Ident, ObjectName};
+    let dropped: std::collections::HashSet<String> = [
+        "public.v1".to_string(),
+        "app.v2".to_string(),
+    ]
+    .into_iter()
+    .collect();
+
+    assert!(was_cascade_dropped(
+        &ObjectName(vec![Ident::new("public"), Ident::new("v1")]),
+        &["public".to_string()],
+        &dropped
+    ));
+    assert!(was_cascade_dropped(
+        &ObjectName(vec![Ident::new("v2")]),
+        &["app".to_string(), "public".to_string()],
+        &dropped
+    ));
+    assert!(!was_cascade_dropped(
+        &ObjectName(vec![Ident::new("v3")]),
+        &["public".to_string()],
+        &dropped
+    ));
+}
+
+#[test]
+fn prefix_end_increments_last_non_ff_byte() {
+    assert_eq!(prefix_end(vec![0x01, 0x02]), vec![0x01, 0x03]);
+    assert_eq!(prefix_end(vec![0x01, 0xFF]), vec![0x02]);
+    assert_eq!(prefix_end(vec![0x00, 0x10, 0xFF, 0xFF]), vec![0x00, 0x11]);
+}
+
+#[test]
+fn coerce_uuid_to_text_for_type_change() {
+    let col = crate::model::ColumnDef {
+        name: "id".to_string(),
+        data_type: DataType::Text,
+        nullable: false,
+        primary_key: false,
+        unique: false,
+        is_serial: false,
+        default_expr: None,
+        collation: None,
+    };
+    let bytes = *uuid::Uuid::nil().as_bytes();
+    let out = coerce_value_for_type_change(Value::Uuid(bytes), &col).unwrap();
+    assert_eq!(out, Value::Text(uuid::Uuid::nil().to_string()));
+}

@@ -80,3 +80,140 @@ impl PreparedStatement {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::analyzer::types::{AnalyzedQueryBody, SetOpKind};
+
+    fn empty_analyzed_query() -> AnalyzedQuery {
+        AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::SetOperation {
+                op: SetOpKind::Union,
+                all: false,
+                left: Box::new(AnalyzedQuery {
+                    ctes: vec![],
+                    body: AnalyzedQueryBody::Values(vec![]),
+                    order_by: vec![],
+                    limit: None,
+                    offset: None,
+                    output_schema: vec![],
+                }),
+                right: Box::new(AnalyzedQuery {
+                    ctes: vec![],
+                    body: AnalyzedQueryBody::Values(vec![]),
+                    order_by: vec![],
+                    limit: None,
+                    offset: None,
+                    output_schema: vec![],
+                }),
+            },
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![],
+        }
+    }
+
+    #[test]
+    fn defaults_to_raw_utility_exec() {
+        let exec = PreparedExec::default();
+        assert!(matches!(exec, PreparedExec::RawSqlUtility));
+
+        let stmt = PreparedStatement::default();
+        assert!(matches!(stmt.exec, PreparedExec::RawSqlUtility));
+        assert!(stmt.sql.is_empty());
+    }
+
+    #[test]
+    fn compute_privileges_for_query_uses_select_base_tables() {
+        let stmt = AnalyzedStatement::Query(empty_analyzed_query());
+        let privileges = PreparedStatement::compute_privileges(
+            &stmt,
+            &["public.t1".to_string(), "app.t2".to_string()],
+        );
+        assert_eq!(
+            privileges,
+            vec![
+                ("public.t1".to_string(), Privilege::Select),
+                ("app.t2".to_string(), Privilege::Select)
+            ]
+        );
+    }
+
+    fn dummy_table_schema() -> crate::sql::analyzer::types::TableRefSchema {
+        crate::sql::analyzer::types::TableRefSchema {
+            table_id: 1,
+            columns: vec![],
+        }
+    }
+
+    #[test]
+    fn compute_privileges_for_insert_update_delete_variants() {
+        use crate::sql::analyzer::types::{
+            AnalyzedDelete, AnalyzedInsert, AnalyzedInsertSource, AnalyzedOnConflict,
+            AnalyzedUpdate,
+        };
+
+        let insert_plain = AnalyzedStatement::Insert(AnalyzedInsert {
+            table_name: "public.t".to_string(),
+            table_schema: dummy_table_schema(),
+            target_columns: vec![],
+            source: AnalyzedInsertSource::DefaultValues,
+            on_conflict: None,
+            returning: None,
+        });
+        assert_eq!(
+            PreparedStatement::compute_privileges(&insert_plain, &[]),
+            vec![("public.t".to_string(), Privilege::Insert)]
+        );
+
+        let insert_upsert = AnalyzedStatement::Insert(AnalyzedInsert {
+            table_name: "public.t".to_string(),
+            table_schema: dummy_table_schema(),
+            target_columns: vec![],
+            source: AnalyzedInsertSource::DefaultValues,
+            on_conflict: Some(AnalyzedOnConflict::DoUpdate {
+                target: None,
+                assignments: vec![],
+                where_clause: None,
+            }),
+            returning: None,
+        });
+        assert_eq!(
+            PreparedStatement::compute_privileges(&insert_upsert, &[]),
+            vec![
+                ("public.t".to_string(), Privilege::Insert),
+                ("public.t".to_string(), Privilege::Update)
+            ]
+        );
+
+        let update_stmt = AnalyzedStatement::Update(AnalyzedUpdate {
+            table_name: "app.u".to_string(),
+            table_schema: dummy_table_schema(),
+            table_alias: "u".to_string(),
+            assignments: vec![],
+            from: vec![],
+            where_clause: None,
+            returning: None,
+        });
+        assert_eq!(
+            PreparedStatement::compute_privileges(&update_stmt, &[]),
+            vec![("app.u".to_string(), Privilege::Update)]
+        );
+
+        let delete_stmt = AnalyzedStatement::Delete(AnalyzedDelete {
+            table_name: "app.d".to_string(),
+            table_schema: dummy_table_schema(),
+            table_alias: "d".to_string(),
+            using: vec![],
+            where_clause: None,
+            returning: None,
+        });
+        assert_eq!(
+            PreparedStatement::compute_privileges(&delete_stmt, &[]),
+            vec![("app.d".to_string(), Privilege::Delete)]
+        );
+    }
+}

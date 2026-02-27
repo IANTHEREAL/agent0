@@ -150,10 +150,11 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 ## Issue Resolution Map (Execution Order)
 
 ```
-Phase 0 — Testing / Infra (parallel, independent)
-├── #898 || #317 || #419 || #411
-└── #700 → #699                      [admin portal: security before refactor]
-    Validation: cargo test, admin-portal E2E
+Phase 0 — Quick wins (start now, parallel lanes)
+├── Lane T1: #898 || #317 || #419 || #411    [auto_testing/infra, independent]
+├── Lane T2: #920                              [db9 CLI auth, independent]
+└── Lane T3: #700 → #699                      [admin portal: security before refactor]
+    Validation: cargo test, db9 CLI smoke, admin-portal E2E
 
 Phase 1 — SQL parity (remaining)
 └── #395 || #396 || #397             [collated index + ALTER TYPE mismatches]

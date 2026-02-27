@@ -1027,4 +1027,431 @@ mod tests {
         let exec = analyzed_query_exec(query_with_scalar_subquery_projection(), false);
         assert!(!is_plan_cache_eligible(&exec));
     }
+
+    #[test]
+    fn plan_cache_ineligible_for_non_query_variants() {
+        let dml = PreparedExec::AnalyzedDml {
+            analyzed: crate::sql::analyzer::types::AnalyzedStatement::Query(values_query()),
+            required_privileges: vec![],
+        };
+        assert!(!is_plan_cache_eligible(&dml));
+        assert!(!is_plan_cache_eligible(&PreparedExec::RawSqlUtility));
+    }
+}
+
+#[cfg(test)]
+mod prepared_policy_tests {
+    use super::*;
+    use crate::sql::analyzer::types::AnalyzedQueryBody;
+    use crate::sql::analyzer::AnalyzedQuery;
+    use std::sync::Arc;
+
+    fn test_executor() -> Executor {
+        Executor::new(
+            crate::storage::TikvStore::new_stub(),
+            "tenant_prepared_ut".to_string(),
+            crate::observability::registry().tenant("tenant_prepared_ut"),
+            crate::pool::TenantMemoryAccountant::unlimited("tenant_prepared_ut".to_string()),
+            Arc::new(crate::sql::triggers::TriggerBodyCache::new()),
+            Arc::new(crate::sql::stats::TableStatsCache::new()),
+        )
+    }
+
+    fn test_session(username: &str, is_superuser: bool) -> Session {
+        Session::new_with_user_and_database(
+            crate::storage::TikvStore::new_stub(),
+            crate::observability::registry().tenant("tenant_prepared_ut"),
+            username.to_string(),
+            is_superuser,
+            1,
+            1,
+            "postgres".to_string(),
+            0,
+            0,
+        )
+    }
+
+    fn analyzed_query_exec() -> PreparedExec {
+        PreparedExec::AnalyzedQuery {
+            analyzed: AnalyzedQuery {
+                ctes: vec![],
+                body: AnalyzedQueryBody::Values(vec![vec![]]),
+                order_by: vec![],
+                limit: None,
+                offset: None,
+                output_schema: vec![],
+            },
+            locks: vec![],
+            select_into: None,
+            required_privileges: vec![],
+            has_recursive_cte: false,
+        }
+    }
+
+    #[test]
+    fn build_prepared_query_context_carries_params_and_types() {
+        let exec = test_executor();
+        let mut session = test_session("tester", true);
+        let qctx = exec.build_prepared_query_context(
+            &mut session,
+            vec![Some(Value::Int32(7)), None],
+            &[DataType::Int32, DataType::Text],
+        );
+        assert_eq!(qctx.params.len(), 2);
+        assert_eq!(qctx.param_types.len(), 2);
+        assert_eq!(qctx.params[0], Some(Value::Int32(7)));
+        assert_eq!(qctx.param_types[0], Some(DataType::Int32));
+    }
+
+    #[test]
+    fn observability_policy_normal_user_is_always_normal_mode() {
+        let exec = test_executor();
+        let mut session = test_session("tester", false);
+        let mode = exec
+            .enforce_observability_prepared_policy(
+                &mut session,
+                "SELECT 1",
+                &PreparedExec::RawSqlUtility,
+            )
+            .unwrap();
+        assert_eq!(mode, PreparedObservabilityMode::Normal);
+    }
+
+    #[test]
+    fn observability_user_but_superuser_is_treated_as_normal_mode() {
+        let exec = test_executor();
+        let mut session = test_session(OBSERVABILITY_USER, true);
+        let mode = exec
+            .enforce_observability_prepared_policy(
+                &mut session,
+                "SELECT * FROM any_table",
+                &PreparedExec::RawSqlUtility,
+            )
+            .unwrap();
+        assert_eq!(mode, PreparedObservabilityMode::Normal);
+    }
+
+    #[test]
+    fn observability_policy_rejects_non_analyzed_exec() {
+        let exec = test_executor();
+        let mut session = test_session(OBSERVABILITY_USER, false);
+        let err = exec
+            .enforce_observability_prepared_policy(
+                &mut session,
+                "SELECT 1",
+                &PreparedExec::RawSqlUtility,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("permission denied"));
+    }
+
+    #[test]
+    fn observability_policy_allows_tableless_select_for_analyzed_exec() {
+        let exec = test_executor();
+        let mut session = test_session(OBSERVABILITY_USER, false);
+        let mode = exec
+            .enforce_observability_prepared_policy(
+                &mut session,
+                "SELECT 1",
+                &analyzed_query_exec(),
+            )
+            .unwrap();
+        assert_eq!(mode, PreparedObservabilityMode::Observability);
+    }
+
+    #[test]
+    fn observability_policy_rejects_non_observability_select() {
+        let exec = test_executor();
+        let mut session = test_session(OBSERVABILITY_USER, false);
+        let err = exec
+            .enforce_observability_prepared_policy(
+                &mut session,
+                "SELECT * FROM public.t",
+                &analyzed_query_exec(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("permission denied"));
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_recursive_cte_falls_back_to_text_path() {
+        let exec = test_executor();
+        let mut session = test_session("tester", true);
+        let PreparedExec::AnalyzedQuery {
+            analyzed,
+            locks,
+            select_into,
+            required_privileges,
+            ..
+        } = analyzed_query_exec()
+        else {
+            unreachable!()
+        };
+        let prepared = PreparedExec::AnalyzedQuery {
+            analyzed,
+            locks,
+            select_into,
+            required_privileges,
+            has_recursive_cte: true,
+        };
+
+        let out = exec
+            .execute_prepared(
+                &mut session,
+                "",
+                &prepared,
+                vec![Some(Value::Int32(11))],
+                &[DataType::Int32],
+                &[],
+            )
+            .await
+            .unwrap()
+            .into_vec();
+        assert!(matches!(out.as_slice(), [ExecuteResult::Empty]));
+
+        // Empty SQL returns early, so pending params/types are still queued.
+        let qctx = session.query_context_for_statement(1, 1);
+        assert_eq!(qctx.params, vec![Some(Value::Int32(11))]);
+        assert_eq!(qctx.param_types, vec![Some(DataType::Int32)]);
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_text_fallback_sets_pending_bind_values() {
+        let exec = test_executor();
+        let mut session = test_session("tester", true);
+        let qctx = exec.build_prepared_query_context(
+            &mut session,
+            vec![Some(Value::Text("x".to_string()))],
+            &[DataType::Text],
+        );
+
+        let out = exec
+            .execute_prepared_text_fallback(&mut session, "", qctx.as_ref())
+            .await
+            .unwrap()
+            .into_vec();
+        assert!(matches!(out.as_slice(), [ExecuteResult::Empty]));
+
+        let drained = session.query_context_for_statement(2, 2);
+        assert_eq!(drained.params, vec![Some(Value::Text("x".to_string()))]);
+        assert_eq!(drained.param_types, vec![Some(DataType::Text)]);
+    }
+
+    #[test]
+    fn observability_policy_returns_parse_error_for_invalid_sql() {
+        let exec = test_executor();
+        let mut session = test_session(OBSERVABILITY_USER, false);
+        let err = exec
+            .enforce_observability_prepared_policy(
+                &mut session,
+                "SELECT (",
+                &analyzed_query_exec(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn observability_policy_marks_failed_for_rejected_exec_in_transaction() {
+        let exec = test_executor();
+        let mut session = test_session(OBSERVABILITY_USER, false);
+        session.force_test_transaction_state(true, false);
+        let _ = exec
+            .enforce_observability_prepared_policy(
+                &mut session,
+                "SELECT 1",
+                &PreparedExec::RawSqlUtility,
+            )
+            .unwrap_err();
+        assert!(session.is_transaction_failed());
+    }
+
+    #[test]
+    fn sql_deallocate_removes_named_statement_and_supports_all() {
+        let exec = test_executor();
+        let mut session = test_session("tester", true);
+
+        let stmt = PreparedStatement {
+            sql: "SELECT 1".to_string(),
+            exec: PreparedExec::RawSqlUtility,
+            output_schema: vec![],
+            param_data_types: vec![],
+            table_versions: vec![],
+        };
+        session.put_sql_prepared_statement("p1".to_string(), stmt.clone());
+        session.put_sql_prepared_statement("p2".to_string(), stmt);
+
+        let out = exec
+            .execute_sql_deallocate_statement(&mut session, &sqlparser::ast::Ident::new("p1"))
+            .unwrap();
+        assert!(matches!(
+            out.as_slice(),
+            [ExecuteResult::CommandComplete { tag: "DEALLOCATE" }]
+        ));
+        assert!(session.get_sql_prepared_statement_cloned("p1").is_none());
+        assert!(session.get_sql_prepared_statement_cloned("p2").is_some());
+
+        let out_all = exec
+            .execute_sql_deallocate_statement(&mut session, &sqlparser::ast::Ident::new("ALL"))
+            .unwrap();
+        assert!(matches!(
+            out_all.as_slice(),
+            [ExecuteResult::CommandComplete { tag: "DEALLOCATE" }]
+        ));
+        assert!(session.get_sql_prepared_statement_cloned("p2").is_none());
+    }
+
+    #[test]
+    fn sql_deallocate_unknown_name_errors() {
+        let exec = test_executor();
+        let mut session = test_session("tester", true);
+        let err = exec
+            .execute_sql_deallocate_statement(&mut session, &sqlparser::ast::Ident::new("missing"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"));
+    }
+
+    #[test]
+    fn sql_deallocate_all_is_case_insensitive() {
+        let exec = test_executor();
+        let mut session = test_session("tester", true);
+        session.put_sql_prepared_statement(
+            "p".to_string(),
+            PreparedStatement {
+                sql: "SELECT 1".to_string(),
+                exec: PreparedExec::RawSqlUtility,
+                output_schema: vec![],
+                param_data_types: vec![],
+                table_versions: vec![],
+            },
+        );
+        let out = exec
+            .execute_sql_deallocate_statement(&mut session, &sqlparser::ast::Ident::new("aLl"))
+            .unwrap();
+        assert!(matches!(
+            out.as_slice(),
+            [ExecuteResult::CommandComplete { tag: "DEALLOCATE" }]
+        ));
+        assert!(session.get_sql_prepared_statement_cloned("p").is_none());
+    }
+
+    #[tokio::test]
+    async fn sql_execute_validates_prepared_exists_and_parameter_count() {
+        let exec = test_executor();
+        let mut session = test_session("tester", true);
+
+        let missing_err = exec
+            .execute_sql_execute_statement(&mut session, &sqlparser::ast::Ident::new("missing"), &[])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(missing_err.contains("does not exist"));
+
+        let stmt = PreparedStatement {
+            sql: "SELECT 1".to_string(),
+            exec: analyzed_query_exec(),
+            output_schema: vec![],
+            param_data_types: vec![DataType::Int32],
+            table_versions: vec![],
+        };
+        session.put_sql_prepared_statement("p1".to_string(), stmt);
+
+        let err = exec
+            .execute_sql_execute_statement(&mut session, &sqlparser::ast::Ident::new("p1"), &[])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.to_lowercase().contains("prepared")
+                || err.to_lowercase().contains("parameter")
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_execute_requires_constant_parameter_expressions() {
+        let exec = test_executor();
+        let mut session = test_session("tester", true);
+        let stmt = PreparedStatement {
+            sql: "SELECT 1".to_string(),
+            exec: analyzed_query_exec(),
+            output_schema: vec![],
+            param_data_types: vec![DataType::Int32],
+            table_versions: vec![],
+        };
+        session.put_sql_prepared_statement("p1".to_string(), stmt);
+
+        let err = exec
+            .execute_sql_execute_statement(
+                &mut session,
+                &sqlparser::ast::Ident::new("p1"),
+                &[Expr::Identifier(sqlparser::ast::Ident::new("x"))],
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!err.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sql_execute_recursive_cte_fallback_sets_pending_bindings() {
+        let exec = test_executor();
+        let mut session = test_session("tester", true);
+        let PreparedExec::AnalyzedQuery {
+            analyzed,
+            locks,
+            select_into,
+            required_privileges,
+            ..
+        } = analyzed_query_exec()
+        else {
+            unreachable!()
+        };
+
+        let stmt = PreparedStatement {
+            sql: "".to_string(),
+            exec: PreparedExec::AnalyzedQuery {
+                analyzed,
+                locks,
+                select_into,
+                required_privileges,
+                has_recursive_cte: true,
+            },
+            output_schema: vec![],
+            param_data_types: vec![DataType::Int32],
+            table_versions: vec![],
+        };
+        session.put_sql_prepared_statement("p1".to_string(), stmt);
+
+        let out = exec
+            .execute_sql_execute_statement(
+                &mut session,
+                &sqlparser::ast::Ident::new("p1"),
+                &[Expr::Value(sqlparser::ast::Value::Number(
+                    "7".to_string(),
+                    false,
+                ))],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(out.as_slice(), [ExecuteResult::Empty]));
+
+        let qctx = session.query_context_for_statement(1, 1);
+        assert_eq!(qctx.params, vec![Some(Value::Int32(7))]);
+        assert_eq!(qctx.param_types, vec![Some(DataType::Int32)]);
+    }
+
+    #[test]
+    fn observability_policy_empty_sql_is_denied_and_marks_failed_in_txn() {
+        let exec = test_executor();
+        let mut session = test_session(OBSERVABILITY_USER, false);
+        session.force_test_transaction_state(true, false);
+        let _ = exec
+            .enforce_observability_prepared_policy(&mut session, " ; ", &analyzed_query_exec())
+            .unwrap_err();
+        assert!(session.is_transaction_failed());
+    }
 }

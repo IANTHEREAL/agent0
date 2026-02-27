@@ -1,0 +1,74 @@
+version: 1
+critical_paths:
+  simple_query_path:
+    desc: SQL simple query through parser/analyzer/executor
+    required_statement_cells:
+      - [SELECT, simple_query]
+      - [INSERT, simple_query]
+      - [UPDATE, simple_query]
+    required_areas_any:
+      - analyzer
+      - executor_operators
+
+  extended_protocol_path:
+    desc: Parse/Bind/Describe/Execute/Sync protocol path
+    required_statement_cells:
+      - [SELECT, parse_bind_execute]
+      - [SELECT, describe]
+      - [SELECT, sync]
+      - [INSERT, parse_bind_execute]
+
+  ddl_path:
+    desc: DDL lifecycle path
+    required_statement_cells:
+      - [CREATE_TABLE, simple_query]
+      - [ALTER_TABLE, simple_query]
+      - [DROP_TABLE, simple_query]
+    required_areas_any:
+      - analyzer
+      - executor_operators
+      - catalog
+
+  dml_path:
+    desc: DML CRUD path
+    required_statement_cells:
+      - [INSERT, simple_query]
+      - [UPDATE, simple_query]
+      - [DELETE, simple_query]
+    required_scenario_cells_any:
+      - [typeorm, crud_basic]
+      - [prisma, crud_basic]
+      - [sequelize, crud_basic]
+
+  join_optimizer_path:
+    desc: Join + optimizer critical path
+    required_scenario_cells_any:
+      - [typeorm, join_and_subquery]
+      - [prisma, join_and_subquery]
+      - [knex, join_and_subquery]
+    required_areas_any:
+      - optimizer
+      - executor_operators
+
+  transaction_savepoint_path:
+    desc: Transaction and savepoint semantics path
+    required_scenario_cells_any:
+      - [typeorm, transaction]
+      - [prisma, transaction]
+      - [sequelize, transaction]
+      - [knex, transaction]
+    required_statement_cells:
+      - [BEGIN_COMMIT_ROLLBACK, simple_query]
+
+  copy_path:
+    desc: COPY import path
+    required_statement_cells:
+      - [COPY, simple_query]
+      - [COPY, error_path]
+
+  orm_end_to_end_path:
+    desc: ORM and app-driver end-to-end chain
+    required_scenario_cells_any:
+      - [sqlalchemy, crud_basic]
+      - [dify_sqlalchemy, crud_basic]
+      - [gorm, crud_basic]

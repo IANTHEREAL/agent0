@@ -1,0 +1,33 @@
+version: 1
+areas:
+  protocol:
+    paths:
+      - src/protocol/
+    owner: protocol-team
+  analyzer:
+    paths:
+      - src/sql/analyzer/
+    owner: sql-analyzer
+  optimizer:
+    paths:
+      - src/sql/optimizer/
+    owner: sql-optimizer
+  executor_operators:
+    paths:
+      - src/sql/executor/
+      - src/sql/operators/
+    owner: sql-execution
+  storage_txn:
+    paths:
+      - src/storage/
+      - src/txn/
+    owner: storage-txn
+  catalog:
+    paths:
+      - src/sql/catalog/
+    owner: sql-catalog
+  expr_types:
+    paths:
+      - src/sql/expr/
+      - src/sql/types/
+    owner: sql-types

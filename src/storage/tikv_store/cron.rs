@@ -350,3 +350,56 @@ impl TikvStore {
         .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserialize_cron_job_reads_current_shape() {
+        let job = CronJob {
+            job_id: 11,
+            schedule: "*/10 * * * *".to_string(),
+            command: "SELECT 1".to_string(),
+            nodename: "localhost".to_string(),
+            nodeport: 5433,
+            database: "postgres".to_string(),
+            username: "admin".to_string(),
+            active: true,
+            jobname: Some("j".to_string()),
+            max_runtime_ms: Some(30_000),
+        };
+
+        let data = bincode::serialize(&job).unwrap();
+        let decoded = deserialize_cron_job(&data).unwrap();
+        assert_eq!(decoded, job);
+    }
+
+    #[test]
+    fn deserialize_cron_job_falls_back_to_legacy_shape() {
+        let legacy = CronJobLegacy {
+            job_id: 7,
+            schedule: "0 * * * *".to_string(),
+            command: "VACUUM".to_string(),
+            nodename: "localhost".to_string(),
+            nodeport: 5433,
+            database: "postgres".to_string(),
+            username: "admin".to_string(),
+            active: true,
+            jobname: Some("legacy".to_string()),
+        };
+
+        let data = bincode::serialize(&legacy).unwrap();
+        let decoded = deserialize_cron_job(&data).unwrap();
+        assert_eq!(decoded.job_id, legacy.job_id);
+        assert_eq!(decoded.schedule, legacy.schedule);
+        assert_eq!(decoded.command, legacy.command);
+        assert_eq!(decoded.max_runtime_ms, None);
+    }
+
+    #[test]
+    fn deserialize_cron_job_rejects_invalid_payload() {
+        let err = deserialize_cron_job(&[1, 2, 3, 4]).unwrap_err().to_string();
+        assert!(err.contains("Failed to deserialize cron job"));
+    }
+}

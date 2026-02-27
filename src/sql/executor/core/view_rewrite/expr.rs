@@ -777,3 +777,198 @@ pub(crate) fn expr_requires_view_expansion(expr: &Expr) -> bool {
 
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::expr_requires_view_expansion;
+    use crate::sql::parse_sql;
+    use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement};
+
+    fn parse_projection_expr(expr_sql: &str) -> Expr {
+        let mut stmts = parse_sql(&format!("SELECT {}", expr_sql)).expect("parse sql");
+        let stmt = stmts.remove(0);
+        let Statement::Query(q) = stmt else {
+            panic!("expected query");
+        };
+        let SetExpr::Select(s) = *q.body else {
+            panic!("expected select");
+        };
+        let item = s.projection.into_iter().next().expect("projection item");
+        match item {
+            SelectItem::UnnamedExpr(e) => e,
+            _ => panic!("expected unnamed expr"),
+        }
+    }
+
+    fn parse_query_projection_expr(query_sql: &str) -> Expr {
+        let mut stmts = parse_sql(query_sql).expect("parse sql");
+        let stmt = stmts.remove(0);
+        let Statement::Query(q) = stmt else {
+            panic!("expected query");
+        };
+        let SetExpr::Select(s) = *q.body else {
+            panic!("expected select");
+        };
+        let item = s.projection.into_iter().next().expect("projection item");
+        match item {
+            SelectItem::UnnamedExpr(e) => e,
+            _ => panic!("expected unnamed expr"),
+        }
+    }
+
+    #[test]
+    fn no_subquery_shapes_do_not_require_expansion() {
+        let expr = parse_projection_expr("((a + 1) * 2) BETWEEN 1 AND 10");
+        assert!(!expr_requires_view_expansion(&expr));
+
+        let expr = parse_projection_expr(
+            "CASE WHEN a > 1 THEN substring(b from 1 for 2) ELSE trim(c) END",
+        );
+        assert!(!expr_requires_view_expansion(&expr));
+    }
+
+    #[test]
+    fn direct_subquery_shapes_require_expansion() {
+        let e1 = parse_projection_expr("(SELECT 1)");
+        assert!(expr_requires_view_expansion(&e1));
+
+        let e2 = parse_projection_expr("EXISTS (SELECT 1)");
+        assert!(expr_requires_view_expansion(&e2));
+
+        let e3 = parse_projection_expr("a IN (SELECT x FROM t)");
+        assert!(expr_requires_view_expansion(&e3));
+    }
+
+    #[test]
+    fn any_all_ops_require_expansion_when_subquery_present() {
+        let e1 = parse_projection_expr("a = ANY(SELECT x FROM t)");
+        assert!(expr_requires_view_expansion(&e1));
+
+        let e2 = parse_projection_expr("a = ALL(SELECT x FROM t)");
+        assert!(expr_requires_view_expansion(&e2));
+    }
+
+    #[test]
+    fn nested_subquery_inside_function_is_detected() {
+        let expr = parse_projection_expr(
+            "coalesce(1, (SELECT max(x) FROM t), CASE WHEN 1=1 THEN 2 ELSE 3 END)",
+        );
+        assert!(expr_requires_view_expansion(&expr));
+    }
+
+    #[test]
+    fn specialized_expression_shapes_detect_subqueries() {
+        let cases = [
+            "array[(SELECT 1)]",
+            "(ARRAY[1,2])[ (SELECT 1) ]",
+            "'{\"k\":1}'::jsonb -> (SELECT 'k')",
+            "substring((SELECT 'abc') from 1 for 2)",
+            "trim((SELECT 'abc'))",
+            "position((SELECT 'a') in 'abc')",
+            "extract(epoch from (SELECT now()))",
+            "overlay((SELECT 'abc') placing 'X' from 1 for 1)",
+            "(SELECT now()) AT TIME ZONE 'UTC'",
+        ];
+
+        for sql in cases {
+            let expr = parse_projection_expr(sql);
+            assert!(
+                expr_requires_view_expansion(&expr),
+                "expected subquery detection for: {}",
+                sql
+            );
+        }
+    }
+
+    #[test]
+    fn specialized_expression_shapes_without_subquery_do_not_require_expansion() {
+        let expr = parse_projection_expr(
+            "overlay(substring(trim('abc') from 1 for 2) placing 'X' from 1 for 1)",
+        );
+        assert!(!expr_requires_view_expansion(&expr));
+    }
+
+    #[test]
+    fn unary_cast_and_null_predicates_follow_subquery_presence() {
+        let cases = [
+            ("-(SELECT 1)", true),
+            ("(SELECT 1)::int", true),
+            ("(SELECT 1) IS NULL", true),
+            ("(SELECT 1) IS NOT NULL", true),
+            ("(SELECT true) IS TRUE", true),
+            ("(SELECT false) IS NOT FALSE", true),
+            ("(SELECT NULL) IS UNKNOWN", true),
+            ("(SELECT 1) IS NOT UNKNOWN", true),
+            ("-1", false),
+            ("1::int", false),
+            ("1 IS NULL", false),
+        ];
+
+        for (sql, expected) in cases {
+            let expr = parse_projection_expr(sql);
+            assert_eq!(
+                expr_requires_view_expansion(&expr),
+                expected,
+                "sql={sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_list_and_case_branches_detect_nested_subqueries() {
+        let e1 = parse_projection_expr("1 IN (2, 3, (SELECT 4))");
+        assert!(expr_requires_view_expansion(&e1));
+
+        let e2 = parse_projection_expr("CASE (SELECT 1) WHEN 1 THEN 2 ELSE 3 END");
+        assert!(expr_requires_view_expansion(&e2));
+
+        let e3 = parse_projection_expr("CASE WHEN 1=1 THEN 2 ELSE 3 END");
+        assert!(!expr_requires_view_expansion(&e3));
+    }
+
+    #[test]
+    fn function_filter_and_window_spec_branches_are_walked() {
+        let expr = parse_query_projection_expr(
+            "SELECT sum(x) FILTER (WHERE EXISTS (SELECT 1)) OVER (PARTITION BY (SELECT 2) ORDER BY (SELECT 3)) FROM t",
+        );
+        assert!(expr_requires_view_expansion(&expr));
+
+        let expr = parse_query_projection_expr("SELECT sum(x) OVER w FROM t WINDOW w AS (PARTITION BY x)");
+        assert!(!expr_requires_view_expansion(&expr));
+    }
+
+    #[test]
+    fn array_and_json_shapes_follow_subquery_presence() {
+        let with_subquery = [
+            "array[(SELECT 1), 2]",
+            "(ARRAY[1,2])[1][(SELECT 1)]",
+            "'{\"a\":1}'::jsonb -> (SELECT 'a')",
+        ];
+        for sql in with_subquery {
+            let expr = parse_projection_expr(sql);
+            assert!(expr_requires_view_expansion(&expr), "sql={sql}");
+        }
+
+        let without_subquery = [
+            "array[1, 2, 3]",
+            "(ARRAY[1,2])[1]",
+            "'{\"a\":1}'::jsonb -> 'a'",
+        ];
+        for sql in without_subquery {
+            let expr = parse_projection_expr(sql);
+            assert!(!expr_requires_view_expansion(&expr), "sql={sql}");
+        }
+    }
+
+    #[test]
+    fn binary_between_and_position_shapes_cover_positive_and_negative() {
+        let expr = parse_projection_expr("((SELECT 1) + 2) BETWEEN 1 AND 10");
+        assert!(expr_requires_view_expansion(&expr));
+
+        let expr = parse_projection_expr("position('a' in (SELECT 'abc'))");
+        assert!(expr_requires_view_expansion(&expr));
+
+        let expr = parse_projection_expr("(1 + 2) BETWEEN 1 AND 10");
+        assert!(!expr_requires_view_expansion(&expr));
+    }
+}

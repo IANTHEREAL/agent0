@@ -240,3 +240,255 @@ fn test_hash_join_full_outer_mapping() {
     assert!(op.build_outer);
     assert!(op.probe_outer);
 }
+
+#[test]
+fn test_hash_join_config_default_value() {
+    let cfg = HashJoinConfig::default();
+    assert_eq!(cfg.max_memory_bytes, 256 * 1024 * 1024);
+}
+
+#[test]
+fn test_hash_join_constructor_swaps_build_probe_keys_when_right_is_build() {
+    let left_child: BoxedOperator =
+        Box::new(super::super::scan::TableScanOperator::new(schema_left()));
+    let right_child: BoxedOperator =
+        Box::new(super::super::scan::TableScanOperator::new(schema_right()));
+
+    let op = HashJoinOperator::new(
+        left_child,
+        right_child,
+        HashJoinType::Inner,
+        vec![0], // left key
+        vec![1], // right key
+        false,   // right as build
+        None,
+        HashJoinConfig::default(),
+    );
+
+    assert!(!op.left_is_build);
+    assert_eq!(op.build_key_indices, vec![1]);
+    assert_eq!(op.probe_key_indices, vec![0]);
+    assert!(!op.build_outer);
+    assert!(!op.probe_outer);
+}
+
+#[test]
+fn test_hash_join_right_join_outer_mapping_with_left_build() {
+    let left_child: BoxedOperator =
+        Box::new(super::super::scan::TableScanOperator::new(schema_left()));
+    let right_child: BoxedOperator =
+        Box::new(super::super::scan::TableScanOperator::new(schema_right()));
+
+    let op = HashJoinOperator::new(
+        left_child,
+        right_child,
+        HashJoinType::Right,
+        vec![0],
+        vec![0],
+        true, // left is build
+        None,
+        HashJoinConfig::default(),
+    );
+
+    assert!(!op.build_outer);
+    assert!(op.probe_outer);
+}
+
+#[test]
+fn test_hash_join_output_schema_keeps_left_then_right_column_order() {
+    let left_child: BoxedOperator =
+        Box::new(super::super::scan::TableScanOperator::new(schema_left()));
+    let right_child: BoxedOperator =
+        Box::new(super::super::scan::TableScanOperator::new(schema_right()));
+
+    let op = HashJoinOperator::new(
+        left_child,
+        right_child,
+        HashJoinType::Inner,
+        vec![0],
+        vec![0],
+        true,
+        None,
+        HashJoinConfig::default(),
+    );
+
+    let names: Vec<String> = op
+        .schema()
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "id".to_string(),
+            "l".to_string(),
+            "id".to_string(),
+            "r".to_string()
+        ]
+    );
+}
+
+#[test]
+fn test_join_key_helpers_handle_length_and_missing_indices() {
+    assert!(!join_keys_equal(&[Value::Int32(1)], &[]));
+
+    let row = Row::new(vec![Value::Int32(1)]);
+    assert!(row_key_has_null_for_join(&row, &[1])); // out-of-bounds treated as NULL
+    assert!(!row_key_has_null_for_join(&row, &[0]));
+
+    let row_missing = Row::new(vec![]);
+    let row_null = Row::new(vec![Value::Null]);
+    assert_eq!(
+        hash_row_key_for_join(&row_missing, &[0]),
+        hash_row_key_for_join(&row_null, &[0])
+    );
+}
+
+#[test]
+fn test_row_keys_equal_for_join_cross_indices_and_length_mismatch() {
+    let build_row = Row::new(vec![Value::Int32(7), Value::Text("x".into())]);
+    let probe_row = Row::new(vec![Value::Text("y".into()), Value::Int64(7)]);
+    assert!(row_keys_equal_for_join(&build_row, &[0], &probe_row, &[1]));
+    assert!(!row_keys_equal_for_join(&build_row, &[0, 1], &probe_row, &[1]));
+}
+
+#[test]
+fn test_hash_table_tracks_null_key_rows_and_indices() {
+    let mut table = JoinHashTable::new(vec![0]);
+    table.insert(Row::new(vec![Value::Int32(1), Value::Text("a".into())]));
+    table.insert(Row::new(vec![Value::Null, Value::Text("null-key".into())]));
+    table.insert(Row::new(vec![Value::Int32(2), Value::Text("b".into())]));
+    table.finalize();
+
+    assert_eq!(table.total_row_count(), 3);
+    assert_eq!(table.null_key_start_index, 2);
+    assert_eq!(table.null_key_rows.len(), 1);
+
+    let hash = hash_join_key(&[Value::Int32(1)]);
+    let (rows, indices) = table.bucket_by_hash(hash).expect("bucket exists");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(indices, &[0]);
+
+    let all: Vec<(usize, Value)> = table
+        .all_rows_with_indices()
+        .map(|(idx, r)| (idx, r.values[1].clone()))
+        .collect();
+    assert!(all.iter().any(|(idx, v)| *idx == 2 && *v == Value::Text("null-key".into())));
+}
+
+#[test]
+fn test_hash_table_into_unmatched_parts_preserves_components() {
+    let mut table = JoinHashTable::with_capacity(vec![0], 8);
+    table.insert(Row::new(vec![Value::Int32(1)]));
+    table.insert(Row::new(vec![Value::Null]));
+    table.finalize();
+
+    let (buckets, null_rows, null_start) = table.into_unmatched_parts();
+    assert!(!buckets.is_empty());
+    assert_eq!(null_rows.len(), 1);
+    assert_eq!(null_start, 1);
+}
+
+#[test]
+fn test_hash_key_and_join_equality_for_misc_value_variants() {
+    use crate::model::IntervalValue;
+    use rust_decimal::Decimal;
+
+    let values = vec![
+        Value::Boolean(true),
+        Value::Text("abc".into()),
+        Value::Bytes(vec![1, 2, 3]),
+        Value::Timestamp(1_700_000_000_000),
+        Value::Interval(IntervalValue::new(2, 3456)),
+        Value::Uuid([7u8; 16]),
+        Value::Array(vec![Value::Int32(1), Value::Text("x".into())]),
+        Value::Vector(vec![1.5, 2.5]),
+        Value::Json("{\"a\":1}".into()),
+        Value::Jsonb("{\"b\":2}".into()),
+        Value::Time(12_345_678),
+        Value::Date(20000),
+        Value::Numeric(Decimal::new(12345, 2)),
+        Value::Tsvector("'a' 'b'".into()),
+        Value::Tsquery("a & b".into()),
+    ];
+
+    for v in values {
+        assert_eq!(hash_join_key(std::slice::from_ref(&v)), hash_join_key(&[v.clone()]));
+        assert!(join_keys_equal(std::slice::from_ref(&v), &[v.clone()]));
+    }
+}
+
+#[test]
+fn test_row_key_equals_values_length_mismatch_returns_false() {
+    let mut table = JoinHashTable::new(vec![0, 1]);
+    table.insert(Row::new(vec![Value::Int32(1), Value::Int32(2)]));
+    table.finalize();
+    let hash = hash_join_key(&[Value::Int32(1), Value::Int32(2)]);
+    let bucket = table.buckets.get(&hash).expect("bucket exists");
+    assert!(!table.row_key_equals_values(&bucket.rows[0], &[Value::Int32(1)]));
+}
+
+#[test]
+fn test_hash_join_metadata_and_children_ordering() {
+    let left_child: BoxedOperator =
+        Box::new(super::super::scan::TableScanOperator::new(schema_left()));
+    let right_child: BoxedOperator =
+        Box::new(super::super::scan::TableScanOperator::new(schema_right()));
+
+    let op = HashJoinOperator::new(
+        left_child,
+        right_child,
+        HashJoinType::Inner,
+        vec![0],
+        vec![0],
+        true,
+        None,
+        HashJoinConfig::default(),
+    );
+
+    assert_eq!(op.name(), "HashJoin");
+    assert_eq!(
+        op.explain_info(),
+        Some("type=INNER, left_is_build=true".to_string())
+    );
+
+    let children = op.children();
+    assert_eq!(children.len(), 2);
+    assert_eq!(children[0].schema().name, "left");
+    assert_eq!(children[1].schema().name, "right");
+}
+
+#[test]
+fn test_hash_join_children_ordering_when_right_is_build() {
+    let left_child: BoxedOperator =
+        Box::new(super::super::scan::TableScanOperator::new(schema_left()));
+    let right_child: BoxedOperator =
+        Box::new(super::super::scan::TableScanOperator::new(schema_right()));
+
+    let mut op = HashJoinOperator::new(
+        left_child,
+        right_child,
+        HashJoinType::Right,
+        vec![0],
+        vec![0],
+        false,
+        None,
+        HashJoinConfig::default(),
+    );
+
+    assert_eq!(
+        op.explain_info(),
+        Some("type=RIGHT, left_is_build=false".to_string())
+    );
+
+    let children = op.children();
+    assert_eq!(children.len(), 2);
+    assert_eq!(children[0].schema().name, "left");
+    assert_eq!(children[1].schema().name, "right");
+
+    let children_mut = op.children_mut();
+    assert_eq!(children_mut.len(), 2);
+    assert_eq!(children_mut[0].schema().name, "left");
+    assert_eq!(children_mut[1].schema().name, "right");
+}

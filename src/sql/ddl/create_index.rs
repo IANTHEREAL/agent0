@@ -853,3 +853,99 @@ pub async fn reconcile_index(
     )
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ColumnDef;
+
+    fn test_schema() -> TableSchema {
+        TableSchema::new(
+            "custom.t".to_string(),
+            1,
+            vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: true,
+                    unique: true,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+                ColumnDef {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+            ],
+            vec![0],
+        )
+    }
+
+    fn test_index(columns: Vec<&str>, expressions: Vec<&str>) -> IndexDef {
+        IndexDef {
+            name: "idx_test".to_string(),
+            id: 1,
+            columns: columns.into_iter().map(ToString::to_string).collect(),
+            unique: false,
+            is_constraint: false,
+            method: None,
+            predicate: None,
+            expressions: expressions.into_iter().map(ToString::to_string).collect(),
+            state: IndexState::Ready,
+        }
+    }
+
+    #[test]
+    fn reconcile_index_search_path_prefers_public_then_pg_catalog() {
+        let path = reconcile_index_search_path("public.t1");
+        assert_eq!(path, vec!["public", "pg_catalog"]);
+    }
+
+    #[test]
+    fn reconcile_index_search_path_keeps_non_public_schema_first() {
+        let path = reconcile_index_search_path("tenant_a.t1");
+        assert_eq!(path, vec!["tenant_a", "public", "pg_catalog"]);
+    }
+
+    #[test]
+    fn infer_index_value_types_reads_columns_and_expressions() {
+        let schema = test_schema();
+        let index = test_index(vec!["id"], vec!["id"]);
+        let types = infer_index_value_types_for_reconcile(&index, &schema, 1, "custom.t", &[])
+            .expect("infer index value types");
+        assert_eq!(types, vec![DataType::Int32, DataType::Int32]);
+    }
+
+    #[test]
+    fn infer_index_value_types_errors_on_missing_column() {
+        let schema = test_schema();
+        let index = test_index(vec!["missing_col"], vec![]);
+        let err = infer_index_value_types_for_reconcile(&index, &schema, 1, "custom.t", &[])
+            .expect_err("missing column should error");
+        assert!(
+            err.to_string().contains("Index column 'missing_col' not found"),
+            "unexpected err: {err}"
+        );
+    }
+
+    #[test]
+    fn infer_index_value_types_errors_on_unparseable_expression() {
+        let schema = test_schema();
+        let index = test_index(vec![], vec!["("]);
+        let err = infer_index_value_types_for_reconcile(&index, &schema, 1, "custom.t", &[])
+            .expect_err("bad expression should error");
+        assert!(
+            err.to_string()
+                .contains("failed to parse index expression '('"),
+            "unexpected err: {err}"
+        );
+    }
+}

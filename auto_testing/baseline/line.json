@@ -1,0 +1,7 @@
+{
+  "status": "ok",
+  "source": "cargo llvm-cov json export",
+  "covered_lines": 42892,
+  "total_lines": 88405,
+  "global_ratio": 0.4852
+}
