@@ -163,7 +163,7 @@ impl Binder {
     /// to be inside a `WITH RECURSIVE` block.
     /// Uses the same binder relation-extraction path to avoid drift in
     /// table-factor handling and CTE scoping semantics.
-    fn cte_body_references_name(body: &sqlparser::ast::SetExpr, cte_name: &str) -> bool {
+    pub(crate) fn cte_body_references_name(body: &sqlparser::ast::SetExpr, cte_name: &str) -> bool {
         let query = sqlparser::ast::Query {
             with: None,
             body: Box::new(body.clone()),

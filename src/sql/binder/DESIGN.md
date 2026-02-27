@@ -129,8 +129,9 @@ fn check_relation(name: &ObjectName) {
 ## cte_body_references_name
 
 Own implementation using `normalize_ident` (not reusing cte.rs which uses
-`.to_lowercase()`). Only checks top-level FROM — does NOT descend into
-nested subqueries (they have their own scope).
+`.to_lowercase()`). Performs a full walk with a clean scope (no outer CTEs
+pre-loaded), so inner WITH clauses correctly shadow the name within their own
+subquery scope without hiding top-level self-references.
 
 ---
 

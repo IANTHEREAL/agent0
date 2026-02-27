@@ -187,3 +187,138 @@ fn values_clause() {
         HashSet::new()
     );
 }
+
+// ── #1022: cte_body_references_name direct tests ───────────────────────
+
+/// Parse a full WITH RECURSIVE statement and call `cte_body_references_name`
+/// on the body of the named CTE. Panics if the CTE is not found.
+fn references_name(sql: &str, cte_name: &str) -> bool {
+    use sqlparser::ast::Statement;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let stmts = Parser::parse_sql(&GenericDialect {}, sql).expect("parse failed");
+    let query = match &stmts[0] {
+        Statement::Query(q) => q,
+        _ => panic!("not a query"),
+    };
+    let with = query.with.as_ref().expect("no WITH clause");
+    let cte = with
+        .cte_tables
+        .iter()
+        .find(|c| c.alias.name.value == cte_name)
+        .expect("CTE not found");
+    super::Binder::cte_body_references_name(&cte.query.body, cte_name)
+}
+
+#[test]
+fn cte_body_references_name_true_for_top_level_ref() {
+    // counter references itself at top level in UNION ALL arm → recursive
+    assert!(references_name(
+        "WITH RECURSIVE counter(n) AS (
+             SELECT 1
+             UNION ALL
+             SELECT n+1 FROM counter WHERE n < 5
+         ) SELECT * FROM counter",
+        "counter"
+    ));
+}
+
+#[test]
+fn cte_body_references_name_false_when_only_inner_shadow() {
+    // 'shadow' is referenced only inside an inner WITH shadow AS (...) that shadows it.
+    // cte_body_references_name must return FALSE — this is the exact #1022 regression.
+    assert!(!references_name(
+        "WITH RECURSIVE shadow AS (
+             SELECT 0
+             UNION ALL
+             SELECT sub.v FROM (
+                 WITH shadow AS (SELECT 1 AS v)
+                 SELECT v FROM shadow
+             ) sub WHERE sub.v > 100
+         ) SELECT * FROM shadow",
+        "shadow"
+    ));
+}
+
+#[test]
+fn cte_body_references_name_false_for_non_recursive() {
+    // Simple non-recursive CTE — name never appears in body
+    assert!(!references_name(
+        "WITH RECURSIVE simple AS (SELECT 42) SELECT * FROM simple",
+        "simple"
+    ));
+}
+
+// ── #1022: recursive CTE with nested WITH shadowing ────────────────────
+
+#[test]
+fn recursive_cte_nested_shadow_still_recursive() {
+    // #1022: Recursive CTE whose recursive arm also contains a nested WITH
+    // clause that shadows the outer CTE name inside a derived subquery.
+    // cte_body_references_name must detect the top-level `FROM counter`
+    // reference and classify the CTE as recursive despite the inner shadow.
+    // All appearances of `counter` resolve to either the outer working table
+    // or the inner CTE shadow — no real table dependencies.
+    assert_eq!(
+        deps(
+            "WITH RECURSIVE counter AS (\
+             SELECT 1 AS n \
+             UNION ALL \
+             SELECT counter.n + 1 FROM counter \
+             JOIN (WITH counter AS (SELECT 100 AS shadow_n) \
+                   SELECT shadow_n FROM counter) shadow_sub \
+             ON shadow_sub.shadow_n > 0 \
+             WHERE counter.n < 5) \
+             SELECT n FROM counter ORDER BY n"
+        ),
+        HashSet::new()
+    );
+}
+
+#[test]
+fn non_recursive_body_has_real_table_dep_not_self_ref() {
+    // #1022: CTE 'shadow_only' in WITH RECURSIVE where every reference to the
+    // CTE name inside the body is enclosed in a nested WITH that shadows it.
+    // cte_body_references_name returns false (non-recursive), so the body is
+    // walked before shadow_only enters scope.
+    // The body references 'real_t' at the top level → recorded as external dep.
+    // The body also references 'shadow_only' inside an inner WITH that shadows
+    // it → NOT recorded (inner shadow resolves it before it can escape).
+    // Expected: {real_t} — non-empty, so a regression that drops real_t or
+    // spuriously adds shadow_only would be caught.
+    assert_eq!(
+        deps(
+            "WITH RECURSIVE shadow_only AS (\
+               SELECT * FROM real_t \
+               UNION ALL \
+               SELECT v FROM (WITH shadow_only AS (SELECT 0 AS v) \
+                              SELECT v FROM shadow_only) sub \
+               WHERE sub.v > 100\
+             ) SELECT * FROM shadow_only"
+        ),
+        HashSet::from([u("real_t")])
+    );
+}
+
+#[test]
+fn non_recursive_cte_body_only_shadowed_refs() {
+    // #1022: CTE in WITH RECURSIVE block where every reference to the CTE
+    // name inside the body is enclosed within a nested WITH that shadows it.
+    // cte_body_references_name returns false → classified as non-recursive.
+    // Main query also resolves `non_recursive_shadow` to the CTE shadow —
+    // no real table dependencies.
+    assert_eq!(
+        deps(
+            "WITH RECURSIVE non_recursive_shadow AS (\
+             SELECT 42 AS val \
+             UNION ALL \
+             SELECT inner_q.val + 1 \
+             FROM (WITH non_recursive_shadow AS (SELECT 0 AS val) \
+                   SELECT val FROM non_recursive_shadow) inner_q \
+             WHERE inner_q.val > 100) \
+             SELECT val FROM non_recursive_shadow ORDER BY val"
+        ),
+        HashSet::new()
+    );
+}

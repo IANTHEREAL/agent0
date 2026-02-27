@@ -564,6 +564,59 @@ mod tests {
         assert!(set_expr_references_table(&recursive, "t"));
     }
 
+    /// Regression for #1022: a CTE whose recursive arm references the CTE name
+    /// ONLY inside a nested WITH that shadows the outer name at an inner scope.
+    ///
+    /// The scope-aware binder suppresses the inner reference (it is shadowed),
+    /// so `set_expr_references_table` returns `false` for both arms.
+    /// `decompose_recursive_union` must therefore error — this CTE is not
+    /// recursive and `execute_recursive_cte` is never called for it.
+    ///
+    /// If `set_expr_references_table` were NOT scope-aware it would see `shadow`
+    /// referenced in the right arm (inside the inner WITH body) and wrongly
+    /// return `true`, causing misclassification as a recursive CTE.
+    #[test]
+    fn decompose_nested_shadow_arm_not_self_ref() {
+        let cte_q = cte_query(
+            "WITH RECURSIVE shadow AS ( \
+                 SELECT 0 AS val \
+                 UNION ALL \
+                 SELECT sub.val + 1 \
+                 FROM ( \
+                     WITH shadow AS (SELECT 1 AS val) \
+                     SELECT val FROM shadow \
+                 ) sub \
+                 WHERE sub.val > 100 \
+             ) SELECT * FROM shadow",
+        );
+        // Left arm: SELECT 0 AS val — no table reference at all.
+        let SetExpr::SetOperation { left, right, .. } = cte_q.body.as_ref() else {
+            panic!("expected UNION body");
+        };
+        assert!(
+            !set_expr_references_table(left, "shadow"),
+            "left arm must not reference shadow"
+        );
+        // Right arm: shadow is referenced only inside a nested WITH that re-defines
+        // shadow at an inner scope. The scope-aware binder suppresses this reference.
+        assert!(
+            !set_expr_references_table(right, "shadow"),
+            "right arm must not reference shadow (inner WITH shadows it)"
+        );
+
+        // With both arms returning false, decompose_recursive_union cannot identify
+        // a recursive arm and must error — the same path taken for non-recursive CTEs.
+        let err = decompose_recursive_union(&cte_q, "shadow").unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("must be SqlError::Unsupported");
+        assert_eq!(sql_err.sqlstate(), "0A000");
+        assert!(
+            err.to_string().contains("one non-recursive UNION arm"),
+            "expected non-recursive error, got: {err}"
+        );
+    }
+
     // --- build_cte_table_schema tests ---
 
     #[test]
