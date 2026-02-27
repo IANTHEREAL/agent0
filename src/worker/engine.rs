@@ -14,6 +14,7 @@ use crate::worker::now_epoch_ms;
 use crate::worker::types::*;
 use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +22,9 @@ use tokio::sync::Notify;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
+
+const STATEMENT_TIMEOUT_ERROR: &str = "canceling statement due to statement timeout";
+const CANCELLED_BY_ADMIN_ERROR: &str = "cancelled by administrator";
 
 pub struct WorkerEngine {
     config: WorkerConfig,
@@ -826,24 +830,7 @@ impl WorkerEngine {
                     ),
                 );
 
-                let res = match (&stmt_timeout, &cancel_signal) {
-                    (Some(t), Some(sig)) => tokio::select! {
-                        r = tokio::time::timeout(*t, fut) => match r {
-                            Ok(res) => res,
-                            Err(_) => Err(anyhow::anyhow!("canceling statement due to statement timeout")),
-                        },
-                        _ = sig.notified() => Err(anyhow::anyhow!("cancelled by administrator")),
-                    },
-                    (Some(t), None) => match tokio::time::timeout(*t, fut).await {
-                        Ok(res) => res,
-                        Err(_) => Err(anyhow::anyhow!("canceling statement due to statement timeout")),
-                    },
-                    (None, Some(sig)) => tokio::select! {
-                        r = fut => r,
-                        _ = sig.notified() => Err(anyhow::anyhow!("cancelled by administrator")),
-                    },
-                    (None, None) => fut.await,
-                };
+                let res = run_with_guards(fut, stmt_timeout, cancel_signal.as_ref()).await;
                 let _ = res?;
             }
             txn.commit().await?;
@@ -938,6 +925,32 @@ impl WorkerEngine {
         }
 
         Ok(())
+    }
+}
+
+async fn run_with_guards<F, T>(
+    fut: F,
+    timeout: Option<Duration>,
+    cancel: Option<&Arc<Notify>>,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let timed_fut = async move {
+        match timeout {
+            Some(dur) => tokio::time::timeout(dur, fut)
+                .await
+                .map_err(|_| anyhow!(STATEMENT_TIMEOUT_ERROR))?,
+            None => fut.await,
+        }
+    };
+
+    match cancel {
+        Some(cancel) => tokio::select! {
+            res = timed_fut => res,
+            _ = cancel.notified() => Err(anyhow!(CANCELLED_BY_ADMIN_ERROR)),
+        },
+        None => timed_fut.await,
     }
 }
 
@@ -1087,5 +1100,57 @@ mod tests {
 
         assert!(panic_result.is_err());
         assert_eq!(0, active_jobs.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn run_with_guards_timeout_and_cancel_returns_timeout_error() {
+        let cancel = Arc::new(Notify::new());
+        let fut = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let err = run_with_guards(fut, Some(Duration::from_millis(5)), Some(&cancel))
+            .await
+            .expect_err("expected timeout");
+        assert_eq!(err.to_string(), STATEMENT_TIMEOUT_ERROR);
+    }
+
+    #[tokio::test]
+    async fn run_with_guards_timeout_without_cancel_returns_timeout_error() {
+        let fut = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let err = run_with_guards(fut, Some(Duration::from_millis(5)), None)
+            .await
+            .expect_err("expected timeout");
+        assert_eq!(err.to_string(), STATEMENT_TIMEOUT_ERROR);
+    }
+
+    #[tokio::test]
+    async fn run_with_guards_without_timeout_cancel_returns_cancel_error() {
+        let cancel = Arc::new(Notify::new());
+        cancel.notify_one();
+        let fut = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let err = run_with_guards(fut, None, Some(&cancel))
+            .await
+            .expect_err("expected cancel");
+        assert_eq!(err.to_string(), CANCELLED_BY_ADMIN_ERROR);
+    }
+
+    #[tokio::test]
+    async fn run_with_guards_without_timeout_or_cancel_returns_inner_result() {
+        let fut = async { Ok::<usize, anyhow::Error>(7) };
+
+        let result = run_with_guards(fut, None, None)
+            .await
+            .expect("expected success");
+        assert_eq!(result, 7);
     }
 }
