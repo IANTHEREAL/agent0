@@ -37,6 +37,7 @@ pub fn parse_pg_array(s: &str) -> Result<Vec<Value>> {
     let mut result = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
+    let mut quoted_element = false;
     let mut escape_next = false;
 
     for c in inner.chars() {
@@ -48,18 +49,24 @@ pub fn parse_pg_array(s: &str) -> Result<Vec<Value>> {
 
         match c {
             '\\' => escape_next = true,
-            '"' => in_quotes = !in_quotes,
+            '"' => {
+                if !in_quotes && current.trim().is_empty() {
+                    quoted_element = true;
+                }
+                in_quotes = !in_quotes;
+            }
             ',' if !in_quotes => {
-                let val = parse_array_element(&current);
+                let val = parse_array_element(&current, quoted_element);
                 result.push(val);
                 current.clear();
+                quoted_element = false;
             }
             _ => current.push(c),
         }
     }
 
     if !current.is_empty() || inner.ends_with(',') {
-        let val = parse_array_element(&current);
+        let val = parse_array_element(&current, quoted_element);
         result.push(val);
     }
 
@@ -67,9 +74,9 @@ pub fn parse_pg_array(s: &str) -> Result<Vec<Value>> {
 }
 
 /// Parse a single array element string into a Value
-fn parse_array_element(s: &str) -> Value {
+fn parse_array_element(s: &str, quoted: bool) -> Value {
     let s = s.trim();
-    if s.eq_ignore_ascii_case("NULL") {
+    if !quoted && s.eq_ignore_ascii_case("NULL") {
         return Value::Null;
     }
 
@@ -573,6 +580,14 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], Value::Text("hello".to_string()));
         assert_eq!(result[1], Value::Text("world".to_string()));
+    }
+
+    #[test]
+    fn test_parse_pg_array_quoted_null_is_text() {
+        let result = parse_pg_array("{NULL,\"NULL\"}").unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], Value::Null);
+        assert_eq!(result[1], Value::Text("NULL".to_string()));
     }
 
     #[test]

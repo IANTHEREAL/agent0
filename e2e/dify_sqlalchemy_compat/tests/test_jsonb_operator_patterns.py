@@ -415,8 +415,61 @@ def test_jsonb_set_function(jsonb_table, schema, db):
             result = json.loads(result)
         assert result["nested"]["b"] == "updated"
 
-        # Known gap (#1136): jsonb_set creates intermediate objects when path steps are
-        # absent (PG17 leaves target unchanged). Not tested here.
+        # Test intermediate path behavior fixed in #1136
+
+        # When intermediate path steps are missing, should return original value unchanged
+        # even with create_missing=true (which only applies to final step)
+        result = _sql(
+            conn,
+            """SELECT jsonb_set('{"a":1}'::jsonb, '{missing,key}', '"new"', true)""",
+        ).scalar_one()
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result == {"a": 1}  # Original value unchanged
+
+        # With create_missing=false and intermediate path missing, also unchanged
+        result = _sql(
+            conn,
+            """SELECT jsonb_set('{"a":1}'::jsonb, '{missing,key}', '"new"', false)""",
+        ).scalar_one()
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result == {"a": 1}
+
+        # But when all intermediate steps exist, create_missing=true works for final step
+        result = _sql(
+            conn,
+            """SELECT jsonb_set('{"nested":{}}'::jsonb, '{nested,newkey}', '"value"', true)""",
+        ).scalar_one()
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result == {"nested": {"newkey": "value"}}
+
+        # And create_missing=false doesn't create final step when it's missing
+        result = _sql(
+            conn,
+            """SELECT jsonb_set('{"nested":{}}'::jsonb, '{nested,newkey}', '"value"', false)""",
+        ).scalar_one()
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result == {"nested": {}}
+
+    # Empty path on object/array — PG 17 behavior: return unchanged (no-op).
+    # Each error case uses a fresh connection to avoid transaction state bleeding.
+    with db.engine.connect() as conn2:
+        result = _sql(
+            conn2,
+            """SELECT jsonb_set('{"a":1}'::jsonb, '{}', '42')""",
+        ).scalar_one()
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result == {"a": 1}  # unchanged
+
+    # Empty path on scalar — PG 17 behavior: error "cannot set path in scalar"
+    with db.engine.connect() as error_conn:
+        with pytest.raises(Exception) as exc_info:
+            _sql(error_conn, """SELECT jsonb_set('"hello"'::jsonb, '{}', '42')""")
+        assert "cannot set path in scalar" in str(exc_info.value)
 
 
 # ---- jsonb_build_object function ----
@@ -450,5 +503,17 @@ def test_jsonb_build_object_function(db):
             result = json.loads(result)
         assert result == {}
 
-        # Known gap (#1137): PG17 errors on odd number of args and NULL keys;
-        # db9 silently pads with NULL and coerces NULL keys. Not tested here.
+    # Test error cases now fixed in #1137 — each in a fresh connection to
+    # avoid transaction state bleeding between error cases.
+
+    # Odd number of arguments should error
+    with db.engine.connect() as error_conn:
+        with pytest.raises(Exception) as exc_info:
+            _sql(error_conn, "SELECT jsonb_build_object('key1', 1, 'key2')")
+        assert "even number of elements" in str(exc_info.value)
+
+    # NULL key should error
+    with db.engine.connect() as error_conn:
+        with pytest.raises(Exception) as exc_info:
+            _sql(error_conn, "SELECT jsonb_build_object(NULL, 'value')")
+        assert "key must not be null" in str(exc_info.value)

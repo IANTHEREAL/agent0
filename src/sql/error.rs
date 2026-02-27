@@ -165,6 +165,9 @@ pub enum SqlError {
     #[error("{message}")]
     InvalidParameterValue { message: String },
 
+    #[error("{message}")]
+    NullValueNotAllowed { message: String },
+
     // Dependency errors
     #[error("{message}")]
     DependentObjectsStillExist { message: String },
@@ -260,6 +263,7 @@ impl SqlError {
             Self::UndefinedObject(_) => "42704",
             Self::DuplicateObject(_) => "42710",
             Self::InvalidParameterValue { .. } => "22023",
+            Self::NullValueNotAllowed { .. } => "22004",
             Self::DependentObjectsStillExist { .. } => "2BP01",
             Self::NoActiveTransaction { .. } => "25P01",
             Self::DataTypeMismatch { .. } => "42804",

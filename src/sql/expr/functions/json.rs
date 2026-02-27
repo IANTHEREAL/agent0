@@ -1,4 +1,5 @@
 use crate::model::Value;
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
@@ -119,16 +120,29 @@ pub fn jsonb_typeof(args: Vec<Value>) -> Result<Value> {
 }
 
 pub fn jsonb_build_object(args: Vec<Value>) -> Result<Value> {
+    // PostgreSQL requires even number of arguments
+    if !args.len().is_multiple_of(2) {
+        return Err(SqlError::InvalidParameterValue {
+            message: "argument list must have even number of elements".into(),
+        }
+        .into());
+    }
+
     let mut obj = serde_json::Map::new();
-    let mut iter = args.into_iter();
-    while let Some(key) = iter.next() {
-        let key_str = match key {
-            Value::Text(s) => s,
-            Value::Null => "null".to_string(),
+    for (i, chunk) in args.chunks(2).enumerate() {
+        // PostgreSQL errors on NULL keys, reporting the 1-based argument position
+        if matches!(chunk[0], Value::Null) {
+            return Err(SqlError::InvalidParameterValue {
+                message: format!("argument {}: key must not be null", i * 2 + 1),
+            }
+            .into());
+        }
+
+        let key_str = match &chunk[0] {
+            Value::Text(s) => s.clone(),
             v => v.to_string(),
         };
-        let val = iter.next().unwrap_or(Value::Null);
-        let json_val = value_to_json(&val);
+        let json_val = value_to_json(&chunk[1]);
         obj.insert(key_str, json_val);
     }
     Ok(Value::Jsonb(serde_json::Value::Object(obj).to_string()))
@@ -137,15 +151,30 @@ pub fn jsonb_build_object(args: Vec<Value>) -> Result<Value> {
 /// PostgreSQL `json_build_object` uses `" : "` separator (space before and after colon),
 /// which differs from `jsonb_build_object`'s compact `": "` format.
 pub fn json_build_object(args: Vec<Value>) -> Result<Value> {
+    // PostgreSQL requires even number of arguments
+    if !args.len().is_multiple_of(2) {
+        return Err(SqlError::InvalidParameterValue {
+            message: "argument list must have even number of elements".into(),
+        }
+        .into());
+    }
+
     let mut obj = serde_json::Map::new();
     let mut iter = args.into_iter();
     while let Some(key) = iter.next() {
+        // PostgreSQL errors on NULL keys
+        if matches!(key, Value::Null) {
+            return Err(SqlError::NullValueNotAllowed {
+                message: "null value not allowed for object key".into(),
+            }
+            .into());
+        }
+
         let key_str = match key {
             Value::Text(s) => s,
-            Value::Null => "null".to_string(),
             v => v.to_string(),
         };
-        let val = iter.next().unwrap_or(Value::Null);
+        let val = iter.next().expect("Even argument count guaranteed above");
         let json_val = value_to_json(&val);
         obj.insert(key_str, json_val);
     }
@@ -388,6 +417,68 @@ pub fn row_to_json(args: Vec<Value>) -> Result<Value> {
     }
 }
 
+fn parse_jsonb_set_text_path(path: &str) -> Result<Vec<Value>> {
+    let mut path = path.trim();
+    if path.len() >= 2 && path.starts_with('\'') && path.ends_with('\'') {
+        path = &path[1..path.len() - 1];
+    }
+    if !path.starts_with('{') || !path.ends_with('}') {
+        return Err(anyhow!("invalid text[] path literal"));
+    }
+
+    let inner = &path[1..path.len() - 1];
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut elements = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escape_next = false;
+
+    for ch in inner.chars() {
+        if escape_next {
+            current.push(ch);
+            escape_next = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => {
+                current.push(ch);
+                escape_next = true;
+            }
+            '"' => {
+                current.push(ch);
+                in_quotes = !in_quotes;
+            }
+            ',' if !in_quotes => {
+                elements.push(current);
+                current = String::new();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if in_quotes {
+        return Err(anyhow!("invalid text[] path literal"));
+    }
+    elements.push(current);
+
+    let mut path_elems = Vec::with_capacity(elements.len());
+    for element in elements {
+        let element = element.trim();
+        if element.len() >= 2 && element.starts_with('"') && element.ends_with('"') {
+            path_elems.push(Value::Text(
+                element[1..element.len() - 1].replace("\\\"", "\""),
+            ));
+        } else if element.eq_ignore_ascii_case("NULL") {
+            path_elems.push(Value::Null);
+        } else {
+            path_elems.push(Value::Text(element.to_string()));
+        }
+    }
+    Ok(path_elems)
+}
+
 pub fn jsonb_set(args: Vec<Value>) -> Result<Value> {
     let mut iter = args.into_iter();
     let json_str = match iter.next() {
@@ -397,13 +488,8 @@ pub fn jsonb_set(args: Vec<Value>) -> Result<Value> {
     };
     let path = match iter.next() {
         Some(Value::Array(arr)) => arr,
-        Some(Value::Text(s)) => {
-            let trimmed = s.trim().trim_start_matches('{').trim_end_matches('}');
-            trimmed
-                .split(',')
-                .map(|p| Value::Text(p.trim().to_string()))
-                .collect()
-        }
+        Some(Value::Text(s)) => parse_jsonb_set_text_path(&s)
+            .map_err(|_| anyhow!("jsonb_set requires array path as second argument"))?,
         _ => return Err(anyhow!("jsonb_set requires array path as second argument")),
     };
     let new_value = match iter.next() {
@@ -430,10 +516,10 @@ pub fn jsonb_set(args: Vec<Value>) -> Result<Value> {
         path: &[Value],
         new_val: serde_json::Value,
         create_missing: bool,
-    ) -> bool {
+    ) -> std::result::Result<bool, SqlError> {
         if path.is_empty() {
-            *val = new_val;
-            return true;
+            // Should not be reached: caller handles empty path before calling set_at_path.
+            return Ok(false);
         }
         let key = match &path[0] {
             Value::Text(s) => s.clone(),
@@ -442,45 +528,102 @@ pub fn jsonb_set(args: Vec<Value>) -> Result<Value> {
         match val {
             serde_json::Value::Object(obj) => {
                 if path.len() == 1 {
+                    // Final step: can create if create_missing=true
                     if create_missing || obj.contains_key(&key) {
                         obj.insert(key, new_val);
-                        return true;
+                        return Ok(true);
                     }
                 } else if let Some(child) = obj.get_mut(&key) {
+                    // Intermediate step exists: continue down the path
                     return set_at_path(child, &path[1..], new_val, create_missing);
-                } else if create_missing {
-                    let mut child = serde_json::Value::Object(serde_json::Map::new());
-                    if set_at_path(&mut child, &path[1..], new_val, create_missing) {
-                        obj.insert(key, child);
-                        return true;
-                    }
                 }
+                // Intermediate step missing: PostgreSQL returns original value unchanged
+                // (create_missing only applies to the final step)
             }
             serde_json::Value::Array(arr) => {
-                if let Ok(idx) = key.parse::<usize>() {
-                    if path.len() == 1 {
-                        if idx < arr.len() {
-                            arr[idx] = new_val;
-                            return true;
-                        } else if create_missing {
-                            while arr.len() <= idx {
-                                arr.push(serde_json::Value::Null);
-                            }
-                            arr[idx] = new_val;
-                            return true;
-                        }
-                    } else if idx < arr.len() {
-                        return set_at_path(&mut arr[idx], &path[1..], new_val, create_missing);
+                let raw_idx = key
+                    .parse::<isize>()
+                    .map_err(|_| SqlError::InvalidInputSyntax {
+                        type_name: "integer".into(),
+                        value: key.clone(),
+                    })?;
+                let idx = if raw_idx >= 0 {
+                    Some(raw_idx as usize)
+                } else {
+                    let abs = raw_idx.unsigned_abs();
+                    if abs <= arr.len() {
+                        Some(arr.len() - abs)
+                    } else {
+                        None
                     }
+                };
+                if path.len() == 1 {
+                    if let Some(i) = idx {
+                        if i < arr.len() {
+                            arr[i] = new_val;
+                            return Ok(true);
+                        }
+                    }
+                    if create_missing {
+                        // PostgreSQL prepends for out-of-range negative indexes,
+                        // appends for out-of-range positive indexes.
+                        if raw_idx < 0 && idx.is_none() {
+                            arr.insert(0, new_val);
+                        } else {
+                            arr.push(new_val);
+                        }
+                        return Ok(true);
+                    }
+                } else if let Some(i) = idx {
+                    if i < arr.len() {
+                        // Intermediate step exists: continue down the path
+                        return set_at_path(&mut arr[i], &path[1..], new_val, create_missing);
+                    }
+                    // Array index out of bounds for intermediate step: return unchanged
                 }
             }
             _ => {}
         }
-        false
+        Ok(false)
     }
 
-    set_at_path(&mut json_val, &path, new_value, create_missing);
-    Ok(Value::Jsonb(json_val.to_string()))
+    // Validate path elements: NULL is not allowed
+    for (i, v) in path.iter().enumerate() {
+        if matches!(v, Value::Null) {
+            return Err(SqlError::NullValueNotAllowed {
+                message: format!("path element at position {} is null", i + 1),
+            }
+            .into());
+        }
+    }
+
+    // PG 17 empty-path semantics:
+    //   - scalar target → error
+    //   - object/array target → return unchanged (no-op)
+    if path.is_empty() {
+        if matches!(
+            json_val,
+            serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_)
+                | serde_json::Value::String(_)
+        ) {
+            return Err(SqlError::InvalidParameterValue {
+                message: "cannot set path in scalar".into(),
+            }
+            .into());
+        }
+        return Ok(Value::Jsonb(json_str));
+    }
+
+    // Store original value in case path cannot be set
+    let original_json = json_val.clone();
+    if set_at_path(&mut json_val, &path, new_value, create_missing)? {
+        Ok(Value::Jsonb(json_val.to_string()))
+    } else {
+        // Path couldn't be set (intermediate steps missing), return original
+        Ok(Value::Jsonb(original_json.to_string()))
+    }
 }
 
 pub fn jsonb_array_elements(args: Vec<Value>) -> Result<Value> {
@@ -617,6 +760,16 @@ mod tests {
     }
 
     #[test]
+    fn test_jsonb_build_object_null_key_uses_22023() {
+        let err = jsonb_build_object(vec![Value::Null, Value::Text("v".into())]).unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected SqlError for null key");
+        assert!(matches!(sql_err, SqlError::InvalidParameterValue { .. }));
+        assert_eq!(sql_err.sqlstate(), "22023");
+    }
+
+    #[test]
     fn test_jsonb_build_array() {
         let result =
             jsonb_build_array(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)]).unwrap();
@@ -675,5 +828,135 @@ mod tests {
             to_json(vec![Value::Text("hello".into())]).unwrap(),
             Value::Json("\"hello\"".into())
         );
+    }
+
+    #[test]
+    fn test_jsonb_set_text_path_null_rejected() {
+        let err = jsonb_set(vec![
+            Value::Jsonb("{\"a\":1}".into()),
+            Value::Text("{NULL}".into()),
+            Value::Jsonb("42".into()),
+        ])
+        .unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected SqlError for NULL path element");
+        assert!(matches!(sql_err, SqlError::NullValueNotAllowed { .. }));
+        assert_eq!(sql_err.sqlstate(), "22004");
+    }
+
+    #[test]
+    fn test_jsonb_set_array_path_text_null_is_valid_key() {
+        let result = jsonb_set(vec![
+            Value::Jsonb("{\"a\":1}".into()),
+            Value::Array(vec![Value::Text("NULL".into())]),
+            Value::Jsonb("42".into()),
+        ])
+        .unwrap();
+        let Value::Jsonb(s) = result else {
+            panic!("expected jsonb result");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed["NULL"], 42);
+        assert_eq!(parsed["a"], 1);
+    }
+
+    #[test]
+    fn test_jsonb_set_array_path_sql_null_rejected() {
+        let err = jsonb_set(vec![
+            Value::Jsonb("{\"a\":1}".into()),
+            Value::Array(vec![Value::Null]),
+            Value::Jsonb("42".into()),
+        ])
+        .unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected SqlError for NULL path element");
+        assert!(matches!(sql_err, SqlError::NullValueNotAllowed { .. }));
+        assert_eq!(sql_err.sqlstate(), "22004");
+    }
+
+    #[test]
+    fn test_jsonb_set_text_path_quoted_null_is_valid_key() {
+        let result = jsonb_set(vec![
+            Value::Jsonb("{\"a\":1}".into()),
+            Value::Text("{\"NULL\"}".into()),
+            Value::Jsonb("42".into()),
+        ])
+        .unwrap();
+        let Value::Jsonb(s) = result else {
+            panic!("expected jsonb result");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed["NULL"], 42);
+        assert_eq!(parsed["a"], 1);
+    }
+
+    #[test]
+    fn test_jsonb_set_text_path_preserves_numeric_like_key() {
+        let result = jsonb_set(vec![
+            Value::Jsonb("{\"01\":0}".into()),
+            Value::Text("{01}".into()),
+            Value::Jsonb("42".into()),
+        ])
+        .unwrap();
+        let Value::Jsonb(s) = result else {
+            panic!("expected jsonb result");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed["01"], 42);
+    }
+
+    #[test]
+    fn test_jsonb_set_text_path_preserves_boolean_like_key_case() {
+        let result = jsonb_set(vec![
+            Value::Jsonb("{\"TRUE\":0}".into()),
+            Value::Text("{TRUE}".into()),
+            Value::Jsonb("42".into()),
+        ])
+        .unwrap();
+        let Value::Jsonb(s) = result else {
+            panic!("expected jsonb result");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed["TRUE"], 42);
+    }
+
+    #[test]
+    fn test_jsonb_set_array_path_non_integer_rejected() {
+        let err = jsonb_set(vec![
+            Value::Jsonb("[1,2,3]".into()),
+            Value::Array(vec![Value::Text("x".into())]),
+            Value::Jsonb("42".into()),
+        ])
+        .unwrap_err();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("expected SqlError for non-integer array index");
+        assert!(matches!(sql_err, SqlError::InvalidInputSyntax { .. }));
+        assert_eq!(sql_err.sqlstate(), "22P02");
+    }
+
+    #[test]
+    fn test_jsonb_set_array_path_negative_index() {
+        let result = jsonb_set(vec![
+            Value::Jsonb("[1,2,3]".into()),
+            Value::Array(vec![Value::Text("-1".into())]),
+            Value::Jsonb("42".into()),
+        ])
+        .unwrap();
+        assert_eq!(result, Value::Jsonb("[1,2,42]".into()));
+    }
+
+    #[test]
+    fn test_jsonb_set_array_path_out_of_range_appends_without_padding() {
+        let result = jsonb_set(vec![
+            Value::Jsonb("[1,2]".into()),
+            Value::Array(vec![Value::Text("5".into())]),
+            Value::Jsonb("42".into()),
+            Value::Boolean(true),
+        ])
+        .unwrap();
+        assert_eq!(result, Value::Jsonb("[1,2,42]".into()));
     }
 }
