@@ -1,3 +1,4 @@
+use crate::sql::Session;
 use futures::{Sink, SinkExt, StreamExt};
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
@@ -8,6 +9,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::{DataRow, FieldDescription, RowDescription};
 use pgwire::messages::response::{EmptyQueryResponse, TransactionStatus};
 use pgwire::messages::PgWireBackendMessage;
+use pgwire::tokio::CancellationToken;
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
@@ -128,10 +130,40 @@ where
     .await
 }
 
+#[cfg(test)]
 pub(in crate::protocol::handler) async fn on_execute_with_tx_status_fix<H, C>(
     handler: &H,
     suspended_portals: &Mutex<HashMap<String, SuspendedPortalState>>,
     statement_memory_accountant: Option<TenantMemoryAccountant>,
+    client: &mut C,
+    message: pgwire::messages::extendedquery::Execute,
+) -> PgWireResult<()>
+where
+    H: ExtendedQueryHandler,
+    H::Statement: 'static,
+    C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+    C::PortalStore: PortalStore<Statement = H::Statement>,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    on_execute_with_tx_status_fix_with_guards(
+        handler,
+        suspended_portals,
+        statement_memory_accountant,
+        None,
+        None,
+        client,
+        message,
+    )
+    .await
+}
+
+pub(in crate::protocol::handler) async fn on_execute_with_tx_status_fix_with_guards<H, C>(
+    handler: &H,
+    suspended_portals: &Mutex<HashMap<String, SuspendedPortalState>>,
+    statement_memory_accountant: Option<TenantMemoryAccountant>,
+    cancel_token: Option<&CancellationToken>,
+    session: Option<&Mutex<Session>>,
     client: &mut C,
     message: pgwire::messages::extendedquery::Execute,
 ) -> PgWireResult<()>
@@ -167,8 +199,49 @@ where
                 drained_reservation,
             )) = take_suspended_rows(suspended_portals, portal_name, max_rows).await
             {
+                if let Some(token) = cancel_token {
+                    if token.is_cancelled() {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "FATAL".to_string(),
+                            "25P03".to_string(),
+                            "terminating connection due to idle-in-transaction timeout".to_string(),
+                        ))));
+                    }
+                }
+
+                if let Some(session) = session {
+                    let mut session = session.lock().await;
+                    if let Some(token) = cancel_token {
+                        if token.is_cancelled() {
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "FATAL".to_string(),
+                                "25P03".to_string(),
+                                "terminating connection due to idle-in-transaction timeout"
+                                    .to_string(),
+                            ))));
+                        }
+                    }
+                    if let Err(e) = session.check_idle_in_transaction_timeout() {
+                        let _ = session.rollback().await;
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "FATAL".to_string(),
+                            e.sqlstate().to_string(),
+                            e.to_string(),
+                        ))));
+                    }
+                }
+
                 // Hold drained reservation through wire send for this Execute.
                 let _drained_reservation = drained_reservation;
+                if let Some(token) = cancel_token {
+                    if token.is_cancelled() {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "FATAL".to_string(),
+                            "25P03".to_string(),
+                            "terminating connection due to idle-in-transaction timeout".to_string(),
+                        ))));
+                    }
+                }
                 for row in chunk {
                     client.feed(PgWireBackendMessage::DataRow(row)).await?;
                 }

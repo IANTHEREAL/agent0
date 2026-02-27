@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use futures::{Sink, SinkExt};
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::ClientInfo;
-use pgwire::error::{PgWireError, PgWireResult};
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::response::CommandComplete;
 use pgwire::messages::PgWireBackendMessage;
@@ -121,6 +121,23 @@ impl CopyHandler for DynamicPgHandler {
             crate::sql::query_context::with_scoped_query_context(&qctx, async {
                 let mut session = self.auth().session.lock().await;
 
+                if self.cancel_token.is_cancelled() {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "FATAL".to_string(),
+                        "25P03".to_string(),
+                        "terminating connection due to idle-in-transaction timeout".to_string(),
+                    ))));
+                }
+
+                if let Err(e) = session.check_idle_in_transaction_timeout() {
+                    let _ = session.rollback().await;
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "FATAL".to_string(),
+                        e.sqlstate().to_string(),
+                        e.to_string(),
+                    ))));
+                }
+
                 if session.is_transaction_failed() {
                     return Err(in_failed_sql_transaction_pgwire_error());
                 }
@@ -186,6 +203,23 @@ impl CopyHandler for DynamicPgHandler {
 
             crate::sql::query_context::with_scoped_query_context(&qctx, async {
                 let mut session = self.auth().session.lock().await;
+
+                if self.cancel_token.is_cancelled() {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "FATAL".to_string(),
+                        "25P03".to_string(),
+                        "terminating connection due to idle-in-transaction timeout".to_string(),
+                    ))));
+                }
+
+                if let Err(e) = session.check_idle_in_transaction_timeout() {
+                    let _ = session.rollback().await;
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "FATAL".to_string(),
+                        e.sqlstate().to_string(),
+                        e.to_string(),
+                    ))));
+                }
 
                 if session.is_transaction_failed() {
                     return Err(in_failed_sql_transaction_pgwire_error());
@@ -268,6 +302,27 @@ impl CopyHandler for DynamicPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        {
+            let mut session = self.auth().session.lock().await;
+
+            if self.cancel_token.is_cancelled() {
+                return PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".to_string(),
+                    "25P03".to_string(),
+                    "terminating connection due to idle-in-transaction timeout".to_string(),
+                )));
+            }
+
+            if let Err(e) = session.check_idle_in_transaction_timeout() {
+                let _ = session.rollback().await;
+                return PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".to_string(),
+                    e.sqlstate().to_string(),
+                    e.to_string(),
+                )));
+            }
+        }
+
         let ctx_opt = {
             let mut ctx_guard = self.copy_context.lock().await;
             ctx_guard.take()
@@ -275,6 +330,7 @@ impl CopyHandler for DynamicPgHandler {
 
         if let Some(ctx) = ctx_opt {
             let mut session = self.auth().session.lock().await;
+
             rollback_autocommit_or_mark_failed(&mut session, ctx.started_txn).await;
         }
 

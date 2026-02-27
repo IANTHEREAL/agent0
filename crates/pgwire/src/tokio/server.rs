@@ -711,6 +711,21 @@ where
             },
         };
 
+        // Re-check cancel token before dispatching. Closes the window where
+        // the watchdog fires cancel between socket.next() returning and
+        // process_message() beginning (Timeline A in #1124).
+        if let Some(token) = &cancel_token {
+            if token.is_cancelled() {
+                let err = PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".into(),
+                    "25P03".into(),
+                    "terminating connection due to idle-in-transaction timeout".into(),
+                )));
+                process_error(socket, err, false).await?;
+                break;
+            }
+        }
+
         let is_extended_query = match socket.state() {
             PgWireConnectionState::CopyInProgress(is_extended_query) => is_extended_query,
             _ => msg.is_extended_query(),

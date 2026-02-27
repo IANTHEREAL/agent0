@@ -417,14 +417,13 @@ fn test_hash_key_and_join_equality_for_misc_value_variants() {
     ];
 
     for v in values {
-        let v_clone = v.clone();
         assert_eq!(
             hash_join_key(std::slice::from_ref(&v)),
-            hash_join_key(std::slice::from_ref(&v_clone))
+            hash_join_key(std::slice::from_ref(&v))
         );
         assert!(join_keys_equal(
             std::slice::from_ref(&v),
-            std::slice::from_ref(&v_clone)
+            std::slice::from_ref(&v)
         ));
     }
 }

@@ -85,6 +85,23 @@ impl DynamicPgHandler {
         let executor = &state.executor;
         let mut session = state.session.lock().await;
 
+        if self.cancel_token.is_cancelled() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "25P03".to_string(),
+                "terminating connection due to idle-in-transaction timeout".to_string(),
+            ))));
+        }
+
+        if let Err(e) = session.check_idle_in_transaction_timeout() {
+            let _ = session.rollback().await;
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                e.sqlstate().to_string(),
+                e.to_string(),
+            ))));
+        }
+
         if session.is_transaction_failed() {
             return Err(in_failed_sql_transaction_pgwire_error());
         }
@@ -503,6 +520,23 @@ impl DynamicPgHandler {
         let state = self.auth();
         let executor = &state.executor;
         let mut session = state.session.lock().await;
+
+        if self.cancel_token.is_cancelled() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "25P03".to_string(),
+                "terminating connection due to idle-in-transaction timeout".to_string(),
+            ))));
+        }
+
+        if let Err(e) = session.check_idle_in_transaction_timeout() {
+            let _ = session.rollback().await;
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                e.sqlstate().to_string(),
+                e.to_string(),
+            ))));
+        }
 
         if session.is_transaction_failed() {
             return Err(in_failed_sql_transaction_pgwire_error());

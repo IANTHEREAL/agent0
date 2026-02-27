@@ -37,7 +37,9 @@ use super::super::errors::{
     sqlstate_for_executor_error,
 };
 use super::super::params::{count_sql_parameters, decode_parameters};
-use super::super::portal::{on_execute_with_tx_status_fix, on_query_with_tx_status_fix};
+use super::super::portal::{
+    on_execute_with_tx_status_fix_with_guards, on_query_with_tx_status_fix,
+};
 use super::super::prepared::{PreparedExec, PreparedStatement};
 use super::super::resolve_copy_columns;
 use super::super::{
@@ -279,6 +281,16 @@ impl SimpleQueryHandler for DynamicPgHandler {
         let state = self.auth();
         let executor = &state.executor;
 
+        // Defense-in-depth: block COPY statements after idle-in-transaction timeout.
+        // Checked before ALL COPY branches including parquet/fs9 paths.
+        if self.cancel_token.is_cancelled() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "25P03".to_string(),
+                "terminating connection due to idle-in-transaction timeout".to_string(),
+            ))));
+        }
+
         #[cfg(feature = "parquet")]
         if let Some(result) = self.try_handle_copy_from_fs9(client, query).await? {
             return Ok(result);
@@ -311,6 +323,24 @@ impl SimpleQueryHandler for DynamicPgHandler {
 
             let (resolved_table, resolved_columns, column_types, col_count, started_txn, qctx) = {
                 let mut session = state.session.lock().await;
+
+                // Recheck after acquiring lock — watchdog may have fired in the gap.
+                if self.cancel_token.is_cancelled() {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "FATAL".to_string(),
+                        "25P03".to_string(),
+                        "terminating connection due to idle-in-transaction timeout".to_string(),
+                    ))));
+                }
+
+                if let Err(e) = session.check_idle_in_transaction_timeout() {
+                    let _ = session.rollback().await;
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "FATAL".to_string(),
+                        e.sqlstate().to_string(),
+                        e.to_string(),
+                    ))));
+                }
 
                 if session.is_transaction_failed() {
                     return Err(in_failed_sql_transaction_pgwire_error());
@@ -499,7 +529,26 @@ impl SimpleQueryHandler for DynamicPgHandler {
             )]);
         }
 
+        // Defense-in-depth: check if the cancel token was fired before acquiring
+        // the session lock (Timeline A gap in #1124).
+        if self.cancel_token.is_cancelled() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "25P03".to_string(),
+                "terminating connection due to idle-in-transaction timeout".to_string(),
+            ))));
+        }
+
         let mut session = state.session.lock().await;
+
+        // Recheck after acquiring lock — watchdog may have fired in the gap.
+        if self.cancel_token.is_cancelled() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "25P03".to_string(),
+                "terminating connection due to idle-in-transaction timeout".to_string(),
+            ))));
+        }
 
         if let Err(e) = session.check_idle_in_transaction_timeout() {
             let _ = session.rollback().await;
@@ -729,11 +778,14 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let memory_accountant = Some(self.auth().executor.tenant_memory_accountant().clone());
-        on_execute_with_tx_status_fix(
+        let state = self.auth();
+        let memory_accountant = Some(state.executor.tenant_memory_accountant().clone());
+        on_execute_with_tx_status_fix_with_guards(
             self,
             &self.suspended_portals,
             memory_accountant,
+            Some(&self.cancel_token),
+            Some(state.session.as_ref()),
             client,
             message,
         )
@@ -890,7 +942,26 @@ impl ExtendedQueryHandler for DynamicPgHandler {
 
         debug!("Extended query: {}", prepared.sql);
 
+        // Defense-in-depth: check if the cancel token was fired before acquiring
+        // the session lock (Timeline A gap in #1124).
+        if self.cancel_token.is_cancelled() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "25P03".to_string(),
+                "terminating connection due to idle-in-transaction timeout".to_string(),
+            ))));
+        }
+
         let mut session = state.session.lock().await;
+
+        // Recheck after acquiring lock — watchdog may have fired in the gap.
+        if self.cancel_token.is_cancelled() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "25P03".to_string(),
+                "terminating connection due to idle-in-transaction timeout".to_string(),
+            ))));
+        }
 
         if let Err(e) = session.check_idle_in_transaction_timeout() {
             let _ = session.rollback().await;

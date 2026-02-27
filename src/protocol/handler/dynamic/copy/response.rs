@@ -63,6 +63,23 @@ impl DynamicPgHandler {
 
         let mut session = state.session.lock().await;
 
+        if self.cancel_token.is_cancelled() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "25P03".to_string(),
+                "terminating connection due to idle-in-transaction timeout".to_string(),
+            ))));
+        }
+
+        if let Err(e) = session.check_idle_in_transaction_timeout() {
+            let _ = session.rollback().await;
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                e.sqlstate().to_string(),
+                e.to_string(),
+            ))));
+        }
+
         let result = executor
             .execute(&mut session, &select_sql)
             .await

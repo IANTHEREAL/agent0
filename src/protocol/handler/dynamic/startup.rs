@@ -522,20 +522,14 @@ async fn idle_in_transaction_watchdog(
             _ = tokio::time::sleep(sleep_dur) => {}
         }
 
-        // Atomically check + rollback under a single lock guard (P1 fix).
-        let should_cancel = {
+        // Atomically check + rollback + cancel under a single lock guard.
+        {
             let mut session = session_lock.lock().await;
             if session.check_idle_in_transaction_timeout().is_err() {
                 let _ = session.rollback().await;
-                true
-            } else {
-                false
+                cancel.cancel();
+                break;
             }
-        };
-
-        if should_cancel {
-            cancel.cancel();
-            break;
         }
     }
 }
