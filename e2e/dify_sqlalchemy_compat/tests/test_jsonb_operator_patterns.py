@@ -211,8 +211,36 @@ def test_jsonb_concat(jsonb_table, schema, db):
             result = json.loads(result)
         assert result == {"a": "z", "foo": "bar", "new_key": "v"}
 
-        # Known gap (#1134): mixed-type concat (object||array, array||scalar) has different
-        # semantics than PG — not tested here.
+        # Array || scalar wraps scalar in array (PG17 behavior)
+        result = _sql(
+            conn, "SELECT '[1,2]'::jsonb || '3'::jsonb"
+        ).scalar_one()
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result == [1, 2, 3]
+
+        # scalar || Array wraps scalar in array (PG17 behavior)
+        result = _sql(
+            conn, "SELECT '0'::jsonb || '[1,2]'::jsonb"
+        ).scalar_one()
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result == [0, 1, 2]
+
+
+    # Mixed-type concat: object || array wraps object into array (PG behavior)
+    with db.engine.begin() as conn2:
+        result = _sql(conn2, "SELECT '{\"a\":1}'::jsonb || '[1,2]'::jsonb").scalar_one()
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result == [{"a": 1}, 1, 2]
+
+    # Mixed-type concat: array || object appends object to array (PG behavior)
+    with db.engine.begin() as conn2:
+        result = _sql(conn2, "SELECT '[1,2]'::jsonb || '{\"a\":1}'::jsonb").scalar_one()
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result == [1, 2, {"a": 1}]
 
 
 # ---- - key/index deletion ----
@@ -245,7 +273,59 @@ def test_jsonb_delete(jsonb_table, schema, db):
             result = json.loads(result)
         assert result == {"a": "x", "tags": ["a", "b"]}
 
-        # Known gap (#1135): jsonb - text[] (delete multiple keys) is unsupported.
+        # Delete multiple keys using jsonb - text[] (fixed #1135)
+        result = _sql(
+            conn, """SELECT '{"a":1,"b":2,"c":3,"d":4}'::jsonb - ARRAY['a','c']"""
+        ).scalar_one()
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result == {"b": 2, "d": 4}
+
+        # Delete multiple keys from column data (fixed #1135)
+        result = _sql(
+            conn, f"""SELECT payload - ARRAY['a','nested'] FROM {tbl} WHERE id = 1"""
+        ).scalar_one()
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result == {"tags": ["a", "b"]}
+
+        # Delete non-existent keys should be a no-op
+        result = _sql(
+            conn, """SELECT '{"a":1,"b":2}'::jsonb - ARRAY['nonexistent','alsomissing']"""
+        ).scalar_one()
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result == {"a": 1, "b": 2}
+
+        # Delete keys from non-object (array) should be a no-op
+        result = _sql(
+            conn, """SELECT '[1,2,3]'::jsonb - ARRAY['a','b']"""
+        ).scalar_one()
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result == [1, 2, 3]
+
+        # Array LHS with string elements — matching strings removed, non-strings kept
+        result = _sql(
+            conn, """SELECT '["a","b","c"]'::jsonb - ARRAY['a','x']"""
+        ).scalar_one()
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result == ["b", "c"]
+
+        result = _sql(
+            conn, """SELECT '[1,"a","b"]'::jsonb - ARRAY['a']"""
+        ).scalar_one()
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result == [1, "b"]
+
+        result = _sql(
+            conn, """SELECT '[1,2,3]'::jsonb - ARRAY['a']"""
+        ).scalar_one()
+        if isinstance(result, str):
+            result = json.loads(result)
+        assert result == [1, 2, 3]  # no string elements, no-op
 
 
 # ---- #> path extraction (JSON result) ----

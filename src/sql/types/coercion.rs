@@ -223,6 +223,15 @@ pub fn binary_op_result_type(op: &str, left: &DataType, right: &DataType) -> Opt
                 {
                     Some(DataType::Jsonb)
                 }
+                (DataType::Jsonb, DataType::Array(inner))
+                    if (op == "Minus" || op == "-")
+                        && matches!(
+                            inner.as_ref(),
+                            DataType::Text | DataType::Varchar(_) | DataType::Name
+                        ) =>
+                {
+                    Some(DataType::Jsonb)
+                }
                 _ if is_numeric(left) && is_numeric(right) => common_type(left, right),
                 _ => None,
             }

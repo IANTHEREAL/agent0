@@ -187,6 +187,27 @@ pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<
                         la.extend(ra);
                         serde_json::Value::Array(la)
                     }
+                    // PG behavior: object || array wraps object into array, prepended
+                    (serde_json::Value::Object(lo), serde_json::Value::Array(mut ra)) => {
+                        ra.insert(0, serde_json::Value::Object(lo));
+                        serde_json::Value::Array(ra)
+                    }
+                    // PG behavior: array || object appends object to array
+                    (serde_json::Value::Array(mut la), serde_json::Value::Object(ro)) => {
+                        la.push(serde_json::Value::Object(ro));
+                        serde_json::Value::Array(la)
+                    }
+                    // PG17 compatibility: array || scalar wraps scalar in array
+                    (serde_json::Value::Array(mut la), scalar) => {
+                        la.push(scalar);
+                        serde_json::Value::Array(la)
+                    }
+                    // PG17 compatibility: scalar || array wraps scalar in array
+                    (scalar, serde_json::Value::Array(mut ra)) => {
+                        ra.insert(0, scalar);
+                        serde_json::Value::Array(ra)
+                    }
+                    // Default: wrap both in array for other mixed types
                     (l, r) => serde_json::Value::Array(vec![l, r]),
                 };
 
@@ -454,7 +475,12 @@ fn jsonb_subtract(left: Value, right: Value) -> Result<Value> {
             serde_json::Value::Array(arr) => {
                 arr.retain(|v| v.as_str() != Some(key.as_str()));
             }
-            _ => {}
+            _ => {
+                return Err(SqlError::InvalidParameterValue {
+                    message: "cannot delete from scalar".into(),
+                }
+                .into());
+            }
         },
         Value::Int32(idx) => {
             if let serde_json::Value::Array(arr) = &mut json_val {
@@ -463,6 +489,16 @@ fn jsonb_subtract(left: Value, right: Value) -> Result<Value> {
                 if idx >= 0 && (idx as usize) < arr.len() {
                     arr.remove(idx as usize);
                 }
+            } else {
+                let msg = if matches!(json_val, serde_json::Value::Object(_)) {
+                    "cannot delete from object using integer index"
+                } else {
+                    "cannot delete from scalar"
+                };
+                return Err(SqlError::InvalidParameterValue {
+                    message: msg.into(),
+                }
+                .into());
             }
         }
         Value::Int64(idx) => {
@@ -472,13 +508,71 @@ fn jsonb_subtract(left: Value, right: Value) -> Result<Value> {
                 if idx >= 0 && (idx as usize) < arr.len() {
                     arr.remove(idx as usize);
                 }
+            } else {
+                let msg = if matches!(json_val, serde_json::Value::Object(_)) {
+                    "cannot delete from object using integer index"
+                } else {
+                    "cannot delete from scalar"
+                };
+                return Err(SqlError::InvalidParameterValue {
+                    message: msg.into(),
+                }
+                .into());
+            }
+        }
+        // PG17 compatibility: jsonb - text[] for multiple key deletion
+        Value::Array(keys) => {
+            if matches!(
+                json_val,
+                serde_json::Value::Null
+                    | serde_json::Value::Bool(_)
+                    | serde_json::Value::Number(_)
+                    | serde_json::Value::String(_)
+            ) {
+                return Err(SqlError::InvalidParameterValue {
+                    message: "cannot delete from scalar".into(),
+                }
+                .into());
+            }
+            if let serde_json::Value::Object(obj) = &mut json_val {
+                for key_value in keys {
+                    match key_value {
+                        Value::Null => continue, // skip NULL keys per PG semantics
+                        Value::Text(key) => {
+                            obj.remove(&key);
+                        }
+                        _ => continue, // skip non-text elements per PG17 semantics
+                    }
+                }
+            } else if let serde_json::Value::Array(arr) = &mut json_val {
+                // Build a set of keys to remove for O(1) lookup
+                let key_set: std::collections::HashSet<&str> = keys
+                    .iter()
+                    .filter_map(|k| {
+                        if let Value::Text(s) = k {
+                            Some(s.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                arr.retain(|elem| {
+                    // Only remove string elements whose value is in the key set
+                    // Non-string elements (numbers, bools, nulls, objects, arrays) always pass through
+                    if let serde_json::Value::String(s) = elem {
+                        !key_set.contains(s.as_str())
+                    } else {
+                        true
+                    }
+                });
             }
         }
         other => {
-            return Err(anyhow!(
+            return Err(SqlError::Unsupported(format!(
                 "unsupported right operand for jsonb subtraction: {:?}",
                 other
             ))
+            .into())
         }
     }
 

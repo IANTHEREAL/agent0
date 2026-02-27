@@ -203,6 +203,7 @@ impl<'a> Analyzer<'a> {
                         (DataType::Jsonb, DataType::Text)
                             | (DataType::Jsonb, DataType::Int32)
                             | (DataType::Jsonb, DataType::Int64)
+                            | (DataType::Jsonb, DataType::Array(_))
                     ) =>
                 {
                     None
