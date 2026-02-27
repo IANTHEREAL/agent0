@@ -1,6 +1,7 @@
 use std::env;
 
 const DEFAULT_POLL_MS: u64 = 60_000;
+const MIN_POLL_MS: u64 = 100;
 const DEFAULT_MAX_CONCURRENT_JOBS: usize = 32;
 const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_CRON_JOB_TIMEOUT_MS: u64 = 1_800_000;
@@ -62,12 +63,26 @@ impl WorkerConfig {
             cfg.enabled = parse_bool(&v).unwrap_or(cfg.enabled);
         }
         if let Ok(v) = env::var("DB9_WORKER_POLL_MS") {
-            cfg.poll_ms = v
-                .parse::<u64>()
-                .ok()
-                .filter(|n| *n > 0)
-                .unwrap_or(cfg.poll_ms);
-            cfg.poll_ms = cfg.poll_ms.max(DEFAULT_POLL_MS);
+            match v.parse::<u64>() {
+                Ok(parsed) if parsed >= MIN_POLL_MS => {
+                    cfg.poll_ms = parsed;
+                }
+                Ok(parsed) => {
+                    tracing::warn!(
+                        "DB9_WORKER_POLL_MS={} is below minimum {}ms; using default {}ms",
+                        parsed,
+                        MIN_POLL_MS,
+                        cfg.poll_ms
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "DB9_WORKER_POLL_MS='{}' is not a valid integer; using default {}ms",
+                        v,
+                        cfg.poll_ms
+                    );
+                }
+            }
         }
         if let Ok(v) = env::var("DB9_WORKER_MAX_CONCURRENT_JOBS") {
             cfg.max_concurrent_jobs = v
@@ -183,6 +198,58 @@ mod tests {
                 None => unsafe { env::remove_var(key) },
             }
         }
+    }
+
+    #[test]
+    fn from_env_applies_poll_ms_when_at_least_minimum() {
+        let _guard = test_lock().lock().unwrap();
+
+        let key = "DB9_WORKER_POLL_MS";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "5000");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.poll_ms, 5_000);
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn from_env_keeps_default_poll_ms_when_below_minimum() {
+        let _guard = test_lock().lock().unwrap();
+
+        let key = "DB9_WORKER_POLL_MS";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "99");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.poll_ms, DEFAULT_POLL_MS);
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn from_env_ignores_non_integer_poll_ms() {
+        let _lock = test_lock().lock().unwrap();
+        unsafe { env::set_var("DB9_WORKER_POLL_MS", "not_a_number") };
+        let cfg = WorkerConfig::from_env();
+        unsafe { env::remove_var("DB9_WORKER_POLL_MS") };
+        assert_eq!(
+            cfg.poll_ms, DEFAULT_POLL_MS,
+            "non-integer should fall back to default"
+        );
     }
 
     #[test]
