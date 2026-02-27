@@ -97,6 +97,179 @@ pub(crate) enum PromotionCounterOutcome {
     NotTracked,
 }
 
+#[derive(Debug)]
+struct LruState {
+    head: Option<usize>,
+    tail: Option<usize>,
+    nodes: Vec<Option<LruNode>>,
+    free: Vec<usize>,
+    index: HashMap<PlanCacheKey, usize>,
+}
+
+#[derive(Debug)]
+struct LruNode {
+    key: PlanCacheKey,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+impl LruState {
+    fn new() -> Self {
+        Self {
+            head: None,
+            tail: None,
+            nodes: Vec::new(),
+            free: Vec::new(),
+            index: HashMap::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.head = None;
+        self.tail = None;
+        self.nodes.clear();
+        self.free.clear();
+        self.index.clear();
+    }
+
+    fn push_back(&mut self, key: PlanCacheKey) {
+        if self.index.contains_key(&key) {
+            self.move_to_back(&key);
+            return;
+        }
+
+        let node_id = self.alloc_node(LruNode {
+            key: key.clone(),
+            prev: self.tail,
+            next: None,
+        });
+        if let Some(tail_id) = self.tail {
+            if let Some(slot) = self.nodes.get_mut(tail_id) {
+                if let Some(node) = slot.as_mut() {
+                    node.next = Some(node_id);
+                }
+            }
+        } else {
+            self.head = Some(node_id);
+        }
+        self.tail = Some(node_id);
+        self.index.insert(key, node_id);
+    }
+
+    fn move_to_back(&mut self, key: &PlanCacheKey) {
+        let Some(&node_id) = self.index.get(key) else {
+            return;
+        };
+        self.move_node_to_back(node_id);
+    }
+
+    fn pop_front(&mut self) -> Option<PlanCacheKey> {
+        let head_id = self.head?;
+        self.remove_node(head_id).map(|node| node.key)
+    }
+
+    fn remove(&mut self, key: &PlanCacheKey) -> Option<PlanCacheKey> {
+        let node_id = self.index.get(key).copied()?;
+        self.remove_node(node_id).map(|node| node.key)
+    }
+
+    fn alloc_node(&mut self, node: LruNode) -> usize {
+        if let Some(node_id) = self.free.pop() {
+            if let Some(slot) = self.nodes.get_mut(node_id) {
+                *slot = Some(node);
+            }
+            node_id
+        } else {
+            self.nodes.push(Some(node));
+            self.nodes.len() - 1
+        }
+    }
+
+    fn move_node_to_back(&mut self, node_id: usize) {
+        if self.tail == Some(node_id) {
+            return;
+        }
+
+        let Some((prev, next)) = self
+            .nodes
+            .get(node_id)
+            .and_then(|slot| slot.as_ref())
+            .map(|node| (node.prev, node.next))
+        else {
+            return;
+        };
+
+        if let Some(prev_id) = prev {
+            if let Some(slot) = self.nodes.get_mut(prev_id) {
+                if let Some(node) = slot.as_mut() {
+                    node.next = next;
+                }
+            }
+        } else {
+            self.head = next;
+        }
+
+        if let Some(next_id) = next {
+            if let Some(slot) = self.nodes.get_mut(next_id) {
+                if let Some(node) = slot.as_mut() {
+                    node.prev = prev;
+                }
+            }
+        } else {
+            self.tail = prev;
+        }
+
+        let old_tail = self.tail;
+        if let Some(slot) = self.nodes.get_mut(node_id) {
+            if let Some(node) = slot.as_mut() {
+                node.prev = old_tail;
+                node.next = None;
+            }
+        }
+
+        if let Some(tail_id) = old_tail {
+            if let Some(slot) = self.nodes.get_mut(tail_id) {
+                if let Some(node) = slot.as_mut() {
+                    node.next = Some(node_id);
+                }
+            }
+        } else {
+            self.head = Some(node_id);
+        }
+        self.tail = Some(node_id);
+    }
+
+    fn remove_node(&mut self, node_id: usize) -> Option<LruNode> {
+        let node = self.nodes.get_mut(node_id)?.take()?;
+        let prev = node.prev;
+        let next = node.next;
+
+        if let Some(prev_id) = prev {
+            if let Some(slot) = self.nodes.get_mut(prev_id) {
+                if let Some(prev_node) = slot.as_mut() {
+                    prev_node.next = next;
+                }
+            }
+        } else {
+            self.head = next;
+        }
+
+        if let Some(next_id) = next {
+            if let Some(slot) = self.nodes.get_mut(next_id) {
+                if let Some(next_node) = slot.as_mut() {
+                    next_node.prev = prev;
+                }
+            }
+        } else {
+            self.tail = prev;
+        }
+
+        self.index.remove(&node.key);
+        self.free.push(node_id);
+        Some(node)
+    }
+}
+
 /// Session-local LRU-bounded plan cache for prepared statements.
 ///
 /// Plans are promoted into the cache after `min_exec` identical executions
@@ -112,8 +285,8 @@ pub(crate) struct PreparedPlanCache {
     entries: HashMap<PlanCacheKey, PlanCacheEntry>,
     /// Execution counters for promotion tracking.
     counters: HashMap<PlanCacheKey, PromotionState>,
-    /// Entry LRU ordering: most-recently-used keys at the back.
-    lru_order: Vec<PlanCacheKey>,
+    /// Entry LRU ordering: head=least-recently-used, tail=most-recently-used.
+    lru: LruState,
     /// Counter LRU ordering for miss-path promotion tracking.
     ///
     /// Keys in this list must be a duplicate-free mirror of `counters`.
@@ -128,7 +301,7 @@ impl PreparedPlanCache {
             min_exec,
             entries: HashMap::new(),
             counters: HashMap::new(),
-            lru_order: Vec::new(),
+            lru: LruState::new(),
             counter_lru_order: Vec::new(),
         }
     }
@@ -194,17 +367,10 @@ impl PreparedPlanCache {
 
         // Trim to the new capacity, evicting least-recently-used entries first.
         while self.entries.len() > self.capacity {
-            if let Some(evict_key) = self.lru_order.first().cloned() {
-                self.entries.remove(&evict_key);
-                self.remove_counter(&evict_key);
-                self.lru_order.remove(0);
-            } else {
+            if !self.evict_lru_one() {
                 break;
             }
         }
-
-        // Keep LRU order consistent with current entries.
-        self.lru_order.retain(|k| self.entries.contains_key(k));
         self.trim_counters_to_capacity();
     }
 
@@ -224,18 +390,14 @@ impl PreparedPlanCache {
 
         // Evict LRU entries if at capacity.
         while self.entries.len() >= self.capacity {
-            if let Some(evict_key) = self.lru_order.first().cloned() {
-                self.entries.remove(&evict_key);
-                self.remove_counter(&evict_key);
-                self.lru_order.remove(0);
-            } else {
+            if !self.evict_lru_one() {
                 break;
             }
         }
 
         self.entries.insert(key.clone(), entry);
         self.remove_counter(&key);
-        self.lru_order.push(key);
+        self.lru.push_back(key);
     }
 
     /// Invalidate (remove) a specific key.
@@ -243,7 +405,7 @@ impl PreparedPlanCache {
     pub fn invalidate(&mut self, key: &PlanCacheKey) {
         self.entries.remove(key);
         self.remove_counter(key);
-        self.lru_order.retain(|k| k != key);
+        self.lru.remove(key);
     }
 
     /// Invalidate all entries that depend on the given table_id.
@@ -271,8 +433,8 @@ impl PreparedPlanCache {
         for key in &keys_to_remove {
             self.entries.remove(key);
             self.remove_counter(key);
+            self.lru.remove(key);
         }
-        self.lru_order.retain(|k| !keys_to_remove.contains(k));
     }
 
     /// Clear the entire cache. Called on transaction rollback to prevent
@@ -280,8 +442,8 @@ impl PreparedPlanCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.counters.clear();
-        self.lru_order.clear();
         self.counter_lru_order.clear();
+        self.lru.clear();
     }
 
     /// Number of cached entries.
@@ -342,8 +504,16 @@ impl PreparedPlanCache {
 
     /// Move a key to the back of the LRU list.
     fn touch_lru(&mut self, key: &PlanCacheKey) {
-        self.lru_order.retain(|k| k != key);
-        self.lru_order.push(key.clone());
+        self.lru.move_to_back(key);
+    }
+
+    fn evict_lru_one(&mut self) -> bool {
+        let Some(evict_key) = self.lru.pop_front() else {
+            return false;
+        };
+        self.entries.remove(&evict_key);
+        self.counters.remove(&evict_key);
+        true
     }
 
     /// Move a counter key to MRU position.
@@ -704,6 +874,46 @@ mod tests {
         cache.insert(key.clone(), make_entry(vec![]));
         assert_eq!(cache.counter_count_for(&key), None);
         cache.assert_counter_internal_consistency();
+    }
+
+    #[test]
+    fn repeated_hits_do_not_duplicate_lru_nodes() {
+        let mut cache = PreparedPlanCache::new(2, 1);
+        let k1 = make_key("SELECT 1");
+        let k2 = make_key("SELECT 2");
+        let k3 = make_key("SELECT 3");
+
+        cache.insert(k1.clone(), make_entry(vec![]));
+        cache.insert(k2.clone(), make_entry(vec![]));
+
+        for _ in 0..5 {
+            assert!(cache.get(&k1).is_some());
+        }
+
+        cache.insert(k3.clone(), make_entry(vec![]));
+        assert!(cache.get(&k1).is_some());
+        assert!(cache.get(&k2).is_none());
+        assert!(cache.get(&k3).is_some());
+    }
+
+    #[test]
+    fn insert_existing_key_keeps_size_and_refreshes_recency() {
+        let mut cache = PreparedPlanCache::new(2, 1);
+        let k1 = make_key("SELECT 1");
+        let k2 = make_key("SELECT 2");
+        let k3 = make_key("SELECT 3");
+
+        cache.insert(k1.clone(), make_entry(vec![]));
+        cache.insert(k2.clone(), make_entry(vec![]));
+        assert_eq!(cache.len(), 2);
+
+        cache.insert(k1.clone(), make_entry(vec![]));
+        assert_eq!(cache.len(), 2);
+
+        cache.insert(k3.clone(), make_entry(vec![]));
+        assert!(cache.get(&k1).is_some());
+        assert!(cache.get(&k2).is_none());
+        assert!(cache.get(&k3).is_some());
     }
 
     #[test]
