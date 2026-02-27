@@ -10,7 +10,7 @@ use super::scan_type::{
     normalize_expr_for_match, normalize_expr_string, parse_predicate_expr,
     typed_expr_to_canonical_sql,
 };
-use super::{AccessPath, PredicateInfo, PredicateOp, ScanType};
+use super::{AccessPath, CmpOp, ScanType, TypedPredicate};
 use crate::model::{IndexDef, TableSchema, Value};
 use crate::worker::types::IndexState;
 
@@ -36,7 +36,7 @@ pub fn choose_btree_access_path_for_typed_filter(
 /// predicate implication.
 fn choose_best_access_path_with_typed_filter(
     schema: &TableSchema,
-    predicates: &[PredicateInfo],
+    predicates: &[TypedPredicate],
     typed_filter: &crate::sql::analyzer::types::TypedExpr,
     estimated_table_rows: usize,
 ) -> AccessPath {
@@ -108,24 +108,31 @@ fn index_scan_cost(estimated_rows: usize) -> f64 {
 fn evaluate_index(
     schema: &TableSchema,
     index: &IndexDef,
-    predicates: &[PredicateInfo],
+    predicates: &[TypedPredicate],
     estimated_table_rows: usize,
 ) -> Option<(ScanType, f64)> {
-    let eq_predicate_map: std::collections::HashMap<&str, &PredicateInfo> = predicates
+    // Build a map of column → constant value for Eq predicates.
+    let eq_predicate_map: std::collections::HashMap<&str, &Value> = predicates
         .iter()
-        .filter(|p| p.op == PredicateOp::Eq)
-        .map(|p| (p.column.as_str(), p))
+        .filter_map(|p| {
+            if let TypedPredicate::Comparison {
+                column,
+                op: CmpOp::Eq,
+                value,
+            } = p
+            {
+                Some((column.as_str(), value))
+            } else {
+                None
+            }
+        })
         .collect();
 
     let mut prefix_values = Vec::new();
 
     for col in &index.columns {
-        if let Some(pred) = eq_predicate_map.get(col.as_str()) {
-            prefix_values.push(coerce_index_predicate_value(
-                schema,
-                col,
-                pred.value.as_ref().expect("Eq predicate must have a value"),
-            ));
+        if let Some(val) = eq_predicate_map.get(col.as_str()) {
+            prefix_values.push(coerce_index_predicate_value(schema, col, val));
         } else {
             break;
         }
@@ -148,20 +155,23 @@ fn evaluate_index(
 
     let next_col = index.columns.get(prefix_values.len())?;
 
-    if let Some(in_pred) = predicates.iter().find(|p| {
-        p.op == PredicateOp::In
-            && p.column.eq_ignore_ascii_case(next_col)
-            && !p.in_values.is_empty()
+    if let Some(in_values) = predicates.iter().find_map(|p| {
+        if let TypedPredicate::InList { column, values } = p {
+            if column.eq_ignore_ascii_case(next_col) && !values.is_empty() {
+                return Some(values);
+            }
+        }
+        None
     }) {
-        let mut column_values = Vec::with_capacity(in_pred.in_values.len());
-        for in_value in &in_pred.in_values {
+        let mut column_values = Vec::with_capacity(in_values.len());
+        for in_value in in_values {
             let mut lookup = prefix_values.clone();
             lookup.push(coerce_index_predicate_value(schema, next_col, in_value));
             column_values.push(lookup);
         }
 
         let table_rows = estimated_table_rows.max(1);
-        let selectivity = ((in_pred.in_values.len() as f64) * (1.0 / table_rows as f64)).min(0.5);
+        let selectivity = ((in_values.len() as f64) * (1.0 / table_rows as f64)).min(0.5);
         let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
         let cost = index_scan_cost(estimated_rows);
 
@@ -175,61 +185,81 @@ fn evaluate_index(
         ));
     }
 
-    let lower_inclusive = predicates
-        .iter()
-        .find(|p| p.column.eq_ignore_ascii_case(next_col) && p.op == PredicateOp::Ge);
-    let lower_exclusive = predicates
-        .iter()
-        .find(|p| p.column.eq_ignore_ascii_case(next_col) && p.op == PredicateOp::Gt);
-    let upper_inclusive = predicates
-        .iter()
-        .find(|p| p.column.eq_ignore_ascii_case(next_col) && p.op == PredicateOp::Le);
-    let upper_exclusive = predicates
-        .iter()
-        .find(|p| p.column.eq_ignore_ascii_case(next_col) && p.op == PredicateOp::Lt);
+    let lower_inclusive = predicates.iter().find_map(|p| {
+        if let TypedPredicate::Comparison {
+            column,
+            op: CmpOp::Ge,
+            value,
+        } = p
+        {
+            if column.eq_ignore_ascii_case(next_col) {
+                return Some(value);
+            }
+        }
+        None
+    });
+    let lower_exclusive = predicates.iter().find_map(|p| {
+        if let TypedPredicate::Comparison {
+            column,
+            op: CmpOp::Gt,
+            value,
+        } = p
+        {
+            if column.eq_ignore_ascii_case(next_col) {
+                return Some(value);
+            }
+        }
+        None
+    });
+    let upper_inclusive = predicates.iter().find_map(|p| {
+        if let TypedPredicate::Comparison {
+            column,
+            op: CmpOp::Le,
+            value,
+        } = p
+        {
+            if column.eq_ignore_ascii_case(next_col) {
+                return Some(value);
+            }
+        }
+        None
+    });
+    let upper_exclusive = predicates.iter().find_map(|p| {
+        if let TypedPredicate::Comparison {
+            column,
+            op: CmpOp::Lt,
+            value,
+        } = p
+        {
+            if column.eq_ignore_ascii_case(next_col) {
+                return Some(value);
+            }
+        }
+        None
+    });
 
-    let (range_start, start_inclusive) = if let Some(pred) = lower_inclusive {
+    let (range_start, start_inclusive) = if let Some(val) = lower_inclusive {
         (
-            Some(coerce_index_predicate_value(
-                schema,
-                next_col,
-                pred.value
-                    .as_ref()
-                    .expect("Ge/Le predicate must have a value"),
-            )),
+            Some(coerce_index_predicate_value(schema, next_col, val)),
             true,
         )
-    } else if let Some(pred) = lower_exclusive {
+    } else if let Some(val) = lower_exclusive {
         (
-            Some(coerce_index_predicate_value(
-                schema,
-                next_col,
-                pred.value
-                    .as_ref()
-                    .expect("Gt/Lt predicate must have a value"),
-            )),
+            Some(coerce_index_predicate_value(schema, next_col, val)),
             false,
         )
     } else {
         (None, true)
     };
 
-    let (range_end, end_inclusive) = if let Some(pred) = upper_inclusive {
+    let (range_end, end_inclusive) = if let Some(val) = upper_inclusive {
         (
-            Some(coerce_index_predicate_value(
-                schema,
-                next_col,
-                pred.value.as_ref().expect("Le predicate must have a value"),
-            )),
+            Some(coerce_index_predicate_value(schema, next_col, val)),
             true,
         )
-    } else if let Some(pred) = upper_exclusive {
+    } else if let Some(val) = upper_exclusive {
         (
-            Some(coerce_index_predicate_value(
-                schema,
-                next_col,
-                pred.value.as_ref().expect("Lt predicate must have a value"),
-            )),
+            Some(coerce_index_predicate_value(schema, next_col, val)),
             false,
         )
     } else {

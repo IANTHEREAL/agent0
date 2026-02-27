@@ -56,23 +56,32 @@ pub struct AccessPath {
     pub cost: f64,
 }
 
-#[derive(Debug, Clone)]
-pub struct PredicateInfo {
-    pub column: String,
-    pub op: PredicateOp,
-    pub value: Option<Value>,
-    pub in_values: Vec<Value>,
-}
-
+/// Comparison operators for scalar predicates (col OP const).
 #[derive(Debug, Clone, PartialEq)]
-pub enum PredicateOp {
+pub enum CmpOp {
     Eq,
     Ne,
     Lt,
     Le,
     Gt,
     Ge,
-    In,
-    IsNull,
-    IsNotNull,
+}
+
+/// A typed predicate extracted from a filter expression for index planning.
+///
+/// Each variant carries exactly the fields it needs — no sentinel values, no
+/// dual-purpose fields that mean different things depending on `op`.
+///
+/// IS NULL / IS NOT NULL are not represented here because B-tree indexes cannot
+/// be used to satisfy those predicates in the current planner.
+#[derive(Debug, Clone)]
+pub enum TypedPredicate {
+    /// `column OP constant` where OP is a scalar comparison.
+    Comparison {
+        column: String,
+        op: CmpOp,
+        value: Value,
+    },
+    /// `column IN (v1, v2, ...)` — all list elements are constants.
+    InList { column: String, values: Vec<Value> },
 }
