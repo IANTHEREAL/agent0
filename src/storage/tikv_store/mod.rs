@@ -27,6 +27,7 @@ mod schemas;
 mod sequences;
 mod statistics;
 mod tables;
+mod text_search;
 mod triggers;
 mod types;
 mod views;

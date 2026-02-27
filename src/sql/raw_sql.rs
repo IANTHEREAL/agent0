@@ -38,6 +38,13 @@ pub(crate) enum RawSqlKind {
     DropType,
     CreateCollation,
     DropCollation,
+    /// `CREATE TEXT SEARCH CONFIGURATION <name> ...` — creates a user-defined
+    /// FTS config→tokenizer mapping (zhparser compat; others → 0A000).
+    CreateTextSearchConfiguration,
+    /// `DROP TEXT SEARCH CONFIGURATION [IF EXISTS] <name>`
+    DropTextSearchConfiguration,
+    /// `ALTER TEXT SEARCH CONFIGURATION <name> ...` — handles ADD MAPPING etc.
+    AlterTextSearchConfiguration,
     /// `RESET <guc>` or `RESET ALL` — handled directly by executor (bypasses
     /// sqlparser which does not support standalone `RESET`).  `RESET ROLE` is
     /// excluded: it is rewritten to `SET ROLE NONE` in the parser layer.
@@ -251,6 +258,17 @@ pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
         return Some(RawSqlKind::DropCollation);
     }
 
+    // Text search configuration DDL — multi-word prefix matching.
+    if is_create_text_search_configuration(sql_upper) {
+        return Some(RawSqlKind::CreateTextSearchConfiguration);
+    }
+    if is_drop_text_search_configuration(sql_upper) {
+        return Some(RawSqlKind::DropTextSearchConfiguration);
+    }
+    if is_alter_text_search_configuration(sql_upper) {
+        return Some(RawSqlKind::AlterTextSearchConfiguration);
+    }
+
     // DO block: keyword boundary ensures we don't match DOCUMENT, DOUBLE, etc.
     if sql_upper.len() > 2
         && sql_upper.starts_with("DO")
@@ -360,6 +378,45 @@ fn is_create_type_as_enum_sql(sql_upper: &str) -> bool {
         prev = token;
     }
     false
+}
+
+fn is_create_text_search_configuration(sql_upper: &str) -> bool {
+    let mut words = sql_upper.split_whitespace();
+    matches!(
+        (words.next(), words.next(), words.next(), words.next()),
+        (
+            Some("CREATE"),
+            Some("TEXT"),
+            Some("SEARCH"),
+            Some("CONFIGURATION")
+        )
+    )
+}
+
+fn is_drop_text_search_configuration(sql_upper: &str) -> bool {
+    let mut words = sql_upper.split_whitespace();
+    matches!(
+        (words.next(), words.next(), words.next(), words.next()),
+        (
+            Some("DROP"),
+            Some("TEXT"),
+            Some("SEARCH"),
+            Some("CONFIGURATION")
+        )
+    )
+}
+
+fn is_alter_text_search_configuration(sql_upper: &str) -> bool {
+    let mut words = sql_upper.split_whitespace();
+    matches!(
+        (words.next(), words.next(), words.next(), words.next()),
+        (
+            Some("ALTER"),
+            Some("TEXT"),
+            Some("SEARCH"),
+            Some("CONFIGURATION")
+        )
+    )
 }
 
 fn is_unsupported_sql_that_executor_skips(sql_upper: &str) -> bool {

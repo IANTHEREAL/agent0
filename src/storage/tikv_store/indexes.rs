@@ -512,6 +512,53 @@ impl TikvStore {
 
         Ok(())
     }
+
+    /// Scan a single GIN posting list for the given token hash.
+    ///
+    /// Returns a `Vec<Vec<u8>>` of raw PK byte sequences (un-decoded).
+    /// The caller is responsible for decoding these with
+    /// `decode_pk_from_index_suffix`.  Keeping them as raw bytes allows
+    /// efficient set operations (intersect / union) before decoding.
+    pub async fn scan_gin_posting_list(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        token_hash: u64,
+    ) -> Result<Vec<Vec<u8>>> {
+        let prefix = self.key(&encode_gin_index_prefix_v2(
+            db_id, table_id, index_id, token_hash,
+        ));
+        let prefix_len = prefix.len();
+
+        // End key: increment last byte of prefix to get exclusive upper bound.
+        // The prefix ends with GIN_PK_SEP_START (0x00).  Incrementing gives 0x01
+        // which is past all PK suffixes appended after the 0x00 separator.
+        let end_key = {
+            let mut end = prefix.clone();
+            if let Some(last) = end.last_mut() {
+                *last = last.wrapping_add(1);
+            }
+            end
+        };
+
+        let range: BoundRange = (prefix.clone()..end_key).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        let mut pk_bytes_list = Vec::new();
+        let mut scanned = 0usize;
+        for pair in pairs {
+            scanned += 1;
+            let full_key: &[u8] = pair.key().as_ref().into();
+            if full_key.len() > prefix_len {
+                pk_bytes_list.push(full_key[prefix_len..].to_vec());
+            }
+        }
+        kv_stats::record_index_scan_pairs(scanned);
+
+        Ok(pk_bytes_list)
+    }
 }
 
 #[cfg(test)]

@@ -463,7 +463,7 @@ pub(crate) fn extract_tsvector_gin_tokens(tsvector: &str) -> Vec<u64> {
     tokens
 }
 
-fn hash_tsvector_lexeme(word: &str) -> u64 {
+pub(crate) fn hash_tsvector_lexeme(word: &str) -> u64 {
     let mut h = FNV1A_OFFSET_BASIS;
     h = fnv1a_u64(h, b"T");
     fnv1a_u64(h, word.to_lowercase().as_bytes())

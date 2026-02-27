@@ -265,7 +265,7 @@ impl Executor {
         is_observability_query: bool,
     ) -> Pin<Box<dyn Future<Output = Result<ExecuteResults>> + Send + 'a>> {
         let rt_settings = RuntimeSettings::from_session(session);
-
+        let db_id = session.current_database_id();
         let execute_future: Pin<Box<dyn Future<Output = Result<ExecuteResults>> + Send + 'a>> =
             Box::pin(self.execute_prepared_autocommit(
                 session,
@@ -276,10 +276,10 @@ impl Executor {
                 qctx,
                 is_observability_query,
             ));
-
         wrap_with_runtime_context(
             &rt_settings,
             self.tenant_keyspace(),
+            db_id,
             self.store.transaction_client(),
             execute_future,
         )

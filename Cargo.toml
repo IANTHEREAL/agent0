@@ -63,6 +63,9 @@ cron = "0.15"
 # Chinese tokenizer for full-text search
 jieba-rs = "0.7"
 
+# Snowball stemming for full-text search
+rust-stemmers = "1.2"
+
 # ICU for collation support
 rust_icu_ucol = "5.0"
 rust_icu_ustring = "5.0"

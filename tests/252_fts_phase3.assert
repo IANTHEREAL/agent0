@@ -1,0 +1,51 @@
+# FTS Phase 3: Phrase operators, new functions, ts_headline
+
+# Section 1: Phrase operators in to_tsquery output
+<->
+<2>
+
+# Section 2: Phrase matching
+t
+f
+t
+
+# Section 3: phraseto_tsquery
+'hello' <-> 'world'
+'quick' <-> 'brown' <-> 'fox'
+'fat' <-> 'cat'
+'cat' <2> 'big'
+'cat'
+
+# Section 4: phraseto_tsquery with @@ matching
+t
+f
+
+# Section 5: websearch_to_tsquery
+'hello' & 'world'
+'hello' <-> 'world'
+'hello' & !'world'
+'hello' | 'world'
+'hello' | 'world'
+'quick' & 'brown' <-> 'fox' & !'lazy'
+
+# Section 7: ts_headline basic
+<b>fox</b>
+<em>hello</em>
+
+# Section 8: ts_headline with no match
+hello world
+
+# Section 9: ts_rank with phrase queries
+t
+
+# Section 10: ts_rank_cd
+t
+
+# Section 11: Phrase + GIN index
+hello world test
+
+# Section 12: websearch_to_tsquery with GIN
+hello world test
+
+# Section 13: ts_headline with query
+<b>hello</b>

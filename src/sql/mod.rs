@@ -22,6 +22,7 @@ pub(crate) mod executor;
 mod explain;
 pub mod expr;
 pub(crate) mod fts;
+pub(crate) mod fts_stopwords;
 pub(crate) mod fts_tokenizers;
 mod gin;
 pub(crate) mod index_consistency;

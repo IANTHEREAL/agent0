@@ -8,8 +8,8 @@ use super::BuildContext;
 use crate::model::{DataType, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::operators::{
-    BoxedOperator, InListScanOperator, IndexScanOperator, ProjectOperator, RangeIndexScanOperator,
-    TableScanOperator,
+    BoxedOperator, GinScanOperator, InListScanOperator, IndexScanOperator, ProjectOperator,
+    RangeIndexScanOperator, TableScanOperator,
 };
 use crate::sql::optimizer::physical_plan::{PhysicalNode, PhysicalPlan};
 use crate::sql::planner::{collect_typed_eq_predicates, ScanType};
@@ -116,6 +116,17 @@ pub(super) fn build_index_scan_operator(
             *index_id,
             index_name.clone(),
             column_values.clone(),
+        ))),
+        ScanType::GinIndexScan {
+            index_id,
+            index_name,
+            qual,
+            ..
+        } => Ok(Box::new(GinScanOperator::new(
+            schema,
+            *index_id,
+            index_name.clone(),
+            qual.clone(),
         ))),
         // FullTableScan should not appear in PhysicalNode::IndexScan.
         other => Err(anyhow!(

@@ -212,6 +212,27 @@ impl Executor {
                     .await;
                 Some(self.finish_raw_single(session, &ctx.sql_trimmed, start, res))
             }
+            RawSqlKind::CreateTextSearchConfiguration => {
+                let start = Instant::now();
+                let res = self
+                    .execute_create_text_search_configuration_cmd(session, sql)
+                    .await;
+                Some(self.finish_raw_single(session, &ctx.sql_trimmed, start, res))
+            }
+            RawSqlKind::DropTextSearchConfiguration => {
+                let start = Instant::now();
+                let res = self
+                    .execute_drop_text_search_configuration_cmd(session, sql)
+                    .await;
+                Some(self.finish_raw_single(session, &ctx.sql_trimmed, start, res))
+            }
+            RawSqlKind::AlterTextSearchConfiguration => {
+                let start = Instant::now();
+                let res = self
+                    .execute_alter_text_search_configuration_cmd(session, sql)
+                    .await;
+                Some(self.finish_raw_single(session, &ctx.sql_trimmed, start, res))
+            }
             _ => None,
         }
     }

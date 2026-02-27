@@ -1,0 +1,122 @@
+# GIN Index Scan assertions — Phase 1 regression gate
+# Data correctness validated against PG 17.7
+
+# Section 1: Tsvector @@ with column GIN index
+
+# 1a: Single term — 'hello' matches rows 1,2
+ 1
+ 2
+
+# 1b: Multi-term AND — 'hello' & 'world' matches row 1 only
+ 1
+(1 row)
+
+# 1c: OR query — 'hello | database' matches rows 1,2,3,5
+ 1
+ 2
+ 3
+ 5
+
+# 1d: AND + NOT — 'hello & !world' matches row 2
+ 2
+(1 row)
+
+# 1e: Complex boolean — (hello | database) & rust matches rows 2,4(no—database & rust: none; hello & rust: 2)
+# Actually: 'hello' in {1,2}, 'database' in {3,5}, union = {1,2,3,5}; 'rust' in {2,4}; intersect = {2}
+ 2
+(1 row)
+
+# 1f: No match
+(0 rows)
+
+# 1g: EXPLAIN shows GIN Index Scan
+Index Scan using idx_gin_scan_fts on gin_scan_fts
+doc @@ plainto_tsquery('hello'::text)
+
+# Section 2: Expression index
+
+# 2a: 'fox' matches rows 1,5
+ 1
+ 5
+
+# 2b: 'database' & 'system' matches row 3
+ 3
+(1 row)
+
+# 2c: EXPLAIN shows GIN scan on expression index
+Index Scan using idx_gin_expr on gin_scan_expr
+to_tsvector('english'::text, body) @@ plainto_tsquery('english'::text, 'fox'::text)
+
+# Section 3: JSONB @>
+
+# 3a: {"color":"red"} matches rows 1,3
+ 1
+ 3
+
+# 3b: {"color":"red","size":10} matches row 1
+ 1
+(1 row)
+
+# 3c: Nested containment matches row 4
+ 4
+(1 row)
+
+# 3d: No match
+(0 rows)
+
+# 3e: EXPLAIN shows GIN scan for JSONB
+Index Scan using idx_gin_jsonb on gin_scan_jsonb
+
+# Section 4: ARRAY @> and &&
+
+# 4a: Array @> ['rust'] matches rows 1,3
+ 1
+ 3
+
+# 4b: Array @> ['rust','fast'] matches row 1
+ 1
+(1 row)
+
+# 4c: Array && ['rust','python'] matches rows 1,2,3,5
+ 1
+ 2
+ 3
+ 5
+
+# 4d: No match
+(0 rows)
+
+# 4e: EXPLAIN shows GIN scan for array @>
+Index Scan using idx_gin_array on gin_scan_array
+
+# 4f: EXPLAIN shows GIN scan for array &&
+Index Scan using idx_gin_array on gin_scan_array
+
+# Section 5: Chinese FTS
+
+# 5a: Chinese query '数据库' matches row 1
+ 1
+(1 row)
+
+# 5b: EXPLAIN shows GIN scan for Chinese expression index
+Index Scan using idx_gin_chinese on gin_scan_chinese
+
+# Section 6: Correctness regression — recheck
+
+# 6a: alpha & beta matches rows 1,4
+ 1
+ 4
+
+# 6b: alpha | gamma matches rows 1,2,3,4
+ 1
+ 2
+ 3
+ 4
+
+# 6c: alpha & !gamma matches row 2
+ 2
+(1 row)
+
+# 6d: (alpha | epsilon) & delta matches rows 2,4
+ 2
+ 4

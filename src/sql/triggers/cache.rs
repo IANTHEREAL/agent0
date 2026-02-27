@@ -58,11 +58,7 @@ impl TriggerBodyCache {
     }
 }
 
-const UNSUPPORTED_FTS_FUNCTIONS: &[&str] = &[
-    "tsvector_update_trigger",
-    "websearch_to_tsquery",
-    "phraseto_tsquery",
-];
+const UNSUPPORTED_FTS_FUNCTIONS: &[&str] = &["tsvector_update_trigger"];
 
 fn validate_trigger_body(body: &str) -> Result<()> {
     let body_lower = body.to_lowercase();

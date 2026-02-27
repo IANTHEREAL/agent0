@@ -149,6 +149,7 @@ pub(in crate::sql::executor::core) struct RuntimeSettings {
     pub timezone: Arc<str>,
     pub max_sort_bytes: usize,
     pub search_path: Arc<Vec<String>>,
+    pub text_search_config: Arc<str>,
 }
 
 impl RuntimeSettings {
@@ -162,37 +163,59 @@ impl RuntimeSettings {
             ),
             max_sort_bytes: session.max_sort_bytes(),
             search_path: Arc::new(session.search_path().to_vec()),
+            text_search_config: Arc::from(
+                session
+                    .show_setting_value("default_text_search_config")
+                    .unwrap_or_else(|| {
+                        crate::sql::fts_tokenizers::default_text_search_config().to_string()
+                    }),
+            ),
         }
     }
 }
 
 /// Wrap a future in the per-statement task-local runtime context layers:
-/// timezone → max_sort_bytes → search_path → extension context.
+/// timezone → max_sort_bytes → search_path → text_search_config → keyspace → database_id → extension context.
 ///
 /// Returns a boxed future — transparent passthrough (`T`, not `Result<T>`).
 pub(in crate::sql::executor::core) fn wrap_with_runtime_context<'a, T: Send + 'a>(
     settings: &RuntimeSettings,
     tenant_keyspace: &'a str,
+    database_id: u64,
     tikv_client: Option<Arc<TransactionClient>>,
     fut: impl Future<Output = T> + Send + 'a,
 ) -> Pin<Box<dyn Future<Output = T> + Send + 'a>> {
+    #[cfg(debug_assertions)]
+    let fut = Box::pin(fut);
+
     let tz = settings.timezone.clone();
     let msb = settings.max_sort_bytes;
     let sp = settings.search_path.clone();
     let su = settings.is_superuser;
+    let tsc = settings.text_search_config.clone();
+    let ks: Arc<str> = Arc::from(tenant_keyspace);
     Box::pin(session_context::with_timezone(
         tz,
         session_context::with_max_sort_bytes(
             msb,
             session_context::with_search_path(
                 sp,
-                crate::extensions::context::with_context_opts(
-                    crate::extensions::context::ExtensionContextOpts::statement(
-                        su,
-                        tenant_keyspace,
-                    )
-                    .with_tikv_client(tikv_client),
-                    fut,
+                session_context::with_text_search_config(
+                    tsc,
+                    session_context::with_keyspace(
+                        ks,
+                        session_context::with_database_id(
+                            database_id,
+                            crate::extensions::context::with_context_opts(
+                                crate::extensions::context::ExtensionContextOpts::statement(
+                                    su,
+                                    tenant_keyspace,
+                                )
+                                .with_tikv_client(tikv_client),
+                                fut,
+                            ),
+                        ),
+                    ),
                 ),
             ),
         ),
@@ -308,13 +331,16 @@ mod tests {
             timezone: Arc::from("UTC"),
             max_sort_bytes: 1234,
             search_path: Arc::new(vec!["$user".to_string(), "public".to_string()]),
+            text_search_config: Arc::from("simple"),
         };
-        let out = wrap_with_runtime_context(&settings, "tenant_a", None, async {
+        let out = wrap_with_runtime_context(&settings, "tenant_a", 42, None, async {
             let tz = crate::session_context::current_timezone();
             let msb = crate::session_context::current_max_sort_bytes();
             let first_schema = crate::session_context::current_search_path_first_schema();
             let tenant = crate::extensions::context::tenant_keyspace().unwrap_or_default();
-            (tz, msb, first_schema, tenant)
+            let tsc = crate::session_context::current_text_search_config();
+            let db_id = crate::session_context::current_database_id();
+            (tz, msb, first_schema, tenant, tsc, db_id)
         })
         .await;
 
@@ -322,6 +348,8 @@ mod tests {
         assert_eq!(out.1, 1234);
         assert_eq!(out.2, "public");
         assert_eq!(out.3, "tenant_a");
+        assert_eq!(out.4.as_ref(), "simple");
+        assert_eq!(out.5, 42);
     }
 
     #[tokio::test]

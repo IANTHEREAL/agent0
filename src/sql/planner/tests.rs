@@ -116,7 +116,7 @@ fn gin_schema() -> TableSchema {
 }
 
 #[test]
-fn test_gin_typed_tsmatch_skipped_without_operator() {
+fn test_gin_typed_tsmatch_selects_gin_scan() {
     let schema = gin_schema();
     // body @@ to_tsquery('hello')
     let filter = typed_binop(
@@ -127,11 +127,15 @@ fn test_gin_typed_tsmatch_skipped_without_operator() {
     );
 
     let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000);
-    assert!(matches!(path.scan_type, ScanType::FullTableScan));
+    assert!(
+        matches!(path.scan_type, ScanType::GinIndexScan { ref index_name, .. } if index_name == "idx_body_gin"),
+        "expected GinIndexScan on idx_body_gin, got {:?}",
+        path.scan_type,
+    );
 }
 
 #[test]
-fn test_gin_typed_json_contains_skipped_without_operator() {
+fn test_gin_typed_json_contains_selects_gin_scan() {
     let schema = gin_schema();
     // data @> '{"key": "val"}'::jsonb
     let filter = typed_binop(
@@ -145,7 +149,11 @@ fn test_gin_typed_json_contains_skipped_without_operator() {
     );
 
     let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000);
-    assert!(matches!(path.scan_type, ScanType::FullTableScan));
+    assert!(
+        matches!(path.scan_type, ScanType::GinIndexScan { ref index_name, .. } if index_name == "idx_data_gin"),
+        "expected GinIndexScan on idx_data_gin, got {:?}",
+        path.scan_type,
+    );
 }
 
 #[test]

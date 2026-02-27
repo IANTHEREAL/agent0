@@ -27,4 +27,22 @@ impl CostModel {
 
     /// Minimum selectivity floor - no query is estimated to match fewer than this fraction of rows
     pub const MIN_SELECTIVITY_FLOOR: f64 = 0.0001;
+
+    // ── GIN index scan cost constants ──────────────────────────
+
+    /// Base (fixed) cost of a GIN index scan, higher than B-tree because
+    /// multiple posting-list range scans + set operations are required.
+    pub const GIN_SCAN_BASE_COST: f64 = 4.0;
+
+    /// Per-token scan cost: each distinct token hash requires one TiKV
+    /// range scan over the posting list.
+    pub const GIN_TOKEN_SCAN_COST: f64 = 1.0;
+
+    /// Per-row fetch cost for GIN candidate rows (batch_get after posting
+    /// list intersection/union).
+    pub const GIN_ROW_FETCH_COST: f64 = 1.0;
+
+    /// Default GIN selectivity when no column statistics are available.
+    /// Assumes ~1% of rows match a typical FTS / containment query.
+    pub const GIN_DEFAULT_SELECTIVITY: f64 = 0.01;
 }

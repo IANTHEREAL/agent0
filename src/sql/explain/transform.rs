@@ -224,7 +224,8 @@ fn extract_index_name(scan_type: &ScanType) -> String {
         ScanType::IndexScan { index_name, .. }
         | ScanType::IndexRangeScan { index_name, .. }
         | ScanType::IndexBoundedRangeScan { index_name, .. }
-        | ScanType::InListScan { index_name, .. } => index_name.clone(),
+        | ScanType::InListScan { index_name, .. }
+        | ScanType::GinIndexScan { index_name, .. } => index_name.clone(),
         _ => "unknown".to_string(),
     }
 }

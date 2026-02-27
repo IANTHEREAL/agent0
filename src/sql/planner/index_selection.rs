@@ -1,8 +1,8 @@
 //! Access path selection and expression/partial index matching
 //!
-//! Selects the best access path (full table scan, B-tree index scan variants)
-//! for a given typed filter expression. Supports expression-index matching and
-//! partial-index predicate implication.
+//! Selects the best access path (full table scan, B-tree index scan, GIN index
+//! scan) for a given typed filter expression. Supports expression-index matching
+//! and partial-index predicate implication.
 
 use super::cost_model::CostModel;
 use super::scan_type::{
@@ -50,6 +50,19 @@ fn choose_best_access_path_with_typed_filter(
             continue;
         }
 
+        // GIN indexes use a completely different predicate analysis path.
+        if is_gin_index(index) {
+            if let Some((scan_type, cost)) =
+                evaluate_gin_index(schema, index, typed_filter, estimated_table_rows)
+            {
+                if cost < best_path.cost {
+                    best_path = AccessPath { scan_type, cost };
+                }
+            }
+            continue;
+        }
+
+        // ── B-tree path below ──────────────────────────────────
         // Partial-index predicate implication: check that the query filter
         // implies the index predicate (e.g. WHERE status = 'active' implies
         // a partial index on status = 'active').
@@ -58,7 +71,6 @@ fn choose_best_access_path_with_typed_filter(
                 continue;
             }
         }
-
         // Expression-index matching (e.g. CREATE INDEX ON t (lower(name))).
         if !index.expressions.is_empty() {
             if let Some((scan_type, cost)) =
@@ -72,7 +84,6 @@ fn choose_best_access_path_with_typed_filter(
                 continue;
             }
         }
-
         // Regular B-tree column index matching.
         if let Some((scan_type, cost)) =
             evaluate_index(schema, index, predicates, estimated_table_rows)
@@ -93,13 +104,54 @@ fn is_planner_usable_index(index: &IndexDef) -> bool {
     if index.columns.is_empty() && index.expressions.is_empty() {
         return false;
     }
+    let method = index.method.as_deref().unwrap_or("btree");
+    method.eq_ignore_ascii_case("btree") || method.eq_ignore_ascii_case("gin")
+}
+
+/// Returns true if this index uses the GIN access method.
+fn is_gin_index(index: &IndexDef) -> bool {
     index
         .method
         .as_deref()
-        .map(|m| m.eq_ignore_ascii_case("btree"))
-        .unwrap_or(true)
+        .is_some_and(|m| m.eq_ignore_ascii_case("gin"))
 }
 
+/// Evaluate whether a GIN index can accelerate the given filter.
+///
+/// Delegates to `gin_predicate::try_extract_gin_predicate` for predicate
+/// analysis, then computes cost using GIN-specific cost model constants.
+fn evaluate_gin_index(
+    schema: &TableSchema,
+    index: &IndexDef,
+    filter: &crate::sql::analyzer::types::TypedExpr,
+    estimated_table_rows: usize,
+) -> Option<(ScanType, f64)> {
+    let m = super::gin_predicate::try_extract_gin_predicate(schema, index, filter)?;
+
+    // Reject pure-negative quals (e.g. `NOT 'foo'`) — these cannot use the
+    // inverted index because there is no positive term to scan.
+    if !super::gin_predicate::gin_qual_has_positive_term(&m.qual) {
+        return None;
+    }
+
+    let n_tokens = super::gin_predicate::gin_qual_term_count(&m.qual);
+    let selectivity = CostModel::GIN_DEFAULT_SELECTIVITY;
+    let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
+
+    let cost = CostModel::GIN_SCAN_BASE_COST
+        + n_tokens as f64 * CostModel::GIN_TOKEN_SCAN_COST
+        + estimated_rows as f64 * CostModel::GIN_ROW_FETCH_COST;
+
+    Some((
+        ScanType::GinIndexScan {
+            index_id: m.index_id,
+            index_name: m.index_name,
+            qual: m.qual,
+            recheck_expr: Box::new(m.recheck_expr),
+        },
+        cost,
+    ))
+}
 /// Compute index scan cost from estimated matching rows.
 fn index_scan_cost(estimated_rows: usize) -> f64 {
     CostModel::BASE_COST + estimated_rows as f64 * CostModel::ROW_COST

@@ -309,9 +309,7 @@ impl PhysicalPlanner {
                 };
 
                 // Access-path selection: when Filter sits above SeqScan and
-                // we have index metadata, choose the best B-tree/SeqScan path.
-                // GIN access-path planning is intentionally disabled until
-                // runtime GIN operators are implemented.
+                // we have index metadata, choose the best B-tree/GIN/SeqScan path.
                 let scan_node = if let PhysicalNode::SeqScan { table_name, alias } = &child.node {
                     let scan_key = super::schema_map_key(table_name, alias.as_deref());
                     if let Some(schema) = ctx.get_schema(&scan_key) {

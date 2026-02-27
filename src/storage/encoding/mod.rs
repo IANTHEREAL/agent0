@@ -48,12 +48,12 @@ pub use metadata_keys::{
     encode_schema_def_prefix_v2, encode_schema_key_v2, encode_schema_prefix_v2,
     encode_sequence_def_key_v2, encode_sequence_def_prefix_v2, encode_sequence_value_key_v2,
     encode_stats_key_v2, encode_table_sequence_value_key_v2, encode_trigger_key_v2,
-    encode_trigger_prefix_v2, encode_trigger_table_prefix_v2, encode_type_key_v2,
-    encode_type_prefix_v2, encode_view_bindings_key_v2, encode_view_bindings_prefix_v2,
-    encode_view_key_v2, encode_view_prefix_v2, encode_worker_bg_result_key,
-    encode_worker_claim_key, encode_worker_claim_prefix, encode_worker_queue_key,
-    encode_worker_queue_prefix, encode_worker_queue_scan_end, encode_worker_registry_key,
-    encode_worker_registry_prefix,
+    encode_trigger_prefix_v2, encode_trigger_table_prefix_v2, encode_tsc_key_v2,
+    encode_type_key_v2, encode_type_prefix_v2, encode_view_bindings_key_v2,
+    encode_view_bindings_prefix_v2, encode_view_key_v2, encode_view_prefix_v2,
+    encode_worker_bg_result_key, encode_worker_claim_key, encode_worker_claim_prefix,
+    encode_worker_queue_key, encode_worker_queue_prefix, encode_worker_queue_scan_end,
+    encode_worker_registry_key, encode_worker_registry_prefix,
 };
 pub(crate) use metadata_keys::{
     encode_comment_column_key_v2, encode_comment_extension_key_v2, encode_comment_function_key_v2,

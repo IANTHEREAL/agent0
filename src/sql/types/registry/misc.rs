@@ -149,7 +149,15 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         FunctionSignature::fixed(DataType::Tsquery).with_args(1, Some(2)),
     );
     r.register(
+        "PHRASETO_TSQUERY",
+        FunctionSignature::fixed(DataType::Tsquery).with_args(1, Some(2)),
+    );
+    r.register(
         "TO_TSQUERY",
+        FunctionSignature::fixed(DataType::Tsquery).with_args(1, Some(2)),
+    );
+    r.register(
+        "WEBSEARCH_TO_TSQUERY",
         FunctionSignature::fixed(DataType::Tsquery).with_args(1, Some(2)),
     );
     r.register(
@@ -163,6 +171,10 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
     r.register(
         "SETWEIGHT",
         FunctionSignature::fixed(DataType::Tsvector).with_args(2, Some(2)),
+    );
+    r.register(
+        "TS_HEADLINE",
+        FunctionSignature::fixed(DataType::Text).with_args(2, Some(4)),
     );
 
     // Array functions (additional)

@@ -39,6 +39,18 @@ fn test_function_registry_min_max() {
 }
 
 #[test]
+fn test_ts_rank_registry_supports_pg_overloads() {
+    let reg = global_registry();
+    let ts_rank = reg.get("TS_RANK").expect("TS_RANK must exist");
+    assert_eq!(ts_rank.min_args, 2);
+    assert_eq!(ts_rank.max_args, Some(4));
+
+    let ts_rank_cd = reg.get("TS_RANK_CD").expect("TS_RANK_CD must exist");
+    assert_eq!(ts_rank_cd.min_args, 2);
+    assert_eq!(ts_rank_cd.max_args, Some(4));
+}
+
+#[test]
 fn test_type_unification() {
     let types = vec![DataType::Int32, DataType::Int64];
     assert_eq!(unify_types(&types), Some(DataType::Int64));

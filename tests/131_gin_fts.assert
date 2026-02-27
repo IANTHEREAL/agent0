@@ -1,19 +1,10 @@
 # GIN FTS assertions — data correctness validated against PG 17.7
-# Note: PG 17 uses Bitmap Heap Scan + Bitmap Index Scan for GIN, not plain Index Scan.
-
+# Note: PG 17 uses Bitmap Heap Scan + Bitmap Index Scan for GIN; db9 uses Index Scan.
 # Test 1: Basic FTS match for 'postgresql'
 PostgreSQL Tutorial
-
-# Test 2: Multiple term search for 'database indexing'
 Database Indexing
-
-# Test 3: ts_rank ordering — rank column present
 0.06079271
-
-# Test 4: No match case
 (0 rows)
-
-# Test 5: EXPLAIN includes scan node + predicate.
-# Current db9 behavior keeps planner/runtime honest by not selecting GIN access path yet.
-Scan on fts_articles
+# Test 5: EXPLAIN shows GIN Index Scan with predicate.
+Index Scan using idx_fts_search on fts_articles
 search_vector @@ plainto_tsquery('postgresql'::text)

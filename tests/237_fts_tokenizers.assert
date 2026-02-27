@@ -1,0 +1,99 @@
+# Phase 2: FTS tokenizer enhancement assertions
+# Validated against db9-server Phase 2 implementation
+
+# Section 1: N-gram tokenizer (bigram)
+
+# 1a: CJK bigram — 4 bigrams from 5 chars
+数据
+据库
+库技
+技术
+
+# 1b: English bigram — 7 bigrams from "database"
+da
+at
+ta
+ab
+ba
+as
+se
+
+# 1c: N-gram match — '数据' bigram exists in '数据库技术'
+ t
+
+# 1d: N-gram no-match
+ f
+
+# Section 2: Trigram tokenizer
+
+# 2a: CJK trigram — 3 trigrams from 5 chars
+数据库
+据库技
+库技术
+
+# 2b: Short segment — emitted as-is
+数据
+
+# Section 3: English stemmed tokenizer
+
+# 3a: Stemmed tsvector — stopwords filtered, words stemmed
+'run'
+'dog'
+'happi'
+
+# 3b: Stemmed match — 'run' & 'dog' both in document
+ t
+
+# 3c: Unstemmed form matches (tokenizer normalizes)
+ t
+
+# 3d: Stopword-only query produces empty result
+(1 row)
+
+# Section 4: Chinese ngram (jieba + bigram overlay)
+
+# 4a: Contains jieba words AND bigram overlays
+分布式
+数据库
+分布
+布式
+数据
+据库
+
+# 4b: Substring match via bigram
+ t
+
+# Section 5: GIN index scan with new tokenizers
+
+# 5a: ngram GIN — rows with '数据' bigram (rows 1,3)
+ 1
+ 3
+
+# 5b: ngram GIN — no match
+(0 rows)
+
+# 5c: english_stem GIN — 'run' matches 'running' (rows 1,4)
+ 1
+ 4
+
+# 5d: english_stem GIN — 'dog' matches 'dogs' (rows 1,3)
+ 1
+ 3
+
+# Section 6: CREATE/DROP TEXT SEARCH CONFIGURATION DDL
+# 6a: CREATE succeeds (DDL tag suppressed by psql -q)
+# 6b: User-defined config resolves to zhparser tokenizer
+分布式
+数据库系统
+
+# 6c: ALTER with ADD MAPPING accepted (DDL tag suppressed by psql -q)
+
+# 6d: DROP succeeds (DDL tag suppressed by psql -q)
+
+# 6e: DROP IF EXISTS when already dropped (DDL tag suppressed by psql -q)
+
+# 6f: USING syntax — verifies config works before drop
+自然语言
+处理
+# 6g: Unsupported parser
+not supported

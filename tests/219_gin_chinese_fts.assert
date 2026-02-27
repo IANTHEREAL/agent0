@@ -1,0 +1,43 @@
+# Chinese FTS GIN assertions — data validated against PG 17.7
+# Converted from .expected to .assert due to EXPLAIN cost variance after enabling GIN scan.
+
+# Test 2: Query with Chinese tokenizer — exact match
+数据库技术
+
+# Test 3: Multi-term query — should return 0 rows (PG 也是 0 rows, 因为 jieba 分词“搜索”“索引”与 doc “倒排索引”不完全匹配)
+(0 rows)
+
+# Test 4: ts_rank ordering
+机器学习入门
+0.18784232
+
+# Test 5: Insert + query — new row found
+自然语言处理
+
+# Test 6: English tokenizer on title
+Database Systems
+
+# Test 7: Mixed Chinese-English
+数据库技术
+PostgreSQL教程
+
+# Test 8: to_tsvector Chinese direct
+我
+爱
+中国
+
+# Test 9: plainto_tsquery Chinese
+人工智能
+机器
+学习
+
+# Test 10: Unknown config error
+unknown text search configuration: klingon
+
+# Test 11: Single-argument to_tsvector
+'test'
+'this'
+
+# Test 12: EXPLAIN should show GIN Index Scan on expression index
+Index Scan using idx_content_cn on articles
+to_tsvector('chinese'::text, content) @@ plainto_tsquery('chinese'::text, '数据库'::text)

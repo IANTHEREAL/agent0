@@ -105,6 +105,15 @@ const PARQUET_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
     default_schema: EXTENSIONS_SCHEMA,
 };
 
+// zhparser — Chinese full-text search parser (built-in via jieba-rs).
+// CREATE EXTENSION zhparser is a no-op; the tokenizer is always available.
+const ZHPARSER_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
+    name: "zhparser",
+    oid: 2006,
+    version: "2.0.0",
+    default_schema: "public",
+};
+
 /// Lookup an extension descriptor by name (case-insensitive).
 pub fn descriptor(name: &str) -> Option<&'static ExtensionDescriptor> {
     if name.eq_ignore_ascii_case(HTTP_EXTENSION.name) {
@@ -124,6 +133,9 @@ pub fn descriptor(name: &str) -> Option<&'static ExtensionDescriptor> {
     }
     if name.eq_ignore_ascii_case(PARQUET_EXTENSION.name) {
         return Some(&PARQUET_EXTENSION);
+    }
+    if name.eq_ignore_ascii_case(ZHPARSER_EXTENSION.name) {
+        return Some(&ZHPARSER_EXTENSION);
     }
     None
 }

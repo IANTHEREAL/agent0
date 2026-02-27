@@ -6,8 +6,8 @@
   - JSON/JSONB containment (`@>`),
   - ARRAY containment (`@>`),
   - FTS match (`@@`) via `TSVECTOR`/`TSQUERY`.
-- Planner access-path note: in the current single-path engine, `GIN` scan selection is
-  intentionally disabled until a real runtime GIN operator is implemented.
+- GIN index scan is enabled: the planner selects `GinIndexScan` for eligible `@@`, `@>`, and `&&` predicates.
+  A `GinScanOperator` evaluates boolean-tree GIN quals at runtime and a recheck filter ensures correctness.
 - Extension-owned configuration knobs and feature flags (defined once; see `./ops-config.md`).
 
 ## Non-goals
@@ -41,19 +41,24 @@
   - Evidence: `src/extensions/context.rs` (`try_consume_http_request`), `src/extensions/http.rs` (`MAX_REQUESTS_PER_STATEMENT`, `MAX_INFLIGHT_REQUESTS_PER_TENANT_PER_NODE`, `TenantLimiters`).
 
 - **[Stable] GIN-like index lifecycle for JSONB/ARRAY/TSVECTOR**
-  - The engine supports a lightweight inverted index (“GIN-like”) storage lifecycle for a restricted subset of `USING gin` indexes:
-    - exactly one indexed column,
-    - no expressions,
+  - The engine supports a lightweight inverted index ("GIN-like") storage lifecycle for a restricted subset of `USING gin` indexes:
+    - exactly one indexed column (or expression-index on `to_tsvector('config', col)`),
     - no partial predicate,
     - column type is `JSON/JSONB`, `ARRAY`, or `TSVECTOR`.
-  - Evidence: `src/sql/ddl.rs` (`supported_gin_index_column`, `create_gin_index_entries` backfill path), `src/sql/dml.rs` (maintenance), `src/sql/gin.rs`, `tests/94_gin_index_query.sql`, `tests/131_gin_fts.sql`.
+  - Evidence: `src/sql/ddl.rs` (`supported_gin_index_column`, `create_gin_index_entries` backfill path), `src/sql/dml.rs` (maintenance), `src/sql/gin.rs`, `tests/94_gin_index_query.sql`, `tests/131_gin_fts.sql`, `tests/236_gin_index_scan.sql`.
   - Note: `USING gin` indexes on other column types are accepted syntactically but are outside the supported lifecycle and may not be populated/used.
     - Evidence: `src/sql/index_helpers.rs` (`is_index_materializable`).
 
-- **[Experimental] GIN planner/executor access path is currently disabled**
-  - The planner currently does not select `ScanType::GinIndexScan`; GIN-eligible predicates execute through non-GIN scan paths with predicate filtering.
-  - Runtime/operator builders reject accidental `GinIndexScan` routing with explicit errors (no silent fallback).
-  - Evidence: `src/sql/planner/index_selection.rs`, `src/sql/optimizer/build/scan.rs`, `src/sql/operators/planner.rs`, `src/sql/planner/tests.rs`, `tests/131_gin_fts.assert`.
+- **[Stable] GIN planner/executor access path**
+  - The planner selects `ScanType::GinIndexScan` when eligible GIN predicates are detected:
+    - `@@` (tsvector match): AND/OR/NOT boolean tsquery with at least one positive term.
+    - `@>` (JSONB containment): constant RHS tokenized to AND of token hashes.
+    - `@>` (ARRAY containment): constant RHS elements as AND of hashes.
+    - `&&` (ARRAY overlap): constant RHS elements as OR of hashes.
+  - Expression-index matching: `to_tsvector('config', col)` GIN indexes are matched against equivalent LHS expressions.
+  - Pure-negative GIN quals (e.g. `!A` with no positive terms) are rejected by the planner (falls through to Seq Scan).
+  - `GinScanOperator` evaluates the `GinQual` tree via posting-list set operations (intersect/union/difference) and a recheck filter ensures correctness (no false negatives).
+  - Evidence: `src/sql/planner/gin_predicate.rs`, `src/sql/planner/index_selection.rs`, `src/sql/operators/gin_scan.rs`, `src/storage/tikv_store/indexes.rs` (`scan_gin_posting_list`), `tests/236_gin_index_scan.sql`, `tests/218_gin_correctness.sql`.
 
 - **[Experimental] Tokenization guarantees and limits**
   - For JSONB containment (`@>`), tokenization MUST avoid false negatives and MAY allow false positives (final containment recheck is required for correctness).
@@ -94,6 +99,10 @@ This module MUST NOT redefine config keys. Relevant keys are defined exactly onc
 - `src/sql/gin.rs`
 - `src/sql/fts.rs`
 - `src/storage/encoding.rs`
+- `src/sql/planner/gin_predicate.rs`
+- `src/sql/planner/index_selection.rs`
+- `src/sql/operators/gin_scan.rs`
+- `src/storage/tikv_store/indexes.rs`
 
 ## Verification (Gates)
 Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
@@ -105,6 +114,9 @@ Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
   - `python3 scripts/integration_test.py --dsn "$PG_DSN" tests/94_gin_index_query.sql`
   - `python3 scripts/integration_test.py --dsn "$PG_DSN" tests/130_fts.sql`
   - `python3 scripts/integration_test.py --dsn "$PG_DSN" tests/131_gin_fts.sql`
+  - `python3 scripts/integration_test.py --dsn "$PG_DSN" tests/218_gin_correctness.sql`
+  - `python3 scripts/integration_test.py --dsn "$PG_DSN" tests/219_gin_chinese_fts.sql`
+  - `python3 scripts/integration_test.py --dsn "$PG_DSN" tests/236_gin_index_scan.sql`
 
 ## Change Management
 - Any change to HTTP extension security posture (superuser boundary, URL validation rules, limits/timeouts), GIN-like access-path eligibility, or tokenization semantics MUST update this document and the corresponding module entries in `docs/sot/modules.yaml`.
