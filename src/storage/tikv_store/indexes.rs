@@ -52,6 +52,62 @@ impl TikvStore {
         decode_pk_from_index_suffix(pk_bytes, pk_types)
     }
 
+    /// Decodes a non-unique index key into its primary-key values.
+    ///
+    /// Policy: fails fast on any malformed or truncated key, consistent with
+    /// `scan_index`'s behaviour for unique indexes. Corruption is surfaced
+    /// immediately rather than silently skipped.
+    fn try_decode_non_unique_pk_inner(
+        &self,
+        full_key: &[u8],
+        fixed_prefix_len: usize,
+        index_column_types: &[DataType],
+        pk_types: &[DataType],
+    ) -> Result<Vec<Value>> {
+        if full_key.len() <= fixed_prefix_len {
+            return Err(anyhow!("non-unique index key too short"));
+        }
+        let mut offset = fixed_prefix_len;
+        for data_type in index_column_types {
+            let (_, consumed) = decode_value_memcomparable(&full_key[offset..], data_type)?;
+            offset += consumed;
+        }
+        if full_key.get(offset) != Some(&0x01) {
+            return Err(anyhow!("non-unique index key missing PK separator byte"));
+        }
+        offset += 1;
+        decode_pk_from_index_suffix(&full_key[offset..], pk_types)
+    }
+
+    /// Decode primary-key values from a unique index entry.
+    ///
+    /// For unique indexes that allow NULL (stored with PK-suffixed key shape), the value is
+    /// empty and the PK lives in the key suffix. For normal unique entries, the PK is encoded
+    /// in the value.
+    fn decode_unique_pk_from_index_entry(
+        &self,
+        full_key: &[u8],
+        value: &[u8],
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        index_column_types: &[DataType],
+        pk_types: &[DataType],
+    ) -> Result<Vec<Value>> {
+        if value.is_empty() {
+            self.decode_non_unique_pk_from_index_key(
+                full_key,
+                db_id,
+                table_id,
+                index_id,
+                index_column_types,
+                pk_types,
+            )
+        } else {
+            decode_pk_from_index_suffix(value, pk_types)
+        }
+    }
+
     pub async fn create_index_entry(
         &self,
         txn: &mut Transaction,
@@ -220,48 +276,38 @@ impl TikvStore {
             let mut scanned_pairs = 0usize;
             for pair in pairs {
                 scanned_pairs += 1;
-                let pk = if pair.value().is_empty() {
-                    let full_key: &[u8] = pair.key().as_ref().into();
-                    self.decode_non_unique_pk_from_index_key(
-                        full_key,
-                        db_id,
-                        table_id,
-                        index_id,
-                        index_column_types,
-                        pk_types,
-                    )?
-                } else {
-                    let pk_bytes: &[u8] = pair.value().as_ref();
-                    decode_pk_from_index_suffix(pk_bytes, pk_types)?
-                };
+                let full_key: &[u8] = pair.key().as_ref().into();
+                let value: &[u8] = pair.value().as_ref();
+                let pk = self.decode_unique_pk_from_index_entry(
+                    full_key,
+                    value,
+                    db_id,
+                    table_id,
+                    index_id,
+                    index_column_types,
+                    pk_types,
+                )?;
                 pks.push(pk);
             }
             kv_stats::record_index_scan_pairs(scanned_pairs);
             return Ok(pks);
         }
 
-        let fixed_prefix_len = encode_index_key_v2(db_id, table_id, index_id, &[], None).len();
+        // Compute once per scan (not per row) to avoid the per-row allocation cost of
+        // make_index_key inside decode_non_unique_pk_from_index_key.
+        let fixed_prefix_len = self
+            .make_index_key(db_id, table_id, index_id, &[], None)
+            .len();
         let mut scanned_pairs = 0usize;
         for pair in pairs {
             scanned_pairs += 1;
             let full_key: &[u8] = pair.key().as_ref().into();
-            if full_key.len() <= fixed_prefix_len {
-                continue;
-            }
-
-            let mut offset = fixed_prefix_len;
-            for data_type in index_column_types {
-                let (_, consumed) = decode_value_memcomparable(&full_key[offset..], data_type)?;
-                offset += consumed;
-            }
-
-            if full_key.get(offset) != Some(&0x01) {
-                return Err(anyhow!("Non-unique index key missing PK separator"));
-            }
-            offset += 1;
-
-            let pk_bytes = &full_key[offset..];
-            let pk = decode_pk_from_index_suffix(pk_bytes, pk_types)?;
+            let pk = self.try_decode_non_unique_pk_inner(
+                full_key,
+                fixed_prefix_len,
+                index_column_types,
+                pk_types,
+            )?;
             pks.push(pk);
         }
 
@@ -321,48 +367,38 @@ impl TikvStore {
             let mut scanned_pairs = 0usize;
             for pair in pairs {
                 scanned_pairs += 1;
-                let pk = if pair.value().is_empty() {
-                    let full_key: &[u8] = pair.key().as_ref().into();
-                    self.decode_non_unique_pk_from_index_key(
-                        full_key,
-                        db_id,
-                        table_id,
-                        index_id,
-                        index_column_types,
-                        pk_types,
-                    )?
-                } else {
-                    let pk_bytes: &[u8] = pair.value().as_ref();
-                    decode_pk_from_index_suffix(pk_bytes, pk_types)?
-                };
+                let full_key: &[u8] = pair.key().as_ref().into();
+                let value: &[u8] = pair.value().as_ref();
+                let pk = self.decode_unique_pk_from_index_entry(
+                    full_key,
+                    value,
+                    db_id,
+                    table_id,
+                    index_id,
+                    index_column_types,
+                    pk_types,
+                )?;
                 pks.push(pk);
             }
             kv_stats::record_index_scan_pairs(scanned_pairs);
             return Ok(pks);
         }
 
-        let fixed_prefix_len = encode_index_key_v2(db_id, table_id, index_id, &[], None).len();
+        // Compute once per scan (not per row) to avoid the per-row allocation cost of
+        // make_index_key inside decode_non_unique_pk_from_index_key.
+        let fixed_prefix_len = self
+            .make_index_key(db_id, table_id, index_id, &[], None)
+            .len();
         let mut scanned_pairs = 0usize;
         for pair in pairs {
             scanned_pairs += 1;
             let full_key: &[u8] = pair.key().as_ref().into();
-            if full_key.len() <= fixed_prefix_len {
-                continue;
-            }
-
-            let mut offset = fixed_prefix_len;
-            for data_type in index_column_types {
-                let (_, consumed) = decode_value_memcomparable(&full_key[offset..], data_type)?;
-                offset += consumed;
-            }
-
-            if full_key.get(offset) != Some(&0x01) {
-                return Err(anyhow!("Non-unique index key missing PK separator"));
-            }
-            offset += 1;
-
-            let pk_bytes = &full_key[offset..];
-            let pk = decode_pk_from_index_suffix(pk_bytes, pk_types)?;
+            let pk = self.try_decode_non_unique_pk_inner(
+                full_key,
+                fixed_prefix_len,
+                index_column_types,
+                pk_types,
+            )?;
             pks.push(pk);
         }
 
