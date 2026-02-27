@@ -117,9 +117,10 @@ impl WorkerConfig {
         }
         if let Ok(v) = env::var("DB9_WORKER_GC_BATCH_SIZE") {
             cfg.gc_batch_size = v
-                .parse::<usize>()
+                .parse::<u64>()
                 .ok()
                 .filter(|n| *n > 0)
+                .map(|n| n.min(u32::MAX as u64) as usize)
                 .unwrap_or(cfg.gc_batch_size);
         }
         if let Ok(v) = env::var("DB9_AUTO_ANALYZE_ENABLED") {
@@ -201,6 +202,26 @@ mod tests {
     }
 
     #[test]
+    fn from_env_clamps_gc_batch_size_to_u32_max() {
+        let _guard = test_lock().lock().unwrap();
+
+        let key = "DB9_WORKER_GC_BATCH_SIZE";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, (u64::from(u32::MAX) + 1).to_string());
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.gc_batch_size, u32::MAX as usize);
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
+        }
+    }
+
+    #[test]
     fn from_env_applies_poll_ms_when_at_least_minimum() {
         let _guard = test_lock().lock().unwrap();
 
@@ -251,7 +272,6 @@ mod tests {
             "non-integer should fall back to default"
         );
     }
-
     #[test]
     fn test_parse_bool_true_variants() {
         for input in &["1", "true", "t", "yes", "y", "on"] {

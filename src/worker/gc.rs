@@ -5,6 +5,7 @@ use crate::storage::TikvStore;
 use crate::worker::config::WorkerConfig;
 use crate::worker::now_epoch_ms;
 use anyhow::Result;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -13,6 +14,12 @@ pub struct WorkerGc {
     system_store: Arc<TikvStore>,
     pool: Arc<TikvClientPool>,
     config: WorkerConfig,
+}
+
+struct ClaimGcBatch {
+    scanned: usize,
+    cleaned: u32,
+    last_key: Option<Vec<u8>>,
 }
 
 impl WorkerGc {
@@ -92,13 +99,38 @@ impl WorkerGc {
     /// Orphaned claims are NOT re-enqueued — the next cron fire or scheduler
     /// handles retries. One-shot tasks stay failed.
     async fn cleanup_orphan_claims(&self) -> Result<()> {
+        let batch_size = self.config.gc_batch_size.max(1);
+        let now_ms = now_epoch_ms();
+        let timeout_ms = (self.config.orphan_timeout_sec as i64).saturating_mul(1000);
+        let cutoff = now_ms.saturating_sub(timeout_ms);
+
+        let (cleaned, _) = run_claim_gc_batches(batch_size, |start_after, requested_batch_size| {
+            self.cleanup_orphan_claims_batch(start_after, requested_batch_size, cutoff)
+        })
+        .await?;
+
+        if cleaned > 0 {
+            info!("GC: cleaned {} orphan claims", cleaned);
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_orphan_claims_batch(
+        &self,
+        start_after: Option<Vec<u8>>,
+        batch_size: usize,
+        cutoff: i64,
+    ) -> Result<ClaimGcBatch> {
         let mut txn = self.system_store.begin().await?;
 
-        let gc_result = async {
-            let claims = self.system_store.list_worker_claims(&mut txn).await?;
-            let now_ms = now_epoch_ms();
-            let timeout_ms = (self.config.orphan_timeout_sec as i64).saturating_mul(1000);
-            let cutoff = now_ms.saturating_sub(timeout_ms);
+        let batch_result = async {
+            let claims = self
+                .system_store
+                .list_worker_claims_batch(&mut txn, start_after.as_deref(), Some(batch_size))
+                .await?;
+            let scanned = claims.len();
+            let last_key = claims.last().map(|(key, _)| key.clone());
             let mut cleaned = 0u32;
 
             for (key, claim) in claims {
@@ -114,26 +146,57 @@ impl WorkerGc {
                 }
             }
 
-            Ok::<u32, anyhow::Error>(cleaned)
+            Ok::<ClaimGcBatch, anyhow::Error>(ClaimGcBatch {
+                scanned,
+                cleaned,
+                last_key,
+            })
         }
         .await;
 
-        match gc_result {
-            Ok(cleaned) if cleaned > 0 => {
-                txn.commit().await?;
-                info!("GC: cleaned {} orphan claims", cleaned);
-            }
-            Ok(_) => {
-                txn.rollback().await.ok();
+        match batch_result {
+            Ok(batch) => {
+                if batch.cleaned > 0 {
+                    txn.commit().await?;
+                } else {
+                    txn.rollback().await.ok();
+                }
+                Ok(batch)
             }
             Err(e) => {
                 txn.rollback().await.ok();
-                return Err(e);
+                Err(e)
             }
         }
-
-        Ok(())
     }
+}
+
+async fn run_claim_gc_batches<F, Fut>(batch_size: usize, mut run_batch: F) -> Result<(u32, usize)>
+where
+    F: FnMut(Option<Vec<u8>>, usize) -> Fut,
+    Fut: Future<Output = Result<ClaimGcBatch>>,
+{
+    let batch_size = batch_size.max(1).min(u32::MAX as usize);
+    let mut total_cleaned = 0u32;
+    let mut batch_count = 0usize;
+    let mut start_after: Option<Vec<u8>> = None;
+
+    loop {
+        let batch = run_batch(start_after.clone(), batch_size).await?;
+        if batch.scanned == 0 {
+            break;
+        }
+
+        batch_count += 1;
+        total_cleaned = total_cleaned.saturating_add(batch.cleaned);
+        start_after = batch.last_key;
+
+        if batch.scanned < batch_size {
+            break;
+        }
+    }
+
+    Ok((total_cleaned, batch_count))
 }
 
 /// Generate random jitter in seconds (0..max_secs) using time-based seed.
@@ -157,6 +220,7 @@ fn effective_cron_orphan_timeout_sec(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future;
 
     #[test]
     fn test_orphan_timeout_calc() {
@@ -232,5 +296,86 @@ mod tests {
             effective_cron_orphan_timeout_sec(&cron_cfg, &worker_cfg),
             7_200
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_orphan_claims_respects_batch_size() {
+        let orphan_count = 7usize;
+        let batch_size = 3usize;
+        let expected_batches = orphan_count.div_ceil(batch_size);
+        let all_claim_keys: Vec<Vec<u8>> = (0..orphan_count).map(|idx| vec![idx as u8]).collect();
+        let mut processed_keys: Vec<Vec<u8>> = Vec::new();
+
+        let (cleaned, batches) = run_claim_gc_batches(batch_size, |start_after, requested_size| {
+            let start_index = start_after
+                .as_ref()
+                .and_then(|key| {
+                    all_claim_keys
+                        .iter()
+                        .position(|candidate_key| candidate_key == key)
+                })
+                .map(|idx| idx + 1)
+                .unwrap_or(0);
+            let end_index = (start_index + requested_size).min(all_claim_keys.len());
+            let page_keys = all_claim_keys[start_index..end_index].to_vec();
+            processed_keys.extend(page_keys.iter().cloned());
+
+            let scanned = page_keys.len();
+            let last_key = page_keys.last().cloned();
+            future::ready(Ok(ClaimGcBatch {
+                scanned,
+                cleaned: scanned as u32,
+                last_key,
+            }))
+        })
+        .await
+        .expect("pagination loop should succeed");
+
+        assert_eq!(batches, expected_batches);
+        assert_eq!(cleaned, orphan_count as u32);
+        assert_eq!(processed_keys, all_claim_keys);
+    }
+
+    #[tokio::test]
+    async fn run_claim_gc_batches_clamps_batch_size_above_u32_max() {
+        let oversized_batch_size = (u32::MAX as usize) + 1;
+        let mut call_count = 0usize;
+
+        let (cleaned, batches) =
+            run_claim_gc_batches(oversized_batch_size, |start_after, requested_size| {
+                assert_eq!(
+                    requested_size,
+                    u32::MAX as usize,
+                    "batch size must be clamped at consumption point",
+                );
+
+                let result = match call_count {
+                    0 => {
+                        assert_eq!(start_after, None);
+                        ClaimGcBatch {
+                            scanned: u32::MAX as usize,
+                            cleaned: 0,
+                            last_key: Some(vec![1]),
+                        }
+                    }
+                    1 => {
+                        assert_eq!(start_after, Some(vec![1]));
+                        ClaimGcBatch {
+                            scanned: 1,
+                            cleaned: 1,
+                            last_key: Some(vec![2]),
+                        }
+                    }
+                    _ => panic!("loop should terminate after second batch"),
+                };
+                call_count += 1;
+                future::ready(Ok(result))
+            })
+            .await
+            .expect("pagination loop should succeed");
+
+        assert_eq!(batches, 2, "must continue after first full capped batch");
+        assert_eq!(cleaned, 1);
+        assert_eq!(call_count, 2);
     }
 }

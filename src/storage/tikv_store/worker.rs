@@ -281,11 +281,32 @@ impl TikvStore {
         &self,
         txn: &mut Transaction,
     ) -> Result<Vec<(Vec<u8>, WorkerClaim)>> {
+        self.list_worker_claims_batch(txn, None, None).await
+    }
+
+    pub async fn list_worker_claims_batch(
+        &self,
+        txn: &mut Transaction,
+        start_after: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, WorkerClaim)>> {
+        if matches!(limit, Some(0)) {
+            return Ok(Vec::new());
+        }
+
         let prefix = encode_worker_claim_prefix();
         let mut end = prefix.clone();
         end.push(0xFF);
-        let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let start = match start_after {
+            Some(last_key) => {
+                let mut next_start = last_key.to_vec();
+                next_start.push(0x00);
+                next_start
+            }
+            None => prefix.clone(),
+        };
+        let range: BoundRange = (start..end).into();
+        let pairs = txn.scan(range, scan_limit_to_u32(limit)).await?;
 
         let mut results = Vec::new();
         for pair in pairs {
