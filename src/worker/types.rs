@@ -1,12 +1,5 @@
+use crate::worker::now_epoch_ms;
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-fn now_ms_i64() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(i64::MAX)
-}
 
 // ============================================================================
 // Task Type Bitmask Constants
@@ -96,7 +89,7 @@ impl TaskRegistryEntry {
             db_id,
             task_types: 0,
             job_count: 0,
-            registered_at: now_ms_i64(),
+            registered_at: now_epoch_ms(),
         }
     }
 
@@ -255,7 +248,7 @@ impl WorkerClaim {
     pub fn new(worker_id: String, task_type: TaskType) -> Self {
         Self {
             worker_id,
-            claimed_at: now_ms_i64(),
+            claimed_at: now_epoch_ms(),
             task_type,
         }
     }

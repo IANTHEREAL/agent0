@@ -15,6 +15,10 @@ use tracing::{info, warn};
 static SYSTEM_STORE: OnceLock<Arc<TikvStore>> = OnceLock::new();
 static WORKER_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 
+pub(crate) fn now_epoch_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
 /// Set the global system store. Called once during startup.
 pub fn set_system_store(store: Arc<TikvStore>) {
     SYSTEM_STORE.set(store).ok(); // Ignore if already set

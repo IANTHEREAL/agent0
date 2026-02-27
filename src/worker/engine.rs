@@ -10,6 +10,7 @@ use crate::sql::Executor;
 use crate::storage::{CronRunClaimStatus, TikvStore};
 use crate::worker::config::WorkerConfig;
 use crate::worker::metrics::WorkerMetrics;
+use crate::worker::now_epoch_ms;
 use crate::worker::types::*;
 use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
@@ -97,7 +98,7 @@ impl WorkerEngine {
     }
 
     async fn tick(&self) -> Result<()> {
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = now_epoch_ms();
 
         let mut txn = self.system_store.begin().await?;
         let due_entries = self
@@ -427,7 +428,7 @@ impl WorkerEngine {
                 db_id: cron_db_id,
                 username: entry.username.clone(),
                 command: entry.command.clone(),
-                started_at: now_ms(),
+                started_at: now_epoch_ms(),
             });
 
             let timeout_ms = max_runtime_ms.unwrap_or(config.cron_job_timeout_ms);
@@ -468,7 +469,7 @@ impl WorkerEngine {
                 status,
                 message,
                 started_at,
-                now_ms(),
+                now_epoch_ms(),
             )
             .await?;
         }
@@ -587,7 +588,7 @@ impl WorkerEngine {
             let max_runtime_ms = job.max_runtime_ms;
 
             let run_id = store.next_cron_run_id(entry.db_id).await?;
-            let started_at = now_ms();
+            let started_at = now_epoch_ms();
             let run = CronRun {
                 run_id,
                 job_id: entry.task_id,
@@ -733,13 +734,13 @@ impl WorkerEngine {
         };
         let current_user: Arc<str> = Arc::from(entry.username.clone());
         let timezone: Arc<str> = Arc::from("UTC");
-        let tx_start_ms = chrono::Utc::now().timestamp_millis();
+        let tx_start_ms = now_epoch_ms();
         let statement_memory_accountant = handle.memory_accountant();
 
         // BgDdl tasks (e.g. CREATE INDEX CONCURRENTLY backfill) are exempt from
         // statement_timeout — they legitimately run for extended periods.
         if entry.task_type == TaskType::BgDdl && entry.command.starts_with("__backfill_index ") {
-            let stmt_ts = chrono::Utc::now().timestamp_millis();
+            let stmt_ts = now_epoch_ms();
             let qctx = QueryContext::new(
                 0,
                 database_name.clone(),
@@ -795,7 +796,7 @@ impl WorkerEngine {
         let result = async {
             let statements = parse_sql(&entry.command)?;
             for stmt in &statements {
-                let stmt_ts = chrono::Utc::now().timestamp_millis();
+                let stmt_ts = now_epoch_ms();
                 let qctx = QueryContext::new(
                     0,
                     database_name.clone(),
@@ -970,10 +971,6 @@ fn parse_backfill_index_command(command: &str) -> Result<(String, String)> {
         return Err(anyhow!("invalid backfill command args: {}", command));
     }
     Ok((table_name.to_string(), index_name.to_string()))
-}
-
-fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
 }
 
 fn success_message(completed_commands: usize) -> String {

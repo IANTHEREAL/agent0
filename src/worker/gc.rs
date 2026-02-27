@@ -3,6 +3,7 @@ use crate::cron::worker::gc_database;
 use crate::pool::TikvClientPool;
 use crate::storage::TikvStore;
 use crate::worker::config::WorkerConfig;
+use crate::worker::now_epoch_ms;
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
@@ -95,7 +96,7 @@ impl WorkerGc {
 
         let gc_result = async {
             let claims = self.system_store.list_worker_claims(&mut txn).await?;
-            let now_ms = chrono::Utc::now().timestamp_millis();
+            let now_ms = now_epoch_ms();
             let timeout_ms = (self.config.orphan_timeout_sec as i64).saturating_mul(1000);
             let cutoff = now_ms.saturating_sub(timeout_ms);
             let mut cleaned = 0u32;
