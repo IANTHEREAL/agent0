@@ -41,6 +41,78 @@ fn is_plan_cache_eligible(exec: &PreparedExec) -> bool {
     }
 }
 
+/// Decide prepared plan cache action and mutate cache state for this attempt.
+///
+/// This helper is intentionally mutating (entry LRU touches + miss-path counter
+/// updates). It always returns owned cached entry data for async-safe use.
+fn decide_and_update_prepared_cache_action(
+    plan_cache: &mut crate::sql::executor::core::plan_cache::PreparedPlanCache,
+    cache_key: &crate::sql::executor::core::plan_cache::PlanCacheKey,
+    cache_eligible: bool,
+) -> (
+    Option<crate::sql::executor::core::plan_cache::PlanCacheEntry>,
+    bool,
+) {
+    use crate::sql::executor::core::plan_cache::PromotionCounterOutcome;
+
+    if !cache_eligible {
+        return (None, false);
+    }
+
+    let cached = plan_cache.get(cache_key).cloned();
+    if cached.is_some() {
+        return (cached, false);
+    }
+
+    let min_exec = plan_cache.min_exec();
+    // Promotion must be miss-only. NotTracked must never drive promotion, even
+    // when min_exec = 0.
+    let should_promote = matches!(
+        plan_cache.record_execution(cache_key),
+        PromotionCounterOutcome::MissCount(exec_count) if exec_count >= min_exec
+    );
+    (None, should_promote)
+}
+
+/// Apply post-attempt cache invalidation and promotion updates.
+fn update_plan_cache_after_attempt(
+    plan_cache: &mut crate::sql::executor::core::plan_cache::PreparedPlanCache,
+    cache_key: &crate::sql::executor::core::plan_cache::PlanCacheKey,
+    table_versions_for_cache: &[(String, u64, u64)],
+    should_promote: bool,
+    txn_result: &PreparedTxnResult,
+    new_physical: Option<&crate::sql::optimizer::physical_plan::PhysicalPlan>,
+    invalidate_cached_hit: bool,
+) {
+    use crate::sql::executor::core::plan_cache::{PlanCacheEntry, PlanDependency};
+
+    if invalidate_cached_hit {
+        plan_cache.invalidate(cache_key);
+    }
+
+    if matches!(txn_result, PreparedTxnResult::Executed(_))
+        && (should_promote || invalidate_cached_hit)
+    {
+        if let Some(new_physical) = new_physical {
+            let deps: Vec<PlanDependency> = table_versions_for_cache
+                .iter()
+                .map(|(name, table_id, version)| PlanDependency {
+                    table_name: name.clone(),
+                    table_id: *table_id,
+                    schema_version: *version,
+                })
+                .collect();
+            plan_cache.insert(
+                cache_key.clone(),
+                PlanCacheEntry {
+                    physical_plan: new_physical.clone(),
+                    dependencies: deps,
+                },
+            );
+        }
+    }
+}
+
 impl Executor {
     /// Execute a prepared analyzed statement without re-parsing SQL text.
     ///
@@ -334,9 +406,7 @@ impl Executor {
         table_versions: &[(String, u64, u64)],
         current_role: Option<&str>,
     ) -> Result<PreparedTxnResult> {
-        use crate::sql::executor::core::plan_cache::{
-            PlanCacheEntry, PlanCacheKey, PlanDependency,
-        };
+        use crate::sql::executor::core::plan_cache::PlanCacheKey;
 
         // ── Plan cache: build key + lookup ──
         let resolved_table_ids: Vec<u64> = table_versions
@@ -355,16 +425,15 @@ impl Executor {
         // require pre-materialization (subquery/async constants).
         let cache_eligible = is_plan_cache_eligible(exec);
 
-        // Record execution and check cache.
-        let (cached_entry, should_promote) = if cache_eligible {
-            let exec_count = session.plan_cache().record_execution(&cache_key);
-            let min_exec = session.plan_cache().min_exec();
-            let cached = session.plan_cache().get(&cache_key).cloned();
-            let should_promote = cached.is_none() && exec_count >= min_exec;
-            (cached, should_promote)
-        } else {
-            (None, false)
-        };
+        // Plan cache decision contract:
+        // - lookup cached entry first
+        // - track miss-path execution counters only on miss
+        // - drive promotion only from miss counts
+        let (cached_entry, should_promote) = decide_and_update_prepared_cache_action(
+            session.plan_cache(),
+            &cache_key,
+            cache_eligible,
+        );
 
         // Extract cached plan/dependency metadata for hit-time drift validation.
         let cached_physical = cached_entry.as_ref().map(|e| e.physical_plan.clone());
@@ -436,34 +505,16 @@ impl Executor {
 
         let result = apply_statement_timeout(timeout, fut).await;
 
-        // ── Plan cache: invalidate stale hit entries before potential reinsert ──
-        if let Ok((_, _, invalidate_cached_hit)) = &result {
-            if *invalidate_cached_hit {
-                session.plan_cache().invalidate(&cache_key);
-            }
-        }
-
-        // ── Plan cache: promote new plan into cache ──
-        if let Ok((PreparedTxnResult::Executed(_), Some(new_physical), invalidate_cached_hit)) =
-            &result
-        {
-            if should_promote || *invalidate_cached_hit {
-                let deps: Vec<PlanDependency> = table_versions_for_cache
-                    .iter()
-                    .map(|(name, table_id, version)| PlanDependency {
-                        table_name: name.clone(),
-                        table_id: *table_id,
-                        schema_version: *version,
-                    })
-                    .collect();
-                session.plan_cache().insert(
-                    cache_key,
-                    PlanCacheEntry {
-                        physical_plan: new_physical.clone(),
-                        dependencies: deps,
-                    },
-                );
-            }
+        if let Ok((txn_result, new_physical, invalidate_cached_hit)) = &result {
+            update_plan_cache_after_attempt(
+                session.plan_cache(),
+                &cache_key,
+                &table_versions_for_cache,
+                should_promote,
+                txn_result,
+                new_physical.as_ref(),
+                *invalidate_cached_hit,
+            );
         }
 
         result.map(|(txn_result, _, _)| txn_result)
@@ -1036,6 +1087,143 @@ mod tests {
         };
         assert!(!is_plan_cache_eligible(&dml));
         assert!(!is_plan_cache_eligible(&PreparedExec::RawSqlUtility));
+    }
+}
+
+#[cfg(test)]
+mod plan_cache_flow_tests {
+    use super::*;
+    use crate::sql::executor::core::plan_cache::{
+        PlanCacheEntry, PlanCacheKey, PlanDependency, PreparedPlanCache,
+    };
+    use crate::sql::optimizer::logical_plan::PlanSchema;
+    use crate::sql::optimizer::physical_plan::{PhysicalCost, PhysicalNode, PhysicalPlan};
+
+    fn make_key(sql: &str, resolved_table_ids: &[u64]) -> PlanCacheKey {
+        PlanCacheKey::new(
+            sql.to_string(),
+            &[],
+            1,
+            &["public".to_string()],
+            resolved_table_ids,
+        )
+    }
+
+    fn make_physical_plan() -> PhysicalPlan {
+        PhysicalPlan {
+            node: PhysicalNode::Empty,
+            schema: PlanSchema::empty(),
+            cost: PhysicalCost::default(),
+        }
+    }
+
+    fn make_entry(deps: Vec<PlanDependency>) -> PlanCacheEntry {
+        PlanCacheEntry {
+            physical_plan: make_physical_plan(),
+            dependencies: deps,
+        }
+    }
+
+    #[test]
+    fn decide_cache_action_ineligible_skips_tracking() {
+        let mut cache = PreparedPlanCache::new(8, 2);
+        let key = make_key("SELECT 1", &[]);
+        let (cached, should_promote) =
+            decide_and_update_prepared_cache_action(&mut cache, &key, false);
+        assert!(cached.is_none());
+        assert!(!should_promote);
+        assert_eq!(cache.counter_len(), 0);
+    }
+
+    #[test]
+    fn decide_cache_action_first_miss_promotes_when_min_exec_zero() {
+        let mut cache = PreparedPlanCache::new(8, 0);
+        let key = make_key("SELECT 1", &[]);
+
+        let (cached, should_promote) =
+            decide_and_update_prepared_cache_action(&mut cache, &key, true);
+
+        assert!(cached.is_none());
+        assert!(should_promote);
+        assert_eq!(cache.counter_count_for(&key), Some(1));
+    }
+
+    #[test]
+    fn decide_cache_action_not_tracked_never_promotes_even_with_min_exec_zero() {
+        let mut cache = PreparedPlanCache::new(0, 0);
+        let key = make_key("SELECT 1", &[]);
+
+        let (cached, should_promote) =
+            decide_and_update_prepared_cache_action(&mut cache, &key, true);
+
+        assert!(cached.is_none());
+        assert!(!should_promote);
+        assert_eq!(cache.counter_len(), 0);
+    }
+
+    #[test]
+    fn decide_cache_action_cached_hit_returns_owned_entry_without_counter_churn() {
+        let mut cache = PreparedPlanCache::new(8, 3);
+        let key = make_key("SELECT 1", &[10]);
+        cache.insert(
+            key.clone(),
+            make_entry(vec![PlanDependency {
+                table_name: "public.t".to_string(),
+                table_id: 10,
+                schema_version: 1,
+            }]),
+        );
+
+        let (cached, should_promote) =
+            decide_and_update_prepared_cache_action(&mut cache, &key, true);
+
+        assert!(cached.is_some());
+        assert!(!should_promote);
+        assert_eq!(cache.counter_count_for(&key), None);
+        assert_eq!(cache.counter_len(), 0);
+    }
+
+    #[test]
+    fn post_attempt_stale_hit_invalidates_and_reinserts_without_counter_churn() {
+        let mut cache = PreparedPlanCache::new(8, 2);
+        let key = make_key("SELECT * FROM t WHERE id = $1", &[42]);
+        cache.insert(
+            key.clone(),
+            make_entry(vec![PlanDependency {
+                table_name: "public.t".to_string(),
+                table_id: 42,
+                schema_version: 1,
+            }]),
+        );
+        assert_eq!(cache.counter_count_for(&key), None);
+
+        let table_versions = vec![("public.t".to_string(), 42, 2)];
+        let new_plan = make_physical_plan();
+        update_plan_cache_after_attempt(
+            &mut cache,
+            &key,
+            &table_versions,
+            false,
+            &PreparedTxnResult::Executed(ExecuteResult::Empty),
+            Some(&new_plan),
+            true,
+        );
+
+        let deps = cache
+            .get(&key)
+            .expect("entry should be reinserted after stale hit")
+            .dependencies
+            .clone();
+        assert_eq!(
+            deps.as_slice(),
+            &[PlanDependency {
+                table_name: "public.t".to_string(),
+                table_id: 42,
+                schema_version: 2,
+            }]
+        );
+        assert_eq!(cache.counter_count_for(&key), None);
+        assert_eq!(cache.counter_len(), 0);
     }
 }
 

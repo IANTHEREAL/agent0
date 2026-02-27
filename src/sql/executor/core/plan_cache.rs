@@ -5,7 +5,7 @@
 //! for runtime invalidation.
 
 use crate::sql::optimizer::physical_plan::PhysicalPlan;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Dependency metadata for a cached plan:
 /// `(table_name, table_id, schema_version)`.
@@ -82,6 +82,21 @@ struct PromotionState {
     exec_count: u64,
 }
 
+/// Result of recording a prepared execution for promotion tracking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromotionCounterOutcome {
+    /// Miss-path execution count for a key that is not yet cached.
+    MissCount(u64),
+    /// Execution was intentionally not tracked for promotion.
+    ///
+    /// This is returned when:
+    /// - cache capacity is zero, or
+    /// - key is already promoted in `entries`.
+    ///
+    /// Callers must never use this to drive promotion decisions.
+    NotTracked,
+}
+
 /// Session-local LRU-bounded plan cache for prepared statements.
 ///
 /// Plans are promoted into the cache after `min_exec` identical executions
@@ -97,8 +112,12 @@ pub(crate) struct PreparedPlanCache {
     entries: HashMap<PlanCacheKey, PlanCacheEntry>,
     /// Execution counters for promotion tracking.
     counters: HashMap<PlanCacheKey, PromotionState>,
-    /// LRU ordering: most-recently-used keys at the back.
+    /// Entry LRU ordering: most-recently-used keys at the back.
     lru_order: Vec<PlanCacheKey>,
+    /// Counter LRU ordering for miss-path promotion tracking.
+    ///
+    /// Keys in this list must be a duplicate-free mirror of `counters`.
+    counter_lru_order: Vec<PlanCacheKey>,
 }
 
 impl PreparedPlanCache {
@@ -110,6 +129,7 @@ impl PreparedPlanCache {
             entries: HashMap::new(),
             counters: HashMap::new(),
             lru_order: Vec::new(),
+            counter_lru_order: Vec::new(),
         }
     }
 
@@ -125,20 +145,36 @@ impl PreparedPlanCache {
         }
     }
 
-    /// Record an execution for the given key and return the current count.
+    /// Record an execution for a non-cached key and return a typed outcome.
     ///
-    /// The caller should check `count >= min_exec` to decide whether to
-    /// promote a plan into the cache.
-    pub fn record_execution(&mut self, key: &PlanCacheKey) -> u64 {
-        if self.capacity == 0 {
-            return 0;
+    /// Promotion decisions must be based only on `MissCount(n)`.
+    /// `NotTracked` is never promotable, even when `min_exec = 0`.
+    pub fn record_execution(&mut self, key: &PlanCacheKey) -> PromotionCounterOutcome {
+        if self.capacity == 0 || self.entries.contains_key(key) {
+            return PromotionCounterOutcome::NotTracked;
         }
-        let state = self
-            .counters
-            .entry(key.clone())
-            .or_insert(PromotionState { exec_count: 0 });
-        state.exec_count = state.exec_count.saturating_add(1);
-        state.exec_count
+
+        if let Some(state) = self.counters.get_mut(key) {
+            state.exec_count = state.exec_count.saturating_add(1);
+            let count = state.exec_count;
+            self.touch_counter_lru(key);
+            return PromotionCounterOutcome::MissCount(count);
+        }
+
+        while self.counters.len() >= self.capacity {
+            if !self.evict_oldest_counter() {
+                if let Some(any_key) = self.counters.keys().next().cloned() {
+                    self.remove_counter(&any_key);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        self.counters
+            .insert(key.clone(), PromotionState { exec_count: 1 });
+        self.touch_counter_lru(key);
+        PromotionCounterOutcome::MissCount(1)
     }
 
     /// Returns the promotion threshold.
@@ -160,7 +196,7 @@ impl PreparedPlanCache {
         while self.entries.len() > self.capacity {
             if let Some(evict_key) = self.lru_order.first().cloned() {
                 self.entries.remove(&evict_key);
-                self.counters.remove(&evict_key);
+                self.remove_counter(&evict_key);
                 self.lru_order.remove(0);
             } else {
                 break;
@@ -169,6 +205,7 @@ impl PreparedPlanCache {
 
         // Keep LRU order consistent with current entries.
         self.lru_order.retain(|k| self.entries.contains_key(k));
+        self.trim_counters_to_capacity();
     }
 
     /// Insert a plan into the cache, evicting LRU if at capacity.
@@ -181,6 +218,7 @@ impl PreparedPlanCache {
         if self.entries.contains_key(&key) {
             self.entries.insert(key.clone(), entry);
             self.touch_lru(&key);
+            self.remove_counter(&key);
             return;
         }
 
@@ -188,7 +226,7 @@ impl PreparedPlanCache {
         while self.entries.len() >= self.capacity {
             if let Some(evict_key) = self.lru_order.first().cloned() {
                 self.entries.remove(&evict_key);
-                self.counters.remove(&evict_key);
+                self.remove_counter(&evict_key);
                 self.lru_order.remove(0);
             } else {
                 break;
@@ -196,6 +234,7 @@ impl PreparedPlanCache {
         }
 
         self.entries.insert(key.clone(), entry);
+        self.remove_counter(&key);
         self.lru_order.push(key);
     }
 
@@ -203,7 +242,7 @@ impl PreparedPlanCache {
     #[allow(dead_code)]
     pub fn invalidate(&mut self, key: &PlanCacheKey) {
         self.entries.remove(key);
-        self.counters.remove(key);
+        self.remove_counter(key);
         self.lru_order.retain(|k| k != key);
     }
 
@@ -211,17 +250,27 @@ impl PreparedPlanCache {
     ///
     /// Called after DDL (CREATE INDEX, DROP INDEX, ALTER TABLE, etc.) to
     /// ensure stale plans are not reused.
+    ///
+    /// Also drops counter-only keys that reference `table_id` via
+    /// `PlanCacheKey.resolved_table_ids` so DDL resets miss-path promotion
+    /// history for the affected table.
     #[allow(dead_code)]
     pub fn invalidate_by_table_id(&mut self, table_id: u64) {
-        let keys_to_remove: Vec<PlanCacheKey> = self
+        let mut keys_to_remove: HashSet<PlanCacheKey> = self
             .entries
             .iter()
             .filter(|(_, entry)| entry.dependencies.iter().any(|d| d.table_id == table_id))
             .map(|(k, _)| k.clone())
             .collect();
+        for key in self.counters.keys() {
+            if key.resolved_table_ids.contains(&table_id) {
+                keys_to_remove.insert(key.clone());
+            }
+        }
+
         for key in &keys_to_remove {
             self.entries.remove(key);
-            self.counters.remove(key);
+            self.remove_counter(key);
         }
         self.lru_order.retain(|k| !keys_to_remove.contains(k));
     }
@@ -232,6 +281,7 @@ impl PreparedPlanCache {
         self.entries.clear();
         self.counters.clear();
         self.lru_order.clear();
+        self.counter_lru_order.clear();
     }
 
     /// Number of cached entries.
@@ -246,10 +296,112 @@ impl PreparedPlanCache {
         self.capacity
     }
 
+    /// Number of promotion counters currently tracked.
+    #[cfg(test)]
+    pub fn counter_len(&self) -> usize {
+        self.counters.len()
+    }
+
+    /// Number of keys in counter LRU order.
+    #[cfg(test)]
+    pub fn counter_order_len(&self) -> usize {
+        self.counter_lru_order.len()
+    }
+
+    /// Current counter for a key if tracked.
+    #[cfg(test)]
+    pub fn counter_count_for(&self, key: &PlanCacheKey) -> Option<u64> {
+        self.counters.get(key).map(|state| state.exec_count)
+    }
+
+    /// Assert duplicate-free and aligned counter map/order internals.
+    #[cfg(test)]
+    pub fn assert_counter_internal_consistency(&self) {
+        let mut seen = HashSet::new();
+        for key in &self.counter_lru_order {
+            assert!(seen.insert(key), "counter_lru_order contains duplicate key");
+            assert!(
+                self.counters.contains_key(key),
+                "counter_lru_order contains orphan key"
+            );
+            assert!(
+                !self.entries.contains_key(key),
+                "counter map should not track promoted keys"
+            );
+        }
+        assert_eq!(
+            self.counters.len(),
+            self.counter_lru_order.len(),
+            "counter map/order size mismatch"
+        );
+        assert!(
+            self.counters.len() <= self.capacity,
+            "counter map exceeds capacity"
+        );
+    }
+
     /// Move a key to the back of the LRU list.
     fn touch_lru(&mut self, key: &PlanCacheKey) {
         self.lru_order.retain(|k| k != key);
         self.lru_order.push(key.clone());
+    }
+
+    /// Move a counter key to MRU position.
+    fn touch_counter_lru(&mut self, key: &PlanCacheKey) {
+        self.counter_lru_order.retain(|k| k != key);
+        self.counter_lru_order.push(key.clone());
+    }
+
+    /// Remove counter state and LRU membership for a key.
+    fn remove_counter(&mut self, key: &PlanCacheKey) {
+        self.counters.remove(key);
+        self.counter_lru_order.retain(|k| k != key);
+    }
+
+    /// Evict one oldest counter entry by counter LRU order.
+    fn evict_oldest_counter(&mut self) -> bool {
+        if let Some(evict_key) = self.counter_lru_order.first().cloned() {
+            self.remove_counter(&evict_key);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Trim counters to configured capacity and restore order consistency.
+    fn trim_counters_to_capacity(&mut self) {
+        if self.capacity == 0 {
+            self.counters.clear();
+            self.counter_lru_order.clear();
+            return;
+        }
+
+        self.counters
+            .retain(|key, _| !self.entries.contains_key(key));
+        self.counter_lru_order
+            .retain(|key| self.counters.contains_key(key) && !self.entries.contains_key(key));
+
+        let mut seen = HashSet::new();
+        let mut deduped_rev = Vec::with_capacity(self.counter_lru_order.len());
+        for key in self.counter_lru_order.iter().rev() {
+            if seen.insert(key.clone()) {
+                deduped_rev.push(key.clone());
+            }
+        }
+        deduped_rev.reverse();
+        self.counter_lru_order = deduped_rev;
+
+        while self.counters.len() > self.capacity {
+            if !self.evict_oldest_counter() {
+                if let Some(any_key) = self.counters.keys().next().cloned() {
+                    self.counters.remove(&any_key);
+                } else {
+                    break;
+                }
+            }
+        }
+        self.counter_lru_order
+            .retain(|k| self.counters.contains_key(k));
     }
 }
 
@@ -290,16 +442,22 @@ mod tests {
         let key = make_key("SELECT 1");
 
         for i in 1..=4 {
-            let count = cache.record_execution(&key);
-            assert_eq!(count, i);
+            let outcome = cache.record_execution(&key);
+            assert_eq!(outcome, PromotionCounterOutcome::MissCount(i));
         }
         assert!(cache.get(&key).is_none());
 
-        let count = cache.record_execution(&key);
-        assert_eq!(count, 5);
+        let outcome = cache.record_execution(&key);
+        assert_eq!(outcome, PromotionCounterOutcome::MissCount(5));
         // After threshold, caller would insert:
         cache.insert(key.clone(), make_entry(vec![]));
         assert!(cache.get(&key).is_some());
+        assert_eq!(
+            cache.record_execution(&key),
+            PromotionCounterOutcome::NotTracked
+        );
+        assert_eq!(cache.counter_count_for(&key), None);
+        cache.assert_counter_internal_consistency();
     }
 
     #[test]
@@ -349,20 +507,42 @@ mod tests {
         let k2 = make_key("SELECT 2");
         cache.insert(k1.clone(), make_entry(vec![]));
         cache.insert(k2.clone(), make_entry(vec![]));
-        cache.record_execution(&k1);
+        assert_eq!(
+            cache.record_execution(&k1),
+            PromotionCounterOutcome::NotTracked
+        );
 
         cache.clear();
         assert_eq!(cache.len(), 0);
+        assert_eq!(cache.counter_len(), 0);
+        assert_eq!(cache.counter_order_len(), 0);
         assert!(cache.get(&k1).is_none());
+        cache.assert_counter_internal_consistency();
     }
 
     #[test]
     fn zero_capacity_cache_never_stores() {
         let mut cache = PreparedPlanCache::new(0, 1);
         let key = make_key("SELECT 1");
-        assert_eq!(cache.record_execution(&key), 0);
+        assert_eq!(
+            cache.record_execution(&key),
+            PromotionCounterOutcome::NotTracked
+        );
         cache.insert(key.clone(), make_entry(vec![]));
         assert_eq!(cache.len(), 0);
+        assert_eq!(cache.counter_len(), 0);
+        assert_eq!(cache.counter_order_len(), 0);
+    }
+
+    #[test]
+    fn min_exec_zero_first_miss_has_count_one() {
+        let mut cache = PreparedPlanCache::new(8, 0);
+        let key = make_key("SELECT 1");
+        assert_eq!(
+            cache.record_execution(&key),
+            PromotionCounterOutcome::MissCount(1)
+        );
+        cache.assert_counter_internal_consistency();
     }
 
     #[test]
@@ -391,6 +571,40 @@ mod tests {
         cache.invalidate_by_table_id(10);
         assert!(cache.get(&k1).is_none());
         assert!(cache.get(&k2).is_some());
+        cache.assert_counter_internal_consistency();
+    }
+
+    #[test]
+    fn invalidate_by_table_id_removes_counter_only_keys() {
+        let mut cache = PreparedPlanCache::new(10, 3);
+        let k1 = PlanCacheKey::new(
+            "SELECT * FROM t1 WHERE id = $1".to_string(),
+            &[],
+            1,
+            &["public".to_string()],
+            &[10],
+        );
+        let k2 = PlanCacheKey::new(
+            "SELECT * FROM t2 WHERE id = $1".to_string(),
+            &[],
+            1,
+            &["public".to_string()],
+            &[20],
+        );
+        assert_eq!(
+            cache.record_execution(&k1),
+            PromotionCounterOutcome::MissCount(1)
+        );
+        assert_eq!(
+            cache.record_execution(&k2),
+            PromotionCounterOutcome::MissCount(1)
+        );
+        assert_eq!(cache.counter_len(), 2);
+
+        cache.invalidate_by_table_id(10);
+        assert_eq!(cache.counter_count_for(&k1), None);
+        assert_eq!(cache.counter_count_for(&k2), Some(1));
+        cache.assert_counter_internal_consistency();
     }
 
     #[test]
@@ -410,18 +624,86 @@ mod tests {
         assert!(cache.get(&k1).is_none());
         assert!(cache.get(&k2).is_some());
         assert!(cache.get(&k3).is_some());
+        cache.assert_counter_internal_consistency();
     }
 
     #[test]
     fn reconfigure_zero_capacity_clears_all_state() {
         let mut cache = PreparedPlanCache::new(2, 1);
         let k1 = make_key("SELECT 1");
+        let k2 = PlanCacheKey::new(
+            "SELECT * FROM t WHERE id = $1".to_string(),
+            &[],
+            1,
+            &["public".to_string()],
+            &[42],
+        );
         cache.insert(k1.clone(), make_entry(vec![]));
-        assert_eq!(cache.record_execution(&k1), 1);
+        assert_eq!(
+            cache.record_execution(&k2),
+            PromotionCounterOutcome::MissCount(1)
+        );
+        assert_eq!(cache.counter_len(), 1);
 
         cache.reconfigure(0, 3);
         assert_eq!(cache.len(), 0);
-        assert_eq!(cache.record_execution(&k1), 0);
+        assert_eq!(cache.counter_len(), 0);
+        assert_eq!(cache.counter_order_len(), 0);
+        assert_eq!(
+            cache.record_execution(&k1),
+            PromotionCounterOutcome::NotTracked
+        );
+        cache.assert_counter_internal_consistency();
+    }
+
+    #[test]
+    fn counters_are_bounded_by_capacity_and_evict_lru() {
+        let mut cache = PreparedPlanCache::new(2, 5);
+        let k1 = make_key("SELECT 1");
+        let k2 = make_key("SELECT 2");
+        let k3 = make_key("SELECT 3");
+
+        assert_eq!(
+            cache.record_execution(&k1),
+            PromotionCounterOutcome::MissCount(1)
+        );
+        assert_eq!(
+            cache.record_execution(&k2),
+            PromotionCounterOutcome::MissCount(1)
+        );
+        // Touch k1 so k2 is the oldest tracked counter.
+        assert_eq!(
+            cache.record_execution(&k1),
+            PromotionCounterOutcome::MissCount(2)
+        );
+        assert_eq!(
+            cache.record_execution(&k3),
+            PromotionCounterOutcome::MissCount(1)
+        );
+
+        assert_eq!(cache.counter_len(), 2);
+        assert_eq!(cache.counter_count_for(&k1), Some(2));
+        assert_eq!(cache.counter_count_for(&k2), None);
+        assert_eq!(cache.counter_count_for(&k3), Some(1));
+        cache.assert_counter_internal_consistency();
+    }
+
+    #[test]
+    fn insert_existing_key_clears_counter_and_keeps_consistency() {
+        let mut cache = PreparedPlanCache::new(4, 2);
+        let key = make_key("SELECT 1");
+        assert_eq!(
+            cache.record_execution(&key),
+            PromotionCounterOutcome::MissCount(1)
+        );
+        assert_eq!(cache.counter_count_for(&key), Some(1));
+
+        cache.insert(key.clone(), make_entry(vec![]));
+        assert_eq!(cache.counter_count_for(&key), None);
+
+        cache.insert(key.clone(), make_entry(vec![]));
+        assert_eq!(cache.counter_count_for(&key), None);
+        cache.assert_counter_internal_consistency();
     }
 
     #[test]
