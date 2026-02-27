@@ -32,23 +32,34 @@ pub(crate) async fn handle_auth(
     let store = tenant_handle.store().clone();
     let auth_manager = AuthManager::new();
 
-    {
+    if !auth_manager.is_initialized(&store).await.unwrap_or(false) {
         let mut bootstrap_txn = store.begin().await.map_err(|err| {
             WsResponse::error(id, WsErrorCode::Eio, format!("txn begin failed: {err}"))
         })?;
-        auth_manager
-            .bootstrap(&mut bootstrap_txn)
-            .await
-            .map_err(|err| {
-                WsResponse::error(
-                    id,
-                    WsErrorCode::Eio,
-                    format!("auth bootstrap failed: {err}"),
-                )
-            })?;
-        bootstrap_txn.commit().await.map_err(|err| {
-            WsResponse::error(id, WsErrorCode::Eio, format!("txn commit failed: {err}"))
-        })?;
+        match auth_manager.bootstrap(&mut bootstrap_txn).await {
+            Ok(()) => {
+                if let Err(err) = bootstrap_txn.commit().await {
+                    let _ = bootstrap_txn.rollback().await;
+                    if !auth_manager.is_initialized(&store).await.unwrap_or(false) {
+                        return Err(WsResponse::error(
+                            id,
+                            WsErrorCode::Eio,
+                            format!("txn commit failed: {err}"),
+                        ));
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = bootstrap_txn.rollback().await;
+                if !auth_manager.is_initialized(&store).await.unwrap_or(false) {
+                    return Err(WsResponse::error(
+                        id,
+                        WsErrorCode::Eio,
+                        format!("auth bootstrap failed: {err}"),
+                    ));
+                }
+            }
+        }
     }
 
     let mut auth_txn = store.begin().await.map_err(|err| {

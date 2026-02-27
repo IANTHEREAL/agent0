@@ -201,7 +201,7 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     info!("TiKV connection verified");
 
     // Fail-fast auth bootstrap for the startup keyspace (secure-by-default posture).
-    // Per-connection bootstrap still runs in pgwire auth path (idempotent).
+    // Per-connection auth path skips bootstrap when already initialized (#1171).
     {
         let auth_manager = auth::AuthManager::new();
         let mut txn = store.begin().await?;

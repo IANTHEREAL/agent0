@@ -283,6 +283,17 @@ impl AuthManager {
         key
     }
 
+    /// Read-only probe: returns `true` if at least one superuser exists.
+    /// Uses an optimistic transaction (no pessimistic locks).
+    pub async fn is_initialized(&self, store: &crate::storage::TikvStore) -> Result<bool> {
+        let mut txn = store.begin_optimistic().await?;
+        let initialized = self.has_any_superuser(&mut txn).await;
+        if let Err(err) = txn.rollback().await {
+            return Err(err.into());
+        }
+        initialized
+    }
+
     pub async fn bootstrap(&self, txn: &mut Transaction) -> Result<()> {
         if self.has_any_superuser(txn).await? {
             return Ok(());

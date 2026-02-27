@@ -240,14 +240,27 @@ impl DynamicPgHandler {
 
         let auth_manager = AuthManager::new();
 
-        // Try bootstrap. Any failure must deny authentication.
-        {
+        // Skip bootstrap write transaction if auth is already initialized.
+        if !auth_manager.is_initialized(&store).await.unwrap_or(false) {
             let mut txn = store.begin().await.context("Failed to bootstrap auth")?;
-            auth_manager
-                .bootstrap(&mut txn)
-                .await
-                .context("Failed to bootstrap auth")?;
-            txn.commit().await.context("Failed to bootstrap auth")?;
+            match auth_manager.bootstrap(&mut txn).await {
+                Ok(()) => {
+                    if let Err(commit_err) = txn.commit().await {
+                        let _ = txn.rollback().await;
+                        if !auth_manager.is_initialized(&store).await.unwrap_or(false) {
+                            return Err(commit_err).context("Failed to bootstrap auth");
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Race: another connection may have bootstrapped concurrently.
+                    // Re-check and proceed if now initialized; otherwise propagate.
+                    txn.rollback().await.ok();
+                    if !auth_manager.is_initialized(&store).await.unwrap_or(false) {
+                        return Err(e.context("Failed to bootstrap auth"));
+                    }
+                }
+            }
         }
 
         let mut txn = store.begin().await.context("Failed to begin transaction")?;
