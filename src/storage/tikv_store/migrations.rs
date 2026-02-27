@@ -642,8 +642,7 @@ mod tests {
     #[test]
     fn derive_bindings_allows_constant_query_with_empty_deps() {
         let bindings =
-            derive_relation_bindings_from_legacy_deps("view", "public.v", "SELECT 1", &[])
-                .unwrap();
+            derive_relation_bindings_from_legacy_deps("view", "public.v", "SELECT 1", &[]).unwrap();
         assert!(bindings.is_empty());
     }
 

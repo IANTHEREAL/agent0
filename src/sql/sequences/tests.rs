@@ -59,10 +59,10 @@ mod owned_sequence_lookup_tests {
 
     #[test]
     fn implicit_sequence_helpers_and_name_normalization() {
+        use crate::model::DataType;
         use crate::sql::sequences::{
             build_implicit_sequence_def, implicit_sequence_name, normalize_sequence_name,
         };
-        use crate::model::DataType;
         use sqlparser::ast::{Ident, ObjectName};
 
         assert_eq!(implicit_sequence_name("t", "id"), "t_id_seq");

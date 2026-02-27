@@ -578,7 +578,9 @@ mod tests {
         let ast = Parser::parse_sql(&dialect, sql).unwrap();
         match ast.into_iter().next().unwrap() {
             sqlparser::ast::Statement::Grant {
-                privileges, objects, ..
+                privileges,
+                objects,
+                ..
             } => (privileges, objects),
             other => panic!("expected GRANT, got {other:?}"),
         }

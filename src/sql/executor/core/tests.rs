@@ -419,8 +419,14 @@ fn test_executor_getters_and_trigger_buffers() {
 
     assert_eq!(executor.tenant_keyspace(), keyspace);
     assert!(std::sync::Arc::ptr_eq(&executor.store(), &store));
-    assert!(std::sync::Arc::ptr_eq(executor.observability(), &observability));
-    assert!(std::sync::Arc::ptr_eq(executor.trigger_cache(), &trigger_cache));
+    assert!(std::sync::Arc::ptr_eq(
+        executor.observability(),
+        &observability
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        executor.trigger_cache(),
+        &trigger_cache
+    ));
     assert!(std::sync::Arc::ptr_eq(executor.stats_cache(), &stats_cache));
     let _ = executor.auth_manager();
     let _ = executor.tenant_memory_accountant();
@@ -464,10 +470,16 @@ fn test_flush_trigger_activations_clears_buffers_even_without_system_store() {
         command: "SELECT 1".to_string(),
     });
     assert_eq!(executor.pending_async_triggers.lock().unwrap().len(), 1);
-    assert_eq!(executor.pending_trigger_activations.lock().unwrap().len(), 1);
+    assert_eq!(
+        executor.pending_trigger_activations.lock().unwrap().len(),
+        1
+    );
 
     executor.flush_trigger_activations();
 
     assert_eq!(executor.pending_async_triggers.lock().unwrap().len(), 0);
-    assert_eq!(executor.pending_trigger_activations.lock().unwrap().len(), 0);
+    assert_eq!(
+        executor.pending_trigger_activations.lock().unwrap().len(),
+        0
+    );
 }

@@ -943,7 +943,9 @@ fn test_window_nth_value_basic_and_errors() {
             window_frame: Some(WindowFrame {
                 units: crate::sql::analyzer::types::WindowFrameUnits::Rows,
                 start: crate::sql::analyzer::types::WindowFrameBound::Preceding(None),
-                end: Some(crate::sql::analyzer::types::WindowFrameBound::Following(None)),
+                end: Some(crate::sql::analyzer::types::WindowFrameBound::Following(
+                    None,
+                )),
             }),
             filter_expr: None,
             output_name: "nth2".to_string(),
@@ -1175,12 +1177,10 @@ fn test_window_peer_group_helpers() {
     assert_eq!(WindowOperator::peer_group_of(&groups, 1), 0);
     assert_eq!(WindowOperator::peer_group_of(&groups, 2), 1);
 
-    assert!(super::order_by_values_are_peers(
-        &[Value::Int32(1)],
-        &[Value::Int32(1)],
-        &wf.order_by
-    )
-    .unwrap());
+    assert!(
+        super::order_by_values_are_peers(&[Value::Int32(1)], &[Value::Int32(1)], &wf.order_by)
+            .unwrap()
+    );
     assert!(!super::order_by_values_are_peers(
         &[Value::Int32(1)],
         &[Value::Int32(2)],
@@ -1215,12 +1215,12 @@ fn test_window_frame_bounds_rows_groups_and_errors() {
                     data_type: DataType::Int32,
                 },
             ))),
-            end: Some(crate::sql::analyzer::types::WindowFrameBound::Following(Some(
-                Box::new(TypedExpr {
+            end: Some(crate::sql::analyzer::types::WindowFrameBound::Following(
+                Some(Box::new(TypedExpr {
                     kind: TypedExprKind::Constant(Value::Int32(1)),
                     data_type: DataType::Int32,
-                }),
-            ))),
+                })),
+            )),
         }),
         filter_expr: None,
         output_name: "x".to_string(),

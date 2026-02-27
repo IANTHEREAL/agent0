@@ -381,8 +381,7 @@ mod tests {
             Value::Boolean(true)
         );
         assert!(
-            cast_current_setting_value(Value::Text("abc".to_string()), &DataType::Boolean)
-                .is_err()
+            cast_current_setting_value(Value::Text("abc".to_string()), &DataType::Boolean).is_err()
         );
     }
 

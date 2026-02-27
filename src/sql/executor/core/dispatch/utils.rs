@@ -258,7 +258,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            session.show_setting_value("transaction_isolation").as_deref(),
+            session
+                .show_setting_value("transaction_isolation")
+                .as_deref(),
             Some("repeatable read")
         );
         assert_eq!(
@@ -280,7 +282,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            session.show_setting_value("transaction_isolation").as_deref(),
+            session
+                .show_setting_value("transaction_isolation")
+                .as_deref(),
             Some("repeatable read")
         );
     }

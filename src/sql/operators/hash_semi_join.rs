@@ -267,12 +267,17 @@ mod tests {
     fn constructor_uses_left_schema_as_output_schema() {
         let left_schema = make_schema(
             "left",
-            &[("id", DataType::Int64, false), ("name", DataType::Text, true)],
+            &[
+                ("id", DataType::Int64, false),
+                ("name", DataType::Text, true),
+            ],
         );
         let right_schema = make_schema("right", &[("id", DataType::Int64, false)]);
 
         let op = HashSemiJoinOperator::new(
-            Box::new(TestOp { schema: left_schema }),
+            Box::new(TestOp {
+                schema: left_schema,
+            }),
             Box::new(TestOp {
                 schema: right_schema,
             }),
@@ -307,7 +312,9 @@ mod tests {
         assert_eq!(semi.explain_info().as_deref(), Some("anti=false"));
 
         let anti = HashSemiJoinOperator::new(
-            Box::new(TestOp { schema: left_schema }),
+            Box::new(TestOp {
+                schema: left_schema,
+            }),
             Box::new(TestOp {
                 schema: right_schema,
             }),
@@ -325,7 +332,9 @@ mod tests {
         let right_schema = make_schema("right", &[("id", DataType::Int64, false)]);
 
         let mut op = HashSemiJoinOperator::new(
-            Box::new(TestOp { schema: left_schema }),
+            Box::new(TestOp {
+                schema: left_schema,
+            }),
             Box::new(TestOp {
                 schema: right_schema,
             }),

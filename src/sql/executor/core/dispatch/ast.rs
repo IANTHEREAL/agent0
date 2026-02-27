@@ -325,10 +325,7 @@ mod tests {
             .handle_parse_error(&mut session, &ctx, anyhow!("parse failure"))
             .unwrap_err()
             .to_string();
-        assert!(
-            err.to_lowercase().contains("supported")
-                || err.to_lowercase().contains("domain")
-        );
+        assert!(err.to_lowercase().contains("supported") || err.to_lowercase().contains("domain"));
         assert!(!session.is_transaction_failed());
     }
 

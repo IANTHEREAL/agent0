@@ -228,7 +228,6 @@ mod tests {
         stmts.remove(0)
     }
 
-
     #[test]
     fn classify_statement_routes_major_categories() {
         assert_eq!(
@@ -366,5 +365,4 @@ mod tests {
             StatementDispatchKind::Rbac
         );
     }
-
 }

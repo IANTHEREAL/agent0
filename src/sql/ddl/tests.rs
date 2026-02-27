@@ -360,8 +360,14 @@ fn check_constraint_effective_name_and_find_index_work_for_generated_names() {
         check_constraint_effective_name("t", 0, &schema.check_constraints[0]),
         "t_age_check"
     );
-    assert_eq!(find_check_constraint_index(&schema, "t", "t_age_check"), Some(0));
-    assert_eq!(find_check_constraint_index(&schema, "t", "explicit_ck"), Some(1));
+    assert_eq!(
+        find_check_constraint_index(&schema, "t", "t_age_check"),
+        Some(0)
+    );
+    assert_eq!(
+        find_check_constraint_index(&schema, "t", "explicit_ck"),
+        Some(1)
+    );
     assert_eq!(find_check_constraint_index(&schema, "t", "missing"), None);
 }
 
@@ -437,12 +443,10 @@ fn parse_referential_action_maps_all_variants() {
 #[test]
 fn was_cascade_dropped_resolves_qualified_and_search_path_names() {
     use sqlparser::ast::{Ident, ObjectName};
-    let dropped: std::collections::HashSet<String> = [
-        "public.v1".to_string(),
-        "app.v2".to_string(),
-    ]
-    .into_iter()
-    .collect();
+    let dropped: std::collections::HashSet<String> =
+        ["public.v1".to_string(), "app.v2".to_string()]
+            .into_iter()
+            .collect();
 
     assert!(was_cascade_dropped(
         &ObjectName(vec![Ident::new("public"), Ident::new("v1")]),

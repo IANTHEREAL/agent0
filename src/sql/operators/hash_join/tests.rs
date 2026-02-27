@@ -312,12 +312,7 @@ fn test_hash_join_output_schema_keeps_left_then_right_column_order() {
         HashJoinConfig::default(),
     );
 
-    let names: Vec<String> = op
-        .schema()
-        .columns
-        .iter()
-        .map(|c| c.name.clone())
-        .collect();
+    let names: Vec<String> = op.schema().columns.iter().map(|c| c.name.clone()).collect();
     assert_eq!(
         names,
         vec![
@@ -350,7 +345,12 @@ fn test_row_keys_equal_for_join_cross_indices_and_length_mismatch() {
     let build_row = Row::new(vec![Value::Int32(7), Value::Text("x".into())]);
     let probe_row = Row::new(vec![Value::Text("y".into()), Value::Int64(7)]);
     assert!(row_keys_equal_for_join(&build_row, &[0], &probe_row, &[1]));
-    assert!(!row_keys_equal_for_join(&build_row, &[0, 1], &probe_row, &[1]));
+    assert!(!row_keys_equal_for_join(
+        &build_row,
+        &[0, 1],
+        &probe_row,
+        &[1]
+    ));
 }
 
 #[test]
@@ -374,7 +374,9 @@ fn test_hash_table_tracks_null_key_rows_and_indices() {
         .all_rows_with_indices()
         .map(|(idx, r)| (idx, r.values[1].clone()))
         .collect();
-    assert!(all.iter().any(|(idx, v)| *idx == 2 && *v == Value::Text("null-key".into())));
+    assert!(all
+        .iter()
+        .any(|(idx, v)| *idx == 2 && *v == Value::Text("null-key".into())));
 }
 
 #[test]
@@ -414,8 +416,14 @@ fn test_hash_key_and_join_equality_for_misc_value_variants() {
     ];
 
     for v in values {
-        assert_eq!(hash_join_key(std::slice::from_ref(&v)), hash_join_key(&[v.clone()]));
-        assert!(join_keys_equal(std::slice::from_ref(&v), &[v.clone()]));
+        assert_eq!(
+            hash_join_key(std::slice::from_ref(&v)),
+            hash_join_key(std::slice::from_ref(&v))
+        );
+        assert!(join_keys_equal(
+            std::slice::from_ref(&v),
+            std::slice::from_ref(&v)
+        ));
     }
 }
 

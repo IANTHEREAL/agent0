@@ -537,9 +537,9 @@ mod tests {
 
     #[test]
     fn typed_value_to_bool_handles_bool_and_null() {
-        assert_eq!(typed_value_to_bool(Value::Boolean(true)).unwrap(), true);
-        assert_eq!(typed_value_to_bool(Value::Boolean(false)).unwrap(), false);
-        assert_eq!(typed_value_to_bool(Value::Null).unwrap(), false);
+        assert!(typed_value_to_bool(Value::Boolean(true)).unwrap());
+        assert!(!typed_value_to_bool(Value::Boolean(false)).unwrap());
+        assert!(!typed_value_to_bool(Value::Null).unwrap());
     }
 
     #[test]

@@ -931,7 +931,8 @@ mod tests {
         let err = infer_index_value_types_for_reconcile(&index, &schema, 1, "custom.t", &[])
             .expect_err("missing column should error");
         assert!(
-            err.to_string().contains("Index column 'missing_col' not found"),
+            err.to_string()
+                .contains("Index column 'missing_col' not found"),
             "unexpected err: {err}"
         );
     }

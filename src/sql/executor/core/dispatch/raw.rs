@@ -369,7 +369,10 @@ mod tests {
         with_server_config: bool,
     ) -> (Executor, Session) {
         let store = crate::storage::TikvStore::new_stub();
-        let keyspace = format!("raw_dispatch_tests_{}", if is_superuser { "su" } else { "nsu" });
+        let keyspace = format!(
+            "raw_dispatch_tests_{}",
+            if is_superuser { "su" } else { "nsu" }
+        );
         let observability = crate::observability::registry().tenant(&keyspace);
         let trigger_cache = std::sync::Arc::new(crate::sql::triggers::TriggerBodyCache::new());
         let stats_cache = std::sync::Arc::new(crate::sql::stats::TableStatsCache::new());
@@ -542,10 +545,8 @@ mod tests {
     fn passthrough_dispatch_routes_reset_and_alter_system_set() {
         let (executor, mut session) = make_executor_and_session(true, true);
 
-        let alter_ctx = DispatchContext::new(
-            "ALTER SYSTEM SET statement_timeout = '1200ms'",
-            &session,
-        );
+        let alter_ctx =
+            DispatchContext::new("ALTER SYSTEM SET statement_timeout = '1200ms'", &session);
         let alter = executor
             .try_dispatch_raw_passthrough(&mut session, &alter_ctx)
             .expect("should dispatch alter system")
@@ -560,10 +561,8 @@ mod tests {
         assert_command_tag(reset, "RESET");
 
         let other_ctx = DispatchContext::new("SELECT 1", &session);
-        assert!(
-            executor
-                .try_dispatch_raw_passthrough(&mut session, &other_ctx)
-                .is_none()
-        );
+        assert!(executor
+            .try_dispatch_raw_passthrough(&mut session, &other_ctx)
+            .is_none());
     }
 }

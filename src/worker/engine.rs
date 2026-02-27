@@ -31,6 +31,23 @@ pub struct WorkerEngine {
     notify: Arc<Notify>,
 }
 
+struct ActiveJobGuard {
+    active_jobs: Arc<AtomicU32>,
+}
+
+impl ActiveJobGuard {
+    fn new(active_jobs: Arc<AtomicU32>) -> Self {
+        active_jobs.fetch_add(1, Ordering::Relaxed);
+        Self { active_jobs }
+    }
+}
+
+impl Drop for ActiveJobGuard {
+    fn drop(&mut self) {
+        self.active_jobs.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl WorkerEngine {
     pub fn new(
         config: WorkerConfig,
@@ -100,10 +117,6 @@ impl WorkerEngine {
 
         let mut join_set = JoinSet::new();
         for (key, entry) in due_entries {
-            if self.active_jobs.load(Ordering::Relaxed) >= self.config.max_concurrent_jobs as u32 {
-                break;
-            }
-
             let permit = match self.semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => break,
@@ -117,7 +130,7 @@ impl WorkerEngine {
 
             join_set.spawn(async move {
                 let _permit = permit;
-                active_jobs.fetch_add(1, Ordering::Relaxed);
+                let _active_jobs_guard = ActiveJobGuard::new(active_jobs);
                 let result = Self::claim_and_execute(
                     &engine_system_store,
                     &engine_pool,
@@ -127,7 +140,6 @@ impl WorkerEngine {
                     entry,
                 )
                 .await;
-                active_jobs.fetch_sub(1, Ordering::Relaxed);
 
                 if let Err(ref e) = result {
                     warn!("Worker task execution error: {}", e);
@@ -1061,5 +1073,22 @@ mod tests {
         assert!(!should_start_cic_backfill(IndexState::Ready));
         assert!(!should_start_cic_backfill(IndexState::Invalid));
         assert!(!should_start_cic_backfill(IndexState::WriteOnly));
+    }
+
+    #[test]
+    fn active_job_guard_decrements_on_panic() {
+        let active_jobs = Arc::new(AtomicU32::new(0));
+
+        let panic_result = std::panic::catch_unwind({
+            let active_jobs = active_jobs.clone();
+            move || {
+                let _guard = ActiveJobGuard::new(active_jobs.clone());
+                assert_eq!(1, active_jobs.load(Ordering::Relaxed));
+                panic!("intentional panic");
+            }
+        });
+
+        assert!(panic_result.is_err());
+        assert_eq!(0, active_jobs.load(Ordering::Relaxed));
     }
 }

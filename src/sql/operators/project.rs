@@ -898,7 +898,10 @@ mod tests {
         assert!(matches!(detect_srf(&unnest), Some(SrfKind::Unnest)));
 
         let obj_keys = function_call("jsonb_object_keys", vec![], DataType::Text);
-        assert!(matches!(detect_srf(&obj_keys), Some(SrfKind::EvalFunctionArray)));
+        assert!(matches!(
+            detect_srf(&obj_keys),
+            Some(SrfKind::EvalFunctionArray)
+        ));
 
         let unknown = function_call("now", vec![], DataType::Timestamp);
         assert!(detect_srf(&unknown).is_none());
@@ -961,10 +964,9 @@ mod tests {
             &QueryContext::from_task_locals(),
         )
         .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("regexp_split_to_table requires at least 2 arguments")
-        );
+        assert!(err
+            .to_string()
+            .contains("regexp_split_to_table requires at least 2 arguments"));
 
         let ci = function_call(
             "REGEXP_SPLIT_TO_TABLE",
@@ -993,10 +995,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            vec![
-                Value::Text("A".to_string()),
-                Value::Text("C".to_string())
-            ]
+            vec![Value::Text("A".to_string()), Value::Text("C".to_string())]
         );
 
         let invalid = function_call(
@@ -1150,10 +1149,7 @@ mod tests {
             &QueryContext::from_task_locals(),
         )
         .unwrap();
-        assert_eq!(
-            out,
-            vec![Value::Int32(3), Value::Int32(2), Value::Int32(1)]
-        );
+        assert_eq!(out, vec![Value::Int32(3), Value::Int32(2), Value::Int32(1)]);
 
         let null_dim = function_call(
             "GENERATE_SUBSCRIPTS",

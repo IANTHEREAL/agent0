@@ -97,7 +97,10 @@ mod tests {
     #[test]
     fn fill_scanned_rows_populates_missing_defaults() {
         let schema = test_schema_with_default();
-        let rows = vec![Row::new(vec![Value::Int32(1)]), Row::new(vec![Value::Int32(2)])];
+        let rows = vec![
+            Row::new(vec![Value::Int32(1)]),
+            Row::new(vec![Value::Int32(2)]),
+        ];
 
         let out = fill_scanned_rows(rows, &schema).unwrap();
         assert_eq!(out.len(), 2);

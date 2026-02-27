@@ -906,11 +906,7 @@ mod tests {
 
         for (sql, expected) in cases {
             let expr = parse_projection_expr(sql);
-            assert_eq!(
-                expr_requires_view_expansion(&expr),
-                expected,
-                "sql={sql}"
-            );
+            assert_eq!(expr_requires_view_expansion(&expr), expected, "sql={sql}");
         }
     }
 
@@ -933,7 +929,8 @@ mod tests {
         );
         assert!(expr_requires_view_expansion(&expr));
 
-        let expr = parse_query_projection_expr("SELECT sum(x) OVER w FROM t WINDOW w AS (PARTITION BY x)");
+        let expr =
+            parse_query_projection_expr("SELECT sum(x) OVER w FROM t WINDOW w AS (PARTITION BY x)");
         assert!(!expr_requires_view_expansion(&expr));
     }
 

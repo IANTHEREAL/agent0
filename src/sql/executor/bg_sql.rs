@@ -164,7 +164,10 @@ mod tests {
 
     #[tokio::test]
     async fn execute_bg_launch_validates_arguments() {
-        let err = execute_bg_launch(1, "u", "ks", &[]).await.unwrap_err().to_string();
+        let err = execute_bg_launch(1, "u", "ks", &[])
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("requires exactly 1 argument"));
 
         let err = execute_bg_launch(1, "u", "ks", &[Value::Null])
@@ -182,7 +185,10 @@ mod tests {
 
     #[tokio::test]
     async fn execute_bg_result_validates_arguments() {
-        let err = execute_bg_result("ks", 1, &[]).await.unwrap_err().to_string();
+        let err = execute_bg_result("ks", 1, &[])
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("requires exactly 1 argument"));
 
         let err = execute_bg_result("ks", 1, &[Value::Null])

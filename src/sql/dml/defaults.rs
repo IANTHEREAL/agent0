@@ -303,7 +303,9 @@ mod tests {
     fn coerce_row_values_reports_not_null_violation_with_detail() {
         let schema = test_schema(false);
         let mut row_vals = vec![Value::Int32(1), Value::Null];
-        let err = coerce_row_values(&schema, &mut row_vals).unwrap_err().to_string();
+        let err = coerce_row_values(&schema, &mut row_vals)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("violates not-null constraint"));
         assert!(err.contains("Failing row contains (1, null)"));
     }

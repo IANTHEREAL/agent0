@@ -403,10 +403,18 @@ mod tests {
 
     #[test]
     fn plan_cache_invalidating_ddl_classifier_matches_contract() {
-        assert!(is_plan_cache_invalidating_ddl(&parse_stmt("CREATE TABLE t(id INT)")));
-        assert!(is_plan_cache_invalidating_ddl(&parse_stmt("CREATE INDEX i ON t(id)")));
-        assert!(is_plan_cache_invalidating_ddl(&parse_stmt("ALTER TABLE t ADD COLUMN c INT")));
-        assert!(is_plan_cache_invalidating_ddl(&parse_stmt("TRUNCATE TABLE t")));
+        assert!(is_plan_cache_invalidating_ddl(&parse_stmt(
+            "CREATE TABLE t(id INT)"
+        )));
+        assert!(is_plan_cache_invalidating_ddl(&parse_stmt(
+            "CREATE INDEX i ON t(id)"
+        )));
+        assert!(is_plan_cache_invalidating_ddl(&parse_stmt(
+            "ALTER TABLE t ADD COLUMN c INT"
+        )));
+        assert!(is_plan_cache_invalidating_ddl(&parse_stmt(
+            "TRUNCATE TABLE t"
+        )));
         assert!(is_plan_cache_invalidating_ddl(&parse_stmt("DROP TABLE t")));
         assert!(!is_plan_cache_invalidating_ddl(&parse_stmt("SELECT 1")));
     }

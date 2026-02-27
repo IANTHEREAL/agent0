@@ -1151,11 +1151,7 @@ mod prepared_policy_tests {
         let exec = test_executor();
         let mut session = test_session(OBSERVABILITY_USER, false);
         let mode = exec
-            .enforce_observability_prepared_policy(
-                &mut session,
-                "SELECT 1",
-                &analyzed_query_exec(),
-            )
+            .enforce_observability_prepared_policy(&mut session, "SELECT 1", &analyzed_query_exec())
             .unwrap();
         assert_eq!(mode, PreparedObservabilityMode::Observability);
     }
@@ -1244,11 +1240,7 @@ mod prepared_policy_tests {
         let exec = test_executor();
         let mut session = test_session(OBSERVABILITY_USER, false);
         let err = exec
-            .enforce_observability_prepared_policy(
-                &mut session,
-                "SELECT (",
-                &analyzed_query_exec(),
-            )
+            .enforce_observability_prepared_policy(&mut session, "SELECT (", &analyzed_query_exec())
             .unwrap_err()
             .to_string();
         assert!(!err.is_empty());
@@ -1345,7 +1337,11 @@ mod prepared_policy_tests {
         let mut session = test_session("tester", true);
 
         let missing_err = exec
-            .execute_sql_execute_statement(&mut session, &sqlparser::ast::Ident::new("missing"), &[])
+            .execute_sql_execute_statement(
+                &mut session,
+                &sqlparser::ast::Ident::new("missing"),
+                &[],
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -1366,8 +1362,7 @@ mod prepared_policy_tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.to_lowercase().contains("prepared")
-                || err.to_lowercase().contains("parameter")
+            err.to_lowercase().contains("prepared") || err.to_lowercase().contains("parameter")
         );
     }
 

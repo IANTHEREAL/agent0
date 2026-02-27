@@ -190,7 +190,10 @@ mod tests {
             panic!("expected select");
         };
         assert_eq!(columns, vec!["name", "setting", "description"]);
-        assert_eq!(column_types, Some(vec![DataType::Text, DataType::Text, DataType::Text]));
+        assert_eq!(
+            column_types,
+            Some(vec![DataType::Text, DataType::Text, DataType::Text])
+        );
         assert!(!rows.is_empty());
     }
 

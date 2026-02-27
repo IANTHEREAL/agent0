@@ -343,12 +343,10 @@ fn query_contains_recursive_cte(query: &Query) -> bool {
 mod tests {
     use super::{query_contains_recursive_cte, returning_schema};
     use crate::model::{DataType, Value};
-    use crate::sql::{
-        analyzer::types::AnalyzedProjection,
-        analyzer::TypedExpr,
-        analyzer::TypedExprKind,
-    };
     use crate::sql::parse_sql;
+    use crate::sql::{
+        analyzer::types::AnalyzedProjection, analyzer::TypedExpr, analyzer::TypedExprKind,
+    };
     use sqlparser::ast::Statement;
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
