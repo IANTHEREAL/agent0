@@ -5,9 +5,7 @@ use super::super::prepared_analysis::PreparedAnalysis;
 use super::super::prepared_stmt::PreparedExec;
 use super::super::prepared_stmt::PreparedStatement;
 use super::super::*;
-use super::utils::{
-    apply_statement_timeout, autocommit_backoff, wrap_with_runtime_context, RuntimeSettings,
-};
+use super::utils::{apply_statement_timeout, wrap_with_runtime_context, RuntimeSettings};
 use crate::sql::expr::bridge::eval_const_ast_expr;
 use crate::sql::types::sql_datatype_to_internal_strict;
 use std::future::Future;

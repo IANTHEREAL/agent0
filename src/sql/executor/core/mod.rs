@@ -36,7 +36,7 @@ use misc::{get_skip_reason, get_unsupported_reason, split_sql_statements};
 use observability::{
     is_observability_system_query, is_observability_tableless_query, OBSERVABILITY_USER,
 };
-use retry::is_retryable_tikv_error;
+use retry::{autocommit_backoff, is_retryable_tikv_error};
 #[cfg(test)]
 use settings_tableless::{
     cast_current_setting_value, is_current_setting_function, is_set_config_function,

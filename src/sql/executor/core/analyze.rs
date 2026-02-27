@@ -1,11 +1,14 @@
 //! ANALYZE command — collects per-column statistics for the query planner.
 //!
-//! ## Single-transaction caveat
+//! ## Transaction contract
 //!
-//! Bare `ANALYZE` (all tables) runs within a single transaction.  On very large
-//! databases this may cause transaction size pressure or commit conflicts.  A
-//! future optimization can split bare ANALYZE into per-table autocommit batches
-//! (only safe outside an explicit transaction block).
+//! - `ANALYZE <table>` uses the caller transaction (or a single implicit
+//!   autocommit transaction).
+//! - Bare `ANALYZE` inside an explicit transaction block remains a single
+//!   transaction operation.
+//! - Bare `ANALYZE` in autocommit mode discovers the table set first, then
+//!   analyzes each table in its own autocommit transaction (with retry on
+//!   retryable TiKV conflicts). This is intentionally non-atomic across tables.
 
 use super::*;
 use crate::auth::Privilege;
@@ -340,98 +343,317 @@ async fn analyze_table(
 
 /// Schemas to skip during bare ANALYZE (system catalogs).
 const SKIP_SCHEMAS: &[&str] = &["information_schema", "pg_catalog", "extensions"];
+const ANALYZE_AUTOCOMMIT_MAX_ATTEMPTS: usize = 10;
+
+enum AnalyzeAutocommitTableOutcome {
+    Skip,
+    Applied {
+        table_id: u64,
+        stats: TableStatistics,
+    },
+}
+
+enum AnalyzeAttemptFailureDisposition {
+    Retry,
+    ReturnErr(anyhow::Error),
+}
+
+fn is_permission_denied(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<SqlError>()
+        .is_some_and(|e| matches!(e, SqlError::PermissionDenied { .. }))
+}
+
+fn should_skip_schema(full_name: &str) -> bool {
+    let schema_name = full_name.split('.').next().unwrap_or("");
+    SKIP_SCHEMAS.contains(&schema_name)
+}
+
+fn should_retry_analyze_autocommit_attempt(attempt: usize, retryable: bool) -> bool {
+    attempt + 1 < ANALYZE_AUTOCOMMIT_MAX_ATTEMPTS && retryable
+}
+
+fn decide_analyze_attempt_failure(
+    attempt: usize,
+    err: anyhow::Error,
+    rollback_result: Result<()>,
+    retryable: bool,
+) -> AnalyzeAttemptFailureDisposition {
+    if let Err(rollback_err) = rollback_result {
+        return AnalyzeAttemptFailureDisposition::ReturnErr(anyhow!(
+            "{}; rollback failed: {}",
+            err,
+            rollback_err
+        ));
+    }
+    if should_retry_analyze_autocommit_attempt(attempt, retryable) {
+        AnalyzeAttemptFailureDisposition::Retry
+    } else {
+        AnalyzeAttemptFailureDisposition::ReturnErr(err)
+    }
+}
 
 impl Executor {
+    async fn analyze_single_table_in_current_txn(
+        &self,
+        session: &mut Session,
+        db_id: u64,
+        current_role: Option<&str>,
+        obj_name: &sqlparser::ast::ObjectName,
+    ) -> Result<()> {
+        let (txn, _sequence_values, search_path) = session
+            .get_mut_txn_sequence_values_and_search_path()
+            .expect("Transaction must be active");
+
+        let resolved = names::resolve_existing_table_name(
+            self.store.as_ref(),
+            txn,
+            db_id,
+            obj_name,
+            search_path,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("relation \"{}\" does not exist", obj_name))?;
+
+        self.require_table_privilege(txn, current_role, Privilege::Select, &resolved.full)
+            .await?;
+
+        let schema = self
+            .store
+            .get_schema(txn, db_id, &resolved.full)
+            .await?
+            .ok_or_else(|| anyhow!("relation \"{}\" does not exist", resolved.full))?;
+
+        let stats = analyze_table(&self.store, txn, db_id, &schema).await?;
+        self.store.store_statistics(txn, db_id, &stats).await?;
+        self.stats_cache()
+            .update_full_stats(db_id, schema.table_id, Arc::new(stats));
+        self.stats_cache().reset_mod_count(db_id, schema.table_id);
+        Ok(())
+    }
+
+    async fn analyze_all_tables_in_current_txn(
+        &self,
+        session: &mut Session,
+        db_id: u64,
+        current_role: Option<&str>,
+    ) -> Result<()> {
+        let (txn, _sequence_values, _search_path) = session
+            .get_mut_txn_sequence_values_and_search_path()
+            .expect("Transaction must be active");
+
+        let all_tables = self.store.list_tables(txn, db_id).await?;
+        for full_name in &all_tables {
+            if should_skip_schema(full_name) {
+                continue;
+            }
+
+            if let Err(err) = self
+                .require_table_privilege(txn, current_role, Privilege::Select, full_name)
+                .await
+            {
+                if is_permission_denied(&err) {
+                    continue;
+                }
+                return Err(err);
+            }
+
+            let schema = match self.store.get_schema(txn, db_id, full_name).await? {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let stats = analyze_table(&self.store, txn, db_id, &schema).await?;
+            self.store.store_statistics(txn, db_id, &stats).await?;
+            self.stats_cache()
+                .update_full_stats(db_id, schema.table_id, Arc::new(stats));
+            self.stats_cache().reset_mod_count(db_id, schema.table_id);
+        }
+        Ok(())
+    }
+
+    async fn rollback_autocommit_attempt_with_error(
+        &self,
+        session: &mut Session,
+        attempt: usize,
+        err: anyhow::Error,
+    ) -> Result<()> {
+        let retryable = is_retryable_tikv_error(&err);
+        let rollback_res = session.rollback().await;
+        self.clear_trigger_activations();
+        match decide_analyze_attempt_failure(attempt, err, rollback_res, retryable) {
+            AnalyzeAttemptFailureDisposition::Retry => {
+                autocommit_backoff(attempt).await;
+                Ok(())
+            }
+            AnalyzeAttemptFailureDisposition::ReturnErr(err) => Err(err),
+        }
+    }
+
+    async fn discover_bare_analyze_tables_autocommit(
+        &self,
+        session: &mut Session,
+        db_id: u64,
+    ) -> Result<Vec<String>> {
+        for attempt in 0..ANALYZE_AUTOCOMMIT_MAX_ATTEMPTS {
+            session.begin().await?;
+            let discovery_result = async {
+                let (txn, _sequence_values, _search_path) = session
+                    .get_mut_txn_sequence_values_and_search_path()
+                    .expect("Transaction must be active");
+
+                let tables = self.store.list_tables(txn, db_id).await?;
+                let candidates = tables
+                    .into_iter()
+                    .filter(|full_name| !should_skip_schema(full_name))
+                    .collect::<Vec<_>>();
+                Ok::<Vec<String>, anyhow::Error>(candidates)
+            }
+            .await;
+
+            match discovery_result {
+                Ok(candidates) => match session.commit().await {
+                    Ok(_) => {
+                        self.flush_trigger_activations();
+                        return Ok(candidates);
+                    }
+                    Err(err) => {
+                        self.rollback_autocommit_attempt_with_error(session, attempt, err)
+                            .await?;
+                        continue;
+                    }
+                },
+                Err(err) => {
+                    self.rollback_autocommit_attempt_with_error(session, attempt, err)
+                        .await?;
+                    continue;
+                }
+            }
+        }
+        unreachable!("ANALYZE discovery retry loop must return")
+    }
+
+    async fn analyze_table_autocommit_with_retry(
+        &self,
+        session: &mut Session,
+        db_id: u64,
+        current_role: Option<&str>,
+        full_name: &str,
+    ) -> Result<()> {
+        for attempt in 0..ANALYZE_AUTOCOMMIT_MAX_ATTEMPTS {
+            session.begin().await?;
+            let attempt_result = async {
+                let (txn, _sequence_values, _search_path) = session
+                    .get_mut_txn_sequence_values_and_search_path()
+                    .expect("Transaction must be active");
+
+                if let Err(err) = self
+                    .require_table_privilege(txn, current_role, Privilege::Select, full_name)
+                    .await
+                {
+                    if is_permission_denied(&err) {
+                        return Ok(AnalyzeAutocommitTableOutcome::Skip);
+                    }
+                    return Err(err);
+                }
+
+                let schema = match self.store.get_schema(txn, db_id, full_name).await? {
+                    Some(s) => s,
+                    None => return Ok(AnalyzeAutocommitTableOutcome::Skip),
+                };
+
+                let stats = analyze_table(&self.store, txn, db_id, &schema).await?;
+                self.store.store_statistics(txn, db_id, &stats).await?;
+                Ok::<AnalyzeAutocommitTableOutcome, anyhow::Error>(
+                    AnalyzeAutocommitTableOutcome::Applied {
+                        table_id: schema.table_id,
+                        stats,
+                    },
+                )
+            }
+            .await;
+
+            match attempt_result {
+                Ok(AnalyzeAutocommitTableOutcome::Skip) => {
+                    let rollback_res = session.rollback().await;
+                    self.clear_trigger_activations();
+                    return match rollback_res {
+                        Ok(_) => Ok(()),
+                        Err(err) => Err(err),
+                    };
+                }
+                Ok(AnalyzeAutocommitTableOutcome::Applied { table_id, stats }) => {
+                    match session.commit().await {
+                        Ok(_) => {
+                            self.flush_trigger_activations();
+                            self.stats_cache()
+                                .update_full_stats(db_id, table_id, Arc::new(stats));
+                            self.stats_cache().reset_mod_count(db_id, table_id);
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            self.rollback_autocommit_attempt_with_error(session, attempt, err)
+                                .await?;
+                            continue;
+                        }
+                    }
+                }
+                Err(err) => {
+                    self.rollback_autocommit_attempt_with_error(session, attempt, err)
+                        .await?;
+                    continue;
+                }
+            }
+        }
+        unreachable!("ANALYZE per-table retry loop must return")
+    }
+
     pub(crate) async fn execute_analyze_cmd(
         &self,
         session: &mut Session,
         sql: &str,
     ) -> Result<ExecuteResult> {
         let table_name = parse_analyze_table_name(sql)?;
-
         let is_autocommit = !session.is_in_transaction();
+        let current_role = session.current_user().map(|u| u.to_string());
+        let db_id = session.current_database_id();
+
+        // Bare ANALYZE in autocommit mode: discover a fixed candidate set,
+        // then process each table in its own autocommit transaction. Missing
+        // tables at execution time are skipped.
+        if table_name.is_none() && is_autocommit {
+            let candidates = self
+                .discover_bare_analyze_tables_autocommit(session, db_id)
+                .await?;
+            for full_name in &candidates {
+                self.analyze_table_autocommit_with_retry(
+                    session,
+                    db_id,
+                    current_role.as_deref(),
+                    full_name,
+                )
+                .await?;
+            }
+            return Ok(ExecuteResult::CommandComplete { tag: "ANALYZE" });
+        }
+
         if is_autocommit {
             session.begin().await?;
         }
 
-        let current_role = session.current_user().map(|u| u.to_string());
-        let db_id = session.current_database_id();
-
         let result = async {
-            let (txn, _sequence_values, search_path) = session
-                .get_mut_txn_sequence_values_and_search_path()
-                .expect("Transaction must be active");
-
-            if let Some(obj_name) = table_name {
-                // Single table ANALYZE.
-                let resolved = names::resolve_existing_table_name(
-                    self.store.as_ref(),
-                    txn,
-                    db_id,
-                    &obj_name,
-                    search_path,
-                )
-                .await?
-                .ok_or_else(|| anyhow!("relation \"{}\" does not exist", obj_name))?;
-
-                self.require_table_privilege(
-                    txn,
-                    current_role.as_deref(),
-                    Privilege::Select,
-                    &resolved.full,
-                )
-                .await?;
-
-                let schema = self
-                    .store
-                    .get_schema(txn, db_id, &resolved.full)
-                    .await?
-                    .ok_or_else(|| anyhow!("relation \"{}\" does not exist", resolved.full))?;
-
-                let stats = analyze_table(&self.store, txn, db_id, &schema).await?;
-                self.store.store_statistics(txn, db_id, &stats).await?;
-                self.stats_cache()
-                    .update_full_stats(db_id, schema.table_id, Arc::new(stats));
-                self.stats_cache().reset_mod_count(db_id, schema.table_id);
-            } else {
-                // Bare ANALYZE: all accessible tables.
-                let all_tables = self.store.list_tables(txn, db_id).await?;
-                for full_name in &all_tables {
-                    // Skip system schemas.
-                    let schema_name = full_name.split('.').next().unwrap_or("");
-                    if SKIP_SCHEMAS.contains(&schema_name) {
-                        continue;
-                    }
-
-                    // Check privilege; silently skip on PermissionDenied only.
-                    if let Err(err) = self
-                        .require_table_privilege(
-                            txn,
-                            current_role.as_deref(),
-                            Privilege::Select,
-                            full_name,
-                        )
-                        .await
-                    {
-                        if err
-                            .downcast_ref::<SqlError>()
-                            .is_some_and(|e| matches!(e, SqlError::PermissionDenied { .. }))
-                        {
-                            continue; // silently skip inaccessible tables
-                        }
-                        return Err(err); // propagate real errors
-                    }
-
-                    let schema = match self.store.get_schema(txn, db_id, full_name).await? {
-                        Some(s) => s,
-                        None => continue,
-                    };
-
-                    let stats = analyze_table(&self.store, txn, db_id, &schema).await?;
-                    self.store.store_statistics(txn, db_id, &stats).await?;
-                    self.stats_cache()
-                        .update_full_stats(db_id, schema.table_id, Arc::new(stats));
-                    self.stats_cache().reset_mod_count(db_id, schema.table_id);
+            match &table_name {
+                Some(obj_name) => {
+                    self.analyze_single_table_in_current_txn(
+                        session,
+                        db_id,
+                        current_role.as_deref(),
+                        obj_name,
+                    )
+                    .await?;
+                }
+                None => {
+                    self.analyze_all_tables_in_current_txn(session, db_id, current_role.as_deref())
+                        .await?;
                 }
             }
 
@@ -735,15 +957,69 @@ mod tests {
             object_name: "secret".to_string(),
         }
         .into();
-        assert!(err
-            .downcast_ref::<SqlError>()
-            .is_some_and(|e| matches!(e, SqlError::PermissionDenied { .. })));
+        assert!(is_permission_denied(&err));
 
         // Non-SqlError → should NOT match PermissionDenied.
         let err2: anyhow::Error = anyhow!("TiKV connection lost");
-        assert!(!err2
-            .downcast_ref::<SqlError>()
-            .is_some_and(|e| matches!(e, SqlError::PermissionDenied { .. })));
+        assert!(!is_permission_denied(&err2));
+    }
+
+    #[test]
+    fn bare_analyze_schema_filter_skips_system_catalogs_only() {
+        assert!(should_skip_schema("information_schema.tables"));
+        assert!(should_skip_schema("pg_catalog.pg_class"));
+        assert!(should_skip_schema("extensions.pg_trgm"));
+        assert!(!should_skip_schema("public.users"));
+    }
+
+    #[test]
+    fn analyze_retry_gate_respects_attempt_budget_and_retryable_flag() {
+        assert!(should_retry_analyze_autocommit_attempt(0, true));
+        assert!(should_retry_analyze_autocommit_attempt(
+            ANALYZE_AUTOCOMMIT_MAX_ATTEMPTS - 2,
+            true
+        ));
+        assert!(!should_retry_analyze_autocommit_attempt(
+            ANALYZE_AUTOCOMMIT_MAX_ATTEMPTS - 1,
+            true
+        ));
+        assert!(!should_retry_analyze_autocommit_attempt(0, false));
+    }
+
+    #[test]
+    fn analyze_attempt_failure_decision_retries_on_retryable_after_successful_rollback() {
+        let decision = decide_analyze_attempt_failure(0, anyhow!("write conflict"), Ok(()), true);
+        assert!(matches!(decision, AnalyzeAttemptFailureDisposition::Retry));
+    }
+
+    #[test]
+    fn analyze_attempt_failure_decision_returns_error_when_not_retryable() {
+        let decision =
+            decide_analyze_attempt_failure(0, anyhow!("permanent failure"), Ok(()), false);
+        match decision {
+            AnalyzeAttemptFailureDisposition::Retry => panic!("expected return error"),
+            AnalyzeAttemptFailureDisposition::ReturnErr(err) => {
+                assert!(err.to_string().contains("permanent failure"));
+            }
+        }
+    }
+
+    #[test]
+    fn analyze_attempt_failure_decision_surfaces_rollback_failure() {
+        let decision = decide_analyze_attempt_failure(
+            0,
+            anyhow!("commit failed"),
+            Err(anyhow!("rollback failed")),
+            true,
+        );
+        match decision {
+            AnalyzeAttemptFailureDisposition::Retry => panic!("expected return error"),
+            AnalyzeAttemptFailureDisposition::ReturnErr(err) => {
+                let msg = err.to_string();
+                assert!(msg.contains("commit failed"));
+                assert!(msg.contains("rollback failed"));
+            }
+        }
     }
 
     #[test]

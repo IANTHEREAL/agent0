@@ -38,3 +38,11 @@ pub(super) fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
             .is_some_and(contains_write_conflict)
     })
 }
+
+/// Exponential backoff with jitter for autocommit retry loops.
+pub(super) async fn autocommit_backoff(attempt: usize) {
+    let base_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
+    let jitter_ms = rand::random::<u64>() % (base_ms + 1);
+    let backoff_ms = base_ms + jitter_ms;
+    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+}

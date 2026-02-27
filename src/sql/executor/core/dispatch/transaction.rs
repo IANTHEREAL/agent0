@@ -2,7 +2,7 @@
 
 use super::super::*;
 use super::guc::build_show_all_result;
-use super::utils::{apply_statement_timeout, autocommit_backoff, validate_transaction_modes};
+use super::utils::{apply_statement_timeout, validate_transaction_modes};
 
 /// Check whether an observability user is permitted to execute the given
 /// statement.

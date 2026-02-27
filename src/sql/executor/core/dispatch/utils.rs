@@ -217,14 +217,6 @@ pub(in crate::sql::executor::core) async fn apply_statement_timeout<T>(
     }
 }
 
-/// Exponential backoff with jitter for autocommit retry loops.
-pub(in crate::sql::executor::core) async fn autocommit_backoff(attempt: usize) {
-    let base_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
-    let jitter_ms = rand::random::<u64>() % (base_ms + 1);
-    let backoff_ms = base_ms + jitter_ms;
-    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,7 +346,7 @@ mod tests {
 
     #[tokio::test]
     async fn autocommit_backoff_returns() {
-        autocommit_backoff(0).await;
-        autocommit_backoff(8).await;
+        crate::sql::executor::core::retry::autocommit_backoff(0).await;
+        crate::sql::executor::core::retry::autocommit_backoff(8).await;
     }
 }
