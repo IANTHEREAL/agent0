@@ -241,6 +241,228 @@ impl DynamicPgHandler {
         }
         Ok(())
     }
+
+    async fn handle_copy_from_simple_query<'a>(
+        &self,
+        query: &'a str,
+    ) -> PgWireResult<Option<Vec<Response<'a>>>> {
+        let Some((table_name, columns)) = DynamicPgHandler::parse_copy_command(query) else {
+            return Ok(None);
+        };
+
+        debug!(
+            "COPY FROM STDIN: table={}, columns={:?}",
+            table_name, columns
+        );
+
+        let state = self.auth();
+        let executor = &state.executor;
+        let (resolved_table, resolved_columns, column_types, col_count, started_txn, qctx) = {
+            let mut session = state.session.lock().await;
+
+            // Recheck after acquiring lock — watchdog may have fired in the gap.
+            if self.cancel_token.is_cancelled() {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".to_string(),
+                    "25P03".to_string(),
+                    "terminating connection due to idle-in-transaction timeout".to_string(),
+                ))));
+            }
+
+            if let Err(e) = session.check_idle_in_transaction_timeout() {
+                let _ = session.rollback().await;
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".to_string(),
+                    e.sqlstate().to_string(),
+                    e.to_string(),
+                ))));
+            }
+
+            if session.is_transaction_failed() {
+                return Err(in_failed_sql_transaction_pgwire_error());
+            }
+
+            let started_txn = !session.is_in_transaction();
+            if started_txn {
+                session.begin().await.map_err(|e| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "XX000".to_string(),
+                        e.to_string(),
+                    )))
+                })?;
+            }
+
+            let statement_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
+            let qctx = session.query_context_for_statement(statement_ts, transaction_ts);
+
+            let db_id = session.current_database_id();
+            let search_path: Vec<String> = session.search_path().to_vec();
+            let (resolved_table, schema) = {
+                let txn = session.get_mut_txn().ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "XX000".to_string(),
+                        "No transaction".to_string(),
+                    )))
+                })?;
+
+                let strip_quotes = |s: &str| -> String { s.trim_matches('"').to_string() };
+                let (schema_opt, table_ident) = if table_name.contains('.') {
+                    let parts: Vec<&str> = table_name.splitn(2, '.').collect();
+                    if parts.len() == 2 {
+                        (
+                            Some(strip_quotes(parts[0]).to_lowercase()),
+                            strip_quotes(parts[1]).to_lowercase(),
+                        )
+                    } else {
+                        (None, strip_quotes(&table_name).to_lowercase())
+                    }
+                } else {
+                    (None, strip_quotes(&table_name).to_lowercase())
+                };
+
+                if let Some(schema_ident) = schema_opt {
+                    let resolved_table = format!("{}.{}", schema_ident, table_ident);
+                    match executor
+                        .store()
+                        .get_schema(txn, db_id, &resolved_table)
+                        .await
+                    {
+                        Ok(Some(schema)) => (resolved_table, schema),
+                        Ok(None) => {
+                            rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "42P01".to_string(),
+                                format!("relation \"{}\" does not exist", table_name),
+                            ))));
+                        }
+                        Err(e) => {
+                            rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "XX000".to_string(),
+                                e.to_string(),
+                            ))));
+                        }
+                    }
+                } else {
+                    let schemas: Vec<&str> = if search_path.is_empty() {
+                        vec!["public"]
+                    } else {
+                        search_path.iter().map(|s| s.as_str()).collect()
+                    };
+
+                    let mut found: Option<(String, crate::model::TableSchema)> = None;
+                    for schema_ident in schemas {
+                        let resolved_table = format!("{}.{}", schema_ident, table_ident);
+                        match executor
+                            .store()
+                            .get_schema(txn, db_id, &resolved_table)
+                            .await
+                        {
+                            Ok(Some(schema)) => {
+                                found = Some((resolved_table, schema));
+                                break;
+                            }
+                            Ok(None) => continue,
+                            Err(e) => {
+                                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    "XX000".to_string(),
+                                    e.to_string(),
+                                ))));
+                            }
+                        }
+                    }
+
+                    match found {
+                        Some(found) => found,
+                        None => {
+                            rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "42P01".to_string(),
+                                format!("relation \"{}\" does not exist", table_name),
+                            ))));
+                        }
+                    }
+                }
+            };
+
+            // Authorization: COPY FROM STDIN bypasses statement execution.
+            // Require INSERT privilege before entering COPY mode.
+            let current_role = session.current_user().map(|s| s.to_string());
+            let privilege_result = {
+                let txn = session.get_mut_txn().ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "XX000".to_string(),
+                        "No transaction".to_string(),
+                    )))
+                })?;
+                executor
+                    .require_table_privilege(
+                        txn,
+                        current_role.as_deref(),
+                        Privilege::Insert,
+                        &resolved_table,
+                    )
+                    .await
+            };
+
+            if let Err(e) = privilege_result {
+                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    sqlstate_for_executor_error(&e).to_string(),
+                    e.to_string(),
+                ))));
+            }
+
+            let (resolved_columns, column_types) =
+                match resolve_copy_columns(&schema, &columns, &table_name) {
+                    Ok(resolved) => resolved,
+                    Err(e) => {
+                        rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                        return Err(e);
+                    }
+                };
+
+            let col_count = resolved_columns.len();
+            (
+                resolved_table,
+                resolved_columns,
+                column_types,
+                col_count,
+                started_txn,
+                qctx,
+            )
+        };
+
+        let mut ctx = self.copy_context.lock().await;
+        *ctx = Some(CopyContext {
+            table_name: resolved_table,
+            columns: resolved_columns,
+            column_types,
+            query_context: qctx,
+            line_buffer: Vec::new(),
+            row_count: 0,
+            started_txn,
+            reached_end_marker: false,
+        });
+
+        let column_formats: Vec<i16> = vec![0; col_count];
+        Ok(Some(vec![Response::CopyIn(
+            pgwire::api::results::CopyResponse::new(0, col_count, column_formats),
+        )]))
+    }
 }
 
 #[async_trait]
@@ -315,218 +537,8 @@ impl SimpleQueryHandler for DynamicPgHandler {
             Err(e) => return Err(PgWireError::UserError(Box::new(e))),
         }
 
-        if let Some((table_name, columns)) = DynamicPgHandler::parse_copy_command(query) {
-            debug!(
-                "COPY FROM STDIN: table={}, columns={:?}",
-                table_name, columns
-            );
-
-            let (resolved_table, resolved_columns, column_types, col_count, started_txn, qctx) = {
-                let mut session = state.session.lock().await;
-
-                // Recheck after acquiring lock — watchdog may have fired in the gap.
-                if self.cancel_token.is_cancelled() {
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "FATAL".to_string(),
-                        "25P03".to_string(),
-                        "terminating connection due to idle-in-transaction timeout".to_string(),
-                    ))));
-                }
-
-                if let Err(e) = session.check_idle_in_transaction_timeout() {
-                    let _ = session.rollback().await;
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "FATAL".to_string(),
-                        e.sqlstate().to_string(),
-                        e.to_string(),
-                    ))));
-                }
-
-                if session.is_transaction_failed() {
-                    return Err(in_failed_sql_transaction_pgwire_error());
-                }
-
-                let started_txn = !session.is_in_transaction();
-                if started_txn {
-                    session.begin().await.map_err(|e| {
-                        PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".to_string(),
-                            "XX000".to_string(),
-                            e.to_string(),
-                        )))
-                    })?;
-                }
-
-                let statement_ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
-                let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
-                let qctx = session.query_context_for_statement(statement_ts, transaction_ts);
-
-                let db_id = session.current_database_id();
-                let search_path: Vec<String> = session.search_path().to_vec();
-                let (resolved_table, schema) = {
-                    let txn = session.get_mut_txn().ok_or_else(|| {
-                        PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".to_string(),
-                            "XX000".to_string(),
-                            "No transaction".to_string(),
-                        )))
-                    })?;
-
-                    let strip_quotes = |s: &str| -> String { s.trim_matches('"').to_string() };
-                    let (schema_opt, table_ident) = if table_name.contains('.') {
-                        let parts: Vec<&str> = table_name.splitn(2, '.').collect();
-                        if parts.len() == 2 {
-                            (
-                                Some(strip_quotes(parts[0]).to_lowercase()),
-                                strip_quotes(parts[1]).to_lowercase(),
-                            )
-                        } else {
-                            (None, strip_quotes(&table_name).to_lowercase())
-                        }
-                    } else {
-                        (None, strip_quotes(&table_name).to_lowercase())
-                    };
-
-                    if let Some(schema_ident) = schema_opt {
-                        let resolved_table = format!("{}.{}", schema_ident, table_ident);
-                        match executor
-                            .store()
-                            .get_schema(txn, db_id, &resolved_table)
-                            .await
-                        {
-                            Ok(Some(schema)) => (resolved_table, schema),
-                            Ok(None) => {
-                                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
-                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                                    "ERROR".to_string(),
-                                    "42P01".to_string(),
-                                    format!("relation \"{}\" does not exist", table_name),
-                                ))));
-                            }
-                            Err(e) => {
-                                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
-                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                                    "ERROR".to_string(),
-                                    "XX000".to_string(),
-                                    e.to_string(),
-                                ))));
-                            }
-                        }
-                    } else {
-                        let schemas: Vec<&str> = if search_path.is_empty() {
-                            vec!["public"]
-                        } else {
-                            search_path.iter().map(|s| s.as_str()).collect()
-                        };
-
-                        let mut found: Option<(String, crate::model::TableSchema)> = None;
-                        for schema_ident in schemas {
-                            let resolved_table = format!("{}.{}", schema_ident, table_ident);
-                            match executor
-                                .store()
-                                .get_schema(txn, db_id, &resolved_table)
-                                .await
-                            {
-                                Ok(Some(schema)) => {
-                                    found = Some((resolved_table, schema));
-                                    break;
-                                }
-                                Ok(None) => continue,
-                                Err(e) => {
-                                    rollback_autocommit_or_mark_failed(&mut session, started_txn)
-                                        .await;
-                                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                                        "ERROR".to_string(),
-                                        "XX000".to_string(),
-                                        e.to_string(),
-                                    ))));
-                                }
-                            }
-                        }
-
-                        match found {
-                            Some(found) => found,
-                            None => {
-                                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
-                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                                    "ERROR".to_string(),
-                                    "42P01".to_string(),
-                                    format!("relation \"{}\" does not exist", table_name),
-                                ))));
-                            }
-                        }
-                    }
-                };
-
-                // Authorization: COPY FROM STDIN bypasses statement execution.
-                // Require INSERT privilege before entering COPY mode.
-                let current_role = session.current_user().map(|s| s.to_string());
-                let privilege_result = {
-                    let txn = session.get_mut_txn().ok_or_else(|| {
-                        PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".to_string(),
-                            "XX000".to_string(),
-                            "No transaction".to_string(),
-                        )))
-                    })?;
-                    executor
-                        .require_table_privilege(
-                            txn,
-                            current_role.as_deref(),
-                            Privilege::Insert,
-                            &resolved_table,
-                        )
-                        .await
-                };
-
-                if let Err(e) = privilege_result {
-                    rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(),
-                        sqlstate_for_executor_error(&e).to_string(),
-                        e.to_string(),
-                    ))));
-                }
-
-                let (resolved_columns, column_types) =
-                    match resolve_copy_columns(&schema, &columns, &table_name) {
-                        Ok(resolved) => resolved,
-                        Err(e) => {
-                            rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
-                            return Err(e);
-                        }
-                    };
-
-                let col_count = resolved_columns.len();
-                (
-                    resolved_table,
-                    resolved_columns,
-                    column_types,
-                    col_count,
-                    started_txn,
-                    qctx,
-                )
-            };
-
-            let mut ctx = self.copy_context.lock().await;
-            *ctx = Some(CopyContext {
-                table_name: resolved_table,
-                columns: resolved_columns,
-                column_types,
-                query_context: qctx,
-                line_buffer: Vec::new(),
-                row_count: 0,
-                started_txn,
-                reached_end_marker: false,
-            });
-
-            let column_formats: Vec<i16> = vec![0; col_count];
-            return Ok(vec![Response::CopyIn(
-                pgwire::api::results::CopyResponse::new(0, col_count, column_formats),
-            )]);
+        if let Some(result) = self.handle_copy_from_simple_query(query).await? {
+            return Ok(result);
         }
 
         // Defense-in-depth: check if the cancel token was fired before acquiring
