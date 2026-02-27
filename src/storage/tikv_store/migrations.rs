@@ -313,6 +313,24 @@ fn plan_relation_binding_backfills(
     plan
 }
 
+/// Computes the full migration outcome from a list of relation binding targets
+/// and whether the marker currently exists. Returns the backfill plan and the
+/// marker action that should be applied.
+///
+/// This is the pure decision core of `ensure_view_relation_bindings_migration`.
+/// Extracted for testability without requiring a live TiKV connection.
+fn compute_migration_outcome(
+    targets: Vec<RelationBindingBackfillTarget>,
+    _marker_exists: bool,
+) -> (
+    RelationBindingBackfillPlan,
+    ViewBindingsMigrationMarkerAction,
+) {
+    let plan = plan_relation_binding_backfills(targets);
+    let action = view_bindings_migration_marker_action(&plan);
+    (plan, action)
+}
+
 impl TikvStore {
     pub async fn record_migration(
         &self,
@@ -390,7 +408,7 @@ impl TikvStore {
             }
         }
 
-        let plan = plan_relation_binding_backfills(targets);
+        let (plan, marker_action) = compute_migration_outcome(targets, marker_exists);
         for action in &plan.actions {
             match action.kind {
                 RelationBindingKind::View => {
@@ -414,7 +432,6 @@ impl TikvStore {
             }
         }
 
-        let marker_action = view_bindings_migration_marker_action(&plan);
         let mut marker_updated = false;
         match marker_action {
             ViewBindingsMigrationMarkerAction::EnsurePresent => {
@@ -604,5 +621,291 @@ mod tests {
             view_bindings_migration_marker_action(&incomplete_plan),
             ViewBindingsMigrationMarkerAction::EnsureAbsent
         );
+    }
+
+    /// Apply the marker action to the simulated in-memory marker state (true = marker present).
+    fn apply_marker_action(
+        _marker_present: bool,
+        action: ViewBindingsMigrationMarkerAction,
+    ) -> bool {
+        match action {
+            ViewBindingsMigrationMarkerAction::EnsurePresent => true,
+            ViewBindingsMigrationMarkerAction::EnsureAbsent => false,
+        }
+    }
+
+    /// Integration test: full marker lifecycle across three simulated startups.
+    ///
+    /// Phase 1 — first run with an unresolvable view: the backfill plan records an
+    ///           unresolved entry, so the marker must stay absent.
+    /// Phase 2 — next startup retry: the same unresolvable state is encountered again;
+    ///           the marker must remain absent (migration retries on every startup).
+    /// Phase 3 — after the legacy objects are fixed (deps become unambiguous): the plan
+    ///           produces a backfill action and no unresolved entries, so the marker is
+    ///           written and the migration converges.
+    #[test]
+    fn marker_lifecycle_unresolved_retried_then_resolved() {
+        // Phase 1: first startup — ambiguous deps prevent backfill.
+        // The query references the unqualified table 't' twice, but the two legacy
+        // deps ("s1.t", "s2.t") cannot be uniquely assigned → unresolvable.
+        let unresolvable = vec![target(
+            1,
+            RelationBindingKind::View,
+            "public.v_ambig",
+            "SELECT 1 FROM t a JOIN t b ON a.id = b.id",
+            &["s1.t", "s2.t"],
+            false,
+        )];
+
+        let plan1 = plan_relation_binding_backfills(unresolvable.clone());
+        assert_eq!(
+            plan1.unresolved.len(),
+            1,
+            "Phase 1: should have one unresolved entry"
+        );
+        assert!(
+            plan1.actions.is_empty(),
+            "Phase 1: no backfill actions expected"
+        );
+
+        let action1 = view_bindings_migration_marker_action(&plan1);
+        assert_eq!(
+            action1,
+            ViewBindingsMigrationMarkerAction::EnsureAbsent,
+            "Phase 1: marker must be absent when backfill is unresolved"
+        );
+
+        let mut marker_present = false; // initial state: no marker
+        marker_present = apply_marker_action(marker_present, action1);
+        assert!(!marker_present, "Phase 1: marker must remain absent");
+
+        // Phase 2: next startup — same unresolvable state, migration retries.
+        let plan2 = plan_relation_binding_backfills(unresolvable);
+        assert!(
+            !plan2.unresolved.is_empty(),
+            "Phase 2: still unresolved on retry"
+        );
+
+        let action2 = view_bindings_migration_marker_action(&plan2);
+        assert_eq!(
+            action2,
+            ViewBindingsMigrationMarkerAction::EnsureAbsent,
+            "Phase 2: marker must stay absent on retry"
+        );
+
+        marker_present = apply_marker_action(marker_present, action2);
+        assert!(!marker_present, "Phase 2: marker must still be absent");
+
+        // Phase 3: after fix — the view is recreated with unambiguous, qualified deps.
+        // The qualified reference resolves directly from the single dep entry.
+        let resolvable = vec![target(
+            1,
+            RelationBindingKind::View,
+            "public.v_ambig",
+            "SELECT 1 FROM public.t",
+            &["public.t"],
+            false,
+        )];
+
+        let plan3 = plan_relation_binding_backfills(resolvable);
+        assert!(
+            plan3.unresolved.is_empty(),
+            "Phase 3: all targets should resolve"
+        );
+        assert_eq!(
+            plan3.actions.len(),
+            1,
+            "Phase 3: one backfill action expected"
+        );
+        assert_eq!(plan3.actions[0].bindings, vec!["public.t".to_string()]);
+
+        let action3 = view_bindings_migration_marker_action(&plan3);
+        assert_eq!(
+            action3,
+            ViewBindingsMigrationMarkerAction::EnsurePresent,
+            "Phase 3: marker must be written after convergence"
+        );
+
+        marker_present = apply_marker_action(marker_present, action3);
+        assert!(
+            marker_present,
+            "Phase 3: marker must be present after migration converges"
+        );
+    }
+
+    /// Integration test: a pre-existing marker is cleared when a new unresolvable view
+    /// appears, then re-written once all views become resolvable again.
+    ///
+    /// This validates the "clear/retry" semantic: an incomplete run must never leave a
+    /// stale marker that would suppress future retries.
+    #[test]
+    fn stale_marker_cleared_when_unresolvable_view_appears() {
+        // Pre-condition: migration previously completed; marker is present.
+        let mut marker_present = true;
+
+        // A new unresolvable view is added alongside the already-backfilled one.
+        let targets_with_new_bad_view = vec![
+            // Previously backfilled — has persisted bindings, skip.
+            target(
+                1,
+                RelationBindingKind::View,
+                "public.v_ok",
+                "SELECT 1 FROM public.t",
+                &["public.t"],
+                true,
+            ),
+            // Newly added view with ambiguous legacy deps — cannot be backfilled.
+            target(
+                1,
+                RelationBindingKind::View,
+                "public.v_new_bad",
+                "SELECT 1 FROM t a JOIN t b ON a.id = b.id",
+                &["s1.t", "s2.t"],
+                false,
+            ),
+        ];
+
+        let plan1 = plan_relation_binding_backfills(targets_with_new_bad_view);
+        assert_eq!(plan1.skipped_existing, 1, "existing view should be skipped");
+        assert_eq!(plan1.unresolved.len(), 1, "new bad view must be unresolved");
+        assert!(plan1.actions.is_empty());
+
+        let action1 = view_bindings_migration_marker_action(&plan1);
+        assert_eq!(
+            action1,
+            ViewBindingsMigrationMarkerAction::EnsureAbsent,
+            "stale marker must be cleared when unresolved entries exist"
+        );
+
+        marker_present = apply_marker_action(marker_present, action1);
+        assert!(!marker_present, "stale marker must be absent after clear");
+
+        // After the bad view is fixed, both views can be resolved.
+        let targets_fixed = vec![
+            target(
+                1,
+                RelationBindingKind::View,
+                "public.v_ok",
+                "SELECT 1 FROM public.t",
+                &["public.t"],
+                true, // still has persisted bindings
+            ),
+            target(
+                1,
+                RelationBindingKind::View,
+                "public.v_new_bad",
+                "SELECT 1 FROM public.t",
+                &["public.t"],
+                false, // recreated, now unambiguous
+            ),
+        ];
+
+        let plan2 = plan_relation_binding_backfills(targets_fixed);
+        assert!(
+            plan2.unresolved.is_empty(),
+            "all targets should resolve after fix"
+        );
+        assert_eq!(plan2.skipped_existing, 1);
+        assert_eq!(plan2.actions.len(), 1);
+
+        let action2 = view_bindings_migration_marker_action(&plan2);
+        assert_eq!(
+            action2,
+            ViewBindingsMigrationMarkerAction::EnsurePresent,
+            "marker must be re-written after all views resolve"
+        );
+
+        marker_present = apply_marker_action(marker_present, action2);
+        assert!(
+            marker_present,
+            "marker must be present after migration re-converges"
+        );
+    }
+
+    #[test]
+    fn migration_outcome_no_views_writes_marker() {
+        // Empty cluster: no views to backfill, plan is complete, marker should be written.
+        let (plan, action) = compute_migration_outcome(vec![], false);
+        assert!(plan.actions.is_empty());
+        assert!(plan.unresolved.is_empty());
+        assert_eq!(action, ViewBindingsMigrationMarkerAction::EnsurePresent);
+    }
+
+    #[test]
+    fn migration_outcome_unresolvable_keeps_marker_absent() {
+        // A view with ambiguous legacy deps: backfill can't complete, marker must stay absent.
+        let targets = vec![target(
+            1,
+            RelationBindingKind::View,
+            "public.v_ambig",
+            "SELECT 1 FROM t a JOIN t b ON a.id = b.id",
+            &["s1.t", "s2.t"],
+            false,
+        )];
+        let (plan, action) = compute_migration_outcome(targets, false);
+        assert_eq!(plan.unresolved.len(), 1);
+        assert!(plan.actions.is_empty());
+        assert_eq!(action, ViewBindingsMigrationMarkerAction::EnsureAbsent);
+    }
+
+    #[test]
+    fn migration_outcome_already_backfilled_writes_marker() {
+        // View already has persisted bindings: skipped, plan complete, marker written.
+        let targets = vec![target(
+            1,
+            RelationBindingKind::View,
+            "public.v1",
+            "SELECT 1 FROM public.t",
+            &["public.t"],
+            true, // has_persisted_bindings
+        )];
+        let (plan, action) = compute_migration_outcome(targets, false);
+        assert!(plan.actions.is_empty());
+        assert_eq!(plan.skipped_existing, 1);
+        assert!(plan.unresolved.is_empty());
+        assert_eq!(action, ViewBindingsMigrationMarkerAction::EnsurePresent);
+    }
+
+    #[test]
+    fn migration_outcome_full_lifecycle_converges() {
+        // Phase 1: unresolvable view → marker absent
+        let unresolvable = vec![target(
+            1,
+            RelationBindingKind::View,
+            "public.v",
+            "SELECT 1 FROM t a JOIN t b ON a.id = b.id",
+            &["s1.t", "s2.t"],
+            false,
+        )];
+        let (_, action1) = compute_migration_outcome(unresolvable, false);
+        assert_eq!(action1, ViewBindingsMigrationMarkerAction::EnsureAbsent);
+
+        // Phase 2: view fixed (unambiguous deps) → plan has action → marker written
+        let resolvable = vec![target(
+            1,
+            RelationBindingKind::View,
+            "public.v",
+            "SELECT 1 FROM public.t",
+            &["public.t"],
+            false,
+        )];
+        let (plan2, action2) = compute_migration_outcome(resolvable, false);
+        assert_eq!(plan2.actions.len(), 1);
+        assert!(plan2.unresolved.is_empty());
+        assert_eq!(action2, ViewBindingsMigrationMarkerAction::EnsurePresent);
+
+        // Phase 3: idempotent restart — bindings already persisted → skip → marker still written
+        let after_backfill = vec![target(
+            1,
+            RelationBindingKind::View,
+            "public.v",
+            "SELECT 1 FROM public.t",
+            &["public.t"],
+            true,
+        )];
+        let (plan3, action3) = compute_migration_outcome(after_backfill, true);
+        assert!(plan3.actions.is_empty());
+        assert_eq!(plan3.skipped_existing, 1);
+        assert_eq!(action3, ViewBindingsMigrationMarkerAction::EnsurePresent);
     }
 }
