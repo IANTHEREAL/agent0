@@ -158,6 +158,21 @@ fn is_plan_cache_invalidating_ddl(stmt: &Statement) -> bool {
     )
 }
 
+// DDL can contend with background schema writers (e.g. CIC backfill phases).
+// Keep a wider retry budget to emulate PostgreSQL-style lock wait behavior.
+const DDL_DML_MAX_RETRY_ATTEMPTS: usize = 64;
+
+fn ddl_dml_retry_max_attempts(
+    is_autocommit: bool,
+    explicit_first_stmt_retry_eligible: bool,
+) -> usize {
+    if is_autocommit || explicit_first_stmt_retry_eligible {
+        DDL_DML_MAX_RETRY_ATTEMPTS
+    } else {
+        1
+    }
+}
+
 impl Executor {
     /// Execute a DDL/DML statement with autocommit retry logic.
     ///
@@ -179,10 +194,15 @@ impl Executor {
         }
 
         let is_autocommit = !session.is_in_transaction();
+        let explicit_first_stmt_retry_eligible =
+            !is_autocommit && !session.has_executed_statement_in_transaction();
         let db_id = session.current_database_id();
 
         // Retry up to 10 times for autocommit to handle concurrent conflicts
-        let max_attempts = if is_autocommit { 10usize } else { 1usize };
+        // and for the first statement in an explicit transaction (safe to restart
+        // because no prior statement has completed in that transaction yet).
+        let max_attempts =
+            ddl_dml_retry_max_attempts(is_autocommit, explicit_first_stmt_retry_eligible);
 
         for attempt in 0..max_attempts {
             if is_autocommit {
@@ -261,10 +281,27 @@ impl Executor {
                     }
                 }
             } else {
-                let (notices, result) = res?;
-                let mut stmt_results = notices;
-                stmt_results.push(result);
-                return Ok(stmt_results);
+                match res {
+                    Ok((notices, result)) => {
+                        session.note_statement_success_in_transaction();
+                        let mut stmt_results = notices;
+                        stmt_results.push(result);
+                        return Ok(stmt_results);
+                    }
+                    Err(err) => {
+                        let should_retry = explicit_first_stmt_retry_eligible
+                            && attempt + 1 < max_attempts
+                            && is_retryable_tikv_error(&err);
+                        if should_retry {
+                            session.rollback().await?;
+                            self.clear_trigger_activations();
+                            session.begin().await?;
+                            autocommit_backoff(attempt).await;
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                }
             }
         }
 
@@ -274,7 +311,10 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_observability_statement_permission, is_plan_cache_invalidating_ddl};
+    use super::{
+        check_observability_statement_permission, ddl_dml_retry_max_attempts,
+        is_plan_cache_invalidating_ddl, DDL_DML_MAX_RETRY_ATTEMPTS,
+    };
     use crate::sql::parse_sql;
     use crate::sql::{ExecuteResult, Executor, Session};
     use sqlparser::ast::Statement;
@@ -417,5 +457,26 @@ mod tests {
         )));
         assert!(is_plan_cache_invalidating_ddl(&parse_stmt("DROP TABLE t")));
         assert!(!is_plan_cache_invalidating_ddl(&parse_stmt("SELECT 1")));
+    }
+
+    #[test]
+    fn ddl_dml_retry_budget_uses_full_budget_for_autocommit() {
+        assert_eq!(
+            ddl_dml_retry_max_attempts(true, false),
+            DDL_DML_MAX_RETRY_ATTEMPTS
+        );
+    }
+
+    #[test]
+    fn ddl_dml_retry_budget_uses_full_budget_for_first_explicit_statement() {
+        assert_eq!(
+            ddl_dml_retry_max_attempts(false, true),
+            DDL_DML_MAX_RETRY_ATTEMPTS
+        );
+    }
+
+    #[test]
+    fn ddl_dml_retry_budget_disables_retries_after_first_explicit_statement() {
+        assert_eq!(ddl_dml_retry_max_attempts(false, false), 1);
     }
 }

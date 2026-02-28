@@ -353,7 +353,7 @@ async fn enqueue_cron_to_worker(keyspace: &str, db_id: u64, job: &CronJob) {
     let result = async {
         let mut sys_txn = system_store.begin().await?;
         let old_keys = system_store
-            .scan_queue_entries_for_task(&mut sys_txn, keyspace, db_id, job.job_id)
+            .scan_queue_entries_for_task(&mut sys_txn, keyspace, db_id, job.job_id, TaskType::Cron)
             .await?;
         for key in old_keys {
             system_store
@@ -386,7 +386,7 @@ async fn dequeue_cron_from_worker(keyspace: &str, db_id: u64, job_id: i64) {
     let result = async {
         let mut sys_txn = system_store.begin().await?;
         let old_keys = system_store
-            .scan_queue_entries_for_task(&mut sys_txn, keyspace, db_id, job_id)
+            .scan_queue_entries_for_task(&mut sys_txn, keyspace, db_id, job_id, TaskType::Cron)
             .await?;
         for key in old_keys {
             system_store

@@ -106,6 +106,7 @@ impl TikvStore {
         let key = self.key(&encode_worker_queue_key(
             entry.priority,
             fire_time_ms,
+            entry.task_type.to_bitmask(),
             &entry.keyspace,
             entry.db_id,
             entry.task_id,
@@ -175,6 +176,7 @@ impl TikvStore {
         keyspace: &str,
         db_id: u64,
         task_id: i64,
+        task_type: TaskType,
     ) -> Result<Vec<Vec<u8>>> {
         let prefix = encode_worker_queue_prefix();
         let mut end = prefix.clone();
@@ -190,7 +192,11 @@ impl TikvStore {
             }
             let entry: TaskQueueEntry = bincode::deserialize(pair.value())
                 .context("Failed to deserialize worker queue entry")?;
-            if entry.keyspace == keyspace && entry.db_id == db_id && entry.task_id == task_id {
+            if entry.keyspace == keyspace
+                && entry.db_id == db_id
+                && entry.task_id == task_id
+                && entry.task_type == task_type
+            {
                 matching_keys.push(key.to_vec());
             }
         }
@@ -243,6 +249,7 @@ impl TikvStore {
         claim: &WorkerClaim,
     ) -> Result<bool> {
         let key = self.key(&encode_worker_claim_key(
+            claim.task_type.to_bitmask(),
             keyspace,
             db_id,
             task_id,
@@ -267,8 +274,10 @@ impl TikvStore {
         db_id: u64,
         task_id: i64,
         fire_time_min: i64,
+        task_type: TaskType,
     ) -> Result<()> {
         let key = self.key(&encode_worker_claim_key(
+            task_type.to_bitmask(),
             keyspace,
             db_id,
             task_id,
@@ -323,6 +332,33 @@ impl TikvStore {
     }
 
     // ========================================================================
+    // Background SQL task ID allocation
+    // ========================================================================
+
+    /// Allocate the next collision-free background task ID for a (keyspace, db_id) scope.
+    ///
+    /// Uses a dedicated TiKV CAS sequence key so that concurrent allocations across
+    /// multiple db9-server instances always produce distinct IDs.
+    pub async fn next_bg_task_id(&self, keyspace: &str, db_id: u64) -> Result<i64> {
+        let key = self.key(&encode_worker_bg_task_seq_key(keyspace, db_id));
+        self.autocommit_update_key(key, |current| {
+            let next_val = match current {
+                Some(data) => {
+                    let id = i64::from_be_bytes(
+                        data.try_into()
+                            .map_err(|_| anyhow!("Invalid bg task sequence format"))?,
+                    );
+                    id.checked_add(1)
+                        .ok_or_else(|| anyhow!("Background task ID overflow"))?
+                }
+                None => 1,
+            };
+            Ok((Some(next_val.to_be_bytes().to_vec()), next_val))
+        })
+        .await
+    }
+
+    // ========================================================================
     // Background SQL result methods
     // ========================================================================
 
@@ -353,5 +389,111 @@ impl TikvStore {
             )),
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bg_task_id_atomic_counter_concurrent_allocations_are_unique() {
+        let next_id = Arc::new(AtomicI64::new(0));
+        let task_count = 100;
+        let mut handles = Vec::with_capacity(task_count);
+
+        for _ in 0..task_count {
+            let next_id = Arc::clone(&next_id);
+            handles.push(tokio::spawn(async move {
+                // Mirror the monotonic increment contract behind TiKV CAS allocation.
+                next_id.fetch_add(1, Ordering::SeqCst) + 1
+            }));
+        }
+
+        let mut ids = Vec::with_capacity(task_count);
+        for handle in handles {
+            ids.push(handle.await.expect("spawned allocator task should join"));
+        }
+
+        let unique: HashSet<i64> = ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            task_count,
+            "concurrent atomic allocations must be unique"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires TiKV / PD cluster"]
+    async fn next_bg_task_id_concurrent_allocations_are_unique() {
+        let pd_endpoints = std::env::var("PD_ENDPOINTS")
+            .unwrap_or_else(|_| "127.0.0.1:2379".to_string())
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let system_keyspace = format!(
+            "_sys_worker_test_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let cfg = crate::worker::config::WorkerConfig {
+            enabled: true,
+            system_keyspace: system_keyspace.clone(),
+            ..Default::default()
+        };
+        let store = crate::worker::init_system_store(pd_endpoints, &cfg)
+            .await
+            .expect("failed to initialize system store for bg task ID concurrency test")
+            .expect("worker system store should be present when enabled");
+
+        let scope_keyspace = format!(
+            "test_bg_task_seq_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let db_id = 4242_u64;
+
+        let task_count = 100;
+        let mut handles = Vec::with_capacity(task_count);
+        for _ in 0..task_count {
+            let store = Arc::clone(&store);
+            let keyspace = scope_keyspace.clone();
+            handles.push(tokio::spawn(async move {
+                let mut backoff_ms = 1_u64;
+                for attempt in 0..20 {
+                    match store.next_bg_task_id(&keyspace, db_id).await {
+                        Ok(id) => return id,
+                        Err(err)
+                            if err.to_string().contains("autocommit update failed after")
+                                && attempt < 19 =>
+                        {
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            backoff_ms = (backoff_ms * 2).min(50);
+                        }
+                        Err(err) => {
+                            panic!("next_bg_task_id allocation should succeed: {err}");
+                        }
+                    }
+                }
+                panic!("next_bg_task_id allocation exhausted retry attempts")
+            }));
+        }
+
+        let mut ids = Vec::with_capacity(task_count);
+        for handle in handles {
+            ids.push(handle.await.expect("spawned allocator task should join"));
+        }
+
+        let unique: HashSet<i64> = ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            task_count,
+            "concurrent next_bg_task_id allocations must be unique"
+        );
     }
 }

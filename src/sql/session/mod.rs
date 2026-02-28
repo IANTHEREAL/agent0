@@ -63,6 +63,9 @@ pub struct Session {
     /// Used for `idle_in_transaction_session_timeout` enforcement.
     /// Set by `record_command_complete()`, cleared on commit/rollback.
     last_command_complete_at: Option<Instant>,
+    /// Number of successfully executed non-transaction-control statements in the
+    /// current explicit transaction block.
+    tx_statement_count: u32,
     /// Shared server-level configuration (for ALTER SYSTEM SET).
     server_config: Option<SharedServerConfig>,
     /// Pending parameter values from extended-query Bind for the next Execute.
@@ -135,6 +138,7 @@ impl Session {
             connection_id,
             transaction_timestamp_ms: None,
             last_command_complete_at: None,
+            tx_statement_count: 0,
             server_config: None,
             pending_params: vec![],
             pending_param_types: vec![],
@@ -187,6 +191,7 @@ impl Session {
             connection_id,
             transaction_timestamp_ms: None,
             last_command_complete_at: None,
+            tx_statement_count: 0,
             server_config: None,
             pending_params: vec![],
             pending_param_types: vec![],
@@ -348,6 +353,20 @@ impl Session {
             return true;
         }
         matches!(self.state, TransactionState::Failed(_))
+    }
+
+    /// Returns true if the current explicit transaction has already executed at
+    /// least one non-transaction-control statement.
+    pub(crate) fn has_executed_statement_in_transaction(&self) -> bool {
+        self.is_in_transaction() && self.tx_statement_count > 0
+    }
+
+    /// Record successful completion of a non-transaction-control statement in
+    /// the current explicit transaction block.
+    pub(crate) fn note_statement_success_in_transaction(&mut self) {
+        if self.is_in_transaction() {
+            self.tx_statement_count = self.tx_statement_count.saturating_add(1);
+        }
     }
 
     pub(crate) fn mark_transaction_failed(&mut self) {

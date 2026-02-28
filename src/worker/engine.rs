@@ -486,6 +486,7 @@ impl WorkerEngine {
                 entry.db_id,
                 entry.task_id,
                 fire_time_min,
+                entry.task_type,
             )
             .await?;
         if !keep_queue_entry {

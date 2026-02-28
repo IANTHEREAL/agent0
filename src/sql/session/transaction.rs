@@ -157,6 +157,7 @@ impl Session {
                 self.reset_xact_advisory_savepoint_tracker();
                 self.state = TransactionState::Active(txn);
                 self.transaction_timestamp_ms = Some(ts);
+                self.tx_statement_count = 0;
                 Ok(())
             }
             TransactionState::Active(_) | TransactionState::Failed(_) => {
@@ -174,6 +175,7 @@ impl Session {
     /// Commit a transaction block (COMMIT)
     pub async fn commit(&mut self) -> Result<()> {
         self.transaction_timestamp_ms = None;
+        self.tx_statement_count = 0;
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
                 self.savepoints.reset().await?;
@@ -215,6 +217,7 @@ impl Session {
     /// Rollback a transaction block (ROLLBACK)
     pub async fn rollback(&mut self) -> Result<()> {
         self.transaction_timestamp_ms = None;
+        self.tx_statement_count = 0;
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
                 self.savepoints.reset().await?;

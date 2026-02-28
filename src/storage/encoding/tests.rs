@@ -394,7 +394,7 @@ fn test_encode_worker_registry_prefix() {
 
 #[test]
 fn test_encode_worker_queue_key() {
-    let key = encode_worker_queue_key(10, 1000, "myapp", 42, 100);
+    let key = encode_worker_queue_key(10, 1000, 1, "myapp", 42, 100);
     assert!(key.starts_with(WORKER_QUEUE_PREFIX));
     // Verify priority byte is at correct position
     let priority_byte = key[WORKER_QUEUE_PREFIX.len()];
@@ -403,15 +403,15 @@ fn test_encode_worker_queue_key() {
 
 #[test]
 fn test_worker_queue_key_priority_ordering() {
-    let key_p0 = encode_worker_queue_key(0, 1000, "myapp", 42, 100);
-    let key_p128 = encode_worker_queue_key(128, 1000, "myapp", 42, 100);
+    let key_p0 = encode_worker_queue_key(0, 1000, 1, "myapp", 42, 100);
+    let key_p128 = encode_worker_queue_key(128, 1000, 1, "myapp", 42, 100);
     assert!(key_p0 < key_p128, "lower priority value should sort first");
 }
 
 #[test]
 fn test_worker_queue_key_fire_time_ordering() {
-    let key_t1000 = encode_worker_queue_key(0, 1000, "myapp", 42, 100);
-    let key_t2000 = encode_worker_queue_key(0, 2000, "myapp", 42, 100);
+    let key_t1000 = encode_worker_queue_key(0, 1000, 1, "myapp", 42, 100);
+    let key_t2000 = encode_worker_queue_key(0, 2000, 1, "myapp", 42, 100);
     assert!(key_t1000 < key_t2000, "earlier fire_time should sort first");
 }
 
@@ -431,7 +431,7 @@ fn test_encode_worker_queue_scan_end() {
 
 #[test]
 fn test_decode_worker_queue_fire_time() {
-    let key = encode_worker_queue_key(10, 1234567890, "myapp", 42, 100);
+    let key = encode_worker_queue_key(10, 1234567890, 1, "myapp", 42, 100);
     let fire_time = decode_worker_queue_fire_time(&key).expect("decode");
     assert_eq!(fire_time, 1234567890);
 }
@@ -439,9 +439,16 @@ fn test_decode_worker_queue_fire_time() {
 #[test]
 fn test_decode_worker_queue_fire_time_roundtrip() {
     let original_time = 9876543210i64;
-    let key = encode_worker_queue_key(5, original_time, "test", 1, 50);
+    let key = encode_worker_queue_key(5, original_time, 1, "test", 1, 50);
     let decoded_time = decode_worker_queue_fire_time(&key).expect("decode");
     assert_eq!(decoded_time, original_time);
+}
+
+#[test]
+fn test_decode_worker_queue_task_type_roundtrip() {
+    let key = encode_worker_queue_key(5, 1000, 0x10, "test", 1, 50);
+    let decoded_task_type = decode_worker_queue_task_type(&key).expect("decode");
+    assert_eq!(decoded_task_type, 0x10);
 }
 
 #[test]
@@ -452,10 +459,11 @@ fn test_decode_worker_queue_fire_time_invalid_key() {
 
 #[test]
 fn test_encode_worker_claim_key() {
-    let key = encode_worker_claim_key("myapp", 42, 100, 5000);
+    let key = encode_worker_claim_key(0x10, "myapp", 42, 100, 5000);
     assert!(key.starts_with(WORKER_CLAIM_PREFIX));
+    assert_eq!(key[WORKER_CLAIM_PREFIX.len()], 0x10);
     // Verify keyspace length encoding
-    let keyspace_len_bytes = &key[WORKER_CLAIM_PREFIX.len()..WORKER_CLAIM_PREFIX.len() + 2];
+    let keyspace_len_bytes = &key[WORKER_CLAIM_PREFIX.len() + 1..WORKER_CLAIM_PREFIX.len() + 1 + 2];
     let keyspace_len = u16::from_be_bytes([keyspace_len_bytes[0], keyspace_len_bytes[1]]);
     assert_eq!(keyspace_len, 5); // "myapp" is 5 bytes
 }
@@ -470,8 +478,8 @@ fn test_encode_worker_claim_prefix() {
 fn test_worker_queue_key_priority_before_time() {
     // Higher priority (lower byte value) at later time should sort before lower priority at earlier time.
     // This proves that priority byte comes BEFORE fire_time in the key encoding.
-    let key_high_late = encode_worker_queue_key(0, 2000, "ks", 1, 1);
-    let key_low_early = encode_worker_queue_key(128, 1000, "ks", 1, 1);
+    let key_high_late = encode_worker_queue_key(0, 2000, 1, "ks", 1, 1);
+    let key_low_early = encode_worker_queue_key(128, 1000, 1, "ks", 1, 1);
     assert!(
         key_high_late < key_low_early,
         "priority must take precedence over fire_time"
@@ -480,9 +488,9 @@ fn test_worker_queue_key_priority_before_time() {
 
 #[test]
 fn test_worker_queue_key_big_endian_fire_time() {
-    let key_neg = encode_worker_queue_key(0, -1000i64, "app", 1, 1);
-    let key_zero = encode_worker_queue_key(0, 0i64, "app", 1, 1);
-    let key_pos = encode_worker_queue_key(0, 1000i64, "app", 1, 1);
+    let key_neg = encode_worker_queue_key(0, -1000i64, 1, "app", 1, 1);
+    let key_zero = encode_worker_queue_key(0, 0i64, 1, "app", 1, 1);
+    let key_pos = encode_worker_queue_key(0, 1000i64, 1, "app", 1, 1);
     assert!(key_neg < key_zero, "negative fire_time should sort first");
     assert!(key_zero < key_pos, "zero should sort before positive");
 }
@@ -503,9 +511,16 @@ fn test_worker_registry_key_different_db_ids() {
 
 #[test]
 fn test_worker_claim_key_different_task_ids() {
-    let key_1 = encode_worker_claim_key("myapp", 42, 100, 5000);
-    let key_2 = encode_worker_claim_key("myapp", 42, 200, 5000);
+    let key_1 = encode_worker_claim_key(0x10, "myapp", 42, 100, 5000);
+    let key_2 = encode_worker_claim_key(0x10, "myapp", 42, 200, 5000);
     assert_ne!(key_1, key_2);
+}
+
+#[test]
+fn test_worker_claim_key_same_identity_different_task_type() {
+    let key_a = encode_worker_claim_key(0x04, "myapp", 42, 100, 5000);
+    let key_b = encode_worker_claim_key(0x10, "myapp", 42, 100, 5000);
+    assert_ne!(key_a, key_b);
 }
 
 #[test]
@@ -518,7 +533,7 @@ fn test_worker_registry_key_roundtrip_prefix() {
 
 #[test]
 fn test_worker_claim_key_structure() {
-    let key = encode_worker_claim_key("demo", 10, 555, 9999);
+    let key = encode_worker_claim_key(0x01, "demo", 10, 555, 9999);
     assert!(key.starts_with(b"_worker_claim_"));
     let prefix = encode_worker_claim_prefix();
     assert!(key.starts_with(&prefix));
@@ -526,8 +541,15 @@ fn test_worker_claim_key_structure() {
 
 #[test]
 fn test_worker_queue_key_same_time_same_priority_different_keyspace() {
-    let key_a = encode_worker_queue_key(5, 1000, "ks_alpha", 1, 1);
-    let key_b = encode_worker_queue_key(5, 1000, "ks_beta", 1, 1);
+    let key_a = encode_worker_queue_key(5, 1000, 1, "ks_alpha", 1, 1);
+    let key_b = encode_worker_queue_key(5, 1000, 1, "ks_beta", 1, 1);
+    assert_ne!(key_a, key_b);
+}
+
+#[test]
+fn test_worker_queue_key_same_identity_different_task_type() {
+    let key_a = encode_worker_queue_key(5, 1000, 0x04, "ks", 1, 1);
+    let key_b = encode_worker_queue_key(5, 1000, 0x10, "ks", 1, 1);
     assert_ne!(key_a, key_b);
 }
 
@@ -543,8 +565,8 @@ fn test_worker_bg_result_key_structure() {
 #[test]
 fn test_worker_queue_scan_end_boundary() {
     let scan_end = encode_worker_queue_scan_end(5, 2000);
-    let key_before = encode_worker_queue_key(5, 1999, "ks", 1, 1);
-    let key_at = encode_worker_queue_key(5, 2000, "ks", 1, 1);
+    let key_before = encode_worker_queue_key(5, 1999, 1, "ks", 1, 1);
+    let key_at = encode_worker_queue_key(5, 2000, 1, "ks", 1, 1);
     assert!(
         key_before < scan_end,
         "key with earlier fire_time should be < scan_end"

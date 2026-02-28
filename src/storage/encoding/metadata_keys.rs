@@ -45,6 +45,7 @@ pub(super) const WORKER_REGISTRY_PREFIX: &[u8] = b"_worker_registry_";
 pub(super) const WORKER_QUEUE_PREFIX: &[u8] = b"_worker_queue_";
 pub(super) const WORKER_CLAIM_PREFIX: &[u8] = b"_worker_claim_";
 pub(super) const WORKER_BG_RESULT_PREFIX: &[u8] = b"_worker_bg_result_";
+pub(super) const WORKER_BG_TASK_SEQ_PREFIX: &[u8] = b"_worker_bg_task_seq_";
 
 // ============================================================================
 // Migration keys
@@ -359,22 +360,24 @@ pub fn encode_worker_registry_prefix() -> Vec<u8> {
 
 /// Encode a worker queue key (global).
 ///
-/// Format: `_worker_queue_{priority:u8}_{fire_time_ms:memcomparable}_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}_{task_id:be8}`
+/// Format: `_worker_queue_{priority:u8}_{fire_time_ms:memcomparable}_{task_type:u8}_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}_{task_id:be8}`
 ///
 /// Priority byte comes first so lower values (higher priority) sort first.
 /// Fire time uses memcomparable encoding so earlier times sort first (handles negative values correctly).
 pub fn encode_worker_queue_key(
     priority: u8,
     fire_time_ms: i64,
+    task_type: u8,
     keyspace: &str,
     db_id: u64,
     task_id: i64,
 ) -> Vec<u8> {
     let mut key =
-        Vec::with_capacity(WORKER_QUEUE_PREFIX.len() + 1 + 8 + 2 + keyspace.len() + 1 + 8 + 8);
+        Vec::with_capacity(WORKER_QUEUE_PREFIX.len() + 1 + 8 + 1 + 2 + keyspace.len() + 1 + 8 + 8);
     key.extend_from_slice(WORKER_QUEUE_PREFIX);
     key.push(priority);
     key.extend(memcomparable::to_vec(&fire_time_ms).unwrap());
+    key.push(task_type);
     key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
     key.extend_from_slice(keyspace.as_bytes());
     key.push(b'_');
@@ -414,18 +417,27 @@ pub fn decode_worker_queue_fire_time(key: &[u8]) -> Option<i64> {
     serde::Deserialize::deserialize(&mut deserializer).ok()
 }
 
+/// Decode task_type from a worker queue key.
+#[cfg(test)]
+pub fn decode_worker_queue_task_type(key: &[u8]) -> Option<u8> {
+    let offset = WORKER_QUEUE_PREFIX.len() + 1 + 8;
+    key.get(offset).copied()
+}
+
 /// Encode a worker claim key (global).
 ///
-/// Format: `_worker_claim_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}_{task_id:be8}_{fire_time_min:be8}`
+/// Format: `_worker_claim_{task_type:u8}_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}_{task_id:be8}_{fire_time_min:be8}`
 pub fn encode_worker_claim_key(
+    task_type: u8,
     keyspace: &str,
     db_id: u64,
     task_id: i64,
     fire_time_min: i64,
 ) -> Vec<u8> {
     let mut key =
-        Vec::with_capacity(WORKER_CLAIM_PREFIX.len() + 2 + keyspace.len() + 1 + 8 + 1 + 8 + 8);
+        Vec::with_capacity(WORKER_CLAIM_PREFIX.len() + 1 + 2 + keyspace.len() + 1 + 8 + 1 + 8 + 8);
     key.extend_from_slice(WORKER_CLAIM_PREFIX);
+    key.push(task_type);
     key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
     key.extend_from_slice(keyspace.as_bytes());
     key.push(b'_');
@@ -455,6 +467,21 @@ pub fn encode_worker_bg_result_key(keyspace: &str, db_id: u64, task_id: i64) -> 
     key.extend_from_slice(&db_id.to_be_bytes());
     key.push(b'_');
     key.extend_from_slice(&task_id.to_be_bytes());
+    key
+}
+
+/// Encode a worker background task sequence key (global, per tenant-db).
+///
+/// Format: `_worker_bg_task_seq_{keyspace_len:u16}{keyspace_bytes}_{db_id:be8}`
+///
+/// Used as the CAS-protected counter key for collision-free bg task ID allocation.
+pub fn encode_worker_bg_task_seq_key(keyspace: &str, db_id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(WORKER_BG_TASK_SEQ_PREFIX.len() + 2 + keyspace.len() + 1 + 8);
+    key.extend_from_slice(WORKER_BG_TASK_SEQ_PREFIX);
+    key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
+    key.extend_from_slice(keyspace.as_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&db_id.to_be_bytes());
     key
 }
 
@@ -625,10 +652,16 @@ mod tests {
 
     #[test]
     fn worker_queue_fire_time_roundtrip_positive_and_negative() {
-        let key_pos = encode_worker_queue_key(3, 1234567890, "tenant_a", 42, 7);
-        let key_neg = encode_worker_queue_key(3, -987654321, "tenant_a", 42, 7);
+        let key_pos = encode_worker_queue_key(3, 1234567890, 1, "tenant_a", 42, 7);
+        let key_neg = encode_worker_queue_key(3, -987654321, 1, "tenant_a", 42, 7);
         assert_eq!(decode_worker_queue_fire_time(&key_pos), Some(1234567890));
         assert_eq!(decode_worker_queue_fire_time(&key_neg), Some(-987654321));
+    }
+
+    #[test]
+    fn worker_queue_task_type_roundtrip() {
+        let key = encode_worker_queue_key(3, 1234567890, 0x10, "tenant_a", 42, 7);
+        assert_eq!(decode_worker_queue_task_type(&key), Some(0x10));
     }
 
     #[test]
@@ -663,11 +696,37 @@ mod tests {
     fn worker_queue_scan_end_matches_key_prefix_for_same_priority_and_fire_time() {
         let fire_time = 1000_i64;
         let prefix = encode_worker_queue_scan_end(5, fire_time);
-        let key = encode_worker_queue_key(5, fire_time, "k", 1, 2);
+        let key = encode_worker_queue_key(5, fire_time, 1, "k", 1, 2);
         assert!(key.starts_with(&prefix));
 
         let later = encode_worker_queue_scan_end(5, fire_time + 1);
         assert!(prefix < later);
+    }
+
+    #[test]
+    fn worker_bg_task_seq_key_encodes_keyspace_and_db_id() {
+        let key = encode_worker_bg_task_seq_key("ks", 9);
+        assert!(key.starts_with(WORKER_BG_TASK_SEQ_PREFIX));
+
+        let len_offset = WORKER_BG_TASK_SEQ_PREFIX.len();
+        let len = u16::from_be_bytes([key[len_offset], key[len_offset + 1]]) as usize;
+        assert_eq!(len, 2);
+        assert_eq!(&key[len_offset + 2..len_offset + 2 + len], b"ks");
+        assert_eq!(key[len_offset + 2 + len], b'_');
+        assert_eq!(
+            &key[len_offset + 2 + len + 1..len_offset + 2 + len + 1 + 8],
+            &9u64.to_be_bytes()
+        );
+    }
+
+    #[test]
+    fn worker_bg_task_seq_key_differs_across_tenant_db_scopes() {
+        let key_a = encode_worker_bg_task_seq_key("ks_a", 1);
+        let key_b = encode_worker_bg_task_seq_key("ks_b", 1);
+        let key_c = encode_worker_bg_task_seq_key("ks_a", 2);
+        assert_ne!(key_a, key_b);
+        assert_ne!(key_a, key_c);
+        assert_ne!(key_b, key_c);
     }
 
     #[test]

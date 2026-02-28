@@ -17,6 +17,27 @@ use super::scaffold::DispatchContext;
 use super::transaction::check_observability_statement_permission;
 use super::utils::{validate_transaction_modes, wrap_with_runtime_context, RuntimeSettings};
 
+fn is_dedicated_ast_non_tx_control_statement(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::Savepoint { .. }
+            | Statement::ReleaseSavepoint { .. }
+            | Statement::Rollback {
+                savepoint: Some(_),
+                ..
+            }
+            | Statement::SetRole { .. }
+            | Statement::SetVariable { .. }
+            | Statement::SetTimeZone { .. }
+            | Statement::SetNames { .. }
+            | Statement::SetTransaction { .. }
+            | Statement::ShowVariable { .. }
+            | Statement::Prepare { .. }
+            | Statement::Execute { .. }
+            | Statement::Deallocate { .. }
+    )
+}
+
 impl Executor {
     /// Parse SQL and dispatch each AST statement.
     ///
@@ -230,6 +251,10 @@ impl Executor {
             )
             .await;
 
+            if stmt_exec.is_ok() && is_dedicated_ast_non_tx_control_statement(stmt) {
+                session.note_statement_success_in_transaction();
+            }
+
             if stmt_exec.is_err() && session.is_in_transaction() {
                 session.mark_transaction_failed();
             }
@@ -439,6 +464,22 @@ mod tests {
             session.show_setting_value("timezone").as_deref(),
             Some("UTC")
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_set_local_timezone_inside_txn_marks_statement_executed() {
+        let (executor, mut session) = make_executor_and_session();
+        session.force_test_transaction_state(true, false);
+        assert!(!session.has_executed_statement_in_transaction());
+
+        let sql = "SET LOCAL TIME ZONE 'UTC'";
+        let ctx = DispatchContext::new(sql, &session);
+        executor
+            .dispatch_parsed_statements(&mut session, sql, &ctx)
+            .await
+            .unwrap();
+
+        assert!(session.has_executed_statement_in_transaction());
     }
 
     #[tokio::test]

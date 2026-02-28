@@ -26,6 +26,10 @@ fn worker_claim_keyspace_matches(key: &[u8], keyspace: &str) -> bool {
         return false;
     }
     let mut idx = PREFIX.len();
+    if idx + 1 > key.len() {
+        return false;
+    }
+    idx += 1; // task_type:u8
     if idx + 2 > key.len() {
         return false;
     }

@@ -350,7 +350,13 @@ impl Executor {
             let result: Result<bool, anyhow::Error> = async {
                 let mut txn = store.begin().await?;
                 let existing = store
-                    .scan_queue_entries_for_task(&mut txn, &keyspace, db_id, table_id as i64)
+                    .scan_queue_entries_for_task(
+                        &mut txn,
+                        &keyspace,
+                        db_id,
+                        table_id as i64,
+                        crate::worker::types::TaskType::AutoAnalyze,
+                    )
                     .await?;
                 if existing.is_empty() {
                     let now_ms = std::time::SystemTime::now()

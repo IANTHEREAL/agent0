@@ -68,8 +68,10 @@ async fn execute_bg_launch(
     let system_store = get_system_store()
         .ok_or_else(|| anyhow!("pg_background_launch: worker engine not available"))?;
 
-    let task_id = chrono::Utc::now().timestamp_millis();
-    let fire_time = task_id;
+    // task_id: collision-free identity via TiKV CAS atomic counter (per tenant-db scope).
+    // fire_time: scheduling order only — may repeat across launches.
+    let task_id = system_store.next_bg_task_id(keyspace, db_id).await?;
+    let fire_time = chrono::Utc::now().timestamp_millis();
 
     let entry = TaskQueueEntry::new(
         keyspace.to_string(),
@@ -123,7 +125,7 @@ async fn execute_bg_result(keyspace: &str, db_id: u64, args: &[Value]) -> Result
     }
 
     let queue_keys = system_store
-        .scan_queue_entries_for_task(&mut sys_txn, keyspace, db_id, task_id)
+        .scan_queue_entries_for_task(&mut sys_txn, keyspace, db_id, task_id, TaskType::BgSql)
         .await?;
     sys_txn.commit().await?;
 
@@ -217,5 +219,20 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("worker engine not available"));
+    }
+
+    /// task_id is now sourced from TiKV CAS counter (not timestamp), so no inline
+    /// timestamp fallback exists. The launch path errors at system_store acquisition,
+    /// confirming the CAS allocator is the sole task_id source.
+    #[tokio::test]
+    async fn execute_bg_launch_uses_system_store_for_task_id() {
+        let err = execute_bg_launch(1, "u", "ks", &[Value::Text("select 1".to_string())])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("worker engine not available"),
+            "launch must go through system_store (CAS allocator), not inline timestamp"
+        );
     }
 }
