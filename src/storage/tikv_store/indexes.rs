@@ -1,6 +1,8 @@
 use super::*;
 use crate::storage::backpressure::tikv_op;
 
+const INDEX_SENTINEL_VALUE: &[u8] = &[0x01];
+
 impl TikvStore {
     #[inline]
     fn index_key_has_null(values: &[Value]) -> bool {
@@ -82,9 +84,9 @@ impl TikvStore {
 
     /// Decode primary-key values from a unique index entry.
     ///
-    /// For unique indexes that allow NULL (stored with PK-suffixed key shape), the value is
-    /// empty and the PK lives in the key suffix. For normal unique entries, the PK is encoded
-    /// in the value.
+    /// For unique indexes that allow NULL (stored with PK-suffixed key shape), the value uses
+    /// a sentinel and the PK lives in the key suffix. Legacy entries may still have empty values.
+    /// For normal unique entries, the PK is encoded in the value.
     fn decode_unique_pk_from_index_entry(
         &self,
         full_key: &[u8],
@@ -95,7 +97,7 @@ impl TikvStore {
         index_column_types: &[DataType],
         pk_types: &[DataType],
     ) -> Result<Vec<Value>> {
-        if value.is_empty() {
+        if value.is_empty() || value == INDEX_SENTINEL_VALUE {
             self.decode_non_unique_pk_from_index_key(
                 full_key,
                 db_id,
@@ -140,7 +142,7 @@ impl TikvStore {
                 values,
                 Some(pk_values),
             ));
-            txn_put(txn, idx_key, vec![]).await?;
+            txn_put(txn, idx_key, INDEX_SENTINEL_VALUE.to_vec()).await?;
         }
         Ok(())
     }
@@ -413,7 +415,7 @@ impl TikvStore {
     /// Create GIN-like inverted index entries for a row.
     ///
     /// Each `token_hash` is stored as a separate key that points to `pk_values` via the
-    /// key suffix. The value is empty.
+    /// key suffix. The value uses a non-empty sentinel.
     pub async fn create_gin_index_entries(
         &self,
         txn: &mut Transaction,
@@ -432,7 +434,7 @@ impl TikvStore {
             let key = self.key(&encode_gin_index_key_v2(
                 db_id, table_id, index_id, token_hash, &pk_key,
             ));
-            txn_put(txn, key, Vec::new()).await?;
+            txn_put(txn, key, INDEX_SENTINEL_VALUE.to_vec()).await?;
         }
         Ok(())
     }
@@ -626,5 +628,49 @@ mod tests {
             )
             .expect_err("unique key shape should be rejected");
         assert!(err.to_string().contains("missing PK separator"));
+    }
+
+    #[test]
+    fn decode_unique_pk_from_index_entry_accepts_sentinel_suffix_encoding() {
+        let store = TikvStore::new_stub();
+        let idx_values = vec![Value::Text("idx".to_string())];
+        let pk_values = vec![Value::Int64(99)];
+        let full_key = store.make_index_key(1, 2, 3, &idx_values, Some(pk_values.as_slice()));
+
+        let decoded = store
+            .decode_unique_pk_from_index_entry(
+                &full_key,
+                INDEX_SENTINEL_VALUE,
+                1,
+                2,
+                3,
+                &[DataType::Text],
+                &[DataType::Int64],
+            )
+            .expect("decode sentinel-backed unique entry");
+
+        assert_eq!(decoded, pk_values);
+    }
+
+    #[test]
+    fn decode_unique_pk_from_index_entry_accepts_legacy_empty_suffix_encoding() {
+        let store = TikvStore::new_stub();
+        let idx_values = vec![Value::Int32(17)];
+        let pk_values = vec![Value::Int32(5), Value::Text("pk".to_string())];
+        let full_key = store.make_index_key(7, 8, 9, &idx_values, Some(pk_values.as_slice()));
+
+        let decoded = store
+            .decode_unique_pk_from_index_entry(
+                &full_key,
+                &[],
+                7,
+                8,
+                9,
+                &[DataType::Int32],
+                &[DataType::Int32, DataType::Text],
+            )
+            .expect("decode legacy empty-value unique entry");
+
+        assert_eq!(decoded, pk_values);
     }
 }
