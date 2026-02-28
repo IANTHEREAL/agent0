@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::backpressure::tikv_op;
 
 impl TikvStore {
     #[inline]
@@ -123,7 +124,7 @@ impl TikvStore {
             let idx_key = self.key(&encode_index_key_v2(
                 db_id, table_id, index_id, values, None,
             ));
-            if txn.get(idx_key.clone()).await?.is_some() {
+            if tikv_op!(txn.get(idx_key.clone()).await)?.is_some() {
                 return Err(crate::storage::unique_index_duplicate_error());
             }
             let idx_val = encode_pk_values(pk_values);
@@ -199,7 +200,7 @@ impl TikvStore {
             let idx_key = self.key(&encode_index_key_v2(
                 db_id, table_id, index_id, values, None,
             ));
-            if let Some(val) = txn.get(idx_key).await? {
+            if let Some(val) = tikv_op!(txn.get(idx_key).await)? {
                 let pk = decode_pk_from_index_suffix(&val, pk_types)?;
                 Ok(vec![pk])
             } else {
@@ -217,7 +218,8 @@ impl TikvStore {
             let end_key = self.key(&end_raw);
 
             let range: BoundRange = (start_key.clone()..end_key).into();
-            let pairs = txn.scan(range, scan_limit_to_u32(limit)).await?;
+            let pairs = tikv_op!(txn.scan(range, scan_limit_to_u32(limit)).await)
+                .map_err(|e| anyhow!(e))?;
 
             let mut pks = Vec::new();
             let mut scanned_pairs = 0usize;
@@ -269,7 +271,8 @@ impl TikvStore {
         let end_key = self.key(&end_raw);
 
         let range: BoundRange = (start_key..end_key).into();
-        let pairs = txn.scan(range, scan_limit_to_u32(limit)).await?;
+        let pairs =
+            tikv_op!(txn.scan(range, scan_limit_to_u32(limit)).await).map_err(|e| anyhow!(e))?;
 
         let mut pks = Vec::new();
         if unique {
@@ -360,7 +363,8 @@ impl TikvStore {
         let end_key = self.key(&end_raw);
 
         let range: BoundRange = (start_key..end_key).into();
-        let pairs = txn.scan(range, scan_limit_to_u32(limit)).await?;
+        let pairs =
+            tikv_op!(txn.scan(range, scan_limit_to_u32(limit)).await).map_err(|e| anyhow!(e))?;
 
         let mut pks = Vec::new();
         if unique {
@@ -495,7 +499,8 @@ impl TikvStore {
         out: &mut Vec<Row>,
     ) -> Result<()> {
         kv_stats::record_batch_get_keys(data_keys.len());
-        let pairs = txn.batch_get(data_keys.iter().cloned()).await?;
+        let pairs =
+            tikv_op!(txn.batch_get(data_keys.iter().cloned()).await).map_err(|e| anyhow!(e))?;
         let mut by_key: HashMap<Key, tikv_client::Value> = HashMap::with_capacity(data_keys.len());
 
         for pair in pairs {
@@ -544,7 +549,7 @@ impl TikvStore {
         };
 
         let range: BoundRange = (prefix.clone()..end_key).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         let mut pk_bytes_list = Vec::new();
         let mut scanned = 0usize;

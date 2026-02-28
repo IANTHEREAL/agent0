@@ -17,7 +17,7 @@ impl TikvStore {
         config_name: &str,
     ) -> Result<Option<String>> {
         let key = self.key(&encode_tsc_key_v2(db_id, config_name));
-        match txn.get(key).await? {
+        match tikv_op!(txn.get(key).await)? {
             Some(data) => Ok(Some(
                 String::from_utf8(data).context("invalid UTF-8 in text search config value")?,
             )),
@@ -48,7 +48,7 @@ impl TikvStore {
         config_name: &str,
     ) -> Result<bool> {
         let key = self.key(&encode_tsc_key_v2(db_id, config_name));
-        let existed = txn.get(key.clone()).await?.is_some();
+        let existed = tikv_op!(txn.get(key.clone()).await)?.is_some();
         if existed {
             txn_delete(txn, key).await?;
         }

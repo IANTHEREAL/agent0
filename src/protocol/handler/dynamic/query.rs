@@ -242,6 +242,33 @@ impl DynamicPgHandler {
         Ok(())
     }
 
+    /// Check TiKV adaptive backpressure. Returns a guard that tracks in-flight
+    /// concurrency (SQLSTATE 53300 on rejection). Caller must hold the guard for
+    /// the duration of the query.
+    pub(super) fn check_backpressure(
+        &self,
+    ) -> PgWireResult<Option<crate::storage::backpressure::BackpressureGuard>> {
+        if let Some(ctrl) = crate::storage::backpressure::controller() {
+            match ctrl.try_acquire() {
+                Ok(guard) => return Ok(Some(guard)),
+                Err(rejection) => {
+                    if let Some(handle) = self.tenant_handle.get() {
+                        tracing::warn!(
+                            keyspace = handle.keyspace(),
+                            "Query rejected by TiKV backpressure"
+                        );
+                    }
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "53300".to_string(),
+                        rejection.to_string(),
+                    ))));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     async fn handle_copy_from_simple_query<'a>(
         &self,
         query: &'a str,
@@ -452,6 +479,7 @@ impl DynamicPgHandler {
             columns: resolved_columns,
             column_types,
             query_context: qctx,
+            backpressure_guard: None,
             line_buffer: Vec::new(),
             row_count: 0,
             started_txn,
@@ -496,9 +524,12 @@ impl SimpleQueryHandler for DynamicPgHandler {
         // Transaction-control statements (BEGIN, COMMIT, ROLLBACK, SAVEPOINT, …)
         // are exempt from rate limiting -- blocking them would prevent transaction
         // cleanup and violate PostgreSQL recovery semantics.
-        if !is_transaction_control(query) {
+        let _bp_guard = if !is_transaction_control(query) {
             self.check_rate_limit()?;
-        }
+            Some(self.check_backpressure()?)
+        } else {
+            None
+        };
 
         let state = self.auth();
         let executor = &state.executor;
@@ -654,6 +685,13 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                 }
             })
             .collect();
+
+        // Keep transaction-control statements parseable for cleanup/recovery paths.
+        let _bp_guard = if !is_transaction_control(&stored.statement.sql) {
+            Some(self.check_backpressure()?)
+        } else {
+            None
+        };
 
         // 4. Analyze for frozen execution IR
         let state = self.auth();
@@ -945,9 +983,12 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         let prepared = &portal.statement.statement;
 
         // Transaction-control statements bypass rate limiting (see simple-query path).
-        if !is_transaction_control(&prepared.sql) {
+        let _bp_guard = if !is_transaction_control(&prepared.sql) {
             self.check_rate_limit()?;
-        }
+            Some(self.check_backpressure()?)
+        } else {
+            None
+        };
 
         let state = self.auth();
         let executor = &state.executor;

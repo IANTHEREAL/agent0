@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::backpressure::tikv_op;
 use crate::worker::types::{TaskQueueEntry, TaskRegistryEntry, TaskType, WorkerClaim};
 
 impl TikvStore {
@@ -25,7 +26,7 @@ impl TikvStore {
         db_id: u64,
     ) -> Result<Option<TaskRegistryEntry>> {
         let key = self.key(&encode_worker_registry_key(keyspace, db_id));
-        match txn.get(key).await? {
+        match tikv_op!(txn.get(key).await)? {
             Some(data) => Ok(Some(
                 bincode::deserialize(&data)
                     .context("Failed to deserialize worker registry entry")?,
@@ -42,7 +43,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         let mut entries = Vec::new();
         for pair in pairs {
@@ -148,7 +149,7 @@ impl TikvStore {
             let range: BoundRange = (start.clone()..end).into();
             let remaining = limit as usize - results.len();
             let scan_limit = scan_limit_to_u32(Some(remaining));
-            let pairs = txn.scan(range, scan_limit).await?;
+            let pairs = tikv_op!(txn.scan(range, scan_limit).await)?;
 
             for pair in pairs {
                 let key: &[u8] = pair.key().as_ref().into();
@@ -179,7 +180,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         let mut matching_keys = Vec::new();
         for pair in pairs {
@@ -208,7 +209,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         let mut results = Vec::new();
         for pair in pairs {
@@ -247,7 +248,7 @@ impl TikvStore {
             task_id,
             fire_time_min,
         ));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             return Ok(false);
         }
         txn_put(
@@ -306,7 +307,7 @@ impl TikvStore {
             None => prefix.clone(),
         };
         let range: BoundRange = (start..end).into();
-        let pairs = txn.scan(range, scan_limit_to_u32(limit)).await?;
+        let pairs = tikv_op!(txn.scan(range, scan_limit_to_u32(limit)).await)?;
 
         let mut results = Vec::new();
         for pair in pairs {
@@ -346,7 +347,7 @@ impl TikvStore {
         task_id: i64,
     ) -> Result<Option<String>> {
         let key = self.key(&encode_worker_bg_result_key(keyspace, db_id, task_id));
-        match txn.get(key).await? {
+        match tikv_op!(txn.get(key).await)? {
             Some(data) => Ok(Some(
                 String::from_utf8(data).context("Failed to decode bg result as UTF-8")?,
             )),

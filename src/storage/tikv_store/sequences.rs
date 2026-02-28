@@ -1,5 +1,6 @@
 use super::*;
 use crate::sql::error::SqlError;
+use crate::storage::backpressure::tikv_op;
 
 pub(super) fn nextval_standalone(
     full_name: &str,
@@ -148,7 +149,7 @@ impl TikvStore {
 
         let full_name = def.full_name();
         let key = self.key(&encode_sequence_def_key_v2(db_id, &full_name));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             return Err(SqlError::DuplicateRelation(full_name.to_string()).into());
         }
         let data = bincode::serialize(&def).context("Failed to serialize sequence definition")?;
@@ -233,7 +234,7 @@ impl TikvStore {
         full_name: &str,
     ) -> Result<Option<SequenceDef>> {
         let key = self.key(&encode_sequence_def_key_v2(db_id, full_name));
-        match txn.get(key).await? {
+        match tikv_op!(txn.get(key).await)? {
             Some(data) => {
                 let mut def: SequenceDef = bincode::deserialize(&data)
                     .context("Failed to deserialize sequence definition")?;
@@ -261,7 +262,7 @@ impl TikvStore {
 
         for attempt in 0..AUTOCOMMIT_MAX_RETRIES {
             let mut txn = self.begin_optimistic().await?;
-            let Some(data) = txn.get(def_key.clone()).await? else {
+            let Some(data) = tikv_op!(txn.get(def_key.clone()).await)? else {
                 let _ = txn.rollback().await;
                 return Ok(None);
             };
@@ -274,7 +275,7 @@ impl TikvStore {
                 return Ok(Some(def));
             }
 
-            let current = txn.get(oid_key.clone()).await?;
+            let current = tikv_op!(txn.get(oid_key.clone()).await)?;
             let next_val = match current {
                 Some(data) => {
                     let oid = u32::from_be_bytes(
@@ -286,18 +287,18 @@ impl TikvStore {
                 }
                 None => FIRST_SEQUENCE_OID,
             };
-            txn.put(oid_key.clone(), next_val.to_be_bytes().to_vec())
-                .await
-                .map_err(|e| anyhow!(e))?;
+            tikv_op!(
+                txn.put(oid_key.clone(), next_val.to_be_bytes().to_vec())
+                    .await
+            )
+            .map_err(|e| anyhow!(e))?;
 
             def.oid = next_val;
             let data =
                 bincode::serialize(&def).context("Failed to serialize sequence definition")?;
-            txn.put(def_key.clone(), data)
-                .await
-                .map_err(|e| anyhow!(e))?;
+            tikv_op!(txn.put(def_key.clone(), data).await).map_err(|e| anyhow!(e))?;
 
-            match txn.commit().await {
+            match tikv_op!(txn.commit().await) {
                 Ok(_) => return Ok(Some(def)),
                 Err(e) => {
                     let _ = txn.rollback().await;
@@ -326,7 +327,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         let mut sequences = Vec::new();
         for pair in pairs {
@@ -345,7 +346,7 @@ impl TikvStore {
         full_name: &str,
     ) -> Result<bool> {
         let key = self.key(&encode_sequence_def_key_v2(db_id, full_name));
-        let Some(data) = txn.get(key.clone()).await? else {
+        let Some(data) = tikv_op!(txn.get(key.clone()).await)? else {
             return Ok(false);
         };
 
@@ -357,7 +358,7 @@ impl TikvStore {
         // definition so that a later recreate (with a new OID) doesn't accumulate orphan keys.
         if matches!(def.backing, SequenceBacking::Standalone(_)) && def.oid != 0 {
             let state_key = self.key(&encode_sequence_value_key_v2(db_id, def.oid));
-            if txn.get(state_key.clone()).await?.is_some() {
+            if tikv_op!(txn.get(state_key.clone()).await)?.is_some() {
                 txn_delete(txn, state_key).await?;
             }
         }
@@ -386,7 +387,7 @@ impl TikvStore {
         let key = self.key(&encode_table_sequence_value_key_v2(db_id, table_id));
         let current = {
             let mut read_txn = self.begin_optimistic().await?;
-            let current = read_txn.get(key).await?;
+            let current = tikv_op!(read_txn.get(key).await)?;
             let _ = read_txn.rollback().await;
             current
         };

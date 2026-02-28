@@ -46,6 +46,37 @@ impl CopyHandler for DynamicPgHandler {
     {
         let executor = &self.auth().executor;
 
+        // COPY FROM STDIN runs outside the original simple-query `do_query` scope,
+        // so acquire admission here and keep the guard in CopyContext until COPY ends.
+        let copy_admission = {
+            let mut ctx_guard = self.copy_context.lock().await;
+            let Some(ctx) = ctx_guard.as_mut() else {
+                return Ok(());
+            };
+
+            if ctx.backpressure_guard.is_none() {
+                match self.check_backpressure() {
+                    Ok(guard) => {
+                        ctx.backpressure_guard = guard;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let started_txn = ctx.started_txn;
+                        *ctx_guard = None;
+                        Err((e, started_txn))
+                    }
+                }
+            } else {
+                Ok(())
+            }
+        };
+
+        if let Err((e, started_txn)) = copy_admission {
+            let mut session = self.auth().session.lock().await;
+            rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+            return Err(e);
+        }
+
         let (parse_res, table_name, started_txn, qctx) = {
             let mut ctx_guard = self.copy_context.lock().await;
             let Some(ctx) = ctx_guard.as_mut() else {

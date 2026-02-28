@@ -27,12 +27,12 @@ pub(in crate::protocol::handler) fn copy_row_column_mismatch_error(
     )))
 }
 
-#[derive(Debug, Clone)]
 pub struct CopyContext {
     pub table_name: String,
     pub columns: Vec<String>,
     pub column_types: Vec<Option<DataType>>,
     pub query_context: QueryContext,
+    pub backpressure_guard: Option<crate::storage::backpressure::BackpressureGuard>,
     pub line_buffer: Vec<u8>,
     pub row_count: usize,
     pub started_txn: bool,

@@ -5,6 +5,7 @@ use crate::model::{
     DataType, DatabaseDef, FunctionDef, MatViewDef, MigrationRecord, Row, SequenceBacking,
     SequenceDef, SequenceState, TableSchema, TriggerDef, UserTypeDef, Value, ViewDef,
 };
+use crate::storage::backpressure::tikv_op;
 use crate::txn::{txn_delete, txn_put};
 use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -189,18 +190,12 @@ impl TikvStore {
 
     pub async fn begin(&self) -> Result<Transaction> {
         let options = TransactionOptions::new_pessimistic().drop_check(CheckLevel::Warn);
-        self.client()
-            .begin_with_options(options)
-            .await
-            .map_err(|e| anyhow!(e))
+        tikv_op!(self.client().begin_with_options(options).await).map_err(|e| anyhow!(e))
     }
 
     pub async fn begin_optimistic(&self) -> Result<Transaction> {
         let options = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
-        self.client()
-            .begin_with_options(options)
-            .await
-            .map_err(|e| anyhow!(e))
+        tikv_op!(self.client().begin_with_options(options).await).map_err(|e| anyhow!(e))
     }
 
     /// Perform a single-key read/modify/write in its own auto-committed transaction.
@@ -214,17 +209,17 @@ impl TikvStore {
     ) -> Result<R> {
         for attempt in 0..AUTOCOMMIT_MAX_RETRIES {
             let mut txn = self.begin_optimistic().await?;
-            let current = txn.get(key.clone()).await?;
+            let current = tikv_op!(txn.get(key.clone()).await)?;
             let (new_value, result) = compute(current)?;
 
             // Intentional: use raw txn.put/delete (not txn_put/txn_delete) to bypass
             // savepoint undo tracking — matches PostgreSQL's non-transactional sequence semantics.
             match new_value {
-                Some(val) => txn.put(key.clone(), val).await.map_err(|e| anyhow!(e))?,
-                None => txn.delete(key.clone()).await.map_err(|e| anyhow!(e))?,
+                Some(val) => tikv_op!(txn.put(key.clone(), val).await).map_err(|e| anyhow!(e))?,
+                None => tikv_op!(txn.delete(key.clone()).await).map_err(|e| anyhow!(e))?,
             }
 
-            match txn.commit().await {
+            match tikv_op!(txn.commit().await) {
                 Ok(_) => return Ok(result),
                 Err(e) => {
                     let _ = txn.rollback().await;
@@ -255,7 +250,7 @@ impl TikvStore {
         let mut txn = self.begin().await?;
         let key = self.key(&encode_format_version_key());
 
-        match txn.get(key.clone()).await? {
+        match tikv_op!(txn.get(key.clone()).await)? {
             Some(data) => {
                 let bytes: [u8; 4] = data
                     .as_slice()
@@ -277,9 +272,7 @@ impl TikvStore {
             None => {
                 // New keyspace (or a legacy v1 keyspace). Refuse to auto-upgrade if we detect
                 // v1 table metadata keys.
-                let has_v1_tables = txn
-                    .get(self.key(&encode_next_table_id_key()))
-                    .await?
+                let has_v1_tables = tikv_op!(txn.get(self.key(&encode_next_table_id_key())).await)?
                     .is_some()
                     || self
                         .prefix_has_any(&mut txn, encode_schema_prefix())
@@ -294,7 +287,7 @@ impl TikvStore {
                 }
 
                 txn_put(&mut txn, key, STORAGE_FORMAT_VERSION.to_be_bytes().to_vec()).await?;
-                txn.commit().await?;
+                tikv_op!(txn.commit().await)?;
                 Ok(())
             }
         }
@@ -320,7 +313,7 @@ impl TikvStore {
         let data = bincode::serialize(&def).context("Failed to serialize database definition")?;
         txn_put(&mut txn, id_key, data).await?;
 
-        txn.commit().await?;
+        tikv_op!(txn.commit().await)?;
         info!("Bootstrapped default database 'postgres' with ID {}", db_id);
         Ok(())
     }
@@ -333,7 +326,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix..end).into();
-        let mut pairs = txn.scan(range, 1).await?;
+        let mut pairs = tikv_op!(txn.scan(range, 1).await)?;
         Ok(pairs.next().is_some())
     }
 
@@ -412,7 +405,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         let mut records = Vec::new();
         for pair in pairs {
@@ -483,7 +476,7 @@ impl TikvStore {
         first_value: u32,
         entity_name: &str,
     ) -> Result<u32> {
-        let current = txn.get(key.clone()).await?;
+        let current = tikv_op!(txn.get(key.clone()).await)?;
         let next_val = match current {
             Some(data) => {
                 let oid = u32::from_be_bytes(

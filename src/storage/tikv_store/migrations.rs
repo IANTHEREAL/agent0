@@ -1,5 +1,6 @@
 use super::*;
 use crate::sql::binder::{extract_relation_references_from_query, RelationDep};
+use crate::storage::backpressure::tikv_op;
 use sqlparser::ast::{Query, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -348,7 +349,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         let mut migrations = Vec::new();
         for pair in pairs {
@@ -368,7 +369,7 @@ impl TikvStore {
     pub async fn ensure_view_relation_bindings_migration(&self) -> Result<()> {
         let mut txn = self.begin().await?;
         let migration_key = self.key(&encode_migration_key(VIEW_BINDINGS_MIGRATION_NAME));
-        let marker_exists = txn.get(migration_key.clone()).await?.is_some();
+        let marker_exists = tikv_op!(txn.get(migration_key.clone()).await)?.is_some();
 
         let mut targets: Vec<RelationBindingBackfillTarget> = Vec::new();
         let databases = self.list_databases(&mut txn).await?;
@@ -459,7 +460,7 @@ impl TikvStore {
             }
         }
 
-        txn.commit().await?;
+        tikv_op!(txn.commit().await)?;
 
         if !plan.unresolved.is_empty() {
             tracing::warn!(

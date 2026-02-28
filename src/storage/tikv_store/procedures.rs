@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::backpressure::tikv_op;
 
 impl TikvStore {
     pub async fn create_procedure(
@@ -9,7 +10,7 @@ impl TikvStore {
         definition: &str,
     ) -> Result<()> {
         let key = self.key(&encode_procedure_key_v2(db_id, name));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             return Err(anyhow!("Procedure '{}' already exists", name));
         }
         txn_put(txn, key, definition.as_bytes().to_vec()).await?;
@@ -24,7 +25,7 @@ impl TikvStore {
         name: &str,
     ) -> Result<Option<String>> {
         let key = self.key(&encode_procedure_key_v2(db_id, name));
-        match txn.get(key).await? {
+        match tikv_op!(txn.get(key).await)? {
             Some(data) => Ok(Some(String::from_utf8(data)?)),
             None => Ok(None),
         }
@@ -37,7 +38,7 @@ impl TikvStore {
         name: &str,
     ) -> Result<bool> {
         let key = self.key(&encode_procedure_key_v2(db_id, name));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             txn_delete(txn, key).await?;
             info!("Dropped procedure '{}'", name);
             Ok(true)

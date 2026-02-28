@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::backpressure::tikv_op;
 
 impl TikvStore {
     pub async fn create_trigger(
@@ -12,7 +13,7 @@ impl TikvStore {
         }
 
         let key = self.key(&encode_trigger_key_v2(db_id, &def.table, def.name.as_str()));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             return Err(anyhow!(
                 "Trigger '{}' already exists on '{}'",
                 def.name,
@@ -33,7 +34,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         let mut triggers = Vec::new();
         for pair in pairs {
@@ -64,7 +65,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         let mut triggers = Vec::new();
         for pair in pairs {
@@ -87,7 +88,7 @@ impl TikvStore {
         trigger_name: &str,
     ) -> Result<bool> {
         let key = self.key(&encode_trigger_key_v2(db_id, table_full_name, trigger_name));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             txn_delete(txn, key).await?;
             Ok(true)
         } else {
@@ -173,7 +174,7 @@ impl TikvStore {
         let mut new_end = new_prefix.clone();
         new_end.push(0xFF);
         let range: BoundRange = (new_prefix..new_end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
         let mut existing_triggers = HashMap::new();
         for pair in pairs {
             let key: &[u8] = pair.key().as_ref().into();
@@ -190,7 +191,7 @@ impl TikvStore {
         let mut old_end = old_prefix.clone();
         old_end.push(0xFF);
         let range: BoundRange = (old_prefix.clone()..old_end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         let mut triggers = Vec::new();
         for pair in pairs {
@@ -245,7 +246,7 @@ impl TikvStore {
 
         // Move table comment, if present.
         let old_table_key = self.key(&encode_comment_table_key_v2(db_id, old_table));
-        if let Some(value) = txn.get(old_table_key.clone()).await? {
+        if let Some(value) = tikv_op!(txn.get(old_table_key.clone()).await)? {
             let new_table_key = self.key(&encode_comment_table_key_v2(db_id, new_table));
             txn_put(txn, new_table_key, value).await?;
             txn_delete(txn, old_table_key).await?;
@@ -256,7 +257,7 @@ impl TikvStore {
         let mut end = old_prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (old_prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
         for pair in pairs {
             let key: &[u8] = pair.key().as_ref().into();
             if !key.starts_with(&old_prefix) {
@@ -284,7 +285,7 @@ impl TikvStore {
             table_full_name,
             old_column,
         ));
-        let Some(value) = txn.get(old_key.clone()).await? else {
+        let Some(value) = tikv_op!(txn.get(old_key.clone()).await)? else {
             return Ok(());
         };
         let new_key = self.key(&encode_comment_column_key_v2(
@@ -307,7 +308,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
         for pair in pairs {
             txn_delete(txn, pair.into_key().into()).await?;
         }

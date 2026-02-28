@@ -1,5 +1,6 @@
 use super::*;
 use crate::sql::error::SqlError;
+use crate::storage::backpressure::tikv_op;
 
 fn is_row_lock_conflict(err: &tikv_client::Error) -> bool {
     match err {
@@ -29,7 +30,7 @@ async fn scan_one_page(
     batch_size: u32,
 ) -> Result<(Vec<tikv_client::KvPair>, Option<Vec<u8>>)> {
     let range: BoundRange = (start_key..end_key).into();
-    let raw = txn.scan(range, batch_size).await?;
+    let raw = tikv_op!(txn.scan(range, batch_size).await)?;
     let mut pairs: Vec<tikv_client::KvPair> = Vec::new();
     let mut last_key: Option<Vec<u8>> = None;
     for pair in raw {
@@ -99,12 +100,19 @@ impl TikvStore {
             .build_row_lock_keys(txn, db_id, table_name, rows)
             .await?;
         match lock_timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, txn.lock_keys(keys)).await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(anyhow!(e)),
-                Err(_elapsed) => Err(SqlError::LockTimeout.into()),
-            },
-            None => txn.lock_keys(keys).await.map_err(|e| anyhow!(e)),
+            Some(timeout) => {
+                match tokio::time::timeout(
+                    timeout,
+                    async move { tikv_op!(txn.lock_keys(keys).await) },
+                )
+                .await
+                {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(anyhow!(e)),
+                    Err(_elapsed) => Err(SqlError::LockTimeout.into()),
+                }
+            }
+            None => tikv_op!(txn.lock_keys(keys).await).map_err(|e| anyhow!(e)),
         }
     }
 
@@ -141,7 +149,7 @@ impl TikvStore {
             if available_indices.len() >= max_locks {
                 break;
             }
-            match txn.lock_keys_nowait(vec![key]).await {
+            match tikv_op!(txn.lock_keys_nowait(vec![key]).await) {
                 Ok(()) => available_indices.push(idx),
                 Err(e) if is_row_lock_conflict(&e) => continue,
                 Err(e) => return Err(anyhow!(e)),
@@ -177,7 +185,7 @@ impl TikvStore {
         // - Self-locks succeed (same TiKV txn recognises its own locks).
         // - Lock conflicts return an error immediately (wait_timeout = -1).
         // - Non-lock errors propagate without being misclassified as 55P03.
-        match txn.lock_keys_nowait(keys).await {
+        match tikv_op!(txn.lock_keys_nowait(keys).await) {
             Ok(()) => Ok(()),
             Err(e) if is_row_lock_conflict(&e) => {
                 Err(crate::sql::error::SqlError::LockNotAvailable {
@@ -201,7 +209,7 @@ impl TikvStore {
         full_name: &str,
     ) -> Result<()> {
         let key = self.key(&encode_relname_key_v2(db_id, full_name));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             let short_name = full_name.rsplit('.').next().unwrap_or(full_name);
             return Err(SqlError::DuplicateRelation(short_name.to_string()).into());
         }
@@ -229,7 +237,7 @@ impl TikvStore {
         table_name: &str,
     ) -> Result<bool> {
         let key = self.key(&encode_schema_key_v2(db_id, table_name));
-        let exists = txn.get(key).await?.is_some();
+        let exists = tikv_op!(txn.get(key).await)?.is_some();
         Ok(exists)
     }
 
@@ -240,7 +248,7 @@ impl TikvStore {
         schema: TableSchema,
     ) -> Result<()> {
         let schema_key = self.key(&encode_schema_key_v2(db_id, &schema.name));
-        if txn.get(schema_key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(schema_key.clone()).await)?.is_some() {
             let short_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
             return Err(anyhow!("relation \"{}\" already exists", short_name));
         }
@@ -261,7 +269,7 @@ impl TikvStore {
         table_name: &str,
     ) -> Result<Option<TableSchema>> {
         let key = self.key(&encode_schema_key_v2(db_id, table_name));
-        let val = txn.get(key).await?;
+        let val = tikv_op!(txn.get(key).await)?;
         match val {
             Some(data) => Ok(Some(deserialize_schema(&data)?)),
             None => Ok(None),
@@ -361,7 +369,7 @@ impl TikvStore {
         let row_key = encode_pk_values(&pk_values);
         let data_key = self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key));
         let row_data = serialize_row(&row)?;
-        if txn.get(data_key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(data_key.clone()).await)?.is_some() {
             let short_table = table_name.rsplit('.').next().unwrap_or(table_name);
             let constraint_name = schema
                 .pk_constraint_name
@@ -502,7 +510,7 @@ impl TikvStore {
             .ok_or_else(|| anyhow!("Table not found"))?;
         let row_key = encode_pk_values(pk_values);
         let data_key = self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key));
-        let existed = txn.get(data_key.clone()).await?.is_some();
+        let existed = tikv_op!(txn.get(data_key.clone()).await)?.is_some();
         if existed {
             txn_delete(txn, data_key).await?;
             Ok(1)
@@ -521,7 +529,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
         let mut tables = Vec::new();
         for pair in pairs {
             let key: &[u8] = pair.key().as_ref().into();
@@ -553,7 +561,8 @@ impl TikvStore {
                 .collect();
 
             kv_stats::record_batch_get_keys(keys.len());
-            let pairs = txn.batch_get(keys.iter().cloned()).await?;
+            let pairs =
+                tikv_op!(txn.batch_get(keys.iter().cloned()).await).map_err(|e| anyhow!(e))?;
             let mut by_key: HashMap<Key, tikv_client::Value> = HashMap::with_capacity(keys.len());
             for pair in pairs {
                 let tikv_client::KvPair(key, value) = pair;
@@ -667,13 +676,11 @@ impl TikvStore {
         let old_key = self.key(&encode_schema_key_v2(db_id, old_table));
         let new_key = self.key(&encode_schema_key_v2(db_id, new_table));
 
-        if txn.get(new_key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(new_key.clone()).await)?.is_some() {
             return Err(anyhow!("Table '{}' already exists", new_table));
         }
 
-        let schema_bytes = txn
-            .get(old_key.clone())
-            .await?
+        let schema_bytes = tikv_op!(txn.get(old_key.clone()).await)?
             .ok_or_else(|| anyhow!("Table '{}' does not exist", old_table))?;
 
         let mut schema = deserialize_schema(&schema_bytes)?;

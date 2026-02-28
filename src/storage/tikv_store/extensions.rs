@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::backpressure::tikv_op;
 
 impl TikvStore {
     pub async fn get_extension(
@@ -8,7 +9,7 @@ impl TikvStore {
         ext_name: &str,
     ) -> Result<Option<InstalledExtension>> {
         let key = self.key(&encode_extension_key_v2(db_id, ext_name));
-        match txn.get(key).await? {
+        match tikv_op!(txn.get(key).await)? {
             Some(data) => Ok(Some(
                 bincode::deserialize(&data).context("Failed to deserialize extension")?,
             )),
@@ -35,7 +36,7 @@ impl TikvStore {
         ext_name: &str,
     ) -> Result<bool> {
         let key = self.key(&encode_extension_key_v2(db_id, ext_name));
-        let existed = txn.get(key.clone()).await?.is_some();
+        let existed = tikv_op!(txn.get(key.clone()).await)?.is_some();
         if !existed {
             return Ok(false);
         }
@@ -57,7 +58,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         let mut exts = Vec::new();
         for pair in pairs {

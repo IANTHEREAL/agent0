@@ -11,6 +11,8 @@ use std::future::Future;
 use std::sync::Arc;
 use tikv_client::Transaction;
 
+use crate::storage::backpressure::tikv_op;
+
 pub(crate) use state::SavepointState;
 
 tokio::task_local! {
@@ -45,13 +47,13 @@ pub(crate) async fn txn_put(txn: &mut Transaction, key: Vec<u8>, value: Vec<u8>)
     };
 
     if should_record {
-        let prev = txn.get(key.clone()).await.map_err(|e| anyhow!(e))?;
+        let prev = tikv_op!(txn.get(key.clone()).await).map_err(|e| anyhow!(e))?;
         if let Some(sp) = savepoints {
             sp.record_prev_value(key.clone(), prev).await?;
         }
     }
 
-    txn.put(key, value).await.map_err(|e| anyhow!(e))
+    tikv_op!(txn.put(key, value).await).map_err(|e| anyhow!(e))
 }
 
 /// TiKV `delete` wrapper that records undo information when SAVEPOINT is active.
@@ -64,11 +66,11 @@ pub(crate) async fn txn_delete(txn: &mut Transaction, key: Vec<u8>) -> Result<()
     };
 
     if should_record {
-        let prev = txn.get(key.clone()).await.map_err(|e| anyhow!(e))?;
+        let prev = tikv_op!(txn.get(key.clone()).await).map_err(|e| anyhow!(e))?;
         if let Some(sp) = savepoints {
             sp.record_prev_value(key.clone(), prev).await?;
         }
     }
 
-    txn.delete(key).await.map_err(|e| anyhow!(e))
+    tikv_op!(txn.delete(key).await).map_err(|e| anyhow!(e))
 }

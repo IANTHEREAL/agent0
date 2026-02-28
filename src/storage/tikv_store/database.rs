@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::backpressure::tikv_op;
 
 impl TikvStore {
     /// Allocate and persist the next database ID (storage format v2).
@@ -6,7 +7,7 @@ impl TikvStore {
         const FIRST_DATABASE_ID: u64 = 1;
 
         let key = self.key(&encode_next_database_id_key());
-        let current = txn.get(key.clone()).await?;
+        let current = tikv_op!(txn.get(key.clone()).await)?;
         let next_val = match current {
             Some(data) => {
                 let bytes: [u8; 8] = data
@@ -30,7 +31,7 @@ impl TikvStore {
         db_name: &str,
     ) -> Result<Option<u64>> {
         let key = self.key(&encode_database_name_key(db_name));
-        match txn.get(key).await? {
+        match tikv_op!(txn.get(key).await)? {
             Some(data) => {
                 let bytes: [u8; 8] = data
                     .as_slice()
@@ -49,7 +50,7 @@ impl TikvStore {
         db_id: u64,
     ) -> Result<Option<DatabaseDef>> {
         let key = self.key(&encode_database_id_key(db_id));
-        match txn.get(key).await? {
+        match tikv_op!(txn.get(key).await)? {
             Some(data) => Ok(Some(
                 bincode::deserialize(&data).context("Failed to deserialize database definition")?,
             )),
@@ -63,7 +64,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         let mut dbs = Vec::new();
         for pair in pairs {
@@ -89,7 +90,7 @@ impl TikvStore {
         if_not_exists: bool,
     ) -> Result<Option<DatabaseDef>> {
         let name_key = self.key(&encode_database_name_key(name));
-        if txn.get(name_key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(name_key.clone()).await)?.is_some() {
             if if_not_exists {
                 return Ok(None);
             }
@@ -133,7 +134,7 @@ impl TikvStore {
         }
 
         let name_key = self.key(&encode_database_name_key(db_name));
-        let db_id = match txn.get(name_key.clone()).await? {
+        let db_id = match tikv_op!(txn.get(name_key.clone()).await)? {
             Some(data) => {
                 let bytes: [u8; 8] = data
                     .as_slice()
@@ -183,7 +184,7 @@ impl TikvStore {
         }
 
         let old_key = self.key(&encode_database_name_key(old_name));
-        let db_id = match txn.get(old_key.clone()).await? {
+        let db_id = match tikv_op!(txn.get(old_key.clone()).await)? {
             Some(data) => {
                 let bytes: [u8; 8] = data
                     .as_slice()
@@ -199,7 +200,7 @@ impl TikvStore {
         }
 
         let new_key = self.key(&encode_database_name_key(new_name));
-        if txn.get(new_key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(new_key.clone()).await)?.is_some() {
             return Err(anyhow!("database \"{}\" already exists", new_name));
         }
 
@@ -226,7 +227,7 @@ impl TikvStore {
         new_owner: &str,
     ) -> Result<()> {
         let name_key = self.key(&encode_database_name_key(db_name));
-        let db_id = match txn.get(name_key).await? {
+        let db_id = match tikv_op!(txn.get(name_key).await)? {
             Some(data) => {
                 let bytes: [u8; 8] = data
                     .as_slice()

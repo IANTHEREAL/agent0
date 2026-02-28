@@ -1,5 +1,6 @@
 use super::*;
 use crate::sql::optimizer::statistics::TableStatistics;
+use crate::storage::backpressure::tikv_op;
 
 impl TikvStore {
     /// Persist table statistics to TiKV.
@@ -22,7 +23,7 @@ impl TikvStore {
         table_id: u64,
     ) -> Result<Option<TableStatistics>> {
         let key = self.key(&encode_stats_key_v2(db_id, table_id));
-        match txn.get(key).await? {
+        match tikv_op!(txn.get(key).await)? {
             Some(data) => {
                 let stats: TableStatistics = bincode::deserialize(&data)
                     .context("Failed to deserialize table statistics")?;

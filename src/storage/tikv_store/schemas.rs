@@ -1,5 +1,6 @@
 use super::*;
 use crate::sql::error::SqlError;
+use crate::storage::backpressure::tikv_op;
 
 impl TikvStore {
     pub async fn list_procedures(&self, txn: &mut Transaction, db_id: u64) -> Result<Vec<String>> {
@@ -7,7 +8,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         let mut procedures = Vec::new();
         for pair in pairs {
@@ -30,7 +31,7 @@ impl TikvStore {
             return Ok(true);
         }
         let key = self.key(&encode_schema_def_key_v2(db_id, schema));
-        Ok(txn.get(key).await?.is_some())
+        Ok(tikv_op!(txn.get(key).await)?.is_some())
     }
 
     fn is_builtin_schema(schema: &str) -> bool {
@@ -62,7 +63,7 @@ impl TikvStore {
         }
 
         let key = self.key(&encode_schema_def_key_v2(db_id, schema));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             if if_not_exists {
                 return Ok(false);
             }
@@ -78,7 +79,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
         let mut schemas = vec![
             "public".to_string(),
             "information_schema".to_string(),
@@ -109,7 +110,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         let mut oids: HashMap<String, u32> = HashMap::new();
         oids.insert("public".to_string(), 2200);
@@ -172,7 +173,7 @@ impl TikvStore {
         }
 
         let key = self.key(&encode_schema_def_key_v2(db_id, schema));
-        if txn.get(key.clone()).await?.is_none() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_none() {
             if if_exists {
                 return Ok(false);
             }
@@ -282,7 +283,7 @@ impl TikvStore {
         }
 
         let key = self.key(&encode_schema_def_key_v2(db_id, schema));
-        if txn.get(key.clone()).await?.is_none() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_none() {
             if if_exists {
                 return Ok(false);
             }

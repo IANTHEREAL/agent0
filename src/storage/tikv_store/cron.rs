@@ -1,5 +1,6 @@
 use super::*;
 use crate::cron::types::{CronJob, CronJobLegacy, CronRun};
+use crate::storage::backpressure::tikv_op;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CronRunClaimStatus {
@@ -39,7 +40,7 @@ impl TikvStore {
         job_id: i64,
     ) -> Result<Option<CronJob>> {
         let key = self.key(&encode_cron_job_key_v2(db_id, job_id));
-        match txn.get(key).await? {
+        match tikv_op!(txn.get(key).await)? {
             Some(data) => Ok(Some(deserialize_cron_job(&data)?)),
             None => Ok(None),
         }
@@ -50,7 +51,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         let mut jobs = Vec::new();
         for pair in pairs {
@@ -107,7 +108,7 @@ impl TikvStore {
         run_id: i64,
     ) -> Result<Option<CronRun>> {
         let key = self.key(&encode_cron_run_key_v2(db_id, run_id));
-        match txn.get(key).await? {
+        match tikv_op!(txn.get(key).await)? {
             Some(data) => Ok(Some(
                 bincode::deserialize(&data).context("Failed to deserialize cron run")?,
             )),
@@ -126,7 +127,7 @@ impl TikvStore {
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
         let scan_limit = scan_limit_to_u32(Some(limit));
-        let pairs = txn.scan(range, scan_limit).await?;
+        let pairs = tikv_op!(txn.scan(range, scan_limit).await)?;
 
         let mut runs = Vec::new();
         for pair in pairs {
@@ -150,7 +151,7 @@ impl TikvStore {
     ) -> Result<CronRunClaimStatus> {
         // Step 1: Check if there's a running guard for this job
         let guard_key = self.key(&encode_cron_running_guard_key_v2(db_id, job_id));
-        if let Some(guard_data) = txn.get(guard_key.clone()).await? {
+        if let Some(guard_data) = tikv_op!(txn.get(guard_key.clone()).await)? {
             // Guard exists, check if the referenced run is still active
             if guard_data.len() == 8 {
                 let run_id = i64::from_be_bytes(
@@ -187,7 +188,7 @@ impl TikvStore {
 
         // Step 2: Proceed with existing same-minute claim logic
         let key = self.key(&encode_cron_claim_key_v2(db_id, job_id, scheduled_min));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             return Ok(CronRunClaimStatus::AlreadyClaimedForMinute);
         }
         txn_put(txn, key, vec![1]).await?;
@@ -204,7 +205,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         for pair in pairs {
             let key: &[u8] = pair.key().as_ref().into();
@@ -228,7 +229,7 @@ impl TikvStore {
 
     pub async fn remove_cron_enabled(&self, txn: &mut Transaction, db_id: u64) -> Result<()> {
         let key = self.key(&encode_cron_enabled_key_v2(db_id));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             txn_delete(txn, key).await?;
         }
         Ok(())
@@ -236,7 +237,7 @@ impl TikvStore {
 
     pub async fn is_cron_enabled(&self, txn: &mut Transaction, db_id: u64) -> Result<bool> {
         let key = self.key(&encode_cron_enabled_key_v2(db_id));
-        Ok(txn.get(key).await?.is_some())
+        Ok(tikv_op!(txn.get(key).await)?.is_some())
     }
 
     pub async fn set_cron_running_guard(
@@ -259,7 +260,7 @@ impl TikvStore {
         expected_run_id: i64,
     ) -> Result<()> {
         let key = self.key(&encode_cron_running_guard_key_v2(db_id, job_id));
-        if let Some(data) = txn.get(key.clone()).await? {
+        if let Some(data) = tikv_op!(txn.get(key.clone()).await)? {
             if data.len() != 8 {
                 // Self-heal malformed guard payloads.
                 txn_delete(txn, key).await?;
@@ -290,7 +291,7 @@ impl TikvStore {
             let mut end = prefix.clone();
             end.push(0xFF);
             let range: BoundRange = (prefix.clone()..end).into();
-            let pairs = txn.scan(range, SCAN_LIMIT).await?;
+            let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
             for pair in pairs {
                 let key: &[u8] = pair.key().as_ref().into();
                 if key.starts_with(prefix) {
@@ -304,7 +305,7 @@ impl TikvStore {
             self.key(&encode_next_cron_run_id_key_v2(db_id)),
         ];
         for key in seq_keys {
-            if txn.get(key.clone()).await?.is_some() {
+            if tikv_op!(txn.get(key.clone()).await)?.is_some() {
                 txn_delete(txn, key).await?;
             }
         }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::backpressure::tikv_op;
 
 impl TikvStore {
     pub async fn create_function(
@@ -13,7 +14,7 @@ impl TikvStore {
 
         let full_name = format!("{}.{}", def.schema, def.name);
         let key = self.key(&encode_function_key_v2(db_id, &full_name));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             return Err(anyhow!("Function '{}' already exists", full_name));
         }
         let data = serialize_function_def(&def)?;
@@ -31,7 +32,7 @@ impl TikvStore {
         let key = self.key(&encode_function_key_v2(db_id, &full_name));
 
         if def.oid == 0 {
-            if let Some(existing) = txn.get(key.clone()).await? {
+            if let Some(existing) = tikv_op!(txn.get(key.clone()).await)? {
                 let existing: FunctionDef = deserialize_function_def(&existing)?;
                 if existing.oid != 0 {
                     def.oid = existing.oid;
@@ -54,7 +55,7 @@ impl TikvStore {
         full_name: &str,
     ) -> Result<Option<FunctionDef>> {
         let key = self.key(&encode_function_key_v2(db_id, full_name));
-        match txn.get(key).await? {
+        match tikv_op!(txn.get(key).await)? {
             Some(data) => {
                 let mut def: FunctionDef = deserialize_function_def(&data)?;
                 if def.oid == 0 {
@@ -82,7 +83,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         let mut funcs = Vec::new();
         for pair in pairs {
@@ -115,7 +116,7 @@ impl TikvStore {
         cascade: bool,
     ) -> Result<bool> {
         let key = self.key(&encode_function_key_v2(db_id, full_name));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             let dependent_triggers: Vec<TriggerDef> = self
                 .list_triggers(txn, db_id)
                 .await?

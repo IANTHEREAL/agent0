@@ -1,5 +1,6 @@
 use super::*;
 use crate::sql::error::SqlError;
+use crate::storage::backpressure::tikv_op;
 
 impl TikvStore {
     pub async fn create_view(
@@ -14,7 +15,7 @@ impl TikvStore {
     ) -> Result<()> {
         let key = self.key(&encode_view_key_v2(db_id, name));
         let bindings_key = self.key(&encode_view_bindings_key_v2(db_id, name));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             if !or_replace {
                 return Err(SqlError::DuplicateRelation(name.to_string()).into());
             }
@@ -59,7 +60,7 @@ impl TikvStore {
         name: &str,
     ) -> Result<Option<ViewDef>> {
         let key = self.key(&encode_view_key_v2(db_id, name));
-        match txn.get(key).await? {
+        match tikv_op!(txn.get(key).await)? {
             Some(data) => {
                 let def: ViewDef =
                     bincode::deserialize(&data).context("Failed to deserialize view definition")?;
@@ -91,7 +92,7 @@ impl TikvStore {
     pub async fn drop_view(&self, txn: &mut Transaction, db_id: u64, name: &str) -> Result<bool> {
         let key = self.key(&encode_view_key_v2(db_id, name));
         let bindings_key = self.key(&encode_view_bindings_key_v2(db_id, name));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             txn_delete(txn, key).await?;
             txn_delete(txn, bindings_key).await?;
             info!("Dropped view '{}'", name);
@@ -107,7 +108,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
         let mut views = Vec::new();
         for pair in pairs {
             let key_bytes: &[u8] = pair.key().as_ref().into();
@@ -128,7 +129,7 @@ impl TikvStore {
         name: &str,
     ) -> Result<Option<Vec<String>>> {
         let key = self.key(&encode_view_bindings_key_v2(db_id, name));
-        match txn.get(key).await? {
+        match tikv_op!(txn.get(key).await)? {
             Some(data) => {
                 let bindings: Vec<String> = bincode::deserialize(&data)
                     .context("Failed to deserialize view relation bindings")?;
@@ -163,7 +164,7 @@ impl TikvStore {
     ) -> Result<()> {
         let key = self.key(&encode_matview_key_v2(db_id, name));
         let bindings_key = self.key(&encode_matview_bindings_key_v2(db_id, name));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             return Err(SqlError::DuplicateRelation(name.to_string()).into());
         }
         let (schema, mv_name) = name.split_once('.').unwrap_or(("public", name));
@@ -189,7 +190,7 @@ impl TikvStore {
         name: &str,
     ) -> Result<Option<MatViewDef>> {
         let key = self.key(&encode_matview_key_v2(db_id, name));
-        match txn.get(key).await? {
+        match tikv_op!(txn.get(key).await)? {
             Some(data) => {
                 let def: MatViewDef = bincode::deserialize(&data)
                     .context("Failed to deserialize matview definition")?;
@@ -226,7 +227,7 @@ impl TikvStore {
     ) -> Result<bool> {
         let key = self.key(&encode_matview_key_v2(db_id, name));
         let bindings_key = self.key(&encode_matview_bindings_key_v2(db_id, name));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             txn_delete(txn, key).await?;
             txn_delete(txn, bindings_key).await?;
             info!("Dropped materialized view '{}'", name);
@@ -246,7 +247,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
         let mut matviews = Vec::new();
         for pair in pairs {
             let key: &[u8] = pair.key().as_ref().into();
@@ -267,7 +268,7 @@ impl TikvStore {
         name: &str,
     ) -> Result<Option<Vec<String>>> {
         let key = self.key(&encode_matview_bindings_key_v2(db_id, name));
-        match txn.get(key).await? {
+        match tikv_op!(txn.get(key).await)? {
             Some(data) => {
                 let bindings: Vec<String> = bincode::deserialize(&data)
                     .context("Failed to deserialize matview relation bindings")?;

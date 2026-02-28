@@ -1,5 +1,6 @@
 use super::*;
 use crate::sql::error::SqlError;
+use crate::storage::backpressure::tikv_op;
 
 impl TikvStore {
     pub async fn create_type(
@@ -10,7 +11,7 @@ impl TikvStore {
     ) -> Result<()> {
         let full_name = format!("{}.{}", def.schema, def.name);
         let key = self.key(&encode_type_key_v2(db_id, &full_name));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             return Err(
                 SqlError::DuplicateObject(format!("Type '{}' already exists", full_name)).into(),
             );
@@ -27,7 +28,7 @@ impl TikvStore {
         full_name: &str,
     ) -> Result<Option<UserTypeDef>> {
         let key = self.key(&encode_type_key_v2(db_id, full_name));
-        match txn.get(key).await? {
+        match tikv_op!(txn.get(key).await)? {
             Some(data) => Ok(Some(
                 bincode::deserialize(&data).context("Failed to deserialize type definition")?,
             )),
@@ -40,7 +41,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix..end).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = tikv_op!(txn.scan(range, SCAN_LIMIT).await)?;
 
         let mut types = Vec::new();
         for pair in pairs {
@@ -76,7 +77,7 @@ impl TikvStore {
     ) -> Result<UserTypeDef> {
         let old_key = self.key(&encode_type_key_v2(db_id, old_full));
         let new_key = self.key(&encode_type_key_v2(db_id, new_full));
-        if txn.get(new_key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(new_key.clone()).await)?.is_some() {
             return Err(
                 SqlError::DuplicateObject(format!("type \"{}\" already exists", new_full)).into(),
             );
@@ -100,7 +101,7 @@ impl TikvStore {
         full_name: &str,
     ) -> Result<bool> {
         let key = self.key(&encode_type_key_v2(db_id, full_name));
-        if txn.get(key.clone()).await?.is_some() {
+        if tikv_op!(txn.get(key.clone()).await)?.is_some() {
             txn_delete(txn, key).await?;
             Ok(true)
         } else {

@@ -996,9 +996,7 @@ fn parse_weights(val: &Value, func: &str) -> Result<[f64; 4]> {
         return Err(anyhow::anyhow!("{func} weight argument must be real[]"));
     };
     if items.len() < 4 {
-        return Err(anyhow::anyhow!(
-            "array of weight is too short"
-        ));
+        return Err(anyhow::anyhow!("array of weight is too short"));
     }
     let mut out = [0.0f64; 4];
     for (idx, item) in items.iter().take(4).enumerate() {
@@ -3184,7 +3182,10 @@ mod tests {
             Value::Float64(1.0),
         ]);
         let w = parse_weights(&val, "ts_rank").unwrap();
-        assert!((w[0] - 0.1).abs() < 1e-9, "negative weight should fallback to default 0.1");
+        assert!(
+            (w[0] - 0.1).abs() < 1e-9,
+            "negative weight should fallback to default 0.1"
+        );
         assert!((w[1] - 0.2).abs() < 1e-9);
     }
 
@@ -3198,7 +3199,10 @@ mod tests {
             Value::Float64(1.0),
         ]);
         let w = parse_weights(&val, "ts_rank").unwrap();
-        assert!((w[0] - 0.1).abs() < 1e-9, "NaN weight should fallback to default 0.1");
+        assert!(
+            (w[0] - 0.1).abs() < 1e-9,
+            "NaN weight should fallback to default 0.1"
+        );
     }
 
     #[test]
@@ -3228,10 +3232,7 @@ mod tests {
 
     #[test]
     fn test_parse_weights_too_short() {
-        let val = Value::Array(vec![
-            Value::Float64(0.1),
-            Value::Float64(0.2),
-        ]);
+        let val = Value::Array(vec![Value::Float64(0.1), Value::Float64(0.2)]);
         let err = parse_weights(&val, "ts_rank").unwrap_err();
         assert!(err.to_string().contains("too short"));
     }
@@ -3270,7 +3271,10 @@ mod tests {
         ]);
         assert!(result.is_ok());
         if let Ok(Value::Float64(r)) = result {
-            assert!(r >= 0.0 && r <= 1.0, "norm=32 clamps to rank/(rank+1) ≤ 1");
+            assert!(
+                (0.0..=1.0).contains(&r),
+                "norm=32 clamps to rank/(rank+1) ≤ 1"
+            );
         }
     }
 
@@ -3287,7 +3291,10 @@ mod tests {
             Value::Tsquery("'hello'".to_string()),
         ]);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("weight out of range"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("weight out of range"));
     }
 
     #[test]
@@ -3311,7 +3318,9 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(with_defaults, with_negative,
-            "all-negative weights should produce same result as default weights");
+        assert_eq!(
+            with_defaults, with_negative,
+            "all-negative weights should produce same result as default weights"
+        );
     }
 }
