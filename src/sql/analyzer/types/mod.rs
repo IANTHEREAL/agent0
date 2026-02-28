@@ -687,6 +687,42 @@ pub fn reindex_typed_expr(expr: &TypedExpr, offset: usize) -> TypedExpr {
     }
 }
 
+/// Owned version of [`reindex_typed_expr`] that consumes the input expression.
+///
+/// Avoids cloning for `ColumnRef` leaf nodes (moves `column_name` and `data_type`
+/// instead of cloning them). For compound expressions, child recursion still uses
+/// the borrowed [`reindex_typed_expr`] via `map_children`.
+///
+/// Use this when the caller already owns the expression and does not need it
+/// afterwards (e.g. predicate pushdown consuming a `Vec<TypedExpr>`).
+pub fn reindex_typed_expr_owned(expr: TypedExpr, offset: usize) -> TypedExpr {
+    use crate::sql::expr::traverse::map_children;
+
+    let TypedExpr { kind, data_type } = expr;
+    match kind {
+        TypedExprKind::ColumnRef {
+            scope_depth: 0,
+            column_index,
+            column_name,
+        } => TypedExpr {
+            kind: TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: column_index.saturating_sub(offset),
+                column_name,
+            },
+            data_type,
+        },
+        kind => {
+            let tmp = TypedExpr { kind, data_type };
+            let new_kind = map_children(&tmp, &mut |child| reindex_typed_expr(child, offset));
+            TypedExpr {
+                kind: new_kind,
+                data_type: tmp.data_type,
+            }
+        }
+    }
+}
+
 // ── CTE ─────────────────────────────────────────────────────
 
 /// A resolved CTE (WITH clause entry).

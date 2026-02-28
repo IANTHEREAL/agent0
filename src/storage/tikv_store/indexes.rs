@@ -63,23 +63,15 @@ impl TikvStore {
         let fixed_prefix_len = self
             .make_index_key(db_id, table_id, index_id, &[], None)
             .len();
-        if full_key.len() <= fixed_prefix_len {
-            return Err(anyhow!("Non-unique index key too short"));
-        }
-
-        let mut offset = fixed_prefix_len;
-        for data_type in index_column_types {
-            let (_, consumed) = decode_value_memcomparable(&full_key[offset..], data_type)?;
-            offset += consumed;
-        }
-
-        if full_key.get(offset) != Some(&0x01) {
-            return Err(anyhow!("Non-unique index key missing PK separator"));
-        }
-        offset += 1;
-
-        let pk_bytes = &full_key[offset..];
-        decode_pk_from_index_suffix(pk_bytes, pk_types)
+        self.try_decode_non_unique_pk_inner(
+            full_key,
+            fixed_prefix_len,
+            index_column_types,
+            pk_types,
+            db_id,
+            table_id,
+            index_id,
+        )
     }
 
     /// Decodes a non-unique index key into its primary-key values.
@@ -93,9 +85,17 @@ impl TikvStore {
         fixed_prefix_len: usize,
         index_column_types: &[DataType],
         pk_types: &[DataType],
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
     ) -> Result<Vec<Value>> {
         if full_key.len() <= fixed_prefix_len {
-            return Err(anyhow!("non-unique index key too short"));
+            return Err(anyhow!(
+                "non-unique index key too short (db_id={}, table_id={}, index_id={})",
+                db_id,
+                table_id,
+                index_id
+            ));
         }
         let mut offset = fixed_prefix_len;
         for data_type in index_column_types {
@@ -103,7 +103,10 @@ impl TikvStore {
             offset += consumed;
         }
         if full_key.get(offset) != Some(&0x01) {
-            return Err(anyhow!("non-unique index key missing PK separator byte"));
+            return Err(anyhow!(
+                "non-unique index key missing PK separator byte (db_id={}, table_id={}, index_id={})",
+                db_id, table_id, index_id
+            ));
         }
         offset += 1;
         decode_pk_from_index_suffix(&full_key[offset..], pk_types)
@@ -457,6 +460,9 @@ impl TikvStore {
                 fixed_prefix_len,
                 index_column_types,
                 pk_types,
+                db_id,
+                table_id,
+                index_id,
             )?;
             pks.push(pk);
         }
@@ -549,6 +555,9 @@ impl TikvStore {
                 fixed_prefix_len,
                 index_column_types,
                 pk_types,
+                db_id,
+                table_id,
+                index_id,
             )?;
             pks.push(pk);
         }

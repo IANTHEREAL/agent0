@@ -15,7 +15,7 @@ use super::join_keys;
 use super::logical_plan::{LogicalNode, LogicalPlan, PlanSchema};
 use crate::model::DataType;
 use crate::sql::analyzer::types::{
-    reindex_typed_expr, BinaryOp, JoinCondition, JoinType, TypedExpr, TypedExprKind,
+    reindex_typed_expr_owned, BinaryOp, JoinCondition, JoinType, TypedExpr, TypedExprKind,
 };
 use crate::sql::expr::classify::{has_correlated_ref, has_unresolved_subquery, is_volatile};
 
@@ -246,7 +246,7 @@ fn push_filter_through_join(
         // Reindex right-side predicates: subtract left_width from column indices
         let reindexed: Vec<TypedExpr> = right_pushable
             .into_iter()
-            .map(|e| reindex_typed_expr(&e, left_width))
+            .map(|e| reindex_typed_expr_owned(e, left_width))
             .collect();
         let pred = conjuncts_to_predicate(reindexed);
         push_filter_down(pred, right)
