@@ -683,38 +683,6 @@ fn infer_index_value_types_for_reconcile(
     Ok(types)
 }
 
-fn decode_reconcile_index_pk_values(
-    store: &TikvStore,
-    scanned_key: &[u8],
-    scanned_value: &[u8],
-    db_id: u64,
-    table_id: u64,
-    index: &IndexDef,
-    index_value_types: &[DataType],
-    pk_types: &[DataType],
-) -> Result<Vec<Value>> {
-    if index.unique {
-        store.decode_unique_pk_from_index_entry(
-            scanned_key,
-            scanned_value,
-            db_id,
-            table_id,
-            index.id,
-            index_value_types,
-            pk_types,
-        )
-    } else {
-        store.decode_non_unique_pk_from_index_key(
-            scanned_key,
-            db_id,
-            table_id,
-            index.id,
-            index_value_types,
-            pk_types,
-        )
-    }
-}
-
 async fn reconcile_index_pass(
     store: &Arc<TikvStore>,
     db_id: u64,
@@ -771,16 +739,26 @@ async fn reconcile_index_pass(
                     let key: &[u8] = pair.key().as_ref().into();
                     key.to_vec()
                 };
-                let pk_values = decode_reconcile_index_pk_values(
-                    store,
-                    &scanned_key,
-                    pair.value().as_ref(),
-                    db_id,
-                    schema.table_id,
-                    &index,
-                    &index_value_types,
-                    &pk_types,
-                )?;
+                let pk_values = if index.unique {
+                    store.decode_unique_pk_from_index_entry(
+                        &scanned_key,
+                        pair.value().as_ref(),
+                        db_id,
+                        schema.table_id,
+                        index.id,
+                        &index_value_types,
+                        &pk_types,
+                    )?
+                } else {
+                    store.decode_non_unique_pk_from_index_key(
+                        &scanned_key,
+                        db_id,
+                        schema.table_id,
+                        index.id,
+                        &index_value_types,
+                        &pk_types,
+                    )?
+                };
                 let existing_rows = store
                     .batch_get_rows(
                         &mut txn,
@@ -799,16 +777,21 @@ async fn reconcile_index_pass(
                         let current_values = index_helpers::get_index_values_with_expressions(
                             &index, &schema, &row,
                         )?;
+                        let expected_pk_suffix = if !index.unique
+                            || current_values
+                                .iter()
+                                .any(|value| matches!(value, Value::Null))
+                        {
+                            Some(pk_values.as_slice())
+                        } else {
+                            None
+                        };
                         let expected_key = store.make_index_key(
                             db_id,
                             schema.table_id,
                             index.id,
                             &current_values,
-                            if index.unique {
-                                None
-                            } else {
-                                Some(pk_values.as_slice())
-                            },
+                            expected_pk_suffix,
                         );
                         scanned_key != expected_key
                     }
@@ -978,32 +961,5 @@ mod tests {
                 .contains("failed to parse index expression '('"),
             "unexpected err: {err}"
         );
-    }
-
-    #[test]
-    fn decode_reconcile_index_pk_values_handles_unique_sentinel_suffix() {
-        let store = TikvStore::new_stub();
-        let mut index = test_index(vec!["name"], vec![]);
-        index.unique = true;
-        index.id = 7;
-
-        let idx_values = vec![Value::Null];
-        let expected_pk = vec![Value::Int32(42)];
-        let scanned_key =
-            store.make_index_key(1, 2, index.id, &idx_values, Some(expected_pk.as_slice()));
-
-        let decoded = decode_reconcile_index_pk_values(
-            store.as_ref(),
-            &scanned_key,
-            &[0x01],
-            1,
-            2,
-            &index,
-            &[DataType::Text],
-            &[DataType::Int32],
-        )
-        .expect("decode unique sentinel suffix entry");
-
-        assert_eq!(decoded, expected_pk);
     }
 }
