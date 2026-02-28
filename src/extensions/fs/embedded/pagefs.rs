@@ -456,6 +456,7 @@ impl EmbeddedPageFs {
     pub(crate) async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
         let old_normalized = normalize_path(old_path);
         let new_normalized = normalize_path(new_path);
+        let new_has_trailing_slash = new_path.len() > 1 && new_path.ends_with('/');
 
         if old_normalized == "/" {
             return Err(anyhow!(EmbeddedFsError::PermissionDenied(
@@ -465,34 +466,49 @@ impl EmbeddedPageFs {
 
         // No-op if paths are identical
         if old_normalized == new_normalized {
+            if new_has_trailing_slash {
+                let mut txn = self.begin().await?;
+                let (_, inode) = resolve_path(&mut txn, &old_normalized).await?;
+                if !inode.is_directory() {
+                    return Err(anyhow!(EmbeddedFsError::not_directory(&new_normalized)));
+                }
+            }
             return Ok(());
-        }
-
-        // Prevent directory cycle: renaming a dir into its own subtree
-        // would corrupt the directory tree (POSIX returns EINVAL for this).
-        // Safe to use string prefix here because both paths are already
-        // normalized (no trailing slash) and validate_path rejected "..".
-        if new_normalized.starts_with(&format!("{old_normalized}/")) {
-            return Err(anyhow!(EmbeddedFsError::PermissionDenied(format!(
-                "cannot rename {old_normalized} into its own subdirectory {new_normalized}"
-            ),)));
         }
 
         let mut txn = self.begin().await?;
 
-        // Resolve the source
+        // Resolve the source first — NotFound takes precedence over cycle check
         let (old_inode_id, old_inode) = resolve_path(&mut txn, &old_normalized).await?;
         let (old_parent_inode, old_name) = resolve_parent(&mut txn, &old_normalized).await?;
 
-        // Ensure parent directories of destination exist
-        ensure_parents(&mut txn, &new_normalized).await?;
+        // Destination parent must already exist (POSIX semantics — no auto-create)
         let (new_parent_inode, new_name) = resolve_parent(&mut txn, &new_normalized).await?;
+
+        // If destination has trailing slash, source must be a directory (POSIX ENOTDIR).
+        if new_has_trailing_slash && !old_inode.is_directory() {
+            return Err(anyhow!(EmbeddedFsError::not_directory(&new_normalized)));
+        }
+
+        // Prevent directory cycle: renaming a dir into its own subtree
+        // would corrupt the directory tree (POSIX returns EINVAL for this).
+        // Parent existence must be checked first so ENOENT takes precedence.
+        // Only applies to directories — files cannot create cycles.
+        if old_inode.is_directory() && new_normalized.starts_with(&format!("{old_normalized}/")) {
+            return Err(anyhow!(EmbeddedFsError::InvalidInput(format!(
+                "cannot rename {old_normalized} into its own subdirectory {new_normalized}"
+            ))));
+        }
 
         // Check if destination already exists
         if let Some(existing_inode_id) = lookup(&mut txn, new_parent_inode, &new_name).await? {
             let existing_inode = load_inode(&mut txn, existing_inode_id)
                 .await?
                 .ok_or_else(|| anyhow!(EmbeddedFsError::not_found(&new_normalized)))?;
+
+            if new_has_trailing_slash && !existing_inode.is_directory() {
+                return Err(anyhow!(EmbeddedFsError::not_directory(&new_normalized)));
+            }
 
             if existing_inode.is_directory() {
                 // Don't replace existing directories
@@ -758,12 +774,8 @@ async fn resolve_parent(txn: &mut Transaction, path: &str) -> Result<(u64, Strin
 }
 
 fn normalize_path(path: &str) -> String {
-    let path = if path.is_empty() { "/" } else { path };
-    if path == "/" {
-        "/".to_string()
-    } else {
-        path.trim_end_matches('/').to_string()
-    }
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    format!("/{}", parts.join("/"))
 }
 
 fn pages_needed(size: u64) -> u64 {
@@ -1057,6 +1069,74 @@ mod tests {
     }
 
     // scan_end_key tests
+    // rename contract: cycle detection + path normalization
+    #[test]
+    fn test_rename_cycle_detection_logic() {
+        // Simulates the cycle guard: new_path starts with old_path + "/"
+        let old = normalize_path("/a/b");
+        let new = normalize_path("/a/b/c/d");
+        assert!(
+            new.starts_with(&format!("{old}/")),
+            "moving /a/b into /a/b/c/d is a directory cycle"
+        );
+    }
+
+    #[test]
+    fn test_rename_no_cycle_for_sibling() {
+        let old = normalize_path("/a/b");
+        let new = normalize_path("/a/b2");
+        assert!(
+            !new.starts_with(&format!("{old}/")),
+            "/a/b → /a/b2 is not a cycle (sibling, not subtree)"
+        );
+    }
+
+    #[test]
+    fn test_rename_no_cycle_for_parent() {
+        let old = normalize_path("/a/b/c");
+        let new = normalize_path("/a");
+        assert!(
+            !new.starts_with(&format!("{old}/")),
+            "moving deeper path to shallower is not a cycle"
+        );
+    }
+
+    #[test]
+    fn test_rename_same_path_noop() {
+        let old = normalize_path("/foo/bar/");
+        let new = normalize_path("/foo/bar");
+        assert_eq!(
+            old, new,
+            "trailing slash normalization makes paths equal → no-op"
+        );
+    }
+
+    #[test]
+    fn test_rename_root_normalized() {
+        let path = normalize_path("/");
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn test_normalize_path_collapses_repeated_slashes() {
+        assert_eq!(normalize_path("/a//b"), "/a/b");
+        assert_eq!(normalize_path("/a///b/c"), "/a/b/c");
+        assert_eq!(normalize_path("//a//b//"), "/a/b");
+        assert_eq!(normalize_path("///"), "/");
+    }
+
+    #[test]
+    fn test_cycle_guard_with_repeated_slashes() {
+        // /a//b/c normalizes to /a/b/c — the cycle guard must detect
+        // that moving /a/b under /a/b/c is a cycle even with repeated slashes.
+        let old = normalize_path("/a/b");
+        let new = normalize_path("/a//b/c");
+        assert!(
+            new.starts_with(&format!("{old}/")),
+            "repeated slashes must not bypass cycle guard"
+        );
+    }
+
     #[test]
     fn test_scan_end_key_simple() {
         let prefix = b"_fs_D";
@@ -1077,5 +1157,262 @@ mod tests {
         let prefix = vec![0x01, 0x02, 0x03];
         let end = scan_end_key(&prefix);
         assert_eq!(end, vec![0x01, 0x02, 0x04]);
+    }
+
+    // ── Behavioral rename tests (require TiKV) ─────────────────────────
+    //
+    // These tests exercise actual rename() calls on EmbeddedPageFs and
+    // verify filesystem state.  They are #[ignore] because they need a
+    // running TiKV cluster (PD_ENDPOINTS env var).
+    //
+    //   cargo test -p db9-server rename_behavioral -- --ignored
+
+    async fn make_fs() -> EmbeddedPageFs {
+        let pd = std::env::var("PD_ENDPOINTS").unwrap_or("127.0.0.1:2379".into());
+        let config = tikv_client::Config::default();
+        let client = TransactionClient::new_with_config(vec![pd], config)
+            .await
+            .expect("TiKV connection required for behavioral tests");
+        let fs = EmbeddedPageFs::new(Arc::new(client));
+        fs.init_filesystem().await.expect("init_filesystem");
+        fs
+    }
+
+    /// Helper: ensure directory exists (idempotent).
+    async fn ensure_dir(fs: &EmbeddedPageFs, path: &str) {
+        let _ = fs.mkdir(path, true).await;
+    }
+
+    /// Helper: clean up a path (file or dir) — best effort.
+    async fn cleanup(fs: &EmbeddedPageFs, path: &str) {
+        let _ = fs.remove_recursive(path).await;
+        let _ = fs.remove(path).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_rename_behavioral_basic_file() {
+        let fs = make_fs().await;
+        let dir = "/test_rename_basic";
+        cleanup(&fs, dir).await;
+        ensure_dir(&fs, dir).await;
+
+        let old = &format!("{dir}/a.txt");
+        let new = &format!("{dir}/b.txt");
+        fs.write_file(old, b"hello").await.unwrap();
+
+        fs.rename(old, new).await.unwrap();
+
+        // old name must be gone
+        assert!(fs.stat(old).await.is_err(), "old path should not exist");
+        // new name must exist with same content
+        let data = fs.read_file(new).await.unwrap();
+        assert_eq!(data, b"hello", "content must be preserved");
+
+        cleanup(&fs, dir).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_rename_behavioral_cross_directory() {
+        let fs = make_fs().await;
+        let base = "/test_rename_cross";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, &format!("{base}/src")).await;
+        ensure_dir(&fs, &format!("{base}/dst")).await;
+
+        let old = &format!("{base}/src/file.txt");
+        let new = &format!("{base}/dst/file.txt");
+        fs.write_file(old, b"cross").await.unwrap();
+
+        fs.rename(old, new).await.unwrap();
+
+        assert!(fs.stat(old).await.is_err());
+        assert_eq!(fs.read_file(new).await.unwrap(), b"cross");
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_rename_behavioral_directory() {
+        let fs = make_fs().await;
+        let base = "/test_rename_dir";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, &format!("{base}/old_dir")).await;
+        fs.write_file(&format!("{base}/old_dir/child.txt"), b"nested")
+            .await
+            .unwrap();
+
+        fs.rename(&format!("{base}/old_dir"), &format!("{base}/new_dir"))
+            .await
+            .unwrap();
+
+        assert!(fs.stat(&format!("{base}/old_dir")).await.is_err());
+        let children = fs.readdir(&format!("{base}/new_dir")).await.unwrap();
+        assert!(
+            children.iter().any(|(name, _)| name == "child.txt"),
+            "children must follow renamed directory"
+        );
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_rename_behavioral_missing_source_enoent() {
+        let fs = make_fs().await;
+        let err = fs
+            .rename("/nonexistent_path_xyz", "/somewhere")
+            .await
+            .unwrap_err();
+        let fs_err = err
+            .downcast_ref::<EmbeddedFsError>()
+            .expect("expected EmbeddedFsError");
+        assert!(
+            matches!(fs_err, EmbeddedFsError::NotFound(_)),
+            "missing source should produce ENOENT-equivalent, got: {fs_err}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_rename_behavioral_missing_dest_parent_enoent_before_einval() {
+        let fs = make_fs().await;
+        let base = "/test_rename_parent_precedence";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, &format!("{base}/a")).await;
+
+        let err = fs
+            .rename(&format!("{base}/a"), &format!("{base}/a/missing/x"))
+            .await
+            .unwrap_err();
+        let fs_err = err
+            .downcast_ref::<EmbeddedFsError>()
+            .expect("expected EmbeddedFsError");
+        assert!(
+            matches!(fs_err, EmbeddedFsError::NotFound(_)),
+            "missing destination parent should produce ENOENT-equivalent before cycle EINVAL, got: {fs_err}"
+        );
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_rename_behavioral_cycle_einval() {
+        let fs = make_fs().await;
+        let base = "/test_rename_cycle";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, &format!("{base}/a/b/c")).await;
+
+        let err = fs
+            .rename(&format!("{base}/a"), &format!("{base}//a/b/c/moved"))
+            .await
+            .unwrap_err();
+        let fs_err = err
+            .downcast_ref::<EmbeddedFsError>()
+            .expect("expected EmbeddedFsError");
+        assert!(
+            matches!(fs_err, EmbeddedFsError::InvalidInput(_)),
+            "cycle should produce EINVAL-equivalent, got: {fs_err}"
+        );
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_rename_behavioral_root_rejected() {
+        let fs = make_fs().await;
+        let err = fs.rename("/", "/newroot").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot rename root"),
+            "root rename must be rejected: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_rename_behavioral_same_path_trailing_slash_enotdir() {
+        let fs = make_fs().await;
+        let base = "/test_rename_noop";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+        let path = &format!("{base}/f.txt");
+        fs.write_file(path, b"stable").await.unwrap();
+
+        // trailing slash on destination requires a directory target
+        let err = fs.rename(path, &format!("{path}/")).await.unwrap_err();
+        let fs_err = err
+            .downcast_ref::<EmbeddedFsError>()
+            .expect("expected EmbeddedFsError");
+        assert!(
+            matches!(fs_err, EmbeddedFsError::NotDirectory(_)),
+            "trailing-slash destination on file should produce ENOTDIR-equivalent, got: {fs_err}"
+        );
+        let data = fs.read_file(path).await.unwrap();
+        assert_eq!(data, b"stable", "failed rename must not corrupt data");
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_rename_behavioral_missing_dest_leaf_trailing_slash_enotdir() {
+        let fs = make_fs().await;
+        let base = "/test_rename_missing_leaf_trailing_slash";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+        let src = &format!("{base}/f.txt");
+        let dst = &format!("{base}/missing/");
+        fs.write_file(src, b"stable").await.unwrap();
+
+        let err = fs.rename(src, dst).await.unwrap_err();
+        let fs_err = err
+            .downcast_ref::<EmbeddedFsError>()
+            .expect("expected EmbeddedFsError");
+        assert!(
+            matches!(fs_err, EmbeddedFsError::NotDirectory(_)),
+            "trailing-slash destination on file with missing leaf should produce ENOTDIR-equivalent, got: {fs_err}"
+        );
+        assert_eq!(
+            fs.read_file(src).await.unwrap(),
+            b"stable",
+            "failed rename must not move source file"
+        );
+        assert!(fs.stat(&format!("{base}/missing")).await.is_err());
+
+        cleanup(&fs, base).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_rename_behavioral_existing_dir_dest_trailing_slash_enotdir() {
+        let fs = make_fs().await;
+        let base = "/test_rename_existing_dir_trailing_slash";
+        cleanup(&fs, base).await;
+        ensure_dir(&fs, base).await;
+        ensure_dir(&fs, &format!("{base}/existing_dir")).await;
+        let src = &format!("{base}/f.txt");
+        let dst = &format!("{base}/existing_dir/");
+        fs.write_file(src, b"stable").await.unwrap();
+
+        let err = fs.rename(src, dst).await.unwrap_err();
+        let fs_err = err
+            .downcast_ref::<EmbeddedFsError>()
+            .expect("expected EmbeddedFsError");
+        assert!(
+            matches!(fs_err, EmbeddedFsError::NotDirectory(_)),
+            "trailing-slash destination on file with existing directory destination should produce ENOTDIR-equivalent, got: {fs_err}"
+        );
+        assert_eq!(
+            fs.read_file(src).await.unwrap(),
+            b"stable",
+            "failed rename must not move source file"
+        );
+
+        cleanup(&fs, base).await;
     }
 }

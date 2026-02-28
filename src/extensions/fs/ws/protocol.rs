@@ -283,6 +283,9 @@ pub(crate) fn map_fs_error(err: &Error) -> (WsErrorCode, String) {
                 EmbeddedFsError::PermissionDenied(msg) => {
                     (WsErrorCode::Eacces, format!("Permission denied: {msg}"))
                 }
+                EmbeddedFsError::InvalidInput(msg) => {
+                    (WsErrorCode::Einval, format!("Invalid argument: {msg}"))
+                }
                 EmbeddedFsError::Internal(msg) => (WsErrorCode::Eio, format!("I/O error: {msg}")),
             };
         }
@@ -507,5 +510,66 @@ mod tests {
             }
             _ => panic!("expected rename request"),
         }
+    }
+
+    #[test]
+    fn test_request_deserialize_rename_cross_directory() {
+        let payload =
+            r#"{"id":"11","op":"rename","old_path":"/src/file.txt","new_path":"/dst/file.txt"}"#;
+        let req: WsRequest = serde_json::from_str(payload).expect("rename request should parse");
+        match req {
+            WsRequest::Rename {
+                id,
+                old_path,
+                new_path,
+            } => {
+                assert_eq!(id, "11");
+                assert_eq!(old_path, "/src/file.txt");
+                assert_eq!(new_path, "/dst/file.txt");
+            }
+            _ => panic!("expected rename request"),
+        }
+    }
+
+    #[test]
+    fn test_map_fs_error_invalid_input() {
+        let err = anyhow::anyhow!(EmbeddedFsError::InvalidInput(
+            "cannot rename /a into its own subdirectory /a/b".to_string()
+        ));
+        let (code, msg) = map_fs_error(&err);
+        assert_eq!(code, WsErrorCode::Einval);
+        assert!(msg.contains("Invalid argument"));
+        assert!(msg.contains("cannot rename /a into its own subdirectory /a/b"));
+    }
+
+    #[test]
+    fn test_map_fs_error_not_found() {
+        let err = anyhow::anyhow!(EmbeddedFsError::NotFound("/missing".to_string()));
+        let (code, _msg) = map_fs_error(&err);
+        assert_eq!(code, WsErrorCode::Enoent);
+    }
+
+    #[test]
+    fn test_map_fs_error_permission_denied() {
+        let err = anyhow::anyhow!(EmbeddedFsError::PermissionDenied(
+            "cannot rename root".to_string()
+        ));
+        let (code, _msg) = map_fs_error(&err);
+        assert_eq!(code, WsErrorCode::Eacces);
+    }
+
+    #[test]
+    fn test_validate_path_rename_root_rejected() {
+        // Root path is valid syntactically; rename-root rejection is at the backend level.
+        // validate_path itself accepts "/" — the rename handler rejects root renaming.
+        assert!(validate_path("/").is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_empty_rejected() {
+        let result = validate_path("");
+        assert!(result.is_err());
+        let (code, _) = result.expect_err("empty path must fail");
+        assert_eq!(code, WsErrorCode::Einval);
     }
 }

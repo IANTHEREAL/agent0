@@ -45,7 +45,7 @@ fs9 底层使用 `EmbeddedPageFs`（`src/extensions/fs/embedded/pagefs.rs`），
 
 ### 2.4 FsBackend Trait
 
-`src/extensions/fs/backend.rs` 定义了 `FsBackend` trait，提供 12 个异步方法：
+`src/extensions/fs/backend.rs` 定义了 `FsBackend` trait，提供 13 个异步方法：
 
 ```rust
 #[async_trait]
@@ -63,6 +63,7 @@ pub(crate) trait FsBackend: Send + Sync {
     async fn write_file_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<usize>;
     async fn append_file(&self, path: &str, data: &[u8]) -> Result<usize>;
     async fn truncate(&self, path: &str, size: u64) -> Result<()>;
+    async fn rename(&self, old_path: &str, new_path: &str) -> Result<()>;
 }
 ```
 
@@ -95,7 +96,7 @@ pub(crate) struct FsFileInfo {
 
 ### 3.1 目标（MVP）
 
-1. 提供 WebSocket 接口，支持 11 个 POSIX 风格文件操作（`auth`、`stat`、`readdir`、`mkdir`、`unlink`、`rm`、`read`、`write`、`pwrite`、`append`、`truncate`）。
+1. 提供 WebSocket 接口，支持 12 个 POSIX 风格文件操作（`auth`、`stat`、`readdir`、`mkdir`、`unlink`、`rm`、`read`、`write`、`pwrite`、`append`、`truncate`、`rename`）。
 2. **认证完全复用** db9 现有的 `AuthManager`，通过 `parse_tenant_username()` 解析租户、`TikvClientPool::acquire()` 获取 TiKV 客户端。
 3. 多租户 keyspace 隔离——每个 WebSocket 连接绑定到一个 keyspace，与 pgwire 连接的隔离模型一致。
 4. 大文件（≥1MB）流式传输协议，支持分块读写。
@@ -497,7 +498,7 @@ struct WsConnectionGuard {
 | 字段 | 类型 | 必须 | 说明 |
 |------|------|------|------|
 | `id` | string | 是 | 请求 ID，客户端生成，响应中原样返回，用于请求/响应关联 |
-| `op` | string | 是 | 操作名称（`auth`/`stat`/`readdir`/`mkdir`/`unlink`/`rm`/`read`/`write`/`pwrite`/`append`/`truncate`） |
+| `op` | string | 是 | 操作名称（`auth`/`stat`/`readdir`/`mkdir`/`unlink`/`rm`/`read`/`write`/`pwrite`/`append`/`truncate`/`rename`） |
 | `path` | string | 视操作 | 目标文件/目录的绝对路径 |
 | 其他 | - | 视操作 | 各操作的特有参数（见 §7） |
 
@@ -765,6 +766,31 @@ struct WsConnectionGuard {
 
 `size` 为截断后的目标大小（字节）。`size: 0` 表示清空文件内容。
 
+### 7.12 `rename` — 重命名/移动文件或目录
+
+请求：
+```json
+{"id": "12", "op": "rename", "old_path": "/data/a.csv", "new_path": "/data/b.csv"}
+```
+
+成功响应：
+```json
+{"id": "12", "ok": true, "data": {}}
+```
+
+映射：`FsBackend::rename(old_path, new_path)`
+
+语义：
+- 同目录重命名和跨目录移动均为原子操作（单 TiKV 事务）。
+- 目标父目录必须已存在（不自动创建，缺失时返回 `ENOENT`）。
+- 目标为已有文件时，源文件替换目标文件。
+- 目标为已有目录时，返回 `EEXIST`。
+- 源为目录、目标为文件时，返回 `ENOTDIR`。
+- 将目录移入自身子树时，返回 `EINVAL`（防止目录循环）。
+- 源路径不存在时，返回 `ENOENT`。
+- 重命名根路径 `/` 时，返回 `EACCES`。
+- 源路径与目标路径相同时，为 no-op（直接成功）。
+
 ---
 
 ## 8. 流式传输协议
@@ -866,7 +892,7 @@ WebSocket API 使用 POSIX 风格错误码，映射自 `EmbeddedFsError`（`src/
 | `EFBIG` | 文件过大（超过 `MAX_BYTES_PER_FILE` 10MB） | 大小检查 |
 | `EAGAIN` | 读预算耗尽（超过 `FS9_READ_BUDGET` 128MB） | 全局读预算检查（资源暂时不可用，建议稍后重试） |
 | `EAUTH` | 认证失败 | `AuthManager::authenticate` 返回 `None` |
-| `EINVAL` | 无效参数（路径格式错误、缺少必须字段等） | 参数校验 |
+| `EINVAL` | 无效参数（路径格式错误、缺少必须字段、目录循环等） | `EmbeddedFsError::InvalidInput` / 参数校验 |
 | `EPROTO` | 协议错误（JSON 解析失败、未认证先操作、非法帧类型） | 协议校验 |
 | `EIO` | 内部错误（TiKV 通信异常、checksum 不匹配等） | `EmbeddedFsError::Internal` / 运行时错误 |
 
@@ -1000,3 +1026,4 @@ tokio-tungstenite = "0.24"
 | `pwrite` | `write_file_at(path, offset, data)` | `path`, `offset`, `content` | `written` |
 | `append` | `append_file(path, data)` | `path`, `content` | `written` |
 | `truncate` | `truncate(path, size)` | `path`, `size` | — |
+| `rename` | `rename(old_path, new_path)` | `old_path`, `new_path` | — |

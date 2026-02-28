@@ -108,6 +108,7 @@ pub(crate) enum EmbeddedFsError {
     NotDirectory(String),
     DirectoryNotEmpty(String),
     PermissionDenied(String),
+    InvalidInput(String),
     Internal(String),
 }
 
@@ -146,6 +147,7 @@ impl std::fmt::Display for EmbeddedFsError {
             Self::NotDirectory(msg) => write!(f, "embedded_fs: NotDirectory: {}", msg),
             Self::DirectoryNotEmpty(msg) => write!(f, "embedded_fs: DirectoryNotEmpty: {}", msg),
             Self::PermissionDenied(msg) => write!(f, "embedded_fs: PermissionDenied: {}", msg),
+            Self::InvalidInput(msg) => write!(f, "embedded_fs: InvalidInput: {}", msg),
             Self::Internal(msg) => write!(f, "embedded_fs: Internal: {}", msg),
         }
     }
