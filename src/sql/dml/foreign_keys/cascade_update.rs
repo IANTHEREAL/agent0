@@ -106,7 +106,9 @@ async fn handle_foreign_key_on_update_with_ctx(
                 enum_cache =
                     Some(build_enum_label_cache(ctx.store, txn, ctx.db_id, &other_schema).await?);
             }
-            let enum_cache = enum_cache.as_ref().expect("enum cache initialized");
+            let enum_cache = enum_cache
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("enum cache not initialized for cascade update"))?;
             let updated_row = Box::pin(execute_update_row_without_fk_update(
                 ctx.store,
                 txn,
@@ -227,7 +229,9 @@ async fn handle_foreign_key_on_update_no_ctx(
                 enum_cache =
                     Some(build_enum_label_cache(ctx.store, txn, ctx.db_id, &other_schema).await?);
             }
-            let enum_cache = enum_cache.as_ref().expect("enum cache initialized");
+            let enum_cache = enum_cache
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("enum cache not initialized for cascade update"))?;
             let updated_row = Box::pin(execute_update_row_without_fk_update(
                 ctx.store,
                 txn,

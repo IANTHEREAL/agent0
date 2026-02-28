@@ -195,14 +195,17 @@ impl Executor {
     }
 
     pub(crate) fn push_pending_async_trigger(&self, trigger: PendingAsyncTrigger) {
-        self.pending_async_triggers.lock().unwrap().push(trigger);
+        self.pending_async_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(trigger);
     }
 
     pub(crate) fn flush_trigger_activations(&self) {
         let triggers: Vec<PendingAsyncTrigger> = self
             .pending_async_triggers
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .drain(..)
             .collect();
         if !triggers.is_empty() {
@@ -248,15 +251,24 @@ impl Executor {
                 });
             }
         }
-        self.pending_trigger_activations.lock().unwrap().clear();
+        self.pending_trigger_activations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Discard pending activations without notifying trigger workers.
     /// Called after rollback so that events that were never committed
     /// don't cause unnecessary worker wake-ups.
     pub(crate) fn clear_trigger_activations(&self) {
-        self.pending_trigger_activations.lock().unwrap().clear();
-        self.pending_async_triggers.lock().unwrap().clear();
+        self.pending_trigger_activations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.pending_async_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 

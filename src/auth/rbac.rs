@@ -9,7 +9,6 @@ use tikv_client::Transaction;
 const USER_KEY_PREFIX: &[u8] = b"_sys_user_";
 const ROLE_KEY_PREFIX: &[u8] = b"_sys_role_";
 const DEFAULT_ADMIN_USER: &str = "admin";
-const LEGACY_DEV_ADMIN_PASSWORD: &str = "admin";
 const SCAN_LIMIT: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -299,17 +298,42 @@ impl AuthManager {
             return Ok(());
         }
 
-        if config::env_bool("DB9_DEV") {
-            // Legacy dev bootstrap (explicit opt-in only).
-            if self.get_user(txn, DEFAULT_ADMIN_USER).await?.is_none() {
-                let admin = User::new_superuser(DEFAULT_ADMIN_USER, LEGACY_DEV_ADMIN_PASSWORD);
-                self.create_user(txn, admin).await?;
-                tracing::warn!(
-                    "DB9_DEV=1: bootstrapped legacy default superuser '{}' (password omitted)",
-                    DEFAULT_ADMIN_USER
-                );
-            }
+        let (username, password) = Self::resolve_bootstrap_credentials()?;
+
+        if Self::validate_existing_bootstrap_user(
+            self.get_user(txn, &username).await?.as_ref(),
+            &username,
+        )? {
             return Ok(());
+        }
+
+        let admin = User::new_superuser(&username, &password);
+        self.create_user(txn, admin).await?;
+        if config::env_bool("DB9_DEV") {
+            tracing::warn!(
+                "DB9_DEV=1: bootstrapped dev superuser '{}' (password from DB9_DEV_ADMIN_PASSWORD)",
+                username
+            );
+        } else {
+            tracing::info!("Bootstrapped initial superuser '{}'", username);
+        }
+        Ok(())
+    }
+
+    /// Resolves bootstrap credentials from environment variables.
+    /// Returns `(username, password)` on success.
+    ///
+    /// In DB9_DEV mode: requires DB9_DEV_ADMIN_PASSWORD (rejects hardcoded defaults).
+    /// In production mode: requires DB9_BOOTSTRAP_ADMIN_PASSWORD.
+    fn resolve_bootstrap_credentials() -> Result<(String, String)> {
+        if config::env_bool("DB9_DEV") {
+            let dev_password =
+                config::env_string("DB9_DEV_ADMIN_PASSWORD").ok_or_else(|| {
+                    SqlError::InvalidAuthorizationSpecification {
+                        message: "DB9_DEV=1 requires DB9_DEV_ADMIN_PASSWORD to be set. Hardcoded credentials are not allowed.".into(),
+                    }
+                })?;
+            return Ok((DEFAULT_ADMIN_USER.to_string(), dev_password));
         }
 
         let bootstrap_user = config::env_string("DB9_BOOTSTRAP_ADMIN_USER")
@@ -321,23 +345,25 @@ impl AuthManager {
                 }
             })?;
 
-        if let Some(existing) = self.get_user(txn, &bootstrap_user).await? {
-            if existing.is_superuser {
-                return Ok(());
-            }
-            return Err(SqlError::InvalidAuthorizationSpecification {
+        Ok((bootstrap_user, bootstrap_password))
+    }
+
+    /// Checks whether an existing user is compatible with bootstrap.
+    /// Returns `Ok(true)` if the user is already a superuser (skip creation),
+    /// `Ok(false)` if no user exists (proceed with creation),
+    /// or `Err` if the user exists but is not a superuser.
+    fn validate_existing_bootstrap_user(existing: Option<&User>, username: &str) -> Result<bool> {
+        match existing {
+            Some(user) if user.is_superuser => Ok(true),
+            Some(_) => Err(SqlError::InvalidAuthorizationSpecification {
                 message: format!(
                     "Bootstrap user '{}' already exists but is not a superuser",
-                    bootstrap_user
+                    username
                 ),
             }
-            .into());
+            .into()),
+            None => Ok(false),
         }
-
-        let admin = User::new_superuser(&bootstrap_user, &bootstrap_password);
-        self.create_user(txn, admin).await?;
-        tracing::info!("Bootstrapped initial superuser '{}'", bootstrap_user);
-        Ok(())
     }
 
     async fn has_any_superuser(&self, txn: &mut Transaction) -> Result<bool> {
@@ -578,6 +604,32 @@ impl AuthManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn save_env_vars(keys: &[&str]) -> Vec<(String, Option<String>)> {
+        keys.iter()
+            .map(|k| (k.to_string(), env::var(k).ok()))
+            .collect()
+    }
+
+    fn restore_env_vars(saved: Vec<(String, Option<String>)>) {
+        for (key, value) in saved {
+            match value {
+                Some(v) => unsafe {
+                    env::set_var(key, v);
+                },
+                None => unsafe {
+                    env::remove_var(key);
+                },
+            }
+        }
+    }
 
     #[test]
     fn test_user_password() {
@@ -935,5 +987,73 @@ mod tests {
         assert!(role.is_superuser);
         assert!(role.can_create_db);
         assert!(role.can_create_role);
+    }
+
+    #[test]
+    fn bootstrap_rejects_db9_dev_without_dev_admin_password() {
+        let env_keys = [
+            "DB9_DEV",
+            "DB9_DEV_ADMIN_PASSWORD",
+            "DB9_BOOTSTRAP_ADMIN_USER",
+            "DB9_BOOTSTRAP_ADMIN_PASSWORD",
+        ];
+        let result = {
+            let _guard = env_lock().lock().unwrap();
+            let saved = save_env_vars(&env_keys);
+            unsafe {
+                env::set_var("DB9_DEV", "1");
+                env::remove_var("DB9_DEV_ADMIN_PASSWORD");
+                env::remove_var("DB9_BOOTSTRAP_ADMIN_USER");
+                env::remove_var("DB9_BOOTSTRAP_ADMIN_PASSWORD");
+            }
+            let result = AuthManager::resolve_bootstrap_credentials();
+            restore_env_vars(saved);
+            result
+        };
+
+        let err = result.expect_err("must reject DB9_DEV=1 without DB9_DEV_ADMIN_PASSWORD");
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("error should be SqlError::InvalidAuthorizationSpecification");
+        match sql_err {
+            SqlError::InvalidAuthorizationSpecification { message } => {
+                assert!(message.contains("DB9_DEV=1 requires DB9_DEV_ADMIN_PASSWORD"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bootstrap_rejects_existing_non_superuser_bootstrap_user() {
+        let non_super = User::new("bootstrap_user", "pass");
+        let result =
+            AuthManager::validate_existing_bootstrap_user(Some(&non_super), "bootstrap_user");
+
+        let err = result.expect_err("must reject existing non-superuser bootstrap account");
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("error should be SqlError::InvalidAuthorizationSpecification");
+        match sql_err {
+            SqlError::InvalidAuthorizationSpecification { message } => {
+                assert!(message.contains("already exists but is not a superuser"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bootstrap_accepts_existing_superuser() {
+        let superuser = User::new_superuser("admin", "pass");
+        let result = AuthManager::validate_existing_bootstrap_user(Some(&superuser), "admin");
+        assert!(result.unwrap(), "existing superuser should be accepted");
+    }
+
+    #[test]
+    fn bootstrap_accepts_no_existing_user() {
+        let result = AuthManager::validate_existing_bootstrap_user(None, "admin");
+        assert!(
+            !result.unwrap(),
+            "no existing user means proceed with creation"
+        );
     }
 }

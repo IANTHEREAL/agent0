@@ -259,10 +259,7 @@ pub fn try_grow_statement_memory_scope(
         return Ok(());
     }
     if let Ok(scope) = STATEMENT_MEMORY_SCOPE.try_with(Arc::clone) {
-        let mut guard = scope
-            .reservation
-            .lock()
-            .expect("statement memory reservation lock");
+        let mut guard = scope.reservation.lock().unwrap_or_else(|e| e.into_inner());
         guard.grow(component, bytes)
     } else {
         Ok(())
@@ -277,10 +274,7 @@ pub fn try_shrink_statement_memory_scope(bytes: usize) {
         return;
     }
     if let Ok(scope) = STATEMENT_MEMORY_SCOPE.try_with(Arc::clone) {
-        let mut guard = scope
-            .reservation
-            .lock()
-            .expect("statement memory reservation lock");
+        let mut guard = scope.reservation.lock().unwrap_or_else(|e| e.into_inner());
         guard.shrink(bytes);
     }
 }
@@ -295,10 +289,7 @@ pub fn split_statement_memory_scope(bytes: usize) -> Option<TenantMemoryReservat
     }
     STATEMENT_MEMORY_SCOPE
         .try_with(|scope| {
-            let mut guard = scope
-                .reservation
-                .lock()
-                .expect("statement memory reservation lock");
+            let mut guard = scope.reservation.lock().unwrap_or_else(|e| e.into_inner());
             guard.split(bytes)
         })
         .ok()
@@ -331,7 +322,7 @@ impl TokenBucket {
 
     /// Try to consume one token. Returns `true` if the request is allowed.
     pub(crate) fn try_acquire(&self) -> bool {
-        let mut state = self.state.lock().expect("token bucket lock");
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(state.last_refill).as_secs_f64();
         let capacity = self.rate as f64;
@@ -353,7 +344,7 @@ impl TokenBucket {
     /// Drain all tokens so the next `try_acquire` returns false.
     #[cfg(test)]
     pub(crate) fn drain(&self) {
-        let mut state = self.state.lock().expect("token bucket lock");
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.tokens = 0.0;
         state.last_refill = std::time::Instant::now();
     }
@@ -404,7 +395,10 @@ impl TenantEntry {
     /// `limit < 0` means unlimited (PostgreSQL `rolconnlimit = -1`).
     /// Returns `true` if the slot was acquired, `false` if the limit is reached.
     fn try_acquire_user_slot(&self, username: &str, limit: i32) -> bool {
-        let mut map = self.user_connections.lock().expect("user_connections lock");
+        let mut map = self
+            .user_connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let count = map.entry(username.to_string()).or_insert(0);
         if limit >= 0 && (*count as i32) >= limit {
             return false;
@@ -415,7 +409,10 @@ impl TenantEntry {
 
     /// Release a per-user connection slot.
     fn release_user_slot(&self, username: &str) {
-        let mut map = self.user_connections.lock().expect("user_connections lock");
+        let mut map = self
+            .user_connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(count) = map.get_mut(username) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -437,7 +434,10 @@ impl TenantEntry {
     /// Per-user connection count snapshot (for tests).
     #[allow(dead_code)] // test: used in pool tests
     pub(crate) fn user_connections_for(&self, username: &str) -> u32 {
-        let map = self.user_connections.lock().expect("user_connections lock");
+        let map = self
+            .user_connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         map.get(username).copied().unwrap_or(0)
     }
 
@@ -642,24 +642,37 @@ impl TikvClientPool {
         {
             let tenants = self.tenants.read().await;
             if let Some(entry) = tenants.get(&key) {
+                let entry = entry.clone();
                 entry.active_connections.fetch_add(1, Ordering::Relaxed);
                 entry.last_idle_at.store(0, Ordering::Relaxed);
+                drop(tenants);
+                self.cleanup_creation_lock_if_unused(&key, &creation_lock)
+                    .await;
                 return Ok(TenantHandle {
-                    entry: entry.clone(),
+                    entry,
                     user_slot: None,
                 });
             }
         }
 
         info!("Creating new TiKV client for keyspace: {}", key);
-        let store = self.create_store(&key, keyspace).await?;
+        let store = match self.create_store(&key, keyspace).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.cleanup_creation_lock_if_unused(&key, &creation_lock)
+                    .await;
+                return Err(e);
+            }
+        };
         let entry = Arc::new(TenantEntry::new(store, key.clone()));
         entry.active_connections.fetch_add(1, Ordering::Relaxed);
 
         {
             let mut tenants = self.tenants.write().await;
-            tenants.insert(key, entry.clone());
+            tenants.insert(key.clone(), entry.clone());
         }
+        self.cleanup_creation_lock_if_unused(&key, &creation_lock)
+            .await;
 
         Ok(TenantHandle {
             entry,
@@ -699,12 +712,23 @@ impl TikvClientPool {
         {
             let tenants = self.tenants.read().await;
             if let Some(entry) = tenants.get(&key) {
-                return Ok(entry.store.clone());
+                let store = entry.store.clone();
+                drop(tenants);
+                self.cleanup_creation_lock_if_unused(&key, &creation_lock)
+                    .await;
+                return Ok(store);
             }
         }
 
         info!("Creating new TiKV client for keyspace: {}", key);
-        let store = self.create_store(&key, keyspace).await?;
+        let store = match self.create_store(&key, keyspace).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.cleanup_creation_lock_if_unused(&key, &creation_lock)
+                    .await;
+                return Err(e);
+            }
+        };
         let entry = Arc::new(TenantEntry::new(store, key.clone()));
         // Mark as idle immediately since no handle is held.
         entry.last_idle_at.store(now_epoch_ms(), Ordering::Relaxed);
@@ -712,10 +736,29 @@ impl TikvClientPool {
         let store_clone = entry.store.clone();
         {
             let mut tenants = self.tenants.write().await;
-            tenants.insert(key, entry);
+            tenants.insert(key.clone(), entry);
         }
+        self.cleanup_creation_lock_if_unused(&key, &creation_lock)
+            .await;
 
         Ok(store_clone)
+    }
+
+    /// Remove a per-keyspace creation lock after a slow-path operation
+    /// when no concurrent waiters remain.
+    async fn cleanup_creation_lock_if_unused(
+        &self,
+        key: &str,
+        creation_lock: &Arc<TokioMutex<()>>,
+    ) {
+        let mut locks = self.creation_locks.write().await;
+        let should_remove = locks
+            .get(key)
+            .is_some_and(|existing| Arc::ptr_eq(existing, creation_lock))
+            && Arc::strong_count(creation_lock) == 2;
+        if should_remove {
+            locks.remove(key);
+        }
     }
 
     /// Shared TikvStore creation logic. Resolves the "default" keyspace name
@@ -870,6 +913,27 @@ mod tests {
     async fn test_pool_creation() {
         let pool = TikvClientPool::new(vec!["127.0.0.1:2379".to_string()]);
         assert_eq!(pool.tenant_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_creation_lock_removed_after_create_store_failure() {
+        let pool = TikvClientPool::new(vec!["invalid-pd-endpoint".to_string()]);
+        let keyspace = "lock_cleanup_failure";
+
+        let err = match pool.acquire(Some(keyspace.to_string())).await {
+            Ok(_) => panic!("acquire should fail when create_store cannot connect"),
+            Err(err) => err,
+        };
+        assert!(
+            !err.to_string().is_empty(),
+            "failure should return an error message"
+        );
+
+        let locks = pool.creation_locks.read().await;
+        assert!(
+            !locks.contains_key(keyspace),
+            "creation lock must be removed after failed create_store"
+        );
     }
 
     #[tokio::test]

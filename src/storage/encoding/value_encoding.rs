@@ -252,7 +252,9 @@ pub fn decode_value_memcomparable(data: &[u8], data_type: &DataType) -> Result<(
             }
 
             let is_negative = sign_byte == DECIMAL_SIGN_NEG;
-            let exp_bytes: [u8; 2] = payload[1..3].try_into().unwrap();
+            let exp_bytes: [u8; 2] = payload[1..3]
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Numeric decode: exponent slice not 2 bytes"))?;
             let digits_bytes: &[u8] = &payload[3..3 + DECIMAL_MAX_DIGITS];
             let digits_len_byte = payload[3 + DECIMAL_MAX_DIGITS];
 

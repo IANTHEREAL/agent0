@@ -503,6 +503,7 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
 
         // ===== Vector =====
         (Value::Text(s), DataType::Vector(dim)) => {
+            const MAX_VECTOR_DIMENSIONS: usize = 16384;
             let trimmed = s.trim();
             if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
                 return Err(SqlError::InvalidInputSyntax {
@@ -511,21 +512,35 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 }
                 .into());
             }
+            // Reject modifier > MAX before parsing elements.
+            if *dim as usize > MAX_VECTOR_DIMENSIONS {
+                return Err(anyhow!(
+                    "vector cannot have more than {} dimensions",
+                    MAX_VECTOR_DIMENSIONS
+                ));
+            }
             let inner = &trimmed[1..trimmed.len() - 1];
-            let elements: std::result::Result<Vec<f64>, _> = if inner.trim().is_empty() {
-                Ok(Vec::new())
-            } else {
-                inner.split(',').map(|e| e.trim().parse::<f64>()).collect()
-            };
-            let vec = elements.map_err(|_| {
-                anyhow::Error::from(SqlError::InvalidInputSyntax {
-                    type_name: "vector".into(),
-                    value: trimmed.to_string(),
-                })
-            })?;
-            if vec.is_empty() {
+            if inner.trim().is_empty() {
                 return Err(anyhow!("vector must have at least 1 dimension"));
             }
+            // Count elements before allocating: single pass, early break at MAX+1.
+            let elem_count = inner.split(',').take(MAX_VECTOR_DIMENSIONS + 1).count();
+            if elem_count > MAX_VECTOR_DIMENSIONS {
+                return Err(anyhow!(
+                    "vector cannot have more than {} dimensions",
+                    MAX_VECTOR_DIMENSIONS
+                ));
+            }
+            let vec: Vec<f64> = inner
+                .split(',')
+                .map(|e| e.trim().parse::<f64>())
+                .collect::<std::result::Result<Vec<f64>, _>>()
+                .map_err(|_| {
+                    anyhow::Error::from(SqlError::InvalidInputSyntax {
+                        type_name: "vector".into(),
+                        value: trimmed.to_string(),
+                    })
+                })?;
             // dim == 0 means "any dimension" (bare `vector` without modifier).
             if *dim > 0 && vec.len() != *dim as usize {
                 return Err(anyhow!("expected {} dimensions, not {}", dim, vec.len()));

@@ -315,7 +315,7 @@ impl AdvisoryLockManager {
         mode: AdvisoryLockMode,
         count: u32,
     ) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let lk = (keyspace.clone(), key);
         let lock_state = state.locks.entry(lk.clone()).or_insert_with(LockState::new);
         let holders = match mode {
@@ -496,7 +496,7 @@ impl AdvisoryLockManager {
     }
 
     fn release_keys_for_connection(&self, conn_id: i64, kind: BulkReleaseKind) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let Some(keys_set) = state.connection_keys.get(&conn_id) else {
             return;
         };
@@ -582,7 +582,7 @@ impl AdvisoryLockManager {
         mode: AdvisoryLockMode,
         scope: AdvisoryLockScope,
     ) -> Result<bool, AcquireError> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(limit) = self.should_reject_new_lock_for_limit(&state, keyspace, key, conn_id) {
             return Err(AcquireError::LockLimitExceeded { limit });
         }
@@ -603,7 +603,7 @@ impl AdvisoryLockManager {
         let wait = async {
             loop {
                 let notify = {
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(limit) =
                         self.should_reject_new_lock_for_limit(&state, keyspace, key, conn_id)
                     {
@@ -618,7 +618,7 @@ impl AdvisoryLockManager {
                 tokio::pin!(notified);
                 notified.as_mut().enable();
                 {
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(limit) =
                         self.should_reject_new_lock_for_limit(&state, keyspace, key, conn_id)
                     {
@@ -639,7 +639,7 @@ impl AdvisoryLockManager {
             None => wait.await,
         };
         if result.is_err() {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             Self::maybe_remove_unused_notifier(&mut state, &lk);
         }
         result
@@ -653,7 +653,7 @@ impl AdvisoryLockManager {
         mode: AdvisoryLockMode,
     ) -> bool {
         let lk = (keyspace.clone(), key);
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut became_unheld = false;
         let mut became_empty = false;
         let released = if let Some(lock_state) = state.locks.get_mut(&lk) {
@@ -690,7 +690,7 @@ impl AdvisoryLockManager {
         mode: AdvisoryLockMode,
     ) -> bool {
         let lk = (keyspace.clone(), key);
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut became_unheld = false;
         let mut became_empty = false;
         let released = if let Some(lock_state) = state.locks.get_mut(&lk) {
@@ -1355,7 +1355,7 @@ mod tests {
         ));
 
         {
-            let state = mgr.state.lock().unwrap();
+            let state = mgr.state.lock().unwrap_or_else(|e| e.into_inner());
             let keys = state
                 .connection_keys
                 .get(&100)
@@ -1369,7 +1369,7 @@ mod tests {
         mgr.release_xact_locks(100);
 
         {
-            let state = mgr.state.lock().unwrap();
+            let state = mgr.state.lock().unwrap_or_else(|e| e.into_inner());
             let keys = state
                 .connection_keys
                 .get(&100)
@@ -1757,7 +1757,7 @@ mod tests {
         // Releasing the last holder should clean both lock-state and notifier entry.
         assert!(mgr.release_session(&keyspace, key, 100, AdvisoryLockMode::Exclusive));
 
-        let state = mgr.state.lock().unwrap();
+        let state = mgr.state.lock().unwrap_or_else(|e| e.into_inner());
         assert!(!state.locks.contains_key(&lk));
         assert!(!state.key_notifiers.contains_key(&lk));
     }
@@ -1771,7 +1771,7 @@ mod tests {
         mode: AdvisoryLockMode,
         count: u32,
     ) {
-        let mut state = mgr.state.lock().unwrap();
+        let mut state = mgr.state.lock().unwrap_or_else(|e| e.into_inner());
         let lk = (keyspace.clone(), key);
         let lock_state = state.locks.entry(lk.clone()).or_insert_with(LockState::new);
         let holders = match mode {
@@ -1791,7 +1791,7 @@ mod tests {
         mode: AdvisoryLockMode,
         count: u32,
     ) {
-        let mut state = mgr.state.lock().unwrap();
+        let mut state = mgr.state.lock().unwrap_or_else(|e| e.into_inner());
         let lk = (keyspace.clone(), key);
         let lock_state = state.locks.entry(lk.clone()).or_insert_with(LockState::new);
         let holders = match mode {
@@ -1959,7 +1959,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             let has_waiter_clone = {
-                let state = mgr.state.lock().unwrap();
+                let state = mgr.state.lock().unwrap_or_else(|e| e.into_inner());
                 state
                     .key_notifiers
                     .get(&lk)
@@ -1979,7 +1979,7 @@ mod tests {
         // remove lock ownership while keeping the notifier entry alive.
         // The waiter is still pending and will time out.
         {
-            let mut state = mgr.state.lock().unwrap();
+            let mut state = mgr.state.lock().unwrap_or_else(|e| e.into_inner());
             state.locks.remove(&lk);
             state.connection_keys.remove(&100);
             assert!(state.key_notifiers.contains_key(&lk));
@@ -1991,7 +1991,7 @@ mod tests {
             .expect_err("waiter should time out");
         assert_eq!(err, AcquireError::Timeout);
 
-        let state = mgr.state.lock().unwrap();
+        let state = mgr.state.lock().unwrap_or_else(|e| e.into_inner());
         assert!(!state.locks.contains_key(&lk));
         assert!(
             !state.key_notifiers.contains_key(&lk),

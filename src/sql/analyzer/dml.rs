@@ -322,7 +322,10 @@ impl<'a> Analyzer<'a> {
         let analyzed_from = if let Some(from_table) = from {
             self.scopes.push(scope);
             let from_ref = self.analyze_table_with_joins(from_table)?;
-            scope = self.scopes.pop().unwrap();
+            scope = self
+                .scopes
+                .pop()
+                .ok_or_else(|| AnalyzerError::Internal("scope stack underflow".into()))?;
             // Re-push the combined scope.
             self.scopes.push(scope);
             vec![from_ref]
@@ -432,7 +435,10 @@ impl<'a> Analyzer<'a> {
                 let table_ref = self.analyze_table_with_joins(twj)?;
                 using_refs.push(table_ref);
             }
-            scope = self.scopes.pop().unwrap();
+            scope = self
+                .scopes
+                .pop()
+                .ok_or_else(|| AnalyzerError::Internal("scope stack underflow".into()))?;
             self.scopes.push(scope);
             using_refs
         } else {

@@ -108,7 +108,7 @@ impl ObservabilityRegistry {
             keyspace.to_string()
         };
 
-        let mut guard = self.tenants.lock().expect("observability tenants lock");
+        let mut guard = self.tenants.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = guard.get(&key) {
             return existing.clone();
         }
@@ -240,7 +240,7 @@ impl TenantObservability {
                 query: sql,
             };
 
-            let mut guard = self.samples.lock().expect("observability samples lock");
+            let mut guard = self.samples.lock().unwrap_or_else(|e| e.into_inner());
             prune_samples(&mut guard, now);
             guard.push_back(ev);
             while guard.len() > self.config.max_sample_events {
@@ -284,7 +284,7 @@ impl TenantObservability {
         }
 
         let now = now_ms();
-        let mut guard = self.samples.lock().expect("observability samples lock");
+        let mut guard = self.samples.lock().unwrap_or_else(|e| e.into_inner());
         prune_samples(&mut guard, now);
 
         let mut agg: HashMap<u64, SampleAgg> = HashMap::new();

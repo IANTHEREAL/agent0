@@ -52,6 +52,16 @@ fn invalid_param(index: usize, type_name: &str, message: String) -> PgWireError 
     invalid_param_with_code(index, type_name, "22P02", message)
 }
 
+const INSUFFICIENT_DATA_LEFT_IN_MESSAGE: &str = "insufficient data left in message";
+
+fn insufficient_data_param(_index: usize, _type_name: &str, _message: String) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_string(),
+        "08P01".to_string(),
+        INSUFFICIENT_DATA_LEFT_IN_MESSAGE.to_string(),
+    )))
+}
+
 fn invalid_param_with_code(
     index: usize,
     type_name: &str,
@@ -134,17 +144,20 @@ fn array_element_type(array_type: &Type) -> Option<Type> {
 
 fn decode_binary_array(bytes: &[u8], pg_type: &Type, index: usize) -> PgWireResult<Value> {
     let err = |msg: String| invalid_param(index, pg_type.name(), msg);
+    let insufficient_data = |msg: String| insufficient_data_param(index, pg_type.name(), msg);
     let mut pos = 0usize;
 
     let read_i32 = |bytes: &[u8], pos: &mut usize| -> PgWireResult<i32> {
         if bytes.len().saturating_sub(*pos) < 4 {
-            return Err(invalid_param(
-                index,
-                pg_type.name(),
+            return Err(insufficient_data(
                 "truncated binary array header".to_string(),
             ));
         }
-        let v = i32::from_be_bytes(bytes[*pos..*pos + 4].try_into().unwrap());
+        let v = i32::from_be_bytes(
+            bytes[*pos..*pos + 4]
+                .try_into()
+                .map_err(|_| insufficient_data("truncated binary array header".to_string()))?,
+        );
         *pos += 4;
         Ok(v)
     };
@@ -190,7 +203,7 @@ fn decode_binary_array(bytes: &[u8], pg_type: &Type, index: usize) -> PgWireResu
         }
         let elem_len = elem_len as usize;
         if bytes.len().saturating_sub(pos) < elem_len {
-            return Err(err(format!(
+            return Err(insufficient_data(format!(
                 "truncated binary array element: need {} bytes, have {}",
                 elem_len,
                 bytes.len().saturating_sub(pos)
@@ -226,18 +239,35 @@ fn decode_binary_numeric(bytes: &[u8], pg_type: &Type, index: usize) -> PgWireRe
     use std::str::FromStr;
 
     let err = |msg: String| invalid_param(index, pg_type.name(), msg);
+    let insufficient_data = |msg: String| insufficient_data_param(index, pg_type.name(), msg);
 
     if bytes.len() < 8 {
-        return Err(err(format!(
+        return Err(insufficient_data(format!(
             "truncated NUMERIC binary payload: expected at least 8 bytes, got {}",
             bytes.len()
         )));
     }
 
-    let ndigits = i16::from_be_bytes(bytes[0..2].try_into().unwrap());
-    let weight = i16::from_be_bytes(bytes[2..4].try_into().unwrap());
-    let sign = i16::from_be_bytes(bytes[4..6].try_into().unwrap());
-    let dscale = i16::from_be_bytes(bytes[6..8].try_into().unwrap());
+    let ndigits = i16::from_be_bytes(
+        bytes[0..2]
+            .try_into()
+            .map_err(|_| insufficient_data("truncated NUMERIC header".to_string()))?,
+    );
+    let weight = i16::from_be_bytes(
+        bytes[2..4]
+            .try_into()
+            .map_err(|_| insufficient_data("truncated NUMERIC header".to_string()))?,
+    );
+    let sign = i16::from_be_bytes(
+        bytes[4..6]
+            .try_into()
+            .map_err(|_| insufficient_data("truncated NUMERIC header".to_string()))?,
+    );
+    let dscale = i16::from_be_bytes(
+        bytes[6..8]
+            .try_into()
+            .map_err(|_| insufficient_data("truncated NUMERIC header".to_string()))?,
+    );
 
     if ndigits < 0 {
         return Err(err(format!("invalid NUMERIC ndigits {}", ndigits)));
@@ -254,7 +284,14 @@ fn decode_binary_numeric(bytes: &[u8], pg_type: &Type, index: usize) -> PgWireRe
 
     let ndigits = ndigits as usize;
     let expected = 8usize + ndigits * 2usize;
-    if bytes.len() != expected {
+    if bytes.len() < expected {
+        return Err(insufficient_data(format!(
+            "truncated NUMERIC binary payload: expected {}, got {}",
+            expected,
+            bytes.len()
+        )));
+    }
+    if bytes.len() > expected {
         return Err(err(format!(
             "invalid NUMERIC binary length: expected {}, got {}",
             expected,
@@ -265,7 +302,11 @@ fn decode_binary_numeric(bytes: &[u8], pg_type: &Type, index: usize) -> PgWireRe
     let mut digits = Vec::with_capacity(ndigits);
     let mut pos = 8usize;
     for _ in 0..ndigits {
-        let d = i16::from_be_bytes(bytes[pos..pos + 2].try_into().unwrap());
+        let d = i16::from_be_bytes(
+            bytes[pos..pos + 2]
+                .try_into()
+                .map_err(|_| insufficient_data("truncated NUMERIC digit".to_string()))?,
+        );
         pos += 2;
         if !(0..=9999).contains(&d) {
             return Err(err(format!("invalid NUMERIC base-10000 digit {}", d)));
@@ -442,11 +483,27 @@ fn decode_binary(bytes: &[u8], pg_type: &Type, index: usize) -> PgWireResult<Val
         t if *t == Type::INTERVAL => {
             // PostgreSQL interval binary: 8 bytes µs + 4 bytes days + 4 bytes months
             if bytes.len() != 16 {
-                return Err(err(format!("expected 16 bytes, got {}", bytes.len())));
+                let msg = format!("expected 16 bytes, got {}", bytes.len());
+                if bytes.len() < 16 {
+                    return Err(insufficient_data_param(index, pg_type.name(), msg));
+                }
+                return Err(err(msg));
             }
-            let us = i64::from_be_bytes(bytes[0..8].try_into().unwrap());
-            let days = i32::from_be_bytes(bytes[8..12].try_into().unwrap());
-            let months = i32::from_be_bytes(bytes[12..16].try_into().unwrap());
+            let us = i64::from_be_bytes(
+                bytes[0..8]
+                    .try_into()
+                    .map_err(|_| err(format!("expected 16 bytes, got {}", bytes.len())))?,
+            );
+            let days = i32::from_be_bytes(
+                bytes[8..12]
+                    .try_into()
+                    .map_err(|_| err(format!("expected 16 bytes, got {}", bytes.len())))?,
+            );
+            let months = i32::from_be_bytes(
+                bytes[12..16]
+                    .try_into()
+                    .map_err(|_| err(format!("expected 16 bytes, got {}", bytes.len())))?,
+            );
             let total_ms = us / 1000
                 + (days as i64) * 24 * 60 * 60 * 1000
                 + (months as i64) * 30 * 24 * 60 * 60 * 1000;
@@ -696,6 +753,62 @@ mod tests {
             v,
             Value::Array(vec![Value::Text("alice".to_string()), Value::Null])
         );
+    }
+
+    #[test]
+    fn decode_binary_array_rejects_truncated_payload_with_08p01() {
+        // Deliberately truncated: not enough bytes for full binary array header.
+        let bytes = vec![0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00];
+        let err = decode_binary(&bytes, &Type::TEXT_ARRAY, 0).unwrap_err();
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "08P01");
+                assert_eq!(info.message, INSUFFICIENT_DATA_LEFT_IN_MESSAGE);
+            }
+            other => panic!("expected user error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_binary_numeric_rejects_truncated_payload_with_08p01() {
+        // Deliberately truncated: NUMERIC binary payload requires at least 8 bytes.
+        let bytes = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let err = decode_binary(&bytes, &Type::NUMERIC, 0).unwrap_err();
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "08P01");
+                assert_eq!(info.message, INSUFFICIENT_DATA_LEFT_IN_MESSAGE);
+            }
+            other => panic!("expected user error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_binary_numeric_rejects_truncated_digit_payload_with_08p01() {
+        // Valid NUMERIC header (ndigits=2) but only one 2-byte digit is present.
+        let bytes = build_numeric_bin(2, 0, PG_NUMERIC_POS, 0, &[12]);
+        let err = decode_binary(&bytes, &Type::NUMERIC, 0).unwrap_err();
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "08P01");
+                assert_eq!(info.message, INSUFFICIENT_DATA_LEFT_IN_MESSAGE);
+            }
+            other => panic!("expected user error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_binary_interval_rejects_truncated_payload_with_08p01() {
+        // Deliberately truncated: INTERVAL binary payload must be exactly 16 bytes.
+        let bytes = vec![0u8; 15];
+        let err = decode_binary(&bytes, &Type::INTERVAL, 0).unwrap_err();
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "08P01");
+                assert_eq!(info.message, INSUFFICIENT_DATA_LEFT_IN_MESSAGE);
+            }
+            other => panic!("expected user error, got {other:?}"),
+        }
     }
 
     fn build_numeric_bin(

@@ -59,10 +59,7 @@ struct TenantParquetLimiters {
 
 impl TenantParquetLimiters {
     fn semaphore(&self, tenant: &str) -> Arc<Semaphore> {
-        let mut guard = self
-            .by_tenant
-            .lock()
-            .expect("parquet tenant semaphore lock");
+        let mut guard = self.by_tenant.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = guard.get(tenant) {
             return existing.clone();
         }
