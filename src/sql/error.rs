@@ -115,6 +115,9 @@ pub enum SqlError {
     #[error("advisory lock reentrant acquisition count overflow")]
     AdvisoryLockCounterOverflow,
 
+    #[error("{message}")]
+    StatementTooComplex { message: String },
+
     #[error("current transaction is aborted, commands ignored until end of transaction block")]
     InFailedTransaction,
 
@@ -251,6 +254,7 @@ impl SqlError {
             Self::LockNotAvailable { .. } => "55P03",
             Self::AdvisoryLockLimitExceeded { .. } => "54000",
             Self::AdvisoryLockCounterOverflow => "54000",
+            Self::StatementTooComplex { .. } => "54001",
             Self::InFailedTransaction => "25P02",
             Self::PermissionDenied { .. } => "42501",
             Self::DuplicateRelation(_) => "42P07",
@@ -466,6 +470,13 @@ mod tests {
         assert_eq!(
             SqlError::AdvisoryLockLimitExceeded { limit: 64 }.sqlstate(),
             "54000"
+        );
+        assert_eq!(
+            SqlError::StatementTooComplex {
+                message: "too deep".into()
+            }
+            .sqlstate(),
+            "54001"
         );
         assert_eq!(
             SqlError::DuplicateRelation("idx".into()).sqlstate(),

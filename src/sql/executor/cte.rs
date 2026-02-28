@@ -14,6 +14,40 @@ use std::ops::ControlFlow;
 use std::pin::Pin;
 use tikv_client::Transaction;
 
+const RECURSIVE_CTE_MAX_ITERATIONS: usize = 1000;
+
+fn check_recursive_cte_iteration_limit(iteration: usize) -> Result<()> {
+    if iteration == RECURSIVE_CTE_MAX_ITERATIONS {
+        return Err(SqlError::StatementTooComplex {
+            message: format!(
+                "recursive query exceeded maximum iteration count ({RECURSIVE_CTE_MAX_ITERATIONS})"
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn merge_recursive_rows(
+    all_rows: &mut Vec<Row>,
+    new_rows: Vec<Row>,
+    is_union_all: bool,
+) -> Vec<Row> {
+    if is_union_all {
+        all_rows.extend(new_rows.clone());
+        new_rows
+    } else {
+        let mut unique_new_rows = Vec::new();
+        for row in new_rows {
+            if !all_rows.contains(&row) {
+                unique_new_rows.push(row.clone());
+                all_rows.push(row);
+            }
+        }
+        unique_new_rows
+    }
+}
+
 impl Executor {
     pub(crate) async fn build_cte_context_with_base(
         &self,
@@ -225,12 +259,9 @@ impl Executor {
         );
 
         let mut working_table = all_rows.clone();
-        let max_iterations = 1000;
         let mut iteration = 0;
 
-        while !working_table.is_empty() && iteration < max_iterations {
-            iteration += 1;
-
+        while !working_table.is_empty() {
             let mut temp_ctes = existing_ctes.clone();
             temp_ctes.insert(
                 cte_name.to_string(),
@@ -265,22 +296,33 @@ impl Executor {
                 _ => return Err(anyhow!("Recursive CTE iteration must be SELECT")),
             };
 
-            if new_rows.is_empty() {
-                break;
-            }
-
             if is_union_all {
-                all_rows.extend(new_rows.clone());
-                working_table = new_rows;
-            } else {
-                let mut unique_new_rows = Vec::new();
-                for row in new_rows {
-                    if !all_rows.contains(&row) {
-                        unique_new_rows.push(row.clone());
-                        all_rows.push(row);
-                    }
+                if new_rows.is_empty() {
+                    break;
                 }
-                working_table = unique_new_rows;
+
+                // db9 divergence: PostgreSQL does not impose a built-in recursive CTE depth cap;
+                // unbounded recursion is typically constrained by statement_timeout. db9 enforces
+                // a hard cap of 1000 iterations intentionally to prevent runaway recursive queries
+                // from exhausting memory.
+                //
+                // For UNION ALL, the recursive step continues whenever the arm yields rows.
+                check_recursive_cte_iteration_limit(iteration)?;
+                iteration += 1;
+
+                working_table = merge_recursive_rows(&mut all_rows, new_rows, true);
+            } else {
+                // For UNION (DISTINCT), deduplicate against accumulated result rows first.
+                // If this iteration contributes no new distinct rows, recursion terminates
+                // naturally and must not consume/violate the iteration cap.
+                let deduped_new_rows = merge_recursive_rows(&mut all_rows, new_rows, false);
+                if deduped_new_rows.is_empty() {
+                    break;
+                }
+
+                check_recursive_cte_iteration_limit(iteration)?;
+                iteration += 1;
+                working_table = deduped_new_rows;
             }
         }
 
@@ -430,6 +472,7 @@ fn collect_nested_with_queries(query: &Query) -> Vec<Query> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Value;
     use crate::sql::parse_sql;
     use sqlparser::ast::Statement;
 
@@ -447,6 +490,14 @@ mod tests {
         let query = parse_query(sql);
         let cte = &query.with.as_ref().unwrap().cte_tables[0];
         cte.query.as_ref().clone()
+    }
+
+    fn row_first_i64(row: &Row) -> i64 {
+        match row.values.first().expect("row must have one column") {
+            Value::Int32(v) => i64::from(*v),
+            Value::Int64(v) => *v,
+            other => panic!("expected int value, got {other:?}"),
+        }
     }
 
     // --- decompose_recursive_union tests ---
@@ -615,6 +666,96 @@ mod tests {
             err.to_string().contains("one non-recursive UNION arm"),
             "expected non-recursive error, got: {err}"
         );
+    }
+
+    // --- recursive iteration limit regression tests ---
+
+    // db9 divergence: PG has no max_recursion_depth setting; infinite recursive CTEs hit statement_timeout.
+    // db9 enforces a hard iteration cap (1000) as a resource protection measure.
+    #[test]
+    fn recursive_cte_limit_hit_returns_typed_sqlstate_and_error_message() {
+        let mut all_rows = vec![Row::new(vec![Value::Int32(1)])];
+        let mut working_table = all_rows.clone();
+        let mut iteration = 0usize;
+
+        loop {
+            let new_rows: Vec<Row> = working_table
+                .iter()
+                .map(|row| Row::new(vec![Value::Int64(row_first_i64(row) + 1)]))
+                .collect();
+            if new_rows.is_empty() {
+                panic!("infinite recursive arm simulation unexpectedly returned no rows");
+            }
+
+            match check_recursive_cte_iteration_limit(iteration) {
+                Ok(()) => {}
+                Err(err) => {
+                    let sql_err = err
+                        .downcast_ref::<SqlError>()
+                        .expect("must be typed SqlError, not bare anyhow");
+                    assert_eq!(sql_err.sqlstate(), "54001");
+                    assert!(
+                        err.to_string()
+                            .contains("recursive query exceeded maximum iteration count"),
+                        "unexpected error: {err}"
+                    );
+                    assert_eq!(iteration, RECURSIVE_CTE_MAX_ITERATIONS);
+                    return;
+                }
+            }
+            iteration += 1;
+
+            working_table = merge_recursive_rows(&mut all_rows, new_rows, true);
+        }
+    }
+
+    // db9 divergence: PG has no max_recursion_depth setting; infinite recursive CTEs hit statement_timeout.
+    // db9 enforces a hard iteration cap (1000) as a resource protection measure.
+    #[test]
+    fn recursive_cte_999_iterations_returns_full_results() {
+        let mut all_rows = vec![Row::new(vec![Value::Int32(1)])];
+        let mut working_table = all_rows.clone();
+        let mut iteration = 0usize;
+
+        while !working_table.is_empty() {
+            let new_rows: Vec<Row> = working_table
+                .iter()
+                .filter_map(|row| {
+                    let n = row_first_i64(row);
+                    (n < 999).then(|| Row::new(vec![Value::Int64(n + 1)]))
+                })
+                .collect();
+            if new_rows.is_empty() {
+                break;
+            }
+
+            check_recursive_cte_iteration_limit(iteration).unwrap();
+            iteration += 1;
+            working_table = merge_recursive_rows(&mut all_rows, new_rows, true);
+        }
+
+        assert_eq!(iteration, 998);
+        assert_eq!(all_rows.len(), 999);
+        for (idx, row) in all_rows.iter().enumerate() {
+            assert_eq!(row_first_i64(row), (idx + 1) as i64);
+        }
+    }
+
+    #[test]
+    fn recursive_union_distinct_dedup_stops_before_cap() {
+        let mut all_rows = vec![Row::new(vec![Value::Int32(1)])];
+        let iteration = RECURSIVE_CTE_MAX_ITERATIONS;
+
+        let new_rows = vec![Row::new(vec![Value::Int32(1)])];
+        let deduped_new_rows = merge_recursive_rows(&mut all_rows, new_rows, false);
+        assert!(deduped_new_rows.is_empty());
+        assert!(check_recursive_cte_iteration_limit(iteration).is_err());
+
+        // UNION (DISTINCT) must terminate on empty post-dedup working table and
+        // therefore never evaluate the cap check in this case.
+        if !deduped_new_rows.is_empty() {
+            check_recursive_cte_iteration_limit(iteration).unwrap();
+        }
     }
 
     // --- build_cte_table_schema tests ---
