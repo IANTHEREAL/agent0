@@ -9,6 +9,7 @@ mod state;
 use anyhow::{anyhow, Result};
 use std::future::Future;
 use std::sync::Arc;
+use tikv_client::transaction::Mutation;
 use tikv_client::Transaction;
 
 use crate::storage::backpressure::tikv_op;
@@ -54,6 +55,38 @@ pub(crate) async fn txn_put(txn: &mut Transaction, key: Vec<u8>, value: Vec<u8>)
     }
 
     tikv_op!(txn.put(key, value).await).map_err(|e| anyhow!(e))
+}
+
+/// TiKV `batch_mutate` wrapper that records undo information when SAVEPOINT is
+/// active and acquires pessimistic locks for **all** keys in a single RPC
+/// (vs one lock RPC per key with individual `txn_put` calls).
+#[inline]
+pub(crate) async fn txn_batch_mutate(
+    txn: &mut Transaction,
+    mutations: Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<()> {
+    if mutations.is_empty() {
+        return Ok(());
+    }
+
+    let savepoints = SAVEPOINTS.try_with(|sp| sp.clone()).ok();
+
+    if let Some(ref sp) = savepoints {
+        for (key, _) in &mutations {
+            if sp.should_record_key(key).await? {
+                let prev = txn.get(key.clone()).await.map_err(|e| anyhow!(e))?;
+                sp.record_prev_value(key.clone(), prev).await?;
+            }
+        }
+    }
+
+    let tikv_mutations: Vec<Mutation> = mutations
+        .into_iter()
+        .map(|(k, v)| Mutation::Put(k.into(), v))
+        .collect();
+    txn.batch_mutate(tikv_mutations)
+        .await
+        .map_err(|e| anyhow!(e))
 }
 
 /// TiKV `delete` wrapper that records undo information when SAVEPOINT is active.

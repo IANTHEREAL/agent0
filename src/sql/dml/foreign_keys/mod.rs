@@ -28,21 +28,39 @@ pub(crate) struct FkStoreCtx<'a> {
     pub db_id: u64,
 }
 
+pub(crate) type ConstraintId = usize;
+
 pub(super) fn short_relation_name(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
 }
 
-/// Deterministic string key from a PK value vector for HashSet membership.
+/// Collision-resistant string key from a PK value vector for HashSet/HashMap
+/// membership.  Uses `Debug` format (which includes variant tags and escapes
+/// string content) joined by NUL bytes so that composite text values with
+/// embedded commas can never collide:
+///
+///   `[Text("a"), Text("b, c")]` → `Text("a")\0Text("b, c")`
+///   `[Text("a, b"), Text("c")]` → `Text("a, b")\0Text("c")`
+///
+/// This function is **internal only** — never expose its output to users.
+/// For user-facing DETAIL messages, use [`format_fk_detail_values`].
 pub(crate) fn pk_to_hash_key(pk: &[Value]) -> String {
-    use std::fmt::Write;
-    let mut key = String::new();
-    for (i, v) in pk.iter().enumerate() {
-        if i > 0 {
-            key.push('\x00');
-        }
-        let _ = write!(key, "{:?}", v);
-    }
-    key
+    pk.iter()
+        .map(|v| format!("{:?}", v))
+        .collect::<Vec<_>>()
+        .join("\0")
+}
+
+/// Format FK column names and values for user-facing PG-compatible DETAIL
+/// strings.  Produces output like `Key (col1, col2)=(val1, val2)`.
+pub(crate) fn format_fk_detail_values(cols: &[String], vals: &[Value]) -> String {
+    let col_str = cols.join(", ");
+    let val_str: String = vals
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({})=({})", col_str, val_str)
 }
 
 /// Extract referenced-column values from a parent row for a given FK.
@@ -302,7 +320,168 @@ pub async fn validate_foreign_keys(
     schema: &TableSchema,
     row: &Row,
 ) -> Result<()> {
+    validate_foreign_keys_inner(store, txn, db_id, schema, row, &HashMap::new(), false).await
+}
+
+/// Validate only non-self-referencing foreign keys for a row.
+/// Self-referencing FK validation is deferred to CopyDone for COPY.
+pub(crate) async fn validate_foreign_keys_non_self_ref(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &TableSchema,
+    row: &Row,
+) -> Result<()> {
+    validate_foreign_keys_inner(store, txn, db_id, schema, row, &HashMap::new(), true).await
+}
+
+/// Collect unresolved self-referencing FK checks for deferred CopyDone validation.
+/// Returns `(constraint_id, hash_key, display_values)`:
+///   - `hash_key`: collision-resistant key for set membership (from [`pk_to_hash_key`])
+///   - `display_values`: PG-like `(col)=(val)` string for error DETAIL
+///
+/// Any reference already resolvable in storage is not deferred.
+pub(crate) async fn collect_deferred_self_fk_checks(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &TableSchema,
+    row: &Row,
+) -> Result<Vec<(ConstraintId, String, String)>> {
+    let mut checks = Vec::new();
+    for (constraint_id, fk) in schema.foreign_keys.iter().enumerate() {
+        if fk.ref_table != schema.name {
+            continue;
+        }
+        let mut fk_values = Vec::with_capacity(fk.columns.len());
+        let mut any_null = false;
+        for col_name in &fk.columns {
+            let col_idx = schema
+                .column_index(col_name)
+                .ok_or_else(|| anyhow!("FK column '{}' not found in schema", col_name))?;
+            let val = row.values[col_idx].clone();
+            if val == Value::Null {
+                any_null = true;
+            }
+            fk_values.push(val);
+        }
+        // MATCH SIMPLE: skip if any FK column is NULL.
+        if any_null {
+            continue;
+        }
+        // Skip self-identity reference (row references itself).
+        let self_ref_vals = get_ref_values(fk, schema, row)?;
+        if fk_values.len() == self_ref_vals.len()
+            && fk_values
+                .iter()
+                .zip(&self_ref_vals)
+                .all(|(a, b)| compare_values(a, b).is_ok_and(|c| c == 0))
+        {
+            continue;
+        }
+
+        let lookup = resolve_fk_ref_lookup(&fk.ref_columns, schema)?;
+        let parent_exists = match lookup {
+            FkRefLookup::Pk => {
+                let ref_rows = store
+                    .batch_get_rows(txn, db_id, schema.table_id, vec![fk_values.clone()], schema)
+                    .await?;
+                !ref_rows.is_empty()
+            }
+            FkRefLookup::UniqueIndex { index_id, pk_types } => {
+                let pks = store
+                    .scan_index(
+                        txn,
+                        db_id,
+                        schema.table_id,
+                        index_id,
+                        &fk_values,
+                        true,
+                        &pk_types,
+                        Some(1),
+                    )
+                    .await?;
+                !pks.is_empty()
+            }
+        };
+
+        if !parent_exists {
+            let hash_key = pk_to_hash_key(&fk_values);
+            let display = format_fk_detail_values(&fk.columns, &fk_values);
+            checks.push((constraint_id, hash_key, display));
+        }
+    }
+    Ok(checks)
+}
+
+/// Validate deferred self-referencing FK constraints at CopyDone.
+/// Each deferred check stores `(constraint_id, hash_key, display_values)`:
+///   - `hash_key` is checked against `pending_pk_keys` for set membership
+///   - `display_values` is used in the user-facing DETAIL message
+pub(crate) fn validate_deferred_self_fk_refs(
+    schema: &TableSchema,
+    deferred_refs: &[(ConstraintId, String, String)],
+    pending_pk_keys: &HashMap<String, HashSet<String>>,
+) -> Result<()> {
+    for (constraint_id, hash_key, display_values) in deferred_refs {
+        let fk = schema
+            .foreign_keys
+            .get(*constraint_id)
+            .ok_or_else(|| anyhow!("FK constraint id '{}' not found in schema", constraint_id))?;
+
+        // Parent was inserted during this COPY (possibly in a later batch).
+        if pending_pk_keys
+            .get(&fk.name)
+            .is_some_and(|keys| keys.contains(hash_key))
+        {
+            continue;
+        }
+
+        let short_table = short_relation_name(&schema.name);
+        let short_ref_table = short_relation_name(&fk.ref_table);
+        return Err(SqlError::ForeignKeyViolation {
+            constraint: fk.name.clone(),
+            message: format!(
+                "insert or update on table \"{}\" violates foreign key constraint \"{}\"\n\
+                 DETAIL:  Key {} is not present in table \"{}\".",
+                short_table, fk.name, display_values, short_ref_table
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Collect hash keys for every self-referencing FK's referenced columns in
+/// `row`.  The caller accumulates these into a `HashSet<String>` so that
+/// later rows in the same COPY batch can resolve intra-batch references
+/// without a storage round-trip.
+pub(crate) fn self_ref_fk_keys(schema: &TableSchema, row: &Row) -> Result<Vec<(String, String)>> {
+    let mut keys = Vec::new();
     for fk in &schema.foreign_keys {
+        if fk.ref_table != schema.name {
+            continue;
+        }
+        // For self-referencing FKs the parent schema IS the child schema.
+        let ref_vals = get_ref_values(fk, schema, row)?;
+        keys.push((fk.name.clone(), pk_to_hash_key(&ref_vals)));
+    }
+    Ok(keys)
+}
+
+async fn validate_foreign_keys_inner(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &TableSchema,
+    row: &Row,
+    pending_ref_keys: &HashMap<String, HashSet<String>>,
+    skip_self_ref: bool,
+) -> Result<()> {
+    for fk in &schema.foreign_keys {
+        if skip_self_ref && fk.ref_table == schema.name {
+            continue;
+        }
         let mut fk_values: Vec<Value> = Vec::with_capacity(fk.columns.len());
         let mut any_null = false;
 
@@ -382,25 +561,167 @@ pub async fn validate_foreign_keys(
             }
         };
 
+        // For self-referencing FKs, also check the pending batch rows that
+        // have been prepared but not yet flushed to storage.
+        // Scoped per FK constraint name to prevent cross-FK contamination.
+        let parent_exists = parent_exists
+            || (fk.ref_table == schema.name
+                && pending_ref_keys
+                    .get(&fk.name)
+                    .is_some_and(|keys| keys.contains(&pk_to_hash_key(&fk_values))));
+
         if !parent_exists {
-            let cols = fk.columns.join(", ");
-            let vals: Vec<String> = fk_values.iter().map(|v| format!("{}", v)).collect();
+            let detail_kv = format_fk_detail_values(&fk.columns, &fk_values);
             let short_table = short_relation_name(&schema.name);
             let short_ref_table = short_relation_name(&fk.ref_table);
             return Err(SqlError::ForeignKeyViolation {
                 constraint: fk.name.clone(),
                 message: format!(
                     "insert or update on table \"{}\" violates foreign key constraint \"{}\"\n\
-                     DETAIL:  Key ({})=({}) is not present in table \"{}\".",
-                    short_table,
-                    fk.name,
-                    cols,
-                    vals.join(", "),
-                    short_ref_table
+                     DETAIL:  Key {} is not present in table \"{}\".",
+                    short_table, fk.name, detail_kv, short_ref_table
                 ),
             }
             .into());
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ColumnDef, DataType, ForeignKeyAction};
+
+    fn self_ref_schema() -> TableSchema {
+        TableSchema {
+            name: "public.items".to_string(),
+            table_id: 1,
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+                ColumnDef {
+                    name: "parent_id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+            ],
+            pk_indices: vec![0],
+            foreign_keys: vec![ForeignKeyConstraint {
+                name: "items_parent_id_fkey".to_string(),
+                columns: vec!["parent_id".to_string()],
+                ref_table: "public.items".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: ForeignKeyAction::NoAction,
+                on_update: ForeignKeyAction::NoAction,
+            }],
+            ..TableSchema::default()
+        }
+    }
+
+    #[test]
+    fn self_ref_fk_keys_extracts_parent_ref_column_values() {
+        let schema = self_ref_schema();
+        let row = Row {
+            values: vec![Value::Int32(1), Value::Null],
+        };
+        let keys = self_ref_fk_keys(&schema, &row).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].0, "items_parent_id_fkey");
+        assert_eq!(keys[0].1, pk_to_hash_key(&[Value::Int32(1)]));
+    }
+
+    #[test]
+    fn pending_ref_key_matches_child_fk_value_hash() {
+        let schema = self_ref_schema();
+
+        // Parent row: (id=1, parent_id=NULL)
+        let parent_row = Row {
+            values: vec![Value::Int32(1), Value::Null],
+        };
+        let keys = self_ref_fk_keys(&schema, &parent_row).unwrap();
+        let mut pending: HashMap<String, HashSet<String>> = HashMap::new();
+        for (fk_name, k) in keys {
+            pending.entry(fk_name).or_default().insert(k);
+        }
+
+        // Child row: (id=2, parent_id=1) — FK value is 1
+        let child_fk_values = vec![Value::Int32(1)];
+        assert!(
+            pending
+                .get("items_parent_id_fkey")
+                .is_some_and(|keys| keys.contains(&pk_to_hash_key(&child_fk_values))),
+            "pending ref keys from parent row (id=1) must match child FK value (parent_id=1)"
+        );
+    }
+
+    #[test]
+    fn pending_ref_key_rejects_missing_parent() {
+        let schema = self_ref_schema();
+
+        let parent_row = Row {
+            values: vec![Value::Int32(1), Value::Null],
+        };
+        let keys = self_ref_fk_keys(&schema, &parent_row).unwrap();
+        let mut pending: HashMap<String, HashSet<String>> = HashMap::new();
+        for (fk_name, k) in keys {
+            pending.entry(fk_name).or_default().insert(k);
+        }
+
+        // FK value 999 is not in pending
+        let child_fk_values = vec![Value::Int32(999)];
+        assert!(
+            !pending
+                .get("items_parent_id_fkey")
+                .is_some_and(|keys| keys.contains(&pk_to_hash_key(&child_fk_values))),
+            "FK value 999 must not be satisfied by pending key for id=1"
+        );
+    }
+
+    #[test]
+    fn pk_to_hash_key_deterministic() {
+        let a = pk_to_hash_key(&[Value::Int32(42)]);
+        let b = pk_to_hash_key(&[Value::Int32(42)]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn pk_to_hash_key_uses_debug_format() {
+        let key = pk_to_hash_key(&[Value::Int32(1), Value::Int32(2)]);
+        // Debug format includes variant tags, joined by NUL
+        assert_eq!(key, "Int32(1)\0Int32(2)");
+    }
+
+    /// Regression test: composite text FK values that differ only by delimiter
+    /// placement MUST NOT collide in the internal hash key.
+    #[test]
+    fn pk_to_hash_key_no_collision_on_embedded_delimiter() {
+        let key_a = pk_to_hash_key(&[Value::Text("a".into()), Value::Text("b, c".into())]);
+        let key_b = pk_to_hash_key(&[Value::Text("a, b".into()), Value::Text("c".into())]);
+        assert_ne!(
+            key_a, key_b,
+            "composite text keys with embedded commas must not collide"
+        );
+    }
+
+    #[test]
+    fn format_fk_detail_values_produces_pg_format() {
+        let cols = vec!["col1".to_string(), "col2".to_string()];
+        let vals = vec![Value::Int32(1), Value::Text("hello".into())];
+        let detail = format_fk_detail_values(&cols, &vals);
+        assert_eq!(detail, "(col1, col2)=(1, hello)");
+    }
 }

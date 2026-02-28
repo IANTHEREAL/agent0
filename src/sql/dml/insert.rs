@@ -102,6 +102,7 @@ fn build_unique_violation_error(index: &IndexDef, idx_values: &[Value]) -> SqlEr
             cols,
             vals.join(", ")
         ),
+        row_offset: None,
     }
 }
 

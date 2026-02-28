@@ -242,6 +242,7 @@ fn test_sqlstate_for_executor_error() {
             SqlError::UniqueViolation {
                 constraint: "pk_users".into(),
                 message: "dup".into(),
+                row_offset: None,
             },
             "23505",
         ),

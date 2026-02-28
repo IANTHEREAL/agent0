@@ -77,7 +77,14 @@ impl CopyHandler for DynamicPgHandler {
             return Err(e);
         }
 
-        let (parse_res, table_name, started_txn, qctx) = {
+        let (
+            parse_res,
+            table_name,
+            started_txn,
+            qctx,
+            mut accumulated_fk_keys,
+            mut accumulated_deferred_fk,
+        ) = {
             let mut ctx_guard = self.copy_context.lock().await;
             let Some(ctx) = ctx_guard.as_mut() else {
                 return Ok(());
@@ -86,6 +93,8 @@ impl CopyHandler for DynamicPgHandler {
             let table_name = ctx.table_name.clone();
             let started_txn = ctx.started_txn;
             let qctx = ctx.query_context.clone();
+            let accumulated_fk_keys = std::mem::take(&mut ctx.pending_self_fk_keys);
+            let accumulated_deferred_fk = std::mem::take(&mut ctx.deferred_self_fk_checks);
 
             let parse_res = (|| -> PgWireResult<Vec<(usize, Vec<(String, Value)>)>> {
                 if ctx.reached_end_marker {
@@ -127,7 +136,14 @@ impl CopyHandler for DynamicPgHandler {
                 Ok(rows_to_insert)
             })();
 
-            (parse_res, table_name, started_txn, qctx)
+            (
+                parse_res,
+                table_name,
+                started_txn,
+                qctx,
+                accumulated_fk_keys,
+                accumulated_deferred_fk,
+            )
         };
 
         let rows_to_insert = match parse_res {
@@ -145,8 +161,20 @@ impl CopyHandler for DynamicPgHandler {
 
         let inserted_count = rows_to_insert.len();
         if inserted_count == 0 {
+            // Write back accumulated state even on empty frames to avoid
+            // dropping previously accumulated FK keys via mem::take.
+            let mut ctx_guard = self.copy_context.lock().await;
+            if let Some(ctx) = ctx_guard.as_mut() {
+                ctx.pending_self_fk_keys = accumulated_fk_keys;
+                ctx.deferred_self_fk_checks = accumulated_deferred_fk;
+            }
             return Ok(());
         }
+        let line_numbers: Vec<usize> = rows_to_insert.iter().map(|(line_no, _)| *line_no).collect();
+        let rows_to_insert: Vec<Vec<(String, Value)>> = rows_to_insert
+            .into_iter()
+            .map(|(_, col_values)| col_values)
+            .collect();
 
         let insert_res: PgWireResult<()> =
             crate::sql::query_context::with_scoped_query_context(&qctx, async {
@@ -175,21 +203,33 @@ impl CopyHandler for DynamicPgHandler {
 
                 let savepoints = session.savepoints();
                 crate::txn::with_savepoints(savepoints, async {
-                    for (line_no, col_values) in rows_to_insert {
-                        executor
-                            .execute_copy_insert(&mut session, &table_name, col_values)
-                            .await
-                            .map_err(|e| {
-                                error!("COPY insert error: {}", e);
-                                let table = copy_display_table_name(&table_name);
-                                let message = if should_add_copy_insert_context(&e) {
-                                    format!("{}\nCONTEXT:  COPY {}, line {}", e, table, line_no)
+                    executor
+                        .execute_copy_insert_batch(
+                            &mut session,
+                            &table_name,
+                            rows_to_insert,
+                            Some(&mut accumulated_fk_keys),
+                            Some(&mut accumulated_deferred_fk),
+                        )
+                        .await
+                        .map_err(|batch_err| {
+                            let line_no = batch_err
+                                .failed_row_offset()
+                                .and_then(|offset| line_numbers.get(offset).copied());
+                            let err = batch_err.source_error();
+                            error!("COPY insert error: {}", err);
+                            let table = copy_display_table_name(&table_name);
+                            let message = if should_add_copy_insert_context(err) {
+                                if let Some(line_no) = line_no {
+                                    format!("{}\nCONTEXT:  COPY {}, line {}", err, table, line_no)
                                 } else {
-                                    e.to_string()
-                                };
-                                user_error(sqlstate_for_executor_error(&e), message)
-                            })?;
-                    }
+                                    err.to_string()
+                                }
+                            } else {
+                                err.to_string()
+                            };
+                            user_error(sqlstate_for_executor_error(err), message)
+                        })?;
 
                     Ok::<(), PgWireError>(())
                 })
@@ -212,6 +252,8 @@ impl CopyHandler for DynamicPgHandler {
         let mut ctx_guard = self.copy_context.lock().await;
         if let Some(ctx) = ctx_guard.as_mut() {
             ctx.row_count = ctx.row_count.saturating_add(inserted_count);
+            ctx.pending_self_fk_keys = accumulated_fk_keys;
+            ctx.deferred_self_fk_checks = accumulated_deferred_fk;
         }
 
         Ok(())
@@ -278,19 +320,39 @@ impl CopyHandler for DynamicPgHandler {
                         };
 
                         let savepoints = session.savepoints();
+                        let line_numbers = [line_no];
+                        let mut final_fk_keys = std::mem::take(&mut ctx.pending_self_fk_keys);
+                        let mut final_deferred = std::mem::take(&mut ctx.deferred_self_fk_checks);
                         let insert_res = crate::txn::with_savepoints(savepoints, async {
                             executor
-                                .execute_copy_insert(&mut session, &ctx.table_name, col_values)
+                                .execute_copy_insert_batch(
+                                    &mut session,
+                                    &ctx.table_name,
+                                    vec![col_values],
+                                    Some(&mut final_fk_keys),
+                                    Some(&mut final_deferred),
+                                )
                                 .await
-                                .map_err(|e| {
-                                    error!("COPY insert error: {}", e);
+                                .map_err(|batch_err| {
+                                    let line_no = batch_err
+                                        .failed_row_offset()
+                                        .and_then(|offset| line_numbers.get(offset).copied());
+                                    let err = batch_err.source_error();
+                                    error!("COPY insert error: {}", err);
                                     let table = copy_display_table_name(&ctx.table_name);
-                                    let message = if should_add_copy_insert_context(&e) {
-                                        format!("{}\nCONTEXT:  COPY {}, line {}", e, table, line_no)
+                                    let message = if should_add_copy_insert_context(err) {
+                                        if let Some(line_no) = line_no {
+                                            format!(
+                                                "{}\nCONTEXT:  COPY {}, line {}",
+                                                err, table, line_no
+                                            )
+                                        } else {
+                                            err.to_string()
+                                        }
                                     } else {
-                                        e.to_string()
+                                        err.to_string()
                                     };
-                                    user_error(sqlstate_for_executor_error(&e), message)
+                                    user_error(sqlstate_for_executor_error(err), message)
                                 })
                         })
                         .await;
@@ -300,7 +362,31 @@ impl CopyHandler for DynamicPgHandler {
                             return Err(e);
                         }
 
+                        ctx.pending_self_fk_keys = final_fk_keys;
+                        ctx.deferred_self_fk_checks = final_deferred;
                         ctx.row_count = ctx.row_count.saturating_add(1);
+                    }
+                }
+
+                // Deferred self-FK validation: all rows from every CopyData
+                // chunk are now in storage (within the transaction).  Validate
+                // unresolved child FK references against the complete PK key
+                // set accumulated during COPY.
+                if !ctx.deferred_self_fk_checks.is_empty() {
+                    if let Err(e) = executor
+                        .validate_copy_deferred_self_fk(
+                            &mut session,
+                            &ctx.table_name,
+                            &ctx.deferred_self_fk_checks,
+                            &ctx.pending_self_fk_keys,
+                        )
+                        .await
+                    {
+                        error!("COPY deferred self-FK error: {}", e);
+                        let err_msg = e.to_string();
+                        let sqlstate = sqlstate_for_executor_error(&e);
+                        rollback_autocommit_or_mark_failed(&mut session, ctx.started_txn).await;
+                        return Err(user_error(sqlstate, err_msg));
                     }
                 }
 

@@ -399,12 +399,141 @@ impl TikvStore {
             return Err(SqlError::UniqueViolation {
                 constraint: constraint_name,
                 message,
+                row_offset: None,
             }
             .into());
         }
         txn_put(txn, data_key, row_data).await?;
         debug!("Inserted row into '{}'", table_name);
         Ok(pk_values)
+    }
+
+    /// Batch-insert rows into a table, using a single `batch_get` for the PK
+    /// duplicate check instead of one `get` per row.
+    ///
+    /// Each element in `rows` is `(row, row_offset)` where `row_offset` is the
+    /// caller-assigned position used for error reporting.
+    ///
+    /// Returns `(pk_results, mutations)`:
+    /// - `pk_results`: PK values and row_offset for each prepared row.
+    /// - `mutations`: encoded `(data_key, row_data)` pairs — caller is
+    ///   responsible for flushing via `txn_batch_mutate`.
+    pub async fn insert_batch(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_name: &str,
+        schema: &TableSchema,
+        rows: &[(Row, usize)],
+    ) -> Result<(Vec<(Vec<Value>, usize)>, Vec<(Vec<u8>, Vec<u8>)>)> {
+        if rows.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        // ── Phase 1: encode keys + values ──────────────────────────────
+        struct Prepared {
+            pk_values: Vec<Value>,
+            data_key: Vec<u8>,
+            row_data: Vec<u8>,
+            row_offset: usize,
+        }
+        let short_table = table_name.rsplit('.').next().unwrap_or(table_name);
+        let constraint_name = schema
+            .pk_constraint_name
+            .clone()
+            .unwrap_or_else(|| format!("{}_pkey", short_table));
+        let pk_col_names: Vec<String> = schema
+            .pk_indices
+            .iter()
+            .map(|&i| schema.columns[i].name.clone())
+            .collect();
+
+        let mut prepared: Vec<Prepared> = Vec::with_capacity(rows.len());
+
+        for (row, row_offset) in rows {
+            let pk_values = schema.get_pk_values(row);
+            let row_key = encode_pk_values(&pk_values);
+            let data_key = self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key));
+            let row_data = serialize_row(row)?;
+
+            prepared.push(Prepared {
+                pk_values,
+                data_key,
+                row_data,
+                row_offset: *row_offset,
+            });
+        }
+
+        // ── Phase 2: prefetch existing PK keys from TiKV ───────────────
+        let mut keys_for_get: Vec<Vec<u8>> = Vec::new();
+        let mut deduped: HashSet<Vec<u8>> = HashSet::with_capacity(prepared.len());
+        for p in &prepared {
+            if deduped.insert(p.data_key.clone()) {
+                keys_for_get.push(p.data_key.clone());
+            }
+        }
+        drop(deduped);
+        let mut existing_keys: HashSet<Vec<u8>> = HashSet::new();
+        for chunk in keys_for_get.chunks(BATCH_GET_CHUNK_SIZE) {
+            kv_stats::record_batch_get_keys(chunk.len());
+            for pair in txn
+                .batch_get(chunk.iter().cloned())
+                .await?
+                .collect::<Vec<tikv_client::KvPair>>()
+            {
+                existing_keys.insert(pair.0.into());
+            }
+        }
+
+        // ── Phase 3: row-order-preserving conflict check ────────────────
+        // Process rows in insertion order. For each row, check both storage
+        // conflicts (from prefetched set) and intra-batch duplicates (from
+        // previously-seen keys). The first row to fail either check is the
+        // reported conflict — matching PostgreSQL's row-by-row semantics.
+        let mut seen_keys: HashSet<Vec<u8>> = HashSet::with_capacity(prepared.len());
+        for p in &prepared {
+            let is_storage_conflict = existing_keys.contains(&p.data_key);
+            let is_intra_batch_dup = !seen_keys.insert(p.data_key.clone());
+            if is_storage_conflict || is_intra_batch_dup {
+                let pk_val_strs: Vec<String> = p
+                    .pk_values
+                    .iter()
+                    .map(|v| match v {
+                        Value::Int32(n) => n.to_string(),
+                        Value::Int64(n) => n.to_string(),
+                        Value::Text(s) => s.clone(),
+                        Value::Uuid(bytes) => uuid::Uuid::from_bytes(*bytes).to_string(),
+                        other => format!("{}", other),
+                    })
+                    .collect();
+                let message = format!(
+                    "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
+                    constraint_name,
+                    pk_col_names.join(", "),
+                    pk_val_strs.join(", ")
+                );
+                return Err(SqlError::UniqueViolation {
+                    constraint: constraint_name.clone(),
+                    message,
+                    row_offset: Some(p.row_offset),
+                }
+                .into());
+            }
+        }
+
+        // ── Phase 4: collect mutations (caller flushes via txn_batch_mutate) ──
+        let mut result = Vec::with_capacity(prepared.len());
+        let mut mutations = Vec::with_capacity(prepared.len());
+        for p in prepared {
+            mutations.push((p.data_key, p.row_data));
+            result.push((p.pk_values, p.row_offset));
+        }
+        debug!(
+            "Batch-prepared {} row mutations for '{}'",
+            result.len(),
+            table_name
+        );
+        Ok((result, mutations))
     }
 
     /// Upsert a row into a table

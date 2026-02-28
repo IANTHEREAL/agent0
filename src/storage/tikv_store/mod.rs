@@ -21,7 +21,7 @@ pub mod cron;
 mod database;
 mod extensions;
 mod functions;
-mod indexes;
+pub(crate) mod indexes;
 mod migrations;
 mod procedures;
 mod schemas;

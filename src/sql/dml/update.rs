@@ -241,6 +241,7 @@ async fn execute_update_row_inner(
                     "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
                     pk_constraint_name, pk_cols.join(", "), pk_vals.join(", ")
                 ),
+                row_offset: None,
             }.into());
         }
     }
@@ -368,6 +369,7 @@ async fn execute_update_row_inner(
                             "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
                             index.name, cols, vals.join(", ")
                         ),
+                        row_offset: None,
                     }
                     .into());
                 }

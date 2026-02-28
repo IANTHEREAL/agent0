@@ -484,6 +484,8 @@ impl DynamicPgHandler {
             row_count: 0,
             started_txn,
             reached_end_marker: false,
+            pending_self_fk_keys: std::collections::HashMap::new(),
+            deferred_self_fk_checks: Vec::new(),
         });
 
         let column_formats: Vec<i16> = vec![0; col_count];

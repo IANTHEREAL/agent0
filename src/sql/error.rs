@@ -61,7 +61,11 @@ pub enum SqlError {
 
     // Constraint violations
     #[error("{message}")]
-    UniqueViolation { constraint: String, message: String },
+    UniqueViolation {
+        constraint: String,
+        message: String,
+        row_offset: Option<usize>,
+    },
 
     #[error("{message}")]
     NotNullViolation {
@@ -425,7 +429,8 @@ mod tests {
         assert_eq!(
             SqlError::UniqueViolation {
                 constraint: "pk".into(),
-                message: "dup".into()
+                message: "dup".into(),
+                row_offset: None,
             }
             .sqlstate(),
             "23505"

@@ -1,9 +1,36 @@
 use super::*;
+use crate::sql::error::SqlError;
 use crate::storage::backpressure::tikv_op;
 
 const INDEX_SENTINEL_VALUE: &[u8] = &[0x01];
 
+/// A single index entry to be created as part of a batch insert.
+#[derive(Debug, Clone)]
+pub(crate) struct BatchIndexEntry {
+    pub index_id: u64,
+    pub idx_values: Vec<Value>,
+    pub pk_values: Vec<Value>,
+    pub unique: bool,
+    pub row_offset: usize,
+    pub constraint_name: String,
+    pub key_columns: Vec<String>,
+}
+
 impl TikvStore {
+    fn build_batch_unique_violation(entry: &BatchIndexEntry) -> SqlError {
+        let vals: Vec<String> = entry.idx_values.iter().map(|v| format!("{}", v)).collect();
+        SqlError::UniqueViolation {
+            constraint: entry.constraint_name.clone(),
+            message: format!(
+                "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
+                entry.constraint_name,
+                entry.key_columns.join(", "),
+                vals.join(", ")
+            ),
+            row_offset: Some(entry.row_offset),
+        }
+    }
+
     #[inline]
     fn index_key_has_null(values: &[Value]) -> bool {
         values.iter().any(|v| matches!(v, Value::Null))
@@ -145,6 +172,124 @@ impl TikvStore {
             txn_put(txn, idx_key, INDEX_SENTINEL_VALUE.to_vec()).await?;
         }
         Ok(())
+    }
+
+    /// Batch-create index entries, using a single `batch_get` for the unique
+    /// duplicate check instead of one `get` per entry.
+    ///
+    /// On unique violation returns an error; the caller can use `row_offset`
+    /// from the returned error context to attribute the failure.
+    ///
+    /// Returns the encoded `(key, value)` mutations — caller is responsible
+    /// for flushing via `txn_batch_mutate`.
+    pub async fn create_index_entries_batch(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_id: u64,
+        entries: &[BatchIndexEntry],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Separate entries that need a unique-check GET from those that don't.
+        struct UniqueEntry {
+            idx_key: Vec<u8>,
+            idx_val: Vec<u8>,
+            entry: BatchIndexEntry,
+        }
+        struct NonUniqueEntry {
+            idx_key: Vec<u8>,
+        }
+
+        let mut unique_entries: Vec<UniqueEntry> = Vec::new();
+        let mut non_unique_entries: Vec<NonUniqueEntry> = Vec::new();
+
+        for entry in entries {
+            let enforce_unique = entry.unique && !Self::index_key_has_null(&entry.idx_values);
+            if enforce_unique {
+                let idx_key = self.key(&encode_index_key_v2(
+                    db_id,
+                    table_id,
+                    entry.index_id,
+                    &entry.idx_values,
+                    None,
+                ));
+                let idx_val = encode_pk_values(&entry.pk_values);
+                unique_entries.push(UniqueEntry {
+                    idx_key,
+                    idx_val,
+                    entry: entry.clone(),
+                });
+            } else {
+                let idx_key = self.key(&encode_index_key_v2(
+                    db_id,
+                    table_id,
+                    entry.index_id,
+                    &entry.idx_values,
+                    Some(&entry.pk_values),
+                ));
+                non_unique_entries.push(NonUniqueEntry { idx_key });
+            }
+        }
+
+        // Phase 2: prefetch existing unique index keys from TiKV.
+        if !unique_entries.is_empty() {
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            let mut deduped: HashSet<Vec<u8>> = HashSet::with_capacity(unique_entries.len());
+            for ue in &unique_entries {
+                if deduped.insert(ue.idx_key.clone()) {
+                    keys.push(ue.idx_key.clone());
+                }
+            }
+            drop(deduped);
+
+            let mut existing_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+            for chunk in keys.chunks(BATCH_GET_CHUNK_SIZE) {
+                kv_stats::record_batch_get_keys(chunk.len());
+                for pair in txn
+                    .batch_get(chunk.iter().cloned())
+                    .await?
+                    .collect::<Vec<tikv_client::KvPair>>()
+                {
+                    let k: Vec<u8> = pair.0.into();
+                    let v: Vec<u8> = pair.1;
+                    existing_map.insert(k, v);
+                }
+            }
+
+            // Phase 3: row-order-preserving conflict check.
+            // Sort unique entries by row_offset to process in insertion order.
+            // For each entry, check both storage conflicts (from prefetched map)
+            // and intra-batch duplicates (from previously-seen keys). The first
+            // entry to fail either check is the reported conflict — matching
+            // PostgreSQL's row-by-row semantics.
+            unique_entries.sort_by_key(|ue| ue.entry.row_offset);
+            let mut seen_keys: HashSet<Vec<u8>> = HashSet::with_capacity(unique_entries.len());
+            for ue in &unique_entries {
+                if let Some(existing_val) = existing_map.get(&ue.idx_key) {
+                    // Idempotent writes (same index key already points to the same PK)
+                    // are not conflicts and should not fail COPY retry paths.
+                    if existing_val.as_slice() != ue.idx_val.as_slice() {
+                        return Err(Self::build_batch_unique_violation(&ue.entry).into());
+                    }
+                }
+                if !seen_keys.insert(ue.idx_key.clone()) {
+                    return Err(Self::build_batch_unique_violation(&ue.entry).into());
+                }
+            }
+        }
+
+        // Collect mutations (caller flushes via txn_batch_mutate).
+        let mut mutations = Vec::with_capacity(unique_entries.len() + non_unique_entries.len());
+        for ue in unique_entries {
+            mutations.push((ue.idx_key, ue.idx_val));
+        }
+        for ne in non_unique_entries {
+            mutations.push((ne.idx_key, vec![]));
+        }
+        Ok(mutations)
     }
 
     /// Delete an index entry
@@ -437,6 +582,33 @@ impl TikvStore {
             txn_put(txn, key, INDEX_SENTINEL_VALUE.to_vec()).await?;
         }
         Ok(())
+    }
+
+    /// Encode GIN index entry mutations without writing to TiKV.
+    ///
+    /// Returns `(key, value)` pairs for batch collection; caller flushes
+    /// via `txn_batch_mutate`.
+    pub fn encode_gin_index_mutations(
+        &self,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        token_hashes: &[u64],
+        pk_values: &[Value],
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        if token_hashes.is_empty() {
+            return Vec::new();
+        }
+        let pk_key = encode_pk_values(pk_values);
+        token_hashes
+            .iter()
+            .map(|&token_hash| {
+                let key = self.key(&encode_gin_index_key_v2(
+                    db_id, table_id, index_id, token_hash, &pk_key,
+                ));
+                (key, Vec::new())
+            })
+            .collect()
     }
 
     /// Delete GIN-like inverted index entries for a row.

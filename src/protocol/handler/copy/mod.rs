@@ -1,6 +1,7 @@
 use crate::model::DataType;
 use crate::sql::query_context::QueryContext;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use std::collections::{HashMap, HashSet};
 
 pub(in crate::protocol::handler) fn copy_from_stdin_line_too_long_error() -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -37,6 +38,12 @@ pub struct CopyContext {
     pub row_count: usize,
     pub started_txn: bool,
     pub reached_end_marker: bool,
+    /// Accumulated self-referencing FK ref-column keys (PK side) across all
+    /// CopyData chunks.  Keyed by FK constraint name.
+    pub pending_self_fk_keys: HashMap<String, HashSet<String>>,
+    /// Accumulated unresolved self-referencing FK checks that need deferred
+    /// validation at CopyDone. Each entry is `(constraint_id, hash_key, display_values)`.
+    pub deferred_self_fk_checks: Vec<(usize, String, String)>,
 }
 
 /// A safety cap to prevent unbounded buffering if the client sends a single row without newlines.

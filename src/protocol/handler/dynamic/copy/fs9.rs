@@ -13,6 +13,7 @@ use pgwire::api::ClientInfo;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 use sqlparser::ast::{CopySource, CopyTarget, Statement};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 
 impl DynamicPgHandler {
@@ -388,27 +389,65 @@ impl DynamicPgHandler {
         let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
         let qctx = session.query_context_for_statement(statement_ts, transaction_ts);
         let row_count = records.len();
+        let line_numbers: Vec<usize> = (1..=row_count).collect();
+
+        let mut pending_self_fk_keys: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut deferred_self_fk_checks: Vec<(usize, String, String)> = Vec::new();
 
         let insert_result: PgWireResult<()> =
             crate::sql::query_context::with_scoped_query_context(&qctx, async {
-                for (rec_idx, col_values) in records.into_iter().enumerate() {
-                    let line_no = rec_idx + 1;
+                executor
+                    .execute_copy_insert_batch(
+                        &mut session,
+                        &resolved_table,
+                        records,
+                        Some(&mut pending_self_fk_keys),
+                        Some(&mut deferred_self_fk_checks),
+                    )
+                    .await
+                    .map_err(|batch_err| {
+                        let line_no = batch_err
+                            .failed_row_offset()
+                            .and_then(|offset| line_numbers.get(offset).copied());
+                        let err = batch_err.source_error();
+                        let message = if should_add_copy_insert_context(err) {
+                            if let Some(line_no) = line_no {
+                                format!("{}\nCONTEXT:  COPY {}, line {}", err, short_table, line_no)
+                            } else {
+                                err.to_string()
+                            }
+                        } else {
+                            err.to_string()
+                        };
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_string(),
+                            sqlstate_for_executor_error(err).to_string(),
+                            message,
+                        )))
+                    })?;
+
+                // Deferred self-FK validation: all rows are now in storage
+                // within the transaction. Validate accumulated child FK
+                // checks against the complete PK key set (matching STDIN
+                // path behavior in on_copy_done).
+                if !deferred_self_fk_checks.is_empty() {
                     executor
-                        .execute_copy_insert(&mut session, &resolved_table, col_values)
+                        .validate_copy_deferred_self_fk(
+                            &mut session,
+                            &resolved_table,
+                            &deferred_self_fk_checks,
+                            &pending_self_fk_keys,
+                        )
                         .await
                         .map_err(|e| {
-                            let message = if should_add_copy_insert_context(&e) {
-                                format!("{}\nCONTEXT:  COPY {}, line {}", e, short_table, line_no)
-                            } else {
-                                e.to_string()
-                            };
                             PgWireError::UserError(Box::new(ErrorInfo::new(
                                 "ERROR".to_string(),
                                 sqlstate_for_executor_error(&e).to_string(),
-                                message,
+                                e.to_string(),
                             )))
                         })?;
                 }
+
                 Ok(())
             })
             .await;
