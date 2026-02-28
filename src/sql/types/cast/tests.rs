@@ -146,6 +146,35 @@ fn assignment_numeric_to_float() {
     assert_eq!(r, Value::Float64(2.75));
 }
 
+/// PG 17.7 parity: assignment numeric→float64 never produces NaN.
+/// Decimal::MAX fits in f64, but the code path must return an error (not NaN)
+/// if to_f64() ever returns None.
+#[test]
+fn assignment_numeric_to_float_never_produces_nan() {
+    let d = Decimal::MAX;
+    let r = cast(
+        Value::Numeric(d),
+        &DataType::Float64,
+        CastContext::Assignment,
+    )
+    .unwrap();
+    match r {
+        Value::Float64(v) => assert!(!v.is_nan(), "assignment numeric→float must not produce NaN"),
+        other => panic!("expected Float64, got {:?}", other),
+    }
+}
+
+/// PG 17.7 parity: implicit numeric→float64 never produces NaN.
+#[test]
+fn implicit_numeric_to_float_never_produces_nan() {
+    let d = Decimal::MAX;
+    let r = cast(Value::Numeric(d), &DataType::Float64, CastContext::Implicit).unwrap();
+    match r {
+        Value::Float64(v) => assert!(!v.is_nan(), "implicit numeric→float must not produce NaN"),
+        other => panic!("expected Float64, got {:?}", other),
+    }
+}
+
 // ---- Unknown target: pass-through vs error ----
 #[test]
 fn explicit_unknown_target_passes_through() {

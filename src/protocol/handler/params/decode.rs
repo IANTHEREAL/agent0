@@ -20,7 +20,18 @@ pub(in crate::protocol::handler) fn decode_parameters(
     let wire_types = &portal.statement.parameter_types;
     let mut values = Vec::with_capacity(portal.parameters.len());
     for i in 0..portal.parameters.len() {
-        let pg_type = wire_types.get(i).cloned().unwrap_or(Type::TEXT);
+        let pg_type = wire_types.get(i).cloned().ok_or_else(|| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                "08P01".to_string(),
+                format!(
+                    "no type resolved for parameter ${}: expected {} parameter types, got {}",
+                    i + 1,
+                    portal.parameters.len(),
+                    wire_types.len(),
+                ),
+            )))
+        })?;
         let format = portal.parameter_format.format_for(i);
         match &portal.parameters[i] {
             None => values.push(None), // SQL NULL

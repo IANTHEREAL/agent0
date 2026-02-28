@@ -10,32 +10,53 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 impl DynamicPgHandler {
+    #[allow(clippy::result_large_err)]
     pub(in crate::protocol::handler) fn parse_copy_command(
         query: &str,
-    ) -> Option<(String, Vec<String>)> {
-        let query = strip_leading_whitespace_and_comments(query)?;
+    ) -> Result<Option<(String, Vec<String>)>, ErrorInfo> {
+        fn is_valid_unquoted_ident(ident: &str) -> bool {
+            let mut chars = ident.chars();
+            let Some(first) = chars.next() else {
+                return false;
+            };
+            if first != '_' && !first.is_ascii_alphabetic() {
+                return false;
+            }
+            chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        }
+
+        let Some(query) = strip_leading_whitespace_and_comments(query) else {
+            return Ok(None);
+        };
         let query_upper = query.to_uppercase();
         // COPY FROM STDIN must start at statement start (after leading whitespace/comments).
         if !query_upper.starts_with("COPY")
             || !query_upper.contains("FROM")
             || !query_upper.contains("STDIN")
         {
-            return None;
+            return Ok(None);
         }
 
         // Single regex: COPY [schema.]table_name [(col1, col2, ...)] FROM stdin
         let re = regex::Regex::new(
             r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s*(?:\(([^)]+)\)\s+|\s+)FROM\s+stdin",
-        )
-        .ok()?;
-        let caps = re.captures(query)?;
+        );
+        let Ok(re) = re else {
+            return Ok(None);
+        };
+        let Some(caps) = re.captures(query) else {
+            return Ok(None);
+        };
         let schema = caps.get(1).map(|m| m.as_str().to_string());
-        let table = caps.get(2)?.as_str().to_string();
+        let table = match caps.get(2) {
+            Some(m) => m.as_str().to_string(),
+            None => return Ok(None),
+        };
         let table_name = match schema {
             Some(s) => format!("{}.{}", s, table),
             None => table,
         };
-        let columns = match caps.get(3) {
+        let columns: Vec<String> = match caps.get(3) {
             Some(cols) => cols
                 .as_str()
                 .split(',')
@@ -43,7 +64,18 @@ impl DynamicPgHandler {
                 .collect(),
             None => vec![],
         };
-        Some((table_name, columns))
+
+        // Validate column names against unquoted identifier rules (PG parity).
+        for col in &columns {
+            if !is_valid_unquoted_ident(col) {
+                return Err(error_info(
+                    "42602",
+                    format!("Invalid identifier in COPY FROM STDIN: \"{}\"", col),
+                ));
+            }
+        }
+
+        Ok(Some((table_name, columns)))
     }
 
     #[allow(clippy::result_large_err)]

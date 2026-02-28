@@ -59,7 +59,7 @@ impl GinScanOperator {
     /// Resolve PK column types from the schema.
     fn pk_types(&self) -> Vec<crate::model::DataType> {
         if self.schema.pk_indices.is_empty() {
-            vec![crate::model::DataType::Uuid]
+            vec![super::scan::IMPLICIT_PK_TYPE]
         } else {
             self.schema
                 .pk_indices

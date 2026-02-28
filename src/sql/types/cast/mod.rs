@@ -303,7 +303,12 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                     .into()
                 }),
                 CastContext::Assignment | CastContext::Implicit => {
-                    Ok(Value::Float64(d.to_f64().unwrap_or(f64::NAN)))
+                    d.to_f64().map(Value::Float64).ok_or_else(|| {
+                        SqlError::NumericValueOutOfRange {
+                            message: "numeric value out of range for double precision".into(),
+                        }
+                        .into()
+                    })
                 }
             }
         }

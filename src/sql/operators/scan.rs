@@ -7,6 +7,12 @@ use crate::sql::projection::fill_row_defaults;
 
 const OPERATOR_BATCH_FETCH_SIZE: usize = 256;
 
+/// Fallback PK type for tables without an explicit primary key.
+///
+/// When `pk_indices` is empty the storage layer synthesizes a UUID-based
+/// row identifier, so index scans must decode PK entries as `DataType::Uuid`.
+pub(super) const IMPLICIT_PK_TYPE: crate::model::DataType = crate::model::DataType::Uuid;
+
 #[derive(Debug)]
 pub struct TableScanOperator {
     schema: TableSchema,
@@ -183,7 +189,7 @@ impl IndexScanBase {
             .ok_or_else(|| anyhow!("Index {} not found", self.index_name))?;
 
         let pk_types: Vec<_> = if self.schema.pk_indices.is_empty() {
-            vec![crate::model::DataType::Uuid]
+            vec![IMPLICIT_PK_TYPE]
         } else {
             self.schema
                 .pk_indices

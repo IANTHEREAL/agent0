@@ -1575,7 +1575,7 @@ fn test_parse_tenant_username_long_names() {
 
 #[test]
 fn test_parse_copy_command_basic() {
-    let result = DynamicPgHandler::parse_copy_command("COPY users (id, name) FROM stdin");
+    let result = DynamicPgHandler::parse_copy_command("COPY users (id, name) FROM stdin").unwrap();
     assert_eq!(
         result,
         Some((
@@ -1587,13 +1587,14 @@ fn test_parse_copy_command_basic() {
 
 #[test]
 fn test_parse_copy_command_no_columns() {
-    let result = DynamicPgHandler::parse_copy_command("COPY users FROM stdin");
+    let result = DynamicPgHandler::parse_copy_command("COPY users FROM stdin").unwrap();
     assert_eq!(result, Some(("users".to_string(), vec![])));
 }
 
 #[test]
 fn test_parse_copy_command_with_public_schema() {
-    let result = DynamicPgHandler::parse_copy_command("COPY public.users (id, name) FROM stdin");
+    let result =
+        DynamicPgHandler::parse_copy_command("COPY public.users (id, name) FROM stdin").unwrap();
     assert_eq!(
         result,
         Some((
@@ -1605,7 +1606,7 @@ fn test_parse_copy_command_with_public_schema() {
 
 #[test]
 fn test_parse_copy_command_case_insensitive() {
-    let result = DynamicPgHandler::parse_copy_command("copy USERS (ID, NAME) from STDIN");
+    let result = DynamicPgHandler::parse_copy_command("copy USERS (ID, NAME) from STDIN").unwrap();
     assert_eq!(
         result,
         Some((
@@ -1618,11 +1619,11 @@ fn test_parse_copy_command_case_insensitive() {
 #[test]
 fn test_parse_copy_command_not_copy() {
     assert_eq!(
-        DynamicPgHandler::parse_copy_command("SELECT * FROM users"),
+        DynamicPgHandler::parse_copy_command("SELECT * FROM users").unwrap(),
         None
     );
     assert_eq!(
-        DynamicPgHandler::parse_copy_command("INSERT INTO users VALUES (1)"),
+        DynamicPgHandler::parse_copy_command("INSERT INTO users VALUES (1)").unwrap(),
         None
     );
 }
@@ -1630,7 +1631,7 @@ fn test_parse_copy_command_not_copy() {
 #[test]
 fn test_parse_copy_command_copy_keyword_inside_string_literal() {
     assert_eq!(
-        DynamicPgHandler::parse_copy_command("SELECT 'COPY users FROM stdin' AS s;"),
+        DynamicPgHandler::parse_copy_command("SELECT 'COPY users FROM stdin' AS s;").unwrap(),
         None
     );
 }
@@ -1638,11 +1639,11 @@ fn test_parse_copy_command_copy_keyword_inside_string_literal() {
 #[test]
 fn test_parse_copy_command_copy_keyword_inside_comment() {
     assert_eq!(
-        DynamicPgHandler::parse_copy_command("/* COPY users FROM stdin */ SELECT 1;"),
+        DynamicPgHandler::parse_copy_command("/* COPY users FROM stdin */ SELECT 1;").unwrap(),
         None
     );
     assert_eq!(
-        DynamicPgHandler::parse_copy_command("-- COPY users FROM stdin\nSELECT 1;"),
+        DynamicPgHandler::parse_copy_command("-- COPY users FROM stdin\nSELECT 1;").unwrap(),
         None
     );
 }
@@ -1650,7 +1651,7 @@ fn test_parse_copy_command_copy_keyword_inside_comment() {
 #[test]
 fn test_parse_copy_command_copy_to() {
     assert_eq!(
-        DynamicPgHandler::parse_copy_command("COPY users TO stdout"),
+        DynamicPgHandler::parse_copy_command("COPY users TO stdout").unwrap(),
         None
     );
 }
@@ -1735,7 +1736,8 @@ fn test_parse_copy_to_command_rejects_quoted_identifiers() {
 fn test_parse_copy_command_many_columns() {
     let result = DynamicPgHandler::parse_copy_command(
         "COPY orders (id, user_id, product, quantity, price, created_at) FROM stdin",
-    );
+    )
+    .unwrap();
     assert_eq!(
         result,
         Some((
@@ -1757,64 +1759,78 @@ fn test_parse_copy_command_many_columns() {
 #[test]
 fn test_parse_copy_command_extra_spaces_before_columns() {
     // Extra whitespace between table name and column list.
-    let result = DynamicPgHandler::parse_copy_command("COPY  users   (id, name) FROM stdin");
-    assert!(result.is_some());
-    let (table, cols) = result.unwrap();
-    assert_eq!(table, "users");
-    assert_eq!(cols, vec!["id", "name"]);
+    let result = DynamicPgHandler::parse_copy_command("COPY  users   (id, name) FROM stdin")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.0, "users");
+    assert_eq!(result.1, vec!["id", "name"]);
 }
 
 #[test]
 fn test_parse_copy_command_no_space_before_parens() {
     // No space between table name and opening paren.
-    let result = DynamicPgHandler::parse_copy_command("COPY users(id, name) FROM stdin");
-    assert!(result.is_some());
-    let (table, cols) = result.unwrap();
-    assert_eq!(table, "users");
-    assert_eq!(cols, vec!["id", "name"]);
+    let result = DynamicPgHandler::parse_copy_command("COPY users(id, name) FROM stdin")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.0, "users");
+    assert_eq!(result.1, vec!["id", "name"]);
 }
 
 #[test]
 fn test_parse_copy_command_schema_no_columns() {
     // Schema-qualified table with no column list.
-    let result = DynamicPgHandler::parse_copy_command("COPY myschema.users FROM stdin");
+    let result = DynamicPgHandler::parse_copy_command("COPY myschema.users FROM stdin").unwrap();
     assert_eq!(result, Some(("myschema.users".to_string(), vec![])));
 }
 
 #[test]
 fn test_parse_copy_command_schema_with_columns() {
     // Schema-qualified table with column list.
-    let result = DynamicPgHandler::parse_copy_command("COPY myschema.users (id) FROM stdin");
-    assert!(result.is_some());
-    let (table, cols) = result.unwrap();
-    assert_eq!(table, "myschema.users");
-    assert_eq!(cols, vec!["id"]);
+    let result = DynamicPgHandler::parse_copy_command("COPY myschema.users (id) FROM stdin")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.0, "myschema.users");
+    assert_eq!(result.1, vec!["id"]);
 }
 
 #[test]
 fn test_parse_copy_command_single_column() {
-    let result = DynamicPgHandler::parse_copy_command("COPY t (col) FROM stdin");
-    assert!(result.is_some());
-    let (table, cols) = result.unwrap();
-    assert_eq!(table, "t");
-    assert_eq!(cols, vec!["col"]);
+    let result = DynamicPgHandler::parse_copy_command("COPY t (col) FROM stdin")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.0, "t");
+    assert_eq!(result.1, vec!["col"]);
 }
 
 #[test]
 fn test_parse_copy_command_trailing_options_ignored() {
     // WITH (OPTIONS ...) after stdin — regex only captures up to "stdin",
     // so trailing text doesn't prevent a match.
-    let result = DynamicPgHandler::parse_copy_command("COPY t (a, b) FROM stdin WITH (FORMAT csv)");
-    assert!(result.is_some());
-    let (table, cols) = result.unwrap();
-    assert_eq!(table, "t");
-    assert_eq!(cols, vec!["a", "b"]);
+    let result = DynamicPgHandler::parse_copy_command("COPY t (a, b) FROM stdin WITH (FORMAT csv)")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.0, "t");
+    assert_eq!(result.1, vec!["a", "b"]);
 }
 
 #[test]
 fn test_parse_copy_command_to_stdout_rejected() {
     // COPY ... TO stdout should not match (only FROM stdin).
-    assert!(DynamicPgHandler::parse_copy_command("COPY users TO stdout").is_none());
+    assert!(DynamicPgHandler::parse_copy_command("COPY users TO stdout")
+        .unwrap()
+        .is_none());
+}
+
+/// PG 17.7 parity: COPY FROM STDIN with invalid column identifiers returns SQLSTATE 42602.
+#[test]
+fn test_parse_copy_command_invalid_column_identifier_returns_42602() {
+    // Column name starting with a digit is invalid.
+    let err = DynamicPgHandler::parse_copy_command("COPY t (1col) FROM stdin").unwrap_err();
+    assert_eq!(err.code, "42602");
+
+    // Empty column name (consecutive commas produce empty string after trim).
+    let err = DynamicPgHandler::parse_copy_command("COPY t (, b) FROM stdin").unwrap_err();
+    assert_eq!(err.code, "42602");
 }
 
 #[test]
@@ -2238,8 +2254,8 @@ fn test_decode_parameters_text_always_text_value() {
 }
 
 #[test]
-fn test_decode_parameters_unknown_text_format_text_value() {
-    // Empty parameter_types defaults to TEXT in decode_parameters
+fn test_decode_parameters_missing_type_returns_protocol_error() {
+    // Empty parameter_types with parameters present must error (not silently fall back).
     let stmt = Arc::new(StoredStatement::new(
         "stmt".to_string(),
         test_prepared_stmt("SELECT $1::text"),
@@ -2252,8 +2268,14 @@ fn test_decode_parameters_unknown_text_format_text_value() {
     portal.parameters = vec![Some(Bytes::from_static(b"001"))];
     portal.result_column_format = Format::UnifiedText;
 
-    let values = decode_parameters(&portal).unwrap();
-    assert_eq!(values, vec![Some(Value::Text("001".to_string()))]);
+    let err = decode_parameters(&portal).unwrap_err();
+    match err {
+        PgWireError::UserError(info) => {
+            assert_eq!(info.code, "08P01");
+            assert!(info.message.contains("no type resolved for parameter $1"));
+        }
+        other => panic!("expected UserError, got {:?}", other),
+    }
 }
 
 #[test]
