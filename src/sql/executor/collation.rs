@@ -44,24 +44,26 @@ fn parse_identifier(input: &str) -> Result<(String, &str)> {
 
     if input.starts_with('"') {
         // Quoted identifier
-        let mut i = 1;
+        let mut it = input.char_indices().peekable();
+        it.next();
         let mut name = String::new();
-        while i < input.len() {
-            let ch = input.chars().nth(i).unwrap();
+        while let Some((pos, ch)) = it.next() {
             if ch == '"' {
-                if input.chars().nth(i + 1) == Some('"') {
+                if let Some((_, '"')) = it.peek() {
+                    it.next();
                     name.push('"');
-                    i += 2;
                 } else {
-                    i += 1;
-                    return Ok((name, &input[i..]));
+                    let rest_start = pos + ch.len_utf8();
+                    return Ok((name, &input[rest_start..]));
                 }
             } else {
                 name.push(ch);
-                i += ch.len_utf8();
             }
         }
-        return Err(anyhow!("Unterminated quoted identifier"));
+        return Err(anyhow!(
+            "unterminated quoted identifier at or near \"{}\"",
+            input
+        ));
     }
 
     // Unquoted identifier — lowercase per SQL standard (matches normalize_ident)
@@ -81,24 +83,26 @@ fn parse_string_literal(input: &str) -> Result<(String, &str)> {
         return Err(anyhow!("Expected string literal"));
     }
 
-    let mut i = 1;
+    let mut it = input.char_indices().peekable();
+    it.next();
     let mut value = String::new();
-    while i < input.len() {
-        let ch = input.chars().nth(i).unwrap();
+    while let Some((pos, ch)) = it.next() {
         if ch == '\'' {
-            if input.chars().nth(i + 1) == Some('\'') {
+            if let Some((_, '\'')) = it.peek() {
+                it.next();
                 value.push('\'');
-                i += 2;
             } else {
-                i += 1;
-                return Ok((value, &input[i..]));
+                let rest_start = pos + ch.len_utf8();
+                return Ok((value, &input[rest_start..]));
             }
         } else {
             value.push(ch);
-            i += ch.len_utf8();
         }
     }
-    Err(anyhow!("Unterminated string literal"))
+    Err(anyhow!(
+        "unterminated quoted string at or near \"{}\"",
+        input
+    ))
 }
 
 /// Parse CREATE COLLATION statement. Returns (CollationDef, if_not_exists).
@@ -385,6 +389,66 @@ mod tests {
     fn test_parse_identifier_preserves_quoted() {
         let (name, _) = parse_identifier("\"DA\" rest").unwrap();
         assert_eq!(name, "DA");
+    }
+
+    #[test]
+    fn test_parse_identifier_quoted_ascii() {
+        let (name, rest) = parse_identifier("\"hello\" tail").unwrap();
+        assert_eq!(name, "hello");
+        assert_eq!(rest, " tail");
+    }
+
+    #[test]
+    fn test_parse_identifier_quoted_non_ascii() {
+        let (name, rest) = parse_identifier("\"café日本語\" tail").unwrap();
+        assert_eq!(name, "café日本語");
+        assert_eq!(rest, " tail");
+    }
+
+    #[test]
+    fn test_parse_identifier_quoted_escaped_quote() {
+        let (name, rest) = parse_identifier("\"a\"\"b\" tail").unwrap();
+        assert_eq!(name, "a\"b");
+        assert_eq!(rest, " tail");
+    }
+
+    #[test]
+    fn test_parse_identifier_unterminated_quoted() {
+        let err = parse_identifier("\"unterminated").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unterminated quoted identifier at or near \"\"unterminated\""
+        );
+    }
+
+    #[test]
+    fn test_parse_string_literal_ascii() {
+        let (value, rest) = parse_string_literal("'hello' tail").unwrap();
+        assert_eq!(value, "hello");
+        assert_eq!(rest, " tail");
+    }
+
+    #[test]
+    fn test_parse_string_literal_non_ascii() {
+        let (value, rest) = parse_string_literal("'café日本語' tail").unwrap();
+        assert_eq!(value, "café日本語");
+        assert_eq!(rest, " tail");
+    }
+
+    #[test]
+    fn test_parse_string_literal_escaped_quote() {
+        let (value, rest) = parse_string_literal("'a''b' tail").unwrap();
+        assert_eq!(value, "a'b");
+        assert_eq!(rest, " tail");
+    }
+
+    #[test]
+    fn test_parse_string_literal_unterminated() {
+        let err = parse_string_literal("'unterminated").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unterminated quoted string at or near \"'unterminated\""
+        );
     }
 
     #[test]
