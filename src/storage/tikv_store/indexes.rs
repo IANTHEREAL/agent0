@@ -87,7 +87,7 @@ impl TikvStore {
     /// For unique indexes that allow NULL (stored with PK-suffixed key shape), the value uses
     /// a sentinel and the PK lives in the key suffix. Legacy entries may still have empty values.
     /// For normal unique entries, the PK is encoded in the value.
-    fn decode_unique_pk_from_index_entry(
+    pub(crate) fn decode_unique_pk_from_index_entry(
         &self,
         full_key: &[u8],
         value: &[u8],
