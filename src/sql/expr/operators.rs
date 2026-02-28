@@ -409,6 +409,18 @@ pub(super) fn add_values(left: Value, right: Value) -> Result<Value> {
             ))
         }
         (Value::Interval(l), Value::Interval(r)) => Ok(Value::Interval(l + r)),
+        (Value::Vector(l), Value::Vector(r)) => {
+            if l.len() != r.len() {
+                return Err(anyhow!(
+                    "cannot add vectors with different dimensions ({} and {})",
+                    l.len(),
+                    r.len()
+                ));
+            }
+            Ok(Value::Vector(
+                l.iter().zip(r.iter()).map(|(a, b)| a + b).collect(),
+            ))
+        }
         _ => Err(SqlError::Unsupported("Unsupported types for addition".into()).into()),
     }
 }
@@ -416,6 +428,19 @@ pub(super) fn add_values(left: Value, right: Value) -> Result<Value> {
 pub(super) fn sub_values(left: Value, right: Value) -> Result<Value> {
     if matches!(left, Value::Jsonb(_)) {
         return jsonb_subtract(left, right);
+    }
+
+    if let (Value::Vector(l), Value::Vector(r)) = (&left, &right) {
+        if l.len() != r.len() {
+            return Err(anyhow!(
+                "cannot subtract vectors with different dimensions ({} and {})",
+                l.len(),
+                r.len()
+            ));
+        }
+        return Ok(Value::Vector(
+            l.iter().zip(r.iter()).map(|(a, b)| a - b).collect(),
+        ));
     }
 
     let left = crate::sql::types::cast::coerce_text_to_numeric(left)?;
@@ -580,6 +605,21 @@ fn jsonb_subtract(left: Value, right: Value) -> Result<Value> {
 }
 
 fn mul_values(left: Value, right: Value) -> Result<Value> {
+    match (&left, &right) {
+        (Value::Vector(v), Value::Float64(s)) | (Value::Float64(s), Value::Vector(v)) => {
+            return Ok(Value::Vector(v.iter().map(|x| x * s).collect()));
+        }
+        (Value::Vector(v), Value::Int32(s)) | (Value::Int32(s), Value::Vector(v)) => {
+            let scalar = *s as f64;
+            return Ok(Value::Vector(v.iter().map(|x| x * scalar).collect()));
+        }
+        (Value::Vector(v), Value::Int64(s)) | (Value::Int64(s), Value::Vector(v)) => {
+            let scalar = *s as f64;
+            return Ok(Value::Vector(v.iter().map(|x| x * scalar).collect()));
+        }
+        _ => {}
+    }
+
     let left = crate::sql::types::cast::coerce_text_to_numeric(left)?;
     let right = crate::sql::types::cast::coerce_text_to_numeric(right)?;
 
@@ -961,6 +1001,17 @@ fn compare_same_type(left: &Value, right: &Value) -> Result<i8> {
             }
             Ok(l.len().cmp(&r.len()) as i8)
         }
+        (Value::Vector(l), Value::Vector(r)) => {
+            for (a, b) in l.iter().zip(r.iter()) {
+                if a < b {
+                    return Ok(-1);
+                }
+                if a > b {
+                    return Ok(1);
+                }
+            }
+            Ok(l.len().cmp(&r.len()) as i8)
+        }
         (Value::Jsonb(l), Value::Jsonb(r)) => compare_jsonb_pg(l, r),
         _ => Err(anyhow!("Cannot compare values: {:?} vs {:?}", left, right)),
     }
@@ -976,11 +1027,6 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
         (Value::Json(_), _) | (_, Value::Json(_)) => {
             return Err(anyhow!(
                 "could not identify a comparison function for type json"
-            ))
-        }
-        (Value::Vector(_), _) | (_, Value::Vector(_)) => {
-            return Err(anyhow!(
-                "Vectors cannot be directly compared. Use vector distance functions instead."
             ))
         }
         _ => {}

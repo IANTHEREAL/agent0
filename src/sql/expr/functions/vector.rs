@@ -10,6 +10,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("INNER_PRODUCT", inner_product_fn);
     map.insert("VECTOR_DIMS", vector_dims);
     map.insert("VECTOR_NORM", vector_norm_fn);
+    map.insert("L2_NORMALIZE", l2_normalize_fn);
 }
 
 fn extract_vector(val: &Value) -> Result<Vec<f64>> {
@@ -174,6 +175,22 @@ pub fn vector_norm_fn(args: Vec<Value>) -> Result<Value> {
     Ok(Value::Float64(vector_norm(&vec)))
 }
 
+pub fn l2_normalize_fn(args: Vec<Value>) -> Result<Value> {
+    if args.is_empty() {
+        return Err(anyhow!("l2_normalize requires 1 argument"));
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let vec = extract_vector(&args[0])?;
+    let norm: f64 = vec.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if norm == 0.0 {
+        // pgvector returns zero vector for zero input
+        return Ok(Value::Vector(vec));
+    }
+    Ok(Value::Vector(vec.iter().map(|x| x / norm).collect()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +273,42 @@ mod tests {
         ])])
         .unwrap();
         assert_eq!(result, Value::Int32(2));
+    }
+
+    #[test]
+    fn test_l2_normalize() {
+        let result = l2_normalize_fn(vec![Value::Vector(vec![3.0, 4.0])]).unwrap();
+        match result {
+            Value::Vector(v) => {
+                assert!((v[0] - 0.6).abs() < 1e-10);
+                assert!((v[1] - 0.8).abs() < 1e-10);
+            }
+            _ => panic!("Expected vector"),
+        }
+    }
+
+    #[test]
+    fn test_l2_normalize_null() {
+        let result = l2_normalize_fn(vec![Value::Null]).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_l2_normalize_zero() {
+        let result = l2_normalize_fn(vec![Value::Vector(vec![0.0, 0.0])]).unwrap();
+        assert_eq!(result, Value::Vector(vec![0.0, 0.0]));
+    }
+
+    #[test]
+    fn test_l2_normalize_unit_vector() {
+        let result = l2_normalize_fn(vec![Value::Vector(vec![1.0, 0.0, 0.0])]).unwrap();
+        match result {
+            Value::Vector(v) => {
+                assert!((v[0] - 1.0).abs() < 1e-10);
+                assert!((v[1] - 0.0).abs() < 1e-10);
+                assert!((v[2] - 0.0).abs() < 1e-10);
+            }
+            _ => panic!("Expected vector"),
+        }
     }
 }
