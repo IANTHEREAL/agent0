@@ -404,7 +404,7 @@ impl<'a> Analyzer<'a> {
             "COSINE_DISTANCE" | "L2_DISTANCE" | "INNER_PRODUCT" => {
                 self.coerce_args_to_vector(args, 2)
             }
-            "VECTOR_DIMS" | "VECTOR_NORM" => self.coerce_args_to_vector(args, 1),
+            "VECTOR_DIMS" | "VECTOR_NORM" | "L2_NORMALIZE" => self.coerce_args_to_vector(args, 1),
             "GENERATE_SUBSCRIPTS" => self.coerce_generate_subscripts_signature(func_name, args),
             "PG_GET_INDEXDEF" => self.coerce_pg_get_indexdef_signature(args),
             _ if is_two_arg_advisory_lock_function(func_name) => {

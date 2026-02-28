@@ -41,10 +41,93 @@ use crate::sql::analyzer::types::{
     TypedExprKind, TypedOrderByExpr,
 };
 use crate::sql::analyzer::AnalyzedQuery;
+use crate::sql::expr::traverse::map_children;
 use anyhow::Result;
 
 /// Builds a [`LogicalPlan`] from an [`AnalyzedQuery`].
 pub struct LogicalPlanner;
+
+fn remap_order_by_to_projection_positions(
+    original_order: &[TypedOrderByExpr],
+    rewritten_order: Vec<TypedOrderByExpr>,
+    agg_projection: &[AnalyzedProjection],
+    group_by: &[TypedExpr],
+    group_by_count: usize,
+    aggregate_exprs: &[crate::sql::operators::AggregateExpr],
+) -> Result<Vec<TypedOrderByExpr>> {
+    let rewritten_projection_exprs: Vec<TypedExpr> = agg_projection
+        .iter()
+        .map(|proj| {
+            super::build::rewrite_post_aggregate_expr(
+                &proj.expr,
+                group_by,
+                group_by_count,
+                aggregate_exprs,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(rewritten_order
+        .into_iter()
+        .enumerate()
+        .map(|(ob_idx, ob)| {
+            let original_expr = original_order.get(ob_idx).map(|o| &o.expr);
+            for (i, (proj, proj_rewritten)) in agg_projection
+                .iter()
+                .zip(rewritten_projection_exprs.iter())
+                .enumerate()
+            {
+                let matches_original = original_expr
+                    .map(|expr| exprs_match_for_order_remap(expr, &proj.expr))
+                    .unwrap_or(false);
+                let matches_rewritten = exprs_match_for_order_remap(&ob.expr, proj_rewritten);
+
+                if matches_original || matches_rewritten {
+                    return TypedOrderByExpr {
+                        expr: TypedExpr {
+                            kind: TypedExprKind::ColumnRef {
+                                scope_depth: 0,
+                                column_index: i,
+                                column_name: proj.output_name.clone(),
+                            },
+                            data_type: ob.expr.data_type.clone(),
+                        },
+                        asc: ob.asc,
+                        nulls_first: ob.nulls_first,
+                    };
+                }
+            }
+            ob
+        })
+        .collect())
+}
+
+fn exprs_match_for_order_remap(lhs: &TypedExpr, rhs: &TypedExpr) -> bool {
+    lhs.data_type == rhs.data_type && canonical_expr_key(lhs) == canonical_expr_key(rhs)
+}
+
+fn canonical_expr_key(expr: &TypedExpr) -> String {
+    format!("{}", canonicalize_column_refs(expr))
+}
+
+fn canonicalize_column_refs(expr: &TypedExpr) -> TypedExpr {
+    let kind = match &expr.kind {
+        TypedExprKind::ColumnRef {
+            scope_depth,
+            column_index,
+            ..
+        } => TypedExprKind::ColumnRef {
+            scope_depth: *scope_depth,
+            column_index: *column_index,
+            column_name: format!("__col_{}_{}", scope_depth, column_index),
+        },
+        _ => map_children(expr, &mut canonicalize_column_refs),
+    };
+    TypedExpr {
+        kind,
+        data_type: expr.data_type.clone(),
+    }
+}
 
 impl LogicalPlanner {
     /// Build a logical plan from an analyzed query.
@@ -210,7 +293,7 @@ impl LogicalPlanner {
                     .map(|p| (p.output_name.clone(), p.expr.data_type.clone()))
                     .collect(),
             );
-            plan = plan.aggregate(select.group_by.clone(), agg_projection, agg_schema);
+            plan = plan.aggregate(select.group_by.clone(), agg_projection.clone(), agg_schema);
 
             // HAVING → Filter (rewritten)
             if let Some(having) = &select.having {
@@ -257,6 +340,14 @@ impl LogicalPlanner {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
+                let rewritten_order = remap_order_by_to_projection_positions(
+                    order_by,
+                    rewritten_order,
+                    &agg_projection,
+                    group_by,
+                    group_by_count,
+                    &aggregate_exprs,
+                )?;
 
                 // Extract window functions from BOTH projection and ORDER BY.
                 let input_col_count = plan.schema.columns.len();
@@ -347,6 +438,14 @@ impl LogicalPlanner {
                             })
                         })
                         .collect::<Result<Vec<_>>>()?;
+                    let rewritten_order = remap_order_by_to_projection_positions(
+                        order_by,
+                        rewritten_order,
+                        &agg_projection,
+                        group_by,
+                        group_by_count,
+                        &aggregate_exprs,
+                    )?;
                     plan = plan.sort(rewritten_order);
                 }
 

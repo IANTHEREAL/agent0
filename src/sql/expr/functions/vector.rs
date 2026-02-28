@@ -10,6 +10,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("INNER_PRODUCT", inner_product_fn);
     map.insert("VECTOR_DIMS", vector_dims);
     map.insert("VECTOR_NORM", vector_norm_fn);
+    map.insert("L2_NORMALIZE", l2_normalize_fn);
 }
 
 fn extract_vector(val: &Value) -> Result<Vec<f64>> {
@@ -117,6 +118,9 @@ pub fn l2_distance_fn(args: Vec<Value>) -> Result<Value> {
     if args.len() != 2 {
         return Err(anyhow!("l2_distance requires exactly 2 arguments"));
     }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
     let vec1 = extract_vector(&args[0])?;
     let vec2 = extract_vector(&args[1])?;
     let dist = l2_distance(&vec1, &vec2)?;
@@ -126,6 +130,9 @@ pub fn l2_distance_fn(args: Vec<Value>) -> Result<Value> {
 pub fn cosine_distance_fn(args: Vec<Value>) -> Result<Value> {
     if args.len() != 2 {
         return Err(anyhow!("cosine_distance requires exactly 2 arguments"));
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
     }
     let vec1 = extract_vector(&args[0])?;
     let vec2 = extract_vector(&args[1])?;
@@ -137,6 +144,9 @@ pub fn inner_product_fn(args: Vec<Value>) -> Result<Value> {
     if args.len() != 2 {
         return Err(anyhow!("inner_product requires exactly 2 arguments"));
     }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
     let vec1 = extract_vector(&args[0])?;
     let vec2 = extract_vector(&args[1])?;
     let prod = inner_product(&vec1, &vec2)?;
@@ -147,6 +157,9 @@ pub fn vector_dims(args: Vec<Value>) -> Result<Value> {
     if args.is_empty() {
         return Err(anyhow!("vector_dims requires 1 argument"));
     }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
     let vec = extract_vector(&args[0])?;
     Ok(Value::Int32(vec.len() as i32))
 }
@@ -155,8 +168,27 @@ pub fn vector_norm_fn(args: Vec<Value>) -> Result<Value> {
     if args.is_empty() {
         return Err(anyhow!("vector_norm requires 1 argument"));
     }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
     let vec = extract_vector(&args[0])?;
     Ok(Value::Float64(vector_norm(&vec)))
+}
+
+pub fn l2_normalize_fn(args: Vec<Value>) -> Result<Value> {
+    if args.is_empty() {
+        return Err(anyhow!("l2_normalize requires 1 argument"));
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let vec = extract_vector(&args[0])?;
+    let norm: f64 = vec.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if norm == 0.0 {
+        // pgvector returns zero vector for zero input
+        return Ok(Value::Vector(vec));
+    }
+    Ok(Value::Vector(vec.iter().map(|x| x / norm).collect()))
 }
 
 #[cfg(test)]
@@ -209,6 +241,25 @@ mod tests {
     }
 
     #[test]
+    fn test_l2_distance_null() {
+        let result = l2_distance_fn(vec![Value::Null, Value::Vector(vec![1.0, 2.0, 3.0])]).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_cosine_distance_null() {
+        let result =
+            cosine_distance_fn(vec![Value::Vector(vec![1.0, 2.0, 3.0]), Value::Null]).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_vector_dims_null() {
+        let result = vector_dims(vec![Value::Null]).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
     fn test_extract_from_text() {
         let result = vector_dims(vec![Value::Text("[1.0, 2.0, 3.0]".into())]).unwrap();
         assert_eq!(result, Value::Int32(3));
@@ -222,5 +273,42 @@ mod tests {
         ])])
         .unwrap();
         assert_eq!(result, Value::Int32(2));
+    }
+
+    #[test]
+    fn test_l2_normalize() {
+        let result = l2_normalize_fn(vec![Value::Vector(vec![3.0, 4.0])]).unwrap();
+        match result {
+            Value::Vector(v) => {
+                assert!((v[0] - 0.6).abs() < 1e-10);
+                assert!((v[1] - 0.8).abs() < 1e-10);
+            }
+            _ => panic!("Expected vector"),
+        }
+    }
+
+    #[test]
+    fn test_l2_normalize_null() {
+        let result = l2_normalize_fn(vec![Value::Null]).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_l2_normalize_zero() {
+        let result = l2_normalize_fn(vec![Value::Vector(vec![0.0, 0.0])]).unwrap();
+        assert_eq!(result, Value::Vector(vec![0.0, 0.0]));
+    }
+
+    #[test]
+    fn test_l2_normalize_unit_vector() {
+        let result = l2_normalize_fn(vec![Value::Vector(vec![1.0, 0.0, 0.0])]).unwrap();
+        match result {
+            Value::Vector(v) => {
+                assert!((v[0] - 1.0).abs() < 1e-10);
+                assert!((v[1] - 0.0).abs() < 1e-10);
+                assert!((v[2] - 0.0).abs() < 1e-10);
+            }
+            _ => panic!("Expected vector"),
+        }
     }
 }

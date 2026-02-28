@@ -240,6 +240,14 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         "COSINE_DISTANCE",
         FunctionSignature::fixed(DataType::Float64).with_args(2, Some(2)),
     );
+    r.register(
+        "VECTOR_NORM",
+        FunctionSignature::fixed(DataType::Float64).with_args(1, Some(1)),
+    );
+    r.register(
+        "L2_NORMALIZE",
+        FunctionSignature::same_as_arg(0).with_args(1, Some(1)),
+    );
 
     // Special internal functions
     r.register(

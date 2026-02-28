@@ -1,0 +1,25 @@
+content|dist
+has vec|0
+null vec|
+another|0.025368153802923787
+(3 rows)
+content|dist
+has vec|0
+another|0.025368153802923787
+null vec|
+(3 rows)
+content|dist
+null vec|
+has vec|0
+another|0.025368153802923787
+(3 rows)
+l2_distance
+
+(1 row)
+vector_dims
+
+(1 row)
+content|dist
+has vec|0
+another|0.025368153802923787
+(2 rows)

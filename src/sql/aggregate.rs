@@ -32,6 +32,7 @@ pub enum Aggregator {
     Avg {
         sum: Decimal,
         sum_float: Option<f64>,
+        sum_vector: Option<Vec<f64>>,
         count: i64,
     },
     StringAgg {
@@ -67,6 +68,7 @@ impl Aggregator {
             "AVG" => Ok(Aggregator::Avg {
                 sum: Decimal::ZERO,
                 sum_float: None,
+                sum_vector: None,
                 count: 0,
             }),
             "STRING_AGG" => Ok(Aggregator::StringAgg {
@@ -129,6 +131,7 @@ impl Aggregator {
             Aggregator::Avg {
                 sum,
                 sum_float,
+                sum_vector,
                 count,
             } => {
                 if !matches!(val, Value::Null) {
@@ -166,6 +169,20 @@ impl Aggregator {
                                 *sf += df;
                             } else {
                                 *sum += *d;
+                            }
+                        }
+                        Value::Vector(v) => {
+                            if let Some(sv) = sum_vector.as_mut() {
+                                if sv.len() != v.len() {
+                                    return Err(anyhow!(
+                                        "cannot average vectors of different dimensions"
+                                    ));
+                                }
+                                for (a, b) in sv.iter_mut().zip(v.iter()) {
+                                    *a += b;
+                                }
+                            } else {
+                                *sum_vector = Some(v.clone());
                             }
                         }
                         _ => return Err(anyhow!("AVG requires numeric type")),
@@ -218,10 +235,13 @@ impl Aggregator {
             Aggregator::Avg {
                 sum,
                 sum_float,
+                sum_vector,
                 count,
             } => {
                 if *count == 0 {
                     Value::Null
+                } else if let Some(sv) = sum_vector {
+                    Value::Vector(sv.iter().map(|x| x / *count as f64).collect())
                 } else if let Some(sf) = sum_float {
                     Value::Float64(*sf / *count as f64)
                 } else {
@@ -396,6 +416,14 @@ fn add_values(left: &Value, right: &Value) -> Result<Value> {
                 .to_f64()
                 .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
             Ok(Value::Float64(df + *f))
+        }
+        (Value::Vector(l), Value::Vector(r)) => {
+            if l.len() != r.len() {
+                return Err(anyhow!("cannot add vectors of different dimensions"));
+            }
+            Ok(Value::Vector(
+                l.iter().zip(r.iter()).map(|(a, b)| a + b).collect(),
+            ))
         }
         _ => Err(SqlError::Unsupported("Unsupported types for SUM".into()).into()),
     }
@@ -589,6 +617,24 @@ mod tests {
     }
 
     #[test]
+    fn test_sum_vector() {
+        let mut agg = Aggregator::new("SUM", None).unwrap();
+        agg.update(&Value::Vector(vec![1.0, 2.0, 3.0])).unwrap();
+        agg.update(&Value::Vector(vec![4.0, 5.0, 6.0])).unwrap();
+        agg.update(&Value::Vector(vec![7.0, 8.0, 9.0])).unwrap();
+        assert_eq!(agg.result(), Value::Vector(vec![12.0, 15.0, 18.0]));
+    }
+
+    #[test]
+    fn test_sum_vector_with_null() {
+        let mut agg = Aggregator::new("SUM", None).unwrap();
+        agg.update(&Value::Vector(vec![1.0, 2.0, 3.0])).unwrap();
+        agg.update(&Value::Null).unwrap();
+        agg.update(&Value::Vector(vec![4.0, 5.0, 6.0])).unwrap();
+        assert_eq!(agg.result(), Value::Vector(vec![5.0, 7.0, 9.0]));
+    }
+
+    #[test]
     fn test_max() {
         let mut agg = Aggregator::new("MAX", None).unwrap();
         agg.update(&Value::Int32(5)).unwrap();
@@ -637,6 +683,30 @@ mod tests {
 
     #[test]
     fn test_avg_empty() {
+        let agg = Aggregator::new("AVG", None).unwrap();
+        assert_eq!(agg.result(), Value::Null);
+    }
+
+    #[test]
+    fn test_avg_vector() {
+        let mut agg = Aggregator::new("AVG", None).unwrap();
+        agg.update(&Value::Vector(vec![1.0, 2.0, 3.0])).unwrap();
+        agg.update(&Value::Vector(vec![4.0, 5.0, 6.0])).unwrap();
+        agg.update(&Value::Vector(vec![7.0, 8.0, 9.0])).unwrap();
+        assert_eq!(agg.result(), Value::Vector(vec![4.0, 5.0, 6.0]));
+    }
+
+    #[test]
+    fn test_avg_vector_with_null() {
+        let mut agg = Aggregator::new("AVG", None).unwrap();
+        agg.update(&Value::Vector(vec![1.0, 2.0, 3.0])).unwrap();
+        agg.update(&Value::Null).unwrap();
+        agg.update(&Value::Vector(vec![7.0, 8.0, 9.0])).unwrap();
+        assert_eq!(agg.result(), Value::Vector(vec![4.0, 5.0, 6.0]));
+    }
+
+    #[test]
+    fn test_avg_vector_empty() {
         let agg = Aggregator::new("AVG", None).unwrap();
         assert_eq!(agg.result(), Value::Null);
     }
