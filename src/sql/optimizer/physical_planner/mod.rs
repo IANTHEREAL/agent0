@@ -21,6 +21,7 @@ use super::{
 };
 use crate::model::TableSchema;
 use crate::sql::analyzer::types::{JoinCondition, JoinType};
+use crate::sql::planner::hnsw_predicate::{detect_hnsw_scan_opportunity, estimate_hnsw_scan_cost};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -468,6 +469,87 @@ impl PhysicalPlanner {
                             .as_ref()
                             .and_then(extract_constant_usize)
                             .unwrap_or(0);
+
+                        if offset_val == 0 {
+                            if let PhysicalNode::SeqScan { table_name, alias } = &sort_input.node {
+                                let scan_key = super::schema_map_key(table_name, alias.as_deref());
+                                if let Some(schema) = ctx.get_schema(&scan_key) {
+                                    if let Some(hnsw_params) = detect_hnsw_scan_opportunity(
+                                        schema,
+                                        order_by,
+                                        Some(limit_val),
+                                        &schema.indexes,
+                                    ) {
+                                        let full_scan_sort_cost = sort_input.cost.total
+                                            + (sort_input.cost.rows as f64
+                                                * (sort_input.cost.rows as f64).log2().max(1.0));
+                                        let hnsw_scan_cost = estimate_hnsw_scan_cost(hnsw_params.k);
+
+                                        if hnsw_scan_cost < full_scan_sort_cost {
+                                            let hnsw_scan_plan = PhysicalPlan {
+                                                node: PhysicalNode::HnswScan {
+                                                    table_name: table_name.clone(),
+                                                    alias: alias.clone(),
+                                                    scan_type: crate::sql::planner::ScanType::HnswIndexScan {
+                                                        index_id: hnsw_params.index_id,
+                                                        index_name: hnsw_params.index_name,
+                                                        query_vector: hnsw_params.query_vector,
+                                                        k: hnsw_params.k,
+                                                        distance_metric: hnsw_params.distance_metric,
+                                                        distance_expr: Some(Box::new(
+                                                            hnsw_params.distance_expr,
+                                                        )),
+                                                    },
+                                                },
+                                                schema: sort_input.schema.clone(),
+                                                cost: PhysicalCost {
+                                                    startup: 0.0,
+                                                    total: hnsw_scan_cost,
+                                                    rows: limit_val.min(sort_input.cost.rows),
+                                                },
+                                            };
+
+                                            let limit_child = if let Some(projections) =
+                                                project_wrapper
+                                            {
+                                                PhysicalPlan {
+                                                    node: PhysicalNode::Project {
+                                                        projections: projections.clone(),
+                                                        input: Box::new(hnsw_scan_plan),
+                                                    },
+                                                    schema: child.schema.clone(),
+                                                    cost: PhysicalCost {
+                                                        startup: 0.0,
+                                                        total: hnsw_scan_cost,
+                                                        rows: limit_val.min(sort_input.cost.rows),
+                                                    },
+                                                }
+                                            } else {
+                                                hnsw_scan_plan
+                                            };
+
+                                            let limit_cost = PhysicalCost {
+                                                startup: limit_child.cost.startup,
+                                                total: limit_child.cost.total
+                                                    + limit_val as f64 * 0.01,
+                                                rows: limit_val.min(limit_child.cost.rows),
+                                            };
+
+                                            return PhysicalPlan {
+                                                node: PhysicalNode::Limit {
+                                                    limit: limit.clone(),
+                                                    offset: offset.clone(),
+                                                    input: Box::new(limit_child),
+                                                },
+                                                schema: logical.schema.clone(),
+                                                cost: limit_cost,
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         if limit_val + offset_val < TOPN_THRESHOLD {
                             let effective_limit = limit_val + offset_val;
                             let topn_cost = PhysicalCost {

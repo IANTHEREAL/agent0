@@ -28,9 +28,10 @@ pub(super) fn join_condition_has_correlated_ref(condition: &JoinCondition) -> bo
 
 pub(super) fn plan_has_correlated_refs(plan: &PhysicalPlan) -> bool {
     match &plan.node {
-        PhysicalNode::SeqScan { .. } | PhysicalNode::IndexScan { .. } | PhysicalNode::Empty => {
-            false
-        }
+        PhysicalNode::SeqScan { .. }
+        | PhysicalNode::IndexScan { .. }
+        | PhysicalNode::HnswScan { .. }
+        | PhysicalNode::Empty => false,
         PhysicalNode::Values { rows } => rows.iter().flatten().any(has_correlated_ref),
         PhysicalNode::TableFunction { args, .. } => args.iter().any(|arg| match arg {
             crate::sql::analyzer::types::TypedFunctionArg::Positional(expr) => {

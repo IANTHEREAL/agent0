@@ -433,6 +433,9 @@ mod tests {
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
         };
         let ddl = index_to_ddl("public.users", &idx);
         assert_eq!(

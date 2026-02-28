@@ -357,6 +357,7 @@ impl Executor {
         if_not_exists: bool,
         concurrently: bool,
         predicate: Option<&Expr>,
+        with_params: Option<&str>,
         username: &str,
     ) -> Result<ExecuteResult> {
         let resolved = names::resolve_existing_table_name(
@@ -404,6 +405,7 @@ impl Executor {
             if_not_exists,
             concurrently,
             predicate,
+            with_params,
             rows,
             self.tenant_keyspace(),
             username,

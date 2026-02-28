@@ -192,6 +192,30 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
                 writeln!(output, "{}  Filter: {}", " ".repeat(indent), f).unwrap();
             }
         }
+        PlanNode::HnswScan {
+            table_name,
+            alias,
+            index_name,
+            distance_metric,
+            k,
+            cost,
+        } => {
+            let table_display = format_relation_display(table_name, alias.as_deref());
+            writeln!(
+                output,
+                "{}HNSW Scan using {} on {}  (cost={:.2}..{:.2} rows={} width={})",
+                prefix, index_name, table_display, cost.startup, cost.total, cost.rows, cost.width
+            )
+            .unwrap();
+            writeln!(
+                output,
+                "{}  Distance Metric: {}  K: {}",
+                " ".repeat(indent),
+                distance_metric,
+                k
+            )
+            .unwrap();
+        }
         PlanNode::NestedLoop {
             join_type,
             cost,

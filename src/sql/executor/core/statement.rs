@@ -130,6 +130,27 @@ impl Executor {
         stmt: &'a Statement,
         current_role: Option<&'a str>,
     ) -> super::BoxStmtFuture<'a> {
+        self.execute_statement_on_txn_with_create_index_with_params(
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            stmt,
+            None,
+            current_role,
+        )
+    }
+
+    pub(crate) fn execute_statement_on_txn_with_create_index_with_params<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        db_id: u64,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        stmt: &'a Statement,
+        create_index_with_params: Option<&'a str>,
+        current_role: Option<&'a str>,
+    ) -> super::BoxStmtFuture<'a> {
         Box::pin(async move {
             self.execute_statement_on_txn_impl(
                 txn,
@@ -137,6 +158,7 @@ impl Executor {
                 sequence_values,
                 search_path,
                 stmt,
+                create_index_with_params,
                 current_role,
             )
             .await
@@ -150,6 +172,7 @@ impl Executor {
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         stmt: &Statement,
+        create_index_with_params: Option<&str>,
         current_role: Option<&str>,
     ) -> Result<ExecuteResult> {
         match classify_statement(stmt) {
@@ -160,6 +183,7 @@ impl Executor {
                     sequence_values,
                     search_path,
                     stmt,
+                    create_index_with_params,
                     current_role,
                 ))
                 .await

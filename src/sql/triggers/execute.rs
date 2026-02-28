@@ -174,10 +174,25 @@ pub(crate) async fn execute_trigger_statement_standalone(
     // Treat as SQL statement.
     let substituted = substitute_row_references(stmt, schema, new_values, old_row);
     let statements = crate::sql::parse_sql(&substituted)?;
+    let mut create_index_with_params =
+        crate::sql::extract_create_index_with_params(&substituted).into_iter();
     for s in &statements {
+        let with_params = if matches!(s, sqlparser::ast::Statement::CreateIndex { .. }) {
+            create_index_with_params.next().flatten()
+        } else {
+            None
+        };
         // Ignore result rows; errors propagate.
         let _ = executor
-            .execute_statement_on_txn(txn, db_id, sequence_values, search_path, s, None)
+            .execute_statement_on_txn_with_create_index_with_params(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                s,
+                with_params.as_deref(),
+                None,
+            )
             .await?;
     }
 

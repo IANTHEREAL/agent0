@@ -1316,6 +1316,9 @@ fn make_schema_with_index() -> TableSchema {
         expressions: vec![],
         state: crate::worker::types::IndexState::Ready,
         cached_predicate_conjuncts: None,
+        hnsw_m: None,
+        hnsw_ef_construction: None,
+        hnsw_distance_metric: None,
     });
     schema
 }

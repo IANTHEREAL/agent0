@@ -561,6 +561,9 @@ mod tests {
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
         };
         let row = Row::new(vec![Value::Jsonb(r#"{"a":1,"b":2}"#.to_string())]);
 

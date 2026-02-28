@@ -185,6 +185,9 @@ mod tests {
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
         };
         assert!(is_index_materializable(&btree_col_index));
 
@@ -199,6 +202,9 @@ mod tests {
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
         };
         assert!(!is_index_materializable(&gin_index));
 
@@ -213,6 +219,9 @@ mod tests {
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
         };
         assert!(is_index_materializable(&partial_index));
 
@@ -227,6 +236,9 @@ mod tests {
             expressions: vec!["lower(a)".to_string()],
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
         };
         assert!(is_index_materializable(&expr_index));
     }
@@ -244,6 +256,9 @@ mod tests {
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
         };
         let schema = test_schema(vec![test_col("name")]);
         let old_row = Row::new(vec![Value::Text("Alice".to_string())]);
@@ -265,6 +280,9 @@ mod tests {
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
         };
         let schema = test_schema(vec![test_col("name")]);
         let old_row = Row::new(vec![Value::Text("Alice".to_string())]);
@@ -286,6 +304,9 @@ mod tests {
             expressions: vec!["lower(name)".to_string()],
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
         };
         let schema = test_schema(vec![test_col("name")]);
         let old_row = Row::new(vec![Value::Text("Alice".to_string())]);
@@ -307,6 +328,9 @@ mod tests {
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
         };
         let schema = test_schema(vec![test_col("id"), test_col("name"), test_col("bio")]);
         let old_row = Row::new(vec![
@@ -336,6 +360,9 @@ mod tests {
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
             cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
         };
         let schema = test_schema(vec![test_col("email")]);
         let old_row = Row::new(vec![Value::Text("a@b.com".to_string())]);

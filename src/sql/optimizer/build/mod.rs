@@ -94,6 +94,14 @@ impl PhysicalPlan {
                 scan::build_index_scan_operator(ctx, table_name, alias.as_deref(), scan_type, None)
             }
 
+            PhysicalNode::HnswScan {
+                table_name,
+                alias,
+                scan_type,
+            } => {
+                scan::build_index_scan_operator(ctx, table_name, alias.as_deref(), scan_type, None)
+            }
+
             PhysicalNode::Empty => {
                 // No-input operator for SELECT without FROM.
                 // Use a single-row empty schema scan so projection can evaluate constants.

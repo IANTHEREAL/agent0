@@ -60,6 +60,13 @@ pub(super) async fn delete_row_storage_entries(
         {
             continue;
         }
+
+        // HNSW uses lazy deletion: the old PK label stays in the graph and
+        // is filtered out by the over-fetch strategy in HnswScanOperator.
+        if index.is_hnsw() {
+            continue;
+        }
+
         let gin_hashes = extract_gin_token_hashes_from_row(schema, index, row)?;
         if !gin_hashes.is_empty() {
             store

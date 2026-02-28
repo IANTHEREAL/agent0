@@ -160,6 +160,9 @@ impl From<V2Schema> for TableSchema {
                     expressions: idx.expressions,
                     state: idx.state,
                     cached_predicate_conjuncts: None,
+                    hnsw_m: None,
+                    hnsw_ef_construction: None,
+                    hnsw_distance_metric: None,
                 }
             })
             .collect();
@@ -351,6 +354,9 @@ impl From<V1Era3Schema> for TableSchema {
                     expressions,
                     state,
                     cached_predicate_conjuncts: None,
+                    hnsw_m: None,
+                    hnsw_ef_construction: None,
+                    hnsw_distance_metric: None,
                 }
             })
             .collect();
@@ -443,6 +449,9 @@ impl From<V1Era2Schema> for TableSchema {
                     expressions,
                     state,
                     cached_predicate_conjuncts: None,
+                    hnsw_m: None,
+                    hnsw_ef_construction: None,
+                    hnsw_distance_metric: None,
                 }
             })
             .collect();
@@ -521,6 +530,9 @@ impl From<V1Era1Schema> for TableSchema {
                     expressions,
                     state: IndexState::Ready,
                     cached_predicate_conjuncts: None,
+                    hnsw_m: None,
+                    hnsw_ef_construction: None,
+                    hnsw_distance_metric: None,
                 }
             })
             .collect();
@@ -620,6 +632,9 @@ mod tests {
                 expressions: vec![],
                 state: IndexState::Ready,
                 cached_predicate_conjuncts: None,
+                hnsw_m: None,
+                hnsw_ef_construction: None,
+                hnsw_distance_metric: None,
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
@@ -958,6 +973,9 @@ mod tests {
                     expressions: vec![],
                     state: IndexState::Ready,
                     cached_predicate_conjuncts: None,
+                    hnsw_m: None,
+                    hnsw_ef_construction: None,
+                    hnsw_distance_metric: None,
                 },
                 IndexDef {
                     name: "legacy_email_key".into(),
@@ -970,6 +988,9 @@ mod tests {
                     expressions: vec![],
                     state: IndexState::Ready,
                     cached_predicate_conjuncts: None,
+                    hnsw_m: None,
+                    hnsw_ef_construction: None,
+                    hnsw_distance_metric: None,
                 },
                 IndexDef {
                     name: "legacy_lower_email_uix".into(),
@@ -982,6 +1003,9 @@ mod tests {
                     expressions: vec!["lower(email)".into()],
                     state: IndexState::Ready,
                     cached_predicate_conjuncts: None,
+                    hnsw_m: None,
+                    hnsw_ef_construction: None,
+                    hnsw_distance_metric: None,
                 },
             ],
             check_constraints: vec![],

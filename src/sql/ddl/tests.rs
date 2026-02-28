@@ -100,6 +100,9 @@ fn test_index(name: &str) -> IndexDef {
         expressions: vec![],
         state: IndexState::Ready,
         cached_predicate_conjuncts: None,
+        hnsw_m: None,
+        hnsw_ef_construction: None,
+        hnsw_distance_metric: None,
     }
 }
 
@@ -297,6 +300,9 @@ fn assign_generated_check_names_avoids_existing_constraint_names() {
             expressions: vec![],
             state: IndexState::Ready,
             cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
         }],
         &[ForeignKeyConstraint {
             name: "users_age_check1".to_string(),
@@ -393,6 +399,9 @@ fn constraint_name_exists_checks_pk_fk_index_and_checks() {
             expressions: vec![],
             state: IndexState::Ready,
             cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
         }],
         check_constraints: vec![CheckConstraint {
             name: None,

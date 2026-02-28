@@ -7,6 +7,7 @@
 
 mod cost_model;
 pub(crate) mod gin_predicate;
+pub mod hnsw_predicate;
 mod index_selection;
 mod predicate;
 mod scan_type;
@@ -88,6 +89,25 @@ pub enum ScanType {
         /// collisions and lossy tokenisation can produce false positives.
         #[allow(dead_code)]
         recheck_expr: Box<crate::sql::analyzer::types::TypedExpr>,
+    },
+    /// HNSW approximate nearest-neighbor index scan.
+    ///
+    /// The planner selects this scan type when a query uses vector distance
+    /// operators (e.g., `<->` for L2 distance) on an HNSW-indexed column.
+    /// The runtime operator loads the in-memory HNSW graph and performs
+    /// beam search to find the k nearest neighbors.
+    HnswIndexScan {
+        index_id: u64,
+        index_name: String,
+        /// The query vector to search for nearest neighbors.
+        query_vector: Vec<Value>,
+        /// Maximum number of results (from LIMIT clause).
+        k: usize,
+        /// Distance metric: "l2", "cosine", or "ip".
+        distance_metric: String,
+        /// The distance expression for projecting distance values.
+        #[allow(dead_code)]
+        distance_expr: Option<Box<crate::sql::analyzer::types::TypedExpr>>,
     },
 }
 

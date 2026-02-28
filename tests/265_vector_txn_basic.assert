@@ -1,0 +1,6 @@
+baseline_nearest|t
+txn_insert_visible|t
+txn_update_visible|t
+rollback_insert_gone|t
+rollback_update_gone|t
+null_vector_filtered|t

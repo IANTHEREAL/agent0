@@ -5,7 +5,7 @@
 //! on `Executor`.
 
 use super::super::super::names;
-use super::super::super::{parse_sql, ExecuteResult, Session};
+use super::super::super::{extract_create_index_with_params, parse_sql, ExecuteResult, Session};
 use super::super::core::Executor;
 use super::{object_name_from_token, parse_call_arguments, substitute_parameters_in_statement};
 use anyhow::{anyhow, Result};
@@ -160,13 +160,21 @@ impl Executor {
                 let expanded_stmt = substitute_parameters_in_statement(stmt_str, &param_map)?;
 
                 let stmts = parse_sql(&expanded_stmt)?;
+                let mut create_index_with_params =
+                    extract_create_index_with_params(&expanded_stmt).into_iter();
                 for stmt in stmts {
-                    self.execute_statement_on_txn(
+                    let with_params = if matches!(&stmt, Statement::CreateIndex { .. }) {
+                        create_index_with_params.next().flatten()
+                    } else {
+                        None
+                    };
+                    self.execute_statement_on_txn_with_create_index_with_params(
                         txn,
                         db_id,
                         sequence_values,
                         search_path,
                         &stmt,
+                        with_params.as_deref(),
                         current_role.as_deref(),
                     )
                     .await?;

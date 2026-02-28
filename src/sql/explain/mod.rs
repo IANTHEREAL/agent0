@@ -34,6 +34,14 @@ pub enum PlanNode {
         filter: Option<String>,
         cost: PlanCost,
     },
+    HnswScan {
+        table_name: String,
+        alias: Option<String>,
+        index_name: String,
+        distance_metric: String,
+        k: usize,
+        cost: PlanCost,
+    },
     NestedLoop {
         join_type: String,
         cost: PlanCost,

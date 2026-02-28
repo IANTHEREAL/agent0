@@ -11,6 +11,7 @@ use super::operator_rewrite::{
     rewrite_all_any_subquery_parse_compat, rewrite_at_time_zone_placeholders,
     rewrite_jsonb_exists_ops, rewrite_reset_role, rewrite_vector_distance_ops,
 };
+use super::tokenizer::{tokenize_sql_for_rewrite, Token, TokenKind};
 
 /// Normalize PostgreSQL's `EXPLAIN (...)` option list into sqlparser-rs'
 /// keyword-form `EXPLAIN ANALYZE VERBOSE ...`.
@@ -590,6 +591,300 @@ fn replace_commas_at_depth0(s: &str) -> String {
     result
 }
 
+fn is_semicolon(tok: &Token) -> bool {
+    tok.kind == TokenKind::Punct && tok.text == ";"
+}
+
+fn is_ignorable_statement_token(tok: &Token) -> bool {
+    matches!(tok.kind, TokenKind::Whitespace | TokenKind::Comment)
+}
+
+fn is_word_eq(tok: &Token, expected: &str) -> bool {
+    tok.kind == TokenKind::Word && tok.text.eq_ignore_ascii_case(expected)
+}
+
+fn statement_window(tokens: &[Token], offset: usize) -> Option<&[Token]> {
+    let mut match_idx = None;
+    for (idx, tok) in tokens.iter().enumerate() {
+        if offset < tok.end {
+            match_idx = Some(idx);
+            break;
+        }
+    }
+    let match_idx = match_idx?;
+
+    let mut start = match_idx;
+    while start > 0 && !is_semicolon(&tokens[start - 1]) {
+        start -= 1;
+    }
+
+    let mut end = match_idx;
+    while end < tokens.len() && !is_semicolon(&tokens[end]) {
+        end += 1;
+    }
+
+    Some(&tokens[start..end])
+}
+
+fn is_create_index_statement(tokens: &[Token]) -> bool {
+    let mut i = 0usize;
+    while i < tokens.len() && is_ignorable_statement_token(&tokens[i]) {
+        i += 1;
+    }
+    if i >= tokens.len() || !is_word_eq(&tokens[i], "CREATE") {
+        return false;
+    }
+    i += 1;
+
+    while i < tokens.len() && is_ignorable_statement_token(&tokens[i]) {
+        i += 1;
+    }
+    if i < tokens.len() && is_word_eq(&tokens[i], "UNIQUE") {
+        i += 1;
+        while i < tokens.len() && is_ignorable_statement_token(&tokens[i]) {
+            i += 1;
+        }
+    }
+
+    i < tokens.len() && is_word_eq(&tokens[i], "INDEX")
+}
+
+fn mask_hnsw_rewrite_unsafe_regions(sql: &str, tokens: &[Token]) -> String {
+    let mut masked = sql.as_bytes().to_vec();
+    for tok in tokens {
+        if matches!(
+            tok.kind,
+            TokenKind::StringLiteral | TokenKind::DollarString | TokenKind::Comment
+        ) {
+            for byte in &mut masked[tok.start..tok.end] {
+                if !matches!(*byte, b'\n' | b'\r') {
+                    *byte = b' ';
+                }
+            }
+        }
+    }
+    String::from_utf8(masked).unwrap_or_else(|_| sql.to_string())
+}
+
+fn next_non_ignorable_token(tokens: &[Token], mut idx: usize, end: usize) -> Option<usize> {
+    while idx < end {
+        if !is_ignorable_statement_token(&tokens[idx]) {
+            return Some(idx);
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn find_matching_rparen(tokens: &[Token], open_idx: usize, end: usize) -> Option<usize> {
+    if open_idx >= end || tokens[open_idx].kind != TokenKind::Punct || tokens[open_idx].text != "("
+    {
+        return None;
+    }
+
+    let mut depth = 0i32;
+    for (idx, tok) in tokens
+        .iter()
+        .enumerate()
+        .skip(open_idx)
+        .take(end - open_idx)
+    {
+        if tok.kind != TokenKind::Punct {
+            continue;
+        }
+        match tok.text.as_str() {
+            "(" => depth += 1,
+            ")" => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx);
+                }
+                if depth < 0 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[derive(Debug, Default, Clone)]
+struct CreateIndexWithAnalysis {
+    rewrites: Vec<(usize, usize)>,
+    // One entry per CREATE INDEX statement in source order.
+    with_params_by_create_index: Vec<Option<String>>,
+}
+
+fn analyze_create_index_with_params(sql: &str) -> CreateIndexWithAnalysis {
+    let tokens = tokenize_sql_for_rewrite(sql);
+    if tokens.is_empty() {
+        return CreateIndexWithAnalysis::default();
+    }
+
+    let mut analysis = CreateIndexWithAnalysis::default();
+    let mut stmt_start = 0usize;
+
+    while stmt_start < tokens.len() {
+        let mut stmt_end = stmt_start;
+        while stmt_end < tokens.len() && !is_semicolon(&tokens[stmt_end]) {
+            stmt_end += 1;
+        }
+
+        let stmt_tokens = &tokens[stmt_start..stmt_end];
+        if is_create_index_statement(stmt_tokens) {
+            let mut depth = 0i32;
+            let mut i = stmt_start;
+            let mut stmt_with_params: Option<String> = None;
+
+            while i < stmt_end {
+                let tok = &tokens[i];
+
+                if tok.kind == TokenKind::Punct {
+                    match tok.text.as_str() {
+                        "(" => depth += 1,
+                        ")" => {
+                            if depth > 0 {
+                                depth -= 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                if depth == 0 && is_word_eq(tok, "WITH") {
+                    let Some(open_idx) = next_non_ignorable_token(&tokens, i + 1, stmt_end) else {
+                        i += 1;
+                        continue;
+                    };
+                    if tokens[open_idx].kind == TokenKind::Punct && tokens[open_idx].text == "(" {
+                        let Some(close_idx) = find_matching_rparen(&tokens, open_idx, stmt_end)
+                        else {
+                            i += 1;
+                            continue;
+                        };
+                        if stmt_with_params.is_none() {
+                            let params = sql[tokens[open_idx].end..tokens[close_idx].start]
+                                .trim()
+                                .to_string();
+                            stmt_with_params = Some(params);
+                        }
+                        analysis.rewrites.push((tok.start, tokens[close_idx].end));
+                        i = close_idx + 1;
+                        continue;
+                    }
+                }
+
+                i += 1;
+            }
+
+            analysis.with_params_by_create_index.push(stmt_with_params);
+        }
+
+        stmt_start = if stmt_end < tokens.len() {
+            stmt_end + 1
+        } else {
+            stmt_end
+        };
+    }
+
+    analysis
+}
+
+pub(super) fn extract_create_index_with_params(sql: &str) -> Vec<Option<String>> {
+    analyze_create_index_with_params(sql).with_params_by_create_index
+}
+
+/// Strip `WITH (...)` storage parameters from CREATE INDEX.
+///
+/// sqlparser 0.40 does not parse CREATE INDEX WITH parameters yet.
+/// This parse-compat shim removes the WITH clause so statements can be parsed.
+/// Extracted WITH payload is preserved by `extract_create_index_with_params()`
+/// for executor-time validation/semantics.
+///
+/// Classification: parse-compat shim.
+/// Exit condition: remove when sqlparser-rs supports CREATE INDEX WITH (...).
+fn preprocess_create_index_with_params(sql: &str) -> Option<String> {
+    let analysis = analyze_create_index_with_params(sql);
+    if analysis.rewrites.is_empty() {
+        return None;
+    }
+
+    let mut rewritten = sql.to_string();
+    for (start, end) in analysis.rewrites.into_iter().rev() {
+        rewritten.replace_range(start..end, "");
+    }
+    Some(rewritten)
+}
+
+/// Strip pgvector operator class from HNSW CREATE INDEX column list.
+///
+/// PostgreSQL+pgvector uses `CREATE INDEX ... USING hnsw (col vector_l2_ops)`.
+/// sqlparser 0.40 cannot parse operator classes in index column lists.
+/// This shim strips the opclass token and encodes the distance metric in the
+/// method name: `hnsw` (L2 default, no opclass), `hnsw__l2` (explicit
+/// `vector_l2_ops`), `hnsw__cosine`, `hnsw__ip`.
+/// `execute_create_index` reads the suffix and normalizes back to `"hnsw"`
+/// before storing in `IndexDef`.
+///
+/// Classification: parse-normalization shim.
+/// Exit condition: remove when sqlparser-rs supports operator classes.
+fn preprocess_hnsw_opclass(sql: &str) -> Option<String> {
+    let re =
+        Regex::new(r"(?i)(USING\s+hnsw)\s*\(\s*([^\s)]+)\s+(vector_(?:l2|cosine|ip)_ops)\s*\)")
+            .ok()?;
+    let tokens = tokenize_sql_for_rewrite(sql);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    // Never match inside string literals / dollar strings / comments.
+    let masked_sql = mask_hnsw_rewrite_unsafe_regions(sql, &tokens);
+    let mut rewrites: Vec<(usize, usize, String)> = Vec::new();
+
+    for caps in re.captures_iter(&masked_sql) {
+        let Some(full) = caps.get(0) else {
+            continue;
+        };
+        let Some(stmt_tokens) = statement_window(&tokens, full.start()) else {
+            continue;
+        };
+        if !is_create_index_statement(stmt_tokens) {
+            continue;
+        }
+
+        let Some(col_match) = caps.get(2) else {
+            continue;
+        };
+        let Some(opclass_match) = caps.get(3) else {
+            continue;
+        };
+        let col = sql[col_match.start()..col_match.end()].trim();
+        let opclass = sql[opclass_match.start()..opclass_match.end()].to_ascii_lowercase();
+        let suffix = match opclass.as_str() {
+            "vector_l2_ops" => "__l2",
+            "vector_cosine_ops" => "__cosine",
+            "vector_ip_ops" => "__ip",
+            _ => "",
+        };
+        rewrites.push((
+            full.start(),
+            full.end(),
+            format!("USING hnsw{} ({})", suffix, col),
+        ));
+    }
+
+    if rewrites.is_empty() {
+        return None;
+    }
+
+    let mut rewritten = sql.to_string();
+    for (start, end, replacement) in rewrites.into_iter().rev() {
+        rewritten.replace_range(start..end, &replacement);
+    }
+    Some(rewritten)
+}
+
 /// SQL preprocessor shim registry (all parse-time compatibility only).
 ///
 /// Shim inventory:
@@ -645,6 +940,16 @@ fn replace_commas_at_depth0(s: &str) -> String {
 ///   What: comma-separated UPDATE FROM tables -> CROSS JOIN.
 ///   Why: sqlparser 0.40 only parses single table_and_joins in UPDATE FROM.
 ///   Exit condition: multi-table UPDATE FROM support.
+/// - `preprocess_create_index_with_params`
+///   What: strip `WITH (...)` from CREATE INDEX statements.
+///   Why: sqlparser 0.40 doesn't parse CREATE INDEX storage parameters.
+///   Exit condition: CREATE INDEX WITH(...) support in sqlparser-rs.
+/// - `preprocess_hnsw_opclass`
+///   What: strip pgvector opclass from HNSW index column list, encode metric
+///   in method name (`hnsw__l2`, `hnsw__cosine`, `hnsw__ip`; default L2
+///   without explicit opclass stays as `hnsw`).
+///   Why: sqlparser 0.40 doesn't support operator classes in CREATE INDEX.
+///   Exit condition: operator class support in sqlparser-rs.
 pub(super) fn preprocess_sql(sql: &str) -> String {
     let mut result = sql.to_string();
 
@@ -676,6 +981,12 @@ pub(super) fn preprocess_sql(sql: &str) -> String {
         result = rewritten;
     }
     if let Some(rewritten) = preprocess_update_from_comma(&result) {
+        result = rewritten;
+    }
+    if let Some(rewritten) = preprocess_create_index_with_params(&result) {
+        result = rewritten;
+    }
+    if let Some(rewritten) = preprocess_hnsw_opclass(&result) {
         result = rewritten;
     }
 
@@ -794,5 +1105,105 @@ mod tests {
         // Commas inside subquery parens should not be rewritten
         let input = r#"UPDATE t SET x = 1 FROM (SELECT a, b FROM s) sub WHERE t.id = sub.a"#;
         assert!(preprocess_update_from_comma(input).is_none());
+    }
+
+    #[test]
+    fn preprocess_create_index_with_params_strips_with_clause() {
+        let input =
+            "CREATE INDEX idx_hnsw_custom ON t USING hnsw (v vector_l2_ops) WITH (m = 32, ef_construction = 128)";
+        let rewritten = preprocess_create_index_with_params(input).expect("expected rewrite");
+        assert!(!rewritten.to_ascii_uppercase().contains("WITH ("));
+        assert!(rewritten.contains("USING hnsw (v vector_l2_ops)"));
+    }
+
+    #[test]
+    fn preprocess_create_index_with_params_keeps_non_index_statements() {
+        let input = "CREATE TABLE t (id int) WITH (fillfactor = 70)";
+        assert!(preprocess_create_index_with_params(input).is_none());
+    }
+
+    #[test]
+    fn preprocess_create_index_with_params_preserves_where_tail() {
+        let input = "CREATE INDEX idx_a ON t USING btree (a) WITH (fillfactor = 70) WHERE a > 0";
+        let rewritten = preprocess_create_index_with_params(input).expect("expected rewrite");
+        assert!(!rewritten.to_ascii_uppercase().contains("WITH ("));
+        assert!(rewritten.contains("WHERE a > 0"));
+    }
+
+    #[test]
+    fn extract_create_index_with_params_ignores_non_create_index_with_clauses() {
+        let input = "CREATE TABLE t (id int) WITH (fillfactor = 70); CREATE INDEX idx_a ON t USING btree (id) WITH (fillfactor = 80); CREATE INDEX idx_b ON t USING btree (id)";
+        let extracted = extract_create_index_with_params(input);
+        assert_eq!(extracted, vec![Some("fillfactor = 80".to_string()), None]);
+    }
+
+    #[test]
+    fn extract_create_index_with_params_captures_hnsw_options() {
+        let input = "CREATE INDEX idx_h ON t USING hnsw (v vector_l2_ops) WITH (m = 32, ef_construction = 128)";
+        let extracted = extract_create_index_with_params(input);
+        assert_eq!(
+            extracted,
+            vec![Some("m = 32, ef_construction = 128".to_string())]
+        );
+    }
+
+    #[test]
+    fn preprocess_hnsw_opclass_l2() {
+        let input = "CREATE INDEX idx ON t USING hnsw (v vector_l2_ops)";
+        let result = preprocess_hnsw_opclass(input).unwrap();
+        assert_eq!(result, "CREATE INDEX idx ON t USING hnsw__l2 (v)");
+    }
+
+    #[test]
+    fn preprocess_hnsw_opclass_cosine() {
+        let input = "CREATE INDEX idx ON t USING hnsw (v vector_cosine_ops)";
+        let result = preprocess_hnsw_opclass(input).unwrap();
+        assert_eq!(result, "CREATE INDEX idx ON t USING hnsw__cosine (v)");
+    }
+
+    #[test]
+    fn preprocess_hnsw_opclass_ip() {
+        let input = "CREATE INDEX idx ON t USING hnsw (v vector_ip_ops)";
+        let result = preprocess_hnsw_opclass(input).unwrap();
+        assert_eq!(result, "CREATE INDEX idx ON t USING hnsw__ip (v)");
+    }
+
+    #[test]
+    fn preprocess_hnsw_opclass_no_opclass() {
+        let input = "CREATE INDEX idx ON t USING hnsw (v)";
+        assert!(preprocess_hnsw_opclass(input).is_none());
+    }
+
+    #[test]
+    fn preprocess_hnsw_opclass_case_insensitive() {
+        let input = "CREATE INDEX idx ON t USING HNSW (v VECTOR_COSINE_OPS)";
+        let result = preprocess_hnsw_opclass(input).unwrap();
+        assert_eq!(result, "CREATE INDEX idx ON t USING hnsw__cosine (v)");
+    }
+
+    #[test]
+    fn preprocess_hnsw_opclass_skips_string_literals() {
+        // P0: must not rewrite inside string literals — only CREATE statements
+        // are candidates, so SELECT/INSERT with quoted USING hnsw must be skipped.
+        let input = "SELECT 'USING hnsw (v vector_cosine_ops)' AS s";
+        assert!(preprocess_hnsw_opclass(input).is_none());
+
+        let input2 =
+            "INSERT INTO t (sql) VALUES ('CREATE INDEX idx ON t USING hnsw (v vector_cosine_ops)')";
+        assert!(preprocess_hnsw_opclass(input2).is_none());
+    }
+
+    #[test]
+    fn preprocess_hnsw_opclass_skips_create_table_literal_default() {
+        let input = "CREATE TABLE __lit_create(s text DEFAULT 'USING hnsw (v vector_cosine_ops)')";
+        assert!(preprocess_hnsw_opclass(input).is_none());
+    }
+
+    #[test]
+    fn preprocess_hnsw_opclass_rewrites_only_create_index_statements() {
+        let input = "CREATE TABLE t (s text DEFAULT 'USING hnsw (v vector_cosine_ops)'); CREATE INDEX idx ON t USING hnsw (v vector_cosine_ops)";
+        let rewritten = preprocess_hnsw_opclass(input).expect("expected HNSW rewrite");
+        assert!(rewritten.contains("DEFAULT 'USING hnsw (v vector_cosine_ops)'"));
+        assert!(rewritten.contains("CREATE INDEX idx ON t USING hnsw__cosine (v)"));
     }
 }

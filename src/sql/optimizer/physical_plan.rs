@@ -58,6 +58,16 @@ pub enum PhysicalNode {
         scan_type: ScanType,
     },
 
+    /// HNSW approximate nearest-neighbor scan.
+    ///
+    /// The operator loads the in-memory HNSW graph and runs beam search
+    /// to find the k nearest neighbors.
+    HnswScan {
+        table_name: String,
+        alias: Option<String>,
+        scan_type: ScanType,
+    },
+
     /// No-input operator (for SELECT without FROM).
     Empty,
 

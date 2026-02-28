@@ -8,11 +8,13 @@ use tikv_client::Transaction;
 
 use crate::model::{DataType, Row, TableSchema};
 use crate::sql::gin::extract_gin_token_hashes_from_row;
+use crate::sql::hnsw::storage::{hnsw_graph_key, hnsw_meta_key};
 use crate::sql::index_helpers;
 use crate::sql::names;
 use crate::sql::projection::fill_row_defaults;
 use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
+use crate::txn::txn_delete;
 
 use super::{
     drop_dependent_views, drop_owned_sequences_for_table, KvScanBatches, DDL_SCAN_BATCH_SIZE,
@@ -204,6 +206,11 @@ pub async fn execute_drop_index(
         // Bump schema version so plan-cache drift detection catches index changes.
         schema.version += 1;
         store.update_schema(txn, db_id, schema.clone()).await?;
+
+        if index.is_hnsw() {
+            txn_delete(txn, hnsw_graph_key(db_id, schema.table_id, index.id)).await?;
+            txn_delete(txn, hnsw_meta_key(db_id, schema.table_id, index.id)).await?;
+        }
 
         // Release the reservation key for the dropped index name.
         let owning_schema = _table_name.split('.').next().unwrap_or("public");

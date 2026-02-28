@@ -61,8 +61,14 @@ impl Executor {
         }
 
         let mut results: Vec<ExecuteResult> = Vec::with_capacity(statements.len());
+        let mut create_index_with_params_iter = extract_create_index_with_params(sql).into_iter();
 
         for stmt in &statements {
+            let create_index_with_params = if matches!(stmt, Statement::CreateIndex { .. }) {
+                create_index_with_params_iter.next().flatten()
+            } else {
+                None
+            };
             debug!("Executing statement: {:?}", stmt);
             let is_observability_query = ctx.is_observability_user
                 && (is_observability_system_query(stmt) || is_observability_tableless_query(stmt));
@@ -243,6 +249,7 @@ impl Executor {
                                 session,
                                 stmt,
                                 is_observability_query,
+                                create_index_with_params.as_deref(),
                             )
                             .await
                         }

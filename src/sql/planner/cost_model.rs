@@ -45,4 +45,16 @@ impl CostModel {
     /// Default GIN selectivity when no column statistics are available.
     /// Assumes ~1% of rows match a typical FTS / containment query.
     pub const GIN_DEFAULT_SELECTIVITY: f64 = 0.01;
+
+    // ── HNSW index scan cost constants ──────────────────────────
+
+    /// Base cost of HNSW scan: graph load (amortized) + beam search.
+    pub const HNSW_SCAN_BASE_COST: f64 = 2.0;
+
+    /// Per-result cost: distance computation per candidate.
+    pub const HNSW_PER_RESULT_COST: f64 = 0.1;
+
+    #[allow(dead_code)]
+    /// Default HNSW selectivity when no statistics are available.
+    pub const HNSW_DEFAULT_SELECTIVITY: f64 = 0.001;
 }

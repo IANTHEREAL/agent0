@@ -120,6 +120,12 @@ pub(crate) const KNOWN_GUCS: &[GucMeta] = &[
         static_default: Some("1"),
     },
     GucMeta {
+        name: "hnsw.ef_search",
+        immutable: false,
+        description: "Sets the size of the dynamic candidate list for HNSW index search.",
+        static_default: Some("40"),
+    },
+    GucMeta {
         name: "idle_in_transaction_session_timeout",
         immutable: false,
         description: "",
@@ -283,6 +289,9 @@ pub(crate) struct SessionSettings {
     /// Plan cache promotion threshold (executions before caching). Default: 5.
     prepared_plan_cache_min_exec: u64,
 
+    /// HNSW ef_search beam width during search. Default: 40, range: 1-1000.
+    hnsw_ef_search: u16,
+
     // pg_dump startup variables we keep for readback (`SHOW`) and later timeout enforcement.
     pub(crate) statement_timeout_ms: u64,
     pub(crate) default_statement_timeout_ms: u64,
@@ -379,6 +388,7 @@ impl SessionSettings {
             max_sort_bytes: DEFAULT_MAX_SORT_BYTES,
             prepared_plan_cache_size: 128,
             prepared_plan_cache_min_exec: 5,
+            hnsw_ef_search: 40,
             statement_timeout_ms: default_statement_timeout_ms,
             default_statement_timeout_ms,
             idle_in_transaction_session_timeout_ms: default_idle_in_txn_timeout_ms,
@@ -544,6 +554,21 @@ impl SessionSettings {
                     })?;
                 Ok(v.to_string())
             }
+            "hnsw.ef_search" => {
+                let v: u16 = value
+                    .trim()
+                    .parse()
+                    .map_err(|_| SqlError::InvalidParameterValue {
+                        message: format!("invalid value for parameter \"{}\": \"{}\"", name, value),
+                    })?;
+                if !(1..=1000).contains(&v) {
+                    return Err(SqlError::InvalidParameterValue {
+                        message: format!("hnsw.ef_search must be between 1 and 1000, got {}", v),
+                    }
+                    .into());
+                }
+                Ok(v.to_string())
+            }
             "db9.use_optimizer" => {
                 let normalized = value.trim().to_lowercase();
                 match normalized.as_str() {
@@ -650,6 +675,23 @@ impl SessionSettings {
             }
             "db9.prepared_plan_cache_min_exec" => {
                 self.prepared_plan_cache_min_exec = normalized.parse().unwrap_or(5);
+            }
+            "hnsw.ef_search" => {
+                let v: u16 = normalized
+                    .parse()
+                    .map_err(|_| SqlError::InvalidParameterValue {
+                        message: format!(
+                            "invalid value for parameter \"{}\": \"{}\"",
+                            canonical, normalized
+                        ),
+                    })?;
+                if !(1..=1000).contains(&v) {
+                    return Err(SqlError::InvalidParameterValue {
+                        message: format!("hnsw.ef_search must be between 1 and 1000, got {}", v),
+                    }
+                    .into());
+                }
+                self.hnsw_ef_search = v;
             }
             "db9.use_optimizer" => {}
             "timezone" => self.timezone = Some(normalized.clone()),
@@ -758,6 +800,7 @@ impl SessionSettings {
             "db9.max_sort_bytes" => self.max_sort_bytes = DEFAULT_MAX_SORT_BYTES,
             "db9.prepared_plan_cache_size" => self.prepared_plan_cache_size = 128,
             "db9.prepared_plan_cache_min_exec" => self.prepared_plan_cache_min_exec = 5,
+            "hnsw.ef_search" => self.hnsw_ef_search = 40,
             "db9.use_optimizer" => {}
             "timezone" => self.timezone = None,
             "application_name" => self.application_name = None,
@@ -833,6 +876,7 @@ impl SessionSettings {
             "db9.prepared_plan_cache_min_exec" => {
                 Some(self.prepared_plan_cache_min_exec.to_string())
             }
+            "hnsw.ef_search" => Some(self.hnsw_ef_search.to_string()),
             "db9.use_optimizer" => Some("on".to_string()),
             "timezone" => Some(self.timezone.as_deref().unwrap_or("UTC").to_string()),
             "application_name" => Some(self.application_name.as_deref().unwrap_or("").to_string()),
@@ -1080,6 +1124,7 @@ impl SessionSettings {
         "transaction_isolation",
         "default_transaction_isolation",
         "default_transaction_read_only",
+        "hnsw.ef_search",
         // default_value() fallthrough keys
         "extra_float_digits",
         "bytea_output",

@@ -13,6 +13,7 @@ impl Executor {
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         stmt: &Statement,
+        create_index_with_params: Option<&str>,
         current_role: Option<&str>,
     ) -> Result<ExecuteResult> {
         match stmt {
@@ -133,6 +134,7 @@ impl Executor {
                         *if_not_exists,
                         *concurrently,
                         predicate.as_ref(),
+                        create_index_with_params,
                         current_role.unwrap_or("postgres"),
                     )
                     .await
@@ -149,6 +151,7 @@ impl Executor {
                         *if_not_exists,
                         *concurrently,
                         predicate.as_ref(),
+                        create_index_with_params,
                         current_role.unwrap_or("postgres"),
                     )
                     .await
@@ -601,6 +604,7 @@ impl Executor {
         if_not_exists: bool,
         concurrently: bool,
         predicate: Option<&Expr>,
+        create_index_with_params: Option<&str>,
         current_role: &str,
     ) -> Result<ExecuteResult> {
         // PostgreSQL auto-generates a relation name for unnamed CREATE INDEX.
@@ -628,6 +632,7 @@ impl Executor {
                     if_not_exists,
                     concurrently,
                     predicate,
+                    create_index_with_params,
                     current_role,
                 )
                 .await

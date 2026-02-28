@@ -17,7 +17,9 @@ use sqlparser::ast::{SelectItem, Statement, WildcardAdditionalOptions};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use preprocess::preprocess_sql;
+use preprocess::{
+    extract_create_index_with_params as extract_create_index_with_params_impl, preprocess_sql,
+};
 use tokenizer::{skip_ws_comments_forward, tokenize_sql_for_rewrite, TokenKind};
 
 /// Parse a SQL string into AST statements
@@ -33,6 +35,18 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             Err(anyhow!("SQL parse error: {}", e))
         }
     }
+}
+
+/// Extract raw `CREATE INDEX ... WITH (...)` payloads in source order.
+///
+/// Returned vector contains one entry per `CREATE INDEX` statement:
+/// - `Some(raw_params)` when `WITH (...)` is present
+/// - `None` when absent
+///
+/// This side-channel exists because sqlparser 0.40 can't parse CREATE INDEX
+/// storage parameters yet.
+pub(crate) fn extract_create_index_with_params(sql: &str) -> Vec<Option<String>> {
+    extract_create_index_with_params_impl(sql)
 }
 
 /// Parse-compatibility fallback for INSERT ... RETURNING *.

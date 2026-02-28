@@ -258,6 +258,9 @@ pub async fn execute_create_table(
                 expressions: Vec::new(),
                 state: IndexState::Ready,
                 cached_predicate_conjuncts: None,
+                hnsw_m: None,
+                hnsw_ef_construction: None,
+                hnsw_distance_metric: None,
             });
             next_index_id += 1;
         }
@@ -288,6 +291,9 @@ pub async fn execute_create_table(
                         expressions: Vec::new(),
                         state: IndexState::Ready,
                         cached_predicate_conjuncts: None,
+                        hnsw_m: None,
+                        hnsw_ef_construction: None,
+                        hnsw_distance_metric: None,
                     });
                     next_index_id += 1;
                 }

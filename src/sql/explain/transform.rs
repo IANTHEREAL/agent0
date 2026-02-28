@@ -41,6 +41,35 @@ pub fn physical_plan_to_plan_node(
                 cost,
             }
         }
+        PhysicalNode::HnswScan {
+            table_name,
+            alias,
+            scan_type,
+        } => {
+            if let ScanType::HnswIndexScan {
+                index_name,
+                distance_metric,
+                k,
+                ..
+            } = scan_type
+            {
+                PlanNode::HnswScan {
+                    table_name: table_name.clone(),
+                    alias: alias.clone(),
+                    index_name: index_name.clone(),
+                    distance_metric: distance_metric.clone(),
+                    k: *k,
+                    cost,
+                }
+            } else {
+                PlanNode::SeqScan {
+                    table_name: table_name.clone(),
+                    alias: alias.clone(),
+                    filter: None,
+                    cost,
+                }
+            }
+        }
         PhysicalNode::Filter { predicate, input } => {
             if let PhysicalNode::IndexScan {
                 table_name,
@@ -225,7 +254,8 @@ fn extract_index_name(scan_type: &ScanType) -> String {
         | ScanType::IndexRangeScan { index_name, .. }
         | ScanType::IndexBoundedRangeScan { index_name, .. }
         | ScanType::InListScan { index_name, .. }
-        | ScanType::GinIndexScan { index_name, .. } => index_name.clone(),
+        | ScanType::GinIndexScan { index_name, .. }
+        | ScanType::HnswIndexScan { index_name, .. } => index_name.clone(),
         _ => "unknown".to_string(),
     }
 }

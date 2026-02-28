@@ -232,13 +232,22 @@ fn execute_statements<'a>(
                     }
 
                     let stmts = parse_sql(&expanded)?;
+                    let mut create_index_with_params =
+                        crate::sql::extract_create_index_with_params(&expanded).into_iter();
                     for stmt in stmts {
-                        exec.execute_statement_on_txn(
+                        let with_params =
+                            if matches!(&stmt, sqlparser::ast::Statement::CreateIndex { .. }) {
+                                create_index_with_params.next().flatten()
+                            } else {
+                                None
+                            };
+                        exec.execute_statement_on_txn_with_create_index_with_params(
                             txn,
                             db_id,
                             sequence_values,
                             search_path,
                             &stmt,
+                            with_params.as_deref(),
                             None,
                         )
                         .await?;

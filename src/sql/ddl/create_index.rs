@@ -4,12 +4,18 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{Expr, OrderByExpr};
+use sqlparser::ast::{Expr, Ident, OrderByExpr};
 use tikv_client::Transaction;
+use usearch::ffi::{IndexOptions, ScalarKind};
 
 use crate::model::{build_predicate_conjunct_cache, DataType, IndexDef, Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::gin::{extract_gin_token_hashes_from_row, supported_gin_index_column};
+use crate::sql::hnsw::storage::{hnsw_graph_key, hnsw_meta_key, serialize_hnsw_snapshot};
+use crate::sql::hnsw::{
+    hnsw_pk_label, metric_from_string, vec_f64_to_f32, HnswMeta, HNSW_DEFAULT_EF_CONSTRUCTION,
+    HNSW_DEFAULT_EF_SEARCH, HNSW_DEFAULT_M,
+};
 use crate::sql::index_consistency::{
     is_unique_duplicate_error, pk_types_for_schema, resolve_unique_index_conflict,
     UniqueConflictResolution,
@@ -19,7 +25,7 @@ use crate::sql::names::normalize_ident;
 use crate::sql::projection::fill_row_defaults;
 use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
-use crate::txn::txn_delete;
+use crate::txn::{txn_delete, txn_put};
 use crate::worker::types::{IndexState, TaskQueueEntry, TaskType, TASK_TYPE_BG_DDL};
 
 use super::create_table::check_relation_name_available;
@@ -27,6 +33,78 @@ use super::{
     analyze_row_level_expr, delete_range, index_prefix_range, maybe_rotate_backfill_txn,
     KvScanBatches, DDL_SCAN_BATCH_SIZE,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HnswMethodVariant {
+    L2Default,
+    L2Explicit,
+    Cosine,
+    Ip,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedIndexMethod {
+    /// Access method persisted in schema metadata (`None` => default btree).
+    storage_method: Option<String>,
+    /// HNSW metric encoded by parser preprocessor suffix.
+    hnsw_variant: Option<HnswMethodVariant>,
+}
+
+impl ResolvedIndexMethod {
+    fn is_hnsw(&self) -> bool {
+        self.hnsw_variant.is_some()
+    }
+}
+
+fn hnsw_opclass_name(variant: HnswMethodVariant) -> Option<&'static str> {
+    match variant {
+        HnswMethodVariant::L2Default => None,
+        HnswMethodVariant::L2Explicit => Some("vector_l2_ops"),
+        HnswMethodVariant::Cosine => Some("vector_cosine_ops"),
+        HnswMethodVariant::Ip => Some("vector_ip_ops"),
+    }
+}
+
+fn resolve_create_index_method(using: Option<&Ident>) -> Result<ResolvedIndexMethod> {
+    let Some(method_ident) = using else {
+        return Ok(ResolvedIndexMethod {
+            storage_method: None,
+            hnsw_variant: None,
+        });
+    };
+
+    let method_raw = method_ident.value.to_ascii_lowercase();
+    let resolved = match method_raw.as_str() {
+        "hnsw" => ResolvedIndexMethod {
+            storage_method: Some("hnsw".to_string()),
+            hnsw_variant: Some(HnswMethodVariant::L2Default),
+        },
+        "hnsw__l2" => ResolvedIndexMethod {
+            storage_method: Some("hnsw".to_string()),
+            hnsw_variant: Some(HnswMethodVariant::L2Explicit),
+        },
+        "hnsw__cosine" => ResolvedIndexMethod {
+            storage_method: Some("hnsw".to_string()),
+            hnsw_variant: Some(HnswMethodVariant::Cosine),
+        },
+        "hnsw__ip" => ResolvedIndexMethod {
+            storage_method: Some("hnsw".to_string()),
+            hnsw_variant: Some(HnswMethodVariant::Ip),
+        },
+        "btree" | "hash" | "gin" | "gist" | "spgist" | "brin" => ResolvedIndexMethod {
+            storage_method: Some(method_raw),
+            hnsw_variant: None,
+        },
+        _ => {
+            return Err(anyhow!(
+                "access method \"{}\" does not exist",
+                method_ident.value
+            ));
+        }
+    };
+
+    Ok(resolved)
+}
 
 pub async fn execute_create_index(
     store: &Arc<TikvStore>,
@@ -40,6 +118,7 @@ pub async fn execute_create_index(
     if_not_exists: bool,
     concurrently: bool,
     predicate: Option<&Expr>,
+    with_params: Option<&str>,
     rows: Vec<Row>,
     keyspace: &str,
     username: &str,
@@ -72,7 +151,26 @@ pub async fn execute_create_index(
         });
     }
 
-    let method = using.map(|m| m.value.to_lowercase());
+    let resolved_method = resolve_create_index_method(using)?;
+    let is_hnsw = resolved_method.is_hnsw();
+    let method = resolved_method.storage_method.clone();
+    let storage_params = parse_index_storage_params(with_params)?;
+
+    if !is_hnsw {
+        validate_non_hnsw_build_params(&storage_params)?;
+    }
+
+    if is_hnsw && concurrently {
+        return Err(anyhow!(
+            "CREATE INDEX CONCURRENTLY is not supported for HNSW indexes"
+        ));
+    }
+
+    if is_hnsw && predicate.is_some() {
+        return Err(anyhow!(
+            "HNSW indexes do not support partial index predicates (WHERE clause)"
+        ));
+    }
 
     if let Some(pred_expr) = predicate {
         index_helpers::validate_index_predicate(pred_expr, &schema)?;
@@ -110,6 +208,72 @@ pub async fn execute_create_index(
                 idx_exprs.push(expr.to_string());
             }
         }
+    }
+
+    let mut hnsw_m: Option<u16> = None;
+    let mut hnsw_ef_construction: Option<u16> = None;
+    let mut hnsw_distance_metric: Option<String> = None;
+    if is_hnsw {
+        if idx_cols.len() != 1 || !idx_exprs.is_empty() {
+            return Err(anyhow!(
+                "access method \"hnsw\" does not support multicolumn indexes"
+            ));
+        }
+
+        // HNSW requires a single non-composite INTEGER or BIGINT primary key.
+        if schema.pk_indices.len() != 1 {
+            return Err(anyhow!(
+                "HNSW indexes require a single-column primary key (INTEGER or BIGINT)"
+            ));
+        }
+        let pk_col_type = &schema.columns[schema.pk_indices[0]].data_type;
+        if !matches!(pk_col_type, DataType::Int32 | DataType::Int64) {
+            return Err(anyhow!(
+                "HNSW indexes require an INTEGER or BIGINT primary key, found {}",
+                pk_col_type
+            ));
+        }
+
+        let indexed_col = idx_cols[0].clone();
+        let col_idx = schema
+            .column_index(&indexed_col)
+            .ok_or_else(|| anyhow!("Column not found"))?;
+        let col_data_type = &schema.columns[col_idx].data_type;
+        if !matches!(col_data_type, DataType::Vector(_)) {
+            if let Some(variant) = resolved_method.hnsw_variant {
+                if let Some(opclass) = hnsw_opclass_name(variant) {
+                    return Err(anyhow!(
+                        "operator class \"{}\" does not accept data type {}",
+                        opclass,
+                        col_data_type.to_string().to_lowercase()
+                    ));
+                }
+            }
+            return Err(anyhow!(
+                "data type {} has no default operator class for access method \"hnsw\"\nHINT:  You must specify an operator class for the index or define a default operator class for the data type.",
+                col_data_type.to_string().to_lowercase()
+            ));
+        }
+
+        // Distance metric is sourced from the preprocessor suffix when present
+        // (`hnsw__l2` / `hnsw__cosine` / `hnsw__ip`). For plain `USING hnsw`,
+        // allow opclass parsing as a compatibility fallback for direct API
+        // callers.
+        let metric = match resolved_method.hnsw_variant {
+            Some(HnswMethodVariant::L2Explicit) => "l2".to_string(),
+            Some(HnswMethodVariant::Cosine) => "cosine".to_string(),
+            Some(HnswMethodVariant::Ip) => "ip".to_string(),
+            Some(HnswMethodVariant::L2Default) => {
+                let opclass = parse_hnsw_operator_class(columns, &indexed_col)?;
+                parse_hnsw_distance_metric(opclass.as_deref())?
+            }
+            None => return Err(anyhow!("internal error: HNSW index without HNSW method")),
+        };
+        let (m, ef_construction) = parse_hnsw_build_params(&storage_params)?;
+
+        hnsw_m = Some(m as u16);
+        hnsw_ef_construction = Some(ef_construction as u16);
+        hnsw_distance_metric = Some(metric);
     }
 
     // ── Operator class validation for GIN / GIST ────────────────────
@@ -163,7 +327,7 @@ pub async fn execute_create_index(
         name: idx_name_str.clone(),
         id: index_id,
         columns: idx_cols,
-        unique,
+        unique: if is_hnsw { false } else { unique },
         is_constraint: false,
         method,
         predicate: predicate_str,
@@ -174,6 +338,9 @@ pub async fn execute_create_index(
             IndexState::Ready
         },
         cached_predicate_conjuncts: None,
+        hnsw_m,
+        hnsw_ef_construction,
+        hnsw_distance_metric,
     };
     new_index.cached_predicate_conjuncts =
         build_predicate_conjunct_cache(new_index.predicate.as_deref());
@@ -216,7 +383,119 @@ pub async fn execute_create_index(
     let mut has_committed_batches = false;
 
     let create_result: Result<()> = async {
-        if index_helpers::is_index_materializable(&new_index) {
+        if new_index.is_hnsw() {
+            let col_name = new_index
+                .columns
+                .first()
+                .ok_or_else(|| anyhow!("HNSW indexes only support single vector columns"))?
+                .clone();
+            let col_idx = schema
+                .column_index(&col_name)
+                .ok_or_else(|| anyhow!("Column not found"))?;
+            let vector_dimensions = match schema.columns[col_idx].data_type {
+                DataType::Vector(dim) => dim as usize,
+                _ => return Err(anyhow!("Column {} is not a vector type", col_name)),
+            };
+
+            let distance_metric = new_index
+                .hnsw_distance_metric
+                .clone()
+                .unwrap_or_else(|| "l2".to_string());
+            let metric = metric_from_string(distance_metric.as_str())
+                .map_err(|e| anyhow!("failed to parse HNSW distance metric: {}", e))?;
+            let m = usize::from(new_index.hnsw_m.unwrap_or(HNSW_DEFAULT_M as u16));
+            let ef_construction = usize::from(
+                new_index
+                    .hnsw_ef_construction
+                    .unwrap_or(HNSW_DEFAULT_EF_CONSTRUCTION as u16),
+            );
+
+            let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+            let data_key_prefix = start.clone();
+            let pk_types = pk_types_for_schema(&schema);
+
+            let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
+            let mut pending_vectors: Vec<(u64, Vec<f32>)> = Vec::new();
+            let mut count = 0u64;
+            while let Some(batch) = scanner.next_batch(txn).await? {
+                for pair in batch {
+                    let key: &[u8] = pair.key().as_ref().into();
+                    let mut row = crate::storage::deserialize_row(pair.value())?;
+                    fill_row_defaults(&mut row, &schema)?;
+
+                    let pk_values = if schema.pk_indices.is_empty() {
+                        let pk_bytes =
+                            key.strip_prefix(data_key_prefix.as_slice())
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "corrupted row key while backfilling index '{}'",
+                                        idx_name_str
+                                    )
+                                })?;
+                        crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?
+                    } else {
+                        schema.get_pk_values(&row)
+                    };
+
+                    let vector = match row.values.get(col_idx) {
+                        Some(Value::Null) | None => continue,
+                        Some(Value::Vector(v)) => v,
+                        Some(_) => return Err(anyhow!("Column {} is not a vector type", col_name)),
+                    };
+                    let pk_label = hnsw_pk_label(&pk_values)?;
+                    pending_vectors.push((pk_label, vec_f64_to_f32(vector)));
+                    count = count.saturating_add(1);
+                }
+            }
+
+            let (graph_bytes, meta_bytes) = {
+                let options = IndexOptions {
+                    dimensions: vector_dimensions,
+                    metric,
+                    quantization: ScalarKind::F32,
+                    connectivity: m,
+                    expansion_add: ef_construction,
+                    expansion_search: HNSW_DEFAULT_EF_SEARCH,
+                };
+                let index = usearch::ffi::new_index(&options)
+                    .map_err(|e| anyhow!("failed to create HNSW index: {}", e))?;
+                // Reserve capacity before adding — usearch segfaults on add()
+                // to an unreserved index (0 capacity from new_index).
+                if !pending_vectors.is_empty() {
+                    index
+                        .reserve(pending_vectors.len())
+                        .map_err(|e| anyhow!("failed to reserve HNSW capacity: {}", e))?;
+                }
+                for (pk_label, vector) in &pending_vectors {
+                    index
+                        .add(*pk_label, vector)
+                        .map_err(|e| anyhow!("failed to add vector to HNSW index: {}", e))?;
+                }
+
+                let meta = HnswMeta {
+                    count,
+                    capacity: index.capacity() as u64,
+                    dimensions: vector_dimensions,
+                    distance_metric,
+                    m,
+                    ef_construction,
+                };
+                serialize_hnsw_snapshot(db_id, schema.table_id, index_id, &index, &meta)
+                    .map_err(|e| anyhow!("failed to serialize HNSW index: {}", e))?
+            };
+            txn_put(
+                txn,
+                hnsw_graph_key(db_id, schema.table_id, index_id),
+                graph_bytes,
+            )
+            .await?;
+            txn_put(
+                txn,
+                hnsw_meta_key(db_id, schema.table_id, index_id),
+                meta_bytes,
+            )
+            .await?;
+        } else if index_helpers::is_index_materializable(&new_index) {
             if !rows.is_empty() {
                 if schema.pk_indices.is_empty() {
                     let pk_types: Vec<DataType> = vec![DataType::Uuid];
@@ -255,7 +534,7 @@ pub async fn execute_create_index(
                                     index_id,
                                     &idx_values,
                                     &pk_values,
-                                    unique,
+                                    new_index.unique,
                                 )
                                 .await?;
                             current_batch_writes += 1;
@@ -285,7 +564,7 @@ pub async fn execute_create_index(
                                 index_id,
                                 &idx_values,
                                 &pk_values,
-                                unique,
+                                new_index.unique,
                             )
                             .await?;
                         current_batch_writes += 1;
@@ -418,6 +697,116 @@ pub async fn execute_create_index(
     Ok(ExecuteResult::CreateIndex {
         index_name: idx_name_str,
     })
+}
+
+fn parse_hnsw_operator_class(columns: &[OrderByExpr], column_name: &str) -> Result<Option<String>> {
+    if columns.is_empty() {
+        return Ok(None);
+    }
+
+    let raw_expr = columns[0].expr.to_string();
+    let compact = raw_expr.trim();
+    let normalized_col = column_name.to_ascii_lowercase();
+
+    if compact.eq_ignore_ascii_case(column_name) {
+        return Ok(None);
+    }
+
+    let mut tokens = compact.split_whitespace();
+    let first = tokens.next().unwrap_or_default().trim_matches('"');
+    let first = first.to_ascii_lowercase();
+    let second = tokens.next();
+    let third = tokens.next();
+
+    if first == normalized_col {
+        if let (Some(opclass), None) = (second, third) {
+            return Ok(Some(opclass.to_ascii_lowercase()));
+        }
+    }
+
+    Ok(None)
+}
+
+fn parse_hnsw_distance_metric(opclass: Option<&str>) -> Result<String> {
+    match opclass {
+        None => Ok("l2".to_string()),
+        Some("vector_l2_ops") => Ok("l2".to_string()),
+        Some("vector_cosine_ops") => Ok("cosine".to_string()),
+        Some("vector_ip_ops") => Ok("ip".to_string()),
+        Some(other) => Err(anyhow!("Unknown operator class: {}", other)),
+    }
+}
+
+type IndexStorageParam = (String, String);
+
+fn parse_index_storage_params(with_params: Option<&str>) -> Result<Vec<IndexStorageParam>> {
+    let Some(with_params) = with_params else {
+        return Ok(Vec::new());
+    };
+    let trimmed = with_params.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut params = Vec::new();
+    for part in trimmed.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (key_raw, value_raw) = part
+            .split_once('=')
+            .ok_or_else(|| anyhow!("invalid storage parameter syntax: \"{}\"", part))?;
+        let key = key_raw.trim().to_ascii_lowercase();
+        let value = value_raw.trim().to_string();
+        if key.is_empty() || value.is_empty() {
+            return Err(anyhow!("invalid storage parameter syntax: \"{}\"", part));
+        }
+        params.push((key, value));
+    }
+    Ok(params)
+}
+
+fn validate_non_hnsw_build_params(params: &[IndexStorageParam]) -> Result<()> {
+    if let Some((key, _)) = params.first() {
+        return Err(anyhow!("unrecognized parameter \"{}\"", key));
+    }
+    Ok(())
+}
+
+fn parse_hnsw_build_params(params: &[IndexStorageParam]) -> Result<(usize, usize)> {
+    let mut m = HNSW_DEFAULT_M;
+    let mut ef_construction = HNSW_DEFAULT_EF_CONSTRUCTION;
+
+    for (key, value) in params {
+        match key.as_str() {
+            "m" => {
+                m = value
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("m must be between 2 and 100"))?;
+            }
+            "ef_construction" => {
+                ef_construction = value
+                    .parse::<usize>()
+                    .map_err(|_| anyhow!("ef_construction must be between 4 and 1000"))?;
+            }
+            _ => {
+                return Err(anyhow!("unrecognized parameter \"{}\"", key));
+            }
+        }
+    }
+
+    if !(2..=100).contains(&m) {
+        return Err(anyhow!("m must be between 2 and 100"));
+    }
+    if !(4..=1000).contains(&ef_construction) {
+        return Err(anyhow!("ef_construction must be between 4 and 1000"));
+    }
+    if ef_construction < 2 * m {
+        return Err(anyhow!("ef_construction must be >= 2*m"));
+    }
+
+    Ok((m, ef_construction))
 }
 
 pub async fn update_index_state(
@@ -917,6 +1306,9 @@ mod tests {
             expressions: expressions.into_iter().map(ToString::to_string).collect(),
             state: IndexState::Ready,
             cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
         }
     }
 
@@ -964,6 +1356,76 @@ mod tests {
             err.to_string()
                 .contains("failed to parse index expression '('"),
             "unexpected err: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_create_index_method_accepts_hnsw_suffixes() {
+        let base = resolve_create_index_method(Some(&Ident::new("hnsw")))
+            .expect("resolve hnsw base method");
+        assert_eq!(base.storage_method.as_deref(), Some("hnsw"));
+        assert_eq!(base.hnsw_variant, Some(HnswMethodVariant::L2Default));
+
+        let l2 = resolve_create_index_method(Some(&Ident::new("hnsw__l2")))
+            .expect("resolve hnsw l2 sentinel");
+        assert_eq!(l2.storage_method.as_deref(), Some("hnsw"));
+        assert_eq!(l2.hnsw_variant, Some(HnswMethodVariant::L2Explicit));
+
+        let cosine = resolve_create_index_method(Some(&Ident::new("hnsw__cosine")))
+            .expect("resolve hnsw cosine sentinel");
+        assert_eq!(cosine.storage_method.as_deref(), Some("hnsw"));
+        assert_eq!(cosine.hnsw_variant, Some(HnswMethodVariant::Cosine));
+
+        let ip = resolve_create_index_method(Some(&Ident::new("hnsw__ip")))
+            .expect("resolve hnsw ip sentinel");
+        assert_eq!(ip.storage_method.as_deref(), Some("hnsw"));
+        assert_eq!(ip.hnsw_variant, Some(HnswMethodVariant::Ip));
+    }
+
+    #[test]
+    fn resolve_create_index_method_rejects_unknown_method() {
+        let err = resolve_create_index_method(Some(&Ident::new("hnsw__evil")))
+            .expect_err("unknown access method should be rejected");
+        assert!(
+            err.to_string()
+                .contains("access method \"hnsw__evil\" does not exist"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_index_storage_params_parses_key_values() {
+        let params = parse_index_storage_params(Some("m = 32, ef_construction = 128"))
+            .expect("parse storage params");
+        assert_eq!(
+            params,
+            vec![
+                ("m".to_string(), "32".to_string()),
+                ("ef_construction".to_string(), "128".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_hnsw_build_params_rejects_unknown_parameter() {
+        let params = vec![("unknown_param".to_string(), "1".to_string())];
+        let err = parse_hnsw_build_params(&params).expect_err("unknown hnsw param should fail");
+        assert!(
+            err.to_string()
+                .contains("unrecognized parameter \"unknown_param\""),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_non_hnsw_build_params_rejects_any_parameter() {
+        let params = vec![("not_a_real_option".to_string(), "123".to_string())];
+        let err = validate_non_hnsw_build_params(&params)
+            .expect_err("non-hnsw params should not be silently accepted");
+        assert!(
+            err.to_string()
+                .contains("unrecognized parameter \"not_a_real_option\""),
+            "unexpected error: {err}"
         );
     }
 }

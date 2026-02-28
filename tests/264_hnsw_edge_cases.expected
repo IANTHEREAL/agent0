@@ -1,0 +1,8 @@
+id|v
+(0 rows)
+id|v
+1|[1,0,0]
+2|[0,1,0]
+(2 rows)
+ERROR:  operator class "vector_l2_ops" does not accept data type text
+ERROR:  access method "hnsw" does not support multicolumn indexes

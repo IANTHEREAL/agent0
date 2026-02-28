@@ -124,6 +124,9 @@ pub(super) async fn alter_table_add_unique_constraint(
         expressions: Vec::new(),
         state: IndexState::Ready,
         cached_predicate_conjuncts: None,
+        hnsw_m: None,
+        hnsw_ef_construction: None,
+        hnsw_distance_metric: None,
     };
 
     let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
@@ -562,6 +565,9 @@ mod tests {
             expressions: vec![],
             state: IndexState::Ready,
             cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
         }
     }
 

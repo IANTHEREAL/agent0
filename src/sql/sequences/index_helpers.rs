@@ -99,6 +99,9 @@ mod tests {
             expressions: vec!["lower(c)".to_string()],
             state: IndexState::Ready,
             cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
         }
     }
 

@@ -417,6 +417,15 @@ pub struct IndexDef {
     pub state: IndexState,
     #[serde(skip, default)]
     pub cached_predicate_conjuncts: Option<Vec<String>>,
+    /// HNSW: max connections per node (default: 16)
+    #[serde(default)]
+    pub hnsw_m: Option<u16>,
+    /// HNSW: build beam width (default: 64)
+    #[serde(default)]
+    pub hnsw_ef_construction: Option<u16>,
+    /// HNSW: distance metric ("l2", "cosine", "ip")
+    #[serde(default)]
+    pub hnsw_distance_metric: Option<String>,
 }
 
 fn default_index_is_constraint() -> bool {
@@ -505,6 +514,13 @@ fn has_wrapping_parentheses(input: &str) -> bool {
     }
 
     depth == 0
+}
+
+impl IndexDef {
+    /// Returns true if this is an HNSW index.
+    pub fn is_hnsw(&self) -> bool {
+        self.method.as_deref() == Some("hnsw")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -183,6 +183,7 @@ impl Executor {
         session: &mut Session,
         stmt: &Statement,
         is_observability_query: bool,
+        create_index_with_params: Option<&str>,
     ) -> Result<Vec<ExecuteResult>> {
         if let Statement::Query(query) = stmt {
             if let Some(result) = try_execute_set_config_select(session, query.as_ref())? {
@@ -219,12 +220,13 @@ impl Executor {
                     .collect_notices_before_statement(txn, db_id, search_path, stmt)
                     .await?;
                 let result = self
-                    .execute_statement_on_txn(
+                    .execute_statement_on_txn_with_create_index_with_params(
                         txn,
                         db_id,
                         sequence_values,
                         search_path,
                         stmt,
+                        create_index_with_params,
                         current_role.as_deref(),
                     )
                     .await?;

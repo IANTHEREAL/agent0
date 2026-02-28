@@ -8,8 +8,8 @@ use super::BuildContext;
 use crate::model::{DataType, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::operators::{
-    BoxedOperator, GinScanOperator, InListScanOperator, IndexScanOperator, ProjectOperator,
-    RangeIndexScanOperator, TableScanOperator,
+    BoxedOperator, GinScanOperator, HnswScanOperator, InListScanOperator, IndexScanOperator,
+    ProjectOperator, RangeIndexScanOperator, TableScanOperator,
 };
 use crate::sql::optimizer::physical_plan::{PhysicalNode, PhysicalPlan};
 use crate::sql::planner::{collect_typed_eq_predicates, ScanType};
@@ -128,6 +128,22 @@ pub(super) fn build_index_scan_operator(
             index_name.clone(),
             qual.clone(),
         ))),
+        ScanType::HnswIndexScan {
+            index_id,
+            index_name,
+            query_vector,
+            k,
+            distance_metric,
+            distance_expr,
+        } => Ok(Box::new(HnswScanOperator::new(
+            schema,
+            *index_id,
+            index_name.clone(),
+            query_vector.clone(),
+            *k,
+            distance_metric.clone(),
+            distance_expr.as_ref().map(|e| *e.clone()),
+        ))),
         // FullTableScan should not appear in PhysicalNode::IndexScan.
         other => Err(anyhow!(
             "Unexpected ScanType {:?} in PhysicalNode::IndexScan for table '{}'",
@@ -150,6 +166,17 @@ pub(super) fn build_limit_child_with_scan_pushdown(
             Some(scan_limit),
         )?)),
         PhysicalNode::IndexScan {
+            table_name,
+            alias,
+            scan_type,
+        } => Ok(Some(build_index_scan_operator(
+            ctx,
+            table_name,
+            alias.as_deref(),
+            scan_type,
+            Some(scan_limit),
+        )?)),
+        PhysicalNode::HnswScan {
             table_name,
             alias,
             scan_type,

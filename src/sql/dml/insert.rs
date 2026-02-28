@@ -9,11 +9,18 @@ use tikv_client::Transaction;
 use crate::model::{DataType, IndexDef, Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::gin::extract_gin_token_hashes_from_row;
+use crate::sql::hnsw::storage::{
+    create_empty_hnsw_index, hnsw_graph_key, hnsw_meta_key, load_hnsw_graph_from_txn,
+    serialize_hnsw_snapshot,
+};
+use crate::sql::hnsw::vec_f64_to_f32;
+use crate::sql::hnsw::{hnsw_pk_label, HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_DEFAULT_M};
 use crate::sql::index_consistency::{
     is_unique_duplicate_error, resolve_unique_index_conflict, UniqueConflictResolution,
 };
 use crate::sql::index_helpers;
 use crate::storage::TikvStore;
+use crate::txn::txn_put;
 use crate::worker::types::IndexState;
 
 use super::defaults::coerce_row_values;
@@ -104,6 +111,130 @@ fn build_unique_violation_error(index: &IndexDef, idx_values: &[Value]) -> SqlEr
         ),
         row_offset: None,
     }
+}
+
+/// Maintain HNSW indexes after INSERT.
+///
+/// Loads the graph fresh from TiKV (committed state), adds the new vector,
+/// serializes, and writes back to the transaction buffer. If the enclosing
+/// transaction rolls back, TiKV never received the write and the next load
+/// sees the old graph. If it commits, the next load gets the new graph.
+async fn maintain_hnsw_indexes_after_insert(
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &TableSchema,
+    row: &Row,
+    pk_values: &[Value],
+) -> Result<()> {
+    if !schema.indexes.iter().any(|idx| idx.is_hnsw()) {
+        return Ok(());
+    }
+
+    let pk_label = hnsw_pk_label(pk_values)?;
+
+    for index in &schema.indexes {
+        if !index.is_hnsw() {
+            continue;
+        }
+        if matches!(index.state, IndexState::Invalid | IndexState::Building) {
+            continue;
+        }
+
+        let Some(vector_col_name) = index.columns.first() else {
+            return Err(anyhow!("HNSW index '{}' has no indexed column", index.name));
+        };
+        let vector_col_idx = schema
+            .column_index(vector_col_name)
+            .ok_or_else(|| anyhow!("HNSW index '{}' column not found", index.name))?;
+
+        let vector_f64 = match row.values.get(vector_col_idx) {
+            Some(Value::Null) | None => continue,
+            Some(Value::Vector(v)) => v,
+            Some(other) => {
+                return Err(anyhow!(
+                    "HNSW index '{}' requires vector value, found {}",
+                    index.name,
+                    other.type_display_name()
+                ))
+            }
+        };
+        let vector_f32 = vec_f64_to_f32(vector_f64);
+        let vector_dimensions = match schema.columns.get(vector_col_idx).map(|c| &c.data_type) {
+            Some(DataType::Vector(dim)) => usize::try_from(*dim).map_err(|_| {
+                anyhow!(
+                    "HNSW index '{}' vector dimension {} exceeds platform limits",
+                    index.name,
+                    dim
+                )
+            })?,
+            _ => {
+                return Err(anyhow!(
+                    "HNSW index '{}' column '{}' is not a vector type",
+                    index.name,
+                    vector_col_name
+                ))
+            }
+        };
+
+        // Load graph from the current DML transaction so that multi-row
+        // INSERTs accumulate: row N+1 sees row N's graph write via the
+        // txn's local buffer (txn.get checks buffer before TiKV).
+        let (hnsw_index, mut meta) =
+            match load_hnsw_graph_from_txn(txn, db_id, schema.table_id, index.id).await? {
+                Some(existing) => existing,
+                None => {
+                    let distance_metric = index.hnsw_distance_metric.as_deref().unwrap_or("l2");
+                    let m = usize::from(index.hnsw_m.unwrap_or(HNSW_DEFAULT_M as u16));
+                    let ef_construction = usize::from(
+                        index
+                            .hnsw_ef_construction
+                            .unwrap_or(HNSW_DEFAULT_EF_CONSTRUCTION as u16),
+                    );
+                    create_empty_hnsw_index(vector_dimensions, distance_metric, m, ef_construction)
+                        .map_err(|e| {
+                            anyhow!(
+                                "failed to initialize HNSW graph for index '{}': {}",
+                                index.name,
+                                e
+                            )
+                        })?
+                }
+            };
+
+        if meta.count >= (meta.capacity.saturating_mul(80) / 100) {
+            let next_capacity = meta.capacity.saturating_mul(2).max(1);
+            hnsw_index
+                .reserve(next_capacity as usize)
+                .map_err(|e| anyhow!("failed to grow HNSW capacity: {}", e))?;
+            meta.capacity = next_capacity;
+        }
+
+        hnsw_index
+            .add(pk_label, &vector_f32)
+            .map_err(|e| anyhow!("failed to add vector to HNSW index: {}", e))?;
+        // Use size() for accurate count — re-inserted PK labels (after
+        // DELETE left a stale entry) are overwrites, not new entries.
+        meta.count = hnsw_index.size() as u64;
+
+        let (graph_bytes, meta_bytes) =
+            serialize_hnsw_snapshot(db_id, schema.table_id, index.id, &hnsw_index, &meta)
+                .map_err(|e| anyhow!("failed to persist HNSW graph '{}': {}", index.name, e))?;
+
+        txn_put(
+            txn,
+            hnsw_graph_key(db_id, schema.table_id, index.id),
+            graph_bytes,
+        )
+        .await?;
+        txn_put(
+            txn,
+            hnsw_meta_key(db_id, schema.table_id, index.id),
+            meta_bytes,
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
 pub async fn build_enum_label_cache(
@@ -431,6 +562,7 @@ pub async fn execute_insert_row(
                     )
                     .await?;
             }
+            maintain_hnsw_indexes_after_insert(txn, db_id, schema, &row, &pk_values).await?;
             Ok(InsertRowResult::Inserted(row))
         }
         Err(e)
@@ -551,6 +683,9 @@ mod tests {
             expressions: vec![],
             state: IndexState::Ready,
             cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
         }
     }
 

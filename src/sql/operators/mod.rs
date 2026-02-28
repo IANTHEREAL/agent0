@@ -34,6 +34,7 @@ mod filter;
 mod gin_scan;
 mod hash_join;
 mod hash_semi_join;
+mod hnsw_scan;
 mod join;
 pub(crate) mod key_encoding;
 mod limit;
@@ -54,6 +55,8 @@ pub use filter::*;
 pub use gin_scan::*;
 pub use hash_join::*;
 pub use hash_semi_join::*;
+#[allow(unused_imports)] // Operator framework — re-exported for future use
+pub use hnsw_scan::*;
 pub use join::*;
 pub use limit::*;
 pub use project::*;

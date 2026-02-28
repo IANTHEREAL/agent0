@@ -1,5 +1,6 @@
 use super::*;
 use crate::sql::error::SqlError;
+use crate::sql::hnsw::storage::{hnsw_graph_key, hnsw_meta_key};
 use crate::storage::backpressure::tikv_op;
 
 fn is_row_lock_conflict(err: &tikv_client::Error) -> bool {
@@ -299,6 +300,14 @@ impl TikvStore {
                 let (raw_start, raw_end) = encode_table_index_range_v2(db_id, schema.table_id);
                 self.delete_range_paginated(txn, &raw_start, &raw_end)
                     .await?;
+            }
+
+            // HNSW graph/meta are outside the generic index key range.
+            for index in &schema.indexes {
+                if index.is_hnsw() {
+                    txn_delete(txn, hnsw_graph_key(db_id, schema.table_id, index.id)).await?;
+                    txn_delete(txn, hnsw_meta_key(db_id, schema.table_id, index.id)).await?;
+                }
             }
 
             // Remove the per-table sequence counter (used by TableId-backed sequences),
@@ -763,6 +772,15 @@ impl TikvStore {
                 let (raw_start, raw_end) = encode_table_index_range_v2(db_id, schema.table_id);
                 self.delete_range_paginated(txn, &raw_start, &raw_end)
                     .await?;
+            }
+
+            // Keep TRUNCATE semantics consistent across index methods: HNSW
+            // graph/meta are stored outside the generic index keyspace.
+            for index in &schema.indexes {
+                if index.is_hnsw() {
+                    txn_delete(txn, hnsw_graph_key(db_id, schema.table_id, index.id)).await?;
+                    txn_delete(txn, hnsw_meta_key(db_id, schema.table_id, index.id)).await?;
+                }
             }
             info!("Truncated table '{}'", table_name);
             Ok(true)
