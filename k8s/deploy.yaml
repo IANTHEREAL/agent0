@@ -15,7 +15,7 @@ spec:
     name: letsencrypt
     kind: ClusterIssuer
   dnsNames:
-    - pg.shared.aws.tidbcloud.com
+    - pg.staging.db9.ai
 ---
 apiVersion: apps/v1
 kind: Deployment
