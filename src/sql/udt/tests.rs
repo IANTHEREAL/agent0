@@ -86,6 +86,7 @@ fn enum_literal_rewrite_preserves_unrelated_text_literals() {
         predicate: Some("state = 'active' AND txt <> 'active'".to_string()),
         expressions: vec!["CASE WHEN state = 'active' THEN 1 ELSE 0 END".to_string()],
         state: IndexState::Ready,
+        cached_predicate_conjuncts: None,
     }];
 
     let changed =
@@ -100,6 +101,12 @@ fn enum_literal_rewrite_preserves_unrelated_text_literals() {
     let pred = schema.indexes[0].predicate.as_deref().unwrap();
     assert!(pred.contains("txt <> 'active'"));
     assert!(pred.contains("state = 'enabled'"));
+    let cached = schema.indexes[0]
+        .cached_predicate_conjuncts
+        .as_ref()
+        .expect("cache should be rebuilt");
+    assert_eq!(cached[0], "state = 'enabled'");
+    assert_eq!(cached[1], "txt <> 'active'");
 
     let expr = &schema.indexes[0].expressions[0];
     assert!(expr.contains("state = 'enabled'"));

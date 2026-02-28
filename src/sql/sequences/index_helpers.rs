@@ -98,6 +98,7 @@ mod tests {
             predicate: Some("a > 0".to_string()),
             expressions: vec!["lower(c)".to_string()],
             state: IndexState::Ready,
+            cached_predicate_conjuncts: None,
         }
     }
 

@@ -597,6 +597,7 @@ mod tests {
             predicate: None,
             expressions: vec![],
             state: Default::default(),
+            cached_predicate_conjuncts: None,
         }];
         schema
     }

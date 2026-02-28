@@ -11,7 +11,7 @@ use sqlparser::parser::Parser;
 use tikv_client::Transaction;
 
 use super::helpers::{expr_has_unqualified_type_cast, query_has_unqualified_type_cast};
-use crate::model::{DataType, TableSchema, UserTypeKind};
+use crate::model::{build_predicate_conjunct_cache, DataType, TableSchema, UserTypeKind};
 use crate::sql::names;
 use crate::sql::names::normalize_ident;
 use crate::sql::ExecuteResult;
@@ -283,6 +283,8 @@ pub(super) fn update_schema_type_casts(
                 rewrite_expr_type_casts(pred, old_full, new_full, allow_unqualified_type_match)?
             {
                 idx.predicate = Some(rewritten);
+                idx.cached_predicate_conjuncts =
+                    build_predicate_conjunct_cache(idx.predicate.as_deref());
                 changed = true;
             }
         }

@@ -9,7 +9,7 @@ use super::enum_rewrite::{
 };
 use super::helpers::enum_column_names;
 use super::rename::{can_match_unqualified_type_name, get_enum_type};
-use crate::model::{DataType, TableSchema, UserTypeKind};
+use crate::model::{build_predicate_conjunct_cache, DataType, TableSchema, UserTypeKind};
 use crate::sql::alter_type::AddValuePosition;
 use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
@@ -303,6 +303,8 @@ pub(super) fn update_schema_enum_literal(
                 allow_unqualified_type_match,
             )? {
                 idx.predicate = Some(rewritten);
+                idx.cached_predicate_conjuncts =
+                    build_predicate_conjunct_cache(idx.predicate.as_deref());
                 changed = true;
             }
         }

@@ -7,7 +7,7 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::{Expr, OrderByExpr};
 use tikv_client::Transaction;
 
-use crate::model::{DataType, IndexDef, Row, TableSchema, Value};
+use crate::model::{build_predicate_conjunct_cache, DataType, IndexDef, Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::gin::{extract_gin_token_hashes_from_row, supported_gin_index_column};
 use crate::sql::index_consistency::{
@@ -159,7 +159,7 @@ pub async fn execute_create_index(
         .unwrap_or(0)
         .checked_add(1)
         .ok_or_else(|| anyhow!("Index id overflow"))?;
-    let new_index = IndexDef {
+    let mut new_index = IndexDef {
         name: idx_name_str.clone(),
         id: index_id,
         columns: idx_cols,
@@ -173,7 +173,10 @@ pub async fn execute_create_index(
         } else {
             IndexState::Ready
         },
+        cached_predicate_conjuncts: None,
     };
+    new_index.cached_predicate_conjuncts =
+        build_predicate_conjunct_cache(new_index.predicate.as_deref());
 
     if concurrently {
         schema.indexes.push(new_index);
@@ -913,6 +916,7 @@ mod tests {
             predicate: None,
             expressions: expressions.into_iter().map(ToString::to_string).collect(),
             state: IndexState::Ready,
+            cached_predicate_conjuncts: None,
         }
     }
 

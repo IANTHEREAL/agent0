@@ -560,6 +560,7 @@ mod tests {
             predicate: None,
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
+            cached_predicate_conjuncts: None,
         };
         let row = Row::new(vec![Value::Jsonb(r#"{"a":1,"b":2}"#.to_string())]);
 

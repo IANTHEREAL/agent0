@@ -184,6 +184,7 @@ mod tests {
             predicate: None,
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
+            cached_predicate_conjuncts: None,
         };
         assert!(is_index_materializable(&btree_col_index));
 
@@ -197,6 +198,7 @@ mod tests {
             predicate: None,
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
+            cached_predicate_conjuncts: None,
         };
         assert!(!is_index_materializable(&gin_index));
 
@@ -210,6 +212,7 @@ mod tests {
             predicate: Some("a > 0".to_string()),
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
+            cached_predicate_conjuncts: None,
         };
         assert!(is_index_materializable(&partial_index));
 
@@ -223,6 +226,7 @@ mod tests {
             predicate: None,
             expressions: vec!["lower(a)".to_string()],
             state: crate::worker::types::IndexState::Ready,
+            cached_predicate_conjuncts: None,
         };
         assert!(is_index_materializable(&expr_index));
     }
@@ -239,6 +243,7 @@ mod tests {
             predicate: None,
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
+            cached_predicate_conjuncts: None,
         };
         let schema = test_schema(vec![test_col("name")]);
         let old_row = Row::new(vec![Value::Text("Alice".to_string())]);
@@ -259,6 +264,7 @@ mod tests {
             predicate: None,
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
+            cached_predicate_conjuncts: None,
         };
         let schema = test_schema(vec![test_col("name")]);
         let old_row = Row::new(vec![Value::Text("Alice".to_string())]);
@@ -279,6 +285,7 @@ mod tests {
             predicate: None,
             expressions: vec!["lower(name)".to_string()],
             state: crate::worker::types::IndexState::Ready,
+            cached_predicate_conjuncts: None,
         };
         let schema = test_schema(vec![test_col("name")]);
         let old_row = Row::new(vec![Value::Text("Alice".to_string())]);
@@ -299,6 +306,7 @@ mod tests {
             predicate: None,
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
+            cached_predicate_conjuncts: None,
         };
         let schema = test_schema(vec![test_col("id"), test_col("name"), test_col("bio")]);
         let old_row = Row::new(vec![
@@ -327,6 +335,7 @@ mod tests {
             predicate: None,
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
+            cached_predicate_conjuncts: None,
         };
         let schema = test_schema(vec![test_col("email")]);
         let old_row = Row::new(vec![Value::Text("a@b.com".to_string())]);

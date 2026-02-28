@@ -550,6 +550,7 @@ mod tests {
             predicate: None,
             expressions: vec![],
             state: IndexState::Ready,
+            cached_predicate_conjuncts: None,
         }
     }
 

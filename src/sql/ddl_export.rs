@@ -432,6 +432,7 @@ mod tests {
             predicate: Some("email IS NOT NULL".to_string()),
             expressions: vec![],
             state: crate::worker::types::IndexState::Ready,
+            cached_predicate_conjuncts: None,
         };
         let ddl = index_to_ddl("public.users", &idx);
         assert_eq!(

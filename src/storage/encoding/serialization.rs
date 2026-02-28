@@ -20,14 +20,28 @@
 
 use crate::model::{FunctionDef, Row, TableSchema};
 use anyhow::{Context, Result};
+use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Once;
+use std::sync::{LazyLock, Once};
 
 const SCHEMA_MAGIC_V2: &[u8] = b"DB9_SCHEMA_V2\0";
 const SCHEMA_MAGIC_V1: &[u8] = b"DB9_SCHEMA_V1\0";
 const LEGACY_SUNSET_DATE: &str = "2026-12-31";
 
 static USE_V2_SCHEMA_FORMAT: AtomicBool = AtomicBool::new(false);
+
+/// Process-global cache: maps raw schema bytes → deserialized+hydrated TableSchema.
+///
+/// Avoids repeated SQL parsing in `hydrate_runtime_caches()` when the same
+/// schema bytes are read from TiKV across queries. The cache is content-addressed
+/// (keyed by raw bytes), so DDL mutations that produce different serialized bytes
+/// automatically miss and re-populate.
+///
+/// Bounded to MAX_SCHEMA_CACHE_ENTRIES; cleared entirely on overflow (rare —
+/// entry count equals the number of distinct table schema blobs ever seen).
+const MAX_SCHEMA_CACHE_ENTRIES: usize = 4096;
+
+static SCHEMA_DESER_CACHE: LazyLock<DashMap<Vec<u8>, TableSchema>> = LazyLock::new(DashMap::new);
 
 pub fn serialize_schema(schema: &TableSchema) -> Result<Vec<u8>> {
     if USE_V2_SCHEMA_FORMAT.load(Ordering::Relaxed) {
@@ -50,13 +64,29 @@ pub fn serialize_schema_v2(schema: &TableSchema) -> Result<Vec<u8>> {
 }
 
 pub fn deserialize_schema(data: &[u8]) -> Result<TableSchema> {
-    if let Some(payload) = data.strip_prefix(SCHEMA_MAGIC_V2) {
-        return deserialize_v2_msgpack(payload);
+    // Fast path: return cached schema if we've deserialized these exact bytes before.
+    // This avoids the SQL parser cost in hydrate_runtime_caches() on repeated reads
+    // of the same schema across queries (get_schema() re-reads from TiKV each call).
+    if let Some(cached) = SCHEMA_DESER_CACHE.get(data) {
+        return Ok(cached.clone());
     }
-    if let Some(payload) = data.strip_prefix(SCHEMA_MAGIC_V1) {
-        return deserialize_v1_bincode(payload);
+
+    let mut schema = if let Some(payload) = data.strip_prefix(SCHEMA_MAGIC_V2) {
+        deserialize_v2_msgpack(payload)?
+    } else if let Some(payload) = data.strip_prefix(SCHEMA_MAGIC_V1) {
+        deserialize_v1_bincode(payload)?
+    } else {
+        anyhow::bail!("Schema data missing magic header (expected DB9_SCHEMA_V2 or V1)")
+    };
+    schema.hydrate_runtime_caches();
+
+    // Populate cache. Clear if too large to bound memory usage.
+    if SCHEMA_DESER_CACHE.len() >= MAX_SCHEMA_CACHE_ENTRIES {
+        SCHEMA_DESER_CACHE.clear();
     }
-    anyhow::bail!("Schema data missing magic header (expected DB9_SCHEMA_V2 or V1)")
+    SCHEMA_DESER_CACHE.insert(data.to_vec(), schema.clone());
+
+    Ok(schema)
 }
 
 #[derive(serde::Deserialize)]
@@ -129,6 +159,7 @@ impl From<V2Schema> for TableSchema {
                     predicate: idx.predicate,
                     expressions: idx.expressions,
                     state: idx.state,
+                    cached_predicate_conjuncts: None,
                 }
             })
             .collect();
@@ -319,6 +350,7 @@ impl From<V1Era3Schema> for TableSchema {
                     predicate,
                     expressions,
                     state,
+                    cached_predicate_conjuncts: None,
                 }
             })
             .collect();
@@ -410,6 +442,7 @@ impl From<V1Era2Schema> for TableSchema {
                     predicate,
                     expressions,
                     state,
+                    cached_predicate_conjuncts: None,
                 }
             })
             .collect();
@@ -487,6 +520,7 @@ impl From<V1Era1Schema> for TableSchema {
                     predicate,
                     expressions,
                     state: IndexState::Ready,
+                    cached_predicate_conjuncts: None,
                 }
             })
             .collect();
@@ -585,6 +619,7 @@ mod tests {
                 predicate: None,
                 expressions: vec![],
                 state: IndexState::Ready,
+                cached_predicate_conjuncts: None,
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
@@ -922,6 +957,7 @@ mod tests {
                     predicate: None,
                     expressions: vec![],
                     state: IndexState::Ready,
+                    cached_predicate_conjuncts: None,
                 },
                 IndexDef {
                     name: "legacy_email_key".into(),
@@ -933,6 +969,7 @@ mod tests {
                     predicate: None,
                     expressions: vec![],
                     state: IndexState::Ready,
+                    cached_predicate_conjuncts: None,
                 },
                 IndexDef {
                     name: "legacy_lower_email_uix".into(),
@@ -944,6 +981,7 @@ mod tests {
                     predicate: None,
                     expressions: vec!["lower(email)".into()],
                     state: IndexState::Ready,
+                    cached_predicate_conjuncts: None,
                 },
             ],
             check_constraints: vec![],
@@ -986,6 +1024,33 @@ mod tests {
         assert!(plain.is_constraint);
         assert!(constraint.is_constraint);
         assert!(!expression.is_constraint);
+    }
+
+    #[test]
+    fn schema_deser_cache_prevents_reparse() {
+        SCHEMA_DESER_CACHE.clear();
+        let data = serialize_schema(&sample_schema()).unwrap();
+
+        // First call: cache miss → full parse + hydrate + insert.
+        let first = deserialize_schema(&data).unwrap();
+        assert_eq!(first.name, "public.users");
+        assert!(
+            SCHEMA_DESER_CACHE.contains_key(&data),
+            "entry must be cached after first deserialize"
+        );
+
+        // Mutate the cached entry so we can distinguish a cache hit from
+        // a fresh parse (fresh parse would return "public.users").
+        SCHEMA_DESER_CACHE.get_mut(&data).unwrap().name = "CACHE_HIT".to_string();
+
+        // Second call: same bytes → must return the mutated cached entry.
+        let second = deserialize_schema(&data).unwrap();
+        assert_eq!(
+            second.name, "CACHE_HIT",
+            "second call must return cached entry, not re-parse"
+        );
+
+        SCHEMA_DESER_CACHE.clear();
     }
 
     #[test]

@@ -1021,6 +1021,7 @@ mod tests {
             predicate: None,
             expressions: vec![],
             state,
+            cached_predicate_conjuncts: None,
         }
     }
 

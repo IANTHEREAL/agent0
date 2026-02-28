@@ -291,11 +291,13 @@ mod tests {
             predicate: None,
             expressions: vec![],
             state: IndexState::Ready,
+            cached_predicate_conjuncts: None,
         };
         assert!(!is_unique_constraint_index(&plain_unique_index));
 
         let unique_constraint_backing_index = IndexDef {
             is_constraint: true,
+            cached_predicate_conjuncts: None,
             ..plain_unique_index
         };
         assert!(is_unique_constraint_index(&unique_constraint_backing_index));

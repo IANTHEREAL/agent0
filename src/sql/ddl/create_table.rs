@@ -257,6 +257,7 @@ pub async fn execute_create_table(
                 predicate: None,
                 expressions: Vec::new(),
                 state: IndexState::Ready,
+                cached_predicate_conjuncts: None,
             });
             next_index_id += 1;
         }
@@ -286,6 +287,7 @@ pub async fn execute_create_table(
                         predicate: None,
                         expressions: Vec::new(),
                         state: IndexState::Ready,
+                        cached_predicate_conjuncts: None,
                     });
                     next_index_id += 1;
                 }

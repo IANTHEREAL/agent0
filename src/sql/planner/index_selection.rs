@@ -11,7 +11,7 @@ use super::scan_type::{
     typed_expr_to_canonical_sql,
 };
 use super::{AccessPath, CmpOp, ScanType, TypedPredicate};
-use crate::model::{IndexDef, TableSchema, Value};
+use crate::model::{build_predicate_conjunct_cache, IndexDef, TableSchema, Value};
 use crate::worker::types::IndexState;
 
 /// Choose the best B-tree access path for a typed filter expression.
@@ -66,10 +66,8 @@ fn choose_best_access_path_with_typed_filter(
         // Partial-index predicate implication: check that the query filter
         // implies the index predicate (e.g. WHERE status = 'active' implies
         // a partial index on status = 'active').
-        if let Some(index_predicate) = index.predicate.as_deref() {
-            if !query_implies_index_predicate_typed(typed_filter, index_predicate) {
-                continue;
-            }
+        if index.predicate.is_some() && !query_implies_index_predicate_typed(typed_filter, index) {
+            continue;
         }
         // Expression-index matching (e.g. CREATE INDEX ON t (lower(name))).
         if !index.expressions.is_empty() {
@@ -367,9 +365,13 @@ fn evaluate_index(
 /// [`typed_expr_to_canonical_sql`] + [`normalize_expr_string`].
 fn query_implies_index_predicate_typed(
     filter: &crate::sql::analyzer::types::TypedExpr,
-    index_predicate: &str,
+    index: &IndexDef,
 ) -> bool {
-    let Some(index_pred_expr) = parse_predicate_expr(index_predicate) else {
+    let index_conjuncts = if let Some(cached) = index.cached_predicate_conjuncts.as_ref() {
+        cached.clone()
+    } else if let Some(parsed) = build_predicate_conjunct_cache(index.predicate.as_deref()) {
+        parsed
+    } else {
         return false;
     };
 
@@ -378,26 +380,9 @@ fn query_implies_index_predicate_typed(
         .map(|c| normalize_expr_string(typed_expr_to_canonical_sql(c)))
         .collect();
 
-    extract_conjuncts(&index_pred_expr)
+    index_conjuncts
         .iter()
-        .map(normalize_expr_for_match)
-        .all(|idx_conj| query_conjuncts.iter().any(|q| q == &idx_conj))
-}
-
-fn extract_conjuncts(expr: &sqlparser::ast::Expr) -> Vec<sqlparser::ast::Expr> {
-    match expr {
-        sqlparser::ast::Expr::BinaryOp {
-            left,
-            op: sqlparser::ast::BinaryOperator::And,
-            right,
-        } => {
-            let mut result = extract_conjuncts(left);
-            result.extend(extract_conjuncts(right));
-            result
-        }
-        sqlparser::ast::Expr::Nested(inner) => extract_conjuncts(inner),
-        other => vec![other.clone()],
-    }
+        .all(|idx_conj| query_conjuncts.iter().any(|q| q == idx_conj))
 }
 
 /// Evaluate expression-index applicability using a typed filter.

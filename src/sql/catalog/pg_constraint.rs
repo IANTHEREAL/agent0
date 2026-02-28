@@ -292,6 +292,7 @@ mod tests {
             predicate: None,
             expressions: vec![],
             state: IndexState::Ready,
+            cached_predicate_conjuncts: None,
         };
         assert!(!is_unique_constraint_index(&idx));
 
