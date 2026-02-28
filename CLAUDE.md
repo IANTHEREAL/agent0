@@ -43,11 +43,12 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 
 - `Analyzer` (`src/sql/analyzer/`): name resolution, scope checking, and type inference; outputs `AnalyzedQuery` / `TypedExpr`.
 - `Optimizer` (`src/sql/optimizer/`): `AnalyzedQuery → LogicalPlan → (rewrite: decorrelation, predicate pushdown, join reorder) → PhysicalPlan → BoxedOperator`. Handles single-table, multi-table joins, set operations (UNION/INTERSECT/EXCEPT), CTEs, window functions, DISTINCT ON, SemiJoin/AntiJoin. Always-on (the `db9.use_optimizer` GUC is accepted for compatibility but is a no-op — `SET ... = off` logs a notice and is ignored; `SHOW` always returns `on`).
-- `Operators` (`src/sql/operators/`): physical operators (scan, filter, project, sort, aggregate, hash_join, hash_semi_join, NLJ, window/, CTE, set_operation, table_function).
+- `Operators` (`src/sql/operators/`): physical operators (scan, filter, project, sort, aggregate, hash_join, hash_semi_join, NLJ, hnsw_scan, window/, CTE, set_operation, table_function).
 - `Executor` (`src/sql/executor/`): DDL/DML dispatch, SELECT execution (analyzed path at `executor/select/analyzed/`), background SQL (`bg_sql.rs`).
 - `Catalog` (`src/sql/catalog/`): `information_schema` / `pg_catalog` / `cron` compatibility surface (37 virtual table implementations).
 - `Storage` (`src/storage/`): all persistent keys must remain keyspace-isolated via `TikvStore`. Database-scoped v2 key format (`d_{db_id}_*`).
 - `Worker` (`src/worker/`): unified async task engine (Cron, AsyncTrigger, AutoAnalyze, BgDdl, BgSql). Global task queue in TiKV, pessimistic locking, no leader election.
+- `HNSW` (`src/sql/hnsw/`): HNSW vector index — process-level LRU cache, TiKV persistence (graph + meta), usearch FFI bridge. Operator at `src/sql/operators/hnsw_scan.rs`, pattern detection at `src/sql/planner/hnsw_predicate.rs`.
 - `Cron` (`src/cron/`): pg_cron-compatible scheduler integrated with worker engine.
 
 ### Multi-tenancy Invariant (Critical)
@@ -100,6 +101,7 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) ->
 - **SQL functions**: json_agg/jsonb_agg, hashtext (#930), RETURNS TABLE syntax (#895).
 - **FTS** Chinese tokenizer support for GIN full-text search (#774).
 - **Infra**: SQL execution timeout protection (#860), stack overflow prevention (#929), information_schema.columns optimization (#936), unified SqlError with SQLSTATE (#900).
+- **HNSW vector index** (#1220/#1241): pgvector-compatible HNSW ANN index — CREATE INDEX USING hnsw, 3 distance metrics (L2/cosine/inner product), k-NN query via `ORDER BY <-> LIMIT k`, `hnsw.ef_search` GUC, DML maintenance (INSERT/DELETE), EXPLAIN support, process-level LRU cache. New modules: `src/sql/hnsw/`, `src/sql/operators/hnsw_scan.rs`, `src/sql/planner/hnsw_predicate.rs`.
 - **Refactoring**: dispatch_raw! macro for executor dispatch (#966), deduplicated utility functions (#964), LogicalPlan::map_children() (#963), IndexScanBase coverage (#970).
 
 ### Phase 1 — Core Correctness (ALL DONE)
@@ -198,6 +200,7 @@ db9-server/
 │   │   ├── operators/                 # Physical operators (Volcano iterator model)
 │   │   │   ├── hash_join/             # Equi-join with hash table
 │   │   │   ├── hash_semi_join.rs      # Semi/anti-join for EXISTS decorrelation
+│   │   │   ├── hnsw_scan.rs           # HNSW approximate nearest neighbor scan
 │   │   │   └── window/                # Window functions (access, aggregates, ranking)
 │   │   ├── executor/                  # DDL/DML dispatch + SELECT execution
 │   │   │   ├── core/                  # Statement dispatch + infrastructure
@@ -218,7 +221,8 @@ db9-server/
 │   │   ├── ddl/                       # DDL: CREATE/ALTER/DROP (alter_table, create_index, create_table, drop, view)
 │   │   ├── dml/                       # DML helpers: defaults, foreign_keys, insert, update, delete
 │   │   ├── session/                   # Per-session state (settings, transaction)
-│   │   ├── planner/                   # Index selection, scan strategy, expression-index support
+│   │   ├── hnsw/                      # HNSW vector index (cache, storage, usearch FFI)
+│   │   ├── planner/                   # Index selection, scan strategy, expression-index, HNSW predicate
 │   │   ├── explain/                   # EXPLAIN output (format, transform)
 │   │   ├── triggers/                  # Trigger subsystem (cache, before, rewrite, enqueue, execute)
 │   │   ├── sequences/                 # SEQUENCE management (DDL, eval, replace)
@@ -257,7 +261,7 @@ db9-server/
 │   ├── pool.rs                        # TiKV connection pool
 │   └── tls.rs                         # TLS setup
 ├── docs/                              # Architecture + feature docs
-├── tests/                             # SQL integration tests (557 test files)
+├── tests/                             # SQL integration tests (563 test files)
 ├── orm-tests/                         # TypeORM, Prisma, Sequelize compatibility
 └── scripts/
 ```
@@ -274,7 +278,8 @@ db9-server/
 | Join reordering | `src/sql/optimizer/join_reorder/` (algorithms.rs, cost.rs, predicates.rs) |
 | Subquery decorrelation | `src/sql/optimizer/rewrite/decorrelate.rs` |
 | Physical operators | `src/sql/operators/` (scan, join, hash_join/, hash_semi_join, sort, aggregate, window/, etc.) |
-| Index planning / scan strategy | `src/sql/planner/` (mod.rs, index_selection.rs, predicate.rs, scan_type.rs) |
+| Index planning / scan strategy | `src/sql/planner/` (mod.rs, index_selection.rs, predicate.rs, scan_type.rs, hnsw_predicate.rs) |
+| HNSW vector index | `src/sql/hnsw/` (mod.rs, storage.rs) + `src/sql/operators/hnsw_scan.rs` + `src/sql/planner/hnsw_predicate.rs` |
 | EXPLAIN output | `src/sql/explain/` (mod.rs, format.rs, transform.rs) |
 | Add PostgreSQL type mapping | `src/protocol/handler/encode/types.rs` |
 | Change key encoding | `src/storage/encoding/` (data_keys.rs, metadata_keys.rs, value_encoding.rs, serialization.rs) |

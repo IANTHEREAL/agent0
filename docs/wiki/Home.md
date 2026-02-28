@@ -46,6 +46,7 @@
 - [Sequences](SQL-Engine/Advanced-SQL/Sequences.md) -- SEQUENCE management
 - [Triggers](SQL-Engine/Advanced-SQL/Triggers.md) -- Trigger subsystem
 - [Full-Text Search](SQL-Engine/Advanced-SQL/Full-Text-Search.md) -- GIN, tsvector/tsquery
+- [HNSW Vector Index](SQL-Engine/Advanced-SQL/HNSW-Vector-Index.md) -- HNSW ANN index, k-NN queries
 - [Rewriter](SQL-Engine/Advanced-SQL/Rewriter.md) -- SQL rewriter
 
 ### Diagrams

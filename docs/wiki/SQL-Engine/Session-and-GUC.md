@@ -44,7 +44,7 @@ The `Session` sits between the protocol handler and the executor layer. The prot
 | **TransactionState** | Three-state FSM: `Idle`, `Active(Transaction)`, `Failed(Transaction)`. |
 | **SessionSettings** | Typed container for all GUC parameters with SET/SHOW/RESET support. |
 | **GucMeta** | Static metadata for each known GUC: name, immutability flag, description, default. |
-| **KNOWN_GUCS** | Alphabetically-sorted const array of 39 GUC parameters (single source of truth). |
+| **KNOWN_GUCS** | Alphabetically-sorted const array of 40 GUC parameters (single source of truth). Includes `hnsw.ef_search` for HNSW vector index tuning. |
 | **SET LOCAL** | Transaction-scoped override, stored in `local_overrides` HashMap, cleared on commit/rollback. |
 | **Savepoint stack** | `settings_savepoint_stack` captures and restores settings state across SAVEPOINT/ROLLBACK TO. |
 | **Task-local context** | `tokio::task_local!` variables (TIMEZONE, MAX_SORT_BYTES, CURRENT_SEARCH_PATH) scoped per query execution. |

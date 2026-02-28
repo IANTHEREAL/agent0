@@ -25,6 +25,8 @@ The planner extracts structured predicates from typed filter expressions, evalua
 
 GIN indexes are intentionally excluded -- they remain on SeqScan until runtime GIN operators are implemented.
 
+**HNSW indexes** use a separate detection path (`hnsw_predicate.rs`) that matches `ORDER BY <distance_op> LIMIT k` patterns during physical planning, rather than going through B-tree index selection. See [HNSW Vector Index](Advanced-SQL/HNSW-Vector-Index.md) for details.
+
 ---
 
 ## 2. Architecture Position
@@ -126,6 +128,7 @@ Indexes with a `WHERE` predicate (e.g., `CREATE INDEX idx ON t (col) WHERE statu
 | File | Lines | Purpose |
 |------|-------|---------|
 | `mod.rs` | 87 | Module root: re-exports, `ScanType` enum, `AccessPath`, `CmpOp`, `TypedPredicate` |
+| `hnsw_predicate.rs` | 141 | HNSW pattern detection: `detect_hnsw_pattern()` for `ORDER BY <distance_op> LIMIT k` |
 | `index_selection.rs` | 429 | `choose_btree_access_path_for_typed_filter()`, index evaluation, expression/partial index matching |
 | `predicate.rs` | 166 | `analyze_typed_predicates()`, `collect_typed_eq_predicates()`, predicate extraction from `TypedExpr` |
 | `scan_type.rs` | 187 | Expression normalization, SQL canonicalization, value coercion, selectivity estimation helpers |
@@ -328,3 +331,4 @@ flowchart TD
 - `src/sql/optimizer/physical_planner/mod.rs` -- the Filter-over-SeqScan pattern that triggers index selection
 - `src/sql/optimizer/build/scan.rs` -- scan operator construction from `ScanType`
 - `src/sql/explain/transform.rs` -- EXPLAIN output showing chosen scan type
+- [HNSW Vector Index](Advanced-SQL/HNSW-Vector-Index.md) -- HNSW ANN index (separate detection path from B-tree)

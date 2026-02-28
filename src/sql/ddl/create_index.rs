@@ -106,6 +106,7 @@ fn resolve_create_index_method(using: Option<&Ident>) -> Result<ResolvedIndexMet
     Ok(resolved)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_create_index(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,

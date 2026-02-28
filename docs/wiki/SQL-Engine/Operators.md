@@ -19,7 +19,7 @@ The operator tree is constructed by the Optimizer's build layer (`src/sql/optimi
 
 | Category | Operators | Description |
 |----------|-----------|-------------|
-| **Scan** | `TableScan`, `IndexScan`, `RangeIndexScan`, `InListScan`, `CTEScan`, `TableFunctionScan` | Leaf operators that read from TiKV, CTEs, or generated data |
+| **Scan** | `TableScan`, `IndexScan`, `RangeIndexScan`, `InListScan`, `HnswScan`, `CTEScan`, `TableFunctionScan` | Leaf operators that read from TiKV, HNSW indexes, CTEs, or generated data |
 | **Filter** | `Filter` | Row filtering with typed predicates |
 | **Projection** | `Project` | Column selection, expression evaluation, set-returning function (SRF) expansion |
 | **Sort** | `Sort` | ORDER BY with memory limit enforcement |
@@ -138,6 +138,7 @@ Operators track memory usage via `try_grow_statement_memory_scope()` and `try_sh
 | `cte.rs` | `CTEScanOperator` | CTE materialized scan (pre-computed rows) |
 | `set_operation.rs` | `SetOperationOperator`, `SetOperationType` | UNION/INTERSECT/EXCEPT (with ALL variants) |
 | `table_function.rs` | `TableFunctionScanOperator` | Streaming table function results via `mpsc::Receiver<Row>` |
+| `hnsw_scan.rs` | `HnswScanOperator` | HNSW approximate nearest neighbor scan (usearch FFI) |
 | `key_encoding.rs` | `encode_value_key()`, `encode_values_key()` | Binary key encoding for hash tables and deduplication sets |
 | `tests.rs` | -- | Cross-operator integration tests |
 
@@ -512,4 +513,5 @@ SQL integration tests in `tests/` cover all operator types through end-to-end qu
 - `src/sql/expr/typed_eval/mod.rs` -- Expression evaluation engine used by operators
 - `src/sql/expr/classify.rs` -- Expression classification (`needs_async`, `needs_pre_materialization`)
 - `docs/ARCHITECTURE.md` -- System-wide architecture and execution pipeline
+- [HNSW Vector Index](Advanced-SQL/HNSW-Vector-Index.md) -- HNSW scan operator details, cache design, DML maintenance
 - `src/sql/AGENTS.md` -- SQL layer navigation guide

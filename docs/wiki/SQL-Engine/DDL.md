@@ -45,10 +45,11 @@ The Dispatcher routes DDL statements (`CREATE`, `ALTER`, `DROP`) to the DDL modu
 - Supports `CREATE TABLE AS` (CTAS) with both batch and streaming row insertion.
 
 ### Index Creation
-- Supports btree (default), GIN, and GIST access methods.
+- Supports btree (default), GIN, GIST, and **HNSW** access methods.
 - Expression indexes and partial indexes (with `WHERE` predicates) are supported.
 - `CREATE INDEX CONCURRENTLY` (CIC) schedules a background worker task with `IndexState::Building`, followed by asynchronous backfill and reconciliation.
 - Operator class validation enforces that GIN/GIST columns have compatible data types.
+- **HNSW indexes** require a `vector` column and one of `vector_l2_ops`, `vector_cosine_ops`, `vector_ip_ops` operator classes. Supports `WITH (m=N, ef_construction=M)` parameters. See [HNSW Vector Index](Advanced-SQL/HNSW-Vector-Index.md).
 - Schema-wide namespace uniqueness is enforced via reservation keys in TiKV.
 
 ### View Management
