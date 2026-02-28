@@ -38,9 +38,18 @@ pub(in crate::protocol::handler) fn decode_parameters(
 }
 
 fn invalid_param(index: usize, type_name: &str, message: String) -> PgWireError {
+    invalid_param_with_code(index, type_name, "22P02", message)
+}
+
+fn invalid_param_with_code(
+    index: usize,
+    type_name: &str,
+    code: &str,
+    message: String,
+) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "ERROR".to_string(),
-        "22P02".to_string(),
+        code.to_string(),
         format!(
             "invalid input syntax for parameter ${} ({}): {}",
             index + 1,
@@ -48,6 +57,45 @@ fn invalid_param(index: usize, type_name: &str, message: String) -> PgWireError 
             message
         ),
     )))
+}
+
+fn invalid_param_character_not_in_repertoire(
+    index: usize,
+    type_name: &str,
+    message: String,
+) -> PgWireError {
+    invalid_param_with_code(index, type_name, "22021", message)
+}
+
+fn format_hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("0x{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn invalid_utf8_param(
+    index: usize,
+    type_name: &str,
+    bytes: &[u8],
+    valid_up_to: usize,
+    _error_len: Option<usize>,
+) -> PgWireError {
+    let lead = bytes[valid_up_to];
+    let seq_len = match lead {
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    };
+    let n = seq_len.min(bytes.len() - valid_up_to);
+    let offending = format_hex_bytes(&bytes[valid_up_to..valid_up_to + n]);
+    invalid_param_character_not_in_repertoire(
+        index,
+        type_name,
+        format!("invalid byte sequence for encoding \"UTF8\": {offending}"),
+    )
 }
 
 fn array_element_type(array_type: &Type) -> Option<Type> {
@@ -407,30 +455,25 @@ fn decode_binary(bytes: &[u8], pg_type: &Type, index: usize) -> PgWireResult<Val
         t if array_element_type(t).is_some() => decode_binary_array(bytes, t, index),
         // Type::UNKNOWN (OID 705) - pgx/GORM sends binary unknown
         t if *t == Type::UNKNOWN => {
-            // Prefer text decoding when possible
-            if let Ok(s) = std::str::from_utf8(bytes) {
-                let trimmed = s.trim();
-                // Try integer first (common for LIMIT/OFFSET)
-                if let Ok(v) = trimmed.parse::<i64>() {
-                    return Ok(Value::Int64(v));
+            let nul_pos = bytes.iter().position(|b| *b == 0);
+            let utf8_err = std::str::from_utf8(bytes).err();
+            let utf8_pos = utf8_err.as_ref().map(|e| e.valid_up_to());
+
+            match (nul_pos, utf8_pos) {
+                (Some(n), Some(u)) if n <= u => {
+                    Err(invalid_utf8_param(index, "unknown", bytes, n, Some(1)))
                 }
-                return Ok(Value::Text(s.to_string()));
-            }
-            // Non-UTF8: attempt fixed-width numeric decode
-            match bytes.len() {
-                8 => {
-                    let arr: [u8; 8] = bytes.try_into().unwrap();
-                    Ok(Value::Int64(i64::from_be_bytes(arr)))
+                (Some(n), None) => Err(invalid_utf8_param(index, "unknown", bytes, n, Some(1))),
+                (None, Some(u)) | (Some(_), Some(u)) => {
+                    let error_len = utf8_err.as_ref().and_then(|e| e.error_len());
+                    Err(invalid_utf8_param(index, "unknown", bytes, u, error_len))
                 }
-                4 => {
-                    let arr: [u8; 4] = bytes.try_into().unwrap();
-                    Ok(Value::Int32(i32::from_be_bytes(arr)))
+                (None, None) => {
+                    let s = std::str::from_utf8(bytes).map_err(|e| {
+                        invalid_utf8_param(index, "unknown", bytes, e.valid_up_to(), e.error_len())
+                    })?;
+                    Ok(Value::Text(s.to_string()))
                 }
-                2 => {
-                    let arr: [u8; 2] = bytes.try_into().unwrap();
-                    Ok(Value::Int32(i16::from_be_bytes(arr) as i32))
-                }
-                _ => Ok(Value::Bytes(bytes.to_vec())),
             }
         }
         _ => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -681,6 +724,153 @@ mod tests {
         match v {
             Value::Numeric(d) => assert_eq!(d.to_string(), "-0.125"),
             other => panic!("expected numeric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_binary_unknown_utf8_digits_decodes_as_text() {
+        let v = decode_binary(b"16", &Type::UNKNOWN, 0).unwrap();
+        assert_eq!(v, Value::Text("16".to_string()));
+    }
+
+    #[test]
+    fn decode_binary_unknown_utf8_text_decodes_as_text() {
+        let v = decode_binary(b"hello", &Type::UNKNOWN, 0).unwrap();
+        assert_eq!(v, Value::Text("hello".to_string()));
+    }
+
+    #[test]
+    fn decode_binary_unknown_invalid_utf8_reports_three_bytes_for_e228a1() {
+        let err = decode_binary(b"\xE2\x28\xA1", &Type::UNKNOWN, 0).unwrap_err();
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "22021");
+                assert_eq!(
+                    info.message,
+                    "invalid input syntax for parameter $1 (unknown): invalid byte sequence for encoding \"UTF8\": 0xe2 0x28 0xa1"
+                );
+            }
+            other => panic!("expected user error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_binary_unknown_invalid_utf8_reports_two_bytes_for_c27f() {
+        let err = decode_binary(b"\xC2\x7F", &Type::UNKNOWN, 0).unwrap_err();
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "22021");
+                assert_eq!(
+                    info.message,
+                    "invalid input syntax for parameter $1 (unknown): invalid byte sequence for encoding \"UTF8\": 0xc2 0x7f"
+                );
+            }
+            other => panic!("expected user error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_binary_unknown_invalid_utf8_reports_single_byte_for_fffe() {
+        let err = decode_binary(b"\xFF\xFE", &Type::UNKNOWN, 0).unwrap_err();
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "22021");
+                assert_eq!(
+                    info.message,
+                    "invalid input syntax for parameter $1 (unknown): invalid byte sequence for encoding \"UTF8\": 0xff"
+                );
+            }
+            other => panic!("expected user error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_binary_unknown_invalid_utf8_reports_all_remaining_for_f09f() {
+        let err = decode_binary(b"\xF0\x9F", &Type::UNKNOWN, 0).unwrap_err();
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "22021");
+                assert_eq!(
+                    info.message,
+                    "invalid input syntax for parameter $1 (unknown): invalid byte sequence for encoding \"UTF8\": 0xf0 0x9f"
+                );
+            }
+            other => panic!("expected user error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_binary_unknown_invalid_utf8_reports_single_error_byte_after_valid_prefix() {
+        let err = decode_binary(b"a\xFF\xFEb", &Type::UNKNOWN, 0).unwrap_err();
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "22021");
+                assert_eq!(
+                    info.message,
+                    "invalid input syntax for parameter $1 (unknown): invalid byte sequence for encoding \"UTF8\": 0xff"
+                );
+            }
+            other => panic!("expected user error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_binary_unknown_reports_nul_error_before_utf8_error() {
+        let err = decode_binary(b"\x00\x85", &Type::UNKNOWN, 0).unwrap_err();
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "22021");
+                assert_eq!(
+                    info.message,
+                    "invalid input syntax for parameter $1 (unknown): invalid byte sequence for encoding \"UTF8\": 0x00"
+                );
+            }
+            other => panic!("expected user error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_binary_unknown_reports_utf8_error_before_nul_error() {
+        let err = decode_binary(b"\xFF\x00", &Type::UNKNOWN, 0).unwrap_err();
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "22021");
+                assert_eq!(
+                    info.message,
+                    "invalid input syntax for parameter $1 (unknown): invalid byte sequence for encoding \"UTF8\": 0xff"
+                );
+            }
+            other => panic!("expected user error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_binary_unknown_rejects_single_nul_byte() {
+        let err = decode_binary(b"\x00", &Type::UNKNOWN, 0).unwrap_err();
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "22021");
+                assert_eq!(
+                    info.message,
+                    "invalid input syntax for parameter $1 (unknown): invalid byte sequence for encoding \"UTF8\": 0x00"
+                );
+            }
+            other => panic!("expected user error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_binary_unknown_rejects_nul_bytes() {
+        let err = decode_binary(b"hi\x00there", &Type::UNKNOWN, 0).unwrap_err();
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "22021");
+                assert_eq!(
+                    info.message,
+                    "invalid input syntax for parameter $1 (unknown): invalid byte sequence for encoding \"UTF8\": 0x00"
+                );
+            }
+            other => panic!("expected user error, got {other:?}"),
         }
     }
 }
