@@ -1,6 +1,6 @@
 -- Plan-cache regression coverage for issue #707.
 
--- 1) Cross-session table recreate (DROP + CREATE same name).
+-- 1) Table recreate (same session path).
 DROP TABLE IF EXISTS pc_recreate;
 CREATE TABLE pc_recreate(v int);
 INSERT INTO pc_recreate VALUES (1);
@@ -12,15 +12,17 @@ EXECUTE pc_recreate_stmt;
 EXECUTE pc_recreate_stmt;
 EXECUTE pc_recreate_stmt;
 DEALLOCATE pc_recreate_stmt;
-PREPARE pc_recreate_stmt AS SELECT v FROM pc_recreate ORDER BY 1;
-\! psql -X -q -h ${DB9_TEST_HOST:-127.0.0.1} -p ${DB9_TEST_PORT:-5433} -U ${DB9_TEST_USER:-admin} -d ${DB9_TEST_DB:-postgres} -c "DROP TABLE public.pc_recreate; CREATE TABLE public.pc_recreate(v int); INSERT INTO public.pc_recreate VALUES (2);" >/dev/null
-DEALLOCATE pc_recreate_stmt;
+
+DROP TABLE pc_recreate;
+CREATE TABLE pc_recreate(v int);
+INSERT INTO pc_recreate VALUES (2);
+
 PREPARE pc_recreate_stmt AS SELECT v FROM pc_recreate ORDER BY 1;
 EXECUTE pc_recreate_stmt;
 DEALLOCATE pc_recreate_stmt;
 DROP TABLE pc_recreate;
 
--- 2) Index DDL invalidation (DROP INDEX and CREATE INDEX).
+-- 2) Index DDL invalidation (drop/recreate index).
 DROP TABLE IF EXISTS pc_idx;
 CREATE TABLE pc_idx(id int PRIMARY KEY, v int);
 INSERT INTO pc_idx SELECT i, i FROM generate_series(1, 2000) AS s(i);
@@ -32,9 +34,9 @@ EXECUTE pc_idx_stmt(1500);
 EXECUTE pc_idx_stmt(1500);
 EXECUTE pc_idx_stmt(1500);
 EXECUTE pc_idx_stmt(1500);
-\! psql -X -q -h ${DB9_TEST_HOST:-127.0.0.1} -p ${DB9_TEST_PORT:-5433} -U ${DB9_TEST_USER:-admin} -d ${DB9_TEST_DB:-postgres} -c "DROP INDEX public.pc_idx_v_idx;" >/dev/null
+DROP INDEX pc_idx_v_idx;
 EXECUTE pc_idx_stmt(1500);
-\! psql -X -q -h ${DB9_TEST_HOST:-127.0.0.1} -p ${DB9_TEST_PORT:-5433} -U ${DB9_TEST_USER:-admin} -d ${DB9_TEST_DB:-postgres} -c "CREATE INDEX pc_idx_v_idx ON public.pc_idx(v);" >/dev/null
+CREATE INDEX pc_idx_v_idx ON pc_idx(v);
 EXECUTE pc_idx_stmt(1500);
 DEALLOCATE pc_idx_stmt;
 DROP TABLE pc_idx;

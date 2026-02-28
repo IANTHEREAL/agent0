@@ -139,3 +139,34 @@ pub(crate) async fn execute_drop_sequence(
         tag: "DROP SEQUENCE",
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_minmax;
+    use sqlparser::ast::{Expr, MinMaxValue, Value};
+
+    fn int_expr(n: &str) -> Expr {
+        Expr::Value(Value::Number(n.to_string(), false))
+    }
+
+    #[test]
+    fn parse_minmax_handles_empty_and_none() {
+        assert_eq!(parse_minmax(&MinMaxValue::Empty).unwrap(), None);
+        assert_eq!(parse_minmax(&MinMaxValue::None).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_minmax_parses_numeric_expression() {
+        let v = MinMaxValue::Some(int_expr("123"));
+        assert_eq!(parse_minmax(&v).unwrap(), Some(123));
+
+        let v = MinMaxValue::Some(int_expr("-5"));
+        assert_eq!(parse_minmax(&v).unwrap(), Some(-5));
+    }
+
+    #[test]
+    fn parse_minmax_rejects_non_integer_expression() {
+        let v = MinMaxValue::Some(Expr::Value(Value::SingleQuotedString("x".to_string())));
+        assert!(parse_minmax(&v).is_err());
+    }
+}

@@ -1,13 +1,13 @@
-DROP TABLE
-CREATE TABLE
-INSERT 3
 name
 Alice
+(1 row)
 name
 Alice
-name,role
-Alice,admin
-Bob,user
+(1 row)
+name|role
+Alice|admin
+Bob|user
+(2 rows)
 name
 Alice
-DROP TABLE
+(1 row)

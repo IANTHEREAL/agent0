@@ -1,7 +1,8 @@
 -- Full-Text Search (FTS) MVP Tests
 
 -- Test to_tsvector with single argument
-SELECT to_tsvector('The quick brown fox');
+-- Use explicit config to keep output deterministic regardless of session default_tsc.
+SELECT to_tsvector('english', 'The quick brown fox');
 
 -- Test to_tsvector with config argument (config is ignored in MVP)
 SELECT to_tsvector('english', 'Hello World');

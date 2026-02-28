@@ -19,7 +19,7 @@ DO $$
 DECLARE
     saw_session_a BOOLEAN := FALSE;
 BEGIN
-    FOR i IN 1..1000 LOOP
+    FOR i IN 1..5000 LOOP
         IF pg_try_advisory_lock(91096) THEN
             PERFORM pg_advisory_unlock(91096);
             IF saw_session_a THEN

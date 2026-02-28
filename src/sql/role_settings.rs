@@ -231,3 +231,158 @@ pub(crate) async fn list_db_role_settings(txn: &mut Transaction) -> Result<Vec<D
     });
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_roundtrip_and_role_prefix_shape() {
+        let key = key_for("Alice", 42);
+        let (role, db_oid) = decode_key(&key).expect("decode should succeed");
+        assert_eq!(role, "Alice");
+        assert_eq!(db_oid, 42);
+
+        let prefix = role_prefix("Alice");
+        assert!(key.starts_with(&prefix));
+    }
+
+    #[test]
+    fn key_uses_big_endian_database_oid_and_expected_separator() {
+        let key_small = key_for("alice", 1);
+        let key_big = key_for("alice", 2);
+        assert!(key_small < key_big);
+
+        let role_end = DB_ROLE_SETTING_KEY_PREFIX.len() + "alice".len();
+        assert_eq!(key_small[role_end], ROLE_SEPARATOR);
+
+        let db_bytes = &key_small[(role_end + 1)..];
+        assert_eq!(db_bytes, &1u32.to_be_bytes());
+    }
+
+    #[test]
+    fn decode_key_rejects_invalid_shapes() {
+        let mut bad_prefix = b"_bad_prefix_".to_vec();
+        bad_prefix.extend_from_slice(b"alice\0");
+        bad_prefix.extend_from_slice(&1u32.to_be_bytes());
+        assert!(decode_key(&bad_prefix)
+            .unwrap_err()
+            .to_string()
+            .contains("key prefix"));
+
+        let mut no_sep = DB_ROLE_SETTING_KEY_PREFIX.to_vec();
+        no_sep.extend_from_slice(b"alice");
+        no_sep.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode_key(&no_sep)
+            .unwrap_err()
+            .to_string()
+            .contains("separator"));
+
+        let mut empty_role = DB_ROLE_SETTING_KEY_PREFIX.to_vec();
+        empty_role.push(ROLE_SEPARATOR);
+        empty_role.extend_from_slice(&1u32.to_be_bytes());
+        assert!(decode_key(&empty_role)
+            .unwrap_err()
+            .to_string()
+            .contains("role name"));
+
+        let mut bad_oid_len = DB_ROLE_SETTING_KEY_PREFIX.to_vec();
+        bad_oid_len.extend_from_slice(b"alice");
+        bad_oid_len.push(ROLE_SEPARATOR);
+        bad_oid_len.extend_from_slice(&[0x01, 0x02]);
+        assert!(decode_key(&bad_oid_len)
+            .unwrap_err()
+            .to_string()
+            .contains("database oid"));
+
+        let mut bad_utf8 = DB_ROLE_SETTING_KEY_PREFIX.to_vec();
+        bad_utf8.extend_from_slice(&[0xFF, 0xFE]);
+        bad_utf8.push(ROLE_SEPARATOR);
+        bad_utf8.extend_from_slice(&1u32.to_be_bytes());
+        assert!(decode_key(&bad_utf8)
+            .unwrap_err()
+            .to_string()
+            .contains("encoding"));
+    }
+
+    #[test]
+    fn normalize_setting_name_trims_and_lowercases() {
+        assert_eq!(normalize_setting_name("  SEARCH_PATH "), "search_path");
+        assert_eq!(normalize_setting_name(""), "");
+        assert_eq!(normalize_setting_name("  "), "");
+    }
+
+    #[test]
+    fn remove_setting_is_case_insensitive_and_prefix_exact() {
+        let mut setconfig = vec![
+            "search_path=public".to_string(),
+            "SEARCH_PATH=pg_catalog".to_string(),
+            "work_mem=64MB".to_string(),
+            "search_path_extra=x".to_string(),
+        ];
+
+        remove_setting(&mut setconfig, " Search_Path ");
+        assert_eq!(
+            setconfig,
+            vec![
+                "work_mem=64MB".to_string(),
+                "search_path_extra=x".to_string()
+            ]
+        );
+
+        // No '=' means this is not a valid key-value entry and should be preserved.
+        setconfig.push("search_path".to_string());
+        remove_setting(&mut setconfig, "search_path");
+        assert!(setconfig.contains(&"search_path".to_string()));
+
+        // Empty setting name should be ignored.
+        let before = setconfig.clone();
+        remove_setting(&mut setconfig, "   ");
+        assert_eq!(setconfig, before);
+    }
+
+    #[test]
+    fn decode_key_with_extra_separator_in_role_rejects_bad_oid_shape() {
+        let mut key = DB_ROLE_SETTING_KEY_PREFIX.to_vec();
+        key.extend_from_slice(b"role");
+        key.push(ROLE_SEPARATOR);
+        key.extend_from_slice(b"suffix");
+        key.push(ROLE_SEPARATOR);
+        key.extend_from_slice(&1u32.to_be_bytes());
+
+        assert!(decode_key(&key)
+            .unwrap_err()
+            .to_string()
+            .contains("database oid"));
+    }
+
+    #[test]
+    fn decode_key_accepts_embedded_zero_inside_role_and_uses_first_separator() {
+        // role bytes: "ab\0cd", then separator, then u32 oid
+        let mut key = DB_ROLE_SETTING_KEY_PREFIX.to_vec();
+        key.extend_from_slice(b"ab");
+        key.push(ROLE_SEPARATOR);
+        key.extend_from_slice(b"cd");
+        key.push(ROLE_SEPARATOR);
+        key.extend_from_slice(&9u32.to_be_bytes());
+
+        // decode_key uses the first separator as the role terminator, so
+        // database bytes become invalid shape and must fail deterministically.
+        let err = decode_key(&key).unwrap_err().to_string();
+        assert!(err.contains("database oid"));
+    }
+
+    #[test]
+    fn remove_setting_only_removes_exact_key_prefix() {
+        let mut setconfig = vec![
+            "work_mem=16MB".to_string(),
+            "work_memx=32MB".to_string(),
+            "xwork_mem=64MB".to_string(),
+        ];
+        remove_setting(&mut setconfig, "work_mem");
+        assert_eq!(
+            setconfig,
+            vec!["work_memx=32MB".to_string(), "xwork_mem=64MB".to_string()]
+        );
+    }
+}

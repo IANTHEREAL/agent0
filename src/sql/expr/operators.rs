@@ -617,6 +617,13 @@ fn mul_values(left: Value, right: Value) -> Result<Value> {
             let scalar = *s as f64;
             return Ok(Value::Vector(v.iter().map(|x| x * scalar).collect()));
         }
+        (Value::Vector(v), Value::Numeric(s)) | (Value::Numeric(s), Value::Vector(v)) => {
+            use rust_decimal::prelude::ToPrimitive;
+            let scalar = s
+                .to_f64()
+                .ok_or_else(|| anyhow!("numeric value out of range"))?;
+            return Ok(Value::Vector(v.iter().map(|x| x * scalar).collect()));
+        }
         _ => {}
     }
 

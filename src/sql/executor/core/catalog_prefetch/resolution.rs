@@ -7,13 +7,46 @@ use crate::sql::names;
 use crate::sql::table_functions::infer_system_virtual_table_function_schema;
 use crate::storage::TikvStore;
 use anyhow::Result;
-use sqlparser::ast::{ObjectName, Query};
+use sqlparser::ast::{Expr, ObjectName, Query, Value as SqlValue};
 use std::collections::{HashMap, HashSet};
 use tikv_client::Transaction;
 
 use super::extraction::{
     extract_scalar_function_names, extract_table_function_calls, extract_table_names,
 };
+
+fn literal_expr_to_text(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Value(SqlValue::SingleQuotedString(s))
+        | Expr::Value(SqlValue::DoubleQuotedString(s)) => Some(s.clone()),
+        Expr::Cast { expr, .. } => literal_expr_to_text(expr),
+        _ => None,
+    }
+}
+
+fn literal_expr_to_bool(expr: &Expr) -> Option<bool> {
+    match expr {
+        Expr::Value(SqlValue::Boolean(b)) => Some(*b),
+        Expr::Value(SqlValue::SingleQuotedString(s))
+        | Expr::Value(SqlValue::DoubleQuotedString(s)) => match s.to_ascii_lowercase().as_str() {
+            "true" | "t" | "1" | "yes" | "y" => Some(true),
+            "false" | "f" | "0" | "no" | "n" => Some(false),
+            _ => None,
+        },
+        Expr::Cast { expr, .. } => literal_expr_to_bool(expr),
+        _ => None,
+    }
+}
+
+fn literal_expr_to_char(expr: &Expr) -> Option<char> {
+    let s = literal_expr_to_text(expr)?;
+    let mut chars = s.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(ch)
+}
 
 #[cfg(feature = "parquet")]
 fn parquet_fallback_table_function_schema() -> TableSchema {
@@ -395,41 +428,7 @@ pub(super) async fn prefetch_table_function_schemas(
     snapshot: &mut CatalogSnapshot,
 ) -> Result<()> {
     use crate::extensions::{fs, http, EXTENSIONS_SCHEMA};
-    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Value as SqlValue};
-
-    fn expr_to_text(expr: &Expr) -> Option<String> {
-        match expr {
-            Expr::Value(SqlValue::SingleQuotedString(s))
-            | Expr::Value(SqlValue::DoubleQuotedString(s)) => Some(s.clone()),
-            Expr::Cast { expr, .. } => expr_to_text(expr),
-            _ => None,
-        }
-    }
-
-    fn expr_to_bool(expr: &Expr) -> Option<bool> {
-        match expr {
-            Expr::Value(SqlValue::Boolean(b)) => Some(*b),
-            Expr::Value(SqlValue::SingleQuotedString(s))
-            | Expr::Value(SqlValue::DoubleQuotedString(s)) => match s.to_ascii_lowercase().as_str()
-            {
-                "true" | "t" | "1" | "yes" | "y" => Some(true),
-                "false" | "f" | "0" | "no" | "n" => Some(false),
-                _ => None,
-            },
-            Expr::Cast { expr, .. } => expr_to_bool(expr),
-            _ => None,
-        }
-    }
-
-    fn expr_to_char(expr: &Expr) -> Option<char> {
-        let s = expr_to_text(expr)?;
-        let mut chars = s.chars();
-        let ch = chars.next()?;
-        if chars.next().is_some() {
-            return None;
-        }
-        Some(ch)
-    }
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr};
 
     let mut seen: HashSet<String> = HashSet::new();
     for call in extract_table_function_calls(query) {
@@ -477,7 +476,7 @@ pub(super) async fn prefetch_table_function_schemas(
 
                 // Parse args (constants only).
                 let path = match call.args.first() {
-                    Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => expr_to_text(e),
+                    Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => literal_expr_to_text(e),
                     _ => None,
                 };
                 let Some(path) = path else {
@@ -502,19 +501,19 @@ pub(super) async fn prefetch_table_function_schemas(
                     let param = names::normalize_ident(name).to_ascii_lowercase();
                     match param.as_str() {
                         "format" => {
-                            format = expr_to_text(e);
+                            format = literal_expr_to_text(e);
                         }
                         "delimiter" => {
-                            delimiter = expr_to_char(e);
+                            delimiter = literal_expr_to_char(e);
                         }
                         "header" => {
-                            header = expr_to_bool(e);
+                            header = literal_expr_to_bool(e);
                         }
                         "recursive" => {
-                            recursive = expr_to_bool(e);
+                            recursive = literal_expr_to_bool(e);
                         }
                         "exclude" => {
-                            exclude = expr_to_text(e);
+                            exclude = literal_expr_to_text(e);
                         }
                         _ => {}
                     }
@@ -562,7 +561,9 @@ pub(super) async fn prefetch_table_function_schemas(
                     continue;
                 }
                 let url = match call.args.first() {
-                    Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => expr_to_text(e),
+                    Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => {
+                        literal_expr_to_text(e)
+                    }
                     _ => None,
                 };
                 let Some(url) = url else {
@@ -698,4 +699,194 @@ pub(super) async fn build_catalog_snapshot_inner(
     }
 
     Ok(snapshot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        infer_returns_table_schema, literal_expr_to_bool, literal_expr_to_char,
+        literal_expr_to_text,
+    };
+    use crate::model::DataType;
+    use sqlparser::ast::{DataType as SqlDataType, Expr, Value as SqlValue};
+
+    #[test]
+    fn infer_returns_table_schema_parses_common_types() {
+        let schema = infer_returns_table_schema(
+            "table(id int, name text, created_at timestamp, active boolean)",
+        )
+        .expect("schema");
+        assert_eq!(schema.columns.len(), 4);
+        assert_eq!(schema.columns[0].name, "id");
+        assert!(matches!(schema.columns[0].data_type, DataType::Int32));
+        assert!(matches!(schema.columns[1].data_type, DataType::Text));
+        assert!(matches!(schema.columns[2].data_type, DataType::Timestamp));
+        assert!(matches!(schema.columns[3].data_type, DataType::Boolean));
+    }
+
+    #[test]
+    fn infer_returns_table_schema_handles_numeric_temporal_and_vector() {
+        let schema = infer_returns_table_schema(
+            "table(n numeric, d date, tm time, tz timestamptz, i interval, v vector(3))",
+        )
+        .expect("schema");
+        assert_eq!(schema.columns.len(), 6);
+        assert!(matches!(
+            schema.columns[0].data_type,
+            DataType::Numeric {
+                precision: None,
+                scale: None
+            }
+        ));
+        assert!(matches!(schema.columns[1].data_type, DataType::Date));
+        assert!(matches!(schema.columns[2].data_type, DataType::Time));
+        assert!(matches!(schema.columns[3].data_type, DataType::TimestampTz));
+        assert!(matches!(schema.columns[4].data_type, DataType::Interval));
+        assert!(matches!(schema.columns[5].data_type, DataType::Vector(3)));
+    }
+
+    #[test]
+    fn infer_returns_table_schema_handles_json_uuid_bytes_fts_and_unknown() {
+        let schema = infer_returns_table_schema(
+            "table(u uuid, b bytea, j json, jb jsonb, tv tsvector, tq tsquery, x customtype)",
+        )
+        .expect("schema");
+        assert_eq!(schema.columns.len(), 7);
+        assert!(matches!(schema.columns[0].data_type, DataType::Uuid));
+        assert!(matches!(schema.columns[1].data_type, DataType::Bytes));
+        assert!(matches!(schema.columns[2].data_type, DataType::Json));
+        assert!(matches!(schema.columns[3].data_type, DataType::Jsonb));
+        assert!(matches!(schema.columns[4].data_type, DataType::Tsvector));
+        assert!(matches!(schema.columns[5].data_type, DataType::Tsquery));
+        // Unknown type currently falls back to TEXT in this inference path.
+        assert!(matches!(schema.columns[6].data_type, DataType::Text));
+    }
+
+    #[test]
+    fn infer_returns_table_schema_rejects_non_table_signature_or_bad_columns() {
+        assert!(infer_returns_table_schema("setof public.t").is_none());
+        assert!(infer_returns_table_schema("table").is_none());
+        assert!(infer_returns_table_schema("table()").is_none());
+        assert!(infer_returns_table_schema("table(id)").is_none());
+    }
+
+    #[test]
+    fn infer_returns_table_schema_covers_type_aliases_and_defaults() {
+        let schema = infer_returns_table_schema(
+            "table(a integer, b int4, c smallint, d int2, e bigint, f int8, g float4, h float8, i double precision, j varchar, k character varying, l char, m character)",
+        )
+        .expect("schema");
+        assert_eq!(schema.columns.len(), 13);
+        for idx in [0usize, 1, 2, 3] {
+            assert!(matches!(schema.columns[idx].data_type, DataType::Int32));
+        }
+        assert!(matches!(schema.columns[4].data_type, DataType::Int64));
+        assert!(matches!(schema.columns[5].data_type, DataType::Int64));
+        for idx in [6usize, 7, 8] {
+            assert!(matches!(schema.columns[idx].data_type, DataType::Float64));
+        }
+        for idx in [9usize, 10, 11, 12] {
+            assert!(matches!(schema.columns[idx].data_type, DataType::Text));
+        }
+    }
+
+    #[test]
+    fn infer_returns_table_schema_vector_dimension_and_invalid_fallback() {
+        let schema = infer_returns_table_schema("table(v1 vector(8), v2 vector, v3 vector(x))")
+            .expect("schema");
+        assert_eq!(schema.columns.len(), 3);
+        assert!(matches!(schema.columns[0].data_type, DataType::Vector(8)));
+        assert!(matches!(schema.columns[1].data_type, DataType::Vector(0)));
+        assert!(matches!(schema.columns[2].data_type, DataType::Vector(0)));
+    }
+
+    #[test]
+    fn infer_returns_table_schema_expects_lowercase_input_contract() {
+        let schema = infer_returns_table_schema("table(id bool, n numeric, ts timestamptz)")
+            .expect("schema");
+        assert_eq!(schema.columns.len(), 3);
+        assert_eq!(schema.columns[0].name, "id");
+        assert!(matches!(schema.columns[0].data_type, DataType::Boolean));
+        assert!(matches!(
+            schema.columns[1].data_type,
+            DataType::Numeric {
+                precision: None,
+                scale: None
+            }
+        ));
+        assert!(matches!(schema.columns[2].data_type, DataType::TimestampTz));
+
+        // Caller contract: input is already normalized to lowercase.
+        assert!(infer_returns_table_schema("TABLE(id bool)").is_none());
+        assert!(infer_returns_table_schema(" TABLE (id int)").is_none());
+    }
+
+    #[test]
+    fn literal_expr_to_text_supports_quotes_and_casts() {
+        let direct = Expr::Value(SqlValue::SingleQuotedString("abc".to_string()));
+        assert_eq!(literal_expr_to_text(&direct), Some("abc".to_string()));
+
+        let casted = Expr::Cast {
+            expr: Box::new(Expr::Value(SqlValue::DoubleQuotedString("xyz".to_string()))),
+            data_type: SqlDataType::Text,
+            format: None,
+        };
+        assert_eq!(literal_expr_to_text(&casted), Some("xyz".to_string()));
+
+        let non_literal = Expr::Identifier("v".into());
+        assert_eq!(literal_expr_to_text(&non_literal), None);
+    }
+
+    #[test]
+    fn literal_expr_to_bool_accepts_pg_like_literals_and_rejects_others() {
+        for (expr, expected) in [
+            (Expr::Value(SqlValue::Boolean(true)), Some(true)),
+            (
+                Expr::Value(SqlValue::SingleQuotedString("YES".to_string())),
+                Some(true),
+            ),
+            (
+                Expr::Value(SqlValue::SingleQuotedString("0".to_string())),
+                Some(false),
+            ),
+            (
+                Expr::Cast {
+                    expr: Box::new(Expr::Value(SqlValue::DoubleQuotedString("n".to_string()))),
+                    data_type: SqlDataType::Boolean,
+                    format: None,
+                },
+                Some(false),
+            ),
+            (
+                Expr::Value(SqlValue::SingleQuotedString("maybe".to_string())),
+                None,
+            ),
+        ] {
+            assert_eq!(literal_expr_to_bool(&expr), expected, "expr={expr:?}");
+        }
+    }
+
+    #[test]
+    fn literal_expr_to_char_requires_single_character() {
+        assert_eq!(
+            literal_expr_to_char(&Expr::Value(SqlValue::SingleQuotedString(",".to_string()))),
+            Some(',')
+        );
+        assert_eq!(
+            literal_expr_to_char(&Expr::Cast {
+                expr: Box::new(Expr::Value(SqlValue::SingleQuotedString("|".to_string()))),
+                data_type: SqlDataType::Char(None),
+                format: None,
+            }),
+            Some('|')
+        );
+        assert_eq!(
+            literal_expr_to_char(&Expr::Value(SqlValue::SingleQuotedString("".to_string()))),
+            None
+        );
+        assert_eq!(
+            literal_expr_to_char(&Expr::Value(SqlValue::SingleQuotedString("ab".to_string()))),
+            None
+        );
+    }
 }

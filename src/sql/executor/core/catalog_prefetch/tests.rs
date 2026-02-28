@@ -219,3 +219,59 @@ fn test_extract_scalar_functions_from_statement() {
     assert!(keys.contains("my_udf"));
     assert!(keys.contains("is_large"));
 }
+
+#[test]
+fn test_extract_table_function_calls_basic() {
+    let query = parse_query("SELECT * FROM generate_series(1, 3)");
+    let calls = extract_table_function_calls(&query);
+    assert_eq!(calls.len(), 1, "expected one table function, got {calls:?}");
+    let call = &calls[0];
+    assert_eq!(call.name_parts, vec!["generate_series".to_string()]);
+    assert_eq!(call.args.len(), 2);
+    assert!(call.key.contains("generate_series"));
+}
+
+#[test]
+fn test_extract_table_function_calls_schema_qualified() {
+    let query = parse_query("SELECT * FROM pg_catalog.generate_series(1, 2)");
+    let calls = extract_table_function_calls(&query);
+    assert_eq!(calls.len(), 1);
+    let call = &calls[0];
+    assert_eq!(
+        call.name_parts,
+        vec!["pg_catalog".to_string(), "generate_series".to_string()]
+    );
+    assert!(call.key.contains("generate_series"));
+}
+
+#[test]
+fn test_extract_table_function_calls_skips_regular_tables() {
+    let query = parse_query(
+        "SELECT * FROM users u JOIN generate_series(1, 2) g(i) ON true JOIN orders o ON true",
+    );
+    let calls = extract_table_function_calls(&query);
+    assert_eq!(calls.len(), 1, "regular tables must not be collected");
+    assert_eq!(calls[0].name_parts, vec!["generate_series".to_string()]);
+}
+
+#[test]
+fn test_extract_scalar_functions_dedup_with_qualified_names() {
+    let query = parse_query(
+        "SELECT public.my_udf(v), public.my_udf(v + 1), pg_catalog.lower(name), lower(name) FROM t",
+    );
+    let names = extract_scalar_function_names(&query);
+    let keys: HashSet<String> = names
+        .iter()
+        .map(|name| {
+            name.0
+                .iter()
+                .map(crate::sql::names::normalize_ident)
+                .collect::<Vec<_>>()
+                .join(".")
+        })
+        .collect();
+    assert!(keys.contains("public.my_udf"));
+    assert!(keys.contains("pg_catalog.lower"));
+    assert!(keys.contains("lower"));
+    assert_eq!(keys.iter().filter(|k| *k == "public.my_udf").count(), 1);
+}

@@ -217,8 +217,7 @@ describe('Prisma Transactions & Isolation [db9-server]', () => {
       expect(user).not.toBeNull();
     });
 
-    // skip: SERIALIZABLE not supported (TiKV provides Snapshot Isolation) — tracked in #840
-    it.skip('should handle SERIALIZABLE isolation', async () => {
+    it('should handle SERIALIZABLE isolation', async () => {
       await prisma.$transaction(
         async (tx) => {
           await tx.prismaUser.create({
@@ -236,8 +235,7 @@ describe('Prisma Transactions & Isolation [db9-server]', () => {
   });
 
   describe('nested writes (implicit transactions)', () => {
-    // skip: nested create (implicit multi-statement transaction) not supported — tracked in #840
-    it.skip('should handle nested create', async () => {
+    it('should handle nested create', async () => {
       await prisma.$executeRawUnsafe(`
         CREATE TABLE IF NOT EXISTS prisma_posts (
           id SERIAL PRIMARY KEY,

@@ -1,0 +1,62 @@
+version: 1
+description: ORM scenario operation taxonomy for capability-level deep coverage.
+
+orms:
+  - typeorm
+  - prisma
+  - sequelize
+  - knex
+  - drizzle
+  - kysely
+  - sqlalchemy
+  - dify_sqlalchemy
+  - gorm
+
+capability_operations:
+  ddl_lifecycle:
+    - create_table
+    - alter_table
+    - drop_table
+    - create_index
+    - drop_index
+    - create_schema
+    - drop_schema
+    - migrate
+  crud_basic:
+    - insert
+    - select
+    - update
+    - delete
+    - upsert
+    - returning
+    - batch_write
+  transaction:
+    - begin_commit
+    - rollback
+    - savepoint
+    - nested_tx
+    - isolation_level
+  prepared_statement:
+    - positional_bind
+    - named_bind
+    - repeated_execute
+    - prepared_metadata
+  json_and_array:
+    - json_insert
+    - json_query
+    - json_update
+    - array_insert
+    - array_query
+  join_and_subquery:
+    - inner_join
+    - left_join
+    - group_having
+    - subquery
+    - cte
+    - window
+  vector:
+    - vector_column
+    - vector_insert
+    - vector_distance
+    - vector_index
+    - vector_filter

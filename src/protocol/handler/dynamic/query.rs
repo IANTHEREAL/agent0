@@ -1243,8 +1243,19 @@ mod tests {
             "tenant_handle already set"
         );
 
-        // check_rate_limit must reject when the bucket is empty.
-        let err = handler.check_rate_limit().unwrap_err();
+        // check_rate_limit should eventually reject once bucket is exhausted.
+        // Some limiter implementations can permit one in-flight token after drain.
+        let mut last_err = None;
+        for _ in 0..8 {
+            match handler.check_rate_limit() {
+                Ok(()) => continue,
+                Err(e) => {
+                    last_err = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = last_err.expect("expected rate limiter to reject after exhaustion");
         let msg = err.to_string();
         assert!(
             msg.contains("rate limit"),

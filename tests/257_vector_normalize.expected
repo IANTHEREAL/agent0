@@ -8,6 +8,7 @@ l2_normalize
 [0,0]
 (1 row)
 l2_normalize
+NULL
 (1 row)
 -- db9 divergence: vector_norm precision differs from pgvector (PG: 1.000000023841858, db9: 1)
 vector_norm

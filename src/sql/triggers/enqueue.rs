@@ -218,3 +218,141 @@ fn parse_new_assignment(stmt: &str) -> Option<(&str, &str)> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ColumnDef, DataType, TableSchema, Value};
+
+    fn test_schema() -> TableSchema {
+        TableSchema {
+            name: "t".to_string(),
+            table_id: 1,
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+                ColumnDef {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![0],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+            from_alias: None,
+        }
+    }
+
+    #[test]
+    fn async_keyword_detection_is_case_insensitive() {
+        assert!(trigger_body_needs_async("PERFORM http_get('x')"));
+        assert!(trigger_body_needs_async("select EXTENSIONS.HTTP('/x')"));
+        assert!(!trigger_body_needs_async("PERFORM now()"));
+    }
+
+    #[test]
+    fn parse_new_assignment_handles_assignment_syntaxes_and_ignores_comparisons() {
+        assert_eq!(
+            parse_new_assignment("NEW.id := 1"),
+            Some(("id", "1"))
+        );
+        assert_eq!(
+            parse_new_assignment("new.name = 'x'"),
+            Some(("name", "'x'"))
+        );
+
+        assert_eq!(parse_new_assignment("NEW.id >= 1"), None);
+        assert_eq!(parse_new_assignment("NEW.id != 1"), None);
+        assert_eq!(parse_new_assignment("id = 1"), None);
+    }
+
+    #[test]
+    fn strip_prefix_ignore_ascii_case_works() {
+        assert_eq!(
+            strip_prefix_ignore_ascii_case("PeRfOrM 1", "PERFORM "),
+            Some("1")
+        );
+        assert!(strip_prefix_ignore_ascii_case("SELECT 1", "PERFORM ").is_none());
+    }
+
+    #[test]
+    fn flatten_trigger_statement_covers_core_paths() {
+        let schema = test_schema();
+        let new_values = vec![Value::Int32(7), Value::Text("neo".to_string())];
+        let old_row = crate::model::Row::new(vec![Value::Int32(1), Value::Text("old".to_string())]);
+
+        assert_eq!(
+            flatten_trigger_statement("RETURN NEW;", &schema, &new_values, Some(&old_row)),
+            None
+        );
+        assert_eq!(
+            flatten_trigger_statement("NULL;", &schema, &new_values, Some(&old_row)),
+            None
+        );
+        assert_eq!(
+            flatten_trigger_statement(
+                "NEW.name := 'x';",
+                &schema,
+                &new_values,
+                Some(&old_row)
+            ),
+            None
+        );
+
+        let sql = flatten_trigger_statement("PERFORM 1 + 2;", &schema, &new_values, Some(&old_row))
+            .expect("perform should rewrite");
+        assert_eq!(sql, "SELECT 1 + 2");
+
+        let sql = flatten_trigger_statement(
+            "SELECT NEW.id, NEW.name;",
+            &schema,
+            &new_values,
+            Some(&old_row),
+        )
+        .expect("statement should be preserved");
+        assert!(sql.contains("7"));
+        assert!(sql.contains("neo"));
+    }
+
+    #[test]
+    fn flatten_trigger_body_to_sql_joins_statements_and_skips_non_sql() {
+        let schema = test_schema();
+        let new_row = crate::model::Row::new(vec![Value::Int32(42), Value::Text("alice".to_string())]);
+        let old_row = crate::model::Row::new(vec![Value::Int32(41), Value::Text("bob".to_string())]);
+
+        let body = r#"
+BEGIN
+  -- comment
+  PERFORM 1;
+  NEW.name := 'x';
+  SELECT NEW.id, OLD.name;
+  RETURN NEW;
+END;
+"#;
+
+        let flattened = flatten_trigger_body_to_sql(body, &schema, Some(&new_row), Some(&old_row))
+            .expect("should produce sql");
+        assert!(flattened.contains("SELECT 1"));
+        assert!(flattened.contains("42"));
+        assert!(flattened.contains("bob"));
+        assert!(!flattened.to_ascii_uppercase().contains("RETURN NEW"));
+    }
+}

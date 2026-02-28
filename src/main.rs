@@ -447,7 +447,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_accept_loop_rejects_over_limit() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                // Some sandboxed/instrumented environments deny local binds.
+                // Skip rather than make unrelated coverage jobs flaky.
+                return;
+            }
+            Err(e) => panic!("failed to bind test listener: {e}"),
+        };
         let addr = listener.local_addr().unwrap();
         let max_connections: u32 = 2;
         let semaphore = Arc::new(Semaphore::new(max_connections as usize));

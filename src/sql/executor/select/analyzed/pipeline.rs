@@ -761,3 +761,191 @@ fn bridge_function_args(args: &[EvaluatedTableFunctionArg]) -> Vec<FunctionArg> 
 fn has_any_column_ref(expr: &TypedExpr) -> bool {
     visit_any(expr, |e| matches!(&e.kind, TypedExprKind::ColumnRef { .. }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        bridge_function_args, evaluate_table_function_args, has_any_column_ref,
+        EvaluatedTableFunctionArg,
+    };
+    use crate::model::{DataType, Row, Value};
+    use crate::sql::analyzer::types::{
+        BinaryOp, FunctionKind, ResolvedFunction, TypedExpr, TypedExprKind, TypedFunctionArg,
+    };
+    use crate::sql::query_context::QueryContext;
+    use crate::sql::types::CastContext;
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr};
+    use std::sync::Arc;
+
+    fn test_qctx() -> QueryContext {
+        QueryContext::new(
+            1,
+            Arc::from("testdb"),
+            Arc::from("testuser"),
+            0,
+            0,
+            Arc::from("UTC"),
+        )
+    }
+
+    #[test]
+    fn evaluate_table_function_args_evaluates_positional_and_named() {
+        let args = vec![
+            TypedFunctionArg::Positional(TypedExpr::new(
+                TypedExprKind::Constant(Value::Int32(7)),
+                DataType::Int32,
+            )),
+            TypedFunctionArg::Named {
+                name: "step".to_string(),
+                expr: TypedExpr::new(
+                    TypedExprKind::BinaryOp {
+                        left: Box::new(TypedExpr::new(
+                            TypedExprKind::Constant(Value::Int32(1)),
+                            DataType::Int32,
+                        )),
+                        op: BinaryOp::Add,
+                        right: Box::new(TypedExpr::new(
+                            TypedExprKind::Constant(Value::Int32(2)),
+                            DataType::Int32,
+                        )),
+                    },
+                    DataType::Int32,
+                ),
+            },
+        ];
+
+        let evaluated =
+            evaluate_table_function_args(&args, &Row::new(vec![]), &test_qctx()).unwrap();
+        assert_eq!(evaluated.len(), 2);
+        assert_eq!(evaluated[0].name, None);
+        assert_eq!(evaluated[0].value, Value::Int32(7));
+        assert_eq!(evaluated[1].name.as_deref(), Some("step"));
+        assert_eq!(evaluated[1].value, Value::Int32(3));
+    }
+
+    #[test]
+    fn evaluate_table_function_args_propagates_eval_error() {
+        let args = vec![TypedFunctionArg::Positional(TypedExpr::new(
+            TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: 0,
+                column_name: "missing".to_string(),
+            },
+            DataType::Int32,
+        ))];
+        assert!(evaluate_table_function_args(&args, &Row::new(vec![]), &test_qctx()).is_err());
+    }
+
+    #[test]
+    fn bridge_function_args_preserves_named_and_unnamed_shape() {
+        let evaluated = vec![
+            EvaluatedTableFunctionArg {
+                name: None,
+                value: Value::Int32(42),
+            },
+            EvaluatedTableFunctionArg {
+                name: Some("step".to_string()),
+                value: Value::Int32(5),
+            },
+        ];
+
+        let bridged = bridge_function_args(&evaluated);
+        assert_eq!(bridged.len(), 2);
+        match &bridged[0] {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                assert_eq!(expr.to_string(), "42");
+            }
+            other => panic!("expected unnamed arg, got {:?}", other),
+        }
+        match &bridged[1] {
+            FunctionArg::Named { name, arg } => {
+                assert_eq!(name.value, "step");
+                match arg {
+                    FunctionArgExpr::Expr(expr) => assert_eq!(expr.to_string(), "5"),
+                    _ => panic!("expected named expression arg"),
+                }
+            }
+            other => panic!("expected named arg, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bridge_function_args_handles_null_value() {
+        let evaluated = vec![EvaluatedTableFunctionArg {
+            name: None,
+            value: Value::Null,
+        }];
+        let bridged = bridge_function_args(&evaluated);
+        assert_eq!(bridged.len(), 1);
+        match &bridged[0] {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                assert_eq!(expr.to_string(), "NULL");
+            }
+            other => panic!("expected unnamed NULL arg, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn has_any_column_ref_detects_nested_column_reference() {
+        let expr = TypedExpr::new(
+            TypedExprKind::Cast {
+                expr: Box::new(TypedExpr::new(
+                    TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: 1,
+                        column_name: "c1".to_string(),
+                    },
+                    DataType::Int64,
+                )),
+                target_type: DataType::Text,
+                cast_context: CastContext::Implicit,
+            },
+            DataType::Text,
+        );
+        assert!(has_any_column_ref(&expr));
+    }
+
+    #[test]
+    fn has_any_column_ref_is_false_for_constant_tree() {
+        let expr = TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(TypedExpr::new(
+                    TypedExprKind::Constant(Value::Int32(10)),
+                    DataType::Int32,
+                )),
+                op: BinaryOp::Sub,
+                right: Box::new(TypedExpr::new(
+                    TypedExprKind::Constant(Value::Int32(3)),
+                    DataType::Int32,
+                )),
+            },
+            DataType::Int32,
+        );
+        assert!(!has_any_column_ref(&expr));
+    }
+
+    #[test]
+    fn has_any_column_ref_detects_reference_inside_function_call_args() {
+        let expr = TypedExpr::new(
+            TypedExprKind::FunctionCall {
+                func: ResolvedFunction {
+                    name: "abs".to_string(),
+                    kind: FunctionKind::Builtin,
+                    return_type: DataType::Int32,
+                },
+                args: vec![TypedExpr::new(
+                    TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: 0,
+                        column_name: "x".to_string(),
+                    },
+                    DataType::Int32,
+                )],
+                order_by: vec![],
+                filter: None,
+            },
+            DataType::Int32,
+        );
+        assert!(has_any_column_ref(&expr));
+    }
+}

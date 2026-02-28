@@ -1259,8 +1259,11 @@ async fn lookup_typname_by_oid(
 
 #[cfg(test)]
 mod tests {
-    use super::{advisory_lock_timeout, value_to_bool_strict, value_to_i64_strict};
-    use crate::model::Value;
+    use super::{
+        advisory_lock_timeout, find_text_column, value_to_bool_strict, value_to_i64,
+        value_to_i64_strict,
+    };
+    use crate::model::{ColumnDef, DataType, TableSchema, Value};
     use std::collections::HashMap;
     use std::time::Duration;
 
@@ -1296,11 +1299,69 @@ mod tests {
     }
 
     #[test]
+    fn test_advisory_lock_timeout_handles_missing_sources() {
+        assert_eq!(advisory_lock_timeout(None, None), None);
+        assert_eq!(
+            advisory_lock_timeout(Some(Duration::from_millis(1)), None),
+            Some(Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    fn test_advisory_lock_timeout_returns_none_when_lock_timeout_missing() {
+        let mut settings = HashMap::new();
+        settings.insert("statement_timeout".to_string(), "5s".to_string());
+        assert_eq!(advisory_lock_timeout(None, Some(&settings)), None);
+    }
+
+    #[test]
+    fn test_advisory_lock_timeout_parses_non_ms_unit_values() {
+        let mut settings = HashMap::new();
+        settings.insert("lock_timeout".to_string(), "2s".to_string());
+        assert_eq!(
+            advisory_lock_timeout(None, Some(&settings)),
+            Some(Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn test_advisory_lock_timeout_parses_minute_unit_values() {
+        let mut settings = HashMap::new();
+        settings.insert("lock_timeout".to_string(), "1min".to_string());
+        assert_eq!(
+            advisory_lock_timeout(None, Some(&settings)),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn test_advisory_lock_timeout_parses_plain_milliseconds_value() {
+        let mut settings = HashMap::new();
+        settings.insert("lock_timeout".to_string(), "2500".to_string());
+        assert_eq!(
+            advisory_lock_timeout(None, Some(&settings)),
+            Some(Duration::from_millis(2500))
+        );
+    }
+
+    #[test]
+    fn test_advisory_lock_timeout_keeps_zero_typed_timeout() {
+        let mut settings = HashMap::new();
+        settings.insert("lock_timeout".to_string(), "10s".to_string());
+        assert_eq!(
+            advisory_lock_timeout(Some(Duration::ZERO), Some(&settings)),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
     fn test_value_to_i64_strict_accepts_integer_text() {
         assert_eq!(
             value_to_i64_strict(&Value::Text("42".to_string()), "column_no").unwrap(),
             42
         );
+        assert_eq!(value_to_i64_strict(&Value::Int32(7), "column_no").unwrap(), 7);
+        assert_eq!(value_to_i64_strict(&Value::Int64(8), "column_no").unwrap(), 8);
     }
 
     #[test]
@@ -1314,6 +1375,25 @@ mod tests {
     }
 
     #[test]
+    fn test_value_to_i64_strict_error_mentions_argument_name() {
+        let err = value_to_i64_strict(&Value::Boolean(false), "column_no").unwrap_err();
+        assert!(err.to_string().contains("column_no"));
+    }
+
+    #[test]
+    fn test_value_to_i64_strict_accepts_negative_integer_text_with_spaces() {
+        assert_eq!(
+            value_to_i64_strict(&Value::Text("  -42 ".to_string()), "column_no").unwrap(),
+            -42
+        );
+    }
+
+    #[test]
+    fn test_value_to_i64_strict_rejects_null_value() {
+        assert!(value_to_i64_strict(&Value::Null, "column_no").is_err());
+    }
+
+    #[test]
     fn test_value_to_bool_strict_accepts_boolean() {
         assert!(value_to_bool_strict(&Value::Boolean(true), "pretty").unwrap());
     }
@@ -1321,5 +1401,115 @@ mod tests {
     #[test]
     fn test_value_to_bool_strict_rejects_int32() {
         assert!(value_to_bool_strict(&Value::Int32(1), "pretty").is_err());
+    }
+
+    #[test]
+    fn test_value_to_bool_strict_error_mentions_argument_name() {
+        let err = value_to_bool_strict(&Value::Text("true".to_string()), "pretty").unwrap_err();
+        assert!(err.to_string().contains("pretty"));
+    }
+
+    #[test]
+    fn test_value_to_bool_strict_rejects_null_value() {
+        assert!(value_to_bool_strict(&Value::Null, "pretty").is_err());
+    }
+
+    #[test]
+    fn test_find_text_column_case_insensitive_and_none_cases() {
+        let schema = TableSchema {
+            name: "t".to_string(),
+            table_id: 1,
+            columns: vec![
+                ColumnDef {
+                    name: "OID".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+                ColumnDef {
+                    name: "typname".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+            from_alias: None,
+        };
+
+        let (_, idx) = find_text_column(Some(&schema), "TypName").expect("column should match");
+        assert_eq!(idx, 1);
+        assert!(find_text_column(Some(&schema), "missing").is_none());
+        assert!(find_text_column(None, "typname").is_none());
+    }
+
+    #[test]
+    fn test_find_text_column_returns_first_match_when_duplicate_names_exist() {
+        let schema = TableSchema {
+            name: "dup".to_string(),
+            table_id: 2,
+            columns: vec![
+                ColumnDef {
+                    name: "typname".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+                ColumnDef {
+                    name: "TyPnAmE".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+            from_alias: None,
+        };
+
+        let (_, idx) = find_text_column(Some(&schema), "typname").expect("column should match");
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn test_value_to_i64_accepts_numeric_and_text_inputs() {
+        assert_eq!(value_to_i64(&Value::Int32(7)), Some(7));
+        assert_eq!(value_to_i64(&Value::Int64(8)), Some(8));
+        assert_eq!(value_to_i64(&Value::Float64(9.9)), Some(9));
+        assert_eq!(value_to_i64(&Value::Float64(-9.1)), Some(-9));
+        assert_eq!(value_to_i64(&Value::Text("+12".to_string())), Some(12));
+        assert_eq!(value_to_i64(&Value::Text(" 10 ".to_string())), Some(10));
+        assert_eq!(value_to_i64(&Value::Text(" -11 ".to_string())), Some(-11));
+        assert_eq!(value_to_i64(&Value::Text("12.5".to_string())), None);
+        assert_eq!(value_to_i64(&Value::Text("bad".to_string())), None);
+        assert_eq!(value_to_i64(&Value::Null), None);
+        assert_eq!(value_to_i64(&Value::Boolean(true)), None);
     }
 }

@@ -363,7 +363,7 @@ describe('TypeORM SQL Features [db9-server]', () => {
       expect(Number(result[0].tag_count)).toBe(2);
     });
 
-    it.skip('should support UNNEST', async () => {
+    it('should support UNNEST', async () => {
       const result = await dataSource.query(`
         SELECT UNNEST(tags) as tag
         FROM sql_categories

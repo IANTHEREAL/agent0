@@ -1,4 +1,3 @@
-CREATE EXTENSION
  setup_cleanup_existing 
 ------------------------
  0

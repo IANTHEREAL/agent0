@@ -154,3 +154,86 @@ impl std::fmt::Display for EmbeddedFsError {
 }
 
 impl std::error::Error for EmbeddedFsError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn superblock_default_matches_contract() {
+        let sb = Superblock::default();
+        assert_eq!(sb.next_inode, ROOT_INODE + 1);
+        assert_eq!(sb.page_size, PAGE_SIZE);
+        assert_eq!(sb.total_pages, 1_000_000);
+        assert_eq!(sb.used_pages, 0);
+    }
+
+    #[test]
+    fn inode_new_file_initializes_expected_fields() {
+        let inode = Inode::new_file(42, 0o644);
+        assert_eq!(inode.id, 42);
+        assert_eq!(inode.inode_type, InodeType::File);
+        assert_eq!(inode.mode, 0o644);
+        assert_eq!(inode.size, 0);
+        assert_eq!(inode.page_count, 0);
+        assert_eq!(inode.nlink, 1);
+        assert!(!inode.is_directory());
+        assert!(inode.atime > 0);
+        assert!(inode.mtime > 0);
+        assert!(inode.ctime > 0);
+    }
+
+    #[test]
+    fn inode_new_directory_initializes_expected_fields() {
+        let inode = Inode::new_directory(7, 0o755);
+        assert_eq!(inode.id, 7);
+        assert_eq!(inode.inode_type, InodeType::Directory);
+        assert_eq!(inode.mode, 0o755);
+        assert_eq!(inode.size, 0);
+        assert_eq!(inode.page_count, 0);
+        assert_eq!(inode.nlink, 2);
+        assert!(inode.is_directory());
+    }
+
+    #[test]
+    fn touch_methods_update_timestamps() {
+        let mut inode = Inode::new_file(1, 0o600);
+
+        inode.atime = 0;
+        inode.mtime = 0;
+        inode.ctime = 0;
+
+        inode.touch_atime();
+        assert!(inode.atime > 0);
+        assert_eq!(inode.mtime, 0);
+        assert_eq!(inode.ctime, 0);
+
+        inode.touch_mtime();
+        assert!(inode.mtime > 0);
+        assert!(inode.ctime > 0);
+    }
+
+    #[test]
+    fn embedded_fs_error_constructors_and_display_are_consistent() {
+        let e = EmbeddedFsError::not_found("/a");
+        assert_eq!(e.to_string(), "embedded_fs: NotFound: /a");
+
+        let e = EmbeddedFsError::already_exists("/b");
+        assert_eq!(e.to_string(), "embedded_fs: AlreadyExists: /b");
+
+        let e = EmbeddedFsError::is_directory("/c");
+        assert_eq!(e.to_string(), "embedded_fs: IsDirectory: /c");
+
+        let e = EmbeddedFsError::not_directory("/d");
+        assert_eq!(e.to_string(), "embedded_fs: NotDirectory: /d");
+
+        let e = EmbeddedFsError::directory_not_empty("/e");
+        assert_eq!(e.to_string(), "embedded_fs: DirectoryNotEmpty: /e");
+
+        let e = EmbeddedFsError::internal("boom");
+        assert_eq!(e.to_string(), "embedded_fs: Internal: boom");
+
+        let e = EmbeddedFsError::PermissionDenied("/f".to_string());
+        assert_eq!(e.to_string(), "embedded_fs: PermissionDenied: /f");
+    }
+}

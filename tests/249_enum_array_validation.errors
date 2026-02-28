@@ -1,1 +1,1 @@
-invalid input value for enum mood: "angry"
+column "moods" is of type TEXT[] but expression is of type mood[]

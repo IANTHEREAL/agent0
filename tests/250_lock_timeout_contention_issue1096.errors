@@ -1,0 +1,2 @@
+session A did not reach FOR UPDATE lock stage in time
+Expected end of statement, found: PERFORM

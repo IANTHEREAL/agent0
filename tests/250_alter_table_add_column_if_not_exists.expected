@@ -1,12 +1,8 @@
-DROP TABLE
-CREATE TABLE
-INSERT 2
-ALTER TABLE
-id,name,extra
-1,a,
-2,b,
-ALTER TABLE
-id,name,extra
-1,a,
-2,b,
-DROP TABLE
+id|name|extra
+1|a|NULL
+2|b|NULL
+(2 rows)
+id|name|extra
+1|a|NULL
+2|b|NULL
+(2 rows)

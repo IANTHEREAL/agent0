@@ -35,7 +35,7 @@
 
 2. `scripts/coverage_line.sh`
 3. `scripts/coverage_statement_protocol.py`
-4. `scripts/coverage_scenario_from_vitest.py`
+4. `scripts/coverage_scenario_operation.py`
 5. `scripts/coverage_area_path.py`
 6. `scripts/generate_agent_backlog.py`
 - 覆盖采集与 backlog 生成链路。

@@ -641,7 +641,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_url_https_allowed() {
-        let url = Url::parse("https://example.com/api").unwrap();
+        // Use a public literal IP to avoid DNS flakiness in restricted test sandboxes.
+        let url = Url::parse("https://1.1.1.1/api").unwrap();
         assert!(validate_url_with_policy(&url, false).await.is_ok());
     }
 

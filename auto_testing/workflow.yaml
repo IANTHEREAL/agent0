@@ -21,7 +21,7 @@ skills:
         - "artifacts/coverage/gap_list.json"
         - "artifacts/coverage/line_coverage.json"
         - "artifacts/coverage/statement_protocol_coverage.json"
-        - "artifacts/coverage/scenario_coverage.json"
+        - "artifacts/coverage/scenario_operation_coverage.json"
         - "artifacts/coverage/area_coverage.json"
         - "artifacts/coverage/critical_path_coverage.json"
         - "artifacts/agent_backlog.json"

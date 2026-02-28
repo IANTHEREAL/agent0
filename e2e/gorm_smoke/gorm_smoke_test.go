@@ -132,6 +132,75 @@ func TestGormSmoke(t *testing.T) {
 	}
 }
 
+func TestGormPreparedAndVectorSmoke(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("PG_DSN"))
+	if dsn == "" {
+		t.Skip("PG_DSN not set; skipping e2e smoke test")
+	}
+	dsn = normalizeDSN(dsn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+
+	schemaName := fmt.Sprintf("gorm_adv_%s_%d", randomHex(t, 4), time.Now().Unix())
+	db, cleanup := openDB(t, ctx, dsn, schemaName)
+	t.Cleanup(cleanup)
+
+	if err := db.WithContext(ctx).Exec("CREATE SCHEMA " + quoteIdent(schemaName)).Error; err != nil {
+		t.Fatalf("create schema %q: %v", schemaName, err)
+	}
+
+	// prepared statement / positional bind / repeated execute
+	var sum1, sum2 int
+	if err := db.WithContext(ctx).Raw("SELECT ?::int + ?::int", 1, 2).Scan(&sum1).Error; err != nil {
+		t.Fatalf("prepared statement bind #1: %v", err)
+	}
+	if err := db.WithContext(ctx).Raw("SELECT ?::int + ?::int", 3, 4).Scan(&sum2).Error; err != nil {
+		t.Fatalf("prepared statement bind #2: %v", err)
+	}
+	if sum1 != 3 || sum2 != 7 {
+		t.Fatalf("unexpected prepared statement results: got (%d, %d)", sum1, sum2)
+	}
+
+	// vector column / vector index / vector insert / vector distance / vector filter
+	createVectorTable := fmt.Sprintf(`
+		CREATE TABLE %s.vectors (
+			id INTEGER PRIMARY KEY,
+			embedding vector(3) NOT NULL
+		)`, quoteIdent(schemaName))
+	if err := db.WithContext(ctx).Exec(createVectorTable).Error; err != nil {
+		t.Fatalf("create vector table: %v", err)
+	}
+
+	createVectorIndex := fmt.Sprintf(
+		"CREATE INDEX idx_vectors_embedding ON %s.vectors USING ivfflat (embedding)",
+		quoteIdent(schemaName),
+	)
+	if err := db.WithContext(ctx).Exec(createVectorIndex).Error; err != nil {
+		t.Fatalf("create vector index: %v", err)
+	}
+
+	insertVectors := fmt.Sprintf(
+		"INSERT INTO %s.vectors (id, embedding) VALUES (1, '[1,0,0]'), (2, '[0,1,0]')",
+		quoteIdent(schemaName),
+	)
+	if err := db.WithContext(ctx).Exec(insertVectors).Error; err != nil {
+		t.Fatalf("insert vectors: %v", err)
+	}
+
+	var ids []int
+	queryVector := fmt.Sprintf(
+		"SELECT id FROM %s.vectors WHERE embedding <-> '[1,0,0]' < 1.0 ORDER BY embedding <-> '[1,0,0]'",
+		quoteIdent(schemaName),
+	)
+	if err := db.WithContext(ctx).Raw(queryVector).Scan(&ids).Error; err != nil {
+		t.Fatalf("query vector distance/filter: %v", err)
+	}
+	if len(ids) == 0 || ids[0] != 1 {
+		t.Fatalf("unexpected vector query result: %#v", ids)
+	}
+}
+
 func openDB(t *testing.T, ctx context.Context, dsn, schemaName string) (*gorm.DB, func()) {
 	t.Helper()
 

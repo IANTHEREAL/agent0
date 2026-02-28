@@ -260,3 +260,128 @@ impl<'a> ExprRuntime<'a> {
 pub(super) fn needs_async(expr: &TypedExpr) -> bool {
     crate::sql::expr::classify::needs_async(expr)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::needs_async;
+    use crate::model::{DataType, Value};
+    use crate::sql::analyzer::types::{
+        AnalyzedQuery, AnalyzedQueryBody, BinaryOp, FunctionKind, ResolvedFunction, TypedExpr,
+        TypedExprKind,
+    };
+
+    fn values_query_one() -> AnalyzedQuery {
+        AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Values(vec![vec![TypedExpr::new(
+                TypedExprKind::Constant(Value::Int32(1)),
+                DataType::Int32,
+            )]]),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("v".to_string(), DataType::Int32, None)],
+        }
+    }
+
+    #[test]
+    fn needs_async_is_false_for_pure_scalar_expr() {
+        let expr = TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(TypedExpr::new(
+                    TypedExprKind::Constant(Value::Int32(1)),
+                    DataType::Int32,
+                )),
+                op: BinaryOp::Add,
+                right: Box::new(TypedExpr::new(
+                    TypedExprKind::Constant(Value::Int32(2)),
+                    DataType::Int32,
+                )),
+            },
+            DataType::Int32,
+        );
+        assert!(!needs_async(&expr));
+    }
+
+    #[test]
+    fn needs_async_is_true_for_scalar_subquery() {
+        let expr = TypedExpr::new(
+            TypedExprKind::ScalarSubquery(Box::new(values_query_one())),
+            DataType::Int32,
+        );
+        assert!(needs_async(&expr));
+    }
+
+    #[test]
+    fn needs_async_is_true_for_subquery_forms() {
+        let base = TypedExpr::new(TypedExprKind::Constant(Value::Int32(1)), DataType::Int32);
+        let in_subquery = TypedExpr::new(
+            TypedExprKind::InSubquery {
+                expr: Box::new(base.clone()),
+                subquery: Box::new(values_query_one()),
+                negated: false,
+            },
+            DataType::Boolean,
+        );
+        let array_subquery = TypedExpr::new(
+            TypedExprKind::ArraySubquery(Box::new(values_query_one())),
+            DataType::Array(Box::new(DataType::Int32)),
+        );
+        let exists_subquery = TypedExpr::new(
+            TypedExprKind::Exists {
+                subquery: Box::new(values_query_one()),
+                negated: false,
+            },
+            DataType::Boolean,
+        );
+
+        assert!(needs_async(&in_subquery));
+        assert!(needs_async(&array_subquery));
+        assert!(needs_async(&exists_subquery));
+    }
+
+    #[test]
+    fn needs_async_is_true_for_any_all_and_tuple_in_subquery() {
+        let base = TypedExpr::new(TypedExprKind::Constant(Value::Int32(1)), DataType::Int32);
+        let any_all = TypedExpr::new(
+            TypedExprKind::AnyAll {
+                expr: Box::new(base.clone()),
+                op: BinaryOp::Eq,
+                subquery: Box::new(values_query_one()),
+                is_all: false,
+            },
+            DataType::Boolean,
+        );
+        let tuple_in = TypedExpr::new(
+            TypedExprKind::TupleInSubquery {
+                exprs: vec![base],
+                subquery: Box::new(values_query_one()),
+                negated: false,
+            },
+            DataType::Boolean,
+        );
+        assert!(needs_async(&any_all));
+        assert!(needs_async(&tuple_in));
+    }
+
+    #[test]
+    fn needs_async_is_false_for_regular_function_call() {
+        let expr = TypedExpr::new(
+            TypedExprKind::FunctionCall {
+                func: ResolvedFunction {
+                    name: "abs".to_string(),
+                    kind: FunctionKind::Builtin,
+                    return_type: DataType::Int32,
+                },
+                args: vec![TypedExpr::new(
+                    TypedExprKind::Constant(Value::Int32(-7)),
+                    DataType::Int32,
+                )],
+                order_by: vec![],
+                filter: None,
+            },
+            DataType::Int32,
+        );
+        assert!(!needs_async(&expr));
+    }
+}

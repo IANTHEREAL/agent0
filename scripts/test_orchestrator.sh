@@ -59,7 +59,7 @@ for lane, lane_cfg in lanes_raw.items():
 cov_dim = cfg.get("coverage_dimensions", {})
 line_targets = (cov_dim.get("line", {}) or {}).get("targets_by_mode", {})
 stmt_targets = (cov_dim.get("pg_protocol_statement", {}) or {}).get("required_min_ratio_by_mode", {})
-scn_targets = (cov_dim.get("scenario", {}) or {}).get("required_min_ratio_by_mode", {})
+scn_op_targets = (cov_dim.get("scenario_operation_v2", {}) or {}).get("required_min_ratio_by_mode", {})
 
 def run(cmd, timeout, log_file):
     env = os.environ.copy()
@@ -146,11 +146,12 @@ for lane in selected:
 # collectors
 subprocess.call(["bash", "scripts/coverage_line.sh", str(cov_dir / "line_coverage.json")])
 subprocess.call(["python3", "scripts/coverage_statement_protocol.py", "--out", str(cov_dir / "statement_protocol_coverage.json")])
-subprocess.call(["python3", "scripts/coverage_scenario_from_vitest.py", "--out", str(cov_dir / "scenario_coverage.json")])
+subprocess.call(["python3", "scripts/coverage_scenario_operation.py",
+                 "--out", str(cov_dir / "scenario_operation_coverage.json")])
 subprocess.call(["python3", "scripts/coverage_area_path.py",
                  "--line-cov", str(cov_dir / "line_coverage.json"),
                  "--stmt-cov", str(cov_dir / "statement_protocol_coverage.json"),
-                 "--scn-cov", str(cov_dir / "scenario_coverage.json"),
+                 "--scn-cov", str(cov_dir / "scenario_operation_coverage.json"),
                  "--out-area", str(cov_dir / "area_coverage.json"),
                  "--out-path", str(cov_dir / "critical_path_coverage.json")])
 
@@ -176,23 +177,23 @@ if line_path.exists():
         line_data = {}
 
 stmt_data = json.loads((cov_dir / "statement_protocol_coverage.json").read_text(encoding="utf-8"))
-scn_data = json.loads((cov_dir / "scenario_coverage.json").read_text(encoding="utf-8"))
+scn_op_data = json.loads((cov_dir / "scenario_operation_coverage.json").read_text(encoding="utf-8"))
 
 mode_line_cfg = line_targets.get(mode, {})
 line_target = mode_line_cfg.get("global_min", mode_line_cfg.get("changed_module_min", 0.60))
 statement_target = stmt_targets.get(mode, 0.65)
-scenario_target = scn_targets.get(mode, 0.55)
+scenario_op_target = scn_op_targets.get(mode, 0.55)
 statement_ratio = stmt_data.get("ratio", 0.0)
-scenario_ratio = scn_data.get("ratio", 0.0)
+scenario_op_ratio = scn_op_data.get("ratio", 0.0)
 
 line_gaps = []
 if isinstance(line_ratio, (int, float)) and line_ratio < line_target:
     line_gaps.append({"module": "global", "current": round(line_ratio, 4), "target": line_target})
 
 statement_gaps = stmt_data.get("uncovered_cells", [])[:50]
-scenario_gaps = scn_data.get("uncovered_cells", [])[:50]
+scenario_operation_gaps = scn_op_data.get("uncovered_cells", [])[:50]
 
-if statement_ratio < statement_target or scenario_ratio < scenario_target or line_gaps:
+if statement_ratio < statement_target or scenario_op_ratio < scenario_op_target or line_gaps:
     merge_allowed = False
 if fail_if_unmapped_change and unmapped_files:
     merge_allowed = False
@@ -200,7 +201,7 @@ if fail_if_unmapped_change and unmapped_files:
 gap_list = {
     "line_gaps": line_gaps,
     "statement_gaps": statement_gaps,
-    "scenario_gaps": scenario_gaps,
+    "scenario_operation_gaps": scenario_operation_gaps,
 }
 (cov_dir / "gap_list.json").write_text(json.dumps(gap_list, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -234,8 +235,8 @@ report = {
         "line_target": line_target,
         "statement_ratio": statement_ratio,
         "statement_target": statement_target,
-        "scenario_ratio": scenario_ratio,
-        "scenario_target": scenario_target,
+        "scenario_operation_ratio": scenario_op_ratio,
+        "scenario_operation_target": scenario_op_target,
     },
     "config_source": str(cfg_path),
     "unmapped_changed_files": unmapped_files,
@@ -269,7 +270,7 @@ md.append("## Coverage Summary")
 md.append(f"- line_ratio: `{line_ratio}`")
 md.append(f"- line_target: `{line_target}`")
 md.append(f"- statement_ratio: `{statement_ratio}` (target `{statement_target}`)")
-md.append(f"- scenario_ratio: `{scenario_ratio}` (target `{scenario_target}`)")
+md.append(f"- scenario_operation_ratio: `{scenario_op_ratio}` (target `{scenario_op_target}`)")
 md.append(f"- agent_backlog_tasks: `{backlog_task_count}`")
 md.append("")
 md.append("## Config/Rule Summary")
@@ -281,7 +282,7 @@ md.append("")
 md.append("## Gap Summary")
 md.append(f"- line_gaps: `{len(line_gaps)}`")
 md.append(f"- statement_gaps: `{len(statement_gaps)}`")
-md.append(f"- scenario_gaps: `{len(scenario_gaps)}`")
+md.append(f"- scenario_operation_gaps: `{len(scenario_operation_gaps)}`")
 md.append("")
 md.append("## Rerun Commands")
 for c in rerun:

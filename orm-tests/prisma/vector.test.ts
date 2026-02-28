@@ -189,8 +189,7 @@ describe('Prisma Vector Operations [db9-server]', () => {
       expect(results[0].dims).toBe(3);
     });
 
-    // skip: vector_norm() not implemented — tracked in #840
-    it.skip('should calculate vector norm', async () => {
+    it('should calculate vector norm', async () => {
       const results = await prisma.$queryRawUnsafe<any[]>(
         `SELECT name, vector_norm(embedding) as norm FROM prisma_embeddings`
       );

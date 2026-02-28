@@ -194,6 +194,16 @@ pub fn unify_types(types: &[DataType]) -> Option<DataType> {
 }
 
 pub fn binary_op_result_type(op: &str, left: &DataType, right: &DataType) -> Option<DataType> {
+    let vector_result_type = |left: &DataType, right: &DataType| match (left, right) {
+        (DataType::Vector(ld), DataType::Vector(rd)) if *ld > 0 && *rd > 0 && ld == rd => {
+            Some(DataType::Vector(*ld))
+        }
+        (DataType::Vector(ld), DataType::Vector(_)) if *ld > 0 => Some(DataType::Vector(*ld)),
+        (DataType::Vector(_), DataType::Vector(rd)) if *rd > 0 => Some(DataType::Vector(*rd)),
+        (DataType::Vector(_), DataType::Vector(_)) => Some(DataType::Vector(0)),
+        _ => None,
+    };
+
     match op {
         // Arithmetic operators
         "Plus" | "Minus" | "+" | "-" => {
@@ -232,6 +242,7 @@ pub fn binary_op_result_type(op: &str, left: &DataType, right: &DataType) -> Opt
                 {
                     Some(DataType::Jsonb)
                 }
+                (DataType::Vector(_), DataType::Vector(_)) => vector_result_type(left, right),
                 _ if is_numeric(left) && is_numeric(right) => common_type(left, right),
                 _ => None,
             }
@@ -239,6 +250,10 @@ pub fn binary_op_result_type(op: &str, left: &DataType, right: &DataType) -> Opt
         "Multiply" | "Divide" | "Modulo" | "PGExp" | "*" | "/" | "%" | "^" => {
             if is_numeric(left) && is_numeric(right) {
                 common_type(left, right)
+            } else if is_numeric(left) && matches!(right, DataType::Vector(_)) {
+                Some(right.clone())
+            } else if matches!(left, DataType::Vector(_)) && is_numeric(right) {
+                Some(left.clone())
             } else if matches!(
                 (left, right),
                 (DataType::Interval, _) | (_, DataType::Interval)
@@ -414,6 +429,26 @@ mod tests {
         assert_eq!(
             comparison_target_type(&DataType::Text, &DataType::Text),
             Some(DataType::Text)
+        );
+    }
+
+    #[test]
+    fn vector_arithmetic_result_types() {
+        assert_eq!(
+            binary_op_result_type("+", &DataType::Vector(3), &DataType::Vector(3)),
+            Some(DataType::Vector(3))
+        );
+        assert_eq!(
+            binary_op_result_type("-", &DataType::Vector(0), &DataType::Vector(5)),
+            Some(DataType::Vector(5))
+        );
+        assert_eq!(
+            binary_op_result_type("*", &DataType::Vector(3), &DataType::Int32),
+            Some(DataType::Vector(3))
+        );
+        assert_eq!(
+            binary_op_result_type("*", &DataType::Float64, &DataType::Vector(0)),
+            Some(DataType::Vector(0))
         );
     }
 

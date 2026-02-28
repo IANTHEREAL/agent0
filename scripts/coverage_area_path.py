@@ -57,9 +57,17 @@ def calc_area_coverage(line_cov: dict, area_map: dict):
     }
 
 
+def _scenario_capability_cells(scn_cov: dict):
+    # Preferred input: scenario_operation_coverage.json with {orm, capability, operation}.
+    if scn_cov.get('capability_operations') is not None:
+        return {(x['orm'], x['capability']) for x in scn_cov.get('covered_cells', [])}
+    # Backward compatibility: scenario_coverage.json with {orm, capability}.
+    return {(x['orm'], x['capability']) for x in scn_cov.get('covered_cells', [])}
+
+
 def calc_critical_path_coverage(path_map: dict, stmt_cov: dict, scn_cov: dict, area_cov: dict):
     covered_stmt = {(x['statement'], x['phase']) for x in stmt_cov.get('covered_cells', [])}
-    covered_scn = {(x['orm'], x['capability']) for x in scn_cov.get('covered_cells', [])}
+    covered_scn = _scenario_capability_cells(scn_cov)
     area_ratio = {x['area']: x['ratio'] for x in area_cov.get('areas', [])}
 
     out = []
@@ -108,7 +116,7 @@ def main():
     ap.add_argument('--path-map', default='auto_testing/path_map.yaml')
     ap.add_argument('--line-cov', default='artifacts/coverage/line_coverage.json')
     ap.add_argument('--stmt-cov', default='artifacts/coverage/statement_protocol_coverage.json')
-    ap.add_argument('--scn-cov', default='artifacts/coverage/scenario_coverage.json')
+    ap.add_argument('--scn-cov', default='artifacts/coverage/scenario_operation_coverage.json')
     ap.add_argument('--out-area', default='artifacts/coverage/area_coverage.json')
     ap.add_argument('--out-path', default='artifacts/coverage/critical_path_coverage.json')
     args = ap.parse_args()

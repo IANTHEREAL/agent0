@@ -1,10 +1,9 @@
-DROP TABLE
-CREATE TABLE
-INSERT 5
-grp,s,a,mn,mx,c
-a,40,20,10,30,2
-grp,s,a,mn,mx,c
-b,,,,0
-s,a,mn,mx,c
-,,,,0
-DROP TABLE
+grp|s|a|mn|mx|c
+a|40|20.0000000000000000|10|30|2
+(1 row)
+grp|s|a|mn|mx|c
+b|NULL|NULL|NULL|NULL|0
+(1 row)
+s|a|mn|mx|c
+NULL|NULL|NULL|NULL|0
+(1 row)

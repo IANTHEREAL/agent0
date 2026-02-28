@@ -700,4 +700,14 @@ mod tests {
             &expr
         ));
     }
+
+    #[test]
+    fn async_expr_does_not_short_circuit_without_prechecked_flag() {
+        let expr = scalar_subquery_expr();
+        let mut skip_root_check_once = false;
+        assert!(!should_return_expr_unchanged(
+            &mut skip_root_check_once,
+            &expr
+        ));
+    }
 }

@@ -30,12 +30,12 @@ coverage_dimensions:
       nightly: 0.85
     lanes: ["sql_builtin", "protocol_smoke", "sql_corpus"]
 
-  scenario:
-    collector: collect_scenario_coverage
+  scenario_operation_v2:
+    collector: collect_scenario_operation_coverage
     matrix:
-      drivers: ["psql", "node-pg", "python-psycopg", "gorm"]
-      orm: ["typeorm", "prisma", "sequelize", "knex", "drizzle", "kysely", "sqlalchemy", "dify_sqlalchemy"]
+      orm: ["typeorm", "prisma", "sequelize", "knex", "drizzle", "kysely", "sqlalchemy", "dify_sqlalchemy", "gorm"]
       capabilities: ["ddl_lifecycle", "crud_basic", "transaction", "prepared_statement", "json_and_array", "join_and_subquery", "vector"]
+      operation_map_source: "auto_testing/scenario_operation_map.yaml"
     required_min_ratio_by_mode:
       pr: 0.55
       main_push: 0.65

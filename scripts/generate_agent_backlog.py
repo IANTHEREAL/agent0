@@ -149,9 +149,8 @@ def build_backlog(gap_list: dict, path_cov: dict, area_cov: dict, gap_action_map
         tasks.append(make_statement_task(i, key, stmt_cfg, lane_cmd))
 
     scn_cfg = action_template("scenario", gap_action_map)
-    scn_gaps = sorted(
-        {(g.get("orm"), g.get("capability")) for g in gap_list.get("scenario_gaps", []) if g.get("orm") and g.get("capability")}
-    )
+    raw_scn_gaps = gap_list.get("scenario_operation_gaps", gap_list.get("scenario_gaps", []))
+    scn_gaps = sorted({(g.get("orm"), g.get("capability")) for g in raw_scn_gaps if g.get("orm") and g.get("capability")})
     for i, key in enumerate(scn_gaps, start=1):
         tasks.append(make_scenario_task(i, key, scn_cfg, lane_cmd))
 
@@ -166,7 +165,7 @@ def build_backlog(gap_list: dict, path_cov: dict, area_cov: dict, gap_action_map
     summary = {
         "line_gap_count": len(gap_list.get("line_gaps", [])),
         "statement_gap_count": len(gap_list.get("statement_gaps", [])),
-        "scenario_gap_count": len(gap_list.get("scenario_gaps", [])),
+        "scenario_gap_count": len(raw_scn_gaps),
         "missing_critical_paths": len(missing_paths),
         "area_global_ratio": area_cov.get("global_ratio"),
         "critical_path_ratio": path_cov.get("ratio"),

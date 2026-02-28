@@ -1,23 +1,23 @@
 content|dist
 has vec|0
-null vec|
+null vec|NULL
 another|0.025368153802923787
 (3 rows)
 content|dist
 has vec|0
 another|0.025368153802923787
-null vec|
+null vec|NULL
 (3 rows)
 content|dist
-null vec|
+null vec|NULL
 has vec|0
 another|0.025368153802923787
 (3 rows)
 l2_distance
-
+NULL
 (1 row)
 vector_dims
-
+NULL
 (1 row)
 content|dist
 has vec|0

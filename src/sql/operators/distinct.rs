@@ -177,6 +177,7 @@ mod tests {
     use super::*;
     use crate::model::{ColumnDef, DataType, Value};
     use crate::sql::analyzer::types::TypedExprKind;
+    use crate::sql::query_context::QueryContext;
     use crate::sql::operators::scan::TableScanOperator;
 
     fn test_schema() -> TableSchema {
@@ -258,5 +259,49 @@ mod tests {
             DistinctOperator::row_to_key(&row1),
             DistinctOperator::row_to_key(&row2)
         );
+    }
+
+    #[test]
+    fn test_distinct_operator_metadata_helpers() {
+        let schema = test_schema();
+        let child = Box::new(TableScanOperator::new(schema.clone()));
+        let mut op = DistinctOperator::new(child);
+
+        assert_eq!(op.schema().name, schema.name);
+        assert_eq!(op.explain_info(), None);
+        let children = op.children();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].schema().name, "test");
+
+        let children_mut = op.children_mut();
+        assert_eq!(children_mut.len(), 1);
+        assert_eq!(children_mut[0].schema().name, "test");
+    }
+
+    #[test]
+    fn test_distinct_on_compute_key_uses_expr_projection() {
+        let schema = test_schema();
+        let child = Box::new(TableScanOperator::new(schema));
+        let on_exprs = vec![TypedExpr {
+            kind: TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: 1,
+                column_name: "name".to_string(),
+            },
+            data_type: DataType::Text,
+        }];
+        let op = DistinctOnOperator::new(child, on_exprs);
+        let query_ctx = QueryContext::from_task_locals();
+
+        let row_a = Row::new(vec![Value::Int32(1), Value::Text("alice".to_string())]);
+        let row_b = Row::new(vec![Value::Int32(2), Value::Text("alice".to_string())]);
+        let row_c = Row::new(vec![Value::Int32(3), Value::Text("bob".to_string())]);
+
+        let key_a = op.compute_key(&row_a, &query_ctx).unwrap();
+        let key_b = op.compute_key(&row_b, &query_ctx).unwrap();
+        let key_c = op.compute_key(&row_c, &query_ctx).unwrap();
+
+        assert_eq!(key_a, key_b, "same DISTINCT ON value should share key");
+        assert_ne!(key_a, key_c, "different DISTINCT ON value must differ");
     }
 }
