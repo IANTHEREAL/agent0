@@ -28,6 +28,17 @@ impl CostModel {
     /// Minimum selectivity floor - no query is estimated to match fewer than this fraction of rows
     pub const MIN_SELECTIVITY_FLOOR: f64 = 0.0001;
 
+    /// Selectivity threshold above which full table scan is preferred over index scan.
+    /// When an index scan would fetch more than this fraction of table rows, the random
+    /// I/O overhead outweighs the benefit of reading fewer rows sequentially.
+    pub const FULL_SCAN_SELECTIVITY_THRESHOLD: f64 = 0.3;
+
+    /// Per-row cost for index scans that exceed the selectivity threshold.
+    /// Reflects random I/O overhead (cf. PostgreSQL's `random_page_cost = 4.0`).
+    /// With this value, index cost = 1 + 4.0 * estimated_rows, which exceeds
+    /// full-scan cost (= table_rows) when selectivity > ~25%.
+    pub const RANDOM_IO_COST_PER_ROW: f64 = 4.0;
+
     // ── GIN index scan cost constants ──────────────────────────
 
     /// Base (fixed) cost of a GIN index scan, higher than B-tree because

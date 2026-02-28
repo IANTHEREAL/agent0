@@ -169,7 +169,7 @@ fn test_gin_typed_tsmatch_selects_gin_scan() {
         DataType::Boolean,
     );
 
-    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000);
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
     assert!(
         matches!(path.scan_type, ScanType::GinIndexScan { ref index_name, .. } if index_name == "idx_body_gin"),
         "expected GinIndexScan on idx_body_gin, got {:?}",
@@ -191,7 +191,7 @@ fn test_gin_typed_json_contains_selects_gin_scan() {
         DataType::Boolean,
     );
 
-    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000);
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
     assert!(
         matches!(path.scan_type, ScanType::GinIndexScan { ref index_name, .. } if index_name == "idx_data_gin"),
         "expected GinIndexScan on idx_data_gin, got {:?}",
@@ -232,7 +232,7 @@ fn test_gin_typed_no_gin_index_falls_back() {
         DataType::Boolean,
     );
 
-    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000);
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
     assert!(matches!(path.scan_type, ScanType::FullTableScan));
 }
 
@@ -297,7 +297,7 @@ fn test_expression_index_typed_lower() {
         DataType::Boolean,
     );
 
-    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000);
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
     match &path.scan_type {
         ScanType::IndexScan {
             index_name, values, ..
@@ -379,7 +379,7 @@ fn test_partial_index_typed_exact_predicate() {
         DataType::Boolean,
     );
 
-    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000);
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
     match &path.scan_type {
         ScanType::IndexScan {
             index_name, values, ..
@@ -451,7 +451,7 @@ fn test_partial_index_typed_missing_predicate() {
         DataType::Boolean,
     );
 
-    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000);
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
     // Should NOT use the partial index since the predicate isn't satisfied
     assert!(
         matches!(path.scan_type, ScanType::FullTableScan),
@@ -510,7 +510,7 @@ fn test_partial_index_typed_valid_cached_predicate() {
         DataType::Boolean,
     );
 
-    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000);
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
     assert!(
         matches!(path.scan_type, ScanType::IndexScan { ref index_name, .. } if index_name == "idx_active_orders"),
         "expected cached partial index match, got {:?}",
@@ -565,7 +565,7 @@ fn test_partial_index_typed_malformed_predicate() {
         DataType::Boolean,
     );
 
-    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000);
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
     assert!(
         matches!(path.scan_type, ScanType::FullTableScan),
         "expected FullTableScan for malformed predicate without cache, got {:?}",
@@ -632,7 +632,7 @@ fn test_partial_index_typed_multi_conjunct_predicate() {
         DataType::Boolean,
     );
 
-    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000);
+    let path = choose_btree_access_path_for_typed_filter(&schema, &filter, 10000, None);
     assert!(
         matches!(path.scan_type, ScanType::IndexScan { ref index_name, .. } if index_name == "idx_active_us_orders"),
         "expected multi-conjunct cached partial index match, got {:?}",
@@ -681,4 +681,627 @@ fn test_canonicalizer_parity_with_ast_cast() {
     let ast_expr = parse_predicate_expr("CAST(x AS TEXT)").unwrap();
     let ast_canonical = normalize_expr_for_match(&ast_expr);
     assert_eq!(typed_canonical, ast_canonical);
+}
+
+use super::cost_model::CostModel;
+use super::index_selection::compute_inlist_selectivity;
+use crate::model::ColumnDef;
+use crate::sql::optimizer::statistics::{ColumnStatistics, TableStatistics};
+use std::collections::HashMap;
+
+fn build_single_column_schema(unique: bool) -> (TableSchema, IndexDef) {
+    let index = IndexDef {
+        id: 100,
+        name: if unique {
+            "idx_status_unique".to_string()
+        } else {
+            "idx_status".to_string()
+        },
+        columns: vec!["status".to_string()],
+        unique,
+        is_constraint: false,
+        method: None,
+        predicate: None,
+        expressions: Vec::new(),
+        state: crate::worker::types::IndexState::Ready,
+        cached_predicate_conjuncts: None,
+    };
+
+    let schema = TableSchema {
+        name: "orders".to_string(),
+        table_id: 1,
+        columns: vec![ColumnDef {
+            name: "status".to_string(),
+            data_type: DataType::Text,
+            nullable: true,
+            primary_key: false,
+            unique,
+            is_serial: false,
+            default_expr: None,
+            collation: None,
+        }],
+        version: 1,
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![index.clone()],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
+        from_alias: None,
+    };
+
+    (schema, index)
+}
+
+fn build_table_stats(column_name: &str, n_distinct: f64, null_fraction: f64) -> TableStatistics {
+    let mut columns = HashMap::new();
+    columns.insert(
+        column_name.to_string(),
+        ColumnStatistics {
+            null_fraction,
+            n_distinct,
+            avg_width: 0,
+            most_common_vals: Vec::new(),
+            most_common_freqs: Vec::new(),
+            histogram_bounds: Vec::new(),
+            correlation: 0.0,
+        },
+    );
+
+    TableStatistics {
+        table_id: 1,
+        row_count: 100000,
+        last_analyzed: 0,
+        columns,
+    }
+}
+
+#[test]
+fn test_compute_inlist_selectivity_ndv_positive() {
+    let (schema, index) = build_single_column_schema(false);
+    let stats = build_table_stats("status", 3.0, 0.0);
+    let in_values = vec![
+        Value::Text("active".to_string()),
+        Value::Text("pending".to_string()),
+    ];
+
+    let sel = compute_inlist_selectivity(&in_values, &index, &[], 100000, Some(&stats), &schema);
+    assert!((sel - (2.0 / 3.0)).abs() < 1e-9, "expected 2/3, got {sel}");
+}
+
+#[test]
+fn test_compute_inlist_selectivity_unique_full_prefix_no_floor() {
+    let (schema, index) = build_single_column_schema(true);
+    let in_values = vec![Value::Text("a".to_string()), Value::Text("b".to_string())];
+
+    let sel = compute_inlist_selectivity(&in_values, &index, &[], 100000, None, &schema);
+    assert!((sel - 0.00002).abs() < 1e-12, "expected 0.00002, got {sel}");
+    assert!(sel < CostModel::MIN_SELECTIVITY_FLOOR);
+}
+
+#[test]
+fn test_compute_inlist_selectivity_negative_ndistinct() {
+    let (schema, index) = build_single_column_schema(false);
+    let stats = build_table_stats("status", -0.1, 0.0);
+    let in_values = vec![Value::Text("a".to_string()), Value::Text("b".to_string())];
+
+    let sel = compute_inlist_selectivity(&in_values, &index, &[], 100000, Some(&stats), &schema);
+    assert!((sel - 0.0002).abs() < 1e-12, "expected 0.0002, got {sel}");
+}
+
+#[test]
+fn test_compute_inlist_selectivity_null_fraction_scaling() {
+    let (schema, index) = build_single_column_schema(false);
+    let stats = build_table_stats("status", 5.0, 0.8);
+    let in_values = vec![Value::Text("a".to_string()), Value::Text("b".to_string())];
+
+    let sel = compute_inlist_selectivity(&in_values, &index, &[], 100000, Some(&stats), &schema);
+    assert!((sel - 0.08).abs() < 1e-12, "expected 0.08, got {sel}");
+}
+
+#[test]
+fn test_compute_inlist_selectivity_no_stats_fallback() {
+    let (schema, index) = build_single_column_schema(false);
+    let in_values = vec![
+        Value::Text("a".to_string()),
+        Value::Text("b".to_string()),
+        Value::Text("c".to_string()),
+    ];
+
+    let sel = compute_inlist_selectivity(&in_values, &index, &[], 100000, None, &schema);
+    assert!((sel - 0.3).abs() < 1e-12, "expected 0.3, got {sel}");
+}
+
+#[test]
+fn test_compute_inlist_selectivity_normalized_input() {
+    let (schema, index) = build_single_column_schema(false);
+    let stats = build_table_stats("status", 5.0, 0.0);
+    let normalized_values = vec![Value::Text("a".to_string())];
+
+    let sel = compute_inlist_selectivity(
+        &normalized_values,
+        &index,
+        &[],
+        100000,
+        Some(&stats),
+        &schema,
+    );
+    assert!((sel - 0.2).abs() < 1e-12, "expected 0.2, got {sel}");
+}
+
+#[test]
+fn test_inlist_mixed_null_and_duplicates_matches_normalized_scan_keys_and_cost() {
+    use super::index_selection::choose_btree_access_path_for_typed_filter;
+
+    let index = IndexDef {
+        id: 7,
+        name: "idx_items_id".to_string(),
+        columns: vec!["id".to_string()],
+        unique: false,
+        is_constraint: false,
+        method: None,
+        predicate: None,
+        expressions: Vec::new(),
+        state: crate::worker::types::IndexState::Ready,
+        cached_predicate_conjuncts: None,
+    };
+    let schema = TableSchema {
+        name: "items".to_string(),
+        table_id: 1,
+        columns: vec![ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int32,
+            nullable: true,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+            collation: None,
+        }],
+        version: 1,
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![index],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
+        from_alias: None,
+    };
+    let stats = build_table_stats("id", 1000.0, 0.0);
+
+    let mixed_filter = TypedExpr {
+        kind: TypedExprKind::InList {
+            expr: Box::new(typed_column("id", DataType::Int32)),
+            list: vec![
+                typed_constant(Value::Int32(1), DataType::Int32),
+                typed_constant(Value::Int32(1), DataType::Int32),
+                typed_constant(Value::Null, DataType::Int32),
+                typed_constant(Value::Int32(2), DataType::Int32),
+            ],
+            negated: false,
+        },
+        data_type: DataType::Boolean,
+    };
+    let normalized_filter = TypedExpr {
+        kind: TypedExprKind::InList {
+            expr: Box::new(typed_column("id", DataType::Int32)),
+            list: vec![
+                typed_constant(Value::Int32(1), DataType::Int32),
+                typed_constant(Value::Int32(2), DataType::Int32),
+            ],
+            negated: false,
+        },
+        data_type: DataType::Boolean,
+    };
+
+    let mixed_path =
+        choose_btree_access_path_for_typed_filter(&schema, &mixed_filter, 100_000, Some(&stats));
+    let normalized_path = choose_btree_access_path_for_typed_filter(
+        &schema,
+        &normalized_filter,
+        100_000,
+        Some(&stats),
+    );
+
+    let mixed_keys = match &mixed_path.scan_type {
+        ScanType::InListScan { column_values, .. } => column_values,
+        other => panic!("expected InListScan for mixed IN list, got {:?}", other),
+    };
+    let normalized_keys = match &normalized_path.scan_type {
+        ScanType::InListScan { column_values, .. } => column_values,
+        other => panic!(
+            "expected InListScan for normalized IN list, got {:?}",
+            other
+        ),
+    };
+
+    assert_eq!(
+        mixed_keys, normalized_keys,
+        "IN (1, 1, NULL, 2) must generate the same scan keys as IN (1, 2)"
+    );
+    let expected_keys = vec![vec![Value::Int32(1)], vec![Value::Int32(2)]];
+    assert_eq!(
+        mixed_keys, &expected_keys,
+        "scan keys should be deduplicated and NULL-free"
+    );
+    assert!(
+        (mixed_path.cost - normalized_path.cost).abs() < 1e-12,
+        "IN (1, 1, NULL, 2) must have the same planned cost as IN (1, 2)"
+    );
+}
+
+#[test]
+fn test_inlist_mixed_sign_nan_deduplicates_to_one_effective_nan() {
+    use super::index_selection::choose_btree_access_path_for_typed_filter;
+
+    let index = IndexDef {
+        id: 8,
+        name: "idx_items_score".to_string(),
+        columns: vec!["score".to_string()],
+        unique: false,
+        is_constraint: false,
+        method: None,
+        predicate: None,
+        expressions: Vec::new(),
+        state: crate::worker::types::IndexState::Ready,
+        cached_predicate_conjuncts: None,
+    };
+    let schema = TableSchema {
+        name: "items".to_string(),
+        table_id: 1,
+        columns: vec![ColumnDef {
+            name: "score".to_string(),
+            data_type: DataType::Float64,
+            nullable: true,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+            collation: None,
+        }],
+        version: 1,
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![index],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
+        from_alias: None,
+    };
+    let stats = build_table_stats("score", 10.0, 0.0);
+
+    let neg_nan = -f64::NAN;
+
+    let mixed_nan_filter = TypedExpr {
+        kind: TypedExprKind::InList {
+            expr: Box::new(typed_column("score", DataType::Float64)),
+            list: vec![
+                typed_constant(Value::Float64(neg_nan), DataType::Float64),
+                typed_constant(Value::Float64(1.0), DataType::Float64),
+                typed_constant(Value::Float64(f64::NAN), DataType::Float64),
+            ],
+            negated: false,
+        },
+        data_type: DataType::Boolean,
+    };
+    let normalized_filter = TypedExpr {
+        kind: TypedExprKind::InList {
+            expr: Box::new(typed_column("score", DataType::Float64)),
+            list: vec![
+                typed_constant(Value::Float64(1.0), DataType::Float64),
+                typed_constant(Value::Float64(f64::NAN), DataType::Float64),
+            ],
+            negated: false,
+        },
+        data_type: DataType::Boolean,
+    };
+
+    let mixed_path = choose_btree_access_path_for_typed_filter(
+        &schema,
+        &mixed_nan_filter,
+        100_000,
+        Some(&stats),
+    );
+    let normalized_path = choose_btree_access_path_for_typed_filter(
+        &schema,
+        &normalized_filter,
+        100_000,
+        Some(&stats),
+    );
+
+    let mixed_keys = match &mixed_path.scan_type {
+        ScanType::InListScan { column_values, .. } => column_values,
+        other => panic!("expected InListScan for mixed NaN list, got {:?}", other),
+    };
+    let normalized_keys = match &normalized_path.scan_type {
+        ScanType::InListScan { column_values, .. } => column_values,
+        other => panic!("expected InListScan for normalized list, got {:?}", other),
+    };
+
+    // assert_eq! uses PartialEq where NaN != NaN, so compare lengths instead.
+    assert_eq!(
+        mixed_keys.len(),
+        normalized_keys.len(),
+        "IN (-NaN, 1.0, NaN) must normalize to the same scan key count as IN (1.0, NaN)"
+    );
+    assert_eq!(mixed_keys.len(), 2);
+    assert_eq!(mixed_keys[0].len(), 1);
+    assert_eq!(mixed_keys[1].len(), 1);
+
+    let nan_key_count = mixed_keys
+        .iter()
+        .filter(|key| matches!(key[0], Value::Float64(v) if v.is_nan()))
+        .count();
+    let one_key_count = mixed_keys
+        .iter()
+        .filter(|key| matches!(key[0], Value::Float64(v) if v == 1.0))
+        .count();
+    assert_eq!(
+        nan_key_count, 1,
+        "IN (-NaN, 1.0, NaN) should retain exactly one NaN key after dedup"
+    );
+    assert_eq!(one_key_count, 1, "IN list should retain the finite key 1.0");
+    assert!(
+        (mixed_path.cost - normalized_path.cost).abs() < 1e-12,
+        "IN (-NaN, 1.0, NaN) must have the same planned cost as IN (1.0, NaN)"
+    );
+}
+
+/// Motivating case from issue #1231: table with 100k rows, non-unique `status`
+/// column with 3 distinct values, query `WHERE status IN ('active', 'pending')`.
+/// Selectivity = 2/3 > 0.3 threshold → planner must choose FullTableScan.
+#[test]
+fn test_inlist_high_selectivity_prefers_full_scan() {
+    use super::index_selection::choose_btree_access_path_for_typed_filter;
+
+    let (schema, _index) = build_single_column_schema(false);
+    let stats = build_table_stats("status", 3.0, 0.0);
+    let table_rows = 100_000;
+
+    // Construct: status IN ('active', 'pending')
+    let filter = TypedExpr {
+        kind: TypedExprKind::InList {
+            expr: Box::new(typed_column("status", DataType::Text)),
+            list: vec![
+                typed_constant(Value::Text("active".to_string()), DataType::Text),
+                typed_constant(Value::Text("pending".to_string()), DataType::Text),
+            ],
+            negated: false,
+        },
+        data_type: DataType::Boolean,
+    };
+
+    let path =
+        choose_btree_access_path_for_typed_filter(&schema, &filter, table_rows, Some(&stats));
+    assert!(
+        matches!(path.scan_type, ScanType::FullTableScan),
+        "expected FullTableScan for high-selectivity InList (sel=2/3), got {:?} with cost {}",
+        path.scan_type,
+        path.cost,
+    );
+}
+
+/// Low-selectivity InList should still prefer index scan.
+#[test]
+fn test_inlist_low_selectivity_prefers_index_scan() {
+    use super::index_selection::choose_btree_access_path_for_typed_filter;
+
+    let (schema, _index) = build_single_column_schema(false);
+    let stats = build_table_stats("status", 1000.0, 0.0);
+    let table_rows = 100_000;
+
+    // Construct: status IN ('active', 'pending') — only 2 of 1000 distinct values
+    let filter = TypedExpr {
+        kind: TypedExprKind::InList {
+            expr: Box::new(typed_column("status", DataType::Text)),
+            list: vec![
+                typed_constant(Value::Text("active".to_string()), DataType::Text),
+                typed_constant(Value::Text("pending".to_string()), DataType::Text),
+            ],
+            negated: false,
+        },
+        data_type: DataType::Boolean,
+    };
+
+    let path =
+        choose_btree_access_path_for_typed_filter(&schema, &filter, table_rows, Some(&stats));
+    assert!(
+        matches!(path.scan_type, ScanType::InListScan { .. }),
+        "expected InListScan for low-selectivity InList (sel=2/1000), got {:?} with cost {}",
+        path.scan_type,
+        path.cost,
+    );
+}
+
+/// Boundary case: selectivity exactly equals threshold (0.3) and should NOT flip
+/// to full scan because index_scan_cost uses a strict `>` comparison.
+#[test]
+fn test_inlist_selectivity_at_threshold_prefers_index_scan() {
+    use super::index_selection::choose_btree_access_path_for_typed_filter;
+
+    let (schema, _index) = build_single_column_schema(false);
+    let stats = build_table_stats("status", 10.0, 0.0);
+    let table_rows = 1_000;
+
+    // Selectivity = 3/10 = 0.3 (exact threshold)
+    let filter = TypedExpr {
+        kind: TypedExprKind::InList {
+            expr: Box::new(typed_column("status", DataType::Text)),
+            list: vec![
+                typed_constant(Value::Text("a".to_string()), DataType::Text),
+                typed_constant(Value::Text("b".to_string()), DataType::Text),
+                typed_constant(Value::Text("c".to_string()), DataType::Text),
+            ],
+            negated: false,
+        },
+        data_type: DataType::Boolean,
+    };
+
+    let path =
+        choose_btree_access_path_for_typed_filter(&schema, &filter, table_rows, Some(&stats));
+    assert!(
+        matches!(path.scan_type, ScanType::InListScan { .. }),
+        "expected InListScan at threshold (sel=0.3, strict >), got {:?} with cost {}",
+        path.scan_type,
+        path.cost,
+    );
+}
+
+/// Boundary case just above threshold: selectivity > 0.3 should flip to full scan.
+#[test]
+fn test_inlist_selectivity_above_threshold_prefers_full_scan() {
+    use super::index_selection::choose_btree_access_path_for_typed_filter;
+
+    let (schema, _index) = build_single_column_schema(false);
+    let stats = build_table_stats("status", 10.0, 0.0);
+    let table_rows = 1_000;
+
+    // Selectivity = 4/10 = 0.4 (> threshold)
+    let filter = TypedExpr {
+        kind: TypedExprKind::InList {
+            expr: Box::new(typed_column("status", DataType::Text)),
+            list: vec![
+                typed_constant(Value::Text("a".to_string()), DataType::Text),
+                typed_constant(Value::Text("b".to_string()), DataType::Text),
+                typed_constant(Value::Text("c".to_string()), DataType::Text),
+                typed_constant(Value::Text("d".to_string()), DataType::Text),
+            ],
+            negated: false,
+        },
+        data_type: DataType::Boolean,
+    };
+
+    let path =
+        choose_btree_access_path_for_typed_filter(&schema, &filter, table_rows, Some(&stats));
+    assert!(
+        matches!(path.scan_type, ScanType::FullTableScan),
+        "expected FullTableScan above threshold (sel=0.4), got {:?} with cost {}",
+        path.scan_type,
+        path.cost,
+    );
+}
+
+/// Composite index (tenant_id, status): `tenant_id = ? AND status IN (a, b)`.
+/// Without prefix selectivity factoring, the IN-list selectivity alone (2/5 = 0.4)
+/// exceeds the 0.3 threshold and the planner incorrectly picks FullTableScan.
+/// With prefix selectivity (1/100 for tenant_id), the combined selectivity is
+/// 1/100 * 2/5 = 0.004, well below threshold → InListScan must be chosen.
+#[test]
+fn test_composite_index_inlist_factors_prefix_equality_selectivity() {
+    use super::index_selection::choose_btree_access_path_for_typed_filter;
+
+    let index = IndexDef {
+        id: 10,
+        name: "idx_tenant_status".to_string(),
+        columns: vec!["tenant_id".to_string(), "status".to_string()],
+        unique: false,
+        is_constraint: false,
+        method: None,
+        predicate: None,
+        expressions: Vec::new(),
+        state: crate::worker::types::IndexState::Ready,
+        cached_predicate_conjuncts: None,
+    };
+    let schema = TableSchema {
+        name: "events".to_string(),
+        table_id: 1,
+        columns: vec![
+            ColumnDef {
+                name: "tenant_id".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+                collation: None,
+            },
+            ColumnDef {
+                name: "status".to_string(),
+                data_type: DataType::Text,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+                collation: None,
+            },
+        ],
+        version: 1,
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![index],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
+        from_alias: None,
+    };
+
+    // Stats: tenant_id has 100 distinct values, status has 5
+    let mut columns = HashMap::new();
+    columns.insert(
+        "tenant_id".to_string(),
+        ColumnStatistics {
+            null_fraction: 0.0,
+            n_distinct: 100.0,
+            avg_width: 0,
+            most_common_vals: Vec::new(),
+            most_common_freqs: Vec::new(),
+            histogram_bounds: Vec::new(),
+            correlation: 0.0,
+        },
+    );
+    columns.insert(
+        "status".to_string(),
+        ColumnStatistics {
+            null_fraction: 0.0,
+            n_distinct: 5.0,
+            avg_width: 0,
+            most_common_vals: Vec::new(),
+            most_common_freqs: Vec::new(),
+            histogram_bounds: Vec::new(),
+            correlation: 0.0,
+        },
+    );
+    let stats = TableStatistics {
+        table_id: 1,
+        row_count: 100_000,
+        last_analyzed: 0,
+        columns,
+    };
+
+    let table_rows = 100_000;
+
+    // WHERE tenant_id = 42 AND status IN ('active', 'pending')
+    let filter = typed_binop(
+        typed_binop(
+            typed_column("tenant_id", DataType::Int64),
+            TypedBinaryOp::Eq,
+            typed_constant(Value::Int64(42), DataType::Int64),
+            DataType::Boolean,
+        ),
+        TypedBinaryOp::And,
+        TypedExpr {
+            kind: TypedExprKind::InList {
+                expr: Box::new(typed_column("status", DataType::Text)),
+                list: vec![
+                    typed_constant(Value::Text("active".to_string()), DataType::Text),
+                    typed_constant(Value::Text("pending".to_string()), DataType::Text),
+                ],
+                negated: false,
+            },
+            data_type: DataType::Boolean,
+        },
+        DataType::Boolean,
+    );
+
+    let path =
+        choose_btree_access_path_for_typed_filter(&schema, &filter, table_rows, Some(&stats));
+    assert!(
+        matches!(path.scan_type, ScanType::InListScan { .. }),
+        "expected InListScan for composite-index IN-list with prefix equality \
+         (combined sel = 1/100 * 2/5 = 0.004), got {:?} with cost {}",
+        path.scan_type,
+        path.cost,
+    );
 }

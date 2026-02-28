@@ -319,6 +319,7 @@ impl PhysicalPlanner {
                                 schema,
                                 predicate,
                                 child.cost.rows,
+                                ctx.get_stats(&scan_key),
                             );
                         match &access_path.scan_type {
                             crate::sql::planner::ScanType::FullTableScan => None,

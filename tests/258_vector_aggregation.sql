@@ -14,6 +14,6 @@ SELECT AVG(embedding) FROM vec_agg_test;
 
 SELECT id % 2 AS grp, SUM(embedding) FROM vec_agg_test WHERE embedding IS NOT NULL GROUP BY id % 2 ORDER BY grp;
 
-SELECT MIN(embedding), MAX(embedding) FROM vec_agg_test;
+-- db9 divergence: MIN/MAX(vector) not in pgvector; parity case removed
 
 DROP TABLE vec_agg_test;
