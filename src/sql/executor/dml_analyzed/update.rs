@@ -11,11 +11,13 @@ use super::{
     build_returning_types_from_analyzed, combine_rows, cross_product_rows, eval_returning_typed,
     typed_value_to_bool,
 };
-use crate::model::{Row, TableSchema};
-use crate::sql::analyzer::types::AnalyzedUpdate;
+use crate::model::{DataType, Row, TableSchema, Value};
+use crate::sql::analyzer::types::{AnalyzedUpdate, TypedExpr, TypedExprKind};
 use crate::sql::check_constraints;
 use crate::sql::expr::typed_fold::fold_typed_expr;
+use crate::sql::projection::fill_row_defaults;
 use crate::sql::query_context::QueryContext;
+use crate::worker::types::IndexState;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tikv_client::Transaction;
@@ -57,7 +59,25 @@ impl Executor {
         let folded_where = upd.where_clause.as_ref().map(|e| fold_typed_expr(e, &qctx));
         let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         let compiled_checks = check_constraints::compile_check_constraints(&schema, &qctx)?;
-        let mut rows = self.scan_and_fill(txn, db_id, t, &schema).await?;
+        // Fast path: when WHERE targets a PK or unique key, use point-get
+        // instead of a full table scan.  Falls back to scan_and_fill for all
+        // other predicate shapes (FROM present, WHERE absent, non-strict
+        // predicates).  See issue #1284.
+        let mut rows = if upd.from.is_empty() {
+            if let Some(ref where_expr) = folded_where {
+                match self
+                    .try_pk_fast_fetch(txn, db_id, &schema, where_expr)
+                    .await?
+                {
+                    Some(fetched) => fetched,
+                    None => self.scan_and_fill(txn, db_id, t, &schema).await?,
+                }
+            } else {
+                self.scan_and_fill(txn, db_id, t, &schema).await?
+            }
+        } else {
+            self.scan_and_fill(txn, db_id, t, &schema).await?
+        };
         append_ctid_to_rows(&mut rows);
         let has_hnsw = schema.indexes.iter().any(|idx| idx.is_hnsw());
         let mut cnt = 0;
@@ -298,4 +318,221 @@ impl Executor {
             Ok(ExecuteResult::Update { affected_rows: cnt })
         }
     }
+
+    // ── PK/Unique-key fast-path helpers ──────────────────────
+
+    /// Attempt point-get fetch when WHERE targets PK or a unique index.
+    ///
+    /// Supports three strict predicate shapes:
+    /// 1. `pk = const` — single/composite PK equality
+    /// 2. `pk IN (c1, c2, ...)` — single-column PK in-list (all constants)
+    /// 3. AND-connected `col = const` covering all columns of a UNIQUE index
+    ///
+    /// Returns `Some(rows)` when the predicate qualifies for fast fetch,
+    /// `None` to fall back to full table scan.
+    async fn try_pk_fast_fetch(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        schema: &TableSchema,
+        where_expr: &TypedExpr,
+    ) -> Result<Option<Vec<Row>>> {
+        // --- Path A: pure AND-tree of col = const ---
+        // Keyed by column_index (not name) to avoid case-folding bugs
+        // with quoted identifiers (e.g. "A" vs "a").
+        let mut eq_map: HashMap<usize, Value> = HashMap::new();
+        if collect_eq_by_col_index(where_expr, &mut eq_map).is_some() {
+            // NULL constants disable fast path (col = NULL is UNKNOWN).
+            if eq_map.values().any(|v| matches!(v, Value::Null)) {
+                return Ok(None);
+            }
+
+            // Check if all PK columns are covered → single PK point-get.
+            if schema.pk_indices.iter().all(|i| eq_map.contains_key(i)) {
+                let pk_values: Vec<Value> = schema
+                    .pk_indices
+                    .iter()
+                    .map(|i| eq_map[i].clone())
+                    .collect();
+                let rows = self
+                    .store()
+                    .batch_get_rows(txn, db_id, schema.table_id, vec![pk_values], schema)
+                    .await?;
+                return Ok(Some(fill_fetched_rows(rows, schema)?));
+            }
+
+            // Check unique indexes (only Ready, pure-column, non-partial,
+            // non-expression indexes qualify).
+            for idx in &schema.indexes {
+                if !idx.unique
+                    || !matches!(idx.state, IndexState::Ready)
+                    || !idx.expressions.is_empty()
+                    || idx.predicate.is_some()
+                {
+                    continue;
+                }
+                // Resolve index column names to schema column indices.
+                let idx_col_indices: Vec<usize> = idx
+                    .columns
+                    .iter()
+                    .filter_map(|c| schema.column_index(c))
+                    .collect();
+                if idx_col_indices.len() != idx.columns.len() {
+                    continue; // unresolvable column — skip
+                }
+                if idx_col_indices.iter().all(|i| eq_map.contains_key(i)) {
+                    let idx_values: Vec<Value> =
+                        idx_col_indices.iter().map(|i| eq_map[i].clone()).collect();
+                    let pk_types: Vec<DataType> = schema
+                        .pk_indices
+                        .iter()
+                        .map(|&i| schema.columns[i].data_type.clone())
+                        .collect();
+                    let pk_list = self
+                        .store()
+                        .scan_index(
+                            txn,
+                            db_id,
+                            schema.table_id,
+                            idx.id,
+                            &idx_values,
+                            true,
+                            &pk_types,
+                            None,
+                        )
+                        .await?;
+                    if pk_list.is_empty() {
+                        return Ok(Some(vec![]));
+                    }
+                    let rows = self
+                        .store()
+                        .batch_get_rows(txn, db_id, schema.table_id, pk_list, schema)
+                        .await?;
+                    return Ok(Some(fill_fetched_rows(rows, schema)?));
+                }
+            }
+
+            // Equalities don't cover PK or any qualifying unique index.
+            return Ok(None);
+        }
+
+        // --- Path B: pk IN (c1, c2, ...) for single-column PK ---
+        if schema.pk_indices.len() == 1 {
+            let pk_col_idx = schema.pk_indices[0];
+            if let TypedExprKind::InList {
+                expr,
+                list,
+                negated: false,
+            } = &where_expr.kind
+            {
+                if let TypedExprKind::ColumnRef { column_index, .. } = &expr.kind {
+                    if *column_index == pk_col_idx {
+                        // All list elements must be constants.
+                        let values: Vec<Value> = list
+                            .iter()
+                            .filter_map(|e| {
+                                if let TypedExprKind::Constant(v) = &e.kind {
+                                    Some(v.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        if values.len() != list.len() {
+                            return Ok(None);
+                        }
+
+                        // Deduplicate (avoid updating same row twice) and
+                        // filter NULLs (IN with NULL never matches).
+                        let mut deduped: Vec<Vec<Value>> = Vec::new();
+                        for v in values {
+                            if matches!(v, Value::Null) {
+                                continue;
+                            }
+                            let pk_vec = vec![v];
+                            if !deduped.contains(&pk_vec) {
+                                deduped.push(pk_vec);
+                            }
+                        }
+
+                        if deduped.is_empty() {
+                            return Ok(Some(vec![]));
+                        }
+                        let rows = self
+                            .store()
+                            .batch_get_rows(txn, db_id, schema.table_id, deduped, schema)
+                            .await?;
+                        return Ok(Some(fill_fetched_rows(rows, schema)?));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+/// Extract a conjunction of `col = const` predicates keyed by
+/// `column_index` (from `ColumnRef`).
+///
+/// Unlike `collect_typed_eq_predicates` (which keys by lowercased name),
+/// this avoids case-folding bugs with quoted identifiers (e.g. columns
+/// `"A"` and `"a"` are distinct in PostgreSQL but would collide under
+/// `to_lowercase()`).
+///
+/// Returns `None` if the expression is not a pure AND tree of equalities,
+/// or if the same column index appears with conflicting values.
+fn collect_eq_by_col_index(expr: &TypedExpr, out: &mut HashMap<usize, Value>) -> Option<()> {
+    use crate::sql::analyzer::types::BinaryOp as TypedBinaryOp;
+
+    match &expr.kind {
+        TypedExprKind::BinaryOp { left, op, right } => match op {
+            TypedBinaryOp::And => {
+                collect_eq_by_col_index(left, out)?;
+                collect_eq_by_col_index(right, out)?;
+                Some(())
+            }
+            TypedBinaryOp::Eq => {
+                let (col_idx, val) =
+                    if let TypedExprKind::ColumnRef { column_index, .. } = &left.kind {
+                        if let TypedExprKind::Constant(v) = &right.kind {
+                            (*column_index, v.clone())
+                        } else {
+                            return None;
+                        }
+                    } else if let TypedExprKind::ColumnRef { column_index, .. } = &right.kind {
+                        if let TypedExprKind::Constant(v) = &left.kind {
+                            (*column_index, v.clone())
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    };
+
+                if let Some(existing) = out.get(&col_idx) {
+                    if existing != &val {
+                        return None;
+                    }
+                    return Some(());
+                }
+                out.insert(col_idx, val);
+                Some(())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Fill defaults on rows returned by `batch_get_rows`, matching the
+/// behavior of `scan_and_fill` for rows with fewer columns than the
+/// current schema (e.g. columns added after the row was written).
+fn fill_fetched_rows(rows: Vec<Row>, schema: &TableSchema) -> Result<Vec<Row>> {
+    let mut filled = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        fill_row_defaults(&mut row, schema)?;
+        filled.push(row);
+    }
+    Ok(filled)
 }
