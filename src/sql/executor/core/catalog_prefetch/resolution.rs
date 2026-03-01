@@ -660,6 +660,13 @@ pub(super) async fn build_catalog_snapshot_inner(
             let qualified = raw_name.to_string();
             snapshot.add_table(raw_name, qualified.clone(), virtual_schema);
             snapshot.mark_non_base(&qualified);
+        } else if let Some(virtual_schema) =
+            crate::sql::catalog::virtual_tables::virtual_table_schema(raw_name)
+        {
+            // _DB9_SYS_* virtual tables (bare table name, no () suffix).
+            let qualified = raw_name.to_uppercase();
+            snapshot.add_table(raw_name, qualified.clone(), virtual_schema);
+            snapshot.mark_non_base(&qualified);
         }
         // If not found, we don't error here -- the Analyzer will produce
         // a proper "table not found" error with context.
