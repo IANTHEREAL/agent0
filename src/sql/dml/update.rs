@@ -186,6 +186,7 @@ pub async fn execute_update_row(
 ) -> Result<Row> {
     execute_update_row_inner(
         store, txn, db_id, table_name, schema, old_row, new_row, enum_cache, fk_ctx, true, true,
+        false,
     )
     .await
 }
@@ -203,8 +204,315 @@ pub(crate) async fn execute_update_row_without_fk_update(
 ) -> Result<Row> {
     execute_update_row_inner(
         store, txn, db_id, table_name, schema, old_row, new_row, enum_cache, fk_ctx, false, false,
+        false,
     )
     .await
+}
+
+/// Like [`execute_update_row`] but defers HNSW index maintenance.
+///
+/// The caller is responsible for calling [`batch_maintain_hnsw_indexes`]
+/// after all rows in the statement have been updated.  This avoids
+/// per-row graph load/serialize/write, reducing the cost from
+/// O(updated_rows * graph_size) to O(graph_size + updated_rows).
+pub async fn execute_update_row_defer_hnsw(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    table_name: &str,
+    schema: &TableSchema,
+    old_row: &Row,
+    new_row: Row,
+    enum_cache: &EnumLabelCache,
+    fk_ctx: Option<&mut FkDeleteContext>,
+) -> Result<Row> {
+    execute_update_row_inner(
+        store, txn, db_id, table_name, schema, old_row, new_row, enum_cache, fk_ctx, true, true,
+        true,
+    )
+    .await
+}
+
+/// Batch-maintain all HNSW indexes after a multi-row UPDATE.
+///
+/// Loads each HNSW graph ONCE, adds all changed vectors, then serializes
+/// and writes ONCE.  This replaces the per-row load/add/serialize/write
+/// loop that was the primary I/O amplifier under concurrent UPDATE
+/// workloads (see issue #1284).
+///
+/// `changes` contains `(old_row, new_row)` pairs for every row that was
+/// updated in the statement.  Rows whose vector column is unchanged are
+/// filtered internally — callers may pass all updated rows.
+pub async fn batch_maintain_hnsw_indexes(
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &TableSchema,
+    changes: &[(Row, Row)],
+) -> Result<()> {
+    if changes.is_empty() || !schema.indexes.iter().any(|idx| idx.is_hnsw()) {
+        return Ok(());
+    }
+
+    for index in &schema.indexes {
+        if !index.is_hnsw() {
+            continue;
+        }
+        if matches!(index.state, IndexState::Invalid | IndexState::Building) {
+            continue;
+        }
+
+        let Some(vector_col_name) = index.columns.first() else {
+            return Err(anyhow::anyhow!(
+                "HNSW index '{}' has no indexed column",
+                index.name
+            ));
+        };
+        let vector_col_idx = schema
+            .column_index(vector_col_name)
+            .ok_or_else(|| anyhow::anyhow!("HNSW index '{}' column not found", index.name))?;
+        let vector_dimensions = match schema.columns.get(vector_col_idx).map(|c| &c.data_type) {
+            Some(DataType::Vector(dim)) => usize::try_from(*dim).map_err(|_| {
+                anyhow::anyhow!(
+                    "HNSW index '{}' vector dimension {} exceeds platform limits",
+                    index.name,
+                    dim
+                )
+            })?,
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "HNSW index '{}' column '{}' is not a vector type",
+                    index.name,
+                    vector_col_name
+                ))
+            }
+        };
+
+        // Collect vectors that actually changed (skip unchanged vector + PK).
+        let mut pending: Vec<(u64, Vec<f32>)> = Vec::new();
+        for (old_row, new_row) in changes {
+            let old_pk_values = schema.get_pk_values(old_row);
+            let new_pk_values = schema.get_pk_values(new_row);
+            if old_pk_values == new_pk_values
+                && old_row.values.get(vector_col_idx) == new_row.values.get(vector_col_idx)
+            {
+                continue;
+            }
+            let vector_f64 = match new_row.values.get(vector_col_idx) {
+                Some(Value::Null) | None => continue,
+                Some(Value::Vector(v)) => v,
+                Some(other) => {
+                    return Err(anyhow::anyhow!(
+                        "HNSW index '{}' requires vector value, found {}",
+                        index.name,
+                        other.type_display_name()
+                    ))
+                }
+            };
+            let pk_label = hnsw_pk_label(&new_pk_values)?;
+            pending.push((pk_label, vec_f64_to_f32(vector_f64)));
+        }
+
+        if pending.is_empty() {
+            continue;
+        }
+
+        // Load graph ONCE.
+        let (hnsw_index, mut meta) =
+            match load_hnsw_graph_from_txn(txn, db_id, schema.table_id, index.id).await? {
+                Some(existing) => existing,
+                None => {
+                    let distance_metric = index.hnsw_distance_metric.as_deref().unwrap_or("l2");
+                    let m = usize::from(index.hnsw_m.unwrap_or(HNSW_DEFAULT_M as u16));
+                    let ef_construction = usize::from(
+                        index
+                            .hnsw_ef_construction
+                            .unwrap_or(HNSW_DEFAULT_EF_CONSTRUCTION as u16),
+                    );
+                    create_empty_hnsw_index(vector_dimensions, distance_metric, m, ef_construction)
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "failed to initialize HNSW graph for index '{}': {}",
+                                index.name,
+                                e
+                            )
+                        })?
+                }
+            };
+
+        meta.capacity = hnsw_index.capacity() as u64;
+
+        // Reserve capacity for all pending vectors at once.
+        let needed = meta.count + pending.len() as u64;
+        if needed >= (meta.capacity.saturating_mul(80) / 100) {
+            let next_capacity = needed.saturating_mul(2).max(1);
+            hnsw_index
+                .reserve(next_capacity as usize)
+                .map_err(|e| anyhow::anyhow!("failed to grow HNSW capacity: {}", e))?;
+            meta.capacity = next_capacity;
+        }
+
+        // Add all vectors.
+        for (pk_label, vector_f32) in &pending {
+            hnsw_index
+                .add(*pk_label, vector_f32)
+                .map_err(|e| anyhow::anyhow!("failed to add vector to HNSW index: {}", e))?;
+        }
+        meta.count = hnsw_index.size() as u64;
+
+        // Serialize and write ONCE.
+        let (graph_bytes, meta_bytes) =
+            serialize_hnsw_snapshot(db_id, schema.table_id, index.id, &hnsw_index, &meta).map_err(
+                |e| anyhow::anyhow!("failed to persist HNSW graph '{}': {}", index.name, e),
+            )?;
+
+        txn_put(
+            txn,
+            hnsw_graph_key(db_id, schema.table_id, index.id),
+            graph_bytes,
+        )
+        .await?;
+        txn_put(
+            txn,
+            hnsw_meta_key(db_id, schema.table_id, index.id),
+            meta_bytes,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Batch-maintain all HNSW indexes after a multi-row INSERT.
+///
+/// Same load-once/serialize-once strategy as [`batch_maintain_hnsw_indexes`]
+/// but for inserted rows (no old_row comparison needed).
+pub async fn batch_maintain_hnsw_indexes_for_inserts(
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &TableSchema,
+    inserted_rows: &[Row],
+) -> Result<()> {
+    if inserted_rows.is_empty() || !schema.indexes.iter().any(|idx| idx.is_hnsw()) {
+        return Ok(());
+    }
+
+    for index in &schema.indexes {
+        if !index.is_hnsw() {
+            continue;
+        }
+        if matches!(index.state, IndexState::Invalid | IndexState::Building) {
+            continue;
+        }
+
+        let Some(vector_col_name) = index.columns.first() else {
+            return Err(anyhow::anyhow!(
+                "HNSW index '{}' has no indexed column",
+                index.name
+            ));
+        };
+        let vector_col_idx = schema
+            .column_index(vector_col_name)
+            .ok_or_else(|| anyhow::anyhow!("HNSW index '{}' column not found", index.name))?;
+        let vector_dimensions = match schema.columns.get(vector_col_idx).map(|c| &c.data_type) {
+            Some(DataType::Vector(dim)) => usize::try_from(*dim).map_err(|_| {
+                anyhow::anyhow!(
+                    "HNSW index '{}' vector dimension {} exceeds platform limits",
+                    index.name,
+                    dim
+                )
+            })?,
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "HNSW index '{}' column '{}' is not a vector type",
+                    index.name,
+                    vector_col_name
+                ))
+            }
+        };
+
+        // Collect vectors from inserted rows (skip NULLs).
+        let mut pending: Vec<(u64, Vec<f32>)> = Vec::new();
+        for row in inserted_rows {
+            let vector_f64 = match row.values.get(vector_col_idx) {
+                Some(Value::Null) | None => continue,
+                Some(Value::Vector(v)) => v,
+                Some(other) => {
+                    return Err(anyhow::anyhow!(
+                        "HNSW index '{}' requires vector value, found {}",
+                        index.name,
+                        other.type_display_name()
+                    ))
+                }
+            };
+            let pk_values = schema.get_pk_values(row);
+            let pk_label = hnsw_pk_label(&pk_values)?;
+            pending.push((pk_label, vec_f64_to_f32(vector_f64)));
+        }
+
+        if pending.is_empty() {
+            continue;
+        }
+
+        let (hnsw_index, mut meta) =
+            match load_hnsw_graph_from_txn(txn, db_id, schema.table_id, index.id).await? {
+                Some(existing) => existing,
+                None => {
+                    let distance_metric = index.hnsw_distance_metric.as_deref().unwrap_or("l2");
+                    let m = usize::from(index.hnsw_m.unwrap_or(HNSW_DEFAULT_M as u16));
+                    let ef_construction = usize::from(
+                        index
+                            .hnsw_ef_construction
+                            .unwrap_or(HNSW_DEFAULT_EF_CONSTRUCTION as u16),
+                    );
+                    create_empty_hnsw_index(vector_dimensions, distance_metric, m, ef_construction)
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "failed to initialize HNSW graph for index '{}': {}",
+                                index.name,
+                                e
+                            )
+                        })?
+                }
+            };
+
+        meta.capacity = hnsw_index.capacity() as u64;
+
+        let needed = meta.count + pending.len() as u64;
+        if needed >= (meta.capacity.saturating_mul(80) / 100) {
+            let next_capacity = needed.saturating_mul(2).max(1);
+            hnsw_index
+                .reserve(next_capacity as usize)
+                .map_err(|e| anyhow::anyhow!("failed to grow HNSW capacity: {}", e))?;
+            meta.capacity = next_capacity;
+        }
+
+        for (pk_label, vector_f32) in &pending {
+            hnsw_index
+                .add(*pk_label, vector_f32)
+                .map_err(|e| anyhow::anyhow!("failed to add vector to HNSW index: {}", e))?;
+        }
+        meta.count = hnsw_index.size() as u64;
+
+        let (graph_bytes, meta_bytes) =
+            serialize_hnsw_snapshot(db_id, schema.table_id, index.id, &hnsw_index, &meta).map_err(
+                |e| anyhow::anyhow!("failed to persist HNSW graph '{}': {}", index.name, e),
+            )?;
+
+        txn_put(
+            txn,
+            hnsw_graph_key(db_id, schema.table_id, index.id),
+            graph_bytes,
+        )
+        .await?;
+        txn_put(
+            txn,
+            hnsw_meta_key(db_id, schema.table_id, index.id),
+            meta_bytes,
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
 async fn execute_update_row_inner(
@@ -219,6 +527,7 @@ async fn execute_update_row_inner(
     fk_ctx: Option<&mut FkDeleteContext>,
     propagate_fk_update: bool,
     validate_fk_now: bool,
+    skip_hnsw: bool,
 ) -> Result<Row> {
     let mut new_row_values = new_row.values;
     coerce_row_values(schema, &mut new_row_values)?;
@@ -404,8 +713,12 @@ async fn execute_update_row_inner(
         }
     }
 
-    maintain_hnsw_indexes_after_update(txn, db_id, schema, old_row, &new_row, &old_pks, &new_pks)
+    if !skip_hnsw {
+        maintain_hnsw_indexes_after_update(
+            txn, db_id, schema, old_row, &new_row, &old_pks, &new_pks,
+        )
         .await?;
+    }
 
     if propagate_fk_update {
         let fk_store_ctx = FkStoreCtx { store, db_id };

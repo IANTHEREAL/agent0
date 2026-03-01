@@ -69,9 +69,11 @@ impl Executor {
             _ => None,
         };
         let compiled_checks = check_constraints::compile_check_constraints(&schema, &qctx)?;
+        let has_hnsw = schema.indexes.iter().any(|idx| idx.is_hnsw());
         let mut affected = 0;
         let mut inserted = 0usize;
         let mut ret_rows = Vec::new();
+        let mut hnsw_inserted_rows: Vec<Row> = Vec::new();
         let ret_cols = build_returning_columns_from_analyzed(&ins.returning, &schema);
 
         // Get source rows. Each entry is (values, default_positions) where
@@ -226,20 +228,37 @@ impl Executor {
                 }
                 None => ConflictBehavior::Error,
             };
-            let result = dml::execute_insert_row(
-                &self.store(),
-                txn,
-                db_id,
-                t,
-                &schema,
-                row,
-                conflict_behavior,
-                &enum_cache,
-            )
-            .await?;
+            let result = if has_hnsw {
+                dml::execute_insert_row_defer_hnsw(
+                    &self.store(),
+                    txn,
+                    db_id,
+                    t,
+                    &schema,
+                    row,
+                    conflict_behavior,
+                    &enum_cache,
+                )
+                .await?
+            } else {
+                dml::execute_insert_row(
+                    &self.store(),
+                    txn,
+                    db_id,
+                    t,
+                    &schema,
+                    row,
+                    conflict_behavior,
+                    &enum_cache,
+                )
+                .await?
+            };
 
             match result {
                 dml::InsertRowResult::Inserted(final_row) => {
+                    if has_hnsw {
+                        hnsw_inserted_rows.push(final_row.clone());
+                    }
                     trigger_worker::enqueue_after_triggers(
                         txn,
                         db_id,
@@ -410,6 +429,34 @@ impl Executor {
                     }
                 }
             }
+        }
+
+        // Batch HNSW maintenance: load graph once, add all inserted
+        // vectors, serialize once, write once.  See issue #1284.
+        //
+        // Visibility contract change vs. pre-batch (per-row) behavior:
+        //
+        //   Preserved — transaction-level read-your-writes: after this
+        //   statement returns, subsequent statements in the same txn see
+        //   the updated HNSW graph (batch writes to the same txn buffer).
+        //
+        //   Changed — intra-statement HNSW graph visibility: previously,
+        //   each row wrote the graph to the txn buffer immediately, so a
+        //   BEFORE trigger's HNSW scan on row K could see graph updates
+        //   from rows 1..K-1.  Now, HNSW graph writes are deferred to
+        //   statement end; a BEFORE trigger's HNSW scan sees the
+        //   pre-statement graph.
+        //
+        //   Unaffected — row data visibility: non-HNSW row data is still
+        //   written per-row, so triggers can read previously-modified
+        //   rows via regular (non-HNSW) queries within the same statement.
+        //
+        //   Affected surface: only BEFORE triggers (or VALUES subqueries)
+        //   that perform HNSW vector search on the same table being
+        //   modified.  This is an extremely narrow pattern.
+        if !hnsw_inserted_rows.is_empty() {
+            dml::batch_maintain_hnsw_indexes_for_inserts(txn, db_id, &schema, &hnsw_inserted_rows)
+                .await?;
         }
 
         if inserted > 0 {

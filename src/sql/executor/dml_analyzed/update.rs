@@ -59,8 +59,10 @@ impl Executor {
         let compiled_checks = check_constraints::compile_check_constraints(&schema, &qctx)?;
         let mut rows = self.scan_and_fill(txn, db_id, t, &schema).await?;
         append_ctid_to_rows(&mut rows);
+        let has_hnsw = schema.indexes.iter().any(|idx| idx.is_hnsw());
         let mut cnt = 0;
         let mut ret_rows = Vec::new();
+        let mut hnsw_changes: Vec<(Row, Row)> = Vec::new();
         let ret_cols = build_returning_columns_from_analyzed(&upd.returning, &schema);
 
         // Handle FROM clause: scan ALL FROM tables and build cross-product rows.
@@ -192,19 +194,37 @@ impl Executor {
                 &qctx,
             )?;
 
-            // Persist.
-            let updated_row = dml::execute_update_row(
-                &self.store(),
-                txn,
-                db_id,
-                t,
-                &schema,
-                r,
-                new_row,
-                &enum_cache,
-                None,
-            )
-            .await?;
+            // Persist (defer HNSW maintenance to batch after the loop).
+            let updated_row = if has_hnsw {
+                let old_row_snapshot = Row::new(r.values[..schema.columns.len()].to_vec());
+                let result = dml::execute_update_row_defer_hnsw(
+                    &self.store(),
+                    txn,
+                    db_id,
+                    t,
+                    &schema,
+                    r,
+                    new_row,
+                    &enum_cache,
+                    None,
+                )
+                .await?;
+                hnsw_changes.push((old_row_snapshot, result.clone()));
+                result
+            } else {
+                dml::execute_update_row(
+                    &self.store(),
+                    txn,
+                    db_id,
+                    t,
+                    &schema,
+                    r,
+                    new_row,
+                    &enum_cache,
+                    None,
+                )
+                .await?
+            };
 
             // AFTER triggers.
             trigger_worker::enqueue_after_triggers(
@@ -230,6 +250,33 @@ impl Executor {
             }
 
             cnt += 1;
+        }
+
+        // Batch HNSW maintenance: load graph once, add all changed
+        // vectors, serialize once, write once.  See issue #1284.
+        //
+        // Visibility contract change vs. pre-batch (per-row) behavior:
+        //
+        //   Preserved — transaction-level read-your-writes: after this
+        //   statement returns, subsequent statements in the same txn see
+        //   the updated HNSW graph (batch writes to the same txn buffer).
+        //
+        //   Changed — intra-statement HNSW graph visibility: previously,
+        //   each row wrote the graph to the txn buffer immediately, so a
+        //   BEFORE trigger's HNSW scan on row K could see graph updates
+        //   from rows 1..K-1.  Now, HNSW graph writes are deferred to
+        //   statement end; a BEFORE trigger's HNSW scan sees the
+        //   pre-statement graph.
+        //
+        //   Unaffected — row data visibility: non-HNSW row data is still
+        //   written per-row, so triggers can read previously-modified
+        //   rows via regular (non-HNSW) queries within the same statement.
+        //
+        //   Affected surface: only BEFORE triggers (or SET subqueries)
+        //   that perform HNSW vector search on the same table being
+        //   modified.  This is an extremely narrow pattern.
+        if !hnsw_changes.is_empty() {
+            dml::batch_maintain_hnsw_indexes(txn, db_id, &schema, &hnsw_changes).await?;
         }
 
         // Bump mod_count for auto-ANALYZE tracking.

@@ -73,6 +73,10 @@ pub(crate) use foreign_keys::{
 pub use foreign_keys::{
     handle_foreign_key_on_delete, handle_foreign_key_on_update, validate_foreign_keys,
 };
+pub use insert::execute_insert_row_defer_hnsw;
 pub use insert::{build_enum_label_cache, execute_insert_row};
 pub(crate) use update::execute_update_row_without_fk_update;
-pub use update::{execute_update_row, execute_update_row_by_pk};
+pub use update::{
+    batch_maintain_hnsw_indexes, batch_maintain_hnsw_indexes_for_inserts, execute_update_row,
+    execute_update_row_by_pk, execute_update_row_defer_hnsw,
+};

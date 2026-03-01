@@ -1,0 +1,13 @@
+multi_row_insert|t
+insert_nearest|t
+update_nearest|t
+batch_update_all_visible|t
+on_conflict_do_nothing_new|t
+on_conflict_do_nothing_old|t
+on_conflict_do_update|t
+on_conflict_new_row|t
+on_conflict_search|t
+rollback_insert|t
+rollback_update|t
+null_vector_set|t
+insert_select_visible|t

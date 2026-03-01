@@ -376,6 +376,60 @@ pub async fn execute_insert_row(
     on_conflict: ConflictBehavior,
     enum_cache: &EnumLabelCache,
 ) -> Result<InsertRowResult> {
+    execute_insert_row_inner(
+        store,
+        txn,
+        db_id,
+        table_name,
+        schema,
+        row,
+        on_conflict,
+        enum_cache,
+        false,
+    )
+    .await
+}
+
+/// Like [`execute_insert_row`] but defers HNSW index maintenance.
+///
+/// The caller is responsible for calling
+/// [`super::update::batch_maintain_hnsw_indexes_for_inserts`] after all
+/// rows in the statement have been inserted.
+pub async fn execute_insert_row_defer_hnsw(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    table_name: &str,
+    schema: &TableSchema,
+    row: Row,
+    on_conflict: ConflictBehavior,
+    enum_cache: &EnumLabelCache,
+) -> Result<InsertRowResult> {
+    execute_insert_row_inner(
+        store,
+        txn,
+        db_id,
+        table_name,
+        schema,
+        row,
+        on_conflict,
+        enum_cache,
+        true,
+    )
+    .await
+}
+
+async fn execute_insert_row_inner(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    table_name: &str,
+    schema: &TableSchema,
+    row: Row,
+    on_conflict: ConflictBehavior,
+    enum_cache: &EnumLabelCache,
+    skip_hnsw: bool,
+) -> Result<InsertRowResult> {
     let mut row_values = row.values;
     coerce_row_values(schema, &mut row_values)?;
     let row = Row::new(row_values);
@@ -566,7 +620,9 @@ pub async fn execute_insert_row(
                     )
                     .await?;
             }
-            maintain_hnsw_indexes_after_insert(txn, db_id, schema, &row, &pk_values).await?;
+            if !skip_hnsw {
+                maintain_hnsw_indexes_after_insert(txn, db_id, schema, &row, &pk_values).await?;
+            }
             Ok(InsertRowResult::Inserted(row))
         }
         Err(e)
