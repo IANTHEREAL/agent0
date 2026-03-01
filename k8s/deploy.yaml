@@ -34,7 +34,7 @@ spec:
     spec:
       containers:
       - name: db9-server
-        image: 093162653901.dkr.ecr.us-west-2.amazonaws.com/pg-tikv:latest
+        image: 385595570414.dkr.ecr.us-west-2.amazonaws.com/pg-tikv:latest
         ports:
         - containerPort: 5433
         - containerPort: 5480
