@@ -270,10 +270,7 @@ mod tests {
 
     #[test]
     fn parse_new_assignment_handles_assignment_syntaxes_and_ignores_comparisons() {
-        assert_eq!(
-            parse_new_assignment("NEW.id := 1"),
-            Some(("id", "1"))
-        );
+        assert_eq!(parse_new_assignment("NEW.id := 1"), Some(("id", "1")));
         assert_eq!(
             parse_new_assignment("new.name = 'x'"),
             Some(("name", "'x'"))
@@ -308,12 +305,7 @@ mod tests {
             None
         );
         assert_eq!(
-            flatten_trigger_statement(
-                "NEW.name := 'x';",
-                &schema,
-                &new_values,
-                Some(&old_row)
-            ),
+            flatten_trigger_statement("NEW.name := 'x';", &schema, &new_values, Some(&old_row)),
             None
         );
 
@@ -335,8 +327,10 @@ mod tests {
     #[test]
     fn flatten_trigger_body_to_sql_joins_statements_and_skips_non_sql() {
         let schema = test_schema();
-        let new_row = crate::model::Row::new(vec![Value::Int32(42), Value::Text("alice".to_string())]);
-        let old_row = crate::model::Row::new(vec![Value::Int32(41), Value::Text("bob".to_string())]);
+        let new_row =
+            crate::model::Row::new(vec![Value::Int32(42), Value::Text("alice".to_string())]);
+        let old_row =
+            crate::model::Row::new(vec![Value::Int32(41), Value::Text("bob".to_string())]);
 
         let body = r#"
 BEGIN

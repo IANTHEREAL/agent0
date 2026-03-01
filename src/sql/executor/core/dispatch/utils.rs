@@ -378,4 +378,3 @@ mod tests {
         crate::sql::executor::core::retry::autocommit_backoff(8).await;
     }
 }
-

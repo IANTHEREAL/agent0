@@ -123,12 +123,7 @@ LIMIT  5;
 ### 6. Add an Index for Performance
 
 ```sql
--- IVFFlat: good for medium datasets, fast build
-CREATE INDEX ON documents
-USING ivfflat (embedding vector_cosine_ops)
-WITH (lists = 100);
-
--- HNSW: better recall, slower build, good for large datasets
+-- HNSW index
 CREATE INDEX ON documents
 USING hnsw (embedding vector_cosine_ops);
 ```

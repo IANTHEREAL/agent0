@@ -1636,4 +1636,3 @@ mod prepared_policy_tests {
         assert!(session.is_transaction_failed());
     }
 }
-

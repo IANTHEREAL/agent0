@@ -91,17 +91,16 @@ class VectorDB:
             """)
             logger.info("Table 'documents' ready")
 
-            # IVFFlat index — not supported on db9-server, optional on standard PG
+            # HNSW index
             try:
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_documents_embedding
                     ON documents
-                    USING ivfflat (embedding vector_cosine_ops)
-                    WITH (lists = 10)
+                    USING hnsw (embedding vector_cosine_ops)
                 """)
-                logger.info("IVFFlat index created on embedding column")
+                logger.info("HNSW index created on embedding column")
             except Exception:
-                logger.info("IVFFlat index skipped (not supported, using sequential scan)")
+                logger.info("HNSW index skipped (falling back to sequential scan)")
 
     def drop_table(self):
         """Drop the documents table (for demo cleanup)."""

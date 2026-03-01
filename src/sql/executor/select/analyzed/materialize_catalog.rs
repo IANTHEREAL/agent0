@@ -1360,8 +1360,14 @@ mod tests {
             value_to_i64_strict(&Value::Text("42".to_string()), "column_no").unwrap(),
             42
         );
-        assert_eq!(value_to_i64_strict(&Value::Int32(7), "column_no").unwrap(), 7);
-        assert_eq!(value_to_i64_strict(&Value::Int64(8), "column_no").unwrap(), 8);
+        assert_eq!(
+            value_to_i64_strict(&Value::Int32(7), "column_no").unwrap(),
+            7
+        );
+        assert_eq!(
+            value_to_i64_strict(&Value::Int64(8), "column_no").unwrap(),
+            8
+        );
     }
 
     #[test]

@@ -133,7 +133,7 @@ def detect_operations(text: str):
         ops.add(("vector", "vector_insert"))
     if any(k in t for k in ["cosine", "l2", "distance", "<->"]):
         ops.add(("vector", "vector_distance"))
-    if "ivfflat" in t or ("vector" in t and "index" in t):
+    if "hnsw" in t or ("vector" in t and "index" in t):
         ops.add(("vector", "vector_index"))
     if "vector" in t and any(k in t for k in ["where", "filter"]):
         ops.add(("vector", "vector_filter"))

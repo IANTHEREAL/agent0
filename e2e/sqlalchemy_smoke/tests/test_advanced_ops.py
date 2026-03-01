@@ -112,7 +112,7 @@ def test_sqlalchemy_join_subquery_prepared_and_vector_ops():
                     """
                 )
                 conn.exec_driver_sql(
-                    f"CREATE INDEX idx_vectors_embedding ON {SCHEMA_NAME}.vectors USING ivfflat (embedding)"
+                    f"CREATE INDEX idx_vectors_embedding ON {SCHEMA_NAME}.vectors USING hnsw (embedding)"
                 )
                 conn.exec_driver_sql(
                     f"""

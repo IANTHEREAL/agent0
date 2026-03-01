@@ -65,7 +65,7 @@ describe('Prisma gapfill operations [db9-server]', () => {
       `INSERT INTO prisma_gap_arr_vec (tags, embedding) VALUES (ARRAY[1,2,3], '[1,0,0]')`
     );
     await prisma.$executeRawUnsafe(
-      `CREATE INDEX idx_prisma_gap_vec_embedding ON prisma_gap_arr_vec USING ivfflat (embedding)`
+      `CREATE INDEX idx_prisma_gap_vec_embedding ON prisma_gap_arr_vec USING hnsw (embedding)`
     );
     await prisma.$executeRawUnsafe('DROP TABLE IF EXISTS prisma_gap_arr_vec');
     expect(true).toBe(true);

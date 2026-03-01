@@ -60,7 +60,7 @@ describe('Kysely gapfill operations [db9-server]', () => {
       WHERE id = 1
     `.execute(db);
 
-    await sql`CREATE INDEX idx_kysely_gap_embedding ON kysely_gap_batch USING ivfflat (embedding)`.execute(db);
+    await sql`CREATE INDEX idx_kysely_gap_embedding ON kysely_gap_batch USING hnsw (embedding)`.execute(db);
     await sql`UPDATE kysely_gap_batch SET embedding = '[1,0,0]' WHERE id = 1`.execute(db);
     await sql`UPDATE kysely_gap_batch SET embedding = '[0,1,0]' WHERE id = 2`.execute(db);
 

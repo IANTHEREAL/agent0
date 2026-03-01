@@ -173,7 +173,7 @@ func TestGormPreparedAndVectorSmoke(t *testing.T) {
 	}
 
 	createVectorIndex := fmt.Sprintf(
-		"CREATE INDEX idx_vectors_embedding ON %s.vectors USING ivfflat (embedding)",
+		"CREATE INDEX idx_vectors_embedding ON %s.vectors USING hnsw (embedding)",
 		quoteIdent(schemaName),
 	)
 	if err := db.WithContext(ctx).Exec(createVectorIndex).Error; err != nil {

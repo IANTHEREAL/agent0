@@ -15,7 +15,7 @@ def test_dify_sqlalchemy_gapfill_ops(schema, db):
             """
         )
         conn.exec_driver_sql(
-            f'CREATE INDEX "idx_dify_vec_gap_embedding" ON "{schema}"."dify_vec_gap" USING ivfflat (embedding)'
+            f'CREATE INDEX "idx_dify_vec_gap_embedding" ON "{schema}"."dify_vec_gap" USING hnsw (embedding)'
         )
         conn.exec_driver_sql(
             f"""
@@ -99,5 +99,6 @@ def test_dify_sqlalchemy_gapfill_ops(schema, db):
         assert r1 == [(1,)]
         assert r2 == [(1,)]
 
-        positional = conn.exec_driver_sql("SELECT $1::int AS v", (2,)).fetchall()
+        # Use DBAPI positional placeholder so psycopg2 binds correctly.
+        positional = conn.exec_driver_sql("SELECT %s::int AS v", (2,)).fetchall()
         assert positional == [(2,)]

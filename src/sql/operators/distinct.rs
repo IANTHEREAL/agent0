@@ -177,8 +177,8 @@ mod tests {
     use super::*;
     use crate::model::{ColumnDef, DataType, Value};
     use crate::sql::analyzer::types::TypedExprKind;
-    use crate::sql::query_context::QueryContext;
     use crate::sql::operators::scan::TableScanOperator;
+    use crate::sql::query_context::QueryContext;
 
     fn test_schema() -> TableSchema {
         TableSchema {

@@ -561,9 +561,7 @@ pub(super) async fn prefetch_table_function_schemas(
                     continue;
                 }
                 let url = match call.args.first() {
-                    Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => {
-                        literal_expr_to_text(e)
-                    }
+                    Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => literal_expr_to_text(e),
                     _ => None,
                 };
                 let Some(url) = url else {

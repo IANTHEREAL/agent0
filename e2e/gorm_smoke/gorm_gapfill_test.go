@@ -50,7 +50,9 @@ func TestGormGapfillOps(t *testing.T) {
 	).Error; err != nil {
 		t.Fatalf("create index: %v", err)
 	}
-	if err := db.WithContext(ctx).Exec("DROP INDEX idx_gorm_gap_users_name").Error; err != nil {
+	if err := db.WithContext(ctx).Exec(
+		fmt.Sprintf("DROP INDEX %s.%s", quoteIdent(schemaName), quoteIdent("idx_gorm_gap_users_name")),
+	).Error; err != nil {
 		t.Fatalf("drop index: %v", err)
 	}
 

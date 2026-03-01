@@ -290,16 +290,19 @@ mod tests {
     use super::*;
     use crate::model::{DataType, Value};
     use crate::sql::analyzer::types::{
-        JoinCondition, JoinType, ResolvedFunction, ResolvedUsingColumn, SetOpKind, TypedExpr,
-        TypedExprKind, TypedFunctionArg, TypedOrderByExpr, FunctionKind,
+        FunctionKind, JoinCondition, JoinType, ResolvedFunction, ResolvedUsingColumn, SetOpKind,
+        TypedExpr, TypedExprKind, TypedFunctionArg, TypedOrderByExpr,
     };
+    use crate::sql::operators::WindowFunctionExpr;
     use crate::sql::optimizer::logical_plan::PlanSchema;
     use crate::sql::optimizer::physical_plan::{PhysicalCost, PhysicalNode, PhysicalPlan};
     use crate::sql::planner::ScanType;
-    use crate::sql::operators::WindowFunctionExpr;
 
     fn bool_const(v: bool) -> TypedExpr {
-        TypedExpr::new(TypedExprKind::Constant(Value::Boolean(v)), DataType::Boolean)
+        TypedExpr::new(
+            TypedExprKind::Constant(Value::Boolean(v)),
+            DataType::Boolean,
+        )
     }
 
     fn int_const(v: i32) -> TypedExpr {
@@ -680,7 +683,9 @@ mod tests {
             cost: PhysicalCost::default(),
         };
         match physical_plan_to_plan_node(&semi) {
-            PlanNode::SemiJoin { anti, hash_cond, .. } => {
+            PlanNode::SemiJoin {
+                anti, hash_cond, ..
+            } => {
                 assert!(anti);
                 assert!(hash_cond.is_none());
             }

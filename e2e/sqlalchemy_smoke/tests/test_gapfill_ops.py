@@ -38,7 +38,7 @@ def test_sqlalchemy_gapfill_ops():
             with engine.begin() as conn:
                 conn.exec_driver_sql(f"ALTER TABLE {SCHEMA_NAME}.user2 ADD COLUMN nick TEXT")
                 conn.exec_driver_sql(f"CREATE INDEX idx_user2_name ON {SCHEMA_NAME}.user2(name)")
-                conn.exec_driver_sql(f"DROP INDEX idx_user2_name")
+                conn.exec_driver_sql(f"DROP INDEX {SCHEMA_NAME}.idx_user2_name")
                 # migrate marker keyword for coverage taxonomy (represents migration-style DDL).
                 conn.exec_driver_sql(f"ALTER TABLE {SCHEMA_NAME}.user2 ALTER COLUMN nick TYPE TEXT")
 
