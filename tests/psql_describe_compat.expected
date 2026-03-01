@@ -26,3 +26,19 @@ q7_eq=true
 ?column?
 q8_index=_psql_compat_pkey,replident=false
 (1 row)
+?column?
+q9_fk=_psql_compat_ref_compat_id_fkey,parent=0
+(1 row)
+?column?
+q10_refby=_psql_compat_ref_compat_id_fkey,parent=0
+(1 row)
+?column?
+q11_rel=_psql_compat,hastriggers=true
+q11_rel=_psql_compat_ref,hastriggers=true
+(2 rows)
+?column?
+q12_refby_plus=_psql_compat_ref_compat_id_fkey,parent=0
+(1 row)
+?column?
+q13_trigger_rows=0
+(1 row)

@@ -1,6 +1,6 @@
-use super::helpers::{int_col, int_val, text_col, text_val};
+use super::helpers::{bool_col, int_col, int_val, text_col, text_val};
 use super::{ScanContext, VirtualTable};
-use crate::model::{Row, TableSchema};
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::catalog_oids;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -28,6 +28,8 @@ impl VirtualTable for PgTrigger {
                 int_col("tgrelid"),
                 int_col("tgfoid"),
                 text_col("tgenabled"),
+                bool_col("tgisinternal"),
+                int_col("tgparentid"),
             ],
             version: 1,
             pk_constraint_name: None,
@@ -74,9 +76,24 @@ impl VirtualTable for PgTrigger {
                 int_val(tgrelid),
                 int_val(tgfoid),
                 text_val("O"),
+                Value::Boolean(false),
+                int_val(0),
             ]));
         }
 
         Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_includes_psql_describe_columns() {
+        let schema = PgTrigger.schema();
+        let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"tgisinternal"));
+        assert!(names.contains(&"tgparentid"));
     }
 }

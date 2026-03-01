@@ -1,14 +1,42 @@
 use super::helpers::{
-    access_method_oid, bool_col, int_col, int_val, null_val, schema_oid, text_array_col, text_col,
-    text_val,
+    access_method_oid, bool_col, int_col, int_val, null_val, schema_oid, split_schema_and_name,
+    text_array_col, text_col, text_val,
 };
 use super::{ScanContext, VirtualTable};
 use crate::model::{Row, TableSchema, Value};
 use crate::sql::catalog_oids;
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::{HashMap, HashSet};
 
 pub struct PgClass;
+
+fn normalize_fk_ref_table(source_schema: &str, ref_table: &str) -> String {
+    if crate::sql::names::parse_full_name(ref_table).is_ok() {
+        ref_table.to_string()
+    } else {
+        format!("{}.{}", source_schema, ref_table)
+    }
+}
+
+fn tables_referenced_by_foreign_keys(
+    table_schemas: &HashMap<String, TableSchema>,
+) -> HashSet<String> {
+    let mut referenced = HashSet::new();
+    for (source_full_name, schema) in table_schemas {
+        let (source_schema, _) = split_schema_and_name(source_full_name);
+        for fk in &schema.foreign_keys {
+            let normalized_ref = normalize_fk_ref_table(&source_schema, &fk.ref_table);
+            if table_schemas.contains_key(&normalized_ref) {
+                referenced.insert(normalized_ref);
+            } else if table_schemas.contains_key(&fk.ref_table) {
+                // Legacy fallback: tolerate old schemas that persisted ref_table without schema.
+                referenced.insert(fk.ref_table.clone());
+            }
+        }
+    }
+    referenced
+}
 
 #[async_trait]
 impl VirtualTable for PgClass {
@@ -65,17 +93,27 @@ impl VirtualTable for PgClass {
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
+        let mut table_schemas: HashMap<String, TableSchema> = HashMap::new();
 
         for full_table_name in ctx.user_tables {
-            let (table_schema, table_name) = super::helpers::split_schema_and_name(full_table_name);
-            let namespace_oid = schema_oid(ctx.schema_oids, &table_schema);
             if let Some(schema) = ctx
                 .store
                 .get_schema(ctx.txn, ctx.db_id, full_table_name)
                 .await?
             {
+                table_schemas.insert(full_table_name.to_string(), schema);
+            }
+        }
+        let tables_with_incoming_fk = tables_referenced_by_foreign_keys(&table_schemas);
+
+        for full_table_name in ctx.user_tables {
+            let (table_schema, table_name) = split_schema_and_name(full_table_name);
+            let namespace_oid = schema_oid(ctx.schema_oids, &table_schema);
+            if let Some(schema) = table_schemas.get(full_table_name.as_str()) {
                 let table_oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
                 let relhasindex = !schema.indexes.is_empty() || !schema.pk_indices.is_empty();
+                let relhastriggers = !schema.foreign_keys.is_empty()
+                    || tables_with_incoming_fk.contains(full_table_name);
                 let relnatts = schema.columns.len() as i64;
                 let relchecks = schema.check_constraints.len() as i64;
                 rows.push(Row::new(vec![
@@ -96,7 +134,7 @@ impl VirtualTable for PgClass {
                     Value::Int64(relnatts),
                     Value::Int64(relchecks),
                     Value::Boolean(false), // relhasrules
-                    Value::Boolean(false), // relhastriggers
+                    Value::Boolean(relhastriggers),
                     Value::Boolean(false), // relhassubclass
                     Value::Boolean(false), // relrowsecurity
                     Value::Boolean(false), // relforcerowsecurity
@@ -250,5 +288,62 @@ impl VirtualTable for PgClass {
         }
 
         Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tables_referenced_by_foreign_keys;
+    use crate::model::{ForeignKeyAction, ForeignKeyConstraint, TableSchema};
+    use std::collections::HashMap;
+
+    fn empty_schema(name: &str) -> TableSchema {
+        TableSchema {
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn incoming_fk_detection_handles_qualified_and_unqualified_refs() {
+        let mut schemas = HashMap::new();
+        schemas.insert("public.parent".to_string(), empty_schema("public.parent"));
+        schemas.insert(
+            "public.child".to_string(),
+            TableSchema {
+                name: "public.child".to_string(),
+                foreign_keys: vec![ForeignKeyConstraint {
+                    name: "child_parent_fkey".to_string(),
+                    columns: vec!["parent_id".to_string()],
+                    ref_table: "public.parent".to_string(),
+                    ref_columns: vec!["id".to_string()],
+                    on_delete: ForeignKeyAction::NoAction,
+                    on_update: ForeignKeyAction::NoAction,
+                }],
+                ..Default::default()
+            },
+        );
+        schemas.insert("tenant.p".to_string(), empty_schema("tenant.p"));
+        schemas.insert(
+            "tenant.c".to_string(),
+            TableSchema {
+                name: "tenant.c".to_string(),
+                foreign_keys: vec![ForeignKeyConstraint {
+                    name: "tenant_c_p_fkey".to_string(),
+                    columns: vec!["p_id".to_string()],
+                    ref_table: "p".to_string(),
+                    ref_columns: vec!["id".to_string()],
+                    on_delete: ForeignKeyAction::NoAction,
+                    on_update: ForeignKeyAction::NoAction,
+                }],
+                ..Default::default()
+            },
+        );
+
+        let incoming = tables_referenced_by_foreign_keys(&schemas);
+        assert!(incoming.contains("public.parent"));
+        assert!(incoming.contains("tenant.p"));
+        assert!(!incoming.contains("public.child"));
+        assert!(!incoming.contains("tenant.c"));
     }
 }

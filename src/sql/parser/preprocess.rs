@@ -885,6 +885,90 @@ fn preprocess_hnsw_opclass(sql: &str) -> Option<String> {
     Some(rewritten)
 }
 
+/// Rewrite `pg_partition_ancestors(... ) WITH ORDINALITY` table factors to an
+/// empty `unnest(regclass[]) WITH ORDINALITY` relation.
+///
+/// PostgreSQL's `psql \d+` emits:
+/// `pg_catalog.pg_partition_ancestors(t.tgrelid) WITH ORDINALITY AS a(relid, depth)`.
+/// sqlparser 0.40 cannot parse `WITH ORDINALITY` on general table functions.
+///
+/// db9 currently has no partition ancestry metadata, so replacing this source
+/// with an empty relation preserves observable behavior for non-partitioned
+/// tables while allowing the statement to parse.
+///
+/// Classification: parse-compat shim.
+/// Exit condition: remove when sqlparser-rs supports `WITH ORDINALITY` on
+/// generic table functions and db9 supports real partition ancestry metadata.
+fn preprocess_partition_ancestors_with_ordinality(sql: &str) -> Option<String> {
+    if !sql.to_ascii_uppercase().contains("PG_PARTITION_ANCESTORS")
+        || !sql.to_ascii_uppercase().contains("WITH ORDINALITY")
+    {
+        return None;
+    }
+
+    let with_alias_re = Regex::new(
+        r"(?is)(?:pg_catalog\.)?pg_partition_ancestors\s*\([^)]*\)\s+WITH\s+ORDINALITY\s+AS\s+([A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\))",
+    )
+    .ok()?;
+    let bare_re =
+        Regex::new(r"(?is)(?:pg_catalog\.)?pg_partition_ancestors\s*\([^)]*\)\s+WITH\s+ORDINALITY")
+            .ok()?;
+    let tokens = tokenize_sql_for_rewrite(sql);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    // Never match inside string literals / dollar strings / comments.
+    let masked_sql = mask_hnsw_rewrite_unsafe_regions(sql, &tokens);
+    let mut rewrites: Vec<(usize, usize, String)> = Vec::new();
+
+    for caps in with_alias_re.captures_iter(&masked_sql) {
+        let Some(full) = caps.get(0) else {
+            continue;
+        };
+        let Some(alias) = caps.get(1) else {
+            continue;
+        };
+        let alias_text = sql[alias.start()..alias.end()].trim();
+        rewrites.push((
+            full.start(),
+            full.end(),
+            format!(
+                "UNNEST(ARRAY[]::pg_catalog.regclass[]) AS {} WITH OFFSET",
+                alias_text
+            ),
+        ));
+    }
+
+    for caps in bare_re.captures_iter(&masked_sql) {
+        let Some(full) = caps.get(0) else {
+            continue;
+        };
+        let covered = rewrites
+            .iter()
+            .any(|(s, e, _)| full.start() >= *s && full.end() <= *e);
+        if covered {
+            continue;
+        }
+        rewrites.push((
+            full.start(),
+            full.end(),
+            "UNNEST(ARRAY[]::pg_catalog.regclass[]) WITH OFFSET".to_string(),
+        ));
+    }
+
+    if rewrites.is_empty() {
+        return None;
+    }
+    rewrites.sort_by_key(|(start, _, _)| *start);
+
+    let mut rewritten = sql.to_string();
+    for (start, end, replacement) in rewrites.into_iter().rev() {
+        rewritten.replace_range(start..end, &replacement);
+    }
+    Some(rewritten)
+}
+
 /// SQL preprocessor shim registry (all parse-time compatibility only).
 ///
 /// Shim inventory:
@@ -950,6 +1034,13 @@ fn preprocess_hnsw_opclass(sql: &str) -> Option<String> {
 ///   without explicit opclass stays as `hnsw`).
 ///   Why: sqlparser 0.40 doesn't support operator classes in CREATE INDEX.
 ///   Exit condition: operator class support in sqlparser-rs.
+/// - `preprocess_partition_ancestors_with_ordinality`
+///   What: rewrite `pg_partition_ancestors(... ) WITH ORDINALITY` to an empty
+///   `unnest(regclass[]) WITH ORDINALITY` source.
+///   Why: sqlparser 0.40 cannot parse `WITH ORDINALITY` on non-UNNEST table
+///   functions.
+///   Exit condition: parser support for generic `WITH ORDINALITY` plus native
+///   partition ancestry support.
 pub(super) fn preprocess_sql(sql: &str) -> String {
     let mut result = sql.to_string();
 
@@ -987,6 +1078,9 @@ pub(super) fn preprocess_sql(sql: &str) -> String {
         result = rewritten;
     }
     if let Some(rewritten) = preprocess_hnsw_opclass(&result) {
+        result = rewritten;
+    }
+    if let Some(rewritten) = preprocess_partition_ancestors_with_ordinality(&result) {
         result = rewritten;
     }
 
@@ -1205,5 +1299,21 @@ mod tests {
         let rewritten = preprocess_hnsw_opclass(input).expect("expected HNSW rewrite");
         assert!(rewritten.contains("DEFAULT 'USING hnsw (v vector_cosine_ops)'"));
         assert!(rewritten.contains("CREATE INDEX idx ON t USING hnsw__cosine (v)"));
+    }
+
+    #[test]
+    fn preprocess_partition_ancestors_with_ordinality_rewrites_psql_pattern() {
+        let input = "SELECT u.tgrelid::pg_catalog.regclass FROM pg_catalog.pg_trigger AS u, pg_catalog.pg_partition_ancestors(t.tgrelid) WITH ORDINALITY AS a(relid, depth) WHERE u.tgname = 't'";
+        let rewritten = preprocess_partition_ancestors_with_ordinality(input)
+            .expect("expected pg_partition_ancestors WITH ORDINALITY rewrite");
+        assert!(rewritten
+            .contains("UNNEST(ARRAY[]::pg_catalog.regclass[]) AS a(relid, depth) WITH OFFSET"));
+        assert!(!rewritten.contains("pg_partition_ancestors(t.tgrelid) WITH ORDINALITY"));
+    }
+
+    #[test]
+    fn preprocess_partition_ancestors_with_ordinality_ignores_scalar_usage() {
+        let input = "SELECT pg_catalog.pg_partition_ancestors('42')";
+        assert!(preprocess_partition_ancestors_with_ordinality(input).is_none());
     }
 }

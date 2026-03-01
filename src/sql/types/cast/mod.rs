@@ -13,6 +13,14 @@ use std::str::FromStr;
 
 const MAX_RUNTIME_NUMERIC_SCALE: u32 = Decimal::MAX_SCALE;
 
+fn is_regclass_udt(udt: &str) -> bool {
+    udt.eq_ignore_ascii_case("regclass") || udt.eq_ignore_ascii_case("pg_catalog.regclass")
+}
+
+fn is_regtype_udt(udt: &str) -> bool {
+    udt.eq_ignore_ascii_case("regtype") || udt.eq_ignore_ascii_case("pg_catalog.regtype")
+}
+
 /// Controls which type conversions are allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CastContext {
@@ -66,6 +74,8 @@ fn value_is_compatible_with_column_type(value: &Value, column_type: &DataType) -
             Value::Text(_),
             DataType::Text | DataType::Name | DataType::Varchar(_) | DataType::UserDefined(_),
         ) => true,
+        (Value::Int32(_), DataType::UserDefined(udt)) if is_regclass_udt(udt) => true,
+        (Value::Int64(_), DataType::UserDefined(udt)) if is_regclass_udt(udt) => true,
         (Value::Bytes(_), DataType::Bytes) => true,
         (Value::Timestamp(_), DataType::Timestamp | DataType::TimestampTz) => true,
         (Value::Interval(_), DataType::Interval) => true,
@@ -557,10 +567,30 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             Ok(Value::Vector(vec))
         }
 
+        // ===== regclass pseudo-type =====
+        // db9 stores catalog OIDs as Int64. For psql compatibility queries
+        // (e.g. pg_partition_ancestors(...) UNION ...::regclass), accept
+        // numeric text and integer values and normalize to Int64.
+        (Value::Text(s), DataType::UserDefined(ref udt)) if is_regclass_udt(udt) => {
+            s.trim().parse::<i64>().map(Value::Int64).map_err(|_| {
+                SqlError::InvalidInputSyntax {
+                    type_name: "regclass".into(),
+                    value: s,
+                }
+                .into()
+            })
+        }
+        (Value::Int32(n), DataType::UserDefined(ref udt)) if is_regclass_udt(udt) => {
+            Ok(Value::Int64(n as i64))
+        }
+        (Value::Int64(n), DataType::UserDefined(ref udt)) if is_regclass_udt(udt) => {
+            Ok(Value::Int64(n))
+        }
+
         // ===== regtype pseudo-type =====
         // Implements minimal ::regtype::text — strip schema qualification and
         // map short PostgreSQL aliases to their canonical display names.
-        (Value::Text(s), DataType::UserDefined(ref udt)) if udt.eq_ignore_ascii_case("regtype") => {
+        (Value::Text(s), DataType::UserDefined(ref udt)) if is_regtype_udt(udt) => {
             Ok(Value::Text(normalize_regtype(&s)))
         }
 

@@ -61,6 +61,7 @@ impl VirtualTable for PgConstraint {
                 bool_col("condeferred"),
                 text_col("constraintdef"),
                 int_col("conindid"),
+                int_col("conparentid"),
             ],
             version: 1,
             pk_constraint_name: None,
@@ -132,6 +133,7 @@ impl VirtualTable for PgConstraint {
                     Value::Boolean(false),
                     text_val(&constraintdef),
                     int_val(conindid),
+                    int_val(0),
                 ]));
                 constraint_oid += 1;
             }
@@ -166,6 +168,7 @@ impl VirtualTable for PgConstraint {
                     Value::Boolean(false),
                     text_val(&constraintdef),
                     int_val(conindid),
+                    int_val(0),
                 ]));
                 constraint_oid += 1;
             }
@@ -196,6 +199,7 @@ impl VirtualTable for PgConstraint {
                     Value::Boolean(false),
                     Value::Boolean(false),
                     text_val(&constraintdef),
+                    int_val(0),
                     int_val(0),
                 ]));
                 constraint_oid += 1;
@@ -265,6 +269,7 @@ impl VirtualTable for PgConstraint {
                     Value::Boolean(false),
                     text_val(&constraintdef),
                     int_val(0),
+                    int_val(0),
                 ]));
                 constraint_oid += 1;
             }
@@ -277,6 +282,9 @@ impl VirtualTable for PgConstraint {
 #[cfg(test)]
 mod tests {
     use super::is_unique_constraint_index;
+    use super::PgConstraint;
+    use super::VirtualTable;
+    use crate::model::DataType;
     use crate::model::IndexDef;
     use crate::worker::types::IndexState;
 
@@ -301,5 +309,16 @@ mod tests {
 
         idx.is_constraint = true;
         assert!(is_unique_constraint_index(&idx));
+    }
+
+    #[test]
+    fn pg_constraint_has_conparentid_column() {
+        let schema = PgConstraint.schema();
+        let col = schema
+            .columns
+            .iter()
+            .find(|c| c.name == "conparentid")
+            .expect("pg_constraint.conparentid column must exist");
+        assert_eq!(col.data_type, DataType::Int64);
     }
 }

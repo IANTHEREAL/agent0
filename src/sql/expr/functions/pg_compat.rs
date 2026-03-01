@@ -31,6 +31,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("HAS_TABLE_PRIVILEGE", has_privilege);
     map.insert("HAS_DATABASE_PRIVILEGE", has_privilege);
     map.insert("PG_RELATION_IS_PUBLISHABLE", pg_relation_is_publishable);
+    map.insert("PG_PARTITION_ANCESTORS", pg_partition_ancestors);
     // Binary send functions (bytea serialization)
     map.insert("INT4SEND", int4send);
     map.insert("INT8SEND", int8send);
@@ -331,6 +332,14 @@ pub fn pg_relation_is_publishable(args: Vec<Value>) -> Result<Value> {
     }
 }
 
+/// Compatibility shim for `pg_partition_ancestors(regclass)`.
+///
+/// db9 currently has no partition ancestry metadata, so introspection should
+/// behave like "no ancestors".
+pub fn pg_partition_ancestors(_args: Vec<Value>) -> Result<Value> {
+    Ok(Value::Null)
+}
+
 /// int4send(integer) → bytea — 4-byte big-endian encoding
 pub fn int4send(args: Vec<Value>) -> Result<Value> {
     let val = args.into_iter().next().unwrap_or(Value::Null);
@@ -596,6 +605,18 @@ mod tests {
         );
         assert_eq!(pg_table_is_visible(vec![Value::Null]).unwrap(), Value::Null);
         assert_eq!(pg_table_is_visible(vec![]).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_pg_partition_ancestors_stub() {
+        assert_eq!(
+            pg_partition_ancestors(vec![Value::Int64(12345)]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            pg_partition_ancestors(vec![Value::Null]).unwrap(),
+            Value::Null
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@
 -- Exercises the exact query patterns psql generates for \d and \d+.
 -- Each section is labelled with the psql metacommand that generates it.
 
+DROP TABLE IF EXISTS _psql_compat_ref CASCADE;
 DROP TABLE IF EXISTS _psql_compat CASCADE;
 
 CREATE TABLE _psql_compat (
@@ -88,5 +89,97 @@ WHERE c.relname = '_psql_compat'
   AND i.indexrelid = c2.oid
 ORDER BY c2.relname;
 
+-- ============================================================
+-- Q9: psql \d foreign-key constraints (pg_constraint.conparentid)
+-- ============================================================
+CREATE TABLE _psql_compat_ref (
+    id SERIAL PRIMARY KEY,
+    compat_id INT REFERENCES _psql_compat(id)
+);
+
+SELECT 'q9_fk=' || r.conname || ',parent=' || r.conparentid::text
+FROM pg_catalog.pg_constraint r
+WHERE r.conrelid = (
+    SELECT c.oid
+    FROM pg_catalog.pg_class c
+    WHERE c.relname = '_psql_compat_ref'
+      AND pg_catalog.pg_table_is_visible(c.oid)
+)
+  AND r.contype = 'f'
+  AND conparentid = 0
+ORDER BY r.conname;
+
+-- ============================================================
+-- Q10: psql \d referenced-by query (incoming FK + conparentid)
+-- ============================================================
+SELECT 'q10_refby=' || c.conname || ',parent=' || c.conparentid::text
+FROM pg_catalog.pg_constraint c
+WHERE c.confrelid = (
+    SELECT pc.oid
+    FROM pg_catalog.pg_class pc
+    WHERE pc.relname = '_psql_compat'
+      AND pg_catalog.pg_table_is_visible(pc.oid)
+)
+  AND c.contype = 'f'
+  AND conparentid = 0
+ORDER BY c.conname;
+
+-- ============================================================
+-- Q11: psql \d branch guard (relhastriggers true for FK source/target)
+-- ============================================================
+SELECT 'q11_rel=' || c.relname || ',hastriggers=' || c.relhastriggers::text
+FROM pg_catalog.pg_class c
+WHERE c.relname IN ('_psql_compat', '_psql_compat_ref')
+  AND pg_catalog.pg_table_is_visible(c.oid)
+ORDER BY c.relname;
+
+-- ============================================================
+-- Q12: psql \d+ referenced-by branch (pg_partition_ancestors + conparentid)
+-- ============================================================
+SELECT 'q12_refby_plus=' || c.conname || ',parent=' || c.conparentid::text
+FROM pg_catalog.pg_constraint c
+WHERE c.confrelid IN (
+    SELECT pg_catalog.pg_partition_ancestors(pc.oid::pg_catalog.regclass)
+    FROM pg_catalog.pg_class pc
+    WHERE pc.relname = '_psql_compat'
+      AND pg_catalog.pg_table_is_visible(pc.oid)
+    UNION ALL
+    SELECT pc.oid::pg_catalog.regclass
+    FROM pg_catalog.pg_class pc
+    WHERE pc.relname = '_psql_compat'
+      AND pg_catalog.pg_table_is_visible(pc.oid)
+)
+  AND c.contype = 'f'
+  AND conparentid = 0
+ORDER BY c.conname;
+
+-- ============================================================
+-- Q13: psql \d+ trigger-parent branch (WITH ORDINALITY + tgparentid)
+-- ============================================================
+SELECT 'q13_trigger_rows=' || COUNT(*)::text
+FROM (
+    SELECT t.tgname,
+           pg_catalog.pg_get_triggerdef(t.oid, true),
+           t.tgenabled,
+           t.tgisinternal,
+           CASE WHEN t.tgparentid != 0 THEN
+               (SELECT u.tgrelid::pg_catalog.regclass
+                FROM pg_catalog.pg_trigger AS u,
+                     pg_catalog.pg_partition_ancestors(t.tgrelid) WITH ORDINALITY AS a(relid, depth)
+                WHERE u.tgname = t.tgname AND u.tgrelid = a.relid
+                      AND u.tgparentid = 0
+                ORDER BY a.depth LIMIT 1)
+           END AS parent
+    FROM pg_catalog.pg_trigger t
+    WHERE t.tgrelid = (
+        SELECT c.oid
+        FROM pg_catalog.pg_class c
+        WHERE c.relname = '_psql_compat'
+          AND pg_catalog.pg_table_is_visible(c.oid)
+    )
+      AND (NOT t.tgisinternal OR (t.tgisinternal AND t.tgenabled = 'D'))
+) s;
+
 -- Cleanup
+DROP TABLE IF EXISTS _psql_compat_ref CASCADE;
 DROP TABLE _psql_compat CASCADE;

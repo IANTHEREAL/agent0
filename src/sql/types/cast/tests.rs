@@ -392,6 +392,28 @@ fn coerce_text_to_numeric_passthrough_non_text() {
     assert_eq!(v, Value::Int32(42));
 }
 
+#[test]
+fn regclass_casts_normalize_to_int64_oid() {
+    let regclass = DataType::UserDefined("pg_catalog.regclass".to_string());
+    assert_eq!(
+        cast(
+            Value::Text("10000000001".into()),
+            &regclass,
+            CastContext::Explicit
+        )
+        .unwrap(),
+        Value::Int64(10000000001)
+    );
+    assert_eq!(
+        cast(Value::Int32(42), &regclass, CastContext::Implicit).unwrap(),
+        Value::Int64(42)
+    );
+    assert_eq!(
+        cast(Value::Int64(43), &regclass, CastContext::Assignment).unwrap(),
+        Value::Int64(43)
+    );
+}
+
 // ---- VARCHAR(n) ----
 #[test]
 fn explicit_varchar3_truncates() {

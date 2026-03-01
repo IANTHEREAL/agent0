@@ -370,7 +370,7 @@ mod tests {
         let t = catalog.get("pg_trigger").unwrap();
         assert_eq!(t.name(), "pg_trigger");
         assert_eq!(t.schema_name(), "pg_catalog");
-        assert_eq!(t.schema().columns.len(), 5);
+        assert_eq!(t.schema().columns.len(), 7);
     }
 
     #[test]
@@ -388,7 +388,7 @@ mod tests {
         let t = catalog.get("pg_constraint").unwrap();
         assert_eq!(t.name(), "pg_constraint");
         assert_eq!(t.schema_name(), "pg_catalog");
-        assert_eq!(t.schema().columns.len(), 15);
+        assert_eq!(t.schema().columns.len(), 16);
     }
 
     #[test]

@@ -144,6 +144,11 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         FunctionSignature::fixed(DataType::Boolean).with_args(1, Some(1)),
     );
     r.register(
+        "PG_PARTITION_ANCESTORS",
+        FunctionSignature::fixed(DataType::UserDefined("pg_catalog.regclass".to_string()))
+            .with_args(1, Some(1)),
+    );
+    r.register(
         "HASHTEXT",
         FunctionSignature::fixed(DataType::Int32).with_args(1, Some(1)),
     );
