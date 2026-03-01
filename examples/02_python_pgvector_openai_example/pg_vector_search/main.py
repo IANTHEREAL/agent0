@@ -200,7 +200,7 @@ def demo(dsn: str, api_key: str, model: str | None = None):
     print("  - vector(N) column type              (store embeddings)")
     print("  - <=> operator                       (cosine distance)")
     print("  - <-> operator                       (L2 / Euclidean distance)")
-    print("  - IVFFlat index                      (approximate nearest neighbor)")
+    print("  - HNSW index                         (approximate nearest neighbor)")
     print("  - OpenAI text-embedding-3-small API  (generate embeddings)")
     print("  - Semantic search vs. keyword search  (meaning, not exact match)")
     print("=" * 72)

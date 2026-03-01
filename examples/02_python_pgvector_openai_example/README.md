@@ -10,7 +10,7 @@ A tutorial demonstrating how to build a semantic search system using PostgreSQL'
 | **pgvector Extension** | Store and query vectors directly in PostgreSQL |
 | **Cosine Similarity** | Find semantically similar documents using `<=>` operator |
 | **L2 Distance** | Alternative distance metric using `<->` operator |
-| **IVFFlat Index** | Approximate nearest neighbor index for fast similarity search |
+| **HNSW Index** | Approximate nearest neighbor index for fast similarity search |
 | **Batch Embeddings** | Generate multiple embeddings in a single OpenAI API call |
 
 ## Prerequisites
@@ -166,7 +166,7 @@ USING hnsw (embedding vector_cosine_ops);
 
 - **Normalize your text** before embedding: trim whitespace, remove excessive newlines
 - **Batch API calls**: `embed_texts()` is much faster than calling `embed_text()` in a loop
-- **Choose the right index**: IVFFlat for < 1M rows, HNSW for larger datasets
+- **Choose the right index**: this demo uses HNSW for vector search
 - **Filter first, then search**: use `WHERE category = 'x'` to narrow before vector search
 - **Cosine distance → similarity**: `similarity = 1 - cosine_distance`
 
