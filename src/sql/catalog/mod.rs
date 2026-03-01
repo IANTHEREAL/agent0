@@ -20,12 +20,19 @@ mod pg_enum;
 mod pg_extension;
 mod pg_index;
 mod pg_indexes;
+mod pg_inherits;
 mod pg_namespace;
 mod pg_opclass;
+mod pg_policy;
 mod pg_proc;
+mod pg_publication;
+mod pg_publication_namespace;
+mod pg_publication_rel;
 mod pg_range;
 mod pg_roles;
 mod pg_sequence;
+mod pg_stat_user_tables;
+mod pg_statistic_ext;
 mod pg_tables;
 mod pg_trigger;
 mod pg_type;
@@ -93,14 +100,21 @@ impl CatalogRegistry {
         registry.register(Box::new(pg_description::PgDescription));
         registry.register(Box::new(pg_enum::PgEnum));
         registry.register(Box::new(pg_extension::PgExtension));
+        registry.register(Box::new(pg_inherits::PgInherits));
         registry.register(Box::new(pg_index::PgIndex));
         registry.register(Box::new(pg_indexes::PgIndexes));
         registry.register(Box::new(pg_namespace::PgNamespace));
         registry.register(Box::new(pg_opclass::PgOpclass));
+        registry.register(Box::new(pg_policy::PgPolicy));
+        registry.register(Box::new(pg_publication::PgPublication));
+        registry.register(Box::new(pg_publication_namespace::PgPublicationNamespace));
+        registry.register(Box::new(pg_publication_rel::PgPublicationRel));
         registry.register(Box::new(pg_proc::PgProc));
         registry.register(Box::new(pg_range::PgRange));
         registry.register(Box::new(pg_roles::PgRoles));
         registry.register(Box::new(pg_sequence::PgSequence));
+        registry.register(Box::new(pg_statistic_ext::PgStatisticExt));
+        registry.register(Box::new(pg_stat_user_tables::PgStatUserTables));
         registry.register(Box::new(pg_tables::PgTables));
         registry.register(Box::new(pg_trigger::PgTrigger));
         registry.register(Box::new(pg_type::PgType));
@@ -302,7 +316,7 @@ mod tests {
         let t = catalog.get("pg_class").unwrap();
         assert_eq!(t.name(), "pg_class");
         assert_eq!(t.schema_name(), "pg_catalog");
-        assert_eq!(t.schema().columns.len(), 13);
+        assert_eq!(t.schema().columns.len(), 26);
     }
 
     #[test]
@@ -320,7 +334,16 @@ mod tests {
         let t = catalog.get("pg_attribute").unwrap();
         assert_eq!(t.name(), "pg_attribute");
         assert_eq!(t.schema_name(), "pg_catalog");
-        assert_eq!(t.schema().columns.len(), 12);
+        assert_eq!(t.schema().columns.len(), 18);
+    }
+
+    #[test]
+    fn registry_contains_pg_statistic_ext() {
+        let catalog = global_catalog();
+        let t = catalog.get("pg_statistic_ext").unwrap();
+        assert_eq!(t.name(), "pg_statistic_ext");
+        assert_eq!(t.schema_name(), "pg_catalog");
+        assert_eq!(t.schema().columns.len(), 6);
     }
 
     #[test]

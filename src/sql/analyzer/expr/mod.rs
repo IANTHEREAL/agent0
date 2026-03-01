@@ -253,7 +253,19 @@ impl<'a> Analyzer<'a> {
             }
 
             // -- Binary operators --
-            Expr::BinaryOp { left, op, right } => self.analyze_binary_op(left, op, right),
+            Expr::BinaryOp { left, op, right } => {
+                // Schema-qualified JSON access: OPERATOR(pg_catalog.->) etc.
+                // Rewrite to JsonAccess before regular binary-op analysis.
+                if let Some(json_op) = Self::binary_op_to_json_access_op(op) {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: json_op,
+                        right: right.clone(),
+                    };
+                    return self.analyze_expr(&json_access);
+                }
+                self.analyze_binary_op(left, op, right)
+            }
 
             // -- Unary operators --
             Expr::UnaryOp { op, expr } => self.analyze_unary_op(op, expr),

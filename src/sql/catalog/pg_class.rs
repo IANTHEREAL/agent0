@@ -28,15 +28,28 @@ impl VirtualTable for PgClass {
                 int_col("oid"),
                 text_col("relname"),
                 int_col("relnamespace"),
+                int_col("reltype"),
+                int_col("reloftype"),
                 text_col("relkind"),
                 int_col("relowner"),
                 int_col("relam"),
                 int_col("reltuples"),
                 int_col("relpages"),
+                int_col("reltoastrelid"),
                 bool_col("relhasindex"),
                 bool_col("relispopulated"),
+                text_col("relpersistence"),
+                int_col("relnatts"),
+                int_col("relchecks"),
+                bool_col("relhasrules"),
+                bool_col("relhastriggers"),
+                bool_col("relhassubclass"),
+                bool_col("relrowsecurity"),
+                bool_col("relforcerowsecurity"),
                 text_col("relreplident"),
                 bool_col("relispartition"),
+                text_col("relpartbound"),
+                int_col("reltablespace"),
                 text_array_col("reloptions"),
             ],
             version: 1,
@@ -63,20 +76,35 @@ impl VirtualTable for PgClass {
             {
                 let table_oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
                 let relhasindex = !schema.indexes.is_empty() || !schema.pk_indices.is_empty();
+                let relnatts = schema.columns.len() as i64;
+                let relchecks = schema.check_constraints.len() as i64;
                 rows.push(Row::new(vec![
                     int_val(table_oid),
                     text_val(&table_name),
                     int_val(namespace_oid),
+                    int_val(0), // reltype
+                    int_val(0), // reloftype
                     text_val("r"),
                     int_val(10),
-                    int_val(0),
-                    int_val(0),
-                    int_val(0),
+                    int_val(0), // relam
+                    int_val(0), // reltuples
+                    int_val(0), // relpages
+                    int_val(0), // reltoastrelid (no TOAST)
                     Value::Boolean(relhasindex),
-                    Value::Boolean(true),
-                    text_val("d"),
-                    Value::Boolean(false),
-                    null_val(), // reloptions
+                    Value::Boolean(true), // relispopulated
+                    text_val("p"),        // relpersistence: permanent
+                    Value::Int64(relnatts),
+                    Value::Int64(relchecks),
+                    Value::Boolean(false), // relhasrules
+                    Value::Boolean(false), // relhastriggers
+                    Value::Boolean(false), // relhassubclass
+                    Value::Boolean(false), // relrowsecurity
+                    Value::Boolean(false), // relforcerowsecurity
+                    text_val("d"),         // relreplident
+                    Value::Boolean(false), // relispartition
+                    null_val(),            // relpartbound
+                    int_val(0),            // reltablespace
+                    null_val(),            // reloptions
                 ]));
 
                 for idx in &schema.indexes {
@@ -85,16 +113,29 @@ impl VirtualTable for PgClass {
                         int_val(index_oid),
                         text_val(&idx.name),
                         int_val(namespace_oid),
+                        int_val(0), // reltype
+                        int_val(0), // reloftype
                         text_val("i"),
                         int_val(10),
                         int_val(access_method_oid(idx.method.as_deref())),
-                        int_val(0),
-                        int_val(0),
-                        Value::Boolean(false),
-                        Value::Boolean(true),
-                        text_val("d"),
-                        Value::Boolean(false),
-                        null_val(), // reloptions
+                        int_val(0),            // reltuples
+                        int_val(0),            // relpages
+                        int_val(0),            // reltoastrelid
+                        Value::Boolean(false), // relhasindex
+                        Value::Boolean(true),  // relispopulated
+                        text_val("p"),         // relpersistence
+                        int_val(0),            // relnatts
+                        int_val(0),            // relchecks
+                        Value::Boolean(false), // relhasrules
+                        Value::Boolean(false), // relhastriggers
+                        Value::Boolean(false), // relhassubclass
+                        Value::Boolean(false), // relrowsecurity
+                        Value::Boolean(false), // relforcerowsecurity
+                        text_val("d"),         // relreplident
+                        Value::Boolean(false), // relispartition
+                        null_val(),            // relpartbound
+                        int_val(0),            // reltablespace
+                        null_val(),            // reloptions
                     ]));
                 }
 
@@ -108,16 +149,29 @@ impl VirtualTable for PgClass {
                         int_val(pk_oid),
                         text_val(&pk_name),
                         int_val(namespace_oid),
+                        int_val(0), // reltype
+                        int_val(0), // reloftype
                         text_val("i"),
                         int_val(10),
-                        int_val(403),
-                        int_val(0),
-                        int_val(0),
-                        Value::Boolean(false),
-                        Value::Boolean(true),
-                        text_val("d"),
-                        Value::Boolean(false),
-                        null_val(), // reloptions
+                        int_val(403),          // relam (btree)
+                        int_val(0),            // reltuples
+                        int_val(0),            // relpages
+                        int_val(0),            // reltoastrelid
+                        Value::Boolean(false), // relhasindex
+                        Value::Boolean(true),  // relispopulated
+                        text_val("p"),         // relpersistence
+                        int_val(0),            // relnatts
+                        int_val(0),            // relchecks
+                        Value::Boolean(false), // relhasrules
+                        Value::Boolean(false), // relhastriggers
+                        Value::Boolean(false), // relhassubclass
+                        Value::Boolean(false), // relrowsecurity
+                        Value::Boolean(false), // relforcerowsecurity
+                        text_val("d"),         // relreplident
+                        Value::Boolean(false), // relispartition
+                        null_val(),            // relpartbound
+                        int_val(0),            // reltablespace
+                        null_val(),            // reloptions
                     ]));
                 }
             }
@@ -131,16 +185,29 @@ impl VirtualTable for PgClass {
                 int_val(seq_oid),
                 text_val(&seq.name),
                 int_val(namespace_oid),
+                int_val(0), // reltype
+                int_val(0), // reloftype
                 text_val("S"),
                 int_val(10),
-                int_val(0),
-                int_val(0),
-                int_val(0),
-                Value::Boolean(false),
-                Value::Boolean(true),
-                text_val("d"),
-                Value::Boolean(false),
-                null_val(), // reloptions
+                int_val(0),            // relam
+                int_val(0),            // reltuples
+                int_val(0),            // relpages
+                int_val(0),            // reltoastrelid
+                Value::Boolean(false), // relhasindex
+                Value::Boolean(true),  // relispopulated
+                text_val("p"),         // relpersistence
+                int_val(0),            // relnatts
+                int_val(0),            // relchecks
+                Value::Boolean(false), // relhasrules
+                Value::Boolean(false), // relhastriggers
+                Value::Boolean(false), // relhassubclass
+                Value::Boolean(false), // relrowsecurity
+                Value::Boolean(false), // relforcerowsecurity
+                text_val("d"),         // relreplident
+                Value::Boolean(false), // relispartition
+                null_val(),            // relpartbound
+                int_val(0),            // reltablespace
+                null_val(),            // reloptions
             ]));
         }
 
@@ -156,16 +223,29 @@ impl VirtualTable for PgClass {
                 int_val(view_oid),
                 text_val(&view_def.name),
                 int_val(namespace_oid),
+                int_val(0), // reltype
+                int_val(0), // reloftype
                 text_val("v"),
                 int_val(10),
-                int_val(0),
-                int_val(0),
-                int_val(0),
-                Value::Boolean(false),
-                Value::Boolean(true),
-                text_val("d"),
-                Value::Boolean(false),
-                null_val(), // reloptions
+                int_val(0),            // relam
+                int_val(0),            // reltuples
+                int_val(0),            // relpages
+                int_val(0),            // reltoastrelid
+                Value::Boolean(false), // relhasindex
+                Value::Boolean(true),  // relispopulated
+                text_val("p"),         // relpersistence
+                int_val(0),            // relnatts
+                int_val(0),            // relchecks
+                Value::Boolean(false), // relhasrules
+                Value::Boolean(false), // relhastriggers
+                Value::Boolean(false), // relhassubclass
+                Value::Boolean(false), // relrowsecurity
+                Value::Boolean(false), // relforcerowsecurity
+                text_val("d"),         // relreplident
+                Value::Boolean(false), // relispartition
+                null_val(),            // relpartbound
+                int_val(0),            // reltablespace
+                null_val(),            // reloptions
             ]));
         }
 

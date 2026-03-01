@@ -93,9 +93,22 @@ impl<'a> Analyzer<'a> {
                     .as_ref()
                     .map(|a| normalize_ident(&a.name))
                     .unwrap_or_else(|| obj_name.clone());
-                let dispatch_name = match &schema_opt {
-                    Some(schema) => format!("{}.{}", schema, obj_name),
-                    None => obj_name.clone(),
+                let dispatch_name = if obj_name.eq_ignore_ascii_case("generate_series")
+                    || obj_name.eq_ignore_ascii_case("unnest")
+                    || obj_name.eq_ignore_ascii_case("current_schema")
+                    || obj_name.eq_ignore_ascii_case("current_database")
+                    || obj_name.eq_ignore_ascii_case("current_user")
+                    || obj_name.eq_ignore_ascii_case("session_user")
+                    || obj_name.eq_ignore_ascii_case("user")
+                {
+                    // Built-in table/scalar-in-FROM functions should keep their canonical
+                    // dispatch name even when schema-qualified in SQL (e.g. pg_catalog.unnest).
+                    obj_name.clone()
+                } else {
+                    match &schema_opt {
+                        Some(schema) => format!("{}.{}", schema, obj_name),
+                        None => obj_name.clone(),
+                    }
                 };
 
                 // Analyze function arguments, preserving named parameters.
@@ -199,6 +212,35 @@ impl<'a> Analyzer<'a> {
                         };
 
                         vec![(col_name, out_ty, false, None)]
+                    } else if obj_name.eq_ignore_ascii_case("unnest") {
+                        // unnest(array) as table-valued function (e.g. FROM pg_catalog.unnest(...))
+                        let positional: Vec<&TypedExpr> = typed_args
+                            .iter()
+                            .filter_map(|a| match a {
+                                TypedFunctionArg::Positional(e) => Some(e),
+                                _ => None,
+                            })
+                            .collect();
+                        if positional.is_empty() {
+                            return Err(AnalyzerError::Unsupported(
+                                "unnest requires at least 1 argument".to_string(),
+                            ));
+                        }
+                        let elem_type = match &positional[0].data_type {
+                            DataType::Array(inner) => inner.as_ref().clone(),
+                            _ => DataType::Text,
+                        };
+                        let col_name = alias
+                            .as_ref()
+                            .map(|ta| {
+                                if !ta.columns.is_empty() {
+                                    crate::sql::names::normalize_ident(&ta.columns[0])
+                                } else {
+                                    crate::sql::names::normalize_ident(&ta.name)
+                                }
+                            })
+                            .unwrap_or_else(|| "unnest".to_string());
+                        vec![(col_name, elem_type, true, None)]
                     } else if obj_name.eq_ignore_ascii_case("current_schema")
                         || obj_name.eq_ignore_ascii_case("current_database")
                         || obj_name.eq_ignore_ascii_case("current_user")

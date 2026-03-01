@@ -112,6 +112,10 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         FunctionSignature::fixed(DataType::Text).with_args(2, Some(3)),
     );
     r.register(
+        "PG_GET_STATISTICSOBJDEF_COLUMNS",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
+    );
+    r.register(
         "PG_GET_USERBYID",
         FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
     );
@@ -134,6 +138,10 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
     r.register(
         "TXID_CURRENT",
         FunctionSignature::fixed(DataType::Int64).with_args(0, Some(0)),
+    );
+    r.register(
+        "PG_RELATION_IS_PUBLISHABLE",
+        FunctionSignature::fixed(DataType::Boolean).with_args(1, Some(1)),
     );
     r.register(
         "HASHTEXT",

@@ -1,0 +1,28 @@
+q1_lookup
+q1_lookup=_psql_compat
+(1 row)
+?column?
+q2_relkind=r,checks=0,hasindex=true,hasrules=false,hastriggers=false,rowsecurity=false,forcerowsecurity=false,ispartition=false,persistence=p,replident=d
+(1 row)
+?column?
+q3_col=id,notnull=true,collation=0,identity=,generated=
+q3_col=name,notnull=true,collation=100,identity=,generated=
+q3_col=score,notnull=false,collation=0,identity=,generated=
+q3_col=tags,notnull=false,collation=100,identity=,generated=
+(4 rows)
+?column?
+q4_unnest=option1=val1
+q4_unnest=option2=val2
+(2 rows)
+?column?
+q5_json="v"
+(1 row)
+?column?
+q6_json_text=v
+(1 row)
+?column?
+q7_eq=true
+(1 row)
+?column?
+q8_index=_psql_compat_pkey,replident=false
+(1 row)

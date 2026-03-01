@@ -37,11 +37,17 @@ impl VirtualTable for PgAttribute {
                 int_col("atttypid"),
                 int_col("attnum"),
                 int_col("attlen"),
+                int_col("attndims"),
+                text_col("attstorage"),
+                text_col("attcompression"),
                 bool_col("attnotnull"),
                 bool_col("atthasdef"),
                 bool_col("attisdropped"),
                 bool_col("attislocal"),
                 int_col("atttypmod"),
+                int_col("attinhcount"),
+                int_col("attcollation"),
+                int_col("attstattarget"),
                 text_col("attgenerated"),
                 text_col("attidentity"),
             ],
@@ -70,13 +76,19 @@ impl VirtualTable for PgAttribute {
                         int_val(type_oid),
                         int_val(attnum),
                         int_val(attlen),
-                        Value::Boolean(true),
-                        Value::Boolean(false),
-                        Value::Boolean(false),
-                        Value::Boolean(true),
-                        int_val(-1),
-                        text_val(""),
-                        text_val(""),
+                        int_val(0),            // attndims
+                        text_val("p"),         // attstorage: plain
+                        text_val(""),          // attcompression
+                        Value::Boolean(true),  // attnotnull
+                        Value::Boolean(false), // atthasdef
+                        Value::Boolean(false), // attisdropped
+                        Value::Boolean(true),  // attislocal
+                        int_val(-1),           // atttypmod
+                        int_val(0),            // attinhcount
+                        int_val(0),            // attcollation
+                        int_val(-1),           // attstattarget
+                        text_val(""),          // attgenerated
+                        text_val(""),          // attidentity
                     ]));
                 }
 
@@ -105,19 +117,37 @@ impl VirtualTable for PgAttribute {
                         _ => -1,
                     };
 
+                    // attcollation: collatable types (text, varchar, name, arrays
+                    // of text) get the default collation OID (100);
+                    // non-collatable types get 0.
+                    let attcollation: i64 = match &col.data_type {
+                        DataType::Text | DataType::Varchar(_) | DataType::Name => 100,
+                        DataType::Array(inner) => match inner.as_ref() {
+                            DataType::Text | DataType::Varchar(_) | DataType::Name => 100,
+                            _ => 0,
+                        },
+                        _ => 0,
+                    };
+
                     rows.push(Row::new(vec![
                         int_val(base_table_oid),
                         text_val(&col.name),
                         int_val(type_oid),
                         int_val((i + 1) as i64),
                         int_val(attlen),
+                        int_val(0),    // attndims
+                        text_val("x"), // attstorage: extended
+                        text_val(""),  // attcompression
                         Value::Boolean(!col.nullable),
                         Value::Boolean(col.is_serial || col.default_expr.is_some()),
-                        Value::Boolean(false),
-                        Value::Boolean(true),
+                        Value::Boolean(false), // attisdropped
+                        Value::Boolean(true),  // attislocal
                         int_val(atttypmod),
-                        text_val(""),
-                        text_val(""),
+                        int_val(0), // attinhcount
+                        int_val(attcollation),
+                        int_val(-1),  // attstattarget
+                        text_val(""), // attgenerated
+                        text_val(""), // attidentity
                     ]));
                 }
             }

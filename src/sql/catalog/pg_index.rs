@@ -80,6 +80,7 @@ impl VirtualTable for PgIndex {
                 bool_col("indimmediate"),
                 bool_col("indisclustered"),
                 bool_col("indisvalid"),
+                bool_col("indisreplident"),
                 int2vector_col("indkey"),
                 text_col("indexprs"),
                 text_col("indpred"),
@@ -162,6 +163,7 @@ impl VirtualTable for PgIndex {
                         Value::Boolean(true),
                         Value::Boolean(false),
                         Value::Boolean(true),
+                        Value::Boolean(false),
                         indkey,
                         indexprs,
                         indpred,
@@ -207,6 +209,7 @@ impl VirtualTable for PgIndex {
                         Value::Boolean(true),
                         Value::Boolean(false),
                         Value::Boolean(true),
+                        Value::Boolean(false),
                         Value::Array(indkey.iter().map(|i| Value::Int64(*i)).collect()),
                         null_val(),                   // indexprs
                         null_val(),                   // indpred
@@ -273,5 +276,16 @@ mod tests {
             indclass.data_type,
             DataType::UserDefined("oidvector".to_string())
         );
+    }
+
+    #[test]
+    fn pg_index_indisreplident_column_is_boolean() {
+        let schema = PgIndex.schema();
+        let indisreplident = schema
+            .columns
+            .iter()
+            .find(|c| c.name == "indisreplident")
+            .expect("pg_index.indisreplident column must exist");
+        assert_eq!(indisreplident.data_type, DataType::Boolean);
     }
 }

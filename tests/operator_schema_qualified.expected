@@ -1,0 +1,50 @@
+ regex_match
+-------------
+ t
+(1 row)
+
+ regex_imatch
+--------------
+ t
+(1 row)
+
+ regex_not_match
+-----------------
+ t
+(1 row)
+
+ regex_not_imatch
+------------------
+ t
+(1 row)
+
+ eq_true
+---------
+ t
+(1 row)
+
+ neq_true
+----------
+ t
+(1 row)
+
+ lt_true
+---------
+ t
+(1 row)
+
+ gt_true
+---------
+ t
+(1 row)
+
+ concat_result
+---------------
+ hello world
+(1 row)
+
+ unqualified_regex
+-------------------
+ t
+(1 row)
+

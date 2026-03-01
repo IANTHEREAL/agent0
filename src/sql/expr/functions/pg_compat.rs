@@ -23,9 +23,14 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("SHOBJ_DESCRIPTION", obj_description);
     map.insert("PG_GET_SERIAL_SEQUENCE", pg_get_serial_sequence);
     map.insert("PG_GET_EXPR", pg_get_expr);
+    map.insert(
+        "PG_GET_STATISTICSOBJDEF_COLUMNS",
+        pg_get_statisticsobjdef_columns,
+    );
     map.insert("HAS_SCHEMA_PRIVILEGE", has_privilege);
     map.insert("HAS_TABLE_PRIVILEGE", has_privilege);
     map.insert("HAS_DATABASE_PRIVILEGE", has_privilege);
+    map.insert("PG_RELATION_IS_PUBLISHABLE", pg_relation_is_publishable);
     // Binary send functions (bytea serialization)
     map.insert("INT4SEND", int4send);
     map.insert("INT8SEND", int8send);
@@ -305,8 +310,25 @@ pub fn pg_get_expr(args: Vec<Value>) -> Result<Value> {
     }
 }
 
+/// Compatibility stub used by psql introspection (`\d`).
+/// db9 currently has no extended stats definitions, so returning empty text is sufficient.
+pub fn pg_get_statisticsobjdef_columns(args: Vec<Value>) -> Result<Value> {
+    match args.into_iter().next() {
+        Some(Value::Null) | None => Ok(Value::Null),
+        _ => Ok(Value::Text(String::new())),
+    }
+}
+
 pub fn has_privilege(_args: Vec<Value>) -> Result<Value> {
     Ok(Value::Boolean(true))
+}
+
+pub fn pg_relation_is_publishable(args: Vec<Value>) -> Result<Value> {
+    match args.into_iter().next() {
+        Some(Value::Null) | None => Ok(Value::Null),
+        // db9 has no logical replication publication support yet.
+        Some(_) => Ok(Value::Boolean(false)),
+    }
 }
 
 /// int4send(integer) → bytea — 4-byte big-endian encoding

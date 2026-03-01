@@ -301,15 +301,33 @@ impl<'a> Analyzer<'a> {
             SqlOp::PGOverlap => BinaryOp::ArrayOverlap,
             SqlOp::PGExp => BinaryOp::Exp,
             SqlOp::PGCustomBinaryOperator(parts) => {
-                let op_str: String = parts.iter().map(|p| p.as_str()).collect();
-                match op_str.as_str() {
-                    "?|" => BinaryOp::JsonExistsAny,
-                    "?&" => BinaryOp::JsonExistsAll,
-                    "@@" => BinaryOp::TsMatch,
-                    "@>" => BinaryOp::ArrayContains,
-                    "<@" => BinaryOp::ArrayContainedBy,
-                    other => BinaryOp::Custom(other.to_string()),
-                }
+                // OPERATOR(pg_catalog.~) → parts = ["pg_catalog", "~"]
+                // OPERATOR(~)            → parts = ["~"]
+                // ?|                     → parts = ["?|"]
+                let op_symbol = match parts.len() {
+                    0 => {
+                        return Err(AnalyzerError::Unsupported(
+                            "empty OPERATOR() reference".to_string(),
+                        ));
+                    }
+                    1 => parts[0].as_str(),
+                    2 => {
+                        if !parts[0].eq_ignore_ascii_case("pg_catalog") {
+                            return Err(AnalyzerError::Unsupported(format!(
+                                "schema-qualified operator: {}.{}",
+                                parts[0], parts[1]
+                            )));
+                        }
+                        parts[1].as_str()
+                    }
+                    _ => {
+                        return Err(AnalyzerError::Unsupported(format!(
+                            "cross-schema operator reference: {}",
+                            parts.join(".")
+                        )));
+                    }
+                };
+                Self::resolve_custom_op_symbol(op_symbol)
             }
             other => {
                 return Err(AnalyzerError::Unsupported(format!(
@@ -320,13 +338,57 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    /// Map a custom operator symbol string to the corresponding `BinaryOp`.
+    ///
+    /// Handles both operators that sqlparser routes through `PGCustomBinaryOperator`
+    /// (e.g. `?|`, `@@`) and standard PostgreSQL operators that arrive via
+    /// schema-qualified `OPERATOR(pg_catalog.~)` syntax.
+    fn resolve_custom_op_symbol(symbol: &str) -> BinaryOp {
+        match symbol {
+            // Regex
+            "~" => BinaryOp::RegexMatch,
+            "~*" => BinaryOp::RegexIMatch,
+            "!~" => BinaryOp::RegexNotMatch,
+            "!~*" => BinaryOp::RegexNotIMatch,
+            // Array
+            "&&" => BinaryOp::ArrayOverlap,
+            "@>" => BinaryOp::ArrayContains,
+            "<@" => BinaryOp::ArrayContainedBy,
+            // JSON existence
+            "?|" => BinaryOp::JsonExistsAny,
+            "?&" => BinaryOp::JsonExistsAll,
+            // Full-text search
+            "@@" => BinaryOp::TsMatch,
+            // Standard operators (for OPERATOR(pg_catalog.=) etc.)
+            "+" => BinaryOp::Add,
+            "-" => BinaryOp::Sub,
+            "*" => BinaryOp::Mul,
+            "/" => BinaryOp::Div,
+            "%" => BinaryOp::Mod,
+            "=" => BinaryOp::Eq,
+            "<>" | "!=" => BinaryOp::NotEq,
+            "<" => BinaryOp::Lt,
+            "<=" => BinaryOp::LtEq,
+            ">" => BinaryOp::Gt,
+            ">=" => BinaryOp::GtEq,
+            "||" => BinaryOp::Concat,
+            // Fallback
+            other => BinaryOp::Custom(other.to_string()),
+        }
+    }
+
     pub(super) fn binary_op_to_json_access_op(
         op: &ast::BinaryOperator,
     ) -> Option<ast::JsonOperator> {
         match op {
             ast::BinaryOperator::PGCustomBinaryOperator(parts) => {
-                let op_str: String = parts.iter().map(|p| p.as_str()).collect();
-                match op_str.as_str() {
+                // Strip optional pg_catalog schema prefix
+                let op_symbol = match parts.len() {
+                    1 => parts[0].as_str(),
+                    2 if parts[0].eq_ignore_ascii_case("pg_catalog") => parts[1].as_str(),
+                    _ => return None,
+                };
+                match op_symbol {
                     "->" => Some(ast::JsonOperator::Arrow),
                     "->>" => Some(ast::JsonOperator::LongArrow),
                     "#>" => Some(ast::JsonOperator::HashArrow),
@@ -497,5 +559,70 @@ impl<'a> Analyzer<'a> {
                 other,
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_custom_op_symbol_regex() {
+        assert_eq!(
+            Analyzer::resolve_custom_op_symbol("~"),
+            BinaryOp::RegexMatch
+        );
+        assert_eq!(
+            Analyzer::resolve_custom_op_symbol("~*"),
+            BinaryOp::RegexIMatch
+        );
+        assert_eq!(
+            Analyzer::resolve_custom_op_symbol("!~"),
+            BinaryOp::RegexNotMatch
+        );
+        assert_eq!(
+            Analyzer::resolve_custom_op_symbol("!~*"),
+            BinaryOp::RegexNotIMatch
+        );
+    }
+
+    #[test]
+    fn resolve_custom_op_symbol_json_array_fts() {
+        assert_eq!(
+            Analyzer::resolve_custom_op_symbol("?|"),
+            BinaryOp::JsonExistsAny
+        );
+        assert_eq!(
+            Analyzer::resolve_custom_op_symbol("?&"),
+            BinaryOp::JsonExistsAll
+        );
+        assert_eq!(Analyzer::resolve_custom_op_symbol("@@"), BinaryOp::TsMatch);
+        assert_eq!(
+            Analyzer::resolve_custom_op_symbol("@>"),
+            BinaryOp::ArrayContains
+        );
+        assert_eq!(
+            Analyzer::resolve_custom_op_symbol("<@"),
+            BinaryOp::ArrayContainedBy
+        );
+    }
+
+    #[test]
+    fn resolve_custom_op_symbol_standard() {
+        assert_eq!(Analyzer::resolve_custom_op_symbol("="), BinaryOp::Eq);
+        assert_eq!(Analyzer::resolve_custom_op_symbol("<>"), BinaryOp::NotEq);
+        assert_eq!(Analyzer::resolve_custom_op_symbol("<"), BinaryOp::Lt);
+        assert_eq!(Analyzer::resolve_custom_op_symbol("<="), BinaryOp::LtEq);
+        assert_eq!(Analyzer::resolve_custom_op_symbol(">"), BinaryOp::Gt);
+        assert_eq!(Analyzer::resolve_custom_op_symbol(">="), BinaryOp::GtEq);
+        assert_eq!(Analyzer::resolve_custom_op_symbol("||"), BinaryOp::Concat);
+    }
+
+    #[test]
+    fn resolve_custom_op_symbol_unknown_falls_through() {
+        assert_eq!(
+            Analyzer::resolve_custom_op_symbol("???"),
+            BinaryOp::Custom("???".to_string())
+        );
     }
 }
