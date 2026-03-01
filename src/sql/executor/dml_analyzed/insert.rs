@@ -74,6 +74,7 @@ impl Executor {
         let mut inserted = 0usize;
         let mut ret_rows = Vec::new();
         let mut hnsw_inserted_rows: Vec<Row> = Vec::new();
+        let mut hnsw_conflict_updates: Vec<(Row, Row)> = Vec::new();
         let ret_cols = build_returning_columns_from_analyzed(&ins.returning, &schema);
 
         // Get source rows. Each entry is (values, default_positions) where
@@ -374,7 +375,39 @@ impl Executor {
                                     &qctx,
                                 )?;
 
-                                let updated_row = if schema.pk_indices.is_empty() {
+                                let updated_row = if has_hnsw {
+                                    // Defer HNSW maintenance to batch after the loop.
+                                    let result = if schema.pk_indices.is_empty() {
+                                        dml::execute_update_row_by_pk_defer_hnsw(
+                                            &self.store(),
+                                            txn,
+                                            db_id,
+                                            t,
+                                            &schema,
+                                            &existing_pk,
+                                            &existing_row,
+                                            updated_row,
+                                            &enum_cache,
+                                        )
+                                        .await?
+                                    } else {
+                                        dml::execute_update_row_defer_hnsw(
+                                            &self.store(),
+                                            txn,
+                                            db_id,
+                                            t,
+                                            &schema,
+                                            &existing_row,
+                                            updated_row,
+                                            &enum_cache,
+                                            None,
+                                        )
+                                        .await?
+                                    };
+                                    hnsw_conflict_updates
+                                        .push((existing_row.clone(), result.clone()));
+                                    result
+                                } else if schema.pk_indices.is_empty() {
                                     dml::execute_update_row_by_pk(
                                         &self.store(),
                                         txn,
@@ -457,6 +490,14 @@ impl Executor {
         if !hnsw_inserted_rows.is_empty() {
             dml::batch_maintain_hnsw_indexes_for_inserts(txn, db_id, &schema, &hnsw_inserted_rows)
                 .await?;
+        }
+
+        // Batch HNSW maintenance for ON CONFLICT DO UPDATE rows.
+        // Same load-once/serialize-once strategy; separate from the insert
+        // batch because batch_maintain_hnsw_indexes needs (old, new) pairs
+        // to detect unchanged vectors.
+        if !hnsw_conflict_updates.is_empty() {
+            dml::batch_maintain_hnsw_indexes(txn, db_id, &schema, &hnsw_conflict_updates).await?;
         }
 
         if inserted > 0 {

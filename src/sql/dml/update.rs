@@ -40,6 +40,45 @@ pub async fn execute_update_row_by_pk(
     new_row: Row,
     enum_cache: &EnumLabelCache,
 ) -> Result<Row> {
+    execute_update_row_by_pk_inner(
+        store, txn, db_id, table_name, schema, pk_values, old_row, new_row, enum_cache, false,
+    )
+    .await
+}
+
+/// Like [`execute_update_row_by_pk`] but defers HNSW index maintenance.
+///
+/// The caller is responsible for calling [`batch_maintain_hnsw_indexes`]
+/// after all rows in the statement have been updated.
+pub async fn execute_update_row_by_pk_defer_hnsw(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    table_name: &str,
+    schema: &TableSchema,
+    pk_values: &[Value],
+    old_row: &Row,
+    new_row: Row,
+    enum_cache: &EnumLabelCache,
+) -> Result<Row> {
+    execute_update_row_by_pk_inner(
+        store, txn, db_id, table_name, schema, pk_values, old_row, new_row, enum_cache, true,
+    )
+    .await
+}
+
+async fn execute_update_row_by_pk_inner(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    table_name: &str,
+    schema: &TableSchema,
+    pk_values: &[Value],
+    old_row: &Row,
+    new_row: Row,
+    enum_cache: &EnumLabelCache,
+    skip_hnsw: bool,
+) -> Result<Row> {
     let mut new_row_values = new_row.values;
     coerce_row_values(schema, &mut new_row_values)?;
     let new_row = Row::new(new_row_values);
@@ -49,7 +88,10 @@ pub async fn execute_update_row_by_pk(
         validate_foreign_keys(store, txn, db_id, schema, &new_row).await?;
     }
 
-    update_row_indexes(store, txn, db_id, schema, pk_values, old_row, &new_row).await?;
+    update_row_indexes(
+        store, txn, db_id, schema, pk_values, old_row, &new_row, skip_hnsw,
+    )
+    .await?;
     store
         .upsert_by_pk(txn, db_id, table_name, pk_values, new_row.clone())
         .await?;
@@ -64,6 +106,7 @@ async fn update_row_indexes(
     pk_values: &[Value],
     old_row: &Row,
     new_row: &Row,
+    skip_hnsw: bool,
 ) -> Result<()> {
     for index in &schema.indexes {
         if matches!(index.state, IndexState::Invalid)
@@ -168,8 +211,12 @@ async fn update_row_indexes(
         }
     }
 
-    maintain_hnsw_indexes_after_update(txn, db_id, schema, old_row, new_row, pk_values, pk_values)
+    if !skip_hnsw {
+        maintain_hnsw_indexes_after_update(
+            txn, db_id, schema, old_row, new_row, pk_values, pk_values,
+        )
         .await?;
+    }
     Ok(())
 }
 
