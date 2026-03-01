@@ -147,20 +147,40 @@ func TestGormGapfillOps(t *testing.T) {
 	).Scan(&ids).Error; err != nil {
 		t.Fatalf("left_join: %v", err)
 	}
+	var grouped []struct {
+		DeptID int   `gorm:"column:dept_id"`
+		Total  int64 `gorm:"column:total"`
+	}
 	if err := db.WithContext(ctx).Raw(
-		fmt.Sprintf("SELECT dept_id, COUNT(*) FROM %s.users GROUP BY dept_id HAVING COUNT(*) >= 1", quoteIdent(schemaName)),
-	).Scan(&ids).Error; err != nil {
+		fmt.Sprintf(
+			"SELECT dept_id, COUNT(*) AS total FROM %s.users GROUP BY dept_id HAVING COUNT(*) >= 1",
+			quoteIdent(schemaName),
+		),
+	).Scan(&grouped).Error; err != nil {
 		t.Fatalf("group_having: %v", err)
+	}
+	if len(grouped) == 0 || grouped[0].Total < 1 {
+		t.Fatalf("group_having: unexpected grouped rows: %#v", grouped)
 	}
 	if err := db.WithContext(ctx).Raw(
 		fmt.Sprintf("SELECT id FROM %s.users WHERE dept_id IN (SELECT id FROM %s.dept)", quoteIdent(schemaName), quoteIdent(schemaName)),
 	).Scan(&ids).Error; err != nil {
 		t.Fatalf("subquery: %v", err)
 	}
+	var windowRows []struct {
+		ID int   `gorm:"column:id"`
+		RN int64 `gorm:"column:rn"`
+	}
 	if err := db.WithContext(ctx).Raw(
-		fmt.Sprintf("SELECT id, ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY id) FROM %s.users", quoteIdent(schemaName)),
-	).Scan(&ids).Error; err != nil {
+		fmt.Sprintf(
+			"SELECT id, ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY id) AS rn FROM %s.users",
+			quoteIdent(schemaName),
+		),
+	).Scan(&windowRows).Error; err != nil {
 		t.Fatalf("window: %v", err)
+	}
+	if len(windowRows) == 0 || windowRows[0].RN < 1 {
+		t.Fatalf("window: unexpected rows: %#v", windowRows)
 	}
 
 	// json_and_array: array_insert / array_query
