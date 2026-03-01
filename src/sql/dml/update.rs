@@ -168,7 +168,7 @@ async fn update_row_indexes(
         }
     }
 
-    maintain_hnsw_indexes_after_update(txn, db_id, schema, new_row, pk_values).await?;
+    maintain_hnsw_indexes_after_update(txn, db_id, schema, old_row, new_row, pk_values).await?;
     Ok(())
 }
 
@@ -403,7 +403,7 @@ async fn execute_update_row_inner(
         }
     }
 
-    maintain_hnsw_indexes_after_update(txn, db_id, schema, &new_row, &new_pks).await?;
+    maintain_hnsw_indexes_after_update(txn, db_id, schema, old_row, &new_row, &new_pks).await?;
 
     if propagate_fk_update {
         let fk_store_ctx = FkStoreCtx { store, db_id };
@@ -423,16 +423,22 @@ async fn execute_update_row_inner(
 
 /// Maintain HNSW indexes after UPDATE.
 ///
-/// Loads the graph fresh from TiKV (committed state), adds the new vector
-/// with the new PK label, serializes, and writes back to the transaction
-/// buffer. usearch 0.21 has no `remove` method, so the old label (if PK
-/// changed) stays in the graph — the HnswScanOperator's over-fetch strategy
-/// filters it out via batch_get_rows visibility. For same-PK updates, the
-/// new `add` overwrites the old vector at the same label.
+/// Loads the graph from TiKV, adds the new vector with the new PK label,
+/// serializes, and writes back to the transaction buffer.
+///
+/// Skips the graph write entirely when the vector column is unchanged
+/// (e.g. `UPDATE t SET non_vector_col = ...`), avoiding unnecessary
+/// serialization round-trips and duplicate label accumulation.
+///
+/// usearch 0.21 `add()` always appends — it does NOT overwrite an
+/// existing label. When the PK is unchanged, the old label stays in the
+/// graph; the HnswScanOperator's over-fetch strategy filters stale
+/// entries via batch_get_rows visibility.
 async fn maintain_hnsw_indexes_after_update(
     txn: &mut Transaction,
     db_id: u64,
     schema: &TableSchema,
+    old_row: &Row,
     new_row: &Row,
     new_pk_values: &[Value],
 ) -> Result<()> {
@@ -459,6 +465,15 @@ async fn maintain_hnsw_indexes_after_update(
         let vector_col_idx = schema
             .column_index(vector_col_name)
             .ok_or_else(|| anyhow::anyhow!("HNSW index '{}' column not found", index.name))?;
+
+        // Skip HNSW maintenance when the vector column is unchanged.
+        // usearch 0.21 add() always appends (does not overwrite), so
+        // re-adding the same vector would create a duplicate entry.
+        // Note: we compare the vector values directly rather than using
+        // index_values_unchanged(), which only works for btree indexes.
+        if old_row.values.get(vector_col_idx) == new_row.values.get(vector_col_idx) {
+            continue;
+        }
 
         let vector_f64 = match new_row.values.get(vector_col_idx) {
             Some(Value::Null) | None => continue,
@@ -514,6 +529,13 @@ async fn maintain_hnsw_indexes_after_update(
                 }
             };
 
+        // Sync meta.capacity with actual usearch capacity after load.
+        // usearch save() serializes only used vectors; load() restores
+        // with tight capacity = count. The Rust-side meta.capacity may
+        // be stale (larger) from a previous reserve() call, causing the
+        // check below to skip reserve() when the index is actually full.
+        meta.capacity = hnsw_index.capacity() as u64;
+
         if meta.count >= (meta.capacity.saturating_mul(80) / 100) {
             let next_capacity = meta.capacity.saturating_mul(2).max(1);
             hnsw_index
@@ -525,8 +547,6 @@ async fn maintain_hnsw_indexes_after_update(
         hnsw_index
             .add(pk_label, &vector_f32)
             .map_err(|e| anyhow::anyhow!("failed to add vector to HNSW index: {}", e))?;
-        // Use size() instead of blindly incrementing — same-PK overwrites
-        // don't increase the vector count, only new labels do.
         meta.count = hnsw_index.size() as u64;
 
         let (graph_bytes, meta_bytes) =

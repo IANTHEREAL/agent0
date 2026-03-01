@@ -113,4 +113,91 @@ mod tests {
         // Cleanup
         let _ = std::fs::remove_file(tmp_path);
     }
+
+    /// Regression test: usearch save/load shrinks capacity to size.
+    /// The DML paths must sync meta.capacity after load to avoid
+    /// skipping reserve() when the index is actually full.
+    #[test]
+    fn test_capacity_shrinks_after_save_load() {
+        let options = IndexOptions {
+            dimensions: 3,
+            metric: MetricKind::L2Sq,
+            quantization: ScalarKind::F32,
+            connectivity: super::HNSW_DEFAULT_M,
+            expansion_add: super::HNSW_DEFAULT_EF_CONSTRUCTION,
+            expansion_search: super::HNSW_DEFAULT_EF_SEARCH,
+        };
+
+        let index = new_index(&options).expect("create");
+        index.reserve(10).expect("reserve");
+        for i in 0u64..6 {
+            let v = [i as f32 * 0.1, i as f32 * 0.2, i as f32 * 0.3];
+            index.add(i + 1, &v).expect("add");
+        }
+        assert_eq!(index.size(), 6);
+        assert!(index.capacity() >= 10); // reserved 10
+
+        let tmp = "/tmp/usearch_test_cap_shrink.usearch";
+        index.save(tmp).expect("save");
+
+        let loaded = new_index(&options).expect("create");
+        loaded.load(tmp).expect("load");
+        assert_eq!(loaded.size(), 6);
+        // Key assertion: capacity shrinks to exactly count after load.
+        // DML code must sync meta.capacity with this value.
+        assert_eq!(loaded.capacity(), loaded.size());
+
+        // After reserve, add must succeed without heap corruption
+        loaded.reserve(12).expect("reserve after load");
+        assert!(loaded.capacity() >= 12);
+        loaded
+            .add(1, &[0.1f32, 0.2, 0.3])
+            .expect("add after reserve");
+
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// Verify usearch 0.21 add() behavior: duplicate labels APPEND
+    /// (do not overwrite), causing size inflation and duplicate search
+    /// results. The scan operator must deduplicate by label.
+    #[test]
+    fn test_duplicate_label_appends_and_search_returns_dupes() {
+        let options = IndexOptions {
+            dimensions: 3,
+            metric: MetricKind::L2Sq,
+            quantization: ScalarKind::F32,
+            connectivity: super::HNSW_DEFAULT_M,
+            expansion_add: super::HNSW_DEFAULT_EF_CONSTRUCTION,
+            expansion_search: super::HNSW_DEFAULT_EF_SEARCH,
+        };
+
+        let index = new_index(&options).expect("create");
+        index.reserve(10).expect("reserve");
+
+        // Add label=1 with two different vectors (simulates vector UPDATE).
+        let v1: [f32; 3] = [1.0, 0.0, 0.0];
+        let v2: [f32; 3] = [0.0, 1.0, 0.0];
+        index.add(1, &v1).expect("add first");
+        index.add(1, &v2).expect("add duplicate");
+
+        // Size grows to 2 even though there's only 1 unique label.
+        assert_eq!(index.size(), 2, "add() must append, not overwrite");
+
+        // Add a second distinct label to make results interesting.
+        index.add(2, &[0.0f32, 0.0, 1.0]).expect("add label 2");
+        assert_eq!(index.size(), 3);
+
+        // Search for k=3 — should return label=1 twice and label=2 once.
+        let query: [f32; 3] = [1.0, 0.0, 0.0];
+        let results = index.search(&query, 3).expect("search");
+        let labels: Vec<u64> = results.labels[..results.count].to_vec();
+
+        // Confirm duplicate labels are present in raw search results.
+        let label_1_count = labels.iter().filter(|&&l| l == 1).count();
+        assert!(
+            label_1_count >= 2,
+            "search should return duplicate labels; got {:?}",
+            labels
+        );
+    }
 }

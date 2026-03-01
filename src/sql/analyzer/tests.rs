@@ -3623,7 +3623,8 @@ fn collate_invalid_schema_is_rejected() {
     let query = parse_query("SELECT name COLLATE no_such_schema.\"default\" FROM users");
     let err = analyzer.analyze_query(&query).unwrap_err();
     assert!(
-        err.to_string().contains("schema \"no_such_schema\" does not exist"),
+        err.to_string()
+            .contains("schema \"no_such_schema\" does not exist"),
         "Non-pg_catalog schema should be rejected with schema-not-found, got: {}",
         err
     );
@@ -3638,7 +3639,8 @@ fn collate_public_schema_is_rejected() {
     let query = parse_query("SELECT name COLLATE public.\"default\" FROM users");
     let err = analyzer.analyze_query(&query).unwrap_err();
     assert!(
-        err.to_string().contains("collation \"public.default\" does not exist"),
+        err.to_string()
+            .contains("collation \"public.default\" does not exist"),
         "Known schema should return collation-not-found, got: {}",
         err
     );
@@ -3652,7 +3654,8 @@ fn collate_three_part_name_is_rejected() {
     let query = parse_query("SELECT name COLLATE pg_catalog.foo.\"default\" FROM users");
     let err = analyzer.analyze_query(&query).unwrap_err();
     assert!(
-        err.to_string().contains("cross-database references are not implemented"),
+        err.to_string()
+            .contains("cross-database references are not implemented"),
         "3-part collation name should be rejected, got: {}",
         err
     );

@@ -44,3 +44,6 @@ artifacts/
 
 # Generated test data
 tests/parquet_testdata/
+
+# Issue investigation files (may contain credentials)
+p0_unavailable_issue.md

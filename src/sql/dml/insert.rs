@@ -201,6 +201,12 @@ async fn maintain_hnsw_indexes_after_insert(
                 }
             };
 
+        // Sync meta.capacity with actual usearch capacity after load.
+        // usearch save() serializes only used vectors; load() restores
+        // with tight capacity = count. The Rust-side meta.capacity may
+        // be stale (larger) from a previous reserve() call.
+        meta.capacity = hnsw_index.capacity() as u64;
+
         if meta.count >= (meta.capacity.saturating_mul(80) / 100) {
             let next_capacity = meta.capacity.saturating_mul(2).max(1);
             hnsw_index
@@ -212,8 +218,6 @@ async fn maintain_hnsw_indexes_after_insert(
         hnsw_index
             .add(pk_label, &vector_f32)
             .map_err(|e| anyhow!("failed to add vector to HNSW index: {}", e))?;
-        // Use size() for accurate count — re-inserted PK labels (after
-        // DELETE left a stale entry) are overwrites, not new entries.
         meta.count = hnsw_index.size() as u64;
 
         let (graph_bytes, meta_bytes) =

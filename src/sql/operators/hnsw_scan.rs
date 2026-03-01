@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{ExecutionContext, PhysicalOperator};
 use crate::model::{DataType, Row, TableSchema, Value};
@@ -97,9 +97,16 @@ impl HnswScanOperator {
             .count
             .min(matches.labels.len())
             .min(matches.distances.len());
+        // Deduplicate by label, keeping the first (closest) occurrence.
+        // usearch 0.21 add() appends duplicate labels on UPDATE, so the
+        // graph can contain multiple entries for the same PK. Results are
+        // returned in distance order, so the first hit per label is best.
+        let mut seen = HashSet::with_capacity(n);
         let mut ranked_labels = Vec::with_capacity(n);
         for i in 0..n {
-            ranked_labels.push((matches.labels[i], matches.distances[i] as f64));
+            if seen.insert(matches.labels[i]) {
+                ranked_labels.push((matches.labels[i], matches.distances[i] as f64));
+            }
         }
 
         Ok(ranked_labels)

@@ -1227,19 +1227,13 @@ impl<'a> Analyzer<'a> {
                         if schema != "pg_catalog" {
                             // PostgreSQL distinguishes: known schema → "collation not found" (42704),
                             // unknown schema → "schema does not exist" (3F000).
-                            let known = matches!(
-                                schema.as_str(),
-                                "public" | "information_schema"
-                            ) || self
-                                .catalog
-                                .search_path()
-                                .iter()
-                                .any(|s| s == &schema);
+                            let known = matches!(schema.as_str(), "public" | "information_schema")
+                                || self.catalog.search_path().iter().any(|s| s == &schema);
                             if known {
-                                let coll =
-                                    crate::sql::names::normalize_ident(&collation.0[1]);
+                                let coll = crate::sql::names::normalize_ident(&collation.0[1]);
                                 return Err(AnalyzerError::CollationNotFound(format!(
-                                    "{}.{}", schema, coll
+                                    "{}.{}",
+                                    schema, coll
                                 )));
                             }
                             return Err(AnalyzerError::SchemaNotFound(schema));
@@ -1247,9 +1241,7 @@ impl<'a> Analyzer<'a> {
                         crate::sql::names::normalize_ident(&collation.0[1])
                     }
                     _ => {
-                        return Err(AnalyzerError::CrossDatabaseReference(
-                            collation.to_string(),
-                        ));
+                        return Err(AnalyzerError::CrossDatabaseReference(collation.to_string()));
                     }
                 };
                 // COLLATE "default" = use the database default collation, which is
