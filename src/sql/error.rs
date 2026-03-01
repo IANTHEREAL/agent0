@@ -94,6 +94,11 @@ pub enum SqlError {
     #[error("canceling statement due to statement timeout")]
     StatementTimeout,
 
+    #[error(
+        "canceling statement due to retry timeout ({elapsed_ms}ms elapsed, limit {limit_ms}ms)"
+    )]
+    RetryTimeout { elapsed_ms: u64, limit_ms: u64 },
+
     #[error("terminating connection due to idle-in-transaction timeout")]
     IdleInTransactionTimeout,
 
@@ -252,6 +257,7 @@ impl SqlError {
             Self::StringDataRightTruncation { .. } => "22001",
             Self::DivisionByZero => "22012",
             Self::StatementTimeout => "57014",
+            Self::RetryTimeout { .. } => "57014",
             Self::IdleInTransactionTimeout => "25P03",
             Self::LockTimeout => "55P03",
             Self::TenantMemoryQuotaExceeded { .. } => "53200",

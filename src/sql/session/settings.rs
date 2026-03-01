@@ -78,6 +78,18 @@ pub(crate) const KNOWN_GUCS: &[GucMeta] = &[
         static_default: Some("128"),
     },
     GucMeta {
+        name: "db9.retry_max_attempts",
+        immutable: false,
+        description: "Maximum retry attempts for autocommit DML/DDL on write conflict",
+        static_default: None,
+    },
+    GucMeta {
+        name: "db9.retry_timeout",
+        immutable: false,
+        description: "Maximum wall-time for retries per statement (0 = no limit)",
+        static_default: None,
+    },
+    GucMeta {
         name: "db9.use_optimizer",
         immutable: true,
         description: "",
@@ -292,6 +304,11 @@ pub(crate) struct SessionSettings {
     /// HNSW ef_search beam width during search. Default: 40, range: 1-1000.
     hnsw_ef_search: u16,
 
+    /// Maximum retry attempts for autocommit DML/DDL on write conflict. Default: 64.
+    pub(crate) retry_max_attempts: u64,
+    /// Maximum wall-time for retries per statement, in milliseconds. Default: 0 (disabled).
+    pub(crate) retry_timeout_ms: u64,
+
     // pg_dump startup variables we keep for readback (`SHOW`) and later timeout enforcement.
     pub(crate) statement_timeout_ms: u64,
     pub(crate) default_statement_timeout_ms: u64,
@@ -389,6 +406,8 @@ impl SessionSettings {
             prepared_plan_cache_size: 128,
             prepared_plan_cache_min_exec: 5,
             hnsw_ef_search: 40,
+            retry_max_attempts: 64,
+            retry_timeout_ms: 0,
             statement_timeout_ms: default_statement_timeout_ms,
             default_statement_timeout_ms,
             idle_in_transaction_session_timeout_ms: default_idle_in_txn_timeout_ms,
@@ -554,6 +573,28 @@ impl SessionSettings {
                     })?;
                 Ok(v.to_string())
             }
+            "db9.retry_max_attempts" => {
+                let v: u64 = value
+                    .trim()
+                    .parse()
+                    .map_err(|_| SqlError::InvalidParameterValue {
+                        message: format!("invalid value for parameter \"{}\": \"{}\"", name, value),
+                    })?;
+                if v == 0 {
+                    return Err(SqlError::InvalidParameterValue {
+                        message: format!(
+                            "invalid value for parameter \"{}\": \"{}\" must be at least 1",
+                            name, value
+                        ),
+                    }
+                    .into());
+                }
+                Ok(v.to_string())
+            }
+            "db9.retry_timeout" => {
+                let ms = Self::parse_timeout_millis(value)?;
+                Ok(Self::format_timeout_show(ms))
+            }
             "hnsw.ef_search" => {
                 let v: u16 = value
                     .trim()
@@ -675,6 +716,12 @@ impl SessionSettings {
             }
             "db9.prepared_plan_cache_min_exec" => {
                 self.prepared_plan_cache_min_exec = normalized.parse().unwrap_or(5);
+            }
+            "db9.retry_max_attempts" => {
+                self.retry_max_attempts = normalized.parse().unwrap_or(64);
+            }
+            "db9.retry_timeout" => {
+                self.retry_timeout_ms = Self::parse_timeout_millis(&normalized)?;
             }
             "hnsw.ef_search" => {
                 let v: u16 = normalized
@@ -801,6 +848,8 @@ impl SessionSettings {
             "db9.prepared_plan_cache_size" => self.prepared_plan_cache_size = 128,
             "db9.prepared_plan_cache_min_exec" => self.prepared_plan_cache_min_exec = 5,
             "hnsw.ef_search" => self.hnsw_ef_search = 40,
+            "db9.retry_max_attempts" => self.retry_max_attempts = 64,
+            "db9.retry_timeout" => self.retry_timeout_ms = 0,
             "db9.use_optimizer" => {}
             "timezone" => self.timezone = None,
             "application_name" => self.application_name = None,
@@ -877,6 +926,8 @@ impl SessionSettings {
                 Some(self.prepared_plan_cache_min_exec.to_string())
             }
             "hnsw.ef_search" => Some(self.hnsw_ef_search.to_string()),
+            "db9.retry_max_attempts" => Some(self.retry_max_attempts.to_string()),
+            "db9.retry_timeout" => Some(Self::format_timeout_show(self.retry_timeout_ms)),
             "db9.use_optimizer" => Some("on".to_string()),
             "timezone" => Some(self.timezone.as_deref().unwrap_or("UTC").to_string()),
             "application_name" => Some(self.application_name.as_deref().unwrap_or("").to_string()),
@@ -1110,6 +1161,8 @@ impl SessionSettings {
         "db9.max_sort_bytes",
         "db9.prepared_plan_cache_size",
         "db9.prepared_plan_cache_min_exec",
+        "db9.retry_max_attempts",
+        "db9.retry_timeout",
         "db9.use_optimizer",
         "timezone",
         "application_name",

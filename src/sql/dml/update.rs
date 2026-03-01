@@ -22,6 +22,14 @@ use crate::storage::TikvStore;
 use crate::txn::txn_put;
 use crate::worker::types::IndexState;
 
+/// Stats returned by batch HNSW maintenance for observability.
+pub struct HnswBatchStats {
+    /// Total graph bytes written to TiKV.
+    pub graph_bytes: u64,
+    /// Total serialization time in microseconds.
+    pub serialize_duration_us: u64,
+}
+
 use super::defaults::coerce_row_values;
 use super::foreign_keys::{
     handle_foreign_key_on_update, validate_foreign_keys, FkDeleteContext, FkStoreCtx,
@@ -295,10 +303,17 @@ pub async fn batch_maintain_hnsw_indexes(
     db_id: u64,
     schema: &TableSchema,
     changes: &[(Row, Row)],
-) -> Result<()> {
+) -> Result<HnswBatchStats> {
     if changes.is_empty() || !schema.indexes.iter().any(|idx| idx.is_hnsw()) {
-        return Ok(());
+        return Ok(HnswBatchStats {
+            graph_bytes: 0,
+            serialize_duration_us: 0,
+        });
     }
+    let mut stats = HnswBatchStats {
+        graph_bytes: 0,
+        serialize_duration_us: 0,
+    };
 
     for index in &schema.indexes {
         if !index.is_hnsw() {
@@ -407,10 +422,13 @@ pub async fn batch_maintain_hnsw_indexes(
         meta.count = hnsw_index.size() as u64;
 
         // Serialize and write ONCE.
+        let ser_start = std::time::Instant::now();
         let (graph_bytes, meta_bytes) =
             serialize_hnsw_snapshot(db_id, schema.table_id, index.id, &hnsw_index, &meta).map_err(
                 |e| anyhow::anyhow!("failed to persist HNSW graph '{}': {}", index.name, e),
             )?;
+        stats.serialize_duration_us += ser_start.elapsed().as_micros() as u64;
+        stats.graph_bytes += graph_bytes.len() as u64;
 
         txn_put(
             txn,
@@ -426,7 +444,7 @@ pub async fn batch_maintain_hnsw_indexes(
         .await?;
     }
 
-    Ok(())
+    Ok(stats)
 }
 
 /// Batch-maintain all HNSW indexes after a multi-row INSERT.
@@ -438,10 +456,17 @@ pub async fn batch_maintain_hnsw_indexes_for_inserts(
     db_id: u64,
     schema: &TableSchema,
     inserted_rows: &[Row],
-) -> Result<()> {
+) -> Result<HnswBatchStats> {
     if inserted_rows.is_empty() || !schema.indexes.iter().any(|idx| idx.is_hnsw()) {
-        return Ok(());
+        return Ok(HnswBatchStats {
+            graph_bytes: 0,
+            serialize_duration_us: 0,
+        });
     }
+    let mut stats = HnswBatchStats {
+        graph_bytes: 0,
+        serialize_duration_us: 0,
+    };
 
     for index in &schema.indexes {
         if !index.is_hnsw() {
@@ -540,10 +565,13 @@ pub async fn batch_maintain_hnsw_indexes_for_inserts(
         }
         meta.count = hnsw_index.size() as u64;
 
+        let ser_start = std::time::Instant::now();
         let (graph_bytes, meta_bytes) =
             serialize_hnsw_snapshot(db_id, schema.table_id, index.id, &hnsw_index, &meta).map_err(
                 |e| anyhow::anyhow!("failed to persist HNSW graph '{}': {}", index.name, e),
             )?;
+        stats.serialize_duration_us += ser_start.elapsed().as_micros() as u64;
+        stats.graph_bytes += graph_bytes.len() as u64;
 
         txn_put(
             txn,
@@ -559,7 +587,7 @@ pub async fn batch_maintain_hnsw_indexes_for_inserts(
         .await?;
     }
 
-    Ok(())
+    Ok(stats)
 }
 
 async fn execute_update_row_inner(

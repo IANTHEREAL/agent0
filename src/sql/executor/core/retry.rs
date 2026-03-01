@@ -39,6 +39,29 @@ pub(super) fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
     })
 }
 
+/// Extract the TiKV WriteConflict reason code from a retryable error.
+///
+/// Returns the `kvrpcpb::write_conflict::Reason` integer (0..=5) if found,
+/// or `None` if the error is not a write conflict.
+pub(super) fn extract_write_conflict_reason(err: &anyhow::Error) -> Option<i32> {
+    fn first_reason(err: &tikv_client::Error) -> Option<i32> {
+        match err {
+            tikv_client::Error::PessimisticLockError { inner, .. } => first_reason(inner),
+            tikv_client::Error::UndeterminedError(inner) => first_reason(inner),
+            tikv_client::Error::ExtractedErrors(errors)
+            | tikv_client::Error::MultipleKeyErrors(errors) => errors.iter().find_map(first_reason),
+            tikv_client::Error::KeyError(ke) => ke.conflict.as_ref().map(|c| c.reason),
+            _ => None,
+        }
+    }
+
+    err.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<tikv_client::Error>()
+            .and_then(first_reason)
+    })
+}
+
 /// Exponential backoff with jitter for autocommit retry loops.
 pub(super) async fn autocommit_backoff(attempt: usize) {
     let base_ms = 5u64.saturating_mul(1u64 << attempt.min(6));

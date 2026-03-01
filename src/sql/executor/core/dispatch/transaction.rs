@@ -159,17 +159,19 @@ fn is_plan_cache_invalidating_ddl(stmt: &Statement) -> bool {
 }
 
 // DDL can contend with background schema writers (e.g. CIC backfill phases).
-// Keep a wider retry budget to emulate PostgreSQL-style lock wait behavior.
+// Default retry budget; configurable via `db9.retry_max_attempts` GUC.
+#[cfg(test)]
 const DDL_DML_MAX_RETRY_ATTEMPTS: usize = 64;
 
 fn ddl_dml_retry_max_attempts(
     is_autocommit: bool,
     explicit_first_stmt_retry_eligible: bool,
+    session_max: usize,
 ) -> usize {
     if is_autocommit || explicit_first_stmt_retry_eligible {
-        DDL_DML_MAX_RETRY_ATTEMPTS
+        session_max.max(1) // defensive clamp (validation rejects 0, but belt-and-suspenders)
     } else {
-        1
+        1 // execute once, no retry
     }
 }
 
@@ -199,13 +201,51 @@ impl Executor {
             !is_autocommit && !session.has_executed_statement_in_transaction();
         let db_id = session.current_database_id();
 
-        // Retry up to 10 times for autocommit to handle concurrent conflicts
+        // Retry up to N times for autocommit to handle concurrent conflicts
         // and for the first statement in an explicit transaction (safe to restart
         // because no prior statement has completed in that transaction yet).
-        let max_attempts =
-            ddl_dml_retry_max_attempts(is_autocommit, explicit_first_stmt_retry_eligible);
+        let max_attempts = ddl_dml_retry_max_attempts(
+            is_autocommit,
+            explicit_first_stmt_retry_eligible,
+            session.settings().retry_max_attempts as usize,
+        );
+
+        let retry_start = std::time::Instant::now();
+        let retry_timeout = {
+            let ms = session.settings().retry_timeout_ms;
+            if ms > 0 {
+                Some(std::time::Duration::from_millis(ms))
+            } else {
+                None
+            }
+        };
 
         for attempt in 0..max_attempts {
+            // On retry iterations (after backoff), re-check wall-time ceiling.
+            // This catches the case where backoff sleep pushed us past the deadline.
+            if attempt > 0 {
+                if let Some(timeout) = retry_timeout {
+                    if retry_start.elapsed() >= timeout {
+                        tracing::warn!(
+                            attempt,
+                            max_attempts,
+                            elapsed_ms = retry_start.elapsed().as_millis() as u64,
+                            timeout_ms = timeout.as_millis() as u64,
+                            "retry timeout exceeded after backoff, aborting"
+                        );
+                        if !is_autocommit {
+                            session.rollback().await?;
+                            self.clear_trigger_activations();
+                        }
+                        self.observability.record_retry_timeout_abort();
+                        return Err(SqlError::RetryTimeout {
+                            elapsed_ms: retry_start.elapsed().as_millis() as u64,
+                            limit_ms: timeout.as_millis() as u64,
+                        }
+                        .into());
+                    }
+                }
+            }
             if is_autocommit {
                 session.begin().await?;
             }
@@ -276,8 +316,43 @@ impl Executor {
                         let should_retry =
                             attempt + 1 < max_attempts && is_retryable_tikv_error(&err);
                         if should_retry {
+                            // Check wall-time ceiling BEFORE sleeping
+                            if let Some(timeout) = retry_timeout {
+                                if retry_start.elapsed() >= timeout {
+                                    tracing::warn!(
+                                        attempt = attempt + 1,
+                                        max_attempts,
+                                        elapsed_ms = retry_start.elapsed().as_millis() as u64,
+                                        timeout_ms = timeout.as_millis() as u64,
+                                        "retry timeout exceeded, aborting retries"
+                                    );
+                                    self.observability.record_retry_timeout_abort();
+                                    return Err(SqlError::RetryTimeout {
+                                        elapsed_ms: retry_start.elapsed().as_millis() as u64,
+                                        limit_ms: timeout.as_millis() as u64,
+                                    }
+                                    .into());
+                                }
+                            }
+                            tracing::info!(
+                                attempt = attempt + 1,
+                                max_attempts,
+                                elapsed_ms = retry_start.elapsed().as_millis() as u64,
+                                "write conflict, retrying statement"
+                            );
+                            self.observability
+                                .record_retry_attempt(extract_write_conflict_reason(&err));
                             autocommit_backoff(attempt).await;
                             continue;
+                        }
+                        if is_retryable_tikv_error(&err) {
+                            tracing::warn!(
+                                attempt = attempt + 1,
+                                max_attempts,
+                                elapsed_ms = retry_start.elapsed().as_millis() as u64,
+                                "write conflict retry budget exhausted"
+                            );
+                            self.observability.record_retry_budget_exhausted();
                         }
                         return Err(err);
                     }
@@ -295,11 +370,48 @@ impl Executor {
                             && attempt + 1 < max_attempts
                             && is_retryable_tikv_error(&err);
                         if should_retry {
+                            // Check wall-time ceiling BEFORE sleeping
+                            if let Some(timeout) = retry_timeout {
+                                if retry_start.elapsed() >= timeout {
+                                    tracing::warn!(
+                                        attempt = attempt + 1,
+                                        max_attempts,
+                                        elapsed_ms = retry_start.elapsed().as_millis() as u64,
+                                        timeout_ms = timeout.as_millis() as u64,
+                                        "retry timeout exceeded, aborting retries"
+                                    );
+                                    session.rollback().await?;
+                                    self.clear_trigger_activations();
+                                    self.observability.record_retry_timeout_abort();
+                                    return Err(SqlError::RetryTimeout {
+                                        elapsed_ms: retry_start.elapsed().as_millis() as u64,
+                                        limit_ms: timeout.as_millis() as u64,
+                                    }
+                                    .into());
+                                }
+                            }
+                            tracing::info!(
+                                attempt = attempt + 1,
+                                max_attempts,
+                                elapsed_ms = retry_start.elapsed().as_millis() as u64,
+                                "write conflict, retrying statement"
+                            );
+                            self.observability
+                                .record_retry_attempt(extract_write_conflict_reason(&err));
                             session.rollback().await?;
                             self.clear_trigger_activations();
                             session.begin().await?;
                             autocommit_backoff(attempt).await;
                             continue;
+                        }
+                        if is_retryable_tikv_error(&err) {
+                            tracing::warn!(
+                                attempt = attempt + 1,
+                                max_attempts,
+                                elapsed_ms = retry_start.elapsed().as_millis() as u64,
+                                "write conflict retry budget exhausted"
+                            );
+                            self.observability.record_retry_budget_exhausted();
                         }
                         return Err(err);
                     }
@@ -464,7 +576,7 @@ mod tests {
     #[test]
     fn ddl_dml_retry_budget_uses_full_budget_for_autocommit() {
         assert_eq!(
-            ddl_dml_retry_max_attempts(true, false),
+            ddl_dml_retry_max_attempts(true, false, DDL_DML_MAX_RETRY_ATTEMPTS),
             DDL_DML_MAX_RETRY_ATTEMPTS
         );
     }
@@ -472,13 +584,24 @@ mod tests {
     #[test]
     fn ddl_dml_retry_budget_uses_full_budget_for_first_explicit_statement() {
         assert_eq!(
-            ddl_dml_retry_max_attempts(false, true),
+            ddl_dml_retry_max_attempts(false, true, DDL_DML_MAX_RETRY_ATTEMPTS),
             DDL_DML_MAX_RETRY_ATTEMPTS
         );
     }
 
     #[test]
     fn ddl_dml_retry_budget_disables_retries_after_first_explicit_statement() {
-        assert_eq!(ddl_dml_retry_max_attempts(false, false), 1);
+        assert_eq!(
+            ddl_dml_retry_max_attempts(false, false, DDL_DML_MAX_RETRY_ATTEMPTS),
+            1
+        );
+    }
+
+    #[test]
+    fn ddl_dml_retry_budget_respects_session_override() {
+        assert_eq!(ddl_dml_retry_max_attempts(true, false, 5), 5);
+        assert_eq!(ddl_dml_retry_max_attempts(false, true, 10), 10);
+        // session_max=0 is clamped to 1 (defensive)
+        assert_eq!(ddl_dml_retry_max_attempts(true, false, 0), 1);
     }
 }

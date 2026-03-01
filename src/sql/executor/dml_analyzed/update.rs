@@ -296,7 +296,14 @@ impl Executor {
         //   that perform HNSW vector search on the same table being
         //   modified.  This is an extremely narrow pattern.
         if !hnsw_changes.is_empty() {
-            dml::batch_maintain_hnsw_indexes(txn, db_id, &schema, &hnsw_changes).await?;
+            let hnsw_stats =
+                dml::batch_maintain_hnsw_indexes(txn, db_id, &schema, &hnsw_changes).await?;
+            if hnsw_stats.graph_bytes > 0 {
+                self.observability().record_hnsw_serialize(
+                    hnsw_stats.graph_bytes,
+                    hnsw_stats.serialize_duration_us,
+                );
+            }
         }
 
         // Bump mod_count for auto-ANALYZE tracking.

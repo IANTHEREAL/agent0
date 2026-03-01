@@ -1,3 +1,59 @@
+# Worklog
+
+## Issue #1284 Step 3 — Control Retry Storm (2026-03-01)
+
+### Goal
+Make the autocommit retry budget observable and configurable via GUCs, with structured logging.
+
+### Changes Made
+1. **`src/sql/error.rs`** — Added `SqlError::RetryTimeout { elapsed_ms, limit_ms }` variant mapped to SQLSTATE 57014 (same as `StatementTimeout`). Uses `SqlError` instead of standalone `RetryTimeoutError` struct to ensure proper SQLSTATE mapping through `sqlstate_for_executor_error`.
+
+2. **`src/sql/session/settings.rs`** — Added two GUCs:
+   - `db9.retry_max_attempts` (u64, default 64): max retry count; validation rejects 0 (must be >= 1)
+   - `db9.retry_timeout` (timeout-style, default 0 = disabled): wall-time ceiling using same `parse_timeout_millis` / `format_timeout_show` as `statement_timeout`
+   - Wired into `KNOWN_GUCS`, `SessionSettings` struct fields, `new_with_defaults`, `validate_and_normalize_value`, `set_known_setting`, `show_value`, `reset_setting`, `KNOWN_SETTING_KEYS`
+
+3. **`src/sql/executor/core/dispatch/transaction.rs`** — Retry loop changes:
+   - `ddl_dml_retry_max_attempts()` now takes `session_max: usize` third parameter, with defensive `.max(1)` clamp
+   - `DDL_DML_MAX_RETRY_ATTEMPTS` constant moved to `#[cfg(test)]` (only used in tests now)
+   - Two-layer timeout check: (1) at loop top on `attempt > 0` (catches post-backoff overshoot), (2) before `autocommit_backoff` in both autocommit and explicit-txn error paths
+   - Structured logging: `tracing::info!` on each retry attempt; `tracing::warn!` only for timeout abort and retry budget exhaustion
+   - Conflict-only final warn: non-conflict errors return silently without logging
+   - Cleanup on timeout: explicit-txn always does `rollback + clear_trigger_activations`; autocommit relies on rollback already done before the retry check
+   - New test: `ddl_dml_retry_budget_respects_session_override`
+
+### Key Design Decisions
+- **SqlError::RetryTimeout instead of standalone struct**: Per P1 review feedback — `sqlstate_for_executor_error` only downcasts `SqlError` and TiKV lock conflicts. A standalone struct would fall through to XX000.
+- **`else { 1 }` preserved**: Non-autocommit non-first-stmt always executes once (no retry). Changing to 0 would skip execution entirely.
+- **Default behavior unchanged**: Default values (64 attempts, 0 timeout) match prior hardcoded constants.
+
+4. **`src/sql/executor/core/dispatch/prepared.rs`** — Same GUC wiring and timeout logic as transaction.rs, replacing hardcoded `max_attempts = 10`.
+
+5. **Observability metrics** (5 new counters in `TenantObservability`):
+   - `retry_attempts` — total individual write-conflict retry attempts
+   - `retry_budget_exhausted` — statements that hit max retry count
+   - `retry_timeout_aborts` — statements aborted by `db9.retry_timeout` wall-time cap
+   - `hnsw_graph_bytes_written` — cumulative HNSW graph bytes serialized to TiKV
+   - `hnsw_serialize_duration_us` — cumulative HNSW serialization time (microseconds)
+
+   Files changed:
+   - `src/observability.rs` — 5 new `AtomicU64` fields, recording methods, snapshot fields
+   - `src/sql/catalog/virtual_tables.rs` — 5 new `Int64` columns in `_DB9_SYS_OBSERVABILITY`
+   - `src/sql/executor/table_utils/mod.rs` — 5 new values in observability row builder
+   - `src/sql/executor/core/dispatch/transaction.rs` — `record_retry_*` calls at all 6 exit sites
+   - `src/sql/executor/core/dispatch/prepared.rs` — `record_retry_*` calls at all 4 exit sites
+   - `src/sql/dml/update.rs` — `HnswBatchStats` struct, return type changes, timing instrumentation
+   - `src/sql/executor/dml_analyzed/insert.rs` — capture `HnswBatchStats`, call `record_hnsw_serialize`
+   - `src/sql/executor/dml_analyzed/update.rs` — capture `HnswBatchStats`, call `record_hnsw_serialize`
+
+### Verification
+- `cargo build` — clean (0 warnings)
+- `cargo clippy -- -D warnings` — clean
+- `cargo fmt` — clean
+- `cargo test` — 2966/2966 pass (0 failures)
+
+---
+
 # Worklog — HNSW Vector Index Fixes (6 Findings + 2 Critical Bugs)
 
 ## Date: 2026-02-28
@@ -165,4 +221,137 @@ if is_hnsw && predicate.is_some() {
 cargo build                          — PASS (no errors, no warnings)
 cargo clippy -- -D warnings          — PASS (no warnings)
 cargo test -q                        — PASS (2822 tests, 0 failures)
+```
+
+---
+
+## Round 6 — Issue #1284: HNSW Concurrent UPDATE Stalls Server
+
+### Date: 2026-03-01
+
+### Problem
+Under concurrent HNSW UPDATE workload (300 rows, 2 workers, 120 iterations each), server becomes unresponsive with ~200 MiB/s disk read I/O. User confirmed the stalling also occurs without HNSW, but HNSW greatly amplifies it.
+
+### Root Cause Analysis (Revised — TiKV-aware)
+
+**Tier 1: Structural root causes (highest impact)**
+
+1. **Single-key full-graph rewrite (持久化粒度错误)** — HNSW graph is stored as ONE large KV pair (`hnsw_graph_key` at `storage.rs:49`). Every UPDATE rewrites the entire ~100-300 KB value. This creates a single-Region/single-leader hot key in TiKV, triggering Raft replication amplification (not just local RocksDB). Each put goes through Raft log → replicate → apply on all replicas. The observed ~200 MiB/s is consistent with distributed write-hot-spot behavior.
+
+2. **Conflict retry storm** — Default pessimistic txn (`begin()` at `tikv_store/mod.rs:191`). Autocommit DML retries up to 64 times (`DDL_DML_MAX_RETRY_ATTEMPTS` at `dispatch/transaction.rs:163`). When w1 and w2 contend on the same row (id=1) AND the same graph key, each retry re-executes the **entire statement**: full table scan + all row upserts + graph serialize. This is a hidden multiplier on all other costs.
+   - Retry condition: `is_retryable_tikv_error` at `retry.rs:3` — retries on ANY WriteConflict reason.
+   - Backoff: exponential from 5ms (`autocommit_backoff` at `retry.rs:43`), but still re-does all heavy work.
+
+3. **MVCC version chain accumulation** — Same graph key rewritten at high frequency accumulates many historical versions in TiKV (until GC/compaction). Both reads and writes on this key become progressively heavier as the version chain grows.
+
+**Tier 2: Amplifying factors**
+
+4. **No process-level cache** — Removed in Round 2 for correctness. Every DML loads full graph from TiKV. This is a consistency trade-off, not the root cause, but it amplifies Tier 1 costs.
+
+5. **Full table scan on every UPDATE** — `scan_and_fill()` at `executor/dml_analyzed/update.rs:60` is a paginated RPC scan (`tables.rs:597`, batch 1024 at `tikv_store/mod.rs:48`). Under high-frequency UPDATE, this becomes cross-Region RPC storm. Worse: conflicts are discovered LATE (at write phase), so the expensive scan work is wasted on retry.
+
+6. **Per-row graph serialize via temp file I/O** — 6 disk ops per vector update (save/read/delete × 2). Still expensive, but secondary to the distributed amplification.
+
+7. **Graph bloat from usearch append-only** — Graph grows without bound on repeated updates to same row. Makes each serialization progressively larger.
+
+### Key Insight
+The "没有 HNSW 也有问题" observation maps to root causes #2 and #5: conflict retry storm + full table scan are general DML problems. HNSW adds root causes #1 and #3 (single-key hot-spot + version chain), which dramatically amplify the stall.
+
+### Fix Strategy (revised priority)
+1. **Fix HNSW persistence granularity** — break single-key monolith into smaller pieces, or use delta-based updates
+2. **Reduce retry blast radius** — avoid re-doing full scan + serialize on each retry
+3. **Batch HNSW maintenance per-statement** — O(N) → O(1) serializations
+4. **In-memory serialization** — eliminate temp file I/O
+
+### Qualifications Added (v3)
+1. RC1: "strong inference" — single-key design confirmed in code, but Region hot-spot/Raft amplification needs TiKV metrics to verify.
+2. RC2: 64-retry budget only when `is_autocommit || explicit_first_stmt_retry_eligible` (gated by `ddl_dml_retry_max_attempts` at `transaction.rs:165`). Reproduction script uses `psql -c` = autocommit = 64-retry path.
+3. RC3: Version chain grows per committed transaction, not per `txn_put` within a single txn.
+4. RC5 (full table scan): explicitly marked as general root cause that applies without HNSW.
+
+### RC2 Wording Fix
+"re-executes full scan + all row upserts" → "re-executes full scan + all predicate-matching row writes" (w2 only writes 1 row, not all 300).
+
+### Implementation Plan (phased)
+1. **Bandaid: batch HNSW maintenance per-statement** — update.rs, insert.rs. O(rows × graph) → O(graph + rows). Low risk.
+2. **PK/unique key fast path for UPDATE** — point-get instead of full scan. Medium risk.
+3. **Observable + configurable retry budget** — metrics + config. Medium risk.
+4. **Structural: change single-key storage granularity** — sharded or delta-log. High risk.
+
+### Step 1 Implementation — Batch HNSW Maintenance (DONE)
+
+**What changed:**
+
+UPDATE path:
+- `src/sql/dml/update.rs`: Added `skip_hnsw` parameter to `execute_update_row_inner`. Added `execute_update_row_defer_hnsw` (public wrapper). Added `batch_maintain_hnsw_indexes` — loads graph ONCE, adds all changed vectors, serializes ONCE, writes ONCE.
+- `src/sql/dml/update.rs`: Added `batch_maintain_hnsw_indexes_for_inserts` — same pattern for INSERT.
+- `src/sql/executor/dml_analyzed/update.rs`: Uses `execute_update_row_defer_hnsw` when HNSW indexes exist, collects `(old_row, new_row)` pairs, calls `batch_maintain_hnsw_indexes` after the loop.
+
+INSERT path:
+- `src/sql/dml/insert.rs`: Extracted `execute_insert_row_inner` with `skip_hnsw` flag. Added `execute_insert_row_defer_hnsw` (public wrapper).
+- `src/sql/executor/dml_analyzed/insert.rs`: Uses `execute_insert_row_defer_hnsw` when HNSW indexes exist, collects inserted rows, calls `batch_maintain_hnsw_indexes_for_inserts` after the loop.
+
+Module exports:
+- `src/sql/dml/mod.rs`: Exported new functions.
+
+**Semantics preserved:**
+- All writes still go to the same transaction buffer via `txn_put`
+- Transaction visibility unchanged (writes visible within same txn)
+- Non-HNSW tables take the unchanged code path (zero overhead)
+- FK cascade and ON CONFLICT callers unchanged (per-row HNSW, typically 1 row)
+
+**Complexity reduction:**
+- Per-statement graph I/O: O(updated_rows × graph_size) → O(graph_size + updated_rows)
+- For w2 in reproduction script (1 row per statement): no change (1 load + 1 serialize)
+- For w1 with vector changes (250 rows): 250 load/serialize → 1 load/serialize
+
+**Verification:**
+```
+cargo build                          — PASS
+cargo clippy -- -D warnings          — PASS
+cargo test -q                        — PASS (2959 tests, 0 failures)
+```
+
+### Step 2 Implementation — PK/Unique-Key Fast Path for UPDATE (DONE)
+
+**What changed:**
+
+Single file: `src/sql/executor/dml_analyzed/update.rs`
+
+Added `try_pk_fast_fetch` method to `Executor` that attempts point-get fetch when WHERE targets a PK or unique index, replacing the full table scan in `scan_and_fill`. Three strict predicate shapes supported:
+
+1. **`pk = const`** — single/composite PK equality via `batch_get_rows`
+2. **`pk IN (c1, c2, ...)`** — single-column PK in-list via `batch_get_rows`
+3. **AND-connected `col = const` covering all columns of a UNIQUE index** — via `scan_index` → `batch_get_rows`
+
+**Integration point:** Replaced line 60's unconditional `scan_and_fill` with:
+```
+if !from.is_empty() || where is None → fallback to scan_and_fill
+else → try_pk_fast_fetch; if None → fallback to scan_and_fill
+```
+
+**Hard constraints enforced (per user requirements):**
+1. PK IN (...) deduplicates values before fetch (prevents double-update of same row)
+2. NULL constants in predicates disable fast path (col = NULL is UNKNOWN)
+3. Unique index fast path only for state=Ready, pure-column, non-partial, non-expression indexes
+4. Fast-path rows still pass through the original WHERE eval loop (behavior unchanged by construction)
+
+**Disqualifiers (automatic fallback):**
+- FROM clause present
+- WHERE is None (update all rows)
+- Predicate contains OR, range ops, subqueries, function calls, etc.
+
+**Infrastructure reused:**
+- `collect_typed_eq_predicates` from `src/sql/planner/predicate.rs`
+- `store.batch_get_rows` from `src/storage/tikv_store/indexes.rs`
+- `store.scan_index` from `src/storage/tikv_store/indexes.rs`
+- `fill_row_defaults` from `src/sql/projection.rs`
+
+**Behavioral equivalence:** WHERE eval loop still runs on fast-path rows, so any predicate mismatch (e.g. extra non-PK predicates) is caught. No behavioral change by construction.
+
+**Verification:**
+```
+cargo build                          — PASS
+cargo clippy -- -D warnings          — PASS
+cargo test -q                        — PASS (2959 tests, 0 failures)
 ```

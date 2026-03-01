@@ -144,6 +144,14 @@ pub struct SummarySnapshot {
     pub txn_commit_count: u64,
     pub error_count: u64,
     pub rate_limited_count: u64,
+    pub retry_attempts: u64,
+    pub retry_budget_exhausted: u64,
+    pub retry_timeout_aborts: u64,
+    /// Per-reason retry counts: [Unknown, Optimistic, PessimisticRetry,
+    /// SelfRolledBack, RcCheckTs, LazyUniquenessCheck].
+    pub retry_conflict_by_reason: [u64; 6],
+    pub hnsw_graph_bytes_written: u64,
+    pub hnsw_serialize_duration_us: u64,
     pub qps: f64,
     pub tps: f64,
     pub latency_avg_ms: f64,
@@ -166,6 +174,20 @@ pub struct TenantObservability {
     config: ObservabilityConfig,
     active_connections: AtomicU64,
     rate_limited_count: AtomicU64,
+    /// Total individual retry attempts across all statements (write-conflict retries).
+    retry_attempts: AtomicU64,
+    /// Statements that exhausted the retry count budget without succeeding.
+    retry_budget_exhausted: AtomicU64,
+    /// Statements aborted by the `db9.retry_timeout` wall-time ceiling.
+    retry_timeout_aborts: AtomicU64,
+    /// Retry attempts by WriteConflict reason code (indices 0..=5 map to
+    /// kvrpcpb::write_conflict::Reason: Unknown, Optimistic, PessimisticRetry,
+    /// SelfRolledBack, RcCheckTs, LazyUniquenessCheck).
+    retry_conflict_by_reason: [AtomicU64; 6],
+    /// Cumulative HNSW graph bytes written to TiKV.
+    hnsw_graph_bytes_written: AtomicU64,
+    /// Cumulative HNSW serialization time in microseconds.
+    hnsw_serialize_duration_us: AtomicU64,
     // Box to avoid stack overflow: RollingWindow is ~130KB (60 buckets × 264 AtomicU64 bins each)
     window: Box<RollingWindow>,
     samples: Mutex<VecDeque<SampleEvent>>,
@@ -177,6 +199,19 @@ impl TenantObservability {
             config,
             active_connections: AtomicU64::new(0),
             rate_limited_count: AtomicU64::new(0),
+            retry_attempts: AtomicU64::new(0),
+            retry_budget_exhausted: AtomicU64::new(0),
+            retry_timeout_aborts: AtomicU64::new(0),
+            retry_conflict_by_reason: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+            hnsw_graph_bytes_written: AtomicU64::new(0),
+            hnsw_serialize_duration_us: AtomicU64::new(0),
             window: Box::new(RollingWindow::new()),
             samples: Mutex::new(VecDeque::new()),
         }
@@ -191,6 +226,36 @@ impl TenantObservability {
 
     pub fn record_rate_limited(&self) {
         self.rate_limited_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a single retry attempt (write-conflict retry).
+    ///
+    /// `conflict_reason` is the `kvrpcpb::write_conflict::Reason` value (0..=5),
+    /// or `None` if the reason could not be extracted from the error.
+    pub fn record_retry_attempt(&self, conflict_reason: Option<i32>) {
+        self.retry_attempts.fetch_add(1, Ordering::Relaxed);
+        if let Some(r) = conflict_reason {
+            let idx = r.clamp(0, 5) as usize;
+            self.retry_conflict_by_reason[idx].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record that a statement exhausted its retry budget without succeeding.
+    pub fn record_retry_budget_exhausted(&self) {
+        self.retry_budget_exhausted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that a statement was aborted by the retry timeout ceiling.
+    pub fn record_retry_timeout_abort(&self) {
+        self.retry_timeout_aborts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record HNSW graph serialization: bytes written and time spent.
+    pub fn record_hnsw_serialize(&self, graph_bytes: u64, duration_us: u64) {
+        self.hnsw_graph_bytes_written
+            .fetch_add(graph_bytes, Ordering::Relaxed);
+        self.hnsw_serialize_duration_us
+            .fetch_add(duration_us, Ordering::Relaxed);
     }
 
     pub fn record_commit(&self) {
@@ -270,6 +335,19 @@ impl TenantObservability {
             txn_commit_count,
             error_count,
             rate_limited_count: self.rate_limited_count.load(Ordering::Relaxed),
+            retry_attempts: self.retry_attempts.load(Ordering::Relaxed),
+            retry_budget_exhausted: self.retry_budget_exhausted.load(Ordering::Relaxed),
+            retry_timeout_aborts: self.retry_timeout_aborts.load(Ordering::Relaxed),
+            retry_conflict_by_reason: [
+                self.retry_conflict_by_reason[0].load(Ordering::Relaxed),
+                self.retry_conflict_by_reason[1].load(Ordering::Relaxed),
+                self.retry_conflict_by_reason[2].load(Ordering::Relaxed),
+                self.retry_conflict_by_reason[3].load(Ordering::Relaxed),
+                self.retry_conflict_by_reason[4].load(Ordering::Relaxed),
+                self.retry_conflict_by_reason[5].load(Ordering::Relaxed),
+            ],
+            hnsw_graph_bytes_written: self.hnsw_graph_bytes_written.load(Ordering::Relaxed),
+            hnsw_serialize_duration_us: self.hnsw_serialize_duration_us.load(Ordering::Relaxed),
             qps,
             tps,
             latency_avg_ms: snap.latency_avg_ms,

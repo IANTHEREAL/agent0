@@ -297,9 +297,42 @@ impl Executor {
     ) -> Result<ExecuteResults> {
         let is_autocommit = !session.is_in_transaction();
         let db_id = session.current_database_id();
-        let max_attempts = if is_autocommit { 10usize } else { 1usize };
+        let max_attempts = if is_autocommit {
+            (session.settings().retry_max_attempts as usize).max(1)
+        } else {
+            1usize
+        };
+
+        let retry_start = std::time::Instant::now();
+        let retry_timeout = {
+            let ms = session.settings().retry_timeout_ms;
+            if ms > 0 {
+                Some(std::time::Duration::from_millis(ms))
+            } else {
+                None
+            }
+        };
 
         for attempt in 0..max_attempts {
+            if attempt > 0 {
+                if let Some(timeout) = retry_timeout {
+                    if retry_start.elapsed() >= timeout {
+                        tracing::warn!(
+                            attempt,
+                            max_attempts,
+                            elapsed_ms = retry_start.elapsed().as_millis() as u64,
+                            timeout_ms = timeout.as_millis() as u64,
+                            "prepared: retry timeout exceeded after backoff, aborting"
+                        );
+                        self.observability.record_retry_timeout_abort();
+                        return Err(SqlError::RetryTimeout {
+                            elapsed_ms: retry_start.elapsed().as_millis() as u64,
+                            limit_ms: timeout.as_millis() as u64,
+                        }
+                        .into());
+                    }
+                }
+            }
             if is_autocommit {
                 session.begin().await?;
             }
@@ -364,8 +397,42 @@ impl Executor {
                         let should_retry =
                             attempt + 1 < max_attempts && is_retryable_tikv_error(&err);
                         if should_retry {
+                            if let Some(timeout) = retry_timeout {
+                                if retry_start.elapsed() >= timeout {
+                                    tracing::warn!(
+                                        attempt = attempt + 1,
+                                        max_attempts,
+                                        elapsed_ms = retry_start.elapsed().as_millis() as u64,
+                                        timeout_ms = timeout.as_millis() as u64,
+                                        "prepared: retry timeout exceeded, aborting retries"
+                                    );
+                                    self.observability.record_retry_timeout_abort();
+                                    return Err(SqlError::RetryTimeout {
+                                        elapsed_ms: retry_start.elapsed().as_millis() as u64,
+                                        limit_ms: timeout.as_millis() as u64,
+                                    }
+                                    .into());
+                                }
+                            }
+                            tracing::info!(
+                                attempt = attempt + 1,
+                                max_attempts,
+                                elapsed_ms = retry_start.elapsed().as_millis() as u64,
+                                "prepared: write conflict, retrying statement"
+                            );
+                            self.observability
+                                .record_retry_attempt(extract_write_conflict_reason(&err));
                             autocommit_backoff(attempt).await;
                             continue;
+                        }
+                        if is_retryable_tikv_error(&err) {
+                            tracing::warn!(
+                                attempt = attempt + 1,
+                                max_attempts,
+                                elapsed_ms = retry_start.elapsed().as_millis() as u64,
+                                "prepared: write conflict retry budget exhausted"
+                            );
+                            self.observability.record_retry_budget_exhausted();
                         }
                         return Err(err);
                     }
