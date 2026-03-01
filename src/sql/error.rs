@@ -338,6 +338,9 @@ impl From<AnalyzerError> for SqlError {
             AnalyzerError::InvalidParameterUsage { index, context } => {
                 SqlError::InvalidParameterUsage { index, context }
             }
+            AnalyzerError::SchemaNotFound(name) => SqlError::InvalidSchemaName(name),
+            AnalyzerError::CollationNotFound(_) => SqlError::UndefinedObject(e.to_string()),
+            AnalyzerError::CrossDatabaseReference(_) => SqlError::Unsupported(e.to_string()),
             AnalyzerError::Unsupported(msg) => SqlError::Unsupported(msg),
             AnalyzerError::OperatorTypeMismatch { .. } => SqlError::OperatorResolution {
                 message: e.to_string(),
@@ -825,5 +828,20 @@ mod tests {
         };
         let sql: SqlError = ae.into();
         assert_eq!(sql.sqlstate(), "42P20");
+
+        // SchemaNotFound → 3F000 (COLLATE with unknown schema)
+        let ae = AnalyzerError::SchemaNotFound("no_such_schema".into());
+        let sql: SqlError = ae.into();
+        assert_eq!(sql.sqlstate(), "3F000");
+
+        // CollationNotFound → 42704 (COLLATE with known schema, no collation)
+        let ae = AnalyzerError::CollationNotFound("public.default".into());
+        let sql: SqlError = ae.into();
+        assert_eq!(sql.sqlstate(), "42704");
+
+        // CrossDatabaseReference → 0A000 (3+ part COLLATE name)
+        let ae = AnalyzerError::CrossDatabaseReference("pg_catalog.foo.default".into());
+        let sql: SqlError = ae.into();
+        assert_eq!(sql.sqlstate(), "0A000");
     }
 }

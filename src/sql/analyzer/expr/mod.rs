@@ -1217,11 +1217,40 @@ impl<'a> Analyzer<'a> {
                         )));
                     }
                 }
-                // ObjectName is a Vec<Ident>, get the last part as collation name
-                let collation_name = if collation.0.len() == 1 {
-                    crate::sql::names::normalize_ident(&collation.0[0])
-                } else {
-                    collation.to_string()
+                // ObjectName is a Vec<Ident>. PostgreSQL allows at most schema.collation
+                // (2-part); 3+ parts are "cross-database references" and rejected.
+                // Only pg_catalog is accepted as schema for built-in collations.
+                let collation_name = match collation.0.len() {
+                    1 => crate::sql::names::normalize_ident(&collation.0[0]),
+                    2 => {
+                        let schema = crate::sql::names::normalize_ident(&collation.0[0]);
+                        if schema != "pg_catalog" {
+                            // PostgreSQL distinguishes: known schema → "collation not found" (42704),
+                            // unknown schema → "schema does not exist" (3F000).
+                            let known = matches!(
+                                schema.as_str(),
+                                "public" | "information_schema"
+                            ) || self
+                                .catalog
+                                .search_path()
+                                .iter()
+                                .any(|s| s == &schema);
+                            if known {
+                                let coll =
+                                    crate::sql::names::normalize_ident(&collation.0[1]);
+                                return Err(AnalyzerError::CollationNotFound(format!(
+                                    "{}.{}", schema, coll
+                                )));
+                            }
+                            return Err(AnalyzerError::SchemaNotFound(schema));
+                        }
+                        crate::sql::names::normalize_ident(&collation.0[1])
+                    }
+                    _ => {
+                        return Err(AnalyzerError::CrossDatabaseReference(
+                            collation.to_string(),
+                        ));
+                    }
                 };
                 // COLLATE "default" = use the database default collation, which is
                 // the engine's default compare_text_pg path. Skip the Collate node.

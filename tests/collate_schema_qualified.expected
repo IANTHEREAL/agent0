@@ -1,0 +1,15 @@
+result
+hello
+(1 row)
+result
+hello
+(1 row)
+result
+hello
+(1 row)
+result
+hello
+(1 row)
+psql:tests/collate_schema_qualified.sql:11: ERROR:  schema "no_such_schema" does not exist
+psql:tests/collate_schema_qualified.sql:12: ERROR:  collation "public.default" does not exist
+psql:tests/collate_schema_qualified.sql:15: ERROR:  cross-database references are not implemented: pg_catalog.foo."default"

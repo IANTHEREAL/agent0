@@ -117,6 +117,15 @@ pub enum AnalyzerError {
     /// Parameter in non-parameterizable statement context (SQLSTATE 42P02).
     InvalidParameterUsage { index: usize, context: String },
 
+    /// Schema does not exist (SQLSTATE 3F000).
+    SchemaNotFound(String),
+
+    /// Collation does not exist in the given schema (SQLSTATE 42704).
+    CollationNotFound(String),
+
+    /// Cross-database reference (SQLSTATE 0A000).
+    CrossDatabaseReference(String),
+
     /// Unsupported SQL feature.
     Unsupported(String),
 
@@ -303,6 +312,15 @@ impl fmt::Display for AnalyzerError {
             ),
             Self::InvalidParameterUsage { index, context } => {
                 write!(f, "there is no parameter ${}: {}", index, context)
+            }
+            Self::SchemaNotFound(name) => {
+                write!(f, "schema \"{}\" does not exist", name)
+            }
+            Self::CollationNotFound(name) => {
+                write!(f, "collation \"{}\" does not exist", name)
+            }
+            Self::CrossDatabaseReference(name) => {
+                write!(f, "cross-database references are not implemented: {}", name)
             }
             Self::Unsupported(msg) => write!(f, "{}", msg),
             Self::Internal(msg) => write!(f, "internal error: {}", msg),

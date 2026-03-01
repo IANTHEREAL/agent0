@@ -3552,3 +3552,108 @@ fn any_subquery_with_text_typed_parameter_is_rejected() {
             if operator == "=" && left == "text" && right == "integer"
     ));
 }
+
+// ── Schema-qualified COLLATE (psql \d compat) ──────
+
+#[test]
+fn collate_pg_catalog_default_resolves() {
+    // psql's \d sends: ... COLLATE pg_catalog."default"
+    // This must resolve to the "default" collation (no-op).
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT name COLLATE pg_catalog.\"default\" FROM users");
+    let result = analyzer.analyze_query(&query).unwrap();
+    let sel = expect_select(&result);
+    // COLLATE "default" is a no-op — the expression should NOT be wrapped in Collate.
+    assert_eq!(
+        extract_collation_name(&sel.projection[0].expr),
+        None,
+        "COLLATE pg_catalog.\"default\" should be a no-op (default collation)"
+    );
+}
+
+#[test]
+fn collate_pg_catalog_c_resolves() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT name COLLATE pg_catalog.\"C\" FROM users");
+    let result = analyzer.analyze_query(&query).unwrap();
+    let sel = expect_select(&result);
+    assert_eq!(
+        extract_collation_name(&sel.projection[0].expr),
+        Some("C".to_string()),
+        "COLLATE pg_catalog.\"C\" should resolve to collation C"
+    );
+}
+
+#[test]
+fn collate_pg_catalog_posix_resolves() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT name COLLATE pg_catalog.\"POSIX\" FROM users");
+    let result = analyzer.analyze_query(&query).unwrap();
+    let sel = expect_select(&result);
+    assert_eq!(
+        extract_collation_name(&sel.projection[0].expr),
+        Some("POSIX".to_string()),
+        "COLLATE pg_catalog.\"POSIX\" should resolve to collation POSIX"
+    );
+}
+
+#[test]
+fn collate_unqualified_default_still_works() {
+    // Ensure the fix for schema-qualified names didn't break unqualified names.
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT name COLLATE \"default\" FROM users");
+    let result = analyzer.analyze_query(&query).unwrap();
+    let sel = expect_select(&result);
+    assert_eq!(
+        extract_collation_name(&sel.projection[0].expr),
+        None,
+        "COLLATE \"default\" should be a no-op"
+    );
+}
+
+#[test]
+fn collate_invalid_schema_is_rejected() {
+    // PostgreSQL: ERROR: schema "no_such_schema" does not exist (3F000)
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT name COLLATE no_such_schema.\"default\" FROM users");
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(
+        err.to_string().contains("schema \"no_such_schema\" does not exist"),
+        "Non-pg_catalog schema should be rejected with schema-not-found, got: {}",
+        err
+    );
+}
+
+#[test]
+fn collate_public_schema_is_rejected() {
+    // PostgreSQL: ERROR: collation "public.default" for encoding "UTF8" does not exist
+    // Schema "public" exists, so the error is "collation not found", not "schema not found".
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT name COLLATE public.\"default\" FROM users");
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(
+        err.to_string().contains("collation \"public.default\" does not exist"),
+        "Known schema should return collation-not-found, got: {}",
+        err
+    );
+}
+
+#[test]
+fn collate_three_part_name_is_rejected() {
+    // PostgreSQL: ERROR: cross-database references are not implemented
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT name COLLATE pg_catalog.foo.\"default\" FROM users");
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(
+        err.to_string().contains("cross-database references are not implemented"),
+        "3-part collation name should be rejected, got: {}",
+        err
+    );
+}
