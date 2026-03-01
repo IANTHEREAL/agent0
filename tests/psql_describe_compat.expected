@@ -42,3 +42,9 @@ q12_refby_plus=_psql_compat_ref_compat_id_fkey,parent=0
 ?column?
 q13_trigger_rows=0
 (1 row)
+?column?
+q14_notnull_rows=0
+(1 row)
+?column?
+q15_notnull_flags_ok=true
+(1 row)

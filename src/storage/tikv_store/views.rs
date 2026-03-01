@@ -8,6 +8,7 @@ impl TikvStore {
         txn: &mut Transaction,
         db_id: u64,
         name: &str,
+        owner: &str,
         query: &str,
         deps: Vec<String>,
         relation_bindings: Vec<String>,
@@ -41,6 +42,7 @@ impl TikvStore {
             oid,
             schema: schema.to_string(),
             name: view_name.to_string(),
+            owner: owner.to_string(),
             query: query.to_string(),
             deps,
         };

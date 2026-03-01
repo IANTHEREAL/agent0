@@ -1,11 +1,12 @@
-use super::helpers::{int_col, text_col};
+use super::helpers::{int_col, int_val, split_schema_and_name, text_col, text_val};
 use super::{ScanContext, VirtualTable};
 use crate::model::{Row, TableSchema};
+use crate::sql::catalog_oids;
 use anyhow::Result;
 use async_trait::async_trait;
 
-/// Stub pg_stat_user_tables — psql `\d+` queries this for table size stats.
-/// Returns empty rows (no persistent statistics in db9-server).
+/// Minimal pg_stat_user_tables implementation:
+/// one row per user table with zeroed counters.
 pub struct PgStatUserTables;
 
 #[async_trait]
@@ -47,7 +48,32 @@ impl VirtualTable for PgStatUserTables {
         }
     }
 
-    async fn scan(&self, _ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {
-        Ok(Vec::new())
+    async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {
+        let mut rows = Vec::new();
+        for full_table_name in ctx.user_tables {
+            let Some(schema) = ctx
+                .store
+                .get_schema(ctx.txn, ctx.db_id, full_table_name)
+                .await?
+            else {
+                continue;
+            };
+            let (schemaname, relname) = split_schema_and_name(full_table_name);
+            rows.push(Row::new(vec![
+                int_val(catalog_oids::pg_class_table_oid(schema.table_id)?),
+                text_val(&schemaname),
+                text_val(&relname),
+                int_val(0),
+                int_val(0),
+                int_val(0),
+                int_val(0),
+                int_val(0),
+                int_val(0),
+                int_val(0),
+                int_val(0),
+                int_val(0),
+            ]));
+        }
+        Ok(rows)
     }
 }

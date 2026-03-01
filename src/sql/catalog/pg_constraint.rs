@@ -31,6 +31,46 @@ fn fk_action_sql(action: &ForeignKeyAction) -> Option<&'static str> {
     }
 }
 
+fn build_not_null_constraint_rows(
+    schema: &TableSchema,
+    table_short_name: &str,
+    connamespace_oid: i64,
+    conrelid: i64,
+    constraint_oid: &mut i64,
+) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for (idx, col) in schema.columns.iter().enumerate() {
+        if col.nullable {
+            continue;
+        }
+        let conname = format!("{}_{}_not_null", table_short_name, col.name);
+        rows.push(Row::new(vec![
+            int_val(*constraint_oid),
+            text_val(&conname),
+            int_val(connamespace_oid),
+            text_val("n"),
+            int_val(conrelid),
+            int_val(0),
+            int_val(0),
+            Value::Array(vec![Value::Int64((idx + 1) as i64)]),
+            Value::Array(vec![]),
+            null_val(),
+            null_val(),
+            Value::Boolean(false),
+            Value::Boolean(false),
+            text_val("NOT NULL"),
+            int_val(0),
+            int_val(0),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            int_val(0),
+            Value::Boolean(true),
+        ]));
+        *constraint_oid += 1;
+    }
+    rows
+}
+
 #[async_trait]
 impl VirtualTable for PgConstraint {
     fn name(&self) -> &str {
@@ -62,6 +102,10 @@ impl VirtualTable for PgConstraint {
                 text_col("constraintdef"),
                 int_col("conindid"),
                 int_col("conparentid"),
+                bool_col("connoinherit"),
+                bool_col("conislocal"),
+                int_col("coninhcount"),
+                bool_col("convalidated"),
             ],
             version: 1,
             pk_constraint_name: None,
@@ -134,6 +178,10 @@ impl VirtualTable for PgConstraint {
                     text_val(&constraintdef),
                     int_val(conindid),
                     int_val(0),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                    int_val(0),
+                    Value::Boolean(true),
                 ]));
                 constraint_oid += 1;
             }
@@ -169,9 +217,21 @@ impl VirtualTable for PgConstraint {
                     text_val(&constraintdef),
                     int_val(conindid),
                     int_val(0),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                    int_val(0),
+                    Value::Boolean(true),
                 ]));
                 constraint_oid += 1;
             }
+
+            rows.extend(build_not_null_constraint_rows(
+                schema,
+                &table_short_name,
+                connamespace_oid,
+                conrelid,
+                &mut constraint_oid,
+            ));
 
             for (i, check) in schema.check_constraints.iter().enumerate() {
                 let name = check
@@ -201,6 +261,10 @@ impl VirtualTable for PgConstraint {
                     text_val(&constraintdef),
                     int_val(0),
                     int_val(0),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                    int_val(0),
+                    Value::Boolean(true),
                 ]));
                 constraint_oid += 1;
             }
@@ -270,6 +334,10 @@ impl VirtualTable for PgConstraint {
                     text_val(&constraintdef),
                     int_val(0),
                     int_val(0),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                    int_val(0),
+                    Value::Boolean(true),
                 ]));
                 constraint_oid += 1;
             }
@@ -281,11 +349,14 @@ impl VirtualTable for PgConstraint {
 
 #[cfg(test)]
 mod tests {
+    use super::build_not_null_constraint_rows;
     use super::is_unique_constraint_index;
     use super::PgConstraint;
     use super::VirtualTable;
     use crate::model::DataType;
     use crate::model::IndexDef;
+    use crate::model::TableSchema;
+    use crate::model::Value;
     use crate::worker::types::IndexState;
 
     #[test]
@@ -312,13 +383,113 @@ mod tests {
     }
 
     #[test]
-    fn pg_constraint_has_conparentid_column() {
+    fn pg_constraint_has_psql18_describe_columns() {
         let schema = PgConstraint.schema();
-        let col = schema
+        let conparentid = schema
             .columns
             .iter()
             .find(|c| c.name == "conparentid")
             .expect("pg_constraint.conparentid column must exist");
-        assert_eq!(col.data_type, DataType::Int64);
+        assert_eq!(conparentid.data_type, DataType::Int64);
+
+        let connoinherit = schema
+            .columns
+            .iter()
+            .find(|c| c.name == "connoinherit")
+            .expect("pg_constraint.connoinherit column must exist");
+        assert_eq!(connoinherit.data_type, DataType::Boolean);
+
+        let conislocal = schema
+            .columns
+            .iter()
+            .find(|c| c.name == "conislocal")
+            .expect("pg_constraint.conislocal column must exist");
+        assert_eq!(conislocal.data_type, DataType::Boolean);
+
+        let coninhcount = schema
+            .columns
+            .iter()
+            .find(|c| c.name == "coninhcount")
+            .expect("pg_constraint.coninhcount column must exist");
+        assert_eq!(coninhcount.data_type, DataType::Int64);
+
+        let convalidated = schema
+            .columns
+            .iter()
+            .find(|c| c.name == "convalidated")
+            .expect("pg_constraint.convalidated column must exist");
+        assert_eq!(convalidated.data_type, DataType::Boolean);
+    }
+
+    #[test]
+    fn not_null_constraints_emit_contype_n_rows_with_psql18_flags() {
+        let schema = TableSchema {
+            table_id: 42,
+            name: "t".to_string(),
+            columns: vec![
+                crate::model::ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+                crate::model::ColumnDef {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+                crate::model::ColumnDef {
+                    name: "score".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![0],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+            from_alias: None,
+        };
+
+        let mut oid = 1;
+        let rows = build_not_null_constraint_rows(&schema, "t", 2200, 12345, &mut oid);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(oid, 3);
+
+        // Row layout: oid, conname, connamespace, contype, conrelid, ...
+        assert_eq!(rows[0].values[3], Value::Text("n".to_string()));
+        assert_eq!(
+            rows[0].values[7],
+            Value::Array(vec![Value::Int64(1)]),
+            "first NOT NULL row should reference attnum 1"
+        );
+        assert_eq!(rows[0].values[16], Value::Boolean(false)); // connoinherit
+        assert_eq!(rows[0].values[17], Value::Boolean(true)); // conislocal
+        assert_eq!(rows[0].values[18], Value::Int64(0)); // coninhcount
+        assert_eq!(rows[0].values[19], Value::Boolean(true)); // convalidated
+
+        assert_eq!(rows[1].values[3], Value::Text("n".to_string()));
+        assert_eq!(
+            rows[1].values[7],
+            Value::Array(vec![Value::Int64(2)]),
+            "second NOT NULL row should reference attnum 2"
+        );
     }
 }

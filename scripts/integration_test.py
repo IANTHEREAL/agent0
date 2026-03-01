@@ -733,37 +733,52 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
             return TestResult.FAILED
 
     errors_ok = True
-    if has_error:
-        errors_ok = False
-        if errors_file.exists():
-            expected_errors = [
-                line.strip()
-                for line in errors_file.read_text().strip().split("\n")
-                if line.strip()
-            ]
-            actual_errors = [
-                line
-                for line in output.split("\n")
-                if any(p in line for p in error_patterns)
-            ]
-            unexpected_errors = [
-                actual
-                for actual in actual_errors
-                if not any(exp in actual for exp in expected_errors)
-            ]
-            if unexpected_errors:
-                log_test(sql_file.name, TestResult.FAILED, "unexpected SQL errors")
-                for line in unexpected_errors[:3]:
-                    print(f"  {RED}{line}{NC}")
-                return TestResult.FAILED
-            errors_ok = True
-        else:
-            log_test(sql_file.name, TestResult.FAILED, "SQL errors detected")
-            for line in output.split("\n"):
-                if any(p in line for p in error_patterns):
-                    print(f"  {RED}{line}{NC}")
-                    break
+    if errors_file.exists():
+        expected_errors = [
+            line.strip()
+            for line in errors_file.read_text().strip().split("\n")
+            if line.strip()
+        ]
+        if not expected_errors:
+            log_test(sql_file.name, TestResult.FAILED, ".errors file is empty")
             return TestResult.FAILED
+
+        actual_errors = [
+            line for line in output.split("\n") if any(p in line for p in error_patterns)
+        ]
+        if not actual_errors:
+            log_test(sql_file.name, TestResult.FAILED, "expected SQL errors but query succeeded")
+            return TestResult.FAILED
+
+        matched_errors = [
+            actual
+            for actual in actual_errors
+            if any(exp in actual for exp in expected_errors)
+        ]
+        unexpected_errors = [
+            actual
+            for actual in actual_errors
+            if not any(exp in actual for exp in expected_errors)
+        ]
+        if unexpected_errors:
+            log_test(sql_file.name, TestResult.FAILED, "unexpected SQL errors")
+            for line in unexpected_errors[:3]:
+                print(f"  {RED}{line}{NC}")
+            return TestResult.FAILED
+        if not matched_errors:
+            log_test(sql_file.name, TestResult.FAILED, "SQL errors did not match .errors patterns")
+            for line in actual_errors[:3]:
+                print(f"  {RED}{line}{NC}")
+            return TestResult.FAILED
+        errors_ok = True
+    elif has_error:
+        errors_ok = False
+        log_test(sql_file.name, TestResult.FAILED, "SQL errors detected")
+        for line in output.split("\n"):
+            if any(p in line for p in error_patterns):
+                print(f"  {RED}{line}{NC}")
+                break
+        return TestResult.FAILED
 
     if assert_file.exists():
         required = [

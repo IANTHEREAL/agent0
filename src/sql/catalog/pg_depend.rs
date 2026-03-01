@@ -4,6 +4,7 @@ use crate::model::{Row, TableSchema};
 use crate::sql::catalog_oids;
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::HashMap;
 
 pub struct PgDepend;
 
@@ -44,6 +45,10 @@ impl VirtualTable for PgDepend {
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {
         // pg_class has OID 1259 in PostgreSQL; use the standard constant so ORMs can join if needed.
         const PG_CLASS_OID: i64 = 1259;
+        // pg_proc catalog relation OID in PostgreSQL.
+        const PG_PROC_OID: i64 = 1255;
+        // pg_trigger catalog relation OID in PostgreSQL.
+        const PG_TRIGGER_OID: i64 = 2620;
 
         let seqs = ctx.store.list_sequences(ctx.txn, ctx.db_id).await?;
         let mut rows = Vec::new();
@@ -75,6 +80,36 @@ impl VirtualTable for PgDepend {
                 int_val(table_oid),
                 int_val(refobjsubid),
                 text_val("a"),
+            ]));
+        }
+
+        let mut func_oids = HashMap::new();
+        for func in ctx.store.list_functions(ctx.txn, ctx.db_id).await? {
+            func_oids.insert(
+                format!("{}.{}", func.schema, func.name),
+                catalog_oids::pg_proc_function_oid(func.oid),
+            );
+        }
+
+        for trigger in ctx.store.list_triggers(ctx.txn, ctx.db_id).await? {
+            // TriggerDef.function is expected to be schema-qualified. Keep a fallback
+            // for legacy unqualified payloads.
+            let func_key = if crate::sql::names::parse_full_name(&trigger.function).is_ok() {
+                trigger.function.clone()
+            } else {
+                format!("{}.{}", trigger.schema, trigger.function)
+            };
+            let Some(&func_oid) = func_oids.get(&func_key) else {
+                continue;
+            };
+            rows.push(Row::new(vec![
+                int_val(PG_TRIGGER_OID),
+                int_val(catalog_oids::pg_trigger_oid(trigger.oid)),
+                int_val(0),
+                int_val(PG_PROC_OID),
+                int_val(func_oid),
+                int_val(0),
+                text_val("n"),
             ]));
         }
 

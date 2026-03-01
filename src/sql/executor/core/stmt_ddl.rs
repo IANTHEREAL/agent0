@@ -520,6 +520,7 @@ impl Executor {
                         txn,
                         db_id,
                         search_path,
+                        current_role.unwrap_or("postgres"),
                         name,
                         query,
                         *or_replace,

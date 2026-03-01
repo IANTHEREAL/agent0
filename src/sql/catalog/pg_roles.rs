@@ -5,6 +5,7 @@ use crate::model::{Row, TableSchema, Value};
 use crate::sql::catalog_oids;
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::HashSet;
 
 pub struct PgRoles;
 
@@ -52,45 +53,77 @@ impl VirtualTable for PgRoles {
         let auth_manager = AuthManager::new();
         let mut users = auth_manager.list_users(ctx.txn).await?;
         users.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut roles = auth_manager.list_roles(ctx.txn).await?;
+        roles.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let mut rows = Vec::with_capacity(users.len() + 1);
-        rows.push(Row::new(vec![
-            text_val("postgres"),
-            Value::Boolean(true),
-            Value::Boolean(true),
-            Value::Boolean(true),
-            Value::Boolean(true),
-            Value::Boolean(true),
-            Value::Boolean(false),
-            int_val(-1),
-            null_val(),
-            null_val(),
-            Value::Boolean(false),
-            null_val(),
-            int_val(catalog_oids::pg_role_oid("postgres")),
-        ]));
+        fn role_row(
+            name: &str,
+            is_superuser: bool,
+            can_create_role: bool,
+            can_create_db: bool,
+            can_login: bool,
+        ) -> Row {
+            Row::new(vec![
+                text_val(name),
+                Value::Boolean(is_superuser),
+                Value::Boolean(true),
+                Value::Boolean(can_create_role),
+                Value::Boolean(can_create_db),
+                Value::Boolean(can_login),
+                Value::Boolean(false),
+                int_val(-1),
+                null_val(),
+                null_val(),
+                Value::Boolean(false),
+                null_val(),
+                int_val(catalog_oids::pg_role_oid(name)),
+            ])
+        }
+
+        let mut seen = HashSet::new();
+        let mut rows = Vec::with_capacity(users.len() + roles.len() + 2);
+        rows.push(role_row("postgres", true, true, true, true));
+        seen.insert("postgres".to_string());
 
         for user in users {
-            if user.name.eq_ignore_ascii_case("admin") || user.name.eq_ignore_ascii_case("postgres")
-            {
+            let lower = user.name.to_ascii_lowercase();
+            if seen.contains(&lower) {
                 continue;
             }
+            rows.push(role_row(
+                &user.name,
+                user.is_superuser,
+                user.can_create_role,
+                user.can_create_db,
+                user.can_login,
+            ));
+            seen.insert(lower);
+        }
 
-            rows.push(Row::new(vec![
-                text_val(&user.name),
-                Value::Boolean(user.is_superuser),
-                Value::Boolean(true),
-                Value::Boolean(user.can_create_role),
-                Value::Boolean(user.can_create_db),
-                Value::Boolean(user.can_login),
-                Value::Boolean(false),
-                int_val(i64::from(user.connection_limit)),
-                null_val(),
-                null_val(),
-                Value::Boolean(false),
-                null_val(),
-                int_val(catalog_oids::pg_role_oid(&user.name)),
-            ]));
+        for role in roles {
+            let lower = role.name.to_ascii_lowercase();
+            if seen.contains(&lower) {
+                continue;
+            }
+            rows.push(role_row(
+                &role.name,
+                role.is_superuser,
+                role.can_create_role,
+                role.can_create_db,
+                false,
+            ));
+            seen.insert(lower);
+        }
+
+        let current_user_lower = ctx.current_user.to_ascii_lowercase();
+        if !seen.contains(&current_user_lower) {
+            rows.push(role_row(
+                ctx.current_user,
+                ctx.is_superuser,
+                false,
+                false,
+                true,
+            ));
         }
 
         Ok(rows)

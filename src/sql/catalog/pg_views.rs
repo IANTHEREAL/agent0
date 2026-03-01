@@ -46,7 +46,7 @@ impl VirtualTable for PgViews {
             rows.push(Row::new(vec![
                 text_val(&view_def.schema),
                 text_val(&view_def.name),
-                text_val("postgres"),
+                text_val(&view_def.owner),
                 text_val(&view_def.query),
             ]));
         }

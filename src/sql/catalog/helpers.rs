@@ -196,6 +196,22 @@ pub fn schema_oid(schema_oids: &HashMap<String, u32>, schema: &str) -> i64 {
     schema_oids.get(schema).copied().unwrap_or(2200) as i64
 }
 
+pub fn owner_role_oid(owner: Option<&str>, fallback_owner: &str) -> i64 {
+    let selected = owner
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let f = fallback_owner.trim();
+            if f.is_empty() {
+                None
+            } else {
+                Some(f)
+            }
+        })
+        .unwrap_or("postgres");
+    crate::sql::catalog_oids::pg_role_oid(selected)
+}
+
 pub fn data_type_to_pg_type(dt: &DataType) -> &'static str {
     match dt {
         DataType::Boolean => "boolean",

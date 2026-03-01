@@ -809,6 +809,8 @@ pub struct ViewDef {
     pub oid: u32,
     pub schema: String,
     pub name: String,
+    #[serde(default = "default_owner")]
+    pub owner: String,
     pub query: String,
     /// Fully-qualified names of relations this view depends on.
     /// Resolved at CREATE time using the active search_path.

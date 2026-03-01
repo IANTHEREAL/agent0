@@ -388,7 +388,7 @@ mod tests {
         let t = catalog.get("pg_constraint").unwrap();
         assert_eq!(t.name(), "pg_constraint");
         assert_eq!(t.schema_name(), "pg_catalog");
-        assert_eq!(t.schema().columns.len(), 16);
+        assert_eq!(t.schema().columns.len(), 20);
     }
 
     #[test]

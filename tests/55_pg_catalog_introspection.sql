@@ -23,6 +23,52 @@ CREATE TABLE cat_posts (
 CREATE VIEW cat_users_view AS
 SELECT id, email FROM cat_users;
 
+CREATE OR REPLACE FUNCTION cat_users_touch()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.email := NEW.email;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER cat_users_touch_trg BEFORE UPDATE ON cat_users
+FOR EACH ROW EXECUTE PROCEDURE cat_users_touch();
+
+-- current_user should always be discoverable in pg_roles.
+SELECT 'a1_current_user_in_pg_roles=' ||
+       (EXISTS (
+           SELECT 1
+           FROM pg_catalog.pg_roles r
+           WHERE r.rolname = current_user
+       ))::text;
+
+-- relowner should be joinable to pg_roles and match pg_tables.tableowner.
+SELECT 'a2_relowner_owner_match=' ||
+       (EXISTS (
+           SELECT 1
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+           JOIN pg_catalog.pg_tables t ON t.schemaname = n.nspname AND t.tablename = c.relname
+           JOIN pg_catalog.pg_roles r ON r.oid = c.relowner
+           WHERE n.nspname = 'public'
+             AND c.relname = 'cat_users'
+             AND t.tableowner = r.rolname
+       ))::text;
+
+-- View relowner should resolve to a real role and match current user.
+SELECT 'a3_view_relowner_owner_match=' ||
+       (EXISTS (
+           SELECT 1
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+           JOIN pg_catalog.pg_roles r ON r.oid = c.relowner
+           WHERE n.nspname = 'public'
+             AND c.relname = 'cat_users_view'
+             AND r.rolname = current_user
+       ))::text;
+
 -- pg_proc should include minimal builtins used by ORMs.
 SELECT 'builtin_pg_proc=' || count(*)
 FROM pg_catalog.pg_proc p
@@ -77,6 +123,35 @@ WHERE ns.nspname = 'public'
   AND seq.relname = 'cat_users_id_seq'
   AND tbl.relname = 'cat_users';
 
+-- Trigger/function dependency should be present in pg_depend.
+SELECT 'pg_depend_trigger_fn=' || count(*)
+FROM pg_catalog.pg_depend d
+JOIN pg_catalog.pg_trigger t ON t.oid = d.objid
+JOIN pg_catalog.pg_proc p ON p.oid = d.refobjid
+WHERE d.classid = 2620
+  AND d.refclassid = 1255
+  AND t.tgname = 'cat_users_touch_trg'
+  AND p.proname = 'cat_users_touch';
+
+-- FK tables should keep relhastriggers consistent with pg_trigger rows.
+SELECT 'a4_fk_relhastriggers_matches_pg_trigger=' ||
+       (c.relhastriggers = (COUNT(t.oid) > 0))::text
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_catalog.pg_trigger t ON t.tgrelid = c.oid
+WHERE n.nspname = 'public'
+  AND c.relname = 'cat_posts'
+GROUP BY c.relhastriggers;
+
+-- pg_stat_user_tables should expose at least one row per user table.
+SELECT 'a5_pg_stat_user_tables_has_cat_users=' ||
+       (EXISTS (
+           SELECT 1
+           FROM pg_catalog.pg_stat_user_tables s
+           WHERE s.schemaname = 'public'
+             AND s.relname = 'cat_users'
+       ))::text;
+
 -- Enums: pg_type join pg_enum.
 SELECT 'enum_typ=' || t.typname || ',label=' || e.enumlabel
 FROM pg_catalog.pg_type t
@@ -101,6 +176,8 @@ SELECT 'pg_views=' || schemaname || '.' || viewname
 FROM pg_catalog.pg_views
 WHERE viewname = 'cat_users_view';
 
+DROP TRIGGER cat_users_touch_trg ON cat_users;
+DROP FUNCTION cat_users_touch();
 DROP VIEW cat_users_view;
 DROP TABLE cat_posts;
 DROP TABLE cat_users;

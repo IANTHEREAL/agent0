@@ -1,6 +1,6 @@
 use super::helpers::{
-    access_method_oid, bool_col, int_col, int_val, null_val, schema_oid, split_schema_and_name,
-    text_array_col, text_col, text_val,
+    access_method_oid, bool_col, int_col, int_val, null_val, owner_role_oid, schema_oid,
+    split_schema_and_name, text_array_col, text_col, text_val,
 };
 use super::{ScanContext, VirtualTable};
 use crate::model::{Row, TableSchema, Value};
@@ -19,23 +19,32 @@ fn normalize_fk_ref_table(source_schema: &str, ref_table: &str) -> String {
     }
 }
 
-fn tables_referenced_by_foreign_keys(
+fn normalize_relation_name(schema: &str, relation: &str) -> String {
+    if crate::sql::names::parse_full_name(relation).is_ok() {
+        relation.to_string()
+    } else {
+        format!("{}.{}", schema, relation)
+    }
+}
+
+fn tables_with_fk_internal_triggers(
     table_schemas: &HashMap<String, TableSchema>,
 ) -> HashSet<String> {
-    let mut referenced = HashSet::new();
+    let mut tables = HashSet::new();
     for (source_full_name, schema) in table_schemas {
         let (source_schema, _) = split_schema_and_name(source_full_name);
         for fk in &schema.foreign_keys {
+            tables.insert(source_full_name.clone());
             let normalized_ref = normalize_fk_ref_table(&source_schema, &fk.ref_table);
             if table_schemas.contains_key(&normalized_ref) {
-                referenced.insert(normalized_ref);
+                tables.insert(normalized_ref);
             } else if table_schemas.contains_key(&fk.ref_table) {
                 // Legacy fallback: tolerate old schemas that persisted ref_table without schema.
-                referenced.insert(fk.ref_table.clone());
+                tables.insert(fk.ref_table.clone());
             }
         }
     }
-    referenced
+    tables
 }
 
 #[async_trait]
@@ -104,7 +113,12 @@ impl VirtualTable for PgClass {
                 table_schemas.insert(full_table_name.to_string(), schema);
             }
         }
-        let tables_with_incoming_fk = tables_referenced_by_foreign_keys(&table_schemas);
+        let tables_with_fk_internal_triggers = tables_with_fk_internal_triggers(&table_schemas);
+        let mut tables_with_user_triggers = HashSet::new();
+        for trigger in ctx.store.list_triggers(ctx.txn, ctx.db_id).await? {
+            tables_with_user_triggers
+                .insert(normalize_relation_name(&trigger.schema, &trigger.table));
+        }
 
         for full_table_name in ctx.user_tables {
             let (table_schema, table_name) = split_schema_and_name(full_table_name);
@@ -112,10 +126,11 @@ impl VirtualTable for PgClass {
             if let Some(schema) = table_schemas.get(full_table_name.as_str()) {
                 let table_oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
                 let relhasindex = !schema.indexes.is_empty() || !schema.pk_indices.is_empty();
-                let relhastriggers = !schema.foreign_keys.is_empty()
-                    || tables_with_incoming_fk.contains(full_table_name);
+                let relhastriggers = tables_with_user_triggers.contains(full_table_name)
+                    || tables_with_fk_internal_triggers.contains(full_table_name);
                 let relnatts = schema.columns.len() as i64;
                 let relchecks = schema.check_constraints.len() as i64;
+                let relowner = owner_role_oid(Some(&schema.owner), ctx.current_user);
                 rows.push(Row::new(vec![
                     int_val(table_oid),
                     text_val(&table_name),
@@ -123,7 +138,7 @@ impl VirtualTable for PgClass {
                     int_val(0), // reltype
                     int_val(0), // reloftype
                     text_val("r"),
-                    int_val(10),
+                    int_val(relowner),
                     int_val(0), // relam
                     int_val(0), // reltuples
                     int_val(0), // relpages
@@ -154,7 +169,7 @@ impl VirtualTable for PgClass {
                         int_val(0), // reltype
                         int_val(0), // reloftype
                         text_val("i"),
-                        int_val(10),
+                        int_val(relowner),
                         int_val(access_method_oid(idx.method.as_deref())),
                         int_val(0),            // reltuples
                         int_val(0),            // relpages
@@ -190,7 +205,7 @@ impl VirtualTable for PgClass {
                         int_val(0), // reltype
                         int_val(0), // reloftype
                         text_val("i"),
-                        int_val(10),
+                        int_val(relowner),
                         int_val(403),          // relam (btree)
                         int_val(0),            // reltuples
                         int_val(0),            // relpages
@@ -219,6 +234,7 @@ impl VirtualTable for PgClass {
         for seq in sequences {
             let seq_oid = catalog_oids::pg_class_sequence_oid(seq.oid);
             let namespace_oid = schema_oid(ctx.schema_oids, &seq.schema);
+            let relowner = owner_role_oid(Some(&seq.owner), ctx.current_user);
             rows.push(Row::new(vec![
                 int_val(seq_oid),
                 text_val(&seq.name),
@@ -226,7 +242,7 @@ impl VirtualTable for PgClass {
                 int_val(0), // reltype
                 int_val(0), // reloftype
                 text_val("S"),
-                int_val(10),
+                int_val(relowner),
                 int_val(0),            // relam
                 int_val(0),            // reltuples
                 int_val(0),            // relpages
@@ -257,6 +273,7 @@ impl VirtualTable for PgClass {
         for view_def in views {
             let namespace_oid = schema_oid(ctx.schema_oids, &view_def.schema);
             let view_oid = catalog_oids::pg_class_view_oid(view_def.oid);
+            let relowner = owner_role_oid(Some(&view_def.owner), ctx.current_user);
             rows.push(Row::new(vec![
                 int_val(view_oid),
                 text_val(&view_def.name),
@@ -264,7 +281,7 @@ impl VirtualTable for PgClass {
                 int_val(0), // reltype
                 int_val(0), // reloftype
                 text_val("v"),
-                int_val(10),
+                int_val(relowner),
                 int_val(0),            // relam
                 int_val(0),            // reltuples
                 int_val(0),            // relpages
@@ -293,7 +310,7 @@ impl VirtualTable for PgClass {
 
 #[cfg(test)]
 mod tests {
-    use super::tables_referenced_by_foreign_keys;
+    use super::tables_with_fk_internal_triggers;
     use crate::model::{ForeignKeyAction, ForeignKeyConstraint, TableSchema};
     use std::collections::HashMap;
 
@@ -305,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn incoming_fk_detection_handles_qualified_and_unqualified_refs() {
+    fn fk_trigger_tables_include_source_and_target_for_qualified_and_unqualified_refs() {
         let mut schemas = HashMap::new();
         schemas.insert("public.parent".to_string(), empty_schema("public.parent"));
         schemas.insert(
@@ -340,10 +357,10 @@ mod tests {
             },
         );
 
-        let incoming = tables_referenced_by_foreign_keys(&schemas);
-        assert!(incoming.contains("public.parent"));
-        assert!(incoming.contains("tenant.p"));
-        assert!(!incoming.contains("public.child"));
-        assert!(!incoming.contains("tenant.c"));
+        let tables = tables_with_fk_internal_triggers(&schemas);
+        assert!(tables.contains("public.parent"));
+        assert!(tables.contains("tenant.p"));
+        assert!(tables.contains("public.child"));
+        assert!(tables.contains("tenant.c"));
     }
 }

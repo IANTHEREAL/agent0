@@ -1,4 +1,4 @@
-use super::helpers::{int_col, int_val, schema_oid, text_col, text_val};
+use super::helpers::{int_col, int_val, owner_role_oid, schema_oid, text_col, text_val};
 use super::{ScanContext, VirtualTable};
 use crate::model::{Row, TableSchema};
 use anyhow::Result;
@@ -33,14 +33,29 @@ impl VirtualTable for PgNamespace {
     }
 
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {
+        let db_owner = ctx
+            .store
+            .get_database_by_id(ctx.txn, ctx.db_id)
+            .await?
+            .map(|db| db.owner)
+            .unwrap_or_else(|| "postgres".to_string());
+
         Ok(ctx
             .schemas
             .iter()
             .map(|s| {
+                let owner_oid = if matches!(
+                    s.as_str(),
+                    "pg_catalog" | "information_schema" | "extensions"
+                ) {
+                    crate::sql::catalog_oids::pg_role_oid("postgres")
+                } else {
+                    owner_role_oid(Some(&db_owner), ctx.current_user)
+                };
                 Row::new(vec![
                     int_val(schema_oid(ctx.schema_oids, s)),
                     text_val(s),
-                    int_val(10),
+                    int_val(owner_oid),
                 ])
             })
             .collect())

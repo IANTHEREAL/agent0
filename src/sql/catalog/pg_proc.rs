@@ -1,4 +1,4 @@
-use super::helpers::{int_col, int_val, schema_oid, text_col, text_val};
+use super::helpers::{int_col, int_val, owner_role_oid, schema_oid, text_col, text_val};
 use super::{ScanContext, VirtualTable};
 use crate::model::{Row, TableSchema};
 use crate::sql::catalog_oids;
@@ -66,7 +66,7 @@ impl VirtualTable for PgProc {
                 int_val(oid),
                 text_val(name),
                 int_val(pg_catalog_oid),
-                int_val(10),
+                int_val(catalog_oids::pg_role_oid("postgres")),
                 int_val(prorettype),
                 text_val("f"),
             ]));
@@ -87,7 +87,7 @@ impl VirtualTable for PgProc {
                         int_val(oid),
                         text_val(name),
                         int_val(extensions_oid),
-                        int_val(10),
+                        int_val(catalog_oids::pg_role_oid("postgres")),
                         int_val(25),
                         text_val("f"),
                     ]));
@@ -132,7 +132,7 @@ impl VirtualTable for PgProc {
                 int_val(oid),
                 text_val(&f.name),
                 int_val(namespace_oid),
-                int_val(10),
+                int_val(owner_role_oid(Some(&f.owner), ctx.current_user)),
                 int_val(prorettype),
                 text_val("f"),
             ]));

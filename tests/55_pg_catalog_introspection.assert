@@ -1,0 +1,13 @@
+a1_current_user_in_pg_roles=true
+a2_relowner_owner_match=true
+a3_view_relowner_owner_match=true
+a4_fk_relhastriggers_matches_pg_trigger=true
+a5_pg_stat_user_tables_has_cat_users=true
+builtin_pg_proc=1
+pg_sequence_row=1
+pg_depend_row=1
+pg_depend_trigger_fn=1
+format_type=mood
+pg_tables=public.cat_posts
+pg_tables=public.cat_users
+pg_views=public.cat_users_view

@@ -599,6 +599,22 @@ impl AuthManager {
         }
         Ok(users)
     }
+
+    pub async fn list_roles(&self, txn: &mut Transaction) -> Result<Vec<Role>> {
+        let prefix = ROLE_KEY_PREFIX.to_vec();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+
+        let range: tikv_client::BoundRange = (prefix..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        let mut roles = Vec::new();
+        for pair in pairs {
+            let role: Role = bincode::deserialize(pair.value())?;
+            roles.push(role);
+        }
+        Ok(roles)
+    }
 }
 
 #[cfg(test)]

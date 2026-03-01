@@ -5,12 +5,18 @@
 
 DROP TABLE IF EXISTS _psql_compat_ref CASCADE;
 DROP TABLE IF EXISTS _psql_compat CASCADE;
+DROP TABLE IF EXISTS _psql_compat_nullable CASCADE;
 
 CREATE TABLE _psql_compat (
     id SERIAL PRIMARY KEY,
     name TEXT NOT NULL,
     score INT DEFAULT 0,
     tags TEXT[]
+);
+
+CREATE TABLE _psql_compat_nullable (
+    id INT,
+    note TEXT
 );
 
 -- ============================================================
@@ -180,6 +186,55 @@ FROM (
       AND (NOT t.tgisinternal OR (t.tgisinternal AND t.tgenabled = 'D'))
 ) s;
 
+-- ============================================================
+-- Q14: psql 18 \d+ NOT NULL branch
+-- (describe.c: contype='n' + pg_attribute join + connoinherit/conislocal/
+-- coninhcount/convalidated)
+-- ============================================================
+SELECT 'q14_notnull_rows=' || COUNT(*)::text
+FROM (
+    SELECT c.conname, a.attname, c.connoinherit,
+      c.conislocal, c.coninhcount <> 0,
+      c.convalidated
+    FROM pg_catalog.pg_constraint c JOIN
+      pg_catalog.pg_attribute a ON
+        (a.attrelid = c.conrelid AND a.attnum = c.conkey[1])
+    WHERE c.contype = 'n' AND
+      c.conrelid = (
+        SELECT pc.oid
+        FROM pg_catalog.pg_class pc
+        WHERE pc.relname = '_psql_compat_nullable'
+          AND pg_catalog.pg_table_is_visible(pc.oid)
+      )
+    ORDER BY a.attnum
+) s;
+
+-- ============================================================
+-- Q15: psql 18 \d+ NOT NULL flags validation (value correctness path)
+-- If rows exist, all flags must match expected defaults:
+--   connoinherit=false, conislocal=true, coninhcount=0, convalidated=true
+-- If rows do not exist (e.g. PG17 oracle), treat as pass.
+-- ============================================================
+SELECT 'q15_notnull_flags_ok=' ||
+       CASE
+         WHEN COUNT(*) = 0 THEN 'true'
+         ELSE (
+           BOOL_AND(c.connoinherit = false)
+           AND BOOL_AND(c.conislocal = true)
+           AND BOOL_AND(c.coninhcount = 0)
+           AND BOOL_AND(c.convalidated = true)
+         )::text
+       END
+FROM pg_catalog.pg_constraint c
+WHERE c.contype = 'n'
+  AND c.conrelid = (
+      SELECT pc.oid
+      FROM pg_catalog.pg_class pc
+      WHERE pc.relname = '_psql_compat'
+        AND pg_catalog.pg_table_is_visible(pc.oid)
+  );
+
 -- Cleanup
 DROP TABLE IF EXISTS _psql_compat_ref CASCADE;
 DROP TABLE _psql_compat CASCADE;
+DROP TABLE _psql_compat_nullable CASCADE;
