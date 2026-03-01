@@ -168,7 +168,8 @@ async fn update_row_indexes(
         }
     }
 
-    maintain_hnsw_indexes_after_update(txn, db_id, schema, old_row, new_row, pk_values).await?;
+    maintain_hnsw_indexes_after_update(txn, db_id, schema, old_row, new_row, pk_values, pk_values)
+        .await?;
     Ok(())
 }
 
@@ -403,7 +404,8 @@ async fn execute_update_row_inner(
         }
     }
 
-    maintain_hnsw_indexes_after_update(txn, db_id, schema, old_row, &new_row, &new_pks).await?;
+    maintain_hnsw_indexes_after_update(txn, db_id, schema, old_row, &new_row, &old_pks, &new_pks)
+        .await?;
 
     if propagate_fk_update {
         let fk_store_ctx = FkStoreCtx { store, db_id };
@@ -440,6 +442,7 @@ async fn maintain_hnsw_indexes_after_update(
     schema: &TableSchema,
     old_row: &Row,
     new_row: &Row,
+    old_pk_values: &[Value],
     new_pk_values: &[Value],
 ) -> Result<()> {
     if !schema.indexes.iter().any(|idx| idx.is_hnsw()) {
@@ -466,12 +469,14 @@ async fn maintain_hnsw_indexes_after_update(
             .column_index(vector_col_name)
             .ok_or_else(|| anyhow::anyhow!("HNSW index '{}' column not found", index.name))?;
 
-        // Skip HNSW maintenance when the vector column is unchanged.
-        // usearch 0.21 add() always appends (does not overwrite), so
-        // re-adding the same vector would create a duplicate entry.
-        // Note: we compare the vector values directly rather than using
+        // Skip HNSW maintenance when both the PK and vector column are
+        // unchanged.  The HNSW label is derived from the PK, so a PK
+        // change requires adding a new label even if the vector is the
+        // same.  We compare values directly rather than using
         // index_values_unchanged(), which only works for btree indexes.
-        if old_row.values.get(vector_col_idx) == new_row.values.get(vector_col_idx) {
+        if old_pk_values == new_pk_values
+            && old_row.values.get(vector_col_idx) == new_row.values.get(vector_col_idx)
+        {
             continue;
         }
 
