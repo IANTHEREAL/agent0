@@ -18,8 +18,6 @@ pub enum ReturnType {
     Fixed(DataType),
     SameAsArg(usize),
     FirstNonNull,
-    #[allow(dead_code)] // framework: type inference module
-    NumericPromotion,
     Custom(fn(&[DataType]) -> DataType),
 }
 
@@ -95,7 +93,6 @@ impl FunctionRegistry {
         self.functions.insert(name.to_uppercase(), sig);
     }
 
-    #[allow(dead_code)] // framework: type inference module
     pub fn get(&self, name: &str) -> Option<&FunctionSignature> {
         self.functions.get(&name.to_uppercase())
     }
@@ -106,26 +103,9 @@ impl FunctionRegistry {
             ReturnType::Fixed(dt) => dt.clone(),
             ReturnType::SameAsArg(idx) => arg_types.get(*idx).cloned()?,
             ReturnType::FirstNonNull => arg_types.first().cloned()?,
-            ReturnType::NumericPromotion => promote_numeric_types(arg_types),
             ReturnType::Custom(f) => f(arg_types),
         })
     }
-}
-
-fn promote_numeric_types(types: &[DataType]) -> DataType {
-    let mut result = DataType::Int32;
-    for t in types {
-        result = match (&result, t) {
-            (_, DataType::Float64) | (DataType::Float64, _) => DataType::Float64,
-            (_, DataType::Numeric { .. }) | (DataType::Numeric { .. }, _) => DataType::Numeric {
-                precision: None,
-                scale: None,
-            },
-            (_, DataType::Int64) | (DataType::Int64, _) => DataType::Int64,
-            _ => result,
-        };
-    }
-    result
 }
 
 pub fn global_registry() -> &'static FunctionRegistry {

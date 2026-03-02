@@ -5,6 +5,7 @@ pub mod classify;
 pub(crate) mod collation_aware;
 pub mod compile;
 pub mod functions;
+pub(crate) mod helpers;
 mod numeric;
 pub(crate) mod operators;
 pub mod static_eval;

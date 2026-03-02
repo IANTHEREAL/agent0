@@ -9,6 +9,12 @@ use sqlparser::ast::{CopySource, CopyTarget, Ident, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
+/// Pre-compiled regex for `COPY [schema.]table [(col1, …)] FROM stdin`.
+static COPY_FROM_STDIN_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s*(?:\(([^)]+)\)\s+|\s+)FROM\s+stdin")
+        .expect("COPY FROM STDIN regex is valid")
+});
+
 impl DynamicPgHandler {
     #[allow(clippy::result_large_err)]
     pub(in crate::protocol::handler) fn parse_copy_command(
@@ -38,13 +44,7 @@ impl DynamicPgHandler {
         }
 
         // Single regex: COPY [schema.]table_name [(col1, col2, ...)] FROM stdin
-        let re = regex::Regex::new(
-            r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s*(?:\(([^)]+)\)\s+|\s+)FROM\s+stdin",
-        );
-        let Ok(re) = re else {
-            return Ok(None);
-        };
-        let Some(caps) = re.captures(query) else {
+        let Some(caps) = COPY_FROM_STDIN_RE.captures(query) else {
             return Ok(None);
         };
         let schema = caps.get(1).map(|m| m.as_str().to_string());

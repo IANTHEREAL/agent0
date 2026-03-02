@@ -138,7 +138,9 @@ impl DynamicPgHandler {
         {
             Some(id) => id,
             None => {
-                db_txn.rollback().await.ok();
+                if let Err(e) = db_txn.rollback().await {
+                    warn!("rollback failed during database lookup: {}", e);
+                }
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "FATAL".to_owned(),
                     "3D000".to_owned(),
@@ -146,7 +148,9 @@ impl DynamicPgHandler {
                 ))));
             }
         };
-        db_txn.rollback().await.ok();
+        if let Err(e) = db_txn.rollback().await {
+            warn!("rollback failed after database lookup: {}", e);
+        }
 
         let mut session = match username {
             Some(user) => Session::new_with_user_and_database(
@@ -246,7 +250,9 @@ impl DynamicPgHandler {
             match auth_manager.bootstrap(&mut txn).await {
                 Ok(()) => {
                     if let Err(commit_err) = txn.commit().await {
-                        let _ = txn.rollback().await;
+                        if let Err(e) = txn.rollback().await {
+                            tracing::warn!("rollback failed: {e}");
+                        }
                         if !auth_manager.is_initialized(&store).await.unwrap_or(false) {
                             return Err(commit_err).context("Failed to bootstrap auth");
                         }
@@ -255,7 +261,9 @@ impl DynamicPgHandler {
                 Err(e) => {
                     // Race: another connection may have bootstrapped concurrently.
                     // Re-check and proceed if now initialized; otherwise propagate.
-                    txn.rollback().await.ok();
+                    if let Err(rb_err) = txn.rollback().await {
+                        warn!("rollback failed after auth bootstrap error: {}", rb_err);
+                    }
                     if !auth_manager.is_initialized(&store).await.unwrap_or(false) {
                         return Err(e.context("Failed to bootstrap auth"));
                     }
@@ -278,7 +286,9 @@ impl DynamicPgHandler {
                 })
             }
             Ok(None) => {
-                txn.rollback().await.ok();
+                if let Err(e) = txn.rollback().await {
+                    warn!("rollback failed after auth rejection: {}", e);
+                }
                 Ok(AuthResult {
                     is_authenticated: false,
                     is_superuser: false,
@@ -286,7 +296,9 @@ impl DynamicPgHandler {
                 })
             }
             Err(e) => {
-                txn.rollback().await.ok();
+                if let Err(rb_err) = txn.rollback().await {
+                    warn!("rollback failed after authentication error: {}", rb_err);
+                }
                 Err(e.context("Authentication error"))
             }
         }
@@ -539,7 +551,9 @@ async fn idle_in_transaction_watchdog(
         {
             let mut session = session_lock.lock().await;
             if session.check_idle_in_transaction_timeout().is_err() {
-                let _ = session.rollback().await;
+                if let Err(e) = session.rollback().await {
+                    tracing::warn!("rollback failed: {e}");
+                }
                 cancel.cancel();
                 break;
             }

@@ -11,13 +11,7 @@ use anyhow::{anyhow, Result};
 
 use super::eval_typed_expr;
 
-/// Extract text representation from a Value (for LIKE/SIMILAR TO).
-pub(super) fn value_to_text(val: &Value) -> String {
-    match val {
-        Value::Text(s) => s.clone(),
-        v => v.to_string(),
-    }
-}
+pub(super) use crate::sql::expr::helpers::value_to_text;
 
 /// Evaluate array indexing (1-based, PostgreSQL convention).
 pub(super) fn eval_array_index(arr_val: Value, idx_val: Value) -> Result<Value> {

@@ -1,6 +1,26 @@
 use crate::model::{ColumnDef, DataType, IndexDef, Value};
 use std::collections::HashMap;
 
+// --- pg_constraint.contype constants ---
+pub const CONTYPE_PRIMARY_KEY: &str = "p";
+pub const CONTYPE_UNIQUE: &str = "u";
+pub const CONTYPE_CHECK: &str = "c";
+pub const CONTYPE_FOREIGN_KEY: &str = "f";
+
+// --- pg_class.relkind constants ---
+pub const RELKIND_TABLE: &str = "r";
+pub const RELKIND_INDEX: &str = "i";
+pub const RELKIND_SEQUENCE: &str = "S";
+pub const RELKIND_VIEW: &str = "v";
+
+// --- pg_class column defaults ---
+/// Bootstrap superuser OID used as `relowner`.
+pub const BOOTSTRAP_SUPERUSER_OID: i64 = 10;
+/// Default replica identity.
+pub const RELREPLIDENT_DEFAULT: &str = "d";
+/// Btree access-method OID (used for PK indexes).
+pub const AM_BTREE_OID: i64 = 403;
+
 pub fn text_col(name: &str) -> ColumnDef {
     ColumnDef {
         name: name.to_string(),
@@ -149,13 +169,13 @@ pub fn is_unique_constraint_index(idx: &IndexDef) -> bool {
 
 pub fn access_method_oid(method: Option<&str>) -> i64 {
     match method.unwrap_or("btree").to_ascii_lowercase().as_str() {
-        "btree" => 403,
+        "btree" => AM_BTREE_OID,
         "hash" => 405,
         "gist" => 783,
         "gin" => 2742,
         "spgist" => 4000,
         "brin" => 3580,
-        _ => 403,
+        _ => AM_BTREE_OID,
     }
 }
 

@@ -51,45 +51,6 @@ pub fn is_numeric(dt: &DataType) -> bool {
     )
 }
 
-#[allow(dead_code)] // framework: type inference module
-pub fn is_temporal(dt: &DataType) -> bool {
-    matches!(
-        dt,
-        DataType::Date
-            | DataType::Time
-            | DataType::Timestamp
-            | DataType::TimestampTz
-            | DataType::Interval
-    )
-}
-
-#[allow(dead_code)] // framework: type inference module
-pub fn can_coerce(from: &DataType, to: &DataType) -> bool {
-    if from == to {
-        return true;
-    }
-
-    match (from, to) {
-        // Numeric upcast
-        (DataType::Int32, DataType::Int64 | DataType::Float64 | DataType::Numeric { .. }) => true,
-        (DataType::Int64, DataType::Float64 | DataType::Numeric { .. }) => true,
-        (DataType::Float64, DataType::Numeric { .. }) => true,
-
-        // Temporal casts
-        (DataType::Date, DataType::Timestamp | DataType::TimestampTz) => true,
-        (DataType::Timestamp, DataType::TimestampTz) => true,
-
-        // Text-like types accept most types
-        (_, DataType::Text | DataType::Varchar(_) | DataType::Name) => true,
-
-        // JSON compatibility
-        (DataType::Json, DataType::Jsonb) => true,
-        (DataType::Jsonb, DataType::Json) => true,
-
-        _ => false,
-    }
-}
-
 pub fn common_type(a: &DataType, b: &DataType) -> Option<DataType> {
     if a == b {
         return Some(a.clone());

@@ -63,7 +63,7 @@ impl TikvStore {
         let fixed_prefix_len = self
             .make_index_key(db_id, table_id, index_id, &[], None)
             .len();
-        self.try_decode_non_unique_pk_inner(
+        self.decode_non_unique_pk_inner(
             full_key,
             fixed_prefix_len,
             index_column_types,
@@ -74,12 +74,13 @@ impl TikvStore {
         )
     }
 
-    /// Decodes a non-unique index key into its primary-key values.
+    /// Decode primary-key values from a non-unique index key given a
+    /// pre-computed prefix length.
     ///
     /// Policy: fails fast on any malformed or truncated key, consistent with
     /// `scan_index`'s behaviour for unique indexes. Corruption is surfaced
     /// immediately rather than silently skipped.
-    fn try_decode_non_unique_pk_inner(
+    fn decode_non_unique_pk_inner(
         &self,
         full_key: &[u8],
         fixed_prefix_len: usize,
@@ -455,7 +456,7 @@ impl TikvStore {
         for pair in pairs {
             scanned_pairs += 1;
             let full_key: &[u8] = pair.key().as_ref().into();
-            let pk = self.try_decode_non_unique_pk_inner(
+            let pk = self.decode_non_unique_pk_inner(
                 full_key,
                 fixed_prefix_len,
                 index_column_types,
@@ -550,7 +551,7 @@ impl TikvStore {
         for pair in pairs {
             scanned_pairs += 1;
             let full_key: &[u8] = pair.key().as_ref().into();
-            let pk = self.try_decode_non_unique_pk_inner(
+            let pk = self.decode_non_unique_pk_inner(
                 full_key,
                 fixed_prefix_len,
                 index_column_types,

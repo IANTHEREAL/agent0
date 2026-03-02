@@ -1,6 +1,7 @@
 use super::helpers::{
     bool_col, int_array_col, int_col, int_val, is_unique_constraint_index, null_val, schema_oid,
-    split_schema_and_name, text_col, text_val,
+    split_schema_and_name, text_col, text_val, CONTYPE_CHECK, CONTYPE_FOREIGN_KEY,
+    CONTYPE_PRIMARY_KEY, CONTYPE_UNIQUE,
 };
 use super::{ScanContext, VirtualTable};
 use crate::model::{ForeignKeyAction, Row, TableSchema, Value};
@@ -10,6 +11,9 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 
 pub struct PgConstraint;
+
+// Synthetic OID seed for virtual pg_constraint rows generated at scan time.
+const SYNTHETIC_CONSTRAINT_OID_START: i64 = 50_000;
 
 fn fk_action_code(action: &ForeignKeyAction) -> &'static str {
     match action {
@@ -131,7 +135,7 @@ impl VirtualTable for PgConstraint {
         }
 
         let mut rows = Vec::new();
-        let mut constraint_oid: i64 = 50000;
+        let mut constraint_oid: i64 = SYNTHETIC_CONSTRAINT_OID_START;
 
         for table_name in ctx.user_tables {
             let (table_schema, table_short_name) = split_schema_and_name(table_name);
@@ -165,7 +169,7 @@ impl VirtualTable for PgConstraint {
                     int_val(constraint_oid),
                     text_val(&conname),
                     int_val(connamespace_oid),
-                    text_val("p"),
+                    text_val(CONTYPE_PRIMARY_KEY),
                     int_val(conrelid),
                     int_val(0),
                     int_val(0),
@@ -204,7 +208,7 @@ impl VirtualTable for PgConstraint {
                     int_val(constraint_oid),
                     text_val(&idx.name),
                     int_val(connamespace_oid),
-                    text_val("u"),
+                    text_val(CONTYPE_UNIQUE),
                     int_val(conrelid),
                     int_val(0),
                     int_val(0),
@@ -248,7 +252,7 @@ impl VirtualTable for PgConstraint {
                     int_val(constraint_oid),
                     text_val(&name),
                     int_val(connamespace_oid),
-                    text_val("c"),
+                    text_val(CONTYPE_CHECK),
                     int_val(conrelid),
                     int_val(0),
                     int_val(0),
@@ -321,7 +325,7 @@ impl VirtualTable for PgConstraint {
                     int_val(constraint_oid),
                     text_val(&fk.name),
                     int_val(connamespace_oid),
-                    text_val("f"),
+                    text_val(CONTYPE_FOREIGN_KEY),
                     int_val(conrelid),
                     int_val(0),
                     int_val(confrelid),

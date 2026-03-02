@@ -1,6 +1,6 @@
 use super::helpers::{
     bool_col, int_array_col, int_col, int_val, null_val, schema_oid, text_array_col, text_col,
-    text_val,
+    text_val, BOOTSTRAP_SUPERUSER_OID,
 };
 use super::{ScanContext, VirtualTable};
 use crate::model::{Row, TableSchema, Value};
@@ -58,7 +58,7 @@ impl VirtualTable for PgExtension {
             rows.push(Row::new(vec![
                 int_val(oid),
                 text_val(&ext.name),
-                int_val(10),
+                int_val(BOOTSTRAP_SUPERUSER_OID),
                 int_val(namespace_oid),
                 Value::Boolean(false),
                 text_val(&ext.version),

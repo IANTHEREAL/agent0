@@ -1,4 +1,6 @@
-use super::helpers::{bool_col, int_col, int_val, null_val, schema_oid, text_col, text_val};
+use super::helpers::{
+    bool_col, int_col, int_val, null_val, schema_oid, text_col, text_val, BOOTSTRAP_SUPERUSER_OID,
+};
 use super::{ScanContext, VirtualTable};
 use crate::model::{Row, TableSchema, Value};
 use anyhow::Result;
@@ -52,7 +54,7 @@ impl VirtualTable for PgCollation {
                 int_val(100),
                 text_val("default"),
                 int_val(pg_catalog_oid),
-                int_val(10),
+                int_val(BOOTSTRAP_SUPERUSER_OID),
                 text_val("d"),
                 Value::Boolean(true),
                 int_val(-1),
@@ -66,7 +68,7 @@ impl VirtualTable for PgCollation {
                 int_val(950),
                 text_val("C"),
                 int_val(pg_catalog_oid),
-                int_val(10),
+                int_val(BOOTSTRAP_SUPERUSER_OID),
                 text_val("c"),
                 Value::Boolean(true),
                 int_val(-1),
@@ -80,7 +82,7 @@ impl VirtualTable for PgCollation {
                 int_val(951),
                 text_val("POSIX"),
                 int_val(pg_catalog_oid),
-                int_val(10),
+                int_val(BOOTSTRAP_SUPERUSER_OID),
                 text_val("c"),
                 Value::Boolean(true),
                 int_val(-1),

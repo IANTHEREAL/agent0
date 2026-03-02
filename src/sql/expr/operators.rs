@@ -42,12 +42,7 @@ fn get_or_compile_regex(pattern: &str) -> Result<regex::Regex> {
     Ok(re)
 }
 
-fn value_to_text(v: &Value) -> String {
-    match v {
-        Value::Text(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
+use super::helpers::value_to_text;
 
 /// Evaluate PostgreSQL regex operators: `~`, `~*`, `!~`, `!~*`.
 fn eval_regex_op(
@@ -66,6 +61,23 @@ fn eval_regex_op(
     let re = get_or_compile_regex(&pattern)?;
     let matched = re.is_match(&text);
     Ok(Value::Boolean(if negate { !matched } else { matched }))
+}
+
+/// Evaluate the JSONB `?` (existence) operator.
+fn eval_json_exists(left: Value, right: Value) -> Result<Value> {
+    let json_str = match left {
+        Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s,
+        Value::Null => return Ok(Value::Null),
+        v => v.to_string(),
+    };
+    let key = match right {
+        Value::Text(s) => s,
+        Value::Null => return Ok(Value::Null),
+        v => v.to_string(),
+    };
+    let json_val: serde_json::Value =
+        serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+    Ok(Value::Boolean(super::super::jsonb::exists(&json_val, &key)))
 }
 
 /// Sort with fallible comparison. Propagates the first comparison error.
@@ -266,37 +278,9 @@ pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<
         // - For objects: key exists
         // - For arrays: string element exists at top-level
         // sqlparser 0.40 parses `?` as a custom operator.
-        BinaryOperator::Custom(op) if op == "?" => {
-            let json_str = match left {
-                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s,
-                Value::Null => return Ok(Value::Null),
-                v => v.to_string(),
-            };
-            let key = match right {
-                Value::Text(s) => s,
-                Value::Null => return Ok(Value::Null),
-                v => v.to_string(),
-            };
-
-            let json_val: serde_json::Value =
-                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
-            Ok(Value::Boolean(super::super::jsonb::exists(&json_val, &key)))
-        }
+        BinaryOperator::Custom(op) if op == "?" => eval_json_exists(left, right),
         BinaryOperator::PGCustomBinaryOperator(op) if op.len() == 1 && op[0] == "?" => {
-            let json_str = match left {
-                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s,
-                Value::Null => return Ok(Value::Null),
-                v => v.to_string(),
-            };
-            let key = match right {
-                Value::Text(s) => s,
-                Value::Null => return Ok(Value::Null),
-                v => v.to_string(),
-            };
-
-            let json_val: serde_json::Value =
-                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
-            Ok(Value::Boolean(super::super::jsonb::exists(&json_val, &key)))
+            eval_json_exists(left, right)
         }
         BinaryOperator::PGCustomBinaryOperator(op) if op.len() == 1 && op[0] == "@@" => {
             super::super::fts::ts_match(&left, &right)

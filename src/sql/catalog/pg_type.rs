@@ -1,4 +1,4 @@
-use super::helpers::{int_col, int_val, schema_oid, text_col, text_val};
+use super::helpers::{int_col, int_val, schema_oid, text_col, text_val, BOOTSTRAP_SUPERUSER_OID};
 use super::{ScanContext, VirtualTable};
 use crate::model::{Row, TableSchema, UserTypeKind};
 use crate::sql::pg_types;
@@ -67,7 +67,7 @@ impl VirtualTable for PgType {
                 int_val(oid),
                 text_val(typname),
                 int_val(pg_catalog_oid),
-                int_val(10),
+                int_val(BOOTSTRAP_SUPERUSER_OID),
                 int_val(typlen as i64),
                 text_val(typbyval),
                 text_val(typtype),
@@ -90,7 +90,7 @@ impl VirtualTable for PgType {
             int_val(HSTORE_ARRAY_OID),
             text_val("_hstore"),
             int_val(public_oid),
-            int_val(10),
+            int_val(BOOTSTRAP_SUPERUSER_OID),
             int_val(-1),
             text_val("f"),
             text_val("b"),
@@ -108,7 +108,7 @@ impl VirtualTable for PgType {
             int_val(HSTORE_OID),
             text_val("hstore"),
             int_val(public_oid),
-            int_val(10),
+            int_val(BOOTSTRAP_SUPERUSER_OID),
             int_val(-1),
             text_val("f"),
             text_val("b"),
@@ -134,7 +134,7 @@ impl VirtualTable for PgType {
                 int_val(def.oid as i64),
                 text_val(&def.name),
                 int_val(schema_oid(ctx.schema_oids, &def.schema)),
-                int_val(10),
+                int_val(BOOTSTRAP_SUPERUSER_OID),
                 int_val(typlen),
                 text_val(typbyval),
                 text_val(typtype),
