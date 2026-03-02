@@ -1838,16 +1838,103 @@ fn test_parse_copy_command_to_stdout_rejected() {
         .is_none());
 }
 
-/// PG 17.7 parity: COPY FROM STDIN with invalid column identifiers returns SQLSTATE 42602.
+/// Invalid column identifiers are not parseable by the fast-path tokenizer, so
+/// parse_copy_command returns None (safe fallthrough to full parser which handles the error).
 #[test]
-fn test_parse_copy_command_invalid_column_identifier_returns_42602() {
-    // Column name starting with a digit is invalid.
-    let err = DynamicPgHandler::parse_copy_command("COPY t (1col) FROM stdin").unwrap_err();
-    assert_eq!(err.code, "42602");
+fn test_parse_copy_command_invalid_column_identifier_falls_through() {
+    // Column name starting with a digit — tokenizer cannot parse, falls through.
+    assert_eq!(
+        DynamicPgHandler::parse_copy_command("COPY t (1col) FROM stdin").unwrap(),
+        None
+    );
 
-    // Empty column name (consecutive commas produce empty string after trim).
-    let err = DynamicPgHandler::parse_copy_command("COPY t (, b) FROM stdin").unwrap_err();
-    assert_eq!(err.code, "42602");
+    // Empty column name (consecutive commas) — tokenizer cannot parse, falls through.
+    assert_eq!(
+        DynamicPgHandler::parse_copy_command("COPY t (, b) FROM stdin").unwrap(),
+        None
+    );
+}
+
+// --- Quoted identifier and edge-case tests (issue #1309) ---
+
+#[test]
+fn test_parse_copy_command_quoted_table() {
+    let result = DynamicPgHandler::parse_copy_command(r#"COPY "MyTable" FROM stdin"#).unwrap();
+    assert_eq!(result, Some(("\"MyTable\"".to_string(), vec![])));
+}
+
+#[test]
+fn test_parse_copy_command_quoted_columns() {
+    let result =
+        DynamicPgHandler::parse_copy_command(r#"COPY t ("Col1", "Col2") FROM stdin"#).unwrap();
+    assert_eq!(
+        result,
+        Some((
+            "t".to_string(),
+            vec!["\"Col1\"".to_string(), "\"Col2\"".to_string()]
+        ))
+    );
+}
+
+#[test]
+fn test_parse_copy_command_quoted_table_and_columns() {
+    let result =
+        DynamicPgHandler::parse_copy_command(r#"COPY "MyTable" ("Col1", "Col2") FROM stdin"#)
+            .unwrap();
+    assert_eq!(
+        result,
+        Some((
+            "\"MyTable\"".to_string(),
+            vec!["\"Col1\"".to_string(), "\"Col2\"".to_string()]
+        ))
+    );
+}
+
+#[test]
+fn test_parse_copy_command_quoted_schema_table() {
+    let result =
+        DynamicPgHandler::parse_copy_command(r#"COPY "my_schema"."my_table" FROM stdin"#).unwrap();
+    assert_eq!(
+        result,
+        Some(("\"my_schema\".\"my_table\"".to_string(), vec![]))
+    );
+}
+
+#[test]
+fn test_parse_copy_command_dollar_ident() {
+    let result = DynamicPgHandler::parse_copy_command("COPY table$1 (col$2) FROM stdin").unwrap();
+    assert_eq!(
+        result,
+        Some(("table$1".to_string(), vec!["col$2".to_string()]))
+    );
+}
+
+#[test]
+fn test_parse_copy_command_comment_in_columns() {
+    let result =
+        DynamicPgHandler::parse_copy_command("COPY t (a, /* comment */ b) FROM stdin").unwrap();
+    assert_eq!(
+        result,
+        Some(("t".to_string(), vec!["a".to_string(), "b".to_string()]))
+    );
+}
+
+#[test]
+fn test_parse_copy_command_mixed_quoted_unquoted_cols() {
+    let result = DynamicPgHandler::parse_copy_command(r#"COPY t (id, "Name") FROM stdin"#).unwrap();
+    assert_eq!(
+        result,
+        Some((
+            "t".to_string(),
+            vec!["id".to_string(), "\"Name\"".to_string()]
+        ))
+    );
+}
+
+#[test]
+fn test_parse_copy_command_quoted_with_escaped_quote() {
+    let result = DynamicPgHandler::parse_copy_command(r#"COPY "my""table" FROM stdin"#).unwrap();
+    assert_eq!(result, Some(("\"my\"\"table\"".to_string(), vec![])));
 }
 
 #[test]

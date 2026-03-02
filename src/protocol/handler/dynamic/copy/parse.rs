@@ -9,11 +9,146 @@ use sqlparser::ast::{CopySource, CopyTarget, Ident, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-/// Pre-compiled regex for `COPY [schema.]table [(col1, …)] FROM stdin`.
-static COPY_FROM_STDIN_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s*(?:\(([^)]+)\)\s+|\s+)FROM\s+stdin")
-        .expect("COPY FROM STDIN regex is valid")
-});
+/// Skip ASCII whitespace and SQL comments (`/* ... */`, `-- ...\n`).
+/// Returns the remaining unconsumed slice.
+fn skip_ws_and_comments(s: &str) -> &str {
+    let mut rest = s;
+    loop {
+        // Skip whitespace
+        rest = rest.trim_start();
+        if rest.starts_with("--") {
+            // Line comment: skip to end of line
+            rest = match rest.find('\n') {
+                Some(pos) => &rest[pos + 1..],
+                None => "",
+            };
+        } else if rest.starts_with("/*") {
+            // Block comment: skip to closing */
+            rest = match rest[2..].find("*/") {
+                Some(pos) => &rest[pos + 4..],
+                None => return rest, // unterminated — bail out
+            };
+        } else {
+            break;
+        }
+    }
+    rest
+}
+
+/// Parse a single SQL identifier (quoted or unquoted) from the front of `s`.
+/// Returns `Some((ident_text, remainder))` or `None` if no valid identifier found.
+///
+/// - **Quoted**: `"..."` with `""` as escaped quote. Returns the full `"..."` text.
+/// - **Unquoted**: `[a-zA-Z_][a-zA-Z0-9_$]*`. Returns the matched text.
+fn parse_ident(s: &str) -> Option<(&str, &str)> {
+    if s.starts_with('"') {
+        // Quoted identifier: scan for unescaped closing quote
+        let mut i = 1;
+        let bytes = s.as_bytes();
+        while i < bytes.len() {
+            if bytes[i] == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    // Escaped quote "", skip both
+                    i += 2;
+                } else {
+                    // Closing quote found
+                    return Some((&s[..i + 1], &s[i + 1..]));
+                }
+            } else {
+                i += 1;
+            }
+        }
+        None // unterminated quoted identifier
+    } else {
+        // Unquoted identifier: [a-zA-Z_][a-zA-Z0-9_$]*
+        let bytes = s.as_bytes();
+        if bytes.is_empty() {
+            return None;
+        }
+        let first = bytes[0];
+        if !first.is_ascii_alphabetic() && first != b'_' {
+            return None;
+        }
+        let len = bytes
+            .iter()
+            .skip(1)
+            .take_while(|&&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+            .count()
+            + 1;
+        Some((&s[..len], &s[len..]))
+    }
+}
+
+/// Match a case-insensitive keyword at the front of `s`.
+/// Returns the remainder after the keyword, or `None` if no match.
+fn match_keyword<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
+    let kw_len = keyword.len();
+    if s.len() >= kw_len && s[..kw_len].eq_ignore_ascii_case(keyword) {
+        Some(&s[kw_len..])
+    } else {
+        None
+    }
+}
+
+/// Try to tokenize `COPY [schema.]table [(col1, ...)] FROM stdin` from `query`.
+/// Returns `None` (safe fallthrough to full parser) for any form we can't handle.
+fn parse_copy_from_stdin_tokens(query: &str) -> Option<(String, Vec<String>)> {
+    // 1. Match "COPY" keyword
+    let rest = match_keyword(query, "COPY")?;
+    // Must have whitespace after COPY
+    if !rest.starts_with(|c: char| c.is_ascii_whitespace()) {
+        return None;
+    }
+    let rest = skip_ws_and_comments(rest);
+
+    // 2. Parse first identifier (could be schema or table)
+    let (ident1, rest) = parse_ident(rest)?;
+
+    // 3. Check for schema qualification: "."
+    let (table_name, rest) = if let Some(rest) = rest.strip_prefix('.') {
+        let (ident2, rest) = parse_ident(rest)?;
+        (format!("{}.{}", ident1, ident2), rest)
+    } else {
+        (ident1.to_string(), rest)
+    };
+
+    let rest = skip_ws_and_comments(rest);
+
+    // 4. Optional column list: "(" col1, col2, ... ")"
+    let (columns, rest) = if let Some(after_paren) = rest.strip_prefix('(') {
+        let mut rest = skip_ws_and_comments(after_paren);
+        let mut cols = Vec::new();
+        loop {
+            let (col, r) = parse_ident(rest)?;
+            cols.push(col.to_string());
+            let r = skip_ws_and_comments(r);
+            if let Some(after_comma) = r.strip_prefix(',') {
+                rest = skip_ws_and_comments(after_comma);
+            } else if let Some(after_close) = r.strip_prefix(')') {
+                rest = after_close;
+                break;
+            } else {
+                return None; // unexpected token inside column list
+            }
+        }
+        let rest = skip_ws_and_comments(rest);
+        (cols, rest)
+    } else {
+        (vec![], rest)
+    };
+
+    // 5. Match "FROM"
+    let rest = match_keyword(rest, "FROM")?;
+    if !rest.starts_with(|c: char| c.is_ascii_whitespace()) {
+        return None;
+    }
+    let rest = skip_ws_and_comments(rest);
+
+    // 6. Match "stdin" (case-insensitive)
+    let _rest = match_keyword(rest, "STDIN")?;
+
+    Some((table_name, columns))
+}
 
 impl DynamicPgHandler {
     #[allow(clippy::result_large_err)]
@@ -28,7 +163,7 @@ impl DynamicPgHandler {
             if first != '_' && !first.is_ascii_alphabetic() {
                 return false;
             }
-            chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+            chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
         }
 
         let Some(query) = strip_leading_whitespace_and_comments(query) else {
@@ -43,31 +178,14 @@ impl DynamicPgHandler {
             return Ok(None);
         }
 
-        // Single regex: COPY [schema.]table_name [(col1, col2, ...)] FROM stdin
-        let Some(caps) = COPY_FROM_STDIN_RE.captures(query) else {
+        let Some((table_name, columns)) = parse_copy_from_stdin_tokens(query) else {
             return Ok(None);
         };
-        let schema = caps.get(1).map(|m| m.as_str().to_string());
-        let table = match caps.get(2) {
-            Some(m) => m.as_str().to_string(),
-            None => return Ok(None),
-        };
-        let table_name = match schema {
-            Some(s) => format!("{}.{}", s, table),
-            None => table,
-        };
-        let columns: Vec<String> = match caps.get(3) {
-            Some(cols) => cols
-                .as_str()
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect(),
-            None => vec![],
-        };
 
-        // Validate column names against unquoted identifier rules (PG parity).
+        // Validate unquoted column names against identifier rules (PG parity).
+        // Quoted columns (starting with `"`) are validated downstream by normalize_copy_ident.
         for col in &columns {
-            if !is_valid_unquoted_ident(col) {
+            if !col.starts_with('"') && !is_valid_unquoted_ident(col) {
                 return Err(error_info(
                     "42602",
                     format!("Invalid identifier in COPY FROM STDIN: \"{}\"", col),
