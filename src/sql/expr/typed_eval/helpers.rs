@@ -143,7 +143,7 @@ pub(super) fn eval_function_call(
         }
         "SET_CONFIG" | "PG_CATALOG.SET_CONFIG" => return Ok(Value::Text(String::new())),
         "PG_GET_USERBYID" => return Ok(Value::Text("postgres".to_string())),
-        "NEXTVAL" | "CURRVAL" | "SETVAL" => {
+        "NEXTVAL" | "CURRVAL" | "SETVAL" | "LASTVAL" => {
             return Err(anyhow!(
                 "{} is a sequence function and must be evaluated during execution",
                 name

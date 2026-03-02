@@ -53,7 +53,7 @@ pub(crate) fn expr_uses_sequence_functions(expr: &Expr) -> bool {
 
         if let Expr::Function(func) = e {
             let name = function_name_upper(func);
-            if matches!(name.as_str(), "NEXTVAL" | "CURRVAL" | "SETVAL") {
+            if matches!(name.as_str(), "NEXTVAL" | "CURRVAL" | "SETVAL" | "LASTVAL") {
                 found = true;
                 return ControlFlow::Break(());
             }
@@ -175,7 +175,7 @@ fn is_known_builtin_function(name: &str) -> bool {
         | "PG_GET_SERIAL_SEQUENCE"
         | "GENERATE_SERIES" | "GENERATE_SUBSCRIPTS"
         // These are handled specially but are built-in
-        | "CURRENT_SCHEMA" | "NEXTVAL" | "CURRVAL" | "SETVAL"
+        | "CURRENT_SCHEMA" | "NEXTVAL" | "CURRVAL" | "SETVAL" | "LASTVAL"
         // Vector functions (if supported)
         | "VECTOR_DIMS" | "VECTOR_NORM"
         // Vector distance functions (rewritten from <->, <#>, <=> operators by parser)
