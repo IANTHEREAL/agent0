@@ -763,45 +763,8 @@ fn mod_values(left: Value, right: Value) -> Result<Value> {
 }
 
 fn compare_text_pg(left: &str, right: &str) -> std::cmp::Ordering {
-    // Approximate PostgreSQL's default collation behavior for ASCII:
-    // compare case-insensitively first, then order lowercase before uppercase.
-    let left_fold = left.to_ascii_lowercase();
-    let right_fold = right.to_ascii_lowercase();
-    match left_fold.cmp(&right_fold) {
-        std::cmp::Ordering::Equal => {}
-        other => return other,
-    }
-
-    for (l, r) in left
-        .as_bytes()
-        .iter()
-        .copied()
-        .zip(right.as_bytes().iter().copied())
-    {
-        if l == r {
-            continue;
-        }
-
-        let l_fold = l.to_ascii_lowercase();
-        let r_fold = r.to_ascii_lowercase();
-        if l_fold != r_fold {
-            return l_fold.cmp(&r_fold);
-        }
-
-        let l_is_upper = l.is_ascii_uppercase();
-        let r_is_upper = r.is_ascii_uppercase();
-        if l_is_upper != r_is_upper {
-            return if l_is_upper {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Less
-            };
-        }
-
-        return l.cmp(&r);
-    }
-
-    left.len().cmp(&right.len())
+    // PostgreSQL C/POSIX collation semantics: bytewise lexicographic ordering.
+    left.as_bytes().cmp(right.as_bytes())
 }
 
 fn compare_float64_pg(left: f64, right: f64) -> std::cmp::Ordering {
@@ -1254,6 +1217,48 @@ mod tests {
 
         // Reverse direction
         assert_eq!(compare_values(&b, &a).unwrap(), -1); // 10.4 < 10.45
+    }
+
+    #[test]
+    fn test_compare_text_pg_uses_bytewise_order_for_unicode() {
+        assert_eq!(
+            compare_values(&Value::Text("é".into()), &Value::Text("a".into())).unwrap(),
+            1
+        );
+        assert_eq!(
+            compare_values(&Value::Text("中".into()), &Value::Text("文".into())).unwrap(),
+            -1
+        );
+        assert_eq!(
+            compare_values(&Value::Text("É".into()), &Value::Text("é".into())).unwrap(),
+            -1
+        );
+    }
+
+    #[test]
+    fn test_compare_order_by_text_default_collation_is_bytewise() {
+        let mut values = vec![
+            Value::Text("文".into()),
+            Value::Text("a".into()),
+            Value::Text("中".into()),
+            Value::Text("é".into()),
+            Value::Text("A".into()),
+        ];
+        sort_by_fallible(&mut values, |left, right| {
+            compare_order_by_values_collated(left, right, true, true, None)
+        })
+        .unwrap();
+
+        assert_eq!(
+            values,
+            vec![
+                Value::Text("A".into()),
+                Value::Text("a".into()),
+                Value::Text("é".into()),
+                Value::Text("中".into()),
+                Value::Text("文".into()),
+            ]
+        );
     }
 
     #[test]
