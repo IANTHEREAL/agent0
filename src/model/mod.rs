@@ -50,7 +50,7 @@ mod decimal_serde {
 }
 
 /// Supported column data types
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DataType {
     Boolean,
     Int32,

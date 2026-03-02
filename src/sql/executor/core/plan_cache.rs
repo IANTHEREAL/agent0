@@ -27,15 +27,12 @@ pub(crate) struct PlanDependency {
 /// Two executions produce the same key iff they would generate the same plan
 /// (same SQL text, same parameter types, same database, same search path,
 /// same resolved base-table IDs).
-///
-/// Parameter types are stored as their `Debug` representation because
-/// `DataType` does not implement `Hash`/`Eq`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PlanCacheKey {
     /// Normalized SQL text (from PreparedStatement.sql).
     pub sql: String,
-    /// Resolved parameter types as debug-format strings.
-    pub param_type_sigs: Vec<String>,
+    /// Resolved parameter types.
+    pub param_types: Vec<crate::model::DataType>,
     /// Current database ID.
     pub db_id: u64,
     /// Active search_path at plan time.
@@ -58,7 +55,7 @@ impl PlanCacheKey {
         resolved_table_ids.dedup();
         Self {
             sql,
-            param_type_sigs: param_types.iter().map(|t| format!("{:?}", t)).collect(),
+            param_types: param_types.to_vec(),
             db_id,
             search_path: search_path.to_vec(),
             resolved_table_ids,
@@ -952,5 +949,90 @@ mod tests {
             &[1, 2],
         );
         assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn key_differs_when_param_types_differ() {
+        use crate::model::DataType;
+        let k1 = PlanCacheKey::new(
+            "SELECT $1".to_string(),
+            &[DataType::Int32],
+            1,
+            &["public".to_string()],
+            &[],
+        );
+        let k2 = PlanCacheKey::new(
+            "SELECT $1".to_string(),
+            &[DataType::Text],
+            1,
+            &["public".to_string()],
+            &[],
+        );
+        let k3 = PlanCacheKey::new(
+            "SELECT $1".to_string(),
+            &[DataType::Int32],
+            1,
+            &["public".to_string()],
+            &[],
+        );
+        assert_ne!(k1, k2, "different param types must produce different keys");
+        assert_eq!(k1, k3, "same param types must produce equal keys");
+    }
+
+    #[test]
+    fn cache_hit_miss_by_param_types() {
+        use crate::model::DataType;
+
+        let mut cache = PreparedPlanCache::new(10, 1);
+
+        let key_int = PlanCacheKey::new(
+            "SELECT $1".to_string(),
+            &[DataType::Int32],
+            1,
+            &["public".to_string()],
+            &[],
+        );
+        let key_text = PlanCacheKey::new(
+            "SELECT $1".to_string(),
+            &[DataType::Text],
+            1,
+            &["public".to_string()],
+            &[],
+        );
+        let key_int_dup = PlanCacheKey::new(
+            "SELECT $1".to_string(),
+            &[DataType::Int32],
+            1,
+            &["public".to_string()],
+            &[],
+        );
+
+        // Insert a plan under key_int.
+        cache.insert(key_int.clone(), make_entry(vec![]));
+
+        // MISS: same SQL but different param_types.
+        assert!(
+            cache.get(&key_text).is_none(),
+            "different param_types must be a cache miss"
+        );
+
+        // HIT: same SQL and same param_types.
+        assert!(
+            cache.get(&key_int_dup).is_some(),
+            "identical param_types must be a cache hit"
+        );
+
+        // record_execution reflects the miss/not-tracked distinction.
+        assert_eq!(
+            cache.record_execution(&key_text),
+            PromotionCounterOutcome::MissCount(1),
+            "uncached key_text should start at miss count 1"
+        );
+        assert_eq!(
+            cache.record_execution(&key_int),
+            PromotionCounterOutcome::NotTracked,
+            "already-cached key_int should be NotTracked"
+        );
+        cache.assert_counter_internal_consistency();
     }
 }
