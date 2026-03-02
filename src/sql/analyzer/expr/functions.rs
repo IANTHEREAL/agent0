@@ -407,6 +407,7 @@ impl<'a> Analyzer<'a> {
             "VECTOR_DIMS" | "VECTOR_NORM" | "L2_NORMALIZE" => self.coerce_args_to_vector(args, 1),
             "GENERATE_SUBSCRIPTS" => self.coerce_generate_subscripts_signature(func_name, args),
             "PG_GET_INDEXDEF" => self.coerce_pg_get_indexdef_signature(args),
+            "TO_REGTYPE" => self.coerce_to_regtype_signature(func_name, args),
             _ if is_two_arg_advisory_lock_function(func_name) => {
                 self.coerce_advisory_lock_two_arg_signature(func_name, args)
             }
@@ -524,6 +525,32 @@ impl<'a> Analyzer<'a> {
             coerced.push(self.coerce_if_needed(arg, &target)?);
         }
         Ok(coerced)
+    }
+
+    fn coerce_to_regtype_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.len() != 1 {
+            return Ok(args);
+        }
+
+        let mut it = args.into_iter();
+        let arg = it.next().expect("arity checked");
+        let arg_types = vec![arg.data_type.clone()];
+        let arg_is_text_like = matches!(
+            arg.data_type,
+            DataType::Text | DataType::Varchar(_) | DataType::Name
+        );
+        if !arg_is_text_like && !self.is_unresolved_param(&arg) && !arg.is_null_constant() {
+            return Err(AnalyzerError::FunctionNotFound {
+                name: func_name.to_string(),
+                arg_types,
+            });
+        }
+
+        Ok(vec![self.coerce_if_needed(arg, &DataType::Text)?])
     }
 
     /// Create a resolved scalar FunctionCall from a function name and analyzed args.

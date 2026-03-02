@@ -2958,6 +2958,31 @@ fn analyze_pg_typeof_unknown_param_returns_42p18_on_finalize() {
 }
 
 #[test]
+fn analyze_to_regtype_unknown_param_infers_text() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT to_regtype($1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text]);
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+    assert_eq!(q.output_schema[0].1, DataType::Int64);
+}
+
+#[test]
+fn analyze_to_regtype_rejects_non_text_argument() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT to_regtype(1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
+#[test]
 fn analyze_parameter_with_client_oid() {
     // Client provides INT4 OID → respected even without contextual typing
     let catalog = test_catalog();

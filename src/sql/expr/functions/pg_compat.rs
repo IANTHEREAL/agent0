@@ -10,6 +10,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("PG_TYPEOF", pg_typeof);
     map.insert("PG_COLUMN_SIZE", pg_column_size);
     map.insert("FORMAT_TYPE", format_type);
+    map.insert("TO_REGTYPE", to_regtype);
     map.insert("PG_IS_IN_RECOVERY", pg_is_in_recovery);
     map.insert("PG_TABLE_IS_VISIBLE", pg_table_is_visible);
     map.insert("PG_TYPE_IS_VISIBLE", pg_type_is_visible);
@@ -154,6 +155,149 @@ pub fn format_type(args: Vec<Value>) -> Result<Value> {
             .to_string(),
     };
     Ok(Value::Text(formatted))
+}
+
+fn normalize_regtype_input(raw: &str) -> (Option<String>, String) {
+    let normalized = raw.trim().replace('"', "").to_lowercase();
+    if let Some((schema, name)) = normalized.rsplit_once('.') {
+        (Some(schema.to_string()), name.to_string())
+    } else {
+        (None, normalized)
+    }
+}
+
+fn strip_regtype_array_dims(raw: &str) -> (String, bool) {
+    let mut name = raw.trim().to_string();
+    let mut is_array = false;
+    loop {
+        let trimmed = name.trim_end();
+        if let Some(stripped) = trimmed.strip_suffix("[]") {
+            is_array = true;
+            name = stripped.trim_end().to_string();
+            continue;
+        }
+        break;
+    }
+    (name, is_array)
+}
+
+fn strip_regtype_typmod(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if !trimmed.ends_with(')') {
+        return trimmed.to_string();
+    }
+
+    let mut depth = 0_i32;
+    for (idx, ch) in trimmed.char_indices().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return trimmed[..idx].trim_end().to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    trimmed.to_string()
+}
+
+fn regtype_array_oid(base_oid: i64) -> Option<i64> {
+    match base_oid {
+        pg_types::OID_BOOL => Some(pg_types::OID_BOOL_ARRAY),
+        pg_types::OID_BYTEA => Some(pg_types::OID_BYTEA_ARRAY),
+        pg_types::OID_NAME => Some(pg_types::OID_NAME_ARRAY),
+        pg_types::OID_INT2 => Some(pg_types::OID_INT2_ARRAY),
+        pg_types::OID_INT4 => Some(pg_types::OID_INT4_ARRAY),
+        pg_types::OID_TEXT => Some(pg_types::OID_TEXT_ARRAY),
+        pg_types::OID_BPCHAR => Some(pg_types::OID_BPCHAR_ARRAY),
+        pg_types::OID_VARCHAR => Some(pg_types::OID_VARCHAR_ARRAY),
+        pg_types::OID_INT8 => Some(pg_types::OID_INT8_ARRAY),
+        pg_types::OID_FLOAT4 => Some(pg_types::OID_FLOAT4_ARRAY),
+        pg_types::OID_FLOAT8 => Some(pg_types::OID_FLOAT8_ARRAY),
+        pg_types::OID_OID => Some(pg_types::OID_OID_ARRAY),
+        pg_types::OID_TIMESTAMP => Some(pg_types::OID_TIMESTAMP_ARRAY),
+        pg_types::OID_DATE => Some(pg_types::OID_DATE_ARRAY),
+        pg_types::OID_TIME => Some(pg_types::OID_TIME_ARRAY),
+        pg_types::OID_TIMESTAMPTZ => Some(pg_types::OID_TIMESTAMPTZ_ARRAY),
+        pg_types::OID_INTERVAL => Some(pg_types::OID_INTERVAL_ARRAY),
+        pg_types::OID_NUMERIC => Some(pg_types::OID_NUMERIC_ARRAY),
+        pg_types::OID_JSON => Some(pg_types::OID_JSON_ARRAY),
+        pg_types::OID_UUID => Some(pg_types::OID_UUID_ARRAY),
+        pg_types::OID_JSONB => Some(pg_types::OID_JSONB_ARRAY),
+        pg_types::OID_HSTORE => Some(pg_types::OID_HSTORE_ARRAY),
+        _ => None,
+    }
+}
+
+fn pg_catalog_regtype_oid(name: &str) -> Option<i64> {
+    match name {
+        "bool" | "boolean" => Some(pg_types::OID_BOOL),
+        "bytea" => Some(pg_types::OID_BYTEA),
+        "name" => Some(pg_types::OID_NAME),
+        "int2" | "smallint" => Some(pg_types::OID_INT2),
+        "int4" | "integer" | "int" => Some(pg_types::OID_INT4),
+        "int8" | "bigint" => Some(pg_types::OID_INT8),
+        "text" => Some(pg_types::OID_TEXT),
+        "oid" => Some(pg_types::OID_OID),
+        "json" => Some(pg_types::OID_JSON),
+        "float4" | "real" => Some(pg_types::OID_FLOAT4),
+        "float8" | "double precision" => Some(pg_types::OID_FLOAT8),
+        "bpchar" | "character" => Some(pg_types::OID_BPCHAR),
+        "varchar" | "character varying" => Some(pg_types::OID_VARCHAR),
+        "date" => Some(pg_types::OID_DATE),
+        "time" | "time without time zone" => Some(pg_types::OID_TIME),
+        "timestamp" | "timestamp without time zone" => Some(pg_types::OID_TIMESTAMP),
+        "timestamptz" | "timestamp with time zone" => Some(pg_types::OID_TIMESTAMPTZ),
+        "interval" => Some(pg_types::OID_INTERVAL),
+        "numeric" | "decimal" => Some(pg_types::OID_NUMERIC),
+        "uuid" => Some(pg_types::OID_UUID),
+        "tsvector" => Some(pg_types::OID_TSVECTOR),
+        "tsquery" => Some(pg_types::OID_TSQUERY),
+        "jsonb" => Some(pg_types::OID_JSONB),
+        "vector" => Some(pg_types::OID_VECTOR),
+        _ => None,
+    }
+}
+
+pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
+    let mut iter = args.into_iter();
+    let raw = match iter.next() {
+        Some(Value::Text(s)) => s,
+        Some(Value::Null) | None => return Ok(Value::Null),
+        _ => return Err(anyhow::anyhow!("function to_regtype(text) does not exist")),
+    };
+
+    let (without_array, is_array) = strip_regtype_array_dims(&raw);
+    let normalized = strip_regtype_typmod(&without_array);
+    let (schema, name) = normalize_regtype_input(&normalized);
+    if name.is_empty() || normalized.is_empty() {
+        return Ok(Value::Null);
+    }
+
+    let base_oid = match schema.as_deref() {
+        None => pg_catalog_regtype_oid(&name).or(match name.as_str() {
+            "hstore" => Some(pg_types::OID_HSTORE),
+            "_hstore" => Some(pg_types::OID_HSTORE_ARRAY),
+            _ => None,
+        }),
+        Some("pg_catalog") => pg_catalog_regtype_oid(&name),
+        Some("public") => match name.as_str() {
+            "hstore" => Some(pg_types::OID_HSTORE),
+            "_hstore" => Some(pg_types::OID_HSTORE_ARRAY),
+            _ => None,
+        },
+        Some(_) => None,
+    };
+
+    let oid = if is_array {
+        base_oid.and_then(regtype_array_oid)
+    } else {
+        base_oid
+    };
+
+    Ok(oid.map(Value::Int64).unwrap_or(Value::Null))
 }
 
 pub fn pg_is_in_recovery(_args: Vec<Value>) -> Result<Value> {
@@ -585,6 +729,59 @@ mod tests {
             format_type(vec![Value::Int32(1043), Value::Int32(-1)]).unwrap(),
             Value::Text("character varying".into())
         );
+    }
+
+    #[test]
+    fn test_to_regtype() {
+        assert_eq!(
+            to_regtype(vec![Value::Text("hstore".into())]).unwrap(),
+            Value::Int64(pg_types::OID_HSTORE)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("hstore[]".into())]).unwrap(),
+            Value::Int64(pg_types::OID_HSTORE_ARRAY)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("public.hstore".into())]).unwrap(),
+            Value::Int64(pg_types::OID_HSTORE)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("\"public\".\"hstore\"".into())]).unwrap(),
+            Value::Int64(pg_types::OID_HSTORE)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("integer".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INT4)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("integer[]".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INT4_ARRAY)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("varchar(5)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_VARCHAR)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("numeric(10,2)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_NUMERIC)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog.int4".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INT4)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("serial".into())]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("bigserial".into())]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("not_a_type".into())]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(to_regtype(vec![Value::Null]).unwrap(), Value::Null);
     }
 
     #[test]

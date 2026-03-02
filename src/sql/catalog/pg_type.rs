@@ -82,12 +82,10 @@ impl VirtualTable for PgType {
             ]));
         }
 
-        const HSTORE_OID: i64 = 16386;
-        const HSTORE_ARRAY_OID: i64 = 16387;
         let public_oid = schema_oid(ctx.schema_oids, "public");
 
         rows.push(Row::new(vec![
-            int_val(HSTORE_ARRAY_OID),
+            int_val(pg_types::OID_HSTORE_ARRAY),
             text_val("_hstore"),
             int_val(public_oid),
             int_val(BOOTSTRAP_SUPERUSER_OID),
@@ -99,13 +97,13 @@ impl VirtualTable for PgType {
             text_val("t"),
             text_val(","),
             int_val(0),
-            int_val(HSTORE_OID),
+            int_val(pg_types::OID_HSTORE),
             int_val(0),
             int_val(0),
         ]));
 
         rows.push(Row::new(vec![
-            int_val(HSTORE_OID),
+            int_val(pg_types::OID_HSTORE),
             text_val("hstore"),
             int_val(public_oid),
             int_val(BOOTSTRAP_SUPERUSER_OID),
@@ -118,7 +116,7 @@ impl VirtualTable for PgType {
             text_val(","),
             int_val(0),
             int_val(0),
-            int_val(HSTORE_ARRAY_OID),
+            int_val(pg_types::OID_HSTORE_ARRAY),
             int_val(0),
         ]));
 

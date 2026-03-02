@@ -191,6 +191,16 @@ impl Executor {
                         return Ok(TypedExpr::new(TypedExprKind::Constant(val), DataType::Text));
                     }
 
+                    if func.name.eq_ignore_ascii_case("TO_REGTYPE") {
+                        let val = self
+                            .eval_to_regtype(&new_args, row, txn, db_id, search_path, qctx)
+                            .await?;
+                        return Ok(TypedExpr::new(
+                            TypedExprKind::Constant(val),
+                            expr.data_type.clone(),
+                        ));
+                    }
+
                     if crate::sql::executor::split_cron_scalar_function_name(&func.name).is_some() {
                         let mut arg_values = Vec::with_capacity(new_args.len());
                         let dummy_row = Row::new(vec![]);
@@ -1052,6 +1062,49 @@ impl Executor {
         let typname = lookup_typname_by_oid(&store, txn, db_id, oid).await?;
         Ok(Value::Text(typname.unwrap_or_else(|| "text".to_string())))
     }
+
+    async fn eval_to_regtype(
+        &self,
+        args: &[TypedExpr],
+        row: &Row,
+        txn: &mut Transaction,
+        db_id: u64,
+        search_path: &[String],
+        qctx: &QueryContext,
+    ) -> Result<Value> {
+        let Some(arg0) = args.first() else {
+            return Ok(Value::Null);
+        };
+
+        let raw = match eval_typed_expr(arg0, row, qctx)? {
+            Value::Null => return Ok(Value::Null),
+            Value::Text(s) => s,
+            _ => return Err(anyhow!("function to_regtype(text) does not exist")),
+        };
+
+        // Fast path for builtins and extension shims already handled by the
+        // scalar function implementation.
+        let resolved_builtin =
+            crate::sql::expr::functions::pg_compat::to_regtype(vec![Value::Text(raw.clone())])?;
+        if !matches!(resolved_builtin, Value::Null) {
+            return Ok(resolved_builtin);
+        }
+
+        let (without_array, is_array) = strip_regtype_array_dims(&raw);
+        if is_array {
+            // db9 does not synthesize array OIDs for user-defined base types yet.
+            return Ok(Value::Null);
+        }
+        let normalized = strip_regtype_typmod(&without_array);
+        if normalized.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+
+        let store = self.store();
+        let oid =
+            lookup_user_defined_regtype_oid(&store, txn, db_id, &normalized, search_path).await?;
+        Ok(oid.map(Value::Int64).unwrap_or(Value::Null))
+    }
 }
 
 fn find_text_column<'a>(
@@ -1067,6 +1120,128 @@ fn find_text_column<'a>(
         return Some((schema, idx));
     }
     None
+}
+
+fn strip_regtype_array_dims(raw: &str) -> (String, bool) {
+    let mut name = raw.trim().to_string();
+    let mut is_array = false;
+    loop {
+        let trimmed = name.trim_end();
+        if let Some(stripped) = trimmed.strip_suffix("[]") {
+            is_array = true;
+            name = stripped.trim_end().to_string();
+            continue;
+        }
+        break;
+    }
+    (name, is_array)
+}
+
+fn strip_regtype_typmod(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if !trimmed.ends_with(')') {
+        return trimmed.to_string();
+    }
+
+    let mut depth = 0_i32;
+    for (idx, ch) in trimmed.char_indices().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return trimmed[..idx].trim_end().to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    trimmed.to_string()
+}
+
+fn split_regtype_name_parts(raw: &str) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut chars = raw.chars().peekable();
+    let mut in_quotes = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                current.push(ch);
+                if in_quotes {
+                    if chars.peek() == Some(&'"') {
+                        current.push('"');
+                        chars.next();
+                    } else {
+                        in_quotes = false;
+                    }
+                } else {
+                    in_quotes = true;
+                }
+            }
+            '.' if !in_quotes => {
+                parts.push(current);
+                current = String::new();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if in_quotes {
+        return None;
+    }
+
+    parts.push(current);
+    Some(parts)
+}
+
+fn parse_regtype_ident(raw: &str) -> Option<sqlparser::ast::Ident> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.starts_with('"') || trimmed.ends_with('"') {
+        if !(trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"')) {
+            return None;
+        }
+        let mut out = String::new();
+        let mut chars = trimmed[1..trimmed.len() - 1].chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    out.push('"');
+                    chars.next();
+                } else {
+                    return None;
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        let mut ident = sqlparser::ast::Ident::new(out);
+        ident.quote_style = Some('"');
+        return Some(ident);
+    }
+
+    if trimmed.contains('"') {
+        return None;
+    }
+
+    Some(sqlparser::ast::Ident::new(trimmed.to_lowercase()))
+}
+
+fn parse_regtype_object_name(raw: &str) -> Option<sqlparser::ast::ObjectName> {
+    let parts = split_regtype_name_parts(raw)?;
+    if parts.is_empty() || parts.len() > 2 {
+        return None;
+    }
+    let mut idents = Vec::with_capacity(parts.len());
+    for p in parts {
+        idents.push(parse_regtype_ident(&p)?);
+    }
+    Some(sqlparser::ast::ObjectName(idents))
 }
 
 fn value_to_i64(v: &Value) -> Option<i64> {
@@ -1257,11 +1432,36 @@ async fn lookup_typname_by_oid(
         .map(|t| t.name))
 }
 
+async fn lookup_user_defined_regtype_oid(
+    store: &Arc<crate::storage::TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    normalized_type_name: &str,
+    search_path: &[String],
+) -> Result<Option<i64>> {
+    let Some(type_name) = parse_regtype_object_name(normalized_type_name) else {
+        return Ok(None);
+    };
+
+    let Some(resolved) =
+        crate::sql::names::resolve_existing_type_name(store, txn, db_id, &type_name, search_path)
+            .await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(store
+        .get_type(txn, db_id, &resolved.full)
+        .await?
+        .map(|def| def.oid as i64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        advisory_lock_timeout, find_text_column, value_to_bool_strict, value_to_i64,
-        value_to_i64_strict,
+        advisory_lock_timeout, find_text_column, parse_regtype_object_name,
+        split_regtype_name_parts, strip_regtype_array_dims, strip_regtype_typmod,
+        value_to_bool_strict, value_to_i64, value_to_i64_strict,
     };
     use crate::model::{ColumnDef, DataType, TableSchema, Value};
     use std::collections::HashMap;
@@ -1517,5 +1717,56 @@ mod tests {
         assert_eq!(value_to_i64(&Value::Text("bad".to_string())), None);
         assert_eq!(value_to_i64(&Value::Null), None);
         assert_eq!(value_to_i64(&Value::Boolean(true)), None);
+    }
+
+    #[test]
+    fn test_strip_regtype_array_dims_and_typmod() {
+        assert_eq!(
+            strip_regtype_array_dims("integer[]"),
+            ("integer".to_string(), true)
+        );
+        assert_eq!(
+            strip_regtype_array_dims("\"MyType\"[][]"),
+            ("\"MyType\"".to_string(), true)
+        );
+        assert_eq!(strip_regtype_typmod("varchar(5)"), "varchar".to_string());
+        assert_eq!(strip_regtype_typmod("numeric(10,2)"), "numeric".to_string());
+        assert_eq!(strip_regtype_typmod("\"MyType\""), "\"MyType\"".to_string());
+    }
+
+    #[test]
+    fn test_parse_regtype_object_name_preserves_quoted_case() {
+        let unquoted = parse_regtype_object_name("mytype").expect("parse unquoted");
+        assert_eq!(unquoted.0.len(), 1);
+        assert_eq!(unquoted.0[0].value, "mytype");
+        assert!(unquoted.0[0].quote_style.is_none());
+
+        let quoted = parse_regtype_object_name("\"MyType\"").expect("parse quoted");
+        assert_eq!(quoted.0.len(), 1);
+        assert_eq!(quoted.0[0].value, "MyType");
+        assert_eq!(quoted.0[0].quote_style, Some('"'));
+
+        let qualified =
+            parse_regtype_object_name("\"MySchema\".\"MyType\"").expect("parse qualified");
+        assert_eq!(qualified.0.len(), 2);
+        assert_eq!(qualified.0[0].value, "MySchema");
+        assert_eq!(qualified.0[0].quote_style, Some('"'));
+        assert_eq!(qualified.0[1].value, "MyType");
+        assert_eq!(qualified.0[1].quote_style, Some('"'));
+    }
+
+    #[test]
+    fn test_parse_regtype_object_name_rejects_invalid_shapes() {
+        assert!(parse_regtype_object_name("").is_none());
+        assert!(parse_regtype_object_name("\"unterminated").is_none());
+        assert!(parse_regtype_object_name("a.b.c").is_none());
+    }
+
+    #[test]
+    fn test_split_regtype_name_parts_handles_escaped_quotes() {
+        let parts = split_regtype_name_parts("\"A\".\"B\"").expect("split");
+        assert_eq!(parts, vec!["\"A\"".to_string(), "\"B\"".to_string()]);
+        let escaped = split_regtype_name_parts("\"A\"\"B\"").expect("split escaped");
+        assert_eq!(escaped, vec!["\"A\"\"B\"".to_string()]);
     }
 }

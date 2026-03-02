@@ -33,6 +33,7 @@ fn is_catalog_dependent_function(func_kind: &FunctionKind, name: &str) -> bool {
     if name.eq_ignore_ascii_case("PG_GET_INDEXDEF")
         || name.eq_ignore_ascii_case("PG_GET_CONSTRAINTDEF")
         || name.eq_ignore_ascii_case("FORMAT_TYPE")
+        || name.eq_ignore_ascii_case("TO_REGTYPE")
     {
         return true;
     }
@@ -204,5 +205,26 @@ mod tests {
         );
 
         assert!(needs_pre_materialization(&expr));
+    }
+
+    #[test]
+    fn needs_async_detects_catalog_dependent_to_regtype() {
+        let expr = TypedExpr::new(
+            TypedExprKind::FunctionCall {
+                func: ResolvedFunction {
+                    name: "to_regtype".to_string(),
+                    kind: FunctionKind::Builtin,
+                    return_type: DataType::Int64,
+                },
+                args: vec![TypedExpr::new(
+                    TypedExprKind::Constant(Value::Text("integer".to_string())),
+                    DataType::Text,
+                )],
+                order_by: vec![],
+                filter: None,
+            },
+            DataType::Int64,
+        );
+        assert!(needs_async(&expr));
     }
 }

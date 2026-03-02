@@ -28,6 +28,29 @@ pub(crate) const OID_TSVECTOR: i64 = 3614;
 pub(crate) const OID_TSQUERY: i64 = 3615;
 pub(crate) const OID_JSONB: i64 = 3802;
 pub(crate) const OID_VECTOR: i64 = 16385;
+pub(crate) const OID_HSTORE: i64 = 16386;
+pub(crate) const OID_HSTORE_ARRAY: i64 = 16387;
+pub(crate) const OID_BOOL_ARRAY: i64 = 1000;
+pub(crate) const OID_BYTEA_ARRAY: i64 = 1001;
+pub(crate) const OID_NAME_ARRAY: i64 = 1003;
+pub(crate) const OID_INT2_ARRAY: i64 = 1005;
+pub(crate) const OID_INT4_ARRAY: i64 = 1007;
+pub(crate) const OID_TEXT_ARRAY: i64 = 1009;
+pub(crate) const OID_BPCHAR_ARRAY: i64 = 1014;
+pub(crate) const OID_VARCHAR_ARRAY: i64 = 1015;
+pub(crate) const OID_INT8_ARRAY: i64 = 1016;
+pub(crate) const OID_FLOAT4_ARRAY: i64 = 1021;
+pub(crate) const OID_FLOAT8_ARRAY: i64 = 1022;
+pub(crate) const OID_OID_ARRAY: i64 = 1028;
+pub(crate) const OID_TIMESTAMP_ARRAY: i64 = 1115;
+pub(crate) const OID_DATE_ARRAY: i64 = 1182;
+pub(crate) const OID_TIME_ARRAY: i64 = 1183;
+pub(crate) const OID_TIMESTAMPTZ_ARRAY: i64 = 1185;
+pub(crate) const OID_INTERVAL_ARRAY: i64 = 1187;
+pub(crate) const OID_NUMERIC_ARRAY: i64 = 1231;
+pub(crate) const OID_JSON_ARRAY: i64 = 199;
+pub(crate) const OID_UUID_ARRAY: i64 = 2951;
+pub(crate) const OID_JSONB_ARRAY: i64 = 3807;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BuiltinPgType {

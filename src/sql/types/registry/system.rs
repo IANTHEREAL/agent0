@@ -100,6 +100,10 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         FunctionSignature::fixed(DataType::Text).with_args(2, Some(2)),
     );
     r.register(
+        "TO_REGTYPE",
+        FunctionSignature::fixed(DataType::Int64).with_args(1, Some(1)),
+    );
+    r.register(
         "PG_GET_INDEXDEF",
         FunctionSignature::fixed(DataType::Text).with_args(1, Some(3)),
     );
