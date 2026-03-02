@@ -166,7 +166,7 @@ fn normalize_regtype_input(raw: &str) -> (Option<String>, String) {
     }
 }
 
-fn strip_regtype_array_dims(raw: &str) -> (String, bool) {
+pub(crate) fn strip_regtype_array_dims(raw: &str) -> (String, bool) {
     let mut name = raw.trim().to_string();
     let mut is_array = false;
     loop {
@@ -181,7 +181,7 @@ fn strip_regtype_array_dims(raw: &str) -> (String, bool) {
     (name, is_array)
 }
 
-fn strip_regtype_typmod(raw: &str) -> String {
+pub(crate) fn strip_regtype_typmod(raw: &str) -> String {
     let trimmed = raw.trim();
     if !trimmed.ends_with(')') {
         return trimmed.to_string();
@@ -201,6 +201,52 @@ fn strip_regtype_typmod(raw: &str) -> String {
         }
     }
     trimmed.to_string()
+}
+
+/// Normalize interval qualifier forms to bare "interval".
+///
+/// PostgreSQL accepts `interval`, `interval(3)`, `interval day to second`,
+/// `interval hour`, etc.  All resolve to OID 1186.
+pub(crate) fn normalize_interval_type(name: &str) -> String {
+    let lower = name.trim().to_lowercase();
+    if lower == "interval" {
+        return lower;
+    }
+    if !lower.starts_with("interval") {
+        return name.to_string();
+    }
+    let rest = &lower["interval".len()..];
+    if rest.starts_with('(') {
+        // Already handled by strip_regtype_typmod; just return "interval"
+        return "interval".to_string();
+    }
+    if !rest.starts_with(' ') {
+        // e.g. "intervals" — not an interval type
+        return name.to_string();
+    }
+    let rest = rest.trim();
+    const VALID_QUALIFIERS: &[&str] = &[
+        "year to month",
+        "day to second",
+        "day to minute",
+        "day to hour",
+        "hour to second",
+        "hour to minute",
+        "minute to second",
+        "year",
+        "month",
+        "day",
+        "hour",
+        "minute",
+        "second",
+    ];
+    for &q in VALID_QUALIFIERS {
+        if rest == q || rest.starts_with(q) && rest[q.len()..].trim_start().starts_with('(') {
+            return "interval".to_string();
+        }
+    }
+    // Unknown qualifier — return unchanged (will fail pg_catalog_regtype_oid → NULL)
+    name.to_string()
 }
 
 fn regtype_array_oid(base_oid: i64) -> Option<i64> {
@@ -270,19 +316,34 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
     };
 
     let (without_array, is_array) = strip_regtype_array_dims(&raw);
-    let normalized = strip_regtype_typmod(&without_array);
+    let stripped = strip_regtype_typmod(&without_array);
+    let normalized = normalize_interval_type(&stripped);
     let (schema, name) = normalize_regtype_input(&normalized);
     if name.is_empty() || normalized.is_empty() {
         return Ok(Value::Null);
     }
 
     let base_oid = match schema.as_deref() {
-        None => pg_catalog_regtype_oid(&name).or(match name.as_str() {
-            "hstore" => Some(pg_types::OID_HSTORE),
-            "_hstore" => Some(pg_types::OID_HSTORE_ARRAY),
-            _ => None,
+        None => pg_catalog_regtype_oid(&name)
+            .or_else(|| {
+                // Generic _typename → array alias for pg_catalog builtins.
+                // e.g. _int4 → strip '_' → pg_catalog_regtype_oid("int4") → regtype_array_oid
+                // NOTE: hstore is NOT in pg_catalog_regtype_oid(), so _hstore
+                // falls through to the explicit special-case below.
+                name.strip_prefix('_')
+                    .and_then(pg_catalog_regtype_oid)
+                    .and_then(regtype_array_oid)
+            })
+            .or(match name.as_str() {
+                "hstore" => Some(pg_types::OID_HSTORE),
+                "_hstore" => Some(pg_types::OID_HSTORE_ARRAY),
+                _ => None,
+            }),
+        Some("pg_catalog") => pg_catalog_regtype_oid(&name).or_else(|| {
+            name.strip_prefix('_')
+                .and_then(pg_catalog_regtype_oid)
+                .and_then(regtype_array_oid)
         }),
-        Some("pg_catalog") => pg_catalog_regtype_oid(&name),
         Some("public") => match name.as_str() {
             "hstore" => Some(pg_types::OID_HSTORE),
             "_hstore" => Some(pg_types::OID_HSTORE_ARRAY),
@@ -802,6 +863,124 @@ mod tests {
         );
         assert_eq!(pg_table_is_visible(vec![Value::Null]).unwrap(), Value::Null);
         assert_eq!(pg_table_is_visible(vec![]).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_to_regtype_array_aliases() {
+        // Gap 1: generic _typename → array OID
+        assert_eq!(
+            to_regtype(vec![Value::Text("_int4".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INT4_ARRAY)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("_bool".into())]).unwrap(),
+            Value::Int64(pg_types::OID_BOOL_ARRAY)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("_text".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TEXT_ARRAY)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("_float8".into())]).unwrap(),
+            Value::Int64(pg_types::OID_FLOAT8_ARRAY)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("_varchar".into())]).unwrap(),
+            Value::Int64(pg_types::OID_VARCHAR_ARRAY)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("_numeric".into())]).unwrap(),
+            Value::Int64(pg_types::OID_NUMERIC_ARRAY)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("_uuid".into())]).unwrap(),
+            Value::Int64(pg_types::OID_UUID_ARRAY)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("_jsonb".into())]).unwrap(),
+            Value::Int64(pg_types::OID_JSONB_ARRAY)
+        );
+        // _hstore regression guard — must still work via special-case
+        assert_eq!(
+            to_regtype(vec![Value::Text("_hstore".into())]).unwrap(),
+            Value::Int64(pg_types::OID_HSTORE_ARRAY)
+        );
+        // Schema-qualified _typename
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog._int4".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INT4_ARRAY)
+        );
+        // Unknown base type → NULL
+        assert_eq!(
+            to_regtype(vec![Value::Text("_nonexistent".into())]).unwrap(),
+            Value::Null
+        );
+        // Array-of-array not valid
+        assert_eq!(
+            to_regtype(vec![Value::Text("_int4[]".into())]).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_to_regtype_interval_qualifiers() {
+        // Gap 2: interval qualifier forms → OID 1186
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval day to second".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval hour".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval year to month".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval minute(3)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval(3)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        // Case-insensitive
+        assert_eq!(
+            to_regtype(vec![Value::Text("INTERVAL DAY TO SECOND".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        // Invalid qualifier → NULL
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval garbage".into())]).unwrap(),
+            Value::Null
+        );
+        // Not a word-boundary match
+        assert_eq!(
+            to_regtype(vec![Value::Text("intervals".into())]).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_normalize_interval_type() {
+        assert_eq!(normalize_interval_type("interval"), "interval");
+        assert_eq!(
+            normalize_interval_type("interval day to second"),
+            "interval"
+        );
+        assert_eq!(normalize_interval_type("interval hour"), "interval");
+        assert_eq!(normalize_interval_type("interval minute(3)"), "interval");
+        assert_eq!(
+            normalize_interval_type("INTERVAL YEAR TO MONTH"),
+            "interval"
+        );
+        assert_eq!(
+            normalize_interval_type("interval garbage"),
+            "interval garbage"
+        );
+        assert_eq!(normalize_interval_type("intervals"), "intervals");
+        assert_eq!(normalize_interval_type("integer"), "integer");
     }
 
     #[test]

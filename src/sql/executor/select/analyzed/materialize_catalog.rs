@@ -1122,42 +1122,7 @@ fn find_text_column<'a>(
     None
 }
 
-fn strip_regtype_array_dims(raw: &str) -> (String, bool) {
-    let mut name = raw.trim().to_string();
-    let mut is_array = false;
-    loop {
-        let trimmed = name.trim_end();
-        if let Some(stripped) = trimmed.strip_suffix("[]") {
-            is_array = true;
-            name = stripped.trim_end().to_string();
-            continue;
-        }
-        break;
-    }
-    (name, is_array)
-}
-
-fn strip_regtype_typmod(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if !trimmed.ends_with(')') {
-        return trimmed.to_string();
-    }
-
-    let mut depth = 0_i32;
-    for (idx, ch) in trimmed.char_indices().rev() {
-        match ch {
-            ')' => depth += 1,
-            '(' => {
-                depth -= 1;
-                if depth == 0 {
-                    return trimmed[..idx].trim_end().to_string();
-                }
-            }
-            _ => {}
-        }
-    }
-    trimmed.to_string()
-}
+use crate::sql::expr::functions::pg_compat::{strip_regtype_array_dims, strip_regtype_typmod};
 
 fn split_regtype_name_parts(raw: &str) -> Option<Vec<String>> {
     let mut parts = Vec::new();
