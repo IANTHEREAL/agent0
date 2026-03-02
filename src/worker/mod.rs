@@ -14,6 +14,7 @@ use tracing::{info, warn};
 
 static SYSTEM_STORE: OnceLock<Arc<TikvStore>> = OnceLock::new();
 static WORKER_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
+static WORKER_METRICS: OnceLock<Arc<metrics::WorkerMetrics>> = OnceLock::new();
 
 pub(crate) fn now_epoch_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -37,6 +38,14 @@ pub fn wake_worker() {
     if let Some(notify) = WORKER_NOTIFY.get() {
         notify.notify_one();
     }
+}
+
+pub fn set_worker_metrics(m: Arc<metrics::WorkerMetrics>) {
+    WORKER_METRICS.set(m).ok();
+}
+
+pub fn get_worker_metrics() -> Option<&'static Arc<metrics::WorkerMetrics>> {
+    WORKER_METRICS.get()
 }
 
 /// Ensure the system keyspace exists in PD before initializing worker store.
@@ -214,6 +223,25 @@ mod tests {
         assert!(
             msg.contains(&cfg.system_keyspace),
             "error should include target system keyspace, got: {msg}"
+        );
+    }
+
+    /// Regression test: when worker is enabled and system store init fails,
+    /// the init function MUST return Err — never Ok(None). This is the
+    /// precondition for main.rs to propagate the error as a startup failure.
+    #[tokio::test]
+    async fn test_enabled_worker_init_failure_is_never_silent() {
+        let cfg = WorkerConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        // Unreachable PD guarantees init will fail
+        let result = init_system_store(vec!["127.0.0.1:1".to_string()], &cfg).await;
+        assert!(
+            result.is_err(),
+            "enabled worker + init failure must return Err, not Ok(None); \
+             main.rs depends on this to fail-fast at startup"
         );
     }
 }

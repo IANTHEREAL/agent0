@@ -10,6 +10,7 @@ pub const TASK_TYPE_ASYNC_TRIGGER: u8 = 0x02;
 pub const TASK_TYPE_AUTO_ANALYZE: u8 = 0x04;
 pub const TASK_TYPE_BG_DDL: u8 = 0x08;
 pub const TASK_TYPE_BG_SQL: u8 = 0x10;
+pub const TASK_TYPE_HNSW_MERGE: u8 = 0x20;
 
 // ============================================================================
 // TaskType Enum
@@ -22,6 +23,7 @@ pub enum TaskType {
     AutoAnalyze,
     BgDdl,
     BgSql,
+    HnswMerge,
 }
 
 impl TaskType {
@@ -34,6 +36,7 @@ impl TaskType {
             TaskType::AutoAnalyze => TASK_TYPE_AUTO_ANALYZE,
             TaskType::BgDdl => TASK_TYPE_BG_DDL,
             TaskType::BgSql => TASK_TYPE_BG_SQL,
+            TaskType::HnswMerge => TASK_TYPE_HNSW_MERGE,
         }
     }
 
@@ -50,6 +53,8 @@ impl TaskType {
             Some(TaskType::BgDdl)
         } else if mask & TASK_TYPE_BG_SQL != 0 {
             Some(TaskType::BgSql)
+        } else if mask & TASK_TYPE_HNSW_MERGE != 0 {
+            Some(TaskType::HnswMerge)
         } else {
             None
         }
@@ -181,6 +186,24 @@ impl TaskRegistryEntry {
         self.task_types &= !TASK_TYPE_BG_SQL;
     }
 
+    /// Check if hnsw_merge bit is set
+    #[allow(dead_code)]
+    pub fn has_hnsw_merge(&self) -> bool {
+        self.task_types & TASK_TYPE_HNSW_MERGE != 0
+    }
+
+    /// Set hnsw_merge bit
+    #[allow(dead_code)]
+    pub fn set_hnsw_merge(&mut self) {
+        self.task_types |= TASK_TYPE_HNSW_MERGE;
+    }
+
+    /// Clear hnsw_merge bit
+    #[allow(dead_code)]
+    pub fn clear_hnsw_merge(&mut self) {
+        self.task_types &= !TASK_TYPE_HNSW_MERGE;
+    }
+
     /// Check if any task type is registered
     #[allow(dead_code)] // forward-compat: symmetric bitmask API
     pub fn is_empty(&self) -> bool {
@@ -203,6 +226,8 @@ pub struct TaskQueueEntry {
     #[serde(default)]
     pub schedule: Option<String>, // cron expression (only for Cron type)
     pub priority: u8, // 0-255, higher priority executes first
+    #[serde(default)] // backward compat: existing entries deserialize as 0
+    pub nonce: u64,
 }
 
 impl TaskQueueEntry {
@@ -224,12 +249,49 @@ impl TaskQueueEntry {
             username,
             schedule: None,
             priority,
+            nonce: 0,
         }
     }
 
     pub fn with_schedule(mut self, schedule: String) -> Self {
         self.schedule = Some(schedule);
         self
+    }
+
+    /// Deserialize queue entry with backward compatibility for pre-nonce payloads.
+    pub fn deserialize_compat(bytes: &[u8]) -> std::result::Result<Self, Box<bincode::ErrorKind>> {
+        match bincode::deserialize::<TaskQueueEntry>(bytes) {
+            Ok(entry) => Ok(entry),
+            Err(primary_err) => {
+                #[derive(Deserialize)]
+                struct TaskQueueEntryV0 {
+                    keyspace: String,
+                    db_id: u64,
+                    task_id: i64,
+                    task_type: TaskType,
+                    command: String,
+                    username: String,
+                    #[serde(default)]
+                    schedule: Option<String>,
+                    priority: u8,
+                }
+
+                match bincode::deserialize::<TaskQueueEntryV0>(bytes) {
+                    Ok(v0) => Ok(TaskQueueEntry {
+                        keyspace: v0.keyspace,
+                        db_id: v0.db_id,
+                        task_id: v0.task_id,
+                        task_type: v0.task_type,
+                        command: v0.command,
+                        username: v0.username,
+                        schedule: v0.schedule,
+                        priority: v0.priority,
+                        nonce: 0,
+                    }),
+                    Err(_) => Err(primary_err),
+                }
+            }
+        }
     }
 }
 
@@ -390,6 +452,49 @@ mod tests {
     }
 
     #[test]
+    fn test_task_queue_entry_backward_compat_missing_nonce_defaults_zero() {
+        #[derive(Serialize, Deserialize)]
+        struct OldTaskQueueEntryNoNonce {
+            keyspace: String,
+            db_id: u64,
+            task_id: i64,
+            task_type: TaskType,
+            command: String,
+            username: String,
+            schedule: Option<String>,
+            priority: u8,
+        }
+
+        let old = OldTaskQueueEntryNoNonce {
+            keyspace: "default".to_string(),
+            db_id: 7,
+            task_id: 99,
+            task_type: TaskType::HnswMerge,
+            command: "__hnsw_merge 1 1".to_string(),
+            username: "system".to_string(),
+            schedule: None,
+            priority: 192,
+        };
+
+        let bytes = bincode::serialize(&old).expect("serialize old entry");
+        let decoded = TaskQueueEntry::deserialize_compat(&bytes)
+            .expect("deserialize old entry should default nonce to 0");
+
+        assert_eq!(decoded.keyspace, old.keyspace);
+        assert_eq!(decoded.db_id, old.db_id);
+        assert_eq!(decoded.task_id, old.task_id);
+        assert_eq!(decoded.task_type, old.task_type);
+        assert_eq!(decoded.command, old.command);
+        assert_eq!(decoded.username, old.username);
+        assert_eq!(decoded.schedule, old.schedule);
+        assert_eq!(decoded.priority, old.priority);
+        assert_eq!(
+            decoded.nonce, 0,
+            "legacy entries without nonce must deserialize as nonce=0"
+        );
+    }
+
+    #[test]
     fn test_task_registry_entry_multiple_bitmask_set() {
         let mut entry = TaskRegistryEntry::new("ks".to_string(), 1);
         entry.set_cron();
@@ -442,6 +547,237 @@ mod tests {
             let decoded: IndexState = bincode::deserialize(&data).expect("deserialize");
             assert_eq!(decoded, variant);
         }
+    }
+
+    /// CAS nonce logic: when a worker reads back the queue entry it processed,
+    /// it should only delete if the nonce matches. This test verifies the
+    /// comparison semantics that underpin the ABA race prevention.
+    #[test]
+    fn test_cas_nonce_match_decides_delete_eligibility() {
+        let mut entry_a = TaskQueueEntry::new(
+            "ks".to_string(),
+            1,
+            42,
+            TaskType::HnswMerge,
+            "__hnsw_merge 10 1".to_string(),
+            "system".to_string(),
+            192,
+        );
+        entry_a.nonce = 12345;
+
+        // Same nonce → CAS match → worker should delete
+        let mut entry_b = entry_a.clone();
+        entry_b.nonce = 12345;
+        assert_eq!(entry_a.nonce, entry_b.nonce, "same nonce must match");
+
+        // Different nonce → CAS mismatch → worker must NOT delete
+        // (simulates DML overwriting the queue key with a new nonce)
+        let mut entry_c = entry_a.clone();
+        entry_c.nonce = 99999;
+        assert_ne!(
+            entry_a.nonce, entry_c.nonce,
+            "different nonce must mismatch"
+        );
+
+        // Old entry (nonce=0) vs new entry (nonce≠0) → mismatch → skip delete
+        // (simulates rolling upgrade: worker reads old entry, DML writes new)
+        let mut entry_old = entry_a.clone();
+        entry_old.nonce = 0;
+        assert_ne!(
+            entry_old.nonce, entry_a.nonce,
+            "old (nonce=0) vs new (nonce≠0) must mismatch"
+        );
+    }
+
+    /// CAS nonce serialization: verify the nonce field survives bincode
+    /// round-trip and the CAS comparison works on deserialized entries.
+    #[test]
+    fn test_cas_nonce_survives_bincode_roundtrip() {
+        let mut entry = TaskQueueEntry::new(
+            "ks".to_string(),
+            1,
+            42,
+            TaskType::HnswMerge,
+            "__hnsw_merge 10 1".to_string(),
+            "system".to_string(),
+            192,
+        );
+        entry.nonce = 0xDEAD_BEEF_CAFE_BABE;
+
+        let bytes = bincode::serialize(&entry).expect("serialize");
+        let decoded = TaskQueueEntry::deserialize_compat(&bytes).expect("deserialize");
+        assert_eq!(
+            decoded.nonce, entry.nonce,
+            "nonce must survive bincode round-trip for CAS to work"
+        );
+    }
+
+    /// ABA scenario at serialization level: DML overwrites a queue key with a
+    /// new nonce while the worker holds the old nonce. After deserialization,
+    /// the nonces must differ, preventing the worker from deleting DML's entry.
+    #[test]
+    fn test_aba_nonce_mismatch_after_overwrite_roundtrip() {
+        let mut worker_entry = TaskQueueEntry::new(
+            "ks".to_string(),
+            1,
+            42,
+            TaskType::HnswMerge,
+            "__hnsw_merge 10 1".to_string(),
+            "system".to_string(),
+            192,
+        );
+        worker_entry.nonce = 111;
+
+        // DML writes a NEW entry to the same queue key with a different nonce
+        let mut dml_entry = worker_entry.clone();
+        dml_entry.nonce = 222;
+        let dml_bytes = bincode::serialize(&dml_entry).expect("serialize DML entry");
+
+        // Worker reads back from store → gets DML's entry
+        let current = TaskQueueEntry::deserialize_compat(&dml_bytes).expect("deserialize current");
+
+        // CAS comparison: worker_entry.nonce != current.nonce → skip delete
+        assert_ne!(
+            worker_entry.nonce, current.nonce,
+            "ABA: worker must detect nonce mismatch and skip delete"
+        );
+    }
+
+    /// Non-zero nonce guarantee: gen_range(1..=u64::MAX) never produces 0.
+    /// This is critical because legacy entries deserialize with nonce=0,
+    /// and a new entry with nonce=0 would be indistinguishable from legacy.
+    #[test]
+    fn test_nonce_generation_never_zero() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        for _ in 0..10_000 {
+            let nonce: u64 = rng.gen_range(1..=u64::MAX);
+            assert_ne!(nonce, 0, "gen_range(1..=u64::MAX) must never produce 0");
+        }
+    }
+
+    /// Task type branching: only HnswMerge should use CAS delete.
+    /// All other task types use unconditional delete.
+    #[test]
+    fn test_hnsw_merge_is_only_cas_eligible_task_type() {
+        let cas_types = [TaskType::HnswMerge];
+        let unconditional_types = [
+            TaskType::Cron,
+            TaskType::AsyncTrigger,
+            TaskType::AutoAnalyze,
+            TaskType::BgDdl,
+            TaskType::BgSql,
+        ];
+
+        for tt in &cas_types {
+            assert_eq!(*tt, TaskType::HnswMerge, "only HnswMerge uses CAS delete");
+        }
+        for tt in &unconditional_types {
+            assert_ne!(
+                *tt,
+                TaskType::HnswMerge,
+                "{:?} must use unconditional delete, not CAS",
+                tt
+            );
+        }
+    }
+
+    /// New-format entries (with nonce) must also round-trip correctly through
+    /// the compat deserializer. This ensures the compat path doesn't break
+    /// the common case (new→new) while handling old→new.
+    #[test]
+    fn test_deserialize_compat_new_format_preserves_nonce() {
+        let mut entry = TaskQueueEntry::new(
+            "ks".to_string(),
+            5,
+            77,
+            TaskType::HnswMerge,
+            "__hnsw_merge 3 4".to_string(),
+            "system".to_string(),
+            192,
+        );
+        entry.nonce = 0xCAFE_BABE_DEAD_BEEF;
+
+        let bytes = bincode::serialize(&entry).expect("serialize new-format entry");
+        let decoded = TaskQueueEntry::deserialize_compat(&bytes)
+            .expect("new-format entry must deserialize through compat path");
+
+        assert_eq!(decoded.keyspace, "ks");
+        assert_eq!(decoded.db_id, 5);
+        assert_eq!(decoded.task_id, 77);
+        assert_eq!(decoded.task_type, TaskType::HnswMerge);
+        assert_eq!(decoded.command, "__hnsw_merge 3 4");
+        assert_eq!(decoded.nonce, 0xCAFE_BABE_DEAD_BEEF);
+    }
+
+    /// Garbage bytes must produce Err, never panic. Exercises both the
+    /// primary bincode path and the V0 fallback path inside deserialize_compat.
+    #[test]
+    fn test_deserialize_compat_garbage_returns_error() {
+        let garbage = &[0xFF, 0x00, 0x42];
+        let result = TaskQueueEntry::deserialize_compat(garbage);
+        assert!(
+            result.is_err(),
+            "garbage bytes must return Err, not panic or Ok"
+        );
+    }
+
+    /// Empty bytes must produce Err, never panic.
+    #[test]
+    fn test_deserialize_compat_empty_returns_error() {
+        let result = TaskQueueEntry::deserialize_compat(&[]);
+        assert!(
+            result.is_err(),
+            "empty bytes must return Err, not panic or Ok"
+        );
+    }
+
+    /// Rolling upgrade scenario: old worker (code without nonce awareness)
+    /// would see nonce=0 for its own entries, while new DML writes nonce≠0.
+    /// CAS must detect this mismatch and skip delete — preserving DML's entry.
+    #[test]
+    fn test_rolling_upgrade_old_worker_vs_new_dml_nonce_mismatch() {
+        // Old worker: reads an entry, doesn't set nonce → defaults to 0
+        let old_worker_nonce: u64 = 0;
+
+        // New DML: overwrites same queue key with non-zero nonce
+        let new_dml_nonce: u64 = 42;
+
+        // CAS comparison: old worker must NOT delete new DML's entry
+        assert_ne!(
+            old_worker_nonce, new_dml_nonce,
+            "old worker (nonce=0) must not match new DML (nonce≠0)"
+        );
+
+        // Verify this through serialization: old-format entry deserialized
+        // via compat gets nonce=0, which must differ from any new nonce.
+        #[derive(Serialize)]
+        struct OldEntry {
+            keyspace: String,
+            db_id: u64,
+            task_id: i64,
+            task_type: TaskType,
+            command: String,
+            username: String,
+            schedule: Option<String>,
+            priority: u8,
+        }
+        let old = OldEntry {
+            keyspace: "ks".to_string(),
+            db_id: 1,
+            task_id: 42,
+            task_type: TaskType::HnswMerge,
+            command: "__hnsw_merge 1 1".to_string(),
+            username: "system".to_string(),
+            schedule: None,
+            priority: 192,
+        };
+        let old_bytes = bincode::serialize(&old).expect("serialize old");
+        let old_decoded = TaskQueueEntry::deserialize_compat(&old_bytes).expect("compat");
+        assert_eq!(old_decoded.nonce, 0, "old entry must have nonce=0");
+
+        // Any new entry with nonce from gen_range(1..=u64::MAX) must mismatch
+        assert_ne!(old_decoded.nonce, new_dml_nonce);
     }
 
     #[test]

@@ -66,7 +66,7 @@ pub(crate) async fn enqueue_after_triggers(
             continue;
         };
 
-        if trigger_body_needs_async(&func.body) {
+        if trigger_body_needs_async(&func.body) && crate::worker::get_system_store().is_some() {
             if let Some(sql) = flatten_trigger_body_to_sql(&func.body, &schema, new_row, old_row) {
                 executor.push_pending_async_trigger(PendingAsyncTrigger {
                     keyspace: keyspace.to_string(),

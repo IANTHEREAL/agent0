@@ -65,6 +65,8 @@ tests/235_lateral_correlated_no_from.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py
+tests/hnsw_large_liveness_coverage.py
+tests/hnsw_bg_concurrent_liveness.py
 
 [orm]
 orm-tests/pg-client/

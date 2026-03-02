@@ -8,6 +8,10 @@ const DEFAULT_CRON_JOB_TIMEOUT_MS: u64 = 1_800_000;
 const DEFAULT_ORPHAN_TIMEOUT_SEC: u64 = 300;
 const DEFAULT_GC_BATCH_SIZE: usize = 100;
 const DEFAULT_AUTO_ANALYZE_THRESHOLD: u64 = 50;
+const DEFAULT_GC_INTERVAL_SEC: u64 = 600;
+const MIN_GC_INTERVAL_SEC: u64 = 30;
+const DEFAULT_HNSW_SWEEP_INTERVAL_SEC: u64 = 600;
+const MIN_HNSW_SWEEP_INTERVAL_SEC: u64 = 30;
 const DEFAULT_SYSTEM_KEYSPACE: &str = "_sys_worker";
 
 #[derive(Debug, Clone)]
@@ -22,6 +26,8 @@ pub struct WorkerConfig {
     pub gc_batch_size: usize,
     pub auto_analyze_enabled: bool,
     pub auto_analyze_threshold: u64,
+    pub gc_interval_sec: u64,
+    pub hnsw_sweep_interval_sec: u64,
     pub system_keyspace: String,
 }
 
@@ -42,6 +48,8 @@ impl Default for WorkerConfig {
             gc_batch_size: DEFAULT_GC_BATCH_SIZE,
             auto_analyze_enabled: true,
             auto_analyze_threshold: DEFAULT_AUTO_ANALYZE_THRESHOLD,
+            gc_interval_sec: DEFAULT_GC_INTERVAL_SEC,
+            hnsw_sweep_interval_sec: DEFAULT_HNSW_SWEEP_INTERVAL_SEC,
             system_keyspace: DEFAULT_SYSTEM_KEYSPACE.to_string(),
         }
     }
@@ -133,6 +141,50 @@ impl WorkerConfig {
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.auto_analyze_threshold);
         }
+        if let Ok(v) = env::var("DB9_WORKER_GC_INTERVAL_SEC") {
+            match v.parse::<u64>() {
+                Ok(parsed) if parsed >= MIN_GC_INTERVAL_SEC => {
+                    cfg.gc_interval_sec = parsed;
+                }
+                Ok(parsed) => {
+                    tracing::warn!(
+                        "DB9_WORKER_GC_INTERVAL_SEC={} is below minimum {}s; using default {}s",
+                        parsed,
+                        MIN_GC_INTERVAL_SEC,
+                        cfg.gc_interval_sec
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "DB9_WORKER_GC_INTERVAL_SEC='{}' is not a valid integer; using default {}s",
+                        v,
+                        cfg.gc_interval_sec
+                    );
+                }
+            }
+        }
+        if let Ok(v) = env::var("DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC") {
+            match v.parse::<u64>() {
+                Ok(parsed) if parsed >= MIN_HNSW_SWEEP_INTERVAL_SEC => {
+                    cfg.hnsw_sweep_interval_sec = parsed;
+                }
+                Ok(parsed) => {
+                    tracing::warn!(
+                        "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC={} is below minimum {}s; using default {}s",
+                        parsed,
+                        MIN_HNSW_SWEEP_INTERVAL_SEC,
+                        cfg.hnsw_sweep_interval_sec
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC='{}' is not a valid integer; using default {}s",
+                        v,
+                        cfg.hnsw_sweep_interval_sec
+                    );
+                }
+            }
+        }
         if let Ok(v) = env::var("DB9_WORKER_SYSTEM_KEYSPACE") {
             cfg.system_keyspace = v;
         }
@@ -166,6 +218,8 @@ mod tests {
             "DB9_WORKER_GC_BATCH_SIZE",
             "DB9_AUTO_ANALYZE_ENABLED",
             "DB9_AUTO_ANALYZE_THRESHOLD",
+            "DB9_WORKER_GC_INTERVAL_SEC",
+            "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC",
             "DB9_WORKER_SYSTEM_KEYSPACE",
         ];
 
@@ -191,6 +245,8 @@ mod tests {
         assert_eq!(cfg.gc_batch_size, DEFAULT_GC_BATCH_SIZE);
         assert!(cfg.auto_analyze_enabled);
         assert_eq!(cfg.auto_analyze_threshold, DEFAULT_AUTO_ANALYZE_THRESHOLD);
+        assert_eq!(cfg.gc_interval_sec, DEFAULT_GC_INTERVAL_SEC);
+        assert_eq!(cfg.hnsw_sweep_interval_sec, DEFAULT_HNSW_SWEEP_INTERVAL_SEC);
         assert_eq!(cfg.system_keyspace, DEFAULT_SYSTEM_KEYSPACE);
 
         for (key, value) in saved {
@@ -311,6 +367,139 @@ mod tests {
         assert_eq!(cfg.gc_batch_size, 100);
         assert!(cfg.auto_analyze_enabled);
         assert_eq!(cfg.auto_analyze_threshold, 50);
+        assert_eq!(cfg.gc_interval_sec, 600);
+        assert_eq!(cfg.hnsw_sweep_interval_sec, 600);
         assert_eq!(cfg.system_keyspace, "_sys_worker");
+    }
+
+    #[test]
+    fn from_env_applies_hnsw_sweep_interval_when_at_least_minimum() {
+        let _guard = test_lock().lock().unwrap();
+
+        let key = "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "120");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.hnsw_sweep_interval_sec, 120);
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn from_env_keeps_default_hnsw_sweep_interval_when_below_minimum() {
+        let _guard = test_lock().lock().unwrap();
+
+        let key = "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "29");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.hnsw_sweep_interval_sec, DEFAULT_HNSW_SWEEP_INTERVAL_SEC);
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn from_env_ignores_non_integer_hnsw_sweep_interval() {
+        let _guard = test_lock().lock().unwrap();
+
+        let key = "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "not_a_number");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(
+            cfg.hnsw_sweep_interval_sec, DEFAULT_HNSW_SWEEP_INTERVAL_SEC,
+            "non-integer should fall back to default"
+        );
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn from_env_applies_gc_interval_when_at_least_minimum() {
+        let _guard = test_lock().lock().unwrap();
+
+        let key = "DB9_WORKER_GC_INTERVAL_SEC";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "120");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.gc_interval_sec, 120);
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn from_env_keeps_default_gc_interval_when_below_minimum() {
+        let _guard = test_lock().lock().unwrap();
+
+        let key = "DB9_WORKER_GC_INTERVAL_SEC";
+        let saved = env::var(key).ok();
+
+        unsafe {
+            env::set_var(key, "29");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.gc_interval_sec, DEFAULT_GC_INTERVAL_SEC);
+
+        match saved {
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn gc_and_hnsw_sweep_intervals_are_independent() {
+        let _guard = test_lock().lock().unwrap();
+
+        let gc_key = "DB9_WORKER_GC_INTERVAL_SEC";
+        let hnsw_key = "DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC";
+        let gc_saved = env::var(gc_key).ok();
+        let hnsw_saved = env::var(hnsw_key).ok();
+
+        unsafe {
+            env::set_var(gc_key, "60");
+            env::set_var(hnsw_key, "300");
+        }
+
+        let cfg = WorkerConfig::from_env();
+        assert_eq!(cfg.gc_interval_sec, 60);
+        assert_eq!(cfg.hnsw_sweep_interval_sec, 300);
+
+        match gc_saved {
+            Some(v) => unsafe { env::set_var(gc_key, v) },
+            None => unsafe { env::remove_var(gc_key) },
+        }
+        match hnsw_saved {
+            Some(v) => unsafe { env::set_var(hnsw_key, v) },
+            None => unsafe { env::remove_var(hnsw_key) },
+        }
     }
 }

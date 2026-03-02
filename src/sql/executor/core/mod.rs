@@ -79,6 +79,7 @@ use sqlparser::ast::{
     TableFactor, TransactionAccessMode, TransactionIsolationLevel, TransactionMode, Visit, Visitor,
 };
 
+use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
@@ -97,6 +98,15 @@ pub(crate) struct PendingAsyncTrigger {
     pub command: String,
 }
 
+/// Accumulated during DML, flushed after commit (same lifecycle as PendingAsyncTrigger).
+#[derive(Debug, Clone)]
+pub(crate) struct PendingHnswMerge {
+    pub keyspace: String,
+    pub db_id: u64,
+    pub table_id: u64,
+    pub index_id: u64,
+}
+
 pub struct Executor {
     store: Arc<TikvStore>,
     auth_manager: AuthManager,
@@ -111,6 +121,8 @@ pub struct Executor {
     /// worker never sees uncommitted events.
     pending_trigger_activations: Mutex<HashSet<String>>,
     pending_async_triggers: Mutex<Vec<PendingAsyncTrigger>>,
+    /// HNSW merge requests accumulated during DML, flushed after commit.
+    pending_hnsw_merges: Mutex<Vec<PendingHnswMerge>>,
 }
 
 impl Executor {
@@ -132,6 +144,7 @@ impl Executor {
             stats_cache,
             pending_trigger_activations: Mutex::new(HashSet::new()),
             pending_async_triggers: Mutex::new(Vec::new()),
+            pending_hnsw_merges: Mutex::new(Vec::new()),
         }
     }
 
@@ -203,6 +216,13 @@ impl Executor {
             .push(trigger);
     }
 
+    pub(crate) fn push_pending_hnsw_merge(&self, merge: PendingHnswMerge) {
+        self.pending_hnsw_merges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(merge);
+    }
+
     pub(crate) fn flush_trigger_activations(&self) {
         let triggers: Vec<PendingAsyncTrigger> = self
             .pending_async_triggers
@@ -251,12 +271,99 @@ impl Executor {
                     }
                     crate::worker::wake_worker();
                 });
+            } else {
+                tracing::warn!(
+                    "Dropping {} async trigger activation(s): worker subsystem is disabled. \
+                     These triggers will not fire.",
+                    triggers.len()
+                );
             }
         }
         self.pending_trigger_activations
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+
+    /// Flush accumulated HNSW merge requests after successful commit.
+    /// Deduplicates by (table_id, index_id), enqueues a worker task via
+    /// `put_worker_queue_entry` with a constant `fire_time_ms=0` so that
+    /// repeated enqueues for the same index produce the same queue key
+    /// (true idempotent overwrite). Best-effort: errors are logged and ignored.
+    pub(crate) fn flush_pending_hnsw_merges(&self) {
+        let merges: Vec<PendingHnswMerge> = self
+            .pending_hnsw_merges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        if merges.is_empty() {
+            return;
+        }
+
+        // Deduplicate by (keyspace, db_id, table_id, index_id).
+        let mut seen = std::collections::HashSet::new();
+        let unique_merges: Vec<_> = merges
+            .into_iter()
+            .filter(|m| seen.insert((m.keyspace.clone(), m.db_id, m.table_id, m.index_id)))
+            .collect();
+
+        if let Some(system_store) = crate::worker::get_system_store() {
+            let system_store = system_store.clone();
+            tokio::spawn(async move {
+                for merge in unique_merges {
+                    let task_id = match crate::sql::hnsw::storage::hnsw_merge_task_id(
+                        merge.table_id,
+                        merge.index_id,
+                    ) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            tracing::debug!("HNSW merge task_id overflow: {}", e);
+                            continue;
+                        }
+                    };
+                    let result: Result<(), anyhow::Error> = async {
+                        // Use fire_time_ms=0 so the queue key is deterministic for the
+                        // same (priority, task_type, keyspace, db_id, task_id).  Repeated
+                        // puts overwrite the same key — true idempotent dedup.
+                        // fire_time=0 is always <= now, so the task is immediately "due".
+                        let fire_time_ms = 0i64;
+                        let mut entry = crate::worker::types::TaskQueueEntry::new(
+                            merge.keyspace.clone(),
+                            merge.db_id,
+                            task_id,
+                            crate::worker::types::TaskType::HnswMerge,
+                            format!("__hnsw_merge {} {}", merge.table_id, merge.index_id),
+                            "system".to_string(),
+                            192, // Lower priority than BgDdl/AutoAnalyze=128
+                        );
+                        // Guarantee non-zero nonce so CAS delete can distinguish
+                        // fresh entries from legacy entries with default nonce=0.
+                        entry.nonce = rand::thread_rng().gen_range(1..=u64::MAX);
+                        let mut txn = system_store.begin().await?;
+                        system_store
+                            .put_worker_queue_entry(&mut txn, &entry, fire_time_ms)
+                            .await?;
+                        system_store
+                            .update_registry_task_types(
+                                &mut txn,
+                                &merge.keyspace,
+                                merge.db_id,
+                                crate::worker::types::TASK_TYPE_HNSW_MERGE,
+                                0,
+                            )
+                            .await?;
+                        txn.commit().await?;
+                        crate::worker::wake_worker();
+                        Ok(())
+                    }
+                    .await;
+                    if let Err(e) = result {
+                        tracing::debug!("HNSW merge enqueue failed (best-effort): {}", e);
+                    }
+                }
+            });
+        }
     }
 
     /// Discard pending activations without notifying trigger workers.
@@ -268,6 +375,10 @@ impl Executor {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.pending_async_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.pending_hnsw_merges
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();

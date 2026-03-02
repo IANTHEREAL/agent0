@@ -483,3 +483,59 @@ fn test_flush_trigger_activations_clears_buffers_even_without_system_store() {
         0
     );
 }
+
+#[test]
+fn test_hnsw_merge_task_id_is_stable_and_unique_for_common_pairs() {
+    use crate::sql::hnsw::storage::hnsw_merge_task_id;
+    let a = hnsw_merge_task_id(1, 1).unwrap();
+    let b = hnsw_merge_task_id(1, 2).unwrap();
+    let c = hnsw_merge_task_id(2, 1).unwrap();
+    let d = hnsw_merge_task_id(2, 2).unwrap();
+
+    assert_ne!(a, b);
+    assert_ne!(a, c);
+    assert_ne!(a, d);
+    assert_ne!(b, c);
+    assert_ne!(b, d);
+    assert_ne!(c, d);
+
+    // Deterministic encoding: same pair must always produce same task_id.
+    assert_eq!(a, hnsw_merge_task_id(1, 1).unwrap());
+    assert_eq!(d, hnsw_merge_task_id(2, 2).unwrap());
+}
+
+#[test]
+fn test_flush_pending_hnsw_merges_clears_buffer_without_system_store() {
+    let store = crate::storage::TikvStore::new_stub();
+    let keyspace = "core_tests_hnsw_merge_flush".to_string();
+    let observability = crate::observability::registry().tenant(&keyspace);
+    let trigger_cache = std::sync::Arc::new(crate::sql::triggers::TriggerBodyCache::new());
+    let stats_cache = std::sync::Arc::new(crate::sql::stats::TableStatsCache::new());
+    let executor = super::Executor::new(
+        store,
+        keyspace.clone(),
+        observability,
+        crate::pool::TenantMemoryAccountant::unlimited("core_tests".to_string()),
+        trigger_cache,
+        stats_cache,
+    );
+
+    executor.push_pending_hnsw_merge(super::PendingHnswMerge {
+        keyspace: keyspace.clone(),
+        db_id: 1,
+        table_id: 42,
+        index_id: 7,
+    });
+    executor.push_pending_hnsw_merge(super::PendingHnswMerge {
+        keyspace,
+        db_id: 1,
+        table_id: 42,
+        index_id: 8,
+    });
+    assert_eq!(executor.pending_hnsw_merges.lock().unwrap().len(), 2);
+
+    // Even if system_store is unavailable in unit-test env, flush must
+    // drain the pending buffer to avoid stale accumulation.
+    executor.flush_pending_hnsw_merges();
+    assert_eq!(executor.pending_hnsw_merges.lock().unwrap().len(), 0);
+}

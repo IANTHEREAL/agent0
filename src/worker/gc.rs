@@ -3,6 +3,7 @@ use crate::cron::worker::gc_database;
 use crate::pool::TikvClientPool;
 use crate::storage::TikvStore;
 use crate::worker::config::WorkerConfig;
+use crate::worker::metrics::WorkerMetrics;
 use crate::worker::now_epoch_ms;
 use anyhow::Result;
 use std::future::Future;
@@ -14,6 +15,7 @@ pub struct WorkerGc {
     system_store: Arc<TikvStore>,
     pool: Arc<TikvClientPool>,
     config: WorkerConfig,
+    metrics: Arc<WorkerMetrics>,
 }
 
 struct ClaimGcBatch {
@@ -27,22 +29,33 @@ impl WorkerGc {
         system_store: Arc<TikvStore>,
         pool: Arc<TikvClientPool>,
         config: WorkerConfig,
+        metrics: Arc<WorkerMetrics>,
     ) -> Self {
         Self {
             system_store,
             pool,
             config,
+            metrics,
         }
     }
 
-    /// Main GC loop — runs on a separate interval from the engine tick.
-    /// GC interval is 10 minutes (hardcoded, not configurable).
-    pub async fn run(&self) {
-        // Add random jitter (0-60s) to avoid thundering herd across workers
+    /// Start two independent timer loops:
+    /// - GC tick (orphan claims + cron cleanup): `DB9_WORKER_GC_INTERVAL_SEC` (default 600s)
+    /// - HNSW delta sweep: `DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC` (default 600s)
+    ///
+    /// Each runs in its own spawned task so a long HNSW sweep cannot delay
+    /// orphan/cron GC (and vice versa).
+    pub fn spawn(self: Arc<Self>) {
+        let gc_self = self.clone();
+        tokio::spawn(async move { gc_self.run_gc_loop().await });
+        tokio::spawn(async move { self.run_hnsw_sweep_loop().await });
+    }
+
+    async fn run_gc_loop(&self) {
         let jitter = rand_jitter_secs(60);
         tokio::time::sleep(Duration::from_secs(jitter)).await;
 
-        let mut interval = tokio::time::interval(Duration::from_secs(600));
+        let mut interval = tokio::time::interval(Duration::from_secs(self.config.gc_interval_sec));
         loop {
             interval.tick().await;
             if let Err(e) = self.gc_tick().await {
@@ -51,9 +64,81 @@ impl WorkerGc {
         }
     }
 
+    async fn run_hnsw_sweep_loop(&self) {
+        let jitter = rand_jitter_secs(60);
+        tokio::time::sleep(Duration::from_secs(jitter)).await;
+
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(self.config.hnsw_sweep_interval_sec));
+        loop {
+            interval.tick().await;
+            if let Err(e) = self.sweep_hnsw_delta_backlogs().await {
+                warn!("HNSW sweep error: {}", e);
+            }
+        }
+    }
+
     async fn gc_tick(&self) -> Result<()> {
         self.cleanup_orphan_claims().await?;
         self.cleanup_cron_runs().await?;
+        Ok(())
+    }
+
+    /// Periodic sweep: discover HNSW indexes with pending deltas and enqueue
+    /// merge tasks. Uses the same shared helper as startup reconciliation.
+    /// Configurable via `DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC` (default 600s).
+    async fn sweep_hnsw_delta_backlogs(&self) -> Result<()> {
+        let mut txn = self.system_store.begin().await?;
+        let all_entries = self.system_store.list_worker_registry(&mut txn).await?;
+        txn.commit().await?;
+
+        let mut total_observed = 0u32;
+        let mut total_enqueued = 0u32;
+        let mut total_enqueue_errors = 0u32;
+        // Iterate ALL registry entries — discovery does NOT depend on any
+        // task-type bit. The shared helper inspects schemas + probes deltas.
+        for entry in &all_entries {
+            match crate::worker::engine::enqueue_pending_hnsw_merges(
+                &self.system_store,
+                &self.pool,
+                &entry.keyspace,
+                entry.db_id,
+            )
+            .await
+            {
+                Ok(r) => {
+                    total_observed += r.observed;
+                    total_enqueued += r.enqueued;
+                    total_enqueue_errors += r.enqueue_errors;
+                }
+                Err(e) => warn!(
+                    "HNSW sweep error for keyspace={} db_id={}: {}",
+                    entry.keyspace, entry.db_id, e
+                ),
+            }
+        }
+        // Gauge: overwrite with total observed across all DBs this sweep.
+        self.metrics
+            .hnsw_pending_indexes_observed
+            .store(total_observed as u64, std::sync::atomic::Ordering::Relaxed);
+        // Counters: cumulative fetch_add.
+        if total_enqueued > 0 {
+            self.metrics
+                .hnsw_sweep_enqueued
+                .fetch_add(total_enqueued as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        if total_enqueue_errors > 0 {
+            self.metrics.hnsw_sweep_enqueue_errors.fetch_add(
+                total_enqueue_errors as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        if total_observed > 0 {
+            info!(
+                total_observed,
+                total_enqueued, total_enqueue_errors, "HNSW periodic sweep complete"
+            );
+        }
         Ok(())
     }
 

@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use super::{ExecutionContext, PhysicalOperator};
 use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
-use crate::sql::hnsw::storage::load_hnsw_graph_from_txn;
+use crate::sql::hnsw::storage::load_hnsw_graph_with_deltas;
 use crate::sql::hnsw::{vec_f64_to_f32, HnswIndexHandle};
 use crate::sql::projection::fill_row_defaults;
 
@@ -155,15 +155,21 @@ impl PhysicalOperator for HnswScanOperator {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(40);
 
-        // Load graph from the session transaction so that read-your-writes
-        // holds: vectors written by prior INSERT/UPDATE in the same txn are
-        // visible to this scan (txn.get checks the local write buffer first).
-        let Some((hnsw_index, _meta)) =
-            load_hnsw_graph_from_txn(ctx.txn, ctx.db_id, self.schema.table_id, self.index_id)
+        // Load base graph + apply pending deltas so read-your-writes holds:
+        // delta keys written by prior INSERT/UPDATE in the same txn are
+        // visible via txn.scan's buffer merge.
+        let Some((hnsw_index, _meta, delta_count)) =
+            load_hnsw_graph_with_deltas(ctx.txn, ctx.db_id, self.schema.table_id, self.index_id)
                 .await?
         else {
             return Ok(());
         };
+        if delta_count > 0 {
+            if let Some(m) = crate::worker::get_worker_metrics() {
+                m.hnsw_scan_deltas_applied
+                    .fetch_add(delta_count as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
 
         // Resolve the indexed vector column so we can filter out NULL-vector
         // rows (stale graph entries from UPDATE SET col = NULL).

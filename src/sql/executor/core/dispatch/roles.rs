@@ -60,6 +60,7 @@ impl Executor {
                     if result.is_ok() {
                         session.commit().await?;
                         self.flush_trigger_activations();
+                        self.flush_pending_hnsw_merges();
                     } else {
                         session.rollback().await?;
                         self.clear_trigger_activations();

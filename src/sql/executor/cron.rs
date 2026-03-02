@@ -95,6 +95,12 @@ async fn execute_schedule(
     if !installed.enabled {
         return Err(anyhow!("extension pg_cron is disabled"));
     }
+    if get_system_store().is_none() {
+        return Err(anyhow!(
+            "cron.schedule requires the worker subsystem (DB9_WORKER_ENABLED=false). \
+             Cron jobs cannot execute without the worker engine."
+        ));
+    }
 
     let (jobname, schedule, command) = match args.len() {
         2 => {
@@ -129,7 +135,7 @@ async fn execute_schedule(
             existing_job.username = current_user.to_string();
             existing_job.active = true;
             store.put_cron_job(txn, db_id, &existing_job).await?;
-            enqueue_cron_to_worker(keyspace, db_id, &existing_job).await;
+            enqueue_cron_to_worker(keyspace, db_id, &existing_job).await?;
             return Ok(Value::Int64(existing_job.job_id));
         }
     }
@@ -148,7 +154,7 @@ async fn execute_schedule(
         max_runtime_ms: None,
     };
     store.put_cron_job(txn, db_id, &job).await?;
-    enqueue_cron_to_worker(keyspace, db_id, &job).await;
+    enqueue_cron_to_worker(keyspace, db_id, &job).await?;
     Ok(Value::Int64(job_id))
 }
 
@@ -225,6 +231,12 @@ async fn execute_alter_job(
     };
     if !installed.enabled {
         return Err(anyhow!("extension pg_cron is disabled"));
+    }
+    if get_system_store().is_none() {
+        return Err(anyhow!(
+            "cron.alter_job requires the worker subsystem (DB9_WORKER_ENABLED=false). \
+             Cron jobs cannot execute without the worker engine."
+        ));
     }
 
     if args.is_empty() || args.len() > 7 {
@@ -317,7 +329,7 @@ async fn execute_alter_job(
     }
 
     store.put_cron_job(txn, db_id, &job).await?;
-    enqueue_cron_to_worker(keyspace, db_id, &job).await;
+    enqueue_cron_to_worker(keyspace, db_id, &job).await?;
     Ok(Value::Null)
 }
 
@@ -329,15 +341,11 @@ fn compute_cron_next_fire(schedule: &str) -> Result<i64> {
     Ok(next.timestamp_millis())
 }
 
-async fn enqueue_cron_to_worker(keyspace: &str, db_id: u64, job: &CronJob) {
-    let Some(system_store) = get_system_store() else {
-        return;
-    };
+async fn enqueue_cron_to_worker(keyspace: &str, db_id: u64, job: &CronJob) -> Result<()> {
+    let system_store = get_system_store()
+        .ok_or_else(|| anyhow!("worker subsystem is disabled; cannot enqueue cron job"))?;
 
-    let next_fire = match compute_cron_next_fire(&job.schedule) {
-        Ok(t) => t,
-        Err(_) => return,
-    };
+    let next_fire = compute_cron_next_fire(&job.schedule)?;
 
     let entry = TaskQueueEntry::new(
         keyspace.to_string(),
@@ -371,11 +379,9 @@ async fn enqueue_cron_to_worker(keyspace: &str, db_id: u64, job: &CronJob) {
     }
     .await;
 
-    if let Err(e) = result {
-        tracing::warn!("Failed to enqueue cron job to worker queue: {}", e);
-    } else {
-        crate::worker::wake_worker();
-    }
+    result?;
+    crate::worker::wake_worker();
+    Ok(())
 }
 
 async fn dequeue_cron_from_worker(keyspace: &str, db_id: u64, job_id: i64) {

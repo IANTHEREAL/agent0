@@ -12,6 +12,7 @@ pub struct WorkerMetrics {
     pub auto_analyze_executed_ok: AtomicU64,
     pub bg_ddl_executed_ok: AtomicU64,
     pub bg_sql_executed_ok: AtomicU64,
+    pub hnsw_merge_executed_ok: AtomicU64,
 
     /// Tasks executed with errors (by type)
     pub tasks_executed_err: AtomicU64,
@@ -20,6 +21,7 @@ pub struct WorkerMetrics {
     pub auto_analyze_executed_err: AtomicU64,
     pub bg_ddl_executed_err: AtomicU64,
     pub bg_sql_executed_err: AtomicU64,
+    pub hnsw_merge_executed_err: AtomicU64,
 
     /// Claim attempts and successes
     pub claim_attempts: AtomicU64,
@@ -28,6 +30,19 @@ pub struct WorkerMetrics {
     /// Gauges (sampled on each tick)
     pub last_tick_queue_depth: AtomicU64,
     pub last_tick_active_jobs: AtomicU64,
+
+    /// Gauge: number of HNSW indexes with pending deltas, sampled per sweep.
+    /// Updated via store() (overwrite), NOT fetch_add.
+    pub hnsw_pending_indexes_observed: AtomicU64,
+
+    /// Counter: cumulative merge tasks successfully enqueued by sweeper.
+    pub hnsw_sweep_enqueued: AtomicU64,
+
+    /// Counter: cumulative deltas applied during query-time HNSW scans.
+    pub hnsw_scan_deltas_applied: AtomicU64,
+
+    /// Counter: cumulative sweeper enqueue failures (system store write errors).
+    pub hnsw_sweep_enqueue_errors: AtomicU64,
 }
 
 impl WorkerMetrics {
@@ -40,6 +55,7 @@ impl WorkerMetrics {
             auto_analyze_executed_ok: AtomicU64::new(0),
             bg_ddl_executed_ok: AtomicU64::new(0),
             bg_sql_executed_ok: AtomicU64::new(0),
+            hnsw_merge_executed_ok: AtomicU64::new(0),
 
             tasks_executed_err: AtomicU64::new(0),
             cron_executed_err: AtomicU64::new(0),
@@ -47,12 +63,18 @@ impl WorkerMetrics {
             auto_analyze_executed_err: AtomicU64::new(0),
             bg_ddl_executed_err: AtomicU64::new(0),
             bg_sql_executed_err: AtomicU64::new(0),
+            hnsw_merge_executed_err: AtomicU64::new(0),
 
             claim_attempts: AtomicU64::new(0),
             claim_successes: AtomicU64::new(0),
 
             last_tick_queue_depth: AtomicU64::new(0),
             last_tick_active_jobs: AtomicU64::new(0),
+
+            hnsw_pending_indexes_observed: AtomicU64::new(0),
+            hnsw_sweep_enqueued: AtomicU64::new(0),
+            hnsw_scan_deltas_applied: AtomicU64::new(0),
+            hnsw_sweep_enqueue_errors: AtomicU64::new(0),
         }
     }
 
@@ -70,6 +92,7 @@ impl WorkerMetrics {
                     .fetch_add(1, Ordering::Relaxed),
                 TaskType::BgDdl => self.bg_ddl_executed_ok.fetch_add(1, Ordering::Relaxed),
                 TaskType::BgSql => self.bg_sql_executed_ok.fetch_add(1, Ordering::Relaxed),
+                TaskType::HnswMerge => self.hnsw_merge_executed_ok.fetch_add(1, Ordering::Relaxed),
             };
         } else {
             self.tasks_executed_err.fetch_add(1, Ordering::Relaxed);
@@ -83,6 +106,7 @@ impl WorkerMetrics {
                     .fetch_add(1, Ordering::Relaxed),
                 TaskType::BgDdl => self.bg_ddl_executed_err.fetch_add(1, Ordering::Relaxed),
                 TaskType::BgSql => self.bg_sql_executed_err.fetch_add(1, Ordering::Relaxed),
+                TaskType::HnswMerge => self.hnsw_merge_executed_err.fetch_add(1, Ordering::Relaxed),
             };
         }
     }
@@ -121,6 +145,10 @@ mod tests {
         assert_eq!(m.tasks_executed_err.load(Ordering::Relaxed), 0);
         assert_eq!(m.claim_attempts.load(Ordering::Relaxed), 0);
         assert_eq!(m.claim_successes.load(Ordering::Relaxed), 0);
+        assert_eq!(m.hnsw_pending_indexes_observed.load(Ordering::Relaxed), 0);
+        assert_eq!(m.hnsw_sweep_enqueued.load(Ordering::Relaxed), 0);
+        assert_eq!(m.hnsw_scan_deltas_applied.load(Ordering::Relaxed), 0);
+        assert_eq!(m.hnsw_sweep_enqueue_errors.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -157,5 +185,24 @@ mod tests {
         m.sample_tick(42, 5);
         assert_eq!(m.last_tick_queue_depth.load(Ordering::Relaxed), 42);
         assert_eq!(m.last_tick_active_jobs.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn test_hnsw_sweep_metrics_gauge_and_counter_semantics() {
+        let m = WorkerMetrics::new();
+
+        // Gauge semantics: overwrite on each sweep sample.
+        m.hnsw_pending_indexes_observed.store(7, Ordering::Relaxed);
+        m.hnsw_pending_indexes_observed.store(2, Ordering::Relaxed);
+        assert_eq!(m.hnsw_pending_indexes_observed.load(Ordering::Relaxed), 2);
+
+        // Counter semantics: cumulative across sweeps.
+        m.hnsw_sweep_enqueued.fetch_add(3, Ordering::Relaxed);
+        m.hnsw_sweep_enqueued.fetch_add(5, Ordering::Relaxed);
+        assert_eq!(m.hnsw_sweep_enqueued.load(Ordering::Relaxed), 8);
+
+        m.hnsw_sweep_enqueue_errors.fetch_add(1, Ordering::Relaxed);
+        m.hnsw_sweep_enqueue_errors.fetch_add(2, Ordering::Relaxed);
+        assert_eq!(m.hnsw_sweep_enqueue_errors.load(Ordering::Relaxed), 3);
     }
 }

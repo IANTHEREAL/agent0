@@ -9,18 +9,14 @@ use tikv_client::Transaction;
 use crate::model::{DataType, IndexDef, Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::gin::extract_gin_token_hashes_from_row;
-use crate::sql::hnsw::storage::{
-    create_empty_hnsw_index, hnsw_graph_key, hnsw_meta_key, load_hnsw_graph_from_txn,
-    serialize_hnsw_snapshot,
-};
+use crate::sql::hnsw::hnsw_pk_label;
+use crate::sql::hnsw::storage::{hnsw_meta_key, write_hnsw_deltas};
 use crate::sql::hnsw::vec_f64_to_f32;
-use crate::sql::hnsw::{hnsw_pk_label, HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_DEFAULT_M};
 use crate::sql::index_consistency::{
     is_unique_duplicate_error, resolve_unique_index_conflict, UniqueConflictResolution,
 };
 use crate::sql::index_helpers;
 use crate::storage::TikvStore;
-use crate::txn::txn_put;
 use crate::worker::types::IndexState;
 
 use super::defaults::coerce_row_values;
@@ -159,83 +155,27 @@ async fn maintain_hnsw_indexes_after_insert(
             }
         };
         let vector_f32 = vec_f64_to_f32(vector_f64);
-        let vector_dimensions = match schema.columns.get(vector_col_idx).map(|c| &c.data_type) {
-            Some(DataType::Vector(dim)) => usize::try_from(*dim).map_err(|_| {
-                anyhow!(
-                    "HNSW index '{}' vector dimension {} exceeds platform limits",
-                    index.name,
-                    dim
-                )
-            })?,
-            _ => {
+
+        // Validate storage version (only v1 delta-log supported).
+        let meta_key = hnsw_meta_key(db_id, schema.table_id, index.id);
+        let meta_bytes_opt = txn.get(meta_key.clone()).await.map_err(|e| anyhow!(e))?;
+        if let Some(meta_bytes) = meta_bytes_opt {
+            let meta: crate::sql::hnsw::HnswMeta =
+                serde_json::from_slice(&meta_bytes).map_err(|e| anyhow!(e))?;
+            if meta.storage_version != 1 {
                 return Err(anyhow!(
-                    "HNSW index '{}' column '{}' is not a vector type",
+                    "HNSW index '{}' has unsupported storage_version={}; please rebuild",
                     index.name,
-                    vector_col_name
-                ))
+                    meta.storage_version
+                ));
             }
-        };
-
-        // Load graph from the current DML transaction so that multi-row
-        // INSERTs accumulate: row N+1 sees row N's graph write via the
-        // txn's local buffer (txn.get checks buffer before TiKV).
-        let (hnsw_index, mut meta) =
-            match load_hnsw_graph_from_txn(txn, db_id, schema.table_id, index.id).await? {
-                Some(existing) => existing,
-                None => {
-                    let distance_metric = index.hnsw_distance_metric.as_deref().unwrap_or("l2");
-                    let m = usize::from(index.hnsw_m.unwrap_or(HNSW_DEFAULT_M as u16));
-                    let ef_construction = usize::from(
-                        index
-                            .hnsw_ef_construction
-                            .unwrap_or(HNSW_DEFAULT_EF_CONSTRUCTION as u16),
-                    );
-                    create_empty_hnsw_index(vector_dimensions, distance_metric, m, ef_construction)
-                        .map_err(|e| {
-                            anyhow!(
-                                "failed to initialize HNSW graph for index '{}': {}",
-                                index.name,
-                                e
-                            )
-                        })?
-                }
-            };
-
-        // Sync meta.capacity with actual usearch capacity after load.
-        // usearch save() serializes only used vectors; load() restores
-        // with tight capacity = count. The Rust-side meta.capacity may
-        // be stale (larger) from a previous reserve() call.
-        meta.capacity = hnsw_index.capacity() as u64;
-
-        if meta.count >= (meta.capacity.saturating_mul(80) / 100) {
-            let next_capacity = meta.capacity.saturating_mul(2).max(1);
-            hnsw_index
-                .reserve(next_capacity as usize)
-                .map_err(|e| anyhow!("failed to grow HNSW capacity: {}", e))?;
-            meta.capacity = next_capacity;
         }
 
-        hnsw_index
-            .add(pk_label, &vector_f32)
-            .map_err(|e| anyhow!("failed to add vector to HNSW index: {}", e))?;
-        meta.count = hnsw_index.size() as u64;
-
-        let (graph_bytes, meta_bytes) =
-            serialize_hnsw_snapshot(db_id, schema.table_id, index.id, &hnsw_index, &meta)
-                .map_err(|e| anyhow!("failed to persist HNSW graph '{}': {}", index.name, e))?;
-
-        txn_put(
-            txn,
-            hnsw_graph_key(db_id, schema.table_id, index.id),
-            graph_bytes,
-        )
-        .await?;
-        txn_put(
-            txn,
-            hnsw_meta_key(db_id, schema.table_id, index.id),
-            meta_bytes,
-        )
-        .await?;
+        // Write single delta entry.
+        let adds = vec![(pk_label, vector_f32)];
+        write_hnsw_deltas(txn, db_id, schema.table_id, index.id, &adds)
+            .await
+            .map_err(|e| anyhow!("failed to write HNSW delta for '{}': {}", index.name, e))?;
     }
 
     Ok(())

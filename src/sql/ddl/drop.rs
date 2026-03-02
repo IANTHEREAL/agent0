@@ -8,7 +8,7 @@ use tikv_client::Transaction;
 
 use crate::model::{DataType, Row, TableSchema};
 use crate::sql::gin::extract_gin_token_hashes_from_row;
-use crate::sql::hnsw::storage::{hnsw_graph_key, hnsw_meta_key};
+use crate::sql::hnsw::storage::{delete_all_deltas, hnsw_graph_key, hnsw_meta_key};
 use crate::sql::index_helpers;
 use crate::sql::names;
 use crate::sql::projection::fill_row_defaults;
@@ -210,6 +210,9 @@ pub async fn execute_drop_index(
         if index.is_hnsw() {
             txn_delete(txn, hnsw_graph_key(db_id, schema.table_id, index.id)).await?;
             txn_delete(txn, hnsw_meta_key(db_id, schema.table_id, index.id)).await?;
+            // Clean up all delta keys (paginated) to prevent orphan keys
+            // that could be misread by a future index with a recycled index_id.
+            delete_all_deltas(txn, db_id, schema.table_id, index.id).await?;
         }
 
         // Release the reservation key for the dropped index name.

@@ -347,12 +347,23 @@ pub async fn execute_create_index(
         build_predicate_conjunct_cache(new_index.predicate.as_deref());
 
     if concurrently {
+        // CONCURRENTLY requires the worker to process background DDL.
+        // Without it, the index stays in Building state forever.
+        require_worker_for_index(
+            "CONCURRENTLY",
+            &idx_name_str,
+            "Background index builds require the worker engine. \
+             Enable the worker or use CREATE INDEX (without CONCURRENTLY).",
+        )?;
+
         schema.indexes.push(new_index);
         // Bump schema version so plan-cache drift detection catches index changes.
         schema.version += 1;
         store.update_schema(txn, db_id, schema.clone()).await?;
 
-        if let Some(system_store) = crate::worker::get_system_store() {
+        {
+            let system_store = crate::worker::get_system_store()
+                .expect("require_worker_for_index guarantees Some");
             let entry = TaskQueueEntry::new(
                 keyspace.to_string(),
                 db_id,
@@ -373,7 +384,7 @@ pub async fn execute_create_index(
             sys_txn.commit().await?;
             // Wake the worker immediately so CIC does not wait for the poll interval.
             crate::worker::wake_worker();
-        }
+        } // end system_store block
 
         return Ok(ExecuteResult::CreateIndex {
             index_name: idx_name_str,
@@ -385,6 +396,15 @@ pub async fn execute_create_index(
 
     let create_result: Result<()> = async {
         if new_index.is_hnsw() {
+            // HNSW indexes require the worker subsystem for background delta-log
+            // merge. Reject early — before expensive table scan + index build.
+            require_worker_for_index(
+                "HNSW",
+                &idx_name_str,
+                "HNSW indexes require background merge via the worker engine. \
+                 Enable the worker or use a btree index.",
+            )?;
+
             let col_name = new_index
                 .columns
                 .first()
@@ -480,10 +500,35 @@ pub async fn execute_create_index(
                     distance_metric,
                     m,
                     ef_construction,
+                    storage_version: 1, // New indexes use delta-log from the start
                 };
                 serialize_hnsw_snapshot(db_id, schema.table_id, index_id, &index, &meta)
                     .map_err(|e| anyhow!("failed to serialize HNSW index: {}", e))?
             };
+
+            // Register this (keyspace, db_id) in the worker registry so the periodic
+            // HNSW sweeper can discover it. This is FATAL: if registration fails,
+            // CREATE INDEX fails. This guarantees no HNSW index can exist without
+            // a registry entry — closing the crash-orphan discovery gap completely.
+            //
+            // Safety: get_system_store() is guaranteed Some — we checked at the top
+            // of the HNSW branch and returned an error if None.
+            {
+                let system_store = crate::worker::get_system_store()
+                    .expect("worker check at HNSW branch entry guarantees Some");
+                let mut sys_txn = system_store.begin().await?;
+                system_store
+                    .update_registry_task_types(
+                        &mut sys_txn,
+                        keyspace,
+                        db_id,
+                        crate::worker::types::TASK_TYPE_HNSW_MERGE,
+                        0,
+                    )
+                    .await?;
+                sys_txn.commit().await?;
+            }
+
             txn_put(
                 txn,
                 hnsw_graph_key(db_id, schema.table_id, index_id),
@@ -698,6 +743,21 @@ pub async fn execute_create_index(
     Ok(ExecuteResult::CreateIndex {
         index_name: idx_name_str,
     })
+}
+
+/// Gate: reject index creation when worker subsystem is unavailable.
+/// Used by both HNSW (needs background merge) and CONCURRENTLY (needs BgDdl).
+fn require_worker_for_index(feature: &str, index_name: &str, reason: &str) -> Result<()> {
+    if crate::worker::get_system_store().is_none() {
+        return Err(anyhow!(
+            "Cannot create {} index '{}': worker subsystem is disabled \
+             (DB9_WORKER_ENABLED=false). {}",
+            feature,
+            index_name,
+            reason
+        ));
+    }
+    Ok(())
 }
 
 fn parse_hnsw_operator_class(columns: &[OrderByExpr], column_name: &str) -> Result<Option<String>> {
@@ -1415,6 +1475,53 @@ mod tests {
             err.to_string()
                 .contains("unrecognized parameter \"unknown_param\""),
             "unexpected error: {err}"
+        );
+    }
+
+    /// Regression test: require_worker_for_index (used by both HNSW and
+    /// CONCURRENTLY paths) must reject when worker system store is absent.
+    /// In the test environment the global SYSTEM_STORE OnceLock is never set,
+    /// so this exercises the actual production guard function.
+    #[test]
+    fn require_worker_for_index_rejects_when_worker_absent() {
+        // Precondition: system store not initialized in test harness
+        assert!(
+            crate::worker::get_system_store().is_none(),
+            "test expects worker system store to be unset"
+        );
+
+        let err = require_worker_for_index("HNSW", "idx_test", "reason")
+            .expect_err("should reject when worker is absent");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("worker subsystem is disabled"),
+            "error should mention worker disabled, got: {msg}"
+        );
+        assert!(
+            msg.contains("idx_test"),
+            "error should include index name, got: {msg}"
+        );
+        assert!(
+            msg.contains("HNSW"),
+            "error should include feature name, got: {msg}"
+        );
+    }
+
+    /// Regression test: CONCURRENTLY path also requires worker.
+    #[test]
+    fn require_worker_for_index_rejects_concurrently_when_worker_absent() {
+        assert!(crate::worker::get_system_store().is_none());
+
+        let err = require_worker_for_index("CONCURRENTLY", "idx_cic", "needs BgDdl")
+            .expect_err("CONCURRENTLY should reject without worker");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CONCURRENTLY"),
+            "error should include feature, got: {msg}"
+        );
+        assert!(
+            msg.contains("idx_cic"),
+            "error should include index name, got: {msg}"
         );
     }
 

@@ -5,7 +5,7 @@ use super::super::super::trigger_worker;
 use super::super::super::triggers;
 use super::super::super::triggers::queue::TriggerOp;
 use super::super::super::ExecuteResult;
-use super::super::core::Executor;
+use super::super::core::{Executor, PendingHnswMerge};
 use super::{
     build_returning_columns_from_analyzed, build_returning_types_from_analyzed, combine_rows,
     eval_returning_typed, is_default_typed_expr, typed_value_to_bool,
@@ -501,6 +501,14 @@ impl Executor {
                     hnsw_stats.serialize_duration_us,
                 );
             }
+            for &index_id in &hnsw_stats.dirty_index_ids {
+                self.push_pending_hnsw_merge(PendingHnswMerge {
+                    keyspace: self.tenant_keyspace().to_string(),
+                    db_id,
+                    table_id: schema.table_id,
+                    index_id,
+                });
+            }
         }
 
         // Batch HNSW maintenance for ON CONFLICT DO UPDATE rows.
@@ -516,6 +524,14 @@ impl Executor {
                     hnsw_stats.graph_bytes,
                     hnsw_stats.serialize_duration_us,
                 );
+            }
+            for &index_id in &hnsw_stats.dirty_index_ids {
+                self.push_pending_hnsw_merge(PendingHnswMerge {
+                    keyspace: self.tenant_keyspace().to_string(),
+                    db_id,
+                    table_id: schema.table_id,
+                    index_id,
+                });
             }
         }
 

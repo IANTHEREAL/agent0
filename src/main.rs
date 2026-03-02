@@ -225,11 +225,17 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
                         system_store.clone(),
                         client_pool.clone(),
                     );
+                    let metrics = engine.metrics().clone();
+                    worker::set_worker_metrics(metrics.clone());
                     tokio::spawn(async move { engine.run().await });
 
-                    let gc =
-                        worker::gc::WorkerGc::new(system_store, client_pool.clone(), worker_config);
-                    tokio::spawn(async move { gc.run().await });
+                    let gc = Arc::new(worker::gc::WorkerGc::new(
+                        system_store,
+                        client_pool.clone(),
+                        worker_config,
+                        metrics,
+                    ));
+                    gc.spawn();
 
                     info!("WorkerEngine and GC started");
                 }
@@ -237,10 +243,12 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
                     info!("Worker engine disabled");
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to initialize system store: {}. Worker engine not started.",
+                    return Err(anyhow::anyhow!(
+                        "Failed to initialize system store: {}. \
+                         Worker is enabled (DB9_WORKER_ENABLED=true) but cannot start. \
+                         Either fix the system store connection or set DB9_WORKER_ENABLED=false.",
                         e
-                    );
+                    ));
                 }
             }
         }

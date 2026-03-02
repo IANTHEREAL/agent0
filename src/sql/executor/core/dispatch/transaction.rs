@@ -35,6 +35,7 @@ pub(super) async fn check_observability_statement_permission(
             session.commit().await?;
             if tag == "COMMIT" {
                 executor.flush_trigger_activations();
+                executor.flush_pending_hnsw_merges();
             } else {
                 executor.clear_trigger_activations();
             }
@@ -305,6 +306,7 @@ impl Executor {
                         } else {
                             session.commit().await?;
                             self.flush_trigger_activations();
+                            self.flush_pending_hnsw_merges();
                         }
                         let mut stmt_results = notices;
                         stmt_results.push(result);

@@ -385,9 +385,14 @@ impl Executor {
             .get_schema(txn, db_id, &tbl_name)
             .await?
             .ok_or_else(|| SqlError::RelationNotFound(tbl_name.clone()))?;
-        let needs_backfill = using
-            .map(|u| u.value.eq_ignore_ascii_case("btree") || u.value.eq_ignore_ascii_case("gin"))
-            .unwrap_or(true);
+        // CONCURRENTLY delegates backfill to the BgDdl worker — skip the
+        // pre-scan so we reach the worker gate without unnecessary I/O.
+        let needs_backfill = !concurrently
+            && using
+                .map(|u| {
+                    u.value.eq_ignore_ascii_case("btree") || u.value.eq_ignore_ascii_case("gin")
+                })
+                .unwrap_or(true);
         let rows = if needs_backfill {
             self.scan_and_fill(txn, db_id, &tbl_name, &schema).await?
         } else {

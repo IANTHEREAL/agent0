@@ -371,6 +371,7 @@ impl Executor {
                         } else {
                             session.commit().await?;
                             self.flush_trigger_activations();
+                            self.flush_pending_hnsw_merges();
                         }
                         return Ok(ExecuteResults::single(result));
                     }
@@ -880,6 +881,7 @@ impl Executor {
                 if is_autocommit {
                     session.commit().await?;
                     self.flush_trigger_activations();
+                    self.flush_pending_hnsw_merges();
                 }
                 analysis
             }

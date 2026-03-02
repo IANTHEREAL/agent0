@@ -285,8 +285,16 @@ impl Executor {
                 })?;
                 let view_full_name = resolved.full;
 
+                // CONCURRENTLY requires the worker to process BgDdl.
+                let system_store = crate::worker::get_system_store().ok_or_else(|| {
+                    anyhow!(
+                        "Cannot REFRESH MATERIALIZED VIEW CONCURRENTLY: worker subsystem is \
+                         disabled (DB9_WORKER_ENABLED=false). Background refresh requires the \
+                         worker engine. Enable the worker or use REFRESH without CONCURRENTLY."
+                    )
+                })?;
                 // Enqueue BgDdl task
-                if let Some(system_store) = crate::worker::get_system_store() {
+                {
                     let keyspace = self.tenant_keyspace().to_string();
                     let username = session
                         .current_user()

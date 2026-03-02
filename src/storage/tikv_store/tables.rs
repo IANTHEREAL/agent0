@@ -1,6 +1,6 @@
 use super::*;
 use crate::sql::error::SqlError;
-use crate::sql::hnsw::storage::{hnsw_graph_key, hnsw_meta_key};
+use crate::sql::hnsw::storage::{delete_all_deltas, hnsw_graph_key, hnsw_meta_key};
 use crate::storage::backpressure::tikv_op;
 
 fn is_row_lock_conflict(err: &tikv_client::Error) -> bool {
@@ -302,11 +302,12 @@ impl TikvStore {
                     .await?;
             }
 
-            // HNSW graph/meta are outside the generic index key range.
+            // HNSW graph/meta/deltas are outside the generic index key range.
             for index in &schema.indexes {
                 if index.is_hnsw() {
                     txn_delete(txn, hnsw_graph_key(db_id, schema.table_id, index.id)).await?;
                     txn_delete(txn, hnsw_meta_key(db_id, schema.table_id, index.id)).await?;
+                    delete_all_deltas(txn, db_id, schema.table_id, index.id).await?;
                 }
             }
 
@@ -775,11 +776,12 @@ impl TikvStore {
             }
 
             // Keep TRUNCATE semantics consistent across index methods: HNSW
-            // graph/meta are stored outside the generic index keyspace.
+            // graph/meta/deltas are stored outside the generic index keyspace.
             for index in &schema.indexes {
                 if index.is_hnsw() {
                     txn_delete(txn, hnsw_graph_key(db_id, schema.table_id, index.id)).await?;
                     txn_delete(txn, hnsw_meta_key(db_id, schema.table_id, index.id)).await?;
+                    delete_all_deltas(txn, db_id, schema.table_id, index.id).await?;
                 }
             }
             info!("Truncated table '{}'", table_name);

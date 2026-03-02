@@ -514,6 +514,7 @@ impl Executor {
                 Ok(candidates) => match session.commit().await {
                     Ok(_) => {
                         self.flush_trigger_activations();
+                        self.flush_pending_hnsw_merges();
                         return Ok(candidates);
                     }
                     Err(err) => {
@@ -585,6 +586,7 @@ impl Executor {
                     match session.commit().await {
                         Ok(_) => {
                             self.flush_trigger_activations();
+                            self.flush_pending_hnsw_merges();
                             self.stats_cache()
                                 .update_full_stats(db_id, table_id, Arc::new(stats));
                             self.stats_cache().reset_mod_count(db_id, table_id);
@@ -665,6 +667,7 @@ impl Executor {
             if result.is_ok() {
                 session.commit().await?;
                 self.flush_trigger_activations();
+                self.flush_pending_hnsw_merges();
             } else {
                 session.rollback().await?;
                 self.clear_trigger_activations();

@@ -157,7 +157,7 @@ impl TikvStore {
                 if !key.starts_with(&start) {
                     continue;
                 }
-                let entry: TaskQueueEntry = bincode::deserialize(pair.value())
+                let entry = TaskQueueEntry::deserialize_compat(pair.value())
                     .context("Failed to deserialize worker queue entry")?;
                 results.push((key.to_vec(), entry));
             }
@@ -190,7 +190,7 @@ impl TikvStore {
             if !key.starts_with(&prefix) {
                 continue;
             }
-            let entry: TaskQueueEntry = bincode::deserialize(pair.value())
+            let entry = TaskQueueEntry::deserialize_compat(pair.value())
                 .context("Failed to deserialize worker queue entry")?;
             if entry.keyspace == keyspace
                 && entry.db_id == db_id
@@ -223,7 +223,7 @@ impl TikvStore {
             if !key.starts_with(&prefix) {
                 continue;
             }
-            let entry: TaskQueueEntry = bincode::deserialize(pair.value())
+            let entry = TaskQueueEntry::deserialize_compat(pair.value())
                 .context("Failed to deserialize worker queue entry")?;
             if entry.keyspace == keyspace
                 && entry.db_id == db_id

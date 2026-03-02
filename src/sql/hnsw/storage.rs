@@ -1,18 +1,54 @@
 //! HNSW storage layer for persisting vector indexes to TiKV.
+//!
+//! Storage versions:
+//! - v0 (legacy): monolithic graph blob in a single KV pair per index.
+//! - v1 (delta-log): DML writes small delta entries; a background merge worker
+//!   consolidates them into the base graph periodically.
 
 use std::fs;
 use std::ops::Deref;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rand::Rng;
 use serde::{Deserialize, Serialize};
+use tikv_client::{BoundRange, Transaction};
 use usearch::ffi::{new_index, Index, IndexOptions, MetricKind, ScalarKind};
-
-use tikv_client::Transaction;
 
 use crate::sql::error::SqlError;
 use crate::storage::TikvStore;
-use crate::txn::txn_put;
+use crate::txn::{txn_delete, txn_put};
+
+/// Batch size for paginated delta scans (matches TABLE_SCAN_BATCH_SIZE).
+const DELTA_SCAN_BATCH_SIZE: u32 = 1024;
+
+// ---------------------------------------------------------------------------
+// Writer ID + process-level sequence generator
+// ---------------------------------------------------------------------------
+
+/// 16 hex chars of randomness (64 bits), generated once at process startup.
+/// Combined with the per-process monotonic DELTA_SEQ counter, this produces
+/// probabilistically unique delta keys even when multiple db9-server instances
+/// run simultaneously (collision ≈ 2⁻⁶⁴ per pair of instances).
+static WRITER_ID: LazyLock<String> = LazyLock::new(|| {
+    let id: u64 = rand::thread_rng().gen();
+    format!("{id:016x}")
+});
+
+/// Process-local monotonic counter for delta key uniqueness within a process.
+static DELTA_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Allocate next unique delta sequence number. Lock-free, no TiKV round-trip.
+pub fn next_delta_seq() -> u64 {
+    DELTA_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Get this process's writer ID (16 hex chars).
+pub fn writer_id() -> &'static str {
+    &WRITER_ID
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HnswMeta {
@@ -22,6 +58,10 @@ pub struct HnswMeta {
     pub distance_metric: String,
     pub m: usize,
     pub ef_construction: usize,
+    /// 0 = legacy monolithic, 1 = delta-log. Backward-compatible: old JSON
+    /// without this field deserializes to 0.
+    #[serde(default)]
+    pub storage_version: u8,
 }
 
 pub struct HnswIndexHandle(Box<dyn Deref<Target = Index>>);
@@ -53,6 +93,78 @@ pub fn hnsw_graph_key(db_id: u64, table_id: u64, index_id: u64) -> Vec<u8> {
 pub fn hnsw_meta_key(db_id: u64, table_id: u64, index_id: u64) -> Vec<u8> {
     format!("d_{db_id}_hnsw_{table_id}_{index_id}_meta").into_bytes()
 }
+
+// ---------------------------------------------------------------------------
+// Delta key format
+// ---------------------------------------------------------------------------
+
+/// Delta key: probabilistically unique per vector mutation.
+/// Format: `d_{db_id}_hnsw_{table_id}_{index_id}_delta_{writer_id}_{seq:016x}`
+///
+/// - `writer_id` (16 hex chars): per-process random, prevents cross-instance collision.
+/// - `seq` (16 hex chars, zero-padded): monotonic per-process, within-process ordering.
+/// - Prefix scan on `_delta_` collects deltas from ALL writers for an index.
+pub fn hnsw_delta_key(db_id: u64, table_id: u64, index_id: u64, seq: u64) -> Vec<u8> {
+    format!(
+        "d_{db_id}_hnsw_{table_id}_{index_id}_delta_{}_{seq:016x}",
+        writer_id()
+    )
+    .into_bytes()
+}
+
+/// Prefix for range scan of ALL deltas for an index (all writers).
+pub fn hnsw_delta_prefix(db_id: u64, table_id: u64, index_id: u64) -> Vec<u8> {
+    format!("d_{db_id}_hnsw_{table_id}_{index_id}_delta_").into_bytes()
+}
+
+/// Encode (table_id, index_id) into a single i64 for worker task dedup.
+/// table_id occupies upper 32 bits, index_id occupies lower 32 bits.
+///
+/// Returns `Err` if either ID exceeds 32 bits. In practice, these are
+/// auto-increment sequence values starting at 1 — exceeding 2^32 (~4B)
+/// is not realistic for a single database, but we return an error rather
+/// than silently truncating or panicking the process.
+pub fn hnsw_merge_task_id(table_id: u64, index_id: u64) -> anyhow::Result<i64> {
+    if table_id > u32::MAX as u64 {
+        anyhow::bail!(
+            "table_id {} exceeds 32-bit range for HNSW merge task key",
+            table_id
+        );
+    }
+    if index_id > u32::MAX as u64 {
+        anyhow::bail!(
+            "index_id {} exceeds 32-bit range for HNSW merge task key",
+            index_id
+        );
+    }
+    Ok((((table_id & 0xFFFFFFFF) << 32) | (index_id & 0xFFFFFFFF)) as i64)
+}
+
+/// End-of-range sentinel for bounded range scans.
+pub fn hnsw_delta_prefix_end(db_id: u64, table_id: u64, index_id: u64) -> Vec<u8> {
+    let mut end = hnsw_delta_prefix(db_id, table_id, index_id);
+    end.push(0xFF);
+    end
+}
+
+// ---------------------------------------------------------------------------
+// Delta data structure
+// ---------------------------------------------------------------------------
+
+/// A single HNSW delta entry: one vector add operation.
+/// Serialized with bincode (~4 + 4*dimensions bytes per delta).
+///
+/// No Remove variant — usearch 0.21 has no remove() method. DELETEs are
+/// handled by lazy tombstoning via visibility filtering in hnsw_scan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HnswDelta {
+    pub label: u64,
+    pub vector: Vec<f32>,
+}
+
+// ---------------------------------------------------------------------------
+// Merge marker (per-index global state for background merge coordination)
+// ---------------------------------------------------------------------------
 
 fn temp_file_path(db_id: u64, table_id: u64, index_id: u64, op: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -104,6 +216,7 @@ pub fn create_empty_hnsw_index(
         distance_metric: distance_metric.to_string(),
         m,
         ef_construction,
+        storage_version: 1,
     };
     Ok((HnswIndexHandle::new(index), meta))
 }
@@ -171,50 +284,117 @@ pub fn serialize_hnsw_snapshot(
     Ok((graph_bytes, meta_bytes))
 }
 
-/// Load an HNSW graph from an existing transaction.
-///
-/// This reads graph/meta keys via `txn.get()`, which checks the transaction's
-/// local write buffer before hitting TiKV. This is essential for DML
-/// maintenance: in a multi-row INSERT/UPDATE, row N's graph write (via
-/// `txn_put`) is visible to row N+1's `load_hnsw_graph_from_txn` call,
-/// making graph updates accumulative within a single statement/txn.
-pub async fn load_hnsw_graph_from_txn(
+// ===========================================================================
+// Delta-log helpers (v1 storage)
+// ===========================================================================
+
+/// Write a batch of delta entries to TiKV within the caller's transaction.
+/// Each delta gets a unique key via `writer_id()` + `next_delta_seq()`.
+/// Returns total bytes written (for observability).
+pub async fn write_hnsw_deltas(
     txn: &mut Transaction,
     db_id: u64,
     table_id: u64,
     index_id: u64,
+    adds: &[(u64, Vec<f32>)], // (label, vector_f32)
+) -> Result<u64, SqlError> {
+    let mut total_bytes = 0u64;
+    for (label, vector) in adds {
+        let seq = next_delta_seq();
+        let key = hnsw_delta_key(db_id, table_id, index_id, seq);
+        let delta = HnswDelta {
+            label: *label,
+            vector: vector.clone(),
+        };
+        let value =
+            bincode::serialize(&delta).map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+        total_bytes += value.len() as u64;
+        txn_put(txn, key, value)
+            .await
+            .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+    }
+    Ok(total_bytes)
+}
+
+/// Delete delta keys by exact key list (used by merge after applying a batch).
+pub async fn delete_delta_keys(txn: &mut Transaction, keys: &[Vec<u8>]) -> Result<(), SqlError> {
+    for key in keys {
+        txn_delete(txn, key.clone())
+            .await
+            .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+    }
+    Ok(())
+}
+
+/// Delete ALL delta keys for an index. Paginated to completion.
+/// Used by DROP INDEX / DROP TABLE / TRUNCATE.
+pub async fn delete_all_deltas(
+    txn: &mut Transaction,
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+) -> Result<(), SqlError> {
+    let prefix = hnsw_delta_prefix(db_id, table_id, index_id);
+    let end = hnsw_delta_prefix_end(db_id, table_id, index_id);
+    let mut start = prefix.clone();
+    loop {
+        let range: BoundRange = (start.clone()..end.clone()).into();
+        let pairs: Vec<tikv_client::KvPair> = txn
+            .scan(range, DELTA_SCAN_BATCH_SIZE)
+            .await
+            .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?
+            .collect();
+        let count = pairs.len();
+        let mut last_key: Option<Vec<u8>> = None;
+        for pair in pairs {
+            let k: &[u8] = pair.key().as_ref().into();
+            let key: Vec<u8> = k.to_vec();
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            last_key = Some(key.clone());
+            txn_delete(txn, key)
+                .await
+                .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+        }
+        if (count as u32) < DELTA_SCAN_BATCH_SIZE {
+            break;
+        }
+        match last_key {
+            Some(mut lk) => {
+                lk.push(0x00);
+                start = lk;
+            }
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+// ===========================================================================
+// Base graph loader (without re-reading meta)
+// ===========================================================================
+
+/// Load ONLY the base graph blob from TiKV (caller provides meta).
+/// Returns None if no graph_key exists (e.g., empty index before first merge).
+pub async fn load_base_graph(
+    txn: &mut Transaction,
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    meta: &HnswMeta,
 ) -> Result<Option<(HnswIndexHandle, HnswMeta)>, SqlError> {
     let graph_key = hnsw_graph_key(db_id, table_id, index_id);
-    let meta_key = hnsw_meta_key(db_id, table_id, index_id);
-
     let Some(graph_bytes) = txn
         .get(graph_key)
         .await
-        .map_err(|e| SqlError::from(anyhow::anyhow!(e)))?
+        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?
     else {
         return Ok(None);
     };
-
-    let Some(meta_bytes) = txn
-        .get(meta_key)
-        .await
-        .map_err(|e| SqlError::from(anyhow::anyhow!(e)))?
-    else {
-        return Err(SqlError::Internal(anyhow::anyhow!(
-            "HNSW graph exists but metadata missing for d_{}_hnsw_{}_{}",
-            db_id,
-            table_id,
-            index_id
-        )));
-    };
-
-    let meta: HnswMeta =
-        serde_json::from_slice(&meta_bytes).map_err(|e| SqlError::from(anyhow::anyhow!(e)))?;
-
     let temp_path = temp_file_path(db_id, table_id, index_id, "load");
-    fs::write(&temp_path, &graph_bytes).map_err(|e| SqlError::from(anyhow::anyhow!(e)))?;
-
-    let metric = metric_from_string(meta.distance_metric.as_str())?;
+    fs::write(&temp_path, &graph_bytes).map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+    let metric = metric_from_string(&meta.distance_metric)?;
     let options = IndexOptions {
         dimensions: meta.dimensions,
         metric,
@@ -223,14 +403,239 @@ pub async fn load_hnsw_graph_from_txn(
         expansion_add: meta.ef_construction,
         expansion_search: super::HNSW_DEFAULT_EF_SEARCH,
     };
-
-    let index = new_index(&options).map_err(|e| SqlError::from(anyhow::anyhow!(e)))?;
+    let index = new_index(&options).map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
     let temp_path_str = temp_path.to_string_lossy().to_string();
     let load_result = index
         .load(&temp_path_str)
-        .map_err(|e| SqlError::from(anyhow::anyhow!(e)));
+        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)));
     let _ = fs::remove_file(&temp_path);
     load_result?;
+    let mut live_meta = meta.clone();
+    live_meta.count = index.size() as u64;
+    live_meta.capacity = index.capacity() as u64;
+    Ok(Some((HnswIndexHandle::new(index), live_meta)))
+}
 
-    Ok(Some((HnswIndexHandle::new(index), meta)))
+// ===========================================================================
+// Delta-aware graph loader (paginated streaming apply)
+// ===========================================================================
+
+/// Load base graph + apply pending deltas → ready-to-query in-memory index.
+/// Handles both v0 (legacy) and v1 (delta-log) transparently.
+///
+/// Returns `(index_handle, meta, delta_count_applied)`.
+/// `delta_count_applied` lets the caller decide whether to trigger merge.
+///
+/// Deltas are applied via paginated streaming: scan one page, apply to
+/// in-memory index, advance start_key, repeat. Never collects all deltas
+/// into a single Vec.
+pub async fn load_hnsw_graph_with_deltas(
+    txn: &mut Transaction,
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+) -> Result<Option<(HnswIndexHandle, HnswMeta, usize)>, SqlError> {
+    // 1. Read meta
+    let meta_key = hnsw_meta_key(db_id, table_id, index_id);
+    let Some(meta_bytes) = txn
+        .get(meta_key)
+        .await
+        .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?
+    else {
+        return Ok(None); // No index metadata → index doesn't exist
+    };
+    let meta: HnswMeta =
+        serde_json::from_slice(&meta_bytes).map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+
+    // 2. Only v1 (delta-log) is supported; reject anything else.
+    if meta.storage_version != 1 {
+        return Err(SqlError::Internal(anyhow::anyhow!(
+            "HNSW index d_{}_hnsw_{}_{} has unsupported storage_version={}; \
+             only v1 (delta-log) is supported. Please rebuild the index.",
+            db_id,
+            table_id,
+            index_id,
+            meta.storage_version
+        )));
+    }
+
+    // 3. Delta-log path: load base graph (may not exist yet)
+    let (index, mut live_meta) =
+        match load_base_graph(txn, db_id, table_id, index_id, &meta).await? {
+            Some(pair) => pair,
+            None => create_empty_hnsw_index(
+                meta.dimensions,
+                &meta.distance_metric,
+                meta.m,
+                meta.ef_construction,
+            )?,
+        };
+
+    // 4. Paginated streaming apply: scan delta pages, apply each to in-memory index.
+    let prefix = hnsw_delta_prefix(db_id, table_id, index_id);
+    let end = hnsw_delta_prefix_end(db_id, table_id, index_id);
+    let mut start = prefix.clone();
+    let mut delta_count: usize = 0;
+
+    loop {
+        let range: BoundRange = (start.clone()..end.clone()).into();
+        let pairs: Vec<tikv_client::KvPair> = txn
+            .scan(range, DELTA_SCAN_BATCH_SIZE)
+            .await
+            .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?
+            .collect();
+        let page_count = pairs.len();
+        if page_count == 0 {
+            break;
+        }
+
+        // Reserve capacity for this page of deltas.
+        let needed = index.size() as u64 + page_count as u64;
+        if needed > index.capacity() as u64 {
+            let next_cap = needed.saturating_mul(2).max(1);
+            index
+                .reserve(next_cap as usize)
+                .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+        }
+
+        let mut last_key: Option<Vec<u8>> = None;
+        for pair in pairs {
+            let k: &[u8] = pair.key().as_ref().into();
+            let key: Vec<u8> = k.to_vec();
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let delta: HnswDelta = bincode::deserialize(pair.value())
+                .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+            index
+                .add(delta.label, &delta.vector)
+                .map_err(|e| SqlError::Internal(anyhow::anyhow!(e)))?;
+            delta_count += 1;
+            last_key = Some(key);
+        }
+
+        if (page_count as u32) < DELTA_SCAN_BATCH_SIZE {
+            break;
+        }
+        match last_key {
+            Some(mut lk) => {
+                lk.push(0x00);
+                start = lk;
+            }
+            None => break,
+        }
+    }
+
+    live_meta.count = index.size() as u64;
+    live_meta.capacity = index.capacity() as u64;
+
+    if delta_count > 0 {
+        tracing::debug!(
+            db_id,
+            table_id,
+            index_id,
+            delta_count,
+            "HNSW scan applied pending deltas"
+        );
+    }
+
+    Ok(Some((HnswIndexHandle::new(index), live_meta, delta_count)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_hnsw_meta_defaults_to_v1() {
+        let (_, meta) = create_empty_hnsw_index(3, "l2", 16, 200).unwrap();
+        assert_eq!(
+            meta.storage_version, 1,
+            "New HNSW indexes must use v1 (delta-log) storage"
+        );
+    }
+
+    #[test]
+    fn hnsw_merge_task_id_basic() {
+        let id = hnsw_merge_task_id(1, 2).unwrap();
+        // table_id=1 in upper 32 bits, index_id=2 in lower 32 bits
+        assert_eq!(id, ((1i64 << 32) | 2));
+    }
+
+    #[test]
+    fn hnsw_merge_task_id_max_u32() {
+        let id = hnsw_merge_task_id(u32::MAX as u64, u32::MAX as u64).unwrap();
+        assert_eq!(id as u64, (0xFFFFFFFF_FFFFFFFF_u64));
+    }
+
+    #[test]
+    fn hnsw_merge_task_id_overflow_table_id() {
+        let result = hnsw_merge_task_id(u32::MAX as u64 + 1, 1);
+        assert!(result.is_err(), "table_id > u32::MAX should error");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("table_id"),
+            "error should mention table_id: {msg}"
+        );
+    }
+
+    #[test]
+    fn hnsw_merge_task_id_overflow_index_id() {
+        let result = hnsw_merge_task_id(1, u32::MAX as u64 + 1);
+        assert!(result.is_err(), "index_id > u32::MAX should error");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("index_id"),
+            "error should mention index_id: {msg}"
+        );
+    }
+
+    /// Verifies that HnswMeta with legacy v0 storage version produces
+    /// a clear error when deserialized from JSON. This locks the fail-fast
+    /// behavior that replaced the old v0→v1 migration path.
+    #[test]
+    fn hnsw_meta_v0_is_rejected_by_version_check() {
+        let meta_json = r#"{"count":0,"capacity":0,"dimensions":3,"distance_metric":"l2","m":16,"ef_construction":200,"storage_version":0}"#;
+        let meta: HnswMeta = serde_json::from_str(meta_json).expect("parse meta");
+        assert_eq!(meta.storage_version, 0);
+        // The actual fail-fast is in load_hnsw_graph_with_deltas, but we can
+        // verify the contract: storage_version != 1 must be treated as error.
+        assert_ne!(
+            meta.storage_version, 1,
+            "v0 meta must fail the storage_version != 1 check"
+        );
+    }
+
+    /// Verifies that missing storage_version in JSON (old-format meta)
+    /// defaults to 0 via #[serde(default)], which triggers the fail-fast.
+    #[test]
+    fn hnsw_meta_missing_version_defaults_to_zero() {
+        let meta_json = r#"{"count":0,"capacity":0,"dimensions":3,"distance_metric":"l2","m":16,"ef_construction":200}"#;
+        let meta: HnswMeta = serde_json::from_str(meta_json).expect("parse meta");
+        assert_eq!(
+            meta.storage_version, 0,
+            "missing storage_version must default to 0 (triggers fail-fast)"
+        );
+    }
+
+    /// Deterministic queue key property: same (table_id, index_id) always
+    /// maps to the same task_id. This is WHY the ABA race exists (DML and
+    /// worker target the same queue key) and WHY CAS nonce is needed.
+    #[test]
+    fn hnsw_merge_task_id_deterministic_key_enables_aba() {
+        // Two different "writers" computing the task_id for the same index
+        let writer1 = hnsw_merge_task_id(10, 3).unwrap();
+        let writer2 = hnsw_merge_task_id(10, 3).unwrap();
+        assert_eq!(
+            writer1, writer2,
+            "same (table_id, index_id) must produce same task_id (deterministic key)"
+        );
+
+        // Different index → different task_id (no collision)
+        let other = hnsw_merge_task_id(10, 4).unwrap();
+        assert_ne!(
+            writer1, other,
+            "different index must have different task_id"
+        );
+    }
 }

@@ -15,6 +15,7 @@ use crate::worker::types::*;
 use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,6 +74,10 @@ impl WorkerEngine {
         }
     }
 
+    pub fn metrics(&self) -> &Arc<WorkerMetrics> {
+        &self.metrics
+    }
+
     pub async fn run(&self) {
         info!(
             "WorkerEngine starting (poll_ms={}, max_concurrent={})",
@@ -85,6 +90,12 @@ impl WorkerEngine {
         if let Err(e) = self.reconcile_incomplete_cic_indexes().await {
             warn!(
                 "CIC index-state recovery failed (engine will continue): {}",
+                e
+            );
+        }
+        if let Err(e) = self.reconcile_hnsw_merges().await {
+            warn!(
+                "HNSW merge reconciliation failed (engine will continue): {}",
                 e
             );
         }
@@ -490,9 +501,29 @@ impl WorkerEngine {
             )
             .await?;
         if !keep_queue_entry {
-            system_store
-                .delete_worker_queue_entry(&mut txn, &queue_key)
-                .await?;
+            if entry.task_type == TaskType::HnswMerge {
+                // HnswMerge uses deterministic fire_time=0 → concurrent DML can
+                // overwrite the same queue key with a new nonce. Read-compare-delete
+                // ensures we only remove the entry we actually processed.
+                if let Some(current_bytes) = txn.get(queue_key.clone()).await? {
+                    let current =
+                        TaskQueueEntry::deserialize_compat(&current_bytes).map_err(|e| {
+                            anyhow::anyhow!("Failed to deserialize worker queue entry: {e}")
+                        })?;
+                    if current.nonce == entry.nonce {
+                        system_store
+                            .delete_worker_queue_entry(&mut txn, &queue_key)
+                            .await?;
+                    }
+                    // nonce mismatch → DML overwrote → skip delete, next tick handles it
+                }
+            } else {
+                // Non-HnswMerge: these tasks never share deterministic keys with DML,
+                // so unconditional delete is safe (original behavior preserved).
+                system_store
+                    .delete_worker_queue_entry(&mut txn, &queue_key)
+                    .await?;
+            }
         }
 
         if entry.task_type == TaskType::Cron && should_requeue_cron {
@@ -742,6 +773,15 @@ impl WorkerEngine {
         let tx_start_ms = now_epoch_ms();
         let statement_memory_accountant = handle.memory_accountant();
 
+        // HnswMerge tasks consolidate delta entries into the base graph.
+        // They run outside the normal SQL executor path and are exempt from
+        // statement_timeout (merge may be long-running on large backlogs).
+        if entry.task_type == TaskType::HnswMerge && entry.command.starts_with("__hnsw_merge ") {
+            let (table_id, index_id) = parse_hnsw_merge_command(&entry.command)?;
+            execute_hnsw_merge(&store, entry.db_id, table_id, index_id).await?;
+            return Ok(1);
+        }
+
         // BgDdl tasks (e.g. CREATE INDEX CONCURRENTLY backfill) are exempt from
         // statement_timeout — they legitimately run for extended periods.
         if entry.task_type == TaskType::BgDdl && entry.command.starts_with("__backfill_index ") {
@@ -927,6 +967,155 @@ impl WorkerEngine {
 
         Ok(())
     }
+
+    /// Startup reconciliation: scan ALL worker registry entries for HNSW
+    /// indexes with pending deltas and enqueue merge tasks.
+    async fn reconcile_hnsw_merges(&self) -> Result<()> {
+        let mut txn = self.system_store.begin().await?;
+        let all_entries = self.system_store.list_worker_registry(&mut txn).await?;
+        txn.commit().await?;
+
+        let mut total_enqueued = 0u32;
+        let mut total_observed = 0u32;
+        // Iterate ALL entries — no has_hnsw_merge() filter.
+        // A crash between DML commit and flush_pending_hnsw_merges() leaves
+        // deltas without the registry bit being set. We must check every
+        // known (keyspace, db_id) to find orphaned deltas.
+        for entry in &all_entries {
+            match enqueue_pending_hnsw_merges(
+                &self.system_store,
+                &self.pool,
+                &entry.keyspace,
+                entry.db_id,
+            )
+            .await
+            {
+                Ok(r) => {
+                    total_observed += r.observed;
+                    total_enqueued += r.enqueued;
+                }
+                Err(e) => warn!(
+                    "HNSW reconcile error for keyspace={} db_id={}: {}",
+                    entry.keyspace, entry.db_id, e
+                ),
+            }
+        }
+        if total_observed > 0 {
+            info!(
+                total_observed,
+                total_enqueued, "HNSW startup reconciliation complete"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Result of scanning a (keyspace, db_id) for HNSW indexes with pending deltas.
+pub(crate) struct HnswSweepResult {
+    /// Number of HNSW indexes observed to have pending deltas.
+    pub observed: u32,
+    /// Number of merge tasks successfully enqueued to system store.
+    pub enqueued: u32,
+    /// Number of enqueue attempts that failed (system store errors).
+    pub enqueue_errors: u32,
+}
+
+/// Scan all tables in (keyspace, db_id) for HNSW indexes with pending deltas.
+/// For each found, enqueue a merge task (idempotent via deterministic queue key).
+///
+/// This function does NOT filter by any registry bit — it directly inspects
+/// table schemas and probes for delta keys in the tenant store.
+pub(crate) async fn enqueue_pending_hnsw_merges(
+    system_store: &TikvStore,
+    pool: &TikvClientPool,
+    keyspace: &str,
+    db_id: u64,
+) -> Result<HnswSweepResult> {
+    use crate::sql::hnsw::storage::{hnsw_delta_prefix, hnsw_delta_prefix_end, hnsw_merge_task_id};
+    use rand::Rng;
+    use tikv_client::BoundRange;
+
+    let handle = pool.acquire(Some(keyspace.to_string())).await?;
+    let store = handle.store().clone();
+    let mut txn = store.begin().await?;
+
+    let table_names = store.list_tables(&mut txn, db_id).await?;
+    let mut observed = 0u32;
+    let mut enqueued = 0u32;
+    let mut enqueue_errors = 0u32;
+
+    for table_name in table_names {
+        let Some(schema) = store.get_schema(&mut txn, db_id, &table_name).await? else {
+            continue;
+        };
+        for index in &schema.indexes {
+            if !index.is_hnsw() {
+                continue;
+            }
+
+            // Probe for pending deltas (limit=1, just checking existence)
+            let prefix = hnsw_delta_prefix(db_id, schema.table_id, index.id);
+            let end = hnsw_delta_prefix_end(db_id, schema.table_id, index.id);
+            let range: BoundRange = (prefix..end).into();
+            let pairs: Vec<_> = txn.scan(range, 1).await?.collect();
+            if pairs.is_empty() {
+                continue;
+            }
+
+            observed += 1;
+
+            // Deltas found → enqueue merge task
+            let task_id = match hnsw_merge_task_id(schema.table_id, index.id) {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!(
+                        "HNSW sweep: task_id overflow for table_id={} index_id={}: {}",
+                        schema.table_id, index.id, e
+                    );
+                    enqueue_errors += 1;
+                    continue;
+                }
+            };
+            let mut entry = TaskQueueEntry::new(
+                keyspace.to_string(),
+                db_id,
+                task_id,
+                TaskType::HnswMerge,
+                format!("__hnsw_merge {} {}", schema.table_id, index.id),
+                "system".to_string(),
+                192,
+            );
+            entry.nonce = rand::thread_rng().gen_range(1..=u64::MAX);
+
+            let enqueue_result: Result<()> = async {
+                let mut sys_txn = system_store.begin().await?;
+                system_store
+                    .put_worker_queue_entry(&mut sys_txn, &entry, 0)
+                    .await?;
+                sys_txn.commit().await?;
+                Ok(())
+            }
+            .await;
+
+            match enqueue_result {
+                Ok(()) => enqueued += 1,
+                Err(e) => {
+                    enqueue_errors += 1;
+                    warn!(
+                        "HNSW sweep: failed to enqueue merge for table_id={} index_id={}: {}",
+                        schema.table_id, index.id, e
+                    );
+                }
+            }
+        }
+    }
+
+    txn.rollback().await.ok(); // read-only tenant txn
+    Ok(HnswSweepResult {
+        observed,
+        enqueued,
+        enqueue_errors,
+    })
 }
 
 async fn run_with_guards<F, T>(
@@ -985,6 +1174,187 @@ fn parse_backfill_index_command(command: &str) -> Result<(String, String)> {
         return Err(anyhow!("invalid backfill command args: {}", command));
     }
     Ok((table_name.to_string(), index_name.to_string()))
+}
+
+fn parse_hnsw_merge_command(command: &str) -> Result<(u64, u64)> {
+    let args = command
+        .strip_prefix("__hnsw_merge ")
+        .ok_or_else(|| anyhow!("invalid hnsw_merge command: {}", command))?;
+    let mut parts = args.split_whitespace();
+    let table_id: u64 = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing table_id in hnsw_merge command"))?
+        .parse()?;
+    let index_id: u64 = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing index_id in hnsw_merge command"))?
+        .parse()?;
+    if parts.next().is_some() {
+        return Err(anyhow!("invalid hnsw_merge command args: {}", command));
+    }
+    Ok((table_id, index_id))
+}
+
+/// Maximum deltas to process in a single merge transaction.
+const MERGE_BATCH_SIZE: usize = 5000;
+
+/// Execute HNSW merge in batches. Each batch is a separate TiKV transaction
+/// that processes up to MERGE_BATCH_SIZE deltas, writes the consolidated base
+/// graph, deletes consumed deltas, and updates meta — all atomically.
+///
+/// If more deltas remain after a batch, loops with a new transaction.
+/// Crashes between batches lose no data (uncommitted deltas remain in TiKV).
+async fn execute_hnsw_merge(
+    store: &Arc<TikvStore>,
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+) -> Result<()> {
+    use crate::sql::hnsw::storage::{
+        create_empty_hnsw_index, delete_delta_keys, hnsw_delta_prefix, hnsw_delta_prefix_end,
+        hnsw_graph_key, hnsw_meta_key, load_base_graph, serialize_hnsw_snapshot, HnswDelta,
+        HnswMeta,
+    };
+    use crate::txn::txn_put;
+    use tikv_client::BoundRange;
+
+    let merge_start = std::time::Instant::now();
+    let mut total_deltas_merged: usize = 0;
+
+    loop {
+        let mut txn = store.begin().await?;
+
+        // 1. Read meta
+        let meta_key = hnsw_meta_key(db_id, table_id, index_id);
+        let Some(meta_bytes) = txn.get(meta_key.clone()).await? else {
+            // Index metadata missing — index was dropped. Abort silently.
+            txn.rollback().await.ok();
+            break;
+        };
+        let meta: HnswMeta = serde_json::from_slice(&meta_bytes)?;
+        if meta.storage_version != 1 {
+            txn.rollback().await.ok();
+            return Err(anyhow!(
+                "HNSW index has unsupported storage_version={}; only v1 supported",
+                meta.storage_version
+            ));
+        }
+
+        // 2. Scan up to MERGE_BATCH_SIZE delta keys.
+        let prefix = hnsw_delta_prefix(db_id, table_id, index_id);
+        let end = hnsw_delta_prefix_end(db_id, table_id, index_id);
+        let mut batch_keys: Vec<Vec<u8>> = Vec::new();
+        let mut batch_deltas: Vec<HnswDelta> = Vec::new();
+        let mut scan_start = prefix.clone();
+
+        while batch_deltas.len() < MERGE_BATCH_SIZE {
+            let remaining = (MERGE_BATCH_SIZE - batch_deltas.len()) as u32;
+            let scan_limit = remaining.min(1024);
+            let range: BoundRange = (scan_start.clone()..end.clone()).into();
+            let pairs: Vec<tikv_client::KvPair> = txn.scan(range, scan_limit).await?.collect();
+            let page_count = pairs.len();
+            if page_count == 0 {
+                break;
+            }
+
+            for pair in pairs {
+                let k: &[u8] = pair.key().as_ref().into();
+                let key: Vec<u8> = k.to_vec();
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                let delta: HnswDelta = bincode::deserialize(pair.value())?;
+                scan_start = key.clone();
+                scan_start.push(0x00);
+                batch_keys.push(key);
+                batch_deltas.push(delta);
+                if batch_deltas.len() >= MERGE_BATCH_SIZE {
+                    break;
+                }
+            }
+            if (page_count as u32) < scan_limit {
+                break;
+            }
+        }
+
+        if batch_deltas.is_empty() {
+            txn.rollback().await.ok();
+            break; // No more deltas — merge complete.
+        }
+
+        let batch_count = batch_deltas.len();
+
+        // 3. Load base graph (or create empty if none exists yet).
+        let (index, _): (crate::sql::hnsw::HnswIndexHandle, _) =
+            match load_base_graph(&mut txn, db_id, table_id, index_id, &meta).await? {
+                Some(pair) => pair,
+                None => create_empty_hnsw_index(
+                    meta.dimensions,
+                    &meta.distance_metric,
+                    meta.m,
+                    meta.ef_construction,
+                )?,
+            };
+
+        // 4. Reserve capacity + apply deltas.
+        let needed = index.size() as u64 + batch_count as u64;
+        if needed > index.capacity() as u64 {
+            let next_cap = needed.saturating_mul(2).max(1);
+            index
+                .reserve(next_cap as usize)
+                .map_err(|e| anyhow!("HNSW reserve failed: {}", e))?;
+        }
+        for delta in &batch_deltas {
+            index
+                .add(delta.label, &delta.vector)
+                .map_err(|e| anyhow!("HNSW add failed: {}", e))?;
+        }
+
+        // 5. Serialize new base graph.
+        let mut updated_meta = meta.clone();
+        updated_meta.count = index.size() as u64;
+        updated_meta.capacity = index.capacity() as u64;
+        let (graph_bytes, meta_bytes_new) =
+            serialize_hnsw_snapshot(db_id, table_id, index_id, index.deref(), &updated_meta)?;
+
+        // 6. Atomic write: new base graph + delete consumed deltas + update meta.
+        txn_put(
+            &mut txn,
+            hnsw_graph_key(db_id, table_id, index_id),
+            graph_bytes,
+        )
+        .await?;
+        txn_put(&mut txn, meta_key, meta_bytes_new).await?;
+        delete_delta_keys(&mut txn, &batch_keys).await?;
+
+        // 7. Commit.
+        txn.commit().await?;
+        total_deltas_merged += batch_count;
+
+        info!(
+            table_id,
+            index_id,
+            batch_count,
+            graph_size = index.size(),
+            "HNSW merge batch committed"
+        );
+
+        // If we got fewer than MERGE_BATCH_SIZE deltas, no more remain.
+        if batch_count < MERGE_BATCH_SIZE {
+            break;
+        }
+    }
+
+    if total_deltas_merged > 0 {
+        info!(
+            table_id,
+            index_id,
+            total_deltas_merged,
+            elapsed_ms = merge_start.elapsed().as_millis() as u64,
+            "HNSW merge complete"
+        );
+    }
+    Ok(())
 }
 
 fn success_message(completed_commands: usize) -> String {
@@ -1157,5 +1527,44 @@ mod tests {
             .await
             .expect("expected success");
         assert_eq!(result, 7);
+    }
+
+    #[test]
+    fn parse_hnsw_merge_command_accepts_valid_shape() {
+        let (table_id, index_id) =
+            parse_hnsw_merge_command("__hnsw_merge 123 456").expect("valid command");
+        assert_eq!(table_id, 123);
+        assert_eq!(index_id, 456);
+    }
+
+    #[test]
+    fn parse_hnsw_merge_command_rejects_extra_args() {
+        let err = parse_hnsw_merge_command("__hnsw_merge 1 2 trailing")
+            .expect_err("extra args must be rejected");
+        assert!(
+            err.to_string().contains("invalid hnsw_merge command args"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_hnsw_merge_command_rejects_missing_args() {
+        let err =
+            parse_hnsw_merge_command("__hnsw_merge 1").expect_err("missing index_id must fail");
+        assert!(
+            err.to_string()
+                .contains("missing index_id in hnsw_merge command"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_hnsw_merge_command_rejects_non_numeric() {
+        let err = parse_hnsw_merge_command("__hnsw_merge abc 2")
+            .expect_err("non-numeric table_id must fail");
+        assert!(
+            err.to_string().contains("invalid digit") || err.to_string().contains("number"),
+            "unexpected parse error: {err}"
+        );
     }
 }
