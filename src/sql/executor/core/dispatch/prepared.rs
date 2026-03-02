@@ -38,7 +38,6 @@ fn is_plan_cache_eligible(exec: &PreparedExec) -> bool {
         _ => false,
     }
 }
-
 /// Decide prepared plan cache action and mutate cache state for this attempt.
 ///
 /// This helper is intentionally mutating (entry LRU touches + miss-path counter
@@ -110,7 +109,6 @@ fn update_plan_cache_after_attempt(
         }
     }
 }
-
 impl Executor {
     /// Execute a prepared analyzed statement without re-parsing SQL text.
     ///
@@ -1067,7 +1065,6 @@ impl Executor {
         Ok(vec![ExecuteResult::CommandComplete { tag: "DEALLOCATE" }])
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1156,7 +1153,6 @@ mod tests {
         assert!(!is_plan_cache_eligible(&PreparedExec::RawSqlUtility));
     }
 }
-
 #[cfg(test)]
 mod plan_cache_flow_tests {
     use super::*;
@@ -1293,7 +1289,6 @@ mod plan_cache_flow_tests {
         assert_eq!(cache.counter_len(), 0);
     }
 }
-
 #[cfg(test)]
 mod prepared_policy_tests {
     use super::*;

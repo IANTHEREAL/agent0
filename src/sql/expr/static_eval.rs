@@ -31,7 +31,7 @@ pub fn needs_async_materialization(expr: &TypedExpr) -> bool {
         | TypedExprKind::WindowCall { .. } => true,
         TypedExprKind::FunctionCall { func, .. } => {
             let name = func.name.to_ascii_uppercase();
-            matches!(name.as_str(), "NEXTVAL" | "CURRVAL" | "SETVAL")
+            matches!(name.as_str(), "NEXTVAL" | "CURRVAL" | "SETVAL" | "LASTVAL")
         }
         _ => false,
     })
@@ -115,5 +115,27 @@ mod tests {
         );
         let got = eval_static_typed_expr(&expr, &qctx).unwrap();
         assert_eq!(got, Value::Text("db703".to_string()));
+    }
+
+    #[test]
+    fn static_eval_rejects_lastval_for_async_materialization() {
+        let qctx = test_qctx();
+        let expr = TypedExpr::new(
+            TypedExprKind::FunctionCall {
+                func: ResolvedFunction {
+                    name: "lastval".to_string(),
+                    kind: FunctionKind::Builtin,
+                    return_type: DataType::Int64,
+                },
+                args: vec![],
+                order_by: vec![],
+                filter: None,
+            },
+            DataType::Int64,
+        );
+        let err = eval_static_typed_expr(&expr, &qctx)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires async materialization"));
     }
 }

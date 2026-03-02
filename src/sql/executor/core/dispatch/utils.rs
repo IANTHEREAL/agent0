@@ -136,7 +136,6 @@ impl Executor {
         }
     }
 }
-
 // ── Shared runtime helpers ────────────────────────────────────
 
 /// Session settings snapshot used to set up per-statement task-local context.
