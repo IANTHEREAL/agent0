@@ -115,7 +115,10 @@ impl Executor {
                             }
                         }
                         JoinType::Left => {
-                            let r_cols = r_schema.columns.len();
+                            let ctid_slots = count_ctid_slots(right);
+                            let r_cols = r_rows
+                                .first()
+                                .map_or(r_schema.columns.len() + ctid_slots, |r| r.values.len());
                             for lr in &l_rows {
                                 let mut found = false;
                                 for rr in &r_rows {
@@ -485,6 +488,21 @@ pub(super) fn append_ctid_to_rows(rows: &mut [Row]) {
     }
 }
 
+/// Count hidden ctid slots contributed by base-table leaves within a table ref.
+///
+/// Each base-table leaf contributes +1 ctid (appended by `append_ctid_to_rows`).
+/// Subqueries and functions contribute 0. Joins sum their children recursively.
+fn count_ctid_slots(table_ref: &crate::sql::analyzer::types::AnalyzedTableRef) -> usize {
+    use crate::sql::analyzer::types::AnalyzedTableRefKind;
+    match &table_ref.kind {
+        AnalyzedTableRefKind::Table { .. } => 1,
+        AnalyzedTableRefKind::Subquery(_) | AnalyzedTableRefKind::Function { .. } => 0,
+        AnalyzedTableRefKind::Join { left, right, .. } => {
+            count_ctid_slots(left) + count_ctid_slots(right)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,6 +614,68 @@ mod tests {
             out.values,
             vec![Value::Int32(7), Value::Text("alice".to_string())]
         );
+    }
+
+    #[test]
+    fn count_ctid_slots_returns_correct_counts() {
+        use crate::sql::analyzer::types::{
+            AnalyzedTableRef, AnalyzedTableRefKind, JoinCondition, JoinType, TableRefSchema,
+        };
+
+        let make_table = |name: &str| AnalyzedTableRef {
+            kind: AnalyzedTableRefKind::Table {
+                name: name.to_string(),
+                schema: TableRefSchema {
+                    table_id: 0,
+                    columns: vec![],
+                },
+            },
+            alias: None,
+        };
+
+        // Single table → 1 ctid slot
+        assert_eq!(count_ctid_slots(&make_table("t")), 1);
+
+        // Function (like subquery) → 0
+        let func_ref = AnalyzedTableRef {
+            kind: AnalyzedTableRefKind::Function {
+                func: crate::sql::analyzer::types::ResolvedFunction {
+                    name: "unnest".to_string(),
+                    kind: crate::sql::analyzer::types::FunctionKind::Builtin,
+                    return_type: DataType::Int32,
+                },
+                args: vec![],
+                output_columns: vec![],
+            },
+            alias: None,
+        };
+        assert_eq!(count_ctid_slots(&func_ref), 0);
+
+        // Join of two tables → 2
+        let join2 = AnalyzedTableRef {
+            kind: AnalyzedTableRefKind::Join {
+                left: Box::new(make_table("a")),
+                right: Box::new(make_table("b")),
+                join_type: JoinType::Inner,
+                condition: JoinCondition::None,
+                left_col_start: 0,
+            },
+            alias: None,
+        };
+        assert_eq!(count_ctid_slots(&join2), 2);
+
+        // Nested: (a JOIN b) JOIN c → 3
+        let join3 = AnalyzedTableRef {
+            kind: AnalyzedTableRefKind::Join {
+                left: Box::new(join2),
+                right: Box::new(make_table("c")),
+                join_type: JoinType::Inner,
+                condition: JoinCondition::None,
+                left_col_start: 0,
+            },
+            alias: None,
+        };
+        assert_eq!(count_ctid_slots(&join3), 3);
     }
 
     #[test]
