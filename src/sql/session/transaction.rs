@@ -8,11 +8,8 @@ use std::sync::atomic::Ordering;
 use super::{Session, TransactionState};
 
 impl Session {
-    fn reset_xact_advisory_savepoint_tracker(&self) {
-        let mut tracker = self
-            .xact_advisory_savepoint_tracker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    async fn reset_xact_advisory_savepoint_tracker(&self) {
+        let mut tracker = self.xact_advisory_savepoint_tracker.lock().await;
         tracker.reset();
     }
 
@@ -53,10 +50,7 @@ impl Session {
         let name_for_tracker = name.clone();
         self.savepoints.create(name).await?;
         {
-            let mut tracker = self
-                .xact_advisory_savepoint_tracker
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut tracker = self.xact_advisory_savepoint_tracker.lock().await;
             tracker.create(name_for_tracker);
         }
         self.settings.push_settings_savepoint(name_for_settings);
@@ -75,10 +69,7 @@ impl Session {
         }
         self.savepoints.release(name).await?;
         {
-            let mut tracker = self
-                .xact_advisory_savepoint_tracker
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut tracker = self.xact_advisory_savepoint_tracker.lock().await;
             tracker.release(name)?;
         }
         self.settings.release_settings_savepoint(name);
@@ -95,10 +86,7 @@ impl Session {
 
         let mut prepared = self.savepoints.prepare_rollback_to(name).await?;
         let rolled_back_xact_locks = {
-            let mut tracker = self
-                .xact_advisory_savepoint_tracker
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut tracker = self.xact_advisory_savepoint_tracker.lock().await;
             tracker.prepare_rollback_to(name)?
         };
         let res = {
@@ -154,7 +142,7 @@ impl Session {
                 let ts = crate::sql::statement_time::statement_timestamp_millis_or_now();
                 let txn = self.store.begin().await?;
                 self.savepoints.reset().await?;
-                self.reset_xact_advisory_savepoint_tracker();
+                self.reset_xact_advisory_savepoint_tracker().await;
                 self.state = TransactionState::Active(txn);
                 self.transaction_timestamp_ms = Some(ts);
                 self.tx_statement_count = 0;
@@ -179,7 +167,7 @@ impl Session {
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
                 self.savepoints.reset().await?;
-                self.reset_xact_advisory_savepoint_tracker();
+                self.reset_xact_advisory_savepoint_tracker().await;
                 match txn.commit().await {
                     Ok(_) => {
                         self.clear_local_overrides();
@@ -196,7 +184,7 @@ impl Session {
             }
             TransactionState::Failed(mut txn) => {
                 self.savepoints.reset().await?;
-                self.reset_xact_advisory_savepoint_tracker();
+                self.reset_xact_advisory_savepoint_tracker().await;
                 match txn.rollback().await {
                     Ok(_) => {
                         self.clear_local_overrides();
@@ -221,7 +209,7 @@ impl Session {
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
                 self.savepoints.reset().await?;
-                self.reset_xact_advisory_savepoint_tracker();
+                self.reset_xact_advisory_savepoint_tracker().await;
                 match txn.rollback().await {
                     Ok(_) => {
                         self.clear_local_overrides();
@@ -242,7 +230,7 @@ impl Session {
             }
             TransactionState::Failed(mut txn) => {
                 self.savepoints.reset().await?;
-                self.reset_xact_advisory_savepoint_tracker();
+                self.reset_xact_advisory_savepoint_tracker().await;
                 match txn.rollback().await {
                     Ok(_) => {
                         self.clear_local_overrides();

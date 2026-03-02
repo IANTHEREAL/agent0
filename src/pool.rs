@@ -2,12 +2,20 @@ use crate::sql::stats::TableStatsCache;
 use crate::sql::triggers::TriggerBodyCache;
 use crate::storage::TikvStore;
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
 use tracing::{debug, info};
+
+/// Index of idle tenants ordered by `(idle_at_epoch_ms, keyspace)`.
+///
+/// Used by `evict_idle()` to find eviction candidates in O(k) time where k
+/// is the number of candidates due for eviction, rather than scanning all tenants.
+/// Protected by `std::sync::Mutex` (not tokio) so it can be updated from
+/// `TenantHandle::Drop` without requiring an async runtime.
+type IdleIndex = StdMutex<BTreeSet<(u64, String)>>;
 
 /// How long an idle tenant (zero connections) stays cached before eviction.
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -368,10 +376,13 @@ pub(crate) struct TenantEntry {
     memory_accountant: TenantMemoryAccountant,
     /// Per-user active connection counts for `rolconnlimit` enforcement.
     user_connections: std::sync::Mutex<HashMap<String, u32>>,
+    /// Back-reference to the pool-level idle index for Drop-time updates.
+    /// `None` only in test entries created outside a pool.
+    idle_index: Option<Arc<IdleIndex>>,
 }
 
 impl TenantEntry {
-    fn new(store: Arc<TikvStore>, keyspace: String) -> Self {
+    fn new(store: Arc<TikvStore>, keyspace: String, idle_index: Arc<IdleIndex>) -> Self {
         let qps_limit = tenant_qps_limit();
         let memory_quota = tenant_memory_quota_bytes();
         Self {
@@ -388,6 +399,7 @@ impl TenantEntry {
             },
             memory_accountant: TenantMemoryAccountant::new_with_quota(keyspace, memory_quota),
             user_connections: std::sync::Mutex::new(HashMap::new()),
+            idle_index: Some(idle_index),
         }
     }
 
@@ -528,6 +540,7 @@ impl TenantHandle {
                 memory_quota_bytes,
             ),
             user_connections: std::sync::Mutex::new(HashMap::new()),
+            idle_index: None,
         });
         Self {
             entry,
@@ -538,10 +551,19 @@ impl TenantHandle {
 
 impl Clone for TenantHandle {
     fn clone(&self) -> Self {
-        self.entry
+        let prev = self
+            .entry
             .active_connections
             .fetch_add(1, Ordering::Relaxed);
-        self.entry.last_idle_at.store(0, Ordering::Relaxed);
+        let prev_idle_at = self.entry.last_idle_at.swap(0, Ordering::Relaxed);
+        // If transitioning from idle to active, remove from idle index.
+        if prev == 0 && prev_idle_at != 0 {
+            if let Some(ref idx) = self.entry.idle_index {
+                if let Ok(mut set) = idx.lock() {
+                    set.remove(&(prev_idle_at, self.entry.keyspace.clone()));
+                }
+            }
+        }
         Self {
             entry: self.entry.clone(),
             // Clones do NOT inherit the user connection slot — only the
@@ -562,9 +584,14 @@ impl Drop for TenantHandle {
             .fetch_sub(1, Ordering::Relaxed);
         if prev == 1 {
             // This was the last handle — record idle start time.
-            self.entry
-                .last_idle_at
-                .store(now_epoch_ms(), Ordering::Relaxed);
+            let idle_at = now_epoch_ms();
+            self.entry.last_idle_at.store(idle_at, Ordering::Relaxed);
+            // Register as idle candidate in the pool-level index.
+            if let Some(ref idx) = self.entry.idle_index {
+                if let Ok(mut set) = idx.lock() {
+                    set.insert((idle_at, self.entry.keyspace.clone()));
+                }
+            }
         }
     }
 }
@@ -577,6 +604,9 @@ pub struct TikvClientPool {
     creation_locks: RwLock<HashMap<String, Arc<TokioMutex<()>>>>,
     idle_timeout: Duration,
     reaper_interval: Duration,
+    /// Idle-time index: tenants ordered by `(idle_at_epoch_ms, keyspace)`.
+    /// Enables O(k) eviction where k = candidates due, instead of O(n) full scan.
+    idle_index: Arc<IdleIndex>,
 }
 
 impl TikvClientPool {
@@ -587,6 +617,7 @@ impl TikvClientPool {
             creation_locks: RwLock::new(HashMap::new()),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             reaper_interval: DEFAULT_REAPER_INTERVAL,
+            idle_index: Arc::new(StdMutex::new(BTreeSet::new())),
         }
     }
 
@@ -602,6 +633,7 @@ impl TikvClientPool {
             creation_locks: RwLock::new(HashMap::new()),
             idle_timeout,
             reaper_interval,
+            idle_index: Arc::new(StdMutex::new(BTreeSet::new())),
         }
     }
 
@@ -617,8 +649,14 @@ impl TikvClientPool {
         {
             let tenants = self.tenants.read().await;
             if let Some(entry) = tenants.get(&key) {
-                entry.active_connections.fetch_add(1, Ordering::Relaxed);
-                entry.last_idle_at.store(0, Ordering::Relaxed);
+                let prev = entry.active_connections.fetch_add(1, Ordering::Relaxed);
+                let prev_idle_at = entry.last_idle_at.swap(0, Ordering::Relaxed);
+                // Transitioning from idle to active — remove from idle index.
+                if prev == 0 && prev_idle_at != 0 {
+                    if let Ok(mut set) = self.idle_index.lock() {
+                        set.remove(&(prev_idle_at, key.clone()));
+                    }
+                }
                 return Ok(TenantHandle {
                     entry: entry.clone(),
                     user_slot: None,
@@ -643,15 +681,23 @@ impl TikvClientPool {
             let tenants = self.tenants.read().await;
             if let Some(entry) = tenants.get(&key) {
                 let entry = entry.clone();
-                entry.active_connections.fetch_add(1, Ordering::Relaxed);
-                entry.last_idle_at.store(0, Ordering::Relaxed);
+                let prev = entry.active_connections.fetch_add(1, Ordering::Relaxed);
+                let prev_idle_at = entry.last_idle_at.swap(0, Ordering::Relaxed);
+                if prev == 0 && prev_idle_at != 0 {
+                    if let Ok(mut set) = self.idle_index.lock() {
+                        set.remove(&(prev_idle_at, key.clone()));
+                    }
+                }
                 drop(tenants);
-                self.cleanup_creation_lock_if_unused(&key, &creation_lock)
-                    .await;
-                return Ok(TenantHandle {
+                // Construct handle before the `.await` so that async cancellation
+                // triggers `TenantHandle::drop`, which decrements `active_connections`.
+                let handle = TenantHandle {
                     entry,
                     user_slot: None,
-                });
+                };
+                self.cleanup_creation_lock_if_unused(&key, &creation_lock)
+                    .await;
+                return Ok(handle);
             }
         }
 
@@ -664,20 +710,27 @@ impl TikvClientPool {
                 return Err(e);
             }
         };
-        let entry = Arc::new(TenantEntry::new(store, key.clone()));
+        let entry = Arc::new(TenantEntry::new(
+            store,
+            key.clone(),
+            self.idle_index.clone(),
+        ));
         entry.active_connections.fetch_add(1, Ordering::Relaxed);
+        // Construct handle before any `.await` so that async cancellation
+        // triggers `TenantHandle::drop`, which decrements `active_connections`.
+        let handle = TenantHandle {
+            entry: entry.clone(),
+            user_slot: None,
+        };
 
         {
             let mut tenants = self.tenants.write().await;
-            tenants.insert(key.clone(), entry.clone());
+            tenants.insert(key.clone(), entry);
         }
         self.cleanup_creation_lock_if_unused(&key, &creation_lock)
             .await;
 
-        Ok(TenantHandle {
-            entry,
-            user_slot: None,
-        })
+        Ok(handle)
     }
 
     /// Get a TikvStore without a connection-scoped handle.
@@ -729,9 +782,17 @@ impl TikvClientPool {
                 return Err(e);
             }
         };
-        let entry = Arc::new(TenantEntry::new(store, key.clone()));
+        let entry = Arc::new(TenantEntry::new(
+            store,
+            key.clone(),
+            self.idle_index.clone(),
+        ));
         // Mark as idle immediately since no handle is held.
-        entry.last_idle_at.store(now_epoch_ms(), Ordering::Relaxed);
+        let idle_at = now_epoch_ms();
+        entry.last_idle_at.store(idle_at, Ordering::Relaxed);
+        if let Ok(mut set) = self.idle_index.lock() {
+            set.insert((idle_at, key.clone()));
+        }
 
         let store_clone = entry.store.clone();
         {
@@ -812,39 +873,62 @@ impl TikvClientPool {
             .map(|e| e.active_connections.load(Ordering::Relaxed))
     }
 
-    /// Run a single eviction pass. Removes tenants that have zero active
-    /// connections and have been idle longer than the configured timeout.
-    /// Returns the list of evicted keyspace names.
+    /// Run a single eviction pass. Uses the idle-time index to find candidates
+    /// in O(k) time where k is the number of due candidates, instead of scanning
+    /// all tenants.
+    ///
+    /// Stale index entries (tenant reacquired or re-idled at a different timestamp)
+    /// are validated against the current tenant state before eviction: a candidate
+    /// `(idle_at, keyspace)` is only evicted when the tenant still exists, has zero
+    /// active connections, and its current `last_idle_at` matches the candidate.
     pub(crate) async fn evict_idle(&self) -> Vec<String> {
         let now = now_epoch_ms();
         let timeout_ms = self.idle_timeout.as_millis() as u64;
+        let deadline = now.saturating_sub(timeout_ms);
+
+        // Collect due candidates from the idle index.
+        // The index is ordered by (idle_at, keyspace), so we take all entries
+        // with idle_at <= deadline.
+        let candidates: Vec<(u64, String)> = {
+            let mut idx = self.idle_index.lock().expect("idle_index lock");
+            let mut due = Vec::new();
+            // BTreeSet iteration in ascending order — stop at first entry past deadline.
+            while let Some(first) = idx.iter().next().cloned() {
+                if first.0 > deadline {
+                    break;
+                }
+                idx.remove(&first);
+                due.push(first);
+            }
+            due
+        };
+
+        if candidates.is_empty() {
+            return Vec::new();
+        }
 
         let mut tenants = self.tenants.write().await;
         let mut evicted = Vec::new();
 
-        tenants.retain(|keyspace, entry| {
-            let conns = entry.active_connections.load(Ordering::Relaxed);
-            if conns > 0 {
-                return true; // Active connections — keep.
-            }
+        for (candidate_idle_at, keyspace) in candidates {
+            let should_evict = tenants.get(&keyspace).is_some_and(|entry| {
+                let conns = entry.active_connections.load(Ordering::Relaxed);
+                let current_idle_at = entry.last_idle_at.load(Ordering::Relaxed);
+                // Only evict if tenant is still idle and the idle timestamp matches
+                // the candidate (guards against stale/duplicate index entries).
+                conns == 0 && current_idle_at == candidate_idle_at
+            });
 
-            let idle_at = entry.last_idle_at.load(Ordering::Relaxed);
-            if idle_at == 0 {
-                return true; // Not yet marked idle (shouldn't happen, but be safe).
-            }
-
-            if now.saturating_sub(idle_at) >= timeout_ms {
+            if should_evict {
                 info!(
                     "Evicting idle tenant '{}' (idle for {}ms)",
                     keyspace,
-                    now.saturating_sub(idle_at)
+                    now.saturating_sub(candidate_idle_at)
                 );
-                evicted.push(keyspace.clone());
-                false // Remove from map.
-            } else {
-                true // Not yet expired — keep.
+                tenants.remove(&keyspace);
+                evicted.push(keyspace);
             }
-        });
+        }
 
         // Also clean up creation locks for evicted keyspaces.
         if !evicted.is_empty() {
@@ -877,7 +961,10 @@ impl TikvClientPool {
 mod tests {
     use super::*;
 
-    fn make_test_entry(keyspace: &str) -> Arc<TenantEntry> {
+    fn make_test_entry_with_index(
+        keyspace: &str,
+        idle_index: Option<Arc<IdleIndex>>,
+    ) -> Arc<TenantEntry> {
         Arc::new(TenantEntry {
             store: TikvStore::new_stub(),
             active_connections: AtomicU32::new(0),
@@ -888,12 +975,13 @@ mod tests {
             rate_limiter: None,
             memory_accountant: TenantMemoryAccountant::new_with_quota(keyspace.to_string(), 0),
             user_connections: std::sync::Mutex::new(HashMap::new()),
+            idle_index,
         })
     }
 
     impl TikvClientPool {
         async fn inject_entry(&self, keyspace: &str) -> Arc<TenantEntry> {
-            let entry = make_test_entry(keyspace);
+            let entry = make_test_entry_with_index(keyspace, Some(self.idle_index.clone()));
             let mut tenants = self.tenants.write().await;
             tenants.insert(keyspace.to_string(), entry.clone());
             entry
@@ -973,6 +1061,23 @@ mod tests {
         assert_ne!(entry.last_idle_at.load(Ordering::Relaxed), 0);
     }
 
+    /// Helper: mark a test entry as idle and register it in the pool's idle index.
+    fn mark_idle(entry: &Arc<TenantEntry>, pool: &TikvClientPool) {
+        let idle_at = now_epoch_ms();
+        entry.last_idle_at.store(idle_at, Ordering::Relaxed);
+        if let Ok(mut set) = pool.idle_index.lock() {
+            set.insert((idle_at, entry.keyspace.clone()));
+        }
+    }
+
+    /// Helper: mark a test entry as idle at a specific timestamp.
+    fn mark_idle_at(entry: &Arc<TenantEntry>, pool: &TikvClientPool, idle_at: u64) {
+        entry.last_idle_at.store(idle_at, Ordering::Relaxed);
+        if let Ok(mut set) = pool.idle_index.lock() {
+            set.insert((idle_at, entry.keyspace.clone()));
+        }
+    }
+
     #[tokio::test]
     async fn test_evict_idle_respects_timeout() {
         let pool = TikvClientPool::new_with_timeouts(
@@ -986,7 +1091,7 @@ mod tests {
         assert!(evicted.is_empty());
         assert_eq!(pool.tenant_count().await, 1);
 
-        entry.last_idle_at.store(now_epoch_ms(), Ordering::Relaxed);
+        mark_idle(&entry, &pool);
 
         let evicted = pool.evict_idle().await;
         assert!(evicted.is_empty());
@@ -1014,9 +1119,7 @@ mod tests {
             .active_connections
             .fetch_add(1, Ordering::Relaxed);
 
-        idle_entry
-            .last_idle_at
-            .store(now_epoch_ms(), Ordering::Relaxed);
+        mark_idle(&idle_entry, &pool);
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1037,11 +1140,17 @@ mod tests {
         );
         let entry = pool.inject_entry("reacquire_ks").await;
 
-        entry.last_idle_at.store(now_epoch_ms(), Ordering::Relaxed);
+        mark_idle(&entry, &pool);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
+        // Simulate reacquire: transition back to active.
+        let prev_idle_at = entry.last_idle_at.swap(0, Ordering::Relaxed);
         entry.active_connections.fetch_add(1, Ordering::Relaxed);
-        entry.last_idle_at.store(0, Ordering::Relaxed);
+        if prev_idle_at != 0 {
+            if let Ok(mut set) = pool.idle_index.lock() {
+                set.remove(&(prev_idle_at, entry.keyspace.clone()));
+            }
+        }
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1058,7 +1167,7 @@ mod tests {
             Duration::from_secs(60),
         );
         let entry = pool.inject_entry("bg_ks").await;
-        entry.last_idle_at.store(now_epoch_ms(), Ordering::Relaxed);
+        mark_idle(&entry, &pool);
 
         assert_eq!(entry.active_connections(), 0);
 
@@ -1108,15 +1217,11 @@ mod tests {
 
         entry_a.active_connections.fetch_add(1, Ordering::Relaxed);
 
-        entry_b
-            .last_idle_at
-            .store(now_epoch_ms(), Ordering::Relaxed);
+        mark_idle(&entry_b, &pool);
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        entry_c
-            .last_idle_at
-            .store(now_epoch_ms(), Ordering::Relaxed);
+        mark_idle(&entry_c, &pool);
 
         let evicted = pool.evict_idle().await;
         assert_eq!(evicted, vec!["tenant_b".to_string()]);
@@ -1318,5 +1423,149 @@ mod tests {
         })
         .await;
         assert_eq!(accountant.used_bytes(), 0);
+    }
+
+    // ── idle-index stale-candidate tests ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_idle_index_reacquire_before_expiry_prevents_eviction() {
+        // A tenant goes idle, gets a candidate in the index, then reacquires
+        // before the timeout. The stale candidate must not cause eviction.
+        let pool = TikvClientPool::new_with_timeouts(
+            vec![],
+            Duration::from_millis(80),
+            Duration::from_secs(60),
+        );
+        let entry = pool.inject_entry("stale_ks").await;
+
+        // Go idle.
+        mark_idle(&entry, &pool);
+        let old_idle_at = entry.last_idle_at.load(Ordering::Relaxed);
+
+        // Reacquire before expiry.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let prev_idle = entry.last_idle_at.swap(0, Ordering::Relaxed);
+        entry.active_connections.fetch_add(1, Ordering::Relaxed);
+        if prev_idle != 0 {
+            if let Ok(mut set) = pool.idle_index.lock() {
+                set.remove(&(prev_idle, entry.keyspace.clone()));
+            }
+        }
+
+        // Wait past the original timeout.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Eviction should find nothing — stale candidate was removed.
+        let evicted = pool.evict_idle().await;
+        assert!(evicted.is_empty());
+        assert_eq!(pool.tenant_count().await, 1);
+
+        // Verify the old candidate is gone from the index.
+        let idx_len = pool.idle_index.lock().unwrap().len();
+        assert_eq!(idx_len, 0);
+
+        // Make sure the old idle_at was indeed removed (not left dangling).
+        assert_eq!(entry.last_idle_at.load(Ordering::Relaxed), 0);
+        let _ = old_idle_at; // used above via mark_idle
+    }
+
+    #[tokio::test]
+    async fn test_idle_index_duplicate_candidates_are_harmless() {
+        // If a tenant goes idle, gets reacquired, goes idle again — the index
+        // may briefly have two entries. Only the current one should cause eviction.
+        let pool = TikvClientPool::new_with_timeouts(
+            vec![],
+            Duration::from_millis(150),
+            Duration::from_secs(60),
+        );
+        let entry = pool.inject_entry("dup_ks").await;
+
+        // First idle cycle.
+        let first_idle = now_epoch_ms();
+        mark_idle_at(&entry, &pool, first_idle);
+
+        // Reacquire.
+        entry.active_connections.fetch_add(1, Ordering::Relaxed);
+        entry.last_idle_at.store(0, Ordering::Relaxed);
+        // Intentionally do NOT remove the old index entry — simulates a race.
+
+        // Second idle cycle with a large gap so the first candidate expires
+        // well before the second.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        entry.active_connections.fetch_sub(1, Ordering::Relaxed);
+        let second_idle = now_epoch_ms();
+        mark_idle_at(&entry, &pool, second_idle);
+
+        // Wait past the first candidate's expiry but not the second.
+        // First candidate: first_idle + 150ms. Now is ~ first_idle + 100 + 70 = first_idle + 170.
+        // Second candidate: second_idle + 150ms = (first_idle + 100) + 150 = first_idle + 250.
+        tokio::time::sleep(Duration::from_millis(70)).await;
+
+        // The first candidate is stale (idle_at mismatch) — should NOT evict.
+        // The second candidate is not yet due.
+        let evicted = pool.evict_idle().await;
+        assert!(evicted.is_empty());
+        assert_eq!(pool.tenant_count().await, 1);
+
+        // Wait for the second candidate to expire.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let evicted = pool.evict_idle().await;
+        assert_eq!(evicted, vec!["dup_ks".to_string()]);
+        assert_eq!(pool.tenant_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_idle_index_evicted_and_recreated_keyspace() {
+        // A tenant is evicted, then the same keyspace is recreated.
+        // Verify that stale index entries from the old tenant don't interfere.
+        let pool = TikvClientPool::new_with_timeouts(
+            vec![],
+            Duration::from_millis(50),
+            Duration::from_secs(60),
+        );
+
+        // First tenant.
+        let entry1 = pool.inject_entry("recycle_ks").await;
+        mark_idle(&entry1, &pool);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let evicted = pool.evict_idle().await;
+        assert_eq!(evicted, vec!["recycle_ks".to_string()]);
+        assert_eq!(pool.tenant_count().await, 0);
+
+        // Recreate tenant with same keyspace.
+        let entry2 = pool.inject_entry("recycle_ks").await;
+        entry2.active_connections.fetch_add(1, Ordering::Relaxed);
+
+        // No eviction should happen — new tenant is active.
+        let evicted = pool.evict_idle().await;
+        assert!(evicted.is_empty());
+        assert_eq!(pool.tenant_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_idle_index_drop_registers_candidate() {
+        // Verify that TenantHandle::Drop correctly registers an idle candidate.
+        let pool = TikvClientPool::new_with_timeouts(
+            vec![],
+            Duration::from_millis(50),
+            Duration::from_secs(60),
+        );
+        let entry = pool.inject_entry("drop_ks").await;
+        let handle = make_handle(&entry);
+
+        assert_eq!(entry.active_connections(), 1);
+        assert!(pool.idle_index.lock().unwrap().is_empty());
+
+        drop(handle);
+
+        assert_eq!(entry.active_connections(), 0);
+        assert_ne!(entry.last_idle_at.load(Ordering::Relaxed), 0);
+        let idx = pool.idle_index.lock().unwrap();
+        assert_eq!(idx.len(), 1);
+        let (_, ks) = idx.iter().next().unwrap();
+        assert_eq!(ks, "drop_ks");
     }
 }

@@ -22,7 +22,7 @@ use crate::txn::SavepointState;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tikv_client::Transaction;
 
@@ -83,7 +83,8 @@ pub struct Session {
     /// True when current transaction used xact-scoped advisory lock functions.
     pub(crate) has_xact_advisory_locks: Arc<AtomicBool>,
     /// Savepoint-scoped tracker for xact advisory lock acquisitions.
-    pub(crate) xact_advisory_savepoint_tracker: Arc<StdMutex<XactAdvisorySavepointTracker>>,
+    pub(crate) xact_advisory_savepoint_tracker:
+        Arc<tokio::sync::Mutex<XactAdvisorySavepointTracker>>,
 }
 
 /// Force-insert or overwrite a setting in a sorted `(name, value, description)` vec.
@@ -145,7 +146,7 @@ impl Session {
             sql_prepared_statements: HashMap::new(),
             plan_cache,
             has_xact_advisory_locks: Arc::new(AtomicBool::new(false)),
-            xact_advisory_savepoint_tracker: Arc::new(StdMutex::new(
+            xact_advisory_savepoint_tracker: Arc::new(tokio::sync::Mutex::new(
                 XactAdvisorySavepointTracker::default(),
             )),
         }
@@ -198,7 +199,7 @@ impl Session {
             sql_prepared_statements: HashMap::new(),
             plan_cache,
             has_xact_advisory_locks: Arc::new(AtomicBool::new(false)),
-            xact_advisory_savepoint_tracker: Arc::new(StdMutex::new(
+            xact_advisory_savepoint_tracker: Arc::new(tokio::sync::Mutex::new(
                 XactAdvisorySavepointTracker::default(),
             )),
         }

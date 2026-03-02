@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::model::Value;
@@ -45,7 +45,7 @@ pub(crate) async fn execute_advisory_lock_function(
     args: &[Value],
     lock_timeout: Option<Duration>,
     xact_advisory_lock_used: Option<Arc<AtomicBool>>,
-    xact_advisory_savepoint_tracker: Option<Arc<StdMutex<XactAdvisorySavepointTracker>>>,
+    xact_advisory_savepoint_tracker: Option<Arc<tokio::sync::Mutex<XactAdvisorySavepointTracker>>>,
 ) -> Option<Result<Value>> {
     execute_advisory_lock_function_with_manager(
         global_lock_manager(),
@@ -78,21 +78,11 @@ async fn execute_advisory_lock_function_with_manager(
     args: &[Value],
     lock_timeout: Option<Duration>,
     xact_advisory_lock_used: Option<Arc<AtomicBool>>,
-    xact_advisory_savepoint_tracker: Option<Arc<StdMutex<XactAdvisorySavepointTracker>>>,
+    xact_advisory_savepoint_tracker: Option<Arc<tokio::sync::Mutex<XactAdvisorySavepointTracker>>>,
 ) -> Option<Result<Value>> {
-    let mark_xact_lock_acquired = |key: i64, mode: AdvisoryLockMode| {
+    let mark_xact_lock_used = || {
         if let Some(flag) = &xact_advisory_lock_used {
             flag.store(true, Ordering::Release);
-        }
-        if let Some(tracker) = &xact_advisory_savepoint_tracker {
-            let mut tracker = tracker
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            tracker.record_acquired_lock(XactAdvisoryLockRecord {
-                keyspace: keyspace.clone(),
-                key,
-                mode,
-            });
         }
     };
 
@@ -224,7 +214,15 @@ async fn execute_advisory_lock_function_with_manager(
             {
                 return Some(Err(map_acquire_error(e)));
             }
-            mark_xact_lock_acquired(key, AdvisoryLockMode::Exclusive);
+            mark_xact_lock_used();
+            if let Some(tracker) = &xact_advisory_savepoint_tracker {
+                let mut t = tracker.lock().await;
+                t.record_acquired_lock(XactAdvisoryLockRecord {
+                    keyspace: keyspace.clone(),
+                    key,
+                    mode: AdvisoryLockMode::Exclusive,
+                });
+            }
             Ok(Value::Text(String::new()))
         }
         "PG_ADVISORY_XACT_LOCK_SHARED" => {
@@ -246,7 +244,15 @@ async fn execute_advisory_lock_function_with_manager(
             {
                 return Some(Err(map_acquire_error(e)));
             }
-            mark_xact_lock_acquired(key, AdvisoryLockMode::Shared);
+            mark_xact_lock_used();
+            if let Some(tracker) = &xact_advisory_savepoint_tracker {
+                let mut t = tracker.lock().await;
+                t.record_acquired_lock(XactAdvisoryLockRecord {
+                    keyspace: keyspace.clone(),
+                    key,
+                    mode: AdvisoryLockMode::Shared,
+                });
+            }
             Ok(Value::Text(String::new()))
         }
         "PG_TRY_ADVISORY_XACT_LOCK" => {
@@ -264,7 +270,15 @@ async fn execute_advisory_lock_function_with_manager(
             ) {
                 Ok(acquired) => {
                     if acquired {
-                        mark_xact_lock_acquired(key, AdvisoryLockMode::Exclusive);
+                        mark_xact_lock_used();
+                        if let Some(tracker) = &xact_advisory_savepoint_tracker {
+                            let mut t = tracker.lock().await;
+                            t.record_acquired_lock(XactAdvisoryLockRecord {
+                                keyspace: keyspace.clone(),
+                                key,
+                                mode: AdvisoryLockMode::Exclusive,
+                            });
+                        }
                     }
                     Ok(Value::Boolean(acquired))
                 }
@@ -286,7 +300,15 @@ async fn execute_advisory_lock_function_with_manager(
             ) {
                 Ok(acquired) => {
                     if acquired {
-                        mark_xact_lock_acquired(key, AdvisoryLockMode::Shared);
+                        mark_xact_lock_used();
+                        if let Some(tracker) = &xact_advisory_savepoint_tracker {
+                            let mut t = tracker.lock().await;
+                            t.record_acquired_lock(XactAdvisoryLockRecord {
+                                keyspace: keyspace.clone(),
+                                key,
+                                mode: AdvisoryLockMode::Shared,
+                            });
+                        }
                     }
                     Ok(Value::Boolean(acquired))
                 }
@@ -430,11 +452,11 @@ mod tests {
         let manager = AdvisoryLockManager::new();
         let keyspace: Arc<str> = Arc::from("tenant_xact_tracker");
         let used = Arc::new(AtomicBool::new(false));
-        let tracker = Arc::new(StdMutex::new(XactAdvisorySavepointTracker::default()));
+        let tracker = Arc::new(tokio::sync::Mutex::new(
+            XactAdvisorySavepointTracker::default(),
+        ));
         {
-            let mut locked = tracker
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut locked = tracker.lock().await;
             locked.create("sp1".to_string());
         }
 
@@ -455,9 +477,7 @@ mod tests {
         assert!(used.load(Ordering::Acquire));
 
         let released = {
-            let mut locked = tracker
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut locked = tracker.lock().await;
             locked
                 .prepare_rollback_to("sp1")
                 .expect("savepoint should exist")

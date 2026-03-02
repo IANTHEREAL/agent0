@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::model::Value;
@@ -22,7 +22,7 @@ tokio::task_local! {
     static QUERY_PARAM_TYPES: Vec<Option<crate::model::DataType>>;
     static SETTINGS_SNAPSHOT: Arc<HashMap<String, String>>;
     static XACT_ADVISORY_LOCK_USED: Arc<AtomicBool>;
-    static XACT_ADVISORY_SAVEPOINT_TRACKER: Arc<StdMutex<XactAdvisorySavepointTracker>>;
+    static XACT_ADVISORY_SAVEPOINT_TRACKER: Arc<tokio::sync::Mutex<XactAdvisorySavepointTracker>>;
 }
 
 #[derive(Debug, Clone)]
@@ -140,7 +140,8 @@ pub struct QueryContext {
     /// xact-scoped advisory lock functions.
     pub xact_advisory_lock_used: Option<Arc<AtomicBool>>,
     /// Per-session savepoint tracker for xact-scoped advisory locks.
-    pub xact_advisory_savepoint_tracker: Option<Arc<StdMutex<XactAdvisorySavepointTracker>>>,
+    pub xact_advisory_savepoint_tracker:
+        Option<Arc<tokio::sync::Mutex<XactAdvisorySavepointTracker>>>,
 }
 
 impl QueryContext {
@@ -363,7 +364,11 @@ where
     let xact_advisory_savepoint_tracker = qctx
         .xact_advisory_savepoint_tracker
         .clone()
-        .unwrap_or_else(|| Arc::new(StdMutex::new(XactAdvisorySavepointTracker::default())));
+        .unwrap_or_else(|| {
+            Arc::new(tokio::sync::Mutex::new(
+                XactAdvisorySavepointTracker::default(),
+            ))
+        });
     with_query_context(
         qctx.connection_id,
         qctx.database_name.clone(),
@@ -440,7 +445,9 @@ mod tests {
     async fn with_scoped_query_context_propagates_xact_advisory_lock_marker() {
         let mut qctx = QueryContext::for_tests();
         let marker = Arc::new(AtomicBool::new(false));
-        let tracker = Arc::new(StdMutex::new(XactAdvisorySavepointTracker::default()));
+        let tracker = Arc::new(tokio::sync::Mutex::new(
+            XactAdvisorySavepointTracker::default(),
+        ));
         qctx.xact_advisory_lock_used = Some(marker.clone());
         qctx.xact_advisory_savepoint_tracker = Some(tracker.clone());
 
@@ -454,17 +461,13 @@ mod tests {
             let scoped_tracker = from_locals
                 .xact_advisory_savepoint_tracker
                 .expect("xact advisory savepoint tracker should be scoped");
-            let mut locked = scoped_tracker
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut locked = scoped_tracker.lock().await;
             locked.create("sp1".to_string());
         })
         .await;
 
         assert!(marker.load(Ordering::Acquire));
-        let locked = tracker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let locked = tracker.lock().await;
         assert_eq!(locked.stack.len(), 1);
     }
 
