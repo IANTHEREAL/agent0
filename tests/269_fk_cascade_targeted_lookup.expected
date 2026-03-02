@@ -1,0 +1,81 @@
+CREATE TABLE
+CREATE TABLE
+CREATE INDEX
+INSERT 0 2
+INSERT 0 100
+DELETE 1
+ count
+-------
+     1
+(1 row)
+
+ count
+-------
+   100
+(1 row)
+
+DELETE 1
+ count
+-------
+     0
+(1 row)
+
+ count
+-------
+     0
+(1 row)
+
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+INSERT 0 1
+INSERT 0 2
+INSERT 0 3
+DELETE 1
+ count
+-------
+     0
+(1 row)
+
+ count
+-------
+     0
+(1 row)
+
+ count
+-------
+     0
+(1 row)
+
+CREATE TABLE
+CREATE TABLE
+INSERT 0 2
+INSERT 0 3
+DELETE 1
+ count
+-------
+     1
+(1 row)
+
+ count
+-------
+     1
+(1 row)
+
+CREATE TABLE
+CREATE TABLE
+CREATE INDEX
+INSERT 0 1
+INSERT 0 2
+UPDATE 1
+ count
+-------
+     2
+(1 row)
+
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE

@@ -37,7 +37,6 @@ pub async fn execute_delete_row(
     .await?;
 
     delete_row_storage_entries(store, txn, db_id, table_name, schema, row).await?;
-    fk_ctx.on_statement_row_deleted(table_name, schema, row);
     Ok(())
 }
 

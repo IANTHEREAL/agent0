@@ -1,7 +1,6 @@
 //! FK ON UPDATE cascade and enforcement.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use anyhow::Result;
 use tikv_client::Transaction;
@@ -10,7 +9,6 @@ use crate::model::{ForeignKeyAction, ForeignKeyConstraint, Row, TableSchema, Val
 use crate::sql::error::SqlError;
 use crate::sql::projection::eval_default_expr;
 use crate::sql::value_coercion::coerce_value_for_column;
-use crate::storage::TikvStore;
 
 use super::{
     fk_values_for_row, get_ref_values, pk_to_hash_key, ref_column_names, short_relation_name,
@@ -71,42 +69,54 @@ async fn handle_foreign_key_on_update_with_ctx(
             continue;
         }
 
+        // Build candidate row set as union across ALL rules (deduplicated by PK).
+        // A child table may have multiple FKs to the same parent; we must find
+        // referencing rows for each rule's (fk, old_ref_values) pair.
+        let mut matching_rows: Vec<Row> = Vec::new();
+        let mut seen_pk_keys: HashSet<String> = HashSet::new();
+        for rule in &rules {
+            let rows = super::find_referencing_rows(
+                ctx.store,
+                txn,
+                ctx.db_id,
+                &other_table,
+                &other_schema,
+                &rule.fk,
+                &rule.old_ref_values,
+            )
+            .await?;
+            for row in rows {
+                let pk = other_schema.get_pk_values(&row);
+                let pk_key = pk_to_hash_key(&pk);
+                if seen_pk_keys.insert(pk_key) {
+                    matching_rows.push(row);
+                }
+            }
+        }
+
         let mut enum_cache = None;
         let mut pending_propagations: Vec<(Row, Row)> = Vec::new();
         let mut touched_pk_keys: HashSet<String> = HashSet::new();
         let mut touched_pks: Vec<Vec<Value>> = Vec::new();
-        loop {
-            let all_rows = fk_ctx
-                .table_rows
-                .get(&other_table)
-                .cloned()
-                .unwrap_or_default();
-            let mut target_update: Option<(Row, Row)> = None;
-            for child_row in all_rows {
-                let Some(new_child_row) = build_merged_fk_update_row(
-                    &rules,
-                    short_parent,
-                    &other_table,
-                    schema,
-                    &other_schema,
-                    &child_row,
-                )?
-                else {
-                    continue;
-                };
-                target_update = Some((child_row, new_child_row));
-                break;
-            }
 
-            let Some((old_child_row, new_child_row)) = target_update else {
-                break;
+        for child_row in &matching_rows {
+            let Some(new_child_row) = build_merged_fk_update_row(
+                &rules,
+                short_parent,
+                &other_table,
+                schema,
+                &other_schema,
+                child_row,
+            )?
+            else {
+                continue;
             };
 
             if enum_cache.is_none() {
                 enum_cache =
                     Some(build_enum_label_cache(ctx.store, txn, ctx.db_id, &other_schema).await?);
             }
-            let enum_cache = enum_cache
+            let ec = enum_cache
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("enum cache not initialized for cascade update"))?;
             let updated_row = Box::pin(execute_update_row_without_fk_update(
@@ -115,24 +125,19 @@ async fn handle_foreign_key_on_update_with_ctx(
                 ctx.db_id,
                 &other_table,
                 &other_schema,
-                &old_child_row,
+                child_row,
                 new_child_row,
-                enum_cache,
+                ec,
                 Some(fk_ctx),
             ))
             .await?;
-            fk_ctx.replace_row_in_snapshot(
-                &other_table,
-                &other_schema,
-                &old_child_row,
-                updated_row.clone(),
-            );
+
             let updated_pk = other_schema.get_pk_values(&updated_row);
             let updated_pk_key = pk_to_hash_key(&updated_pk);
             if touched_pk_keys.insert(updated_pk_key) {
                 touched_pks.push(updated_pk);
             }
-            pending_propagations.push((old_child_row, updated_row));
+            pending_propagations.push((child_row.clone(), updated_row));
         }
 
         for (old_child_row, updated_row) in pending_propagations {
@@ -149,7 +154,7 @@ async fn handle_foreign_key_on_update_with_ctx(
         }
 
         for pk in touched_pks {
-            if let Some(current_row) = fetch_row_by_pk(
+            if let Some(current_row) = super::fetch_row_by_pk(
                 ctx.store,
                 txn,
                 ctx.db_id,
@@ -198,38 +203,52 @@ async fn handle_foreign_key_on_update_no_ctx(
             continue;
         }
 
+        // Build candidate row set as union across ALL rules (deduplicated by PK).
+        let mut matching_rows: Vec<Row> = Vec::new();
+        let mut seen_pk_keys: HashSet<String> = HashSet::new();
+        for rule in &rules {
+            let rows = super::find_referencing_rows(
+                ctx.store,
+                txn,
+                ctx.db_id,
+                other_table,
+                &other_schema,
+                &rule.fk,
+                &rule.old_ref_values,
+            )
+            .await?;
+            for row in rows {
+                let pk = other_schema.get_pk_values(&row);
+                let pk_key = pk_to_hash_key(&pk);
+                if seen_pk_keys.insert(pk_key) {
+                    matching_rows.push(row);
+                }
+            }
+        }
+
         let mut enum_cache = None;
         let mut pending_propagations: Vec<(Row, Row)> = Vec::new();
         let mut touched_pk_keys: HashSet<String> = HashSet::new();
         let mut touched_pks: Vec<Vec<Value>> = Vec::new();
-        loop {
-            let all_rows = ctx.store.scan(txn, ctx.db_id, other_table, None).await?;
-            let mut target_update: Option<(Row, Row)> = None;
-            for child_row in all_rows {
-                let Some(new_child_row) = build_merged_fk_update_row(
-                    &rules,
-                    short_parent,
-                    other_table,
-                    schema,
-                    &other_schema,
-                    &child_row,
-                )?
-                else {
-                    continue;
-                };
-                target_update = Some((child_row, new_child_row));
-                break;
-            }
 
-            let Some((old_child_row, new_child_row)) = target_update else {
-                break;
+        for child_row in &matching_rows {
+            let Some(new_child_row) = build_merged_fk_update_row(
+                &rules,
+                short_parent,
+                other_table,
+                schema,
+                &other_schema,
+                child_row,
+            )?
+            else {
+                continue;
             };
 
             if enum_cache.is_none() {
                 enum_cache =
                     Some(build_enum_label_cache(ctx.store, txn, ctx.db_id, &other_schema).await?);
             }
-            let enum_cache = enum_cache
+            let ec = enum_cache
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("enum cache not initialized for cascade update"))?;
             let updated_row = Box::pin(execute_update_row_without_fk_update(
@@ -238,9 +257,9 @@ async fn handle_foreign_key_on_update_no_ctx(
                 ctx.db_id,
                 other_table,
                 &other_schema,
-                &old_child_row,
+                child_row,
                 new_child_row,
-                enum_cache,
+                ec,
                 None,
             ))
             .await?;
@@ -249,7 +268,7 @@ async fn handle_foreign_key_on_update_no_ctx(
             if touched_pk_keys.insert(updated_pk_key) {
                 touched_pks.push(updated_pk);
             }
-            pending_propagations.push((old_child_row, updated_row));
+            pending_propagations.push((child_row.clone(), updated_row));
         }
 
         for (old_child_row, updated_row) in pending_propagations {
@@ -266,7 +285,7 @@ async fn handle_foreign_key_on_update_no_ctx(
         }
 
         for pk in touched_pks {
-            if let Some(current_row) = fetch_row_by_pk(
+            if let Some(current_row) = super::fetch_row_by_pk(
                 ctx.store,
                 txn,
                 ctx.db_id,
@@ -456,18 +475,4 @@ fn parent_fk_update_violation(
         ),
     }
     .into()
-}
-
-async fn fetch_row_by_pk(
-    store: &Arc<TikvStore>,
-    txn: &mut Transaction,
-    db_id: u64,
-    table_id: u64,
-    schema: &TableSchema,
-    pk: Vec<Value>,
-) -> Result<Option<Row>> {
-    let rows = store
-        .batch_get_rows(txn, db_id, table_id, vec![pk], schema)
-        .await?;
-    Ok(rows.into_iter().next())
 }

@@ -10,7 +10,7 @@ use anyhow::anyhow;
 use anyhow::Result;
 use tikv_client::Transaction;
 
-use crate::model::{DataType, ForeignKeyConstraint, Row, TableSchema, Value};
+use crate::model::{DataType, ForeignKeyConstraint, IndexDef, Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::expr::compare_values;
 use crate::storage::TikvStore;
@@ -138,11 +138,10 @@ pub(crate) enum FkRefLookup {
 /// Statement-scoped context for FK enforcement during DELETE.
 ///
 /// Built once per statement and reused for every row in that DELETE statement.
+/// Loads only schemas — no row preloading. All row lookups are lazy per-PK
+/// targeted scans via `find_referencing_rows`.
 #[derive(Default)]
 pub(crate) struct FkDeleteContext {
-    /// Snapshot rows for tables that define foreign keys.
-    /// This is kept in sync as cascades mutate data.
-    pub table_rows: HashMap<String, Vec<Row>>,
     /// Schemas for tables that define foreign keys.
     pub table_schemas: HashMap<String, TableSchema>,
     /// Per-table set of deleted PK hash keys, used to prevent redundant work
@@ -153,7 +152,6 @@ pub(crate) struct FkDeleteContext {
 impl FkDeleteContext {
     pub async fn build(store: &Arc<TikvStore>, txn: &mut Transaction, db_id: u64) -> Result<Self> {
         let table_names = store.list_tables(txn, db_id).await?;
-        let mut table_rows = HashMap::new();
         let mut table_schemas = HashMap::new();
 
         for table_name in &table_names {
@@ -161,14 +159,11 @@ impl FkDeleteContext {
                 if schema.foreign_keys.is_empty() {
                     continue;
                 }
-                let rows = store.scan(txn, db_id, table_name, None).await?;
-                table_rows.insert(table_name.clone(), rows);
                 table_schemas.insert(table_name.clone(), schema);
             }
         }
 
         Ok(Self {
-            table_rows,
             table_schemas,
             deleted_pks: HashMap::new(),
         })
@@ -187,60 +182,143 @@ impl FkDeleteContext {
         };
         marked.contains(&pk_to_hash_key(pk))
     }
+}
 
-    pub(super) fn remove_row_from_snapshot(
-        &mut self,
-        table_name: &str,
-        schema: &TableSchema,
-        row: &Row,
-    ) {
-        let pk = schema.get_pk_values(row);
-        let pk_key = pk_to_hash_key(&pk);
-        if let Some(rows) = self.table_rows.get_mut(table_name) {
-            rows.retain(|r| pk_to_hash_key(&schema.get_pk_values(r)) != pk_key);
+/// Find a btree index on `child_schema` whose leading columns cover `fk_columns`.
+///
+/// Returns `None` if no eligible index exists (triggers batched-filter fallback).
+/// Eligible: Ready state, btree method (or NULL = btree default), no expression
+/// columns, no partial-index predicate, leading columns positionally match FK columns.
+pub(super) fn find_fk_covering_index<'a>(
+    child_schema: &'a TableSchema,
+    fk_columns: &[String],
+) -> Option<&'a IndexDef> {
+    child_schema.indexes.iter().find(|idx| {
+        idx.state == IndexState::Ready
+            && idx
+                .method
+                .as_ref()
+                .is_none_or(|m| m.eq_ignore_ascii_case("btree"))
+            && idx.expressions.is_empty()
+            && idx.predicate.is_none()
+            && idx.columns.len() >= fk_columns.len()
+            && idx.columns[..fk_columns.len()]
+                .iter()
+                .zip(fk_columns)
+                .all(|(a, b)| a == b)
+    })
+}
+
+/// Find all rows in `child_table` where FK column values == `ref_values`.
+///
+/// Strategy:
+///   1. If a btree index covers the FK columns → scan_index → batch_get_rows
+///      Complexity: O(matching rows), not O(table size).
+///   2. Otherwise → scan_with_row_filter (bounded-batch scan, 1024 rows/batch,
+///      per-batch client-side filter).
+///      Memory: O(matching_rows + 1024), NOT O(table_size).
+///
+/// NEVER calls store.scan(txn, ..., None).
+pub(super) async fn find_referencing_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    child_table_name: &str,
+    child_schema: &TableSchema,
+    fk: &ForeignKeyConstraint,
+    ref_values: &[Value],
+) -> Result<Vec<Row>> {
+    if let Some(index) = find_fk_covering_index(child_schema, &fk.columns) {
+        // ── Index path ──
+        let pk_types: Vec<DataType> = if child_schema.pk_indices.is_empty() {
+            vec![DataType::Uuid]
+        } else {
+            child_schema
+                .pk_indices
+                .iter()
+                .map(|&i| child_schema.columns[i].data_type.clone())
+                .collect()
+        };
+
+        let matching_pks = if fk.columns.len() == index.columns.len() {
+            store
+                .scan_index(
+                    txn,
+                    db_id,
+                    child_schema.table_id,
+                    index.id,
+                    ref_values,
+                    index.unique,
+                    &pk_types,
+                    None,
+                )
+                .await?
+        } else {
+            let index_col_types: Vec<DataType> = index
+                .columns
+                .iter()
+                .filter_map(|c| {
+                    child_schema
+                        .column_index(c)
+                        .map(|i| child_schema.columns[i].data_type.clone())
+                })
+                .collect();
+            store
+                .scan_index_prefix(
+                    txn,
+                    db_id,
+                    child_schema.table_id,
+                    index.id,
+                    ref_values,
+                    index.unique,
+                    &index_col_types,
+                    &pk_types,
+                    None,
+                )
+                .await?
+        };
+
+        if matching_pks.is_empty() {
+            return Ok(Vec::new());
         }
-    }
 
-    pub(super) fn replace_row_in_snapshot(
-        &mut self,
-        table_name: &str,
-        schema: &TableSchema,
-        old_row: &Row,
-        new_row: Row,
-    ) {
-        let old_pk_key = pk_to_hash_key(&schema.get_pk_values(old_row));
-        if let Some(rows) = self.table_rows.get_mut(table_name) {
-            if let Some(existing) = rows
-                .iter_mut()
-                .find(|r| pk_to_hash_key(&schema.get_pk_values(r)) == old_pk_key)
-            {
-                *existing = new_row;
-            }
-        }
-    }
+        store
+            .batch_get_rows(
+                txn,
+                db_id,
+                child_schema.table_id,
+                matching_pks,
+                child_schema,
+            )
+            .await
+    } else {
+        // ── Non-indexed fallback: bounded-batch scan with filter ──
+        let fk_clone = fk.clone();
+        let schema_clone = child_schema.clone();
+        let ref_values_owned: Vec<Value> = ref_values.to_vec();
 
-    pub(super) fn find_row_in_snapshot(
-        &self,
-        table_name: &str,
-        schema: &TableSchema,
-        pk: &[Value],
-    ) -> Option<Row> {
-        let target_pk = pk_to_hash_key(pk);
-        self.table_rows.get(table_name).and_then(|rows| {
-            rows.iter()
-                .find(|r| pk_to_hash_key(&schema.get_pk_values(r)) == target_pk)
-                .cloned()
-        })
+        store
+            .scan_with_row_filter(txn, db_id, child_table_name, |row| {
+                fk_values_for_row(&fk_clone, &schema_clone, row)
+                    .is_some_and(|fk_vals| fk_vals == ref_values_owned)
+            })
+            .await
     }
+}
 
-    pub(crate) fn on_statement_row_deleted(
-        &mut self,
-        table_name: &str,
-        schema: &TableSchema,
-        row: &Row,
-    ) {
-        self.remove_row_from_snapshot(table_name, schema, row);
-    }
+/// Point-lookup a single row by primary key.
+pub(super) async fn fetch_row_by_pk(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    table_id: u64,
+    schema: &TableSchema,
+    pk: Vec<Value>,
+) -> Result<Option<Row>> {
+    let rows = store
+        .batch_get_rows(txn, db_id, table_id, vec![pk], schema)
+        .await?;
+    Ok(rows.into_iter().next())
 }
 
 /// Resolve lookup strategy for referenced columns against parent schema.
@@ -591,7 +669,7 @@ async fn validate_foreign_keys_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ColumnDef, DataType, ForeignKeyAction};
+    use crate::model::{ColumnDef, DataType, ForeignKeyAction, IndexDef};
 
     fn self_ref_schema() -> TableSchema {
         TableSchema {
@@ -723,5 +801,222 @@ mod tests {
         let vals = vec![Value::Int32(1), Value::Text("hello".into())];
         let detail = format_fk_detail_values(&cols, &vals);
         assert_eq!(detail, "(col1, col2)=(1, hello)");
+    }
+
+    // ── Structural assertion: no unbounded scan in FK cascade path ──
+
+    #[test]
+    fn no_unbounded_scan_in_fk_cascade_path() {
+        let cascade_delete_src = include_str!("cascade_delete.rs");
+        let cascade_update_src = include_str!("cascade_update.rs");
+
+        for (file, src) in [
+            ("cascade_delete.rs", cascade_delete_src),
+            ("cascade_update.rs", cascade_update_src),
+        ] {
+            assert!(
+                !src.contains(".scan(txn,"),
+                "{file} must not directly call store.scan() — \
+                 use find_referencing_rows instead"
+            );
+        }
+    }
+
+    // ── find_fk_covering_index unit tests ──
+
+    fn make_child_schema_with_indexes(indexes: Vec<IndexDef>) -> TableSchema {
+        TableSchema {
+            name: "public.child".to_string(),
+            table_id: 2,
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+                ColumnDef {
+                    name: "parent_id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+                ColumnDef {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+                ColumnDef {
+                    name: "unrelated".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+            ],
+            pk_indices: vec![0],
+            indexes,
+            ..TableSchema::default()
+        }
+    }
+
+    fn btree_index(
+        name: &str,
+        id: u64,
+        columns: Vec<&str>,
+        unique: bool,
+        state: IndexState,
+    ) -> IndexDef {
+        IndexDef {
+            name: name.to_string(),
+            id,
+            columns: columns.into_iter().map(String::from).collect(),
+            unique,
+            is_constraint: false,
+            method: None, // NULL = btree default
+            predicate: None,
+            expressions: Vec::new(),
+            state,
+            cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
+        }
+    }
+
+    #[test]
+    fn fk_covering_index_exact_match() {
+        let schema = make_child_schema_with_indexes(vec![btree_index(
+            "idx_parent_id",
+            10,
+            vec!["parent_id"],
+            false,
+            IndexState::Ready,
+        )]);
+        let fk_columns = vec!["parent_id".to_string()];
+        let result = find_fk_covering_index(&schema, &fk_columns);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "idx_parent_id");
+    }
+
+    #[test]
+    fn fk_covering_index_prefix_match() {
+        let schema = make_child_schema_with_indexes(vec![btree_index(
+            "idx_composite",
+            11,
+            vec!["parent_id", "name"],
+            false,
+            IndexState::Ready,
+        )]);
+        let fk_columns = vec!["parent_id".to_string()];
+        let result = find_fk_covering_index(&schema, &fk_columns);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "idx_composite");
+    }
+
+    #[test]
+    fn fk_covering_index_no_match() {
+        let schema = make_child_schema_with_indexes(vec![btree_index(
+            "idx_unrelated",
+            12,
+            vec!["unrelated"],
+            false,
+            IndexState::Ready,
+        )]);
+        let fk_columns = vec!["parent_id".to_string()];
+        let result = find_fk_covering_index(&schema, &fk_columns);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn fk_covering_index_skips_non_btree() {
+        let schema = make_child_schema_with_indexes(vec![IndexDef {
+            name: "idx_hnsw".to_string(),
+            id: 13,
+            columns: vec!["parent_id".to_string()],
+            unique: false,
+            is_constraint: false,
+            method: Some("hnsw".to_string()),
+            predicate: None,
+            expressions: Vec::new(),
+            state: IndexState::Ready,
+            cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
+        }]);
+        let fk_columns = vec!["parent_id".to_string()];
+        assert!(find_fk_covering_index(&schema, &fk_columns).is_none());
+    }
+
+    #[test]
+    fn fk_covering_index_skips_partial() {
+        let schema = make_child_schema_with_indexes(vec![IndexDef {
+            name: "idx_partial".to_string(),
+            id: 14,
+            columns: vec!["parent_id".to_string()],
+            unique: false,
+            is_constraint: false,
+            method: None,
+            predicate: Some("parent_id > 0".to_string()),
+            expressions: Vec::new(),
+            state: IndexState::Ready,
+            cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
+        }]);
+        let fk_columns = vec!["parent_id".to_string()];
+        assert!(find_fk_covering_index(&schema, &fk_columns).is_none());
+    }
+
+    #[test]
+    fn fk_covering_index_skips_expression() {
+        let schema = make_child_schema_with_indexes(vec![IndexDef {
+            name: "idx_expr".to_string(),
+            id: 15,
+            columns: vec!["parent_id".to_string()],
+            unique: false,
+            is_constraint: false,
+            method: None,
+            predicate: None,
+            expressions: vec!["lower(name)".to_string()],
+            state: IndexState::Ready,
+            cached_predicate_conjuncts: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+            hnsw_distance_metric: None,
+        }]);
+        let fk_columns = vec!["parent_id".to_string()];
+        assert!(find_fk_covering_index(&schema, &fk_columns).is_none());
+    }
+
+    #[test]
+    fn fk_covering_index_skips_not_ready() {
+        let schema = make_child_schema_with_indexes(vec![btree_index(
+            "idx_building",
+            16,
+            vec!["parent_id"],
+            false,
+            IndexState::Building,
+        )]);
+        let fk_columns = vec!["parent_id".to_string()];
+        assert!(find_fk_covering_index(&schema, &fk_columns).is_none());
     }
 }

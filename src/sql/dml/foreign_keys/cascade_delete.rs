@@ -79,16 +79,22 @@ async fn cascade_delete_recursive(
                 None
             };
 
-            let all_rows = fk_ctx
-                .table_rows
-                .get(&other_table)
-                .cloned()
-                .unwrap_or_default();
+            // Targeted lookup: only rows where FK columns == ref_values.
+            let matching_rows = super::find_referencing_rows(
+                ctx.store,
+                txn,
+                ctx.db_id,
+                &other_table,
+                &other_schema,
+                &fk,
+                &ref_values,
+            )
+            .await?;
 
             let mut rows_to_cascade: Vec<Row> = Vec::new();
             let mut rows_to_update_pks: Vec<Vec<Value>> = Vec::new();
 
-            for other_row in &all_rows {
+            for other_row in &matching_rows {
                 let other_pk = other_schema.get_pk_values(other_row);
                 if fk_ctx.is_pk_marked_deleted(&other_table, &other_pk) {
                     continue;
@@ -175,17 +181,21 @@ async fn cascade_delete_recursive(
                     &del_row,
                 )
                 .await?;
-
-                // Keep in-memory snapshot in sync for later parent-row processing.
-                fk_ctx.remove_row_from_snapshot(&other_table, &other_schema, &del_row);
             }
 
             if !rows_to_update_pks.is_empty() {
                 let enum_cache =
                     build_enum_label_cache(ctx.store, txn, ctx.db_id, &other_schema).await?;
                 for target_pk in rows_to_update_pks {
-                    let Some(current_row) =
-                        fk_ctx.find_row_in_snapshot(&other_table, &other_schema, &target_pk)
+                    let Some(current_row) = super::fetch_row_by_pk(
+                        ctx.store,
+                        txn,
+                        ctx.db_id,
+                        other_schema.table_id,
+                        &other_schema,
+                        target_pk,
+                    )
+                    .await?
                     else {
                         // The row may have been deleted by an earlier CASCADE action in this frame.
                         continue;
@@ -261,15 +271,6 @@ async fn cascade_delete_recursive(
                             }
                         }
                     }
-
-                    // Use the applied row returned by UPDATE to preserve exact
-                    // in-memory snapshot parity with storage writes.
-                    fk_ctx.replace_row_in_snapshot(
-                        &other_table,
-                        &other_schema,
-                        &current_row,
-                        updated_row,
-                    );
                 }
             }
         }

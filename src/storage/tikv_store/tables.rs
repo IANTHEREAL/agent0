@@ -635,6 +635,57 @@ impl TikvStore {
         Ok(rows)
     }
 
+    /// Scan table rows in bounded batches with per-batch client-side filtering.
+    ///
+    /// Unlike `scan(..., None)` which accumulates ALL rows before returning,
+    /// this method:
+    /// 1. Reads one page of TABLE_SCAN_BATCH_SIZE (1024) rows at a time
+    /// 2. Applies `filter` to each row in the batch
+    /// 3. Accumulates only matching rows; drops non-matching rows immediately
+    /// 4. Advances the cursor to the next page
+    ///
+    /// Memory: O(matching_rows + TABLE_SCAN_BATCH_SIZE), NOT O(table_size).
+    pub async fn scan_with_row_filter(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_name: &str,
+        filter: impl Fn(&Row) -> bool,
+    ) -> Result<Vec<Row>> {
+        let schema = self
+            .get_schema(txn, db_id, table_name)
+            .await?
+            .ok_or_else(|| anyhow!("Table not found"))?;
+        let (raw_start, raw_end) = encode_table_data_range_v2(db_id, schema.table_id);
+        let end_key = self.key(&raw_end);
+        let mut start_key = self.key(&raw_start);
+        let mut matching_rows = Vec::new();
+
+        loop {
+            let (pairs, next_start) = scan_one_page(
+                txn,
+                start_key.clone(),
+                end_key.clone(),
+                TABLE_SCAN_BATCH_SIZE,
+            )
+            .await?;
+            let batch_len = pairs.len();
+            for pair in pairs {
+                let row = deserialize_row(pair.value())?;
+                if filter(&row) {
+                    matching_rows.push(row);
+                }
+            }
+            kv_stats::record_table_scan_pairs(batch_len);
+            match next_start {
+                Some(k) => start_key = k,
+                None => break,
+            }
+        }
+
+        Ok(matching_rows)
+    }
+
     /// Delete rows matching a simple condition
     pub async fn delete_by_pk(
         &self,
