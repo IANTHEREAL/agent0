@@ -2983,6 +2983,116 @@ fn analyze_to_regtype_rejects_non_text_argument() {
 }
 
 #[test]
+fn analyze_websearch_to_tsquery_unknown_param_infers_text_single_arg() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT websearch_to_tsquery($1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text]);
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+    assert_eq!(q.output_schema[0].1, DataType::Tsquery);
+}
+
+#[test]
+fn analyze_to_tsvector_unknown_param_infers_text_two_args() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT to_tsvector('english', $1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text]);
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+    assert_eq!(q.output_schema[0].1, DataType::Tsvector);
+}
+
+#[test]
+fn analyze_plainto_tsquery_unknown_param_infers_text_two_args() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT plainto_tsquery('english', $1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text]);
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+    assert_eq!(q.output_schema[0].1, DataType::Tsquery);
+}
+
+#[test]
+fn analyze_phraseto_tsquery_unknown_param_infers_text_two_args() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT phraseto_tsquery('english', $1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text]);
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+    assert_eq!(q.output_schema[0].1, DataType::Tsquery);
+}
+
+#[test]
+fn analyze_to_tsquery_unknown_param_infers_text_two_args() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT to_tsquery('english', $1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text]);
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+    assert_eq!(q.output_schema[0].1, DataType::Tsquery);
+}
+
+#[test]
+fn analyze_websearch_to_tsquery_unknown_param_infers_text_two_args() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT websearch_to_tsquery('english', $1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text]);
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+    assert_eq!(q.output_schema[0].1, DataType::Tsquery);
+}
+
+#[test]
+fn analyze_websearch_to_tsquery_rejects_non_text_argument() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT websearch_to_tsquery('english', 1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
+#[test]
+fn analyze_websearch_to_tsquery_rejects_client_typed_non_text_param() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT websearch_to_tsquery('english', $1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[Some(DataType::Int32)]);
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
+#[test]
 fn analyze_parameter_with_client_oid() {
     // Client provides INT4 OID → respected even without contextual typing
     let catalog = test_catalog();
