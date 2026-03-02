@@ -41,6 +41,8 @@ import argparse
 import shutil
 import atexit
 import random
+import urllib.error
+import urllib.request
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Dict
@@ -159,6 +161,18 @@ def wait_for_port(host: str, port: int, timeout: int = 60) -> bool:
     return False
 
 
+def http_get_status(url: str, timeout: float = 1.5) -> Optional[int]:
+    """Best-effort HTTP GET status code probe."""
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:
+        return None
+
+
 def is_port_in_use(port: int) -> bool:
     """Check if a port is in use."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -225,9 +239,43 @@ def check_cluster_process(info: ClusterInfo) -> str:
 
 
 def wait_for_cluster_ready(host: str, pd_port: int, timeout: int = 120) -> bool:
-    """Wait for the cluster to be ready by checking the PD port."""
+    """Wait for the cluster to be ready by checking PD TCP + HTTP API health."""
     check_host = "127.0.0.1" if host == "0.0.0.0" else host
-    return wait_for_port(check_host, pd_port, timeout)
+    deadline = time.time() + timeout
+    consecutive_ok = 0
+    required_consecutive_ok = 3
+
+    while time.time() < deadline:
+        # 1) PD TCP port must be open.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1)
+            tcp_ok = sock.connect_ex((check_host, pd_port)) == 0
+
+        if not tcp_ok:
+            consecutive_ok = 0
+            time.sleep(1)
+            continue
+
+        # 2) PD HTTP endpoints must also answer. This avoids a race where the
+        # port is open but PD is not yet fully ready for clients.
+        base = f"http://{check_host}:{pd_port}"
+        version_status = http_get_status(f"{base}/pd/api/v1/version")
+        keyspace_status = http_get_status(f"{base}/pd/api/v2/keyspaces")
+
+        version_ok = version_status == 200
+        # Accept 200 (newer PD) and 404/405 (older PD without v2 keyspace API).
+        keyspace_ok = keyspace_status in (200, 404, 405)
+
+        if version_ok and keyspace_ok:
+            consecutive_ok += 1
+            if consecutive_ok >= required_consecutive_ok:
+                return True
+        else:
+            consecutive_ok = 0
+
+        time.sleep(1)
+
+    return False
 
 
 def ports_are_free(ports: List[int]) -> bool:
