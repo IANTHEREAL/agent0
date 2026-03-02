@@ -215,6 +215,12 @@ pub async fn execute_create_index(
     let mut hnsw_ef_construction: Option<u16> = None;
     let mut hnsw_distance_metric: Option<String> = None;
     if is_hnsw {
+        if unique {
+            return Err(SqlError::Unsupported(
+                "access method \"hnsw\" does not support unique indexes".into(),
+            )
+            .into());
+        }
         if idx_cols.len() != 1 || !idx_exprs.is_empty() {
             return Err(anyhow!(
                 "access method \"hnsw\" does not support multicolumn indexes"
@@ -328,7 +334,7 @@ pub async fn execute_create_index(
         name: idx_name_str.clone(),
         id: index_id,
         columns: idx_cols,
-        unique: if is_hnsw { false } else { unique },
+        unique,
         is_constraint: false,
         method,
         predicate: predicate_str,
@@ -434,6 +440,53 @@ pub async fn execute_create_index(
             let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
             let data_key_prefix = start.clone();
             let pk_types = pk_types_for_schema(&schema);
+
+            // ── Reject tables with negative PK values ─────────────────────
+            // db9 divergence: PostgreSQL (with pgvector) allows HNSW indexes on
+            // tables with negative PKs.  db9 rejects this because usearch labels
+            // are u64 and we derive them from the PK value — negative integers
+            // cannot be represented.  This restriction may be lifted if we adopt
+            // a PK-to-label mapping layer in the future.
+            // HNSW labels require non-negative u64.  PK values are stored in
+            // key-order, so the first row has the minimum PK.  Read one row.
+            {
+                let range: tikv_client::BoundRange = (start.clone()..end.clone()).into();
+                let pairs: Vec<tikv_client::KvPair> = txn.scan(range, 1).await?.collect();
+                if let Some(pair) = pairs.first() {
+                    let mut row = crate::storage::deserialize_row(pair.value())?;
+                    fill_row_defaults(&mut row, &schema)?;
+                    let pk_values = if schema.pk_indices.is_empty() {
+                        let key: &[u8] = pair.key().as_ref().into();
+                        let pk_bytes =
+                            key.strip_prefix(data_key_prefix.as_slice())
+                                .ok_or_else(|| {
+                                    anyhow!("corrupted row key while validating HNSW index")
+                                })?;
+                        crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?
+                    } else {
+                        schema.get_pk_values(&row)
+                    };
+                    let is_negative = pk_values.iter().any(|v| match v {
+                        Value::Int32(n) => *n < 0,
+                        Value::Int64(n) => *n < 0,
+                        _ => false,
+                    });
+                    if is_negative {
+                        let pk_display = pk_values
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        // db9 divergence: PG+pgvector would succeed here; db9 rejects
+                        // because usearch labels must be non-negative u64.
+                        return Err(anyhow!(
+                            "cannot create HNSW index: primary key contains negative value \
+                             ({}); HNSW indexes require non-negative INTEGER/BIGINT primary keys",
+                            pk_display
+                        ));
+                    }
+                }
+            }
 
             let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
             let mut pending_vectors: Vec<(u64, Vec<f32>)> = Vec::new();

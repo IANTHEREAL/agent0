@@ -6,3 +6,5 @@ id|v
 (2 rows)
 ERROR:  operator class "vector_l2_ops" does not accept data type text
 ERROR:  access method "hnsw" does not support multicolumn indexes
+ERROR:  access method "hnsw" does not support unique indexes
+ERROR:  cannot create HNSW index: primary key contains negative value (-1); HNSW indexes require non-negative INTEGER/BIGINT primary keys

@@ -41,3 +41,24 @@ CREATE TABLE hnsw_multi_test (
 );
 CREATE INDEX idx_hnsw_multi ON hnsw_multi_test USING hnsw (v1, v2);
 DROP TABLE hnsw_multi_test;
+
+-- Error: UNIQUE HNSW index (not supported, must error with SQLSTATE 0A000)
+DROP TABLE IF EXISTS hnsw_unique_test;
+CREATE TABLE hnsw_unique_test (
+    id SERIAL PRIMARY KEY,
+    v VECTOR(3)
+);
+CREATE UNIQUE INDEX idx_hnsw_uniq ON hnsw_unique_test USING hnsw (v vector_l2_ops);
+DROP TABLE hnsw_unique_test;
+
+-- db9 divergence: db9 rejects negative PK for HNSW indexes (PostgreSQL allows it; db9 requires non-negative INTEGER/BIGINT for usearch labels)
+-- Error: HNSW index on table with negative PK (must be rejected at DDL time)
+DROP TABLE IF EXISTS hnsw_neg_pk_test;
+CREATE TABLE hnsw_neg_pk_test (
+    id INTEGER PRIMARY KEY,
+    v VECTOR(3)
+);
+INSERT INTO hnsw_neg_pk_test VALUES (-1, '[1.0, 0.0, 0.0]');
+INSERT INTO hnsw_neg_pk_test VALUES (1, '[0.0, 1.0, 0.0]');
+CREATE INDEX idx_hnsw_neg ON hnsw_neg_pk_test USING hnsw (v vector_l2_ops);
+DROP TABLE hnsw_neg_pk_test;
