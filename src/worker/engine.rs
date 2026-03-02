@@ -403,6 +403,33 @@ impl WorkerEngine {
         queue_key: Vec<u8>,
         entry: TaskQueueEntry,
     ) -> Result<()> {
+        Self::claim_and_execute_core(
+            system_store,
+            pool,
+            config,
+            metrics,
+            queue_key,
+            entry,
+            Self::finalize_cron_run,
+        )
+        .await
+    }
+
+    /// Core implementation of claim_and_execute, parameterized over the finalize
+    /// function so tests can inject failures in the real code path.
+    async fn claim_and_execute_core<F, Fut>(
+        system_store: &Arc<TikvStore>,
+        pool: &Arc<TikvClientPool>,
+        config: &WorkerConfig,
+        metrics: &Arc<WorkerMetrics>,
+        queue_key: Vec<u8>,
+        entry: TaskQueueEntry,
+        finalize_fn: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(Arc<TikvStore>, u64, CronRun, CronRunStatus, Option<String>, i64, i64) -> Fut,
+        Fut: Future<Output = Result<()>> + Send,
+    {
         let fire_time_min = chrono::Utc::now().timestamp() / 60;
         let claim = WorkerClaim::new(config.worker_id.clone(), entry.task_type);
 
@@ -468,27 +495,38 @@ impl WorkerEngine {
             Self::execute_task(pool, config, &entry, None).await
         };
 
-        if let Some((store, db_id, mut run, started_at, _max_runtime_ms)) = cron_run {
-            let (status, message) = match &exec_result {
-                Ok(completed_commands) => (
-                    CronRunStatus::Succeeded,
-                    Some(success_message(*completed_commands)),
-                ),
-                Err(e) => (CronRunStatus::Failed, Some(e.to_string())),
+        // Capture finalize result instead of propagating with `?` — cleanup
+        // must run unconditionally even when finalize fails (#1259).
+        let finalize_result =
+            if let Some((store, db_id, run, started_at, _max_runtime_ms)) = cron_run {
+                let (status, message) = match &exec_result {
+                    Ok(completed_commands) => (
+                        CronRunStatus::Succeeded,
+                        Some(success_message(*completed_commands)),
+                    ),
+                    Err(e) => (CronRunStatus::Failed, Some(e.to_string())),
+                };
+
+                finalize_fn(
+                    store,
+                    db_id,
+                    run,
+                    status,
+                    message,
+                    started_at,
+                    now_epoch_ms(),
+                )
+                .await
+            } else {
+                Ok(())
             };
 
-            Self::finalize_cron_run(
-                &store,
-                db_id,
-                &mut run,
-                status,
-                message,
-                started_at,
-                now_epoch_ms(),
-            )
-            .await?;
+        if let Err(ref e) = finalize_result {
+            warn!("finalize_cron_run failed: {e}; proceeding with cleanup");
         }
 
+        // Cleanup: delete worker claim, manage queue entry, requeue next cron
+        // fire. This block ALWAYS runs regardless of finalize_result.
         let mut txn = system_store.begin().await?;
         system_store
             .delete_worker_claim(
@@ -555,6 +593,9 @@ impl WorkerEngine {
         }
 
         txn.commit().await?;
+
+        // Propagate finalize error AFTER cleanup succeeds.
+        finalize_result?;
 
         match exec_result {
             Ok(_) => {
@@ -715,9 +756,9 @@ impl WorkerEngine {
     }
 
     async fn finalize_cron_run(
-        store: &Arc<TikvStore>,
+        store: Arc<TikvStore>,
         db_id: u64,
-        run: &mut CronRun,
+        mut run: CronRun,
         status: CronRunStatus,
         return_message: Option<String>,
         start_time: i64,
@@ -729,7 +770,7 @@ impl WorkerEngine {
             run.return_message = return_message;
             run.start_time = Some(start_time);
             run.end_time = Some(end_time);
-            store.put_cron_run(&mut txn, db_id, run).await?;
+            store.put_cron_run(&mut txn, db_id, &run).await?;
             // Clear the running guard now that the run is in a terminal state
             store
                 .clear_cron_running_guard(&mut txn, db_id, run.job_id, run.run_id)
@@ -1566,5 +1607,156 @@ mod tests {
             err.to_string().contains("invalid digit") || err.to_string().contains("number"),
             "unexpected parse error: {err}"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TiKV / PD cluster"]
+    async fn finalize_failure_in_claim_and_execute_releases_claim_and_requeues_cron() {
+        let pd_endpoints = std::env::var("PD_ENDPOINTS")
+            .unwrap_or_else(|_| "127.0.0.1:2379".to_string())
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let system_keyspace = format!(
+            "_sys_finalize_test_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let cfg = crate::worker::config::WorkerConfig {
+            enabled: true,
+            system_keyspace: system_keyspace.clone(),
+            cron_job_timeout_ms: 5000,
+            ..Default::default()
+        };
+        let system_store = crate::worker::init_system_store(pd_endpoints.clone(), &cfg)
+            .await
+            .expect("init system store")
+            .expect("store must be present");
+        let pool = Arc::new(crate::pool::TikvClientPool::new(pd_endpoints));
+        let metrics = Arc::new(crate::worker::metrics::WorkerMetrics::new());
+
+        // Setup: tenant store with cron job
+        let keyspace = format!(
+            "test_finalize_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let db_id = 1_u64;
+        let task_id = 42_i64;
+
+        {
+            let handle = pool
+                .acquire(Some(keyspace.clone()))
+                .await
+                .expect("acquire tenant handle");
+            let tenant_store = handle.store().clone();
+            let mut txn = tenant_store.begin().await.unwrap();
+            tenant_store
+                .set_cron_enabled(&mut txn, db_id)
+                .await
+                .unwrap();
+            let job = crate::cron::types::CronJob {
+                job_id: task_id,
+                schedule: "*/5 * * * *".to_string(),
+                command: "SELECT 1".to_string(),
+                nodename: String::new(),
+                nodeport: 0,
+                database: "postgres".to_string(),
+                username: "admin".to_string(),
+                active: true,
+                jobname: None,
+                max_runtime_ms: None,
+            };
+            tenant_store
+                .put_cron_job(&mut txn, db_id, &job)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // Setup: queue entry in system store
+        let entry = TaskQueueEntry::new(
+            keyspace.clone(),
+            db_id,
+            task_id,
+            TaskType::Cron,
+            "SELECT 1".to_string(),
+            "admin".to_string(),
+            100,
+        )
+        .with_schedule("*/5 * * * *".to_string());
+
+        let fire_time_ms = crate::worker::now_epoch_ms();
+        let queue_key = {
+            let mut txn = system_store.begin().await.unwrap();
+            system_store
+                .put_worker_queue_entry(&mut txn, &entry, fire_time_ms)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+
+            // Read back the queue key
+            let mut txn2 = system_store.begin().await.unwrap();
+            let entries = system_store
+                .scan_due_queue_entries(&mut txn2, i64::MAX, 1000)
+                .await
+                .unwrap();
+            let (key, _) = entries
+                .into_iter()
+                .find(|(_, e)| e.task_id == task_id && e.keyspace == keyspace)
+                .expect("queue entry must exist");
+            txn2.rollback().await.ok();
+            key
+        };
+
+        // Call the REAL claim_and_execute code path with injected finalize failure
+        let result = WorkerEngine::claim_and_execute_core(
+            &system_store,
+            &pool,
+            &cfg,
+            &metrics,
+            queue_key,
+            entry.clone(),
+            |_store, _db_id, _run, _status, _msg, _start, _end| async {
+                Err(anyhow!("injected: TiKV write error in finalize_cron_run"))
+            },
+        )
+        .await;
+
+        // Verify: finalize error propagated (claim_and_execute_core returns Err)
+        assert!(
+            result.is_err(),
+            "claim_and_execute_core must propagate finalize error after cleanup"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("injected"),
+            "propagated error must be the finalize error"
+        );
+
+        // Verify persisted state: cleanup DID run
+        let mut txn = system_store.begin().await.unwrap();
+
+        // Worker claim MUST be released
+        let claims = system_store.list_worker_claims(&mut txn).await.unwrap();
+        assert!(
+            !claims.iter().any(|(_, c)| c.worker_id == cfg.worker_id),
+            "INVARIANT VIOLATED: worker claim must be deleted after cleanup"
+        );
+
+        // Next cron fire MUST be requeued (new queue entry with future fire time)
+        let queue = system_store
+            .scan_due_queue_entries(&mut txn, i64::MAX, 1000)
+            .await
+            .unwrap();
+        assert!(
+            queue.iter().any(|(_, e)| e.task_id == task_id
+                && e.keyspace == keyspace
+                && e.task_type == TaskType::Cron),
+            "INVARIANT VIOLATED: next cron fire must be requeued after cleanup"
+        );
+
+        txn.rollback().await.ok();
     }
 }
