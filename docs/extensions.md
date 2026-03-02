@@ -2,6 +2,32 @@
 
 db9-server extensions are **built-in** (compiled into the server binary) and can be **enabled per-tenant** (TiKV keyspace isolated).
 
+## Capability Matrix
+
+| Capability | Runtime availability | Requires `CREATE EXTENSION` for use | `CREATE EXTENSION` behavior |
+|---|---|---|---|
+| `vector` type and operators (`<->`, `<#>`, `<=>`) | Built-in, always available | No | Accepted for compatibility; records `pg_extension` metadata |
+| `http` (`extensions.http_*`) | Built-in code path | Yes | Installs/enables per-tenant |
+| `fs9` (`extensions.fs9`) | Built-in code path | Yes | Installs/enables per-tenant |
+| `pg_cron` | Built-in code path | Yes | Installs/enables per-tenant |
+| `parquet` (`read_parquet`) | Built-in code path (feature-gated at build time) | Yes | Installs/enables per-tenant |
+| `uuid-ossp` | Built-in UUID functions | No | Accepted for compatibility; records `pg_extension` metadata |
+| `hstore` | Compatibility surface only | No | Accepted for compatibility; records `pg_extension` metadata |
+| `zhparser` tokenizer | Built-in via jieba | No | Accepted for compatibility; records `pg_extension` metadata |
+
+For ORM/agent bootstrap flows: `CREATE EXTENSION IF NOT EXISTS vector;` is safe but optional. Vector features work without running this statement.
+
+## Regression Contract
+
+The following behavior is a compatibility contract and must not regress:
+
+- `CREATE EXTENSION IF NOT EXISTS vector` must succeed when `vector` is absent.
+- Re-running `CREATE EXTENSION IF NOT EXISTS vector` must be idempotent (no error).
+- A `pg_extension` row for `vector` must exist after bootstrap.
+- Running the bootstrap command inside an explicit transaction must not abort that transaction.
+
+Coverage is enforced by `tests/269_vector_extension_bootstrap.sql`.
+
 ## Manage Extensions
 
 ```sql

@@ -758,4 +758,17 @@ mod tests {
         assert!(if_exists);
         assert_eq!(name, "http");
     }
+
+    #[test]
+    fn test_parse_create_extension_vector_maps_to_registered_descriptor() {
+        let (if_not_exists, name) =
+            parse_create_extension_sql("CREATE EXTENSION IF NOT EXISTS vector;").unwrap();
+        assert!(if_not_exists);
+        assert_eq!(name, "vector");
+
+        let desc = crate::extensions::descriptor(&name)
+            .expect("vector bootstrap SQL must map to a registered extension descriptor");
+        assert_eq!(desc.name, "vector");
+        assert_eq!(desc.default_schema, "public");
+    }
 }

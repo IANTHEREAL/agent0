@@ -143,7 +143,7 @@ CREATE INDEX idx_users_email ON users (email);
 SHOW TABLES;
 ```
 
-## Extensions (HTTP)
+## Extensions (HTTP + Vector Bootstrap)
 
 db9-server supports built-in extensions that can be enabled per-tenant. The `http` extension provides Supabase-style HTTP table functions under the `extensions` schema:
 
@@ -153,6 +153,12 @@ CREATE EXTENSION http;
 
 SELECT status, content_type, content
 FROM extensions.http_get('https://example.com');
+```
+
+Vector is built-in (no install required). If your ORM/agent emits bootstrap SQL, this is safe:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
 ## Using Transactions

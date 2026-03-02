@@ -114,6 +114,16 @@ const ZHPARSER_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
     default_schema: "public",
 };
 
+// pgvector compatibility shim.
+// db9-server ships vector type/operators as built-ins; CREATE EXTENSION vector
+// records extension metadata for ORM/agent bootstrap compatibility.
+const VECTOR_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
+    name: "vector",
+    oid: 2007,
+    version: "0.8.1",
+    default_schema: "public",
+};
+
 /// Lookup an extension descriptor by name (case-insensitive).
 pub fn descriptor(name: &str) -> Option<&'static ExtensionDescriptor> {
     if name.eq_ignore_ascii_case(HTTP_EXTENSION.name) {
@@ -136,6 +146,9 @@ pub fn descriptor(name: &str) -> Option<&'static ExtensionDescriptor> {
     }
     if name.eq_ignore_ascii_case(ZHPARSER_EXTENSION.name) {
         return Some(&ZHPARSER_EXTENSION);
+    }
+    if name.eq_ignore_ascii_case(VECTOR_EXTENSION.name) {
+        return Some(&VECTOR_EXTENSION);
     }
     None
 }
@@ -188,5 +201,13 @@ mod tests {
         assert_eq!(desc.name, "parquet");
         assert_eq!(desc.default_schema, "extensions");
         assert_eq!(desc.oid, 2005);
+    }
+
+    #[test]
+    fn descriptor_vector_is_registered() {
+        let desc = descriptor("vector").expect("vector must be registered");
+        assert_eq!(desc.name, "vector");
+        assert_eq!(desc.default_schema, "public");
+        assert_eq!(desc.oid, 2007);
     }
 }

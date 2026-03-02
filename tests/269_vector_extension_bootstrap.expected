@@ -1,0 +1,10 @@
+vector_ext_rows
+1
+(1 row)
+id|cos_dist
+1|0
+2|1
+(2 rows)
+txn_alive
+1
+(1 row)
