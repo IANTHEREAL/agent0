@@ -14,7 +14,7 @@ use crate::sql::expr::compile::compile_const_expr;
 use crate::sql::expr::static_eval::{eval_static_typed_expr, needs_async_materialization};
 use crate::sql::expr::typed_rewrite::materialize_sequences_in_typed_expr;
 use crate::sql::query_context::QueryContext;
-use crate::sql::sequences;
+use crate::sql::sequences::{self, set_lastval_sequence_name, LASTVAL_SENTINEL_KEY};
 use crate::sql::value_coercion::coerce_value_for_column;
 use crate::storage::TikvStore;
 
@@ -109,7 +109,9 @@ async fn eval_column_default_or_null_inner(
 
         let seq_val = store.nextval_sequence(txn, db_id, &seq_full_name).await?;
         crate::sql::sequences::set_lastval(sequence_values, &seq_full_name, seq_val);
-        sequence_values.insert(seq_full_name, seq_val);
+        sequence_values.insert(seq_full_name.clone(), seq_val);
+        sequence_values.insert(LASTVAL_SENTINEL_KEY.to_string(), seq_val);
+        set_lastval_sequence_name(sequence_values, &seq_full_name);
         return match column.data_type {
             DataType::Int64 => Ok(Value::Int64(seq_val)),
             _ => Ok(Value::Int32(seq_val.try_into().map_err(|_| {

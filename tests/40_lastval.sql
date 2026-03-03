@@ -110,6 +110,17 @@ INSERT INTO lastval_serial_t (name) VALUES ('bar');
 SELECT lastval();
 DROP TABLE lastval_serial_t;
 
+-- ============================================================
+-- C10: lastval() with arguments must error (SQLSTATE 42883)
+-- ============================================================
+SELECT lastval(1);
+SELECT lastval('x');
+SELECT lastval(1.5);
+SELECT lastval(true);
+SELECT lastval();
+SELECT lastval(2147483648);
+SELECT lastval(1e2);
+
 -- Cleanup
 DROP SEQUENCE lastval_s1;
 DROP SEQUENCE lastval_s2;

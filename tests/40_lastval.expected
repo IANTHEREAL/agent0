@@ -110,3 +110,12 @@ lastval
 lastval
 2
 (1 row)
+ERROR:  function lastval(integer) does not exist
+ERROR:  function lastval(text) does not exist
+ERROR:  function lastval(numeric) does not exist
+ERROR:  function lastval(boolean) does not exist
+lastval
+2
+(1 row)
+ERROR:  function lastval(bigint) does not exist
+ERROR:  function lastval(double) does not exist

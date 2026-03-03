@@ -1,3 +1,7 @@
+setval
+42
+(1 row)
+ERROR:  lastval is not yet defined in this session
 nextval
 5
 (1 row)
@@ -15,6 +19,48 @@ nextval
 (1 row)
 nextval
 3
+(1 row)
+nextval
+100
+(1 row)
+nextval
+200
+(1 row)
+lastval
+200
+(1 row)
+setval
+999
+(1 row)
+lastval
+200
+(1 row)
+setval
+555
+(1 row)
+lastval
+555
+(1 row)
+nextval
+1
+(1 row)
+setval
+10
+(1 row)
+lastval
+1
+(1 row)
+setval
+20
+(1 row)
+lastval
+20
+(1 row)
+setval
+30
+(1 row)
+lastval
+30
 (1 row)
 nextval
 2

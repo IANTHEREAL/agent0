@@ -7,7 +7,9 @@ use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
 use crate::sql::expr::static_eval::eval_static_typed_expr;
 use crate::sql::expr::traverse::{map_children_async, AsyncExprTransform};
 use crate::sql::query_context::QueryContext;
-use crate::sql::sequences;
+use crate::sql::sequences::{
+    self, get_lastval_sequence_name, set_lastval_sequence_name, LASTVAL_SENTINEL_KEY,
+};
 use crate::storage::TikvStore;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -63,7 +65,10 @@ impl AsyncExprTransform for SequenceMaterializeCtx<'_> {
                                 &seq_name,
                                 val,
                             );
-                            self.sequence_values.insert(seq_name, val);
+                            self.sequence_values.insert(seq_name.clone(), val);
+                            self.sequence_values
+                                .insert(LASTVAL_SENTINEL_KEY.to_string(), val);
+                            set_lastval_sequence_name(self.sequence_values, &seq_name);
                             TypedExprKind::Constant(Value::Int64(val))
                         }
                         Some(SequenceFunction::CurrVal) => {
@@ -105,11 +110,15 @@ impl AsyncExprTransform for SequenceMaterializeCtx<'_> {
                                 true
                             };
 
+                            let same_seq = get_lastval_sequence_name(self.sequence_values)
+                                .map(|n| n == seq_name.as_str())
+                                .unwrap_or(false);
                             self.store
                                 .setval_sequence(
                                     self.txn, self.db_id, &seq_name, set_val, is_called,
                                 )
                                 .await?;
+                            // Rule 1: currval cache — always update when is_called=true
                             if is_called {
                                 self.sequence_values.insert(seq_name.clone(), set_val);
                                 crate::sql::sequences::update_lastval_if_same_seq(
@@ -117,6 +126,10 @@ impl AsyncExprTransform for SequenceMaterializeCtx<'_> {
                                     &seq_name,
                                     set_val,
                                 );
+                                if same_seq {
+                                    self.sequence_values
+                                        .insert(LASTVAL_SENTINEL_KEY.to_string(), set_val);
+                                }
                             }
                             TypedExprKind::Constant(Value::Int64(set_val))
                         }

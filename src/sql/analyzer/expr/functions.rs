@@ -218,25 +218,14 @@ impl<'a> Analyzer<'a> {
         let registry = global_registry();
 
         if let Some(sig) = registry.get(&func_name) {
-            // Validate argument count
+            // Validate argument count — PG treats arity mismatch as
+            // "function name(arg_types) does not exist" (SQLSTATE 42883).
             let arg_count = analyzed_args.len();
-            if arg_count < sig.min_args {
-                return Err(AnalyzerError::ArgumentCountMismatch {
-                    function: func_name,
-                    expected_min: sig.min_args,
-                    expected_max: sig.max_args,
-                    got: arg_count,
+            if arg_count < sig.min_args || sig.max_args.is_some_and(|max| arg_count > max) {
+                return Err(AnalyzerError::FunctionNotFound {
+                    name: func_name.to_lowercase(),
+                    arg_types: analyzed_args.iter().map(|a| a.data_type.clone()).collect(),
                 });
-            }
-            if let Some(max) = sig.max_args {
-                if arg_count > max {
-                    return Err(AnalyzerError::ArgumentCountMismatch {
-                        function: func_name,
-                        expected_min: sig.min_args,
-                        expected_max: sig.max_args,
-                        got: arg_count,
-                    });
-                }
             }
 
             // Reject window-only functions used without OVER clause.
