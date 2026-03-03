@@ -2039,6 +2039,27 @@ fn test_parse_copy_command_trailing_junk_after_stdin_errors() {
 }
 
 #[test]
+fn test_parse_copy_command_with_comment_before_options() {
+    // Block comment between WITH and '(' should be stripped.
+    let result =
+        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH/*comment*/(FORMAT csv)")
+            .unwrap();
+    assert!(result.is_some());
+
+    // Line comment between WITH and '(' should be stripped.
+    let result =
+        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH--comment\n(FORMAT csv)")
+            .unwrap();
+    assert!(result.is_some());
+
+    // Unterminated block comment should fall through (Ok(None)).
+    assert_eq!(
+        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH/*unterminated").unwrap(),
+        None
+    );
+}
+
+#[test]
 fn test_count_sql_parameters_ignores_dollar_quoted_strings() {
     assert_eq!(count_sql_parameters("SELECT $$ $99 $$, $1;"), 1);
     assert_eq!(count_sql_parameters("SELECT $tag$ $2 $tag$, $1;"), 1);
