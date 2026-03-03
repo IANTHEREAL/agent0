@@ -1957,9 +1957,30 @@ fn test_parse_copy_command_trailing_junk_after_stdin_errors() {
         err.message
     );
 
+    // WITH-prefix junk (e.g. WITHX, WITH123) must be rejected — WITH is prefix-only
+    // without boundary check otherwise.
+    let err = DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITHX")
+        .expect_err("WITHX should be rejected as trailing junk");
+    assert!(
+        err.message.contains("syntax error"),
+        "expected syntax error for WITHX, got: {}",
+        err.message
+    );
+    let err = DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH123")
+        .expect_err("WITH123 should be rejected as trailing junk");
+    assert!(
+        err.message.contains("syntax error"),
+        "expected syntax error for WITH123, got: {}",
+        err.message
+    );
+
     // Valid WITH clause should still be accepted.
     let result =
         DynamicPgHandler::parse_copy_command(r#"COPY "t" FROM STDIN WITH (FORMAT csv)"#).unwrap();
+    assert!(result.is_some());
+    // WITH( without space is also valid.
+    let result =
+        DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH(FORMAT csv)"#).unwrap();
     assert!(result.is_some());
 
     // Trailing semicolon should be accepted.

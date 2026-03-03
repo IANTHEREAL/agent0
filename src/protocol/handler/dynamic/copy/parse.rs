@@ -165,11 +165,20 @@ fn parse_copy_from_stdin_tokens(query: &str) -> Result<Option<(String, Vec<Strin
 
     // 7. Validate trailing tokens: only whitespace/comments/EOF, `;`, or `WITH` allowed.
     let rest = skip_ws_and_comments(rest);
-    if !rest.is_empty() && !rest.starts_with(';') && match_keyword(rest, "WITH").is_none() {
-        return Err(format!(
-            "syntax error at or near \"{}\"",
-            rest.split_ascii_whitespace().next().unwrap_or(rest)
-        ));
+    if !rest.is_empty() && !rest.starts_with(';') {
+        // WITH must be a complete keyword (followed by whitespace, '(', or EOF).
+        let is_with = match match_keyword(rest, "WITH") {
+            Some(after) => {
+                after.is_empty() || after.starts_with(|c: char| c.is_ascii_whitespace() || c == '(')
+            }
+            None => false,
+        };
+        if !is_with {
+            return Err(format!(
+                "syntax error at or near \"{}\"",
+                rest.split_ascii_whitespace().next().unwrap_or(rest)
+            ));
+        }
     }
 
     Ok(Some((table_name, columns)))
