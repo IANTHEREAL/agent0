@@ -1973,6 +1973,29 @@ fn test_parse_copy_command_trailing_junk_after_stdin_errors() {
         "expected syntax error for WITH123, got: {}",
         err.message
     );
+    let err = DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITHX (FORMAT csv)")
+        .expect_err("WITHX should be rejected as trailing junk even before options");
+    assert!(
+        err.message.contains("syntax error"),
+        "expected syntax error for WITHX (FORMAT ...), got: {}",
+        err.message
+    );
+
+    // WITH clause must start with '('; arbitrary token after WITH is invalid.
+    let err = DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH garbage")
+        .expect_err("WITH garbage should be rejected");
+    assert!(
+        err.message.contains("syntax error"),
+        "expected syntax error for WITH garbage, got: {}",
+        err.message
+    );
+    let err = DynamicPgHandler::parse_copy_command(r#"COPY "t" FROM STDIN WITH garbage"#)
+        .expect_err("quoted table path should reject WITH garbage the same way");
+    assert!(
+        err.message.contains("syntax error"),
+        "expected syntax error for quoted WITH garbage, got: {}",
+        err.message
+    );
 
     // Valid WITH clause should still be accepted.
     let result =

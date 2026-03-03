@@ -163,21 +163,29 @@ fn parse_copy_from_stdin_tokens(query: &str) -> Result<Option<(String, Vec<Strin
         return Ok(None);
     };
 
-    // 7. Validate trailing tokens: only whitespace/comments/EOF, `;`, or `WITH` allowed.
+    // 7. Validate trailing tokens: only whitespace/comments/EOF, `;`, or `WITH (...)` allowed.
     let rest = skip_ws_and_comments(rest);
     if !rest.is_empty() && !rest.starts_with(';') {
-        // WITH must be a complete keyword (followed by whitespace, '(', or EOF).
-        let is_with = match match_keyword(rest, "WITH") {
-            Some(after) => {
-                after.is_empty() || after.starts_with(|c: char| c.is_ascii_whitespace() || c == '(')
-            }
-            None => false,
-        };
-        if !is_with {
+        // WITH must be a complete keyword boundary (followed by whitespace, '(' or EOF).
+        let Some(after_with) = match_keyword(rest, "WITH") else {
             return Err(format!(
                 "syntax error at or near \"{}\"",
                 rest.split_ascii_whitespace().next().unwrap_or(rest)
             ));
+        };
+        if !after_with.is_empty()
+            && !after_with.starts_with(|c: char| c.is_ascii_whitespace() || c == '(')
+        {
+            return Err(format!(
+                "syntax error at or near \"{}\"",
+                rest.split_ascii_whitespace().next().unwrap_or(rest)
+            ));
+        }
+
+        // PG-compatible fast-path guard: after WITH, the next non-ws/comment token must be '('.
+        let after_with = skip_ws_and_comments(after_with);
+        if !after_with.starts_with('(') {
+            return Err("syntax error: expected '(' after WITH in COPY statement".to_string());
         }
     }
 
