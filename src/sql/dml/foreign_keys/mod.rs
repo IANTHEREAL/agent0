@@ -186,6 +186,10 @@ pub(crate) struct FkDeleteContext {
     /// Per-table set of deleted PK hash keys, used to prevent redundant work
     /// and infinite cascade cycles.
     pub deleted_pks: HashMap<String, HashSet<String>>,
+    /// Reverse-FK adjacency: parent table name → list of (child table name,
+    /// FK index within `child_schema.foreign_keys`).  Built once, used for
+    /// O(1) lookup per recursive cascade frame instead of scanning all schemas.
+    pub referencing_by_parent: HashMap<String, Vec<(String, usize)>>,
 }
 
 impl FkDeleteContext {
@@ -202,9 +206,20 @@ impl FkDeleteContext {
             }
         }
 
+        let mut referencing_by_parent: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+        for (child_table, schema) in &table_schemas {
+            for (fk_idx, fk) in schema.foreign_keys.iter().enumerate() {
+                referencing_by_parent
+                    .entry(fk.ref_table.clone())
+                    .or_default()
+                    .push((child_table.clone(), fk_idx));
+            }
+        }
+
         Ok(Self {
             table_schemas,
             deleted_pks: HashMap::new(),
+            referencing_by_parent,
         })
     }
 
