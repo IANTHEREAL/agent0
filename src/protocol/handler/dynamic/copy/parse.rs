@@ -316,33 +316,31 @@ fn parse_copy_from_stdin_tokens(query: &str) -> Result<Option<(String, Vec<Strin
         return Ok(None);
     };
 
-    // 7. Validate trailing tokens: only whitespace/comments/EOF, `;`, or `WITH (...)` allowed.
+    // 7. Validate trailing tokens after STDIN.
+    //    Fast-path only handles: empty/`;`, or well-formed `WITH (...)`.
+    //    Everything else (legacy unparenthesized options, bare keywords, junk)
+    //    → fall through to the full sqlparser via Ok(None).
     let rest = skip_ws_and_comments(rest);
     if !rest.is_empty() && !rest.starts_with(';') {
-        // WITH must be a complete keyword boundary (followed by whitespace, '(' or EOF).
+        // Must start with WITH as a complete keyword boundary.
         let Some(after_with) = match_keyword(rest, "WITH") else {
-            return Err(format!(
-                "syntax error at or near \"{}\"",
-                rest.split_ascii_whitespace().next().unwrap_or(rest)
-            ));
+            return Ok(None); // not WITH — fall through
         };
         if !after_with.is_empty()
             && !after_with.starts_with(|c: char| c.is_ascii_whitespace() || c == '(')
             && !after_with.starts_with("/*")
             && !after_with.starts_with("--")
         {
-            return Err(format!(
-                "syntax error at or near \"{}\"",
-                rest.split_ascii_whitespace().next().unwrap_or(rest)
-            ));
+            return Ok(None); // not a clean WITH keyword boundary — fall through
         }
 
-        // PG-compatible fast-path guard: after WITH, the next non-ws/comment token must be '('.
+        // After WITH, the next non-ws/comment token must be '('.
+        // Legacy unparenthesized syntax (WITH CSV, WITH DELIMITER ',') → fall through.
         let Some(after_with) = strip_leading_whitespace_and_comments(after_with) else {
-            return Ok(None); // unclosed comment — fall through to full parser
+            return Ok(None); // unclosed comment — fall through
         };
         if !after_with.starts_with('(') {
-            return Err("syntax error: expected '(' after WITH in COPY statement".to_string());
+            return Ok(None); // WITH without '(' — legacy syntax, fall through
         }
 
         // Validate WITH clause strictly for fast-path eligibility.

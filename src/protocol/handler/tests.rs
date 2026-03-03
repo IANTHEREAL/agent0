@@ -1938,74 +1938,68 @@ fn test_parse_copy_command_quoted_with_escaped_quote() {
 }
 
 #[test]
-fn test_parse_copy_command_trailing_junk_after_stdin_errors() {
-    // Trailing garbage after STDIN must produce a syntax error (PG parity).
-    let err = DynamicPgHandler::parse_copy_command(r#"COPY "t" FROM STDIN garbage"#)
-        .expect_err("trailing junk should be rejected");
-    assert!(
-        err.message.contains("syntax error"),
-        "expected syntax error, got: {}",
-        err.message
+fn test_parse_copy_command_trailing_junk_after_stdin_falls_through() {
+    // Fast-path only handles WITH (...) form. Everything else → Ok(None) fallthrough
+    // so the full sqlparser handles validation (legacy syntax or error).
+
+    // Trailing garbage after STDIN → fall through.
+    assert_eq!(
+        DynamicPgHandler::parse_copy_command(r#"COPY "t" FROM STDIN garbage"#).unwrap(),
+        None
+    );
+    assert_eq!(
+        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN garbage").unwrap(),
+        None
     );
 
-    // Unquoted table name with trailing junk — same error.
-    let err = DynamicPgHandler::parse_copy_command("COPY t FROM STDIN garbage")
-        .expect_err("trailing junk should be rejected");
-    assert!(
-        err.message.contains("syntax error"),
-        "expected syntax error, got: {}",
-        err.message
+    // WITH-prefix junk (WITHX, WITH123) → fall through (not a keyword boundary).
+    assert_eq!(
+        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITHX").unwrap(),
+        None
+    );
+    assert_eq!(
+        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH123").unwrap(),
+        None
+    );
+    assert_eq!(
+        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITHX (FORMAT csv)").unwrap(),
+        None
     );
 
-    // WITH-prefix junk (e.g. WITHX, WITH123) must be rejected — WITH is prefix-only
-    // without boundary check otherwise.
-    let err = DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITHX")
-        .expect_err("WITHX should be rejected as trailing junk");
-    assert!(
-        err.message.contains("syntax error"),
-        "expected syntax error for WITHX, got: {}",
-        err.message
+    // WITH without '(' (legacy unparenthesized syntax) → fall through (C7, C9).
+    assert_eq!(
+        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH garbage").unwrap(),
+        None
     );
-    let err = DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH123")
-        .expect_err("WITH123 should be rejected as trailing junk");
-    assert!(
-        err.message.contains("syntax error"),
-        "expected syntax error for WITH123, got: {}",
-        err.message
+    assert_eq!(
+        DynamicPgHandler::parse_copy_command(r#"COPY "t" FROM STDIN WITH garbage"#).unwrap(),
+        None
     );
-    let err = DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITHX (FORMAT csv)")
-        .expect_err("WITHX should be rejected as trailing junk even before options");
-    assert!(
-        err.message.contains("syntax error"),
-        "expected syntax error for WITHX (FORMAT ...), got: {}",
-        err.message
+    assert_eq!(
+        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH CSV").unwrap(),
+        None,
+        "C7: legacy unparenthesized WITH CSV must fall through"
+    );
+    assert_eq!(
+        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH DELIMITER ','").unwrap(),
+        None,
+        "C9: legacy unparenthesized WITH DELIMITER must fall through"
     );
 
-    // WITH clause must start with '('; arbitrary token after WITH is invalid.
-    let err = DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH garbage")
-        .expect_err("WITH garbage should be rejected");
-    assert!(
-        err.message.contains("syntax error"),
-        "expected syntax error for WITH garbage, got: {}",
-        err.message
-    );
-    let err = DynamicPgHandler::parse_copy_command(r#"COPY "t" FROM STDIN WITH garbage"#)
-        .expect_err("quoted table path should reject WITH garbage the same way");
-    assert!(
-        err.message.contains("syntax error"),
-        "expected syntax error for quoted WITH garbage, got: {}",
-        err.message
+    // Bare options after STDIN without WITH → fall through (C8).
+    assert_eq!(
+        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN CSV").unwrap(),
+        None,
+        "C8: bare CSV after STDIN must fall through"
     );
 
-    // Valid WITH clause should still be accepted.
+    // Valid WITH (...) clause should still be accepted by fast-path.
     let result =
         DynamicPgHandler::parse_copy_command(r#"COPY "t" FROM STDIN WITH (FORMAT csv)"#).unwrap();
     assert!(result.is_some());
-    // WITH( without space is also valid.
     let result =
         DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH(FORMAT csv)"#).unwrap();
     assert!(result.is_some());
-    // Multiple options must be comma-separated and remain accepted.
     let result =
         DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH (FORMAT csv, HEADER true)"#)
             .unwrap();
