@@ -381,35 +381,53 @@ impl DynamicPgHandler {
                         }
                     }
                 } else {
-                    let schemas: Vec<&str> = if search_path.is_empty() {
+                    let schema_entries: Vec<&str> = if search_path.is_empty() {
                         vec!["public"]
                     } else {
                         search_path.iter().map(|s| s.as_str()).collect()
                     };
 
-                    let mut found: Option<(String, crate::model::TableSchema)> = None;
-                    for schema_ident in schemas {
-                        let resolved_table = format!("{}.{}", schema_ident, table_ident);
-                        match executor
-                            .store()
-                            .get_schema(txn, db_id, &resolved_table)
-                            .await
-                        {
-                            Ok(Some(schema)) => {
-                                found = Some((resolved_table, schema));
-                                break;
-                            }
-                            Ok(None) => continue,
-                            Err(e) => {
-                                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
-                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                                    "ERROR".to_string(),
-                                    "XX000".to_string(),
-                                    e.to_string(),
-                                ))));
-                            }
+                    // Build ordered candidates, deduplicating to avoid redundant
+                    // TiKV key reads while preserving search_path priority.
+                    let mut seen = std::collections::HashSet::new();
+                    let mut candidates: Vec<String> = Vec::with_capacity(schema_entries.len());
+                    let mut ordered: Vec<String> = Vec::with_capacity(schema_entries.len());
+                    for schema_ident in &schema_entries {
+                        let full = format!("{}.{}", schema_ident, table_ident);
+                        ordered.push(full.clone());
+                        if seen.insert(full.clone()) {
+                            candidates.push(full);
                         }
                     }
+
+                    // Single batch fetch for all candidate names.
+                    let batch_schemas = match executor
+                        .store()
+                        .list_table_schemas(txn, db_id, &candidates)
+                        .await
+                    {
+                        Ok(schemas) => schemas,
+                        Err(e) => {
+                            rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "XX000".to_string(),
+                                e.to_string(),
+                            ))));
+                        }
+                    };
+
+                    // Build map keyed by full qualified name.
+                    let schema_map: std::collections::HashMap<String, crate::model::TableSchema> =
+                        batch_schemas
+                            .into_iter()
+                            .map(|s| (s.name.clone(), s))
+                            .collect();
+
+                    // Return first hit in original search_path order.
+                    let found = ordered
+                        .into_iter()
+                        .find_map(|name| schema_map.get(&name).map(|s| (name, s.clone())));
 
                     match found {
                         Some(found) => found,

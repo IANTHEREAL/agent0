@@ -751,6 +751,7 @@ impl TikvStore {
                 .collect();
 
             kv_stats::record_batch_get_keys(keys.len());
+            kv_stats::record_batch_get_calls(1);
             let pairs =
                 tikv_op!(txn.batch_get(keys.iter().cloned()).await).map_err(|e| anyhow!(e))?;
             let mut by_key: HashMap<Key, tikv_client::Value> = HashMap::with_capacity(keys.len());
