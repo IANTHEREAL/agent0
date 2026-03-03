@@ -702,28 +702,42 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         let executor = &state.executor;
         let store = executor.store();
 
-        // Brief session lock to read db_id + search_path
-        let (db_id, search_path) = {
+        // Brief session lock to read db_id + search_path + is_superuser
+        let (db_id, search_path, is_superuser) = {
             let session = state.session.lock().await;
             (
                 session.current_database_id(),
                 session.search_path().to_vec(),
+                session.is_superuser(),
             )
         };
+
+        // Extension context for fs9 schema inference during catalog prefetch.
+        // Without this, fs9 table functions would panic in get_backend() due to
+        // missing tikv_client in the task-local context.
+        let tenant_keyspace = executor.tenant_keyspace().to_string();
+        let tikv_client = store.transaction_client();
+        let ext_opts = crate::extensions::context::ExtensionContextOpts::statement(
+            is_superuser,
+            &tenant_keyspace,
+        )
+        .with_tikv_client(tikv_client);
 
         // Temporary read-only transaction for catalog access
         match store.begin().await {
             Ok(mut txn) => {
-                match executor
-                    .analyze_for_prepared(
+                match crate::extensions::context::with_context_opts(
+                    ext_opts,
+                    executor.analyze_for_prepared(
                         &mut txn,
                         db_id,
                         &search_path,
                         &stored.statement.sql,
                         param_count,
                         &client_oids,
-                    )
-                    .await
+                    ),
+                )
+                .await
                 {
                     Ok(analysis) => {
                         match analysis {
