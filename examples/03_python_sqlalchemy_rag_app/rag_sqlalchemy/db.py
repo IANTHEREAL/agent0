@@ -52,6 +52,14 @@ def init_schema(engine: Engine) -> None:
                 "ON rag_documents USING GIN (to_tsvector('english', content))"
             )
         )
+        # HNSW index for fast approximate vector search (ANN with cosine distance).
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_rag_documents_embedding "
+                "ON rag_documents USING hnsw (embedding vector_cosine_ops) "
+                "WITH (m = 16, ef_construction = 64)"
+            )
+        )
 
 
 def build_session_factory(engine: Engine) -> sessionmaker[Session]:
