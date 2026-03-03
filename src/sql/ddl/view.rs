@@ -478,6 +478,7 @@ pub async fn execute_refresh_materialized_view(
             row,
             dml::ConflictBehavior::Error,
             &enum_cache,
+            None,
         )
         .await?;
     }

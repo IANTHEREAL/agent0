@@ -238,6 +238,7 @@ async fn cascade_delete_recursive(
                         desired_row,
                         &enum_cache,
                         Some(fk_ctx),
+                        None,
                     )
                     .await?;
 

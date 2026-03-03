@@ -32,7 +32,8 @@ pub struct HnswBatchStats {
 
 use super::defaults::coerce_row_values;
 use super::foreign_keys::{
-    handle_foreign_key_on_update, validate_foreign_keys, FkDeleteContext, FkStoreCtx,
+    build_fk_ref_schema_cache, handle_foreign_key_on_update, validate_foreign_keys_with_cache,
+    FkDeleteContext, FkStoreCtx,
 };
 use super::insert::validate_enum_values;
 use super::EnumLabelCache;
@@ -47,9 +48,20 @@ pub async fn execute_update_row_by_pk(
     old_row: &Row,
     new_row: Row,
     enum_cache: &EnumLabelCache,
+    fk_ref_cache: Option<&super::foreign_keys::FkRefSchemaCache>,
 ) -> Result<Row> {
     execute_update_row_by_pk_inner(
-        store, txn, db_id, table_name, schema, pk_values, old_row, new_row, enum_cache, false,
+        store,
+        txn,
+        db_id,
+        table_name,
+        schema,
+        pk_values,
+        old_row,
+        new_row,
+        enum_cache,
+        false,
+        fk_ref_cache,
     )
     .await
 }
@@ -68,9 +80,20 @@ pub async fn execute_update_row_by_pk_defer_hnsw(
     old_row: &Row,
     new_row: Row,
     enum_cache: &EnumLabelCache,
+    fk_ref_cache: Option<&super::foreign_keys::FkRefSchemaCache>,
 ) -> Result<Row> {
     execute_update_row_by_pk_inner(
-        store, txn, db_id, table_name, schema, pk_values, old_row, new_row, enum_cache, true,
+        store,
+        txn,
+        db_id,
+        table_name,
+        schema,
+        pk_values,
+        old_row,
+        new_row,
+        enum_cache,
+        true,
+        fk_ref_cache,
     )
     .await
 }
@@ -86,6 +109,7 @@ async fn execute_update_row_by_pk_inner(
     new_row: Row,
     enum_cache: &EnumLabelCache,
     skip_hnsw: bool,
+    fk_ref_cache: Option<&super::foreign_keys::FkRefSchemaCache>,
 ) -> Result<Row> {
     let mut new_row_values = new_row.values;
     coerce_row_values(schema, &mut new_row_values)?;
@@ -93,7 +117,15 @@ async fn execute_update_row_by_pk_inner(
 
     validate_enum_values(schema, &new_row, enum_cache)?;
     if !schema.foreign_keys.is_empty() {
-        validate_foreign_keys(store, txn, db_id, schema, &new_row).await?;
+        let owned_cache;
+        let ref_cache = match fk_ref_cache {
+            Some(c) => c,
+            None => {
+                owned_cache = build_fk_ref_schema_cache(store, txn, db_id, schema, false).await?;
+                &owned_cache
+            }
+        };
+        validate_foreign_keys_with_cache(store, txn, db_id, schema, &new_row, ref_cache).await?;
     }
 
     update_row_indexes(
@@ -238,10 +270,22 @@ pub async fn execute_update_row(
     new_row: Row,
     enum_cache: &EnumLabelCache,
     fk_ctx: Option<&mut FkDeleteContext>,
+    fk_ref_cache: Option<&super::foreign_keys::FkRefSchemaCache>,
 ) -> Result<Row> {
     execute_update_row_inner(
-        store, txn, db_id, table_name, schema, old_row, new_row, enum_cache, fk_ctx, true, true,
+        store,
+        txn,
+        db_id,
+        table_name,
+        schema,
+        old_row,
+        new_row,
+        enum_cache,
+        fk_ctx,
+        true,
+        true,
         false,
+        fk_ref_cache,
     )
     .await
 }
@@ -259,7 +303,7 @@ pub(crate) async fn execute_update_row_without_fk_update(
 ) -> Result<Row> {
     execute_update_row_inner(
         store, txn, db_id, table_name, schema, old_row, new_row, enum_cache, fk_ctx, false, false,
-        false,
+        false, None,
     )
     .await
 }
@@ -280,10 +324,22 @@ pub async fn execute_update_row_defer_hnsw(
     new_row: Row,
     enum_cache: &EnumLabelCache,
     fk_ctx: Option<&mut FkDeleteContext>,
+    fk_ref_cache: Option<&super::foreign_keys::FkRefSchemaCache>,
 ) -> Result<Row> {
     execute_update_row_inner(
-        store, txn, db_id, table_name, schema, old_row, new_row, enum_cache, fk_ctx, true, true,
+        store,
+        txn,
+        db_id,
+        table_name,
+        schema,
+        old_row,
+        new_row,
+        enum_cache,
+        fk_ctx,
         true,
+        true,
+        true,
+        fk_ref_cache,
     )
     .await
 }
@@ -543,6 +599,7 @@ async fn execute_update_row_inner(
     propagate_fk_update: bool,
     validate_fk_now: bool,
     skip_hnsw: bool,
+    fk_ref_cache: Option<&super::foreign_keys::FkRefSchemaCache>,
 ) -> Result<Row> {
     let mut new_row_values = new_row.values;
     coerce_row_values(schema, &mut new_row_values)?;
@@ -555,7 +612,15 @@ async fn execute_update_row_inner(
     let pk_changed = old_pks != new_pks;
 
     if validate_fk_now && !schema.foreign_keys.is_empty() {
-        validate_foreign_keys(store, txn, db_id, schema, &new_row).await?;
+        let owned_cache;
+        let ref_cache = match fk_ref_cache {
+            Some(c) => c,
+            None => {
+                owned_cache = build_fk_ref_schema_cache(store, txn, db_id, schema, false).await?;
+                &owned_cache
+            }
+        };
+        validate_foreign_keys_with_cache(store, txn, db_id, schema, &new_row, ref_cache).await?;
     }
 
     if pk_changed {
