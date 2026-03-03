@@ -44,6 +44,7 @@ pub fn estimate_values_payload_size(values: &[Value]) -> usize {
 }
 
 /// Estimate size of a `Vec<Value>` allocation plus pointed-to value contents.
+#[allow(dead_code)]
 pub fn estimate_values_size(values: &[Value]) -> usize {
     std::mem::size_of::<Vec<Value>>() + estimate_values_payload_size(values)
 }

@@ -1,0 +1,50 @@
+data
+null
+"hello"
+42
+true
+[1, 2, 3]
+{"a": 1}
+(6 rows)
+id|val
+1|1
+5|2
+3|3
+2|
+4|
+(5 rows)
+id|val
+2|
+4|
+1|1
+5|2
+3|3
+(5 rows)
+id|val
+2|
+4|
+3|3
+5|2
+1|1
+(5 rows)
+id|val
+3|3
+5|2
+1|1
+2|
+4|
+(5 rows)
+grp|payload
+1|2
+1|10
+2|1
+2|30
+(4 rows)
+data
+{"a": 1}
+[1, 2, 3]
+true
+42
+"hello"
+null
+(6 rows)
