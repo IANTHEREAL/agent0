@@ -87,7 +87,8 @@ impl VirtualTable for PgType {
             .store
             .get_extension(ctx.txn, ctx.db_id, "hstore")
             .await?
-            .is_some();
+            .map(|ext| ext.enabled)
+            .unwrap_or(false);
         if has_hstore {
             rows.push(Row::new(vec![
                 int_val(pg_types::OID_HSTORE_ARRAY),
