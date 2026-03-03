@@ -269,53 +269,6 @@ impl DynamicPgHandler {
         Ok(None)
     }
 
-    /// Normalize a single SQL identifier token from the COPY tokenizer.
-    ///
-    /// - Quoted (`"Foo""Bar"`) → strip outer quotes, unescape `""` → `Foo"Bar` (case preserved).
-    /// - Unquoted (`foo`) → fold to lowercase (PostgreSQL convention).
-    fn normalize_ident(ident: &str) -> String {
-        let ident = ident.trim();
-        if ident.starts_with('"') && ident.ends_with('"') && ident.len() >= 2 {
-            ident[1..ident.len() - 1].replace("\"\"", "\"")
-        } else {
-            ident.to_lowercase()
-        }
-    }
-
-    /// Split a potentially schema-qualified table name into `(Option<schema>, table)`,
-    /// respecting quoted identifiers. Each part is normalized via [`Self::normalize_ident`].
-    ///
-    /// Input comes from the COPY tokenizer and may be:
-    /// `"Schema"."Table"`, `schema.table`, `"Table"`, or `table`.
-    fn split_schema_table(name: &str) -> (Option<String>, String) {
-        let bytes = name.as_bytes();
-        let mut i = 0;
-        let mut in_quotes = false;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'"' => {
-                    if in_quotes {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                            i += 2; // escaped quote ""
-                            continue;
-                        }
-                        in_quotes = false;
-                    } else {
-                        in_quotes = true;
-                    }
-                }
-                b'.' if !in_quotes => {
-                    let schema = Self::normalize_ident(&name[..i]);
-                    let table = Self::normalize_ident(&name[i + 1..]);
-                    return (Some(schema), table);
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        (None, Self::normalize_ident(name))
-    }
-
     async fn handle_copy_from_simple_query<'a>(
         &self,
         query: &'a str,
@@ -387,7 +340,20 @@ impl DynamicPgHandler {
                     )))
                 })?;
 
-                let (schema_opt, table_ident) = Self::split_schema_table(&table_name);
+                let strip_quotes = |s: &str| -> String { s.trim_matches('"').to_string() };
+                let (schema_opt, table_ident) = if table_name.contains('.') {
+                    let parts: Vec<&str> = table_name.splitn(2, '.').collect();
+                    if parts.len() == 2 {
+                        (
+                            Some(strip_quotes(parts[0]).to_lowercase()),
+                            strip_quotes(parts[1]).to_lowercase(),
+                        )
+                    } else {
+                        (None, strip_quotes(&table_name).to_lowercase())
+                    }
+                } else {
+                    (None, strip_quotes(&table_name).to_lowercase())
+                };
 
                 if let Some(schema_ident) = schema_opt {
                     let resolved_table = format!("{}.{}", schema_ident, table_ident);
@@ -1272,91 +1238,6 @@ mod tests {
         // Data statement + transaction-control → rate-limited
         assert!(!is_transaction_control("SELECT 1; COMMIT"));
         assert!(!is_transaction_control("INSERT INTO t VALUES (1); BEGIN"));
-    }
-
-    // ─── normalize_ident tests ───────────────────────────────────────
-
-    #[test]
-    fn normalize_ident_unquoted_lowercases() {
-        assert_eq!(DynamicPgHandler::normalize_ident("Foo"), "foo");
-        assert_eq!(DynamicPgHandler::normalize_ident("BAR"), "bar");
-        assert_eq!(DynamicPgHandler::normalize_ident("baz"), "baz");
-    }
-
-    #[test]
-    fn normalize_ident_quoted_preserves_case() {
-        assert_eq!(DynamicPgHandler::normalize_ident("\"Foo\""), "Foo");
-        assert_eq!(DynamicPgHandler::normalize_ident("\"BAR\""), "BAR");
-    }
-
-    #[test]
-    fn normalize_ident_quoted_unescapes_double_quotes() {
-        assert_eq!(DynamicPgHandler::normalize_ident("\"a\"\"b\""), "a\"b");
-    }
-
-    #[test]
-    fn normalize_ident_trims_whitespace() {
-        assert_eq!(DynamicPgHandler::normalize_ident("  foo  "), "foo");
-        assert_eq!(DynamicPgHandler::normalize_ident(" \"Foo\" "), "Foo");
-    }
-
-    // ─── split_schema_table tests ─────────────────────────────────────
-
-    #[test]
-    fn split_schema_table_simple_table() {
-        let (schema, table) = DynamicPgHandler::split_schema_table("users");
-        assert_eq!(schema, None);
-        assert_eq!(table, "users");
-    }
-
-    #[test]
-    fn split_schema_table_simple_qualified() {
-        let (schema, table) = DynamicPgHandler::split_schema_table("public.users");
-        assert_eq!(schema, Some("public".to_string()));
-        assert_eq!(table, "users");
-    }
-
-    #[test]
-    fn split_schema_table_quoted_table() {
-        let (schema, table) = DynamicPgHandler::split_schema_table("\"MyTable\"");
-        assert_eq!(schema, None);
-        assert_eq!(table, "MyTable");
-    }
-
-    #[test]
-    fn split_schema_table_quoted_schema_and_table() {
-        let (schema, table) = DynamicPgHandler::split_schema_table("\"MySchema\".\"MyTable\"");
-        assert_eq!(schema, Some("MySchema".to_string()));
-        assert_eq!(table, "MyTable");
-    }
-
-    #[test]
-    fn split_schema_table_dot_inside_quoted_ident() {
-        // The dot inside "my.schema" must NOT be treated as a separator.
-        let (schema, table) = DynamicPgHandler::split_schema_table("\"my.schema\".\"t\"");
-        assert_eq!(schema, Some("my.schema".to_string()));
-        assert_eq!(table, "t");
-    }
-
-    #[test]
-    fn split_schema_table_unquoted_uppercased_folds() {
-        let (schema, table) = DynamicPgHandler::split_schema_table("PUBLIC.USERS");
-        assert_eq!(schema, Some("public".to_string()));
-        assert_eq!(table, "users");
-    }
-
-    #[test]
-    fn split_schema_table_mixed_quoting() {
-        let (schema, table) = DynamicPgHandler::split_schema_table("public.\"MyTable\"");
-        assert_eq!(schema, Some("public".to_string()));
-        assert_eq!(table, "MyTable");
-    }
-
-    #[test]
-    fn split_schema_table_escaped_quotes_in_ident() {
-        let (schema, table) = DynamicPgHandler::split_schema_table("\"a\"\"b\".\"c\"");
-        assert_eq!(schema, Some("a\"b".to_string()));
-        assert_eq!(table, "c");
     }
 
     /// Pure transaction-control batches remain exempt.
