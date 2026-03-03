@@ -108,6 +108,7 @@ async fn eval_column_default_or_null_inner(
         };
 
         let seq_val = store.nextval_sequence(txn, db_id, &seq_full_name).await?;
+        crate::sql::sequences::set_lastval(sequence_values, &seq_full_name, seq_val);
         sequence_values.insert(seq_full_name, seq_val);
         return match column.data_type {
             DataType::Int64 => Ok(Value::Int64(seq_val)),

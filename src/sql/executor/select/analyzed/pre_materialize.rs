@@ -14,7 +14,10 @@ use crate::sql::executor::core::Executor;
 use crate::sql::expr::classify::needs_pre_materialization;
 use crate::sql::expr::traverse::{map_children_async, AsyncExprTransform};
 use crate::sql::expr::typed_eval::eval_typed_expr;
-use crate::sql::sequences::resolve_sequence_full_name_from_value;
+use crate::sql::sequences::{
+    resolve_sequence_full_name_from_value, set_lastval, update_lastval_if_same_seq,
+    LASTVAL_SENTINEL,
+};
 use crate::sql::ExecuteResult;
 
 use anyhow::{anyhow, Result};
@@ -46,6 +49,7 @@ impl Executor {
                 search_path,
                 ctes,
                 skip_root_check_once,
+                last_nextval_value: None,
             };
             transform.transform_expr(expr).await
         })
@@ -125,6 +129,7 @@ pub(super) struct PreMaterializeTransform<'a> {
     search_path: &'a [String],
     ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     skip_root_check_once: bool,
+    last_nextval_value: Option<i64>,
 }
 
 fn should_return_expr_unchanged(skip_root_check_once: &mut bool, expr: &TypedExpr) -> bool {
@@ -479,7 +484,9 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
                             let val = store
                                 .nextval_sequence(&mut *self.txn, self.db_id, &full_name)
                                 .await?;
+                            set_lastval(self.sequence_values, &full_name, val);
                             self.sequence_values.insert(full_name, val);
+                            self.last_nextval_value = Some(val);
                             Ok(TypedExpr {
                                 kind: TypedExprKind::Constant(Value::Int64(val)),
                                 data_type: DataType::Int64,
@@ -585,20 +592,25 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
                                     is_called,
                                 )
                                 .await?;
+                            if is_called {
+                                self.sequence_values.insert(full_name.clone(), res);
+                                if update_lastval_if_same_seq(self.sequence_values, &full_name, res)
+                                {
+                                    self.last_nextval_value = Some(res);
+                                }
+                            }
                             Ok(TypedExpr {
                                 kind: TypedExprKind::Constant(Value::Int64(res)),
                                 data_type: DataType::Int64,
                             })
                         }
                         "LASTVAL" => {
-                            let val =
-                                self.sequence_values
-                                    .values()
-                                    .last()
-                                    .copied()
-                                    .ok_or_else(|| {
-                                        anyhow!("lastval is not yet defined in this session")
-                                    })?;
+                            let val = self
+                                .last_nextval_value
+                                .or_else(|| self.sequence_values.get(LASTVAL_SENTINEL).copied())
+                                .ok_or_else(|| {
+                                    anyhow!("lastval is not yet defined in this session")
+                                })?;
                             Ok(TypedExpr {
                                 kind: TypedExprKind::Constant(Value::Int64(val)),
                                 data_type: DataType::Int64,

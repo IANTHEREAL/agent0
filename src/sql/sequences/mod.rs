@@ -24,10 +24,46 @@ use crate::sql::names::{function_name_upper, normalize_ident};
 use crate::storage::TikvStore;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, ObjectName};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tikv_client::Transaction;
 
 use super::expr::bridge::{eval_ast_expr_with_row, eval_const_ast_expr};
+
+/// Sentinel key in `sequence_values` that stores the most recent `nextval()`
+/// result.  Uses a null-byte prefix so it can never collide with a real
+/// PostgreSQL sequence name (identifiers cannot contain `\0`).
+pub(crate) const LASTVAL_SENTINEL: &str = "\0__lastval";
+
+/// Prefix for the key that tracks which sequence was last advanced by
+/// `nextval()`.  The full key is `LASTVAL_SEQ_NAME_PREFIX + full_name`.
+const LASTVAL_SEQ_NAME_PREFIX: &str = "\0__lastval_seq=";
+
+/// Record that `seq_name` is the last sequence advanced by `nextval()`, and
+/// store `val` as the sentinel value for `lastval()`.
+pub(crate) fn set_lastval(map: &mut HashMap<String, i64>, seq_name: &str, val: i64) {
+    map.insert(LASTVAL_SENTINEL.to_string(), val);
+    map.retain(|k, _| !k.starts_with(LASTVAL_SEQ_NAME_PREFIX));
+    map.insert(format!("{}{}", LASTVAL_SEQ_NAME_PREFIX, seq_name), 0);
+}
+
+/// If `seq_name` is the sequence currently tracked by lastval (i.e. it was the
+/// most recent `nextval()` target), update the sentinel value and return `true`.
+/// Otherwise no-op and return `false`.
+pub(crate) fn update_lastval_if_same_seq(
+    map: &mut HashMap<String, i64>,
+    seq_name: &str,
+    val: i64,
+) -> bool {
+    let key = format!("{}{}", LASTVAL_SEQ_NAME_PREFIX, seq_name);
+    if map.contains_key(&key) {
+        map.insert(LASTVAL_SENTINEL.to_string(), val);
+        true
+    } else {
+        false
+    }
+}
+
 use super::ExecuteResult;
 
 /// Evaluate an expression in sequence context (optional row/schema).

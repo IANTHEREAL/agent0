@@ -19,3 +19,12 @@ nextval
 nextval
 2
 (1 row)
+nextval
+1
+(1 row)
+setval
+999
+(1 row)
+lastval
+1
+(1 row)

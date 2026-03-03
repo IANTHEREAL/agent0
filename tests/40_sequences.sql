@@ -24,3 +24,15 @@ ALTER SEQUENCE seq_sql_disowned_serial_id_seq OWNED BY NONE;
 DROP TABLE seq_sql_disowned_serial;
 SELECT nextval('seq_sql_disowned_serial_id_seq');
 DROP SEQUENCE seq_sql_disowned_serial_id_seq;
+
+-- Regression: setval() must NOT update lastval() (PostgreSQL parity).
+-- lastval() tracks only the most recent nextval() result.
+DROP SEQUENCE IF EXISTS seq_lv_a;
+DROP SEQUENCE IF EXISTS seq_lv_b;
+CREATE SEQUENCE seq_lv_a;
+CREATE SEQUENCE seq_lv_b;
+SELECT nextval('seq_lv_a');
+SELECT setval('seq_lv_b', 999);
+SELECT lastval();
+DROP SEQUENCE seq_lv_a;
+DROP SEQUENCE seq_lv_b;

@@ -61,6 +61,7 @@ tests/230_idle_in_transaction_timeout.sql
 tests/232_statement_timeout_guc_regression.sql
 tests/234_returns_table_sql_function.sql
 tests/235_lateral_correlated_no_from.sql
+tests/40_lastval.sql
 
 [python]
 tests/advisory_locks_savepoint.py

@@ -49,6 +49,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         )
                         .await?;
                         let val = store.nextval_sequence(txn, db_id, &full_name).await?;
+                        super::set_lastval(last_sequence_values, &full_name, val);
                         last_sequence_values.insert(full_name, val);
                         Ok(value_to_sql_expr(&crate::model::Value::Int64(val)))
                     }
@@ -127,6 +128,14 @@ pub(crate) fn replace_sequence_functions<'a>(
                         let res = store
                             .setval_sequence(txn, db_id, &full_name, value_i64, is_called)
                             .await?;
+                        if is_called {
+                            last_sequence_values.insert(full_name.clone(), res);
+                            super::update_lastval_if_same_seq(
+                                last_sequence_values,
+                                &full_name,
+                                res,
+                            );
+                        }
                         Ok(value_to_sql_expr(&crate::model::Value::Int64(res)))
                     }
                     "PG_GET_INDEXDEF" => {

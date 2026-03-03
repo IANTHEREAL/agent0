@@ -58,6 +58,11 @@ impl AsyncExprTransform for SequenceMaterializeCtx<'_> {
                                 .store
                                 .nextval_sequence(self.txn, self.db_id, &seq_name)
                                 .await?;
+                            crate::sql::sequences::set_lastval(
+                                self.sequence_values,
+                                &seq_name,
+                                val,
+                            );
                             self.sequence_values.insert(seq_name, val);
                             TypedExprKind::Constant(Value::Int64(val))
                         }
@@ -105,7 +110,14 @@ impl AsyncExprTransform for SequenceMaterializeCtx<'_> {
                                     self.txn, self.db_id, &seq_name, set_val, is_called,
                                 )
                                 .await?;
-                            self.sequence_values.insert(seq_name, set_val);
+                            if is_called {
+                                self.sequence_values.insert(seq_name.clone(), set_val);
+                                crate::sql::sequences::update_lastval_if_same_seq(
+                                    self.sequence_values,
+                                    &seq_name,
+                                    set_val,
+                                );
+                            }
                             TypedExprKind::Constant(Value::Int64(set_val))
                         }
                         // Non-sequence function: canonical child recursion
