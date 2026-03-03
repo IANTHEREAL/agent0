@@ -40,9 +40,10 @@ pub(crate) fn is_backend_available() -> bool {
 }
 
 pub(crate) async fn get_backend(_tenant_keyspace: &str) -> Box<dyn FsBackend> {
-    let client = crate::extensions::context::tikv_client()
-        .expect("fs9: TiKV client not available in extension context. \
-                 Ensure the caller wraps this in with_context_opts().");
+    let client = crate::extensions::context::tikv_client().expect(
+        "fs9: TiKV client not available in extension context. \
+                 Ensure the caller wraps this in with_context_opts().",
+    );
     EmbeddedFsBackend::new(client)
         .await
         .map(|b| Box::new(b) as Box<dyn FsBackend>)
