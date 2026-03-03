@@ -207,8 +207,7 @@ pub(crate) fn strip_regtype_typmod(raw: &str) -> String {
 ///
 /// `paren_str` must start with `(`.
 /// Returns `Ok(Some("interval"))` for valid precision (0–6),
-/// `Ok(None)` for out-of-range precision (caller returns NULL),
-/// `Err` for non-numeric or malformed content.
+/// `Err` for non-numeric, negative, or malformed content.
 fn validate_interval_precision(paren_str: &str, original_name: &str) -> Result<Option<String>> {
     let close = paren_str.find(')').ok_or_else(|| {
         anyhow::anyhow!(
@@ -228,9 +227,11 @@ fn validate_interval_precision(paren_str: &str, original_name: &str) -> Result<O
         ))
         .into());
     }
-    match inner.parse::<i32>() {
-        Ok(n) if (0..=6).contains(&n) => Ok(Some("interval".to_string())),
-        Ok(_) => Ok(None), // out of range → NULL
+    // PG grammar: typmod is Iconst (non-negative integer). Negative values
+    // fail the parser. Out-of-range values (>6) are clamped with a WARNING
+    // but still return OID 1186.
+    match inner.parse::<u32>() {
+        Ok(_) => Ok(Some("interval".to_string())),
         Err(_) => Err(crate::sql::error::SqlError::SqlStructure(format!(
             "invalid type name \"{}\"",
             original_name
@@ -251,7 +252,6 @@ fn validate_interval_precision(paren_str: &str, original_name: &str) -> Result<O
 ///
 /// Returns `Ok(Some("interval"))` for valid interval forms,
 /// `Ok(Some(other))` for non-interval types (pass through),
-/// `Ok(None)` for valid syntax but out-of-range precision (→ NULL),
 /// `Err` for invalid type names.
 ///
 /// This function must be called on the ORIGINAL input (before
@@ -1065,19 +1065,17 @@ mod tests {
         assert!(to_regtype(vec![Value::Text("interval garbage".into())]).is_err());
         // Malformed typmod content → error (C8)
         assert!(to_regtype(vec![Value::Text("interval(abc)".into())]).is_err());
-        // Precision out of range → NULL (C9, C10)
+        // Non-negative out-of-range precision → OID (PG clamps, C9)
         assert_eq!(
             to_regtype(vec![Value::Text("interval(999)".into())]).unwrap(),
-            Value::Null
-        );
-        assert_eq!(
-            to_regtype(vec![Value::Text("interval(-1)".into())]).unwrap(),
-            Value::Null
+            Value::Int64(pg_types::OID_INTERVAL)
         );
         assert_eq!(
             to_regtype(vec![Value::Text("interval(7)".into())]).unwrap(),
-            Value::Null
+            Value::Int64(pg_types::OID_INTERVAL)
         );
+        // Negative precision → error (PG Iconst rejects '-', C10)
+        assert!(to_regtype(vec![Value::Text("interval(-1)".into())]).is_err());
         // Not a word-boundary match → NULL (unknown type, not an interval) (C6)
         assert_eq!(
             to_regtype(vec![Value::Text("intervals".into())]).unwrap(),
@@ -1131,10 +1129,17 @@ mod tests {
         assert!(normalize_interval_type("interval garbage").is_err());
         // Malformed precision content → error
         assert!(normalize_interval_type("interval(abc)").is_err());
-        // Precision out of range → None (NULL)
-        assert_eq!(normalize_interval_type("interval(999)").unwrap(), None);
-        assert_eq!(normalize_interval_type("interval(-1)").unwrap(), None);
-        assert_eq!(normalize_interval_type("interval(7)").unwrap(), None);
+        // Non-negative out-of-range precision → Some (PG clamps, returns OID)
+        assert_eq!(
+            normalize_interval_type("interval(999)").unwrap(),
+            Some("interval".to_string())
+        );
+        assert_eq!(
+            normalize_interval_type("interval(7)").unwrap(),
+            Some("interval".to_string())
+        );
+        // Negative precision → error (PG Iconst rejects '-')
+        assert!(normalize_interval_type("interval(-1)").is_err());
         // Not interval types — returned as-is
         assert_eq!(
             normalize_interval_type("intervals").unwrap(),
