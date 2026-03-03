@@ -1,0 +1,43 @@
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 1
+ id | val | r_id |  info
+----+-----+------+---------
+  1 | a   |   10 | matched
+  2 | b   |      |
+  3 | c   |      |
+(3 rows)
+
+ id | val | r_id | info
+----+-----+------+------
+  1 | a   |      |
+  2 | b   |      |
+  3 | c   |      |
+(3 rows)
+
+CREATE TABLE
+INSERT 0 3
+UPDATE 3
+ id |  status
+----+----------
+  1 | matched
+  2 | no_match
+  3 | no_match
+(3 rows)
+
+CREATE TABLE
+CREATE TABLE
+UPDATE 3
+ id |   status
+----+------------
+  1 | empty_join
+  2 | empty_join
+  3 | empty_join
+(3 rows)
+
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE

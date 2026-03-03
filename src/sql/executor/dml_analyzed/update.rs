@@ -99,6 +99,14 @@ impl Executor {
             None
         };
 
+        // Build FK ref-schema cache ONCE for the entire statement so that
+        // per-row update calls skip redundant get_schema lookups.
+        let fk_ref_cache: Option<dml::FkRefSchemaCache> = if !schema.foreign_keys.is_empty() {
+            Some(dml::build_fk_ref_schema_cache(&self.store(), txn, db_id, &schema, false).await?)
+        } else {
+            None
+        };
+
         for r in &rows {
             // Find the matching FROM row (if FROM clause exists) and check WHERE.
             // The matched FROM row is used for SET expression evaluation so that
@@ -227,6 +235,7 @@ impl Executor {
                     new_row,
                     &enum_cache,
                     None,
+                    fk_ref_cache.as_ref(),
                 )
                 .await?;
                 hnsw_changes.push((old_row_snapshot, result.clone()));
@@ -242,6 +251,7 @@ impl Executor {
                     new_row,
                     &enum_cache,
                     None,
+                    fk_ref_cache.as_ref(),
                 )
                 .await?
             };

@@ -1,0 +1,19 @@
+x|y|id|val
+NULL|NULL|1|a
+NULL|NULL|2|b
+(2 rows)
+id|val|r_id|r_val
+NULL|NULL|10|x
+(1 row)
+x|y|id|val
+NULL|NULL|1|a
+NULL|NULL|2|b
+(2 rows)
+id|val|x|y
+1|a|NULL|NULL
+2|b|NULL|NULL
+(2 rows)
+i|j
+1|NULL
+2|NULL
+(2 rows)

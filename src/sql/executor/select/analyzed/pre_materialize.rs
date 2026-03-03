@@ -14,7 +14,10 @@ use crate::sql::executor::core::Executor;
 use crate::sql::expr::classify::needs_pre_materialization;
 use crate::sql::expr::traverse::{map_children_async, AsyncExprTransform};
 use crate::sql::expr::typed_eval::eval_typed_expr;
-use crate::sql::sequences::resolve_sequence_full_name_from_value;
+use crate::sql::sequences::{
+    get_lastval_sequence_name, resolve_sequence_full_name_from_value, set_lastval,
+    set_lastval_sequence_name, update_lastval_if_same_seq, LASTVAL_SENTINEL, LASTVAL_SENTINEL_KEY,
+};
 use crate::sql::ExecuteResult;
 
 use anyhow::{anyhow, Result};
@@ -25,6 +28,34 @@ use tikv_client::Transaction;
 
 use super::postprocess::build_any_all_rhs_constant_expr;
 use super::subquery::is_correlated_query;
+
+fn pg_type_name_from_data_type(data_type: &DataType) -> String {
+    match data_type {
+        DataType::Boolean => "boolean".to_string(),
+        DataType::Int32 => "integer".to_string(),
+        DataType::Int64 => "bigint".to_string(),
+        DataType::Float64 => "double precision".to_string(),
+        DataType::Numeric { .. } => "numeric".to_string(),
+        _ => data_type.to_string().to_lowercase(),
+    }
+}
+
+fn pg_lastval_arg_type_name(arg: &TypedExpr) -> String {
+    if matches!(
+        &arg.kind,
+        TypedExprKind::Constant(Value::Text(_)) | TypedExprKind::Constant(Value::Null)
+    ) {
+        return "unknown".to_string();
+    }
+
+    // PostgreSQL reports scientific-notation numeric literals (parsed in db9 as
+    // float constants) as NUMERIC in function-signature errors.
+    if matches!(&arg.kind, TypedExprKind::Constant(Value::Float64(_))) {
+        return "numeric".to_string();
+    }
+
+    pg_type_name_from_data_type(&arg.data_type)
+}
 
 impl Executor {
     fn pre_materialize_async_exprs_impl<'a>(
@@ -46,6 +77,7 @@ impl Executor {
                 search_path,
                 ctes,
                 skip_root_check_once,
+                last_nextval_value: None,
             };
             transform.transform_expr(expr).await
         })
@@ -125,6 +157,7 @@ pub(super) struct PreMaterializeTransform<'a> {
     search_path: &'a [String],
     ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     skip_root_check_once: bool,
+    last_nextval_value: Option<i64>,
 }
 
 fn should_return_expr_unchanged(skip_root_check_once: &mut bool, expr: &TypedExpr) -> bool {
@@ -479,7 +512,12 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
                             let val = store
                                 .nextval_sequence(&mut *self.txn, self.db_id, &full_name)
                                 .await?;
-                            self.sequence_values.insert(full_name, val);
+                            set_lastval(self.sequence_values, &full_name, val);
+                            self.sequence_values.insert(full_name.clone(), val);
+                            self.last_nextval_value = Some(val);
+                            self.sequence_values
+                                .insert(LASTVAL_SENTINEL_KEY.to_string(), val);
+                            set_lastval_sequence_name(self.sequence_values, &full_name);
                             Ok(TypedExpr {
                                 kind: TypedExprKind::Constant(Value::Int64(val)),
                                 data_type: DataType::Int64,
@@ -576,6 +614,9 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
                             } else {
                                 true
                             };
+                            let same_seq = get_lastval_sequence_name(self.sequence_values)
+                                .map(|n| n == full_name.as_str())
+                                .unwrap_or(false);
                             let res = store
                                 .setval_sequence(
                                     &mut *self.txn,
@@ -585,20 +626,42 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
                                     is_called,
                                 )
                                 .await?;
+                            // Rule 1: currval cache — always update when is_called=true
+                            if is_called {
+                                self.sequence_values.insert(full_name.clone(), res);
+                                if update_lastval_if_same_seq(self.sequence_values, &full_name, res)
+                                {
+                                    self.last_nextval_value = Some(res);
+                                }
+                                if same_seq {
+                                    self.sequence_values
+                                        .insert(LASTVAL_SENTINEL_KEY.to_string(), res);
+                                }
+                            }
                             Ok(TypedExpr {
                                 kind: TypedExprKind::Constant(Value::Int64(res)),
                                 data_type: DataType::Int64,
                             })
                         }
                         "LASTVAL" => {
-                            let val =
-                                self.sequence_values
-                                    .values()
-                                    .last()
-                                    .copied()
-                                    .ok_or_else(|| {
-                                        anyhow!("lastval is not yet defined in this session")
-                                    })?;
+                            if !args.is_empty() {
+                                let arg_types = args
+                                    .iter()
+                                    .map(pg_lastval_arg_type_name)
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                return Err(crate::sql::error::SqlError::FunctionNotFound(
+                                    format!("lastval({})", arg_types),
+                                )
+                                .into());
+                            }
+                            let val = self
+                                .last_nextval_value
+                                .or_else(|| self.sequence_values.get(LASTVAL_SENTINEL).copied())
+                                .or_else(|| self.sequence_values.get(LASTVAL_SENTINEL_KEY).copied())
+                                .ok_or_else(|| {
+                                    anyhow!("lastval is not yet defined in this session")
+                                })?;
                             Ok(TypedExpr {
                                 kind: TypedExprKind::Constant(Value::Int64(val)),
                                 data_type: DataType::Int64,

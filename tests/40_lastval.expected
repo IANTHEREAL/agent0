@@ -1,0 +1,121 @@
+setval
+50
+(1 row)
+ERROR:  lastval is not yet defined in this session
+nextval
+1
+(1 row)
+nextval
+1
+(1 row)
+lastval
+1
+(1 row)
+nextval
+2
+(1 row)
+lastval
+2
+(1 row)
+nextval|lastval|lastval
+3|3|3
+(1 row)
+nextval
+2
+(1 row)
+nextval
+4
+(1 row)
+lastval
+4
+(1 row)
+setval
+100
+(1 row)
+lastval
+4
+(1 row)
+currval
+4
+(1 row)
+currval
+100
+(1 row)
+nextval
+5
+(1 row)
+setval
+99
+(1 row)
+lastval
+99
+(1 row)
+currval
+99
+(1 row)
+nextval
+100
+(1 row)
+setval
+10
+(1 row)
+lastval
+100
+(1 row)
+currval
+100
+(1 row)
+nextval
+10
+(1 row)
+setval
+10
+(1 row)
+lastval
+10
+(1 row)
+currval
+10
+(1 row)
+nextval
+11
+(1 row)
+setval
+10
+(1 row)
+lastval
+10
+(1 row)
+currval
+10
+(1 row)
+nextval|setval|lastval
+11|200|200
+(1 row)
+nextval
+1
+(1 row)
+nextval
+1
+(1 row)
+lastval
+1
+(1 row)
+currval
+1
+(1 row)
+lastval
+1
+(1 row)
+lastval
+2
+(1 row)
+ERROR:  function lastval(integer) does not exist
+ERROR:  function lastval(text) does not exist
+ERROR:  function lastval(numeric) does not exist
+ERROR:  function lastval(boolean) does not exist
+lastval
+2
+(1 row)
+ERROR:  function lastval(bigint) does not exist
+ERROR:  function lastval(double) does not exist
