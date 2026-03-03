@@ -13,10 +13,10 @@ SELECT to_regtype('interval day to second');
 SELECT to_regtype('interval hour');
 SELECT to_regtype('interval year to month');
 SELECT to_regtype('interval(3)');
-SELECT to_regtype('interval garbage');
-SELECT to_regtype('interval(abc)');
+SELECT to_regtype('interval garbage'); -- db9-specific: error text differs from PG
+SELECT to_regtype('interval(abc)'); -- db9-specific: error text differs from PG
 SELECT to_regtype('interval(999)');
-SELECT to_regtype('interval(-1)');
+SELECT to_regtype('interval(-1)'); -- db9-specific: error text differs from PG
 
 -- Existing behavior regression
 SELECT to_regtype('integer');
