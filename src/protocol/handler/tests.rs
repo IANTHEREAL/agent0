@@ -2006,6 +2006,19 @@ fn test_parse_copy_command_trailing_junk_after_stdin_errors() {
         DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH(FORMAT csv)"#).unwrap();
     assert!(result.is_some());
 
+    // Malformed/unknown WITH (...) must not enter COPY fast-path.
+    assert_eq!(
+        DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH (;"#).unwrap(),
+        None
+    );
+    assert_eq!(
+        DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH (garbage);"#).unwrap(),
+        None
+    );
+    let result =
+        DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH (FORMAT csv);"#).unwrap();
+    assert!(result.is_some());
+
     // Trailing semicolon should be accepted.
     let result = DynamicPgHandler::parse_copy_command(r#"COPY "t" FROM STDIN;"#).unwrap();
     assert!(result.is_some());

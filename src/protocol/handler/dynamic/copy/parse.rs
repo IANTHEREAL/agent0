@@ -90,6 +90,176 @@ fn match_keyword<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
     }
 }
 
+fn has_non_ws_or_comment(s: &str) -> bool {
+    let mut rest = s;
+    loop {
+        let trimmed = skip_ws_and_comments(rest);
+        if trimmed.is_empty() {
+            return false;
+        }
+        if trimmed.len() == rest.len() {
+            return true;
+        }
+        rest = trimmed;
+    }
+}
+
+fn is_known_copy_with_option(option: &str) -> bool {
+    option.eq_ignore_ascii_case("FORMAT")
+        || option.eq_ignore_ascii_case("DELIMITER")
+        || option.eq_ignore_ascii_case("NULL")
+        || option.eq_ignore_ascii_case("HEADER")
+        || option.eq_ignore_ascii_case("QUOTE")
+        || option.eq_ignore_ascii_case("ESCAPE")
+        || option.eq_ignore_ascii_case("FORCE_QUOTE")
+        || option.eq_ignore_ascii_case("FORCE_NOT_NULL")
+        || option.eq_ignore_ascii_case("FREEZE")
+        || option.eq_ignore_ascii_case("ENCODING")
+}
+
+fn copy_with_option_requires_value(option: &str) -> bool {
+    option.eq_ignore_ascii_case("FORMAT")
+        || option.eq_ignore_ascii_case("DELIMITER")
+        || option.eq_ignore_ascii_case("NULL")
+        || option.eq_ignore_ascii_case("QUOTE")
+        || option.eq_ignore_ascii_case("ESCAPE")
+        || option.eq_ignore_ascii_case("FORCE_QUOTE")
+        || option.eq_ignore_ascii_case("FORCE_NOT_NULL")
+        || option.eq_ignore_ascii_case("ENCODING")
+}
+
+/// Consume one COPY WITH option value, stopping before the top-level `,` or `)`.
+/// Returns `(remaining_input, has_value)` on success.
+fn consume_copy_with_value(s: &str) -> Option<(&str, bool)> {
+    let mut i = 0usize;
+    let bytes = s.as_bytes();
+    let mut paren_depth = 0usize;
+    while i < bytes.len() {
+        let rest = &s[i..];
+        if rest.starts_with("--") {
+            if let Some(pos) = rest.find('\n') {
+                i += pos + 1;
+                continue;
+            }
+            i = s.len();
+            break;
+        }
+        if let Some(stripped) = rest.strip_prefix("/*") {
+            let pos = stripped.find("*/")?;
+            i += pos + 4;
+            continue;
+        }
+
+        match bytes[i] {
+            b',' if paren_depth == 0 => break,
+            b')' if paren_depth == 0 => break,
+            b'(' => {
+                paren_depth += 1;
+                i += 1;
+            }
+            b')' => {
+                if paren_depth == 0 {
+                    break;
+                }
+                paren_depth -= 1;
+                i += 1;
+            }
+            b'\'' => {
+                let mut closed = false;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            closed = true;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                if !closed {
+                    return None;
+                }
+            }
+            b'"' => {
+                let mut closed = false;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            closed = true;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                if !closed {
+                    return None;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+
+    if paren_depth != 0 {
+        return None;
+    }
+    let consumed = &s[..i];
+    Some((&s[i..], has_non_ws_or_comment(consumed)))
+}
+
+/// Validate `WITH (...)` clause syntax/options for COPY fast-path.
+/// Returns remainder after the closing `)` when valid.
+fn parse_valid_copy_with_clause(mut s: &str) -> Option<&str> {
+    s = s.strip_prefix('(')?;
+    let mut saw_option = false;
+    loop {
+        s = skip_ws_and_comments(s);
+        if let Some(rest) = s.strip_prefix(')') {
+            return if saw_option { Some(rest) } else { None };
+        }
+
+        let (option, rest_after_option) = parse_ident(s)?;
+        if option.starts_with('"') || !is_known_copy_with_option(option) {
+            return None;
+        }
+
+        let mut value_input = skip_ws_and_comments(rest_after_option);
+        let mut used_equals = false;
+        if let Some(after_eq) = value_input.strip_prefix('=') {
+            value_input = skip_ws_and_comments(after_eq);
+            used_equals = true;
+        }
+
+        let (rest_after_value, has_value) = consume_copy_with_value(value_input)?;
+        if copy_with_option_requires_value(option) && !has_value {
+            return None;
+        }
+        if used_equals && !has_value {
+            return None;
+        }
+
+        s = skip_ws_and_comments(rest_after_value);
+        saw_option = true;
+
+        if let Some(rest) = s.strip_prefix(',') {
+            s = rest;
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix(')') {
+            return Some(rest);
+        }
+        return None;
+    }
+}
+
 /// Try to tokenize `COPY [schema.]table [(col1, ...)] FROM stdin [WITH (...)]` from `query`.
 ///
 /// Returns:
@@ -186,6 +356,16 @@ fn parse_copy_from_stdin_tokens(query: &str) -> Result<Option<(String, Vec<Strin
         let after_with = skip_ws_and_comments(after_with);
         if !after_with.starts_with('(') {
             return Err("syntax error: expected '(' after WITH in COPY statement".to_string());
+        }
+
+        // Validate WITH clause strictly for fast-path eligibility.
+        // Unknown options / malformed syntax must fall through to full parser.
+        let Some(after_clause) = parse_valid_copy_with_clause(after_with) else {
+            return Ok(None);
+        };
+        let after_clause = skip_ws_and_comments(after_clause);
+        if !after_clause.is_empty() && !after_clause.starts_with(';') {
+            return Ok(None);
         }
     }
 
