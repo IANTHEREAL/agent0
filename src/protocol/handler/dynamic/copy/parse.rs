@@ -328,6 +328,8 @@ fn parse_copy_from_stdin_tokens(query: &str) -> Result<Option<(String, Vec<Strin
         };
         if !after_with.is_empty()
             && !after_with.starts_with(|c: char| c.is_ascii_whitespace() || c == '(')
+            && !after_with.starts_with("/*")
+            && !after_with.starts_with("--")
         {
             return Err(format!(
                 "syntax error at or near \"{}\"",
@@ -336,7 +338,9 @@ fn parse_copy_from_stdin_tokens(query: &str) -> Result<Option<(String, Vec<Strin
         }
 
         // PG-compatible fast-path guard: after WITH, the next non-ws/comment token must be '('.
-        let after_with = skip_ws_and_comments(after_with);
+        let Some(after_with) = strip_leading_whitespace_and_comments(after_with) else {
+            return Ok(None); // unclosed comment — fall through to full parser
+        };
         if !after_with.starts_with('(') {
             return Err("syntax error: expected '(' after WITH in COPY statement".to_string());
         }
