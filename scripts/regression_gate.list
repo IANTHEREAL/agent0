@@ -61,6 +61,14 @@ tests/230_idle_in_transaction_timeout.sql
 tests/232_statement_timeout_guc_regression.sql
 tests/234_returns_table_sql_function.sql
 tests/235_lateral_correlated_no_from.sql
+tests/94_three_part_identifier.sql
+tests/95_alter_owner.sql
+tests/95_join_using.sql
+tests/99_statement_timeout.sql
+tests/101_server_introspection.sql
+tests/102_hstore_compat.sql
+tests/197_sql_keys.sql
+tests/217_update_pk.sql
 tests/40_lastval.sql
 
 [python]

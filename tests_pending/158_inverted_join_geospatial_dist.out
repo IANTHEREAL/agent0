@@ -1,9 +1,0 @@
-psql:/home/dongxu/lab/db9-server/tests/158_inverted_join_geospatial_dist.sql:105: ERROR:  Missing END for BEGIN block
-psql:/home/dongxu/lab/db9-server/tests/158_inverted_join_geospatial_dist.sql:112: ERROR:  Table 'public.ltable' already exists
-psql:/home/dongxu/lab/db9-server/tests/158_inverted_join_geospatial_dist.sql:118: ERROR:  duplicate key value violates unique constraint "ltable_pkey"
-DETAIL:  Key (lk)=(1) already exists.
-psql:/home/dongxu/lab/db9-server/tests/158_inverted_join_geospatial_dist.sql:124: ERROR:  Table 'public.rtable' already exists
-psql:/home/dongxu/lab/db9-server/tests/158_inverted_join_geospatial_dist.sql:125: ERROR:  Index exists
-psql:/home/dongxu/lab/db9-server/tests/158_inverted_join_geospatial_dist.sql:134: ERROR:  duplicate key value violates unique constraint "rtable_pkey"
-DETAIL:  Key (rk)=(11) already exists.
-psql:/home/dongxu/lab/db9-server/tests/158_inverted_join_geospatial_dist.sql:141: ERROR:  Unsupported function in JOIN: st_intersects

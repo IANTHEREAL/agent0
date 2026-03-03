@@ -1,4 +1,0 @@
-psql:/home/dongxu/lab/db9-server/tests/182_redact_descriptor.sql:8: ERROR:  Table 'public.foo' already exists
-psql:/home/dongxu/lab/db9-server/tests/182_redact_descriptor.sql:9: ERROR:  Column not found
-psql:/home/dongxu/lab/db9-server/tests/182_redact_descriptor.sql:61: ERROR:  Unsupported function: jsonb_agg
-psql:/home/dongxu/lab/db9-server/tests/182_redact_descriptor.sql:64: ERROR:  Unsupported function: jsonb_agg
