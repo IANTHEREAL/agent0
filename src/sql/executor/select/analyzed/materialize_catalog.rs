@@ -1223,6 +1223,14 @@ fn parse_regtype_object_name(raw: &str) -> Option<sqlparser::ast::ObjectName> {
     Some(sqlparser::ast::ObjectName(idents))
 }
 
+fn regtype_ident_matches(ident: &sqlparser::ast::Ident, expected: &str) -> bool {
+    if ident.quote_style.is_some() {
+        ident.value == expected
+    } else {
+        ident.value.eq_ignore_ascii_case(expected)
+    }
+}
+
 fn value_to_i64(v: &Value) -> Option<i64> {
     match v {
         Value::Int32(n) => Some(*n as i64),
@@ -1455,22 +1463,22 @@ async fn lookup_hstore_extension_regtype_oid(
     };
     let parts = type_name.0;
     let (schema, name) = match parts.as_slice() {
-        [name] => (None, name.value.as_str()),
-        [schema, name] => (Some(schema.value.as_str()), name.value.as_str()),
+        [name] => (None, name),
+        [schema, name] => (Some(schema), name),
         _ => return Ok(None),
     };
 
     let schema_matches = match schema {
         None => search_path.iter().any(|s| s.eq_ignore_ascii_case("public")),
-        Some(s) => s.eq_ignore_ascii_case("public"),
+        Some(s) => regtype_ident_matches(s, "public"),
     };
     if !schema_matches {
         return Ok(None);
     }
 
-    let base_oid = if name.eq_ignore_ascii_case("hstore") {
+    let base_oid = if regtype_ident_matches(name, "hstore") {
         Some(crate::sql::pg_types::OID_HSTORE)
-    } else if name.eq_ignore_ascii_case("_hstore") {
+    } else if regtype_ident_matches(name, "_hstore") {
         Some(crate::sql::pg_types::OID_HSTORE_ARRAY)
     } else {
         None
@@ -1491,7 +1499,7 @@ async fn lookup_hstore_extension_regtype_oid(
 #[cfg(test)]
 mod tests {
     use super::{
-        advisory_lock_timeout, find_text_column, parse_regtype_object_name,
+        advisory_lock_timeout, find_text_column, parse_regtype_object_name, regtype_ident_matches,
         split_regtype_name_parts, strip_regtype_array_dims, strip_regtype_typmod,
         value_to_bool_strict, value_to_i64, value_to_i64_strict,
     };
@@ -1785,6 +1793,17 @@ mod tests {
         assert_eq!(qualified.0[0].quote_style, Some('"'));
         assert_eq!(qualified.0[1].value, "MyType");
         assert_eq!(qualified.0[1].quote_style, Some('"'));
+    }
+
+    #[test]
+    fn test_regtype_ident_matches_respects_quoted_case() {
+        let unquoted = parse_regtype_object_name("HSTORE").expect("parse unquoted");
+        assert!(regtype_ident_matches(&unquoted.0[0], "hstore"));
+        assert!(regtype_ident_matches(&unquoted.0[0], "HSTORE"));
+
+        let quoted = parse_regtype_object_name("\"HSTORE\"").expect("parse quoted");
+        assert!(!regtype_ident_matches(&quoted.0[0], "hstore"));
+        assert!(regtype_ident_matches(&quoted.0[0], "HSTORE"));
     }
 
     #[test]

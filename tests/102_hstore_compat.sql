@@ -26,6 +26,12 @@ SELECT
   to_regtype('_hstore') IS NOT NULL AS hstore_arr_alias_visible_after_create,
   to_regtype('hstore[]') IS NOT NULL AS hstore_arr_type_visible_after_create;
 
+-- Quoted identifiers are case-sensitive in PostgreSQL.
+SELECT
+  to_regtype('"HSTORE"') IS NULL AS quoted_hstore_upper_null,
+  to_regtype('"Public".hstore') IS NULL AS quoted_public_schema_case_null,
+  to_regtype('public."HSTORE"') IS NULL AS quoted_hstore_type_case_null;
+
 -- Keep the suite isolated: later tests may assert `pg_extension` contents.
 DROP EXTENSION IF EXISTS hstore;
 
