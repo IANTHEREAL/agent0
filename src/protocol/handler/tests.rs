@@ -1938,6 +1938,36 @@ fn test_parse_copy_command_quoted_with_escaped_quote() {
 }
 
 #[test]
+fn test_parse_copy_command_trailing_junk_after_stdin_errors() {
+    // Trailing garbage after STDIN must produce a syntax error (PG parity).
+    let err = DynamicPgHandler::parse_copy_command(r#"COPY "t" FROM STDIN garbage"#)
+        .expect_err("trailing junk should be rejected");
+    assert!(
+        err.message.contains("syntax error"),
+        "expected syntax error, got: {}",
+        err.message
+    );
+
+    // Unquoted table name with trailing junk — same error.
+    let err = DynamicPgHandler::parse_copy_command("COPY t FROM STDIN garbage")
+        .expect_err("trailing junk should be rejected");
+    assert!(
+        err.message.contains("syntax error"),
+        "expected syntax error, got: {}",
+        err.message
+    );
+
+    // Valid WITH clause should still be accepted.
+    let result =
+        DynamicPgHandler::parse_copy_command(r#"COPY "t" FROM STDIN WITH (FORMAT csv)"#).unwrap();
+    assert!(result.is_some());
+
+    // Trailing semicolon should be accepted.
+    let result = DynamicPgHandler::parse_copy_command(r#"COPY "t" FROM STDIN;"#).unwrap();
+    assert!(result.is_some());
+}
+
+#[test]
 fn test_count_sql_parameters_ignores_dollar_quoted_strings() {
     assert_eq!(count_sql_parameters("SELECT $$ $99 $$, $1;"), 1);
     assert_eq!(count_sql_parameters("SELECT $tag$ $2 $tag$, $1;"), 1);

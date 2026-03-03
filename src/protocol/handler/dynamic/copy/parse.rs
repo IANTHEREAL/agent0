@@ -90,23 +90,33 @@ fn match_keyword<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
     }
 }
 
-/// Try to tokenize `COPY [schema.]table [(col1, ...)] FROM stdin` from `query`.
-/// Returns `None` (safe fallthrough to full parser) for any form we can't handle.
-fn parse_copy_from_stdin_tokens(query: &str) -> Option<(String, Vec<String>)> {
+/// Try to tokenize `COPY [schema.]table [(col1, ...)] FROM stdin [WITH (...)]` from `query`.
+///
+/// Returns:
+/// - `Ok(Some(...))` — valid COPY FROM STDIN recognised.
+/// - `Ok(None)` — does not look like COPY FROM STDIN (safe fallthrough).
+/// - `Err(msg)` — matched COPY … FROM STDIN but unexpected trailing tokens (syntax error).
+fn parse_copy_from_stdin_tokens(query: &str) -> Result<Option<(String, Vec<String>)>, String> {
     // 1. Match "COPY" keyword
-    let rest = match_keyword(query, "COPY")?;
+    let Some(rest) = match_keyword(query, "COPY") else {
+        return Ok(None);
+    };
     // Must have whitespace after COPY
     if !rest.starts_with(|c: char| c.is_ascii_whitespace()) {
-        return None;
+        return Ok(None);
     }
     let rest = skip_ws_and_comments(rest);
 
     // 2. Parse first identifier (could be schema or table)
-    let (ident1, rest) = parse_ident(rest)?;
+    let Some((ident1, rest)) = parse_ident(rest) else {
+        return Ok(None);
+    };
 
     // 3. Check for schema qualification: "."
     let (table_name, rest) = if let Some(rest) = rest.strip_prefix('.') {
-        let (ident2, rest) = parse_ident(rest)?;
+        let Some((ident2, rest)) = parse_ident(rest) else {
+            return Ok(None);
+        };
         (format!("{}.{}", ident1, ident2), rest)
     } else {
         (ident1.to_string(), rest)
@@ -119,7 +129,9 @@ fn parse_copy_from_stdin_tokens(query: &str) -> Option<(String, Vec<String>)> {
         let mut rest = skip_ws_and_comments(after_paren);
         let mut cols = Vec::new();
         loop {
-            let (col, r) = parse_ident(rest)?;
+            let Some((col, r)) = parse_ident(rest) else {
+                return Ok(None);
+            };
             cols.push(col.to_string());
             let r = skip_ws_and_comments(r);
             if let Some(after_comma) = r.strip_prefix(',') {
@@ -128,7 +140,7 @@ fn parse_copy_from_stdin_tokens(query: &str) -> Option<(String, Vec<String>)> {
                 rest = after_close;
                 break;
             } else {
-                return None; // unexpected token inside column list
+                return Ok(None); // unexpected token inside column list
             }
         }
         let rest = skip_ws_and_comments(rest);
@@ -138,16 +150,29 @@ fn parse_copy_from_stdin_tokens(query: &str) -> Option<(String, Vec<String>)> {
     };
 
     // 5. Match "FROM"
-    let rest = match_keyword(rest, "FROM")?;
+    let Some(rest) = match_keyword(rest, "FROM") else {
+        return Ok(None);
+    };
     if !rest.starts_with(|c: char| c.is_ascii_whitespace()) {
-        return None;
+        return Ok(None);
     }
     let rest = skip_ws_and_comments(rest);
 
     // 6. Match "stdin" (case-insensitive)
-    let _rest = match_keyword(rest, "STDIN")?;
+    let Some(rest) = match_keyword(rest, "STDIN") else {
+        return Ok(None);
+    };
 
-    Some((table_name, columns))
+    // 7. Validate trailing tokens: only whitespace/comments/EOF, `;`, or `WITH` allowed.
+    let rest = skip_ws_and_comments(rest);
+    if !rest.is_empty() && !rest.starts_with(';') && match_keyword(rest, "WITH").is_none() {
+        return Err(format!(
+            "syntax error at or near \"{}\"",
+            rest.split_ascii_whitespace().next().unwrap_or(rest)
+        ));
+    }
+
+    Ok(Some((table_name, columns)))
 }
 
 impl DynamicPgHandler {
@@ -178,7 +203,9 @@ impl DynamicPgHandler {
             return Ok(None);
         }
 
-        let Some((table_name, columns)) = parse_copy_from_stdin_tokens(query) else {
+        let Some((table_name, columns)) =
+            parse_copy_from_stdin_tokens(query).map_err(|msg| error_info("42601", msg))?
+        else {
             return Ok(None);
         };
 
