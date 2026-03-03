@@ -405,6 +405,75 @@ impl DynamicPgHandler {
         Ok(Some((table_name, columns)))
     }
 
+    /// Fallback: parse COPY FROM STDIN using sqlparser when the fast-path
+    /// returns `Ok(None)`. Returns the same `(table_name, columns)` format.
+    #[allow(clippy::result_large_err)]
+    pub(in crate::protocol::handler) fn parse_copy_from_stdin_via_sqlparser(
+        query: &str,
+    ) -> Result<Option<(String, Vec<String>)>, ErrorInfo> {
+        let Some(query_trimmed) = strip_leading_whitespace_and_comments(query) else {
+            return Ok(None);
+        };
+
+        // Quick pre-check: must start with COPY
+        match query_trimmed.get(..4) {
+            Some(prefix) if prefix.eq_ignore_ascii_case("COPY") => {}
+            _ => return Ok(None),
+        }
+
+        // sqlparser requires a trailing semicolon for COPY FROM STDIN
+        // (it expects data lines after the statement in non-terminated form).
+        let query_with_semi = if query_trimmed.trim_end().ends_with(';') {
+            query_trimmed.to_string()
+        } else {
+            format!("{};", query_trimmed)
+        };
+
+        let dialect = PostgreSqlDialect {};
+        let stmts = Parser::parse_sql(&dialect, &query_with_semi)
+            .map_err(|e| error_info("42601", e.to_string()))?;
+        let Some(stmt) = stmts.first() else {
+            return Ok(None);
+        };
+
+        let Statement::Copy {
+            source, to, target, ..
+        } = stmt
+        else {
+            return Ok(None);
+        };
+
+        if *to || !matches!(target, CopyTarget::Stdin) {
+            return Ok(None);
+        }
+
+        let CopySource::Table {
+            table_name,
+            columns,
+        } = source
+        else {
+            return Ok(None);
+        };
+
+        fn format_ident(ident: &Ident) -> String {
+            if ident.quote_style.is_some() {
+                format!("\"{}\"", ident.value)
+            } else {
+                ident.value.clone()
+            }
+        }
+
+        let table_str = match table_name.0.as_slice() {
+            [table] => format_ident(table),
+            [schema, table] => format!("{}.{}", format_ident(schema), format_ident(table)),
+            _ => return Err(error_info("42601", "Invalid table name in COPY FROM STDIN")),
+        };
+
+        let col_strs: Vec<String> = columns.iter().map(format_ident).collect();
+
+        Ok(Some((table_str, col_strs)))
+    }
+
     #[allow(clippy::result_large_err)]
     pub(in crate::protocol::handler) fn parse_copy_to_command(
         query: &str,

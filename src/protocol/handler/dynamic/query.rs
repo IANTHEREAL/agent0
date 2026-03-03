@@ -320,10 +320,20 @@ impl DynamicPgHandler {
         &self,
         query: &'a str,
     ) -> PgWireResult<Option<Vec<Response<'a>>>> {
-        let Some((table_name, columns)) = DynamicPgHandler::parse_copy_command(query)
-            .map_err(|e| PgWireError::UserError(Box::new(e)))?
-        else {
-            return Ok(None);
+        let (table_name, columns) = match DynamicPgHandler::parse_copy_command(query) {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                // Fast-path didn't match — try sqlparser for legacy syntax
+                // (e.g. COPY t FROM STDIN WITH CSV, COPY t FROM STDIN CSV).
+                // Sqlparser also rejects invalid syntax (COPY t FROM STDIN garbage)
+                // with a proper 42601 error.
+                match DynamicPgHandler::parse_copy_from_stdin_via_sqlparser(query) {
+                    Ok(Some(result)) => result,
+                    Ok(None) => return Ok(None),
+                    Err(e) => return Err(PgWireError::UserError(Box::new(e))),
+                }
+            }
+            Err(e) => return Err(PgWireError::UserError(Box::new(e))),
         };
 
         debug!(

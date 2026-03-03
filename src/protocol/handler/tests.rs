@@ -2053,6 +2053,101 @@ fn test_parse_copy_command_with_comment_before_options() {
     );
 }
 
+// -- sqlparser fallback (parse_copy_from_stdin_via_sqlparser) tests --
+
+#[test]
+fn test_sqlparser_fallback_legacy_with_csv() {
+    let result =
+        DynamicPgHandler::parse_copy_from_stdin_via_sqlparser("COPY t FROM STDIN WITH CSV")
+            .unwrap();
+    assert!(result.is_some());
+    let (table, cols) = result.unwrap();
+    assert_eq!(table, "t");
+    assert!(cols.is_empty());
+}
+
+#[test]
+fn test_sqlparser_fallback_legacy_bare_csv() {
+    let result =
+        DynamicPgHandler::parse_copy_from_stdin_via_sqlparser("COPY t FROM STDIN CSV").unwrap();
+    assert!(result.is_some());
+}
+
+#[test]
+fn test_sqlparser_fallback_legacy_with_delimiter() {
+    let result = DynamicPgHandler::parse_copy_from_stdin_via_sqlparser(
+        "COPY t FROM STDIN WITH DELIMITER ','",
+    )
+    .unwrap();
+    assert!(result.is_some());
+}
+
+#[test]
+fn test_sqlparser_fallback_garbage_returns_syntax_error() {
+    let result = DynamicPgHandler::parse_copy_from_stdin_via_sqlparser("COPY t FROM STDIN garbage");
+    assert!(
+        result.is_err(),
+        "garbage after STDIN should be a syntax error"
+    );
+    assert_eq!(result.unwrap_err().code, "42601");
+}
+
+#[test]
+fn test_sqlparser_fallback_not_copy() {
+    assert_eq!(
+        DynamicPgHandler::parse_copy_from_stdin_via_sqlparser("SELECT 1").unwrap(),
+        None
+    );
+}
+
+#[test]
+fn test_sqlparser_fallback_copy_to_returns_none() {
+    assert_eq!(
+        DynamicPgHandler::parse_copy_from_stdin_via_sqlparser("COPY t TO STDOUT").unwrap(),
+        None
+    );
+}
+
+#[test]
+fn test_sqlparser_fallback_quoted_table() {
+    let result =
+        DynamicPgHandler::parse_copy_from_stdin_via_sqlparser(r#"COPY "MyTable" FROM STDIN CSV"#)
+            .unwrap();
+    assert!(result.is_some());
+    let (table, _) = result.unwrap();
+    assert_eq!(table, r#""MyTable""#);
+}
+
+#[test]
+fn test_sqlparser_fallback_schema_qualified() {
+    let result = DynamicPgHandler::parse_copy_from_stdin_via_sqlparser(
+        "COPY public.users FROM STDIN WITH CSV",
+    )
+    .unwrap();
+    assert!(result.is_some());
+    let (table, _) = result.unwrap();
+    assert_eq!(table, "public.users");
+}
+
+#[test]
+fn test_sqlparser_fallback_with_columns() {
+    let result =
+        DynamicPgHandler::parse_copy_from_stdin_via_sqlparser("COPY t (a, b) FROM STDIN WITH CSV")
+            .unwrap();
+    assert!(result.is_some());
+    let (table, cols) = result.unwrap();
+    assert_eq!(table, "t");
+    assert_eq!(cols, vec!["a", "b"]);
+}
+
+#[test]
+fn test_sqlparser_fallback_with_semicolon() {
+    let result =
+        DynamicPgHandler::parse_copy_from_stdin_via_sqlparser("COPY t FROM STDIN WITH CSV;")
+            .unwrap();
+    assert!(result.is_some());
+}
+
 #[test]
 fn test_count_sql_parameters_ignores_dollar_quoted_strings() {
     assert_eq!(count_sql_parameters("SELECT $$ $99 $$, $1;"), 1);
