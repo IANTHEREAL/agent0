@@ -203,41 +203,39 @@ pub(crate) fn strip_regtype_typmod(raw: &str) -> String {
     trimmed.to_string()
 }
 
+fn invalid_interval_type_name(original_name: &str) -> anyhow::Error {
+    crate::sql::error::SqlError::SqlStructure(format!("invalid type name \"{}\"", original_name))
+        .into()
+}
+
 /// Validate interval precision inside `(N)`.
 ///
 /// `paren_str` must start with `(`.
-/// Returns `Ok(Some("interval"))` for valid precision (0–6),
-/// `Err` for non-numeric, negative, or malformed content.
-fn validate_interval_precision(paren_str: &str, original_name: &str) -> Result<Option<String>> {
+/// PostgreSQL grammar uses `Iconst` here, so only unsigned decimal digits
+/// fitting signed 32-bit range are accepted by the raw parser.
+fn validate_interval_precision(paren_str: &str, original_name: &str) -> Result<String> {
     let close = paren_str.find(')').ok_or_else(|| {
-        anyhow::anyhow!(
-            "{}",
-            crate::sql::error::SqlError::SqlStructure(format!(
-                "invalid type name \"{}\"",
-                original_name
-            ))
-        )
+        crate::sql::error::SqlError::SqlStructure(format!(
+            "invalid type name \"{}\"",
+            original_name
+        ))
     })?;
     let inner = paren_str[1..close].trim();
     let after = paren_str[close + 1..].trim();
     if !after.is_empty() {
-        return Err(crate::sql::error::SqlError::SqlStructure(format!(
-            "invalid type name \"{}\"",
-            original_name
-        ))
-        .into());
+        return Err(invalid_interval_type_name(original_name));
+    }
+    // Match PostgreSQL Iconst syntax: only bare decimal digits.
+    if inner.is_empty() || !inner.chars().all(|c| c.is_ascii_digit()) {
+        return Err(invalid_interval_type_name(original_name));
     }
     // PG grammar: typmod is Iconst (non-negative integer). Negative values
     // fail the parser. Out-of-range values (>6) are clamped with a WARNING
-    // but still return OID 1186.
-    match inner.parse::<u32>() {
-        Ok(_) => Ok(Some("interval".to_string())),
-        Err(_) => Err(crate::sql::error::SqlError::SqlStructure(format!(
-            "invalid type name \"{}\"",
-            original_name
-        ))
-        .into()),
-    }
+    // but still return OID 1186. Values beyond i32 range are parser errors.
+    inner
+        .parse::<i32>()
+        .map(|_| "interval".to_string())
+        .map_err(|_| invalid_interval_type_name(original_name))
 }
 
 /// Normalize interval qualifier forms to bare "interval".
@@ -250,19 +248,19 @@ fn validate_interval_precision(paren_str: &str, original_name: &str) -> Result<O
 /// PostgreSQL's raw parser rejects them before `to_regtype` can catch the
 /// error, so the error propagates to the client.
 ///
-/// Returns `Ok(Some("interval"))` for valid interval forms,
-/// `Ok(Some(other))` for non-interval types (pass through),
+/// Returns `Ok("interval")` for valid interval forms,
+/// `Ok(other)` for non-interval types (pass through),
 /// `Err` for invalid type names.
 ///
 /// This function must be called on the ORIGINAL input (before
 /// `strip_regtype_typmod`), because it validates precision placement.
-pub(crate) fn normalize_interval_type(name: &str) -> Result<Option<String>> {
+pub(crate) fn normalize_interval_type(name: &str) -> Result<String> {
     let lower = name.trim().to_lowercase();
     if lower == "interval" {
-        return Ok(Some(lower));
+        return Ok(lower);
     }
     if !lower.starts_with("interval") {
-        return Ok(Some(name.to_string()));
+        return Ok(name.to_string());
     }
     let rest = &lower["interval".len()..];
     if rest.starts_with('(') {
@@ -271,7 +269,7 @@ pub(crate) fn normalize_interval_type(name: &str) -> Result<Option<String>> {
     }
     if !rest.starts_with(' ') {
         // e.g. "intervals" — not an interval type, return as-is
-        return Ok(Some(name.to_string()));
+        return Ok(name.to_string());
     }
     let rest = rest.trim();
 
@@ -299,7 +297,7 @@ pub(crate) fn normalize_interval_type(name: &str) -> Result<Option<String>> {
     // Check qualifiers that accept precision first (longer matches first).
     for &q in QUALIFIERS_WITH_PRECISION {
         if rest == q {
-            return Ok(Some("interval".to_string()));
+            return Ok("interval".to_string());
         }
         if let Some(suffix) = rest.strip_prefix(q) {
             let trimmed = suffix.trim_start();
@@ -312,25 +310,18 @@ pub(crate) fn normalize_interval_type(name: &str) -> Result<Option<String>> {
     // Check qualifiers that do NOT accept precision.
     for &q in QUALIFIERS_NO_PRECISION {
         if rest == q {
-            return Ok(Some("interval".to_string()));
+            return Ok("interval".to_string());
         }
         if let Some(suffix) = rest.strip_prefix(q) {
             if suffix.trim_start().starts_with('(') {
                 // Precision on a qualifier that doesn't accept it.
-                return Err(crate::sql::error::SqlError::SqlStructure(format!(
-                    "invalid type name \"{}\"",
-                    name.trim()
-                ))
-                .into());
+                return Err(invalid_interval_type_name(name.trim()));
             }
         }
     }
 
     // Unknown qualifier.
-    Err(
-        crate::sql::error::SqlError::SqlStructure(format!("invalid type name \"{}\"", name.trim()))
-            .into(),
-    )
+    Err(invalid_interval_type_name(name.trim()))
 }
 
 fn regtype_array_oid(base_oid: i64) -> Option<i64> {
@@ -403,10 +394,7 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
     // Validate interval qualifiers BEFORE general typmod stripping so that
     // precision on non-SECOND qualifiers (e.g. `interval minute(3)`) is
     // rejected instead of silently stripped.
-    let after_interval = match normalize_interval_type(&without_array)? {
-        Some(s) => s,
-        None => return Ok(Value::Null), // precision out of range
-    };
+    let after_interval = normalize_interval_type(&without_array)?;
     let ready = if after_interval == "interval" {
         after_interval
     } else {
@@ -1074,8 +1062,14 @@ mod tests {
             to_regtype(vec![Value::Text("interval(7)".into())]).unwrap(),
             Value::Int64(pg_types::OID_INTERVAL)
         );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval(2147483647)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert!(to_regtype(vec![Value::Text("interval(2147483648)".into())]).is_err());
         // Negative precision → error (PG Iconst rejects '-', C10)
         assert!(to_regtype(vec![Value::Text("interval(-1)".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("interval(+1)".into())]).is_err());
         // Not a word-boundary match → NULL (unknown type, not an interval) (C6)
         assert_eq!(
             to_regtype(vec![Value::Text("intervals".into())]).unwrap(),
@@ -1090,38 +1084,29 @@ mod tests {
 
     #[test]
     fn test_normalize_interval_type() {
-        assert_eq!(
-            normalize_interval_type("interval").unwrap(),
-            Some("interval".to_string())
-        );
+        assert_eq!(normalize_interval_type("interval").unwrap(), "interval");
         assert_eq!(
             normalize_interval_type("interval day to second").unwrap(),
-            Some("interval".to_string())
+            "interval"
         );
         assert_eq!(
             normalize_interval_type("interval hour").unwrap(),
-            Some("interval".to_string())
+            "interval"
         );
         assert_eq!(
             normalize_interval_type("interval second(3)").unwrap(),
-            Some("interval".to_string())
+            "interval"
         );
         assert_eq!(
             normalize_interval_type("interval day to second(3)").unwrap(),
-            Some("interval".to_string())
+            "interval"
         );
         assert_eq!(
             normalize_interval_type("INTERVAL YEAR TO MONTH").unwrap(),
-            Some("interval".to_string())
+            "interval"
         );
-        assert_eq!(
-            normalize_interval_type("interval(0)").unwrap(),
-            Some("interval".to_string())
-        );
-        assert_eq!(
-            normalize_interval_type("interval(6)").unwrap(),
-            Some("interval".to_string())
-        );
+        assert_eq!(normalize_interval_type("interval(0)").unwrap(), "interval");
+        assert_eq!(normalize_interval_type("interval(6)").unwrap(), "interval");
         // Precision on non-SECOND qualifier → error
         assert!(normalize_interval_type("interval minute(3)").is_err());
         assert!(normalize_interval_type("interval year(2)").is_err());
@@ -1132,23 +1117,21 @@ mod tests {
         // Non-negative out-of-range precision → Some (PG clamps, returns OID)
         assert_eq!(
             normalize_interval_type("interval(999)").unwrap(),
-            Some("interval".to_string())
+            "interval"
         );
+        assert_eq!(normalize_interval_type("interval(7)").unwrap(), "interval");
+        // Iconst upper bound is signed 32-bit.
         assert_eq!(
-            normalize_interval_type("interval(7)").unwrap(),
-            Some("interval".to_string())
+            normalize_interval_type("interval(2147483647)").unwrap(),
+            "interval"
         );
+        assert!(normalize_interval_type("interval(2147483648)").is_err());
         // Negative precision → error (PG Iconst rejects '-')
         assert!(normalize_interval_type("interval(-1)").is_err());
+        assert!(normalize_interval_type("interval(+1)").is_err());
         // Not interval types — returned as-is
-        assert_eq!(
-            normalize_interval_type("intervals").unwrap(),
-            Some("intervals".to_string())
-        );
-        assert_eq!(
-            normalize_interval_type("integer").unwrap(),
-            Some("integer".to_string())
-        );
+        assert_eq!(normalize_interval_type("intervals").unwrap(), "intervals");
+        assert_eq!(normalize_interval_type("integer").unwrap(), "integer");
     }
 
     #[test]

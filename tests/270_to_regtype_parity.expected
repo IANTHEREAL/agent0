@@ -33,6 +33,7 @@ ERROR:  invalid type name "interval(abc)"
 to_regtype
 1186
 (1 row)
+ERROR:  invalid type name "interval(2147483648)"
 ERROR:  invalid type name "interval(-1)"
 to_regtype
 23
