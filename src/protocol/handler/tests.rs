@@ -1838,21 +1838,14 @@ fn test_parse_copy_command_to_stdout_rejected() {
         .is_none());
 }
 
-/// Invalid column identifiers are not parseable by the fast-path tokenizer, so
-/// parse_copy_command returns None (safe fallthrough to full parser which handles the error).
+/// Invalid COPY syntax should surface as PostgreSQL syntax error.
 #[test]
-fn test_parse_copy_command_invalid_column_identifier_falls_through() {
-    // Column name starting with a digit — tokenizer cannot parse, falls through.
-    assert_eq!(
-        DynamicPgHandler::parse_copy_command("COPY t (1col) FROM stdin").unwrap(),
-        None
-    );
+fn test_parse_copy_command_invalid_column_identifier_returns_syntax_error() {
+    let err = DynamicPgHandler::parse_copy_command("COPY t (1col) FROM stdin").unwrap_err();
+    assert_eq!(err.code, "42601");
 
-    // Empty column name (consecutive commas) — tokenizer cannot parse, falls through.
-    assert_eq!(
-        DynamicPgHandler::parse_copy_command("COPY t (, b) FROM stdin").unwrap(),
-        None
-    );
+    let err = DynamicPgHandler::parse_copy_command("COPY t (, b) FROM stdin").unwrap_err();
+    assert_eq!(err.code, "42601");
 }
 
 // --- Quoted identifier and edge-case tests (issue #1309) ---
@@ -1938,119 +1931,39 @@ fn test_parse_copy_command_quoted_with_escaped_quote() {
 }
 
 #[test]
-fn test_parse_copy_command_trailing_junk_after_stdin_falls_through() {
-    // Fast-path only handles WITH (...) form. Everything else → Ok(None) fallthrough
-    // so the full sqlparser handles validation (legacy syntax or error).
+fn test_parse_copy_command_sqlparser_semantics_after_stdin() {
+    for sql in [
+        r#"COPY "t" FROM STDIN garbage"#,
+        "COPY t FROM STDIN garbage",
+        "COPY t FROM STDIN WITHX",
+        "COPY t FROM STDIN WITH123",
+        "COPY t FROM STDIN WITHX (FORMAT csv)",
+        "COPY t FROM STDIN WITH garbage",
+        r#"COPY "t" FROM STDIN WITH garbage"#,
+        r#"COPY t FROM STDIN WITH (;"#,
+        r#"COPY t FROM STDIN WITH (FORMAT csv HEADER)"#,
+        r#"COPY t FROM STDIN WITH (FORMAT csv,)"#,
+        "COPY t FROM STDIN WITH/*unterminated",
+    ] {
+        let err = DynamicPgHandler::parse_copy_command(sql).unwrap_err();
+        assert_eq!(err.code, "42601", "sql: {sql}");
+    }
 
-    // Trailing garbage after STDIN → fall through.
-    assert_eq!(
-        DynamicPgHandler::parse_copy_command(r#"COPY "t" FROM STDIN garbage"#).unwrap(),
-        None
-    );
-    assert_eq!(
-        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN garbage").unwrap(),
-        None
-    );
-
-    // WITH-prefix junk (WITHX, WITH123) → fall through (not a keyword boundary).
-    assert_eq!(
-        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITHX").unwrap(),
-        None
-    );
-    assert_eq!(
-        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH123").unwrap(),
-        None
-    );
-    assert_eq!(
-        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITHX (FORMAT csv)").unwrap(),
-        None
-    );
-
-    // WITH without '(' (legacy unparenthesized syntax) → fall through (C7, C9).
-    assert_eq!(
-        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH garbage").unwrap(),
-        None
-    );
-    assert_eq!(
-        DynamicPgHandler::parse_copy_command(r#"COPY "t" FROM STDIN WITH garbage"#).unwrap(),
-        None
-    );
-    assert_eq!(
-        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH CSV").unwrap(),
-        None,
-        "C7: legacy unparenthesized WITH CSV must fall through"
-    );
-    assert_eq!(
-        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH DELIMITER ','").unwrap(),
-        None,
-        "C9: legacy unparenthesized WITH DELIMITER must fall through"
-    );
-
-    // Bare options after STDIN without WITH → fall through (C8).
-    assert_eq!(
-        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN CSV").unwrap(),
-        None,
-        "C8: bare CSV after STDIN must fall through"
-    );
-
-    // Valid WITH (...) clause should still be accepted by fast-path.
-    let result =
-        DynamicPgHandler::parse_copy_command(r#"COPY "t" FROM STDIN WITH (FORMAT csv)"#).unwrap();
-    assert!(result.is_some());
-    let result =
-        DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH(FORMAT csv)"#).unwrap();
-    assert!(result.is_some());
-    let result =
-        DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH (FORMAT csv, HEADER true)"#)
-            .unwrap();
-    assert!(result.is_some());
-
-    // Malformed/unknown WITH (...) must not enter COPY fast-path.
-    assert_eq!(
-        DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH (;"#).unwrap(),
-        None
-    );
-    assert_eq!(
-        DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH (garbage);"#).unwrap(),
-        None
-    );
-    assert_eq!(
-        DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH (FORMAT csv HEADER)"#)
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH (FORMAT csv,)"#).unwrap(),
-        None
-    );
-    let result =
-        DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH (FORMAT csv);"#).unwrap();
-    assert!(result.is_some());
-
-    // Trailing semicolon should be accepted.
-    let result = DynamicPgHandler::parse_copy_command(r#"COPY "t" FROM STDIN;"#).unwrap();
-    assert!(result.is_some());
-}
-
-#[test]
-fn test_parse_copy_command_with_comment_before_options() {
-    // Block comment between WITH and '(' should be stripped.
-    let result =
-        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH/*comment*/(FORMAT csv)")
-            .unwrap();
-    assert!(result.is_some());
-
-    // Line comment between WITH and '(' should be stripped.
-    let result =
-        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH--comment\n(FORMAT csv)")
-            .unwrap();
-    assert!(result.is_some());
-
-    // Unterminated block comment should fall through (Ok(None)).
-    assert_eq!(
-        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH/*unterminated").unwrap(),
-        None
-    );
+    for sql in [
+        "COPY t FROM STDIN WITH CSV",
+        "COPY t FROM STDIN CSV",
+        "COPY t FROM STDIN WITH DELIMITER ','",
+        r#"COPY "t" FROM STDIN WITH (FORMAT csv)"#,
+        r#"COPY t FROM STDIN WITH(FORMAT csv)"#,
+        r#"COPY t FROM STDIN WITH (FORMAT csv, HEADER true)"#,
+        r#"COPY t FROM STDIN WITH (FORMAT csv);"#,
+        r#"COPY "t" FROM STDIN;"#,
+        "COPY t FROM STDIN WITH/*comment*/(FORMAT csv)",
+        "COPY t FROM STDIN WITH--comment\n(FORMAT csv)",
+    ] {
+        let result = DynamicPgHandler::parse_copy_command(sql).unwrap();
+        assert!(result.is_some(), "sql: {sql}");
+    }
 }
 
 // -- sqlparser fallback (parse_copy_from_stdin_via_sqlparser) tests --
@@ -2116,6 +2029,17 @@ fn test_sqlparser_fallback_quoted_table() {
     assert!(result.is_some());
     let (table, _) = result.unwrap();
     assert_eq!(table, r#""MyTable""#);
+}
+
+#[test]
+fn test_sqlparser_fallback_escaped_quote_in_qualified_identifier() {
+    let result = DynamicPgHandler::parse_copy_from_stdin_via_sqlparser(
+        r#"COPY "a""b".t FROM STDIN WITH CSV"#,
+    )
+    .unwrap();
+    assert!(result.is_some());
+    let (table, _) = result.unwrap();
+    assert_eq!(table, r#""a""b".t"#);
 }
 
 #[test]
