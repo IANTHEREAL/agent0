@@ -1085,6 +1085,44 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
     Err(anyhow!("Cannot compare values: {:?} vs {:?}", left, right))
 }
 
+/// Shared NULL-sentinel + ASC/DESC ordering logic for ORDER BY comparators.
+///
+/// Handles NULLS FIRST/LAST, then delegates non-null comparison to `cmp_non_null`.
+/// The closure receives two guaranteed-non-null values and returns a raw comparison
+/// integer (negative = left < right, 0 = equal, positive = left > right).
+fn compare_nullable(
+    left: &Value,
+    right: &Value,
+    asc: bool,
+    nulls_first: bool,
+    cmp_non_null: impl FnOnce(&Value, &Value) -> Result<i32>,
+) -> Result<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    match (left, right) {
+        (Value::Null, Value::Null) => Ok(Ordering::Equal),
+        (Value::Null, _) => Ok(if nulls_first {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        }),
+        (_, Value::Null) => Ok(if nulls_first {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        }),
+        _ => {
+            let cmp = cmp_non_null(left, right)?;
+            Ok(if cmp == 0 {
+                Ordering::Equal
+            } else if (cmp > 0) == asc {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            })
+        }
+    }
+}
+
 /// ORDER BY comparator with PostgreSQL-like NULLS FIRST/LAST semantics.
 pub fn compare_order_by_values(
     left: &Value,
@@ -1092,39 +1130,9 @@ pub fn compare_order_by_values(
     asc: bool,
     nulls_first: bool,
 ) -> Result<std::cmp::Ordering> {
-    match (left, right) {
-        (Value::Null, Value::Null) => Ok(std::cmp::Ordering::Equal),
-        (Value::Null, _) => {
-            if nulls_first {
-                Ok(std::cmp::Ordering::Less)
-            } else {
-                Ok(std::cmp::Ordering::Greater)
-            }
-        }
-        (_, Value::Null) => {
-            if nulls_first {
-                Ok(std::cmp::Ordering::Greater)
-            } else {
-                Ok(std::cmp::Ordering::Less)
-            }
-        }
-        _ => {
-            let cmp = compare_values(left, right)?;
-            if cmp == 0 {
-                Ok(std::cmp::Ordering::Equal)
-            } else if asc {
-                if cmp > 0 {
-                    Ok(std::cmp::Ordering::Greater)
-                } else {
-                    Ok(std::cmp::Ordering::Less)
-                }
-            } else if cmp > 0 {
-                Ok(std::cmp::Ordering::Less)
-            } else {
-                Ok(std::cmp::Ordering::Greater)
-            }
-        }
-    }
+    compare_nullable(left, right, asc, nulls_first, |l, r| {
+        Ok(compare_values(l, r)? as i32)
+    })
 }
 
 /// ORDER BY comparator with collation support.
@@ -1139,44 +1147,13 @@ pub fn compare_order_by_values_collated(
     nulls_first: bool,
     collation: Option<&crate::sql::collation::ResolvedCollation>,
 ) -> Result<std::cmp::Ordering> {
-    match (left, right) {
-        (Value::Null, Value::Null) => Ok(std::cmp::Ordering::Equal),
-        (Value::Null, _) => {
-            if nulls_first {
-                Ok(std::cmp::Ordering::Less)
-            } else {
-                Ok(std::cmp::Ordering::Greater)
-            }
+    compare_nullable(left, right, asc, nulls_first, |l, r| {
+        if let (Some(coll), Value::Text(a), Value::Text(b)) = (collation, l, r) {
+            crate::sql::collation::compare_with_resolved_collation(a, b, coll)
+        } else {
+            Ok(compare_values(l, r)? as i32)
         }
-        (_, Value::Null) => {
-            if nulls_first {
-                Ok(std::cmp::Ordering::Greater)
-            } else {
-                Ok(std::cmp::Ordering::Less)
-            }
-        }
-        _ => {
-            let cmp = if let (Some(coll), Value::Text(a), Value::Text(b)) = (collation, left, right)
-            {
-                crate::sql::collation::compare_with_resolved_collation(a, b, coll)?
-            } else {
-                compare_values(left, right)? as i32
-            };
-            if cmp == 0 {
-                Ok(std::cmp::Ordering::Equal)
-            } else if asc {
-                if cmp > 0 {
-                    Ok(std::cmp::Ordering::Greater)
-                } else {
-                    Ok(std::cmp::Ordering::Less)
-                }
-            } else if cmp > 0 {
-                Ok(std::cmp::Ordering::Less)
-            } else {
-                Ok(std::cmp::Ordering::Greater)
-            }
-        }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1447,5 +1424,63 @@ mod tests {
         // PG: null < string < number
         assert!(k_null < k_str);
         assert!(k_str < k1);
+    }
+
+    #[test]
+    fn test_compare_nullable_null_sentinel_logic() {
+        let non_null = Value::Int32(1);
+        let null = Value::Null;
+
+        // (Null, Null) → always Equal regardless of asc/nulls_first
+        for asc in [true, false] {
+            for nf in [true, false] {
+                assert_eq!(
+                    compare_nullable(&null, &null, asc, nf, |_, _| unreachable!()).unwrap(),
+                    std::cmp::Ordering::Equal,
+                );
+            }
+        }
+
+        // (Null, non-null): nulls_first=true → Less, nulls_first=false → Greater
+        assert_eq!(
+            compare_nullable(&null, &non_null, true, true, |_, _| unreachable!()).unwrap(),
+            std::cmp::Ordering::Less,
+        );
+        assert_eq!(
+            compare_nullable(&null, &non_null, true, false, |_, _| unreachable!()).unwrap(),
+            std::cmp::Ordering::Greater,
+        );
+
+        // (non-null, Null): nulls_first=true → Greater, nulls_first=false → Less
+        assert_eq!(
+            compare_nullable(&non_null, &null, true, true, |_, _| unreachable!()).unwrap(),
+            std::cmp::Ordering::Greater,
+        );
+        assert_eq!(
+            compare_nullable(&non_null, &null, true, false, |_, _| unreachable!()).unwrap(),
+            std::cmp::Ordering::Less,
+        );
+    }
+
+    #[test]
+    fn test_compare_nullable_asc_desc_ordering() {
+        let a = Value::Int32(1);
+        let b = Value::Int32(2);
+
+        // ASC: 1 < 2 → Less
+        assert_eq!(
+            compare_nullable(&a, &b, true, true, |l, r| Ok(compare_values(l, r)? as i32)).unwrap(),
+            std::cmp::Ordering::Less,
+        );
+        // DESC: 1 < 2 → reversed → Greater
+        assert_eq!(
+            compare_nullable(&a, &b, false, true, |l, r| Ok(compare_values(l, r)? as i32)).unwrap(),
+            std::cmp::Ordering::Greater,
+        );
+        // Equal values
+        assert_eq!(
+            compare_nullable(&a, &a, true, true, |l, r| Ok(compare_values(l, r)? as i32)).unwrap(),
+            std::cmp::Ordering::Equal,
+        );
     }
 }
