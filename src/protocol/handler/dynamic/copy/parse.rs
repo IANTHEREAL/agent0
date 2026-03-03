@@ -9,73 +9,83 @@ use sqlparser::ast::{CopySource, CopyTarget, Ident, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-/// Pre-compiled regex for `COPY [schema.]table [(col1, …)] FROM stdin`.
-static COPY_FROM_STDIN_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s*(?:\(([^)]+)\)\s+|\s+)FROM\s+stdin")
-        .expect("COPY FROM STDIN regex is valid")
-});
-
 impl DynamicPgHandler {
     #[allow(clippy::result_large_err)]
     pub(in crate::protocol::handler) fn parse_copy_command(
         query: &str,
     ) -> Result<Option<(String, Vec<String>)>, ErrorInfo> {
-        fn is_valid_unquoted_ident(ident: &str) -> bool {
-            let mut chars = ident.chars();
-            let Some(first) = chars.next() else {
-                return false;
-            };
-            if first != '_' && !first.is_ascii_alphabetic() {
-                return false;
+        // Keep COPY FROM STDIN semantics in one parser implementation.
+        Self::parse_copy_from_stdin_via_sqlparser(query)
+    }
+
+    /// Fallback: parse COPY FROM STDIN using sqlparser when the fast-path
+    /// returns `Ok(None)`. Returns the same `(table_name, columns)` format.
+    #[allow(clippy::result_large_err)]
+    pub(in crate::protocol::handler) fn parse_copy_from_stdin_via_sqlparser(
+        query: &str,
+    ) -> Result<Option<(String, Vec<String>)>, ErrorInfo> {
+        let Some(query_trimmed) = strip_leading_whitespace_and_comments(query) else {
+            return Ok(None);
+        };
+
+        // Quick pre-check: must start with COPY
+        match query_trimmed.get(..4) {
+            Some(prefix) if prefix.eq_ignore_ascii_case("COPY") => {}
+            _ => return Ok(None),
+        }
+
+        // sqlparser requires a trailing semicolon for COPY FROM STDIN
+        // (it expects data lines after the statement in non-terminated form).
+        let query_with_semi = if query_trimmed.trim_end().ends_with(';') {
+            query_trimmed.to_string()
+        } else {
+            format!("{};", query_trimmed)
+        };
+
+        let dialect = PostgreSqlDialect {};
+        let stmts = Parser::parse_sql(&dialect, &query_with_semi)
+            .map_err(|e| error_info("42601", e.to_string()))?;
+        let Some(stmt) = stmts.first() else {
+            return Ok(None);
+        };
+
+        let Statement::Copy {
+            source, to, target, ..
+        } = stmt
+        else {
+            return Ok(None);
+        };
+
+        if *to || !matches!(target, CopyTarget::Stdin) {
+            return Ok(None);
+        }
+
+        let CopySource::Table {
+            table_name,
+            columns,
+        } = source
+        else {
+            return Ok(None);
+        };
+
+        fn format_ident(ident: &Ident) -> String {
+            if ident.quote_style.is_some() {
+                let escaped = ident.value.replace('"', "\"\"");
+                format!("\"{}\"", escaped)
+            } else {
+                ident.value.clone()
             }
-            chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
         }
 
-        let Some(query) = strip_leading_whitespace_and_comments(query) else {
-            return Ok(None);
-        };
-        let query_upper = query.to_uppercase();
-        // COPY FROM STDIN must start at statement start (after leading whitespace/comments).
-        if !query_upper.starts_with("COPY")
-            || !query_upper.contains("FROM")
-            || !query_upper.contains("STDIN")
-        {
-            return Ok(None);
-        }
-
-        // Single regex: COPY [schema.]table_name [(col1, col2, ...)] FROM stdin
-        let Some(caps) = COPY_FROM_STDIN_RE.captures(query) else {
-            return Ok(None);
-        };
-        let schema = caps.get(1).map(|m| m.as_str().to_string());
-        let table = match caps.get(2) {
-            Some(m) => m.as_str().to_string(),
-            None => return Ok(None),
-        };
-        let table_name = match schema {
-            Some(s) => format!("{}.{}", s, table),
-            None => table,
-        };
-        let columns: Vec<String> = match caps.get(3) {
-            Some(cols) => cols
-                .as_str()
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect(),
-            None => vec![],
+        let table_str = match table_name.0.as_slice() {
+            [table] => format_ident(table),
+            [schema, table] => format!("{}.{}", format_ident(schema), format_ident(table)),
+            _ => return Err(error_info("42601", "Invalid table name in COPY FROM STDIN")),
         };
 
-        // Validate column names against unquoted identifier rules (PG parity).
-        for col in &columns {
-            if !is_valid_unquoted_ident(col) {
-                return Err(error_info(
-                    "42602",
-                    format!("Invalid identifier in COPY FROM STDIN: \"{}\"", col),
-                ));
-            }
-        }
+        let col_strs: Vec<String> = columns.iter().map(format_ident).collect();
 
-        Ok(Some((table_name, columns)))
+        Ok(Some((table_str, col_strs)))
     }
 
     #[allow(clippy::result_large_err)]
