@@ -14,8 +14,6 @@
 #   - ORM entries are passed as Vitest filters to `npm test` in `orm-tests/`
 
 [sql]
-tests/96_dify_schema.sql
-tests/127_dify_lite_workload.sql
 tests/97_comment_on.sql
 tests/119_upsert_do_update_update_semantics_issue196.sql
 tests/125_pr285_compat_regressions.sql
@@ -32,7 +30,6 @@ tests/operator_schema_qualified.sql
 tests/psql_describe_compat.sql
 tests/152_lateral_join_on_constraint.sql
 tests/153_rename_table_cache_invalidation.sql
-tests/155_dml_type_coercion_invariant_issue407.sql
 tests/156_join_on_correlated_scalar_subquery_issue420.sql
 tests/155_correlated_subquery_join_on_issue446.sql
 tests/157_join_select_correlated_scalar_subquery_issue428.sql
@@ -49,27 +46,124 @@ tests/179_cron_mixed_operations.sql
 tests/180_cron_query_patterns.sql
 tests/181_cron_boundary.sql
 tests/218_gin_correctness.sql
-tests/236_gin_index_scan.sql
-tests/237_fts_tokenizers.sql
-tests/252_fts_phase3.sql
+tests/234_returns_table_sql_function.sql
+tests/235_lateral_correlated_no_from.sql
+tests/40_lastval.sql
+# --- Core correctness (added 2026-03-02, AC triage) ---
+# DML fundamentals
+tests/01_ddl_basic.sql
+tests/02_dml_crud.sql
+tests/04_returning.sql
+tests/05_transaction.sql
+tests/06_composite_pk.sql
+tests/07_order_limit.sql
+tests/08_aggregation.sql
+tests/09_index.sql
+tests/10_index_scan.sql
+tests/11_group_by.sql
+tests/12_tpcc_basic.sql
+tests/13_pg_functions.sql
+tests/14_pessimistic_txn.sql
+tests/18_window_functions.sql
+tests/19_subqueries.sql
+tests/20_cte.sql
+tests/24_json_comprehensive.sql
+tests/27_constraints.sql
+tests/28_advanced_constraints.sql
+tests/29_recursive_cte.sql
+tests/33_transaction_consistency.sql
+tests/37_savepoints.sql
+tests/38_delete_by_pk_index_cleanup.sql
+tests/39_enum_types.sql
+tests/40_sequences.sql
+# Joins (known regression area)
+tests/106_join_comma_join_on.sql
+tests/107_join_on_truthiness.sql
+tests/107_join_right_full_precedence_issue77.sql
+tests/107_join_using_natural_full_right_issue86.sql
+tests/108_chained_natural_using_join_wildcard.sql
+tests/115_join_using_outer_select_star_issue55.sql
+tests/116_join_using_outer_unqualified_refs_issue86.sql
+tests/131_distsql_join.sql
+tests/137_join_using.sql
+tests/139_cross_join.sql
+tests/140_join_using_qualified_wildcard_issue424.sql
+tests/143_group_join.sql
+tests/149_inner-join.sql
+tests/164_merge_join.sql
+tests/165_merge_join_dist.sql
+tests/222_correlated_subquery_bare_column.sql
+tests/228_outer_join_async_on_subquery.sql
+# FK / constraints
+tests/100_fk_null_and_unique_ref.sql
+tests/107_pkless_index.sql
+tests/118_partial_index_predicate_implies_issue42.sql
+tests/145_alter_primary_key.sql
+tests/217_update_pk.sql
+tests/138_update_primary_key.sql
+# Transaction / savepoint semantics
+tests/104_write_conflict_retry.sql
+tests/120_savepoint_trigger_enqueue_undo_issue34.sql
+tests/123_copy_from_stdin_txn_savepoint_issue32.sql
+tests/124_copy_from_stdin_autocommit_atomic_issue32.sql
+# NULL / operator semantics (correctness-critical)
+tests/121_any_all_null_3vl_issue43.sql
+tests/136_and_or_nullif.sql
+tests/231_null_operator_semantics.sql
+tests/250_ne_any_array_semantics_issue1059.sql
+tests/251_any_empty_array_type_check.sql
+# Aggregation / window
+tests/100_aggregate_alias_fixes.sql
+tests/118_intersect_except_all_multiset_issue50.sql
+tests/248_nullable_aggregation.sql
+# Expressions / functions
+tests/105_expr_functions.sql
+tests/110_enum_search_path.sql
+tests/246_jsonb_path_filter.sql
+# COPY FROM (protocol correctness)
+tests/110_copy_from_stdin_column_mismatch.sql
+tests/111_copy_from_stdin_resolution_and_escapes.sql
+tests/112_copy_from_stdin_search_path_fallback.sql
+tests/113_copy_from_stdin_blank_lines.sql
+tests/114_copy_from_stdin_validation.sql
+tests/120_custom_escape_character.sql
+# Plan cache / optimizer
+tests/245_plan_cache_regression_issue707.sql
+# CTEs / recursive
+tests/254_recursive_cte_iteration_cap_boundary_issue1210.sql
+# Misc correctness
+tests/109_drop_table_comment_cleanup_issue59.sql
+tests/115_update_from_empty_issue220.sql
+tests/117_drop_function_trigger_deps_issue222.sql
+tests/141_drop_schema_cascade_types.sql
+tests/245_prisma_upsert_conflict_target.sql
+tests/126_pg_type_is_visible.sql
+tests/102_hstore_compat.sql
+# Dify / schema introspection
+tests/96_dify_schema.sql
+tests/127_dify_lite_workload.sql
+# Worker engine
 tests/185_worker_cron_queue.sql
 tests/187_worker_cic.sql
 tests/188_worker_refresh_mv.sql
 tests/189_worker_auto_analyze.sql
+# Timeout / session GUCs
 tests/229_statement_timeout.sql
 tests/230_idle_in_transaction_timeout.sql
 tests/232_statement_timeout_guc_regression.sql
-tests/234_returns_table_sql_function.sql
-tests/235_lateral_correlated_no_from.sql
+# GIN / FTS
+tests/236_gin_index_scan.sql
+tests/237_fts_tokenizers.sql
+tests/252_fts_phase3.sql
+# Lateral join / DML coercion
+tests/155_dml_type_coercion_invariant_issue407.sql
+# Misc (master merge)
 tests/94_three_part_identifier.sql
 tests/95_alter_owner.sql
 tests/95_join_using.sql
 tests/99_statement_timeout.sql
 tests/101_server_introspection.sql
-tests/102_hstore_compat.sql
 tests/197_sql_keys.sql
-tests/217_update_pk.sql
-tests/40_lastval.sql
 
 [python]
 tests/advisory_locks_savepoint.py

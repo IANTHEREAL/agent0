@@ -704,10 +704,10 @@ fn build_single_column_schema(unique: bool) -> (TableSchema, IndexDef) {
         predicate: None,
         expressions: Vec::new(),
         state: crate::worker::types::IndexState::Ready,
-        cached_predicate_conjuncts: None,
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
+        cached_predicate_conjuncts: None,
     };
 
     let schema = TableSchema {
@@ -846,10 +846,10 @@ fn test_inlist_mixed_null_and_duplicates_matches_normalized_scan_keys_and_cost()
         predicate: None,
         expressions: Vec::new(),
         state: crate::worker::types::IndexState::Ready,
-        cached_predicate_conjuncts: None,
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
+        cached_predicate_conjuncts: None,
     };
     let schema = TableSchema {
         name: "items".to_string(),
@@ -950,10 +950,10 @@ fn test_inlist_mixed_sign_nan_deduplicates_to_one_effective_nan() {
         predicate: None,
         expressions: Vec::new(),
         state: crate::worker::types::IndexState::Ready,
-        cached_predicate_conjuncts: None,
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
+        cached_predicate_conjuncts: None,
     };
     let schema = TableSchema {
         name: "items".to_string(),
@@ -1209,10 +1209,10 @@ fn test_composite_index_inlist_factors_prefix_equality_selectivity() {
         predicate: None,
         expressions: Vec::new(),
         state: crate::worker::types::IndexState::Ready,
-        cached_predicate_conjuncts: None,
         hnsw_m: None,
         hnsw_ef_construction: None,
         hnsw_distance_metric: None,
+        cached_predicate_conjuncts: None,
     };
     let schema = TableSchema {
         name: "events".to_string(),
