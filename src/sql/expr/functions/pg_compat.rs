@@ -203,6 +203,42 @@ pub(crate) fn strip_regtype_typmod(raw: &str) -> String {
     trimmed.to_string()
 }
 
+/// Validate interval precision inside `(N)`.
+///
+/// `paren_str` must start with `(`.
+/// Returns `Ok(Some("interval"))` for valid precision (0–6),
+/// `Ok(None)` for out-of-range precision (caller returns NULL),
+/// `Err` for non-numeric or malformed content.
+fn validate_interval_precision(paren_str: &str, original_name: &str) -> Result<Option<String>> {
+    let close = paren_str.find(')').ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}",
+            crate::sql::error::SqlError::SqlStructure(format!(
+                "invalid type name \"{}\"",
+                original_name
+            ))
+        )
+    })?;
+    let inner = paren_str[1..close].trim();
+    let after = paren_str[close + 1..].trim();
+    if !after.is_empty() {
+        return Err(crate::sql::error::SqlError::SqlStructure(format!(
+            "invalid type name \"{}\"",
+            original_name
+        ))
+        .into());
+    }
+    match inner.parse::<i32>() {
+        Ok(n) if (0..=6).contains(&n) => Ok(Some("interval".to_string())),
+        Ok(_) => Ok(None), // out of range → NULL
+        Err(_) => Err(crate::sql::error::SqlError::SqlStructure(format!(
+            "invalid type name \"{}\"",
+            original_name
+        ))
+        .into()),
+    }
+}
+
 /// Normalize interval qualifier forms to bare "interval".
 ///
 /// PostgreSQL accepts `interval`, `interval(3)`, `interval day to second`,
@@ -213,24 +249,29 @@ pub(crate) fn strip_regtype_typmod(raw: &str) -> String {
 /// PostgreSQL's raw parser rejects them before `to_regtype` can catch the
 /// error, so the error propagates to the client.
 ///
+/// Returns `Ok(Some("interval"))` for valid interval forms,
+/// `Ok(Some(other))` for non-interval types (pass through),
+/// `Ok(None)` for valid syntax but out-of-range precision (→ NULL),
+/// `Err` for invalid type names.
+///
 /// This function must be called on the ORIGINAL input (before
 /// `strip_regtype_typmod`), because it validates precision placement.
-pub(crate) fn normalize_interval_type(name: &str) -> Result<String> {
+pub(crate) fn normalize_interval_type(name: &str) -> Result<Option<String>> {
     let lower = name.trim().to_lowercase();
     if lower == "interval" {
-        return Ok(lower);
+        return Ok(Some(lower));
     }
     if !lower.starts_with("interval") {
-        return Ok(name.to_string());
+        return Ok(Some(name.to_string()));
     }
     let rest = &lower["interval".len()..];
     if rest.starts_with('(') {
-        // "interval(3)" — general precision, valid
-        return Ok("interval".to_string());
+        // "interval(N)" — validate precision content
+        return validate_interval_precision(rest, name.trim());
     }
     if !rest.starts_with(' ') {
         // e.g. "intervals" — not an interval type, return as-is
-        return Ok(name.to_string());
+        return Ok(Some(name.to_string()));
     }
     let rest = rest.trim();
 
@@ -258,11 +299,12 @@ pub(crate) fn normalize_interval_type(name: &str) -> Result<String> {
     // Check qualifiers that accept precision first (longer matches first).
     for &q in QUALIFIERS_WITH_PRECISION {
         if rest == q {
-            return Ok("interval".to_string());
+            return Ok(Some("interval".to_string()));
         }
         if let Some(suffix) = rest.strip_prefix(q) {
-            if suffix.trim_start().starts_with('(') {
-                return Ok("interval".to_string());
+            let trimmed = suffix.trim_start();
+            if trimmed.starts_with('(') {
+                return validate_interval_precision(trimmed, name.trim());
             }
         }
     }
@@ -270,7 +312,7 @@ pub(crate) fn normalize_interval_type(name: &str) -> Result<String> {
     // Check qualifiers that do NOT accept precision.
     for &q in QUALIFIERS_NO_PRECISION {
         if rest == q {
-            return Ok("interval".to_string());
+            return Ok(Some("interval".to_string()));
         }
         if let Some(suffix) = rest.strip_prefix(q) {
             if suffix.trim_start().starts_with('(') {
@@ -361,7 +403,10 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
     // Validate interval qualifiers BEFORE general typmod stripping so that
     // precision on non-SECOND qualifiers (e.g. `interval minute(3)`) is
     // rejected instead of silently stripped.
-    let after_interval = normalize_interval_type(&without_array)?;
+    let after_interval = match normalize_interval_type(&without_array)? {
+        Some(s) => s,
+        None => return Ok(Value::Null), // precision out of range
+    };
     let ready = if after_interval == "interval" {
         after_interval
     } else {
@@ -999,54 +1044,106 @@ mod tests {
             to_regtype(vec![Value::Text("interval(3)".into())]).unwrap(),
             Value::Int64(pg_types::OID_INTERVAL)
         );
+        // Edge: precision 0 and 6 are valid bounds
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval(0)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval(6)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
         // Case-insensitive
         assert_eq!(
             to_regtype(vec![Value::Text("INTERVAL DAY TO SECOND".into())]).unwrap(),
             Value::Int64(pg_types::OID_INTERVAL)
         );
-        // Precision on non-SECOND qualifier → error
+        // Precision on non-SECOND qualifier → error (C2, C3)
         assert!(to_regtype(vec![Value::Text("interval minute(3)".into())]).is_err());
         assert!(to_regtype(vec![Value::Text("interval year(2)".into())]).is_err());
-        // Unknown qualifier → error
+        // Unknown qualifier → error (C1)
         assert!(to_regtype(vec![Value::Text("interval garbage".into())]).is_err());
-        // Not a word-boundary match → NULL (unknown type, not an interval)
+        // Malformed typmod content → error (C8)
+        assert!(to_regtype(vec![Value::Text("interval(abc)".into())]).is_err());
+        // Precision out of range → NULL (C9, C10)
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval(999)".into())]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval(-1)".into())]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval(7)".into())]).unwrap(),
+            Value::Null
+        );
+        // Not a word-boundary match → NULL (unknown type, not an interval) (C6)
         assert_eq!(
             to_regtype(vec![Value::Text("intervals".into())]).unwrap(),
+            Value::Null
+        );
+        // Nonexistent type → NULL (C7)
+        assert_eq!(
+            to_regtype(vec![Value::Text("nonexistent_type".into())]).unwrap(),
             Value::Null
         );
     }
 
     #[test]
     fn test_normalize_interval_type() {
-        assert_eq!(normalize_interval_type("interval").unwrap(), "interval");
+        assert_eq!(
+            normalize_interval_type("interval").unwrap(),
+            Some("interval".to_string())
+        );
         assert_eq!(
             normalize_interval_type("interval day to second").unwrap(),
-            "interval"
+            Some("interval".to_string())
         );
         assert_eq!(
             normalize_interval_type("interval hour").unwrap(),
-            "interval"
+            Some("interval".to_string())
         );
         assert_eq!(
             normalize_interval_type("interval second(3)").unwrap(),
-            "interval"
+            Some("interval".to_string())
         );
         assert_eq!(
             normalize_interval_type("interval day to second(3)").unwrap(),
-            "interval"
+            Some("interval".to_string())
         );
         assert_eq!(
             normalize_interval_type("INTERVAL YEAR TO MONTH").unwrap(),
-            "interval"
+            Some("interval".to_string())
+        );
+        assert_eq!(
+            normalize_interval_type("interval(0)").unwrap(),
+            Some("interval".to_string())
+        );
+        assert_eq!(
+            normalize_interval_type("interval(6)").unwrap(),
+            Some("interval".to_string())
         );
         // Precision on non-SECOND qualifier → error
         assert!(normalize_interval_type("interval minute(3)").is_err());
         assert!(normalize_interval_type("interval year(2)").is_err());
         // Unknown qualifier → error
         assert!(normalize_interval_type("interval garbage").is_err());
+        // Malformed precision content → error
+        assert!(normalize_interval_type("interval(abc)").is_err());
+        // Precision out of range → None (NULL)
+        assert_eq!(normalize_interval_type("interval(999)").unwrap(), None);
+        assert_eq!(normalize_interval_type("interval(-1)").unwrap(), None);
+        assert_eq!(normalize_interval_type("interval(7)").unwrap(), None);
         // Not interval types — returned as-is
-        assert_eq!(normalize_interval_type("intervals").unwrap(), "intervals");
-        assert_eq!(normalize_interval_type("integer").unwrap(), "integer");
+        assert_eq!(
+            normalize_interval_type("intervals").unwrap(),
+            Some("intervals".to_string())
+        );
+        assert_eq!(
+            normalize_interval_type("integer").unwrap(),
+            Some("integer".to_string())
+        );
     }
 
     #[test]

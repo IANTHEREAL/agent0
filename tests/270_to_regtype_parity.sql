@@ -14,6 +14,9 @@ SELECT to_regtype('interval hour');
 SELECT to_regtype('interval year to month');
 SELECT to_regtype('interval(3)');
 SELECT to_regtype('interval garbage');
+SELECT to_regtype('interval(abc)');
+SELECT to_regtype('interval(999)');
+SELECT to_regtype('interval(-1)');
 
 -- Existing behavior regression
 SELECT to_regtype('integer');
