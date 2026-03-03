@@ -128,7 +128,7 @@ impl DynamicPgHandler {
         };
 
         let mut db_txn = store
-            .begin()
+            .begin_optimistic()
             .await
             .map_err(|e| fatal_internal(e.to_string()))?;
         let database_id = match store
@@ -271,14 +271,19 @@ impl DynamicPgHandler {
             }
         }
 
-        let mut txn = store.begin().await.context("Failed to begin transaction")?;
+        let mut txn = store
+            .begin_optimistic()
+            .await
+            .context("Failed to begin transaction")?;
 
         match auth_manager
             .authenticate(&mut txn, username, password)
             .await
         {
             Ok(Some(user)) => {
-                txn.commit().await.context("Failed to commit")?;
+                if let Err(e) = txn.rollback().await {
+                    warn!("rollback failed after auth success: {}", e);
+                }
                 Ok(AuthResult {
                     is_authenticated: true,
                     is_superuser: user.is_superuser,
