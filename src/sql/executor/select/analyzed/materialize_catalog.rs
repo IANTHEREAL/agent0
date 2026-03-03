@@ -1082,8 +1082,8 @@ impl Executor {
             _ => return Err(anyhow!("function to_regtype(text) does not exist")),
         };
 
-        // Fast path for builtins and extension shims already handled by the
-        // scalar function implementation.
+        // Fast path for pg_catalog builtins handled by the scalar function
+        // implementation.
         let resolved_builtin =
             crate::sql::expr::functions::pg_compat::to_regtype(vec![Value::Text(raw.clone())])?;
         if !matches!(resolved_builtin, Value::Null) {
@@ -1091,16 +1091,30 @@ impl Executor {
         }
 
         let (without_array, is_array) = strip_regtype_array_dims(&raw);
-        if is_array {
-            // db9 does not synthesize array OIDs for user-defined base types yet.
-            return Ok(Value::Null);
-        }
         let normalized = strip_regtype_typmod(&without_array);
         if normalized.trim().is_empty() {
             return Ok(Value::Null);
         }
 
         let store = self.store();
+        if let Some(ext_oid) = lookup_hstore_extension_regtype_oid(
+            &store,
+            txn,
+            db_id,
+            &normalized,
+            is_array,
+            search_path,
+        )
+        .await?
+        {
+            return Ok(Value::Int64(ext_oid));
+        }
+
+        if is_array {
+            // db9 does not synthesize array OIDs for user-defined base types yet.
+            return Ok(Value::Null);
+        }
+
         let oid =
             lookup_user_defined_regtype_oid(&store, txn, db_id, &normalized, search_path).await?;
         Ok(oid.map(Value::Int64).unwrap_or(Value::Null))
@@ -1419,6 +1433,59 @@ async fn lookup_user_defined_regtype_oid(
         .get_type(txn, db_id, &resolved.full)
         .await?
         .map(|def| def.oid as i64))
+}
+
+async fn lookup_hstore_extension_regtype_oid(
+    store: &Arc<crate::storage::TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    normalized_type_name: &str,
+    is_array: bool,
+    search_path: &[String],
+) -> Result<Option<i64>> {
+    let Some(installed) = store.get_extension(txn, db_id, "hstore").await? else {
+        return Ok(None);
+    };
+    if !installed.enabled {
+        return Ok(None);
+    }
+
+    let Some(type_name) = parse_regtype_object_name(normalized_type_name) else {
+        return Ok(None);
+    };
+    let parts = type_name.0;
+    let (schema, name) = match parts.as_slice() {
+        [name] => (None, name.value.as_str()),
+        [schema, name] => (Some(schema.value.as_str()), name.value.as_str()),
+        _ => return Ok(None),
+    };
+
+    let schema_matches = match schema {
+        None => search_path.iter().any(|s| s.eq_ignore_ascii_case("public")),
+        Some(s) => s.eq_ignore_ascii_case("public"),
+    };
+    if !schema_matches {
+        return Ok(None);
+    }
+
+    let base_oid = if name.eq_ignore_ascii_case("hstore") {
+        Some(crate::sql::pg_types::OID_HSTORE)
+    } else if name.eq_ignore_ascii_case("_hstore") {
+        Some(crate::sql::pg_types::OID_HSTORE_ARRAY)
+    } else {
+        None
+    };
+
+    let oid = if is_array {
+        match base_oid {
+            Some(crate::sql::pg_types::OID_HSTORE) => Some(crate::sql::pg_types::OID_HSTORE_ARRAY),
+            _ => None,
+        }
+    } else {
+        base_oid
+    };
+
+    Ok(oid)
 }
 
 #[cfg(test)]

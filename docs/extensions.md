@@ -12,7 +12,7 @@ db9-server extensions are **built-in** (compiled into the server binary) and can
 | `pg_cron` | Built-in code path | Yes | Installs/enables per-tenant |
 | `parquet` (`read_parquet`) | Built-in code path (feature-gated at build time) | Yes | Installs/enables per-tenant |
 | `uuid-ossp` | Built-in UUID functions | No | Accepted for compatibility; records `pg_extension` metadata |
-| `hstore` | Compatibility surface only | No | Accepted for compatibility; records `pg_extension` metadata |
+| `hstore` | Compatibility surface only (catalog/type visibility is install-gated) | Yes | Installs metadata and enables `hstore`/`_hstore` visibility in `pg_type` + `to_regtype` |
 | `zhparser` tokenizer | Built-in via jieba | No | Accepted for compatibility; records `pg_extension` metadata |
 
 For ORM/agent bootstrap flows: `CREATE EXTENSION IF NOT EXISTS vector;` is safe but optional. Vector features work without running this statement.

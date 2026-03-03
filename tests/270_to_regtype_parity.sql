@@ -22,6 +22,7 @@ SELECT to_regtype('interval(-1)'); -- db9-specific: error text differs from PG
 -- Existing behavior regression
 SELECT to_regtype('integer');
 SELECT to_regtype('integer[]');
+-- PG parity: without CREATE EXTENSION hstore, hstore regtype lookups are NULL.
 SELECT to_regtype('hstore');
 SELECT to_regtype('hstore[]');
 SELECT to_regtype('varchar(5)');

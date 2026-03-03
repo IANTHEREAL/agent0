@@ -8,7 +8,7 @@ to_regtype
 1009
 (1 row)
 to_regtype
-16387
+NULL
 (1 row)
 to_regtype
 1007
@@ -42,10 +42,10 @@ to_regtype
 1007
 (1 row)
 to_regtype
-16386
+NULL
 (1 row)
 to_regtype
-16387
+NULL
 (1 row)
 to_regtype
 1043

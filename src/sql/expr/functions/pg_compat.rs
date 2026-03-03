@@ -406,31 +406,18 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
     }
 
     let base_oid = match schema.as_deref() {
-        None => pg_catalog_regtype_oid(&name)
-            .or_else(|| {
-                // Generic _typename → array alias for pg_catalog builtins.
-                // e.g. _int4 → strip '_' → pg_catalog_regtype_oid("int4") → regtype_array_oid
-                // NOTE: hstore is NOT in pg_catalog_regtype_oid(), so _hstore
-                // falls through to the explicit special-case below.
-                name.strip_prefix('_')
-                    .and_then(pg_catalog_regtype_oid)
-                    .and_then(regtype_array_oid)
-            })
-            .or(match name.as_str() {
-                "hstore" => Some(pg_types::OID_HSTORE),
-                "_hstore" => Some(pg_types::OID_HSTORE_ARRAY),
-                _ => None,
-            }),
+        None => pg_catalog_regtype_oid(&name).or_else(|| {
+            // Generic _typename → array alias for pg_catalog builtins.
+            // e.g. _int4 → strip '_' → pg_catalog_regtype_oid("int4") → regtype_array_oid
+            name.strip_prefix('_')
+                .and_then(pg_catalog_regtype_oid)
+                .and_then(regtype_array_oid)
+        }),
         Some("pg_catalog") => pg_catalog_regtype_oid(&name).or_else(|| {
             name.strip_prefix('_')
                 .and_then(pg_catalog_regtype_oid)
                 .and_then(regtype_array_oid)
         }),
-        Some("public") => match name.as_str() {
-            "hstore" => Some(pg_types::OID_HSTORE),
-            "_hstore" => Some(pg_types::OID_HSTORE_ARRAY),
-            _ => None,
-        },
         Some(_) => None,
     };
 
@@ -878,19 +865,19 @@ mod tests {
     fn test_to_regtype() {
         assert_eq!(
             to_regtype(vec![Value::Text("hstore".into())]).unwrap(),
-            Value::Int64(pg_types::OID_HSTORE)
+            Value::Null
         );
         assert_eq!(
             to_regtype(vec![Value::Text("hstore[]".into())]).unwrap(),
-            Value::Int64(pg_types::OID_HSTORE_ARRAY)
+            Value::Null
         );
         assert_eq!(
             to_regtype(vec![Value::Text("public.hstore".into())]).unwrap(),
-            Value::Int64(pg_types::OID_HSTORE)
+            Value::Null
         );
         assert_eq!(
             to_regtype(vec![Value::Text("\"public\".\"hstore\"".into())]).unwrap(),
-            Value::Int64(pg_types::OID_HSTORE)
+            Value::Null
         );
         assert_eq!(
             to_regtype(vec![Value::Text("integer".into())]).unwrap(),
@@ -982,10 +969,10 @@ mod tests {
             to_regtype(vec![Value::Text("_jsonb".into())]).unwrap(),
             Value::Int64(pg_types::OID_JSONB_ARRAY)
         );
-        // _hstore regression guard — must still work via special-case
+        // _hstore is extension-defined (not pg_catalog builtin) in db9.
         assert_eq!(
             to_regtype(vec![Value::Text("_hstore".into())]).unwrap(),
-            Value::Int64(pg_types::OID_HSTORE_ARRAY)
+            Value::Null
         );
         // Schema-qualified _typename
         assert_eq!(

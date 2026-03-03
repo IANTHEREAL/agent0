@@ -83,42 +83,48 @@ impl VirtualTable for PgType {
         }
 
         let public_oid = schema_oid(ctx.schema_oids, "public");
+        let has_hstore = ctx
+            .store
+            .get_extension(ctx.txn, ctx.db_id, "hstore")
+            .await?
+            .is_some();
+        if has_hstore {
+            rows.push(Row::new(vec![
+                int_val(pg_types::OID_HSTORE_ARRAY),
+                text_val("_hstore"),
+                int_val(public_oid),
+                int_val(BOOTSTRAP_SUPERUSER_OID),
+                int_val(-1),
+                text_val("f"),
+                text_val("b"),
+                text_val("A"),
+                text_val("f"),
+                text_val("t"),
+                text_val(","),
+                int_val(0),
+                int_val(pg_types::OID_HSTORE),
+                int_val(0),
+                int_val(0),
+            ]));
 
-        rows.push(Row::new(vec![
-            int_val(pg_types::OID_HSTORE_ARRAY),
-            text_val("_hstore"),
-            int_val(public_oid),
-            int_val(BOOTSTRAP_SUPERUSER_OID),
-            int_val(-1),
-            text_val("f"),
-            text_val("b"),
-            text_val("A"),
-            text_val("f"),
-            text_val("t"),
-            text_val(","),
-            int_val(0),
-            int_val(pg_types::OID_HSTORE),
-            int_val(0),
-            int_val(0),
-        ]));
-
-        rows.push(Row::new(vec![
-            int_val(pg_types::OID_HSTORE),
-            text_val("hstore"),
-            int_val(public_oid),
-            int_val(BOOTSTRAP_SUPERUSER_OID),
-            int_val(-1),
-            text_val("f"),
-            text_val("b"),
-            text_val("U"),
-            text_val("f"),
-            text_val("t"),
-            text_val(","),
-            int_val(0),
-            int_val(0),
-            int_val(pg_types::OID_HSTORE_ARRAY),
-            int_val(0),
-        ]));
+            rows.push(Row::new(vec![
+                int_val(pg_types::OID_HSTORE),
+                text_val("hstore"),
+                int_val(public_oid),
+                int_val(BOOTSTRAP_SUPERUSER_OID),
+                int_val(-1),
+                text_val("f"),
+                text_val("b"),
+                text_val("U"),
+                text_val("f"),
+                text_val("t"),
+                text_val(","),
+                int_val(0),
+                int_val(0),
+                int_val(pg_types::OID_HSTORE_ARRAY),
+                int_val(0),
+            ]));
+        }
 
         let mut user_types = ctx.store.list_types(ctx.txn, ctx.db_id).await?;
         user_types.sort_by_key(|t| t.oid);
