@@ -169,10 +169,21 @@ impl Executor {
                 .iter()
                 .any(|fk| fk.ref_table != schema.name);
             if has_non_self_ref_fk {
-                for (row, row_offset) in &prepared_rows {
-                    dml::validate_foreign_keys_non_self_ref(&self.store, txn, db_id, &schema, row)
+                let fk_ref_cache =
+                    dml::build_fk_ref_schema_cache(&self.store, txn, db_id, &schema, true)
                         .await
-                        .map_err(|e| CopyInsertBatchError::row(*row_offset, e))?;
+                        .map_err(CopyInsertBatchError::non_row)?;
+                for (row, row_offset) in &prepared_rows {
+                    dml::validate_foreign_keys_non_self_ref(
+                        &self.store,
+                        txn,
+                        db_id,
+                        &schema,
+                        row,
+                        &fk_ref_cache,
+                    )
+                    .await
+                    .map_err(|e| CopyInsertBatchError::row(*row_offset, e))?;
                 }
             }
             if has_self_ref_fk {
@@ -616,6 +627,7 @@ impl Executor {
                     row,
                     dml::ConflictBehavior::Error,
                     &enum_cache,
+                    None,
                 )
                 .await
                 .map_err(|e| {

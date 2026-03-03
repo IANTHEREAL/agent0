@@ -1,10 +1,13 @@
-//! `replace_sequence_functions` -- recursive AST rewriting for NEXTVAL/CURRVAL/SETVAL/
+//! `replace_sequence_functions` -- recursive AST rewriting for NEXTVAL/CURRVAL/SETVAL/LASTVAL/
 //! CURRENT_SCHEMA/PG_GET_INDEXDEF dispatch and user function evaluation.
 
-use crate::model::{Row, TableSchema, Value};
+use crate::model::{DataType, Row, TableSchema, Value};
+use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
+use crate::sql::expr::compile::{compile_const_expr, compile_row_expr_for_table};
 use crate::sql::names;
 use crate::sql::names::function_name_upper;
 use crate::sql::plpgsql;
+use crate::sql::query_context::QueryContext;
 use crate::sql::value_coercion::value_to_sql_expr;
 use crate::storage::TikvStore;
 use anyhow::{anyhow, Result};
@@ -16,9 +19,57 @@ use std::sync::Arc;
 use tikv_client::Transaction;
 
 use super::{
-    eval_seq_expr, extract_arg_expr, index_helpers::lookup_indexdef_by_oid,
-    resolve_sequence_full_name_from_value, value_to_i64,
+    eval_seq_expr, extract_arg_expr, get_lastval_sequence_name,
+    index_helpers::lookup_indexdef_by_oid, resolve_sequence_full_name_from_value,
+    set_lastval_sequence_name, value_to_i64, LASTVAL_SENTINEL, LASTVAL_SENTINEL_KEY,
 };
+
+fn pg_type_name_from_data_type(data_type: &DataType) -> String {
+    match data_type {
+        DataType::Boolean => "boolean".to_string(),
+        DataType::Int32 => "integer".to_string(),
+        DataType::Int64 => "bigint".to_string(),
+        DataType::Float64 => "double precision".to_string(),
+        DataType::Numeric { .. } => "numeric".to_string(),
+        _ => data_type.to_string().to_lowercase(),
+    }
+}
+
+fn pg_lastval_arg_type_name_from_typed(arg: &TypedExpr) -> String {
+    if matches!(
+        &arg.kind,
+        TypedExprKind::Constant(Value::Text(_)) | TypedExprKind::Constant(Value::Null)
+    ) {
+        return "unknown".to_string();
+    }
+
+    // Scientific notation literals are typed as Float64 in db9; PostgreSQL
+    // reports NUMERIC in this function-signature error surface.
+    if matches!(&arg.kind, TypedExprKind::Constant(Value::Float64(_))) {
+        return "numeric".to_string();
+    }
+
+    pg_type_name_from_data_type(&arg.data_type)
+}
+
+fn pg_lastval_arg_type_name(arg: &FunctionArg, schema: Option<&TableSchema>) -> String {
+    let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg else {
+        return "unknown".to_string();
+    };
+
+    let qctx = QueryContext::from_task_locals();
+    let typed = if let Some(schema) = schema {
+        let alias = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+        compile_row_expr_for_table(expr, schema, alias, &qctx)
+    } else {
+        compile_const_expr(expr, &qctx)
+    };
+
+    match typed {
+        Ok(arg) => pg_lastval_arg_type_name_from_typed(&arg),
+        Err(_) => "unknown".to_string(),
+    }
+}
 
 pub(crate) fn replace_sequence_functions<'a>(
     store: &'a Arc<TikvStore>,
@@ -49,7 +100,10 @@ pub(crate) fn replace_sequence_functions<'a>(
                         )
                         .await?;
                         let val = store.nextval_sequence(txn, db_id, &full_name).await?;
-                        last_sequence_values.insert(full_name, val);
+                        super::set_lastval(last_sequence_values, &full_name, val);
+                        last_sequence_values.insert(full_name.clone(), val);
+                        last_sequence_values.insert(LASTVAL_SENTINEL_KEY.to_string(), val);
+                        set_lastval_sequence_name(last_sequence_values, &full_name);
                         Ok(value_to_sql_expr(&crate::model::Value::Int64(val)))
                     }
                     "CURRVAL" => {
@@ -124,10 +178,48 @@ pub(crate) fn replace_sequence_functions<'a>(
                         } else {
                             true
                         };
+                        // If setval targets the same sequence as the most recent
+                        // nextval(), update the lastval sentinel (PG 17 semantics).
+                        let same_seq = get_lastval_sequence_name(last_sequence_values)
+                            .map(|n| n == full_name.as_str())
+                            .unwrap_or(false);
                         let res = store
                             .setval_sequence(txn, db_id, &full_name, value_i64, is_called)
                             .await?;
+                        // Rule 1: currval cache — always update when is_called=true
+                        if is_called {
+                            last_sequence_values.insert(full_name.clone(), res);
+                            super::update_lastval_if_same_seq(
+                                last_sequence_values,
+                                &full_name,
+                                res,
+                            );
+                            if same_seq {
+                                last_sequence_values.insert(LASTVAL_SENTINEL_KEY.to_string(), res);
+                            }
+                        }
                         Ok(value_to_sql_expr(&crate::model::Value::Int64(res)))
+                    }
+                    "LASTVAL" => {
+                        if !func.args.is_empty() {
+                            let arg_types = func
+                                .args
+                                .iter()
+                                .map(|arg| pg_lastval_arg_type_name(arg, schema))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            return Err(crate::sql::error::SqlError::FunctionNotFound(format!(
+                                "lastval({})",
+                                arg_types
+                            ))
+                            .into());
+                        }
+                        let val = last_sequence_values
+                            .get(LASTVAL_SENTINEL_KEY)
+                            .copied()
+                            .or_else(|| last_sequence_values.get(LASTVAL_SENTINEL).copied())
+                            .ok_or_else(|| anyhow!("lastval is not yet defined in this session"))?;
+                        Ok(value_to_sql_expr(&crate::model::Value::Int64(val)))
                     }
                     "PG_GET_INDEXDEF" => {
                         let arg0 = match extract_arg_expr(&func.args, 0) {

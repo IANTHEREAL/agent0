@@ -1,0 +1,13 @@
+setval
+100
+(1 row)
+ERROR:  lastval is not yet defined in this session
+nextval
+1
+(1 row)
+setval
+999
+(1 row)
+lastval
+999
+(1 row)

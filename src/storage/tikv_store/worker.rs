@@ -287,6 +287,24 @@ impl TikvStore {
         Ok(())
     }
 
+    /// Delete a worker claim by its raw TiKV key.
+    ///
+    /// Used by GC when iterating claims via `list_worker_claims_batch`,
+    /// which returns raw keys directly. Callers must only pass keys
+    /// obtained from claim-namespace scans.
+    pub async fn delete_worker_claim_by_raw_key(
+        &self,
+        txn: &mut Transaction,
+        key: &[u8],
+    ) -> Result<()> {
+        debug_assert!(
+            key.starts_with(&encode_worker_claim_prefix()),
+            "delete_worker_claim_by_raw_key called with non-claim key"
+        );
+        txn_delete(txn, key.to_vec()).await?;
+        Ok(())
+    }
+
     pub async fn list_worker_claims(
         &self,
         txn: &mut Transaction,

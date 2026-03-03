@@ -1,3 +1,4 @@
+-- db9-specific: information_schema owner columns are db9 extensions, not in PG 17
 -- ALTER ... OWNER TO (tables, sequences, functions)
 
 -- Cleanup from prior runs

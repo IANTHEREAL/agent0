@@ -65,9 +65,10 @@ pub use defaults::{
 pub use delete::execute_delete_row;
 // foreign_keys functions are used internally by executor/dml_analyzed
 pub(crate) use foreign_keys::{
-    collect_deferred_self_fk_checks, pk_to_hash_key, resolve_fk_ref_lookup, self_ref_fk_keys,
-    validate_deferred_self_fk_refs, validate_foreign_keys_non_self_ref, ConstraintId,
-    FkDeleteContext, FkRefLookup,
+    build_fk_ref_schema_cache, collect_deferred_self_fk_checks, pk_to_hash_key,
+    resolve_fk_ref_lookup, self_ref_fk_keys, validate_deferred_self_fk_refs,
+    validate_foreign_keys_non_self_ref, ConstraintId, FkDeleteContext, FkRefLookup,
+    FkRefSchemaCache,
 };
 #[allow(unused_imports)]
 pub use foreign_keys::{

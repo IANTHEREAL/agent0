@@ -171,7 +171,10 @@ impl fmt::Display for AnalyzerError {
             }
             Self::TableNotFound(name) => write!(f, "relation \"{}\" does not exist", name),
             Self::FunctionNotFound { name, arg_types } => {
-                let types: Vec<_> = arg_types.iter().map(|t| t.to_string()).collect();
+                let types: Vec<_> = arg_types
+                    .iter()
+                    .map(|t| t.to_string().to_lowercase())
+                    .collect();
                 write!(f, "function {}({}) does not exist", name, types.join(", "))
             }
             Self::ArgumentCountMismatch {

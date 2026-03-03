@@ -166,6 +166,23 @@ async fn extended_query_parse_allows_executor_handled_ddl() {
         .expect("CREATE DATABASE should be accepted at Parse");
 }
 
+#[test]
+fn prepared_websearch_to_tsquery_unknown_param_parse_contract_resolves_text() {
+    use super::dynamic::merge_parameter_types;
+    let catalog = MockCatalog::empty();
+    let finalized = analyze_statement_with_params(
+        &catalog,
+        "SELECT websearch_to_tsquery('english', $1)",
+        1,
+        &[None],
+    )
+    .expect("analyzer should infer parameter type");
+    assert_eq!(finalized, vec![DataType::Text]);
+
+    let merged = merge_parameter_types(&[Type::UNKNOWN], &finalized);
+    assert_eq!(merged, vec![Type::TEXT]);
+}
+
 fn encode_value_to_string(value: &Value, col_type: Option<&DataType>) -> String {
     let fields = vec![FieldInfo::new(
         "col".to_string(),
@@ -2136,6 +2153,47 @@ async fn extended_query_bind_parameter_count_mismatch_returns_08p01() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn extended_query_bind_websearch_to_tsquery_text_param_decodes_text() {
+    let handler = test_dynamic_handler();
+    let mut client = TestPreparedClient::new();
+    let stmt = Arc::new(StoredStatement::new(
+        "stmt".to_string(),
+        test_prepared_stmt_analyzed(
+            "SELECT websearch_to_tsquery('english', $1)",
+            vec![("?column?".to_string(), DataType::Tsquery, None)],
+            vec![DataType::Text],
+        ),
+        vec![Type::TEXT],
+    ));
+    client
+        .portal_store()
+        .put_statement(stmt)
+        .expect("store statement");
+
+    let bind = pgwire::messages::extendedquery::Bind::new(
+        Some("portal".to_string()),
+        Some("stmt".to_string()),
+        vec![],
+        vec![Some(Bytes::from_static(b"incident rollback runbook"))],
+        vec![],
+    );
+    handler
+        .on_bind(&mut client, bind)
+        .await
+        .expect("bind should succeed");
+
+    let portal = client
+        .portal_store()
+        .get_portal("portal")
+        .expect("portal should exist after successful bind");
+    let values = decode_parameters(&portal).expect("decode bound parameters");
+    assert_eq!(
+        values,
+        vec![Some(Value::Text("incident rollback runbook".to_string()))]
+    );
 }
 
 fn test_prepared_stmt_analyzed(

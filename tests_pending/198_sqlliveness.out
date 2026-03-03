@@ -1,4 +1,0 @@
-psql:/home/dongxu/lab/db9-server/tests/198_sqlliveness.sql:33: ERROR:  Unsupported function: sql_liveness_is_alive
-psql:/home/dongxu/lab/db9-server/tests/198_sqlliveness.sql:36: ERROR:  Unsupported function: sql_liveness_is_alive
-psql:/home/dongxu/lab/db9-server/tests/198_sqlliveness.sql:39: ERROR:  Unsupported function: sql_liveness_is_alive
-psql:/home/dongxu/lab/db9-server/tests/198_sqlliveness.sql:42: ERROR:  Unsupported function: sql_liveness_is_alive

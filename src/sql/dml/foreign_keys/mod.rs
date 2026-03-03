@@ -30,6 +30,45 @@ pub(crate) struct FkStoreCtx<'a> {
 
 pub(crate) type ConstraintId = usize;
 
+/// Statement-scoped cache of referenced table schemas for FK validation.
+/// Built once per statement/batch and reused for every row, eliminating
+/// per-row `store.get_schema` calls from the hot path.
+pub(crate) type FkRefSchemaCache = HashMap<String, TableSchema>;
+
+/// Prefetch schemas for all distinct FK-referenced tables.
+///
+/// When `skip_self_ref` is true, self-referencing FK targets are excluded
+/// (used by COPY's non-self-ref validation pass).
+pub(crate) async fn build_fk_ref_schema_cache(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &TableSchema,
+    skip_self_ref: bool,
+) -> Result<FkRefSchemaCache> {
+    let mut cache = FkRefSchemaCache::new();
+    for fk in &schema.foreign_keys {
+        if skip_self_ref && fk.ref_table == schema.name {
+            continue;
+        }
+        if cache.contains_key(&fk.ref_table) {
+            continue;
+        }
+        let ref_schema = store
+            .get_schema(txn, db_id, &fk.ref_table)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "Referenced table '{}' not found for foreign key '{}'",
+                    fk.ref_table,
+                    fk.name
+                )
+            })?;
+        cache.insert(fk.ref_table.clone(), ref_schema);
+    }
+    Ok(cache)
+}
+
 pub(super) fn short_relation_name(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
 }
@@ -147,6 +186,10 @@ pub(crate) struct FkDeleteContext {
     /// Per-table set of deleted PK hash keys, used to prevent redundant work
     /// and infinite cascade cycles.
     pub deleted_pks: HashMap<String, HashSet<String>>,
+    /// Reverse-FK adjacency: parent table name → list of (child table name,
+    /// FK index within `child_schema.foreign_keys`).  Built once, used for
+    /// O(1) lookup per recursive cascade frame instead of scanning all schemas.
+    pub referencing_by_parent: HashMap<String, Vec<(String, usize)>>,
 }
 
 impl FkDeleteContext {
@@ -163,9 +206,20 @@ impl FkDeleteContext {
             }
         }
 
+        let mut referencing_by_parent: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+        for (child_table, schema) in &table_schemas {
+            for (fk_idx, fk) in schema.foreign_keys.iter().enumerate() {
+                referencing_by_parent
+                    .entry(fk.ref_table.clone())
+                    .or_default()
+                    .push((child_table.clone(), fk_idx));
+            }
+        }
+
         Ok(Self {
             table_schemas,
             deleted_pks: HashMap::new(),
+            referencing_by_parent,
         })
     }
 
@@ -398,19 +452,69 @@ pub async fn validate_foreign_keys(
     schema: &TableSchema,
     row: &Row,
 ) -> Result<()> {
-    validate_foreign_keys_inner(store, txn, db_id, schema, row, &HashMap::new(), false).await
+    let cache = build_fk_ref_schema_cache(store, txn, db_id, schema, false).await?;
+    validate_foreign_keys_inner(
+        store,
+        txn,
+        db_id,
+        schema,
+        row,
+        &HashMap::new(),
+        false,
+        &cache,
+    )
+    .await
+}
+
+/// Like [`validate_foreign_keys`] but accepts a pre-built ref-schema cache.
+///
+/// Use this variant when validating multiple rows in a loop so that
+/// referenced table schemas are loaded once per statement instead of once
+/// per row.
+pub(crate) async fn validate_foreign_keys_with_cache(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &TableSchema,
+    row: &Row,
+    ref_schema_cache: &FkRefSchemaCache,
+) -> Result<()> {
+    validate_foreign_keys_inner(
+        store,
+        txn,
+        db_id,
+        schema,
+        row,
+        &HashMap::new(),
+        false,
+        ref_schema_cache,
+    )
+    .await
 }
 
 /// Validate only non-self-referencing foreign keys for a row.
 /// Self-referencing FK validation is deferred to CopyDone for COPY.
+///
+/// Accepts a pre-built ref-schema cache built with `skip_self_ref=true`.
 pub(crate) async fn validate_foreign_keys_non_self_ref(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
     schema: &TableSchema,
     row: &Row,
+    ref_schema_cache: &FkRefSchemaCache,
 ) -> Result<()> {
-    validate_foreign_keys_inner(store, txn, db_id, schema, row, &HashMap::new(), true).await
+    validate_foreign_keys_inner(
+        store,
+        txn,
+        db_id,
+        schema,
+        row,
+        &HashMap::new(),
+        true,
+        ref_schema_cache,
+    )
+    .await
 }
 
 /// Collect unresolved self-referencing FK checks for deferred CopyDone validation.
@@ -555,6 +659,7 @@ async fn validate_foreign_keys_inner(
     row: &Row,
     pending_ref_keys: &HashMap<String, HashSet<String>>,
     skip_self_ref: bool,
+    ref_schema_cache: &FkRefSchemaCache,
 ) -> Result<()> {
     for fk in &schema.foreign_keys {
         if skip_self_ref && fk.ref_table == schema.name {
@@ -579,18 +684,15 @@ async fn validate_foreign_keys_inner(
             continue;
         }
 
-        let ref_schema = store
-            .get_schema(txn, db_id, &fk.ref_table)
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "Referenced table '{}' not found for foreign key '{}'",
-                    fk.ref_table,
-                    fk.name
-                )
-            })?;
+        let ref_schema = ref_schema_cache.get(&fk.ref_table).ok_or_else(|| {
+            anyhow!(
+                "Referenced table '{}' not found for foreign key '{}'",
+                fk.ref_table,
+                fk.name
+            )
+        })?;
 
-        let lookup = resolve_fk_ref_lookup(&fk.ref_columns, &ref_schema)?;
+        let lookup = resolve_fk_ref_lookup(&fk.ref_columns, ref_schema)?;
 
         // Self-referencing FK: if the row's FK column values match its own
         // referenced column values, the constraint is trivially satisfied once
@@ -598,7 +700,7 @@ async fn validate_foreign_keys_inner(
         // (PostgreSQL validates at statement end where the row is visible.)
         // Use compare_values() for PG-like equality semantics (e.g. NaN = NaN).
         if fk.ref_table == schema.name {
-            let self_ref_vals = get_ref_values(fk, &ref_schema, row)?;
+            let self_ref_vals = get_ref_values(fk, ref_schema, row)?;
             if fk_values.len() == self_ref_vals.len()
                 && fk_values
                     .iter()
@@ -617,7 +719,7 @@ async fn validate_foreign_keys_inner(
                         db_id,
                         ref_schema.table_id,
                         vec![fk_values.clone()],
-                        &ref_schema,
+                        ref_schema,
                     )
                     .await?;
                 !ref_rows.is_empty()

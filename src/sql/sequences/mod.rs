@@ -24,11 +24,98 @@ use crate::sql::names::{function_name_upper, normalize_ident};
 use crate::storage::TikvStore;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, ObjectName};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tikv_client::Transaction;
 
 use super::expr::bridge::{eval_ast_expr_with_row, eval_const_ast_expr};
+
+/// Sentinel key in `sequence_values` that stores the most recent `nextval()`
+/// result.  Uses a null-byte prefix so it can never collide with a real
+/// PostgreSQL sequence name (identifiers cannot contain `\0`).
+pub(crate) const LASTVAL_SENTINEL: &str = "\0__lastval";
+
+/// Prefix for the key that tracks which sequence was last advanced by
+/// `nextval()`.  The full key is `LASTVAL_SEQ_NAME_PREFIX + full_name`.
+const LASTVAL_SEQ_NAME_PREFIX: &str = "\0__lastval_seq=";
+
+/// Record that `seq_name` is the last sequence advanced by `nextval()`, and
+/// store `val` as the sentinel value for `lastval()`.
+pub(crate) fn set_lastval(map: &mut HashMap<String, i64>, seq_name: &str, val: i64) {
+    map.insert(LASTVAL_SENTINEL.to_string(), val);
+    map.retain(|k, _| !k.starts_with(LASTVAL_SEQ_NAME_PREFIX));
+    map.insert(format!("{}{}", LASTVAL_SEQ_NAME_PREFIX, seq_name), 0);
+}
+
+/// If `seq_name` is the sequence currently tracked by lastval (i.e. it was the
+/// most recent `nextval()` target), update the sentinel value and return `true`.
+/// Otherwise no-op and return `false`.
+pub(crate) fn update_lastval_if_same_seq(
+    map: &mut HashMap<String, i64>,
+    seq_name: &str,
+    val: i64,
+) -> bool {
+    let key = format!("{}{}", LASTVAL_SEQ_NAME_PREFIX, seq_name);
+    if map.contains_key(&key) {
+        map.insert(LASTVAL_SENTINEL.to_string(), val);
+        true
+    } else {
+        false
+    }
+}
+
 use super::ExecuteResult;
+
+/// Sentinel key stored in `last_sequence_values` to track the most recently
+/// `nextval()`-ed sequence.  LASTVAL reads this key instead of relying on
+/// non-deterministic `HashMap::values().last()` iteration order.
+///
+/// Null-byte delimiters ensure this key can never collide with real sequence
+/// cache keys (`schema.sequence_name`), since PostgreSQL identifiers cannot
+/// contain null bytes.
+pub(crate) const LASTVAL_SENTINEL_KEY: &str = "\0__lastval__\0";
+
+/// Tracks the fully-qualified name of the sequence that last called `nextval()`.
+/// Used by `setval()` to decide whether to update `LASTVAL_SENTINEL_KEY`:
+/// only when the target sequence is the same as the most recent `nextval()`.
+///
+/// Same null-byte guard as `LASTVAL_SENTINEL_KEY` — prevents collision with
+/// schemas that happen to be named `__lastval_seq_name__`.
+pub(crate) const LASTVAL_SEQUENCE_NAME_KEY: &str = "\0__lastval_seq_name__\0";
+
+/// Record which sequence was most recently `nextval()`-ed.
+///
+/// Because the session map is `HashMap<String, i64>` we encode the name as a
+/// compound key `__lastval_seq_name__:<full_name>` with a dummy `0` value.
+/// At most one such entry exists at any time.
+pub(crate) fn set_lastval_sequence_name(map: &mut HashMap<String, i64>, name: &str) {
+    // Remove previous name entry (at most one).  Use exact compound-key
+    // format (`SENTINEL:name`) — never bare prefix matching.
+    let prev = map
+        .keys()
+        .find(|k| {
+            k.split_once(':')
+                .is_some_and(|(sentinel, _)| sentinel == LASTVAL_SEQUENCE_NAME_KEY)
+        })
+        .cloned();
+    if let Some(k) = prev {
+        map.remove(&k);
+    }
+    map.insert(format!("{}:{}", LASTVAL_SEQUENCE_NAME_KEY, name), 0);
+}
+
+/// Retrieve the name of the most recently `nextval()`-ed sequence, if any.
+pub(crate) fn get_lastval_sequence_name(map: &HashMap<String, i64>) -> Option<&str> {
+    // Exact compound-key format: `SENTINEL:name` — never bare prefix matching.
+    for key in map.keys() {
+        if let Some((sentinel, name)) = key.split_once(':') {
+            if sentinel == LASTVAL_SEQUENCE_NAME_KEY {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
 
 /// Evaluate an expression in sequence context (optional row/schema).
 fn eval_seq_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -> Result<Value> {

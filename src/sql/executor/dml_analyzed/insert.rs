@@ -15,7 +15,7 @@ use crate::sql::analyzer::types::{
     AnalyzedConflictTarget, AnalyzedInsert, AnalyzedInsertSource, AnalyzedOnConflict,
 };
 use crate::sql::check_constraints;
-use crate::sql::dml::{ConflictBehavior, ConflictTarget};
+use crate::sql::dml::{ConflictBehavior, ConflictTarget, FkRefSchemaCache};
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
 use anyhow::{anyhow, Result};
@@ -144,6 +144,14 @@ impl Executor {
             }
         };
 
+        // Build FK ref-schema cache ONCE for the entire statement so that
+        // per-row insert/update calls skip redundant get_schema lookups.
+        let fk_ref_cache: Option<FkRefSchemaCache> = if !schema.foreign_keys.is_empty() {
+            Some(dml::build_fk_ref_schema_cache(&self.store(), txn, db_id, &schema, false).await?)
+        } else {
+            None
+        };
+
         for (source_vals, default_positions) in &source_rows {
             // Build full row: map source values to column positions + fill defaults.
             let mut row_vals = vec![Value::Null; schema.columns.len()];
@@ -239,6 +247,7 @@ impl Executor {
                     row,
                     conflict_behavior,
                     &enum_cache,
+                    fk_ref_cache.as_ref(),
                 )
                 .await?
             } else {
@@ -251,6 +260,7 @@ impl Executor {
                     row,
                     conflict_behavior,
                     &enum_cache,
+                    fk_ref_cache.as_ref(),
                 )
                 .await?
             };
@@ -388,6 +398,7 @@ impl Executor {
                                             &existing_row,
                                             updated_row,
                                             &enum_cache,
+                                            fk_ref_cache.as_ref(),
                                         )
                                         .await?
                                     } else {
@@ -401,6 +412,7 @@ impl Executor {
                                             updated_row,
                                             &enum_cache,
                                             None,
+                                            fk_ref_cache.as_ref(),
                                         )
                                         .await?
                                     };
@@ -418,6 +430,7 @@ impl Executor {
                                         &existing_row,
                                         updated_row,
                                         &enum_cache,
+                                        fk_ref_cache.as_ref(),
                                     )
                                     .await?
                                 } else {
@@ -431,6 +444,7 @@ impl Executor {
                                         updated_row,
                                         &enum_cache,
                                         None,
+                                        fk_ref_cache.as_ref(),
                                     )
                                     .await?
                                 };

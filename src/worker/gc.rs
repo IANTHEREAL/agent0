@@ -221,7 +221,7 @@ impl WorkerGc {
             for (key, claim) in claims {
                 if claim.claimed_at < cutoff {
                     self.system_store
-                        .delete_worker_queue_entry(&mut txn, &key)
+                        .delete_worker_claim_by_raw_key(&mut txn, &key)
                         .await?;
                     cleaned += 1;
                     warn!(
@@ -380,6 +380,32 @@ mod tests {
         assert_eq!(
             effective_cron_orphan_timeout_sec(&cron_cfg, &worker_cfg),
             7_200
+        );
+    }
+
+    #[test]
+    fn gc_orphan_cleanup_uses_claim_deletion_api() {
+        // Source-contract: cleanup_orphan_claims_batch must delete via the
+        // claim-specific API (delete_worker_claim_by_raw_key), not the
+        // queue-entry API (delete_worker_queue_entry).
+        //
+        // This test FAILS if someone changes the deletion call back to
+        // delete_worker_queue_entry in gc.rs.
+        let source = include_str!("gc.rs");
+        // Split at #[cfg(test)] to inspect only production code, avoiding
+        // false positives from strings inside this very test module.
+        let prod_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("gc.rs must contain #[cfg(test)]");
+        assert!(
+            prod_source.contains("delete_worker_claim_by_raw_key"),
+            "gc.rs must call delete_worker_claim_by_raw_key for orphan claim cleanup"
+        );
+        assert!(
+            !prod_source.contains("delete_worker_queue_entry"),
+            "gc.rs production code must NOT call delete_worker_queue_entry — \
+             claim keys require delete_worker_claim_by_raw_key"
         );
     }
 

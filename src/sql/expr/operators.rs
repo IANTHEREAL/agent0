@@ -762,8 +762,8 @@ fn compare_float64_pg(left: f64, right: f64) -> std::cmp::Ordering {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum JsonbComparableValue {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JsonbComparableValue {
     Null,
     String(String),
     Number(String),
@@ -772,7 +772,82 @@ enum JsonbComparableValue {
     Object(Vec<(String, JsonbComparableValue)>),
 }
 
-fn parse_jsonb_comparable_value(raw: &str) -> Result<JsonbComparableValue> {
+impl PartialOrd for JsonbComparableValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for JsonbComparableValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match compare_jsonb_value(self, other) {
+            x if x < 0 => std::cmp::Ordering::Less,
+            0 => std::cmp::Ordering::Equal,
+            _ => std::cmp::Ordering::Greater,
+        }
+    }
+}
+
+/// Pre-parsed JSONB value for sort-key comparisons. Avoids re-parsing
+/// during O(N log N) sort comparisons.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct JsonbSortKey(JsonbComparableValue);
+
+impl JsonbSortKey {
+    pub fn from_str(raw: &str) -> Result<Self> {
+        Ok(Self(parse_jsonb_comparable_value(raw)?))
+    }
+
+    /// Estimated heap bytes owned by this sort key (recursive).
+    pub fn estimate_heap_size(&self) -> usize {
+        self.0.estimate_heap_size()
+    }
+}
+
+impl JsonbComparableValue {
+    /// Estimated heap bytes owned by this value (recursive).
+    /// Counts String capacity, Vec overhead, and nested children.
+    fn estimate_heap_size(&self) -> usize {
+        match self {
+            Self::Null | Self::Bool(_) => 0,
+            Self::String(s) | Self::Number(s) => s.len(),
+            Self::Array(items) => {
+                std::mem::size_of::<Self>() * items.capacity()
+                    + items.iter().map(|v| v.estimate_heap_size()).sum::<usize>()
+            }
+            Self::Object(entries) => {
+                std::mem::size_of::<(String, Self)>() * entries.capacity()
+                    + entries
+                        .iter()
+                        .map(|(k, v)| k.len() + v.estimate_heap_size())
+                        .sum::<usize>()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_counters {
+    use std::cell::Cell;
+    thread_local! {
+        static PARSE_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub fn reset() {
+        PARSE_COUNT.with(|c| c.set(0));
+    }
+    pub fn get() -> usize {
+        PARSE_COUNT.with(|c| c.get())
+    }
+    pub(super) fn increment() {
+        PARSE_COUNT.with(|c| c.set(c.get() + 1));
+    }
+}
+
+pub(crate) fn parse_jsonb_comparable_value(raw: &str) -> Result<JsonbComparableValue> {
+    #[cfg(test)]
+    test_counters::increment();
+
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("Invalid JSONB: empty input"));
@@ -1010,6 +1085,44 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
     Err(anyhow!("Cannot compare values: {:?} vs {:?}", left, right))
 }
 
+/// Shared NULL-sentinel + ASC/DESC ordering logic for ORDER BY comparators.
+///
+/// Handles NULLS FIRST/LAST, then delegates non-null comparison to `cmp_non_null`.
+/// The closure receives two guaranteed-non-null values and returns a raw comparison
+/// integer (negative = left < right, 0 = equal, positive = left > right).
+fn compare_nullable(
+    left: &Value,
+    right: &Value,
+    asc: bool,
+    nulls_first: bool,
+    cmp_non_null: impl FnOnce(&Value, &Value) -> Result<i32>,
+) -> Result<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    match (left, right) {
+        (Value::Null, Value::Null) => Ok(Ordering::Equal),
+        (Value::Null, _) => Ok(if nulls_first {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        }),
+        (_, Value::Null) => Ok(if nulls_first {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        }),
+        _ => {
+            let cmp = cmp_non_null(left, right)?;
+            Ok(if cmp == 0 {
+                Ordering::Equal
+            } else if (cmp > 0) == asc {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            })
+        }
+    }
+}
+
 /// ORDER BY comparator with PostgreSQL-like NULLS FIRST/LAST semantics.
 pub fn compare_order_by_values(
     left: &Value,
@@ -1017,39 +1130,9 @@ pub fn compare_order_by_values(
     asc: bool,
     nulls_first: bool,
 ) -> Result<std::cmp::Ordering> {
-    match (left, right) {
-        (Value::Null, Value::Null) => Ok(std::cmp::Ordering::Equal),
-        (Value::Null, _) => {
-            if nulls_first {
-                Ok(std::cmp::Ordering::Less)
-            } else {
-                Ok(std::cmp::Ordering::Greater)
-            }
-        }
-        (_, Value::Null) => {
-            if nulls_first {
-                Ok(std::cmp::Ordering::Greater)
-            } else {
-                Ok(std::cmp::Ordering::Less)
-            }
-        }
-        _ => {
-            let cmp = compare_values(left, right)?;
-            if cmp == 0 {
-                Ok(std::cmp::Ordering::Equal)
-            } else if asc {
-                if cmp > 0 {
-                    Ok(std::cmp::Ordering::Greater)
-                } else {
-                    Ok(std::cmp::Ordering::Less)
-                }
-            } else if cmp > 0 {
-                Ok(std::cmp::Ordering::Less)
-            } else {
-                Ok(std::cmp::Ordering::Greater)
-            }
-        }
-    }
+    compare_nullable(left, right, asc, nulls_first, |l, r| {
+        Ok(compare_values(l, r)? as i32)
+    })
 }
 
 /// ORDER BY comparator with collation support.
@@ -1064,44 +1147,13 @@ pub fn compare_order_by_values_collated(
     nulls_first: bool,
     collation: Option<&crate::sql::collation::ResolvedCollation>,
 ) -> Result<std::cmp::Ordering> {
-    match (left, right) {
-        (Value::Null, Value::Null) => Ok(std::cmp::Ordering::Equal),
-        (Value::Null, _) => {
-            if nulls_first {
-                Ok(std::cmp::Ordering::Less)
-            } else {
-                Ok(std::cmp::Ordering::Greater)
-            }
+    compare_nullable(left, right, asc, nulls_first, |l, r| {
+        if let (Some(coll), Value::Text(a), Value::Text(b)) = (collation, l, r) {
+            crate::sql::collation::compare_with_resolved_collation(a, b, coll)
+        } else {
+            Ok(compare_values(l, r)? as i32)
         }
-        (_, Value::Null) => {
-            if nulls_first {
-                Ok(std::cmp::Ordering::Greater)
-            } else {
-                Ok(std::cmp::Ordering::Less)
-            }
-        }
-        _ => {
-            let cmp = if let (Some(coll), Value::Text(a), Value::Text(b)) = (collation, left, right)
-            {
-                crate::sql::collation::compare_with_resolved_collation(a, b, coll)?
-            } else {
-                compare_values(left, right)? as i32
-            };
-            if cmp == 0 {
-                Ok(std::cmp::Ordering::Equal)
-            } else if asc {
-                if cmp > 0 {
-                    Ok(std::cmp::Ordering::Greater)
-                } else {
-                    Ok(std::cmp::Ordering::Less)
-                }
-            } else if cmp > 0 {
-                Ok(std::cmp::Ordering::Less)
-            } else {
-                Ok(std::cmp::Ordering::Greater)
-            }
-        }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1330,5 +1382,105 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("Invalid regex pattern"));
+    }
+
+    #[test]
+    fn test_jsonb_comparable_value_ord_consistency() {
+        // PG order: Null < String < Number < Boolean < Array < Object
+        let null = parse_jsonb_comparable_value("null").unwrap();
+        let string = parse_jsonb_comparable_value(r#""hello""#).unwrap();
+        let number = parse_jsonb_comparable_value("42").unwrap();
+        let boolean = parse_jsonb_comparable_value("true").unwrap();
+        let array = parse_jsonb_comparable_value("[1,2]").unwrap();
+        let object = parse_jsonb_comparable_value(r#"{"a":1}"#).unwrap();
+
+        // Cross-type ordering
+        assert!(null < string);
+        assert!(string < number);
+        assert!(number < boolean);
+        assert!(boolean < array);
+        assert!(array < object);
+
+        // Same-type comparisons
+        let num1 = parse_jsonb_comparable_value("1").unwrap();
+        let num2 = parse_jsonb_comparable_value("2").unwrap();
+        assert!(num1 < num2);
+        assert_eq!(num1.cmp(&num1), std::cmp::Ordering::Equal);
+
+        let str_a = parse_jsonb_comparable_value(r#""abc""#).unwrap();
+        let str_z = parse_jsonb_comparable_value(r#""xyz""#).unwrap();
+        assert!(str_a < str_z);
+    }
+
+    #[test]
+    fn test_jsonb_sort_key_from_str_round_trip() {
+        let k1 = JsonbSortKey::from_str("1").unwrap();
+        let k2 = JsonbSortKey::from_str("2").unwrap();
+        let k_str = JsonbSortKey::from_str(r#""hello""#).unwrap();
+        let k_null = JsonbSortKey::from_str("null").unwrap();
+
+        // Number ordering
+        assert!(k1 < k2);
+        // PG: null < string < number
+        assert!(k_null < k_str);
+        assert!(k_str < k1);
+    }
+
+    #[test]
+    fn test_compare_nullable_null_sentinel_logic() {
+        let non_null = Value::Int32(1);
+        let null = Value::Null;
+
+        // (Null, Null) → always Equal regardless of asc/nulls_first
+        for asc in [true, false] {
+            for nf in [true, false] {
+                assert_eq!(
+                    compare_nullable(&null, &null, asc, nf, |_, _| unreachable!()).unwrap(),
+                    std::cmp::Ordering::Equal,
+                );
+            }
+        }
+
+        // (Null, non-null): nulls_first=true → Less, nulls_first=false → Greater
+        assert_eq!(
+            compare_nullable(&null, &non_null, true, true, |_, _| unreachable!()).unwrap(),
+            std::cmp::Ordering::Less,
+        );
+        assert_eq!(
+            compare_nullable(&null, &non_null, true, false, |_, _| unreachable!()).unwrap(),
+            std::cmp::Ordering::Greater,
+        );
+
+        // (non-null, Null): nulls_first=true → Greater, nulls_first=false → Less
+        assert_eq!(
+            compare_nullable(&non_null, &null, true, true, |_, _| unreachable!()).unwrap(),
+            std::cmp::Ordering::Greater,
+        );
+        assert_eq!(
+            compare_nullable(&non_null, &null, true, false, |_, _| unreachable!()).unwrap(),
+            std::cmp::Ordering::Less,
+        );
+    }
+
+    #[test]
+    fn test_compare_nullable_asc_desc_ordering() {
+        let a = Value::Int32(1);
+        let b = Value::Int32(2);
+
+        // ASC: 1 < 2 → Less
+        assert_eq!(
+            compare_nullable(&a, &b, true, true, |l, r| Ok(compare_values(l, r)? as i32)).unwrap(),
+            std::cmp::Ordering::Less,
+        );
+        // DESC: 1 < 2 → reversed → Greater
+        assert_eq!(
+            compare_nullable(&a, &b, false, true, |l, r| Ok(compare_values(l, r)? as i32)).unwrap(),
+            std::cmp::Ordering::Greater,
+        );
+        // Equal values
+        assert_eq!(
+            compare_nullable(&a, &a, true, true, |l, r| Ok(compare_values(l, r)? as i32)).unwrap(),
+            std::cmp::Ordering::Equal,
+        );
     }
 }

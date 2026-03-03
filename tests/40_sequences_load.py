@@ -103,7 +103,7 @@ def main() -> int:
         SELECT currval('s1');
         """,
     )
-    assert_lines(out, ["1", "1", "10", "1", "11", "11", "20", "11", "20", "20"])
+    assert_lines(out, ["1", "1", "10", "10", "11", "11", "20", "11", "20", "20"])
 
     # currval cross-connection behavior: session A defines currval, session B errors.
     out = must_stdout(

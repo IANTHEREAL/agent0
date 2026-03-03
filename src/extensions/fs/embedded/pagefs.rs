@@ -464,14 +464,12 @@ impl EmbeddedPageFs {
             )));
         }
 
-        // No-op if paths are identical
+        // No-op if paths are identical — but source must exist (POSIX: ENOENT)
         if old_normalized == new_normalized {
-            if new_has_trailing_slash {
-                let mut txn = self.begin().await?;
-                let (_, inode) = resolve_path(&mut txn, &old_normalized).await?;
-                if !inode.is_directory() {
-                    return Err(anyhow!(EmbeddedFsError::not_directory(&new_normalized)));
-                }
+            let mut txn = self.begin().await?;
+            let (_, inode) = resolve_path(&mut txn, &old_normalized).await?;
+            if new_has_trailing_slash && !inode.is_directory() {
+                return Err(anyhow!(EmbeddedFsError::not_directory(&new_normalized)));
             }
             return Ok(());
         }
@@ -1330,6 +1328,23 @@ mod tests {
         assert!(
             msg.contains("cannot rename root"),
             "root rename must be rejected: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_rename_behavioral_same_path_missing_source_enoent() {
+        let fs = make_fs().await;
+        let err = fs
+            .rename("/nonexistent_same", "/nonexistent_same")
+            .await
+            .unwrap_err();
+        let fs_err = err
+            .downcast_ref::<EmbeddedFsError>()
+            .expect("expected EmbeddedFsError");
+        assert!(
+            matches!(fs_err, EmbeddedFsError::NotFound(_)),
+            "rename(missing, missing) with identical paths must return ENOENT, got: {fs_err}"
         );
     }
 

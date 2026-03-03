@@ -1,0 +1,12 @@
+id|val|id|val|id|val
+NULL|NULL|NULL|NULL|1|c1
+NULL|NULL|NULL|NULL|2|c2
+(2 rows)
+id|val|id|val|id|val
+NULL|NULL|NULL|NULL|1|c1
+NULL|NULL|NULL|NULL|2|c2
+(2 rows)
+id|val|id|val|id|val
+1|a1|NULL|NULL|NULL|NULL
+2|a2|NULL|NULL|NULL|NULL
+(2 rows)
