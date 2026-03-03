@@ -58,7 +58,7 @@ jobs:
             const issueCandidates = Array.from(body.matchAll(/#(\d+)/g))
               .map((m) => Number(m[1]))
               .filter((n) => Number.isInteger(n) && n > 0);
-            const uniqueIssueCandidates = Array.from(new Set(issueCandidates)).slice(0, 20);
+            const uniqueIssueCandidates = Array.from(new Set(issueCandidates));
 
             if (!uniqueIssueCandidates.length) {
               failures.push(
@@ -142,6 +142,42 @@ jobs:
                   "- Fix: split the PR, or link an AC-approved decision Issue in the PR body (an Issue labeled `ac:approved`).",
                 ].join("\\n"),
               );
+            }
+
+            // --- Gate V: bug-fix PRs must update regression_gate.list (#1323) ---
+            const hasBugIssue = referencedIssues.some((issue) =>
+              issue.labelsLower.includes("bug")
+            );
+
+            if (hasBugIssue) {
+              const changedFilesWithStatus = await github.paginate(
+                github.rest.pulls.listFiles,
+                { owner, repo, pull_number: pr.number, per_page: 100 },
+                (response) => response.data.map((f) => ({ filename: f.filename, status: f.status }))
+              );
+
+              const gateListEntry = changedFilesWithStatus.find(
+                (f) => f.filename === "scripts/regression_gate.list"
+              );
+
+              if (!gateListEntry) {
+                failures.push(
+                  [
+                    "Gate V (#1323): bug-fix PR must update `scripts/regression_gate.list`.",
+                    "- At least one referenced issue has the `bug` label.",
+                    "- The PR diff does not modify `scripts/regression_gate.list`.",
+                    "- Fix: add a regression test entry to `scripts/regression_gate.list` that exercises the fix.",
+                  ].join("\\n")
+                );
+              } else if (gateListEntry.status === "removed") {
+                failures.push(
+                  [
+                    "Gate V (#1323): `scripts/regression_gate.list` must not be deleted.",
+                    "- The PR deletes `scripts/regression_gate.list` instead of updating it.",
+                    "- Fix: restore the file and add a regression test entry that exercises the bug fix.",
+                  ].join("\\n")
+                );
+              }
             }
 
             core.info(`PR #${pr.number}: labels=[${labels.join(", ")}]`);
