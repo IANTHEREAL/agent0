@@ -2005,6 +2005,11 @@ fn test_parse_copy_command_trailing_junk_after_stdin_errors() {
     let result =
         DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH(FORMAT csv)"#).unwrap();
     assert!(result.is_some());
+    // Multiple options must be comma-separated and remain accepted.
+    let result =
+        DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH (FORMAT csv, HEADER true)"#)
+            .unwrap();
+    assert!(result.is_some());
 
     // Malformed/unknown WITH (...) must not enter COPY fast-path.
     assert_eq!(
@@ -2013,6 +2018,15 @@ fn test_parse_copy_command_trailing_junk_after_stdin_errors() {
     );
     assert_eq!(
         DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH (garbage);"#).unwrap(),
+        None
+    );
+    assert_eq!(
+        DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH (FORMAT csv HEADER)"#)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        DynamicPgHandler::parse_copy_command(r#"COPY t FROM STDIN WITH (FORMAT csv,)"#).unwrap(),
         None
     );
     let result =

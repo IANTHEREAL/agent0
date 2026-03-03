@@ -90,20 +90,6 @@ fn match_keyword<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
     }
 }
 
-fn has_non_ws_or_comment(s: &str) -> bool {
-    let mut rest = s;
-    loop {
-        let trimmed = skip_ws_and_comments(rest);
-        if trimmed.is_empty() {
-            return false;
-        }
-        if trimmed.len() == rest.len() {
-            return true;
-        }
-        rest = trimmed;
-    }
-}
-
 fn is_known_copy_with_option(option: &str) -> bool {
     option.eq_ignore_ascii_case("FORMAT")
         || option.eq_ignore_ascii_case("DELIMITER")
@@ -117,102 +103,100 @@ fn is_known_copy_with_option(option: &str) -> bool {
         || option.eq_ignore_ascii_case("ENCODING")
 }
 
-fn copy_with_option_requires_value(option: &str) -> bool {
-    option.eq_ignore_ascii_case("FORMAT")
-        || option.eq_ignore_ascii_case("DELIMITER")
-        || option.eq_ignore_ascii_case("NULL")
-        || option.eq_ignore_ascii_case("QUOTE")
-        || option.eq_ignore_ascii_case("ESCAPE")
-        || option.eq_ignore_ascii_case("FORCE_QUOTE")
-        || option.eq_ignore_ascii_case("FORCE_NOT_NULL")
-        || option.eq_ignore_ascii_case("ENCODING")
-}
+/// Consume exactly one COPY WITH option value token.
+/// Returns the remainder after the token.
+fn consume_copy_with_value(s: &str) -> Option<&str> {
+    fn consume_quoted_token(s: &str, quote: u8) -> Option<&str> {
+        let bytes = s.as_bytes();
+        let mut i = 1usize;
+        while i < bytes.len() {
+            if bytes[i] == quote {
+                if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                    i += 2;
+                } else {
+                    return Some(&s[i + 1..]);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        None
+    }
 
-/// Consume one COPY WITH option value, stopping before the top-level `,` or `)`.
-/// Returns `(remaining_input, has_value)` on success.
-fn consume_copy_with_value(s: &str) -> Option<(&str, bool)> {
-    let mut i = 0usize;
-    let bytes = s.as_bytes();
-    let mut paren_depth = 0usize;
-    while i < bytes.len() {
-        let rest = &s[i..];
-        if rest.starts_with("--") {
-            if let Some(pos) = rest.find('\n') {
-                i += pos + 1;
+    fn consume_parenthesized_token(s: &str) -> Option<&str> {
+        let bytes = s.as_bytes();
+        let mut i = 1usize;
+        let mut paren_depth = 1usize;
+        while i < bytes.len() {
+            let rest = &s[i..];
+            if rest.starts_with("--") {
+                if let Some(pos) = rest.find('\n') {
+                    i += pos + 1;
+                    continue;
+                }
+                return None;
+            }
+            if let Some(stripped) = rest.strip_prefix("/*") {
+                let pos = stripped.find("*/")?;
+                i += pos + 4;
                 continue;
             }
-            i = s.len();
-            break;
-        }
-        if let Some(stripped) = rest.strip_prefix("/*") {
-            let pos = stripped.find("*/")?;
-            i += pos + 4;
-            continue;
-        }
 
-        match bytes[i] {
-            b',' if paren_depth == 0 => break,
-            b')' if paren_depth == 0 => break,
-            b'(' => {
-                paren_depth += 1;
-                i += 1;
+            match bytes[i] {
+                b'(' => {
+                    paren_depth += 1;
+                    i += 1;
+                }
+                b')' => {
+                    paren_depth -= 1;
+                    i += 1;
+                    if paren_depth == 0 {
+                        return Some(&s[i..]);
+                    }
+                }
+                b'\'' => {
+                    let rest = consume_quoted_token(&s[i..], b'\'')?;
+                    i = s.len() - rest.len();
+                }
+                b'"' => {
+                    let rest = consume_quoted_token(&s[i..], b'"')?;
+                    i = s.len() - rest.len();
+                }
+                _ => i += 1,
             }
-            b')' => {
-                if paren_depth == 0 {
+        }
+        None
+    }
+
+    let s = skip_ws_and_comments(s);
+    let first = *s.as_bytes().first()?;
+    match first {
+        b'\'' => consume_quoted_token(s, b'\''),
+        b'"' => consume_quoted_token(s, b'"'),
+        b'(' => consume_parenthesized_token(s),
+        b',' | b')' => None,
+        _ => {
+            let bytes = s.as_bytes();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                let rest = &s[i..];
+                if bytes[i].is_ascii_whitespace()
+                    || bytes[i] == b','
+                    || bytes[i] == b')'
+                    || rest.starts_with("--")
+                    || rest.starts_with("/*")
+                {
                     break;
                 }
-                paren_depth -= 1;
                 i += 1;
             }
-            b'\'' => {
-                let mut closed = false;
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\'' {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                            i += 2;
-                        } else {
-                            i += 1;
-                            closed = true;
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-                if !closed {
-                    return None;
-                }
+            if i == 0 {
+                None
+            } else {
+                Some(&s[i..])
             }
-            b'"' => {
-                let mut closed = false;
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'"' {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                            i += 2;
-                        } else {
-                            i += 1;
-                            closed = true;
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-                if !closed {
-                    return None;
-                }
-            }
-            _ => i += 1,
         }
     }
-
-    if paren_depth != 0 {
-        return None;
-    }
-    let consumed = &s[..i];
-    Some((&s[i..], has_non_ws_or_comment(consumed)))
 }
 
 /// Validate `WITH (...)` clause syntax/options for COPY fast-path.
@@ -232,25 +216,24 @@ fn parse_valid_copy_with_clause(mut s: &str) -> Option<&str> {
         }
 
         let mut value_input = skip_ws_and_comments(rest_after_option);
-        let mut used_equals = false;
         if let Some(after_eq) = value_input.strip_prefix('=') {
             value_input = skip_ws_and_comments(after_eq);
-            used_equals = true;
         }
 
-        let (rest_after_value, has_value) = consume_copy_with_value(value_input)?;
-        if copy_with_option_requires_value(option) && !has_value {
-            return None;
-        }
-        if used_equals && !has_value {
+        let rest_after_value = consume_copy_with_value(value_input)?;
+        let rest_after_value = skip_ws_and_comments(rest_after_value);
+        if !rest_after_value.starts_with(',') && !rest_after_value.starts_with(')') {
             return None;
         }
 
-        s = skip_ws_and_comments(rest_after_value);
+        s = rest_after_value;
         saw_option = true;
 
         if let Some(rest) = s.strip_prefix(',') {
-            s = rest;
+            s = skip_ws_and_comments(rest);
+            if s.starts_with(')') {
+                return None;
+            }
             continue;
         }
         if let Some(rest) = s.strip_prefix(')') {
