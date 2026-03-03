@@ -139,10 +139,20 @@ impl Executor {
                                 }
                             }
                         }
-                        _ => {
-                            // RIGHT/FULL joins uncommon in DML FROM; fallback to inner join
-                            for lr in &l_rows {
-                                for rr in &r_rows {
+                        JoinType::Right => {
+                            // RIGHT JOIN = swap sides and do LEFT JOIN logic.
+                            // For each right row, find matching left rows;
+                            // emit NULL-padded left when no match.
+                            // Use runtime row width (includes synthetic ctid from table scans)
+                            // rather than bare schema width which omits system columns.
+                            // Only base table inputs get ctid; subquery/derived do not.
+                            let l_ctid = count_ctid_slots(left);
+                            let l_cols = l_rows
+                                .first()
+                                .map_or(l_schema.columns.len() + l_ctid, |r| r.values.len());
+                            for rr in &r_rows {
+                                let mut found = false;
+                                for lr in &l_rows {
                                     let combined = combine_rows(lr, rr);
                                     if self.join_condition_matches(
                                         condition,
@@ -151,7 +161,61 @@ impl Executor {
                                         &qctx,
                                     )? {
                                         joined_rows.push(combined);
+                                        found = true;
                                     }
+                                }
+                                if !found {
+                                    let null_left = Row::new(vec![Value::Null; l_cols]);
+                                    joined_rows.push(combine_rows(&null_left, rr));
+                                }
+                            }
+                        }
+                        JoinType::Full => {
+                            // FULL OUTER JOIN: LEFT JOIN + unmatched right rows.
+                            // Use runtime row width (includes synthetic ctid from table scans)
+                            // rather than bare schema width which omits system columns.
+                            // Only base table inputs get ctid; subquery/derived do not.
+                            let l_ctid = count_ctid_slots(left);
+                            let r_ctid = count_ctid_slots(right);
+                            let l_cols = l_rows
+                                .first()
+                                .map_or(l_schema.columns.len() + l_ctid, |r| r.values.len());
+                            let r_cols = r_rows
+                                .first()
+                                .map_or(r_schema.columns.len() + r_ctid, |r| r.values.len());
+
+                            // Track which right rows matched at least once.
+                            let mut right_matched = vec![false; r_rows.len()];
+
+                            // Left-join pass: for each left row, find matches
+                            // on the right; emit NULL-padded right when none.
+                            for lr in &l_rows {
+                                let mut found = false;
+                                for (ri, rr) in r_rows.iter().enumerate() {
+                                    let combined = combine_rows(lr, rr);
+                                    if self.join_condition_matches(
+                                        condition,
+                                        &combined,
+                                        *left_col_start,
+                                        &qctx,
+                                    )? {
+                                        joined_rows.push(combined);
+                                        found = true;
+                                        right_matched[ri] = true;
+                                    }
+                                }
+                                if !found {
+                                    let null_right = Row::new(vec![Value::Null; r_cols]);
+                                    joined_rows.push(combine_rows(lr, &null_right));
+                                }
+                            }
+
+                            // Anti-join pass: emit unmatched right rows with
+                            // NULL-padded left side.
+                            for (ri, rr) in r_rows.iter().enumerate() {
+                                if !right_matched[ri] {
+                                    let null_left = Row::new(vec![Value::Null; l_cols]);
+                                    joined_rows.push(combine_rows(&null_left, rr));
                                 }
                             }
                         }
@@ -397,6 +461,20 @@ impl Executor {
     }
 }
 
+/// Returns the number of synthetic ctid slots contributed by a table ref.
+/// Base tables contribute 1 each; subqueries and functions contribute 0;
+/// joins recurse into both sides.
+fn count_ctid_slots(table_ref: &crate::sql::analyzer::types::AnalyzedTableRef) -> usize {
+    use crate::sql::analyzer::types::AnalyzedTableRefKind;
+    match &table_ref.kind {
+        AnalyzedTableRefKind::Table { .. } => 1,
+        AnalyzedTableRefKind::Subquery(_) | AnalyzedTableRefKind::Function { .. } => 0,
+        AnalyzedTableRefKind::Join { left, right, .. } => {
+            count_ctid_slots(left) + count_ctid_slots(right)
+        }
+    }
+}
+
 // ── Free helpers ────────────────────────────────────────────
 
 /// Combine two rows (left + right) for join-style evaluation.
@@ -485,21 +563,6 @@ pub(super) fn is_default_typed_expr(expr: &TypedExpr) -> bool {
 pub(super) fn append_ctid_to_rows(rows: &mut [Row]) {
     for (i, row) in rows.iter_mut().enumerate() {
         row.values.push(Value::Int64(i as i64));
-    }
-}
-
-/// Count hidden ctid slots contributed by base-table leaves within a table ref.
-///
-/// Each base-table leaf contributes +1 ctid (appended by `append_ctid_to_rows`).
-/// Subqueries and functions contribute 0. Joins sum their children recursively.
-fn count_ctid_slots(table_ref: &crate::sql::analyzer::types::AnalyzedTableRef) -> usize {
-    use crate::sql::analyzer::types::AnalyzedTableRefKind;
-    match &table_ref.kind {
-        AnalyzedTableRefKind::Table { .. } => 1,
-        AnalyzedTableRefKind::Subquery(_) | AnalyzedTableRefKind::Function { .. } => 0,
-        AnalyzedTableRefKind::Join { left, right, .. } => {
-            count_ctid_slots(left) + count_ctid_slots(right)
-        }
     }
 }
 
@@ -633,10 +696,10 @@ mod tests {
             alias: None,
         };
 
-        // Single table → 1 ctid slot
+        // Base table → 1
         assert_eq!(count_ctid_slots(&make_table("t")), 1);
 
-        // Function (like subquery) → 0
+        // Function → 0
         let func_ref = AnalyzedTableRef {
             kind: AnalyzedTableRefKind::Function {
                 func: crate::sql::analyzer::types::ResolvedFunction {
