@@ -132,7 +132,17 @@ pub(super) fn eval_function_call(
             let include_implicit = match args.first() {
                 Some(Value::Boolean(b)) => *b,
                 Some(Value::Null) | None => return Ok(Value::Null),
-                _ => false,
+                Some(other) => {
+                    let type_name = other
+                        .data_type()
+                        .map(|dt| dt.to_string().to_lowercase())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    return Err(crate::sql::error::SqlError::FunctionNotFound(format!(
+                        "current_schemas({})",
+                        type_name
+                    ))
+                    .into());
+                }
             };
             let schemas = crate::session_context::current_search_path_schemas(include_implicit);
             return Ok(Value::Array(schemas.into_iter().map(Value::Text).collect()));
