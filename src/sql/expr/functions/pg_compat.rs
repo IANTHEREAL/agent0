@@ -495,20 +495,13 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
             if !name.quoted {
                 let trimmed = name.value.trim();
                 // Check for a bare-word suffix after the type identifier.
+                // Unknown schema + any trailing bare word → syntax error.
+                // PG only allows parenthesized typmods after schema-qualified
+                // type names; interval qualifiers are NOT valid here.
                 if let Some(ws_pos) = trimmed.find(char::is_whitespace) {
                     let after = trimmed[ws_pos..].trim_start();
                     if !after.is_empty() && !after.starts_with('(') {
-                        // Bare word after type name → syntax error.
-                        // For interval types, normalize_interval_type validates
-                        // qualifiers and returns Err for invalid ones.
-                        // For non-interval types, any bare word is always a
-                        // syntax error — PG's general `typename(typmod)` grammar
-                        // only allows parenthesized typmods after the type name.
-                        let ws_normalized = normalize_whitespace(trimmed);
-                        let result = normalize_interval_type(&ws_normalized)?;
-                        if result != "interval" {
-                            return Err(invalid_interval_type_name(&raw));
-                        }
+                        return Err(invalid_interval_type_name(&raw));
                     }
                 }
             }
@@ -521,6 +514,12 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
     // Unquoted names: normalize whitespace, validate interval forms, strip typmod.
     let resolved_name = if name.quoted {
         name.value.clone()
+    } else if schema.is_some() {
+        // Schema-qualified: no interval normalization, no trailing-junk error.
+        // PG treats `pg_catalog.interval day to second` as a literal type
+        // lookup — `interval day to second` doesn't exist → NULL.
+        let ws_normalized = normalize_whitespace(&name.value);
+        strip_regtype_typmod(&ws_normalized)
     } else {
         let ws_normalized = normalize_whitespace(&name.value);
         let after_interval = normalize_interval_type(&ws_normalized)?;
@@ -1288,13 +1287,15 @@ mod tests {
             to_regtype(vec![Value::Text("interval  second  (3)".into())]).unwrap(),
             Value::Int64(pg_types::OID_INTERVAL)
         );
-        // Schema-qualified interval types
+        // Schema-qualified interval with qualifier → NULL (PG parity).
+        // PG treats `pg_catalog.interval day to second` as a literal type
+        // lookup — the qualifier syntax only works for bare `interval`.
         assert_eq!(
             to_regtype(vec![Value::Text(
                 "pg_catalog.interval day to second".into()
             )])
             .unwrap(),
-            Value::Int64(pg_types::OID_INTERVAL)
+            Value::Null
         );
         // Unknown schema + invalid interval typmod → NULL (schema resolution
         // before interval validation: schema not found = NULL, no error).
@@ -1303,6 +1304,7 @@ mod tests {
             Value::Null
         );
         // Bare word after type name → syntax error (PG's parser rejects it).
+        assert!(to_regtype(vec![Value::Text("noschema.interval day to second".into())]).is_err());
         assert!(to_regtype(vec![Value::Text("noschema.interval garbage".into())]).is_err());
         // Non-interval types with trailing junk → syntax error.
         assert!(to_regtype(vec![Value::Text("noschema.int4 garbage".into())]).is_err());

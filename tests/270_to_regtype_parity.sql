@@ -34,7 +34,10 @@ SELECT to_regtype('interval (3)');
 -- Schema resolution: unknown schema + valid typmod structure → NULL
 SELECT to_regtype('noschema.interval(abc)');
 SELECT to_regtype('"PG_CATALOG".interval(abc)');
+-- Schema-qualified interval qualifier → NULL (PG treats as literal type lookup)
+SELECT to_regtype('pg_catalog.interval day to second');
 -- Schema resolution: unknown schema + bare word → syntax error propagates
+SELECT to_regtype('noschema.interval day to second'); -- db9-specific: error text differs from PG
 SELECT to_regtype('noschema.interval garbage'); -- db9-specific: error text differs from PG
 SELECT to_regtype('noschema.int4 garbage'); -- db9-specific: error text differs from PG
 SELECT to_regtype('noschema.foo garbage'); -- db9-specific: error text differs from PG
