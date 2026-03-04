@@ -1,0 +1,15 @@
+setval
+NULL
+(1 row)
+nextval
+1
+(1 row)
+setval
+10
+(1 row)
+setval
+20
+(1 row)
+nextval
+20
+(1 row)

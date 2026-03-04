@@ -8,74 +8,135 @@ use pgwire::error::ErrorInfo;
 use sqlparser::ast::{CopySource, CopyTarget, Ident, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
-
-/// Pre-compiled regex for `COPY [schema.]table [(col1, …)] FROM stdin`.
-static COPY_FROM_STDIN_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s*(?:\(([^)]+)\)\s+|\s+)FROM\s+stdin")
-        .expect("COPY FROM STDIN regex is valid")
-});
+use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
 impl DynamicPgHandler {
     #[allow(clippy::result_large_err)]
     pub(in crate::protocol::handler) fn parse_copy_command(
         query: &str,
     ) -> Result<Option<(String, Vec<String>)>, ErrorInfo> {
-        fn is_valid_unquoted_ident(ident: &str) -> bool {
-            let mut chars = ident.chars();
-            let Some(first) = chars.next() else {
-                return false;
-            };
-            if first != '_' && !first.is_ascii_alphabetic() {
-                return false;
+        // Keep COPY FROM STDIN semantics in one parser implementation.
+        Self::parse_copy_from_stdin_via_sqlparser(query)
+    }
+
+    /// Parse COPY FROM STDIN using sqlparser.
+    /// Returns `(table_name, columns)` or `Ok(None)` if the query is not a COPY FROM STDIN.
+    #[allow(clippy::result_large_err)]
+    pub(in crate::protocol::handler) fn parse_copy_from_stdin_via_sqlparser(
+        query: &str,
+    ) -> Result<Option<(String, Vec<String>)>, ErrorInfo> {
+        let Some(query_trimmed) = strip_leading_whitespace_and_comments(query) else {
+            return Ok(None);
+        };
+
+        // Quick pre-check: must start with COPY
+        match query_trimmed.get(..4) {
+            Some(prefix) if prefix.eq_ignore_ascii_case("COPY") => {}
+            _ => return Ok(None),
+        }
+
+        // sqlparser requires a trailing semicolon for COPY FROM STDIN
+        // (it expects data lines after the statement in non-terminated form).
+        // If the query ends with a line comment (`-- ...` with no trailing newline),
+        // we must insert a newline before the semicolon so it doesn't land inside
+        // the comment. PG 17.7 accepts `COPY t FROM STDIN -- comment` just fine.
+        let query_with_semi = if query_trimmed.trim_end().ends_with(';') {
+            query_trimmed.to_string()
+        } else if Self::ends_with_line_comment(query_trimmed) {
+            format!("{}\n;", query_trimmed)
+        } else {
+            format!("{};", query_trimmed)
+        };
+
+        let dialect = PostgreSqlDialect {};
+        // db9-specific: error message text comes from sqlparser and may differ
+        // from PostgreSQL's canonical syntax error wording. SQLSTATE 42601 is correct.
+        let stmts = Parser::parse_sql(&dialect, &query_with_semi)
+            .map_err(|e| error_info("42601", e.to_string()))?;
+        let Some(stmt) = stmts.first() else {
+            return Ok(None);
+        };
+
+        let Statement::Copy {
+            source, to, target, ..
+        } = stmt
+        else {
+            return Ok(None);
+        };
+
+        if *to || !matches!(target, CopyTarget::Stdin) {
+            return Ok(None);
+        }
+
+        let CopySource::Table {
+            table_name,
+            columns,
+        } = source
+        else {
+            return Ok(None);
+        };
+
+        fn format_ident(ident: &Ident) -> String {
+            if ident.quote_style.is_some() {
+                let escaped = ident.value.replace('"', "\"\"");
+                format!("\"{}\"", escaped)
+            } else {
+                ident.value.clone()
             }
-            chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
         }
 
-        let Some(query) = strip_leading_whitespace_and_comments(query) else {
-            return Ok(None);
-        };
-        let query_upper = query.to_uppercase();
-        // COPY FROM STDIN must start at statement start (after leading whitespace/comments).
-        if !query_upper.starts_with("COPY")
-            || !query_upper.contains("FROM")
-            || !query_upper.contains("STDIN")
-        {
-            return Ok(None);
-        }
-
-        // Single regex: COPY [schema.]table_name [(col1, col2, ...)] FROM stdin
-        let Some(caps) = COPY_FROM_STDIN_RE.captures(query) else {
-            return Ok(None);
-        };
-        let schema = caps.get(1).map(|m| m.as_str().to_string());
-        let table = match caps.get(2) {
-            Some(m) => m.as_str().to_string(),
-            None => return Ok(None),
-        };
-        let table_name = match schema {
-            Some(s) => format!("{}.{}", s, table),
-            None => table,
-        };
-        let columns: Vec<String> = match caps.get(3) {
-            Some(cols) => cols
-                .as_str()
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect(),
-            None => vec![],
-        };
-
-        // Validate column names against unquoted identifier rules (PG parity).
-        for col in &columns {
-            if !is_valid_unquoted_ident(col) {
+        let table_str = match table_name.0.as_slice() {
+            [table] => format_ident(table),
+            [schema, table] => format!("{}.{}", format_ident(schema), format_ident(table)),
+            _ => {
+                let canonical_name = table_name
+                    .0
+                    .iter()
+                    .map(|ident| {
+                        if ident.quote_style.is_some() {
+                            ident.value.clone()
+                        } else {
+                            ident.value.to_lowercase()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(".");
                 return Err(error_info(
-                    "42602",
-                    format!("Invalid identifier in COPY FROM STDIN: \"{}\"", col),
+                    "0A000",
+                    format!(
+                        "cross-database references are not implemented: \"{}\"",
+                        canonical_name
+                    ),
                 ));
             }
-        }
+        };
 
-        Ok(Some((table_name, columns)))
+        let col_strs: Vec<String> = columns.iter().map(format_ident).collect();
+
+        Ok(Some((table_str, col_strs)))
+    }
+
+    /// Returns `true` if the query ends with a `--` line comment that has no
+    /// trailing newline. Uses sqlparser's tokenizer to correctly handle all
+    /// string literal forms (standard `'...'`, escape `E'...'`, dollar-quoted,
+    /// etc.) without re-implementing string scanning.
+    fn ends_with_line_comment(query: &str) -> bool {
+        let dialect = PostgreSqlDialect {};
+        let Ok(tokens) = Tokenizer::new(&dialect, query).tokenize() else {
+            return false;
+        };
+        // Find the last non-whitespace token; if it's a SingleLineComment, the
+        // query ends with an unterminated line comment.
+        let last_significant = tokens.iter().rev().find(|t| {
+            !matches!(
+                t,
+                Token::Whitespace(Whitespace::Space | Whitespace::Tab | Whitespace::Newline)
+            )
+        });
+        matches!(
+            last_significant,
+            Some(Token::Whitespace(Whitespace::SingleLineComment { .. }))
+        )
     }
 
     #[allow(clippy::result_large_err)]

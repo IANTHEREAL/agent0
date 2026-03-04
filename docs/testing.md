@@ -170,6 +170,29 @@ Recommended minimum:
 - `tiup` (to start TiKV playground)
 - `postgresql-client` (provides `psql` / `pg_isready`; required by the SQL runner)
 
+### 4.1.1 CI-like runtime libs without Docker (recommended when local OS differs from CI)
+
+If your host OS is newer than CI (for example Ubuntu 25.xx), you may hit
+runtime dependency drift when running downloaded CI artifacts (common symptom:
+`libicu*.so.74 not found`).
+
+Use `scripts/ci_env.sh` to fetch Ubuntu 24.04 `libicu74` into local cache and
+inject `LD_LIBRARY_PATH` only for that command:
+
+```bash
+# one-time prepare
+bash scripts/ci_env.sh prepare-libs
+
+# run any binary with CI-compatible ICU runtime libs
+bash scripts/ci_env.sh run -- /path/to/db9-server --help
+
+# if you prefer a manual export:
+bash scripts/ci_env.sh env
+```
+
+This avoids Docker while keeping host system packages untouched.
+Detailed guide: [`scripts/README_ci_env.md`](../scripts/README_ci_env.md).
+
 ### 4.2 Start/stop TiKV (recommended: use the admin script)
 
 ```bash

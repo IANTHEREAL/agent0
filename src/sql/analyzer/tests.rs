@@ -3414,6 +3414,222 @@ fn qualified_wildcard_carries_collation() {
 }
 
 #[test]
+fn quoted_qualified_wildcard_expands_columns() {
+    // Regression: SELECT "users".* FROM "users" must resolve via ident-based
+    // matching, not ObjectName::to_string() which preserves SQL quotes (#1376).
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query(r#"SELECT "users".* FROM "users""#);
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    let sel = expect_select(&result);
+    assert_eq!(sel.projection.len(), 7, "users has 7 columns");
+    assert_eq!(sel.projection[0].output_name, "id");
+    assert_eq!(sel.projection[1].output_name, "name");
+}
+
+#[test]
+fn schema_qualified_wildcard_correct_schema_succeeds() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT public.users.* FROM users");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    let sel = expect_select(&result);
+    assert_eq!(
+        sel.projection.len(),
+        7,
+        "public.users.* should expand all columns"
+    );
+}
+
+#[test]
+fn schema_qualified_wildcard_wrong_schema_errors() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT bogus.users.* FROM users");
+    let result = analyzer.analyze_query(&query);
+    assert!(result.is_err(), "wrong schema prefix must be rejected");
+}
+
+#[test]
+fn schema_qualified_wildcard_with_alias_uses_alias() {
+    // SELECT public.users.* FROM users AS u — must fail because the
+    // range variable is "u", not "users".
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT public.users.* FROM users AS u");
+    let result = analyzer.analyze_query(&query);
+    assert!(result.is_err(), "must use alias, not original table name");
+}
+
+#[test]
+fn schema_qualified_wildcard_alias_cannot_be_schema_qualified() {
+    // SELECT public.u.* FROM users AS u — PG rejects: alias must be used alone,
+    // not as schema.alias.
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT public.u.* FROM users AS u");
+    let result = analyzer.analyze_query(&query);
+    assert!(
+        result.is_err(),
+        "schema.alias.* must be rejected — alias cannot be schema-qualified"
+    );
+}
+
+#[test]
+fn schema_qualified_wildcard_cte_cannot_be_schema_qualified() {
+    // WITH c AS (SELECT 1 AS x) SELECT public.c.* FROM c — PG rejects.
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("WITH c AS (SELECT 1 AS x) SELECT public.c.* FROM c");
+    let result = analyzer.analyze_query(&query);
+    assert!(
+        result.is_err(),
+        "CTE cannot be schema-qualified in wildcard"
+    );
+}
+
+#[test]
+fn schema_qualified_wildcard_disambiguates_multi_schema() {
+    // SELECT s1.t.* FROM s1.t, s2.t — PG 17.7 succeeds, expanding only s1.t columns.
+    let catalog = MockCatalog::builder()
+        .table_in_schema(
+            "s1",
+            "t",
+            vec![("a", DataType::Int32, false), ("b", DataType::Text, true)],
+        )
+        .table_in_schema(
+            "s2",
+            "t",
+            vec![
+                ("x", DataType::Int32, false),
+                ("y", DataType::Text, true),
+                ("z", DataType::Float64, true),
+            ],
+        )
+        .build();
+
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT s1.t.* FROM s1.t, s2.t");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    let sel = expect_select(&result);
+    // Should expand only s1.t's 2 columns, not s2.t's 3.
+    assert_eq!(
+        sel.projection.len(),
+        2,
+        "s1.t.* should expand only s1.t columns (a, b)"
+    );
+    assert_eq!(sel.projection[0].output_name, "a");
+    assert_eq!(sel.projection[1].output_name, "b");
+}
+
+#[test]
+fn schema_qualified_wildcard_both_schemas_expand_correctly() {
+    // SELECT s1.t.*, s2.t.* FROM s1.t, s2.t — each schema wildcard
+    // should expand only its own table's columns.
+    let catalog = MockCatalog::builder()
+        .table_in_schema(
+            "s1",
+            "t",
+            vec![("a", DataType::Int32, false), ("b", DataType::Text, true)],
+        )
+        .table_in_schema(
+            "s2",
+            "t",
+            vec![
+                ("x", DataType::Int32, false),
+                ("y", DataType::Float64, true),
+            ],
+        )
+        .build();
+
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT s1.t.*, s2.t.* FROM s1.t, s2.t");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    let sel = expect_select(&result);
+    assert_eq!(
+        sel.projection.len(),
+        4,
+        "should have 2 cols from s1.t + 2 cols from s2.t"
+    );
+    assert_eq!(sel.projection[0].output_name, "a");
+    assert_eq!(sel.projection[1].output_name, "b");
+    assert_eq!(sel.projection[2].output_name, "x");
+    assert_eq!(sel.projection[3].output_name, "y");
+}
+
+#[test]
+fn schema_qualified_wildcard_wrong_schema_with_multi_schemas() {
+    // SELECT bogus.t.* FROM s1.t, s2.t — bogus doesn't match either s1 or s2.
+    let catalog = MockCatalog::builder()
+        .table_in_schema("s1", "t", vec![("a", DataType::Int32, false)])
+        .table_in_schema("s2", "t", vec![("x", DataType::Int32, false)])
+        .build();
+
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT bogus.t.* FROM s1.t, s2.t");
+    let result = analyzer.analyze_query(&query);
+    assert!(
+        result.is_err(),
+        "wrong schema must be rejected even with multiple schemas"
+    );
+}
+
+#[test]
+fn schema_qualified_wildcard_quoted_case_disambiguates() {
+    // SELECT s1."T".* FROM s1."T", s2.t — quoted "T" and unquoted t are distinct
+    // alias keys. The schema-qualified wildcard must expand only "T"'s columns.
+    let catalog = MockCatalog::builder()
+        .table_in_schema(
+            "s1",
+            "T",
+            vec![("a", DataType::Int32, false), ("b", DataType::Text, true)],
+        )
+        .table_in_schema(
+            "s2",
+            "t",
+            vec![
+                ("x", DataType::Int32, false),
+                ("y", DataType::Float64, true),
+            ],
+        )
+        .build();
+
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query(r#"SELECT s1."T".* FROM s1."T", s2.t"#);
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    let sel = expect_select(&result);
+    // Should expand only s1."T"'s 2 columns, not s2.t's.
+    assert_eq!(
+        sel.projection.len(),
+        2,
+        "s1.\"T\".* should expand only quoted T columns (a, b)"
+    );
+    assert_eq!(sel.projection[0].output_name, "a");
+    assert_eq!(sel.projection[1].output_name, "b");
+}
+
+#[test]
+fn four_part_wildcard_cross_database_error() {
+    // SELECT db.schema.table.* — PG: cross-database references are not implemented.
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT foo.public.users.* FROM users");
+    let result = analyzer.analyze_query(&query);
+    assert!(result.is_err(), "4-part name must error");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("cross-database references are not implemented"),
+        "expected cross-database error, got: {}",
+        err_msg
+    );
+}
+
+#[test]
 fn derived_table_propagates_collation() {
     let catalog = collation_catalog();
     let mut analyzer = Analyzer::new(&catalog);

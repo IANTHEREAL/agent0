@@ -8,6 +8,7 @@
 
 use crate::model::DataType;
 use std::collections::HashMap;
+use std::ops::Range;
 
 use super::error::AnalyzerError;
 use sqlparser::ast::Ident;
@@ -87,6 +88,15 @@ pub struct Scope {
     /// CTE schemas visible from this scope (name → output columns with optional collation name).
     cte_schemas: HashMap<String, Vec<(String, DataType, Option<String>)>>,
 
+    /// Source schemas for each table alias (normalized alias → list of (schema, column_range)).
+    /// Keys are stored as-is from the caller (already normalized via `normalize_ident`:
+    /// quoted identifiers preserve case, unquoted are lowercased).
+    /// A Vec is used because the same unaliased table name can appear from
+    /// multiple schemas (e.g. `FROM s1.t, s2.t`). The column range tracks
+    /// which scope columns belong to each schema binding, enabling
+    /// schema-qualified wildcards to expand only the correct table's columns.
+    table_source_schemas: HashMap<String, Vec<(String, Range<usize>)>>,
+
     /// Whether aggregate functions are allowed in expressions at this level.
     pub allow_aggregates: bool,
 
@@ -116,6 +126,7 @@ impl Scope {
             qualified_index: HashMap::new(),
             using_merged_by_left: HashMap::new(),
             cte_schemas: HashMap::new(),
+            table_source_schemas: HashMap::new(),
             allow_aggregates: false,
             allow_windows: false,
             add_system_columns: false,
@@ -125,6 +136,25 @@ impl Scope {
     /// Enable/disable synthetic system column registration for subsequent `add_table` calls.
     pub fn set_add_system_columns(&mut self, enabled: bool) {
         self.add_system_columns = enabled;
+    }
+
+    /// Record the source schema and column range for a table alias.
+    /// `col_range` is the range of column indices in this scope that belong
+    /// to this particular table binding.
+    /// Multiple schemas can be recorded for the same alias when the same table
+    /// name appears from different schemas (e.g. `FROM s1.t, s2.t`).
+    pub fn set_table_source_schema(&mut self, alias: &str, schema: &str, col_range: Range<usize>) {
+        self.table_source_schemas
+            .entry(alias.to_string())
+            .or_default()
+            .push((schema.to_lowercase(), col_range));
+    }
+
+    /// Look up the source schema entries for a table alias.
+    /// Returns `None` if no schema was recorded (CTE, subquery, aliased table).
+    /// Returns `Some(slice)` with one or more (schema, column_range) entries otherwise.
+    pub fn source_schemas_for_alias(&self, alias: &str) -> Option<&[(String, Range<usize>)]> {
+        self.table_source_schemas.get(alias).map(|v| v.as_slice())
     }
 
     /// Build a scope from a `TableSchema`, using the table name (or alias) as qualifier.
@@ -735,5 +765,63 @@ mod tests {
         assert_eq!(resolved.column_index, 0);
         assert!(resolved.merged_using.is_some());
         assert_eq!(resolved.data_type, DataType::Int32);
+    }
+
+    #[test]
+    fn source_schema_tracks_table_origin() {
+        let mut scope = Scope::new();
+        scope.add_table("t", &[int_col("id")]);
+        scope.set_table_source_schema("t", "myschema", 0..1);
+
+        let entries = scope.source_schemas_for_alias("t").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "myschema");
+        assert_eq!(entries[0].1, 0..1);
+
+        // Keys are stored as-is (caller is responsible for normalization).
+        // "T" (uppercase) does not match key "t" (lowercase).
+        assert!(scope.source_schemas_for_alias("T").is_none());
+        assert_eq!(scope.source_schemas_for_alias("other"), None);
+    }
+
+    #[test]
+    fn source_schema_quoted_case_preserved() {
+        // Quoted "T" and unquoted t are distinct alias keys.
+        let mut scope = Scope::new();
+        scope.add_table("T", &[int_col("a"), text_col("b")]);
+        scope.set_table_source_schema("T", "public", 0..2);
+        scope.add_table("t", &[int_col("x")]);
+        scope.set_table_source_schema("t", "public", 2..3);
+
+        // "T" and "t" must not be conflated.
+        let upper = scope
+            .source_schemas_for_alias("T")
+            .expect("quoted T should have its own entry");
+        assert_eq!(upper.len(), 1);
+        assert_eq!(upper[0].1, 0..2);
+
+        let lower = scope
+            .source_schemas_for_alias("t")
+            .expect("unquoted t should have its own entry");
+        assert_eq!(lower.len(), 1);
+        assert_eq!(lower[0].1, 2..3);
+    }
+
+    #[test]
+    fn source_schema_multi_value_tracks_all_schemas() {
+        let mut scope = Scope::new();
+        scope.add_table("t", &[int_col("id")]);
+        scope.set_table_source_schema("t", "s1", 0..1);
+        scope.add_table("t", &[int_col("val")]);
+        scope.set_table_source_schema("t", "s2", 1..2);
+
+        let entries = scope
+            .source_schemas_for_alias("t")
+            .expect("should have schemas");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "s1");
+        assert_eq!(entries[0].1, 0..1);
+        assert_eq!(entries[1].0, "s2");
+        assert_eq!(entries[1].1, 1..2);
     }
 }

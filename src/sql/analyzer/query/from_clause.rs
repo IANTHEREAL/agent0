@@ -426,9 +426,26 @@ impl<'a> Analyzer<'a> {
                                 })
                                 .collect();
 
+                        let col_start = self.scopes.current().column_count();
                         self.scopes
                             .current_mut()
                             .add_table(&alias_str, &columns_for_scope);
+                        let col_end = self.scopes.current().column_count();
+
+                        // Record the source schema so schema-qualified wildcards
+                        // (e.g. `schema.table.*`) can be validated.
+                        // Only record when the table is NOT aliased — PostgreSQL
+                        // rejects `schema.alias.*` and requires bare alias usage.
+                        if alias.is_none() {
+                            if let Some(dot_pos) = qualified_name.find('.') {
+                                let resolved_schema = &qualified_name[..dot_pos];
+                                self.scopes.current_mut().set_table_source_schema(
+                                    &alias_str,
+                                    resolved_schema,
+                                    col_start..col_end,
+                                );
+                            }
+                        }
 
                         let columns_for_schema: Vec<(String, DataType, bool)> = table_schema
                             .columns

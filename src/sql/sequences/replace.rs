@@ -149,13 +149,13 @@ pub(crate) fn replace_sequence_functions<'a>(
                         let is_called = if func.args.len() >= 3 {
                             let arg2 = extract_arg_expr(&func.args, 2)?;
                             match eval_seq_expr(arg2, row, schema)? {
-                                crate::model::Value::Boolean(b) => b,
-                                crate::model::Value::Text(s) => {
-                                    matches!(
-                                        s.to_lowercase().as_str(),
-                                        "true" | "t" | "1" | "yes" | "y"
-                                    )
-                                }
+                                crate::model::Value::Boolean(b) => Some(b),
+                                // Strict semantics: NULL arg → NULL return, no mutation.
+                                crate::model::Value::Null => None,
+                                crate::model::Value::Text(s) => Some(matches!(
+                                    s.to_lowercase().as_str(),
+                                    "true" | "t" | "1" | "yes" | "y"
+                                )),
                                 other => {
                                     return Err(anyhow!(
                                         "setval: is_called must be boolean, got {}",
@@ -164,7 +164,10 @@ pub(crate) fn replace_sequence_functions<'a>(
                                 }
                             }
                         } else {
-                            true
+                            Some(true)
+                        };
+                        let Some(is_called) = is_called else {
+                            return Ok(value_to_sql_expr(&crate::model::Value::Null));
                         };
                         let res = store
                             .setval_sequence(txn, db_id, &full_name, value_i64, is_called)

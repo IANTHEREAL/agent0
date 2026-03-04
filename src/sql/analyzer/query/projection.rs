@@ -314,29 +314,94 @@ impl<'a> Analyzer<'a> {
                 }
 
                 SelectItem::QualifiedWildcard(name, _) => {
-                    let table_name = name.to_string();
-                    let scope = self.scopes.current();
-                    let lower_table = table_name.to_lowercase();
+                    // 3+ identifier parts before `.*` (e.g. `db.schema.table.*`):
+                    // PostgreSQL rejects with "cross-database references are
+                    // not implemented". Three idents = db.schema.table.
+                    if name.0.len() >= 3 {
+                        return Err(AnalyzerError::CrossDatabaseReference(format!("{}.*", name)));
+                    }
 
-                    let matching_cols: Vec<_> = scope
-                        .columns()
-                        .iter()
-                        .filter(|c| {
-                            c.table_alias
-                                .as_ref()
-                                .map(|a| a.to_lowercase() == lower_table)
-                                .unwrap_or(false)
-                        })
-                        .collect();
+                    // Extract the last identifier as the table qualifier.
+                    // For `t.*` → ident "t"; for `schema.t.*` → ident "t".
+                    let table_ident = name.0.last().ok_or_else(|| {
+                        AnalyzerError::Unsupported("empty qualified wildcard".to_string())
+                    })?;
+                    let scope = self.scopes.current();
+
+                    let matching_cols = scope.columns_for_table_alias_ident(table_ident);
 
                     if matching_cols.is_empty() {
                         return Err(AnalyzerError::ColumnNotFound {
-                            name: format!("{}.*", table_name),
+                            name: format!("{}.*", name),
                             available: self.scopes.current().available_columns(),
                         });
                     }
 
+                    // Validate schema prefix for 2-part qualified wildcards
+                    // (e.g. `schema.table.*`). PostgreSQL requires:
+                    // - The binding must be an unaliased real table (not CTE/subquery)
+                    // - The schema must match the source schema
+                    // When the table has an alias, source_schema is not recorded
+                    // (see from_clause.rs), so `source_schemas_for_alias` returns None
+                    // and we reject the reference — PG requires bare alias usage.
+                    // When the same table name appears from multiple schemas
+                    // (e.g. `FROM s1.t, s2.t`), the schema prefix disambiguates:
+                    // `s1.t.*` expands only s1.t's columns (matching PG 17.7).
+                    let schema_col_range = if name.0.len() == 2 {
+                        let schema_ident = &name.0[0];
+                        let schema_name = crate::sql::names::normalize_ident(schema_ident);
+                        let table_name = crate::sql::names::normalize_ident(table_ident);
+                        match scope.source_schemas_for_alias(&table_name) {
+                            Some(entries) => {
+                                // Find entries whose schema matches the qualifier.
+                                let matched: Vec<_> =
+                                    entries.iter().filter(|(s, _)| *s == schema_name).collect();
+                                match matched.len() {
+                                    0 => {
+                                        // Schema doesn't match any recorded entry
+                                        return Err(AnalyzerError::ColumnNotFound {
+                                            name: format!("{}.*", name),
+                                            available: self.scopes.current().available_columns(),
+                                        });
+                                    }
+                                    1 => {
+                                        // Exactly one match — use its column range
+                                        // to filter the expansion below.
+                                        Some(matched[0].1.clone())
+                                    }
+                                    _ => {
+                                        // Same schema appears multiple times for the
+                                        // same alias — truly ambiguous.
+                                        let tables: Vec<String> =
+                                            matched.iter().map(|(s, _)| s.clone()).collect();
+                                        return Err(AnalyzerError::AmbiguousColumn {
+                                            name: format!("{}.*", name),
+                                            tables,
+                                        });
+                                    }
+                                }
+                            }
+                            None => {
+                                // No source schema: binding is a CTE, subquery,
+                                // or aliased table — cannot be schema-qualified
+                                return Err(AnalyzerError::ColumnNotFound {
+                                    name: format!("{}.*", name),
+                                    available: self.scopes.current().available_columns(),
+                                });
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                     for col in matching_cols {
+                        // When a schema-qualified wildcard matched a specific
+                        // table binding, only expand columns within that range.
+                        if let Some(ref range) = schema_col_range {
+                            if !range.contains(&col.column_index) {
+                                continue;
+                            }
+                        }
                         let mut expr = TypedExpr::new(
                             TypedExprKind::ColumnRef {
                                 scope_depth: 0,

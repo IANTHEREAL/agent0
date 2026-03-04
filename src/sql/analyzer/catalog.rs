@@ -522,6 +522,40 @@ impl MockCatalogBuilder {
         self
     }
 
+    /// Add a table in a specific schema (e.g. schema "s1", name "t" → key "s1.t").
+    pub fn table_in_schema(
+        mut self,
+        schema_name: &str,
+        name: &str,
+        columns: Vec<(&str, DataType, bool)>,
+    ) -> Self {
+        let col_defs: Vec<ColumnDef> = columns
+            .iter()
+            .map(|(n, dt, nullable)| ColumnDef {
+                name: n.to_string(),
+                data_type: dt.clone(),
+                nullable: *nullable,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+                collation: None,
+            })
+            .collect();
+
+        let qualified_name = format!("{}.{}", schema_name, name);
+        let schema = TableSchema::new(
+            qualified_name.clone(),
+            1, // dummy table_id
+            col_defs,
+            vec![], // no pk for test
+        );
+
+        self.snapshot
+            .add_table(&qualified_name, qualified_name.clone(), schema);
+        self
+    }
+
     /// Add a table with columns that may have collation:
     /// `(name, type, nullable, collation)`.
     pub fn table_with_collations(
