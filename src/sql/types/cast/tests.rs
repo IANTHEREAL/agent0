@@ -414,6 +414,38 @@ fn regclass_casts_normalize_to_int64_oid() {
     );
 }
 
+#[test]
+fn regclass_text_catalog_name_resolves_to_oid() {
+    let regclass = DataType::UserDefined("pg_catalog.regclass".to_string());
+    // 'pg_class'::regclass → 1259 (used by JDBC getTables query)
+    assert_eq!(
+        cast(
+            Value::Text("pg_class".into()),
+            &regclass,
+            CastContext::Explicit
+        )
+        .unwrap(),
+        Value::Int64(1259)
+    );
+    // With schema prefix
+    assert_eq!(
+        cast(
+            Value::Text("pg_catalog.pg_type".into()),
+            &regclass,
+            CastContext::Explicit
+        )
+        .unwrap(),
+        Value::Int64(1247)
+    );
+    // Unknown name should error
+    assert!(cast(
+        Value::Text("nonexistent_table".into()),
+        &regclass,
+        CastContext::Explicit
+    )
+    .is_err());
+}
+
 // ---- VARCHAR(n) ----
 #[test]
 fn explicit_varchar3_truncates() {

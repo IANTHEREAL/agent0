@@ -1,0 +1,8 @@
+jdbc_startup=
+schemas_true_has_pg_catalog=true
+schemas_false_no_pg_catalog=true
+schema_listing=
+db_listing=
+jdbc_get_tables=
+jdbc_get_schemas=
+nspacl_exists=true

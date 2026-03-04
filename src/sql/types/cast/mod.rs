@@ -21,6 +21,37 @@ fn is_regtype_udt(udt: &str) -> bool {
     udt.eq_ignore_ascii_case("regtype") || udt.eq_ignore_ascii_case("pg_catalog.regtype")
 }
 
+/// Resolve well-known pg_catalog relation names to their fixed OIDs.
+///
+/// These OIDs match PostgreSQL's bootstrap catalog and are used by JDBC
+/// drivers in queries like `d.classoid = 'pg_class'::regclass`.
+fn regclass_catalog_oid(name: &str) -> Option<i64> {
+    match name {
+        "pg_class" => Some(1259),
+        "pg_type" => Some(1247),
+        "pg_attribute" => Some(1249),
+        "pg_proc" => Some(1255),
+        "pg_namespace" => Some(2615),
+        "pg_constraint" => Some(2606),
+        "pg_attrdef" => Some(2604),
+        "pg_index" => Some(2610),
+        "pg_database" => Some(1262),
+        "pg_tablespace" => Some(1213),
+        "pg_description" => Some(2609),
+        "pg_shdescription" => Some(2396),
+        "pg_extension" => Some(3079),
+        "pg_am" => Some(2601),
+        "pg_trigger" => Some(2620),
+        "pg_depend" => Some(2608),
+        "pg_roles" => Some(12000),
+        "pg_authid" => Some(1260),
+        "pg_collation" => Some(3456),
+        "pg_enum" => Some(3501),
+        "pg_sequence" => Some(2224),
+        _ => None,
+    }
+}
+
 /// Controls which type conversions are allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CastContext {
@@ -568,17 +599,28 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
         }
 
         // ===== regclass pseudo-type =====
-        // db9 stores catalog OIDs as Int64. For psql compatibility queries
-        // (e.g. pg_partition_ancestors(...) UNION ...::regclass), accept
-        // numeric text and integer values and normalize to Int64.
+        // db9 stores catalog OIDs as Int64. For psql/JDBC compatibility queries
+        // (e.g. d.classoid = 'pg_class'::regclass), accept numeric text,
+        // well-known catalog table names, and integer values; normalize to Int64.
         (Value::Text(s), DataType::UserDefined(ref udt)) if is_regclass_udt(udt) => {
-            s.trim().parse::<i64>().map(Value::Int64).map_err(|_| {
-                SqlError::InvalidInputSyntax {
-                    type_name: "regclass".into(),
-                    value: s,
-                }
-                .into()
-            })
+            let trimmed = s.trim();
+            // Try numeric OID first.
+            if let Ok(n) = trimmed.parse::<i64>() {
+                return Ok(Value::Int64(n));
+            }
+            // Try well-known catalog relation names (with optional pg_catalog. prefix).
+            let name = trimmed
+                .strip_prefix("pg_catalog.")
+                .unwrap_or(trimmed)
+                .to_lowercase();
+            if let Some(oid) = regclass_catalog_oid(&name) {
+                return Ok(Value::Int64(oid));
+            }
+            Err(SqlError::InvalidInputSyntax {
+                type_name: "regclass".into(),
+                value: s,
+            }
+            .into())
         }
         (Value::Int32(n), DataType::UserDefined(ref udt)) if is_regclass_udt(udt) => {
             Ok(Value::Int64(n as i64))

@@ -90,6 +90,27 @@ pub fn current_search_path_first_schema() -> String {
         .unwrap_or_else(|_| "public".to_string())
 }
 
+/// Return all schemas in the current search_path as a Vec.
+///
+/// When `include_implicit` is true, `pg_catalog` is prepended (matching
+/// PostgreSQL's `current_schemas(true)` behavior). `"$user"` entries are
+/// skipped because db9 does not create per-user schemas.
+pub fn current_search_path_schemas(include_implicit: bool) -> Vec<String> {
+    let mut schemas = CURRENT_SEARCH_PATH
+        .try_with(|sp| {
+            sp.iter()
+                .filter(|s| *s != "$user")
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|_| vec!["public".to_string()]);
+
+    if include_implicit && !schemas.iter().any(|s| s == "pg_catalog") {
+        schemas.insert(0, "pg_catalog".to_string());
+    }
+    schemas
+}
+
 pub async fn with_search_path<R, Fut>(search_path: Arc<Vec<String>>, fut: Fut) -> R
 where
     Fut: Future<Output = R>,

@@ -31,6 +31,7 @@ mod pg_publication_rel;
 mod pg_range;
 mod pg_roles;
 mod pg_sequence;
+mod pg_shdescription;
 mod pg_stat_user_tables;
 mod pg_statistic_ext;
 mod pg_tables;
@@ -113,6 +114,7 @@ impl CatalogRegistry {
         registry.register(Box::new(pg_range::PgRange));
         registry.register(Box::new(pg_roles::PgRoles));
         registry.register(Box::new(pg_sequence::PgSequence));
+        registry.register(Box::new(pg_shdescription::PgShdescription));
         registry.register(Box::new(pg_statistic_ext::PgStatisticExt));
         registry.register(Box::new(pg_stat_user_tables::PgStatUserTables));
         registry.register(Box::new(pg_tables::PgTables));
@@ -167,6 +169,16 @@ mod tests {
         let pg_ns = catalog.get("pg_namespace").unwrap();
         assert_eq!(pg_ns.name(), "pg_namespace");
         assert_eq!(pg_ns.schema_name(), "pg_catalog");
+        assert_eq!(pg_ns.schema().columns.len(), 5);
+    }
+
+    #[test]
+    fn registry_contains_pg_shdescription() {
+        let catalog = global_catalog();
+        let t = catalog.get("pg_shdescription").unwrap();
+        assert_eq!(t.name(), "pg_shdescription");
+        assert_eq!(t.schema_name(), "pg_catalog");
+        assert_eq!(t.schema().columns.len(), 3);
     }
 
     #[test]
