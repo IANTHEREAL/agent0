@@ -63,7 +63,7 @@ to_regtype
 NULL
 (1 row)
 ERROR:  invalid type name "noschema.interval day to second"
-ERROR:  invalid type name "interval garbage"
+ERROR:  invalid type name "noschema.interval garbage"
 ERROR:  invalid type name "noschema.int4 garbage"
 ERROR:  invalid type name "noschema.foo garbage"
 ERROR:  invalid type name "int4 garbage"
