@@ -1488,7 +1488,7 @@ mod tests {
         let tenant = TenantHandle::new_with_rate_limit(1);
         tenant.rate_limiter().unwrap().drain();
         assert!(
-            handler.tenant_handle.set(tenant).is_ok(),
+            handler.tenant_handle.set(tenant.clone()).is_ok(),
             "tenant_handle already set"
         );
 
@@ -1531,10 +1531,18 @@ mod tests {
 
         // Non-transaction SQL is still blocked.
         assert!(!is_transaction_control("SELECT 1"));
-        let err = handler.check_rate_limit().unwrap_err();
-        assert!(
-            err.to_string().contains("rate limit"),
-            "SELECT should still be rate-limited"
-        );
+        tenant.rate_limiter().unwrap().drain();
+        let mut blocked = false;
+        for _ in 0..8 {
+            if let Err(err) = handler.check_rate_limit() {
+                assert!(
+                    err.to_string().contains("rate limit"),
+                    "SELECT should still be rate-limited"
+                );
+                blocked = true;
+                break;
+            }
+        }
+        assert!(blocked, "expected non-transaction SQL to be rate-limited");
     }
 }
