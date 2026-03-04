@@ -1,0 +1,109 @@
+to_regtype
+1007
+(1 row)
+to_regtype
+1000
+(1 row)
+to_regtype
+1009
+(1 row)
+to_regtype
+NULL
+(1 row)
+to_regtype
+1007
+(1 row)
+to_regtype
+NULL
+(1 row)
+to_regtype
+1186
+(1 row)
+to_regtype
+1186
+(1 row)
+to_regtype
+1186
+(1 row)
+to_regtype
+1186
+(1 row)
+ERROR:  invalid type name "interval garbage"
+ERROR:  invalid type name "interval(abc)"
+to_regtype
+1186
+(1 row)
+ERROR:  invalid type name "interval(2147483648)"
+ERROR:  invalid type name "interval(-1)"
+to_regtype
+NULL
+(1 row)
+to_regtype
+NULL
+(1 row)
+to_regtype
+NULL
+(1 row)
+to_regtype
+23
+(1 row)
+to_regtype
+1186
+(1 row)
+to_regtype
+1186
+(1 row)
+to_regtype
+NULL
+(1 row)
+to_regtype
+NULL
+(1 row)
+ERROR:  invalid type name "pg_catalog.interval day to second"
+ERROR:  invalid type name "noschema.interval day to second"
+ERROR:  invalid type name "noschema.interval garbage"
+ERROR:  invalid type name "noschema.int4 garbage"
+ERROR:  invalid type name "noschema.foo garbage"
+ERROR:  invalid type name "int4 garbage"
+ERROR:  invalid type name "text garbage"
+SET
+to_regtype
+NULL
+(1 row)
+SET
+to_regtype
+701
+(1 row)
+to_regtype
+1043
+(1 row)
+to_regtype
+1043
+(1 row)
+to_regtype
+1184
+(1 row)
+to_regtype
+1114
+(1 row)
+to_regtype
+1083
+(1 row)
+to_regtype
+701
+(1 row)
+to_regtype
+23
+(1 row)
+to_regtype
+1007
+(1 row)
+to_regtype
+NULL
+(1 row)
+to_regtype
+NULL
+(1 row)
+to_regtype
+1043
+(1 row)

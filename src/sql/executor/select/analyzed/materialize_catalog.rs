@@ -1083,8 +1083,8 @@ impl Executor {
             _ => return Err(anyhow!("function to_regtype(text) does not exist")),
         };
 
-        // Fast path for builtins and extension shims already handled by the
-        // scalar function implementation.
+        // Fast path for pg_catalog builtins handled by the scalar function
+        // implementation.
         let resolved_builtin =
             crate::sql::expr::functions::pg_compat::to_regtype(vec![Value::Text(raw.clone())])?;
         if !matches!(resolved_builtin, Value::Null) {
@@ -1092,18 +1092,21 @@ impl Executor {
         }
 
         let (without_array, is_array) = strip_regtype_array_dims(&raw);
-        if is_array {
-            // db9 does not synthesize array OIDs for user-defined base types yet.
-            return Ok(Value::Null);
-        }
         let normalized = strip_regtype_typmod(&without_array);
         if normalized.trim().is_empty() {
             return Ok(Value::Null);
         }
 
         let store = self.store();
-        let oid =
-            lookup_user_defined_regtype_oid(&store, txn, db_id, &normalized, search_path).await?;
+        let oid = lookup_regtype_oid_with_hstore_extension(
+            &store,
+            txn,
+            db_id,
+            &normalized,
+            is_array,
+            search_path,
+        )
+        .await?;
         Ok(oid.map(Value::Int64).unwrap_or(Value::Null))
     }
 }
@@ -1123,42 +1126,7 @@ fn find_text_column<'a>(
     None
 }
 
-fn strip_regtype_array_dims(raw: &str) -> (String, bool) {
-    let mut name = raw.trim().to_string();
-    let mut is_array = false;
-    loop {
-        let trimmed = name.trim_end();
-        if let Some(stripped) = trimmed.strip_suffix("[]") {
-            is_array = true;
-            name = stripped.trim_end().to_string();
-            continue;
-        }
-        break;
-    }
-    (name, is_array)
-}
-
-fn strip_regtype_typmod(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if !trimmed.ends_with(')') {
-        return trimmed.to_string();
-    }
-
-    let mut depth = 0_i32;
-    for (idx, ch) in trimmed.char_indices().rev() {
-        match ch {
-            ')' => depth += 1,
-            '(' => {
-                depth -= 1;
-                if depth == 0 {
-                    return trimmed[..idx].trim_end().to_string();
-                }
-            }
-            _ => {}
-        }
-    }
-    trimmed.to_string()
-}
+use crate::sql::expr::functions::pg_compat::{strip_regtype_array_dims, strip_regtype_typmod};
 
 fn split_regtype_name_parts(raw: &str) -> Option<Vec<String>> {
     let mut parts = Vec::new();
@@ -1243,6 +1211,14 @@ fn parse_regtype_object_name(raw: &str) -> Option<sqlparser::ast::ObjectName> {
         idents.push(parse_regtype_ident(&p)?);
     }
     Some(sqlparser::ast::ObjectName(idents))
+}
+
+fn regtype_ident_matches(ident: &sqlparser::ast::Ident, expected: &str) -> bool {
+    if ident.quote_style.is_some() {
+        ident.value == expected
+    } else {
+        ident.value.eq_ignore_ascii_case(expected)
+    }
 }
 
 fn value_to_i64(v: &Value) -> Option<i64> {
@@ -1433,34 +1409,116 @@ async fn lookup_typname_by_oid(
         .map(|t| t.name))
 }
 
-async fn lookup_user_defined_regtype_oid(
+fn regtype_search_path_schemas(search_path: &[String]) -> Vec<&str> {
+    let mut schemas: Vec<&str> = search_path
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| !s.eq_ignore_ascii_case("$user"))
+        .collect();
+    if schemas.is_empty() {
+        schemas.push("public");
+    }
+    schemas
+}
+
+fn hstore_extension_oid_for_name(name: &sqlparser::ast::Ident, is_array: bool) -> Option<i64> {
+    let base_oid = if regtype_ident_matches(name, "hstore") {
+        Some(crate::sql::pg_types::OID_HSTORE)
+    } else if regtype_ident_matches(name, "_hstore") {
+        Some(crate::sql::pg_types::OID_HSTORE_ARRAY)
+    } else {
+        None
+    };
+
+    if is_array {
+        match base_oid {
+            Some(crate::sql::pg_types::OID_HSTORE) => Some(crate::sql::pg_types::OID_HSTORE_ARRAY),
+            _ => None,
+        }
+    } else {
+        base_oid
+    }
+}
+
+async fn lookup_hstore_extension_oid_if_enabled(
+    store: &Arc<crate::storage::TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    name: &sqlparser::ast::Ident,
+    is_array: bool,
+) -> Result<Option<i64>> {
+    let Some(ext_oid) = hstore_extension_oid_for_name(name, is_array) else {
+        return Ok(None);
+    };
+    let Some(installed) = store.get_extension(txn, db_id, "hstore").await? else {
+        return Ok(None);
+    };
+    if !installed.enabled {
+        return Ok(None);
+    }
+    Ok(Some(ext_oid))
+}
+
+async fn lookup_regtype_oid_with_hstore_extension(
     store: &Arc<crate::storage::TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
     normalized_type_name: &str,
+    is_array: bool,
     search_path: &[String],
 ) -> Result<Option<i64>> {
     let Some(type_name) = parse_regtype_object_name(normalized_type_name) else {
         return Ok(None);
     };
+    let parts = type_name.0;
+    match parts.as_slice() {
+        [name] => {
+            for schema in regtype_search_path_schemas(search_path) {
+                let full_name = format!("{}.{}", schema, name.value);
+                if let Some(def) = store.get_type(txn, db_id, &full_name).await? {
+                    if is_array {
+                        // db9 does not synthesize array OIDs for user-defined base types yet.
+                        return Ok(None);
+                    }
+                    return Ok(Some(def.oid as i64));
+                }
 
-    let Some(resolved) =
-        crate::sql::names::resolve_existing_type_name(store, txn, db_id, &type_name, search_path)
-            .await?
-    else {
-        return Ok(None);
-    };
+                if schema == "public" {
+                    if let Some(ext_oid) =
+                        lookup_hstore_extension_oid_if_enabled(store, txn, db_id, name, is_array)
+                            .await?
+                    {
+                        return Ok(Some(ext_oid));
+                    }
+                }
+            }
+            Ok(None)
+        }
+        [schema, name] => {
+            let full_name = format!("{}.{}", schema.value, name.value);
+            if let Some(def) = store.get_type(txn, db_id, &full_name).await? {
+                if is_array {
+                    // db9 does not synthesize array OIDs for user-defined base types yet.
+                    return Ok(None);
+                }
+                return Ok(Some(def.oid as i64));
+            }
 
-    Ok(store
-        .get_type(txn, db_id, &resolved.full)
-        .await?
-        .map(|def| def.oid as i64))
+            if regtype_ident_matches(schema, "public") {
+                return lookup_hstore_extension_oid_if_enabled(store, txn, db_id, name, is_array)
+                    .await;
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        advisory_lock_timeout, find_text_column, parse_regtype_object_name,
+        advisory_lock_timeout, find_text_column, hstore_extension_oid_for_name,
+        parse_regtype_object_name, regtype_ident_matches, regtype_search_path_schemas,
         split_regtype_name_parts, strip_regtype_array_dims, strip_regtype_typmod,
         value_to_bool_strict, value_to_i64, value_to_i64_strict,
     };
@@ -1757,6 +1815,17 @@ mod tests {
     }
 
     #[test]
+    fn test_regtype_ident_matches_respects_quoted_case() {
+        let unquoted = parse_regtype_object_name("HSTORE").expect("parse unquoted");
+        assert!(regtype_ident_matches(&unquoted.0[0], "hstore"));
+        assert!(regtype_ident_matches(&unquoted.0[0], "HSTORE"));
+
+        let quoted = parse_regtype_object_name("\"HSTORE\"").expect("parse quoted");
+        assert!(!regtype_ident_matches(&quoted.0[0], "hstore"));
+        assert!(regtype_ident_matches(&quoted.0[0], "HSTORE"));
+    }
+
+    #[test]
     fn test_parse_regtype_object_name_rejects_invalid_shapes() {
         assert!(parse_regtype_object_name("").is_none());
         assert!(parse_regtype_object_name("\"unterminated").is_none());
@@ -1769,5 +1838,39 @@ mod tests {
         assert_eq!(parts, vec!["\"A\"".to_string(), "\"B\"".to_string()]);
         let escaped = split_regtype_name_parts("\"A\"\"B\"").expect("split escaped");
         assert_eq!(escaped, vec!["\"A\"\"B\"".to_string()]);
+    }
+
+    #[test]
+    fn test_regtype_search_path_schemas_preserves_order_and_defaults_public() {
+        let path = vec!["$user".to_string(), "s1".to_string(), "public".to_string()];
+        let schemas = regtype_search_path_schemas(&path);
+        assert_eq!(schemas, vec!["s1", "public"]);
+        assert_eq!(regtype_search_path_schemas(&[]), vec!["public"]);
+    }
+
+    #[test]
+    fn test_hstore_extension_oid_for_name_respects_identifier_and_array_rules() {
+        let hstore = parse_regtype_object_name("hstore").expect("parse");
+        assert_eq!(
+            hstore_extension_oid_for_name(&hstore.0[0], false),
+            Some(crate::sql::pg_types::OID_HSTORE)
+        );
+        assert_eq!(
+            hstore_extension_oid_for_name(&hstore.0[0], true),
+            Some(crate::sql::pg_types::OID_HSTORE_ARRAY)
+        );
+
+        let array_alias = parse_regtype_object_name("_hstore").expect("parse");
+        assert_eq!(
+            hstore_extension_oid_for_name(&array_alias.0[0], false),
+            Some(crate::sql::pg_types::OID_HSTORE_ARRAY)
+        );
+        assert_eq!(hstore_extension_oid_for_name(&array_alias.0[0], true), None);
+
+        let quoted_upper = parse_regtype_object_name("\"HSTORE\"").expect("parse quoted");
+        assert_eq!(
+            hstore_extension_oid_for_name(&quoted_upper.0[0], false),
+            None
+        );
     }
 }

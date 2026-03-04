@@ -1,3 +1,15 @@
+hstore_null_before|hstore_arr_alias_null_before|hstore_arr_type_null_before
+t|t|t
+(1 row)
 hstore_rows|has_typarray
 1|t
+(1 row)
+hstore_visible_after_create|hstore_arr_alias_visible_after_create|hstore_arr_type_visible_after_create
+t|t|t
+(1 row)
+quoted_hstore_upper_null|quoted_public_schema_case_null|quoted_hstore_type_case_null
+t|t|t
+(1 row)
+hstore_null_after_drop|hstore_arr_alias_null_after_drop|hstore_arr_type_null_after_drop
+t|t|t
 (1 row)

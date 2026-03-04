@@ -157,16 +157,70 @@ pub fn format_type(args: Vec<Value>) -> Result<Value> {
     Ok(Value::Text(formatted))
 }
 
-fn normalize_regtype_input(raw: &str) -> (Option<String>, String) {
-    let normalized = raw.trim().replace('"', "").to_lowercase();
-    if let Some((schema, name)) = normalized.rsplit_once('.') {
-        (Some(schema.to_string()), name.to_string())
+/// Parsed identifier component of a regtype input.
+/// Tracks whether the identifier was double-quoted, which controls
+/// case-sensitivity: quoted = preserve case, unquoted = lowercased.
+#[derive(Debug)]
+struct RegTypeIdent {
+    value: String,
+    quoted: bool,
+}
+
+/// Collapse all runs of whitespace (spaces, tabs, newlines) to a single
+/// ASCII space. Matches PostgreSQL's whitespace normalization for type
+/// names like `interval  day   to   second` or `interval\tday`.
+fn normalize_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Parse a single identifier: quoted preserves case, unquoted lowercases.
+fn parse_regtype_ident(raw: &str) -> RegTypeIdent {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        RegTypeIdent {
+            value: trimmed[1..trimmed.len() - 1].to_string(),
+            quoted: true,
+        }
     } else {
-        (None, normalized)
+        RegTypeIdent {
+            value: trimmed.to_lowercase(),
+            quoted: false,
+        }
     }
 }
 
-fn strip_regtype_array_dims(raw: &str) -> (String, bool) {
+/// Parse a regtype input into (schema, name).
+///
+/// Splits at the last unquoted `.` for schema.name separation.
+/// Each component follows PostgreSQL identifier rules:
+///   - Quoted (double-quoted): strip outer quotes, preserve case
+///   - Unquoted: lowercase
+fn parse_regtype_input(raw: &str) -> (Option<RegTypeIdent>, RegTypeIdent) {
+    let trimmed = raw.trim();
+
+    // Find the last '.' outside double quotes to split schema.name.
+    let mut in_quotes = false;
+    let mut last_dot = None;
+    for (i, c) in trimmed.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '.' if !in_quotes => last_dot = Some(i),
+            _ => {}
+        }
+    }
+
+    let (schema_raw, name_raw) = match last_dot {
+        Some(pos) => (Some(&trimmed[..pos]), &trimmed[pos + 1..]),
+        None => (None, trimmed),
+    };
+
+    let schema = schema_raw.map(parse_regtype_ident);
+    let name = parse_regtype_ident(name_raw);
+
+    (schema, name)
+}
+
+pub(crate) fn strip_regtype_array_dims(raw: &str) -> (String, bool) {
     let mut name = raw.trim().to_string();
     let mut is_array = false;
     loop {
@@ -181,7 +235,7 @@ fn strip_regtype_array_dims(raw: &str) -> (String, bool) {
     (name, is_array)
 }
 
-fn strip_regtype_typmod(raw: &str) -> String {
+pub(crate) fn strip_regtype_typmod(raw: &str) -> String {
     let trimmed = raw.trim();
     if !trimmed.ends_with(')') {
         return trimmed.to_string();
@@ -201,6 +255,152 @@ fn strip_regtype_typmod(raw: &str) -> String {
         }
     }
     trimmed.to_string()
+}
+
+fn invalid_interval_type_name(original_name: &str) -> anyhow::Error {
+    crate::sql::error::SqlError::SqlStructure(format!("invalid type name \"{}\"", original_name))
+        .into()
+}
+
+/// Check if a name is a known PostgreSQL multi-word type.
+///
+/// PostgreSQL's grammar has special syntax for certain multi-word type names
+/// like `double precision`, `character varying`, `timestamp with time zone`,
+/// etc.  These contain spaces but are valid type names, not trailing junk.
+fn is_multi_word_pg_type(name: &str) -> bool {
+    matches!(
+        name,
+        "double precision"
+            | "character varying"
+            | "timestamp with time zone"
+            | "timestamp without time zone"
+            | "time with time zone"
+            | "time without time zone"
+            | "bit varying"
+    )
+}
+
+/// Validate interval precision inside `(N)`.
+///
+/// `paren_str` must start with `(`.
+/// PostgreSQL grammar uses `Iconst` here, so only unsigned decimal digits
+/// fitting signed 32-bit range are accepted by the raw parser.
+fn validate_interval_precision(paren_str: &str, original_name: &str) -> Result<String> {
+    let close = paren_str.find(')').ok_or_else(|| {
+        crate::sql::error::SqlError::SqlStructure(format!(
+            "invalid type name \"{}\"",
+            original_name
+        ))
+    })?;
+    let inner = paren_str[1..close].trim();
+    let after = paren_str[close + 1..].trim();
+    if !after.is_empty() {
+        return Err(invalid_interval_type_name(original_name));
+    }
+    // Match PostgreSQL Iconst syntax: only bare decimal digits.
+    if inner.is_empty() || !inner.chars().all(|c| c.is_ascii_digit()) {
+        return Err(invalid_interval_type_name(original_name));
+    }
+    // PG grammar: typmod is Iconst (non-negative integer). Negative values
+    // fail the parser. Out-of-range values (>6) are clamped with a WARNING
+    // but still return OID 1186. Values beyond i32 range are parser errors.
+    inner
+        .parse::<i32>()
+        .map(|_| "interval".to_string())
+        .map_err(|_| invalid_interval_type_name(original_name))
+}
+
+/// Normalize interval qualifier forms to bare "interval".
+///
+/// PostgreSQL accepts `interval`, `interval(3)`, `interval day to second`,
+/// `interval hour`, `interval second(3)`, etc.  All resolve to OID 1186.
+///
+/// Invalid qualifiers (e.g. `interval garbage`) or precision on qualifiers
+/// that don't accept it (e.g. `interval minute(3)`) are syntax errors —
+/// PostgreSQL's raw parser rejects them before `to_regtype` can catch the
+/// error, so the error propagates to the client.
+///
+/// Returns `Ok("interval")` for valid interval forms,
+/// `Ok(other)` for non-interval types (pass through),
+/// `Err` for invalid type names.
+///
+/// This function must be called on the ORIGINAL input (before
+/// `strip_regtype_typmod`), because it validates precision placement.
+pub(crate) fn normalize_interval_type(name: &str) -> Result<String> {
+    // Normalize whitespace: collapse all runs (spaces, tabs, newlines) to
+    // single space. PostgreSQL accepts `interval\tday`, `interval  (3)`, etc.
+    let lower = normalize_whitespace(&name.trim().to_lowercase());
+    if lower == "interval" {
+        return Ok(lower);
+    }
+    if !lower.starts_with("interval") {
+        return Ok(name.trim().to_string());
+    }
+    let rest = &lower["interval".len()..];
+    if rest.starts_with('(') {
+        // "interval(N)" — validate precision content
+        return validate_interval_precision(rest, name.trim());
+    }
+    if !rest.starts_with(' ') {
+        // e.g. "intervals" — not an interval type, return as-is
+        return Ok(name.trim().to_string());
+    }
+    let rest = rest.trim();
+
+    // "interval (3)" — bare precision with whitespace before `(`.
+    if rest.starts_with('(') {
+        return validate_interval_precision(rest, name.trim());
+    }
+
+    // Qualifiers that accept trailing precision `(N)` — only those ending
+    // in SECOND, per the PostgreSQL grammar.
+    const QUALIFIERS_WITH_PRECISION: &[&str] = &[
+        "day to second",
+        "hour to second",
+        "minute to second",
+        "second",
+    ];
+
+    const QUALIFIERS_NO_PRECISION: &[&str] = &[
+        "year to month",
+        "day to minute",
+        "day to hour",
+        "hour to minute",
+        "year",
+        "month",
+        "day",
+        "hour",
+        "minute",
+    ];
+
+    // Check qualifiers that accept precision first (longer matches first).
+    for &q in QUALIFIERS_WITH_PRECISION {
+        if rest == q {
+            return Ok("interval".to_string());
+        }
+        if let Some(suffix) = rest.strip_prefix(q) {
+            let trimmed = suffix.trim_start();
+            if trimmed.starts_with('(') {
+                return validate_interval_precision(trimmed, name.trim());
+            }
+        }
+    }
+
+    // Check qualifiers that do NOT accept precision.
+    for &q in QUALIFIERS_NO_PRECISION {
+        if rest == q {
+            return Ok("interval".to_string());
+        }
+        if let Some(suffix) = rest.strip_prefix(q) {
+            if suffix.trim_start().starts_with('(') {
+                // Precision on a qualifier that doesn't accept it.
+                return Err(invalid_interval_type_name(name.trim()));
+            }
+        }
+    }
+
+    // Unknown qualifier.
+    Err(invalid_interval_type_name(name.trim()))
 }
 
 fn regtype_array_oid(base_oid: i64) -> Option<i64> {
@@ -269,27 +469,90 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
         _ => return Err(anyhow::anyhow!("function to_regtype(text) does not exist")),
     };
 
+    // Step 1: Strip array suffix `[]`.
     let (without_array, is_array) = strip_regtype_array_dims(&raw);
-    let normalized = strip_regtype_typmod(&without_array);
-    let (schema, name) = normalize_regtype_input(&normalized);
-    if name.is_empty() || normalized.is_empty() {
+
+    // Step 2: Parse into structured schema.name with quoting semantics.
+    // Split BEFORE interval processing so that schema-qualified interval
+    // types like `pg_catalog.interval day to second` are handled correctly.
+    let (schema, name) = parse_regtype_input(&without_array);
+    if name.value.is_empty() {
         return Ok(Value::Null);
     }
 
-    let base_oid = match schema.as_deref() {
-        None => pg_catalog_regtype_oid(&name).or(match name.as_str() {
-            "hstore" => Some(pg_types::OID_HSTORE),
-            "_hstore" => Some(pg_types::OID_HSTORE_ARRAY),
-            _ => None,
-        }),
-        Some("pg_catalog") => pg_catalog_regtype_oid(&name),
-        Some("public") => match name.as_str() {
-            "hstore" => Some(pg_types::OID_HSTORE),
-            "_hstore" => Some(pg_types::OID_HSTORE_ARRAY),
-            _ => None,
-        },
-        Some(_) => None,
+    // Step 3: Early-exit for unknown schemas.
+    // If schema is present and doesn't match `pg_catalog`, the type cannot
+    // resolve — return NULL.  However, PG's raw parser still catches syntax
+    // errors regardless of schema: `noschema.interval(abc)` → NULL (valid
+    // parse, schema not found), but `noschema.interval garbage` → ERROR
+    // (bare word after type name is a parse error).
+    //
+    // For schema-qualified types PG uses the general `typename(typmod)`
+    // grammar, so a trailing `(...)` is a valid typmod expression.  A bare
+    // word after the identifier (without parens) is a syntax error.
+    if let Some(ref s) = schema {
+        if s.value != "pg_catalog" {
+            if !name.quoted {
+                let trimmed = name.value.trim();
+                // Check for a bare-word suffix after the type identifier.
+                // Unknown schema + any trailing bare word → syntax error.
+                // PG only allows parenthesized typmods after schema-qualified
+                // type names; interval qualifiers are NOT valid here.
+                if let Some(ws_pos) = trimmed.find(char::is_whitespace) {
+                    let after = trimmed[ws_pos..].trim_start();
+                    if !after.is_empty() && !after.starts_with('(') {
+                        return Err(invalid_interval_type_name(&raw));
+                    }
+                }
+            }
+            return Ok(Value::Null);
+        }
+    }
+
+    // Step 4: Resolve the type name.
+    // Quoted names: literal value (no interval processing, no typmod stripping).
+    // Unquoted names: normalize whitespace, validate interval forms, strip typmod.
+    let resolved_name = if name.quoted {
+        name.value.clone()
+    } else if schema.is_some() {
+        // Schema-qualified: no interval normalization.
+        // Trailing junk after the type name → ERROR, matching PG behavior.
+        // e.g. `pg_catalog.interval day to second` → ERROR (not NULL).
+        let ws_normalized = normalize_whitespace(&name.value);
+        let stripped = strip_regtype_typmod(&ws_normalized);
+        if stripped.contains(char::is_whitespace) && !is_multi_word_pg_type(&stripped) {
+            return Err(invalid_interval_type_name(&raw));
+        }
+        stripped
+    } else {
+        let ws_normalized = normalize_whitespace(&name.value);
+        let after_interval = normalize_interval_type(&ws_normalized)?;
+        if after_interval == "interval" {
+            after_interval
+        } else {
+            // Bare-word trailing junk check for non-interval unqualified types.
+            // e.g. `to_regtype('int4 garbage')` → ERROR, matching PG behavior.
+            // But PG has valid multi-word type names (double precision,
+            // character varying, timestamp with time zone, etc.) that must
+            // pass through.
+            let stripped = strip_regtype_typmod(&after_interval);
+            if stripped.contains(char::is_whitespace) && !is_multi_word_pg_type(&stripped) {
+                return Err(invalid_interval_type_name(&raw));
+            }
+            stripped
+        }
     };
+
+    // Step 5: Look up OID with `_typename` alias folding.
+    let base_oid = pg_catalog_regtype_oid(&resolved_name).or_else(|| {
+        if name.quoted {
+            return None;
+        }
+        resolved_name
+            .strip_prefix('_')
+            .and_then(pg_catalog_regtype_oid)
+            .and_then(regtype_array_oid)
+    });
 
     let oid = if is_array {
         base_oid.and_then(regtype_array_oid)
@@ -735,19 +998,19 @@ mod tests {
     fn test_to_regtype() {
         assert_eq!(
             to_regtype(vec![Value::Text("hstore".into())]).unwrap(),
-            Value::Int64(pg_types::OID_HSTORE)
+            Value::Null
         );
         assert_eq!(
             to_regtype(vec![Value::Text("hstore[]".into())]).unwrap(),
-            Value::Int64(pg_types::OID_HSTORE_ARRAY)
+            Value::Null
         );
         assert_eq!(
             to_regtype(vec![Value::Text("public.hstore".into())]).unwrap(),
-            Value::Int64(pg_types::OID_HSTORE)
+            Value::Null
         );
         assert_eq!(
             to_regtype(vec![Value::Text("\"public\".\"hstore\"".into())]).unwrap(),
-            Value::Int64(pg_types::OID_HSTORE)
+            Value::Null
         );
         assert_eq!(
             to_regtype(vec![Value::Text("integer".into())]).unwrap(),
@@ -782,6 +1045,63 @@ mod tests {
             Value::Null
         );
         assert_eq!(to_regtype(vec![Value::Null]).unwrap(), Value::Null);
+        // Quoted schema case-sensitivity: quoted "PG_CATALOG" ≠ pg_catalog → NULL
+        assert_eq!(
+            to_regtype(vec![Value::Text("\"PG_CATALOG\".int4".into())]).unwrap(),
+            Value::Null
+        );
+        // Quoted "pg_catalog" (exact case) → resolves normally
+        assert_eq!(
+            to_regtype(vec![Value::Text("\"pg_catalog\".int4".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INT4)
+        );
+        // Multi-word PG type names must resolve, not error as trailing junk.
+        assert_eq!(
+            to_regtype(vec![Value::Text("double precision".into())]).unwrap(),
+            Value::Int64(pg_types::OID_FLOAT8)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("character varying".into())]).unwrap(),
+            Value::Int64(pg_types::OID_VARCHAR)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("character varying(255)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_VARCHAR)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("timestamp with time zone".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIMESTAMPTZ)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("timestamp without time zone".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIMESTAMP)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("time without time zone".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIME)
+        );
+        // Multi-word types not in our OID table → NULL (not error)
+        assert_eq!(
+            to_regtype(vec![Value::Text("time with time zone".into())]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("bit varying".into())]).unwrap(),
+            Value::Null
+        );
+        // Case insensitive (unquoted identifiers are lowercased)
+        assert_eq!(
+            to_regtype(vec![Value::Text("Double Precision".into())]).unwrap(),
+            Value::Int64(pg_types::OID_FLOAT8)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("CHARACTER VARYING".into())]).unwrap(),
+            Value::Int64(pg_types::OID_VARCHAR)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("TIMESTAMP WITH TIME ZONE".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIMESTAMPTZ)
+        );
     }
 
     #[test]
@@ -802,6 +1122,275 @@ mod tests {
         );
         assert_eq!(pg_table_is_visible(vec![Value::Null]).unwrap(), Value::Null);
         assert_eq!(pg_table_is_visible(vec![]).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_to_regtype_array_aliases() {
+        // Gap 1: generic _typename → array OID
+        assert_eq!(
+            to_regtype(vec![Value::Text("_int4".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INT4_ARRAY)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("_bool".into())]).unwrap(),
+            Value::Int64(pg_types::OID_BOOL_ARRAY)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("_text".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TEXT_ARRAY)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("_float8".into())]).unwrap(),
+            Value::Int64(pg_types::OID_FLOAT8_ARRAY)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("_varchar".into())]).unwrap(),
+            Value::Int64(pg_types::OID_VARCHAR_ARRAY)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("_numeric".into())]).unwrap(),
+            Value::Int64(pg_types::OID_NUMERIC_ARRAY)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("_uuid".into())]).unwrap(),
+            Value::Int64(pg_types::OID_UUID_ARRAY)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("_jsonb".into())]).unwrap(),
+            Value::Int64(pg_types::OID_JSONB_ARRAY)
+        );
+        // _hstore is extension-defined (not pg_catalog builtin) in db9.
+        assert_eq!(
+            to_regtype(vec![Value::Text("_hstore".into())]).unwrap(),
+            Value::Null
+        );
+        // Schema-qualified _typename
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog._int4".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INT4_ARRAY)
+        );
+        // Unknown base type → NULL
+        assert_eq!(
+            to_regtype(vec![Value::Text("_nonexistent".into())]).unwrap(),
+            Value::Null
+        );
+        // Array-of-array not valid
+        assert_eq!(
+            to_regtype(vec![Value::Text("_int4[]".into())]).unwrap(),
+            Value::Null
+        );
+        // Quoted _typename aliases must NOT resolve (case-sensitive, no alias folding).
+        assert_eq!(
+            to_regtype(vec![Value::Text("\"_INT4\"".into())]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog.\"_INT4\"".into())]).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_to_regtype_interval_qualifiers() {
+        // Gap 2: interval qualifier forms → OID 1186
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval day to second".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval hour".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval year to month".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        // Precision on SECOND is valid
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval second(3)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval day to second(3)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval(3)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        // Edge: precision 0 and 6 are valid bounds
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval(0)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval(6)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        // Case-insensitive
+        assert_eq!(
+            to_regtype(vec![Value::Text("INTERVAL DAY TO SECOND".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        // Precision on non-SECOND qualifier → error (C2, C3)
+        assert!(to_regtype(vec![Value::Text("interval minute(3)".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("interval year(2)".into())]).is_err());
+        // Unknown qualifier → error (C1)
+        assert!(to_regtype(vec![Value::Text("interval garbage".into())]).is_err());
+        // Malformed typmod content → error (C8)
+        assert!(to_regtype(vec![Value::Text("interval(abc)".into())]).is_err());
+        // Non-negative out-of-range precision → OID (PG clamps, C9)
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval(999)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval(7)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval(2147483647)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert!(to_regtype(vec![Value::Text("interval(2147483648)".into())]).is_err());
+        // Negative precision → error (PG Iconst rejects '-', C10)
+        assert!(to_regtype(vec![Value::Text("interval(-1)".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("interval(+1)".into())]).is_err());
+        // Not a word-boundary match → NULL (unknown type, not an interval) (C6)
+        assert_eq!(
+            to_regtype(vec![Value::Text("intervals".into())]).unwrap(),
+            Value::Null
+        );
+        // Nonexistent type → NULL (C7)
+        assert_eq!(
+            to_regtype(vec![Value::Text("nonexistent_type".into())]).unwrap(),
+            Value::Null
+        );
+        // Whitespace normalization: multi-space, tab, space before precision
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval  day   to   second".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval\tday".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval (3)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval  (3)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval\t(3)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval  second  (3)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        // Schema-qualified interval with qualifier → ERROR (PG parity).
+        // PG treats trailing qualifier as invalid type name junk.
+        assert!(to_regtype(vec![Value::Text(
+            "pg_catalog.interval day to second".into()
+        )])
+        .is_err());
+        // Unknown schema + invalid interval typmod → NULL (schema resolution
+        // before interval validation: schema not found = NULL, no error).
+        assert_eq!(
+            to_regtype(vec![Value::Text("noschema.interval(abc)".into())]).unwrap(),
+            Value::Null
+        );
+        // Bare word after type name → syntax error (PG's parser rejects it).
+        assert!(to_regtype(vec![Value::Text("noschema.interval day to second".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("noschema.interval garbage".into())]).is_err());
+        // Non-interval types with trailing junk → syntax error.
+        assert!(to_regtype(vec![Value::Text("noschema.int4 garbage".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("noschema.foo garbage".into())]).is_err());
+        // Unqualified trailing junk → syntax error (PG parity).
+        assert!(to_regtype(vec![Value::Text("int4 garbage".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("text garbage".into())]).is_err());
+        // Quoted schema case-mismatch + invalid interval typmod → NULL
+        assert_eq!(
+            to_regtype(vec![Value::Text("\"PG_CATALOG\".interval(abc)".into())]).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_normalize_interval_type() {
+        assert_eq!(normalize_interval_type("interval").unwrap(), "interval");
+        assert_eq!(
+            normalize_interval_type("interval day to second").unwrap(),
+            "interval"
+        );
+        assert_eq!(
+            normalize_interval_type("interval hour").unwrap(),
+            "interval"
+        );
+        assert_eq!(
+            normalize_interval_type("interval second(3)").unwrap(),
+            "interval"
+        );
+        assert_eq!(
+            normalize_interval_type("interval day to second(3)").unwrap(),
+            "interval"
+        );
+        assert_eq!(
+            normalize_interval_type("INTERVAL YEAR TO MONTH").unwrap(),
+            "interval"
+        );
+        assert_eq!(normalize_interval_type("interval(0)").unwrap(), "interval");
+        assert_eq!(normalize_interval_type("interval(6)").unwrap(), "interval");
+        // Precision on non-SECOND qualifier → error
+        assert!(normalize_interval_type("interval minute(3)").is_err());
+        assert!(normalize_interval_type("interval year(2)").is_err());
+        // Unknown qualifier → error
+        assert!(normalize_interval_type("interval garbage").is_err());
+        // Malformed precision content → error
+        assert!(normalize_interval_type("interval(abc)").is_err());
+        // Non-negative out-of-range precision → Some (PG clamps, returns OID)
+        assert_eq!(
+            normalize_interval_type("interval(999)").unwrap(),
+            "interval"
+        );
+        assert_eq!(normalize_interval_type("interval(7)").unwrap(), "interval");
+        // Iconst upper bound is signed 32-bit.
+        assert_eq!(
+            normalize_interval_type("interval(2147483647)").unwrap(),
+            "interval"
+        );
+        assert!(normalize_interval_type("interval(2147483648)").is_err());
+        // Negative precision → error (PG Iconst rejects '-')
+        assert!(normalize_interval_type("interval(-1)").is_err());
+        assert!(normalize_interval_type("interval(+1)").is_err());
+        // Not interval types — returned as-is
+        assert_eq!(normalize_interval_type("intervals").unwrap(), "intervals");
+        assert_eq!(normalize_interval_type("integer").unwrap(), "integer");
+        // Whitespace normalization: multi-space, tab, space before precision
+        assert_eq!(
+            normalize_interval_type("interval  day   to   second").unwrap(),
+            "interval"
+        );
+        assert_eq!(
+            normalize_interval_type("interval\tday").unwrap(),
+            "interval"
+        );
+        assert_eq!(normalize_interval_type("interval (3)").unwrap(), "interval");
+        assert_eq!(
+            normalize_interval_type("interval  (3)").unwrap(),
+            "interval"
+        );
+        assert_eq!(
+            normalize_interval_type("interval\t(3)").unwrap(),
+            "interval"
+        );
+        assert_eq!(
+            normalize_interval_type("interval  second  (3)").unwrap(),
+            "interval"
+        );
     }
 
     #[test]
