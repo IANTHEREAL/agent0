@@ -53,6 +53,11 @@ to_regtype
 to_regtype
 1186
 (1 row)
+SET
+to_regtype
+NULL
+(1 row)
+SET
 to_regtype
 23
 (1 row)

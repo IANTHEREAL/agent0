@@ -31,6 +31,11 @@ SELECT to_regtype('"pg_catalog".int4');
 SELECT to_regtype('interval  day   to   second');
 SELECT to_regtype('interval (3)');
 
+-- Quoted search_path schema must not match hstore fallback (case-sensitive)
+SET search_path TO "Public";
+SELECT to_regtype('hstore');
+SET search_path TO public;
+
 -- Existing behavior regression
 SELECT to_regtype('integer');
 SELECT to_regtype('integer[]');

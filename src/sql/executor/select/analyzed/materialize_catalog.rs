@@ -1482,7 +1482,7 @@ async fn lookup_regtype_oid_with_hstore_extension(
                     return Ok(Some(def.oid as i64));
                 }
 
-                if schema.eq_ignore_ascii_case("public") {
+                if schema == "public" {
                     if let Some(ext_oid) =
                         lookup_hstore_extension_oid_if_enabled(store, txn, db_id, name, is_array)
                             .await?
