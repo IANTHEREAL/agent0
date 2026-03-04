@@ -15,7 +15,7 @@ SELECT to_regtype('interval year to month');
 SELECT to_regtype('interval(3)');
 SELECT to_regtype('interval garbage'); -- db9-specific: error text differs from PG
 SELECT to_regtype('interval(abc)'); -- db9-specific: error text differs from PG
-SELECT to_regtype('interval(999)');
+SELECT to_regtype('interval(999)'); -- db9-specific: db9 suppresses interval precision warning
 SELECT to_regtype('interval(2147483648)'); -- db9-specific: error text differs from PG
 SELECT to_regtype('interval(-1)'); -- db9-specific: error text differs from PG
 
