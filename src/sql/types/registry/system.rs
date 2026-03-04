@@ -14,6 +14,10 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         FunctionSignature::fixed(DataType::Text).with_args(0, Some(0)),
     );
     r.register(
+        "CURRENT_SCHEMAS",
+        FunctionSignature::fixed(DataType::Array(Box::new(DataType::Text))).with_args(1, Some(1)),
+    );
+    r.register(
         "CURRENT_DATABASE",
         FunctionSignature::fixed(DataType::Text).with_args(0, Some(0)),
     );

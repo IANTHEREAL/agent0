@@ -1,6 +1,6 @@
 use super::helpers::{int_col, int_val, owner_role_oid, schema_oid, text_col, text_val};
 use super::{ScanContext, VirtualTable};
-use crate::model::{Row, TableSchema};
+use crate::model::{Row, TableSchema, Value};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -20,7 +20,17 @@ impl VirtualTable for PgNamespace {
         TableSchema {
             table_id: 0,
             name: "pg_namespace".to_string(),
-            columns: vec![int_col("oid"), text_col("nspname"), int_col("nspowner")],
+            columns: vec![
+                int_col("oid"),
+                text_col("nspname"),
+                int_col("nspowner"),
+                // nspacl — access privileges (NULL = default).
+                text_col("nspacl"),
+                // xmin — PostgreSQL system column (transaction ID).
+                // JetBrains DataGrip reads this for incremental change detection.
+                // db9 has no MVCC xids, so we return a constant 1.
+                int_col("xmin"),
+            ],
             version: 1,
             pk_constraint_name: None,
             pk_indices: vec![],
@@ -56,6 +66,8 @@ impl VirtualTable for PgNamespace {
                     int_val(schema_oid(ctx.schema_oids, s)),
                     text_val(s),
                     int_val(owner_oid),
+                    Value::Null, // nspacl
+                    int_val(1),  // xmin (constant)
                 ])
             })
             .collect())

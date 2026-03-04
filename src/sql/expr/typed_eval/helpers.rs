@@ -125,6 +125,18 @@ pub(super) fn eval_function_call(
                 crate::session_context::current_search_path_first_schema(),
             ))
         }
+        "CURRENT_SCHEMAS" => {
+            // current_schemas(bool) → text[]
+            // true = include implicit schemas (pg_catalog), false = user schemas only
+            let include_implicit = match args.first() {
+                Some(Value::Boolean(b)) => *b,
+                _ => false,
+            };
+            let schemas = crate::session_context::current_search_path_schemas(include_implicit);
+            return Ok(Value::Array(
+                schemas.into_iter().map(Value::Text).collect(),
+            ));
+        }
         "CURRENT_USER" | "SESSION_USER" | "USER" => {
             return Ok(Value::Text(qctx.current_user.as_ref().to_string()));
         }
