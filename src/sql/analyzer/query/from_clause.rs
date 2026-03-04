@@ -95,6 +95,7 @@ impl<'a> Analyzer<'a> {
                     .unwrap_or_else(|| obj_name.clone());
                 let dispatch_name = if obj_name.eq_ignore_ascii_case("generate_series")
                     || obj_name.eq_ignore_ascii_case("unnest")
+                    || obj_name.eq_ignore_ascii_case("_db9_sys_record_migration")
                     || obj_name.eq_ignore_ascii_case("current_schema")
                     || obj_name.eq_ignore_ascii_case("current_database")
                     || obj_name.eq_ignore_ascii_case("current_user")
@@ -250,6 +251,12 @@ impl<'a> Analyzer<'a> {
                         // Scalar functions used in FROM return a single-row, single-column relation.
                         let col_name = obj_name.to_lowercase();
                         vec![(col_name, DataType::Text, false, None)]
+                    } else if obj_name.eq_ignore_ascii_case("_db9_sys_record_migration") {
+                        vec![
+                            ("name".to_string(), DataType::Text, false, None),
+                            ("applied_at".to_string(), DataType::Text, false, None),
+                            ("status".to_string(), DataType::Text, false, None),
+                        ]
                     } else {
                         return Err(AnalyzerError::Unsupported(format!(
                             "unsupported table-valued function: {}",

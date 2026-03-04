@@ -109,6 +109,7 @@ fn canonical_system_virtual_table_function(func_name: &str) -> Option<&'static s
         "_DB9_SYS_QUERY_SAMPLES" => Some("_DB9_SYS_QUERY_SAMPLES"),
         "_DB9_SYS_EXPORT_DDL" => Some("_DB9_SYS_EXPORT_DDL"),
         "_DB9_SYS_MIGRATIONS" => Some("_DB9_SYS_MIGRATIONS"),
+        "_DB9_SYS_RECORD_MIGRATION" => Some("_DB9_SYS_RECORD_MIGRATION"),
         "_DB9_SYS_TRIGGER_QUEUE_STATS" => Some("_DB9_SYS_TRIGGER_QUEUE_STATS"),
         "_DB9_SYS_TRIGGER_DLQ" => Some("_DB9_SYS_TRIGGER_DLQ"),
         _ => None,
@@ -124,11 +125,19 @@ pub(crate) fn infer_system_virtual_table_function_schema(
     name: &ObjectName,
     args: &[FunctionArg],
 ) -> Option<TableSchema> {
-    if !args.is_empty() {
-        return None;
-    }
     let base = name.0.last().map(names::normalize_ident)?;
     let canonical = canonical_system_virtual_table_function(&base)?;
+
+    // Most virtual-table-backed system functions are zero-arg.
+    // _DB9_SYS_RECORD_MIGRATION is the only supported arg-taking variant.
+    if canonical == "_DB9_SYS_RECORD_MIGRATION" {
+        if args.len() != 3 {
+            return None;
+        }
+    } else if !args.is_empty() {
+        return None;
+    }
+
     crate::sql::catalog::virtual_tables::virtual_table_schema(canonical)
 }
 
@@ -467,5 +476,43 @@ pub(crate) async fn infer_fs9_table_function_schema(
                 _ => Some(crate::extensions::fs::decoders::decode_raw_text(&[], &first, 0).schema),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlparser::ast::{Expr, Ident, Value as AstValue};
+
+    fn obj(name: &str) -> ObjectName {
+        ObjectName(vec![Ident::new(name)])
+    }
+
+    fn str_arg(s: &str) -> FunctionArg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
+            AstValue::SingleQuotedString(s.to_string()),
+        )))
+    }
+
+    #[test]
+    fn record_migration_schema_is_available_with_three_args() {
+        let schema = infer_system_virtual_table_function_schema(
+            &obj("_db9_sys_record_migration"),
+            &[str_arg("n"), str_arg("c"), str_arg("p")],
+        )
+        .expect("record migration schema");
+        assert_eq!(schema.columns.len(), 3);
+        assert_eq!(schema.columns[0].name, "name");
+        assert_eq!(schema.columns[1].name, "applied_at");
+        assert_eq!(schema.columns[2].name, "status");
+    }
+
+    #[test]
+    fn record_migration_schema_requires_three_args() {
+        assert!(infer_system_virtual_table_function_schema(
+            &obj("_db9_sys_record_migration"),
+            &[str_arg("n"), str_arg("c")],
+        )
+        .is_none());
     }
 }

@@ -1063,7 +1063,7 @@ pub async fn dump_database(
             &tenant.id,
             &cred.username,
             &cred.password_plain,
-            "SELECT * FROM _db9_sys_export_ddl() ORDER BY object_type",
+            "SELECT * FROM _db9_sys_export_ddl()",
         )
         .await
         .map_err(|e| AppError::bad_gateway(format!("Failed to export DDL: {e}")))?;
@@ -1390,7 +1390,7 @@ pub async fn branch_database(
             &source_tenant.id,
             &source_cred.username,
             &source_cred.password_plain,
-            "SELECT * FROM _db9_sys_export_ddl() ORDER BY object_type",
+            "SELECT * FROM _db9_sys_export_ddl()",
         )
         .await
         .map_err(|e| AppError::bad_gateway(format!("Failed to export source schema: {e}")))?;

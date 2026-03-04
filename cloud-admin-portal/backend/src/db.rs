@@ -276,11 +276,17 @@ pub async fn list_tenants(
     if let Some(query) = opts.q {
         let pattern = format!("%{query}%");
         filters.push(format!(
-            "(id LIKE ${p} OR COALESCE(notes,'') LIKE ${p} OR COALESCE(tags,'') LIKE ${p})",
-            p = param_idx
+            "(id LIKE ${p1} OR COALESCE(notes,'') LIKE ${p2} OR COALESCE(tags,'') LIKE ${p3})",
+            p1 = param_idx,
+            p2 = param_idx + 1,
+            p3 = param_idx + 2
         ));
+        // Keep one bind per placeholder: sqlite rewrites $n -> ? and does
+        // not support reusing a single bind position across repeated "?".
+        binds.push(pattern.clone());
+        binds.push(pattern.clone());
         binds.push(pattern);
-        param_idx += 1;
+        param_idx += 3;
     }
     if let Some(tag) = opts.tag {
         filters.push(format!("COALESCE(tags,'') LIKE ${param_idx}"));
@@ -313,13 +319,15 @@ pub async fn list_tenants(
     let mut list_where = where_clause.clone();
     if let Some((cursor_ts, cursor_id)) = opts.cursor {
         list_where.push_str(&format!(
-            " AND (created_at < ${p1} OR (created_at = ${p1} AND id < ${p2}))",
+            " AND (created_at < ${p1} OR (created_at = ${p2} AND id < ${p3}))",
             p1 = param_idx,
-            p2 = param_idx + 1
+            p2 = param_idx + 1,
+            p3 = param_idx + 2
         ));
         binds.push(cursor_ts.to_string());
+        binds.push(cursor_ts.to_string());
         binds.push(cursor_id.to_string());
-        param_idx += 2;
+        param_idx += 3;
     }
 
     let mut extra_binds: Vec<i64> = Vec::new();
