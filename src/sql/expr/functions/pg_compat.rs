@@ -157,13 +157,45 @@ pub fn format_type(args: Vec<Value>) -> Result<Value> {
     Ok(Value::Text(formatted))
 }
 
-fn normalize_regtype_input(raw: &str) -> (Option<String>, String) {
-    let normalized = raw.trim().replace('"', "").to_lowercase();
-    if let Some((schema, name)) = normalized.rsplit_once('.') {
-        (Some(schema.to_string()), name.to_string())
-    } else {
-        (None, normalized)
+/// Parse a regtype input into (schema, name, name_was_quoted).
+///
+/// Quoted identifiers preserve case (case-sensitive); unquoted identifiers
+/// are lowercased (case-insensitive), matching PostgreSQL identifier semantics.
+fn normalize_regtype_input(raw: &str) -> (Option<String>, String, bool) {
+    let trimmed = raw.trim();
+
+    // Find the last '.' outside double quotes to split schema.name.
+    let mut in_quotes = false;
+    let mut last_dot = None;
+    for (i, c) in trimmed.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '.' if !in_quotes => last_dot = Some(i),
+            _ => {}
+        }
     }
+
+    let (schema_raw, name_raw) = match last_dot {
+        Some(pos) => (Some(&trimmed[..pos]), &trimmed[pos + 1..]),
+        None => (None, trimmed),
+    };
+
+    // Schema: strip quotes, lowercase (existing behavior).
+    let schema = schema_raw.map(|s| s.trim().replace('"', "").to_lowercase());
+
+    // Name: detect quoting to preserve case for quoted identifiers.
+    let name_trimmed = name_raw.trim();
+    let name_was_quoted =
+        name_trimmed.starts_with('"') && name_trimmed.ends_with('"') && name_trimmed.len() >= 2;
+    let name = if name_was_quoted {
+        // Quoted: strip outer quotes, preserve case.
+        name_trimmed[1..name_trimmed.len() - 1].to_string()
+    } else {
+        // Unquoted: lowercase.
+        name_trimmed.to_lowercase()
+    };
+
+    (schema, name, name_was_quoted)
 }
 
 pub(crate) fn strip_regtype_array_dims(raw: &str) -> (String, bool) {
@@ -400,13 +432,17 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
     } else {
         strip_regtype_typmod(&after_interval)
     };
-    let (schema, name) = normalize_regtype_input(&ready);
+    let (schema, name, name_was_quoted) = normalize_regtype_input(&ready);
     if name.is_empty() || ready.is_empty() {
         return Ok(Value::Null);
     }
 
     let base_oid = match schema.as_deref() {
         None => pg_catalog_regtype_oid(&name).or_else(|| {
+            if name_was_quoted {
+                // Quoted identifier is case-sensitive — skip alias folding.
+                return None;
+            }
             // Generic _typename → array alias for pg_catalog builtins.
             // e.g. _int4 → strip '_' → pg_catalog_regtype_oid("int4") → regtype_array_oid
             name.strip_prefix('_')
@@ -414,6 +450,9 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
                 .and_then(regtype_array_oid)
         }),
         Some("pg_catalog") => pg_catalog_regtype_oid(&name).or_else(|| {
+            if name_was_quoted {
+                return None;
+            }
             name.strip_prefix('_')
                 .and_then(pg_catalog_regtype_oid)
                 .and_then(regtype_array_oid)
@@ -987,6 +1026,15 @@ mod tests {
         // Array-of-array not valid
         assert_eq!(
             to_regtype(vec![Value::Text("_int4[]".into())]).unwrap(),
+            Value::Null
+        );
+        // Quoted _typename aliases must NOT resolve (case-sensitive, no alias folding).
+        assert_eq!(
+            to_regtype(vec![Value::Text("\"_INT4\"".into())]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog.\"_INT4\"".into())]).unwrap(),
             Value::Null
         );
     }

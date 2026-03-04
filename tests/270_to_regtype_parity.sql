@@ -19,6 +19,10 @@ SELECT to_regtype('interval(999)');
 SELECT to_regtype('interval(2147483648)'); -- db9-specific: error text differs from PG
 SELECT to_regtype('interval(-1)'); -- db9-specific: error text differs from PG
 
+-- Quoted _typename aliases: case-sensitive, must NOT match alias list
+SELECT to_regtype('"_INT4"');
+SELECT to_regtype('pg_catalog."_INT4"');
+
 -- Existing behavior regression
 SELECT to_regtype('integer');
 SELECT to_regtype('integer[]');
