@@ -1097,7 +1097,7 @@ impl Executor {
         }
 
         let store = self.store();
-        if let Some(ext_oid) = lookup_hstore_extension_regtype_oid(
+        let oid = lookup_regtype_oid_with_hstore_extension(
             &store,
             txn,
             db_id,
@@ -1105,18 +1105,7 @@ impl Executor {
             is_array,
             search_path,
         )
-        .await?
-        {
-            return Ok(Value::Int64(ext_oid));
-        }
-
-        if is_array {
-            // db9 does not synthesize array OIDs for user-defined base types yet.
-            return Ok(Value::Null);
-        }
-
-        let oid =
-            lookup_user_defined_regtype_oid(&store, txn, db_id, &normalized, search_path).await?;
+        .await?;
         Ok(oid.map(Value::Int64).unwrap_or(Value::Null))
     }
 }
@@ -1419,63 +1408,19 @@ async fn lookup_typname_by_oid(
         .map(|t| t.name))
 }
 
-async fn lookup_user_defined_regtype_oid(
-    store: &Arc<crate::storage::TikvStore>,
-    txn: &mut Transaction,
-    db_id: u64,
-    normalized_type_name: &str,
-    search_path: &[String],
-) -> Result<Option<i64>> {
-    let Some(type_name) = parse_regtype_object_name(normalized_type_name) else {
-        return Ok(None);
-    };
-
-    let Some(resolved) =
-        crate::sql::names::resolve_existing_type_name(store, txn, db_id, &type_name, search_path)
-            .await?
-    else {
-        return Ok(None);
-    };
-
-    Ok(store
-        .get_type(txn, db_id, &resolved.full)
-        .await?
-        .map(|def| def.oid as i64))
+fn regtype_search_path_schemas(search_path: &[String]) -> Vec<&str> {
+    let mut schemas: Vec<&str> = search_path
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| !s.eq_ignore_ascii_case("$user"))
+        .collect();
+    if schemas.is_empty() {
+        schemas.push("public");
+    }
+    schemas
 }
 
-async fn lookup_hstore_extension_regtype_oid(
-    store: &Arc<crate::storage::TikvStore>,
-    txn: &mut Transaction,
-    db_id: u64,
-    normalized_type_name: &str,
-    is_array: bool,
-    search_path: &[String],
-) -> Result<Option<i64>> {
-    let Some(installed) = store.get_extension(txn, db_id, "hstore").await? else {
-        return Ok(None);
-    };
-    if !installed.enabled {
-        return Ok(None);
-    }
-
-    let Some(type_name) = parse_regtype_object_name(normalized_type_name) else {
-        return Ok(None);
-    };
-    let parts = type_name.0;
-    let (schema, name) = match parts.as_slice() {
-        [name] => (None, name),
-        [schema, name] => (Some(schema), name),
-        _ => return Ok(None),
-    };
-
-    let schema_matches = match schema {
-        None => search_path.iter().any(|s| s.eq_ignore_ascii_case("public")),
-        Some(s) => regtype_ident_matches(s, "public"),
-    };
-    if !schema_matches {
-        return Ok(None);
-    }
-
+fn hstore_extension_oid_for_name(name: &sqlparser::ast::Ident, is_array: bool) -> Option<i64> {
     let base_oid = if regtype_ident_matches(name, "hstore") {
         Some(crate::sql::pg_types::OID_HSTORE)
     } else if regtype_ident_matches(name, "_hstore") {
@@ -1484,22 +1429,95 @@ async fn lookup_hstore_extension_regtype_oid(
         None
     };
 
-    let oid = if is_array {
+    if is_array {
         match base_oid {
             Some(crate::sql::pg_types::OID_HSTORE) => Some(crate::sql::pg_types::OID_HSTORE_ARRAY),
             _ => None,
         }
     } else {
         base_oid
-    };
+    }
+}
 
-    Ok(oid)
+async fn lookup_hstore_extension_oid_if_enabled(
+    store: &Arc<crate::storage::TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    name: &sqlparser::ast::Ident,
+    is_array: bool,
+) -> Result<Option<i64>> {
+    let Some(ext_oid) = hstore_extension_oid_for_name(name, is_array) else {
+        return Ok(None);
+    };
+    let Some(installed) = store.get_extension(txn, db_id, "hstore").await? else {
+        return Ok(None);
+    };
+    if !installed.enabled {
+        return Ok(None);
+    }
+    Ok(Some(ext_oid))
+}
+
+async fn lookup_regtype_oid_with_hstore_extension(
+    store: &Arc<crate::storage::TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    normalized_type_name: &str,
+    is_array: bool,
+    search_path: &[String],
+) -> Result<Option<i64>> {
+    let Some(type_name) = parse_regtype_object_name(normalized_type_name) else {
+        return Ok(None);
+    };
+    let parts = type_name.0;
+    match parts.as_slice() {
+        [name] => {
+            for schema in regtype_search_path_schemas(search_path) {
+                let full_name = format!("{}.{}", schema, name.value);
+                if let Some(def) = store.get_type(txn, db_id, &full_name).await? {
+                    if is_array {
+                        // db9 does not synthesize array OIDs for user-defined base types yet.
+                        return Ok(None);
+                    }
+                    return Ok(Some(def.oid as i64));
+                }
+
+                if schema.eq_ignore_ascii_case("public") {
+                    if let Some(ext_oid) =
+                        lookup_hstore_extension_oid_if_enabled(store, txn, db_id, name, is_array)
+                            .await?
+                    {
+                        return Ok(Some(ext_oid));
+                    }
+                }
+            }
+            Ok(None)
+        }
+        [schema, name] => {
+            let full_name = format!("{}.{}", schema.value, name.value);
+            if let Some(def) = store.get_type(txn, db_id, &full_name).await? {
+                if is_array {
+                    // db9 does not synthesize array OIDs for user-defined base types yet.
+                    return Ok(None);
+                }
+                return Ok(Some(def.oid as i64));
+            }
+
+            if regtype_ident_matches(schema, "public") {
+                return lookup_hstore_extension_oid_if_enabled(store, txn, db_id, name, is_array)
+                    .await;
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        advisory_lock_timeout, find_text_column, parse_regtype_object_name, regtype_ident_matches,
+        advisory_lock_timeout, find_text_column, hstore_extension_oid_for_name,
+        parse_regtype_object_name, regtype_ident_matches, regtype_search_path_schemas,
         split_regtype_name_parts, strip_regtype_array_dims, strip_regtype_typmod,
         value_to_bool_strict, value_to_i64, value_to_i64_strict,
     };
@@ -1819,5 +1837,39 @@ mod tests {
         assert_eq!(parts, vec!["\"A\"".to_string(), "\"B\"".to_string()]);
         let escaped = split_regtype_name_parts("\"A\"\"B\"").expect("split escaped");
         assert_eq!(escaped, vec!["\"A\"\"B\"".to_string()]);
+    }
+
+    #[test]
+    fn test_regtype_search_path_schemas_preserves_order_and_defaults_public() {
+        let path = vec!["$user".to_string(), "s1".to_string(), "public".to_string()];
+        let schemas = regtype_search_path_schemas(&path);
+        assert_eq!(schemas, vec!["s1", "public"]);
+        assert_eq!(regtype_search_path_schemas(&[]), vec!["public"]);
+    }
+
+    #[test]
+    fn test_hstore_extension_oid_for_name_respects_identifier_and_array_rules() {
+        let hstore = parse_regtype_object_name("hstore").expect("parse");
+        assert_eq!(
+            hstore_extension_oid_for_name(&hstore.0[0], false),
+            Some(crate::sql::pg_types::OID_HSTORE)
+        );
+        assert_eq!(
+            hstore_extension_oid_for_name(&hstore.0[0], true),
+            Some(crate::sql::pg_types::OID_HSTORE_ARRAY)
+        );
+
+        let array_alias = parse_regtype_object_name("_hstore").expect("parse");
+        assert_eq!(
+            hstore_extension_oid_for_name(&array_alias.0[0], false),
+            Some(crate::sql::pg_types::OID_HSTORE_ARRAY)
+        );
+        assert_eq!(hstore_extension_oid_for_name(&array_alias.0[0], true), None);
+
+        let quoted_upper = parse_regtype_object_name("\"HSTORE\"").expect("parse quoted");
+        assert_eq!(
+            hstore_extension_oid_for_name(&quoted_upper.0[0], false),
+            None
+        );
     }
 }
