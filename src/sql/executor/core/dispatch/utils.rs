@@ -184,7 +184,9 @@ pub(in crate::sql::executor::core) fn wrap_with_runtime_context<'a, T: Send + 'a
     tikv_client: Option<Arc<TransactionClient>>,
     fut: impl Future<Output = T> + Send + 'a,
 ) -> Pin<Box<dyn Future<Output = T> + Send + 'a>> {
-    #[cfg(debug_assertions)]
+    // Keep the inner statement future boxed across build modes so the task-local
+    // scope chain does not monomorphize into an excessively deep async frame in
+    // release builds.
     let fut = Box::pin(fut);
 
     let tz = settings.timezone.clone();
