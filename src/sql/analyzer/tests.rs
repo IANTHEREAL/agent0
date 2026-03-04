@@ -4191,3 +4191,122 @@ fn collate_three_part_name_is_rejected() {
         err
     );
 }
+
+#[test]
+fn pg_namespace_xmin_qualified_analyzes_as_constant_without_join_width_shift() {
+    let catalog = MockCatalog::builder()
+        .table_in_schema(
+            "pg_catalog",
+            "pg_namespace",
+            vec![
+                ("oid", DataType::Int64, false),
+                ("nspname", DataType::Text, false),
+                ("nspowner", DataType::Int64, false),
+                ("nspacl", DataType::Array(Box::new(DataType::Text)), true),
+            ],
+        )
+        .table_in_schema(
+            "pg_catalog",
+            "pg_constraint",
+            vec![
+                ("oid", DataType::Int64, false),
+                ("connamespace", DataType::Int64, false),
+                ("contype", DataType::Text, false),
+            ],
+        )
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+
+    let query = parse_query(
+        "SELECT ns.xmin \
+         FROM pg_catalog.pg_namespace ns \
+         JOIN pg_catalog.pg_constraint con1 ON con1.connamespace = ns.oid \
+         WHERE con1.contype = 'f'",
+    );
+    let analyzed = analyzer.analyze_query(&query).unwrap();
+    let sel = expect_select(&analyzed);
+
+    match &sel.projection[0].expr.kind {
+        TypedExprKind::Constant(crate::model::Value::Int64(1)) => {}
+        other => panic!(
+            "expected pg_namespace.xmin to analyze as constant, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+
+    let where_expr = sel.where_clause.as_ref().expect("WHERE should exist");
+    match &where_expr.kind {
+        TypedExprKind::BinaryOp { left, op, right } => {
+            assert_eq!(*op, BinaryOp::Eq);
+            assert_eq!(left.data_type, DataType::Text);
+            assert_eq!(right.data_type, DataType::Text);
+            match &left.kind {
+                TypedExprKind::ColumnRef { column_index, .. } => {
+                    // pg_namespace visible width is 4; pg_constraint.contype is local index 2.
+                    assert_eq!(*column_index, 6);
+                }
+                other => panic!(
+                    "expected left side to be ColumnRef, got {:?}",
+                    std::mem::discriminant(other)
+                ),
+            }
+        }
+        other => panic!(
+            "expected WHERE BinaryOp, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+}
+
+#[test]
+fn pg_namespace_xmin_unqualified_is_available_when_unambiguous() {
+    let catalog = MockCatalog::builder()
+        .table_in_schema(
+            "pg_catalog",
+            "pg_namespace",
+            vec![
+                ("oid", DataType::Int64, false),
+                ("nspname", DataType::Text, false),
+                ("nspowner", DataType::Int64, false),
+                ("nspacl", DataType::Array(Box::new(DataType::Text)), true),
+            ],
+        )
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+
+    let analyzed = analyzer
+        .analyze_query(&parse_query("SELECT xmin FROM pg_catalog.pg_namespace"))
+        .unwrap();
+    let sel = expect_select(&analyzed);
+    assert!(matches!(
+        sel.projection[0].expr.kind,
+        TypedExprKind::Constant(crate::model::Value::Int64(1))
+    ));
+}
+
+#[test]
+fn pg_namespace_xmin_unqualified_is_ambiguous_with_multiple_bindings() {
+    let catalog = MockCatalog::builder()
+        .table_in_schema(
+            "pg_catalog",
+            "pg_namespace",
+            vec![
+                ("oid", DataType::Int64, false),
+                ("nspname", DataType::Text, false),
+                ("nspowner", DataType::Int64, false),
+                ("nspacl", DataType::Array(Box::new(DataType::Text)), true),
+            ],
+        )
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+
+    let err = analyzer
+        .analyze_query(&parse_query(
+            "SELECT xmin FROM pg_catalog.pg_namespace a, pg_catalog.pg_namespace b",
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::AmbiguousColumn { ref name, .. } if name == "xmin"
+    ));
+}

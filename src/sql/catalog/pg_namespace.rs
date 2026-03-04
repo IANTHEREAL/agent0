@@ -1,4 +1,6 @@
-use super::helpers::{int_col, int_val, owner_role_oid, schema_oid, text_col, text_val};
+use super::helpers::{
+    int_col, int_val, owner_role_oid, schema_oid, text_array_col, text_col, text_val,
+};
 use super::{ScanContext, VirtualTable};
 use crate::model::{Row, TableSchema, Value};
 use anyhow::Result;
@@ -24,10 +26,8 @@ impl VirtualTable for PgNamespace {
                 int_col("oid"),
                 text_col("nspname"),
                 int_col("nspowner"),
-                // nspacl — access privileges (NULL = no explicit ACL, PG default).
-                text_col("nspacl"),
-                // xmin — PG system column (inserting txn ID). Constant for synthetic catalog rows.
-                int_col("xmin"),
+                // nspacl — access privileges; NULL = no explicit ACL (PG default).
+                text_array_col("nspacl"),
             ],
             version: 1,
             pk_constraint_name: None,
@@ -65,7 +65,6 @@ impl VirtualTable for PgNamespace {
                     text_val(s),
                     int_val(owner_oid),
                     Value::Null, // nspacl — NULL means default privileges (PG parity)
-                    int_val(1),  // xmin — constant (no MVCC for catalog rows)
                 ])
             })
             .collect())

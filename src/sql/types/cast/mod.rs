@@ -609,11 +609,12 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 return Ok(Value::Int64(n));
             }
             // Try well-known catalog relation names (with optional pg_catalog. prefix).
-            let name = trimmed
+            // Prefix handling must be case-insensitive (PG_CATALOG.pg_class is valid).
+            let normalized = trimmed.to_lowercase();
+            let name = normalized
                 .strip_prefix("pg_catalog.")
-                .unwrap_or(trimmed)
-                .to_lowercase();
-            if let Some(oid) = regclass_catalog_oid(&name) {
+                .unwrap_or(normalized.as_str());
+            if let Some(oid) = regclass_catalog_oid(name) {
                 return Ok(Value::Int64(oid));
             }
             Err(SqlError::InvalidInputSyntax {

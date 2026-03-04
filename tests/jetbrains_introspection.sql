@@ -79,5 +79,18 @@ SELECT 'nspacl_exists='
 FROM pg_catalog.pg_namespace
 WHERE nspacl IS NULL;
 
+-- 9. SELECT * on pg_namespace should still succeed with hidden system columns
+SELECT 'pg_namespace_star='
+       || count(*)::text
+FROM (
+    SELECT * FROM pg_catalog.pg_namespace LIMIT 1
+) s;
+
+-- 10. pg_namespace.xmin remains queryable as a qualified system column
+SELECT 'pg_namespace_xmin_qualified='
+       || (count(*) > 0)::text
+FROM pg_catalog.pg_namespace n
+WHERE n.xmin IS NOT NULL;
+
 -- Cleanup
 DROP TABLE jb_test;

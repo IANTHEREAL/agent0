@@ -97,13 +97,21 @@ pub struct Scope {
     /// schema-qualified wildcards to expand only the correct table's columns.
     table_source_schemas: HashMap<String, Vec<(String, Range<usize>)>>,
 
+    /// Source relation names for each table alias (normalized alias →
+    /// list of (qualified_relation_name, column_range)).
+    ///
+    /// Used for targeted compatibility behaviors that depend on relation
+    /// identity (for example, pg_namespace system-column handling) without
+    /// changing row-width accounting for unrelated queries.
+    table_source_relations: HashMap<String, Vec<(String, Range<usize>)>>,
+
     /// Whether aggregate functions are allowed in expressions at this level.
     pub allow_aggregates: bool,
 
     /// Whether window functions are allowed in expressions at this level.
     pub allow_windows: bool,
 
-    /// Whether `add_table` should append synthetic system columns (currently `ctid`).
+    /// Whether `add_table` should append default synthetic system columns.
     /// Disabled by default; enabled only for DML scopes that need PostgreSQL
     /// compatibility for table-qualified `alias.ctid`.
     add_system_columns: bool,
@@ -127,6 +135,7 @@ impl Scope {
             using_merged_by_left: HashMap::new(),
             cte_schemas: HashMap::new(),
             table_source_schemas: HashMap::new(),
+            table_source_relations: HashMap::new(),
             allow_aggregates: false,
             allow_windows: false,
             add_system_columns: false,
@@ -155,6 +164,51 @@ impl Scope {
     /// Returns `Some(slice)` with one or more (schema, column_range) entries otherwise.
     pub fn source_schemas_for_alias(&self, alias: &str) -> Option<&[(String, Range<usize>)]> {
         self.table_source_schemas.get(alias).map(|v| v.as_slice())
+    }
+
+    /// Record the source relation and column range for a table alias.
+    pub fn set_table_source_relation(
+        &mut self,
+        alias: &str,
+        relation: &str,
+        col_range: Range<usize>,
+    ) {
+        self.table_source_relations
+            .entry(alias.to_string())
+            .or_default()
+            .push((relation.to_lowercase(), col_range));
+    }
+
+    fn alias_matches_relation_ident(&self, table: &Ident, relation: &str) -> bool {
+        let rel_lower = relation.to_lowercase();
+        self.table_source_relations.iter().any(|(alias, entries)| {
+            Self::ident_matches_name(alias, table)
+                && entries
+                    .iter()
+                    .any(|(bound_rel, _range)| bound_rel == &rel_lower)
+        })
+    }
+
+    /// Whether this scope contains any table alias matching `table`.
+    fn has_matching_alias(&self, table: &Ident) -> bool {
+        self.table_source_relations
+            .keys()
+            .any(|alias| Self::ident_matches_name(alias, table))
+    }
+
+    fn relation_aliases(&self, relation: &str) -> Vec<String> {
+        let rel_lower = relation.to_lowercase();
+        let mut result = Vec::new();
+        for (alias, entries) in &self.table_source_relations {
+            let count = entries
+                .iter()
+                .filter(|(bound_rel, _)| bound_rel == &rel_lower)
+                .count();
+            for _ in 0..count {
+                result.push(alias.clone());
+            }
+        }
+        result
     }
 
     /// Build a scope from a `TableSchema`, using the table name (or alias) as qualifier.
@@ -199,6 +253,25 @@ impl Scope {
         self.add_table_internal(alias, columns, false);
     }
 
+    /// Append a hidden, qualified-only column to the current flattened scope row.
+    ///
+    /// Hidden columns are excluded from unqualified resolution and `SELECT *`
+    /// expansion, but remain resolvable via `alias.column`.
+    pub fn add_hidden_qualified_column(&mut self, alias: &str, name: &str, data_type: DataType) {
+        let abs_index = self.columns.len();
+        self.qualified_index
+            .insert((alias.to_lowercase(), name.to_lowercase()), abs_index);
+        self.columns.push(ScopeColumn {
+            table_alias: Some(alias.to_string()),
+            column_name: name.to_string(),
+            column_index: abs_index,
+            data_type,
+            nullable: false,
+            hidden: true,
+            collation: None,
+        });
+    }
+
     fn add_table_internal(
         &mut self,
         alias: &str,
@@ -233,19 +306,7 @@ impl Scope {
 
         if include_system_columns {
             // Add synthetic ctid system column (hidden, only accessible via table.ctid).
-            let ctid_index = self.columns.len();
-            let ctid_col = ScopeColumn {
-                table_alias: Some(alias.to_string()),
-                column_name: "ctid".to_string(),
-                column_index: ctid_index,
-                data_type: DataType::Int64,
-                nullable: false,
-                hidden: true,
-                collation: None,
-            };
-            self.qualified_index
-                .insert((alias.to_lowercase(), "ctid".to_string()), ctid_index);
-            self.columns.push(ctid_col);
+            self.add_hidden_qualified_column(alias, "ctid", DataType::Int64);
         }
     }
 
@@ -548,6 +609,46 @@ impl ScopeStack {
         }
         None
     }
+
+    /// Return whether `table` resolves to `relation` in the nearest scope
+    /// that contains a matching alias. Stops at the first scope with the
+    /// alias so that inner-scope aliases shadow outer ones.
+    pub fn table_ident_matches_relation(&self, table: &Ident, relation: &str) -> bool {
+        for scope in self.scopes.iter().rev() {
+            if scope.has_matching_alias(table) {
+                return scope.alias_matches_relation_ident(table, relation);
+            }
+        }
+        false
+    }
+
+    /// Resolve relation-backed synthetic unqualified columns at the nearest scope.
+    ///
+    /// Returns:
+    /// - `Ok(Some(depth))` when exactly one matching relation binding exists
+    ///   in the nearest scope that has any such binding.
+    /// - `Err(AmbiguousColumn)` when multiple bindings exist in that nearest scope.
+    /// - `Ok(None)` when no matching relation exists in visible scopes.
+    pub fn resolve_unqualified_relation_column_scope_depth(
+        &self,
+        ident_name: &str,
+        relation: &str,
+    ) -> Result<Option<u32>, AnalyzerError> {
+        for (depth, scope) in self.scopes.iter().rev().enumerate() {
+            let aliases = scope.relation_aliases(relation);
+            if aliases.is_empty() {
+                continue;
+            }
+            if aliases.len() > 1 {
+                return Err(AnalyzerError::AmbiguousColumn {
+                    name: ident_name.to_string(),
+                    tables: aliases,
+                });
+            }
+            return Ok(Some(depth as u32));
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -626,6 +727,37 @@ mod tests {
         assert_eq!(ctid.column_name, "ctid");
         assert_eq!(ctid.column_index, 1);
         assert_eq!(ctid.data_type, DataType::Int64);
+    }
+
+    #[test]
+    fn hidden_qualified_column_is_not_visible_to_unqualified_or_star() {
+        use sqlparser::ast::Ident;
+
+        let mut scope = Scope::new();
+        scope.add_table("n", &[int_col("oid"), text_col("nspname")]);
+        scope.add_hidden_qualified_column("n", "xmin", DataType::Int64);
+
+        // Hidden system column is available via alias-qualified access.
+        let xmin = scope
+            .resolve_qualified_idents(&Ident::new("n"), &Ident::new("xmin"))
+            .expect("qualified hidden system column should resolve");
+        assert_eq!(xmin.column_index, 2);
+        assert_eq!(xmin.data_type, DataType::Int64);
+
+        // Hidden system column is not available to unqualified resolution.
+        assert!(scope
+            .resolve_unqualified_with_ident(&Ident::new("xmin"))
+            .unwrap()
+            .is_none());
+
+        // Hidden columns must stay excluded from the visible column set.
+        let names: Vec<String> = scope
+            .columns
+            .iter()
+            .filter(|c| !c.hidden)
+            .map(|c| c.column_name.clone())
+            .collect();
+        assert_eq!(names, vec!["oid".to_string(), "nspname".to_string()]);
     }
 
     #[test]
@@ -823,5 +955,89 @@ mod tests {
         assert_eq!(entries[0].1, 0..1);
         assert_eq!(entries[1].0, "s2");
         assert_eq!(entries[1].1, 1..2);
+    }
+
+    #[test]
+    fn scope_shadowing_stops_at_nearest_alias() {
+        use sqlparser::ast::Ident;
+
+        let mut stack = ScopeStack::new();
+
+        // Outer scope: alias "n" bound to pg_catalog.pg_namespace
+        let mut outer = Scope::new();
+        outer.add_table("n", &[int_col("oid"), text_col("nspname")]);
+        outer.set_table_source_relation("n", "pg_catalog.pg_namespace", 0..2);
+        stack.push(outer);
+
+        // Inner scope: alias "n" bound to a different relation (subquery)
+        let mut inner = Scope::new();
+        inner.add_table("n", &[int_col("oid")]);
+        inner.set_table_source_relation("n", "subquery", 0..1);
+        stack.push(inner);
+
+        // "n" should NOT match pg_namespace — inner scope shadows the outer.
+        assert!(!stack.table_ident_matches_relation(&Ident::new("n"), "pg_catalog.pg_namespace"));
+
+        // "n" should match the inner relation.
+        assert!(stack.table_ident_matches_relation(&Ident::new("n"), "subquery"));
+    }
+
+    #[test]
+    fn same_alias_multi_binding_is_ambiguous() {
+        let mut scope = Scope::new();
+        // Simulate FROM s1.pg_namespace, s2.pg_namespace (no explicit aliases)
+        scope.add_table("pg_namespace", &[int_col("oid")]);
+        scope.set_table_source_relation("pg_namespace", "pg_catalog.pg_namespace", 0..1);
+        scope.add_table("pg_namespace", &[int_col("oid")]);
+        scope.set_table_source_relation("pg_namespace", "pg_catalog.pg_namespace", 1..2);
+
+        let aliases = scope.relation_aliases("pg_catalog.pg_namespace");
+        assert_eq!(
+            aliases.len(),
+            2,
+            "should count both bindings, not just unique keys"
+        );
+
+        // The ambiguity check in resolve_unqualified_relation_column_scope_depth
+        // relies on aliases.len() > 1.
+        let mut stack = ScopeStack::new();
+        stack.push(scope);
+        let result = stack
+            .resolve_unqualified_relation_column_scope_depth("xmin", "pg_catalog.pg_namespace");
+        assert!(
+            matches!(result, Err(AnalyzerError::AmbiguousColumn { .. })),
+            "same alias with multiple relation bindings should be ambiguous"
+        );
+    }
+
+    #[test]
+    fn derived_table_alias_shadows_outer_relation() {
+        use sqlparser::ast::Ident;
+
+        let mut stack = ScopeStack::new();
+
+        // Outer scope: alias "n" bound to pg_catalog.pg_namespace
+        let mut outer = Scope::new();
+        outer.add_table("n", &[int_col("oid"), text_col("nspname")]);
+        outer.set_table_source_relation("n", "pg_catalog.pg_namespace", 0..2);
+        stack.push(outer);
+
+        // Inner scope: alias "n" from a derived table (empty sentinel relation)
+        let mut inner = Scope::new();
+        inner.add_table_without_system_columns("n", &[int_col("oid")]);
+        inner.set_table_source_relation("n", "", 0..1);
+        stack.push(inner);
+
+        // Inner "n" (derived table) should shadow outer "n" (pg_namespace).
+        assert!(
+            !stack.table_ident_matches_relation(&Ident::new("n"), "pg_catalog.pg_namespace"),
+            "derived table alias must shadow outer pg_namespace binding"
+        );
+
+        // Inner "n" should NOT match pg_namespace relation.
+        assert!(
+            stack.table_ident_matches_relation(&Ident::new("n"), ""),
+            "derived table alias should match its empty sentinel relation"
+        );
     }
 }

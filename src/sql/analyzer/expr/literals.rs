@@ -14,6 +14,45 @@ use crate::sql::analyzer::types::*;
 use crate::sql::analyzer::Analyzer;
 
 impl<'a> Analyzer<'a> {
+    fn ident_is_xmin(ident: &ast::Ident) -> bool {
+        if ident.quote_style.is_some() {
+            ident.value == "xmin"
+        } else {
+            ident.value.eq_ignore_ascii_case("xmin")
+        }
+    }
+
+    fn table_ident_is_pg_namespace(&self, table: &ast::Ident) -> bool {
+        self.scopes
+            .table_ident_matches_relation(table, "pg_catalog.pg_namespace")
+    }
+
+    fn maybe_pg_namespace_xmin_unqualified(
+        &self,
+        ident: &ast::Ident,
+    ) -> Result<Option<TypedExpr>, AnalyzerError> {
+        if !Self::ident_is_xmin(ident) {
+            return Ok(None);
+        }
+        // PostgreSQL exposes xmin as a system column while keeping it out of
+        // SELECT * expansion. For synthetic pg_namespace rows we model xmin as
+        // a stable constant.
+        if self
+            .scopes
+            .resolve_unqualified_relation_column_scope_depth(
+                &ident.value,
+                "pg_catalog.pg_namespace",
+            )?
+            .is_some()
+        {
+            return Ok(Some(TypedExpr::new(
+                TypedExprKind::Constant(Value::Int64(1)),
+                DataType::Int64,
+            )));
+        }
+        Ok(None)
+    }
+
     // -- Helper: identifier resolution --
 
     pub(super) fn analyze_identifier(
@@ -105,6 +144,9 @@ impl<'a> Analyzer<'a> {
                 Ok(expr)
             }
             Err(AnalyzerError::ColumnNotFound { .. }) => {
+                if let Some(expr) = self.maybe_pg_namespace_xmin_unqualified(ident)? {
+                    return Ok(expr);
+                }
                 if let Some((scope_depth, cols)) = self.scopes.resolve_table_alias_columns(ident) {
                     let row_items: Vec<TypedExpr> = cols
                         .into_iter()
@@ -143,77 +185,55 @@ impl<'a> Analyzer<'a> {
             ));
         }
 
-        // Two-part: table.column
-        if parts.len() == 2 {
-            let resolved = self
-                .scopes
-                .resolve_qualified_column_idents(&parts[0], &parts[1])?;
-            let mut expr = TypedExpr::new(
-                TypedExprKind::ColumnRef {
-                    scope_depth: resolved.scope_depth,
-                    column_index: resolved.column_index,
-                    column_name: resolved.column_name,
-                },
-                resolved.data_type.clone(),
-            );
-
-            // Wrap in Collate if column has a declared collation (skip "default").
-            if let Some(collation) = resolved.collation {
-                if collation.to_lowercase() != "default" {
-                    let resolved_coll = self
-                        .resolve_collation(&collation)
-                        .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
-                    expr = TypedExpr::new(
-                        TypedExprKind::Collate {
-                            expr: Box::new(expr),
-                            collation,
-                            resolved: resolved_coll,
-                        },
-                        resolved.data_type.clone(),
-                    );
-                }
-            }
-
-            return Ok(expr);
-        }
-
-        // Three-part: schema.table.column -- use last two parts
-        if parts.len() >= 3 {
-            let n = parts.len();
-            let resolved = self
-                .scopes
-                .resolve_qualified_column_idents(&parts[n - 2], &parts[n - 1])?;
-            let mut expr = TypedExpr::new(
-                TypedExprKind::ColumnRef {
-                    scope_depth: resolved.scope_depth,
-                    column_index: resolved.column_index,
-                    column_name: resolved.column_name,
-                },
-                resolved.data_type.clone(),
-            );
-
-            // Wrap in Collate if column has a declared collation (skip "default").
-            if let Some(collation) = resolved.collation {
-                if collation.to_lowercase() != "default" {
-                    let resolved_coll = self
-                        .resolve_collation(&collation)
-                        .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
-                    expr = TypedExpr::new(
-                        TypedExprKind::Collate {
-                            expr: Box::new(expr),
-                            collation,
-                            resolved: resolved_coll,
-                        },
-                        resolved.data_type.clone(),
-                    );
-                }
-            }
-
-            return Ok(expr);
-        }
-
         // Single part (shouldn't reach here, but handle gracefully)
-        self.analyze_identifier(&parts[0])
+        if parts.len() == 1 {
+            return self.analyze_identifier(&parts[0]);
+        }
+
+        let (table_ident, column_ident) = if parts.len() == 2 {
+            (&parts[0], &parts[1])
+        } else {
+            let n = parts.len();
+            (&parts[n - 2], &parts[n - 1])
+        };
+
+        if Self::ident_is_xmin(column_ident) && self.table_ident_is_pg_namespace(table_ident) {
+            return Ok(TypedExpr::new(
+                TypedExprKind::Constant(Value::Int64(1)),
+                DataType::Int64,
+            ));
+        }
+
+        let resolved = self
+            .scopes
+            .resolve_qualified_column_idents(table_ident, column_ident)?;
+        let mut expr = TypedExpr::new(
+            TypedExprKind::ColumnRef {
+                scope_depth: resolved.scope_depth,
+                column_index: resolved.column_index,
+                column_name: resolved.column_name,
+            },
+            resolved.data_type.clone(),
+        );
+
+        // Wrap in Collate if column has a declared collation (skip "default").
+        if let Some(collation) = resolved.collation {
+            if collation.to_lowercase() != "default" {
+                let resolved_coll = self
+                    .resolve_collation(&collation)
+                    .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                expr = TypedExpr::new(
+                    TypedExprKind::Collate {
+                        expr: Box::new(expr),
+                        collation,
+                        resolved: resolved_coll,
+                    },
+                    resolved.data_type.clone(),
+                );
+            }
+        }
+
+        Ok(expr)
     }
 
     // -- Helper: value literal analysis --

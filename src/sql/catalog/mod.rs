@@ -153,6 +153,7 @@ pub fn global_catalog() -> &'static CatalogRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::DataType;
 
     #[test]
     fn registry_contains_pg_am() {
@@ -169,7 +170,13 @@ mod tests {
         let pg_ns = catalog.get("pg_namespace").unwrap();
         assert_eq!(pg_ns.name(), "pg_namespace");
         assert_eq!(pg_ns.schema_name(), "pg_catalog");
-        assert_eq!(pg_ns.schema().columns.len(), 5);
+        let schema = pg_ns.schema();
+        assert_eq!(schema.columns.len(), 4);
+        assert_eq!(schema.columns[3].name, "nspacl");
+        assert_eq!(
+            schema.columns[3].data_type,
+            DataType::Array(Box::new(DataType::Text))
+        );
     }
 
     #[test]

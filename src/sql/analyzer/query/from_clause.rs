@@ -280,9 +280,16 @@ impl<'a> Analyzer<'a> {
                     }
                 }
 
+                let col_start = self.scopes.current().column_count();
                 self.scopes
                     .current_mut()
                     .add_table_without_system_columns(&alias_str, &output_cols);
+                let col_end = self.scopes.current().column_count();
+                self.scopes.current_mut().set_table_source_relation(
+                    &alias_str,
+                    "",
+                    col_start..col_end,
+                );
 
                 let output_columns: Vec<(String, DataType)> = output_cols
                     .iter()
@@ -349,9 +356,16 @@ impl<'a> Analyzer<'a> {
                             }
                         }
 
+                        let col_start = self.scopes.current().column_count();
                         self.scopes
                             .current_mut()
                             .add_table_without_system_columns(&alias_str, &output_cols);
+                        let col_end = self.scopes.current().column_count();
+                        self.scopes.current_mut().set_table_source_relation(
+                            &alias_str,
+                            "",
+                            col_start..col_end,
+                        );
 
                         let output_columns: Vec<(String, DataType)> = output_cols
                             .iter()
@@ -392,9 +406,16 @@ impl<'a> Analyzer<'a> {
                                 .map(|(n, dt, coll)| (n.clone(), dt.clone(), true, coll.clone()))
                                 .collect();
 
+                        let col_start = self.scopes.current().column_count();
                         self.scopes
                             .current_mut()
                             .add_table_without_system_columns(&alias_str, &columns_for_scope);
+                        let col_end = self.scopes.current().column_count();
+                        self.scopes.current_mut().set_table_source_relation(
+                            &alias_str,
+                            "",
+                            col_start..col_end,
+                        );
 
                         let columns_for_schema: Vec<(String, DataType, bool)> = cte_cols
                             .iter()
@@ -438,6 +459,17 @@ impl<'a> Analyzer<'a> {
                             .current_mut()
                             .add_table(&alias_str, &columns_for_scope);
                         let col_end = self.scopes.current().column_count();
+                        let relation_binding =
+                            if qualified_name.eq_ignore_ascii_case("pg_namespace") {
+                                "pg_catalog.pg_namespace"
+                            } else {
+                                qualified_name.as_str()
+                            };
+                        self.scopes.current_mut().set_table_source_relation(
+                            &alias_str,
+                            relation_binding,
+                            col_start..col_end,
+                        );
 
                         // Record the source schema so schema-qualified wildcards
                         // (e.g. `schema.table.*`) can be validated.
@@ -538,9 +570,16 @@ impl<'a> Analyzer<'a> {
                     }
                 }
 
+                let col_start = self.scopes.current().column_count();
                 self.scopes
                     .current_mut()
                     .add_table_without_system_columns(&alias_str, &output_cols);
+                let col_end = self.scopes.current().column_count();
+                self.scopes.current_mut().set_table_source_relation(
+                    &alias_str,
+                    "",
+                    col_start..col_end,
+                );
 
                 let output_columns: Vec<(String, DataType)> = output_cols
                     .iter()
@@ -598,9 +637,16 @@ impl<'a> Analyzer<'a> {
                         }
                     }
                 }
+                let col_start = self.scopes.current().column_count();
                 self.scopes
                     .current_mut()
                     .add_table_without_system_columns(&alias_str, &columns);
+                let col_end = self.scopes.current().column_count();
+                self.scopes.current_mut().set_table_source_relation(
+                    &alias_str,
+                    "",
+                    col_start..col_end,
+                );
 
                 Ok(AnalyzedTableRef {
                     kind: AnalyzedTableRefKind::Subquery(Box::new(analyzed)),

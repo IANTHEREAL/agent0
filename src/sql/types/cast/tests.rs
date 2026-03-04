@@ -437,6 +437,16 @@ fn regclass_text_catalog_name_resolves_to_oid() {
         .unwrap(),
         Value::Int64(1247)
     );
+    // Case-insensitive schema and relation names
+    assert_eq!(
+        cast(
+            Value::Text("PG_CATALOG.PG_CLASS".into()),
+            &regclass,
+            CastContext::Explicit
+        )
+        .unwrap(),
+        Value::Int64(1259)
+    );
     // Unknown name should error
     assert!(cast(
         Value::Text("nonexistent_table".into()),

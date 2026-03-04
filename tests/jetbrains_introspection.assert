@@ -6,3 +6,5 @@ db_listing=
 jdbc_get_tables=
 jdbc_get_schemas=
 nspacl_exists=true
+pg_namespace_star=
+pg_namespace_xmin_qualified=true
