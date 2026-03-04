@@ -1,0 +1,40 @@
+# Staging-only extras: public NLB + Let's Encrypt TLS cert for pg.staging.db9.ai
+# Apply alongside deploy.yaml when deploying to staging:
+#   kubectl apply -f deploy.yaml -f deploy-staging.yaml
+---
+# Let's Encrypt TLS certificate for PostgreSQL client connections
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: db9-server-tls
+  namespace: db9
+spec:
+  secretName: db9-server-tls
+  issuerRef:
+    name: letsencrypt
+    kind: ClusterIssuer
+  dnsNames:
+    - pg.staging.db9.ai
+---
+# NLB Service — exposes pgwire (5433) and fs9-ws (5480) publicly
+apiVersion: v1
+kind: Service
+metadata:
+  name: db9-server
+  namespace: db9
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+spec:
+  type: LoadBalancer
+  selector:
+    app: db9-server
+  ports:
+  - name: pgwire
+    port: 5433
+    targetPort: 5433
+    protocol: TCP
+  - name: fs9-ws
+    port: 5480
+    targetPort: 5480
+    protocol: TCP
