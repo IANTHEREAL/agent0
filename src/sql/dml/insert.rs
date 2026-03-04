@@ -9,9 +9,6 @@ use tikv_client::Transaction;
 use crate::model::{DataType, IndexDef, Row, TableSchema, Value};
 use crate::sql::error::SqlError;
 use crate::sql::gin::extract_gin_token_hashes_from_row;
-use crate::sql::hnsw::hnsw_pk_label;
-use crate::sql::hnsw::storage::{hnsw_meta_key, write_hnsw_deltas};
-use crate::sql::hnsw::vec_f64_to_f32;
 use crate::sql::index_consistency::{
     is_unique_duplicate_error, resolve_unique_index_conflict, UniqueConflictResolution,
 };
@@ -111,10 +108,8 @@ fn build_unique_violation_error(index: &IndexDef, idx_values: &[Value]) -> SqlEr
 
 /// Maintain HNSW indexes after INSERT.
 ///
-/// Loads the graph fresh from TiKV (committed state), adds the new vector,
-/// serializes, and writes back to the transaction buffer. If the enclosing
-/// transaction rolls back, TiKV never received the write and the next load
-/// sees the old graph. If it commits, the next load gets the new graph.
+/// Delegates to the shared HNSW delta-maintenance helper in
+/// [`super::update::maintain_hnsw_indexes_inner`].
 async fn maintain_hnsw_indexes_after_insert(
     txn: &mut Transaction,
     db_id: u64,
@@ -122,63 +117,7 @@ async fn maintain_hnsw_indexes_after_insert(
     row: &Row,
     pk_values: &[Value],
 ) -> Result<()> {
-    if !schema.indexes.iter().any(|idx| idx.is_hnsw()) {
-        return Ok(());
-    }
-
-    let pk_label = hnsw_pk_label(pk_values)?;
-
-    for index in &schema.indexes {
-        if !index.is_hnsw() {
-            continue;
-        }
-        if matches!(index.state, IndexState::Invalid | IndexState::Building) {
-            continue;
-        }
-
-        let Some(vector_col_name) = index.columns.first() else {
-            return Err(anyhow!("HNSW index '{}' has no indexed column", index.name));
-        };
-        let vector_col_idx = schema
-            .column_index(vector_col_name)
-            .ok_or_else(|| anyhow!("HNSW index '{}' column not found", index.name))?;
-
-        let vector_f64 = match row.values.get(vector_col_idx) {
-            Some(Value::Null) | None => continue,
-            Some(Value::Vector(v)) => v,
-            Some(other) => {
-                return Err(anyhow!(
-                    "HNSW index '{}' requires vector value, found {}",
-                    index.name,
-                    other.type_display_name()
-                ))
-            }
-        };
-        let vector_f32 = vec_f64_to_f32(vector_f64);
-
-        // Validate storage version (only v1 delta-log supported).
-        let meta_key = hnsw_meta_key(db_id, schema.table_id, index.id);
-        let meta_bytes_opt = txn.get(meta_key.clone()).await.map_err(|e| anyhow!(e))?;
-        if let Some(meta_bytes) = meta_bytes_opt {
-            let meta: crate::sql::hnsw::HnswMeta =
-                serde_json::from_slice(&meta_bytes).map_err(|e| anyhow!(e))?;
-            if meta.storage_version != 1 {
-                return Err(anyhow!(
-                    "HNSW index '{}' has unsupported storage_version={}; please rebuild",
-                    index.name,
-                    meta.storage_version
-                ));
-            }
-        }
-
-        // Write single delta entry.
-        let adds = vec![(pk_label, vector_f32)];
-        write_hnsw_deltas(txn, db_id, schema.table_id, index.id, &adds)
-            .await
-            .map_err(|e| anyhow!("failed to write HNSW delta for '{}': {}", index.name, e))?;
-    }
-
-    Ok(())
+    super::update::maintain_hnsw_indexes_inner(txn, db_id, schema, row, pk_values).await
 }
 
 pub async fn build_enum_label_cache(

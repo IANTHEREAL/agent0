@@ -816,39 +816,51 @@ async fn execute_update_row_inner(
     Ok(new_row)
 }
 
-/// Maintain HNSW indexes after UPDATE.
+/// Shared HNSW delta maintenance for a single row.
 ///
-/// Loads the graph from TiKV, adds the new vector with the new PK label,
-/// serializes, and writes back to the transaction buffer.
-///
-/// Skips the graph write entirely when the vector column is unchanged
-/// (e.g. `UPDATE t SET non_vector_col = ...`), avoiding unnecessary
-/// serialization round-trips and duplicate label accumulation.
-///
-/// usearch 0.21 `add()` always appends — it does NOT overwrite an
-/// existing label. When the PK is unchanged, the old label stays in the
-/// graph; the HnswScanOperator's over-fetch strategy filters stale
-/// entries via batch_get_rows visibility.
-async fn maintain_hnsw_indexes_after_update(
+/// For each Ready HNSW index on the schema, writes a delta-log entry
+/// containing the row's vector keyed by its PK label.  Callers are
+/// responsible for any UPDATE-specific unchanged-skip guards.
+pub(super) async fn maintain_hnsw_indexes_inner(
     txn: &mut Transaction,
     db_id: u64,
     schema: &TableSchema,
-    old_row: &Row,
-    new_row: &Row,
-    old_pk_values: &[Value],
-    new_pk_values: &[Value],
+    target_row: &Row,
+    target_pk_values: &[Value],
+) -> Result<()> {
+    maintain_hnsw_indexes_inner_for_index_ids(
+        txn,
+        db_id,
+        schema,
+        target_row,
+        target_pk_values,
+        None,
+    )
+    .await
+}
+
+async fn maintain_hnsw_indexes_inner_for_index_ids(
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &TableSchema,
+    target_row: &Row,
+    target_pk_values: &[Value],
+    only_index_ids: Option<&[u64]>,
 ) -> Result<()> {
     if !schema.indexes.iter().any(|idx| idx.is_hnsw()) {
         return Ok(());
     }
 
-    let pk_label = hnsw_pk_label(new_pk_values)?;
+    let pk_label = hnsw_pk_label(target_pk_values)?;
 
     for index in &schema.indexes {
         if !index.is_hnsw() {
             continue;
         }
         if matches!(index.state, IndexState::Invalid | IndexState::Building) {
+            continue;
+        }
+        if only_index_ids.is_some_and(|ids| !ids.contains(&index.id)) {
             continue;
         }
 
@@ -862,18 +874,7 @@ async fn maintain_hnsw_indexes_after_update(
             .column_index(vector_col_name)
             .ok_or_else(|| anyhow::anyhow!("HNSW index '{}' column not found", index.name))?;
 
-        // Skip HNSW maintenance when both the PK and vector column are
-        // unchanged.  The HNSW label is derived from the PK, so a PK
-        // change requires adding a new label even if the vector is the
-        // same.  We compare values directly rather than using
-        // index_values_unchanged(), which only works for btree indexes.
-        if old_pk_values == new_pk_values
-            && old_row.values.get(vector_col_idx) == new_row.values.get(vector_col_idx)
-        {
-            continue;
-        }
-
-        let vector_f64 = match new_row.values.get(vector_col_idx) {
+        let vector_f64 = match target_row.values.get(vector_col_idx) {
             Some(Value::Null) | None => continue,
             Some(Value::Vector(v)) => v,
             Some(other) => {
@@ -914,4 +915,196 @@ async fn maintain_hnsw_indexes_after_update(
     }
 
     Ok(())
+}
+
+fn should_write_hnsw_delta_for_update_index(
+    index: &crate::model::IndexDef,
+    schema: &TableSchema,
+    old_row: &Row,
+    new_row: &Row,
+    old_pk_values: &[Value],
+    new_pk_values: &[Value],
+) -> Result<bool> {
+    if !index.is_hnsw() {
+        return Ok(false);
+    }
+    if matches!(index.state, IndexState::Invalid | IndexState::Building) {
+        return Ok(false);
+    }
+
+    let Some(vector_col_name) = index.columns.first() else {
+        return Err(anyhow::anyhow!(
+            "HNSW index '{}' has no indexed column",
+            index.name
+        ));
+    };
+    let vector_col_idx = schema
+        .column_index(vector_col_name)
+        .ok_or_else(|| anyhow::anyhow!("HNSW index '{}' column not found", index.name))?;
+
+    // The HNSW label is derived from PK, so PK changes must write deltas
+    // even when the vector value is unchanged.
+    let unchanged = old_pk_values == new_pk_values
+        && old_row.values.get(vector_col_idx) == new_row.values.get(vector_col_idx);
+    Ok(!unchanged)
+}
+
+fn changed_hnsw_index_ids_for_update(
+    schema: &TableSchema,
+    old_row: &Row,
+    new_row: &Row,
+    old_pk_values: &[Value],
+    new_pk_values: &[Value],
+) -> Result<Vec<u64>> {
+    let mut changed_index_ids = Vec::new();
+    for index in &schema.indexes {
+        if should_write_hnsw_delta_for_update_index(
+            index,
+            schema,
+            old_row,
+            new_row,
+            old_pk_values,
+            new_pk_values,
+        )? {
+            changed_index_ids.push(index.id);
+        }
+    }
+    Ok(changed_index_ids)
+}
+
+/// Maintain HNSW indexes after UPDATE.
+///
+/// Computes per-index change detection and writes deltas only for HNSW
+/// indexes whose vector column changed (or whose PK changed).
+async fn maintain_hnsw_indexes_after_update(
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &TableSchema,
+    old_row: &Row,
+    new_row: &Row,
+    old_pk_values: &[Value],
+    new_pk_values: &[Value],
+) -> Result<()> {
+    let changed_index_ids =
+        changed_hnsw_index_ids_for_update(schema, old_row, new_row, old_pk_values, new_pk_values)?;
+    if changed_index_ids.is_empty() {
+        return Ok(());
+    }
+
+    maintain_hnsw_indexes_inner_for_index_ids(
+        txn,
+        db_id,
+        schema,
+        new_row,
+        new_pk_values,
+        Some(&changed_index_ids),
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ColumnDef, DataType, IndexDef};
+
+    fn hnsw_test_schema() -> TableSchema {
+        TableSchema {
+            name: "public.t_hnsw_multi".to_string(),
+            table_id: 42,
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+                ColumnDef {
+                    name: "v1".to_string(),
+                    data_type: DataType::Vector(2),
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+                ColumnDef {
+                    name: "v2".to_string(),
+                    data_type: DataType::Vector(2),
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    collation: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: Some("t_hnsw_multi_pkey".to_string()),
+            pk_indices: vec![0],
+            indexes: vec![
+                IndexDef {
+                    name: "idx_hnsw_v1".to_string(),
+                    id: 101,
+                    columns: vec!["v1".to_string()],
+                    unique: false,
+                    is_constraint: false,
+                    method: Some("hnsw".to_string()),
+                    predicate: None,
+                    expressions: vec![],
+                    state: IndexState::Ready,
+                    cached_predicate_conjuncts: None,
+                    hnsw_m: None,
+                    hnsw_ef_construction: None,
+                    hnsw_distance_metric: None,
+                },
+                IndexDef {
+                    name: "idx_hnsw_v2".to_string(),
+                    id: 102,
+                    columns: vec!["v2".to_string()],
+                    unique: false,
+                    is_constraint: false,
+                    method: Some("hnsw".to_string()),
+                    predicate: None,
+                    expressions: vec![],
+                    state: IndexState::Ready,
+                    cached_predicate_conjuncts: None,
+                    hnsw_m: None,
+                    hnsw_ef_construction: None,
+                    hnsw_distance_metric: None,
+                },
+            ],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: "postgres".to_string(),
+            from_alias: None,
+        }
+    }
+
+    #[test]
+    fn hnsw_update_selects_only_changed_index_for_delta_write() {
+        let schema = hnsw_test_schema();
+        let old_row = Row::new(vec![
+            Value::Int32(1),
+            Value::Vector(vec![1.0, 0.0]),
+            Value::Vector(vec![0.0, 1.0]),
+        ]);
+        let new_row = Row::new(vec![
+            Value::Int32(1),
+            Value::Vector(vec![2.0, 0.0]), // v1 changed
+            Value::Vector(vec![0.0, 1.0]), // v2 unchanged
+        ]);
+
+        let old_pk = schema.get_pk_values(&old_row);
+        let new_pk = schema.get_pk_values(&new_row);
+        let changed =
+            changed_hnsw_index_ids_for_update(&schema, &old_row, &new_row, &old_pk, &new_pk)
+                .expect("change detection should succeed");
+
+        assert_eq!(changed, vec![101]);
+    }
 }

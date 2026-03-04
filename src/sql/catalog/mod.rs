@@ -307,7 +307,7 @@ mod tests {
         let t = catalog.get("pg_type").unwrap();
         assert_eq!(t.name(), "pg_type");
         assert_eq!(t.schema_name(), "pg_catalog");
-        assert_eq!(t.schema().columns.len(), 15);
+        assert_eq!(t.schema().columns.len(), 16);
     }
 
     #[test]
