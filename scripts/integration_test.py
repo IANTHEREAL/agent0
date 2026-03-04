@@ -196,14 +196,23 @@ def psql_args() -> List[str]:
     return psql_args_for_mode(PsqlOutputMode.UNALIGNED)
 
 
-def psql_args_for_mode(mode: PsqlOutputMode, *, database: Optional[str] = None) -> List[str]:
+def psql_args_for_mode(
+    mode: PsqlOutputMode,
+    *,
+    database: Optional[str] = None,
+    null_print: Optional[str] = None,
+    quiet: bool = True,
+) -> List[str]:
     db = config.db
     dsn_db = database or db.database
 
     base = [
         "psql",
         "-X",
-        "-q",
+    ]
+    if quiet:
+        base.append("-q")
+    base += [
         "-P",
         "pager=off",
         "-h",
@@ -217,13 +226,18 @@ def psql_args_for_mode(mode: PsqlOutputMode, *, database: Optional[str] = None) 
     ]
 
     if mode == PsqlOutputMode.UNALIGNED:
+        # Default to explicit NULL marker to keep NULL vs empty-string distinguishable.
+        # Some historical .expected files were generated with psql's default empty
+        # marker; callers can request that via null_print="".
+        if null_print is None:
+            null_print = "NULL"
         return base + [
             "-P",
             "format=unaligned",
             "-P",
             "fieldsep=|",
             "-P",
-            "null=NULL",
+            f"null={null_print}",
         ]
 
     # Default `psql` output is aligned; keep defaults to match `.expected` files that
@@ -521,6 +535,49 @@ def stable_partition_psql_diagnostics(lines: List[str]) -> List[str]:
     return non_diagnostics + diagnostics
 
 
+_COMMAND_TAG_PREFIXES = (
+    "SELECT ",
+    "INSERT ",
+    "UPDATE ",
+    "DELETE ",
+    "MERGE ",
+    "COPY ",
+    "MOVE ",
+    "FETCH ",
+    "CREATE ",
+    "ALTER ",
+    "DROP ",
+    "TRUNCATE",
+    "COMMENT",
+    "GRANT",
+    "REVOKE",
+    "BEGIN",
+    "COMMIT",
+    "ROLLBACK",
+    "SAVEPOINT",
+    "RELEASE",
+    "SET",
+    "RESET",
+    "ANALYZE",
+    "VACUUM",
+    "DISCARD",
+    "DO",
+)
+
+
+def is_command_tag_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if "|" in stripped:
+        return False
+    if re.match(r"^\(\d+ rows?\)$", stripped):
+        return False
+    if not re.match(r"^[A-Z0-9_ ]+$", stripped):
+        return False
+    return any(stripped.startswith(prefix) for prefix in _COMMAND_TAG_PREFIXES)
+
+
 def _is_assert_comment(line: str) -> bool:
     stripped = line.lstrip()
     return stripped.startswith("#") or stripped.startswith("--")
@@ -567,11 +624,19 @@ def run_sql(
     mode: PsqlOutputMode = PsqlOutputMode.UNALIGNED,
     client_min_messages: str = "warning",
     database: Optional[str] = None,
+    null_print: Optional[str] = None,
+    quiet: bool = True,
 ) -> Tuple[str, int]:
     output = ""
     for attempt in range(retries + 1):
         result = subprocess.run(
-            psql_args_for_mode(mode, database=database) + ["-c", sql],
+            psql_args_for_mode(
+                mode,
+                database=database,
+                null_print=null_print,
+                quiet=quiet,
+            )
+            + ["-c", sql],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -595,9 +660,17 @@ def run_sql_file(
     mode: PsqlOutputMode = PsqlOutputMode.UNALIGNED,
     client_min_messages: str = "warning",
     database: Optional[str] = None,
+    null_print: Optional[str] = None,
+    quiet: bool = True,
 ) -> Tuple[str, int]:
     result = subprocess.run(
-        psql_args_for_mode(mode, database=database) + ["-f", str(sql_file)],
+        psql_args_for_mode(
+            mode,
+            database=database,
+            null_print=null_print,
+            quiet=quiet,
+        )
+        + ["-f", str(sql_file)],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -624,8 +697,9 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
     )
 
     # Determine which `psql` formatting was used to generate the `.expected` file.
-    # - Historical tests use `format=unaligned` with `fieldsep=|` and `null=NULL`.
     # - Newer tests use default aligned output (tables with borders, including 1-column tables).
+    # - Historical tests use unaligned output; NULL marker may be either explicit
+    #   (`NULL`) or default empty string, so choose marker per file.
     expects_aligned = False
     if any(" | " in line for line in expected_lines):
         expects_aligned = True
@@ -637,6 +711,18 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
         expects_aligned = False
 
     mode = PsqlOutputMode.ALIGNED if expects_aligned else PsqlOutputMode.UNALIGNED
+    null_print: Optional[str] = None
+    expects_command_tags = any(is_command_tag_line(line) for line in expected_lines)
+    quiet = not expects_command_tags
+    if mode == PsqlOutputMode.UNALIGNED:
+        expected_has_pipe_null = any(
+            re.search(r"(?:^|\|)NULL(?:\||$)", line) for line in expected_lines
+        )
+        expected_has_empty_pipe_field = any(
+            "|" in line and (line.startswith("|") or line.endswith("|") or "||" in line)
+            for line in expected_lines
+        )
+        null_print = "" if expected_has_empty_pipe_field and not expected_has_pipe_null else "NULL"
     expected_wants_notice = any("NOTICE:" in line for line in expected_lines)
     client_min_messages = (
         "notice"
@@ -674,7 +760,13 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
             )
             return TestResult.FAILED
 
-    output, _ = run_sql_file(sql_file, mode=mode, client_min_messages=client_min_messages)
+    output, _ = run_sql_file(
+        sql_file,
+        mode=mode,
+        client_min_messages=client_min_messages,
+        null_print=null_print,
+        quiet=quiet,
+    )
     out_file.write_text(output)
 
     if config.verbose:
