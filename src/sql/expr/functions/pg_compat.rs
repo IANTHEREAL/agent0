@@ -515,11 +515,15 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
     let resolved_name = if name.quoted {
         name.value.clone()
     } else if schema.is_some() {
-        // Schema-qualified: no interval normalization, no trailing-junk error.
-        // PG treats `pg_catalog.interval day to second` as a literal type
-        // lookup — `interval day to second` doesn't exist → NULL.
+        // Schema-qualified: no interval normalization.
+        // Trailing junk after the type name → ERROR, matching PG behavior.
+        // e.g. `pg_catalog.interval day to second` → ERROR (not NULL).
         let ws_normalized = normalize_whitespace(&name.value);
-        strip_regtype_typmod(&ws_normalized)
+        let stripped = strip_regtype_typmod(&ws_normalized);
+        if stripped.contains(char::is_whitespace) && !is_multi_word_pg_type(&stripped) {
+            return Err(invalid_interval_type_name(&raw));
+        }
+        stripped
     } else {
         let ws_normalized = normalize_whitespace(&name.value);
         let after_interval = normalize_interval_type(&ws_normalized)?;
@@ -1287,16 +1291,12 @@ mod tests {
             to_regtype(vec![Value::Text("interval  second  (3)".into())]).unwrap(),
             Value::Int64(pg_types::OID_INTERVAL)
         );
-        // Schema-qualified interval with qualifier → NULL (PG parity).
-        // PG treats `pg_catalog.interval day to second` as a literal type
-        // lookup — the qualifier syntax only works for bare `interval`.
-        assert_eq!(
-            to_regtype(vec![Value::Text(
-                "pg_catalog.interval day to second".into()
-            )])
-            .unwrap(),
-            Value::Null
-        );
+        // Schema-qualified interval with qualifier → ERROR (PG parity).
+        // PG treats trailing qualifier as invalid type name junk.
+        assert!(to_regtype(vec![Value::Text(
+            "pg_catalog.interval day to second".into()
+        )])
+        .is_err());
         // Unknown schema + invalid interval typmod → NULL (schema resolution
         // before interval validation: schema not found = NULL, no error).
         assert_eq!(
