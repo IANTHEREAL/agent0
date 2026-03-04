@@ -37,6 +37,7 @@ impl VirtualTable for PgType {
                 int_col("typelem"),
                 int_col("typarray"),
                 int_col("typcollation"),
+                int_col("typbasetype"),
             ],
             version: 1,
             pk_constraint_name: None,
@@ -79,6 +80,7 @@ impl VirtualTable for PgType {
                 int_val(0),
                 int_val(0),
                 int_val(typcollation),
+                int_val(0), // typbasetype: 0 for non-domain types
             ]));
         }
 
@@ -100,6 +102,7 @@ impl VirtualTable for PgType {
             int_val(pg_types::OID_HSTORE),
             int_val(0),
             int_val(0),
+            int_val(0), // typbasetype
         ]));
 
         rows.push(Row::new(vec![
@@ -118,6 +121,7 @@ impl VirtualTable for PgType {
             int_val(0),
             int_val(pg_types::OID_HSTORE_ARRAY),
             int_val(0),
+            int_val(0), // typbasetype
         ]));
 
         let mut user_types = ctx.store.list_types(ctx.txn, ctx.db_id).await?;
@@ -144,6 +148,7 @@ impl VirtualTable for PgType {
                 int_val(0),
                 int_val(0),
                 int_val(0),
+                int_val(0), // typbasetype
             ]));
         }
 
