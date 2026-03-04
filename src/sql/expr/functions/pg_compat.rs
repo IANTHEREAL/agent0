@@ -262,6 +262,24 @@ fn invalid_interval_type_name(original_name: &str) -> anyhow::Error {
         .into()
 }
 
+/// Check if a name is a known PostgreSQL multi-word type.
+///
+/// PostgreSQL's grammar has special syntax for certain multi-word type names
+/// like `double precision`, `character varying`, `timestamp with time zone`,
+/// etc.  These contain spaces but are valid type names, not trailing junk.
+fn is_multi_word_pg_type(name: &str) -> bool {
+    matches!(
+        name,
+        "double precision"
+            | "character varying"
+            | "timestamp with time zone"
+            | "timestamp without time zone"
+            | "time with time zone"
+            | "time without time zone"
+            | "bit varying"
+    )
+}
+
 /// Validate interval precision inside `(N)`.
 ///
 /// `paren_str` must start with `(`.
@@ -511,13 +529,14 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
         } else {
             // Bare-word trailing junk check for non-interval unqualified types.
             // e.g. `to_regtype('int4 garbage')` → ERROR, matching PG behavior.
-            if let Some(ws_pos) = after_interval.find(char::is_whitespace) {
-                let after = after_interval[ws_pos..].trim_start();
-                if !after.is_empty() && !after.starts_with('(') {
-                    return Err(invalid_interval_type_name(&raw));
-                }
+            // But PG has valid multi-word type names (double precision,
+            // character varying, timestamp with time zone, etc.) that must
+            // pass through.
+            let stripped = strip_regtype_typmod(&after_interval);
+            if stripped.contains(char::is_whitespace) && !is_multi_word_pg_type(&stripped) {
+                return Err(invalid_interval_type_name(&raw));
             }
-            strip_regtype_typmod(&after_interval)
+            stripped
         }
     };
 
@@ -1032,6 +1051,53 @@ mod tests {
         assert_eq!(
             to_regtype(vec![Value::Text("\"pg_catalog\".int4".into())]).unwrap(),
             Value::Int64(pg_types::OID_INT4)
+        );
+        // Multi-word PG type names must resolve, not error as trailing junk.
+        assert_eq!(
+            to_regtype(vec![Value::Text("double precision".into())]).unwrap(),
+            Value::Int64(pg_types::OID_FLOAT8)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("character varying".into())]).unwrap(),
+            Value::Int64(pg_types::OID_VARCHAR)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("character varying(255)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_VARCHAR)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("timestamp with time zone".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIMESTAMPTZ)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("timestamp without time zone".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIMESTAMP)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("time without time zone".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIME)
+        );
+        // Multi-word types not in our OID table → NULL (not error)
+        assert_eq!(
+            to_regtype(vec![Value::Text("time with time zone".into())]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("bit varying".into())]).unwrap(),
+            Value::Null
+        );
+        // Case insensitive (unquoted identifiers are lowercased)
+        assert_eq!(
+            to_regtype(vec![Value::Text("Double Precision".into())]).unwrap(),
+            Value::Int64(pg_types::OID_FLOAT8)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("CHARACTER VARYING".into())]).unwrap(),
+            Value::Int64(pg_types::OID_VARCHAR)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("TIMESTAMP WITH TIME ZONE".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIMESTAMPTZ)
         );
     }
 

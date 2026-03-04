@@ -48,6 +48,15 @@ SET search_path TO "Public";
 SELECT to_regtype('hstore');
 SET search_path TO public;
 
+-- Multi-word PG type names must resolve, not error as trailing junk
+SELECT to_regtype('double precision');
+SELECT to_regtype('character varying');
+SELECT to_regtype('character varying(255)');
+SELECT to_regtype('timestamp with time zone');
+SELECT to_regtype('timestamp without time zone');
+SELECT to_regtype('time without time zone');
+SELECT to_regtype('Double Precision');
+
 -- Existing behavior regression
 SELECT to_regtype('integer');
 SELECT to_regtype('integer[]');
