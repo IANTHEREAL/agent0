@@ -39,6 +39,10 @@ SELECT to_regtype('noschema.interval garbage'); -- db9-specific: error text diff
 SELECT to_regtype('noschema.int4 garbage'); -- db9-specific: error text differs from PG
 SELECT to_regtype('noschema.foo garbage'); -- db9-specific: error text differs from PG
 
+-- Unqualified bare-word trailing junk → syntax error
+SELECT to_regtype('int4 garbage'); -- db9-specific: error text differs from PG
+SELECT to_regtype('text garbage'); -- db9-specific: error text differs from PG
+
 -- Quoted search_path schema must not match hstore fallback (case-sensitive)
 SET search_path TO "Public";
 SELECT to_regtype('hstore');

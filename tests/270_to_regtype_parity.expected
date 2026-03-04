@@ -62,6 +62,8 @@ NULL
 ERROR:  invalid type name "interval garbage"
 ERROR:  invalid type name "noschema.int4 garbage"
 ERROR:  invalid type name "noschema.foo garbage"
+ERROR:  invalid type name "int4 garbage"
+ERROR:  invalid type name "text garbage"
 SET
 to_regtype
 NULL

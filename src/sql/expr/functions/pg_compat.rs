@@ -509,6 +509,14 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
         if after_interval == "interval" {
             after_interval
         } else {
+            // Bare-word trailing junk check for non-interval unqualified types.
+            // e.g. `to_regtype('int4 garbage')` → ERROR, matching PG behavior.
+            if let Some(ws_pos) = after_interval.find(char::is_whitespace) {
+                let after = after_interval[ws_pos..].trim_start();
+                if !after.is_empty() && !after.starts_with('(') {
+                    return Err(invalid_interval_type_name(&raw));
+                }
+            }
             strip_regtype_typmod(&after_interval)
         }
     };
@@ -1233,6 +1241,9 @@ mod tests {
         // Non-interval types with trailing junk → syntax error.
         assert!(to_regtype(vec![Value::Text("noschema.int4 garbage".into())]).is_err());
         assert!(to_regtype(vec![Value::Text("noschema.foo garbage".into())]).is_err());
+        // Unqualified trailing junk → syntax error (PG parity).
+        assert!(to_regtype(vec![Value::Text("int4 garbage".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("text garbage".into())]).is_err());
         // Quoted schema case-mismatch + invalid interval typmod → NULL
         assert_eq!(
             to_regtype(vec![Value::Text("\"PG_CATALOG\".interval(abc)".into())]).unwrap(),
