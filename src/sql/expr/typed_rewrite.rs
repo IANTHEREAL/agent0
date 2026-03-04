@@ -88,7 +88,15 @@ impl AsyncExprTransform for SequenceMaterializeCtx<'_> {
                                     &args[2], self.qctx,
                                 )?)?
                             } else {
-                                true
+                                Some(true)
+                            };
+
+                            // Strict semantics: NULL is_called → return NULL, no mutation.
+                            let Some(is_called) = is_called else {
+                                return Ok(TypedExpr {
+                                    kind: TypedExprKind::Constant(Value::Null),
+                                    data_type: expr.data_type.clone(),
+                                });
                             };
 
                             self.store
@@ -149,13 +157,18 @@ fn sequence_function_kind(name: &str) -> Option<SequenceFunction> {
     }
 }
 
-fn parse_setval_is_called(v: Value) -> Result<bool> {
+/// Parse the `is_called` argument for 3-arg `setval`.
+/// Returns `None` for NULL (strict semantics: NULL arg → NULL return, no mutation).
+fn parse_setval_is_called(v: Value) -> Result<Option<bool>> {
     match v {
-        Value::Boolean(b) => Ok(b),
-        Value::Text(s) => Ok(matches!(
+        Value::Boolean(b) => Ok(Some(b)),
+        // PG's 3-arg setval is strict (proisstrict=true in pg_proc).
+        // NULL argument → return NULL immediately, no side effect.
+        Value::Null => Ok(None),
+        Value::Text(s) => Ok(Some(matches!(
             s.to_lowercase().as_str(),
             "true" | "t" | "1" | "yes" | "y"
-        )),
+        ))),
         other => Err(anyhow!("setval: is_called must be boolean, got {}", other)),
     }
 }
@@ -206,15 +219,33 @@ mod tests {
 
     #[test]
     fn parse_setval_is_called_accepts_bool_and_text() {
-        assert!(parse_setval_is_called(Value::Boolean(true)).unwrap());
-        assert!(!parse_setval_is_called(Value::Boolean(false)).unwrap());
-        assert!(parse_setval_is_called(Value::Text("YES".to_string())).unwrap());
-        assert!(!parse_setval_is_called(Value::Text("n".to_string())).unwrap());
+        assert_eq!(
+            parse_setval_is_called(Value::Boolean(true)).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            parse_setval_is_called(Value::Boolean(false)).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            parse_setval_is_called(Value::Text("YES".to_string())).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            parse_setval_is_called(Value::Text("n".to_string())).unwrap(),
+            Some(false)
+        );
     }
 
     #[test]
     fn parse_setval_is_called_rejects_non_bool() {
         let err = parse_setval_is_called(Value::Int32(1)).unwrap_err();
         assert!(err.to_string().contains("is_called must be boolean"));
+    }
+
+    #[test]
+    fn parse_setval_is_called_null_returns_none() {
+        // PG strict semantics: NULL arg → NULL return (no mutation)
+        assert_eq!(parse_setval_is_called(Value::Null).unwrap(), None);
     }
 }

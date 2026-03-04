@@ -582,11 +582,13 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
                             };
                             let is_called = if let Some(arg2) = args.get(2) {
                                 match eval_typed_expr(arg2, &Row::new(vec![]), &qctx)? {
-                                    Value::Boolean(b) => b,
-                                    Value::Text(s) => matches!(
+                                    Value::Boolean(b) => Some(b),
+                                    // Strict semantics: NULL arg → NULL return, no mutation.
+                                    Value::Null => None,
+                                    Value::Text(s) => Some(matches!(
                                         s.to_lowercase().as_str(),
                                         "true" | "t" | "1" | "yes" | "y"
-                                    ),
+                                    )),
                                     other => {
                                         return Err(anyhow!(
                                             "setval: is_called must be boolean, got {}",
@@ -595,7 +597,13 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
                                     }
                                 }
                             } else {
-                                true
+                                Some(true)
+                            };
+                            let Some(is_called) = is_called else {
+                                return Ok(TypedExpr {
+                                    kind: TypedExprKind::Constant(Value::Null),
+                                    data_type: DataType::Int64,
+                                });
                             };
                             let res = store
                                 .setval_sequence(

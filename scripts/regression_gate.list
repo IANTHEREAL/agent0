@@ -155,6 +155,7 @@ tests/234_returns_table_sql_function.sql
 tests/235_lateral_correlated_no_from.sql
 tests/40_lastval.sql
 tests/40_sequences.sql
+tests/40_setval_null_boolean.sql
 # GIN / FTS
 tests/236_gin_index_scan.sql
 tests/237_fts_tokenizers.sql
