@@ -462,7 +462,18 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
         return Ok(Value::Null);
     }
 
-    // Step 3: Resolve the type name.
+    // Step 3: Early-exit for unknown schemas.
+    // If schema is present and doesn't match `pg_catalog`, the type cannot
+    // resolve — return NULL immediately.  This must happen BEFORE interval
+    // validation so that e.g. `noschema.interval(abc)` returns NULL (schema
+    // not found) instead of raising an interval-validation error.
+    if let Some(ref s) = schema {
+        if s.value != "pg_catalog" {
+            return Ok(Value::Null);
+        }
+    }
+
+    // Step 4: Resolve the type name.
     // Quoted names: literal value (no interval processing, no typmod stripping).
     // Unquoted names: normalize whitespace, validate interval forms, strip typmod.
     let resolved_name = if name.quoted {
@@ -477,31 +488,16 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
         }
     };
 
-    // Step 4: Look up OID — schema-aware with `_typename` alias folding.
-    // Schema matching respects quoting: quoted "PG_CATALOG" ≠ pg_catalog → NULL.
-    let base_oid = match &schema {
-        None => pg_catalog_regtype_oid(&resolved_name).or_else(|| {
-            if name.quoted {
-                return None;
-            }
-            resolved_name
-                .strip_prefix('_')
-                .and_then(pg_catalog_regtype_oid)
-                .and_then(regtype_array_oid)
-        }),
-        Some(s) if s.value == "pg_catalog" => {
-            pg_catalog_regtype_oid(&resolved_name).or_else(|| {
-                if name.quoted {
-                    return None;
-                }
-                resolved_name
-                    .strip_prefix('_')
-                    .and_then(pg_catalog_regtype_oid)
-                    .and_then(regtype_array_oid)
-            })
+    // Step 5: Look up OID with `_typename` alias folding.
+    let base_oid = pg_catalog_regtype_oid(&resolved_name).or_else(|| {
+        if name.quoted {
+            return None;
         }
-        Some(_) => None,
-    };
+        resolved_name
+            .strip_prefix('_')
+            .and_then(pg_catalog_regtype_oid)
+            .and_then(regtype_array_oid)
+    });
 
     let oid = if is_array {
         base_oid.and_then(regtype_array_oid)
@@ -1200,6 +1196,21 @@ mod tests {
             )])
             .unwrap(),
             Value::Int64(pg_types::OID_INTERVAL)
+        );
+        // Unknown schema + invalid interval typmod → NULL (schema resolution
+        // before interval validation: schema not found = NULL, no error).
+        assert_eq!(
+            to_regtype(vec![Value::Text("noschema.interval(abc)".into())]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("noschema.interval garbage".into())]).unwrap(),
+            Value::Null
+        );
+        // Quoted schema case-mismatch + invalid interval typmod → NULL
+        assert_eq!(
+            to_regtype(vec![Value::Text("\"PG_CATALOG\".interval(abc)".into())]).unwrap(),
+            Value::Null
         );
     }
 
