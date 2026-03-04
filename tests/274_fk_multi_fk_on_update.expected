@@ -1,0 +1,14 @@
+cid|fk_a|fk_b
+1|2|NULL
+(1 row)
+psql:tests/274_fk_multi_fk_on_update.sql:26: ERROR:  update or delete on table "mfk2_parent" violates foreign key constraint "mfk2_child_fk_b_fkey" on table "mfk2_child"
+DETAIL:  Key (id)=(1) is still referenced from table "mfk2_child".
+id
+1
+(1 row)
+cid|fk_a|fk_b
+1|2|0
+(1 row)
+cid|pid|pcode
+1|2|Z
+(1 row)
