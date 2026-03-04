@@ -33,7 +33,7 @@ pub(crate) enum Fs9Mode {
     },
 }
 
-pub(crate) const MAX_BYTES_PER_FILE: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_BYTES_PER_FILE: usize = 100 * 1024 * 1024;
 pub(crate) const MAX_FILES_PER_GLOB: usize = 10_000;
 pub(crate) const MAX_TOTAL_BYTES: usize = 100 * 1024 * 1024;
 
@@ -132,7 +132,23 @@ pub(crate) async fn execute_table_function(
     mode: Fs9Mode,
 ) -> Result<(TableSchema, Vec<Row>)> {
     let backend = backend::get_backend(tenant).await;
-    let backend = backend.as_ref();
+    execute_table_function_with_budget_for_backend(backend.as_ref(), mode, MAX_TOTAL_BYTES).await
+}
+
+async fn execute_table_function_with_budget_for_backend(
+    backend: &dyn backend::FsBackend,
+    mode: Fs9Mode,
+    max_total_bytes: usize,
+) -> Result<(TableSchema, Vec<Row>)> {
+    let log_budget_exhausted =
+        |total_bytes_read: usize, files_read_count: usize, total_files: usize| {
+            warn!(
+                "fs9: bytes budget exhausted ({} MB), {} of {} matched files were scanned",
+                total_bytes_read / (1024 * 1024),
+                files_read_count,
+                total_files
+            );
+        };
 
     match mode {
         Fs9Mode::Directory {
@@ -222,17 +238,28 @@ pub(crate) async fn execute_table_function(
             let mut total_bytes_read: usize = 0;
 
             for (files_read_count, file_path) in matching_files.iter().enumerate() {
-                if total_bytes_read >= MAX_TOTAL_BYTES {
-                    warn!(
-                        "fs9: bytes budget exhausted ({} MB), {} of {} matched files were scanned",
-                        total_bytes_read / (1024 * 1024),
-                        files_read_count,
-                        matching_files.len()
-                    );
+                let remaining_budget = max_total_bytes.saturating_sub(total_bytes_read);
+                if remaining_budget == 0 {
+                    log_budget_exhausted(total_bytes_read, files_read_count, matching_files.len());
                     break;
                 }
 
-                let data = backend.read_file(file_path, MAX_BYTES_PER_FILE).await?;
+                let file_info = backend.stat(file_path).await?;
+                let file_size = usize::try_from(file_info.size).unwrap_or(usize::MAX);
+                if file_size > MAX_BYTES_PER_FILE {
+                    return Err(anyhow!(
+                        "fs9: file too large: {} bytes exceeds limit {}",
+                        file_size,
+                        MAX_BYTES_PER_FILE
+                    ));
+                }
+                if file_size > remaining_budget {
+                    log_budget_exhausted(total_bytes_read, files_read_count, matching_files.len());
+                    break;
+                }
+
+                let max_bytes_for_file = remaining_budget.min(MAX_BYTES_PER_FILE);
+                let data = backend.read_file(file_path, max_bytes_for_file).await?;
                 total_bytes_read = total_bytes_read.saturating_add(data.len());
 
                 let fmt = decoders::detect_format(file_path, format.as_deref());
@@ -264,6 +291,15 @@ pub(crate) async fn execute_table_function(
             Ok((schema, all_rows))
         }
     }
+}
+
+#[cfg(test)]
+async fn execute_table_function_with_budget_for_test_backend(
+    backend: Box<dyn backend::FsBackend>,
+    mode: Fs9Mode,
+    max_total_bytes: usize,
+) -> Result<(TableSchema, Vec<Row>)> {
+    execute_table_function_with_budget_for_backend(backend.as_ref(), mode, max_total_bytes).await
 }
 
 pub(crate) async fn start_file_stream(
@@ -730,7 +766,10 @@ mod tests {
 
     use tokio::time::{timeout, Duration};
 
-    use super::{list_directory_entries, start_glob_stream_with_budget_for_test_backend};
+    use super::{
+        execute_table_function_with_budget_for_test_backend, list_directory_entries,
+        start_glob_stream_with_budget_for_test_backend,
+    };
     use crate::extensions::fs::backend::{FsBackend, FsFileInfo};
     use crate::model::Value;
 
@@ -788,8 +827,17 @@ mod tests {
             Ok(out)
         }
 
-        async fn read_file(&self, _path: &str, _max_bytes: usize) -> Result<Vec<u8>> {
-            anyhow::bail!("not implemented for test backend")
+        async fn read_file(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
+            let data = std::fs::read(path)
+                .map_err(|err| anyhow!("fs9: cannot read file '{path}': {err}"))?;
+            if data.len() > max_bytes {
+                return Err(anyhow!(
+                    "fs9: file too large: {} bytes exceeds limit {}",
+                    data.len(),
+                    max_bytes
+                ));
+            }
+            Ok(data)
         }
 
         async fn read_file_stream(
@@ -960,6 +1008,79 @@ mod tests {
         }
 
         assert_eq!(lines, vec!["line1", "line2", "line3"]);
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_execute_glob_bytes_budget_does_not_overshoot_last_file() {
+        let dir = unique_base("glob-exec-budget");
+        fs::write(dir.join("a.txt"), "line1\n").expect("write a.txt");
+        fs::write(dir.join("b.txt"), "line2\nline3\n").expect("write b.txt");
+
+        let pattern = format!("{}/*.txt", dir.display());
+        let budget = "line1\n".len() + 2;
+        let mode = super::Fs9Mode::Glob {
+            pattern,
+            format: None,
+            delimiter: None,
+            header: None,
+            exclude: None,
+        };
+
+        let (_schema, rows) = execute_table_function_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            mode,
+            budget,
+        )
+        .await
+        .expect("execute table function");
+
+        let mut lines = Vec::new();
+        for row in rows {
+            if let Value::Text(line) = &row.values[1] {
+                lines.push(line.clone());
+            }
+        }
+
+        assert_eq!(lines, vec!["line1"]);
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_execute_glob_oversized_file_returns_error() {
+        let dir = unique_base("glob-exec-oversize");
+        fs::write(dir.join("a.txt"), "line1\n").expect("write a.txt");
+
+        let oversized_path = dir.join("b_big.txt");
+        let oversized = std::fs::File::create(&oversized_path).expect("create b_big.txt");
+        oversized
+            .set_len((super::MAX_BYTES_PER_FILE + 1) as u64)
+            .expect("set b_big.txt size");
+
+        let pattern = format!("{}/*.txt", dir.display());
+        let mode = super::Fs9Mode::Glob {
+            pattern,
+            format: None,
+            delimiter: None,
+            header: None,
+            exclude: None,
+        };
+
+        let err = execute_table_function_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            mode,
+            super::MAX_TOTAL_BYTES,
+        )
+        .await
+        .expect_err("expected oversized file to return an error");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("file too large"),
+            "unexpected error message: {msg}"
+        );
 
         cleanup(&dir);
     }
