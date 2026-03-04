@@ -293,6 +293,18 @@ impl QueryContext {
             .flatten()
     }
 
+    /// Read a setting from the current statement's settings snapshot.
+    ///
+    /// Returns `None` when there is no scoped snapshot or the key is absent.
+    pub(crate) fn current_setting_snapshot(name: &str) -> Option<String> {
+        let canonical =
+            crate::sql::session::settings::SessionSettings::canonical_setting_name(name);
+        SETTINGS_SNAPSHOT
+            .try_with(|s| s.get(canonical).cloned())
+            .ok()
+            .flatten()
+    }
+
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
         Self::new(

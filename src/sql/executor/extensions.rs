@@ -8,6 +8,7 @@ use crate::extensions::{descriptor, InstalledExtension};
 use crate::sql::error::SqlError;
 use crate::sql::operators::{BoxedOperator, TableFunctionScanOperator};
 use anyhow::{anyhow, Result};
+use chrono::DateTime;
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, ObjectName, TableAlias};
 use tikv_client::Transaction;
 use tracing::info;
@@ -43,6 +44,37 @@ fn apply_table_function_alias(schema: &mut TableSchema, alias: Option<&TableAlia
         }
     }
     Ok(())
+}
+
+fn parse_iso8601_to_epoch_ms(input: &str) -> Result<i64> {
+    let dt = DateTime::parse_from_rfc3339(input).map_err(|e| {
+        anyhow!(
+            "embedding_usage: invalid resets_at timestamp '{}': {}",
+            input,
+            e
+        )
+    })?;
+    Ok(dt.timestamp_millis())
+}
+
+fn embedding_usage_args_error(args_len: usize) -> anyhow::Error {
+    let signature = if args_len == 0 {
+        "extensions.embedding_usage()".to_string()
+    } else {
+        format!(
+            "extensions.embedding_usage({})",
+            vec!["unknown"; args_len].join(", ")
+        )
+    };
+    SqlError::FunctionNotFound(signature).into()
+}
+
+fn embedding_usage_permission_error() -> anyhow::Error {
+    SqlError::PermissionDenied {
+        object_type: "function".into(),
+        object_name: "embedding_usage".into(),
+    }
+    .into()
 }
 
 use super::core::starts_with_ignore_ascii_case;
@@ -179,6 +211,40 @@ impl Executor {
         }
 
         let func_upper = func_name.to_ascii_uppercase();
+        if func_upper == "EMBEDDING_USAGE" {
+            if !args.is_empty() {
+                return Err(embedding_usage_args_error(args.len()));
+            }
+
+            let client = crate::extensions::context::tikv_client()
+                .ok_or_else(|| anyhow!("embedding_usage: tikv client not available"))?;
+            let db_id = crate::session_context::current_database_id();
+
+            crate::extensions::embedding::check_embedding_installed(
+                &client,
+                db_id,
+                "extensions.embedding_usage()",
+            )
+            .await?;
+
+            if !crate::extensions::context::is_superuser() {
+                return Err(embedding_usage_permission_error());
+            }
+
+            let (used, resets_at) =
+                crate::extensions::embedding::read_embedding_usage(&client, db_id).await?;
+            let resets_at_ms = parse_iso8601_to_epoch_ms(&resets_at)?;
+            let mut schema = crate::extensions::embedding::embedding_usage_table_schema();
+            apply_table_function_alias(&mut schema, alias)?;
+            return Ok(Some(ExtensionTableFunctionResult::Batch(
+                schema,
+                vec![Row::new(vec![
+                    Value::Int64(used),
+                    Value::Timestamp(resets_at_ms),
+                ])],
+            )));
+        }
+
         let http_call = match func_upper.as_str() {
             "HTTP_GET" => {
                 if args.is_empty() || args.len() > 2 {
@@ -600,9 +666,12 @@ impl Executor {
                 .is_some()
             {
                 if if_not_exists {
-                    return Ok(super::super::ExecuteResult::CreateExtension {
-                        ext_name: ext_name.clone(),
-                    });
+                    return Ok((
+                        super::super::ExecuteResult::CreateExtension {
+                            ext_name: ext_name.clone(),
+                        },
+                        false,
+                    ));
                 }
                 return Err(anyhow!("extension \"{}\" already exists", ext_name));
             }
@@ -614,9 +683,12 @@ impl Executor {
                 self.store().set_cron_enabled(txn, db_id).await?;
             }
 
-            Ok(super::super::ExecuteResult::CreateExtension {
-                ext_name: ext_name.clone(),
-            })
+            Ok((
+                super::super::ExecuteResult::CreateExtension {
+                    ext_name: ext_name.clone(),
+                },
+                true,
+            ))
         }
         .await;
 
@@ -625,6 +697,14 @@ impl Executor {
                 session.commit().await?;
             } else {
                 session.rollback().await?;
+            }
+        }
+
+        if !is_autocommit {
+            if let Ok((_, created)) = &result {
+                if *created {
+                    session.note_extension_created(&ext_name);
+                }
             }
         }
 
@@ -655,7 +735,7 @@ impl Executor {
             }
         }
 
-        result
+        result.map(|(res, _created)| res)
     }
 
     pub(crate) async fn execute_drop_extension_cmd(
@@ -714,9 +794,12 @@ impl Executor {
                 }
             }
 
-            Ok(super::super::ExecuteResult::DropExtension {
-                ext_name: ext_name.clone(),
-            })
+            Ok((
+                super::super::ExecuteResult::DropExtension {
+                    ext_name: ext_name.clone(),
+                },
+                dropped,
+            ))
         }
         .await;
 
@@ -728,7 +811,15 @@ impl Executor {
             }
         }
 
-        result
+        if !is_autocommit {
+            if let Ok((_, dropped)) = &result {
+                if *dropped {
+                    session.note_extension_dropped(&ext_name);
+                }
+            }
+        }
+
+        result.map(|(res, _dropped)| res)
     }
 }
 
@@ -770,5 +861,23 @@ mod tests {
             .expect("vector bootstrap SQL must map to a registered extension descriptor");
         assert_eq!(desc.name, "vector");
         assert_eq!(desc.default_schema, "public");
+    }
+
+    #[test]
+    fn embedding_usage_argument_error_has_sqlstate_42883() {
+        let err = embedding_usage_args_error(1);
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("error must downcast to SqlError");
+        assert_eq!(sql_err.sqlstate(), "42883");
+    }
+
+    #[test]
+    fn embedding_usage_permission_error_has_sqlstate_42501() {
+        let err = embedding_usage_permission_error();
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("error must downcast to SqlError");
+        assert_eq!(sql_err.sqlstate(), "42501");
     }
 }

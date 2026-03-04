@@ -102,7 +102,16 @@ Key files: `src/storage/tikv_store/` (tables.rs, indexes.rs, schemas.rs, statist
 The worker engine (`src/worker/`) provides a unified async task queue backed by TiKV with pessimistic locking. It drives cron jobs, async triggers, auto-analyze, background DDL, and background SQL execution. The cron scheduler (`src/cron/`) provides pg_cron-compatible scheduling expressions and job management.
 
 ### Extensions
-Built-in extensions (`src/extensions/`) are compiled into the binary. Currently supported: HTTP client, fs9 file system operations, and Parquet read support. Per-tenant install state is persisted in TiKV.
+Built-in extensions (`src/extensions/`) are compiled into the binary. Currently supported: HTTP client, embedding API integration, fs9 file system operations, and Parquet read support. Per-tenant install state is persisted in TiKV.
+
+Compatibility governance for extension SQL surfaces follows the project rule:
+- PostgreSQL-compatible by default.
+- Any intentional divergence must be explicitly documented and tracked (SoT + design record + tests), not hidden in runtime behavior.
+
+For embedding extension visibility semantics and SQLSTATE boundaries, see:
+- `docs/design/28_embedding_extension_pg_parity_contract.md`
+- `docs/sot/extensions-gin.md`
+- Follow-up tracking: `#1421` (visibility semantics), `#1420` (compatibility-marker gate)
 
 ### Auth and Session
 Authentication (`src/auth/`) handles RBAC and password-based auth. Session state (`src/sql/session/`) manages per-connection GUCs, transaction state, and search paths.

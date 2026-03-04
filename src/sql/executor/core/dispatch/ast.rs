@@ -87,11 +87,15 @@ impl Executor {
             }
             let start = Instant::now();
             let rt_settings = RuntimeSettings::from_session(session);
+            let extension_txn_delta = session.extension_delta_snapshot();
+            let txn_snapshot_ts_version = session.active_txn_start_ts_version();
             let stmt_exec: Result<Vec<ExecuteResult>> = wrap_with_runtime_context(
                 &rt_settings,
                 self.tenant_keyspace(),
                 session.current_database_id(),
+                txn_snapshot_ts_version,
                 self.store.transaction_client(),
+                extension_txn_delta,
                 async {
                     match stmt {
                         // Transaction Control

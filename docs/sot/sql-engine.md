@@ -13,6 +13,12 @@
 - Virtual catalog semantics (`information_schema`/`pg_catalog`) (authoritative: `./catalog-introspection.md`).
 
 ## External Contracts
+- **[Stable] Compatibility baseline and divergence discipline**
+  - SQL-visible behavior MUST target PostgreSQL parity by default.
+  - Any intentional SQL-visible divergence from PostgreSQL MUST be explicitly documented in SoT with rationale, user value, and verification evidence.
+  - Divergence MUST NOT be implicit; tests and docs MUST make the divergence boundary discoverable.
+  - Cross-link: `docs/sot/README.md` section `Compatibility Strategy: PG-Compatible by Default, DB9-Better by Explicit Design`.
+
 - **[Stable] PostgreSQL dialect parsing + multi-statement execution**
   - The engine MUST parse SQL using `sqlparser`’s PostgreSQL dialect and MUST support multiple statements in a single query string (e.g. `BEGIN; ...; COMMIT;`).
   - When multiple statements are provided, the engine MUST execute them in order and return a result stream containing each statement’s results (Simple Query protocol compliance).

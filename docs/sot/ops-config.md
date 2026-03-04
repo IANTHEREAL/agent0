@@ -13,6 +13,7 @@
 
 ## Entrypoints
 - `src/main.rs` (server bootstrap; TiKV endpoints; port; keyspace; TLS env wiring)
+- `src/config.rs` (server defaults + embedding env config normalization)
 - `src/tls.rs` (TLS acceptor setup)
 - `src/observability.rs` (observability knobs)
 - `src/extensions/http.rs` (HTTP extension security knob)
@@ -42,6 +43,11 @@
 | `DB9_OBS_MAX_SAMPLE_EVENTS` | env | `20000` | `src/observability.rs` (`ObservabilityConfig::from_env`) | Cap for sampled events kept in-memory; must be `> 0`. |
 | `DB9_OBS_MAX_SAMPLE_GROUPS` | env | `50` | `src/observability.rs` (`ObservabilityConfig::from_env`) | Cap for distinct query sample groups; must be `> 0`. |
 | `DB9_OBS_MAX_SQL_LEN` | env | `512` | `src/observability.rs` (`ObservabilityConfig::from_env`) | Max SQL length stored for sampled queries; must be `> 0`. |
+| `EMBEDDING_API_KEY` | env | unset | `src/config.rs` (`EmbeddingConfig::from_env`) | API key for embedding provider. When unset, embedding service is unavailable. |
+| `EMBEDDING_ENDPOINT` | env | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1/embeddings` | `src/config.rs` (`embedding_endpoint_from_env`) | Full embeddings endpoint. Path is normalized to end with `/embeddings`. |
+| `EMBEDDING_BASE_URL` | env | unset | `src/config.rs` (`embedding_endpoint_from_env`) | Alias for endpoint base URL. Used only when `EMBEDDING_ENDPOINT` is unset; normalized to `/embeddings`. |
+| `EMBEDDING_MODEL` | env | `text-embedding-v4` | `src/config.rs` (`EmbeddingConfig::from_env`) | Model name. Non-v4 values are normalized/forced to `text-embedding-v4`. |
+| `EMBEDDING_DIMENSIONS` | env | `1024` | `src/config.rs` (`EmbeddingConfig::from_env`) | Default embedding dimensions; must parse as `u32` and be `> 0`. |
 | `DB9_HTTP_ALLOW_INSECURE` | env | `false` | `src/extensions/http.rs` (`allow_insecure_http`) | When true, allows non-HTTPS HTTP extension requests; accepts `"1"` or case-insensitive `"true"`. |
 | `DB9_MAX_GENERATE_SERIES_ROWS` | env | `1000000` | `src/sql/executor/table_utils.rs` (`max_generate_series_rows`) | Guardrail for `generate_series`; must parse as `usize` and be `> 0`. |
 | `DB9_MAX_SUSPENDED_PORTALS` | env | `32` | `src/protocol/handler/portal.rs` (`max_suspended_portals`) | Upper bound for suspended portals kept in memory; must parse as `usize` and be `> 0`. |

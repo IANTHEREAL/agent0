@@ -1,3 +1,4 @@
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use std::cell::Cell;
 use std::future::Future;
@@ -48,6 +49,7 @@ pub(crate) struct ExtensionContext {
     pub(crate) tenant_keyspace: String,
     execution_kind: ExecutionKind,
     http_requests: Cell<u32>,
+    embedding_calls: Cell<u32>,
     tikv_client: Option<Arc<TransactionClient>>,
 }
 
@@ -80,6 +82,7 @@ pub(crate) async fn with_context_opts<R>(
         tenant_keyspace: opts.tenant_keyspace,
         execution_kind: opts.execution_kind,
         http_requests: Cell::new(0),
+        embedding_calls: Cell::new(0),
         tikv_client: opts.tikv_client,
     };
 
@@ -125,4 +128,28 @@ pub(crate) fn try_consume_http_request(max_per_statement: u32) -> Result<()> {
         Ok(())
     })
     .map_err(|_| anyhow!("http: extension context missing"))?
+}
+
+const MAX_EMBEDDING_CALLS_PER_STATEMENT: u32 = 100;
+
+pub(crate) fn try_consume_embedding_call() -> Result<()> {
+    try_consume_embedding_call_with_limit(MAX_EMBEDDING_CALLS_PER_STATEMENT)
+}
+
+pub(crate) fn try_consume_embedding_call_with_limit(max_per_statement: u32) -> Result<()> {
+    CTX.try_with(|ctx| {
+        let used = ctx.embedding_calls.get();
+        if used >= max_per_statement {
+            return Err(SqlError::InvalidParameterValue {
+                message: format!(
+                    "embedding: max calls per statement ({}) exceeded",
+                    max_per_statement
+                ),
+            }
+            .into());
+        }
+        ctx.embedding_calls.set(used + 1);
+        Ok(())
+    })
+    .map_err(|_| anyhow!("embedding: extension context not available"))?
 }

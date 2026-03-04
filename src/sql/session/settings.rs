@@ -126,6 +126,30 @@ pub(crate) const KNOWN_GUCS: &[GucMeta] = &[
         static_default: None,
     },
     GucMeta {
+        name: "embedding.concurrency",
+        immutable: false,
+        description: "",
+        static_default: Some("5"),
+    },
+    GucMeta {
+        name: "embedding.dimensions",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "embedding.max_calls",
+        immutable: false,
+        description: "",
+        static_default: Some("100"),
+    },
+    GucMeta {
+        name: "embedding.model",
+        immutable: false,
+        description: "",
+        static_default: None,
+    },
+    GucMeta {
         name: "extra_float_digits",
         immutable: false,
         description: "",
@@ -595,6 +619,54 @@ impl SessionSettings {
                 let ms = Self::parse_timeout_millis(value)?;
                 Ok(Self::format_timeout_show(ms))
             }
+            "embedding.dimensions" => {
+                let v: u32 = value
+                    .trim()
+                    .parse()
+                    .map_err(|_| SqlError::InvalidParameterValue {
+                        message: format!("invalid value for parameter \"{}\": \"{}\"", name, value),
+                    })?;
+                if v == 0 {
+                    return Err(SqlError::InvalidParameterValue {
+                        message: format!(
+                            "invalid value for parameter \"{}\": \"{}\" must be at least 1",
+                            name, value
+                        ),
+                    }
+                    .into());
+                }
+                Ok(v.to_string())
+            }
+            "embedding.model" => crate::config::canonical_embedding_model(value)
+                .map(|m| m.to_string())
+                .ok_or_else(|| {
+                    SqlError::InvalidParameterValue {
+                        message: format!(
+                            "invalid value for parameter \"embedding.model\": \"{}\"; \
+                             only text-embedding-v4 is supported",
+                            value
+                        ),
+                    }
+                    .into()
+                }),
+            "embedding.max_calls" | "embedding.concurrency" => {
+                let v: u32 = value
+                    .trim()
+                    .parse()
+                    .map_err(|_| SqlError::InvalidParameterValue {
+                        message: format!("invalid value for parameter \"{}\": \"{}\"", name, value),
+                    })?;
+                if v == 0 {
+                    return Err(SqlError::InvalidParameterValue {
+                        message: format!(
+                            "invalid value for parameter \"{}\": \"{}\" must be at least 1",
+                            name, value
+                        ),
+                    }
+                    .into());
+                }
+                Ok(v.to_string())
+            }
             "hnsw.ef_search" => {
                 let v: u16 = value
                     .trim()
@@ -929,6 +1001,32 @@ impl SessionSettings {
             "db9.retry_max_attempts" => Some(self.retry_max_attempts.to_string()),
             "db9.retry_timeout" => Some(Self::format_timeout_show(self.retry_timeout_ms)),
             "db9.use_optimizer" => Some("on".to_string()),
+            "embedding.model" => Some(
+                self.extra_settings
+                    .get(canonical)
+                    .cloned()
+                    .unwrap_or_else(|| crate::config::get_embedding_config().model.clone()),
+            ),
+            "embedding.dimensions" => Some(
+                self.extra_settings
+                    .get(canonical)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        crate::config::get_embedding_config().dimensions.to_string()
+                    }),
+            ),
+            "embedding.max_calls" => Some(
+                self.extra_settings
+                    .get(canonical)
+                    .cloned()
+                    .unwrap_or_else(|| "100".to_string()),
+            ),
+            "embedding.concurrency" => Some(
+                self.extra_settings
+                    .get(canonical)
+                    .cloned()
+                    .unwrap_or_else(|| "5".to_string()),
+            ),
             "timezone" => Some(self.timezone.as_deref().unwrap_or("UTC").to_string()),
             "application_name" => Some(self.application_name.as_deref().unwrap_or("").to_string()),
             "client_encoding" => Some(
@@ -1164,6 +1262,10 @@ impl SessionSettings {
         "db9.retry_max_attempts",
         "db9.retry_timeout",
         "db9.use_optimizer",
+        "embedding.model",
+        "embedding.dimensions",
+        "embedding.max_calls",
+        "embedding.concurrency",
         "timezone",
         "application_name",
         "client_encoding",

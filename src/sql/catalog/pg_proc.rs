@@ -96,6 +96,28 @@ impl VirtualTable for PgProc {
             }
         }
 
+        if let Some(ext) = ctx
+            .store
+            .get_extension(ctx.txn, ctx.db_id, "embedding")
+            .await?
+        {
+            if ext.enabled {
+                for (oid, name, prorettype) in [
+                    (1201_i64, "embedding", crate::sql::pg_types::OID_VECTOR),
+                    (1202_i64, "embedding_usage", 2249_i64),
+                ] {
+                    rows.push(Row::new(vec![
+                        int_val(oid),
+                        text_val(name),
+                        int_val(extensions_oid),
+                        int_val(catalog_oids::pg_role_oid("postgres")),
+                        int_val(prorettype),
+                        text_val("f"),
+                    ]));
+                }
+            }
+        }
+
         for f in funcs {
             let oid = catalog_oids::pg_proc_function_oid(f.oid);
             let namespace_oid = schema_oid(ctx.schema_oids, &f.schema);

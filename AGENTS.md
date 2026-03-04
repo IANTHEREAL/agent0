@@ -189,7 +189,8 @@ docker compose up -d <service>
 
 ## SQL Test Contract (must follow)
 
-- `.expected` > `.errors` > `.assert` priority; use only one validation mode per test.
+- `.expected` is exclusive full-output snapshot mode.
+- When `.expected` is absent, `.errors` and `.assert` MAY be combined in one test (`.errors + .assert`) to validate both expected SQL diagnostics and required output fragments.
 - Always enforce deterministic output (`ORDER BY`, fixed values, no random-dependent assertions).
 - Do not update expected outputs blindly; validate against real PostgreSQL first.
 - **Before changing any `.expected`, `.errors`, or `.assert` file, you MUST run the corresponding `.sql` against real PostgreSQL 17.7 and verify the new expected output matches PG's actual output.** No exceptions — guessing what PG returns is not acceptable.

@@ -137,6 +137,7 @@ pub(crate) fn is_volatile_or_side_effecting_builtin(name: &str) -> bool {
             | "UUIDV7"
             | "CLOCK_TIMESTAMP"
             | "TXID_CURRENT"
+            | "EMBEDDING"
     )
 }
 

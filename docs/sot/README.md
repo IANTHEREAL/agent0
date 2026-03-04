@@ -21,6 +21,36 @@ Stability labels inside SoT docs:
 - **Experimental**: may change; must be labeled and gated
 - **Deprecated**: still supported but scheduled for removal; must include migration path
 
+## PostgreSQL Parity Adjudication Pattern (cross-module)
+
+When behavior is intended to match PostgreSQL, disputes MUST be resolved with a reproducible PostgreSQL oracle flow, not by local assumption or test-harness artifacts.
+
+Rules:
+- PostgreSQL 17.7 is the canonical parity baseline for SQL behavior and SQLSTATE adjudication.
+- Every parity dispute MUST record exact reproduction commands and observed outputs in PR discussion (or linked artifact), including absolute versions and timestamps.
+- Concurrency or visibility disputes MUST use at least two independent client connections (for example psycopg with two sessions). `psql` scripts with `\\!` subprocess calls MAY be used only as supporting evidence, not as the sole oracle.
+- Oracle selection MUST be surface-consistent: if the contract under review is a function call, parity evidence MUST be built from that function-call path (same SQL surface), not from a different catalog-observation path.
+- A single user-visible contract MUST map to one semantic visibility source. Implementations MUST NOT mix independent visibility timelines (for example, transaction snapshot for one path and latest-committed read for another path) without an explicit SoT contract describing precedence.
+- If PostgreSQL reproduction and current SoT text diverge, the PR MUST either:
+  - update code/tests to match PostgreSQL, or
+  - explicitly declare intentional divergence with rationale, migration impact, and DR/ADR reference.
+
+## Compatibility Strategy: PG-Compatible by Default, DB9-Better by Explicit Design
+
+The default product strategy is:
+- PostgreSQL compatibility first for SQL behavior, SQLSTATE contracts, and protocol-observable semantics.
+- Intentional divergence is allowed only when it delivers clear user value for DB9 (for example distributed architecture constraints, safety, operability, or performance).
+
+Intentional divergence contract (MUST for every accepted divergence):
+- `Why not PG here`: concrete reason PG parity is not chosen now.
+- `User value`: explicit improvement vs PG for DB9 users.
+- `Behavior delta`: exact SQL-visible difference and SQLSTATE/wire impact.
+- `Scope`: affected modules, SQL surfaces, and versions.
+- `Fallback or control`: feature flag/GUC/config if applicable.
+- `Verification`: parity tests, divergence tests, and reproducible evidence.
+- `Exit criteria`: conditions and owner plan to converge to PG later (if planned).
+- `Governance`: linked DR/ADR and issue(s) for tracking.
+
 ## No overlaps without cross-links
 
 Module boundaries may touch, but **contracts MUST have exactly one authoritative home**.

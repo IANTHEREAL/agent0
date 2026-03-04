@@ -53,7 +53,9 @@ impl Session {
             let mut tracker = self.xact_advisory_savepoint_tracker.lock().await;
             tracker.create(name_for_tracker);
         }
-        self.settings.push_settings_savepoint(name_for_settings);
+        self.settings
+            .push_settings_savepoint(name_for_settings.clone());
+        self.push_extension_delta_savepoint(name_for_settings);
         Ok(())
     }
 
@@ -73,6 +75,7 @@ impl Session {
             tracker.release(name)?;
         }
         self.settings.release_settings_savepoint(name);
+        self.release_extension_delta_savepoint(name);
         Ok(())
     }
 
@@ -124,6 +127,7 @@ impl Session {
         // TODO(#601-followup): Regular SET (non-LOCAL) is not restored on savepoint rollback.
         // PostgreSQL restores it; tracking that session-state undo separately from SET LOCAL.
         self.settings.rollback_settings_to_savepoint(name);
+        self.rollback_extension_delta_to_savepoint(name);
         self.sync_plan_cache_settings();
         self.release_rolled_back_xact_advisory_locks(rolled_back_xact_locks);
         self.clear_failed_transaction();
@@ -144,6 +148,8 @@ impl Session {
                 self.savepoints.reset().await?;
                 self.reset_xact_advisory_savepoint_tracker().await;
                 self.state = TransactionState::Active(txn);
+                self.extension_delta = super::ExtensionDelta::default();
+                self.extension_delta_savepoints.clear();
                 self.transaction_timestamp_ms = Some(ts);
                 self.tx_statement_count = 0;
                 Ok(())
@@ -164,6 +170,8 @@ impl Session {
     pub async fn commit(&mut self) -> Result<()> {
         self.transaction_timestamp_ms = None;
         self.tx_statement_count = 0;
+        self.extension_delta = super::ExtensionDelta::default();
+        self.extension_delta_savepoints.clear();
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
                 self.savepoints.reset().await?;
@@ -206,6 +214,8 @@ impl Session {
     pub async fn rollback(&mut self) -> Result<()> {
         self.transaction_timestamp_ms = None;
         self.tx_statement_count = 0;
+        self.extension_delta = super::ExtensionDelta::default();
+        self.extension_delta_savepoints.clear();
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
                 self.savepoints.reset().await?;

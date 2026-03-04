@@ -26,6 +26,7 @@ const DB_SYS_TYPE_PREFIX: &[u8] = b"sys_type_";
 const DB_SYS_SEQUENCEDEF_PREFIX: &[u8] = b"sys_seqdef_";
 const DB_SYS_EXTENSION_PREFIX: &[u8] = b"sys_ext_";
 const DB_SYS_EXTENSIONCFG_PREFIX: &[u8] = b"sys_extcfg_";
+const DB_SYS_EMBEDDING_USAGE: &[u8] = b"sys_embedding_usage_";
 const DB_SYS_COMMENT_PREFIX: &[u8] = b"sys_comment_";
 const DB_SYS_RELNAME_PREFIX: &[u8] = b"sys_relname_";
 const DB_SYS_SEQ_PREFIX: &[u8] = b"sys_seq_";
@@ -253,6 +254,13 @@ pub fn encode_extension_config_key_v2(db_id: u64, ext_name: &str) -> Vec<u8> {
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_EXTENSIONCFG_PREFIX);
     key.extend_from_slice(ext_name.as_bytes());
+    key
+}
+
+pub fn encode_embedding_usage_key_v2(db_id: u64, date_yyyymmdd: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_EMBEDDING_USAGE);
+    key.extend_from_slice(date_yyyymmdd.as_bytes());
     key
 }
 

@@ -253,6 +253,8 @@ impl Executor {
 
             let timeout = session.statement_timeout();
             let current_role = session.current_user().map(|u| u.to_string());
+            let txn_snapshot_ts_version = session.active_txn_start_ts_version();
+            let extension_txn_delta = session.extension_delta_snapshot();
             let fut = async {
                 let (txn, sequence_values, search_path) = session
                     .get_mut_txn_sequence_values_and_search_path()
@@ -274,7 +276,13 @@ impl Executor {
                 Ok::<(Vec<ExecuteResult>, ExecuteResult), anyhow::Error>((notices, result))
             };
 
-            let res = apply_statement_timeout(timeout, fut).await;
+            let res = crate::session_context::with_txn_snapshot_ts_version(
+                txn_snapshot_ts_version,
+                crate::session_context::with_extension_txn_delta(extension_txn_delta, async {
+                    apply_statement_timeout(timeout, fut).await
+                }),
+            )
+            .await;
 
             // Invalidate plan cache after schema-altering DDL succeeds.
             // Applies to both autocommit and explicit transactions: within an

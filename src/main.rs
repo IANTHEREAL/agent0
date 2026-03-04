@@ -106,6 +106,7 @@ async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     let dev_mode = config::env_bool("DB9_DEV");
     let insecure_mode = config::env_bool("DB9_INSECURE");
     let server_config = ServerConfig::from_env().shared();
+    config::init_embedding_config();
     info!(
         "Statement timeout default: {}ms, idle-in-transaction timeout default: {}ms",
         server_config.read().unwrap().statement_timeout_ms,

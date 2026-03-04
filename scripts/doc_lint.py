@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,10 @@ REQUIRED_DOC_HEADINGS: tuple[str, ...] = (
     "Verification (Gates)",
     "Change Management",
 )
+
+MARKER_PARITY = "PG_PARITY"
+MARKER_DIVERGENCE_RE = re.compile(r"DB9_DIVERGENCE\(([^)]+)\)")
+MARKER_REF_RE = re.compile(r"^(#\d+|ADR-[A-Za-z0-9._-]+|DR-[A-Za-z0-9._-]+)$")
 
 
 @dataclass(frozen=True)
@@ -316,6 +321,64 @@ def _check_config_ssot(linter: DocLinter) -> None:
                 )
 
 
+def _git_changed_files() -> list[str]:
+    """
+    Return changed paths for current branch compared to origin/master.
+
+    Falls back to HEAD~1 diff if origin/master is unavailable.
+    """
+    candidates = [
+        ["git", "diff", "--name-only", "--diff-filter=ACMRTUXB", "origin/master...HEAD"],
+        ["git", "diff", "--name-only", "--diff-filter=ACMRTUXB", "HEAD~1...HEAD"],
+    ]
+    for cmd in candidates:
+        try:
+            out = subprocess.check_output(cmd, cwd=PROJECT_DIR, text=True, stderr=subprocess.DEVNULL)
+        except Exception:
+            continue
+        files = [line.strip() for line in out.splitlines() if line.strip()]
+        if files:
+            return files
+    return []
+
+
+def _is_sql_contract_test(sql_path: Path) -> bool:
+    return any(
+        sql_path.with_suffix(suffix).exists()
+        for suffix in (".expected", ".errors", ".assert")
+    )
+
+
+def _check_changed_sql_contract_markers(linter: DocLinter) -> None:
+    changed = _git_changed_files()
+    for rel in changed:
+        if not rel.startswith("tests/") or not rel.endswith(".sql"):
+            continue
+        sql_path = PROJECT_DIR / rel
+        if not sql_path.exists() or not _is_sql_contract_test(sql_path):
+            continue
+
+        first_lines = _read_text(sql_path).splitlines()[:20]
+        header = "\n".join(first_lines)
+
+        has_parity = MARKER_PARITY in header
+        divergence_match = MARKER_DIVERGENCE_RE.search(header)
+        if not has_parity and divergence_match is None:
+            linter.error(
+                f"{rel}: SQL contract test must include top-of-file marker "
+                f"`{MARKER_PARITY}` or `DB9_DIVERGENCE(<tracking-id>)`"
+            )
+            continue
+
+        if divergence_match is not None:
+            ref = divergence_match.group(1).strip()
+            if not MARKER_REF_RE.match(ref):
+                linter.error(
+                    f"{rel}: invalid DB9_DIVERGENCE tracking id `{ref}`; "
+                    "expected `#<issue>`, `ADR-...`, or `DR-...`"
+                )
+
+
 def _report(linter: DocLinter) -> int:
     if not linter.errors:
         print("doc-lint: OK")
@@ -394,6 +457,7 @@ def main(argv: list[str]) -> int:
 
     _check_sot_map(linter, args.readme, module_ids)
     _check_config_ssot(linter)
+    _check_changed_sql_contract_markers(linter)
 
     return _report(linter)
 

@@ -1512,6 +1512,45 @@ fn analyze_unknown_function_passthrough() {
 }
 
 #[test]
+fn analyze_embedding_wrong_arg_type_is_42883() {
+    let err = analyze_expr_with_users("embedding(42)").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embedding")
+    ));
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
+#[test]
+fn analyze_embedding_wrong_optional_arg_types_are_42883() {
+    let err = analyze_expr_with_users("embedding('hi', 1, 'bad')").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embedding")
+    ));
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
+#[test]
+fn analyze_embedding_string_literal_dimensions_is_accepted() {
+    let expr = analyze_expr_with_users("embedding('hi', 'text-embedding-v4', '1024')").unwrap();
+    assert!(matches!(expr.kind, TypedExprKind::FunctionCall { .. }));
+}
+
+#[test]
+fn analyze_embedding_text_column_dimensions_is_42883() {
+    let err = analyze_expr_with_users("embedding('hi', 'text-embedding-v4', name)").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embedding")
+    ));
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
+#[test]
 fn analyze_array_subscript_on_non_array_errors() {
     // score (Float64) is not an array
     let err = analyze_expr_with_users("score[1]").unwrap_err();

@@ -39,6 +39,9 @@ System-wide invariants that span multiple modules. These are binding rules that 
 11. **Worker queue isolation**: Worker tasks MUST be scoped to `_sys_worker` keyspace. Task claiming MUST use pessimistic transactions — no duplicate execution across instances.
     - xref: [worker-cron](./worker-cron.md)
 
+12. **No implicit PostgreSQL divergence**: SQL-visible behavior that intentionally differs from PostgreSQL MUST be explicitly declared and governed in SoT; hidden divergence is not allowed.
+    - xref: [sql-engine](./sql-engine.md), [testing-gates](./testing-gates.md)
+
 ## Stability
 
 **Stable** — Breaking changes to any invariant require DR/ADR + migration + rollback + gate updates.
@@ -52,6 +55,7 @@ System-wide invariants that span multiple modules. These are binding rules that 
 - Invariant #9: enforced by `src/sql/triggers/` (BEFORE inline) and `src/worker/` (AFTER async)
 - Invariant #10: enforced by SQL test contract and PR review policy
 - Invariant #11: enforced by `src/worker/engine.rs` (pessimistic transaction claiming)
+- Invariant #12: enforced by SoT compatibility strategy + SQL test annotation/evidence rules (`docs/sot/README.md`, `docs/sot/sql-engine.md`, `docs/sot/testing-gates.md`)
 
 ## Change Management
 

@@ -125,7 +125,7 @@ Notes:
 - Only SUPERUSER can run `CREATE EXTENSION`.
 - Extension compatibility contract:
   - `vector` is built-in and usable without installation; `CREATE EXTENSION [IF NOT EXISTS] vector` is accepted for compatibility.
-  - `http`, `fs9`, `pg_cron`, and `parquet` are install-gated and require `CREATE EXTENSION`.
+  - `http`, `embedding`, `fs9`, `pg_cron`, and `parquet` are install-gated and require `CREATE EXTENSION`.
   - See `docs/extensions.md` for the full matrix.
 
 ### DROP EXTENSION

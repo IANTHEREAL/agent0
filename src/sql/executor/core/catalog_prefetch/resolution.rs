@@ -427,7 +427,7 @@ pub(super) async fn prefetch_table_function_schemas(
     query: &Query,
     snapshot: &mut CatalogSnapshot,
 ) -> Result<()> {
-    use crate::extensions::{fs, http, EXTENSIONS_SCHEMA};
+    use crate::extensions::{embedding, fs, http, EXTENSIONS_SCHEMA};
     use sqlparser::ast::{FunctionArg, FunctionArgExpr};
 
     let mut seen: HashSet<String> = HashSet::new();
@@ -459,6 +459,11 @@ pub(super) async fn prefetch_table_function_schemas(
 
         if is_extensions_schema {
             // Prefetch schemas for known extension table functions.
+            if func_lower == "embedding_usage" {
+                snapshot.add_table_function(&call.key, embedding::embedding_usage_table_schema());
+                continue;
+            }
+
             if let Some(schema) = http::table_function_schema(&func_lower) {
                 snapshot.add_table_function(&call.key, schema);
                 continue;

@@ -21,11 +21,11 @@ use crate::sql::sequences::SequenceSession;
 use crate::storage::TikvStore;
 use crate::txn::SavepointState;
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tikv_client::Transaction;
+use tikv_client::{TimestampExt, Transaction};
 
 pub(crate) const DEFAULT_MAX_SORT_BYTES: usize = 256 * 1024 * 1024;
 
@@ -33,6 +33,18 @@ pub enum TransactionState {
     Idle,
     Active(Transaction),
     Failed(Transaction),
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ExtensionDelta {
+    pub(crate) created: HashSet<String>,
+    pub(crate) dropped: HashSet<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ExtensionDeltaSavepoint {
+    name: String,
+    snapshot: ExtensionDelta,
 }
 
 pub struct Session {
@@ -86,6 +98,10 @@ pub struct Session {
     /// Savepoint-scoped tracker for xact advisory lock acquisitions.
     pub(crate) xact_advisory_savepoint_tracker:
         Arc<tokio::sync::Mutex<XactAdvisorySavepointTracker>>,
+    /// In-transaction extension DDL delta (created/dropped).
+    /// Cleared on COMMIT/ROLLBACK, savepoint-scoped within a transaction block.
+    pub(crate) extension_delta: ExtensionDelta,
+    pub(crate) extension_delta_savepoints: Vec<ExtensionDeltaSavepoint>,
 }
 
 /// Force-insert or overwrite a setting in a sorted `(name, value, description)` vec.
@@ -150,6 +166,8 @@ impl Session {
             xact_advisory_savepoint_tracker: Arc::new(tokio::sync::Mutex::new(
                 XactAdvisorySavepointTracker::default(),
             )),
+            extension_delta: ExtensionDelta::default(),
+            extension_delta_savepoints: Vec::new(),
         }
     }
 
@@ -203,6 +221,8 @@ impl Session {
             xact_advisory_savepoint_tracker: Arc::new(tokio::sync::Mutex::new(
                 XactAdvisorySavepointTracker::default(),
             )),
+            extension_delta: ExtensionDelta::default(),
+            extension_delta_savepoints: Vec::new(),
         }
     }
 
@@ -234,6 +254,15 @@ impl Session {
 
     pub fn current_database_id(&self) -> u64 {
         self.current_database_id
+    }
+
+    pub(crate) fn active_txn_start_ts_version(&self) -> Option<u64> {
+        match &self.state {
+            TransactionState::Active(txn) | TransactionState::Failed(txn) => {
+                Some(txn.start_timestamp().version())
+            }
+            TransactionState::Idle => None,
+        }
     }
 
     pub(crate) fn current_database_name_arc(&self) -> Arc<str> {
@@ -329,6 +358,60 @@ impl Session {
     /// Clear the entire plan cache. Called on transaction rollback.
     pub(crate) fn clear_plan_cache(&mut self) {
         self.plan_cache.clear();
+    }
+
+    pub(crate) fn note_extension_created(&mut self, name: &str) {
+        let normalized = name.to_ascii_lowercase();
+        self.extension_delta.dropped.remove(&normalized);
+        self.extension_delta.created.insert(normalized);
+    }
+
+    pub(crate) fn note_extension_dropped(&mut self, name: &str) {
+        let normalized = name.to_ascii_lowercase();
+        self.extension_delta.created.remove(&normalized);
+        self.extension_delta.dropped.insert(normalized);
+    }
+
+    pub(crate) fn extension_delta_snapshot(
+        &self,
+    ) -> Arc<crate::session_context::ExtensionTxnDelta> {
+        Arc::new((
+            self.extension_delta.created.clone(),
+            self.extension_delta.dropped.clone(),
+        ))
+    }
+
+    pub(crate) fn push_extension_delta_savepoint(&mut self, name: String) {
+        self.extension_delta_savepoints
+            .push(ExtensionDeltaSavepoint {
+                name,
+                snapshot: self.extension_delta.clone(),
+            });
+    }
+
+    pub(crate) fn rollback_extension_delta_to_savepoint(&mut self, name: &str) {
+        let Some(target_idx) = self
+            .extension_delta_savepoints
+            .iter()
+            .rposition(|sp| sp.name == name)
+        else {
+            return;
+        };
+
+        self.extension_delta = self.extension_delta_savepoints[target_idx].snapshot.clone();
+        self.extension_delta_savepoints.truncate(target_idx + 1);
+    }
+
+    pub(crate) fn release_extension_delta_savepoint(&mut self, name: &str) {
+        let Some(target_idx) = self
+            .extension_delta_savepoints
+            .iter()
+            .rposition(|sp| sp.name == name)
+        else {
+            return;
+        };
+
+        self.extension_delta_savepoints.truncate(target_idx);
     }
 
     #[cfg(test)]

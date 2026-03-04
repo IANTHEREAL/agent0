@@ -26,6 +26,7 @@ This directory contains key gap designs and test plans for db9-server from the p
 ## P2/P3 (Not hard migration dependencies, enhance as needed)
 
 - `docs/design/17_extensions_framework_http.md`: Extension framework + HTTP extension (Supabase style)
+- `docs/design/28_embedding_extension_pg_parity_contract.md`: Embedding extension compatibility contract (function visibility, SQLSTATE boundaries, intentional-divergence governance)
 - `docs/design/16_set_returning_functions.md`: generate_series / unnest (FROM clause)
 - `docs/design/15_explain_analyze.md`: EXPLAIN ANALYZE
 - `docs/design/13_listen_notify.md`: LISTEN/NOTIFY

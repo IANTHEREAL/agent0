@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use crate::model::DataType;
 
 mod aggregate_window;
+mod embedding;
 mod json;
 mod math;
 mod misc;
@@ -119,6 +120,7 @@ pub fn global_registry() -> &'static FunctionRegistry {
 
 fn register_builtin_functions(r: &mut FunctionRegistry) {
     aggregate_window::register(r);
+    embedding::register(r);
     string::register(r);
     math::register(r);
     temporal::register(r);

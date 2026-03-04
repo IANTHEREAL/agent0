@@ -69,6 +69,42 @@ Notes:
 - Runtime env keys for starting `db9-server` (e.g. `PD_ENDPOINTS`, `PG_PORT`, TLS env) are SSOT in `./ops-config.md`.
 - Some scripts assume local tooling (`tiup`, `psql/pg_isready`, `python3`, `uv`, `node/npm`, `go`) — see each script’s help and the workflow steps as evidence.
 
+## SQL Validation Modes (`scripts/integration_test.py`)
+
+`scripts/integration_test.py` is the authoritative test-harness behavior for `tests/*.sql` companion files.
+
+Mode contract (current behavior):
+- `.expected` = full output snapshot mode. If present, harness compares normalized query output against `.expected` and returns immediately on pass/fail.
+- `.errors` = expected error substring mode. If present (and `.expected` is absent), harness requires at least one SQL diagnostic line and validates each against allowed patterns.
+- `.assert` = required output fragment mode. If present (and `.expected` is absent), harness requires each assertion needle to appear in output.
+
+Combination rules:
+- `.expected` MUST be treated as exclusive snapshot mode for a test case.
+- `.errors + .assert` is an allowed composite mode when a test must assert both error pattern(s) and additional output fragment(s) in the same run.
+- `.errors` file MUST NOT be empty.
+
+PostgreSQL parity rule:
+- Before changing any `.expected`, `.errors`, or `.assert` contract for SQL semantics, run the corresponding `.sql` against real PostgreSQL 17.7 and record parity evidence in the PR.
+
+Test annotation rule (compatibility clarity):
+- New or changed SQL tests that define behavior contracts SHOULD include a top-of-file marker comment:
+  - `PG_PARITY`: expected to match PostgreSQL behavior.
+  - `DB9_DIVERGENCE(<issue-or-adr-id>)`: intentional divergence with explicit governance link.
+- `DB9_DIVERGENCE(...)` tests MUST NOT be merged without a linked SoT section describing rationale, user value, and impact boundary.
+
+Marker examples:
+```sql
+-- PG_PARITY: verify SQLSTATE and result shape match PostgreSQL 17.7
+```
+
+```sql
+-- DB9_DIVERGENCE(#1421): explicit-transaction extension visibility uses transaction-consistent semantics
+```
+
+Evidence bundle rule (required for disputed semantics):
+- Include PostgreSQL version (`SELECT version()`), exact reproduction script, raw SQLSTATE/output, execution date, and db9 counterpart output in the PR.
+- For concurrency semantics, evidence MUST use at least two independent sessions.
+
 ## Verification (Gates)
 - CI: run the **Required** gates listed in `## CI Gates`.
 - Local: use the commands in `## Local Repro` to reproduce the same checks outside CI.

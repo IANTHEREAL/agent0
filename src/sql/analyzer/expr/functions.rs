@@ -402,6 +402,7 @@ impl<'a> Analyzer<'a> {
             | "PHRASETO_TSQUERY"
             | "TO_TSQUERY"
             | "WEBSEARCH_TO_TSQUERY" => self.coerce_fts_text_signature(func_name, args),
+            "EMBEDDING" => self.coerce_embedding_signature(func_name, args),
             _ if is_two_arg_advisory_lock_function(func_name) => {
                 self.coerce_advisory_lock_two_arg_signature(func_name, args)
             }
@@ -570,6 +571,58 @@ impl<'a> Analyzer<'a> {
                 });
             }
             coerced.push(self.coerce_if_needed(arg, &DataType::Text)?);
+        }
+        Ok(coerced)
+    }
+
+    fn coerce_embedding_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.is_empty() || args.len() > 3 {
+            return Ok(args);
+        }
+
+        let arg_types: Vec<DataType> = args.iter().map(|a| a.data_type.clone()).collect();
+        let mut coerced = Vec::with_capacity(args.len());
+        for (idx, arg) in args.into_iter().enumerate() {
+            match idx {
+                0 | 1 => {
+                    let arg_is_text_like = matches!(
+                        arg.data_type,
+                        DataType::Text | DataType::Varchar(_) | DataType::Name
+                    );
+                    if !arg_is_text_like
+                        && !self.is_unresolved_param(&arg)
+                        && !arg.is_null_constant()
+                    {
+                        return Err(AnalyzerError::FunctionNotFound {
+                            name: func_name.to_string(),
+                            arg_types: arg_types.clone(),
+                        });
+                    }
+                    coerced.push(self.coerce_if_needed(arg, &DataType::Text)?);
+                }
+                2 => {
+                    let arg_is_int_like =
+                        matches!(arg.data_type, DataType::Int32 | DataType::Int64);
+                    let arg_is_string_literal =
+                        matches!(&arg.kind, TypedExprKind::Constant(Value::Text(_)));
+                    if !arg_is_int_like
+                        && !arg_is_string_literal
+                        && !self.is_unresolved_param(&arg)
+                        && !arg.is_null_constant()
+                    {
+                        return Err(AnalyzerError::FunctionNotFound {
+                            name: func_name.to_string(),
+                            arg_types: arg_types.clone(),
+                        });
+                    }
+                    coerced.push(self.coerce_if_needed(arg, &DataType::Int64)?);
+                }
+                _ => unreachable!("arity already validated"),
+            }
         }
         Ok(coerced)
     }

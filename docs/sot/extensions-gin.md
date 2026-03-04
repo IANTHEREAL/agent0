@@ -1,7 +1,8 @@
-# extensions-gin — HTTP extension + GIN-like indexes + full-text search (FTS)
+# extensions-gin — HTTP/embedding extensions + GIN-like indexes + full-text search (FTS)
 
 ## Scope
 - HTTP extension framework and table functions (`extensions.http_*`) and their security model (SSRF protection, limits, superuser boundary).
+- Embedding extension surfaces (`embedding()`, `extensions.embedding_usage()`) and their install/visibility/permission model.
 - GIN-like inverted index storage/maintenance semantics used for:
   - JSON/JSONB containment (`@>`),
   - ARRAY containment (`@>`),
@@ -35,6 +36,32 @@
 - **[Stable] Insecure HTTP is disabled by default**
   - Plain `http://` requests MUST be rejected by default and MAY be enabled only via config.
   - Evidence: `src/extensions/http.rs` (`allow_insecure_http`), `./ops-config.md` (`DB9_HTTP_ALLOW_INSECURE`).
+
+- **[Stable] Embedding extension visibility + permission contract**
+  - `embedding()` and `extensions.embedding_usage()` MUST require `CREATE EXTENSION embedding` visibility and MUST enforce superuser-only execution.
+  - Visibility evaluation order MUST be:
+    1) in-transaction DDL delta override (`CREATE/DROP EXTENSION` in current transaction),
+    2) otherwise explicit transaction statements use a transaction-consistent snapshot source,
+    3) autocommit statements use latest committed extension catalog state at statement boundary.
+  - Parity adjudication for this contract MUST use direct function-call statements (`embedding(...)` / `extensions.embedding_usage()`) on PostgreSQL 17.7 with two independent sessions. Catalog-only probes (for example `pg_extension`) are supportive evidence only.
+  - If extension visibility check fails, the user-facing contract MUST be function-not-found semantics (`42883`), not feature-not-supported (`0A000`).
+  - Evidence anchors: `src/sql/expr/functions/embedding.rs`, `src/extensions/embedding.rs` (`check_embedding_installed`), `src/session_context.rs`, `src/sql/session/{mod.rs,transaction.rs}`.
+
+- **[Stable] Embedding signature resolution and SQLSTATE layering**
+  - Wrong function signature (arity/type mismatch, e.g. `embedding(42)`) MUST fail at function resolution boundary with `42883`.
+  - For `embedding(text [, model, dimensions])`, PostgreSQL-style literal coercion MUST apply to the 3rd argument:
+    - quoted numeric literals (e.g. `'1024'`) are accepted via implicit cast,
+    - non-literal text expressions (e.g. text columns) are rejected at resolution with `42883` unless explicitly cast.
+  - Runtime validation (`22023`) MUST be limited to value-domain checks on already-resolved valid signatures (e.g. non-positive dimensions, empty text, unsupported model value).
+  - Runtime permission and capability gates MUST remain typed:
+    - permission denied => `42501`
+    - service unavailable by config => `0A000`
+    - internal/infra failures => `XX000`
+  - Authoritative rationale: `docs/design/28_embedding_extension_pg_parity_contract.md`.
+
+- **[Stable] Embedding model is pinned to `text-embedding-v4`**
+  - Session/env model values MUST canonicalize to `text-embedding-v4`; non-v4 values MUST be rejected (`SET embedding.model`) or forced to v4 (`EMBEDDING_MODEL` env defaulting path).
+  - Evidence: `src/config.rs` (`canonical_embedding_model`), `src/sql/session/settings.rs`, `src/sql/expr/functions/embedding.rs`.
 
 - **[Stable] Per-statement and per-tenant request limits**
   - HTTP extension execution MUST enforce per-statement request count limits and per-tenant in-flight concurrency limits.
@@ -71,12 +98,13 @@
 
 ## Security Considerations
 - **Threat model (primary): SSRF / exfiltration**
-  - The HTTP extension can reach arbitrary network targets unless constrained; it is therefore a security-sensitive surface.
+  - The HTTP and embedding extensions perform outbound network requests and are therefore security-sensitive surfaces.
 - **Default posture (MUST): secure by default**
   - Superuser-only execution is the default boundary.
   - `http://` is disabled by default; enabling it via `DB9_HTTP_ALLOW_INSECURE` changes security posture and requires DR/ADR per #368.
+  - Embedding requests require explicit provider configuration (`EMBEDDING_API_KEY`) and extension installation.
   - URL validation blocks private/loopback/local targets and non-default ports.
-  - Evidence anchors: `src/extensions/http.rs` (`execute_table_function`, `validate_url`), tests `tests/87_http_ssrf_protection.sql`, `tests/88_http_permission.sql`.
+  - Evidence anchors: `src/extensions/http.rs` (`execute_table_function`, `validate_url`), `src/sql/expr/functions/embedding.rs`, tests `tests/87_http_ssrf_protection.sql`, `tests/88_http_permission.sql`.
 - **Operational guardrails**
   - Per-statement request cap, per-tenant in-flight cap, and timeouts reduce blast radius but do not replace access control.
   - Evidence: `src/extensions/http.rs` (timeouts/limits), `src/extensions/context.rs` (per-statement counter).
@@ -84,6 +112,8 @@
 ## Data Model & Invariants
 - **Installed extensions state** is persisted per database; extension enablement gates runtime execution.
   - Evidence: `src/sql/executor/extensions.rs` (installed/enabled checks), storage persistence in `src/storage/tikv_store.rs` (`get_extension`/`put_extension` paths).
+- **Embedding usage accounting** is persisted per database/day using `sys_embedding_usage_YYYYMMDD` keys and is independent of planner cache behavior.
+  - Evidence: `src/extensions/embedding.rs` (`record_embedding_tokens`, `read_embedding_usage`), `src/storage/encoding/metadata_keys.rs` (`encode_embedding_usage_key_v2`).
 - **GIN-like inverted index entries** are derived from token hashes and stored as index keys; token hashing is deterministic.
   - Evidence: `src/sql/gin.rs` (FNV-1a hashing), storage encoding: `src/storage/encoding.rs` (`encode_gin_index_key_v2`, `encode_gin_index_token_range_v2`).
   - Cross-link: key layout details are authoritative in `./storage-format.md`.
@@ -91,13 +121,22 @@
 ## Configuration
 This module MUST NOT redefine config keys. Relevant keys are defined exactly once in `./ops-config.md`:
 - `DB9_HTTP_ALLOW_INSECURE`
+- `EMBEDDING_API_KEY`
+- `EMBEDDING_ENDPOINT` / `EMBEDDING_BASE_URL`
+- `EMBEDDING_MODEL`
+- `EMBEDDING_DIMENSIONS`
 
 ## Entrypoints
 - `src/extensions/http.rs`
+- `src/extensions/embedding.rs`
 - `src/extensions/context.rs`
 - `src/sql/executor/extensions.rs`
+- `src/sql/expr/functions/embedding.rs`
 - `src/sql/gin.rs`
 - `src/sql/fts.rs`
+- `src/session_context.rs`
+- `src/sql/session/mod.rs`
+- `src/sql/session/transaction.rs`
 - `src/storage/encoding.rs`
 - `src/sql/planner/gin_predicate.rs`
 - `src/sql/planner/index_selection.rs`
@@ -117,8 +156,13 @@ Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
   - `python3 scripts/integration_test.py --dsn "$PG_DSN" tests/218_gin_correctness.sql`
   - `python3 scripts/integration_test.py --dsn "$PG_DSN" tests/219_gin_chinese_fts.sql`
   - `python3 scripts/integration_test.py --dsn "$PG_DSN" tests/236_gin_index_scan.sql`
+  - `python3 scripts/integration_test.py --dsn "$PG_DSN" tests/272_embedding_extension_concurrent_visibility.sql`
+  - `cargo test embedding_null_still_checks_extension_gate -- --nocapture`
+  - `cargo test txn_snapshot_ts_is_scoped -- --nocapture`
+  - `cargo test test_session_settings_embedding_model_accepts_only_v4 -- --nocapture`
 
 ## Change Management
-- Any change to HTTP extension security posture (superuser boundary, URL validation rules, limits/timeouts), GIN-like access-path eligibility, or tokenization semantics MUST update this document and the corresponding module entries in `docs/sot/modules.yaml`.
+- Any change to HTTP/embedding extension security posture (permission boundary, URL validation rules, model constraints, limits/timeouts), GIN-like access-path eligibility, or tokenization semantics MUST update this document and the corresponding module entries in `docs/sot/modules.yaml`.
+- Any change to embedding function visibility/signature SQLSTATE behavior MUST also update `docs/design/28_embedding_extension_pg_parity_contract.md` and keep the two documents consistent (`docs/sot/**` remains authoritative).
 - Breaking changes to security defaults or contracts require DR/ADR per #368 rules (impact surface + migration + rollback + verification updates).
 - Reference: https://github.com/c4pt0r/db9/issues/368

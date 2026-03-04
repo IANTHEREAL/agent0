@@ -44,10 +44,10 @@ The `Session` sits between the protocol handler and the executor layer. The prot
 | **TransactionState** | Three-state FSM: `Idle`, `Active(Transaction)`, `Failed(Transaction)`. |
 | **SessionSettings** | Typed container for all GUC parameters with SET/SHOW/RESET support. |
 | **GucMeta** | Static metadata for each known GUC: name, immutability flag, description, default. |
-| **KNOWN_GUCS** | Alphabetically-sorted const array of 40 GUC parameters (single source of truth). Includes `hnsw.ef_search` for HNSW vector index tuning. |
+| **KNOWN_GUCS** | Alphabetically-sorted const array of 46 GUC parameters (single source of truth). Includes `hnsw.ef_search` and embedding knobs (`embedding.model`, `embedding.dimensions`, `embedding.max_calls`, `embedding.concurrency`). |
 | **SET LOCAL** | Transaction-scoped override, stored in `local_overrides` HashMap, cleared on commit/rollback. |
 | **Savepoint stack** | `settings_savepoint_stack` captures and restores settings state across SAVEPOINT/ROLLBACK TO. |
-| **Task-local context** | `tokio::task_local!` variables (TIMEZONE, MAX_SORT_BYTES, CURRENT_SEARCH_PATH) scoped per query execution. |
+| **Task-local context** | `tokio::task_local!` variables scoped per query execution. Includes timezone/sort/search-path and transaction-scoped context such as current DB id, txn snapshot ts version, and extension DDL delta. |
 
 ---
 
@@ -115,7 +115,7 @@ pub(crate) struct GucMeta {
     static_default: Option<&'static str>,
 }
 
-pub(crate) const KNOWN_GUCS: &[GucMeta] = &[ /* 39 entries */ ];
+pub(crate) const KNOWN_GUCS: &[GucMeta] = &[ /* 46 entries */ ];
 
 pub(crate) struct SessionSettings {
     search_path: Vec<String>,
@@ -147,14 +147,22 @@ tokio::task_local! {
     static TIMEZONE: Arc<str>;
     static MAX_SORT_BYTES: usize;
     static CURRENT_SEARCH_PATH: Arc<Vec<String>>;
+    static CURRENT_DATABASE_ID: u64;
+    static CURRENT_TXN_SNAPSHOT_TS_VERSION: Option<u64>;
+    static EXTENSION_TXN_DELTA: Arc<ExtensionTxnDelta>;
 }
 
 pub fn current_timezone() -> Arc<str>;
 pub fn current_max_sort_bytes() -> usize;
 pub fn current_search_path_first_schema() -> String;
+pub fn current_database_id() -> u64;
+pub fn extension_txn_status(name: &str) -> Option<bool>;
 pub async fn with_timezone<R, Fut>(timezone: Arc<str>, fut: Fut) -> R;
 pub async fn with_max_sort_bytes<R, Fut>(max_sort_bytes: usize, fut: Fut) -> R;
 pub async fn with_search_path<R, Fut>(search_path: Arc<Vec<String>>, fut: Fut) -> R;
+pub async fn with_database_id<R, Fut>(db_id: u64, fut: Fut) -> R;
+pub async fn with_txn_snapshot_ts_version<R, Fut>(ts_version: Option<u64>, fut: Fut) -> R;
+pub async fn with_extension_txn_delta<R, Fut>(delta: Arc<ExtensionTxnDelta>, fut: Fut) -> R;
 ```
 
 ---
@@ -179,6 +187,8 @@ The `set_known_setting()` method validates the value via `validate_and_normalize
 ### Task-Local Propagation
 
 Before executing a query, `Session::query_context_for_statement()` captures the current timezone, max sort bytes, and search path, then wraps the query future in nested `tokio::task_local!` scopes. This allows operators deep in the execution tree (e.g., sort, scan, expression evaluation) to call `current_timezone()` without threading the session reference.
+
+The dispatch layer also propagates transaction-scoped context (`CURRENT_DATABASE_ID`, `CURRENT_TXN_SNAPSHOT_TS_VERSION`, `EXTENSION_TXN_DELTA`) so extension-gated functions can resolve visibility using one deterministic transaction path.
 
 ---
 
@@ -221,6 +231,14 @@ sequenceDiagram
 | **Task-local defaults** | `TIMEZONE` defaults to `"UTC"`, `MAX_SORT_BYTES` to `256 * 1024 * 1024`, search path defaults to `"public"`. |
 | **KNOWN_GUCS is sorted** | Binary search depends on alphabetical sort order. Adding a GUC in wrong position breaks lookup. |
 
+### Extension Visibility Context Contract
+
+- Extension-gated function visibility must consume the same transaction-scoped task-local context used by the statement runtime.
+- In-transaction `CREATE/DROP EXTENSION` delta (`EXTENSION_TXN_DELTA`) is the first precedence.
+- Missing visibility must map to function-resolution semantics (`42883`).
+- Compatibility policy is PG-compatible by default, with explicit divergence governance when architectural trade-offs are required.
+- Follow-up tracking: `#1421` (visibility model implementation), `#1420` (compatibility marker enforcement).
+
 ---
 
 ## 9. Error Handling
@@ -238,7 +256,7 @@ sequenceDiagram
 
 Tests are in `src/sql/session/tests.rs` and cover:
 
-- Default values for all 39 known GUCs
+- Default values for all 46 known GUCs
 - `SET` + `SHOW` round-trip for typed fields (search_path, timezone, statement_timeout)
 - `SET LOCAL` precedence over session-level values
 - Savepoint push/rollback/release for settings

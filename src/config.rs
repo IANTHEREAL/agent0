@@ -1,10 +1,22 @@
 use std::env;
-use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::{Arc, OnceLock};
 
 const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_CONNECTIONS: u32 = 1000;
+const DEFAULT_EMBEDDING_ENDPOINT: &str =
+    "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/embeddings";
+pub(crate) const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-v4";
+const DEFAULT_EMBEDDING_DIMENSIONS: u32 = 1024;
+
+pub(crate) fn canonical_embedding_model(model: &str) -> Option<&'static str> {
+    if model.trim().eq_ignore_ascii_case(DEFAULT_EMBEDDING_MODEL) {
+        Some(DEFAULT_EMBEDDING_MODEL)
+    } else {
+        None
+    }
+}
 
 pub(crate) fn env_bool(key: &str) -> bool {
     std::env::var(key)
@@ -23,6 +35,91 @@ pub(crate) fn env_string(key: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbeddingConfig {
+    pub api_key: Option<String>,
+    pub endpoint: String,
+    pub model: String,
+    pub dimensions: u32,
+}
+
+impl EmbeddingConfig {
+    pub fn from_env() -> Self {
+        let model = env_string("EMBEDDING_MODEL")
+            .map(|value| {
+                if let Some(canonical) = canonical_embedding_model(&value) {
+                    canonical.to_string()
+                } else {
+                    tracing::warn!(
+                        requested = %value,
+                        actual = DEFAULT_EMBEDDING_MODEL,
+                        "unsupported EMBEDDING_MODEL; forcing text-embedding-v4"
+                    );
+                    DEFAULT_EMBEDDING_MODEL.to_string()
+                }
+            })
+            .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
+
+        Self {
+            api_key: env_string("EMBEDDING_API_KEY"),
+            endpoint: embedding_endpoint_from_env(),
+            model,
+            dimensions: std::env::var("EMBEDDING_DIMENSIONS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .filter(|d| *d > 0)
+                .unwrap_or(DEFAULT_EMBEDDING_DIMENSIONS),
+        }
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.api_key.is_some()
+    }
+}
+
+fn embedding_endpoint_from_env() -> String {
+    // Support both EMBEDDING_ENDPOINT and EMBEDDING_BASE_URL naming styles.
+    let raw = env_string("EMBEDDING_ENDPOINT")
+        .or_else(|| env_string("EMBEDDING_BASE_URL"))
+        .unwrap_or_else(|| DEFAULT_EMBEDDING_ENDPOINT.to_string());
+    normalize_embedding_endpoint(&raw)
+}
+
+fn normalize_embedding_endpoint(raw: &str) -> String {
+    if let Ok(mut url) = reqwest::Url::parse(raw) {
+        let mut path = url.path().trim_end_matches('/').to_string();
+        if path.is_empty() {
+            path = "/".to_string();
+        }
+        if !path.ends_with("/embeddings") {
+            if path == "/" {
+                path = "/embeddings".to_string();
+            } else {
+                path.push_str("/embeddings");
+            }
+        }
+        url.set_path(&path);
+        return url.to_string();
+    }
+
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.ends_with("/embeddings") {
+        trimmed.to_string()
+    } else {
+        format!("{}/embeddings", trimmed)
+    }
+}
+
+static EMBEDDING_CONFIG: OnceLock<EmbeddingConfig> = OnceLock::new();
+
+pub fn get_embedding_config() -> &'static EmbeddingConfig {
+    EMBEDDING_CONFIG.get_or_init(EmbeddingConfig::from_env)
+}
+
+pub fn init_embedding_config() {
+    let _ = get_embedding_config();
 }
 
 #[derive(Debug, Clone)]
@@ -317,5 +414,53 @@ mod tests {
             let read_cfg = shared.read().unwrap();
             assert_eq!(read_cfg.statement_timeout_ms, 20_000);
         }
+    }
+
+    #[test]
+    fn test_normalize_embedding_endpoint_base_url() {
+        assert_eq!(
+            normalize_embedding_endpoint("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/embeddings"
+        );
+        assert_eq!(
+            normalize_embedding_endpoint("https://api.openai.com"),
+            "https://api.openai.com/embeddings"
+        );
+    }
+
+    #[test]
+    fn test_normalize_embedding_endpoint_keeps_existing_embeddings_path() {
+        assert_eq!(
+            normalize_embedding_endpoint("https://api.openai.com/v1/embeddings"),
+            "https://api.openai.com/v1/embeddings"
+        );
+        assert_eq!(
+            normalize_embedding_endpoint("https://api.openai.com/v1/embeddings/"),
+            "https://api.openai.com/v1/embeddings"
+        );
+    }
+
+    #[test]
+    fn test_normalize_embedding_endpoint_preserves_query() {
+        assert_eq!(
+            normalize_embedding_endpoint("https://api.openai.com/v1/embeddings?x=1"),
+            "https://api.openai.com/v1/embeddings?x=1"
+        );
+        assert_eq!(
+            normalize_embedding_endpoint("https://api.openai.com/v1?x=1"),
+            "https://api.openai.com/v1/embeddings?x=1"
+        );
+    }
+
+    #[test]
+    fn test_normalize_embedding_endpoint_fallback_for_non_url_inputs() {
+        assert_eq!(
+            normalize_embedding_endpoint("api.openai.com/v1"),
+            "api.openai.com/v1/embeddings"
+        );
+        assert_eq!(
+            normalize_embedding_endpoint("api.openai.com/v1/embeddings"),
+            "api.openai.com/v1/embeddings"
+        );
     }
 }

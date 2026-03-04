@@ -1,7 +1,11 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
 use crate::sql::DEFAULT_MAX_SORT_BYTES;
+
+/// Extension transaction delta snapshot: (created_set, dropped_set).
+pub type ExtensionTxnDelta = (HashSet<String>, HashSet<String>);
 
 tokio::task_local! {
     static TIMEZONE: Arc<str>;
@@ -25,6 +29,21 @@ tokio::task_local! {
 
 tokio::task_local! {
     static CURRENT_DATABASE_ID: u64;
+}
+
+tokio::task_local! {
+    static CURRENT_TXN_SNAPSHOT_TS_VERSION: Option<u64>;
+}
+
+// Extension transaction delta: (created, dropped).
+//
+// Semantics:
+// - DDL executed in the current transaction is tracked in-memory.
+// - When no in-transaction override exists, extension gate checks may use the
+//   transaction snapshot timestamp (explicit transaction) or latest committed
+//   state (autocommit).
+tokio::task_local! {
+    static EXTENSION_TXN_DELTA: Arc<ExtensionTxnDelta>;
 }
 
 fn utc_arc() -> Arc<str> {
@@ -123,4 +142,60 @@ where
     Fut: Future<Output = R>,
 {
     CURRENT_DATABASE_ID.scope(db_id, fut).await
+}
+
+/// Return the current statement's transaction snapshot timestamp version.
+///
+/// Returns `None` outside a transaction-scoped statement execution context.
+pub fn current_txn_snapshot_ts_version() -> Option<u64> {
+    CURRENT_TXN_SNAPSHOT_TS_VERSION
+        .try_with(|ts| *ts)
+        .unwrap_or(None)
+}
+
+pub async fn with_txn_snapshot_ts_version<R, Fut>(ts_version: Option<u64>, fut: Fut) -> R
+where
+    Fut: Future<Output = R>,
+{
+    CURRENT_TXN_SNAPSHOT_TS_VERSION.scope(ts_version, fut).await
+}
+
+pub async fn with_extension_txn_delta<R, Fut>(delta: Arc<ExtensionTxnDelta>, fut: Fut) -> R
+where
+    Fut: Future<Output = R>,
+{
+    EXTENSION_TXN_DELTA.scope(delta, fut).await
+}
+
+/// Returns in-transaction extension status from DDL delta.
+/// - `Some(true)`: extension was created in current txn.
+/// - `Some(false)`: extension was dropped in current transaction scope.
+/// - `None`: no in-transaction override recorded.
+pub fn extension_txn_status(name: &str) -> Option<bool> {
+    let normalized = name.to_ascii_lowercase();
+    EXTENSION_TXN_DELTA
+        .try_with(|delta| {
+            if delta.0.contains(&normalized) {
+                Some(true)
+            } else if delta.1.contains(&normalized) {
+                Some(false)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(None)
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn txn_snapshot_ts_is_scoped() {
+        assert_eq!(super::current_txn_snapshot_ts_version(), None);
+        let got = super::with_txn_snapshot_ts_version(Some(123), async {
+            super::current_txn_snapshot_ts_version()
+        })
+        .await;
+        assert_eq!(got, Some(123));
+        assert_eq!(super::current_txn_snapshot_ts_version(), None);
+    }
 }

@@ -229,6 +229,7 @@ modules:
     doc_path: docs/sot/extensions-gin.md
     scope:
       - HTTP extension framework and security model (including SSRF protection)
+      - Embedding extension semantics (`embedding()`, `extensions.embedding_usage()`) including PG-aligned per-call gate visibility
       - GIN-like index semantics and full-text search (FTS) behavior
       - extension-owned configuration keys and feature flags (defined once; see `ops-config`)
     non_goals:
@@ -237,21 +238,30 @@ modules:
       - 'generic storage format rules (authoritative: `storage-format`, except extension-specific encodings)'
     code_entrypoints:
       - path: src/extensions/http.rs
+      - path: src/extensions/embedding.rs
       - path: src/extensions/context.rs
       - path: src/sql/executor/extensions.rs
+      - path: src/sql/expr/functions/embedding.rs
+      - path: src/session_context.rs
+      - path: src/sql/session/mod.rs
+      - path: src/sql/session/transaction.rs
       - path: src/sql/gin.rs
       - path: src/sql/fts.rs
       - path: src/storage/encoding/mod.rs
     gate_tests:
       - ci:.github/workflows/orm-tests.yml/test
       - cmd:python3 scripts/integration_test.py --dsn "$PG_DSN" tests/86_extensions_framework_http.sql
+      - cmd:cargo test embedding_null_still_checks_extension_gate -- --nocapture
+      - cmd:cargo test test_session_settings_embedding_model_accepts_only_v4 -- --nocapture
     owners: [TBD]
     status: PARTIAL
     coverage_gaps:
       - No CODEOWNERS/maintainer ownership signal on baseline commit.
+      - SQLSTATE-specific parity coverage for embedding visibility/signature errors (`42883`) is still incomplete.
     next_step:
       - Confirm owners and add CODEOWNERS for `src/extensions/**` and extension-related `src/sql/**` files.
       - Keep `docs/sot/extensions-gin.md` aligned; keep security-sensitive behavior explicit and gated.
+      - Keep embedding SQL integration coverage (`tests/272_embedding_extension_concurrent_visibility.sql`) aligned with SoT SQLSTATE contract and avoid ambiguous validation-mode combinations.
     xref:
       - module_id: auth-rbac
         reason: Permission checks and role requirements for extension execution

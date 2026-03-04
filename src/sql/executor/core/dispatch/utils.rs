@@ -174,14 +174,17 @@ impl RuntimeSettings {
 }
 
 /// Wrap a future in the per-statement task-local runtime context layers:
-/// timezone → max_sort_bytes → search_path → text_search_config → keyspace → database_id → extension context.
+/// timezone → max_sort_bytes → search_path → text_search_config → keyspace → database_id
+/// → txn snapshot ts → extension txn delta → extension context.
 ///
 /// Returns a boxed future — transparent passthrough (`T`, not `Result<T>`).
 pub(in crate::sql::executor::core) fn wrap_with_runtime_context<'a, T: Send + 'a>(
     settings: &RuntimeSettings,
     tenant_keyspace: &'a str,
     database_id: u64,
+    txn_snapshot_ts_version: Option<u64>,
     tikv_client: Option<Arc<TransactionClient>>,
+    extension_txn_delta: Arc<crate::session_context::ExtensionTxnDelta>,
     fut: impl Future<Output = T> + Send + 'a,
 ) -> Pin<Box<dyn Future<Output = T> + Send + 'a>> {
     // Keep the inner statement future boxed across build modes so the task-local
@@ -207,13 +210,19 @@ pub(in crate::sql::executor::core) fn wrap_with_runtime_context<'a, T: Send + 'a
                         ks,
                         session_context::with_database_id(
                             database_id,
-                            crate::extensions::context::with_context_opts(
-                                crate::extensions::context::ExtensionContextOpts::statement(
-                                    su,
-                                    tenant_keyspace,
-                                )
-                                .with_tikv_client(tikv_client),
-                                fut,
+                            session_context::with_txn_snapshot_ts_version(
+                                txn_snapshot_ts_version,
+                                session_context::with_extension_txn_delta(
+                                    extension_txn_delta,
+                                    crate::extensions::context::with_context_opts(
+                                        crate::extensions::context::ExtensionContextOpts::statement(
+                                            su,
+                                            tenant_keyspace,
+                                        )
+                                        .with_tikv_client(tikv_client),
+                                        fut,
+                                    ),
+                                ),
                             ),
                         ),
                     ),
@@ -244,6 +253,7 @@ pub(in crate::sql::executor::core) async fn apply_statement_timeout<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn test_session(is_superuser: bool) -> Session {
         let store = crate::storage::TikvStore::new_stub();
@@ -334,15 +344,24 @@ mod tests {
             search_path: Arc::new(vec!["$user".to_string(), "public".to_string()]),
             text_search_config: Arc::from("simple"),
         };
-        let out = wrap_with_runtime_context(&settings, "tenant_a", 42, None, async {
-            let tz = crate::session_context::current_timezone();
-            let msb = crate::session_context::current_max_sort_bytes();
-            let first_schema = crate::session_context::current_search_path_first_schema();
-            let tenant = crate::extensions::context::tenant_keyspace().unwrap_or_default();
-            let tsc = crate::session_context::current_text_search_config();
-            let db_id = crate::session_context::current_database_id();
-            (tz, msb, first_schema, tenant, tsc, db_id)
-        })
+        let out = wrap_with_runtime_context(
+            &settings,
+            "tenant_a",
+            42,
+            Some(999),
+            None,
+            Arc::new((HashSet::new(), HashSet::new())),
+            async {
+                let tz = crate::session_context::current_timezone();
+                let msb = crate::session_context::current_max_sort_bytes();
+                let first_schema = crate::session_context::current_search_path_first_schema();
+                let tenant = crate::extensions::context::tenant_keyspace().unwrap_or_default();
+                let tsc = crate::session_context::current_text_search_config();
+                let db_id = crate::session_context::current_database_id();
+                let txn_ts = crate::session_context::current_txn_snapshot_ts_version();
+                (tz, msb, first_schema, tenant, tsc, db_id, txn_ts)
+            },
+        )
         .await;
 
         assert_eq!(out.0.as_ref(), "UTC");
@@ -351,6 +370,7 @@ mod tests {
         assert_eq!(out.3, "tenant_a");
         assert_eq!(out.4.as_ref(), "simple");
         assert_eq!(out.5, 42);
+        assert_eq!(out.6, Some(999));
     }
 
     #[tokio::test]

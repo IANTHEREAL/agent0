@@ -265,6 +265,8 @@ impl Executor {
     ) -> Pin<Box<dyn Future<Output = Result<ExecuteResults>> + Send + 'a>> {
         let rt_settings = RuntimeSettings::from_session(session);
         let db_id = session.current_database_id();
+        let extension_txn_delta = session.extension_delta_snapshot();
+        let txn_snapshot_ts_version = session.active_txn_start_ts_version();
         let execute_future: Pin<Box<dyn Future<Output = Result<ExecuteResults>> + Send + 'a>> =
             Box::pin(self.execute_prepared_autocommit(
                 session,
@@ -279,7 +281,9 @@ impl Executor {
             &rt_settings,
             self.tenant_keyspace(),
             db_id,
+            txn_snapshot_ts_version,
             self.store.transaction_client(),
+            extension_txn_delta,
             execute_future,
         )
     }
@@ -337,17 +341,24 @@ impl Executor {
             }
 
             let current_role = session.current_user().map(|u| u.to_string());
-            let res = self
-                .execute_prepared_attempt(
-                    session,
-                    db_id,
-                    sql,
-                    exec,
-                    param_data_types,
-                    table_versions,
-                    current_role.as_deref(),
-                )
-                .await;
+            let txn_snapshot_ts_version = session.active_txn_start_ts_version();
+            let extension_txn_delta = session.extension_delta_snapshot();
+            let res = crate::session_context::with_txn_snapshot_ts_version(
+                txn_snapshot_ts_version,
+                crate::session_context::with_extension_txn_delta(
+                    extension_txn_delta,
+                    self.execute_prepared_attempt(
+                        session,
+                        db_id,
+                        sql,
+                        exec,
+                        param_data_types,
+                        table_versions,
+                        current_role.as_deref(),
+                    ),
+                ),
+            )
+            .await;
 
             if res
                 .as_ref()

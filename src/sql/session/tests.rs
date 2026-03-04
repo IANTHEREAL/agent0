@@ -154,6 +154,30 @@ mod tests {
     }
 
     #[test]
+    fn test_session_settings_embedding_model_accepts_only_v4() {
+        let mut settings = SessionSettings::new();
+        assert!(settings
+            .set_known_setting("embedding.model", "text-embedding-v4".to_string())
+            .unwrap());
+        assert_eq!(
+            settings.show_value("embedding.model").as_deref(),
+            Some("text-embedding-v4")
+        );
+
+        assert!(settings
+            .set_known_setting("embedding.model", "TEXT-EMBEDDING-V4".to_string())
+            .unwrap());
+        assert_eq!(
+            settings.show_value("embedding.model").as_deref(),
+            Some("text-embedding-v4")
+        );
+
+        assert!(settings
+            .set_known_setting("embedding.model", "text-embedding-v3".to_string())
+            .is_err());
+    }
+
+    #[test]
     fn test_session_settings_timeout_parsing() {
         let mut settings = SessionSettings::new();
 

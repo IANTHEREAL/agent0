@@ -4,6 +4,7 @@
 //! Per-tenant install state is persisted in TiKV via `_sys_*` metadata keys.
 
 pub(crate) mod context;
+pub(crate) mod embedding;
 pub(crate) mod fs;
 pub(crate) mod http;
 #[cfg(feature = "parquet")]
@@ -124,6 +125,13 @@ const VECTOR_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
     default_schema: "public",
 };
 
+const EMBEDDING_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
+    name: "embedding",
+    oid: 2008,
+    version: "1.0.0",
+    default_schema: EXTENSIONS_SCHEMA,
+};
+
 /// Lookup an extension descriptor by name (case-insensitive).
 pub fn descriptor(name: &str) -> Option<&'static ExtensionDescriptor> {
     if name.eq_ignore_ascii_case(HTTP_EXTENSION.name) {
@@ -149,6 +157,9 @@ pub fn descriptor(name: &str) -> Option<&'static ExtensionDescriptor> {
     }
     if name.eq_ignore_ascii_case(VECTOR_EXTENSION.name) {
         return Some(&VECTOR_EXTENSION);
+    }
+    if name.eq_ignore_ascii_case(EMBEDDING_EXTENSION.name) {
+        return Some(&EMBEDDING_EXTENSION);
     }
     None
 }
@@ -209,5 +220,13 @@ mod tests {
         assert_eq!(desc.name, "vector");
         assert_eq!(desc.default_schema, "public");
         assert_eq!(desc.oid, 2007);
+    }
+
+    #[test]
+    fn descriptor_embedding_is_registered() {
+        let desc = descriptor("embedding").expect("embedding must be registered");
+        assert_eq!(desc.name, "embedding");
+        assert_eq!(desc.default_schema, "extensions");
+        assert_eq!(desc.oid, 2008);
     }
 }
