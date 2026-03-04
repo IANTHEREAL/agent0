@@ -826,6 +826,7 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlparser::ast::Ident;
 
     #[test]
     fn test_parse_create_extension_basic() {
@@ -870,6 +871,36 @@ mod tests {
             .downcast_ref::<SqlError>()
             .expect("error must downcast to SqlError");
         assert_eq!(sql_err.sqlstate(), "42883");
+        assert_eq!(
+            sql_err.to_string(),
+            "function extensions.embedding_usage(unknown) does not exist"
+        );
+    }
+
+    #[test]
+    fn embedding_usage_argument_error_formats_signature_for_multi_args() {
+        let err = embedding_usage_args_error(3);
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("error must downcast to SqlError");
+        assert_eq!(sql_err.sqlstate(), "42883");
+        assert_eq!(
+            sql_err.to_string(),
+            "function extensions.embedding_usage(unknown, unknown, unknown) does not exist"
+        );
+    }
+
+    #[test]
+    fn embedding_usage_zero_arity_signature_text() {
+        let err = embedding_usage_args_error(0);
+        let sql_err = err
+            .downcast_ref::<SqlError>()
+            .expect("error must downcast to SqlError");
+        assert_eq!(sql_err.sqlstate(), "42883");
+        assert_eq!(
+            sql_err.to_string(),
+            "function extensions.embedding_usage() does not exist"
+        );
     }
 
     #[test]
@@ -879,5 +910,48 @@ mod tests {
             .downcast_ref::<SqlError>()
             .expect("error must downcast to SqlError");
         assert_eq!(sql_err.sqlstate(), "42501");
+        assert_eq!(
+            sql_err.to_string(),
+            "permission denied for function embedding_usage"
+        );
+    }
+
+    #[test]
+    fn parse_iso8601_to_epoch_ms_accepts_valid_utc_timestamp() {
+        let ms = parse_iso8601_to_epoch_ms("2026-03-05T00:00:00Z").expect("must parse");
+        assert_eq!(ms, 1_772_668_800_000);
+    }
+
+    #[test]
+    fn parse_iso8601_to_epoch_ms_rejects_invalid_timestamp() {
+        let err = parse_iso8601_to_epoch_ms("not-a-timestamp").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("embedding_usage: invalid resets_at timestamp"));
+    }
+
+    #[test]
+    fn apply_table_function_alias_renames_columns_for_embedding_usage() {
+        let mut schema = crate::extensions::embedding::embedding_usage_table_schema();
+        let alias = TableAlias {
+            name: Ident::new("u"),
+            columns: vec![Ident::new("used"), Ident::new("reset_at")],
+        };
+        apply_table_function_alias(&mut schema, Some(&alias)).expect("alias should apply");
+        assert_eq!(schema.columns[0].name, "used");
+        assert_eq!(schema.columns[1].name, "reset_at");
+    }
+
+    #[test]
+    fn apply_table_function_alias_rejects_mismatched_column_count() {
+        let mut schema = crate::extensions::embedding::embedding_usage_table_schema();
+        let alias = TableAlias {
+            name: Ident::new("u"),
+            columns: vec![Ident::new("only_one")],
+        };
+        let err = apply_table_function_alias(&mut schema, Some(&alias)).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Table function alias column count mismatch: expected 2, got 1"));
     }
 }

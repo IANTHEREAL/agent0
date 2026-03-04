@@ -228,6 +228,9 @@ pub fn extension_txn_status(name: &str) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
     #[tokio::test]
     async fn txn_snapshot_ts_is_scoped() {
         assert_eq!(super::current_txn_snapshot_ts_version(), None);
@@ -237,5 +240,52 @@ mod tests {
         .await;
         assert_eq!(got, Some(123));
         assert_eq!(super::current_txn_snapshot_ts_version(), None);
+    }
+
+    #[tokio::test]
+    async fn extension_txn_status_is_case_insensitive() {
+        let delta = Arc::new((HashSet::from(["embedding".to_string()]), HashSet::new()));
+        let got = super::with_extension_txn_delta(delta, async {
+            super::extension_txn_status("EMBEDDING")
+        })
+        .await;
+        assert_eq!(got, Some(true));
+    }
+
+    #[tokio::test]
+    async fn extension_txn_status_prefers_created_when_both_sets_contain_name() {
+        let delta = Arc::new((
+            HashSet::from(["embedding".to_string()]),
+            HashSet::from(["embedding".to_string()]),
+        ));
+        let got =
+            super::with_extension_txn_delta(delta, async { super::extension_txn_status("embedding") })
+                .await;
+        assert_eq!(got, Some(true));
+    }
+
+    #[tokio::test]
+    async fn extension_txn_status_returns_none_when_absent() {
+        let delta = Arc::new((HashSet::new(), HashSet::new()));
+        let got = super::with_extension_txn_delta(delta, async {
+            super::extension_txn_status("embedding")
+        })
+        .await;
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn extension_txn_status_outside_scope_returns_none() {
+        assert_eq!(super::extension_txn_status("embedding"), None);
+    }
+
+    #[tokio::test]
+    async fn extension_txn_status_returns_false_when_only_dropped() {
+        let delta = Arc::new((HashSet::new(), HashSet::from(["embedding".to_string()])));
+        let got = super::with_extension_txn_delta(delta, async {
+            super::extension_txn_status("embedding")
+        })
+        .await;
+        assert_eq!(got, Some(false));
     }
 }

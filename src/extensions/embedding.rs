@@ -287,6 +287,10 @@ pub(crate) async fn read_embedding_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extensions::context;
+    use crate::sql::error::SqlError;
+    use chrono::{DateTime, Timelike};
+    use std::env;
 
     #[test]
     fn tenant_semaphore_key_does_not_expand_with_limit_changes() {
@@ -304,5 +308,110 @@ mod tests {
         assert!(Arc::ptr_eq(&sem_8, &sem_8_again));
 
         TENANT_SEMAPHORES.clear();
+    }
+
+    #[test]
+    fn embedding_function_not_found_maps_to_42883() {
+        let err = embedding_function_not_found("embedding(text)");
+        let sql_err = err.downcast_ref::<SqlError>().expect("must be SqlError");
+        assert_eq!(sql_err.sqlstate(), "42883");
+        assert_eq!(sql_err.to_string(), "function embedding(text) does not exist");
+    }
+
+    #[test]
+    fn parse_u64_counter_roundtrip_big_endian() {
+        let n = 123_456_789_u64;
+        let bytes = n.to_be_bytes().to_vec();
+        let parsed = parse_u64_counter(bytes).expect("must parse");
+        assert_eq!(parsed, n);
+    }
+
+    #[test]
+    fn parse_u64_counter_accepts_zero() {
+        let parsed = parse_u64_counter(0_u64.to_be_bytes().to_vec()).expect("must parse");
+        assert_eq!(parsed, 0);
+    }
+
+    #[test]
+    fn parse_u64_counter_rejects_wrong_length() {
+        let err = parse_u64_counter(vec![1, 2, 3]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("corrupt usage counter (3 bytes, expected 8)"));
+    }
+
+    #[test]
+    fn today_key_and_reset_timestamp_formats_are_stable() {
+        let day = today_yyyymmdd();
+        assert_eq!(day.len(), 8);
+        assert!(day.chars().all(|c| c.is_ascii_digit()));
+
+        let resets_at = tomorrow_midnight_utc_iso8601();
+        assert!(resets_at.ends_with('Z'));
+        let parsed = DateTime::parse_from_rfc3339(&resets_at).expect("must be RFC3339");
+        assert_eq!(parsed.offset().local_minus_utc(), 0);
+        assert_eq!(parsed.hour(), 0);
+        assert_eq!(parsed.minute(), 0);
+        assert_eq!(parsed.second(), 0);
+    }
+
+    #[test]
+    fn embedding_usage_table_schema_contract() {
+        let schema = embedding_usage_table_schema();
+        assert_eq!(schema.name, "embedding_usage");
+        assert_eq!(schema.columns.len(), 2);
+        assert_eq!(schema.columns[0].name, "tokens_used");
+        assert!(matches!(schema.columns[0].data_type, DataType::Int64));
+        assert!(!schema.columns[0].nullable);
+        assert_eq!(schema.columns[1].name, "resets_at");
+        assert!(matches!(schema.columns[1].data_type, DataType::TimestampTz));
+        assert!(!schema.columns[1].nullable);
+    }
+
+    #[tokio::test]
+    #[ignore = "live embedding provider test; requires EMBEDDING_API_KEY and EMBEDDING_BASE_URL/EMBEDDING_ENDPOINT"]
+    async fn call_embedding_api_live_returns_expected_dimensions() {
+        let has_key = env::var("EMBEDDING_API_KEY")
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty());
+        assert!(
+            has_key,
+            "EMBEDDING_API_KEY is required for live embedding test"
+        );
+
+        let has_endpoint = env::var("EMBEDDING_ENDPOINT")
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
+            || env::var("EMBEDDING_BASE_URL")
+                .ok()
+                .is_some_and(|v| !v.trim().is_empty());
+        assert!(
+            has_endpoint,
+            "EMBEDDING_ENDPOINT or EMBEDDING_BASE_URL is required for live embedding test"
+        );
+
+        let dims = env::var("EMBEDDING_TEST_DIMENSIONS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .or_else(|| {
+                env::var("EMBEDDING_DIMENSIONS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .filter(|v| *v > 0)
+            })
+            .unwrap_or(1024);
+
+        let (vec, tokens) = context::with_context(true, "default", async move {
+            call_embedding_api("db9 live embedding test", "text-embedding-v4", dims).await
+        })
+        .await
+        .expect("live embedding call should succeed");
+
+        assert_eq!(vec.len(), dims as usize, "vector dimension must match");
+        assert!(
+            tokens > 0,
+            "provider should report positive token usage for non-empty input"
+        );
     }
 }
