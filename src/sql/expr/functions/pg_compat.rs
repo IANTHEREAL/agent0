@@ -157,11 +157,45 @@ pub fn format_type(args: Vec<Value>) -> Result<Value> {
     Ok(Value::Text(formatted))
 }
 
-/// Parse a regtype input into (schema, name, name_was_quoted).
+/// Parsed identifier component of a regtype input.
+/// Tracks whether the identifier was double-quoted, which controls
+/// case-sensitivity: quoted = preserve case, unquoted = lowercased.
+#[derive(Debug)]
+struct RegTypeIdent {
+    value: String,
+    quoted: bool,
+}
+
+/// Collapse all runs of whitespace (spaces, tabs, newlines) to a single
+/// ASCII space. Matches PostgreSQL's whitespace normalization for type
+/// names like `interval  day   to   second` or `interval\tday`.
+fn normalize_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Parse a single identifier: quoted preserves case, unquoted lowercases.
+fn parse_regtype_ident(raw: &str) -> RegTypeIdent {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        RegTypeIdent {
+            value: trimmed[1..trimmed.len() - 1].to_string(),
+            quoted: true,
+        }
+    } else {
+        RegTypeIdent {
+            value: trimmed.to_lowercase(),
+            quoted: false,
+        }
+    }
+}
+
+/// Parse a regtype input into (schema, name).
 ///
-/// Quoted identifiers preserve case (case-sensitive); unquoted identifiers
-/// are lowercased (case-insensitive), matching PostgreSQL identifier semantics.
-fn normalize_regtype_input(raw: &str) -> (Option<String>, String, bool) {
+/// Splits at the last unquoted `.` for schema.name separation.
+/// Each component follows PostgreSQL identifier rules:
+///   - Quoted (double-quoted): strip outer quotes, preserve case
+///   - Unquoted: lowercase
+fn parse_regtype_input(raw: &str) -> (Option<RegTypeIdent>, RegTypeIdent) {
     let trimmed = raw.trim();
 
     // Find the last '.' outside double quotes to split schema.name.
@@ -180,22 +214,10 @@ fn normalize_regtype_input(raw: &str) -> (Option<String>, String, bool) {
         None => (None, trimmed),
     };
 
-    // Schema: strip quotes, lowercase (existing behavior).
-    let schema = schema_raw.map(|s| s.trim().replace('"', "").to_lowercase());
+    let schema = schema_raw.map(parse_regtype_ident);
+    let name = parse_regtype_ident(name_raw);
 
-    // Name: detect quoting to preserve case for quoted identifiers.
-    let name_trimmed = name_raw.trim();
-    let name_was_quoted =
-        name_trimmed.starts_with('"') && name_trimmed.ends_with('"') && name_trimmed.len() >= 2;
-    let name = if name_was_quoted {
-        // Quoted: strip outer quotes, preserve case.
-        name_trimmed[1..name_trimmed.len() - 1].to_string()
-    } else {
-        // Unquoted: lowercase.
-        name_trimmed.to_lowercase()
-    };
-
-    (schema, name, name_was_quoted)
+    (schema, name)
 }
 
 pub(crate) fn strip_regtype_array_dims(raw: &str) -> (String, bool) {
@@ -287,12 +309,14 @@ fn validate_interval_precision(paren_str: &str, original_name: &str) -> Result<S
 /// This function must be called on the ORIGINAL input (before
 /// `strip_regtype_typmod`), because it validates precision placement.
 pub(crate) fn normalize_interval_type(name: &str) -> Result<String> {
-    let lower = name.trim().to_lowercase();
+    // Normalize whitespace: collapse all runs (spaces, tabs, newlines) to
+    // single space. PostgreSQL accepts `interval\tday`, `interval  (3)`, etc.
+    let lower = normalize_whitespace(&name.trim().to_lowercase());
     if lower == "interval" {
         return Ok(lower);
     }
     if !lower.starts_with("interval") {
-        return Ok(name.to_string());
+        return Ok(name.trim().to_string());
     }
     let rest = &lower["interval".len()..];
     if rest.starts_with('(') {
@@ -301,9 +325,14 @@ pub(crate) fn normalize_interval_type(name: &str) -> Result<String> {
     }
     if !rest.starts_with(' ') {
         // e.g. "intervals" — not an interval type, return as-is
-        return Ok(name.to_string());
+        return Ok(name.trim().to_string());
     }
     let rest = rest.trim();
+
+    // "interval (3)" — bare precision with whitespace before `(`.
+    if rest.starts_with('(') {
+        return validate_interval_precision(rest, name.trim());
+    }
 
     // Qualifiers that accept trailing precision `(N)` — only those ending
     // in SECOND, per the PostgreSQL grammar.
@@ -422,41 +451,55 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
         _ => return Err(anyhow::anyhow!("function to_regtype(text) does not exist")),
     };
 
+    // Step 1: Strip array suffix `[]`.
     let (without_array, is_array) = strip_regtype_array_dims(&raw);
-    // Validate interval qualifiers BEFORE general typmod stripping so that
-    // precision on non-SECOND qualifiers (e.g. `interval minute(3)`) is
-    // rejected instead of silently stripped.
-    let after_interval = normalize_interval_type(&without_array)?;
-    let ready = if after_interval == "interval" {
-        after_interval
-    } else {
-        strip_regtype_typmod(&after_interval)
-    };
-    let (schema, name, name_was_quoted) = normalize_regtype_input(&ready);
-    if name.is_empty() || ready.is_empty() {
+
+    // Step 2: Parse into structured schema.name with quoting semantics.
+    // Split BEFORE interval processing so that schema-qualified interval
+    // types like `pg_catalog.interval day to second` are handled correctly.
+    let (schema, name) = parse_regtype_input(&without_array);
+    if name.value.is_empty() {
         return Ok(Value::Null);
     }
 
-    let base_oid = match schema.as_deref() {
-        None => pg_catalog_regtype_oid(&name).or_else(|| {
-            if name_was_quoted {
-                // Quoted identifier is case-sensitive — skip alias folding.
+    // Step 3: Resolve the type name.
+    // Quoted names: literal value (no interval processing, no typmod stripping).
+    // Unquoted names: normalize whitespace, validate interval forms, strip typmod.
+    let resolved_name = if name.quoted {
+        name.value.clone()
+    } else {
+        let ws_normalized = normalize_whitespace(&name.value);
+        let after_interval = normalize_interval_type(&ws_normalized)?;
+        if after_interval == "interval" {
+            after_interval
+        } else {
+            strip_regtype_typmod(&after_interval)
+        }
+    };
+
+    // Step 4: Look up OID — schema-aware with `_typename` alias folding.
+    // Schema matching respects quoting: quoted "PG_CATALOG" ≠ pg_catalog → NULL.
+    let base_oid = match &schema {
+        None => pg_catalog_regtype_oid(&resolved_name).or_else(|| {
+            if name.quoted {
                 return None;
             }
-            // Generic _typename → array alias for pg_catalog builtins.
-            // e.g. _int4 → strip '_' → pg_catalog_regtype_oid("int4") → regtype_array_oid
-            name.strip_prefix('_')
+            resolved_name
+                .strip_prefix('_')
                 .and_then(pg_catalog_regtype_oid)
                 .and_then(regtype_array_oid)
         }),
-        Some("pg_catalog") => pg_catalog_regtype_oid(&name).or_else(|| {
-            if name_was_quoted {
-                return None;
-            }
-            name.strip_prefix('_')
-                .and_then(pg_catalog_regtype_oid)
-                .and_then(regtype_array_oid)
-        }),
+        Some(s) if s.value == "pg_catalog" => {
+            pg_catalog_regtype_oid(&resolved_name).or_else(|| {
+                if name.quoted {
+                    return None;
+                }
+                resolved_name
+                    .strip_prefix('_')
+                    .and_then(pg_catalog_regtype_oid)
+                    .and_then(regtype_array_oid)
+            })
+        }
         Some(_) => None,
     };
 
@@ -951,6 +994,16 @@ mod tests {
             Value::Null
         );
         assert_eq!(to_regtype(vec![Value::Null]).unwrap(), Value::Null);
+        // Quoted schema case-sensitivity: quoted "PG_CATALOG" ≠ pg_catalog → NULL
+        assert_eq!(
+            to_regtype(vec![Value::Text("\"PG_CATALOG\".int4".into())]).unwrap(),
+            Value::Null
+        );
+        // Quoted "pg_catalog" (exact case) → resolves normally
+        assert_eq!(
+            to_regtype(vec![Value::Text("\"pg_catalog\".int4".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INT4)
+        );
     }
 
     #[test]
@@ -1115,6 +1168,39 @@ mod tests {
             to_regtype(vec![Value::Text("nonexistent_type".into())]).unwrap(),
             Value::Null
         );
+        // Whitespace normalization: multi-space, tab, space before precision
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval  day   to   second".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval\tday".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval (3)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval  (3)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval\t(3)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("interval  second  (3)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
+        // Schema-qualified interval types
+        assert_eq!(
+            to_regtype(vec![Value::Text(
+                "pg_catalog.interval day to second".into()
+            )])
+            .unwrap(),
+            Value::Int64(pg_types::OID_INTERVAL)
+        );
     }
 
     #[test]
@@ -1167,6 +1253,28 @@ mod tests {
         // Not interval types — returned as-is
         assert_eq!(normalize_interval_type("intervals").unwrap(), "intervals");
         assert_eq!(normalize_interval_type("integer").unwrap(), "integer");
+        // Whitespace normalization: multi-space, tab, space before precision
+        assert_eq!(
+            normalize_interval_type("interval  day   to   second").unwrap(),
+            "interval"
+        );
+        assert_eq!(
+            normalize_interval_type("interval\tday").unwrap(),
+            "interval"
+        );
+        assert_eq!(normalize_interval_type("interval (3)").unwrap(), "interval");
+        assert_eq!(
+            normalize_interval_type("interval  (3)").unwrap(),
+            "interval"
+        );
+        assert_eq!(
+            normalize_interval_type("interval\t(3)").unwrap(),
+            "interval"
+        );
+        assert_eq!(
+            normalize_interval_type("interval  second  (3)").unwrap(),
+            "interval"
+        );
     }
 
     #[test]

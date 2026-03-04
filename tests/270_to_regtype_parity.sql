@@ -23,6 +23,14 @@ SELECT to_regtype('interval(-1)'); -- db9-specific: error text differs from PG
 SELECT to_regtype('"_INT4"');
 SELECT to_regtype('pg_catalog."_INT4"');
 
+-- Quoted schema case-sensitivity: quoted preserves case
+SELECT to_regtype('"PG_CATALOG".int4');
+SELECT to_regtype('"pg_catalog".int4');
+
+-- Interval whitespace normalization
+SELECT to_regtype('interval  day   to   second');
+SELECT to_regtype('interval (3)');
+
 -- Existing behavior regression
 SELECT to_regtype('integer');
 SELECT to_regtype('integer[]');
