@@ -26,7 +26,11 @@ impl VirtualTable for PgShdescription {
         TableSchema {
             table_id: 0,
             name: "pg_shdescription".to_string(),
-            columns: vec![int_col("objoid"), int_col("classoid"), text_col("description")],
+            columns: vec![
+                int_col("objoid"),
+                int_col("classoid"),
+                text_col("description"),
+            ],
             version: 1,
             pk_constraint_name: None,
             pk_indices: vec![],

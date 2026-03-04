@@ -133,9 +133,7 @@ pub(super) fn eval_function_call(
                 _ => false,
             };
             let schemas = crate::session_context::current_search_path_schemas(include_implicit);
-            return Ok(Value::Array(
-                schemas.into_iter().map(Value::Text).collect(),
-            ));
+            return Ok(Value::Array(schemas.into_iter().map(Value::Text).collect()));
         }
         "CURRENT_USER" | "SESSION_USER" | "USER" => {
             return Ok(Value::Text(qctx.current_user.as_ref().to_string()));
