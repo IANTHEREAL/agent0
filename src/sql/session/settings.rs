@@ -9,7 +9,7 @@ use anyhow::Result;
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use super::DEFAULT_MAX_SORT_BYTES;
+use super::{DEFAULT_DML_TABLE_SCAN_MAX_ROWS, DEFAULT_MAX_SORT_BYTES};
 
 /// Metadata for a single known GUC parameter.
 pub(crate) struct GucMeta {
@@ -57,6 +57,12 @@ pub(crate) const KNOWN_GUCS: &[GucMeta] = &[
         name: "datestyle",
         immutable: true,
         description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "db9.dml_table_scan_max_rows",
+        immutable: false,
+        description: "Maximum rows allowed from auxiliary table scans in DML (0 = unlimited)",
         static_default: None,
     },
     GucMeta {
@@ -320,6 +326,11 @@ pub(crate) struct SessionSettings {
     /// Default: 256 MB. 0 = unlimited.
     max_sort_bytes: usize,
 
+    /// Maximum rows allowed from auxiliary table scans in DML.
+    /// Used to clamp dynamic LIMIT expressions at execution time.
+    /// Default: 10000. 0 = unlimited.
+    dml_table_scan_max_rows: usize,
+
     /// Plan cache capacity (max cached plans per session). Default: 128.
     prepared_plan_cache_size: usize,
     /// Plan cache promotion threshold (executions before caching). Default: 5.
@@ -427,6 +438,7 @@ impl SessionSettings {
         Self {
             search_path: Self::default_search_path(),
             max_sort_bytes: DEFAULT_MAX_SORT_BYTES,
+            dml_table_scan_max_rows: DEFAULT_DML_TABLE_SCAN_MAX_ROWS,
             prepared_plan_cache_size: 128,
             prepared_plan_cache_min_exec: 5,
             hnsw_ef_search: 40,
@@ -583,6 +595,19 @@ impl SessionSettings {
             "statement_timeout" | "lock_timeout" | "idle_in_transaction_session_timeout" => {
                 let ms = Self::parse_timeout_millis(value)?;
                 Ok(Self::format_timeout_show(ms))
+            }
+            "db9.dml_table_scan_max_rows" => {
+                let v: usize =
+                    value
+                        .trim()
+                        .parse()
+                        .map_err(|_| SqlError::InvalidParameterValue {
+                            message: format!(
+                                "invalid value for parameter \"{}\": \"{}\"",
+                                name, value
+                            ),
+                        })?;
+                Ok(v.to_string())
             }
             "db9.max_sort_bytes" => {
                 let bytes = Self::parse_byte_size(value)?;
@@ -780,6 +805,11 @@ impl SessionSettings {
                 self.idle_in_transaction_session_timeout_ms =
                     Self::parse_timeout_millis(&normalized)?
             }
+            "db9.dml_table_scan_max_rows" => {
+                self.dml_table_scan_max_rows = normalized
+                    .parse()
+                    .unwrap_or(DEFAULT_DML_TABLE_SCAN_MAX_ROWS);
+            }
             "db9.max_sort_bytes" => {
                 self.max_sort_bytes = Self::parse_byte_size(&normalized)?;
             }
@@ -916,6 +946,9 @@ impl SessionSettings {
                 self.idle_in_transaction_session_timeout_ms =
                     self.default_idle_in_transaction_session_timeout_ms
             }
+            "db9.dml_table_scan_max_rows" => {
+                self.dml_table_scan_max_rows = DEFAULT_DML_TABLE_SCAN_MAX_ROWS
+            }
             "db9.max_sort_bytes" => self.max_sort_bytes = DEFAULT_MAX_SORT_BYTES,
             "db9.prepared_plan_cache_size" => self.prepared_plan_cache_size = 128,
             "db9.prepared_plan_cache_min_exec" => self.prepared_plan_cache_min_exec = 5,
@@ -992,6 +1025,7 @@ impl SessionSettings {
             "idle_in_transaction_session_timeout" => Some(Self::format_timeout_show(
                 self.idle_in_transaction_session_timeout_ms,
             )),
+            "db9.dml_table_scan_max_rows" => Some(self.dml_table_scan_max_rows.to_string()),
             "db9.max_sort_bytes" => Some(self.max_sort_bytes.to_string()),
             "db9.prepared_plan_cache_size" => Some(self.prepared_plan_cache_size.to_string()),
             "db9.prepared_plan_cache_min_exec" => {
@@ -1206,6 +1240,23 @@ impl SessionSettings {
         self.max_sort_bytes
     }
 
+    #[allow(dead_code)] // framework: accessed via settings snapshot in DML executor
+    pub(crate) fn dml_table_scan_max_rows(&self) -> usize {
+        if let Some(v) = self.local_overrides.get("db9.dml_table_scan_max_rows") {
+            match v.parse::<usize>() {
+                Ok(rows) => return rows,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        value = v,
+                        "invalid local db9.dml_table_scan_max_rows override"
+                    );
+                }
+            }
+        }
+        self.dml_table_scan_max_rows
+    }
+
     #[allow(dead_code)]
     pub(crate) fn prepared_plan_cache_size(&self) -> usize {
         if let Some(v) = self.local_overrides.get("db9.prepared_plan_cache_size") {
@@ -1256,6 +1307,7 @@ impl SessionSettings {
         "statement_timeout",
         "lock_timeout",
         "idle_in_transaction_session_timeout",
+        "db9.dml_table_scan_max_rows",
         "db9.max_sort_bytes",
         "db9.prepared_plan_cache_size",
         "db9.prepared_plan_cache_min_exec",

@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use tikv_client::{TimestampExt, Transaction};
 
 pub(crate) const DEFAULT_MAX_SORT_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const DEFAULT_DML_TABLE_SCAN_MAX_ROWS: usize = 10_000;
 
 pub enum TransactionState {
     Idle,
@@ -680,6 +681,11 @@ impl Session {
 
     pub(crate) fn max_sort_bytes(&self) -> usize {
         self.settings.max_sort_bytes()
+    }
+
+    #[allow(dead_code)] // framework: accessed via settings snapshot in DML executor
+    pub(crate) fn dml_table_scan_max_rows(&self) -> usize {
+        self.settings.dml_table_scan_max_rows()
     }
 
     fn sync_plan_cache_settings(&mut self) {

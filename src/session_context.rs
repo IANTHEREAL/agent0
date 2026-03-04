@@ -32,6 +32,10 @@ tokio::task_local! {
 }
 
 tokio::task_local! {
+    static DML_LIMIT_CAP: usize;
+}
+
+tokio::task_local! {
     static CURRENT_TXN_SNAPSHOT_TS_VERSION: Option<u64>;
 }
 
@@ -163,6 +167,21 @@ where
     Fut: Future<Output = R>,
 {
     CURRENT_DATABASE_ID.scope(db_id, fut).await
+}
+
+/// Return the current DML LIMIT cap (0 = unlimited, not set = 0).
+///
+/// Only set within DML subquery execution scopes so that regular SELECT
+/// queries are never capped.
+pub fn current_dml_limit_cap() -> usize {
+    DML_LIMIT_CAP.try_with(|cap| *cap).unwrap_or(0)
+}
+
+pub async fn with_dml_limit_cap<R, Fut>(cap: usize, fut: Fut) -> R
+where
+    Fut: Future<Output = R>,
+{
+    DML_LIMIT_CAP.scope(cap, fut).await
 }
 
 /// Return the current statement's transaction snapshot timestamp version.

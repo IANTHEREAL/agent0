@@ -84,6 +84,18 @@ impl PhysicalOperator for LimitOperator {
         if let Some(expr) = &self.offset_expr {
             self.offset = evaluate_limit_bound(expr, ctx.query_ctx, "OFFSET")?;
         }
+        // Clamp LIMIT to the DML row cap when set.
+        // This prevents excessive memory consumption when a parameter-bound
+        // LIMIT (e.g. LIMIT $1) exceeds the configured maximum for DML
+        // auxiliary subqueries.  The cap is active within all DML execution
+        // scopes: INSERT...SELECT, UPDATE FROM/SET subqueries,
+        // DELETE USING/WHERE subqueries, and VALUES expression subqueries.
+        if let Some(ref mut limit) = self.limit {
+            let cap = crate::session_context::current_dml_limit_cap();
+            if cap > 0 && *limit > cap {
+                *limit = cap;
+            }
+        }
         self.rows_returned = 0;
         self.rows_skipped = 0;
         self.opened = true;
@@ -262,5 +274,82 @@ mod tests {
         let limit_expr = TypedExpr::new(TypedExprKind::Parameter { index: 0 }, DataType::Int64);
         let err = evaluate_limit_bound(&limit_expr, &qctx, "LIMIT").unwrap_err();
         assert!(err.to_string().contains("must not be negative"));
+    }
+
+    #[tokio::test]
+    async fn test_dml_limit_cap_clamps_dynamic_limit() {
+        use crate::session_context::{current_dml_limit_cap, with_dml_limit_cap};
+
+        // Outside DML scope, cap is 0 (unlimited).
+        assert_eq!(current_dml_limit_cap(), 0);
+
+        // Inside a DML scope with cap=100, a dynamic LIMIT of 500 should be
+        // clamped to 100.
+        with_dml_limit_cap(100, async {
+            assert_eq!(current_dml_limit_cap(), 100);
+
+            // Simulate what LimitOperator::open() does after evaluating the
+            // bound LIMIT expression.
+            let mut limit: Option<usize> = Some(500);
+            if let Some(ref mut l) = limit {
+                let cap = current_dml_limit_cap();
+                if cap > 0 && *l > cap {
+                    *l = cap;
+                }
+            }
+            assert_eq!(limit, Some(100));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_dml_limit_cap_no_clamp_when_under() {
+        use crate::session_context::{current_dml_limit_cap, with_dml_limit_cap};
+
+        with_dml_limit_cap(100, async {
+            // LIMIT already under cap — should remain unchanged.
+            let mut limit: Option<usize> = Some(50);
+            if let Some(ref mut l) = limit {
+                let cap = current_dml_limit_cap();
+                if cap > 0 && *l > cap {
+                    *l = cap;
+                }
+            }
+            assert_eq!(limit, Some(50));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_dml_limit_cap_no_clamp_when_unset() {
+        use crate::session_context::current_dml_limit_cap;
+
+        // Without DML scope, cap is 0 → no clamping.
+        let mut limit: Option<usize> = Some(99999);
+        if let Some(ref mut l) = limit {
+            let cap = current_dml_limit_cap();
+            if cap > 0 && *l > cap {
+                *l = cap;
+            }
+        }
+        assert_eq!(limit, Some(99999));
+    }
+
+    #[tokio::test]
+    async fn test_dml_limit_cap_none_limit_unchanged() {
+        use crate::session_context::{current_dml_limit_cap, with_dml_limit_cap};
+
+        // When there is no LIMIT clause (None), the cap should not inject one.
+        with_dml_limit_cap(100, async {
+            let mut limit: Option<usize> = None;
+            if let Some(ref mut l) = limit {
+                let cap = current_dml_limit_cap();
+                if cap > 0 && *l > cap {
+                    *l = cap;
+                }
+            }
+            assert_eq!(limit, None);
+        })
+        .await;
     }
 }

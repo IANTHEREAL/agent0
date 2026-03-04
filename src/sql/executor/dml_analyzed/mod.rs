@@ -58,8 +58,10 @@ impl Executor {
                         .unwrap_or_else(|| "__subquery".to_string());
                     let mut seq_vals = SequenceSession::new();
                     let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
-                    let result = self
-                        .execute_subquery(
+                    let cap = dml_table_scan_max_rows_from_settings();
+                    let result = crate::session_context::with_dml_limit_cap(cap, {
+                        let txn = &mut *txn;
+                        self.execute_subquery(
                             txn,
                             db_id,
                             &mut seq_vals,
@@ -67,7 +69,8 @@ impl Executor {
                             query,
                             &empty_ctes,
                         )
-                        .await?;
+                    })
+                    .await?;
                     match result {
                         crate::sql::ExecuteResult::Select { rows, .. } => {
                             use crate::sql::executor::select::analyzed::postprocess::build_output_schema;
@@ -353,6 +356,11 @@ impl Executor {
 
     /// Evaluate typed expression in DML path, materializing async constructs
     /// (subqueries, sequence/cat funcs) on the current row when needed.
+    ///
+    /// Subquery execution is wrapped with `with_dml_limit_cap` so that any
+    /// `LIMIT` inside a DML expression subquery (e.g. `UPDATE SET col =
+    /// (SELECT ... LIMIT $1)`, `DELETE WHERE col IN (SELECT ... LIMIT $1)`)
+    /// is clamped by `db9.dml_table_scan_max_rows`.
     pub(super) async fn eval_typed_expr_maybe_async(
         &self,
         txn: &mut Transaction,
@@ -366,8 +374,10 @@ impl Executor {
         qctx: &QueryContext,
     ) -> Result<Value> {
         if needs_async_materialization(expr) {
-            let materialized = self
-                .materialize_expr_for_row(
+            let cap = dml_table_scan_max_rows_from_settings();
+            let materialized = crate::session_context::with_dml_limit_cap(
+                cap,
+                self.materialize_expr_for_row(
                     expr,
                     eval_row,
                     None,
@@ -378,8 +388,9 @@ impl Executor {
                     search_path,
                     ctes,
                     qctx,
-                )
-                .await?;
+                ),
+            )
+            .await?;
             eval_typed_expr(&materialized, eval_row, qctx)
         } else {
             eval_typed_expr(expr, eval_row, qctx)
@@ -474,6 +485,18 @@ fn count_ctid_slots(table_ref: &crate::sql::analyzer::types::AnalyzedTableRef) -
             count_ctid_slots(left) + count_ctid_slots(right)
         }
     }
+}
+
+/// Read the `db9.dml_table_scan_max_rows` setting from the current session's
+/// settings snapshot.  Returns the default (10 000) when no snapshot is available.
+fn dml_table_scan_max_rows_from_settings() -> usize {
+    use crate::sql::session::DEFAULT_DML_TABLE_SCAN_MAX_ROWS;
+    let qctx = QueryContext::from_task_locals();
+    qctx.settings_snapshot
+        .as_ref()
+        .and_then(|s| s.get("db9.dml_table_scan_max_rows"))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_DML_TABLE_SCAN_MAX_ROWS)
 }
 
 // ── Free helpers ────────────────────────────────────────────

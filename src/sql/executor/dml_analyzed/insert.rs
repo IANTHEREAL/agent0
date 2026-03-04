@@ -122,8 +122,9 @@ impl Executor {
             AnalyzedInsertSource::Query(ref analyzed_query) => {
                 // Execute the analyzed subquery to get result rows.
                 let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
-                let result = self
-                    .execute_subquery(
+                let cap = super::dml_table_scan_max_rows_from_settings();
+                let result = crate::session_context::with_dml_limit_cap(cap, {
+                    self.execute_subquery(
                         txn,
                         db_id,
                         sequence_values,
@@ -131,7 +132,8 @@ impl Executor {
                         analyzed_query,
                         &empty_ctes,
                     )
-                    .await?;
+                })
+                .await?;
                 match result {
                     super::super::super::ExecuteResult::Select { rows, .. } => {
                         rows.into_iter().map(|r| (r.values, vec![])).collect()
