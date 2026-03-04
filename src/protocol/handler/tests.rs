@@ -1838,16 +1838,311 @@ fn test_parse_copy_command_to_stdout_rejected() {
         .is_none());
 }
 
-/// PG 17.7 parity: COPY FROM STDIN with invalid column identifiers returns SQLSTATE 42602.
+/// Invalid COPY syntax should surface as PostgreSQL syntax error.
+/// db9-specific: error message text comes from sqlparser (not PG canonical wording),
+/// but SQLSTATE 42601 matches PostgreSQL.
 #[test]
-fn test_parse_copy_command_invalid_column_identifier_returns_42602() {
-    // Column name starting with a digit is invalid.
+fn test_parse_copy_command_invalid_column_identifier_returns_syntax_error() {
     let err = DynamicPgHandler::parse_copy_command("COPY t (1col) FROM stdin").unwrap_err();
-    assert_eq!(err.code, "42602");
+    assert_eq!(err.code, "42601");
 
-    // Empty column name (consecutive commas produce empty string after trim).
     let err = DynamicPgHandler::parse_copy_command("COPY t (, b) FROM stdin").unwrap_err();
-    assert_eq!(err.code, "42602");
+    assert_eq!(err.code, "42601");
+}
+
+// --- Quoted identifier and edge-case tests (issue #1309) ---
+
+/// Quoted identifiers are returned with surrounding quotes so that downstream
+/// `split_schema_table` / `normalize_ident` can distinguish quoted (case-preserved)
+/// from unquoted (lowercased) identifiers.
+#[test]
+fn test_parse_copy_command_quoted_table() {
+    let result = DynamicPgHandler::parse_copy_command(r#"COPY "MyTable" FROM stdin"#).unwrap();
+    assert_eq!(result, Some(("\"MyTable\"".to_string(), vec![])));
+}
+
+#[test]
+fn test_parse_copy_command_quoted_columns() {
+    let result =
+        DynamicPgHandler::parse_copy_command(r#"COPY t ("Col1", "Col2") FROM stdin"#).unwrap();
+    assert_eq!(
+        result,
+        Some((
+            "t".to_string(),
+            vec!["\"Col1\"".to_string(), "\"Col2\"".to_string()]
+        ))
+    );
+}
+
+#[test]
+fn test_parse_copy_command_quoted_table_and_columns() {
+    let result =
+        DynamicPgHandler::parse_copy_command(r#"COPY "MyTable" ("Col1", "Col2") FROM stdin"#)
+            .unwrap();
+    assert_eq!(
+        result,
+        Some((
+            "\"MyTable\"".to_string(),
+            vec!["\"Col1\"".to_string(), "\"Col2\"".to_string()]
+        ))
+    );
+}
+
+#[test]
+fn test_parse_copy_command_quoted_schema_table() {
+    let result =
+        DynamicPgHandler::parse_copy_command(r#"COPY "my_schema"."my_table" FROM stdin"#).unwrap();
+    assert_eq!(
+        result,
+        Some(("\"my_schema\".\"my_table\"".to_string(), vec![]))
+    );
+}
+
+#[test]
+fn test_parse_copy_command_dollar_ident() {
+    let result = DynamicPgHandler::parse_copy_command("COPY table$1 (col$2) FROM stdin").unwrap();
+    assert_eq!(
+        result,
+        Some(("table$1".to_string(), vec!["col$2".to_string()]))
+    );
+}
+
+#[test]
+fn test_parse_copy_command_comment_in_columns() {
+    let result =
+        DynamicPgHandler::parse_copy_command("COPY t (a, /* comment */ b) FROM stdin").unwrap();
+    assert_eq!(
+        result,
+        Some(("t".to_string(), vec!["a".to_string(), "b".to_string()]))
+    );
+}
+
+#[test]
+fn test_parse_copy_command_mixed_quoted_unquoted_cols() {
+    let result = DynamicPgHandler::parse_copy_command(r#"COPY t (id, "Name") FROM stdin"#).unwrap();
+    assert_eq!(
+        result,
+        Some((
+            "t".to_string(),
+            vec!["id".to_string(), "\"Name\"".to_string()]
+        ))
+    );
+}
+
+#[test]
+fn test_parse_copy_command_quoted_with_escaped_quote() {
+    let result = DynamicPgHandler::parse_copy_command(r#"COPY "my""table" FROM stdin"#).unwrap();
+    assert_eq!(result, Some(("\"my\"\"table\"".to_string(), vec![])));
+}
+
+#[test]
+fn test_parse_copy_command_three_part_identifier_error_canonicalizes_unquoted_parts() {
+    let err = DynamicPgHandler::parse_copy_command("COPY A.B.C FROM STDIN").unwrap_err();
+    assert_eq!(err.code, "0A000");
+    assert_eq!(
+        err.message,
+        "cross-database references are not implemented: \"a.b.c\""
+    );
+}
+
+#[test]
+fn test_parse_copy_command_three_part_identifier_error_canonicalizes_quoted_dot_part() {
+    let err = DynamicPgHandler::parse_copy_command(r#"COPY "a.b".c.d FROM STDIN"#).unwrap_err();
+    assert_eq!(err.code, "0A000");
+    assert_eq!(
+        err.message,
+        "cross-database references are not implemented: \"a.b.c.d\""
+    );
+}
+
+#[test]
+fn test_parse_copy_command_three_part_identifier_error_canonicalizes_mixed_quoted_unquoted() {
+    let err =
+        DynamicPgHandler::parse_copy_command(r#"COPY "MiXed".B."TaBle" FROM STDIN"#).unwrap_err();
+    assert_eq!(err.code, "0A000");
+    assert_eq!(
+        err.message,
+        "cross-database references are not implemented: \"MiXed.b.TaBle\""
+    );
+}
+
+#[test]
+fn test_parse_copy_command_sqlparser_semantics_after_stdin() {
+    for sql in [
+        r#"COPY "t" FROM STDIN garbage"#,
+        "COPY t FROM STDIN garbage",
+        "COPY t FROM STDIN WITHX",
+        "COPY t FROM STDIN WITH123",
+        "COPY t FROM STDIN WITHX (FORMAT csv)",
+        "COPY t FROM STDIN WITH garbage",
+        r#"COPY "t" FROM STDIN WITH garbage"#,
+        r#"COPY t FROM STDIN WITH (;"#,
+        r#"COPY t FROM STDIN WITH (FORMAT csv HEADER)"#,
+        r#"COPY t FROM STDIN WITH (FORMAT csv,)"#,
+        "COPY t FROM STDIN WITH/*unterminated",
+    ] {
+        let err = DynamicPgHandler::parse_copy_command(sql).unwrap_err();
+        // db9-specific: error message text from sqlparser, SQLSTATE matches PG
+        assert_eq!(err.code, "42601", "sql: {sql}");
+    }
+
+    for sql in [
+        "COPY t FROM STDIN WITH CSV",
+        "COPY t FROM STDIN CSV",
+        "COPY t FROM STDIN WITH DELIMITER ','",
+        r#"COPY "t" FROM STDIN WITH (FORMAT csv)"#,
+        r#"COPY t FROM STDIN WITH(FORMAT csv)"#,
+        r#"COPY t FROM STDIN WITH (FORMAT csv, HEADER true)"#,
+        r#"COPY t FROM STDIN WITH (FORMAT csv);"#,
+        r#"COPY "t" FROM STDIN;"#,
+        "COPY t FROM STDIN WITH/*comment*/(FORMAT csv)",
+        "COPY t FROM STDIN WITH--comment\n(FORMAT csv)",
+    ] {
+        let result = DynamicPgHandler::parse_copy_command(sql).unwrap();
+        assert!(result.is_some(), "sql: {sql}");
+    }
+}
+
+/// Trailing `--` line comment before EOF must not break parsing.
+/// PG 17.7 accepts `COPY t FROM STDIN -- comment` and enters COPY mode.
+#[test]
+fn test_parse_copy_command_trailing_line_comment_eof() {
+    // Simple trailing comment
+    let result = DynamicPgHandler::parse_copy_command("COPY t FROM STDIN -- comment").unwrap();
+    assert_eq!(result, Some(("t".to_string(), vec![])));
+
+    // Trailing comment after WITH CSV
+    let result =
+        DynamicPgHandler::parse_copy_command("COPY t FROM STDIN WITH CSV -- trailing").unwrap();
+    assert!(result.is_some(), "WITH CSV -- trailing should parse");
+
+    // Trailing comment with quoted table
+    let result =
+        DynamicPgHandler::parse_copy_command(r#"COPY "MyTable" FROM STDIN -- comment"#).unwrap();
+    assert_eq!(result, Some(("\"MyTable\"".to_string(), vec![])));
+
+    // Double-dash inside a string literal is NOT a comment
+    let err = DynamicPgHandler::parse_copy_command("COPY t FROM STDIN '--not a comment'");
+    assert!(
+        err.is_err(),
+        "string literal should not be treated as line comment"
+    );
+
+    // E'' escaped string with trailing comment — must not break parsing
+    let result =
+        DynamicPgHandler::parse_copy_command(r"COPY t FROM STDIN WITH (NULL E'it\'s') -- comment")
+            .unwrap();
+    assert!(
+        result.is_some(),
+        "E'' escaped string with trailing comment should parse"
+    );
+}
+
+// -- sqlparser fallback (parse_copy_from_stdin_via_sqlparser) tests --
+
+#[test]
+fn test_sqlparser_fallback_legacy_with_csv() {
+    let result =
+        DynamicPgHandler::parse_copy_from_stdin_via_sqlparser("COPY t FROM STDIN WITH CSV")
+            .unwrap();
+    assert!(result.is_some());
+    let (table, cols) = result.unwrap();
+    assert_eq!(table, "t");
+    assert!(cols.is_empty());
+}
+
+#[test]
+fn test_sqlparser_fallback_legacy_bare_csv() {
+    let result =
+        DynamicPgHandler::parse_copy_from_stdin_via_sqlparser("COPY t FROM STDIN CSV").unwrap();
+    assert!(result.is_some());
+}
+
+#[test]
+fn test_sqlparser_fallback_legacy_with_delimiter() {
+    let result = DynamicPgHandler::parse_copy_from_stdin_via_sqlparser(
+        "COPY t FROM STDIN WITH DELIMITER ','",
+    )
+    .unwrap();
+    assert!(result.is_some());
+}
+
+#[test]
+fn test_sqlparser_fallback_garbage_returns_syntax_error() {
+    let result = DynamicPgHandler::parse_copy_from_stdin_via_sqlparser("COPY t FROM STDIN garbage");
+    assert!(
+        result.is_err(),
+        "garbage after STDIN should be a syntax error"
+    );
+    // db9-specific: error message text from sqlparser, SQLSTATE matches PG
+    assert_eq!(result.unwrap_err().code, "42601");
+}
+
+#[test]
+fn test_sqlparser_fallback_not_copy() {
+    assert_eq!(
+        DynamicPgHandler::parse_copy_from_stdin_via_sqlparser("SELECT 1").unwrap(),
+        None
+    );
+}
+
+#[test]
+fn test_sqlparser_fallback_copy_to_returns_none() {
+    assert_eq!(
+        DynamicPgHandler::parse_copy_from_stdin_via_sqlparser("COPY t TO STDOUT").unwrap(),
+        None
+    );
+}
+
+#[test]
+fn test_sqlparser_fallback_quoted_table() {
+    let result =
+        DynamicPgHandler::parse_copy_from_stdin_via_sqlparser(r#"COPY "MyTable" FROM STDIN CSV"#)
+            .unwrap();
+    assert!(result.is_some());
+    let (table, _) = result.unwrap();
+    assert_eq!(table, r#""MyTable""#);
+}
+
+#[test]
+fn test_sqlparser_fallback_escaped_quote_in_qualified_identifier() {
+    let result = DynamicPgHandler::parse_copy_from_stdin_via_sqlparser(
+        r#"COPY "a""b".t FROM STDIN WITH CSV"#,
+    )
+    .unwrap();
+    assert!(result.is_some());
+    let (table, _) = result.unwrap();
+    assert_eq!(table, r#""a""b".t"#);
+}
+
+#[test]
+fn test_sqlparser_fallback_schema_qualified() {
+    let result = DynamicPgHandler::parse_copy_from_stdin_via_sqlparser(
+        "COPY public.users FROM STDIN WITH CSV",
+    )
+    .unwrap();
+    assert!(result.is_some());
+    let (table, _) = result.unwrap();
+    assert_eq!(table, "public.users");
+}
+
+#[test]
+fn test_sqlparser_fallback_with_columns() {
+    let result =
+        DynamicPgHandler::parse_copy_from_stdin_via_sqlparser("COPY t (a, b) FROM STDIN WITH CSV")
+            .unwrap();
+    assert!(result.is_some());
+    let (table, cols) = result.unwrap();
+    assert_eq!(table, "t");
+    assert_eq!(cols, vec!["a", "b"]);
+}
+
+#[test]
+fn test_sqlparser_fallback_with_semicolon() {
+    let result =
+        DynamicPgHandler::parse_copy_from_stdin_via_sqlparser("COPY t FROM STDIN WITH CSV;")
+            .unwrap();
+    assert!(result.is_some());
 }
 
 #[test]
