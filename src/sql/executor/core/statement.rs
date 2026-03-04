@@ -3,6 +3,7 @@
 use super::*;
 use crate::auth::{Privilege, PrivilegeObject};
 use crate::sql::error::SqlError;
+use crate::sql::sequences::SequenceSession;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatementDispatchKind {
@@ -125,7 +126,7 @@ impl Executor {
         &'a self,
         txn: &'a mut Transaction,
         db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         search_path: &'a [String],
         stmt: &'a Statement,
         current_role: Option<&'a str>,
@@ -145,7 +146,7 @@ impl Executor {
         &'a self,
         txn: &'a mut Transaction,
         db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         search_path: &'a [String],
         stmt: &'a Statement,
         create_index_with_params: Option<&'a str>,
@@ -169,7 +170,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         stmt: &Statement,
         create_index_with_params: Option<&str>,

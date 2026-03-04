@@ -11,6 +11,7 @@ use super::super::super::{parse_sql, ExecuteResult, Session};
 use super::super::core::Executor;
 use super::{is_unquoted_keyword, parse_object_name, tokenize_non_whitespace};
 use crate::model::{ColumnDef, DataType, Row, TableSchema, Value};
+use crate::sql::sequences::SequenceSession;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{ObjectName, Statement};
 use sqlparser::tokenizer::Token;
@@ -139,7 +140,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         name: &ObjectName,
         query: &sqlparser::ast::Query,

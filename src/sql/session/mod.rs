@@ -17,6 +17,7 @@ use crate::sql::error::SqlError;
 use crate::sql::executor::core::plan_cache::PreparedPlanCache;
 use crate::sql::executor::core::prepared_stmt::PreparedStatement as SqlPreparedStatement;
 use crate::sql::query_context::{QueryContext, XactAdvisorySavepointTracker};
+use crate::sql::sequences::SequenceSession;
 use crate::storage::TikvStore;
 use crate::txn::SavepointState;
 use anyhow::Result;
@@ -43,7 +44,7 @@ pub struct Session {
     #[cfg(test)]
     test_force_failed_transaction: bool,
     pub(crate) savepoints: Arc<SavepointState>,
-    last_sequence_values: HashMap<String, i64>,
+    last_sequence_values: SequenceSession,
     settings: SessionSettings,
     /// Authenticated session user (login role). This does not change with `SET ROLE`.
     session_user: Option<String>,
@@ -128,7 +129,7 @@ impl Session {
             #[cfg(test)]
             test_force_failed_transaction: false,
             savepoints: Arc::new(SavepointState::new()),
-            last_sequence_values: HashMap::new(),
+            last_sequence_values: SequenceSession::new(),
             settings,
             session_user: None,
             session_user_is_superuser: false,
@@ -181,7 +182,7 @@ impl Session {
             #[cfg(test)]
             test_force_failed_transaction: false,
             savepoints: Arc::new(SavepointState::new()),
-            last_sequence_values: HashMap::new(),
+            last_sequence_values: SequenceSession::new(),
             settings,
             session_user: Some(username.clone()),
             session_user_is_superuser: is_superuser,
@@ -475,7 +476,7 @@ impl Session {
 
     pub fn get_mut_txn_sequence_values_and_search_path(
         &mut self,
-    ) -> Option<(&mut Transaction, &mut HashMap<String, i64>, &[String])> {
+    ) -> Option<(&mut Transaction, &mut SequenceSession, &[String])> {
         match &mut self.state {
             TransactionState::Active(txn) | TransactionState::Failed(txn) => Some((
                 txn,

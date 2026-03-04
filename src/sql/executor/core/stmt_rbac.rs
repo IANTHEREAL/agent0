@@ -2,13 +2,14 @@
 
 use super::*;
 use crate::auth::{Privilege, PrivilegeObject};
+use crate::sql::sequences::SequenceSession;
 
 impl Executor {
     pub(super) async fn execute_rbac_statement(
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        _sequence_values: &mut HashMap<String, i64>,
+        _sequence_values: &mut SequenceSession,
         _search_path: &[String],
         stmt: &Statement,
         current_role: Option<&str>,

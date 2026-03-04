@@ -26,13 +26,14 @@ use super::utils::{
     substitute_variables,
 };
 use super::PlpgsqlContext;
+use crate::sql::sequences::SequenceSession;
 
 /// Execute a PL/pgSQL function body with the given arguments.
 pub fn execute_plpgsql_function<'a>(
     store: &'a Arc<TikvStore>,
     txn: &'a mut Transaction,
     db_id: u64,
-    sequence_values: &'a mut HashMap<String, i64>,
+    sequence_values: &'a mut SequenceSession,
     search_path: &'a [String],
     func_def: &'a FunctionDef,
     args: Vec<Value>,
@@ -107,7 +108,7 @@ fn execute_statements<'a>(
     store: &'a Arc<TikvStore>,
     txn: &'a mut Transaction,
     db_id: u64,
-    sequence_values: &'a mut HashMap<String, i64>,
+    sequence_values: &'a mut SequenceSession,
     search_path: &'a [String],
     ctx: &'a mut PlpgsqlContext,
     statements: &'a [PlpgsqlStatement],
@@ -505,7 +506,7 @@ async fn evaluate_expression(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
+    sequence_values: &mut SequenceSession,
     search_path: &[String],
     ctx: &PlpgsqlContext,
     expr_str: &str,
@@ -561,7 +562,7 @@ pub async fn try_execute_user_function(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
+    sequence_values: &mut SequenceSession,
     search_path: &[String],
     func_name: &str,
     args: Vec<Value>,
@@ -614,7 +615,7 @@ async fn execute_user_function_by_name(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
+    sequence_values: &mut SequenceSession,
     search_path: &[String],
     full_name: &str,
     args: Vec<Value>,
@@ -663,7 +664,7 @@ async fn execute_sql_function(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
+    sequence_values: &mut SequenceSession,
     search_path: &[String],
     func_def: &FunctionDef,
     args: Vec<Value>,

@@ -33,6 +33,7 @@ pub(crate) mod postprocess;
 mod pre_materialize;
 mod subquery;
 
+use crate::sql::sequences::SequenceSession;
 use expr_runtime::*;
 use postprocess::*;
 
@@ -48,7 +49,7 @@ impl Executor {
         &'a self,
         txn: &'a mut Transaction,
         db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         search_path: &'a [String],
         query: &'a Query,
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
@@ -138,7 +139,7 @@ impl Executor {
         &'a self,
         txn: &'a mut Transaction,
         db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         search_path: &'a [String],
         analyzed: &'a AnalyzedQuery,
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
@@ -170,7 +171,7 @@ impl Executor {
         &'a self,
         txn: &'a mut Transaction,
         db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         search_path: &'a [String],
         analyzed: &'a AnalyzedQuery,
         base_ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
@@ -274,7 +275,7 @@ impl Executor {
         &'a self,
         txn: &'a mut Transaction,
         db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         search_path: &'a [String],
         analyzed: &'a AnalyzedQuery,
         base_ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
@@ -320,7 +321,7 @@ impl Executor {
         &'a self,
         txn: &'a mut Transaction,
         db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         search_path: &'a [String],
         analyzed: Cow<'a, AnalyzedQuery>,
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
@@ -727,7 +728,7 @@ mod _stack_overflow_signature_guards_907 {
     fn _guard_execute_via_optimizer(
         e: &Executor,
         txn: &mut Transaction,
-        seq: &mut HashMap<String, i64>,
+        seq: &mut SequenceSession,
         analyzed: AnalyzedQuery,
     ) {
         let ctes = HashMap::new();
@@ -757,7 +758,7 @@ mod _stack_overflow_signature_guards_907 {
     fn _guard_execute_subquery(
         e: &Executor,
         txn: &mut Transaction,
-        seq: &mut HashMap<String, i64>,
+        seq: &mut SequenceSession,
         analyzed: &AnalyzedQuery,
     ) {
         let ctes = HashMap::new();
@@ -768,7 +769,7 @@ mod _stack_overflow_signature_guards_907 {
     fn _guard_try_execute_analyzed(
         e: &Executor,
         txn: &mut Transaction,
-        seq: &mut HashMap<String, i64>,
+        seq: &mut SequenceSession,
         query: &Query,
     ) {
         let ctes = HashMap::new();

@@ -15,6 +15,7 @@ use crate::sql::executor::core::Executor;
 use crate::sql::expr::classify::needs_pre_materialization;
 use crate::sql::query_context::QueryContext;
 
+use crate::sql::sequences::SequenceSession;
 use anyhow::Result;
 use std::collections::HashMap;
 use tikv_client::Transaction;
@@ -47,7 +48,7 @@ impl Executor {
         schema: Option<&TableSchema>,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
         qctx: &QueryContext,

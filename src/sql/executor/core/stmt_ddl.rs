@@ -3,6 +3,7 @@
 use super::*;
 use crate::auth::{GrantedPrivilege, Privilege, PrivilegeObject};
 use crate::sql::error::SqlError;
+use crate::sql::sequences::SequenceSession;
 use sqlparser::ast::{Expr, ObjectType, ReferentialAction, SchemaName};
 
 impl Executor {
@@ -10,7 +11,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         stmt: &Statement,
         create_index_with_params: Option<&str>,

@@ -3,6 +3,7 @@
 use super::cache::{TriggerBodyCache, TriggerStatement};
 use super::rewrite::substitute_row_references;
 use crate::model::{FunctionDef, Row, TableSchema, TriggerDef};
+use crate::sql::sequences::SequenceSession;
 use crate::storage::TikvStore;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -47,7 +48,7 @@ pub async fn apply_before_triggers_with_cache(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
+    sequence_values: &mut SequenceSession,
     search_path: &[String],
     triggers: &[TriggerDef],
     func_cache: &HashMap<String, FunctionDef>,
@@ -115,7 +116,7 @@ async fn execute_trigger_function(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
+    sequence_values: &mut SequenceSession,
     search_path: &[String],
     func_def: &crate::model::FunctionDef,
     schema: &TableSchema,
@@ -148,7 +149,7 @@ async fn execute_trigger_body_cached(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
+    sequence_values: &mut SequenceSession,
     search_path: &[String],
     func_oid: u32,
     body: &str,

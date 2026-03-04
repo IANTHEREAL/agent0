@@ -11,6 +11,7 @@ use crate::sql::executor::core::Executor;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::query_context::QueryContext;
 
+use crate::sql::sequences::SequenceSession;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::future::Future;
@@ -53,7 +54,7 @@ impl Executor {
         schema: Option<&'a TableSchema>,
         txn: &'a mut Transaction,
         db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         search_path: &'a [String],
         qctx: &'a QueryContext,
     ) -> Pin<Box<dyn Future<Output = Result<TypedExpr>> + Send + 'a>> {

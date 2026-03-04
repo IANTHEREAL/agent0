@@ -226,8 +226,61 @@ def main() -> int:
     )
     assert_lines(out, ["3", "6"])
 
+    # lastval() after nextval returns the nextval result.
+    out = must_stdout(
+        cfg,
+        """
+        DROP SEQUENCE IF EXISTS s_lv1;
+        CREATE SEQUENCE s_lv1 START WITH 1 INCREMENT BY 1;
+        SELECT nextval('s_lv1');
+        SELECT lastval();
+        """,
+    )
+    assert_lines(out, ["1", "1"])
+
+    # lastval() tracks the most-recent nextval across multiple sequences.
+    out = must_stdout(
+        cfg,
+        """
+        DROP SEQUENCE IF EXISTS s_lv2;
+        CREATE SEQUENCE s_lv2 START WITH 100 INCREMENT BY 1;
+        SELECT nextval('s_lv1');
+        SELECT nextval('s_lv2');
+        SELECT lastval();
+        SELECT nextval('s_lv1');
+        SELECT lastval();
+        """,
+    )
+    assert_lines(out, ["2", "100", "100", "3", "3"])
+
+    # setval(seq, val, true) on the SAME sequence as the most-recent nextval
+    # updates both currval AND lastval (PG 17.7 verified).
+    out = must_stdout(
+        cfg,
+        """
+        SELECT nextval('s_lv1');
+        SELECT lastval();
+        SELECT setval('s_lv1', 50);
+        SELECT currval('s_lv1');
+        SELECT lastval();
+        """,
+    )
+    assert_lines(out, ["4", "4", "50", "50", "50"])
+
+    # lastval() before any nextval in session → ERROR.
+    must_error(cfg, "SELECT lastval();", "lastval is not yet defined in this session")
+
     # Cleanup.
-    must_stdout(cfg, "DROP SEQUENCE IF EXISTS s1; DROP SEQUENCE IF EXISTS s2; DROP SEQUENCE IF EXISTS s_txn;")
+    must_stdout(
+        cfg,
+        """
+        DROP SEQUENCE IF EXISTS s1;
+        DROP SEQUENCE IF EXISTS s2;
+        DROP SEQUENCE IF EXISTS s_txn;
+        DROP SEQUENCE IF EXISTS s_lv1;
+        DROP SEQUENCE IF EXISTS s_lv2;
+        """,
+    )
     return 0
 
 

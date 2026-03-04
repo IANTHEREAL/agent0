@@ -878,7 +878,7 @@ impl WorkerEngine {
         };
 
         let mut txn = store.begin().await?;
-        let mut sequence_values: HashMap<String, i64> = HashMap::new();
+        let mut sequence_values = crate::sql::sequences::SequenceSession::new();
         let result = async {
             let statements = parse_sql(&entry.command)?;
             for stmt in &statements {

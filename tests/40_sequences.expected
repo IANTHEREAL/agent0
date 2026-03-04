@@ -21,50 +21,42 @@ nextval
 3
 (1 row)
 nextval
+1
+(1 row)
+lastval
+1
+(1 row)
+nextval
 100
 (1 row)
-nextval
-200
-(1 row)
 lastval
-200
+100
 (1 row)
-setval
-999
-(1 row)
-lastval
-200
-(1 row)
-setval
-555
-(1 row)
-lastval
-555
-(1 row)
-nextval
+currval
 1
 (1 row)
 setval
-10
+50
+(1 row)
+currval
+50
 (1 row)
 lastval
-1
+100
 (1 row)
 setval
-20
+200
+(1 row)
+currval
+50
 (1 row)
 lastval
-20
-(1 row)
-setval
-30
-(1 row)
-lastval
-30
+100
 (1 row)
 nextval
 2
 (1 row)
+ERROR:  currval of sequence "seq_lastval_s3" is not yet defined in this session
 nextval
 1
 (1 row)

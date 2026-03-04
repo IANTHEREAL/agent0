@@ -6,6 +6,7 @@ use super::core::Executor;
 use crate::model::{ColumnDef, DataType, Row, TableSchema};
 use crate::sql::binder::{extract_relation_references_from_query, RelationDep};
 use crate::sql::error::SqlError;
+use crate::sql::sequences::SequenceSession;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Ident, Query, SetExpr, SetOperator, SetQuantifier, Visit, Visitor};
 use std::collections::HashMap;
@@ -53,7 +54,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         query: &Query,
         base_ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
@@ -136,7 +137,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         query: &Query,
         current_role: Option<&str>,
@@ -164,7 +165,7 @@ impl Executor {
         &'a self,
         txn: &'a mut Transaction,
         db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         search_path: &'a [String],
         query: &'a Query,
         base_ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
@@ -194,7 +195,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         cte_name: &str,
         query: &Query,

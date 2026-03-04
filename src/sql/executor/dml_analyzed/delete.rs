@@ -15,6 +15,7 @@ use crate::sql::analyzer::types::AnalyzedDelete;
 use crate::sql::dml::pk_to_hash_key;
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
+use crate::sql::sequences::SequenceSession;
 use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
 use tikv_client::Transaction;
@@ -26,7 +27,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         del: &AnalyzedDelete,
     ) -> Result<ExecuteResult> {

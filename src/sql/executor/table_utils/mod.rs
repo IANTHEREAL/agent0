@@ -14,6 +14,7 @@ use super::core::Executor;
 use crate::model::{ColumnDef, DataType, MigrationRecord, Row, TableSchema, Value};
 use crate::sql::catalog::virtual_tables::virtual_table_schema;
 use crate::sql::error::SqlError;
+use crate::sql::sequences::SequenceSession;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr};
@@ -47,7 +48,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         table_name: &str,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
@@ -68,7 +69,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        _sequence_values: &mut HashMap<String, i64>,
+        _sequence_values: &mut SequenceSession,
         search_path: &[String],
         table_name: &str,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,

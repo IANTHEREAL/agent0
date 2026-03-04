@@ -5,6 +5,7 @@ use tikv_client::Transaction;
 use crate::model::{Row, TableSchema};
 use crate::sql::executor::Executor;
 use crate::sql::query_context::QueryContext;
+use crate::sql::sequences::SequenceSession;
 use crate::storage::TikvStore;
 
 pub struct ExecutionContext<'a> {
@@ -15,7 +16,7 @@ pub struct ExecutionContext<'a> {
     #[allow(dead_code)] // forward-compat: threaded through for future operator use
     pub search_path: &'a [String],
     #[allow(dead_code)] // forward-compat: threaded through for future operator use
-    pub sequence_values: &'a mut HashMap<String, i64>,
+    pub sequence_values: &'a mut SequenceSession,
     pub cte_tables: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     pub query_ctx: &'a QueryContext,
     pub outer_row: Option<Row>,
@@ -31,7 +32,7 @@ impl<'a> ExecutionContext<'a> {
         store: Arc<TikvStore>,
         db_id: u64,
         search_path: &'a [String],
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         query_ctx: &'a QueryContext,
     ) -> Self {
         Self {
@@ -53,7 +54,7 @@ impl<'a> ExecutionContext<'a> {
         store: Arc<TikvStore>,
         db_id: u64,
         search_path: &'a [String],
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         cte_tables: &'a HashMap<String, (TableSchema, Vec<Row>)>,
         query_ctx: &'a QueryContext,
     ) -> Self {

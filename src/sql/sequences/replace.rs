@@ -12,16 +12,16 @@ use crate::sql::value_coercion::value_to_sql_expr;
 use crate::storage::TikvStore;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr};
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tikv_client::Transaction;
 
+use super::SequenceSession;
+
 use super::{
-    eval_seq_expr, extract_arg_expr, get_lastval_sequence_name,
-    index_helpers::lookup_indexdef_by_oid, resolve_sequence_full_name_from_value,
-    set_lastval_sequence_name, value_to_i64, LASTVAL_SENTINEL, LASTVAL_SENTINEL_KEY,
+    eval_seq_expr, extract_arg_expr, index_helpers::lookup_indexdef_by_oid,
+    resolve_sequence_full_name_from_value, value_to_i64,
 };
 
 fn pg_type_name_from_data_type(data_type: &DataType) -> String {
@@ -75,7 +75,7 @@ pub(crate) fn replace_sequence_functions<'a>(
     store: &'a Arc<TikvStore>,
     txn: &'a mut Transaction,
     db_id: u64,
-    last_sequence_values: &'a mut HashMap<String, i64>,
+    last_sequence_values: &'a mut SequenceSession,
     search_path: &'a [String],
     expr: &'a Expr,
     row: Option<&'a Row>,
@@ -100,10 +100,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         )
                         .await?;
                         let val = store.nextval_sequence(txn, db_id, &full_name).await?;
-                        super::set_lastval(last_sequence_values, &full_name, val);
-                        last_sequence_values.insert(full_name.clone(), val);
-                        last_sequence_values.insert(LASTVAL_SENTINEL_KEY.to_string(), val);
-                        set_lastval_sequence_name(last_sequence_values, &full_name);
+                        last_sequence_values.record_nextval(full_name, val);
                         Ok(value_to_sql_expr(&crate::model::Value::Int64(val)))
                     }
                     "CURRVAL" => {
@@ -122,16 +119,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                             )
                             .into());
                         }
-                        let val =
-                            last_sequence_values
-                                .get(&full_name)
-                                .copied()
-                                .ok_or_else(|| {
-                                    anyhow!(
-                            "currval of sequence \"{}\" is not yet defined in this session",
-                            full_name
-                        )
-                                })?;
+                        let val = last_sequence_values.currval(&full_name)?;
                         Ok(value_to_sql_expr(&crate::model::Value::Int64(val)))
                     }
                     "SETVAL" => {
@@ -178,26 +166,10 @@ pub(crate) fn replace_sequence_functions<'a>(
                         } else {
                             true
                         };
-                        // If setval targets the same sequence as the most recent
-                        // nextval(), update the lastval sentinel (PG 17 semantics).
-                        let same_seq = get_lastval_sequence_name(last_sequence_values)
-                            .map(|n| n == full_name.as_str())
-                            .unwrap_or(false);
                         let res = store
                             .setval_sequence(txn, db_id, &full_name, value_i64, is_called)
                             .await?;
-                        // Rule 1: currval cache — always update when is_called=true
-                        if is_called {
-                            last_sequence_values.insert(full_name.clone(), res);
-                            super::update_lastval_if_same_seq(
-                                last_sequence_values,
-                                &full_name,
-                                res,
-                            );
-                            if same_seq {
-                                last_sequence_values.insert(LASTVAL_SENTINEL_KEY.to_string(), res);
-                            }
-                        }
+                        last_sequence_values.record_setval(full_name, res, is_called);
                         Ok(value_to_sql_expr(&crate::model::Value::Int64(res)))
                     }
                     "LASTVAL" => {
@@ -214,11 +186,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                             ))
                             .into());
                         }
-                        let val = last_sequence_values
-                            .get(LASTVAL_SENTINEL_KEY)
-                            .copied()
-                            .or_else(|| last_sequence_values.get(LASTVAL_SENTINEL).copied())
-                            .ok_or_else(|| anyhow!("lastval is not yet defined in this session"))?;
+                        let val = last_sequence_values.lastval()?;
                         Ok(value_to_sql_expr(&crate::model::Value::Int64(val)))
                     }
                     "PG_GET_INDEXDEF" => {

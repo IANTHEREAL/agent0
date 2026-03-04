@@ -7,6 +7,7 @@ use super::super::prepared_stmt::PreparedStatement;
 use super::super::*;
 use super::utils::{apply_statement_timeout, wrap_with_runtime_context, RuntimeSettings};
 use crate::sql::expr::bridge::eval_const_ast_expr;
+use crate::sql::sequences::SequenceSession;
 use crate::sql::types::sql_datatype_to_internal_strict;
 use std::future::Future;
 use std::pin::Pin;
@@ -593,7 +594,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         exec: &PreparedExec,
         current_role: Option<&str>,
@@ -744,7 +745,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         exec: &PreparedExec,
         current_role: Option<&str>,

@@ -6,6 +6,7 @@ use crate::auth::Privilege;
 use crate::sql::analyzer::types::AnalyzedStatement;
 use crate::sql::analyzer::Analyzer;
 use crate::sql::error::SqlError;
+use crate::sql::sequences::SequenceSession;
 
 /// Create an Analyzer that is aware of extended-query parameters when present.
 /// Checks QUERY_PARAMS task-local; if non-empty, creates a param-aware Analyzer
@@ -30,7 +31,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         stmt: &Statement,
         current_role: Option<&str>,

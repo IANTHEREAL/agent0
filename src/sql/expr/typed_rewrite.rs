@@ -7,12 +7,10 @@ use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
 use crate::sql::expr::static_eval::eval_static_typed_expr;
 use crate::sql::expr::traverse::{map_children_async, AsyncExprTransform};
 use crate::sql::query_context::QueryContext;
-use crate::sql::sequences::{
-    self, get_lastval_sequence_name, set_lastval_sequence_name, LASTVAL_SENTINEL_KEY,
-};
+use crate::sql::sequences;
+use crate::sql::sequences::SequenceSession;
 use crate::storage::TikvStore;
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -30,7 +28,7 @@ struct SequenceMaterializeCtx<'a> {
     store: &'a Arc<TikvStore>,
     txn: &'a mut Transaction,
     db_id: u64,
-    sequence_values: &'a mut HashMap<String, i64>,
+    sequence_values: &'a mut SequenceSession,
     search_path: &'a [String],
     qctx: &'a QueryContext,
 }
@@ -60,29 +58,12 @@ impl AsyncExprTransform for SequenceMaterializeCtx<'_> {
                                 .store
                                 .nextval_sequence(self.txn, self.db_id, &seq_name)
                                 .await?;
-                            crate::sql::sequences::set_lastval(
-                                self.sequence_values,
-                                &seq_name,
-                                val,
-                            );
-                            self.sequence_values.insert(seq_name.clone(), val);
-                            self.sequence_values
-                                .insert(LASTVAL_SENTINEL_KEY.to_string(), val);
-                            set_lastval_sequence_name(self.sequence_values, &seq_name);
+                            self.sequence_values.record_nextval(seq_name, val);
                             TypedExprKind::Constant(Value::Int64(val))
                         }
                         Some(SequenceFunction::CurrVal) => {
                             let seq_name = self.resolve_sequence_name_from_typed_args(args).await?;
-                            let val =
-                                self.sequence_values
-                                    .get(&seq_name)
-                                    .copied()
-                                    .ok_or_else(|| {
-                                        anyhow!(
-                                "currval of sequence \"{}\" is not yet defined in this session",
-                                seq_name
-                            )
-                                    })?;
+                            let val = self.sequence_values.currval(&seq_name)?;
                             TypedExprKind::Constant(Value::Int64(val))
                         }
                         Some(SequenceFunction::SetVal) => {
@@ -110,27 +91,13 @@ impl AsyncExprTransform for SequenceMaterializeCtx<'_> {
                                 true
                             };
 
-                            let same_seq = get_lastval_sequence_name(self.sequence_values)
-                                .map(|n| n == seq_name.as_str())
-                                .unwrap_or(false);
                             self.store
                                 .setval_sequence(
                                     self.txn, self.db_id, &seq_name, set_val, is_called,
                                 )
                                 .await?;
-                            // Rule 1: currval cache — always update when is_called=true
-                            if is_called {
-                                self.sequence_values.insert(seq_name.clone(), set_val);
-                                crate::sql::sequences::update_lastval_if_same_seq(
-                                    self.sequence_values,
-                                    &seq_name,
-                                    set_val,
-                                );
-                                if same_seq {
-                                    self.sequence_values
-                                        .insert(LASTVAL_SENTINEL_KEY.to_string(), set_val);
-                                }
-                            }
+                            self.sequence_values
+                                .record_setval(seq_name, set_val, is_called);
                             TypedExprKind::Constant(Value::Int64(set_val))
                         }
                         // Non-sequence function: canonical child recursion
@@ -198,7 +165,7 @@ pub fn materialize_sequences_in_typed_expr<'a>(
     store: &'a Arc<TikvStore>,
     txn: &'a mut Transaction,
     db_id: u64,
-    sequence_values: &'a mut HashMap<String, i64>,
+    sequence_values: &'a mut SequenceSession,
     search_path: &'a [String],
     expr: &'a TypedExpr,
     qctx: &'a QueryContext,

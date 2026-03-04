@@ -17,7 +17,7 @@ fn test_execute_statement_on_txn_signature_stays_boxed() {
         &'a super::Executor,
         &'a mut tikv_client::Transaction,
         u64,
-        &'a mut std::collections::HashMap<String, i64>,
+        &'a mut crate::sql::sequences::SequenceSession,
         &'a [String],
         &'a sqlparser::ast::Statement,
         Option<&'a str>,

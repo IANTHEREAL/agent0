@@ -12,6 +12,7 @@ use crate::sql::query_context::QueryContext;
 use crate::storage::TikvStore;
 
 use crate::model::TableSchema;
+use crate::sql::sequences::SequenceSession;
 
 fn build_query_ctx_from_task_locals() -> QueryContext {
     QueryContext::from_task_locals()
@@ -24,7 +25,7 @@ pub async fn execute_operator_tree(
     store: Arc<TikvStore>,
     db_id: u64,
     search_path: &[String],
-    sequence_values: &mut HashMap<String, i64>,
+    sequence_values: &mut SequenceSession,
 ) -> Result<Vec<Row>> {
     let qc = build_query_ctx_from_task_locals();
     let mut ctx = ExecutionContext::new(
@@ -57,7 +58,7 @@ pub async fn execute_operator_tree_with_ctes(
     store: Arc<TikvStore>,
     db_id: u64,
     search_path: &[String],
-    sequence_values: &mut HashMap<String, i64>,
+    sequence_values: &mut SequenceSession,
     cte_tables: &HashMap<String, (TableSchema, Vec<Row>)>,
 ) -> Result<Vec<Row>> {
     let qc = build_query_ctx_from_task_locals();

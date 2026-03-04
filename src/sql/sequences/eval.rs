@@ -5,9 +5,10 @@ use crate::model::{Row, TableSchema};
 use crate::storage::TikvStore;
 use anyhow::Result;
 use sqlparser::ast::Expr;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tikv_client::Transaction;
+
+use super::SequenceSession;
 
 use super::{eval_seq_expr, expr_needs_async_eval, replace::replace_sequence_functions};
 
@@ -15,7 +16,7 @@ pub(crate) async fn eval_expr_with_sequences(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    last_sequence_values: &mut HashMap<String, i64>,
+    last_sequence_values: &mut SequenceSession,
     search_path: &[String],
     expr: &Expr,
     row: Option<&Row>,

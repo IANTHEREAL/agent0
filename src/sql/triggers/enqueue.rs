@@ -3,9 +3,9 @@ use super::queue::TriggerOp;
 use super::rewrite::substitute_row_references;
 use crate::model::{Row, TriggerDef};
 use crate::sql::executor::{Executor, PendingAsyncTrigger};
+use crate::sql::sequences::SequenceSession;
 use crate::storage::TikvStore;
 use anyhow::Result;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tikv_client::Transaction;
 
@@ -34,7 +34,7 @@ pub(crate) async fn enqueue_after_triggers(
     triggers: &[TriggerDef],
     store: &Arc<TikvStore>,
     executor: &Executor,
-    sequence_values: &mut HashMap<String, i64>,
+    sequence_values: &mut SequenceSession,
     search_path: &[String],
 ) -> Result<()> {
     let op_str = match op {

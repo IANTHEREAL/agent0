@@ -18,6 +18,7 @@ use crate::sql::check_constraints;
 use crate::sql::dml::{ConflictBehavior, ConflictTarget, FkRefSchemaCache};
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
+use crate::sql::sequences::SequenceSession;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tikv_client::Transaction;
@@ -29,7 +30,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         ins: &AnalyzedInsert,
     ) -> Result<ExecuteResult> {

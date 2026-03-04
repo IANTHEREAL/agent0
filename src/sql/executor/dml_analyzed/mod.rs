@@ -16,6 +16,7 @@ use crate::sql::expr::static_eval::needs_async_materialization;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
+use crate::sql::sequences::SequenceSession;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tikv_client::Transaction;
@@ -55,7 +56,7 @@ impl Executor {
                         .alias
                         .clone()
                         .unwrap_or_else(|| "__subquery".to_string());
-                    let mut seq_vals: HashMap<String, i64> = HashMap::new();
+                    let mut seq_vals = SequenceSession::new();
                     let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
                     let result = self
                         .execute_subquery(
@@ -289,7 +290,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         schema: &TableSchema,
         row_vals: &mut [Value],
@@ -313,7 +314,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         schema: &TableSchema,
         col_idx: usize,
@@ -356,7 +357,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         expr: &TypedExpr,
         eval_row: &Row,

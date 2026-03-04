@@ -11,6 +11,7 @@ use tikv_client::Transaction;
 
 use super::core::Executor;
 use crate::sql::expr::bridge::eval_const_ast_expr;
+use crate::sql::sequences::SequenceSession;
 
 impl Executor {
     #[allow(clippy::type_complexity)]
@@ -18,7 +19,7 @@ impl Executor {
         &'a self,
         txn: &'a mut Transaction,
         db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         search_path: &'a [String],
         name: &'a ObjectName,
         args: &'a [FunctionArg],
@@ -127,7 +128,7 @@ async fn execute_sql_table_function(
     executor: &Executor,
     txn: &mut Transaction,
     db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
+    sequence_values: &mut SequenceSession,
     search_path: &[String],
     func_def: &FunctionDef,
     args: Vec<Value>,

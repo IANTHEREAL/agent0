@@ -3,15 +3,15 @@
 use super::rewrite::substitute_row_references;
 use crate::model::{Row, TableSchema};
 use crate::sql::executor::Executor;
+use crate::sql::sequences::SequenceSession;
 use anyhow::Result;
-use std::collections::HashMap;
 use tikv_client::Transaction;
 
 pub(crate) async fn execute_trigger_body_standalone(
     executor: &Executor,
     txn: &mut Transaction,
     db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
+    sequence_values: &mut SequenceSession,
     schema: &TableSchema,
     body: &str,
     old_row: Option<&Row>,
@@ -103,7 +103,7 @@ pub(crate) async fn execute_trigger_statement_standalone(
     executor: &Executor,
     txn: &mut Transaction,
     db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
+    sequence_values: &mut SequenceSession,
     schema: &TableSchema,
     old_row: Option<&Row>,
     new_values: &mut [crate::model::Value],

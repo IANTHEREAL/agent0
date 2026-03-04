@@ -1,13 +1,14 @@
 //! Query statement sub-dispatcher
 
 use super::*;
+use crate::sql::sequences::SequenceSession;
 
 impl Executor {
     pub(super) async fn execute_query_statement(
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         stmt: &Statement,
         current_role: Option<&str>,
@@ -72,7 +73,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         statement: &Statement,
         analyze: bool,

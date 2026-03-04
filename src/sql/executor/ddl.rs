@@ -5,11 +5,11 @@ use super::super::names;
 use super::super::ExecuteResult;
 use super::Executor;
 use crate::sql::error::SqlError;
+use crate::sql::sequences::SequenceSession;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     AlterTableOperation, ColumnDef as SqlColumnDef, Expr, Ident, ObjectName, OrderByExpr, Query,
 };
-use std::collections::HashMap;
 use tikv_client::Transaction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,7 +179,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         name: &ObjectName,
         query: &Query,

@@ -1,6 +1,5 @@
 //! Default expression evaluation, `fill_missing_columns`, and `coerce_row_values`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -14,7 +13,8 @@ use crate::sql::expr::compile::compile_const_expr;
 use crate::sql::expr::static_eval::{eval_static_typed_expr, needs_async_materialization};
 use crate::sql::expr::typed_rewrite::materialize_sequences_in_typed_expr;
 use crate::sql::query_context::QueryContext;
-use crate::sql::sequences::{self, set_lastval_sequence_name, LASTVAL_SENTINEL_KEY};
+use crate::sql::sequences;
+use crate::sql::sequences::SequenceSession;
 use crate::sql::value_coercion::coerce_value_for_column;
 use crate::storage::TikvStore;
 
@@ -22,7 +22,7 @@ async fn eval_default_expr_maybe_sequence(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
+    sequence_values: &mut SequenceSession,
     search_path: &[String],
     expr_str: &str,
 ) -> Result<Value> {
@@ -66,7 +66,7 @@ async fn eval_column_default_or_null_inner(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
+    sequence_values: &mut SequenceSession,
     search_path: &[String],
     schema: &TableSchema,
     column_idx: usize,
@@ -108,10 +108,7 @@ async fn eval_column_default_or_null_inner(
         };
 
         let seq_val = store.nextval_sequence(txn, db_id, &seq_full_name).await?;
-        crate::sql::sequences::set_lastval(sequence_values, &seq_full_name, seq_val);
-        sequence_values.insert(seq_full_name.clone(), seq_val);
-        sequence_values.insert(LASTVAL_SENTINEL_KEY.to_string(), seq_val);
-        set_lastval_sequence_name(sequence_values, &seq_full_name);
+        sequence_values.record_nextval(seq_full_name, seq_val);
         return match column.data_type {
             DataType::Int64 => Ok(Value::Int64(seq_val)),
             _ => Ok(Value::Int32(seq_val.try_into().map_err(|_| {
@@ -143,7 +140,7 @@ pub async fn eval_column_default_or_null(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
+    sequence_values: &mut SequenceSession,
     search_path: &[String],
     schema: &TableSchema,
     column_idx: usize,
@@ -165,7 +162,7 @@ pub async fn fill_missing_columns(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
+    sequence_values: &mut SequenceSession,
     search_path: &[String],
     schema: &TableSchema,
     row_vals: &mut [Value],

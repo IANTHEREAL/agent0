@@ -1,13 +1,14 @@
 //! Query execution helpers
 
 use super::*;
+use crate::sql::sequences::SequenceSession;
 
 impl Executor {
     pub(crate) async fn execute_query(
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         query: &Query,
         current_role: Option<&str>,

@@ -18,6 +18,7 @@ use crate::sql::operators::{
 };
 use crate::sql::query_context::QueryContext;
 
+use crate::sql::sequences::SequenceSession;
 use anyhow::Result;
 use std::collections::HashMap;
 use tikv_client::Transaction;
@@ -71,7 +72,7 @@ impl<'a> ExprRuntime<'a> {
         row: &Row,
         schema: &TableSchema,
         txn: &mut Transaction,
-        seq: &mut HashMap<String, i64>,
+        seq: &mut SequenceSession,
     ) -> Result<Value> {
         let materialized = self
             .executor
@@ -101,7 +102,7 @@ impl<'a> ExprRuntime<'a> {
         exprs: &[TypedExpr],
         schema: &TableSchema,
         txn: &mut Transaction,
-        seq: &mut HashMap<String, i64>,
+        seq: &mut SequenceSession,
     ) -> Result<Vec<Row>> {
         // Pre-detect SRF expressions (UNNEST, regexp_split_to_table, etc.).
         let srf_indices: Vec<(usize, SrfKind)> = exprs
@@ -225,7 +226,7 @@ impl<'a> ExprRuntime<'a> {
         &self,
         op: &mut BoxedOperator,
         txn: &mut Transaction,
-        seq: &mut HashMap<String, i64>,
+        seq: &mut SequenceSession,
     ) -> Result<Vec<Row>> {
         if self.ctes.is_empty() {
             execute_operator_tree(

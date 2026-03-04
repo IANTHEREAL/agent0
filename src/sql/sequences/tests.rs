@@ -86,52 +86,6 @@ mod owned_sequence_lookup_tests {
         assert!(err.contains("Invalid sequence name"));
     }
 
-    /// Sentinel keys must never collide with real sequence cache keys, even when
-    /// a schema is named identically to the sentinel prefix (e.g. `__lastval_seq_name__`).
-    #[test]
-    fn sentinel_keys_do_not_collide_with_real_sequence_keys() {
-        use crate::sql::sequences::{
-            get_lastval_sequence_name, set_lastval_sequence_name, LASTVAL_SENTINEL_KEY,
-            LASTVAL_SEQUENCE_NAME_KEY,
-        };
-        use std::collections::HashMap;
-
-        let mut map: HashMap<String, i64> = HashMap::new();
-
-        // Simulate a real sequence in a schema whose name matches the old
-        // (pre-fix) sentinel prefix.
-        let colliding_key = "__lastval_seq_name__.my_seq";
-        map.insert(colliding_key.to_string(), 42);
-
-        // Also insert the sentinel value.
-        map.insert(LASTVAL_SENTINEL_KEY.to_string(), 100);
-        set_lastval_sequence_name(&mut map, "public.s1");
-
-        // The real sequence entry must survive — it must NOT be removed by
-        // `set_lastval_sequence_name`.
-        assert_eq!(
-            map.get(colliding_key).copied(),
-            Some(42),
-            "real sequence key was incorrectly removed by sentinel bookkeeping"
-        );
-
-        // The sentinel value must still be readable.
-        assert_eq!(map.get(LASTVAL_SENTINEL_KEY).copied(), Some(100));
-
-        // The tracked sequence name must be correct.
-        assert_eq!(get_lastval_sequence_name(&map), Some("public.s1"));
-
-        // Verify sentinel constants contain null bytes (structural invariant).
-        assert!(
-            LASTVAL_SENTINEL_KEY.contains('\0'),
-            "LASTVAL_SENTINEL_KEY must contain null-byte delimiters"
-        );
-        assert!(
-            LASTVAL_SEQUENCE_NAME_KEY.contains('\0'),
-            "LASTVAL_SEQUENCE_NAME_KEY must contain null-byte delimiters"
-        );
-    }
-
     #[test]
     fn expression_async_detection_flags_sequence_current_schema_and_unknown_function() {
         use crate::sql::sequences::{

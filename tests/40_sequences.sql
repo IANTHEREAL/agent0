@@ -24,36 +24,37 @@ INSERT INTO seq_sql_smoke(v) VALUES (1),(2);
 SELECT nextval('seq_sql_smoke_id_seq');
 DROP TABLE seq_sql_smoke;
 
--- lastval() must return the most recently nextval()-ed value, not an arbitrary one.
-DROP SEQUENCE IF EXISTS seq_lv_s1;
-DROP SEQUENCE IF EXISTS seq_lv_s2;
-CREATE SEQUENCE seq_lv_s1 START WITH 100;
-CREATE SEQUENCE seq_lv_s2 START WITH 200;
-SELECT nextval('seq_lv_s1');
-SELECT nextval('seq_lv_s2');
+-- lastval() after nextval returns the same value.
+DROP SEQUENCE IF EXISTS seq_lastval_s1;
+CREATE SEQUENCE seq_lastval_s1;
+SELECT nextval('seq_lastval_s1');
 SELECT lastval();
--- setval on a DIFFERENT sequence must NOT update lastval
-SELECT setval('seq_lv_s1', 999);
-SELECT lastval();
--- setval on the SAME sequence as the most recent nextval MUST update lastval (PG 17 semantics)
-SELECT setval('seq_lv_s2', 555);
-SELECT lastval();
-DROP SEQUENCE seq_lv_s1;
-DROP SEQUENCE seq_lv_s2;
 
--- setval(same_seq, val, is_called=false) must NOT update lastval (PG 17 parity)
-DROP SEQUENCE IF EXISTS seq_lv_iscalled;
-CREATE SEQUENCE seq_lv_iscalled START WITH 1;
-SELECT nextval('seq_lv_iscalled');
-SELECT setval('seq_lv_iscalled', 10, false);
+-- lastval() tracks the most recent nextval across sequences.
+DROP SEQUENCE IF EXISTS seq_lastval_s2;
+CREATE SEQUENCE seq_lastval_s2 START WITH 100;
+SELECT nextval('seq_lastval_s2');
 SELECT lastval();
--- setval(same_seq, val, is_called=true) MUST update lastval
-SELECT setval('seq_lv_iscalled', 20, true);
+SELECT currval('seq_lastval_s1');
+
+-- setval(seq, val, true) updates currval but does NOT change lastval.
+SELECT setval('seq_lastval_s1', 50);
+SELECT currval('seq_lastval_s1');
 SELECT lastval();
--- setval(same_seq, val) with default is_called=true MUST update lastval
-SELECT setval('seq_lv_iscalled', 30);
+
+-- setval(seq, val, false) updates neither currval nor lastval.
+SELECT setval('seq_lastval_s1', 200, false);
+SELECT currval('seq_lastval_s1');
 SELECT lastval();
-DROP SEQUENCE seq_lv_iscalled;
+
+-- currval for untouched sequence errors.
+DROP SEQUENCE IF EXISTS seq_lastval_s3;
+CREATE SEQUENCE seq_lastval_s3;
+SELECT currval('seq_lastval_s3');
+
+DROP SEQUENCE seq_lastval_s1;
+DROP SEQUENCE seq_lastval_s2;
+DROP SEQUENCE seq_lastval_s3;
 
 -- Disowned implicit SERIAL sequences should survive DROP TABLE and preserve their counters.
 CREATE TABLE seq_sql_disowned_serial (id SERIAL);

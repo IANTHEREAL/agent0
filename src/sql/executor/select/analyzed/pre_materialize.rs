@@ -14,10 +14,7 @@ use crate::sql::executor::core::Executor;
 use crate::sql::expr::classify::needs_pre_materialization;
 use crate::sql::expr::traverse::{map_children_async, AsyncExprTransform};
 use crate::sql::expr::typed_eval::eval_typed_expr;
-use crate::sql::sequences::{
-    get_lastval_sequence_name, resolve_sequence_full_name_from_value, set_lastval,
-    set_lastval_sequence_name, update_lastval_if_same_seq, LASTVAL_SENTINEL, LASTVAL_SENTINEL_KEY,
-};
+use crate::sql::sequences::resolve_sequence_full_name_from_value;
 use crate::sql::ExecuteResult;
 
 use anyhow::{anyhow, Result};
@@ -25,6 +22,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use tikv_client::Transaction;
+
+use crate::sql::sequences::SequenceSession;
 
 use super::postprocess::build_any_all_rhs_constant_expr;
 use super::subquery::is_correlated_query;
@@ -63,7 +62,7 @@ impl Executor {
         expr: &'a TypedExpr,
         txn: &'a mut Transaction,
         db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         search_path: &'a [String],
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
         skip_root_check_once: bool,
@@ -77,7 +76,6 @@ impl Executor {
                 search_path,
                 ctes,
                 skip_root_check_once,
-                last_nextval_value: None,
             };
             transform.transform_expr(expr).await
         })
@@ -102,7 +100,7 @@ impl Executor {
         expr: &'a TypedExpr,
         txn: &'a mut Transaction,
         db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         search_path: &'a [String],
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Pin<Box<dyn Future<Output = Result<TypedExpr>> + Send + 'a>> {
@@ -127,7 +125,7 @@ impl Executor {
         expr: &'a TypedExpr,
         txn: &'a mut Transaction,
         db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         search_path: &'a [String],
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Pin<Box<dyn Future<Output = Result<TypedExpr>> + Send + 'a>> {
@@ -153,11 +151,10 @@ pub(super) struct PreMaterializeTransform<'a> {
     executor: &'a Executor,
     txn: &'a mut Transaction,
     db_id: u64,
-    sequence_values: &'a mut HashMap<String, i64>,
+    sequence_values: &'a mut SequenceSession,
     search_path: &'a [String],
     ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     skip_root_check_once: bool,
-    last_nextval_value: Option<i64>,
 }
 
 fn should_return_expr_unchanged(skip_root_check_once: &mut bool, expr: &TypedExpr) -> bool {
@@ -512,12 +509,7 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
                             let val = store
                                 .nextval_sequence(&mut *self.txn, self.db_id, &full_name)
                                 .await?;
-                            set_lastval(self.sequence_values, &full_name, val);
-                            self.sequence_values.insert(full_name.clone(), val);
-                            self.last_nextval_value = Some(val);
-                            self.sequence_values
-                                .insert(LASTVAL_SENTINEL_KEY.to_string(), val);
-                            set_lastval_sequence_name(self.sequence_values, &full_name);
+                            self.sequence_values.record_nextval(full_name, val);
                             Ok(TypedExpr {
                                 kind: TypedExprKind::Constant(Value::Int64(val)),
                                 data_type: DataType::Int64,
@@ -545,16 +537,7 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
                             {
                                 return Err(SqlError::RelationNotFound(full_name.clone()).into());
                             }
-                            let val = self
-                                .sequence_values
-                                .get(&full_name)
-                                .copied()
-                                .ok_or_else(|| {
-                                    anyhow!(
-                                        "currval of sequence \"{}\" is not yet defined in this session",
-                                        full_name
-                                    )
-                                })?;
+                            let val = self.sequence_values.currval(&full_name)?;
                             Ok(TypedExpr {
                                 kind: TypedExprKind::Constant(Value::Int64(val)),
                                 data_type: DataType::Int64,
@@ -614,9 +597,6 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
                             } else {
                                 true
                             };
-                            let same_seq = get_lastval_sequence_name(self.sequence_values)
-                                .map(|n| n == full_name.as_str())
-                                .unwrap_or(false);
                             let res = store
                                 .setval_sequence(
                                     &mut *self.txn,
@@ -626,18 +606,8 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
                                     is_called,
                                 )
                                 .await?;
-                            // Rule 1: currval cache — always update when is_called=true
-                            if is_called {
-                                self.sequence_values.insert(full_name.clone(), res);
-                                if update_lastval_if_same_seq(self.sequence_values, &full_name, res)
-                                {
-                                    self.last_nextval_value = Some(res);
-                                }
-                                if same_seq {
-                                    self.sequence_values
-                                        .insert(LASTVAL_SENTINEL_KEY.to_string(), res);
-                                }
-                            }
+                            self.sequence_values
+                                .record_setval(full_name, res, is_called);
                             Ok(TypedExpr {
                                 kind: TypedExprKind::Constant(Value::Int64(res)),
                                 data_type: DataType::Int64,
@@ -655,13 +625,7 @@ impl AsyncExprTransform for PreMaterializeTransform<'_> {
                                 )
                                 .into());
                             }
-                            let val = self
-                                .last_nextval_value
-                                .or_else(|| self.sequence_values.get(LASTVAL_SENTINEL).copied())
-                                .or_else(|| self.sequence_values.get(LASTVAL_SENTINEL_KEY).copied())
-                                .ok_or_else(|| {
-                                    anyhow!("lastval is not yet defined in this session")
-                                })?;
+                            let val = self.sequence_values.lastval()?;
                             Ok(TypedExpr {
                                 kind: TypedExprKind::Constant(Value::Int64(val)),
                                 data_type: DataType::Int64,

@@ -29,6 +29,7 @@ use tikv_client::Transaction;
 
 use super::expr_runtime::ExprRuntime;
 use super::subquery::has_outer_ref;
+use crate::sql::sequences::SequenceSession;
 
 impl Executor {
     /// Pre-materialize all non-correlated async expressions in the query body.
@@ -41,7 +42,7 @@ impl Executor {
         analyzed: &'a mut AnalyzedQuery,
         txn: &'a mut Transaction,
         db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         search_path: &'a [String],
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
@@ -218,7 +219,7 @@ impl Executor {
         table_ref: &'a mut AnalyzedTableRef,
         txn: &'a mut Transaction,
         db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         search_path: &'a [String],
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
@@ -334,7 +335,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
+        sequence_values: &mut SequenceSession,
         search_path: &[String],
         analyzed: &AnalyzedQuery,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
@@ -422,7 +423,7 @@ impl Executor {
         &'a self,
         txn: &'a mut Transaction,
         db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         search_path: &'a [String],
         analyzed: &'a AnalyzedQuery,
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
@@ -480,7 +481,7 @@ impl Executor {
         table_ref: &'a AnalyzedTableRef,
         txn: &'a mut Transaction,
         db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
+        sequence_values: &'a mut SequenceSession,
         search_path: &'a [String],
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
         build_ctx: &'a mut BuildContext,
