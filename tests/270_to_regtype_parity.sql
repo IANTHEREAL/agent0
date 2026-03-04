@@ -36,6 +36,8 @@ SELECT to_regtype('noschema.interval(abc)');
 SELECT to_regtype('"PG_CATALOG".interval(abc)');
 -- Schema resolution: unknown schema + bare word → syntax error propagates
 SELECT to_regtype('noschema.interval garbage'); -- db9-specific: error text differs from PG
+SELECT to_regtype('noschema.int4 garbage'); -- db9-specific: error text differs from PG
+SELECT to_regtype('noschema.foo garbage'); -- db9-specific: error text differs from PG
 
 -- Quoted search_path schema must not match hstore fallback (case-sensitive)
 SET search_path TO "Public";

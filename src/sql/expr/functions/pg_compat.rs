@@ -481,8 +481,16 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
                     let after = trimmed[ws_pos..].trim_start();
                     if !after.is_empty() && !after.starts_with('(') {
                         // Bare word after type name → syntax error.
+                        // For interval types, normalize_interval_type validates
+                        // qualifiers and returns Err for invalid ones.
+                        // For non-interval types, any bare word is always a
+                        // syntax error — PG's general `typename(typmod)` grammar
+                        // only allows parenthesized typmods after the type name.
                         let ws_normalized = normalize_whitespace(trimmed);
-                        normalize_interval_type(&ws_normalized)?;
+                        let result = normalize_interval_type(&ws_normalized)?;
+                        if result != "interval" {
+                            return Err(invalid_interval_type_name(&raw));
+                        }
                     }
                 }
             }
@@ -1222,6 +1230,9 @@ mod tests {
         );
         // Bare word after type name → syntax error (PG's parser rejects it).
         assert!(to_regtype(vec![Value::Text("noschema.interval garbage".into())]).is_err());
+        // Non-interval types with trailing junk → syntax error.
+        assert!(to_regtype(vec![Value::Text("noschema.int4 garbage".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("noschema.foo garbage".into())]).is_err());
         // Quoted schema case-mismatch + invalid interval typmod → NULL
         assert_eq!(
             to_regtype(vec![Value::Text("\"PG_CATALOG\".interval(abc)".into())]).unwrap(),
