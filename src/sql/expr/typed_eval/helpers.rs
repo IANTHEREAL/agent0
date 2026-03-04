@@ -127,9 +127,11 @@ pub(super) fn eval_function_call(
         }
         "CURRENT_SCHEMAS" => {
             // current_schemas(bool) → text[]
+            // Strict function: NULL input → NULL output (PG parity).
             // true = include implicit schemas (pg_catalog), false = user schemas only
             let include_implicit = match args.first() {
                 Some(Value::Boolean(b)) => *b,
+                Some(Value::Null) | None => return Ok(Value::Null),
                 _ => false,
             };
             let schemas = crate::session_context::current_search_path_schemas(include_implicit);
