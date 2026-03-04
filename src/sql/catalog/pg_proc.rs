@@ -61,6 +61,7 @@ impl VirtualTable for PgProc {
             (1009, "set_config", 25),
             (1010, "pg_is_in_recovery", 16),
             (1011, "pg_backend_pid", 23),
+            (1012, "pg_postmaster_start_time", 1184),
         ] {
             rows.push(Row::new(vec![
                 int_val(oid),

@@ -8,8 +8,32 @@ use crate::sql::analyzer::types::*;
 use crate::sql::error::SqlError;
 use crate::sql::query_context::QueryContext;
 use anyhow::{anyhow, Result};
+use std::sync::OnceLock;
 
 use super::eval_typed_expr;
+
+/// Process start time as epoch milliseconds, set once from main().
+static POSTMASTER_START_TIME_MS: OnceLock<i64> = OnceLock::new();
+
+/// Record the process start time. Must be called once at the top of main().
+pub fn init_postmaster_start_time() {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_millis() as i64;
+    let _ = POSTMASTER_START_TIME_MS.set(ms);
+}
+
+/// Return the recorded process start time (epoch millis).
+fn postmaster_start_time_ms() -> i64 {
+    *POSTMASTER_START_TIME_MS.get_or_init(|| {
+        // Fallback for unit tests where main() is not called.
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_millis() as i64
+    })
+}
 
 pub(super) use crate::sql::expr::helpers::value_to_text;
 
@@ -87,6 +111,11 @@ pub(super) fn eval_function_call(
             // PostgreSQL exposes pg_backend_pid() as int4.
             // Internal connection identity is i64; cast intentionally truncates.
             return Ok(Value::Int32(qctx.connection_id as i32));
+        }
+        "PG_POSTMASTER_START_TIME" => {
+            // Actual process start time, captured once on first access.
+            // PostgreSQL JDBC driver calls this during connection setup.
+            return Ok(Value::Timestamp(postmaster_start_time_ms()));
         }
         "CURRENT_DATABASE" => {
             return Ok(Value::Text(qctx.database_name.as_ref().to_string()));

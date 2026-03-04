@@ -64,4 +64,8 @@ SELECT pg_backend_pid() IS NOT NULL AS has_pid;
 SELECT pg_typeof(pg_backend_pid()) AS pid_type;
 SELECT pg_backend_pid() = pg_backend_pid() AS pid_stable;
 
+-- pg_postmaster_start_time() tests
+SELECT pg_postmaster_start_time() IS NOT NULL AS has_start_time;
+SELECT pg_typeof(pg_postmaster_start_time()) AS start_time_type;
+
 SELECT 'System functions tests completed' AS result;

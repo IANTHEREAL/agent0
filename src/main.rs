@@ -34,6 +34,9 @@ const DEFAULT_PG_LISTEN_ADDR: &str = "127.0.0.1";
 const DEFAULT_TOKIO_STACK_MB: usize = 8;
 
 fn main() -> Result<()> {
+    // Record process start time before anything else.
+    sql::expr::typed_eval::init_postmaster_start_time();
+
     // Parse CLI args first (before tokio runtime, so --help/--version work without async)
     let args: Vec<String> = std::env::args().collect();
     let cli_args = match cli::parse_args(&args) {

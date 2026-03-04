@@ -201,7 +201,17 @@ NOTICE:  table "sys_test" does not exist, skipping
  t
 (1 row)
 
-              result              
+ has_start_time
+----------------
+ t
+(1 row)
+
+     start_time_type
+--------------------------
+ timestamp with time zone
+(1 row)
+
+              result
 ----------------------------------
  System functions tests completed
 (1 row)

@@ -258,7 +258,7 @@ fn is_known_builtin_function(name: &str) -> bool {
         | "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" | "UUIDV7"
         // Misc
         | "PG_TYPEOF" | "VERSION" | "CURRENT_USER" | "CURRENT_ROLE" | "SESSION_USER"
-        | "PG_BACKEND_PID" | "PG_CLIENT_ENCODING" | "PG_CATALOG" | "OBJ_DESCRIPTION" | "COL_DESCRIPTION"
+        | "PG_BACKEND_PID" | "PG_POSTMASTER_START_TIME" | "PG_CLIENT_ENCODING" | "PG_CATALOG" | "OBJ_DESCRIPTION" | "COL_DESCRIPTION"
         | "PG_GET_SERIAL_SEQUENCE"
         | "GENERATE_SERIES" | "GENERATE_SUBSCRIPTS"
         // These are handled specially but are built-in

@@ -26,6 +26,7 @@ use crate::sql::types::cast;
 use anyhow::{anyhow, Result};
 
 use arithmetic::{eval_binary, eval_unary};
+pub use helpers::init_postmaster_start_time;
 use helpers::{
     eval_array_index, eval_function_call, eval_timezone, to_sqlparser_json_op, value_to_text,
 };
