@@ -56,6 +56,32 @@ impl Executor {
         client_oids: &[Option<DataType>],
     ) -> Result<PreparedAnalysis> {
         let statements = parse_sql(sql)?;
+        self.analyze_for_prepared_with_statements(
+            txn,
+            db_id,
+            search_path,
+            &statements,
+            param_count,
+            client_oids,
+        )
+        .await
+    }
+
+    /// Like [`analyze_for_prepared`](Self::analyze_for_prepared), but accepts
+    /// pre-parsed statements so the caller can avoid a redundant `parse_sql`.
+    ///
+    /// The protocol handler's `on_parse` path uses this to thread the single
+    /// authoritative parse result from `Db9QueryParser::parse_sql` through
+    /// classification and analysis without re-parsing.
+    pub(crate) async fn analyze_for_prepared_with_statements(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        search_path: &[String],
+        statements: &[Statement],
+        param_count: usize,
+        client_oids: &[Option<DataType>],
+    ) -> Result<PreparedAnalysis> {
         if statements.is_empty() {
             return Ok(PreparedAnalysis::Utility);
         }

@@ -50,17 +50,28 @@ use super::super::{
 /// Returns true for SELECT/INSERT/UPDATE/DELETE -- statements that require
 /// Analyzer output for correct Describe schema.  Uses parse_sql for
 /// precise AST classification (handles SELECT\n, WITH\t, etc.).
+///
+/// Used by tests; the `on_parse` hot path uses [`is_data_statement_stmts`]
+/// with the cached AST instead.
+#[allow(dead_code)]
 pub(in crate::protocol::handler) fn is_data_statement(sql: &str) -> bool {
     match crate::sql::parse_sql(sql) {
-        Ok(stmts) if !stmts.is_empty() => matches!(
+        Ok(stmts) if !stmts.is_empty() => is_data_statement_stmts(&stmts),
+        _ => false, // unparseable -> accepted by should_accept_sql_without_sqlparser -> utility
+    }
+}
+
+/// Classify pre-parsed statements as data statements.
+/// Returns true for SELECT/INSERT/UPDATE/DELETE.
+pub(in crate::protocol::handler) fn is_data_statement_stmts(stmts: &[Statement]) -> bool {
+    !stmts.is_empty()
+        && matches!(
             &stmts[0],
             Statement::Query(_)
                 | Statement::Insert { .. }
                 | Statement::Update { .. }
                 | Statement::Delete { .. }
-        ),
-        _ => false, // unparseable -> accepted by should_accept_sql_without_sqlparser -> utility
-    }
+        )
 }
 
 /// Returns true for transaction-control statements that must never be
@@ -69,7 +80,16 @@ pub(in crate::protocol::handler) fn is_data_statement(sql: &str) -> bool {
 /// prevent transaction cleanup and violate PostgreSQL recovery semantics.
 pub(in crate::protocol::handler) fn is_transaction_control(sql: &str) -> bool {
     match crate::sql::parse_sql(sql) {
-        Ok(stmts) if !stmts.is_empty() => stmts.iter().all(|s| {
+        Ok(stmts) if !stmts.is_empty() => is_transaction_control_stmts(&stmts),
+        _ => false,
+    }
+}
+
+/// Classify pre-parsed statements as transaction-control.
+/// Returns true when all statements are BEGIN/COMMIT/ROLLBACK/SAVEPOINT/etc.
+pub(in crate::protocol::handler) fn is_transaction_control_stmts(stmts: &[Statement]) -> bool {
+    !stmts.is_empty()
+        && stmts.iter().all(|s| {
             matches!(
                 s,
                 Statement::StartTransaction { .. }
@@ -79,14 +99,16 @@ pub(in crate::protocol::handler) fn is_transaction_control(sql: &str) -> bool {
                     | Statement::ReleaseSavepoint { .. }
                     | Statement::SetTransaction { .. }
             )
-        }),
-        _ => false,
-    }
+        })
 }
 
 /// Reject RawSqlUtility that should have been analyzed.
 /// Check order: data statement first (XX000 with infra failure reason),
 /// then param_count > 0 (42P02 for utility + params).
+///
+/// Used by tests; the `on_parse` hot path uses [`is_data_statement_stmts`]
+/// with the cached AST instead.
+#[allow(dead_code)]
 pub(in crate::protocol::handler) fn reject_unanalyzed_if_needed(
     sql: &str,
     param_count: usize,
@@ -688,9 +710,16 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        // 1. Parse via QueryParser (preserves multi-statement rejection guard)
+        // 1. Parse via QueryParser — single authoritative parse for the
+        //    entire extended Parse message.  The parser caches the AST so we
+        //    can reuse it for classification and analysis below.
         let parser = self.query_parser();
         let mut stored = StoredStatement::parse(&message, parser).await?;
+
+        // Retrieve the cached AST produced by parse_sql.
+        // `None` means the SQL was empty or accepted only via the
+        // should_accept_sql_without_sqlparser fallback (unparseable).
+        let parsed_stmts = self.query_parser.take_parsed_statements();
 
         // 2. Count $N placeholders in the SQL
         let param_count = count_sql_parameters(&stored.statement.sql);
@@ -708,142 +737,185 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             })
             .collect();
 
-        // Keep transaction-control statements parseable for cleanup/recovery paths.
-        let _bp_guard = if !is_transaction_control(&stored.statement.sql) {
+        // Keep transaction-control statements exempt from backpressure for
+        // cleanup/recovery paths.  Uses cached AST — no re-parse.
+        let is_txn_control = parsed_stmts
+            .as_ref()
+            .is_some_and(|stmts| is_transaction_control_stmts(stmts));
+        let _bp_guard = if !is_txn_control {
             Some(self.check_backpressure()?)
         } else {
             None
         };
 
-        // 4. Analyze for frozen execution IR
-        let state = self.auth();
-        let executor = &state.executor;
-        let store = executor.store();
+        // 4. Reject fallback-accepted SQL (unparseable) that carries $N params.
+        //    Fallback SQL is always utility-class; params are never valid.
+        if parsed_stmts.is_none() && param_count > 0 {
+            let err: anyhow::Error = SqlError::InvalidParameterUsage {
+                index: 1,
+                context: "utility statements do not support parameters".into(),
+            }
+            .into();
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                sqlstate_for_executor_error(&err).to_string(),
+                err.to_string(),
+            ))));
+        }
 
-        // Brief session lock to read db_id + search_path + is_superuser
-        let (db_id, search_path, is_superuser) = {
-            let session = state.session.lock().await;
-            (
-                session.current_database_id(),
-                session.search_path().to_vec(),
-                session.is_superuser(),
-            )
-        };
+        // 5. Analyze for frozen execution IR.
+        //    Only attempt analysis when the SQL was successfully parsed
+        //    (parsed_stmts is Some).  Fallback-accepted SQL (None) stays as
+        //    RawSqlUtility — analysis would fail at the internal parse anyway.
+        if let Some(ref stmts) = parsed_stmts {
+            let state = self.auth();
+            let executor = &state.executor;
+            let store = executor.store();
 
-        // Extension context for fs9 schema inference during catalog prefetch.
-        // Without this, fs9 table functions would panic in get_backend() due to
-        // missing tikv_client in the task-local context.
-        let tenant_keyspace = executor.tenant_keyspace().to_string();
-        let tikv_client = store.transaction_client();
-        let ext_opts = crate::extensions::context::ExtensionContextOpts::statement(
-            is_superuser,
-            &tenant_keyspace,
-        )
-        .with_tikv_client(tikv_client);
-
-        // Temporary read-only transaction for catalog access
-        match store.begin().await {
-            Ok(mut txn) => {
-                match crate::extensions::context::with_context_opts(
-                    ext_opts,
-                    executor.analyze_for_prepared(
-                        &mut txn,
-                        db_id,
-                        &search_path,
-                        &stored.statement.sql,
-                        param_count,
-                        &client_oids,
-                    ),
+            // Brief session lock to read db_id + search_path + is_superuser
+            let (db_id, search_path, is_superuser) = {
+                let session = state.session.lock().await;
+                (
+                    session.current_database_id(),
+                    session.search_path().to_vec(),
+                    session.is_superuser(),
                 )
-                .await
-                {
-                    Ok(analysis) => {
-                        match analysis {
-                            PreparedAnalysis::Query {
-                                analyzed,
-                                locks,
-                                select_into,
-                                output_schema,
-                                param_types,
-                                base_table_names,
-                                table_versions,
-                                has_recursive_cte,
-                            } => {
-                                let required_privileges = base_table_names
-                                    .into_iter()
-                                    .map(|t| (t, Privilege::Select))
-                                    .collect();
-                                stored.parameter_types =
-                                    merge_parameter_types(&stored.parameter_types, &param_types);
-                                stored.statement = PreparedStatement {
-                                    sql: stored.statement.sql,
-                                    exec: PreparedExec::AnalyzedQuery {
-                                        analyzed,
-                                        locks,
-                                        select_into,
-                                        required_privileges,
-                                        has_recursive_cte,
-                                    },
+            };
+
+            // Extension context for fs9 schema inference during catalog prefetch.
+            // Without this, fs9 table functions would panic in get_backend() due to
+            // missing tikv_client in the task-local context.
+            let tenant_keyspace = executor.tenant_keyspace().to_string();
+            let tikv_client = store.transaction_client();
+            let ext_opts = crate::extensions::context::ExtensionContextOpts::statement(
+                is_superuser,
+                &tenant_keyspace,
+            )
+            .with_tikv_client(tikv_client);
+
+            // Temporary read-only transaction for catalog access
+            match store.begin().await {
+                Ok(mut txn) => {
+                    match crate::extensions::context::with_context_opts(
+                        ext_opts,
+                        executor.analyze_for_prepared_with_statements(
+                            &mut txn,
+                            db_id,
+                            &search_path,
+                            stmts,
+                            param_count,
+                            &client_oids,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(analysis) => {
+                            match analysis {
+                                PreparedAnalysis::Query {
+                                    analyzed,
+                                    locks,
+                                    select_into,
                                     output_schema,
-                                    param_data_types: param_types,
+                                    param_types,
+                                    base_table_names,
                                     table_versions,
-                                };
-                            }
-                            PreparedAnalysis::Dml {
-                                analyzed,
-                                output_schema,
-                                param_types,
-                                table_versions,
-                            } => {
-                                let required_privileges =
-                                    PreparedStatement::compute_privileges(&analyzed, &[]);
-                                stored.parameter_types =
-                                    merge_parameter_types(&stored.parameter_types, &param_types);
-                                stored.statement = PreparedStatement {
-                                    sql: stored.statement.sql,
-                                    exec: PreparedExec::AnalyzedDml {
-                                        analyzed,
-                                        required_privileges,
-                                    },
+                                    has_recursive_cte,
+                                } => {
+                                    let required_privileges = base_table_names
+                                        .into_iter()
+                                        .map(|t| (t, Privilege::Select))
+                                        .collect();
+                                    stored.parameter_types = merge_parameter_types(
+                                        &stored.parameter_types,
+                                        &param_types,
+                                    );
+                                    stored.statement = PreparedStatement {
+                                        sql: stored.statement.sql,
+                                        exec: PreparedExec::AnalyzedQuery {
+                                            analyzed,
+                                            locks,
+                                            select_into,
+                                            required_privileges,
+                                            has_recursive_cte,
+                                        },
+                                        output_schema,
+                                        param_data_types: param_types,
+                                        table_versions,
+                                    };
+                                }
+                                PreparedAnalysis::Dml {
+                                    analyzed,
                                     output_schema,
-                                    param_data_types: param_types,
+                                    param_types,
                                     table_versions,
-                                };
-                            }
-                            PreparedAnalysis::Utility => {
-                                // Keep RawSqlUtility
+                                } => {
+                                    let required_privileges =
+                                        PreparedStatement::compute_privileges(&analyzed, &[]);
+                                    stored.parameter_types = merge_parameter_types(
+                                        &stored.parameter_types,
+                                        &param_types,
+                                    );
+                                    stored.statement = PreparedStatement {
+                                        sql: stored.statement.sql,
+                                        exec: PreparedExec::AnalyzedDml {
+                                            analyzed,
+                                            required_privileges,
+                                        },
+                                        output_schema,
+                                        param_data_types: param_types,
+                                        table_versions,
+                                    };
+                                }
+                                PreparedAnalysis::Utility => {
+                                    // Keep RawSqlUtility
+                                }
                             }
                         }
+                        Err(e) if param_count > 0 || is_data_statement_stmts(stmts) => {
+                            // Data statements and parameterized statements must be analyzed.
+                            let _ = txn.rollback().await;
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                sqlstate_for_executor_error(&e).to_string(),
+                                e.to_string(),
+                            ))));
+                        }
+                        Err(_) => {
+                            // Utility, no params -- keep RawSqlUtility
+                        }
                     }
-                    Err(e) if param_count > 0 || is_data_statement(&stored.statement.sql) => {
-                        // Data statements and parameterized statements must be analyzed.
-                        let _ = txn.rollback().await;
+                    let _ = txn.rollback().await; // read-only, discard
+                }
+                Err(e) => {
+                    // Can't begin txn -- reject data/parameterized SQL.
+                    // Uses cached AST for classification (no re-parse).
+                    if is_data_statement_stmts(stmts) {
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".to_string(),
-                            sqlstate_for_executor_error(&e).to_string(),
-                            e.to_string(),
+                            "ERROR".into(),
+                            "XX000".to_string(),
+                            format!(
+                                "cannot describe data statement: failed to begin catalog transaction: {}",
+                                e
+                            ),
+                        ))));
+                    } else if param_count > 0 {
+                        let err: anyhow::Error = SqlError::InvalidParameterUsage {
+                            index: 1,
+                            context: "utility statements do not support parameters".into(),
+                        }
+                        .into();
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            sqlstate_for_executor_error(&err).to_string(),
+                            err.to_string(),
                         ))));
                     }
-                    Err(_) => {
-                        // Utility, no params -- keep RawSqlUtility
-                    }
+                    // Utility, no params -- keep RawSqlUtility
                 }
-                let _ = txn.rollback().await; // read-only, discard
-            }
-            Err(e) => {
-                // Can't begin txn -- reject data/parameterized SQL
-                if let Some(err) = reject_unanalyzed_if_needed(
-                    &stored.statement.sql,
-                    param_count,
-                    &format!("failed to begin catalog transaction: {}", e),
-                ) {
-                    return Err(err);
-                }
-                // Utility, no params -- keep RawSqlUtility
             }
         }
 
-        // 5. Store immutable
+        // 6. Store immutable
         client.portal_store().put_statement(Arc::new(stored))?;
         client
             .send(PgWireBackendMessage::ParseComplete(

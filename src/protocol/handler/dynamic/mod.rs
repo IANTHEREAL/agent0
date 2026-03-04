@@ -9,7 +9,7 @@
 //! - `copy`    -- COPY FROM STDIN / COPY TO STDOUT
 
 mod copy;
-mod query;
+pub(super) mod query;
 mod startup;
 
 // Re-export the free functions that tests and sibling modules reference
@@ -17,7 +17,8 @@ mod startup;
 // These are used by test code via `super::dynamic::*`
 #[allow(unused_imports)]
 pub(super) use query::{
-    is_data_statement, merge_parameter_types, reject_unanalyzed_if_needed, utility_describe_fields,
+    is_data_statement, is_data_statement_stmts, is_transaction_control_stmts,
+    merge_parameter_types, reject_unanalyzed_if_needed, utility_describe_fields,
 };
 
 use super::portal::SuspendedPortalState;

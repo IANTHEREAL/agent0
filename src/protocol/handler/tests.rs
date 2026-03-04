@@ -2956,6 +2956,238 @@ fn test_reject_unanalyzed_utility_no_params_returns_none() {
     assert!(reject_unanalyzed_if_needed("CREATE TABLE t (id INT)", 0, "test").is_none());
 }
 
+// ── Tests: statement-based classifiers (no re-parse) ─────────────────────────
+
+#[test]
+fn test_is_data_statement_stmts_classifies_select() {
+    use super::dynamic::query::is_data_statement_stmts;
+    let stmts = crate::sql::parse_sql("SELECT 1").unwrap();
+    assert!(is_data_statement_stmts(&stmts));
+}
+
+#[test]
+fn test_is_data_statement_stmts_classifies_dml() {
+    use super::dynamic::query::is_data_statement_stmts;
+    for sql in [
+        "INSERT INTO t VALUES (1)",
+        "UPDATE t SET x = 1",
+        "DELETE FROM t WHERE id = 1",
+    ] {
+        let stmts = crate::sql::parse_sql(sql).unwrap();
+        assert!(is_data_statement_stmts(&stmts), "expected data: {sql}");
+    }
+}
+
+#[test]
+fn test_is_data_statement_stmts_rejects_utility() {
+    use super::dynamic::query::is_data_statement_stmts;
+    for sql in [
+        "CREATE TABLE t (id INT)",
+        "SET search_path TO public",
+        "SHOW server_version",
+    ] {
+        let stmts = crate::sql::parse_sql(sql).unwrap();
+        assert!(!is_data_statement_stmts(&stmts), "expected non-data: {sql}");
+    }
+    // Empty slice
+    assert!(!is_data_statement_stmts(&[]));
+}
+
+#[test]
+fn test_is_transaction_control_stmts_classifies_txn() {
+    use super::dynamic::query::is_transaction_control_stmts;
+    for sql in [
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+        "SAVEPOINT s1",
+        "RELEASE SAVEPOINT s1",
+    ] {
+        let stmts = crate::sql::parse_sql(sql).unwrap();
+        assert!(
+            is_transaction_control_stmts(&stmts),
+            "expected txn control: {sql}"
+        );
+    }
+}
+
+#[test]
+fn test_is_transaction_control_stmts_rejects_non_txn() {
+    use super::dynamic::query::is_transaction_control_stmts;
+    for sql in ["SELECT 1", "INSERT INTO t VALUES (1)", "SET x TO 1"] {
+        let stmts = crate::sql::parse_sql(sql).unwrap();
+        assert!(
+            !is_transaction_control_stmts(&stmts),
+            "expected non-txn: {sql}"
+        );
+    }
+    assert!(!is_transaction_control_stmts(&[]));
+}
+
+// ── Tests: Db9QueryParser caching ────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_query_parser_caches_parsed_statements() {
+    use super::Db9QueryParser;
+    use pgwire::api::stmt::QueryParser;
+
+    let parser = Db9QueryParser::new();
+
+    // Parseable SQL — cache should be populated
+    let _ = parser.parse_sql("SELECT 1", &[]).await.unwrap();
+    let cached = parser.take_parsed_statements();
+    assert!(cached.is_some(), "expected cached AST for parseable SQL");
+    let stmts = cached.unwrap();
+    assert_eq!(stmts.len(), 1);
+    assert!(matches!(&stmts[0], sqlparser::ast::Statement::Query(_)));
+
+    // Second take returns None (destructive read)
+    assert!(parser.take_parsed_statements().is_none());
+}
+
+#[tokio::test]
+async fn test_query_parser_no_cache_for_empty_sql() {
+    use super::Db9QueryParser;
+    use pgwire::api::stmt::QueryParser;
+
+    let parser = Db9QueryParser::new();
+    let _ = parser.parse_sql("", &[]).await.unwrap();
+    assert!(
+        parser.take_parsed_statements().is_none(),
+        "empty SQL should not populate cache"
+    );
+}
+
+#[tokio::test]
+async fn test_query_parser_no_cache_for_fallback_accepted_sql() {
+    use super::Db9QueryParser;
+    use pgwire::api::stmt::QueryParser;
+
+    let parser = Db9QueryParser::new();
+    // Psql meta-command `\dt` fails sqlparser but is accepted by
+    // should_accept_sql_without_sqlparser as PsqlMetaCommand — cache
+    // should be None because there is no valid AST.
+    let result = parser.parse_sql("\\dt", &[]).await;
+    assert!(result.is_ok(), "\\dt should be accepted via fallback");
+    assert!(
+        parser.take_parsed_statements().is_none(),
+        "fallback-accepted SQL should not populate cache"
+    );
+}
+
+/// End-to-end test: fallback-accepted SQL with `$N` parameters must be
+/// rejected with SQLSTATE 42P02 at the Parse message handler level.
+///
+/// This exercises the full `DynamicPgHandler::on_parse` code path —
+/// `StoredStatement::parse` → query_parser fallback → param_count guard —
+/// not just the helper functions.
+#[tokio::test]
+async fn test_on_parse_fallback_sql_with_params_returns_42p02() {
+    use pgwire::api::query::ExtendedQueryHandler;
+    use pgwire::messages::extendedquery::Parse;
+
+    let handler = test_dynamic_handler();
+    let mut client = TestPreparedClient::new();
+
+    // `\dt $1` — `\dt` is accepted via should_accept_sql_without_sqlparser
+    // fallback (PsqlMetaCommand), but `$1` means param_count > 0.
+    // The on_parse guard must reject this with 42P02.
+    let message = Parse::new(Some("s1".into()), "\\dt $1".into(), vec![0]);
+
+    let result = handler.on_parse(&mut client, message).await;
+
+    let err = result.expect_err("on_parse should reject fallback SQL with $N params");
+    match err {
+        pgwire::error::PgWireError::UserError(info) => {
+            assert_eq!(info.code, "42P02", "expected SQLSTATE 42P02");
+        }
+        other => panic!("expected UserError with 42P02, got: {other:?}"),
+    }
+}
+
+/// End-to-end test: fallback-accepted SQL with zero parameters must be
+/// accepted at Parse, stored as RawSqlUtility, and available for later Bind.
+#[tokio::test]
+async fn test_on_parse_fallback_sql_without_params_returns_parsecomplete_and_stores_statement() {
+    use pgwire::api::query::ExtendedQueryHandler;
+    use pgwire::messages::extendedquery::Parse;
+
+    let handler = test_dynamic_handler();
+    let mut client = TestPreparedClient::new();
+
+    let message = Parse::new(Some("s_ok".into()), "\\dt".into(), vec![]);
+    handler
+        .on_parse(&mut client, message)
+        .await
+        .expect("on_parse should accept fallback SQL when param_count == 0");
+
+    assert_eq!(
+        client.sent.len(),
+        1,
+        "Parse should emit exactly one response"
+    );
+    assert!(
+        matches!(&client.sent[0], PgWireBackendMessage::ParseComplete(_)),
+        "expected ParseComplete response"
+    );
+
+    let stored = client
+        .portal_store()
+        .get_statement("s_ok")
+        .expect("prepared statement should be stored");
+    assert_eq!(stored.statement.sql, "\\dt");
+    assert!(stored.parameter_types.is_empty());
+    assert!(stored.statement.param_data_types.is_empty());
+    assert!(matches!(stored.statement.exec, PreparedExec::RawSqlUtility));
+
+    let bind = pgwire::messages::extendedquery::Bind::new(
+        Some("p_ok".to_string()),
+        Some("s_ok".to_string()),
+        vec![],
+        vec![],
+        vec![],
+    );
+    handler
+        .on_bind(&mut client, bind)
+        .await
+        .expect("stored statement should be usable by Bind");
+    assert!(
+        matches!(
+            client.sent.last(),
+            Some(PgWireBackendMessage::BindComplete(_))
+        ),
+        "expected BindComplete response"
+    );
+    assert!(
+        client.portal_store().get_portal("p_ok").is_some(),
+        "bind should install portal for later Execute"
+    );
+}
+
+#[tokio::test]
+async fn test_query_parser_parse_count_is_one_for_parseable_sql() {
+    // Demonstrates that a full Parse message flow (StoredStatement::parse +
+    // classification + analysis-ready AST) requires exactly one parse_sql call.
+    use super::dynamic::query::{is_data_statement_stmts, is_transaction_control_stmts};
+    use super::Db9QueryParser;
+    use pgwire::api::stmt::QueryParser;
+
+    let parser = Db9QueryParser::new();
+
+    // Simulate StoredStatement::parse calling parse_sql (1 parse)
+    let _ = parser.parse_sql("SELECT 1", &[]).await.unwrap();
+
+    // Extract cached AST — no additional parse needed
+    let stmts = parser.take_parsed_statements().unwrap();
+
+    // Classification from cached AST — zero additional parses
+    assert!(is_data_statement_stmts(&stmts));
+    assert!(!is_transaction_control_stmts(&stmts));
+
+    // The stmts can be passed directly to analyze_for_prepared_with_statements
+    // (which also does not parse). Total: 1 parse for the entire flow.
+}
+
 // ── Regression tests: static utility Describe ───────────────────────────────
 
 #[test]
