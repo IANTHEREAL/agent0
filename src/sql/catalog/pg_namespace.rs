@@ -24,12 +24,8 @@ impl VirtualTable for PgNamespace {
                 int_col("oid"),
                 text_col("nspname"),
                 int_col("nspowner"),
-                // nspacl — access privileges (NULL = default).
+                // nspacl — access privileges (NULL = no explicit ACL, PG default).
                 text_col("nspacl"),
-                // xmin — PostgreSQL system column (transaction ID).
-                // JetBrains DataGrip reads this for incremental change detection.
-                // db9 has no MVCC xids, so we return a constant 1.
-                int_col("xmin"),
             ],
             version: 1,
             pk_constraint_name: None,
@@ -66,8 +62,7 @@ impl VirtualTable for PgNamespace {
                     int_val(schema_oid(ctx.schema_oids, s)),
                     text_val(s),
                     int_val(owner_oid),
-                    Value::Null, // nspacl
-                    int_val(1),  // xmin (constant)
+                    Value::Null, // nspacl — NULL means default privileges (PG parity)
                 ])
             })
             .collect())
