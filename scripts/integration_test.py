@@ -12,6 +12,22 @@ Usage:
 
 Environment:
     PG_DSN=postgres://admin:admin@127.0.0.1:5433/postgres
+
+Expected-output contract (psql flags auto-detected from .expected files):
+    Aligned mode  — detected when .expected contains ' | ' or '---' separator lines.
+                    psql runs with default aligned formatting.
+    Unaligned mode — detected when .expected contains '|' without spaces.
+                    psql runs with: -P format=unaligned -P fieldsep=| -P null=NULL
+    Quiet (-q)    — enabled by default; disabled only when .expected contains
+                    command-tag lines (CREATE TABLE, INSERT 0 N, etc.).
+    NULL display  — unaligned mode defaults to '-P null=NULL' (explicit text).
+                    Falls back to empty string only when .expected already uses
+                    empty pipe-delimited fields (e.g. 'val1|') and no 'NULL' field.
+
+When regenerating .expected files, prefer the canonical defaults:
+    - Use -q (no command tags)
+    - Use -P null=NULL for unaligned mode
+    - Validate output against PostgreSQL 17 before committing
 """
 
 import subprocess
