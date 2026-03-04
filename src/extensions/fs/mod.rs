@@ -316,7 +316,7 @@ pub(crate) async fn start_file_stream(
     }
 
     let fmt = decoders::detect_format(path, format);
-    let reader = backend.read_file_stream(path, usize::MAX).await?;
+    let reader = backend.read_file_stream(path, MAX_BYTES_PER_FILE).await?;
 
     let (schema, rx) = match fmt {
         "csv" | "tsv" => {
@@ -490,65 +490,84 @@ async fn start_glob_stream_with_budget_for_backend(
     exclude: Option<&str>,
     max_total_bytes: usize,
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
-    let first_path = match glob::find_first_match(&*backend, pattern, exclude).await? {
-        Some(p) => p,
-        None => return Ok(None),
-    };
+    // Expand glob once — reused for both schema probe and streaming.
+    let matching_files = glob::expand_glob(&*backend, pattern, MAX_FILES_PER_GLOB, exclude).await?;
+    if matching_files.is_empty() {
+        return Ok(None);
+    }
 
-    let fmt = decoders::detect_format(&first_path, format);
+    let fmt = decoders::detect_format(&matching_files[0], format);
 
-    let schema = match fmt {
-        "csv" | "tsv" => {
-            let delim = if fmt == "tsv" && delimiter.is_none() {
-                Some('\t')
-            } else {
-                delimiter
+    // Probe schema from first readable file; skip oversized/unreadable
+    // files with a warning instead of failing the entire query.
+    let schema = {
+        let mut found = None;
+        for probe_path in &matching_files {
+            let reader = match backend
+                .read_file_stream(probe_path, MAX_BYTES_PER_FILE)
+                .await
+            {
+                Ok(r) => r,
+                Err(err) => {
+                    warn!("fs9: skipping {} during schema probe: {}", probe_path, err);
+                    continue;
+                }
             };
-            let has_headers = header.unwrap_or(true);
-            let reader = backend.read_file_stream(&first_path, usize::MAX).await?;
-            let decoder =
-                streaming::StreamingCsvDecoder::new(reader, first_path.clone(), delim, has_headers)
-                    .await?;
-            decoder.schema().clone()
+            let result = match fmt {
+                "csv" | "tsv" => {
+                    let delim = if fmt == "tsv" && delimiter.is_none() {
+                        Some('\t')
+                    } else {
+                        delimiter
+                    };
+                    let has_headers = header.unwrap_or(true);
+                    streaming::StreamingCsvDecoder::new(
+                        reader,
+                        probe_path.clone(),
+                        delim,
+                        has_headers,
+                    )
+                    .await
+                    .map(|d| d.schema().clone())
+                }
+                "jsonl" | "ndjson" => {
+                    let decoder = streaming::StreamingJsonlDecoder::new(reader, probe_path.clone());
+                    Ok(decoder.schema().clone())
+                }
+                _ => {
+                    let decoder = streaming::StreamingTextDecoder::new(reader, probe_path.clone());
+                    Ok(decoder.schema().clone())
+                }
+            };
+            match result {
+                Ok(s) => {
+                    found = Some(s);
+                    break;
+                }
+                Err(err) => {
+                    warn!("fs9: skipping {} during schema probe: {}", probe_path, err);
+                }
+            }
         }
-        "jsonl" | "ndjson" => {
-            let reader = backend.read_file_stream(&first_path, usize::MAX).await?;
-            let decoder = streaming::StreamingJsonlDecoder::new(reader, first_path.clone());
-            decoder.schema().clone()
-        }
-        _ => {
-            let reader = backend.read_file_stream(&first_path, usize::MAX).await?;
-            let decoder = streaming::StreamingTextDecoder::new(reader, first_path.clone());
-            decoder.schema().clone()
-        }
+        found.ok_or_else(|| {
+            anyhow!(
+                "fs9: no readable files found matching pattern '{}'",
+                pattern
+            )
+        })?
     };
 
     let (tx, rx) = mpsc::channel(256);
     let fmt_owned = fmt.to_string();
     let pattern_owned = pattern.to_string();
-    let exclude_owned = exclude.map(|s| s.to_string());
     // Move the boxed backend into the spawned task so it can make further requests.
     tokio::spawn(async move {
-        let matching_files = match glob::expand_glob(
-            &*backend,
-            &pattern_owned,
-            MAX_FILES_PER_GLOB,
-            exclude_owned.as_deref(),
-        )
-        .await
-        {
-            Ok(files) => files,
-            Err(err) => {
-                warn!("fs9: glob expansion error for {}: {}", pattern_owned, err);
-                return;
-            }
-        };
-
         let mut total_bytes: usize = 0;
         let mut files_read_count: usize = 0;
 
         for file_path in matching_files {
-            if total_bytes >= max_total_bytes {
+            let remaining_budget = max_total_bytes.saturating_sub(total_bytes);
+            if remaining_budget == 0 {
                 warn!(
                     "fs9: bytes budget exhausted ({} MB), {} files were streamed for pattern {}",
                     total_bytes / (1024 * 1024),
@@ -558,7 +577,8 @@ async fn start_glob_stream_with_budget_for_backend(
                 break;
             }
 
-            let reader = match backend.read_file_stream(&file_path, usize::MAX).await {
+            let file_limit = remaining_budget.min(MAX_BYTES_PER_FILE);
+            let reader = match backend.read_file_stream(&file_path, file_limit).await {
                 Ok(reader) => reader,
                 Err(err) => {
                     warn!("fs9: cannot stream {}: {}", file_path, err);
@@ -1081,6 +1101,130 @@ mod tests {
             msg.contains("file too large"),
             "unexpected error message: {msg}"
         );
+
+        cleanup(&dir);
+    }
+
+    /// P1-1 regression: streaming glob loop must cap each file open to the
+    /// remaining budget, not the fixed MAX_BYTES_PER_FILE.
+    #[tokio::test]
+    async fn test_glob_stream_remaining_budget_caps_per_file() {
+        let dir = unique_base("glob-stream-budget-cap");
+        // a.txt = 6 bytes, b.txt = 6 bytes
+        fs::write(dir.join("a.txt"), "alpha\n").expect("write a.txt");
+        fs::write(dir.join("b.txt"), "bravo\n").expect("write b.txt");
+
+        let pattern = format!("{}/*.txt", dir.display());
+        // Budget of 8 bytes: enough for a.txt (6), but remaining 2 < b.txt (6).
+        let budget = 8;
+
+        let (_schema, mut rx) = start_glob_stream_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            &pattern,
+            None,
+            None,
+            None,
+            None,
+            budget,
+        )
+        .await
+        .expect("start glob stream")
+        .expect("expected streaming result");
+
+        let mut lines = Vec::new();
+        while let Some(row) = rx.recv().await {
+            if let Value::Text(line) = &row.values[1] {
+                lines.push(line.clone());
+            }
+        }
+
+        // b.txt exceeds remaining budget (2 bytes) and must be skipped.
+        assert_eq!(lines, vec!["alpha"]);
+
+        cleanup(&dir);
+    }
+
+    /// P1-2 regression: oversized first file in schema probe must be skipped
+    /// (not hard-error), and the query should fall through to the next file.
+    #[tokio::test]
+    async fn test_glob_stream_oversized_first_file_skips_to_next() {
+        let dir = unique_base("glob-stream-oversize-probe");
+
+        // Oversized file sorts first alphabetically.
+        let big_path = dir.join("a_big.txt");
+        let big_file = std::fs::File::create(&big_path).expect("create a_big.txt");
+        big_file
+            .set_len((super::MAX_BYTES_PER_FILE + 1) as u64)
+            .expect("set a_big.txt size");
+
+        fs::write(dir.join("b.txt"), "bravo\n").expect("write b.txt");
+
+        let pattern = format!("{}/*.txt", dir.display());
+        let (_schema, mut rx) = start_glob_stream_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            &pattern,
+            None,
+            None,
+            None,
+            None,
+            super::MAX_TOTAL_BYTES,
+        )
+        .await
+        .expect("schema probe should skip oversized file")
+        .expect("expected streaming result");
+
+        let mut lines = Vec::new();
+        while let Some(row) = rx.recv().await {
+            if let Value::Text(line) = &row.values[1] {
+                lines.push(line.clone());
+            }
+        }
+
+        // a_big.txt skipped; only b.txt content present.
+        assert_eq!(lines, vec!["bravo"]);
+
+        cleanup(&dir);
+    }
+
+    /// P1-2 regression: oversized file in a later position must be skipped
+    /// with a warning (consistent with schema-probe behavior).
+    #[tokio::test]
+    async fn test_glob_stream_oversized_later_file_skipped() {
+        let dir = unique_base("glob-stream-oversize-later");
+
+        fs::write(dir.join("a.txt"), "alpha\n").expect("write a.txt");
+
+        let big_path = dir.join("b_big.txt");
+        let big_file = std::fs::File::create(&big_path).expect("create b_big.txt");
+        big_file
+            .set_len((super::MAX_BYTES_PER_FILE + 1) as u64)
+            .expect("set b_big.txt size");
+
+        fs::write(dir.join("c.txt"), "charlie\n").expect("write c.txt");
+
+        let pattern = format!("{}/*.txt", dir.display());
+        let (_schema, mut rx) = start_glob_stream_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            &pattern,
+            None,
+            None,
+            None,
+            None,
+            super::MAX_TOTAL_BYTES,
+        )
+        .await
+        .expect("start glob stream")
+        .expect("expected streaming result");
+
+        let mut lines = Vec::new();
+        while let Some(row) = rx.recv().await {
+            if let Value::Text(line) = &row.values[1] {
+                lines.push(line.clone());
+            }
+        }
+
+        // b_big.txt skipped; a.txt and c.txt present.
+        assert_eq!(lines, vec!["alpha", "charlie"]);
 
         cleanup(&dir);
     }

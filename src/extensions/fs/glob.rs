@@ -63,6 +63,7 @@ pub(crate) async fn expand_glob(
 
 /// Find the first file matching a glob pattern (for fast schema detection).
 /// Does not sort — returns as soon as one match is found.
+#[cfg(test)]
 pub(crate) async fn find_first_match(
     backend: &dyn FsBackend,
     pattern: &str,
