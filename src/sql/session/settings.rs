@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use super::{DEFAULT_DML_TABLE_SCAN_MAX_ROWS, DEFAULT_MAX_SORT_BYTES};
+const DML_TABLE_SCAN_MAX_ROWS_UPPER_BOUND: usize = i64::MAX as usize;
 
 /// Metadata for a single known GUC parameter.
 pub(crate) struct GucMeta {
@@ -62,7 +63,8 @@ pub(crate) const KNOWN_GUCS: &[GucMeta] = &[
     GucMeta {
         name: "db9.dml_table_scan_max_rows",
         immutable: false,
-        description: "Maximum rows allowed from auxiliary table scans in DML (0 = unlimited)",
+        description:
+            "Maximum rows per auxiliary source and combined cross-product cap for UPDATE FROM / DELETE USING (0 = unlimited)",
         static_default: None,
     },
     GucMeta {
@@ -326,8 +328,9 @@ pub(crate) struct SessionSettings {
     /// Default: 256 MB. 0 = unlimited.
     max_sort_bytes: usize,
 
-    /// Maximum rows allowed from auxiliary table scans in DML.
-    /// Used to clamp dynamic LIMIT expressions at execution time.
+    /// Maximum rows per auxiliary source and combined cross-product cap for
+    /// UPDATE FROM / DELETE USING.
+    /// Also used to clamp dynamic LIMIT expressions at execution time.
     /// Default: 10000. 0 = unlimited.
     dml_table_scan_max_rows: usize,
 
@@ -597,7 +600,7 @@ impl SessionSettings {
                 Ok(Self::format_timeout_show(ms))
             }
             "db9.dml_table_scan_max_rows" => {
-                let v: usize =
+                let v: u128 =
                     value
                         .trim()
                         .parse()
@@ -607,6 +610,15 @@ impl SessionSettings {
                                 name, value
                             ),
                         })?;
+                if v > DML_TABLE_SCAN_MAX_ROWS_UPPER_BOUND as u128 {
+                    return Err(SqlError::InvalidParameterValue {
+                        message: format!(
+                            "invalid value for parameter \"{}\": \"{}\" (must be between 0 and {})",
+                            name, value, DML_TABLE_SCAN_MAX_ROWS_UPPER_BOUND
+                        ),
+                    }
+                    .into());
+                }
                 Ok(v.to_string())
             }
             "db9.max_sort_bytes" => {

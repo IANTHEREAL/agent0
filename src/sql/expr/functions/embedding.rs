@@ -372,14 +372,15 @@ mod tests {
 
         let err = rt
             .block_on(async {
-                crate::session_context::with_extension_txn_delta(
-                    extension_delta(&[], &[]),
-                    async { ensure_embedding_installed_gate() },
-                )
+                crate::session_context::with_extension_txn_delta(extension_delta(&[], &[]), async {
+                    ensure_embedding_installed_gate()
+                })
                 .await
             })
             .unwrap_err();
-        assert!(err.to_string().contains("embedding: tikv client not available"));
+        assert!(err
+            .to_string()
+            .contains("embedding: tikv client not available"));
     }
 
     #[test]
@@ -449,7 +450,9 @@ mod tests {
     #[test]
     fn parse_dimensions_arg_rejects_non_positive_as_22023() {
         let err_zero = parse_dimensions_arg(&Value::Int32(0)).unwrap_err();
-        let sql_zero = err_zero.downcast_ref::<SqlError>().expect("must be SqlError");
+        let sql_zero = err_zero
+            .downcast_ref::<SqlError>()
+            .expect("must be SqlError");
         assert_eq!(sql_zero.sqlstate(), "22023");
         assert!(sql_zero.to_string().contains("dimensions must be positive"));
 

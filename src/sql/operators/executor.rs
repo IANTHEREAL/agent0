@@ -41,7 +41,11 @@ pub async fn execute_operator_tree(
     operator.open(&mut ctx).await?;
 
     let mut rows = Vec::new();
-    while let Some(row) = operator.next(&mut ctx).await? {
+    let row_cap = crate::session_context::current_dml_limit_cap();
+    while row_cap == 0 || rows.len() < row_cap {
+        let Some(row) = operator.next(&mut ctx).await? else {
+            break;
+        };
         try_grow_statement_memory_scope("operators.executor.root_rows", estimate_row_size(&row))?;
         rows.push(row);
     }
@@ -76,7 +80,11 @@ pub async fn execute_operator_tree_with_ctes(
     operator.open(&mut ctx).await?;
 
     let mut rows = Vec::new();
-    while let Some(row) = operator.next(&mut ctx).await? {
+    let row_cap = crate::session_context::current_dml_limit_cap();
+    while row_cap == 0 || rows.len() < row_cap {
+        let Some(row) = operator.next(&mut ctx).await? else {
+            break;
+        };
         try_grow_statement_memory_scope("operators.executor.root_rows", estimate_row_size(&row))?;
         rows.push(row);
     }

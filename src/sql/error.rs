@@ -121,6 +121,9 @@ pub enum SqlError {
     #[error("too many advisory locks held by this session (limit: {limit})")]
     AdvisoryLockLimitExceeded { limit: usize },
 
+    #[error("{message}")]
+    DmlTableScanTooLarge { message: String },
+
     #[error("advisory lock reentrant acquisition count overflow")]
     AdvisoryLockCounterOverflow,
 
@@ -263,6 +266,7 @@ impl SqlError {
             Self::TenantMemoryQuotaExceeded { .. } => "53200",
             Self::LockNotAvailable { .. } => "55P03",
             Self::AdvisoryLockLimitExceeded { .. } => "54000",
+            Self::DmlTableScanTooLarge { .. } => "54000",
             Self::AdvisoryLockCounterOverflow => "54000",
             Self::StatementTooComplex { .. } => "54001",
             Self::InFailedTransaction => "25P02",
@@ -486,6 +490,13 @@ mod tests {
         );
         assert_eq!(
             SqlError::AdvisoryLockLimitExceeded { limit: 64 }.sqlstate(),
+            "54000"
+        );
+        assert_eq!(
+            SqlError::DmlTableScanTooLarge {
+                message: "too many rows".into()
+            }
+            .sqlstate(),
             "54000"
         );
         assert_eq!(

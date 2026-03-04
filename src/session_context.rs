@@ -258,9 +258,10 @@ mod tests {
             HashSet::from(["embedding".to_string()]),
             HashSet::from(["embedding".to_string()]),
         ));
-        let got =
-            super::with_extension_txn_delta(delta, async { super::extension_txn_status("embedding") })
-                .await;
+        let got = super::with_extension_txn_delta(delta, async {
+            super::extension_txn_status("embedding")
+        })
+        .await;
         assert_eq!(got, Some(true));
     }
 

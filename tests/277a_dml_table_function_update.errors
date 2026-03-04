@@ -1,0 +1,1 @@
+table function "generate_series" returned more than 5 rows, exceeding the UPDATE FROM / DELETE USING auxiliary table limit

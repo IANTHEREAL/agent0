@@ -494,6 +494,8 @@ impl Executor {
                     output_columns,
                 } => {
                     let key = table_ref.alias.as_deref().unwrap_or(&func.name).to_string();
+                    let row_cap = crate::session_context::current_dml_limit_cap();
+                    let max_rows = row_cap.saturating_sub(1);
 
                     let has_correlated_args = args.iter().any(|arg| {
                         let expr = match arg {
@@ -555,9 +557,14 @@ impl Executor {
                         }
 
                         let max_len = columns.iter().map(|c| c.len()).max().unwrap_or(0);
+                        let capped_len = if row_cap > 0 {
+                            max_len.min(row_cap)
+                        } else {
+                            max_len
+                        };
                         let has_ordinality = output_columns.len() > columns.len();
-                        let mut rows = Vec::with_capacity(max_len);
-                        for i in 0..max_len {
+                        let mut rows = Vec::with_capacity(capped_len);
+                        for i in 0..capped_len {
                             let mut values: Vec<Value> = columns
                                 .iter()
                                 .map(|col| col.get(i).cloned().unwrap_or(Value::Null))
@@ -567,13 +574,38 @@ impl Executor {
                             }
                             rows.push(Row::new(values));
                         }
+                        if row_cap > 0 && max_len >= row_cap {
+                            return Err(crate::sql::error::SqlError::DmlTableScanTooLarge {
+                                message: format!(
+                                    "table function \"{}\" returned more than {} rows, \
+                                     exceeding the UPDATE FROM / DELETE USING auxiliary \
+                                     table limit (set db9.dml_table_scan_max_rows to \
+                                     adjust or 0 to disable)",
+                                    key, max_rows
+                                ),
+                            }
+                            .into());
+                        }
                         rows
                     } else {
                         let bridge_args = bridge_function_args(&evaluated_args);
                         if func_upper == "GENERATE_SERIES" {
+                            let series_limit = if row_cap > 0 { Some(row_cap) } else { None };
                             let (_, rows) = self
-                                .execute_generate_series(&bridge_args, &key, None, 0, None)
+                                .execute_generate_series(&bridge_args, &key, None, 0, series_limit)
                                 .await?;
+                            if row_cap > 0 && rows.len() >= row_cap {
+                                return Err(crate::sql::error::SqlError::DmlTableScanTooLarge {
+                                    message: format!(
+                                        "table function \"{}\" returned more than {} rows, \
+                                         exceeding the UPDATE FROM / DELETE USING auxiliary \
+                                         table limit (set db9.dml_table_scan_max_rows to \
+                                         adjust or 0 to disable)",
+                                        key, max_rows
+                                    ),
+                                }
+                                .into());
+                            }
                             rows
                         } else if func_upper == "_DB9_SYS_RECORD_MIGRATION" {
                             let (_, rows) =
@@ -675,6 +707,19 @@ impl Executor {
                             }
                         }
                     };
+
+                    if row_cap > 0 && rows.len() >= row_cap {
+                        return Err(crate::sql::error::SqlError::DmlTableScanTooLarge {
+                            message: format!(
+                                "table function \"{}\" returned more than {} rows, \
+                                 exceeding the UPDATE FROM / DELETE USING auxiliary \
+                                 table limit (set db9.dml_table_scan_max_rows to \
+                                 adjust or 0 to disable)",
+                                key, max_rows
+                            ),
+                        }
+                        .into());
+                    }
 
                     build_ctx.preloaded_rows.insert(key, rows);
                 }

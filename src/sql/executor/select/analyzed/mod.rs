@@ -158,6 +158,22 @@ impl Executor {
                     false,
                 )
                 .await?;
+            let row_cap = crate::session_context::current_dml_limit_cap();
+            if row_cap > 0 {
+                if let ExecuteResult::Select { rows, .. } = &result {
+                    if rows.len() >= row_cap {
+                        return Err(crate::sql::error::SqlError::DmlTableScanTooLarge {
+                            message: format!(
+                                "subquery returned more than {} rows, exceeding the \
+                                 DML auxiliary row limit (set \
+                                 db9.dml_table_scan_max_rows to adjust or 0 to disable)",
+                                row_cap.saturating_sub(1)
+                            ),
+                        }
+                        .into());
+                    }
+                }
+            }
             Ok(result)
         })
     }

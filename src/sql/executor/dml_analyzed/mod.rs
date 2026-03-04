@@ -12,11 +12,13 @@ use super::super::dml;
 use super::core::Executor;
 use crate::model::{Row, TableSchema, Value};
 use crate::sql::analyzer::types::{AnalyzedProjection, TypedExpr, TypedExprKind};
+use crate::sql::error::SqlError;
 use crate::sql::expr::static_eval::needs_async_materialization;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
 use crate::sql::sequences::SequenceSession;
+use crate::sql::session::DEFAULT_DML_TABLE_SCAN_MAX_ROWS;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tikv_client::Transaction;
@@ -47,7 +49,23 @@ impl Executor {
                         .get_schema(txn, db_id, name)
                         .await?
                         .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?;
-                    let mut rows = self.scan_and_fill(txn, db_id, name, &schema).await?;
+                    let max_rows = dml_table_scan_max_rows_from_settings();
+                    let row_cap = dml_table_scan_row_cap(max_rows);
+                    let mut rows = self
+                        .scan_and_fill_with_limit(txn, db_id, name, &schema, row_cap)
+                        .await?;
+                    if row_cap_reached(rows.len(), row_cap) {
+                        return Err(SqlError::DmlTableScanTooLarge {
+                            message: format!(
+                                "table \"{}\" contains more than {} rows, exceeding \
+                                 the UPDATE FROM / DELETE USING auxiliary table limit \
+                                 (set db9.dml_table_scan_max_rows to adjust or 0 to \
+                                 disable)",
+                                name, max_rows
+                            ),
+                        }
+                        .into());
+                    }
                     append_ctid_to_rows(&mut rows);
                     Ok((name.clone(), schema, rows))
                 }
@@ -58,8 +76,10 @@ impl Executor {
                         .unwrap_or_else(|| "__subquery".to_string());
                     let mut seq_vals = SequenceSession::new();
                     let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
-                    let cap = dml_table_scan_max_rows_from_settings();
-                    let result = crate::session_context::with_dml_limit_cap(cap, {
+                    let max_rows = dml_table_scan_max_rows_from_settings();
+                    let row_cap = dml_table_scan_row_cap(max_rows);
+                    let cap_scope = row_cap.unwrap_or(0);
+                    let result = crate::session_context::with_dml_limit_cap(cap_scope, {
                         let txn = &mut *txn;
                         self.execute_subquery(
                             txn,
@@ -73,6 +93,19 @@ impl Executor {
                     .await?;
                     match result {
                         crate::sql::ExecuteResult::Select { rows, .. } => {
+                            if row_cap_reached(rows.len(), row_cap) {
+                                return Err(SqlError::DmlTableScanTooLarge {
+                                    message: format!(
+                                        "subquery \"{}\" returned more than {} rows, \
+                                         exceeding the UPDATE FROM / DELETE USING \
+                                         auxiliary table limit (set \
+                                         db9.dml_table_scan_max_rows to adjust or 0 \
+                                         to disable)",
+                                        alias, max_rows
+                                    ),
+                                }
+                                .into());
+                            }
                             use crate::sql::executor::select::analyzed::postprocess::build_output_schema;
                             let schema = build_output_schema(query);
                             Ok((alias, schema, rows))
@@ -99,6 +132,7 @@ impl Executor {
                         .await?;
 
                     let qctx = QueryContext::from_task_locals();
+                    let max_rows = dml_table_scan_max_rows_from_settings();
                     let mut joined_rows = Vec::new();
 
                     use crate::sql::analyzer::types::JoinType;
@@ -114,6 +148,7 @@ impl Executor {
                                         &qctx,
                                     )? {
                                         joined_rows.push(combined);
+                                        check_join_output_limit(joined_rows.len(), max_rows)?;
                                     }
                                 }
                             }
@@ -134,12 +169,14 @@ impl Executor {
                                         &qctx,
                                     )? {
                                         joined_rows.push(combined);
+                                        check_join_output_limit(joined_rows.len(), max_rows)?;
                                         found = true;
                                     }
                                 }
                                 if !found {
                                     let null_right = Row::new(vec![Value::Null; r_cols]);
                                     joined_rows.push(combine_rows(lr, &null_right));
+                                    check_join_output_limit(joined_rows.len(), max_rows)?;
                                 }
                             }
                         }
@@ -165,12 +202,14 @@ impl Executor {
                                         &qctx,
                                     )? {
                                         joined_rows.push(combined);
+                                        check_join_output_limit(joined_rows.len(), max_rows)?;
                                         found = true;
                                     }
                                 }
                                 if !found {
                                     let null_left = Row::new(vec![Value::Null; l_cols]);
                                     joined_rows.push(combine_rows(&null_left, rr));
+                                    check_join_output_limit(joined_rows.len(), max_rows)?;
                                 }
                             }
                         }
@@ -204,6 +243,7 @@ impl Executor {
                                         &qctx,
                                     )? {
                                         joined_rows.push(combined);
+                                        check_join_output_limit(joined_rows.len(), max_rows)?;
                                         found = true;
                                         right_matched[ri] = true;
                                     }
@@ -211,6 +251,7 @@ impl Executor {
                                 if !found {
                                     let null_right = Row::new(vec![Value::Null; r_cols]);
                                     joined_rows.push(combine_rows(lr, &null_right));
+                                    check_join_output_limit(joined_rows.len(), max_rows)?;
                                 }
                             }
 
@@ -220,6 +261,7 @@ impl Executor {
                                 if !right_matched[ri] {
                                     let null_left = Row::new(vec![Value::Null; l_cols]);
                                     joined_rows.push(combine_rows(&null_left, rr));
+                                    check_join_output_limit(joined_rows.len(), max_rows)?;
                                 }
                             }
                         }
@@ -374,9 +416,9 @@ impl Executor {
         qctx: &QueryContext,
     ) -> Result<Value> {
         if needs_async_materialization(expr) {
-            let cap = dml_table_scan_max_rows_from_settings();
+            let row_cap = dml_table_scan_row_cap_from_settings().unwrap_or(0);
             let materialized = crate::session_context::with_dml_limit_cap(
-                cap,
+                row_cap,
                 self.materialize_expr_for_row(
                     expr,
                     eval_row,
@@ -488,15 +530,82 @@ fn count_ctid_slots(table_ref: &crate::sql::analyzer::types::AnalyzedTableRef) -
 }
 
 /// Read the `db9.dml_table_scan_max_rows` setting from the current session's
-/// settings snapshot.  Returns the default (10 000) when no snapshot is available.
-fn dml_table_scan_max_rows_from_settings() -> usize {
-    use crate::sql::session::DEFAULT_DML_TABLE_SCAN_MAX_ROWS;
+/// settings snapshot. Returns default when no snapshot is available.
+pub(super) fn dml_table_scan_max_rows_from_settings() -> usize {
     let qctx = QueryContext::from_task_locals();
     qctx.settings_snapshot
         .as_ref()
         .and_then(|s| s.get("db9.dml_table_scan_max_rows"))
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_DML_TABLE_SCAN_MAX_ROWS)
+}
+
+/// Convert configured `max_rows` to internal `row_cap`.
+///
+/// `row_cap = max_rows + 1` enables deterministic overflow detection:
+/// collecting `row_cap` rows means "returned more than max_rows rows".
+fn dml_table_scan_row_cap(max_rows: usize) -> Option<usize> {
+    if max_rows == 0 {
+        None
+    } else {
+        Some(max_rows.saturating_add(1))
+    }
+}
+
+pub(super) fn dml_table_scan_row_cap_from_settings() -> Option<usize> {
+    dml_table_scan_row_cap(dml_table_scan_max_rows_from_settings())
+}
+
+fn row_cap_reached(len: usize, row_cap: Option<usize>) -> bool {
+    row_cap.is_some_and(|cap| len >= cap)
+}
+
+/// Streaming post-join row guard: checks whether the join output has exceeded
+/// the configured `max_rows` limit. Called after each row is pushed to the
+/// output during nested-loop join execution.
+fn check_join_output_limit(joined_rows_len: usize, max_rows: usize) -> Result<()> {
+    if max_rows > 0 && joined_rows_len > max_rows {
+        return Err(SqlError::DmlTableScanTooLarge {
+            message: format!(
+                "JOIN produced more than {} rows, exceeding the UPDATE FROM / \
+                 DELETE USING auxiliary table limit (set \
+                 db9.dml_table_scan_max_rows to adjust or 0 to disable)",
+                max_rows
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Check that the combined cross-product of auxiliary row counts does not
+/// exceed the configured statement limit.
+///
+/// This catches cases where each source is under per-source limit but their
+/// product would still explode at materialization time.
+pub(super) fn check_cross_product_limit(sizes: &[usize], max_rows: usize) -> Result<()> {
+    if max_rows == 0 || sizes.is_empty() {
+        return Ok(());
+    }
+    let product: usize = sizes
+        .iter()
+        .try_fold(1usize, |acc, &n| acc.checked_mul(n))
+        .unwrap_or(usize::MAX);
+    if product > max_rows {
+        let size_strs: Vec<String> = sizes.iter().map(|n| n.to_string()).collect();
+        return Err(SqlError::DmlTableScanTooLarge {
+            message: format!(
+                "combined auxiliary table row count ({}) exceeds the UPDATE FROM / \
+                 DELETE USING limit of {} rows (individual table sizes: {}; \
+                 set db9.dml_table_scan_max_rows to adjust or 0 to disable)",
+                product,
+                max_rows,
+                size_strs.join(" × "),
+            ),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 // ── Free helpers ────────────────────────────────────────────
@@ -553,26 +662,41 @@ pub(super) fn build_returning_types_from_analyzed(
     }
 }
 
-/// Build cross-product of rows from multiple tables.
+/// Build cross-product of rows from multiple tables with optional max-row guard.
 ///
 /// Given [[A1, A2], [B1, B2, B3]], produces:
 /// [A1+B1, A1+B2, A1+B3, A2+B1, A2+B2, A2+B3]
 /// where + means value concatenation.
-pub(super) fn cross_product_rows(table_rows: &[Vec<Row>]) -> Vec<Row> {
+pub(super) fn cross_product_rows(table_rows: &[Vec<Row>], max_rows: usize) -> Result<Vec<Row>> {
     if table_rows.is_empty() {
-        return vec![];
+        return Ok(vec![]);
     }
+    let sizes: Vec<usize> = table_rows.iter().map(|rows| rows.len()).collect();
+    check_cross_product_limit(&sizes, max_rows)?;
+    let row_cap = dml_table_scan_row_cap(max_rows);
     let mut result = table_rows[0].clone();
     for table in &table_rows[1..] {
         let mut new_result = Vec::with_capacity(result.len() * table.len());
         for left in &result {
             for right in table {
                 new_result.push(combine_rows(left, right));
+                if row_cap_reached(new_result.len(), row_cap) {
+                    return Err(SqlError::DmlTableScanTooLarge {
+                        message: format!(
+                            "combined auxiliary table row count exceeds the UPDATE FROM / \
+                             DELETE USING limit of {} rows during cartesian \
+                             materialization (set db9.dml_table_scan_max_rows \
+                             to adjust or 0 to disable)",
+                            max_rows
+                        ),
+                    }
+                    .into());
+                }
             }
         }
         result = new_result;
     }
-    result
+    Ok(result)
 }
 
 /// Check if a TypedExpr is a DEFAULT placeholder.
@@ -628,7 +752,7 @@ mod tests {
         let a2 = Row::new(vec![Value::Text("a2".to_string())]);
         let b1 = Row::new(vec![Value::Text("b1".to_string())]);
         let b2 = Row::new(vec![Value::Text("b2".to_string())]);
-        let rows = cross_product_rows(&[vec![a1, a2], vec![b1, b2]]);
+        let rows = cross_product_rows(&[vec![a1, a2], vec![b1, b2]], 0).unwrap();
         let got: Vec<Vec<Value>> = rows.into_iter().map(|r| r.values).collect();
         assert_eq!(
             got,
@@ -643,7 +767,21 @@ mod tests {
 
     #[test]
     fn cross_product_rows_handles_empty_input() {
-        assert!(cross_product_rows(&[]).is_empty());
+        assert!(cross_product_rows(&[], 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn check_cross_product_limit_rejects_oversized_product() {
+        let err = check_cross_product_limit(&[4, 4], 5).expect_err("must reject 16 > 5");
+        let msg = err.to_string();
+        assert!(msg.contains("combined auxiliary table row count (16)"));
+        assert!(msg.contains("limit of 5 rows"));
+    }
+
+    #[test]
+    fn check_cross_product_limit_accepts_disabled_or_small() {
+        check_cross_product_limit(&[4, 4], 0).expect("0 disables guard");
+        check_cross_product_limit(&[2, 2], 5).expect("4 <= 5");
     }
 
     #[test]

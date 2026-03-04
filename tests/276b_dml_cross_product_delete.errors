@@ -1,0 +1,1 @@
+combined auxiliary table row count (16) exceeds the UPDATE FROM / DELETE USING limit of 5 rows (individual table sizes: 4 × 4; set db9.dml_table_scan_max_rows to adjust or 0 to disable)

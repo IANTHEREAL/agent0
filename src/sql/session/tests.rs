@@ -256,6 +256,56 @@ mod tests {
     }
 
     #[test]
+    fn test_session_settings_dml_table_scan_max_rows_bounds() {
+        let mut settings = SessionSettings::new();
+
+        settings
+            .set_known_setting("db9.dml_table_scan_max_rows", "0".to_string())
+            .expect("0 should disable row guard");
+        assert_eq!(
+            settings
+                .show_value("db9.dml_table_scan_max_rows")
+                .as_deref(),
+            Some("0")
+        );
+
+        let upper = (i64::MAX as usize).to_string();
+        settings
+            .set_known_setting("db9.dml_table_scan_max_rows", upper.clone())
+            .expect("upper bound should be accepted");
+        assert_eq!(
+            settings
+                .show_value("db9.dml_table_scan_max_rows")
+                .as_deref(),
+            Some(upper.as_str())
+        );
+
+        let overflow = ((i64::MAX as usize as u128) + 1).to_string();
+        let err = settings
+            .set_known_setting("db9.dml_table_scan_max_rows", overflow.clone())
+            .expect_err("overflow value should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must be between 0 and"),
+            "unexpected error message: {}",
+            msg
+        );
+        assert!(
+            msg.contains(&overflow),
+            "error message should include bad value: {}",
+            msg
+        );
+
+        // Rejected SET must not change current value.
+        assert_eq!(
+            settings
+                .show_value("db9.dml_table_scan_max_rows")
+                .as_deref(),
+            Some(upper.as_str())
+        );
+    }
+
+    #[test]
     fn test_session_settings_transaction_isolation() {
         let mut settings = SessionSettings::new();
 

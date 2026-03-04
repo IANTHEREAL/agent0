@@ -8,8 +8,8 @@ use super::super::super::ExecuteResult;
 use super::super::core::{Executor, PendingHnswMerge};
 use super::{
     append_ctid_to_rows, build_returning_columns_from_analyzed,
-    build_returning_types_from_analyzed, combine_rows, cross_product_rows, eval_returning_typed,
-    typed_value_to_bool,
+    build_returning_types_from_analyzed, check_cross_product_limit, combine_rows,
+    cross_product_rows, eval_returning_typed, typed_value_to_bool,
 };
 use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::{AnalyzedUpdate, TypedExpr, TypedExprKind};
@@ -95,7 +95,10 @@ impl Executor {
                     .await?;
                 all_table_rows.push(rows);
             }
-            Some(cross_product_rows(&all_table_rows))
+            let max_rows = super::dml_table_scan_max_rows_from_settings();
+            let sizes: Vec<usize> = all_table_rows.iter().map(|rows| rows.len()).collect();
+            check_cross_product_limit(&sizes, max_rows)?;
+            Some(cross_product_rows(&all_table_rows, max_rows)?)
         } else {
             None
         };

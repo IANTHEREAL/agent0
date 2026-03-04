@@ -1646,8 +1646,7 @@ fn analyze_embedding_text_column_dimensions_is_42883() {
 
 #[test]
 fn analyze_embedding_text_column_dimensions_with_explicit_cast_is_accepted() {
-    let expr =
-        analyze_expr_with_users("embedding('hi', 'text-embedding-v4', name::int)").unwrap();
+    let expr = analyze_expr_with_users("embedding('hi', 'text-embedding-v4', name::int)").unwrap();
     assert!(matches!(expr.kind, TypedExprKind::FunctionCall { .. }));
 }
 
@@ -1682,10 +1681,8 @@ fn analyze_embedding_null_model_with_text_column_dimensions_is_42883() {
 
 #[test]
 fn analyze_embedding_too_many_args_is_42883() {
-    let err = analyze_expr_with_users(
-        "embedding('hi', 'text-embedding-v4', 1024, 'extra')",
-    )
-    .unwrap_err();
+    let err =
+        analyze_expr_with_users("embedding('hi', 'text-embedding-v4', 1024, 'extra')").unwrap_err();
     assert!(matches!(
         err,
         AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embedding")

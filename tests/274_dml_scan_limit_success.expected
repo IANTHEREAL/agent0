@@ -1,0 +1,29 @@
+db9.dml_table_scan_max_rows
+10000
+(1 row)
+db9.dml_table_scan_max_rows
+50
+(1 row)
+db9.dml_table_scan_max_rows
+10000
+(1 row)
+id|val
+1|x
+2|y
+3|z
+(3 rows)
+id|val
+4|keep
+(1 row)
+id|val
+1|x
+2|y
+3|z
+4|keep
+(4 rows)
+id|val
+1|x
+2|y
+3|z
+4|keep
+(4 rows)

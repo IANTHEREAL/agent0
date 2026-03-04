@@ -315,7 +315,10 @@ mod tests {
         let err = embedding_function_not_found("embedding(text)");
         let sql_err = err.downcast_ref::<SqlError>().expect("must be SqlError");
         assert_eq!(sql_err.sqlstate(), "42883");
-        assert_eq!(sql_err.to_string(), "function embedding(text) does not exist");
+        assert_eq!(
+            sql_err.to_string(),
+            "function embedding(text) does not exist"
+        );
     }
 
     #[test]
