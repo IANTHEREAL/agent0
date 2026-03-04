@@ -59,6 +59,7 @@ NULL
 to_regtype
 NULL
 (1 row)
+ERROR:  invalid type name "interval garbage"
 SET
 to_regtype
 NULL

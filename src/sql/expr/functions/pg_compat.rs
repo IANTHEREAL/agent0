@@ -464,11 +464,28 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
 
     // Step 3: Early-exit for unknown schemas.
     // If schema is present and doesn't match `pg_catalog`, the type cannot
-    // resolve — return NULL immediately.  This must happen BEFORE interval
-    // validation so that e.g. `noschema.interval(abc)` returns NULL (schema
-    // not found) instead of raising an interval-validation error.
+    // resolve — return NULL.  However, PG's raw parser still catches syntax
+    // errors regardless of schema: `noschema.interval(abc)` → NULL (valid
+    // parse, schema not found), but `noschema.interval garbage` → ERROR
+    // (bare word after type name is a parse error).
+    //
+    // For schema-qualified types PG uses the general `typename(typmod)`
+    // grammar, so a trailing `(...)` is a valid typmod expression.  A bare
+    // word after the identifier (without parens) is a syntax error.
     if let Some(ref s) = schema {
         if s.value != "pg_catalog" {
+            if !name.quoted {
+                let trimmed = name.value.trim();
+                // Check for a bare-word suffix after the type identifier.
+                if let Some(ws_pos) = trimmed.find(char::is_whitespace) {
+                    let after = trimmed[ws_pos..].trim_start();
+                    if !after.is_empty() && !after.starts_with('(') {
+                        // Bare word after type name → syntax error.
+                        let ws_normalized = normalize_whitespace(trimmed);
+                        normalize_interval_type(&ws_normalized)?;
+                    }
+                }
+            }
             return Ok(Value::Null);
         }
     }
@@ -1203,10 +1220,8 @@ mod tests {
             to_regtype(vec![Value::Text("noschema.interval(abc)".into())]).unwrap(),
             Value::Null
         );
-        assert_eq!(
-            to_regtype(vec![Value::Text("noschema.interval garbage".into())]).unwrap(),
-            Value::Null
-        );
+        // Bare word after type name → syntax error (PG's parser rejects it).
+        assert!(to_regtype(vec![Value::Text("noschema.interval garbage".into())]).is_err());
         // Quoted schema case-mismatch + invalid interval typmod → NULL
         assert_eq!(
             to_regtype(vec![Value::Text("\"PG_CATALOG\".interval(abc)".into())]).unwrap(),
