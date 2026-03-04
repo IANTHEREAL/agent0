@@ -169,7 +169,7 @@ mod tests {
         let pg_ns = catalog.get("pg_namespace").unwrap();
         assert_eq!(pg_ns.name(), "pg_namespace");
         assert_eq!(pg_ns.schema_name(), "pg_catalog");
-        assert_eq!(pg_ns.schema().columns.len(), 4);
+        assert_eq!(pg_ns.schema().columns.len(), 5);
     }
 
     #[test]

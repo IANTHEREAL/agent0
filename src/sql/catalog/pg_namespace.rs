@@ -26,6 +26,8 @@ impl VirtualTable for PgNamespace {
                 int_col("nspowner"),
                 // nspacl — access privileges (NULL = no explicit ACL, PG default).
                 text_col("nspacl"),
+                // xmin — PG system column (inserting txn ID). Constant for synthetic catalog rows.
+                int_col("xmin"),
             ],
             version: 1,
             pk_constraint_name: None,
@@ -63,6 +65,7 @@ impl VirtualTable for PgNamespace {
                     text_val(s),
                     int_val(owner_oid),
                     Value::Null, // nspacl — NULL means default privileges (PG parity)
+                    int_val(1),  // xmin — constant (no MVCC for catalog rows)
                 ])
             })
             .collect())

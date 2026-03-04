@@ -21,14 +21,12 @@ SELECT 'schemas_false_no_pg_catalog='
        || (NOT ('pg_catalog' = ANY(current_schemas(false))))::text;
 
 -- 4. DataGrip schema listing query (simplified — uses pg_get_userbyid)
--- Note: DataGrip also selects N.xmin for incremental change detection;
--- PG exposes xmin as a system column.  db9 does not yet support system
--- columns, so we substitute a constant here.
+-- Uses N.xmin (PG system column) for incremental change detection.
 SELECT 'schema_listing='
        || count(*)::text
 FROM (
     SELECT N.oid::bigint AS id,
-           1 AS state_number,
+           N.xmin AS state_number,
            nspname AS name,
            D.description,
            pg_catalog.pg_get_userbyid(N.nspowner) AS "owner"
