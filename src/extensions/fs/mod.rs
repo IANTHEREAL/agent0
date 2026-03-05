@@ -328,7 +328,8 @@ pub(crate) async fn start_file_stream(
             let has_headers = header.unwrap_or(true);
             let mut decoder =
                 streaming::StreamingCsvDecoder::new(reader, path.to_string(), delim, has_headers)
-                    .await?;
+                    .await
+                    .map_err(|(e, _)| e)?;
             let schema = decoder.schema().clone();
             let (tx, rx) = mpsc::channel(256);
             let stream_path = path.to_string();
@@ -529,6 +530,7 @@ async fn start_glob_stream_with_budget_for_backend(
                     )
                     .await
                     .map(|d| d.schema().clone())
+                    .map_err(|(e, _)| e)
                 }
                 "jsonl" | "ndjson" => {
                     let decoder = streaming::StreamingJsonlDecoder::new(reader, probe_path.clone());
@@ -603,8 +605,9 @@ async fn start_glob_stream_with_budget_for_backend(
                     .await
                     {
                         Ok(decoder) => decoder,
-                        Err(err) => {
+                        Err((err, bytes_read)) => {
                             warn!("fs9: streaming decode error for {}: {}", file_path, err);
+                            total_bytes = total_bytes.saturating_add(bytes_read);
                             continue;
                         }
                     };
@@ -1225,6 +1228,65 @@ mod tests {
 
         // b_big.txt skipped; a.txt and c.txt present.
         assert_eq!(lines, vec!["alpha", "charlie"]);
+
+        cleanup(&dir);
+    }
+
+    /// Regression: malformed CSV files that fail during StreamingCsvDecoder::new
+    /// must still charge their bytes against the total budget so that repeated
+    /// malformed files cannot bypass the budget limit.
+    #[tokio::test]
+    async fn test_malformed_csv_charges_bytes_against_budget() {
+        let dir = unique_base("malformed-csv-budget");
+
+        // a.csv: valid CSV (schema probe succeeds on this file). 12 bytes.
+        let valid = b"col1\nvalue1\n";
+        assert_eq!(valid.len(), 12);
+        fs::write(dir.join("a.csv"), valid).expect("write a.csv");
+
+        // b.csv, c.csv: malformed CSV (invalid UTF-8 → csv headers() error).
+        // Each file is 10 bytes.
+        let bad: &[u8] = b"\xff\xfe\xff\xfe\xff\xfe\xff\xfe\xff\xfe";
+        assert_eq!(bad.len(), 10);
+        fs::write(dir.join("b.csv"), bad).expect("write b.csv");
+        fs::write(dir.join("c.csv"), bad).expect("write c.csv");
+
+        // d.csv: valid CSV that should NOT be reached if budget is enforced.
+        fs::write(dir.join("d.csv"), b"col1\nextra\n").expect("write d.csv");
+
+        let pattern = format!("{}/*.csv", dir.display());
+        // Budget 30: a.csv charges 12 (success), b.csv fails but charges
+        // file_limit (remaining 18), total reaches 30 = budget. Loop breaks
+        // before c.csv/d.csv.
+        let budget: usize = 30;
+
+        let (_schema, mut rx) = start_glob_stream_with_budget_for_test_backend(
+            Box::new(TestLocalBackend),
+            &pattern,
+            Some("csv"),
+            None,
+            None,
+            None,
+            budget,
+        )
+        .await
+        .expect("start glob stream")
+        .expect("expected streaming result");
+
+        let mut rows = Vec::new();
+        while let Some(row) = rx.recv().await {
+            if let Value::Text(v) = &row.values[1] {
+                rows.push(v.clone());
+            }
+        }
+
+        // Only a.csv's data row should appear; b.csv and c.csv are malformed
+        // (no rows) but charge bytes, exhausting the budget before d.csv.
+        assert_eq!(
+            rows,
+            vec!["value1"],
+            "malformed CSV must charge bytes against budget; d.csv should be skipped"
+        );
 
         cleanup(&dir);
     }

@@ -171,16 +171,19 @@ impl StreamingCsvDecoder {
         path: String,
         delimiter: Option<char>,
         has_headers: bool,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, (anyhow::Error, usize)> {
         let delimiter = delimiter.unwrap_or(',');
-        let delimiter = u8::try_from(delimiter as u32)
-            .map_err(|_| anyhow::anyhow!("delimiter must be a single-byte character"))?;
+        let delimiter = u8::try_from(delimiter as u32).map_err(|e| (anyhow::anyhow!(e), 0))?;
 
         let mut data = Vec::new();
-        reader.read_to_end(&mut data).await?;
+        reader
+            .read_to_end(&mut data)
+            .await
+            .map_err(|e| (e.into(), data.len()))?;
         let total_bytes = data.len();
 
-        let (schema, col_count) = csv_schema_from_data(&data, delimiter, has_headers)?;
+        let (schema, col_count) =
+            csv_schema_from_data(&data, delimiter, has_headers).map_err(|e| (e, total_bytes))?;
 
         let (rows_tx, rows_rx) = mpsc::channel(256);
         tokio::task::spawn_blocking(move || {
