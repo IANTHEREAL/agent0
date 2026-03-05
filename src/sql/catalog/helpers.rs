@@ -73,6 +73,20 @@ pub fn float_col(name: &str) -> ColumnDef {
     }
 }
 
+/// PostgreSQL `"char"` — single-byte internal character type.
+pub fn char_col(name: &str) -> ColumnDef {
+    ColumnDef {
+        name: name.to_string(),
+        data_type: DataType::UserDefined("char".to_string()),
+        nullable: true,
+        primary_key: false,
+        unique: false,
+        is_serial: false,
+        default_expr: None,
+        collation: None,
+    }
+}
+
 pub fn bool_col(name: &str) -> ColumnDef {
     ColumnDef {
         name: name.to_string(),

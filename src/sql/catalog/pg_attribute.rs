@@ -95,13 +95,17 @@ impl VirtualTable for PgAttribute {
                 for (i, col) in schema.columns.iter().enumerate() {
                     let (type_oid, attlen) = if let DataType::UserDefined(udt_name) = &col.data_type
                     {
-                        let oid = ctx
-                            .store
-                            .get_type(ctx.txn, ctx.db_id, udt_name)
-                            .await?
-                            .map(|t| t.oid as i64)
-                            .unwrap_or(25);
-                        (oid, 4)
+                        if udt_name == "char" {
+                            (pg_types::OID_CHAR, 1)
+                        } else {
+                            let oid = ctx
+                                .store
+                                .get_type(ctx.txn, ctx.db_id, udt_name)
+                                .await?
+                                .map(|t| t.oid as i64)
+                                .unwrap_or(25);
+                            (oid, 4)
+                        }
                     } else {
                         let (oid, typlen) = pg_types::oid_and_typlen_for_datatype(&col.data_type);
                         (oid, typlen as i64)

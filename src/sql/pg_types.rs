@@ -2,6 +2,7 @@ use crate::model::DataType;
 
 pub(crate) const OID_BOOL: i64 = 16;
 pub(crate) const OID_BYTEA: i64 = 17;
+pub(crate) const OID_CHAR: i64 = 18;
 pub(crate) const OID_NAME: i64 = 19;
 pub(crate) const OID_INT8: i64 = 20;
 pub(crate) const OID_INT2: i64 = 21;
@@ -67,6 +68,7 @@ pub(crate) struct BuiltinPgType {
 pub(crate) const BUILTIN_PG_TYPES: &[BuiltinPgType] = &[
     BuiltinPgType { oid: OID_BOOL,        typname: "bool",        typlen:  1, typbyval: "t", typtype: "b", typcategory: "B", typcollation:   0 },
     BuiltinPgType { oid: OID_BYTEA,       typname: "bytea",       typlen: -1, typbyval: "f", typtype: "b", typcategory: "U", typcollation:   0 },
+    BuiltinPgType { oid: OID_CHAR,        typname: "char",        typlen:  1, typbyval: "t", typtype: "b", typcategory: "Z", typcollation:   0 },
     BuiltinPgType { oid: OID_NAME,        typname: "name",        typlen: 64, typbyval: "f", typtype: "b", typcategory: "S", typcollation: 100 },
     BuiltinPgType { oid: OID_INT8,        typname: "int8",        typlen:  8, typbyval: "t", typtype: "b", typcategory: "N", typcollation:   0 },
     BuiltinPgType { oid: OID_INT2,        typname: "int2",        typlen:  2, typbyval: "t", typtype: "b", typcategory: "N", typcollation:   0 },
@@ -133,6 +135,7 @@ pub(crate) fn oid_and_typlen_for_datatype(dt: &DataType) -> (i64, i32) {
         DataType::Tsquery => (OID_TSQUERY, -1),
         DataType::Name => (OID_NAME, 64),
         DataType::Varchar(_) => (OID_VARCHAR, -1),
+        DataType::UserDefined(s) if s == "char" => (OID_CHAR, 1),
         DataType::Array(_) | DataType::UserDefined(_) => (OID_TEXT, -1),
     }
 }

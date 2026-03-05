@@ -78,6 +78,7 @@ pub(in crate::protocol::handler) fn datatype_to_pgtype(dt: Option<&DataType>) ->
         Some(DataType::Tsquery) => Type::TSQUERY,
         Some(DataType::UserDefined(s)) if s.eq_ignore_ascii_case("int2vector") => Type::INT2_VECTOR,
         Some(DataType::UserDefined(s)) if s.eq_ignore_ascii_case("oidvector") => Type::OID_VECTOR,
+        Some(DataType::UserDefined(s)) if s == "char" => Type::CHAR,
         Some(DataType::Varchar(_)) => Type::VARCHAR,
         Some(DataType::Vector(_))
         | Some(DataType::Text)

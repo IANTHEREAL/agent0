@@ -1,4 +1,4 @@
-use super::helpers::{bool_col, int_col, int_val, null_val, text_col, text_val};
+use super::helpers::{bool_col, char_col, int_col, int_val, null_val, text_col, text_val};
 use super::{ScanContext, VirtualTable};
 use crate::model::{Row, TableSchema, Value};
 use crate::sql::catalog_oids;
@@ -26,15 +26,19 @@ impl VirtualTable for PgDatabase {
                 text_col("datname"),
                 int_col("datdba"),
                 int_col("encoding"),
-                text_col("datcollate"),
-                text_col("datctype"),
+                char_col("datlocprovider"),
                 bool_col("datistemplate"),
                 bool_col("datallowconn"),
+                bool_col("dathasloginevt"),
                 int_col("datconnlimit"),
-                int_col("datlastsysoid"),
                 int_col("datfrozenxid"),
                 int_col("datminmxid"),
                 int_col("dattablespace"),
+                text_col("datcollate"),
+                text_col("datctype"),
+                text_col("datlocale"),
+                text_col("daticurules"),
+                text_col("datcollversion"),
                 text_col("datacl"),
             ],
             version: 1,
@@ -59,15 +63,19 @@ impl VirtualTable for PgDatabase {
                 text_val(&db.name),
                 int_val(catalog_oids::pg_role_oid(&db.owner)),
                 int_val(6),
-                text_val("C"),
-                text_val("C"),
+                text_val("c"),
                 Value::Boolean(db.is_template),
                 Value::Boolean(db.allow_conn),
+                Value::Boolean(false),
                 int_val(-1),
                 int_val(0),
                 int_val(0),
                 int_val(0),
-                int_val(0),
+                text_val("C"),
+                text_val("C"),
+                null_val(),
+                null_val(),
+                null_val(),
                 null_val(),
             ]));
         }
