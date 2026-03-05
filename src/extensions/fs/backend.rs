@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use tokio::io::AsyncBufRead;
 
@@ -39,13 +39,31 @@ pub(crate) fn is_backend_available() -> bool {
     crate::extensions::context::tikv_client().is_some()
 }
 
-pub(crate) async fn get_backend(_tenant_keyspace: &str) -> Box<dyn FsBackend> {
-    let client = crate::extensions::context::tikv_client().expect(
-        "fs9: TiKV client not available in extension context. \
-                 Ensure the caller wraps this in with_context_opts().",
-    );
+pub(crate) async fn get_backend(_tenant_keyspace: &str) -> Result<Box<dyn FsBackend>> {
+    let client = crate::extensions::context::tikv_client().ok_or_else(|| {
+        anyhow!(
+            "fs9: TiKV client not available in extension context. \
+             Ensure the caller wraps this in with_context_opts()."
+        )
+    })?;
     EmbeddedFsBackend::new(client)
         .await
         .map(|b| Box::new(b) as Box<dyn FsBackend>)
-        .expect("fs9: failed to init embedded backend")
+        .map_err(|e| anyhow!("fs9: failed to init embedded backend: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn get_backend_without_context_returns_error() {
+        match get_backend("tenant_a").await {
+            Ok(_) => panic!("missing extension context must return error"),
+            Err(err) => assert!(
+                err.to_string().contains("TiKV client not available"),
+                "unexpected error: {err}"
+            ),
+        }
+    }
 }

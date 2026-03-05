@@ -268,7 +268,19 @@ impl DynamicPgHandler {
         // Read file bytes from fs9 backend
         let bare_path = crate::extensions::parquet::reader::strip_fs9_scheme(&filename);
         let tenant = executor.tenant_keyspace().to_string();
-        let backend = crate::extensions::fs::backend::get_backend(&tenant).await;
+        let backend = match crate::extensions::fs::backend::get_backend(&tenant).await {
+            Ok(backend) => backend,
+            Err(e) => {
+                if started_txn {
+                    let _ = session.rollback().await;
+                }
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "58030".to_string(),
+                    format!("COPY FROM fs9: {e}"),
+                ))));
+            }
+        };
         let file_data = match backend
             .read_file(
                 bare_path,

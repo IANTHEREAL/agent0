@@ -46,7 +46,7 @@ pub(crate) async fn infer_table_function_schema(
     tenant: &str,
     mode: &Fs9Mode,
 ) -> Result<TableSchema> {
-    let backend = backend::get_backend(tenant).await;
+    let backend = backend::get_backend(tenant).await?;
     let backend = backend.as_ref();
 
     match mode {
@@ -131,7 +131,7 @@ pub(crate) async fn execute_table_function(
     tenant: &str,
     mode: Fs9Mode,
 ) -> Result<(TableSchema, Vec<Row>)> {
-    let backend = backend::get_backend(tenant).await;
+    let backend = backend::get_backend(tenant).await?;
     execute_table_function_with_budget_for_backend(backend.as_ref(), mode, MAX_TOTAL_BYTES).await
 }
 
@@ -309,7 +309,7 @@ pub(crate) async fn start_file_stream(
     delimiter: Option<char>,
     header: Option<bool>,
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
-    let backend = backend::get_backend(tenant).await;
+    let backend = backend::get_backend(tenant).await?;
     let info = backend.stat(path).await?;
     if info.is_dir {
         return Ok(None);
@@ -469,7 +469,7 @@ async fn start_glob_stream_with_budget(
     exclude: Option<&str>,
     max_total_bytes: usize,
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
-    let backend = backend::get_backend(tenant).await;
+    let backend = backend::get_backend(tenant).await?;
     start_glob_stream_with_budget_for_backend(
         backend,
         pattern,

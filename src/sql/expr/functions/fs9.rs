@@ -94,7 +94,7 @@ fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
 fn get_backend_sync() -> Result<Box<dyn backend::FsBackend>> {
     let tenant = crate::extensions::context::tenant_keyspace()
         .ok_or_else(|| anyhow!("fs9: tenant keyspace not available in extension context"))?;
-    Ok(run_async(backend::get_backend(&tenant)))
+    run_async(backend::get_backend(&tenant))
 }
 
 pub fn fs9_read(args: Vec<Value>) -> Result<Value> {

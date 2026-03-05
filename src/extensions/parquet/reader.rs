@@ -42,7 +42,7 @@ async fn create_fs9_reader(url: &str) -> Result<super::fs9_reader::Fs9ParquetRea
     if !crate::extensions::context::is_superuser() {
         anyhow::bail!("fs9: permission denied");
     }
-    let backend = crate::extensions::fs::backend::get_backend(&tenant).await;
+    let backend = crate::extensions::fs::backend::get_backend(&tenant).await?;
     let data = backend
         .read_file(path, super::fs9_reader::MAX_FS9_PARQUET_FILE_BYTES)
         .await
