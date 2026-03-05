@@ -16,8 +16,11 @@ use super::fts_stopwords::is_english_stopword;
 /// Tokenizer function type: takes text and returns a vector of tokens.
 pub type TokenizerFn = fn(&str) -> Vec<String>;
 static TOKENIZER_REGISTRY: OnceLock<HashMap<String, TokenizerFn>> = OnceLock::new();
-type UserTscKey = (String, u64, String);
-type UserTscCacheMap = HashMap<UserTscKey, String>;
+/// Nested map: keyspace → db_id → config_name → tokenizer_name.
+///
+/// Three-level structure enables O(1) lookups via `String: Borrow<str>`
+/// at each level, avoiding String allocations on the read path.
+type UserTscCacheMap = HashMap<String, HashMap<u64, HashMap<String, String>>>;
 /// User-defined text search config → built-in tokenizer name.
 ///
 /// Populated by `CREATE TEXT SEARCH CONFIGURATION` (per-tenant DDL).
@@ -35,16 +38,22 @@ fn user_cache() -> &'static RwLock<UserTscCacheMap> {
 /// Called by the executor after successfully persisting to TiKV.
 pub fn register_user_tsc(keyspace: &str, db_id: u64, config_name: &str, tokenizer_name: &str) {
     let mut cache = user_cache().write().unwrap();
-    cache.insert(
-        (keyspace.to_string(), db_id, config_name.to_string()),
-        tokenizer_name.to_string(),
-    );
+    cache
+        .entry(keyspace.to_string())
+        .or_default()
+        .entry(db_id)
+        .or_default()
+        .insert(config_name.to_string(), tokenizer_name.to_string());
 }
 
 /// Remove a user-defined text search configuration from the in-process cache.
 pub fn unregister_user_tsc(keyspace: &str, db_id: u64, config_name: &str) {
     let mut cache = user_cache().write().unwrap();
-    cache.remove(&(keyspace.to_string(), db_id, config_name.to_string()));
+    if let Some(by_db) = cache.get_mut(keyspace) {
+        if let Some(by_cfg) = by_db.get_mut(&db_id) {
+            by_cfg.remove(config_name);
+        }
+    }
 }
 
 /// Resolve a user-defined TSC to a tokenizer function.
@@ -53,7 +62,7 @@ pub fn unregister_user_tsc(keyspace: &str, db_id: u64, config_name: &str) {
 /// tokenizer name doesn't exist in the static registry.
 pub fn resolve_user_tsc(keyspace: &str, db_id: u64, config: &str) -> Option<TokenizerFn> {
     let cache = user_cache().read().unwrap();
-    let tokenizer_name = cache.get(&(keyspace.to_string(), db_id, config.to_string()))?;
+    let tokenizer_name = cache.get(keyspace)?.get(&db_id)?.get(config)?;
     get_tokenizer(tokenizer_name)
 }
 
