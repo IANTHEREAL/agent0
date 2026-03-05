@@ -461,15 +461,11 @@ Notable integration workloads:
 
 ## db9 CLI
 
-`db9` is the customer-facing CLI for managing databases on db9-server. It handles account registration, database lifecycle, SQL execution, schema inspection, migrations, and more.
+`db9` is the customer-facing CLI for managing databases on db9-server. The legacy in-repo CLI source was removed from this repository; the maintained control-plane/CLI code now lives in `db9-backend`.
 
 ### Install
 
-```bash
-cd cloud-admin-portal/backend
-cargo build --release
-# Binary: target/release/db9
-```
+Build `db9` from the `db9-backend` repository.
 
 ### Configuration
 
@@ -589,20 +585,7 @@ Use `db9 --help` or `db9 <command> --help` for full option details.
 
 ## Admin Portal
 
-A web-based admin portal is available for managing multi-tenant deployments:
-
-```bash
-cd cloud-admin-portal
-./scripts/dev.sh
-```
-
-Features:
-- Tenant management (create, view, disable keyspaces)
-- User management per tenant (requires tenant credentials)
-- Health monitoring
-- Modern React UI with shadcn/ui
-
-See [cloud-admin-portal/README.md](cloud-admin-portal/README.md) for details.
+The legacy in-repo admin portal was removed from this repository. Use the maintained control-plane in `db9-backend`.
 
 ## License
 

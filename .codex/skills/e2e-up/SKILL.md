@@ -1,9 +1,11 @@
 ---
 name: e2e-up
-description: "Start the full db9 e2e Docker Compose environment (7 services: postgres, pd, tikv, db9-server, fs9-meta, fs9-server, db9-admin). Runs build, health wait, and smoke tests (db create / db sql / db sh against TiKV pagefs). Triggers on: e2e up, start e2e, 启动 e2e, deploy e2e, e2e environment."
+description: "Legacy notes for the retired 7-service db9 e2e stack. The current in-repo setup uses deploy/e2e/setup.sh for a 6-service stack without db9-admin."
 ---
 
 # db9 E2E Environment
+
+> Legacy note: the in-repo `cloud-admin-portal` / `db9-admin` target has been removed. For the current repo, use `deploy/e2e/setup.sh`, which starts the 6-service stack (`postgres`, `pd`, `tikv`, `db9-server`, `fs9-meta`, `fs9-server`) and runs direct SQL + fs9 smoke tests. The remainder of this document describes the retired setup.
 
 Spin up a complete local integration environment: PostgreSQL-compatible db9-server on TiKV storage, FS9 distributed filesystem (pagefs backed by TiKV), and the db9-admin cloud portal backend with the `db9` CLI.
 

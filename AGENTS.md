@@ -165,25 +165,23 @@ cd orm-tests && npm test
 
 ## E2E Integration Testing (mandatory for cross-component changes)
 
-Changes touching `cloud-admin-portal/`, `db9` CLI, or `fs9` (sh9 shell, fs9-server, fs9-meta, fs9-client) **must** be validated in the full E2E Docker Compose environment before merging.
-
-**Load the `e2e-up` skill** (`.codex/skills/e2e-up/SKILL.md`) for setup instructions, then:
+Changes touching `fs9` (sh9 shell, fs9-server, fs9-meta, fs9-client) **must** be validated in the full E2E Docker Compose environment before merging.
 
 ```bash
 cd deploy/e2e
-./setup.sh            # builds all 7 services, waits healthy, runs smoke tests
+./setup.sh            # builds all 6 services, waits healthy, runs smoke tests
 ```
 
-After the stack is running, verify your change end-to-end via `db9` inside the container:
+After the stack is running, verify your change end-to-end with direct SQL and service health checks:
 
 ```bash
-docker compose exec db9-admin db9 --api-url http://localhost:8090/api <command>
+docker compose exec -T postgres env PGPASSWORD=admin psql -h db9-server -p 5433 -U admin -d postgres -c 'SELECT 1'
 ```
 
 Rebuild only the affected service after code changes:
 
 ```bash
-docker compose build <service>   # db9-admin | db9-server | fs9-server | fs9-meta
+docker compose build <service>   # db9-server | fs9-server | fs9-meta
 docker compose up -d <service>
 ```
 

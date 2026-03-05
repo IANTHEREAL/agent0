@@ -4,19 +4,19 @@
 # What this script does:
 #   1. Validates prerequisites (docker, docker compose)
 #   2. Generates .env if missing (prompts for FS9_REPO_PATH, auto-generates secrets)
-#   3. Brings up all 7 services with --build
+#   3. Brings up all 6 services with --build
 #   4. Waits for all health checks to pass
-#   5. Runs smoke tests: db create → db sql → db sh (TiKV pagefs write/read)
+#   5. Runs smoke tests: direct SQL against db9-server + fs9 health
 #
 # Usage:
 #   ./setup.sh                        # full setup + smoke test
 #   ./setup.sh --skip-build           # skip docker rebuild (use cached images)
 #   ./setup.sh --smoke-only           # only run smoke tests against a running stack
 #   ./setup.sh --reset                # wipe volumes, rebuild everything from scratch
-#   ./setup.sh --multi-tenant-test    # run multi-tenant isolation tests (in addition to smoke)
+#   ./setup.sh --multi-tenant-test    # legacy flag; now unsupported without db9-backend
 #   ./setup.sh --binary svc=/path     # inject local binary into container after start
-#                                     # svc: db9-admin, db9-server, fs9-server, fs9-meta
-#                                     # example: --binary db9-admin=/target/release/db9-admin
+#                                     # svc: db9-server, fs9-server, fs9-meta
+#                                     # example: --binary db9-server=/target/release/db9-server
 #                                     # multiple binaries: --binary a=/p1 --binary b=/p2
 
 set -euo pipefail
@@ -108,7 +108,7 @@ FS9_REPO_PATH=${fs9_path}
 FS9_JWT_SECRET=${jwt_secret}
 FS9_META_KEY=${meta_key}
 
-# PostgreSQL credentials for db9-admin
+# PostgreSQL credentials for e2e smoke tests
 POSTGRES_USER=admin
 POSTGRES_PASSWORD=admin
 
@@ -152,8 +152,8 @@ IGNORE
   fi
 
   # 3. Check for host port conflicts
-  local ports=(5433 8090 9999)
-  local names=("db9-server" "db9-admin" "fs9-server")
+  local ports=(5433 9999)
+  local names=("db9-server" "fs9-server")
   local conflicts=()
 
   for i in "${!ports[@]}"; do
@@ -213,7 +213,6 @@ start_stack() {
 # Returns the in-container binary path for a given service name.
 container_bin_path() {
   case "$1" in
-    db9-admin) echo "/app/db9-admin" ;;
     db9-server)      echo "/app/db9-server" ;;
     fs9-server)   echo "/app/fs9-server" ;;
     fs9-meta)     echo "/app/fs9-meta" ;;
@@ -235,7 +234,7 @@ inject_binaries() {
     container_path="$(container_bin_path "$svc")"
 
     [[ -f "$local_path" ]] || die "Binary not found: $local_path"
-    [[ -n "$container_path" ]] || die "Unknown service for binary injection: $svc (valid: db9-admin, db9-server, fs9-server, fs9-meta)"
+    [[ -n "$container_path" ]] || die "Unknown service for binary injection: $svc (valid: db9-server, fs9-server, fs9-meta)"
 
     info "  Injecting ${svc}: ${local_path} → ${container_path}"
     docker compose cp "${local_path}" "${svc}:${container_path}"
@@ -250,7 +249,7 @@ inject_binaries() {
 
 # ── Wait for all services ─────────────────────────────────────────────────────
 wait_healthy() {
-  local services=(postgres pd tikv db9-server fs9-meta fs9-server db9-admin)
+  local services=(postgres pd tikv db9-server fs9-meta fs9-server)
   local timeout=300  # seconds
   local start=$SECONDS
 
@@ -293,170 +292,37 @@ wait_healthy() {
 run_smoke_tests() {
   info "Running smoke tests..."
 
-  local db9="docker compose exec -T db9-admin db9 --api-url http://localhost:8090/api"
+  # --- 1. pg_isready ---
+  info "  [1/3] pg_isready against db9-server"
+  docker compose exec -T postgres env PGPASSWORD=admin \
+    pg_isready -h db9-server -p 5433 -U admin -d postgres >/dev/null 2>&1 \
+    || die "pg_isready failed against db9-server"
+  ok "  db9-server accepts PostgreSQL connections"
 
-  # --- 1. db create ---
-  info "  [1/3] db9 db create --name smoketest"
-  local create_out
-  create_out=$($db9 db create --name smoketest 2>&1) \
-    || die "db create failed:\n${create_out}"
-
-  local db_id
-  db_id=$(echo "$create_out" | grep '^ID:' | awk '{print $2}' | tr -d '[:space:]')
-  [[ -n "$db_id" ]] || die "Could not parse DB ID from:\n${create_out}"
-  ok "  Created DB: ${db_id}"
-
-  # --- 2. db sql ---
-  info "  [2/3] db9 db sql (SELECT 1)"
+  # --- 2. SQL ---
+  info "  [2/3] psql SELECT 1"
   local sql_out
-  sql_out=$(echo "SELECT 1 AS answer;" | $db9 db sql "$db_id" 2>&1) \
-    || die "db sql failed:\n${sql_out}"
-  echo "$sql_out" | grep -q "1" \
+  sql_out=$(docker compose exec -T postgres env PGPASSWORD=admin \
+    psql -h db9-server -p 5433 -U admin -d postgres -At -v ON_ERROR_STOP=1 \
+      -c "SELECT 1 AS answer;" 2>&1) \
+    || die "psql smoke test failed:\n${sql_out}"
+  echo "$sql_out" | grep -qx "1" \
     || die "SELECT 1 did not return expected result:\n${sql_out}"
-  ok "  SQL OK: $(echo "$sql_out" | grep -v '^$' | tail -1)"
+  ok "  SQL OK"
 
-  # --- 3. db sh (TiKV pagefs) ---
-  info "  [3/3] db9 sh — write and read file on TiKV pagefs"
-  local sh_out
-  sh_out=$($db9 sh "$db_id" -c "echo e2e_smoke_ok > /smoke.txt && cat /smoke.txt" 2>&1) \
-    || die "db sh failed:\n${sh_out}"
-  echo "$sh_out" | grep -q "e2e_smoke_ok" \
-    || die "pagefs write/read failed:\n${sh_out}"
-  ok "  pagefs OK: $(echo "$sh_out" | tr -d '\n')"
+  # --- 3. fs9 health ---
+  info "  [3/3] fs9-server health"
+  docker compose exec -T fs9-server curl -sf http://localhost:9999/health >/dev/null 2>&1 \
+    || die "fs9-server health check failed"
+  ok "  fs9-server health OK"
 
-  # Print connection string for convenience
   echo ""
-  echo "$create_out" | grep -E '(Connection String|psql Command)' || true
-  echo ""
-  ok "All smoke tests passed. DB ID: ${db_id}"
+  ok "All smoke tests passed."
 }
 
 # ── Multi-tenant isolation tests ──────────────────────────────────────────────
 run_multi_tenant_tests() {
-  info "Running multi-tenant isolation tests..."
-
-  local alice_email="e2e_alice_$(date +%s)@test.local"
-  local bob_email="e2e_bob_$(date +%s)@test.local"
-
-  # Register Alice and Bob
-  info "  Registering two customer accounts..."
-  docker compose exec -T db9-admin bash -c "
-    curl -sf -X POST http://localhost:8090/api/customer/register \
-      -H 'Content-Type: application/json' \
-      -d '{\"email\":\"${alice_email}\",\"password\":\"alice_password_123\"}' > /dev/null"
-  docker compose exec -T db9-admin bash -c "
-    curl -sf -X POST http://localhost:8090/api/customer/register \
-      -H 'Content-Type: application/json' \
-      -d '{\"email\":\"${bob_email}\",\"password\":\"bob_password_456\"}' > /dev/null"
-
-  # Run the full isolation test script inside the container.
-  # Use a temp file to avoid heredoc quoting issues with nested quotes.
-  local tmp_script
-  tmp_script=$(mktemp /tmp/mt_test_XXXXXX.sh)
-  trap "rm -f $tmp_script" RETURN
-
-  cat > "$tmp_script" << 'SCRIPT_END'
-#!/bin/sh
-set -eu
-CRED_FILE="/root/.db9/credentials"
-ALICE_EMAIL="$1"
-BOB_EMAIL="$2"
-API="http://localhost:8090/api"
-
-ALICE_TOKEN=$(curl -s -X POST "$API/customer/login" \
-  -H 'Content-Type: application/json' \
-  -d "{\"email\":\"$ALICE_EMAIL\",\"password\":\"alice_password_123\"}" | \
-  sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
-BOB_TOKEN=$(curl -s -X POST "$API/customer/login" \
-  -H 'Content-Type: application/json' \
-  -d "{\"email\":\"$BOB_EMAIL\",\"password\":\"bob_password_456\"}" | \
-  sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
-
-[ -n "$ALICE_TOKEN" ] || { echo "FAIL: could not get Alice token"; exit 1; }
-[ -n "$BOB_TOKEN" ]   || { echo "FAIL: could not get Bob token"; exit 1; }
-
-ALICE_DB=$(curl -s -X POST "$API/customer/databases" \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $ALICE_TOKEN" \
-  -d '{"name":"mt_alice"}' | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-BOB_DB=$(curl -s -X POST "$API/customer/databases" \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $BOB_TOKEN" \
-  -d '{"name":"mt_bob"}' | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-
-[ -n "$ALICE_DB" ] || { echo "FAIL: could not create Alice DB"; exit 1; }
-[ -n "$BOB_DB" ]   || { echo "FAIL: could not create Bob DB"; exit 1; }
-
-cp "$CRED_FILE" "${CRED_FILE}.bak"
-PASS=0; FAIL=0
-
-# Test 1: Alice writes to her own DB
-printf 'token = "%s"\n' "$ALICE_TOKEN" > "$CRED_FILE"
-if db9 --api-url "$API" sh "$ALICE_DB" -c 'echo alice_private > /alice_mt.txt && grep alice_private /alice_mt.txt' > /dev/null 2>&1; then
-  echo "  PASS: Alice writes to her DB"; PASS=$((PASS+1))
-else
-  echo "  FAIL: Alice writes to her DB"; FAIL=$((FAIL+1))
-fi
-
-# Test 2: Bob writes to his own DB
-printf 'token = "%s"\n' "$BOB_TOKEN" > "$CRED_FILE"
-if db9 --api-url "$API" sh "$BOB_DB" -c 'echo bob_private > /bob_mt.txt && grep bob_private /bob_mt.txt' > /dev/null 2>&1; then
-  echo "  PASS: Bob writes to his DB"; PASS=$((PASS+1))
-else
-  echo "  FAIL: Bob writes to his DB"; FAIL=$((FAIL+1))
-fi
-
-# Test 3: Alice's data persists in TiKV
-printf 'token = "%s"\n' "$ALICE_TOKEN" > "$CRED_FILE"
-if db9 --api-url "$API" sh "$ALICE_DB" -c 'grep alice_private /alice_mt.txt' > /dev/null 2>&1; then
-  echo "  PASS: Alice data persists in TiKV"; PASS=$((PASS+1))
-else
-  echo "  FAIL: Alice data persists in TiKV"; FAIL=$((FAIL+1))
-fi
-
-# Test 4: Alice blocked from Bob's DB
-ASTATUS=$(curl -sw "%{http_code}" -o /dev/null \
-  -H "Authorization: Bearer $ALICE_TOKEN" \
-  "http://localhost:8090/fs9/$BOB_DB/api/v1/stat?path=/")
-if [ "$ASTATUS" = "404" ]; then
-  echo "  PASS: Alice blocked from Bob DB (HTTP 404)"; PASS=$((PASS+1))
-else
-  echo "  FAIL: Alice got HTTP $ASTATUS for Bob DB (expected 404)"; FAIL=$((FAIL+1))
-fi
-
-# Test 5: Bob blocked from Alice's DB
-BSTATUS=$(curl -sw "%{http_code}" -o /dev/null \
-  -H "Authorization: Bearer $BOB_TOKEN" \
-  "http://localhost:8090/fs9/$ALICE_DB/api/v1/stat?path=/")
-if [ "$BSTATUS" = "404" ]; then
-  echo "  PASS: Bob blocked from Alice DB (HTTP 404)"; PASS=$((PASS+1))
-else
-  echo "  FAIL: Bob got HTTP $BSTATUS for Alice DB (expected 404)"; FAIL=$((FAIL+1))
-fi
-
-# Test 6: Alice's file not visible in Bob's DB
-printf 'token = "%s"\n' "$BOB_TOKEN" > "$CRED_FILE"
-if db9 --api-url "$API" sh "$BOB_DB" -c 'cat /alice_mt.txt' > /dev/null 2>&1; then
-  echo "  FAIL: alice_mt.txt visible in Bob DB (isolation broken!)"; FAIL=$((FAIL+1))
-else
-  echo "  PASS: alice_mt.txt not visible in Bob DB"; PASS=$((PASS+1))
-fi
-
-cp "${CRED_FILE}.bak" "$CRED_FILE"
-
-echo "Results: $PASS passed, $FAIL failed"
-[ "$FAIL" -eq 0 ] || exit 1
-SCRIPT_END
-
-  docker compose cp "$tmp_script" "db9-admin:/tmp/mt_test.sh"
-  local result
-  result=$(docker compose exec -T db9-admin sh /tmp/mt_test.sh \
-    "$alice_email" "$bob_email" 2>&1)
-
-  echo "$result"
-  echo "$result" | grep -q "Results:" || die "Multi-tenant test script did not complete"
-  echo "$result" | grep -q "0 failed"  || die "Some multi-tenant isolation tests FAILED"
-  ok "All multi-tenant isolation tests passed."
+  die "--multi-tenant-test is unavailable after removing the in-repo cloud admin target; use db9-backend for control-plane isolation tests."
 }
 
 # ── Print service URLs ────────────────────────────────────────────────────────
@@ -465,17 +331,14 @@ print_summary() {
   echo "─────────────────────────────────────────────────────"
   echo " db9 e2e stack is running"
   echo "─────────────────────────────────────────────────────"
-  echo "  db9-admin API : http://localhost:8090/api"
   echo "  db9-server (psql)   : postgresql://localhost:5433"
   echo "  fs9-server       : http://localhost:9999"
   echo "  fs9-meta         : http://localhost:9998"
   echo ""
-  echo " db9 usage (inside container):"
-  echo "  docker compose exec db9-admin db9 --api-url http://localhost:8090/api db list"
-  echo "  docker compose exec db9-admin db9 --api-url http://localhost:8090/api sh <id>"
+  echo " Direct SQL smoke check:"
+  echo "  docker compose exec -T postgres env PGPASSWORD=admin psql -h db9-server -p 5433 -U admin -d postgres -c 'SELECT 1'"
   echo ""
   echo " Inject a local binary (e.g. after cargo build):"
-  echo "  ./setup.sh --skip-build --binary=db9-admin=../../target/release/db9-admin"
   echo "  ./setup.sh --skip-build --binary=db9-server=../../target/release/db9-server"
   echo ""
   echo " Useful commands:"
