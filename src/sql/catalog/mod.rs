@@ -37,6 +37,7 @@ mod pg_statistic_ext;
 mod pg_tables;
 mod pg_trigger;
 mod pg_type;
+mod pg_user;
 mod pg_views;
 mod referential_constraints;
 mod routines;
@@ -113,6 +114,7 @@ impl CatalogRegistry {
         registry.register(Box::new(pg_proc::PgProc));
         registry.register(Box::new(pg_range::PgRange));
         registry.register(Box::new(pg_roles::PgRoles));
+        registry.register(Box::new(pg_user::PgUser));
         registry.register(Box::new(pg_sequence::PgSequence));
         registry.register(Box::new(pg_shdescription::PgShdescription));
         registry.register(Box::new(pg_statistic_ext::PgStatisticExt));
@@ -211,6 +213,15 @@ mod tests {
         let t = catalog.get("pg_roles").unwrap();
         assert_eq!(t.name(), "pg_roles");
         assert_eq!(t.schema().columns.len(), 13);
+    }
+
+    #[test]
+    fn registry_contains_pg_user() {
+        let catalog = global_catalog();
+        let t = catalog.get("pg_user").unwrap();
+        assert_eq!(t.name(), "pg_user");
+        assert_eq!(t.schema_name(), "pg_catalog");
+        assert_eq!(t.schema().columns.len(), 9);
     }
 
     #[test]

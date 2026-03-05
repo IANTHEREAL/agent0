@@ -8,6 +8,7 @@
 //! - pgvector distance operators (`<->`, `<#>`, `<=>`) -> function calls
 //! - `AT TIME ZONE $n` -> `AT TIME ZONE 'UTC'` (parse-time placeholder)
 //! - `RESET ROLE` -> `SET ROLE NONE`
+//! - `CREATE/ALTER/DROP USER` -> `... ROLE` (with `CREATE USER` implying `LOGIN`)
 
 use super::tokenizer::{
     find_left_expr_start, find_right_expr_end, skip_ws_comments_backward, skip_ws_comments_forward,
@@ -413,4 +414,167 @@ fn collect_reset_role_rewrite(
         tokens[j].end,
         "SET ROLE NONE".to_string(),
     ));
+}
+
+/// Rewrite `CREATE/ALTER/DROP USER` to the PostgreSQL-equivalent `... ROLE`.
+///
+/// PostgreSQL treats USER as an alias of ROLE for these statements, with one
+/// semantic tweak: `CREATE USER` implies `LOGIN` by default (unlike
+/// `CREATE ROLE`, which defaults to `NOLOGIN`).
+///
+/// This rewrite intentionally excludes `... USER MAPPING ...` statements (FDW
+/// user mappings), which are unrelated and must not be rewritten.
+///
+/// Classification: parse-compatibility shim.
+/// Exit condition: remove when sqlparser-rs supports USER aliases.
+pub(super) fn rewrite_user_role_aliases(sql: &str) -> String {
+    let tokens = tokenize_sql_for_rewrite(sql);
+    if tokens.is_empty() {
+        return sql.to_string();
+    }
+
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+
+    let mut stmt_start = 0usize;
+    for (idx, tok) in tokens.iter().enumerate() {
+        if tok.kind == TokenKind::Punct && tok.text == ";" {
+            collect_user_role_alias_rewrite(&tokens, stmt_start, idx, &mut replacements);
+            stmt_start = idx + 1;
+        }
+    }
+    collect_user_role_alias_rewrite(&tokens, stmt_start, tokens.len(), &mut replacements);
+
+    if replacements.is_empty() {
+        return sql.to_string();
+    }
+
+    // Apply replacements from right to left so offsets remain valid.
+    replacements.sort_by_key(|(s, _, _)| *s);
+    let mut out = sql.to_string();
+    for (start, end, repl) in replacements.into_iter().rev() {
+        out.replace_range(start..end, &repl);
+    }
+    out
+}
+
+fn collect_user_role_alias_rewrite(
+    tokens: &[Token],
+    stmt_start: usize,
+    stmt_end: usize,
+    replacements: &mut Vec<(usize, usize, String)>,
+) {
+    let idx = skip_ws_comments_forward(tokens, stmt_start, stmt_end);
+    if idx >= stmt_end || tokens[idx].kind != TokenKind::Word {
+        return;
+    }
+
+    let verb = tokens[idx].text.as_str();
+    if !verb.eq_ignore_ascii_case("CREATE")
+        && !verb.eq_ignore_ascii_case("ALTER")
+        && !verb.eq_ignore_ascii_case("DROP")
+    {
+        return;
+    }
+
+    let user_idx = skip_ws_comments_forward(tokens, idx + 1, stmt_end);
+    if user_idx >= stmt_end
+        || tokens[user_idx].kind != TokenKind::Word
+        || !tokens[user_idx].text.eq_ignore_ascii_case("USER")
+    {
+        return;
+    }
+
+    let after_user = skip_ws_comments_forward(tokens, user_idx + 1, stmt_end);
+    if after_user < stmt_end
+        && tokens[after_user].kind == TokenKind::Word
+        && tokens[after_user].text.eq_ignore_ascii_case("MAPPING")
+    {
+        return;
+    }
+
+    // Rewrite USER -> ROLE for CREATE/ALTER/DROP.
+    replacements.push((
+        tokens[user_idx].start,
+        tokens[user_idx].end,
+        "ROLE".to_string(),
+    ));
+
+    // CREATE USER additionally implies LOGIN.
+    if !verb.eq_ignore_ascii_case("CREATE") {
+        return;
+    }
+
+    // Skip optional IF NOT EXISTS.
+    let mut name_idx = after_user;
+    if name_idx < stmt_end
+        && tokens[name_idx].kind == TokenKind::Word
+        && tokens[name_idx].text.eq_ignore_ascii_case("IF")
+    {
+        let not_idx = skip_ws_comments_forward(tokens, name_idx + 1, stmt_end);
+        let exists_idx = skip_ws_comments_forward(tokens, not_idx + 1, stmt_end);
+        if exists_idx < stmt_end
+            && tokens[not_idx].kind == TokenKind::Word
+            && tokens[not_idx].text.eq_ignore_ascii_case("NOT")
+            && tokens[exists_idx].kind == TokenKind::Word
+            && tokens[exists_idx].text.eq_ignore_ascii_case("EXISTS")
+        {
+            name_idx = skip_ws_comments_forward(tokens, exists_idx + 1, stmt_end);
+        }
+    }
+
+    if name_idx >= stmt_end {
+        return;
+    }
+
+    // Consume one or more role names separated by commas.
+    let mut cursor = name_idx;
+    loop {
+        if cursor >= stmt_end
+            || !matches!(
+                tokens[cursor].kind,
+                TokenKind::Word | TokenKind::QuotedIdent
+            )
+        {
+            break;
+        }
+        cursor = skip_ws_comments_forward(tokens, cursor + 1, stmt_end);
+        if cursor < stmt_end
+            && tokens[cursor].kind == TokenKind::Punct
+            && tokens[cursor].text == ","
+        {
+            cursor = skip_ws_comments_forward(tokens, cursor + 1, stmt_end);
+            continue;
+        }
+        break;
+    }
+
+    // Insert LOGIN after an existing WITH, otherwise inject `WITH LOGIN`.
+    let opts_idx = cursor;
+    if opts_idx < stmt_end
+        && tokens[opts_idx].kind == TokenKind::Word
+        && tokens[opts_idx].text.eq_ignore_ascii_case("WITH")
+    {
+        replacements.push((
+            tokens[opts_idx].end,
+            tokens[opts_idx].end,
+            " LOGIN".to_string(),
+        ));
+        return;
+    }
+
+    let insert_at = if opts_idx < stmt_end {
+        tokens[opts_idx].start
+    } else if stmt_end > stmt_start {
+        let last = skip_ws_comments_backward(tokens, stmt_end - 1, stmt_start);
+        tokens[last].end
+    } else {
+        return;
+    };
+
+    let suffix = if opts_idx < stmt_end {
+        " WITH LOGIN ".to_string()
+    } else {
+        " WITH LOGIN".to_string()
+    };
+    replacements.push((insert_at, insert_at, suffix));
 }

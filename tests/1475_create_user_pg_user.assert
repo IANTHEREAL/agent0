@@ -1,0 +1,3 @@
+a1_pg_user_has_readonly=true
+a2_pg_user_row=issue1475_readonly
+a3_pg_user_dropped=true

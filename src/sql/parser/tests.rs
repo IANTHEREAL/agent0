@@ -30,6 +30,26 @@ fn test_parse_create_table() {
 }
 
 #[test]
+fn test_parse_create_user_aliases_to_create_role_with_login() {
+    let stmts = parse_sql("CREATE USER readonly WITH PASSWORD 'test123'").unwrap();
+    assert_eq!(stmts.len(), 1);
+    match &stmts[0] {
+        Statement::CreateRole {
+            names,
+            login,
+            password,
+            ..
+        } => {
+            assert_eq!(names.len(), 1);
+            assert_eq!(names[0].to_string(), "readonly");
+            assert_eq!(*login, Some(true));
+            assert!(password.is_some());
+        }
+        other => panic!("expected CREATE ROLE, got {:?}", other),
+    }
+}
+
+#[test]
 fn test_parse_create_schema_named_authorization() {
     let stmts = parse_sql("CREATE SCHEMA s1 AUTHORIZATION owner1").unwrap();
     assert_eq!(stmts.len(), 1);
@@ -155,6 +175,41 @@ fn test_rewrite_does_not_touch_non_role_reset() {
     assert_eq!(preprocess_sql("RESET ALL"), "RESET ALL");
     // RESET ROLE is still rewritten
     assert_eq!(preprocess_sql("RESET ROLE"), "SET ROLE NONE");
+}
+
+#[test]
+fn test_rewrite_user_role_aliases_is_statement_aware() {
+    assert_eq!(
+        preprocess_sql("CREATE USER bob"),
+        "CREATE ROLE bob WITH LOGIN"
+    );
+    assert_eq!(
+        preprocess_sql("CREATE USER bob WITH PASSWORD 'test123'"),
+        "CREATE ROLE bob WITH LOGIN PASSWORD 'test123'"
+    );
+    assert_eq!(
+        preprocess_sql("ALTER USER bob WITH LOGIN"),
+        "ALTER ROLE bob WITH LOGIN"
+    );
+    assert_eq!(preprocess_sql("DROP USER bob"), "DROP ROLE bob");
+    assert_eq!(
+        preprocess_sql("SELECT 'CREATE USER bob'"),
+        "SELECT 'CREATE USER bob'"
+    );
+    assert_eq!(
+        preprocess_sql("-- CREATE USER bob\nSELECT 1"),
+        "-- CREATE USER bob\nSELECT 1"
+    );
+    assert_eq!(
+        preprocess_sql("CREATE USER bob; SELECT 'DROP USER bob';"),
+        "CREATE ROLE bob WITH LOGIN; SELECT 'DROP USER bob';"
+    );
+}
+
+#[test]
+fn test_rewrite_user_role_aliases_does_not_touch_user_mapping() {
+    let sql = "CREATE USER MAPPING FOR CURRENT_USER SERVER s";
+    assert_eq!(preprocess_sql(sql), sql);
 }
 
 #[test]

@@ -9,7 +9,8 @@ use regex::Regex;
 
 use super::operator_rewrite::{
     rewrite_all_any_subquery_parse_compat, rewrite_at_time_zone_placeholders,
-    rewrite_jsonb_exists_ops, rewrite_reset_role, rewrite_vector_distance_ops,
+    rewrite_jsonb_exists_ops, rewrite_reset_role, rewrite_user_role_aliases,
+    rewrite_vector_distance_ops,
 };
 use super::tokenizer::{tokenize_sql_for_rewrite, Token, TokenKind};
 
@@ -988,6 +989,10 @@ fn preprocess_partition_ancestors_with_ordinality(sql: &str) -> Option<String> {
 ///   What: `RESET ROLE` -> `SET ROLE NONE`.
 ///   Why: sqlparser-rs lacks RESET ROLE support.
 ///   Exit condition: RESET ROLE statement support added.
+/// - `rewrite_user_role_aliases`
+///   What: `CREATE/ALTER/DROP USER` -> `... ROLE` (and `CREATE USER` implies `LOGIN`).
+///   Why: sqlparser-rs lacks USER alias support for role DDL.
+///   Exit condition: sqlparser-rs supports USER aliases.
 /// - `rewrite_all_any_subquery_parse_compat`
 ///   What: `ANY/ALL(SELECT ...)` -> `ANY/ALL(ARRAY(SELECT ...))`.
 ///   Why: sqlparser-rs can't parse direct subquery form.
@@ -1090,6 +1095,9 @@ pub(super) fn preprocess_sql(sql: &str) -> String {
     result = rewrite_jsonb_exists_ops(&result);
 
     result = rewrite_vector_distance_ops(&result);
+
+    // `CREATE/ALTER/DROP USER` are aliases of `... ROLE` in PostgreSQL.
+    result = rewrite_user_role_aliases(&result);
 
     // sqlparser-rs doesn't support PostgreSQL's `RESET ROLE`, but it does support the equivalent
     // `SET ROLE NONE`. Non-ROLE RESET is handled by raw_sql::Reset in the executor.
