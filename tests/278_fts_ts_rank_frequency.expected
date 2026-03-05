@@ -1,0 +1,24 @@
+freq_matters_simple
+t
+(1 row)
+freq_matters_english
+t
+(1 row)
+norm_2_reduces
+t
+(1 row)
+norm_1_reduces
+t
+(1 row)
+norm_32_reduces
+t
+(1 row)
+cd_freq_matters
+t
+(1 row)
+weight_a_higher
+t
+(1 row)
+to_tsvector
+'database':1,2,3
+(1 row)

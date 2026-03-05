@@ -3323,4 +3323,231 @@ mod tests {
             "all-negative weights should produce same result as default weights"
         );
     }
+
+    // ── ts_rank term frequency tests (#1219) ──────────────────────
+
+    #[test]
+    fn test_ts_rank_term_frequency_direct() {
+        // Direct tsvector strings — bypass to_tsvector, test ranking algorithm.
+        // 3 positions must score higher than 1 position.
+        let rank_3x = ts_rank(vec![
+            Value::Tsvector("'database':1,2,3".to_string()),
+            Value::Tsquery("'database'".to_string()),
+        ])
+        .unwrap();
+        let rank_1x = ts_rank(vec![
+            Value::Tsvector("'database':1".to_string()),
+            Value::Tsquery("'database'".to_string()),
+        ])
+        .unwrap();
+        match (&rank_3x, &rank_1x) {
+            (Value::Float64(r3), Value::Float64(r1)) => {
+                assert!(r3 > r1, "3x freq ({}) must be > 1x freq ({})", r3, r1);
+            }
+            _ => panic!("expected Float64"),
+        }
+    }
+
+    #[test]
+    fn test_ts_rank_term_frequency_via_to_tsvector_english() {
+        // End-to-end via to_tsvector (English/simple config).
+        let tv_3x = to_tsvector(vec![
+            Value::Text("simple".to_string()),
+            Value::Text("database database database".to_string()),
+        ])
+        .unwrap();
+        let tv_1x = to_tsvector(vec![
+            Value::Text("simple".to_string()),
+            Value::Text("database".to_string()),
+        ])
+        .unwrap();
+        let tq = plainto_tsquery(vec![
+            Value::Text("simple".to_string()),
+            Value::Text("database".to_string()),
+        ])
+        .unwrap();
+
+        let rank_3x = ts_rank(vec![tv_3x, tq.clone()]).unwrap();
+        let rank_1x = ts_rank(vec![tv_1x, tq]).unwrap();
+
+        match (&rank_3x, &rank_1x) {
+            (Value::Float64(r3), Value::Float64(r1)) => {
+                assert!(
+                    r3 > r1,
+                    "English end-to-end: 3x ({}) must be > 1x ({})",
+                    r3,
+                    r1
+                );
+            }
+            _ => panic!("expected Float64"),
+        }
+    }
+
+    #[test]
+    fn test_ts_rank_term_frequency_via_to_tsvector_chinese() {
+        // End-to-end via to_tsvector (Chinese config).
+        // Jieba must segment "数据库数据库数据库" into 3 separate "数据库" tokens.
+        let tv_3x = to_tsvector(vec![
+            Value::Text("chinese".to_string()),
+            Value::Text("数据库数据库数据库".to_string()),
+        ])
+        .unwrap();
+        let tv_1x = to_tsvector(vec![
+            Value::Text("chinese".to_string()),
+            Value::Text("数据库".to_string()),
+        ])
+        .unwrap();
+        let tq = plainto_tsquery(vec![
+            Value::Text("chinese".to_string()),
+            Value::Text("数据库".to_string()),
+        ])
+        .unwrap();
+
+        // Verify tsvector content
+        match &tv_3x {
+            Value::Tsvector(s) => assert!(
+                s.contains(":1,2,3") || s.contains(":1,2,3"),
+                "expected 3 positions in Chinese tsvector, got: {}",
+                s
+            ),
+            _ => panic!("expected Tsvector"),
+        }
+
+        let rank_3x = ts_rank(vec![tv_3x, tq.clone()]).unwrap();
+        let rank_1x = ts_rank(vec![tv_1x, tq]).unwrap();
+
+        match (&rank_3x, &rank_1x) {
+            (Value::Float64(r3), Value::Float64(r1)) => {
+                assert!(
+                    r3 > r1,
+                    "Chinese end-to-end: 3x ({}) must be > 1x ({})",
+                    r3,
+                    r1
+                );
+            }
+            _ => panic!("expected Float64"),
+        }
+    }
+
+    #[test]
+    fn test_ts_rank_normalization_flags() {
+        let tv = Value::Tsvector("'hello':1 'world':2 'foo':3".to_string());
+        let tq = Value::Tsquery("'hello'".to_string());
+
+        let base = ts_rank(vec![tv.clone(), tq.clone()]).unwrap();
+        for flag in [1, 2, 8, 16, 32] {
+            let normed = ts_rank(vec![tv.clone(), tq.clone(), Value::Int32(flag)]).unwrap();
+            match (&base, &normed) {
+                (Value::Float64(b), Value::Float64(n)) => {
+                    assert!(
+                        n < b,
+                        "norm flag {} should reduce score: base={}, normed={}",
+                        flag,
+                        b,
+                        n
+                    );
+                }
+                _ => panic!("expected Float64"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_ts_rank_normalization_differentiates_by_frequency() {
+        // With normalization flag 2 (LENGTH), different tsvectors produce
+        // different normalized scores because cnt_length differs.
+        let tv_3x = Value::Tsvector("'database':1,2,3".to_string());
+        let tv_1x = Value::Tsvector("'database':1".to_string());
+        let tq = Value::Tsquery("'database'".to_string());
+
+        let norm_3x = ts_rank(vec![tv_3x, tq.clone(), Value::Int32(2)]).unwrap();
+        let norm_1x = ts_rank(vec![tv_1x, tq, Value::Int32(2)]).unwrap();
+
+        match (&norm_3x, &norm_1x) {
+            (Value::Float64(n3), Value::Float64(n1)) => {
+                assert!(
+                    (n3 - n1).abs() > 1e-10,
+                    "norm flag 2 should differentiate: 3x={}, 1x={}",
+                    n3,
+                    n1
+                );
+            }
+            _ => panic!("expected Float64"),
+        }
+    }
+
+    #[test]
+    fn test_ts_rank_cd_term_frequency() {
+        // ts_rank_cd should also respect term frequency.
+        let rank_3x = ts_rank_cd(vec![
+            Value::Tsvector("'hello':1,2,3".to_string()),
+            Value::Tsquery("'hello'".to_string()),
+        ])
+        .unwrap();
+        let rank_1x = ts_rank_cd(vec![
+            Value::Tsvector("'hello':1".to_string()),
+            Value::Tsquery("'hello'".to_string()),
+        ])
+        .unwrap();
+        match (&rank_3x, &rank_1x) {
+            (Value::Float64(r3), Value::Float64(r1)) => {
+                assert!(r3 > r1, "ts_rank_cd: 3x ({}) must be > 1x ({})", r3, r1);
+            }
+            _ => panic!("expected Float64"),
+        }
+    }
+
+    #[test]
+    fn test_ts_rank_weight_a_higher_than_d() {
+        let rank_a = ts_rank(vec![
+            Value::Tsvector("'hello':1A".to_string()),
+            Value::Tsquery("'hello'".to_string()),
+        ])
+        .unwrap();
+        let rank_d = ts_rank(vec![
+            Value::Tsvector("'hello':1".to_string()),
+            Value::Tsquery("'hello'".to_string()),
+        ])
+        .unwrap();
+        match (&rank_a, &rank_d) {
+            (Value::Float64(ra), Value::Float64(rd)) => {
+                assert!(ra > rd, "weight A ({}) must be > weight D ({})", ra, rd);
+            }
+            _ => panic!("expected Float64"),
+        }
+    }
+
+    #[test]
+    fn test_to_tsvector_english_repeated_positions() {
+        let result = to_tsvector(vec![
+            Value::Text("simple".to_string()),
+            Value::Text("database database database".to_string()),
+        ])
+        .unwrap();
+        match result {
+            Value::Tsvector(s) => {
+                assert_eq!(s, "'database':1,2,3");
+            }
+            _ => panic!("expected Tsvector"),
+        }
+    }
+
+    #[test]
+    fn test_to_tsvector_chinese_repeated_positions() {
+        let result = to_tsvector(vec![
+            Value::Text("chinese".to_string()),
+            Value::Text("数据库数据库数据库".to_string()),
+        ])
+        .unwrap();
+        match result {
+            Value::Tsvector(s) => {
+                assert!(
+                    s.contains("'数据库':1,2,3"),
+                    "Chinese 3x should have positions 1,2,3, got: {}",
+                    s
+                );
+            }
+            _ => panic!("expected Tsvector"),
+        }
+    }
 }

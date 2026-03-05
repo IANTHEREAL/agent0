@@ -160,6 +160,7 @@ tests/40_setval_null_boolean.sql
 tests/236_gin_index_scan.sql
 tests/237_fts_tokenizers.sql
 tests/252_fts_phase3.sql
+tests/278_fts_ts_rank_frequency.sql
 # Lateral join / DML coercion
 tests/155_dml_type_coercion_invariant_issue407.sql
 # Misc (master merge)
