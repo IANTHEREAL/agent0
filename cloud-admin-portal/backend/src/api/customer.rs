@@ -1409,7 +1409,7 @@ pub async fn branch_database(
     let ddl_script = if ddl_statements.is_empty() {
         String::new()
     } else {
-        format!("BEGIN;\n{}\nCOMMIT;", ddl_statements.join(";\n\n"))
+        format!("BEGIN;\n{}\nCOMMIT;", ddl_statements.join("\n\n"))
     };
 
     let tenant_id = generate_tenant_id();
