@@ -3,6 +3,8 @@
 //! All database-scoped metadata keys are built on top of `encode_database_data_prefix()`.
 //! Worker system keys are global (not per-database).
 
+use anyhow::Result;
+
 use super::{encode_database_data_prefix, SYS_MIGRATION_PREFIX};
 
 // Database-scoped metadata prefixes (used only in this module).
@@ -379,12 +381,12 @@ pub fn encode_worker_queue_key(
     keyspace: &str,
     db_id: u64,
     task_id: i64,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let mut key =
         Vec::with_capacity(WORKER_QUEUE_PREFIX.len() + 1 + 8 + 1 + 2 + keyspace.len() + 1 + 8 + 8);
     key.extend_from_slice(WORKER_QUEUE_PREFIX);
     key.push(priority);
-    key.extend(memcomparable::to_vec(&fire_time_ms).unwrap());
+    key.extend(memcomparable::to_vec(&fire_time_ms)?);
     key.push(task_type);
     key.extend_from_slice(&(keyspace.len() as u16).to_be_bytes());
     key.extend_from_slice(keyspace.as_bytes());
@@ -392,7 +394,7 @@ pub fn encode_worker_queue_key(
     key.extend_from_slice(&db_id.to_be_bytes());
     key.push(b'_');
     key.extend_from_slice(&task_id.to_be_bytes());
-    key
+    Ok(key)
 }
 
 /// Encode the prefix for all worker queue keys (global).
@@ -404,12 +406,12 @@ pub fn encode_worker_queue_prefix() -> Vec<u8> {
 ///
 /// Used to scan all queue entries with a given priority and fire_time.
 /// Format: `_worker_queue_{priority:u8}_{fire_time_ms:memcomparable}` (no keyspace/db_id/task_id)
-pub fn encode_worker_queue_scan_end(priority: u8, fire_time_ms: i64) -> Vec<u8> {
+pub fn encode_worker_queue_scan_end(priority: u8, fire_time_ms: i64) -> Result<Vec<u8>> {
     let mut key = Vec::with_capacity(WORKER_QUEUE_PREFIX.len() + 1 + 8);
     key.extend_from_slice(WORKER_QUEUE_PREFIX);
     key.push(priority);
-    key.extend(memcomparable::to_vec(&fire_time_ms).unwrap());
-    key
+    key.extend(memcomparable::to_vec(&fire_time_ms)?);
+    Ok(key)
 }
 
 /// Decode fire_time_ms from a worker queue key.
@@ -660,15 +662,15 @@ mod tests {
 
     #[test]
     fn worker_queue_fire_time_roundtrip_positive_and_negative() {
-        let key_pos = encode_worker_queue_key(3, 1234567890, 1, "tenant_a", 42, 7);
-        let key_neg = encode_worker_queue_key(3, -987654321, 1, "tenant_a", 42, 7);
+        let key_pos = encode_worker_queue_key(3, 1234567890, 1, "tenant_a", 42, 7).unwrap();
+        let key_neg = encode_worker_queue_key(3, -987654321, 1, "tenant_a", 42, 7).unwrap();
         assert_eq!(decode_worker_queue_fire_time(&key_pos), Some(1234567890));
         assert_eq!(decode_worker_queue_fire_time(&key_neg), Some(-987654321));
     }
 
     #[test]
     fn worker_queue_task_type_roundtrip() {
-        let key = encode_worker_queue_key(3, 1234567890, 0x10, "tenant_a", 42, 7);
+        let key = encode_worker_queue_key(3, 1234567890, 0x10, "tenant_a", 42, 7).unwrap();
         assert_eq!(decode_worker_queue_task_type(&key), Some(0x10));
     }
 
@@ -703,11 +705,11 @@ mod tests {
     #[test]
     fn worker_queue_scan_end_matches_key_prefix_for_same_priority_and_fire_time() {
         let fire_time = 1000_i64;
-        let prefix = encode_worker_queue_scan_end(5, fire_time);
-        let key = encode_worker_queue_key(5, fire_time, 1, "k", 1, 2);
+        let prefix = encode_worker_queue_scan_end(5, fire_time).unwrap();
+        let key = encode_worker_queue_key(5, fire_time, 1, "k", 1, 2).unwrap();
         assert!(key.starts_with(&prefix));
 
-        let later = encode_worker_queue_scan_end(5, fire_time + 1);
+        let later = encode_worker_queue_scan_end(5, fire_time + 1).unwrap();
         assert!(prefix < later);
     }
 

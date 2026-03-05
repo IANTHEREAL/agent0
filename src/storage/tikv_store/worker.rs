@@ -110,7 +110,7 @@ impl TikvStore {
             &entry.keyspace,
             entry.db_id,
             entry.task_id,
-        ));
+        )?);
         let data = bincode::serialize(entry).context("Failed to serialize worker queue entry")?;
         txn_put(txn, key, data).await?;
         Ok(())
@@ -146,7 +146,7 @@ impl TikvStore {
 
             let mut start = encode_worker_queue_prefix();
             start.push(priority);
-            let end = encode_worker_queue_scan_end(priority, due_exclusive);
+            let end = encode_worker_queue_scan_end(priority, due_exclusive)?;
             let range: BoundRange = (start.clone()..end).into();
             let remaining = limit as usize - results.len();
             let scan_limit = scan_limit_to_u32(Some(remaining));
