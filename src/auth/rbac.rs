@@ -2,9 +2,23 @@ use crate::config;
 use crate::sql::error::SqlError;
 use crate::txn::{txn_delete, txn_put};
 use anyhow::{anyhow, Result};
+use dashmap::DashSet;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::LazyLock;
 use tikv_client::Transaction;
+
+/// Per-keyspace cache tracking which keyspaces have been initialized (have at
+/// least one superuser).  Once a keyspace is inserted it stays until explicitly
+/// invalidated via [`invalidate_initialized`] (called on DROP ROLE / ALTER ROLE
+/// NOSUPERUSER) so that the bootstrap probe re-runs if all superusers are removed.
+static INITIALIZED_KEYSPACES: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+
+/// Remove `keyspace` from the initialized cache so the next
+/// [`AuthManager::is_initialized`] call re-probes TiKV.
+pub fn invalidate_initialized(keyspace: &str) {
+    INITIALIZED_KEYSPACES.remove(keyspace);
+}
 
 const USER_KEY_PREFIX: &[u8] = b"_sys_user_";
 const ROLE_KEY_PREFIX: &[u8] = b"_sys_role_";
@@ -283,14 +297,26 @@ impl AuthManager {
     }
 
     /// Read-only probe: returns `true` if at least one superuser exists.
-    /// Uses an optimistic transaction (no pessimistic locks).
+    ///
+    /// Results are cached per keyspace — once `true` for a given keyspace,
+    /// subsequent calls return immediately without a TiKV transaction.
+    /// The cache is invalidated by [`invalidate_initialized`] on
+    /// DROP ROLE / ALTER ROLE NOSUPERUSER so re-bootstrap can trigger.
     pub async fn is_initialized(&self, store: &crate::storage::TikvStore) -> Result<bool> {
+        let ks = store.keyspace().unwrap_or("").to_string();
+        if INITIALIZED_KEYSPACES.contains(&ks) {
+            return Ok(true);
+        }
         let mut txn = store.begin_optimistic().await?;
-        let initialized = self.has_any_superuser(&mut txn).await;
+        let result = self.has_any_superuser(&mut txn).await;
         if let Err(err) = txn.rollback().await {
             return Err(err.into());
         }
-        initialized
+        let result = result?;
+        if result {
+            INITIALIZED_KEYSPACES.insert(ks);
+        }
+        Ok(result)
     }
 
     pub async fn bootstrap(&self, txn: &mut Transaction) -> Result<()> {

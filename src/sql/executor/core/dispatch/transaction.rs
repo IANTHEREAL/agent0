@@ -36,6 +36,7 @@ pub(super) async fn check_observability_statement_permission(
             if tag == "COMMIT" {
                 executor.flush_trigger_activations();
                 executor.flush_pending_hnsw_merges();
+                executor.flush_pending_init_cache_invalidation();
             } else {
                 executor.clear_trigger_activations();
             }
@@ -312,9 +313,14 @@ impl Executor {
                             session.rollback().await?;
                             self.clear_trigger_activations();
                         } else {
+                            if matches!(result, ExecuteResult::AlterRole | ExecuteResult::DropRole)
+                            {
+                                self.mark_init_cache_invalidation_pending();
+                            }
                             session.commit().await?;
                             self.flush_trigger_activations();
                             self.flush_pending_hnsw_merges();
+                            self.flush_pending_init_cache_invalidation();
                         }
                         let mut stmt_results = notices;
                         stmt_results.push(result);
@@ -371,6 +377,9 @@ impl Executor {
                 match res {
                     Ok((notices, result)) => {
                         session.note_statement_success_in_transaction();
+                        if matches!(result, ExecuteResult::AlterRole | ExecuteResult::DropRole) {
+                            self.mark_init_cache_invalidation_pending();
+                        }
                         let mut stmt_results = notices;
                         stmt_results.push(result);
                         return Ok(stmt_results);

@@ -89,6 +89,7 @@ pub(crate) struct CommentRecord {
 
 pub struct TikvStore {
     client: Option<Arc<TransactionClient>>,
+    keyspace: Option<String>,
 }
 
 impl TikvStore {
@@ -104,6 +105,11 @@ impl TikvStore {
     /// Used by the embedded filesystem to create its own transactions.
     pub fn transaction_client(&self) -> Option<Arc<TransactionClient>> {
         self.client.clone()
+    }
+
+    /// Returns the keyspace this store is scoped to.
+    pub fn keyspace(&self) -> Option<&str> {
+        self.keyspace.as_deref()
     }
 
     pub async fn new_with_keyspace(
@@ -134,6 +140,7 @@ impl TikvStore {
         info!("Connected to TiKV. Keyspace: {:?}", keyspace);
         let store = Self {
             client: Some(Arc::new(client)),
+            keyspace: keyspace.clone(),
         };
 
         store.check_format_version().await?;
@@ -169,6 +176,7 @@ impl TikvStore {
             .context("Failed to connect to TiKV")?;
         let store = Self {
             client: Some(Arc::new(client)),
+            keyspace: Some(keyspace.to_string()),
         };
 
         store.check_format_version().await?;
@@ -181,7 +189,13 @@ impl TikvStore {
     pub(crate) fn new_stub() -> Arc<Self> {
         use std::sync::OnceLock;
         static STUB: OnceLock<Arc<TikvStore>> = OnceLock::new();
-        STUB.get_or_init(|| Arc::new(Self { client: None })).clone()
+        STUB.get_or_init(|| {
+            Arc::new(Self {
+                client: None,
+                keyspace: None,
+            })
+        })
+        .clone()
     }
 
     fn key(&self, key: &[u8]) -> Vec<u8> {

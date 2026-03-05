@@ -379,9 +379,14 @@ impl Executor {
                             session.rollback().await?;
                             self.clear_trigger_activations();
                         } else {
+                            if matches!(result, ExecuteResult::AlterRole | ExecuteResult::DropRole)
+                            {
+                                self.mark_init_cache_invalidation_pending();
+                            }
                             session.commit().await?;
                             self.flush_trigger_activations();
                             self.flush_pending_hnsw_merges();
+                            self.flush_pending_init_cache_invalidation();
                         }
                         return Ok(ExecuteResults::single(result));
                     }

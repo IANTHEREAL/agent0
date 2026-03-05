@@ -82,6 +82,7 @@ use sqlparser::ast::{
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tikv_client::Transaction;
@@ -123,6 +124,11 @@ pub struct Executor {
     pending_async_triggers: Mutex<Vec<PendingAsyncTrigger>>,
     /// HNSW merge requests accumulated during DML, flushed after commit.
     pending_hnsw_merges: Mutex<Vec<PendingHnswMerge>>,
+    /// Set when ALTER ROLE or DROP ROLE executes inside a transaction.
+    /// Flushed after commit to call `invalidate_initialized` only once the
+    /// role mutation is durable, avoiding a race where another session
+    /// repopulates the stale cache before commit lands.
+    pending_init_cache_invalidation: AtomicBool,
 }
 
 impl Executor {
@@ -145,6 +151,7 @@ impl Executor {
             pending_trigger_activations: Mutex::new(HashSet::new()),
             pending_async_triggers: Mutex::new(Vec::new()),
             pending_hnsw_merges: Mutex::new(Vec::new()),
+            pending_init_cache_invalidation: AtomicBool::new(false),
         }
     }
 
@@ -366,6 +373,27 @@ impl Executor {
         }
     }
 
+    /// Mark that the `is_initialized` cache should be invalidated after the
+    /// current transaction commits (ALTER ROLE / DROP ROLE may have removed
+    /// the last superuser).
+    pub(crate) fn mark_init_cache_invalidation_pending(&self) {
+        self.pending_init_cache_invalidation
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// If a role mutation was executed in the committed transaction,
+    /// invalidate the per-keyspace `is_initialized` cache so that
+    /// `bootstrap()` can re-run if all superusers were removed.
+    pub(crate) fn flush_pending_init_cache_invalidation(&self) {
+        if self
+            .pending_init_cache_invalidation
+            .swap(false, Ordering::Relaxed)
+        {
+            let ks = self.store.keyspace().unwrap_or("");
+            crate::auth::invalidate_initialized(ks);
+        }
+    }
+
     /// Discard pending activations without notifying trigger workers.
     /// Called after rollback so that events that were never committed
     /// don't cause unnecessary worker wake-ups.
@@ -382,6 +410,8 @@ impl Executor {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.pending_init_cache_invalidation
+            .store(false, Ordering::Relaxed);
     }
 }
 

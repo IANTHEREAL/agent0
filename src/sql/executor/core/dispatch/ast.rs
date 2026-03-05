@@ -114,6 +114,7 @@ impl Executor {
                             if tag == "COMMIT" {
                                 self.flush_trigger_activations();
                                 self.flush_pending_hnsw_merges();
+                                self.flush_pending_init_cache_invalidation();
                             } else {
                                 self.clear_trigger_activations();
                             }
