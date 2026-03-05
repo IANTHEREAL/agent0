@@ -606,6 +606,24 @@ pub enum ForeignKeyAction {
     SetDefault,
 }
 
+impl ForeignKeyAction {
+    /// Returns `true` for actions that require the child table to have a PK
+    /// so that db9's KV storage can re-derive the storage key for affected
+    /// rows during cascade/set operations.  NO ACTION and RESTRICT never
+    /// mutate child rows, so they are safe without a PK.
+    pub fn requires_child_pk(&self) -> bool {
+        matches!(self, Self::Cascade | Self::SetNull | Self::SetDefault)
+    }
+}
+
+impl ForeignKeyConstraint {
+    /// Returns `true` when either the ON DELETE or ON UPDATE action requires
+    /// the child table to have a primary key.
+    pub fn requires_child_pk(&self) -> bool {
+        self.on_delete.requires_child_pk() || self.on_update.requires_child_pk()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TableSchema {
     pub name: String,

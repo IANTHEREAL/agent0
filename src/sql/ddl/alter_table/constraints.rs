@@ -204,6 +204,20 @@ pub(super) async fn alter_table_add_foreign_key(
         }
     }
 
+    // Reject FK with CASCADE/SET NULL/SET DEFAULT on child tables without a PK
+    // — db9's KV storage model cannot re-derive the storage key for no-PK rows
+    // (#1332).  NO ACTION and RESTRICT are safe.
+    let del_action = parse_referential_action(on_delete);
+    let upd_action = parse_referential_action(on_update);
+    if schema.pk_indices.is_empty()
+        && (del_action.requires_child_pk() || upd_action.requires_child_pk())
+    {
+        return Err(anyhow!(
+            "cannot create foreign key on table \"{}\" with CASCADE/SET NULL/SET DEFAULT because it does not have a primary key",
+            table_object_name
+        ));
+    }
+
     let ref_table =
         names::resolve_existing_table_name(store.as_ref(), txn, db_id, foreign_table, search_path)
             .await?
@@ -324,8 +338,8 @@ pub(super) async fn alter_table_add_foreign_key(
         columns: fk_cols,
         ref_table,
         ref_columns: ref_cols,
-        on_delete: parse_referential_action(on_delete),
-        on_update: parse_referential_action(on_update),
+        on_delete: del_action,
+        on_update: upd_action,
     });
     schema.version += 1;
     store.update_schema(txn, db_id, schema.clone()).await?;
@@ -461,6 +475,17 @@ pub(super) async fn alter_table_drop_constraint(
             }
         };
         if constraint_name == pk_name {
+            // Reject DROP PK when the table has FK constraints with
+            // CASCADE/SET NULL/SET DEFAULT — without a PK, those actions
+            // would silently corrupt data (#1332).  NO ACTION/RESTRICT are
+            // safe because they never mutate child rows.
+            if let Some(fk) = schema.foreign_keys.iter().find(|fk| fk.requires_child_pk()) {
+                return Err(anyhow!(
+                    "cannot drop primary key constraint on table \"{}\" because foreign key \"{}\" requires CASCADE/SET NULL/SET DEFAULT",
+                    table_object_name, fk.name
+                ));
+            }
+
             let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
             let range: tikv_client::BoundRange = (start..end).into();
             let existing_rows: Vec<_> = txn.scan(range, 1).await?.collect();

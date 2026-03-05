@@ -380,6 +380,19 @@ pub async fn execute_create_table(
         &mut check_constraints,
     );
 
+    // Reject FK constraints with CASCADE/SET NULL/SET DEFAULT on child tables
+    // without a PK.  db9's KV storage model cannot re-derive the storage key
+    // for no-PK rows, so those actions would silently corrupt data (#1332).
+    // NO ACTION and RESTRICT are safe — they never mutate child rows.
+    if pk_indices.is_empty() {
+        if let Some(fk) = foreign_keys.iter().find(|fk| fk.requires_child_pk()) {
+            return Err(anyhow!(
+                "cannot create foreign key \"{}\" with CASCADE/SET NULL/SET DEFAULT on table \"{}\" because it does not have a primary key",
+                fk.name, table_object_name
+            ));
+        }
+    }
+
     let schema = TableSchema {
         name: table_full_name.clone(),
         table_id,
