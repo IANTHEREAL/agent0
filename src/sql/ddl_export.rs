@@ -201,6 +201,85 @@ pub fn trigger_to_ddl(def: &TriggerDef) -> String {
     )
 }
 
+/// Topological sort of table names by FK dependencies.
+/// Tables referenced by foreign keys come before the tables that reference them.
+/// Falls back to alphabetical order for tables without dependencies or cycles.
+fn toposort_tables_by_fk(
+    table_names: &[String],
+    schemas: &HashMap<String, TableSchema>,
+) -> Vec<String> {
+    use std::collections::HashSet;
+
+    let name_set: HashSet<&str> = table_names.iter().map(|s| s.as_str()).collect();
+
+    // Build adjacency: table -> set of tables it depends on (FK references)
+    // Use HashSet to deduplicate (a table with multiple FKs to the same parent
+    // should count as a single dependency for in-degree computation).
+    let mut deps: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for name in table_names {
+        let mut table_deps = HashSet::new();
+        if let Some(schema) = schemas.get(name) {
+            for fk in &schema.foreign_keys {
+                // Only add dependency if referenced table is in our set and is not self-referential
+                if name_set.contains(fk.ref_table.as_str()) && fk.ref_table != *name {
+                    table_deps.insert(fk.ref_table.as_str());
+                }
+            }
+        }
+        deps.insert(name.as_str(), table_deps);
+    }
+
+    // Kahn's algorithm for topological sort
+    // in_degree[name] = number of FK dependencies name has (must be created after those)
+    let mut in_degree: HashMap<&str, usize> = HashMap::new();
+    for name in table_names {
+        in_degree.insert(
+            name.as_str(),
+            deps.get(name.as_str()).map_or(0, |d| d.len()),
+        );
+    }
+
+    let mut queue: Vec<&str> = table_names
+        .iter()
+        .filter(|n| in_degree.get(n.as_str()) == Some(&0))
+        .map(|n| n.as_str())
+        .collect();
+    queue.sort_by(|a, b| b.cmp(a)); // descending so pop() yields ascending alphabetical
+
+    let mut result = Vec::with_capacity(table_names.len());
+    while let Some(name) = queue.pop() {
+        result.push(name.to_string());
+        // For each table that depends on `name`, decrement its in-degree
+        for other in table_names {
+            if let Some(other_deps) = deps.get(other.as_str()) {
+                if other_deps.contains(&name) {
+                    let deg = in_degree.get_mut(other.as_str()).unwrap();
+                    *deg -= 1;
+                    if *deg == 0 {
+                        // Insert in sorted position to maintain deterministic order
+                        let pos = queue.partition_point(|q| *q > other.as_str());
+                        queue.insert(pos, other.as_str());
+                    }
+                }
+            }
+        }
+    }
+
+    // If there's a cycle, append remaining tables in alphabetical order
+    if result.len() < table_names.len() {
+        let result_set: HashSet<&str> = result.iter().map(|s| s.as_str()).collect();
+        let mut remaining: Vec<String> = table_names
+            .iter()
+            .filter(|n| !result_set.contains(n.as_str()))
+            .cloned()
+            .collect();
+        remaining.sort();
+        result.extend(remaining);
+    }
+
+    result
+}
+
 pub async fn export_all_ddl(
     store: &TikvStore,
     txn: &mut Transaction,
@@ -233,8 +312,18 @@ pub async fn export_all_ddl(
 
     let mut table_names = store.list_tables(txn, db_id).await?;
     table_names.sort();
+
+    // Topological sort: tables referenced by FKs must come before referencing tables.
+    let mut schemas_map: HashMap<String, TableSchema> = HashMap::new();
+    for table_name in &table_names {
+        if let Some(schema) = store.get_schema(txn, db_id, table_name).await? {
+            schemas_map.insert(table_name.clone(), schema);
+        }
+    }
+    let table_names = toposort_tables_by_fk(&table_names, &schemas_map);
+
     for table_name in table_names {
-        let Some(schema) = store.get_schema(txn, db_id, &table_name).await? else {
+        let Some(schema) = schemas_map.remove(&table_name) else {
             continue;
         };
 
@@ -518,5 +607,132 @@ mod tests {
             ddl,
             "ALTER SEQUENCE public.users_id_seq OWNED BY public.users.id;"
         );
+    }
+
+    fn make_schema(name: &str, fk_refs: &[&str]) -> TableSchema {
+        TableSchema {
+            name: name.to_string(),
+            table_id: 1,
+            columns: vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                primary_key: true,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+                collation: None,
+            }],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![0],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: fk_refs
+                .iter()
+                .map(|rt| ForeignKeyConstraint {
+                    name: format!("fk_{}", rt),
+                    columns: vec!["id".to_string()],
+                    ref_table: rt.to_string(),
+                    ref_columns: vec!["id".to_string()],
+                    on_delete: ForeignKeyAction::NoAction,
+                    on_update: ForeignKeyAction::NoAction,
+                })
+                .collect(),
+            owner: "postgres".to_string(),
+            from_alias: None,
+        }
+    }
+
+    #[test]
+    fn toposort_no_deps_returns_alphabetical() {
+        let names = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+        let mut schemas = HashMap::new();
+        for n in &names {
+            schemas.insert(n.clone(), make_schema(n, &[]));
+        }
+        let result = toposort_tables_by_fk(&names, &schemas);
+        assert_eq!(result, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn toposort_child_after_parent() {
+        // child references parent; alphabetically child < parent
+        let names = vec!["public.child".to_string(), "public.parent".to_string()];
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "public.parent".to_string(),
+            make_schema("public.parent", &[]),
+        );
+        schemas.insert(
+            "public.child".to_string(),
+            make_schema("public.child", &["public.parent"]),
+        );
+        let result = toposort_tables_by_fk(&names, &schemas);
+        // parent must come before child
+        let parent_pos = result.iter().position(|s| s == "public.parent").unwrap();
+        let child_pos = result.iter().position(|s| s == "public.child").unwrap();
+        assert!(
+            parent_pos < child_pos,
+            "parent ({}) should come before child ({}), got {:?}",
+            parent_pos,
+            child_pos,
+            result
+        );
+    }
+
+    #[test]
+    fn toposort_chain_a_refs_b_refs_c() {
+        // a -> b -> c  (a depends on b, b depends on c)
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut schemas = HashMap::new();
+        schemas.insert("a".to_string(), make_schema("a", &["b"]));
+        schemas.insert("b".to_string(), make_schema("b", &["c"]));
+        schemas.insert("c".to_string(), make_schema("c", &[]));
+        let result = toposort_tables_by_fk(&names, &schemas);
+        let pos_a = result.iter().position(|s| s == "a").unwrap();
+        let pos_b = result.iter().position(|s| s == "b").unwrap();
+        let pos_c = result.iter().position(|s| s == "c").unwrap();
+        assert!(pos_c < pos_b, "c before b: {:?}", result);
+        assert!(pos_b < pos_a, "b before a: {:?}", result);
+    }
+
+    #[test]
+    fn toposort_cycle_includes_all_tables() {
+        // a -> b -> a (cycle)
+        let names = vec!["a".to_string(), "b".to_string()];
+        let mut schemas = HashMap::new();
+        schemas.insert("a".to_string(), make_schema("a", &["b"]));
+        schemas.insert("b".to_string(), make_schema("b", &["a"]));
+        let result = toposort_tables_by_fk(&names, &schemas);
+        assert_eq!(result.len(), 2, "all tables present: {:?}", result);
+        assert!(result.contains(&"a".to_string()));
+        assert!(result.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn toposort_multi_fk_to_same_parent_with_downstream() {
+        // A has 2 FKs to B (e.g. author_id and reviewer_id both reference B).
+        // C has 1 FK to A.  Expected order: B, A, C.
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "a".to_string(),
+            make_schema("a", &["b", "b"]), // two FKs to same parent
+        );
+        schemas.insert("b".to_string(), make_schema("b", &[]));
+        schemas.insert("c".to_string(), make_schema("c", &["a"]));
+        let result = toposort_tables_by_fk(&names, &schemas);
+        assert_eq!(result, vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn toposort_self_referential_ignored() {
+        // a references itself — should not create a dependency
+        let names = vec!["a".to_string()];
+        let mut schemas = HashMap::new();
+        schemas.insert("a".to_string(), make_schema("a", &["a"]));
+        let result = toposort_tables_by_fk(&names, &schemas);
+        assert_eq!(result, vec!["a"]);
     }
 }
