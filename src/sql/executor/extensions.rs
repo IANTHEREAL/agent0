@@ -146,6 +146,16 @@ fn parse_drop_extension_sql(sql: &str) -> Result<(bool, String)> {
     Ok((if_exists, ext_name))
 }
 
+fn validate_extension_runtime_requirements(ext_name: &str, worker_available: bool) -> Result<()> {
+    if ext_name.eq_ignore_ascii_case("pg_cron") && !worker_available {
+        return Err(anyhow!(
+            "CREATE EXTENSION pg_cron requires the worker subsystem \
+             (DB9_WORKER_ENABLED=false). Cron jobs cannot execute without the worker engine."
+        ));
+    }
+    Ok(())
+}
+
 impl Executor {
     pub(crate) async fn try_execute_extension_table_function(
         &self,
@@ -676,6 +686,11 @@ impl Executor {
                 return Err(anyhow!("extension \"{}\" already exists", ext_name));
             }
 
+            validate_extension_runtime_requirements(
+                &ext_name,
+                crate::worker::get_system_store().is_some(),
+            )?;
+
             let ext = InstalledExtension::new(desc);
             self.store().put_extension(txn, db_id, &ext).await?;
 
@@ -953,5 +968,26 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Table function alias column count mismatch: expected 2, got 1"));
+    }
+
+    #[test]
+    fn validate_extension_runtime_requirements_rejects_pg_cron_without_worker() {
+        let err = validate_extension_runtime_requirements("pg_cron", false)
+            .expect_err("pg_cron install must fail when worker is disabled");
+        let msg = err.to_string();
+        assert!(msg.contains("CREATE EXTENSION pg_cron requires the worker subsystem"));
+        assert!(msg.contains("DB9_WORKER_ENABLED=false"));
+    }
+
+    #[test]
+    fn validate_extension_runtime_requirements_allows_pg_cron_with_worker() {
+        validate_extension_runtime_requirements("pg_cron", true)
+            .expect("pg_cron install should pass when worker is available");
+    }
+
+    #[test]
+    fn validate_extension_runtime_requirements_allows_other_extensions_without_worker() {
+        validate_extension_runtime_requirements("http", false)
+            .expect("non-cron extensions must remain installable without worker");
     }
 }
