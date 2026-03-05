@@ -169,11 +169,12 @@ pub(super) async fn create_implicit_sequences_for_schema(
     txn: &mut Transaction,
     db_id: u64,
     schema: &TableSchema,
+    exclude_table: Option<&str>,
 ) -> Result<()> {
     for col in &schema.columns {
         if col.is_serial {
             let seq_name =
-                allocate_implicit_sequence_name(store, txn, db_id, &schema.name, &col.name).await?;
+                allocate_implicit_sequence_name(store, txn, db_id, &schema.name, &col.name, exclude_table).await?;
             let mut seq_def =
                 sequences::build_implicit_sequence_def(&schema.name, &col.name, &col.data_type);
             seq_def.name = seq_name;
@@ -233,6 +234,7 @@ async fn relation_name_taken_in_schema(
     db_id: u64,
     schema_name: &str,
     relation_name: &str,
+    exclude_table: Option<&str>,
 ) -> Result<bool> {
     let full_name = format!("{}.{}", schema_name, relation_name);
 
@@ -268,7 +270,7 @@ async fn relation_name_taken_in_schema(
         table_schemas.iter().map(|(n, s)| (n.as_str(), s)),
         schema_name,
         relation_name,
-        None,
+        exclude_table,
     ))
 }
 
@@ -278,19 +280,24 @@ pub(super) async fn allocate_implicit_sequence_name(
     db_id: u64,
     table_full_name: &str,
     column_name: &str,
+    exclude_table: Option<&str>,
 ) -> Result<String> {
     let (schema_name, table_name) = table_full_name
         .rsplit_once('.')
         .unwrap_or(("public", table_full_name));
     let base_name = sequences::implicit_sequence_name(table_name, column_name);
 
-    if !relation_name_taken_in_schema(store, txn, db_id, schema_name, &base_name).await? {
+    if !relation_name_taken_in_schema(store, txn, db_id, schema_name, &base_name, exclude_table)
+        .await?
+    {
         return Ok(base_name);
     }
 
     for suffix in 1_u32..=u32::MAX {
         let candidate = format!("{}{}", base_name, suffix);
-        if !relation_name_taken_in_schema(store, txn, db_id, schema_name, &candidate).await? {
+        if !relation_name_taken_in_schema(store, txn, db_id, schema_name, &candidate, exclude_table)
+            .await?
+        {
             return Ok(candidate);
         }
     }

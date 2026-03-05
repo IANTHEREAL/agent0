@@ -102,6 +102,7 @@ pub(super) async fn alter_table_add_column(
             db_id,
             &schema.name,
             &serial_col_name,
+            None,
         )
         .await?;
         let mut seq_def = sequences::build_implicit_sequence_def(
