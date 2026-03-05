@@ -117,3 +117,110 @@ ERROR:  function lastval(boolean) does not exist
 ERROR:  lastval is not yet defined in this session
 ERROR:  function lastval(bigint) does not exist
 ERROR:  function lastval(double) does not exist
+nextval
+1
+(1 row)
+lastval
+1
+(1 row)
+ERROR:  lastval is not yet defined in this session
+ERROR:  lastval is not yet defined in this session
+nextval
+100
+(1 row)
+lastval
+100
+(1 row)
+currval
+100
+(1 row)
+nextval
+1
+(1 row)
+lastval
+1
+(1 row)
+lastval
+1
+(1 row)
+nextval
+2
+(1 row)
+lastval
+2
+(1 row)
+nextval
+1
+(1 row)
+nextval
+1
+(1 row)
+lastval
+1
+(1 row)
+currval
+1
+(1 row)
+nextval
+1
+(1 row)
+lastval
+1
+(1 row)
+ERROR:  lastval is not yet defined in this session
+lastval
+1
+(1 row)
+nextval
+1
+(1 row)
+nextval
+2
+(1 row)
+ERROR:  lastval is not yet defined in this session
+lastval
+2
+(1 row)
+lastval
+2
+(1 row)
+nextval
+1
+(1 row)
+nextval
+2
+(1 row)
+nextval
+100
+(1 row)
+ERROR:  lastval is not yet defined in this session
+currval
+2
+(1 row)
+nextval
+1
+(1 row)
+nextval
+2
+(1 row)
+nextval
+100
+(1 row)
+ERROR:  lastval is not yet defined in this session
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ERROR:  lastval is not yet defined in this session
+currval
+2
+(1 row)
+nextval
+1
+(1 row)
+nextval
+100
+(1 row)
+nextval
+200
+(1 row)
+currval
+100
+(1 row)

@@ -48,6 +48,7 @@ impl Session {
         }
         let name_for_settings = name.clone();
         let name_for_tracker = name.clone();
+        let name_for_seq = name.clone();
         self.savepoints.create(name).await?;
         {
             let mut tracker = self.xact_advisory_savepoint_tracker.lock().await;
@@ -56,6 +57,7 @@ impl Session {
         self.settings
             .push_settings_savepoint(name_for_settings.clone());
         self.push_extension_delta_savepoint(name_for_settings);
+        self.last_sequence_values.push_savepoint(name_for_seq);
         Ok(())
     }
 
@@ -76,6 +78,7 @@ impl Session {
         }
         self.settings.release_settings_savepoint(name);
         self.release_extension_delta_savepoint(name);
+        self.last_sequence_values.release_savepoint(name);
         Ok(())
     }
 
@@ -128,6 +131,7 @@ impl Session {
         // PostgreSQL restores it; tracking that session-state undo separately from SET LOCAL.
         self.settings.rollback_settings_to_savepoint(name);
         self.rollback_extension_delta_to_savepoint(name);
+        self.last_sequence_values.rollback_to_savepoint(name);
         self.sync_plan_cache_settings();
         self.release_rolled_back_xact_advisory_locks(rolled_back_xact_locks);
         self.clear_failed_transaction();
@@ -180,12 +184,14 @@ impl Session {
                     Ok(_) => {
                         self.clear_local_overrides();
                         self.release_xact_advisory_locks_if_needed();
+                        self.last_sequence_values.apply_pending_drops();
                         self.observability.record_commit();
                         Ok(())
                     }
                     Err(e) => {
                         self.state = TransactionState::Failed(txn);
                         self.release_xact_advisory_locks_if_needed();
+                        self.last_sequence_values.discard_pending_drops();
                         Err(anyhow!(e))
                     }
                 }
@@ -197,11 +203,13 @@ impl Session {
                     Ok(_) => {
                         self.clear_local_overrides();
                         self.release_xact_advisory_locks_if_needed();
+                        self.last_sequence_values.discard_pending_drops();
                         Ok(())
                     }
                     Err(e) => {
                         self.state = TransactionState::Failed(txn);
                         self.release_xact_advisory_locks_if_needed();
+                        self.last_sequence_values.discard_pending_drops();
                         Err(anyhow!(e))
                     }
                 }
@@ -224,6 +232,7 @@ impl Session {
                     Ok(_) => {
                         self.clear_local_overrides();
                         self.release_xact_advisory_locks_if_needed();
+                        self.last_sequence_values.discard_pending_drops();
                         // Clear plan cache: DDL within the rolled-back transaction
                         // may have been optimistically invalidated, but the DDL
                         // itself was reverted — stale entries must not survive.
@@ -233,6 +242,7 @@ impl Session {
                     Err(e) => {
                         self.state = TransactionState::Failed(txn);
                         self.release_xact_advisory_locks_if_needed();
+                        self.last_sequence_values.discard_pending_drops();
                         self.clear_plan_cache();
                         Err(anyhow!(e))
                     }
@@ -245,12 +255,14 @@ impl Session {
                     Ok(_) => {
                         self.clear_local_overrides();
                         self.release_xact_advisory_locks_if_needed();
+                        self.last_sequence_values.discard_pending_drops();
                         self.clear_plan_cache();
                         Ok(())
                     }
                     Err(e) => {
                         self.state = TransactionState::Failed(txn);
                         self.release_xact_advisory_locks_if_needed();
+                        self.last_sequence_values.discard_pending_drops();
                         self.clear_plan_cache();
                         Err(anyhow!(e))
                     }

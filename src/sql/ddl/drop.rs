@@ -57,8 +57,8 @@ pub async fn execute_drop_table(
         if cascade {
             let (_dropped, cascade_seqs) =
                 drop_dependent_views(store, txn, db_id, &resolved.full).await?;
-            for seq in &cascade_seqs {
-                sequence_values.on_sequence_dropped(seq);
+            for seq in cascade_seqs {
+                sequence_values.defer_sequence_drop(seq);
             }
         }
 
@@ -72,8 +72,8 @@ pub async fn execute_drop_table(
         }
         let dropped_seqs =
             drop_owned_sequences_for_table(store, txn, db_id, &resolved.full).await?;
-        for seq in &dropped_seqs {
-            sequence_values.on_sequence_dropped(seq);
+        for seq in dropped_seqs {
+            sequence_values.defer_sequence_drop(seq);
         }
         store.drop_table(txn, db_id, &resolved.full).await?;
 

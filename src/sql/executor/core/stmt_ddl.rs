@@ -747,8 +747,8 @@ impl Executor {
                     .drop_schema_cascade(txn, db_id, &schema, if_exists)
                     .await?;
 
-                for seq in &dropped_seq_names {
-                    sequence_values.on_sequence_dropped(seq);
+                for seq in dropped_seq_names {
+                    sequence_values.defer_sequence_drop(seq);
                 }
             } else {
                 self.store

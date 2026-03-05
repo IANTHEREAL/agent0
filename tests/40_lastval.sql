@@ -121,6 +121,167 @@ SELECT lastval();
 SELECT lastval(2147483648);
 SELECT lastval(1e2);
 
+-- ============================================================
+-- C11: drop/recreate same-name sequence must not leak stale lastval (#1370)
+-- PostgreSQL tracks sequences by OID, so drop+recreate = new identity.
+-- ============================================================
+DROP SEQUENCE IF EXISTS lastval_droprec;
+CREATE SEQUENCE lastval_droprec;
+SELECT nextval('lastval_droprec');
+SELECT lastval();
+DROP SEQUENCE lastval_droprec;
+-- After drop, lastval must error (session state cleared)
+SELECT lastval();
+-- Recreate with different START; lastval must still error until nextval
+CREATE SEQUENCE lastval_droprec START 100;
+SELECT lastval();
+-- Now use the recreated sequence
+SELECT nextval('lastval_droprec');
+SELECT lastval();
+-- currval must also reflect the new sequence
+SELECT currval('lastval_droprec');
+DROP SEQUENCE lastval_droprec;
+
+-- ============================================================
+-- C12: DROP SEQUENCE inside rolled-back transaction must not clear lastval (#1408)
+-- PostgreSQL defers session-state cleanup to commit; ROLLBACK restores lastval.
+-- ============================================================
+DROP SEQUENCE IF EXISTS lastval_rollback;
+CREATE SEQUENCE lastval_rollback;
+SELECT nextval('lastval_rollback');
+SELECT lastval();
+BEGIN;
+DROP SEQUENCE lastval_rollback;
+ROLLBACK;
+-- lastval must still return the pre-DROP value
+SELECT lastval();
+-- sequence must still exist after rollback
+SELECT nextval('lastval_rollback');
+SELECT lastval();
+DROP SEQUENCE lastval_rollback;
+
+-- ============================================================
+-- C13: drop+recreate same-name sequence in one txn must not wipe new lastval (#1408)
+-- Deferred drop must be keyed by identity, not name.
+-- ============================================================
+DROP SEQUENCE IF EXISTS lastval_recreate;
+CREATE SEQUENCE lastval_recreate;
+BEGIN;
+SELECT nextval('lastval_recreate');
+DROP SEQUENCE lastval_recreate;
+CREATE SEQUENCE lastval_recreate;
+SELECT nextval('lastval_recreate');
+COMMIT;
+-- lastval must return 1 (from the new sequence), not be wiped by the old drop
+SELECT lastval();
+SELECT currval('lastval_recreate');
+DROP SEQUENCE lastval_recreate;
+
+-- ============================================================
+-- C14: lastval() must error after DROP SEQUENCE within explicit txn (#1408)
+-- Deferred drop must block reads immediately, not just at commit.
+-- ============================================================
+DROP SEQUENCE IF EXISTS lastval_txndrop;
+CREATE SEQUENCE lastval_txndrop;
+SELECT nextval('lastval_txndrop');
+SELECT lastval();
+BEGIN;
+DROP SEQUENCE lastval_txndrop;
+-- lastval must error within the transaction
+SELECT lastval();
+ROLLBACK;
+-- After rollback, lastval must be restored
+SELECT lastval();
+DROP SEQUENCE lastval_txndrop;
+
+-- C15: ROLLBACK TO SAVEPOINT must restore pending_drops (#1408)
+-- DROP SEQUENCE inside a savepoint that is then rolled back must not
+-- block lastval/currval.
+-- ============================================================
+DROP SEQUENCE IF EXISTS lastval_sp;
+CREATE SEQUENCE lastval_sp;
+SELECT nextval('lastval_sp');
+BEGIN;
+SELECT nextval('lastval_sp');
+SAVEPOINT sp1;
+DROP SEQUENCE lastval_sp;
+-- Inside savepoint after DROP — lastval must error
+SELECT lastval();
+ROLLBACK TO sp1;
+-- After rollback to savepoint — lastval must be restored
+SELECT lastval();
+COMMIT;
+-- After commit — lastval still valid (no stale pending drop)
+SELECT lastval();
+DROP SEQUENCE lastval_sp;
+
+-- ============================================================
+-- C16: DROP+recreate+rollback must invalidate stale lastval identity (#1408)
+-- PG tracks by OID; after rollback the recreated OID is gone.
+-- lastval() must error, currval() must return the pre-DROP value.
+-- ============================================================
+DROP SEQUENCE IF EXISTS lastval_droprec_rb;
+CREATE SEQUENCE lastval_droprec_rb;
+SELECT nextval('lastval_droprec_rb');
+SELECT nextval('lastval_droprec_rb');
+BEGIN;
+DROP SEQUENCE lastval_droprec_rb;
+CREATE SEQUENCE lastval_droprec_rb START 100;
+SELECT nextval('lastval_droprec_rb');
+ROLLBACK;
+-- lastval must error — the recreated identity was rolled back
+SELECT lastval();
+-- currval must return the pre-DROP value (2)
+SELECT currval('lastval_droprec_rb');
+DROP SEQUENCE lastval_droprec_rb;
+
+-- ============================================================
+-- C17: DROP+recreate inside savepoint + ROLLBACK TO (#1408)
+-- Same identity invalidation but via savepoint rollback.
+-- ============================================================
+DROP SEQUENCE IF EXISTS lastval_sp_droprec;
+CREATE SEQUENCE lastval_sp_droprec;
+SELECT nextval('lastval_sp_droprec');
+BEGIN;
+SELECT nextval('lastval_sp_droprec');
+SAVEPOINT sp1;
+DROP SEQUENCE lastval_sp_droprec;
+CREATE SEQUENCE lastval_sp_droprec START 100;
+SELECT nextval('lastval_sp_droprec');
+ROLLBACK TO sp1;
+-- lastval must error after savepoint rollback
+SELECT lastval();
+-- currval must return the pre-savepoint value (2)
+SELECT currval('lastval_sp_droprec');
+COMMIT;
+-- After commit, lastval still errors (identity was invalidated)
+SELECT lastval();
+SELECT currval('lastval_sp_droprec');
+DROP SEQUENCE lastval_sp_droprec;
+
+-- ============================================================
+-- C18: Multi-cycle drop+recreate with savepoint rollback (#1408 R8)
+-- Tests that reobserved_drops is not deduplicated by name.
+-- Second cycle must be properly undone by ROLLBACK TO s2.
+-- ============================================================
+DROP SEQUENCE IF EXISTS lastval_mc;
+CREATE SEQUENCE lastval_mc;
+SELECT nextval('lastval_mc');
+BEGIN;
+SAVEPOINT s1;
+DROP SEQUENCE lastval_mc;
+CREATE SEQUENCE lastval_mc START 100;
+SELECT nextval('lastval_mc');
+SAVEPOINT s2;
+DROP SEQUENCE lastval_mc;
+CREATE SEQUENCE lastval_mc START 200;
+SELECT nextval('lastval_mc');
+ROLLBACK TO s2;
+-- currval must return first cycle's value (100), not second's (200)
+SELECT currval('lastval_mc');
+COMMIT;
+DROP SEQUENCE lastval_mc;
+
 -- Cleanup
 DROP SEQUENCE lastval_s1;
 DROP SEQUENCE lastval_s2;
