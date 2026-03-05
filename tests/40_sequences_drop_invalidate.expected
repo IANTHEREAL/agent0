@@ -1,0 +1,27 @@
+lastval
+1
+(1 row)
+ERROR:  lastval is not yet defined in this session
+nextval
+1
+(1 row)
+nextval
+1
+(1 row)
+lastval
+1
+(1 row)
+lastval
+1
+(1 row)
+nextval
+1
+(1 row)
+ERROR:  lastval is not yet defined in this session
+nextval
+1
+(1 row)
+lastval
+1
+(1 row)
+ERROR:  lastval is not yet defined in this session

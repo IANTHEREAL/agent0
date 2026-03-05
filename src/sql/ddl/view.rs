@@ -286,7 +286,8 @@ pub async fn execute_drop_view(
 
         // CASCADE: drop views that depend on this view.
         if cascade {
-            let dropped = drop_dependent_views(store, txn, db_id, &resolved.full).await?;
+            let (dropped, _dropped_seqs) =
+                drop_dependent_views(store, txn, db_id, &resolved.full).await?;
             cascade_dropped.extend(dropped);
         }
 
@@ -330,7 +331,7 @@ pub async fn execute_create_materialized_view(
                     .drop_trigger(txn, db_id, &view_name, &trigger.name)
                     .await?;
             }
-            drop_owned_sequences_for_table(store, txn, db_id, &view_name).await?;
+            let _seqs = drop_owned_sequences_for_table(store, txn, db_id, &view_name).await?;
             store.drop_materialized_view(txn, db_id, &view_name).await?;
             store.drop_table(txn, db_id, &view_name).await?;
         } else {
@@ -413,7 +414,8 @@ pub async fn execute_drop_materialized_view(
 
         // CASCADE: drop views/matviews that depend on this materialized view.
         if cascade {
-            let dropped = drop_dependent_views(store, txn, db_id, &resolved.full).await?;
+            let (dropped, _dropped_seqs) =
+                drop_dependent_views(store, txn, db_id, &resolved.full).await?;
             cascade_dropped.extend(dropped);
         }
 
@@ -435,7 +437,7 @@ pub async fn execute_drop_materialized_view(
                     .drop_trigger(txn, db_id, &resolved.full, &trigger.name)
                     .await?;
             }
-            drop_owned_sequences_for_table(store, txn, db_id, &resolved.full).await?;
+            let _seqs = drop_owned_sequences_for_table(store, txn, db_id, &resolved.full).await?;
             store.drop_table(txn, db_id, &resolved.full).await?;
         }
         last = resolved.full;

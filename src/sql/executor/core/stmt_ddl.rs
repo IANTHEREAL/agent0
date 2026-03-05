@@ -213,6 +213,7 @@ impl Executor {
                         *if_exists,
                         *cascade,
                         &self.stats_cache,
+                        sequence_values,
                     )
                     .await
                 }
@@ -308,6 +309,7 @@ impl Executor {
                         search_path,
                         names,
                         *if_exists,
+                        sequence_values,
                     )
                     .await
                 }
@@ -321,8 +323,16 @@ impl Executor {
                         "schema".to_string(),
                     )
                     .await?;
-                    self.execute_drop_schema(txn, db_id, search_path, names, *if_exists, *cascade)
-                        .await
+                    self.execute_drop_schema(
+                        txn,
+                        db_id,
+                        search_path,
+                        names,
+                        *if_exists,
+                        *cascade,
+                        sequence_values,
+                    )
+                    .await
                 }
                 _ => Err(
                     SqlError::Unsupported(format!("DROP {} is not supported", object_type)).into(),
@@ -700,6 +710,7 @@ impl Executor {
         names: &[sqlparser::ast::ObjectName],
         if_exists: bool,
         cascade: bool,
+        sequence_values: &mut SequenceSession,
     ) -> Result<ExecuteResult> {
         for name in names {
             let (schema_prefix, schema) = names::split_object_name(name)?;
@@ -707,9 +718,38 @@ impl Executor {
                 return Err(anyhow!("Invalid schema name '{}'", name));
             }
             if cascade {
+                // Collect sequence names that will be dropped by the cascade,
+                // so we can invalidate session state afterwards.
+                let seqs = self.store.list_sequences(txn, db_id).await?;
+                let schema_prefix_dot = format!("{}.", schema);
+                let tables = self.store.list_tables(txn, db_id).await?;
+                let tables_in_schema: std::collections::HashSet<&str> = tables
+                    .iter()
+                    .filter(|t| t.starts_with(&schema_prefix_dot))
+                    .map(|t| t.as_str())
+                    .collect();
+                let mut dropped_seq_names = Vec::new();
+                for def in &seqs {
+                    // Sequences directly in the schema
+                    if def.schema == schema {
+                        dropped_seq_names.push(def.full_name());
+                        continue;
+                    }
+                    // Sequences owned by tables in the schema
+                    if let Some((owned_table, _)) = &def.owned_by {
+                        if tables_in_schema.contains(owned_table.as_str()) {
+                            dropped_seq_names.push(def.full_name());
+                        }
+                    }
+                }
+
                 self.store
                     .drop_schema_cascade(txn, db_id, &schema, if_exists)
                     .await?;
+
+                for seq in &dropped_seq_names {
+                    sequence_values.on_sequence_dropped(seq);
+                }
             } else {
                 self.store
                     .drop_schema_restrict(txn, db_id, &schema, if_exists)

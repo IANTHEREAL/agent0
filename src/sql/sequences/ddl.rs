@@ -9,7 +9,7 @@ use sqlparser::ast::{MinMaxValue, ObjectName, SequenceOptions};
 use std::sync::Arc;
 use tikv_client::Transaction;
 
-use super::{eval_i64, normalize_sequence_name, ExecuteResult};
+use super::{eval_i64, normalize_sequence_name, ExecuteResult, SequenceSession};
 
 fn parse_minmax(value: &MinMaxValue) -> Result<Option<i64>> {
     match value {
@@ -119,6 +119,7 @@ pub(crate) async fn execute_drop_sequence(
     search_path: &[String],
     names: &[ObjectName],
     if_exists: bool,
+    sequence_values: &mut SequenceSession,
 ) -> Result<ExecuteResult> {
     for name in names {
         let resolved =
@@ -133,6 +134,9 @@ pub(crate) async fn execute_drop_sequence(
         let existed = store.drop_sequence(txn, db_id, &resolved.full).await?;
         if !existed && !if_exists {
             return Err(SqlError::SequenceNotFound(resolved.full.clone()).into());
+        }
+        if existed {
+            sequence_values.on_sequence_dropped(&resolved.full);
         }
     }
     Ok(ExecuteResult::CommandComplete {

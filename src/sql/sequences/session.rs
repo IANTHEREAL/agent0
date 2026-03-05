@@ -49,6 +49,16 @@ impl SequenceSession {
         self.last_value
             .ok_or_else(|| anyhow!("lastval is not yet defined in this session"))
     }
+
+    /// Remove a dropped sequence from session state so that `currval()` and
+    /// `lastval()` no longer return stale values for it.
+    pub fn on_sequence_dropped(&mut self, seq_name: &str) {
+        self.per_seq.remove(seq_name);
+        if self.last_nextval_seq.as_deref() == Some(seq_name) {
+            self.last_value = None;
+            self.last_nextval_seq = None;
+        }
+    }
 }
 
 impl Default for SequenceSession {
@@ -157,5 +167,33 @@ mod tests {
         assert_eq!(s.lastval().unwrap(), 50);
         assert_eq!(s.currval("public.s1").unwrap(), 50);
         assert_eq!(s.currval("public.s2").unwrap(), 99);
+    }
+
+    #[test]
+    fn on_sequence_dropped_clears_currval() {
+        let mut s = SequenceSession::new();
+        s.record_nextval("public.s1".into(), 1);
+        s.on_sequence_dropped("public.s1");
+        assert!(s.currval("public.s1").is_err());
+    }
+
+    #[test]
+    fn on_sequence_dropped_clears_lastval_when_last_used() {
+        let mut s = SequenceSession::new();
+        s.record_nextval("public.s1".into(), 1);
+        s.on_sequence_dropped("public.s1");
+        assert!(s.lastval().is_err());
+    }
+
+    #[test]
+    fn on_sequence_dropped_preserves_lastval_from_other_seq() {
+        let mut s = SequenceSession::new();
+        s.record_nextval("public.s1".into(), 1);
+        s.record_nextval("public.s2".into(), 10);
+        // Drop s1 — lastval should still be 10 (from s2)
+        s.on_sequence_dropped("public.s1");
+        assert!(s.currval("public.s1").is_err());
+        assert_eq!(s.currval("public.s2").unwrap(), 10);
+        assert_eq!(s.lastval().unwrap(), 10);
     }
 }

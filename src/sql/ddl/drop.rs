@@ -12,6 +12,7 @@ use crate::sql::hnsw::storage::{delete_all_deltas, hnsw_graph_key, hnsw_meta_key
 use crate::sql::index_helpers;
 use crate::sql::names;
 use crate::sql::projection::fill_row_defaults;
+use crate::sql::sequences::SequenceSession;
 use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
 use crate::txn::txn_delete;
@@ -29,6 +30,7 @@ pub async fn execute_drop_table(
     if_exists: bool,
     cascade: bool,
     stats_cache: &crate::sql::stats::TableStatsCache,
+    sequence_values: &mut SequenceSession,
 ) -> Result<ExecuteResult> {
     let mut last = String::new();
     for name in names {
@@ -53,7 +55,11 @@ pub async fn execute_drop_table(
 
         // CASCADE: drop views that depend on this table.
         if cascade {
-            let _dropped = drop_dependent_views(store, txn, db_id, &resolved.full).await?;
+            let (_dropped, cascade_seqs) =
+                drop_dependent_views(store, txn, db_id, &resolved.full).await?;
+            for seq in &cascade_seqs {
+                sequence_values.on_sequence_dropped(seq);
+            }
         }
 
         for trigger in store
@@ -64,7 +70,11 @@ pub async fn execute_drop_table(
                 .drop_trigger(txn, db_id, &resolved.full, &trigger.name)
                 .await?;
         }
-        drop_owned_sequences_for_table(store, txn, db_id, &resolved.full).await?;
+        let dropped_seqs =
+            drop_owned_sequences_for_table(store, txn, db_id, &resolved.full).await?;
+        for seq in &dropped_seqs {
+            sequence_values.on_sequence_dropped(seq);
+        }
         store.drop_table(txn, db_id, &resolved.full).await?;
 
         // Invalidate the in-memory stats cache (persistent stats deleted by drop_table).

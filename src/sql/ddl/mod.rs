@@ -225,17 +225,20 @@ pub(super) async fn drop_owned_sequences_for_table(
     txn: &mut Transaction,
     db_id: u64,
     table_name: &str,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let seqs = store.list_sequences(txn, db_id).await?;
+    let mut dropped = Vec::new();
     for def in seqs {
         let Some((owned_table, _)) = &def.owned_by else {
             continue;
         };
         if owned_table == table_name {
-            store.drop_sequence(txn, db_id, &def.full_name()).await?;
+            let name = def.full_name();
+            store.drop_sequence(txn, db_id, &name).await?;
+            dropped.push(name);
         }
     }
-    Ok(())
+    Ok(dropped)
 }
 
 // ── KV scan batching ────────────────────────────────────────────────────────
@@ -660,15 +663,19 @@ pub(super) fn was_cascade_dropped(
 /// the target before the caller can, which would cause a spurious
 /// "does not exist" error (#639).
 ///
-/// Returns the set of fully-qualified names that were dropped, so the
-/// caller can skip names already handled in multi-name DROP (#640).
+/// Returns `(dropped_views, dropped_sequences)`:
+/// - the set of fully-qualified view/matview names that were dropped, so the
+///   caller can skip names already handled in multi-name DROP (#640).
+/// - the list of fully-qualified sequence names that were dropped as a
+///   side-effect of dropping materialized views that owned sequences.
 pub(super) async fn drop_dependent_views(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
     target_name: &str,
-) -> Result<HashSet<String>> {
+) -> Result<(HashSet<String>, Vec<String>)> {
     let mut dropped = HashSet::new();
+    let mut dropped_sequences = Vec::new();
     // Names pending dependency resolution; starts with the dropped object.
     let mut pending: Vec<String> = vec![target_name.to_string()];
 
@@ -702,7 +709,8 @@ pub(super) async fn drop_dependent_views(
                 for trigger in store.list_triggers_for_table(txn, db_id, &full).await? {
                     let _ = store.drop_trigger(txn, db_id, &full, &trigger.name).await?;
                 }
-                drop_owned_sequences_for_table(store, txn, db_id, &full).await?;
+                let seqs = drop_owned_sequences_for_table(store, txn, db_id, &full).await?;
+                dropped_sequences.extend(seqs);
                 store.drop_table(txn, db_id, &full).await?;
                 dropped.insert(full.clone());
                 next_pending.push(full);
@@ -712,5 +720,5 @@ pub(super) async fn drop_dependent_views(
         pending = next_pending;
     }
 
-    Ok(dropped)
+    Ok((dropped, dropped_sequences))
 }
