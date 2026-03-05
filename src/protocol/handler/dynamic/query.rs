@@ -342,7 +342,7 @@ impl DynamicPgHandler {
         &self,
         query: &'a str,
     ) -> PgWireResult<Option<Vec<Response<'a>>>> {
-        let Some((table_name, columns)) = DynamicPgHandler::parse_copy_command(query)
+        let Some((table_name, columns, header)) = DynamicPgHandler::parse_copy_command(query)
             .map_err(|e| PgWireError::UserError(Box::new(e)))?
         else {
             return Ok(None);
@@ -586,6 +586,8 @@ impl DynamicPgHandler {
             row_count: 0,
             started_txn,
             reached_end_marker: false,
+            header,
+            header_skipped: false,
             pending_self_fk_keys: std::collections::HashMap::new(),
             deferred_self_fk_checks: Vec::new(),
         });

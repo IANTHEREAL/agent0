@@ -118,6 +118,12 @@ impl CopyHandler for DynamicPgHandler {
                         break;
                     }
 
+                    // HEADER option: skip the first data line (header row).
+                    if ctx.header && !ctx.header_skipped {
+                        ctx.header_skipped = true;
+                        continue;
+                    }
+
                     let line_no = ctx
                         .row_count
                         .saturating_add(rows_to_insert.len())
@@ -301,6 +307,9 @@ impl CopyHandler for DynamicPgHandler {
                 if let Some(final_line_bytes) = ctx.drain_final_line() {
                     if final_line_bytes.as_slice() == b"\\." {
                         ctx.reached_end_marker = true;
+                    } else if ctx.header && !ctx.header_skipped {
+                        // Header row arrived without trailing newline — skip it.
+                        ctx.header_skipped = true;
                     } else if !ctx.reached_end_marker {
                         let line_no = ctx.row_count.saturating_add(1);
                         let col_values = match parse_copy_text_line(

@@ -38,6 +38,10 @@ pub struct CopyContext {
     pub row_count: usize,
     pub started_txn: bool,
     pub reached_end_marker: bool,
+    /// When true, the first data line is a header row and must be skipped.
+    pub header: bool,
+    /// Set to true after the header row has been consumed.
+    pub header_skipped: bool,
     /// Accumulated self-referencing FK ref-column keys (PK side) across all
     /// CopyData chunks.  Keyed by FK constraint name.
     pub pending_self_fk_keys: HashMap<String, HashSet<String>>,
