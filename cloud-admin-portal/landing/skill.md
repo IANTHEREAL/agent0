@@ -457,7 +457,7 @@ All functions return a table: `(status INT, content_type TEXT, headers JSONB, co
 
 ```sql
 -- GET a JSON API
-SELECT content::jsonb->>'ip' AS my_ip
+SELECT content::jsonb->>'origin' AS my_ip
 FROM extensions.http_get('https://httpbin.org/ip');
 
 -- POST a webhook
