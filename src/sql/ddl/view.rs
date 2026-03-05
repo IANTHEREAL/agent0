@@ -358,7 +358,8 @@ pub async fn execute_create_materialized_view(
 
     let row_count = rows.len();
     store.create_table(txn, db_id, schema.clone()).await?;
-    create_implicit_sequences_for_schema(store, txn, db_id, &schema, Some(schema.name.as_str())).await?;
+    create_implicit_sequences_for_schema(store, txn, db_id, &schema, Some(schema.name.as_str()))
+        .await?;
     if let Some(pk_name) = &schema.pk_constraint_name {
         check_relation_name_available(
             store,

@@ -434,7 +434,8 @@ pub async fn execute_create_table(
     }
 
     store.create_table(txn, db_id, schema.clone()).await?;
-    create_implicit_sequences_for_schema(store, txn, db_id, &schema, Some(schema.name.as_str())).await?;
+    create_implicit_sequences_for_schema(store, txn, db_id, &schema, Some(schema.name.as_str()))
+        .await?;
 
     // Reserve relation names for PK constraint and unique indexes so that
     // CREATE INDEX cannot reuse these names in the same schema.
@@ -556,7 +557,8 @@ pub async fn create_table_from_query_result(
         from_alias: None,
     };
     store.create_table(txn, db_id, schema.clone()).await?;
-    create_implicit_sequences_for_schema(store, txn, db_id, &schema, Some(schema.name.as_str())).await?;
+    create_implicit_sequences_for_schema(store, txn, db_id, &schema, Some(schema.name.as_str()))
+        .await?;
 
     let row_count = result_rows.len();
     for (i, row) in result_rows.into_iter().enumerate() {
@@ -635,7 +637,8 @@ pub async fn create_table_from_stream(
         from_alias: None,
     };
     store.create_table(txn, db_id, schema.clone()).await?;
-    create_implicit_sequences_for_schema(store, txn, db_id, &schema, Some(schema.name.as_str())).await?;
+    create_implicit_sequences_for_schema(store, txn, db_id, &schema, Some(schema.name.as_str()))
+        .await?;
 
     use futures::StreamExt;
     let mut row_stream = stream.0;
@@ -725,7 +728,8 @@ pub async fn create_table_from_select_into(
         from_alias: None,
     };
     store.create_table(txn, db_id, schema.clone()).await?;
-    create_implicit_sequences_for_schema(store, txn, db_id, &schema, Some(schema.name.as_str())).await?;
+    create_implicit_sequences_for_schema(store, txn, db_id, &schema, Some(schema.name.as_str()))
+        .await?;
 
     let row_count = result_rows.len();
     for (i, row) in result_rows.into_iter().enumerate() {

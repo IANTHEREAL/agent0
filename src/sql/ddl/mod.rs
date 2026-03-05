@@ -173,8 +173,15 @@ pub(super) async fn create_implicit_sequences_for_schema(
 ) -> Result<()> {
     for col in &schema.columns {
         if col.is_serial {
-            let seq_name =
-                allocate_implicit_sequence_name(store, txn, db_id, &schema.name, &col.name, exclude_table).await?;
+            let seq_name = allocate_implicit_sequence_name(
+                store,
+                txn,
+                db_id,
+                &schema.name,
+                &col.name,
+                exclude_table,
+            )
+            .await?;
             let mut seq_def =
                 sequences::build_implicit_sequence_def(&schema.name, &col.name, &col.data_type);
             seq_def.name = seq_name;
