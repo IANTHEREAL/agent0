@@ -1,0 +1,9 @@
+merged
+{"new": true, "page": "/home", "type": "click"}
+(1 row)
+merged_unknown_literal
+{"new": true, "page": "/home", "type": "click"}
+(1 row)
+obj_obj
+{"a": 1, "bb": 2}
+(1 row)

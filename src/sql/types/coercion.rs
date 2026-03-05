@@ -226,8 +226,19 @@ pub fn binary_op_result_type(op: &str, left: &DataType, right: &DataType) -> Opt
             }
         }
 
-        // String concatenation
-        "StringConcat" | "||" => Some(DataType::Text),
+        // Concatenation (||) overloads (PostgreSQL):
+        // - text || text -> text
+        // - jsonb || jsonb -> jsonb
+        // - anyarray || anyarray / anyarray || anyelement / anyelement || anyarray -> anyarray
+        // - tsvector || tsvector -> tsvector
+        "StringConcat" | "||" => match (left, right) {
+            (DataType::Jsonb, DataType::Jsonb) => Some(DataType::Jsonb),
+            (DataType::Tsvector, DataType::Tsvector) => Some(DataType::Tsvector),
+            (DataType::Array(inner), DataType::Array(_)) => Some(DataType::Array(inner.clone())),
+            (DataType::Array(inner), _) => Some(DataType::Array(inner.clone())),
+            (_, DataType::Array(inner)) => Some(DataType::Array(inner.clone())),
+            _ => Some(DataType::Text),
+        },
 
         // Comparison operators
         "Eq" | "NotEq" | "Lt" | "LtEq" | "Gt" | "GtEq" | "=" | "!=" | "<>" | "<" | "<=" | ">"

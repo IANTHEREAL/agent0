@@ -160,6 +160,26 @@ impl<'a> Analyzer<'a> {
             }
         }
 
+        // PostgreSQL UNKNOWN literal rule (jsonb concat):
+        //
+        // In PostgreSQL, an untyped string literal on either side of `jsonb ||`
+        // is coerced to JSONB via the type input function (so invalid JSON
+        // errors, rather than silently falling back to text concatenation).
+        //
+        //   SELECT '{"a":1}'::jsonb || '{"b":2}'  -> jsonb merge
+        //   SELECT '{"a":1}'::jsonb || 'x'        -> ERROR (invalid JSON)
+        //
+        // We only apply this to semantically-unknown expressions (bare string
+        // literals, NULL, unresolved params). Explicit TEXT (`::text`) should
+        // remain eligible for text concatenation (PG anynonarray||text).
+        if typed_op == BinaryOp::Concat {
+            if l.data_type == DataType::Jsonb && self.is_semantically_unknown(&r) {
+                r = self.coerce_if_needed(r, &DataType::Jsonb)?;
+            } else if r.data_type == DataType::Jsonb && self.is_semantically_unknown(&l) {
+                l = self.coerce_if_needed(l, &DataType::Jsonb)?;
+            }
+        }
+
         // Use our BinaryOp Display impl (outputs "+", "-", "=", etc.)
         // which maps directly to the operator symbols in binary_op_result_type.
         let op_display = typed_op.to_string();

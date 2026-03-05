@@ -250,6 +250,36 @@ fn analyze_string_concat() {
 }
 
 #[test]
+fn analyze_jsonb_concat_coerces_unknown_literal_to_jsonb() {
+    let expr = analyze_expr_with_users("'{\"a\":1}'::jsonb || '{\"b\":2}'").unwrap();
+    assert_eq!(expr.data_type, DataType::Jsonb);
+
+    let (left, op, right) = match &expr.kind {
+        TypedExprKind::BinaryOp { left, op, right } => (left, op, right),
+        other => panic!("expected BinaryOp, got {:?}", other),
+    };
+    assert_eq!(*op, BinaryOp::Concat);
+    assert_eq!(left.data_type, DataType::Jsonb);
+    assert_eq!(right.data_type, DataType::Jsonb);
+
+    assert!(matches!(
+        right.kind,
+        TypedExprKind::Cast {
+            target_type: DataType::Jsonb,
+            cast_context: crate::sql::types::cast::CastContext::Implicit,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn analyze_jsonb_concat_with_explicit_text_stays_text() {
+    // PostgreSQL: explicit TEXT forces anynonarray||text concatenation.
+    let expr = analyze_expr_with_users("'{\"a\":1}'::jsonb || '{\"b\":2}'::text").unwrap();
+    assert_eq!(expr.data_type, DataType::Text);
+}
+
+#[test]
 fn analyze_logical() {
     let expr = analyze_expr_with_users("age > 18 AND active").unwrap();
     assert_eq!(expr.data_type, DataType::Boolean);
