@@ -611,6 +611,20 @@ impl Executor {
                             let (_, rows) =
                                 self.execute_record_migration(txn, &bridge_args).await?;
                             rows
+                        } else if matches!(
+                            func_upper.as_str(),
+                            "JSONB_OBJECT_KEYS"
+                                | "JSON_OBJECT_KEYS"
+                                | "JSONB_ARRAY_ELEMENTS"
+                                | "JSON_ARRAY_ELEMENTS"
+                                | "JSONB_ARRAY_ELEMENTS_TEXT"
+                                | "JSON_ARRAY_ELEMENTS_TEXT"
+                                | "JSONB_EACH"
+                                | "JSON_EACH"
+                                | "JSONB_EACH_TEXT"
+                                | "JSON_EACH_TEXT"
+                        ) {
+                            json_table_function_rows(&func_upper, &evaluated_args)?
                         } else if bridge_args.is_empty()
                             && is_virtual_table_backed_system_function(&func.name)
                         {
@@ -804,6 +818,122 @@ fn bridge_function_args(args: &[EvaluatedTableFunctionArg]) -> Vec<FunctionArg> 
         .collect()
 }
 
+fn json_table_function_rows(
+    func_upper: &str,
+    args: &[EvaluatedTableFunctionArg],
+) -> Result<Vec<Row>> {
+    let Some(arg0) = args.first() else {
+        return Err(anyhow!("{func_upper} requires at least 1 argument"));
+    };
+    if args.len() != 1 {
+        return Err(anyhow!("{func_upper} requires exactly 1 argument"));
+    }
+
+    let json_str = match &arg0.value {
+        Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => Some(s.as_str()),
+        Value::Null => None,
+        other => {
+            return Err(anyhow!(
+                "{func_upper} requires json/jsonb argument, got {other}"
+            ))
+        }
+    };
+    let Some(json_str) = json_str else {
+        // SRFs are strict: NULL input produces an empty set.
+        return Ok(Vec::new());
+    };
+
+    let json_val: serde_json::Value =
+        serde_json::from_str(json_str).map_err(|e| anyhow!("Invalid JSON: {e}"))?;
+
+    let is_jsonb = func_upper.starts_with("JSONB_");
+    match func_upper {
+        "JSONB_OBJECT_KEYS" | "JSON_OBJECT_KEYS" => match json_val {
+            serde_json::Value::Object(obj) => {
+                let mut entries: Vec<String> = obj.into_iter().map(|(k, _)| k).collect();
+                if is_jsonb {
+                    entries.sort();
+                }
+                Ok(entries
+                    .into_iter()
+                    .map(|k| Row::new(vec![Value::Text(k)]))
+                    .collect())
+            }
+            _ => Err(anyhow!("cannot call jsonb_object_keys on a non-object")),
+        },
+        "JSONB_ARRAY_ELEMENTS" | "JSON_ARRAY_ELEMENTS" => match json_val {
+            serde_json::Value::Array(arr) => Ok(arr
+                .into_iter()
+                .map(|v| {
+                    let s = v.to_string();
+                    let val = if func_upper == "JSON_ARRAY_ELEMENTS" {
+                        Value::Json(s)
+                    } else {
+                        Value::Jsonb(s)
+                    };
+                    Row::new(vec![val])
+                })
+                .collect()),
+            _ => Err(anyhow!("cannot extract elements from a non-array")),
+        },
+        "JSONB_ARRAY_ELEMENTS_TEXT" | "JSON_ARRAY_ELEMENTS_TEXT" => match json_val {
+            serde_json::Value::Array(arr) => Ok(arr
+                .into_iter()
+                .map(|v| {
+                    let val = match v {
+                        serde_json::Value::String(s) => Value::Text(s),
+                        serde_json::Value::Null => Value::Null,
+                        other => Value::Text(other.to_string()),
+                    };
+                    Row::new(vec![val])
+                })
+                .collect()),
+            _ => Err(anyhow!("cannot extract elements from a non-array")),
+        },
+        "JSONB_EACH" | "JSON_EACH" => match json_val {
+            serde_json::Value::Object(obj) => {
+                let mut entries: Vec<(String, serde_json::Value)> = obj.into_iter().collect();
+                if is_jsonb {
+                    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+                }
+                Ok(entries
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let val = if func_upper == "JSON_EACH" {
+                            Value::Json(v.to_string())
+                        } else {
+                            Value::Jsonb(v.to_string())
+                        };
+                        Row::new(vec![Value::Text(k), val])
+                    })
+                    .collect())
+            }
+            _ => Err(anyhow!("cannot call jsonb_each on a non-object")),
+        },
+        "JSONB_EACH_TEXT" | "JSON_EACH_TEXT" => match json_val {
+            serde_json::Value::Object(obj) => {
+                let mut entries: Vec<(String, serde_json::Value)> = obj.into_iter().collect();
+                if is_jsonb {
+                    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+                }
+                Ok(entries
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let val = match v {
+                            serde_json::Value::String(s) => Value::Text(s),
+                            serde_json::Value::Null => Value::Null,
+                            other => Value::Text(other.to_string()),
+                        };
+                        Row::new(vec![Value::Text(k), val])
+                    })
+                    .collect())
+            }
+            _ => Err(anyhow!("cannot call jsonb_each on a non-object")),
+        },
+        _ => Err(anyhow!("unsupported json table function: {func_upper}")),
+    }
+}
+
 fn has_any_column_ref(expr: &TypedExpr) -> bool {
     visit_any(expr, |e| matches!(&e.kind, TypedExprKind::ColumnRef { .. }))
 }
@@ -812,7 +942,7 @@ fn has_any_column_ref(expr: &TypedExpr) -> bool {
 mod tests {
     use super::{
         bridge_function_args, evaluate_table_function_args, has_any_column_ref,
-        EvaluatedTableFunctionArg,
+        json_table_function_rows, EvaluatedTableFunctionArg,
     };
     use crate::model::{DataType, Row, Value};
     use crate::sql::analyzer::types::{
@@ -993,5 +1123,42 @@ mod tests {
             DataType::Int32,
         );
         assert!(has_any_column_ref(&expr));
+    }
+
+    #[test]
+    fn json_table_function_rows_jsonb_each_expands_object() {
+        let args = vec![EvaluatedTableFunctionArg {
+            name: None,
+            value: Value::Jsonb(r#"{"a":1,"b":2}"#.to_string()),
+        }];
+        let rows = json_table_function_rows("JSONB_EACH", &args).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values,
+            vec![Value::Text("a".into()), Value::Jsonb("1".into())]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![Value::Text("b".into()), Value::Jsonb("2".into())]
+        );
+    }
+
+    #[test]
+    fn json_table_function_rows_jsonb_each_text_null_and_empty_string_distinct() {
+        let args = vec![EvaluatedTableFunctionArg {
+            name: None,
+            value: Value::Jsonb(r#"{"empty":"","nullv":null}"#.to_string()),
+        }];
+        let rows = json_table_function_rows("JSONB_EACH_TEXT", &args).unwrap();
+        assert_eq!(rows.len(), 2);
+        // jsonb_* ordering should be key-sorted for determinism / PostgreSQL parity.
+        assert_eq!(
+            rows[0].values,
+            vec![Value::Text("empty".into()), Value::Text("".into())]
+        );
+        assert_eq!(
+            rows[1].values,
+            vec![Value::Text("nullv".into()), Value::Null]
+        );
     }
 }

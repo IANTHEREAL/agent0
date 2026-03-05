@@ -1170,6 +1170,67 @@ fn analyze_current_user_in_from_without_parentheses() {
 }
 
 #[test]
+fn analyze_jsonb_each_in_from_select_star_expands_columns() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT * FROM jsonb_each('{\"a\":1,\"b\":2}'::jsonb)");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    assert_eq!(result.output_schema.len(), 2);
+    assert_eq!(
+        result.output_schema[0],
+        ("key".to_string(), DataType::Text, None)
+    );
+    assert_eq!(
+        result.output_schema[1],
+        ("value".to_string(), DataType::Jsonb, None)
+    );
+}
+
+#[test]
+fn analyze_schema_qualified_jsonb_each_in_from_uses_canonical_dispatch_name() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT * FROM pg_catalog.jsonb_each('{\"a\":1}'::jsonb)");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    let select = expect_select(&result);
+    assert_eq!(select.from.len(), 1);
+    match &select.from[0].kind {
+        AnalyzedTableRefKind::Function { func, .. } => {
+            assert_eq!(func.name, "jsonb_each");
+        }
+        other => panic!("expected Function table ref, got {:?}", other),
+    }
+}
+
+#[test]
+fn analyze_jsonb_each_in_from_honors_alias_column_list() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT * FROM jsonb_each('{\"a\":1}'::jsonb) AS e(k, v)");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    assert_eq!(result.output_schema.len(), 2);
+    assert_eq!(result.output_schema[0].0, "k");
+    assert_eq!(result.output_schema[0].1, DataType::Text);
+    assert_eq!(result.output_schema[1].0, "v");
+    assert_eq!(result.output_schema[1].1, DataType::Jsonb);
+}
+
+#[test]
+fn analyze_jsonb_object_keys_in_from_uses_alias_as_column_name() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT * FROM jsonb_object_keys('{\"a\":1}'::jsonb) AS k");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    assert_eq!(result.output_schema.len(), 1);
+    assert_eq!(result.output_schema[0].0, "k");
+    assert_eq!(result.output_schema[0].1, DataType::Text);
+}
+
+#[test]
 fn analyze_group_by() {
     let catalog = test_catalog();
     let mut analyzer = Analyzer::new(&catalog);

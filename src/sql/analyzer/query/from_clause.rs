@@ -101,6 +101,16 @@ impl<'a> Analyzer<'a> {
                     || obj_name.eq_ignore_ascii_case("current_user")
                     || obj_name.eq_ignore_ascii_case("session_user")
                     || obj_name.eq_ignore_ascii_case("user")
+                    || obj_name.eq_ignore_ascii_case("jsonb_object_keys")
+                    || obj_name.eq_ignore_ascii_case("json_object_keys")
+                    || obj_name.eq_ignore_ascii_case("jsonb_array_elements")
+                    || obj_name.eq_ignore_ascii_case("json_array_elements")
+                    || obj_name.eq_ignore_ascii_case("jsonb_array_elements_text")
+                    || obj_name.eq_ignore_ascii_case("json_array_elements_text")
+                    || obj_name.eq_ignore_ascii_case("jsonb_each")
+                    || obj_name.eq_ignore_ascii_case("json_each")
+                    || obj_name.eq_ignore_ascii_case("jsonb_each_text")
+                    || obj_name.eq_ignore_ascii_case("json_each_text")
                 {
                     // Built-in table/scalar-in-FROM functions should keep their canonical
                     // dispatch name even when schema-qualified in SQL (e.g. pg_catalog.unnest).
@@ -251,6 +261,69 @@ impl<'a> Analyzer<'a> {
                         // Scalar functions used in FROM return a single-row, single-column relation.
                         let col_name = obj_name.to_lowercase();
                         vec![(col_name, DataType::Text, false, None)]
+                    } else if obj_name.eq_ignore_ascii_case("jsonb_object_keys")
+                        || obj_name.eq_ignore_ascii_case("json_object_keys")
+                    {
+                        let col_name = if let Some(ta) = alias {
+                            if !ta.columns.is_empty() {
+                                crate::sql::names::normalize_ident(&ta.columns[0])
+                            } else {
+                                crate::sql::names::normalize_ident(&ta.name)
+                            }
+                        } else {
+                            obj_name.to_lowercase()
+                        };
+                        vec![(col_name, DataType::Text, false, None)]
+                    } else if obj_name.eq_ignore_ascii_case("jsonb_array_elements")
+                        || obj_name.eq_ignore_ascii_case("json_array_elements")
+                    {
+                        let col_name = if let Some(ta) = alias {
+                            if !ta.columns.is_empty() {
+                                crate::sql::names::normalize_ident(&ta.columns[0])
+                            } else {
+                                crate::sql::names::normalize_ident(&ta.name)
+                            }
+                        } else {
+                            obj_name.to_lowercase()
+                        };
+                        let out_ty = if obj_name.eq_ignore_ascii_case("json_array_elements") {
+                            DataType::Json
+                        } else {
+                            DataType::Jsonb
+                        };
+                        vec![(col_name, out_ty, false, None)]
+                    } else if obj_name.eq_ignore_ascii_case("jsonb_array_elements_text")
+                        || obj_name.eq_ignore_ascii_case("json_array_elements_text")
+                    {
+                        let col_name = if let Some(ta) = alias {
+                            if !ta.columns.is_empty() {
+                                crate::sql::names::normalize_ident(&ta.columns[0])
+                            } else {
+                                crate::sql::names::normalize_ident(&ta.name)
+                            }
+                        } else {
+                            obj_name.to_lowercase()
+                        };
+                        vec![(col_name, DataType::Text, true, None)]
+                    } else if obj_name.eq_ignore_ascii_case("jsonb_each")
+                        || obj_name.eq_ignore_ascii_case("json_each")
+                    {
+                        let val_ty = if obj_name.eq_ignore_ascii_case("json_each") {
+                            DataType::Json
+                        } else {
+                            DataType::Jsonb
+                        };
+                        vec![
+                            ("key".to_string(), DataType::Text, false, None),
+                            ("value".to_string(), val_ty, false, None),
+                        ]
+                    } else if obj_name.eq_ignore_ascii_case("jsonb_each_text")
+                        || obj_name.eq_ignore_ascii_case("json_each_text")
+                    {
+                        vec![
+                            ("key".to_string(), DataType::Text, false, None),
+                            ("value".to_string(), DataType::Text, true, None),
+                        ]
                     } else if obj_name.eq_ignore_ascii_case("_db9_sys_record_migration") {
                         vec![
                             ("name".to_string(), DataType::Text, false, None),
