@@ -293,6 +293,9 @@ impl TenantObservability {
                 return;
             }
             sql = redact_sensitive_sql(&sql);
+            if is_observability_system_sql(&sql) {
+                return;
+            }
             if sql.contains('|') {
                 sql = sql.replace('|', " ");
             }
@@ -709,6 +712,11 @@ fn normalize_sql(s: &str, max_len: usize) -> String {
     }
 }
 
+fn is_observability_system_sql(s: &str) -> bool {
+    let upper = s.to_ascii_uppercase();
+    upper.contains("_DB9_SYS_OBSERVABILITY") || upper.contains("_DB9_SYS_QUERY_SAMPLES")
+}
+
 fn latency_us_to_bin(latency_us: u64) -> usize {
     if latency_us == 0 {
         return 0;
@@ -839,5 +847,35 @@ mod tests {
             redact_sensitive_sql(sql),
             "CREATE ROLE foo WITH LOGIN password '***' SUPERUSER"
         );
+    }
+
+    #[test]
+    fn test_observability_system_queries_are_not_sampled() {
+        let cfg = ObservabilityConfig {
+            sample_every: 1,
+            ..ObservabilityConfig::default()
+        };
+        let tenant = TenantObservability::new(cfg);
+        tenant.record_statement_us(1_000, true, || {
+            "SELECT * FROM _db9_sys_query_samples()".to_string()
+        });
+
+        assert!(tenant.snapshot_query_samples().is_empty());
+        assert_eq!(tenant.snapshot_summary().statement_count, 1);
+    }
+
+    #[test]
+    fn test_normal_queries_are_still_sampled() {
+        let cfg = ObservabilityConfig {
+            sample_every: 1,
+            ..ObservabilityConfig::default()
+        };
+        let tenant = TenantObservability::new(cfg);
+        tenant.record_statement_us(1_000, true, || "SELECT 1".to_string());
+
+        let groups = tenant.snapshot_query_samples();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].query, "SELECT 1");
+        assert_eq!(groups[0].sample_count, 1);
     }
 }
