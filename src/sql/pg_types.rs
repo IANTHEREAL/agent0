@@ -20,6 +20,7 @@ pub(crate) const OID_BPCHAR: i64 = 1042;
 pub(crate) const OID_VARCHAR: i64 = 1043;
 pub(crate) const OID_DATE: i64 = 1082;
 pub(crate) const OID_TIME: i64 = 1083;
+pub(crate) const OID_TIMETZ: i64 = 1266;
 pub(crate) const OID_TIMESTAMP: i64 = 1114;
 pub(crate) const OID_TIMESTAMPTZ: i64 = 1184;
 pub(crate) const OID_INTERVAL: i64 = 1186;
@@ -46,6 +47,7 @@ pub(crate) const OID_OID_ARRAY: i64 = 1028;
 pub(crate) const OID_TIMESTAMP_ARRAY: i64 = 1115;
 pub(crate) const OID_DATE_ARRAY: i64 = 1182;
 pub(crate) const OID_TIME_ARRAY: i64 = 1183;
+pub(crate) const OID_TIMETZ_ARRAY: i64 = 1270;
 pub(crate) const OID_TIMESTAMPTZ_ARRAY: i64 = 1185;
 pub(crate) const OID_INTERVAL_ARRAY: i64 = 1187;
 pub(crate) const OID_NUMERIC_ARRAY: i64 = 1231;
@@ -85,6 +87,7 @@ pub(crate) const BUILTIN_PG_TYPES: &[BuiltinPgType] = &[
     BuiltinPgType { oid: OID_VARCHAR,     typname: "varchar",     typlen: -1, typbyval: "f", typtype: "b", typcategory: "S", typcollation: 100 },
     BuiltinPgType { oid: OID_DATE,        typname: "date",        typlen:  4, typbyval: "t", typtype: "b", typcategory: "D", typcollation:   0 },
     BuiltinPgType { oid: OID_TIME,        typname: "time",        typlen:  8, typbyval: "t", typtype: "b", typcategory: "D", typcollation:   0 },
+    BuiltinPgType { oid: OID_TIMETZ,      typname: "timetz",      typlen: 12, typbyval: "f", typtype: "b", typcategory: "D", typcollation:   0 },
     BuiltinPgType { oid: OID_TIMESTAMP,   typname: "timestamp",   typlen:  8, typbyval: "t", typtype: "b", typcategory: "D", typcollation:   0 },
     BuiltinPgType { oid: OID_TIMESTAMPTZ, typname: "timestamptz", typlen:  8, typbyval: "t", typtype: "b", typcategory: "D", typcollation:   0 },
     BuiltinPgType { oid: OID_INTERVAL,    typname: "interval",    typlen: 16, typbyval: "f", typtype: "b", typcategory: "T", typcollation:   0 },
@@ -106,6 +109,7 @@ pub(crate) fn typname_for_oid(oid: i64) -> Option<&'static str> {
 pub(crate) fn format_type_name_for_oid(oid: i64) -> Option<&'static str> {
     match oid {
         OID_TIME => Some("time without time zone"),
+        OID_TIMETZ => Some("time with time zone"),
         OID_TID => Some("tid"),
         OID_XID => Some("xid"),
         OID_CID => Some("cid"),

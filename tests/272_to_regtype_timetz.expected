@@ -1,0 +1,23 @@
+to_regtype
+1266
+(1 row)
+to_regtype
+1266
+(1 row)
+to_regtype
+1266
+(1 row)
+to_regtype
+1266
+(1 row)
+to_regtype
+1270
+(1 row)
+to_regtype
+1266
+(1 row)
+to_regtype
+1266
+(1 row)
+ERROR:  TIME(-1) WITH TIME ZONE precision must not be negative
+ERROR:  invalid type name "pg_catalog.timetz(foo)"

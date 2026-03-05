@@ -366,12 +366,13 @@ fn validate_schema_qualified_typmod(base: &str, typmod: &str, original_name: &st
             Ok(true)
         }
         // Typmod arity: 1, precision must be non-negative (PG clamps >6 with WARNING)
-        "time" | "timestamp" | "timestamptz" => {
+        "time" | "timetz" | "timestamp" | "timestamptz" => {
             let args = parse_typmod_int_list(typmod, original_name)?;
             if args.len() == 1 {
                 if args[0] < 0 {
                     let type_display = match base {
                         "timestamptz" => format!("TIMESTAMP({}) WITH TIME ZONE", args[0]),
+                        "timetz" => format!("TIME({}) WITH TIME ZONE", args[0]),
                         _ => format!("{}({})", base.to_uppercase(), args[0]),
                     };
                     return Err(crate::sql::error::SqlError::SqlStructure(format!(
@@ -570,6 +571,7 @@ fn regtype_array_oid(base_oid: i64) -> Option<i64> {
         pg_types::OID_TIMESTAMP => Some(pg_types::OID_TIMESTAMP_ARRAY),
         pg_types::OID_DATE => Some(pg_types::OID_DATE_ARRAY),
         pg_types::OID_TIME => Some(pg_types::OID_TIME_ARRAY),
+        pg_types::OID_TIMETZ => Some(pg_types::OID_TIMETZ_ARRAY),
         pg_types::OID_TIMESTAMPTZ => Some(pg_types::OID_TIMESTAMPTZ_ARRAY),
         pg_types::OID_INTERVAL => Some(pg_types::OID_INTERVAL_ARRAY),
         pg_types::OID_NUMERIC => Some(pg_types::OID_NUMERIC_ARRAY),
@@ -598,6 +600,7 @@ fn pg_catalog_regtype_oid(name: &str) -> Option<i64> {
         "varchar" | "character varying" => Some(pg_types::OID_VARCHAR),
         "date" => Some(pg_types::OID_DATE),
         "time" | "time without time zone" => Some(pg_types::OID_TIME),
+        "timetz" | "time with time zone" => Some(pg_types::OID_TIMETZ),
         "timestamp" | "timestamp without time zone" => Some(pg_types::OID_TIMESTAMP),
         "timestamptz" | "timestamp with time zone" => Some(pg_types::OID_TIMESTAMPTZ),
         "interval" => Some(pg_types::OID_INTERVAL),
@@ -722,13 +725,23 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
                 }
                 // Negative precision for temporal types → ERROR (PG parity).
                 // PG bare path: time(-1) and timestamp(-1) → "invalid type name",
-                // but timestamptz(-1) → precision error (same as schema-qualified).
-                if matches!(base_part.as_str(), "time" | "timestamp" | "timestamptz") {
+                // but timestamptz(-1)/timetz(-1) → precision error (same as schema-qualified).
+                if matches!(
+                    base_part.as_str(),
+                    "time" | "timetz" | "timestamp" | "timestamptz"
+                ) {
                     let args = parse_typmod_int_list(tm, &raw)?;
                     if args.len() == 1 && args[0] < 0 {
                         if base_part == "timestamptz" {
                             return Err(crate::sql::error::SqlError::SqlStructure(format!(
                                 "TIMESTAMP({}) WITH TIME ZONE precision must not be negative",
+                                args[0]
+                            ))
+                            .into());
+                        }
+                        if base_part == "timetz" {
+                            return Err(crate::sql::error::SqlError::SqlStructure(format!(
+                                "TIME({}) WITH TIME ZONE precision must not be negative",
                                 args[0]
                             ))
                             .into());
@@ -1243,6 +1256,80 @@ mod tests {
             Value::Null
         );
         assert_eq!(to_regtype(vec![Value::Null]).unwrap(), Value::Null);
+        // --- timetz support (PR #1447) ---
+        assert_eq!(
+            to_regtype(vec![Value::Text("timetz".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIMETZ)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("time with time zone".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIMETZ)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog.timetz".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIMETZ)
+        );
+        // Valid timetz precision (0-6)
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog.timetz(3)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIMETZ)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("timetz(0)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIMETZ)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("timetz(6)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIMETZ)
+        );
+        // Precision > 6 is clamped (PG returns OID with a warning)
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog.timetz(7)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIMETZ)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("timetz(7)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIMETZ)
+        );
+        // Negative precision → error (PG: TIME(-1) WITH TIME ZONE precision must not be negative)
+        let err = to_regtype(vec![Value::Text("pg_catalog.timetz(-1)".into())]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("TIME(-1) WITH TIME ZONE precision must not be negative"),
+            "unexpected error: {err}"
+        );
+        // Non-integer precision → error
+        assert!(to_regtype(vec![Value::Text("pg_catalog.timetz(foo)".into())]).is_err());
+        // Other temporal types: precision > 6 also returns OID (clamped)
+        assert_eq!(
+            to_regtype(vec![Value::Text("time(7)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIME)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("timestamp(7)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIMESTAMP)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("timestamptz(7)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIMESTAMPTZ)
+        );
+        // Bare timetz(-1) → specific precision error (PG parity)
+        let err = to_regtype(vec![Value::Text("timetz(-1)".into())]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("TIME(-1) WITH TIME ZONE precision must not be negative"),
+            "unexpected error: {err}"
+        );
+        // Unknown schema + temporal typmod → NULL (no validation, no error)
+        assert_eq!(
+            to_regtype(vec![Value::Text("foo.timetz(-1)".into())]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("foo.time(foo)".into())]).unwrap(),
+            Value::Null
+        );
+        // --- regtype parity (PR #1425) ---
         // Quoted schema case-sensitivity: quoted "PG_CATALOG" ≠ pg_catalog → NULL
         assert_eq!(
             to_regtype(vec![Value::Text("\"PG_CATALOG\".int4".into())]).unwrap(),
@@ -1279,10 +1366,6 @@ mod tests {
             Value::Int64(pg_types::OID_TIME)
         );
         // Multi-word types not in our OID table → NULL (not error)
-        assert_eq!(
-            to_regtype(vec![Value::Text("time with time zone".into())]).unwrap(),
-            Value::Null
-        );
         assert_eq!(
             to_regtype(vec![Value::Text("bit varying".into())]).unwrap(),
             Value::Null
@@ -1391,7 +1474,7 @@ mod tests {
             Value::Int64(pg_types::OID_NUMERIC)
         );
         // Negative precision for bare temporal types (PG parity):
-        // time/timestamp → "invalid type name", timestamptz → precision error.
+        // time/timestamp → "invalid type name", timestamptz/timetz → precision error.
         assert!(to_regtype(vec![Value::Text("time(-1)".into())]).is_err());
         assert!(to_regtype(vec![Value::Text("timestamp(-1)".into())]).is_err());
         let err = to_regtype(vec![Value::Text("timestamptz(-1)".into())]).unwrap_err();
