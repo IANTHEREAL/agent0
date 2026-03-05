@@ -190,6 +190,19 @@ pub fn procedure_to_ddl(name: &str, definition: &str) -> String {
     )
 }
 
+pub fn function_to_ddl(def: &crate::model::FunctionDef) -> String {
+    let full_name = format!("{}.{}", def.schema, def.name);
+    let args = def.arg_types.join(", ");
+    let return_type = def.return_type.trim();
+    let language = def.language.trim();
+    let body = def.body.trim();
+
+    format!(
+        "CREATE OR REPLACE FUNCTION {}({}) RETURNS {} AS $$\n{}\n$$ LANGUAGE {};",
+        full_name, args, return_type, body, language
+    )
+}
+
 pub fn trigger_to_ddl(def: &TriggerDef) -> String {
     let events = if def.events.is_empty() {
         "INSERT".to_string()
@@ -415,6 +428,19 @@ pub async fn export_all_ddl(
         });
     }
 
+    let mut functions = store.list_functions(txn, db_id).await?;
+    functions.sort_by(|a, b| {
+        (a.schema.as_str(), a.name.as_str()).cmp(&(b.schema.as_str(), b.name.as_str()))
+    });
+    for function in functions {
+        rows.push(DdlExportRow {
+            ddl_order: 0,
+            object_type: "function".to_string(),
+            object_name: format!("{}.{}", function.schema, function.name),
+            ddl_sql: function_to_ddl(&function),
+        });
+    }
+
     let mut triggers = store.list_triggers(txn, db_id).await?;
     triggers.sort_by(|a, b| {
         (a.table.as_str(), a.name.as_str()).cmp(&(b.table.as_str(), b.name.as_str()))
@@ -570,6 +596,25 @@ mod tests {
         let ddl = procedure_to_ddl("public.p", "PARAMS:a int, b text\nBODY:SELECT a;SELECT b;");
         assert!(ddl.starts_with("CREATE OR REPLACE PROCEDURE public.p(a int, b text)"));
         assert!(ddl.contains("SELECT a;SELECT b;"));
+    }
+
+    #[test]
+    fn function_to_ddl_formats_body_and_language() {
+        let def = crate::model::FunctionDef {
+            oid: 1,
+            schema: "public".to_string(),
+            name: "audit_fn".to_string(),
+            arg_types: vec![],
+            return_type: "trigger".to_string(),
+            language: "plpgsql".to_string(),
+            body: "BEGIN RETURN NEW; END;".to_string(),
+            owner: "postgres".to_string(),
+        };
+        let ddl = function_to_ddl(&def);
+        assert!(ddl.starts_with("CREATE OR REPLACE FUNCTION public.audit_fn() RETURNS trigger"));
+        assert!(ddl.contains("AS $$"));
+        assert!(ddl.contains("BEGIN RETURN NEW; END;"));
+        assert!(ddl.ends_with("LANGUAGE plpgsql;"));
     }
 
     #[test]

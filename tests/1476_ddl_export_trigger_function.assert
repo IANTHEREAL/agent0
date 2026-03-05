@@ -1,0 +1,5 @@
+function|public.ddl_export_1502_fn
+trigger|public.t_ddl_export_1502.t_ddl_export_1502_bi
+t
+CREATE OR REPLACE FUNCTION public.ddl_export_1502_fn() RETURNS trigger AS $$
+LANGUAGE plpgsql;
