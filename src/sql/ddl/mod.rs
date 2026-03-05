@@ -172,13 +172,12 @@ pub(super) async fn create_implicit_sequences_for_schema(
 ) -> Result<()> {
     for col in &schema.columns {
         if col.is_serial {
-            store
-                .create_sequence(
-                    txn,
-                    db_id,
-                    sequences::build_implicit_sequence_def(&schema.name, &col.name, &col.data_type),
-                )
-                .await?;
+            let seq_name =
+                allocate_implicit_sequence_name(store, txn, db_id, &schema.name, &col.name).await?;
+            let mut seq_def =
+                sequences::build_implicit_sequence_def(&schema.name, &col.name, &col.data_type);
+            seq_def.name = seq_name;
+            store.create_sequence(txn, db_id, seq_def).await?;
         }
     }
     Ok(())
@@ -197,6 +196,7 @@ pub(super) async fn advance_implicit_sequences_for_seeded_rows(
 
     let last_value = i64::try_from(row_count)
         .map_err(|_| anyhow!("row count {} overflows sequence value", row_count))?;
+    let sequence_defs = store.list_sequences(txn, db_id).await?;
     let (table_schema, table_name) = schema
         .name
         .rsplit_once('.')
@@ -207,17 +207,99 @@ pub(super) async fn advance_implicit_sequences_for_seeded_rows(
             continue;
         }
 
-        let seq_full_name = format!(
-            "{}.{}",
-            table_schema,
-            sequences::implicit_sequence_name(table_name, &col.name)
-        );
+        let seq_full_name = match sequences::find_owned_sequence_full_name(
+            &sequence_defs,
+            &schema.name,
+            &col.name,
+        )? {
+            Some(name) => name,
+            None => format!(
+                "{}.{}",
+                table_schema,
+                sequences::implicit_sequence_name(table_name, &col.name)
+            ),
+        };
         store
             .setval_sequence(txn, db_id, &seq_full_name, last_value, true)
             .await?;
     }
 
     Ok(())
+}
+
+async fn relation_name_taken_in_schema(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema_name: &str,
+    relation_name: &str,
+) -> Result<bool> {
+    let full_name = format!("{}.{}", schema_name, relation_name);
+
+    if store.table_exists(txn, db_id, &full_name).await? {
+        return Ok(true);
+    }
+    if store.get_view(txn, db_id, &full_name).await?.is_some() {
+        return Ok(true);
+    }
+    if store
+        .get_materialized_view(txn, db_id, &full_name)
+        .await?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    if store.get_sequence(txn, db_id, &full_name).await?.is_some() {
+        return Ok(true);
+    }
+
+    let schema_prefix = format!("{}.", schema_name);
+    let mut table_schemas: Vec<(String, TableSchema)> = Vec::new();
+    for table_name in store.list_tables(txn, db_id).await? {
+        if !table_name.starts_with(&schema_prefix) {
+            continue;
+        }
+        if let Some(tbl_schema) = store.get_schema(txn, db_id, &table_name).await? {
+            table_schemas.push((table_name, tbl_schema));
+        }
+    }
+
+    Ok(create_table::has_legacy_name_conflict(
+        table_schemas.iter().map(|(n, s)| (n.as_str(), s)),
+        schema_name,
+        relation_name,
+        None,
+    ))
+}
+
+pub(super) async fn allocate_implicit_sequence_name(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    table_full_name: &str,
+    column_name: &str,
+) -> Result<String> {
+    let (schema_name, table_name) = table_full_name
+        .rsplit_once('.')
+        .unwrap_or(("public", table_full_name));
+    let base_name = sequences::implicit_sequence_name(table_name, column_name);
+
+    if !relation_name_taken_in_schema(store, txn, db_id, schema_name, &base_name).await? {
+        return Ok(base_name);
+    }
+
+    for suffix in 1_u32..=u32::MAX {
+        let candidate = format!("{}{}", base_name, suffix);
+        if !relation_name_taken_in_schema(store, txn, db_id, schema_name, &candidate).await? {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow!(
+        "could not allocate implicit sequence name for {}.{}",
+        table_full_name,
+        column_name
+    ))
 }
 
 pub(super) async fn drop_owned_sequences_for_table(

@@ -84,22 +84,33 @@ pub(super) async fn alter_table_add_column(
         collation: None,
     });
     if is_serial {
-        store
-            .create_sequence(
-                txn,
-                db_id,
-                sequences::build_implicit_sequence_def(
-                    &schema.name,
-                    schema
-                        .columns
-                        .last()
-                        .expect("column just pushed")
-                        .name
-                        .as_str(),
-                    &schema.columns.last().expect("column just pushed").data_type,
-                ),
-            )
-            .await?;
+        let serial_col_name = schema
+            .columns
+            .last()
+            .expect("column just pushed")
+            .name
+            .clone();
+        let serial_col_type = schema
+            .columns
+            .last()
+            .expect("column just pushed")
+            .data_type
+            .clone();
+        let seq_name = super::super::allocate_implicit_sequence_name(
+            store,
+            txn,
+            db_id,
+            &schema.name,
+            &serial_col_name,
+        )
+        .await?;
+        let mut seq_def = sequences::build_implicit_sequence_def(
+            &schema.name,
+            &serial_col_name,
+            &serial_col_type,
+        );
+        seq_def.name = seq_name;
+        store.create_sequence(txn, db_id, seq_def).await?;
     }
     schema.version += 1;
     store.update_schema(txn, db_id, schema.clone()).await?;
