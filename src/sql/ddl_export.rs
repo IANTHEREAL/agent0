@@ -4,7 +4,10 @@ use crate::model::{
 };
 use crate::storage::TikvStore;
 use anyhow::Result;
+use std::collections::HashMap;
 use tikv_client::Transaction;
+
+use super::sequences;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DdlExportRow {
@@ -28,16 +31,10 @@ fn foreign_key_action_sql(action: &ForeignKeyAction) -> &'static str {
 }
 
 fn column_type_sql(schema_col: &crate::model::ColumnDef) -> String {
-    if schema_col.is_serial {
-        return match schema_col.data_type {
-            crate::model::DataType::Int64 => "BIGSERIAL".to_string(),
-            _ => "SERIAL".to_string(),
-        };
-    }
     schema_col.data_type.to_string()
 }
 
-pub fn table_to_ddl(schema: &TableSchema) -> String {
+pub fn table_to_ddl(schema: &TableSchema, serial_sequences: &HashMap<String, String>) -> String {
     let mut definitions: Vec<String> = Vec::new();
 
     for col in &schema.columns {
@@ -45,9 +42,16 @@ pub fn table_to_ddl(schema: &TableSchema) -> String {
         if !col.nullable {
             col_sql.push_str(" NOT NULL");
         }
-        if let Some(default_expr) = &col.default_expr {
+        let default_expr = if col.is_serial {
+            serial_sequences
+                .get(&col.name)
+                .map(|seq_full_name| format!("nextval('{}'::regclass)", seq_full_name))
+        } else {
+            col.default_expr.clone()
+        };
+        if let Some(default_expr) = default_expr {
             col_sql.push_str(" DEFAULT ");
-            col_sql.push_str(default_expr);
+            col_sql.push_str(&default_expr);
         }
         if col.unique {
             col_sql.push_str(" UNIQUE");
@@ -136,6 +140,17 @@ pub fn sequence_to_ddl(def: &SequenceDef) -> String {
     )
 }
 
+pub fn sequence_owned_by_to_ddl(
+    sequence_name: &str,
+    table_name: &str,
+    column_name: &str,
+) -> String {
+    format!(
+        "ALTER SEQUENCE {} OWNED BY {}.{};",
+        sequence_name, table_name, column_name
+    )
+}
+
 pub fn type_to_ddl(def: &UserTypeDef) -> String {
     let full_name = format!("{}.{}", def.schema, def.name);
     match &def.kind {
@@ -208,11 +223,11 @@ pub async fn export_all_ddl(
 
     let mut sequences = store.list_sequences(txn, db_id).await?;
     sequences.sort_by_key(|d| d.full_name());
-    for def in sequences {
+    for def in &sequences {
         rows.push(DdlExportRow {
             object_type: "sequence".to_string(),
             object_name: def.full_name(),
-            ddl_sql: sequence_to_ddl(&def),
+            ddl_sql: sequence_to_ddl(def),
         });
     }
 
@@ -222,11 +237,58 @@ pub async fn export_all_ddl(
         let Some(schema) = store.get_schema(txn, db_id, &table_name).await? else {
             continue;
         };
+
+        let (table_schema, table_object_name) = schema
+            .name
+            .rsplit_once('.')
+            .unwrap_or(("public", schema.name.as_str()));
+        let mut serial_sequences: HashMap<String, String> = HashMap::new();
+        for col in &schema.columns {
+            if !col.is_serial {
+                continue;
+            }
+            let seq_full_name = match sequences::find_owned_sequence_full_name(
+                &sequences,
+                &schema.name,
+                &col.name,
+            )? {
+                Some(name) => name,
+                None => format!(
+                    "{}.{}",
+                    table_schema,
+                    sequences::implicit_sequence_name(table_object_name, &col.name)
+                ),
+            };
+            serial_sequences.insert(col.name.clone(), seq_full_name);
+        }
+
         rows.push(DdlExportRow {
             object_type: "table".to_string(),
             object_name: schema.name.clone(),
-            ddl_sql: table_to_ddl(&schema),
+            ddl_sql: table_to_ddl(&schema, &serial_sequences),
         });
+
+        let mut owned_sequences = sequences
+            .iter()
+            .filter_map(|def| {
+                let Some((owned_table, owned_col)) = &def.owned_by else {
+                    return None;
+                };
+                if owned_table != &schema.name {
+                    return None;
+                }
+                Some((def.full_name(), owned_col.clone()))
+            })
+            .collect::<Vec<_>>();
+        owned_sequences.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (sequence_name, column_name) in owned_sequences {
+            rows.push(DdlExportRow {
+                object_type: "sequence_ownership".to_string(),
+                object_name: sequence_name.clone(),
+                ddl_sql: sequence_owned_by_to_ddl(&sequence_name, &schema.name, &column_name),
+            });
+        }
+
         for idx in &schema.indexes {
             rows.push(DdlExportRow {
                 object_type: "index".to_string(),
@@ -290,6 +352,7 @@ mod tests {
         CheckConstraint, ColumnDef, DataType, ForeignKeyConstraint, IndexDef, SequenceBacking,
         SequenceState,
     };
+    use std::collections::HashMap;
 
     #[test]
     fn table_to_ddl_includes_constraints() {
@@ -338,9 +401,13 @@ mod tests {
             from_alias: None,
         };
 
-        let ddl = table_to_ddl(&schema);
+        let mut serial_sequences = HashMap::new();
+        serial_sequences.insert("id".to_string(), "public.users_id_seq".to_string());
+        let ddl = table_to_ddl(&schema, &serial_sequences);
         assert!(ddl.contains("CREATE TABLE public.users"));
-        assert!(ddl.contains("id SERIAL NOT NULL"));
+        assert!(
+            ddl.contains("id INTEGER NOT NULL DEFAULT nextval('public.users_id_seq'::regclass)")
+        );
         assert!(ddl.contains("email TEXT NOT NULL DEFAULT 'x@example.com' UNIQUE"));
         assert!(ddl.contains("CONSTRAINT users_pkey PRIMARY KEY (id)"));
         assert!(ddl.contains("CONSTRAINT users_email_chk CHECK (email <> '')"));
@@ -441,6 +508,15 @@ mod tests {
         assert_eq!(
             ddl,
             "CREATE UNIQUE INDEX idx_users_email ON public.users USING btree (email) WHERE email IS NOT NULL;"
+        );
+    }
+
+    #[test]
+    fn sequence_owned_by_to_ddl_formats_statement() {
+        let ddl = sequence_owned_by_to_ddl("public.users_id_seq", "public.users", "id");
+        assert_eq!(
+            ddl,
+            "ALTER SEQUENCE public.users_id_seq OWNED BY public.users.id;"
         );
     }
 }
