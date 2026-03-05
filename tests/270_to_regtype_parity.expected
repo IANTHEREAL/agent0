@@ -107,3 +107,51 @@ NULL
 to_regtype
 1043
 (1 row)
+ERROR:  length for type varchar must be at least 1
+ERROR:  length for type char must be at least 1
+ERROR:  NUMERIC precision 0 must be between 1 and 1000
+ERROR:  NUMERIC precision 1001 must be between 1 and 1000
+to_regtype
+1700
+(1 row)
+ERROR:  length for type varchar must be at least 1
+to_regtype
+NULL
+(1 row)
+to_regtype
+NULL
+(1 row)
+to_regtype
+NULL
+(1 row)
+ERROR:  NUMERIC precision 0 must be between 1 and 1000
+ERROR:  NUMERIC precision 1001 must be between 1 and 1000
+to_regtype
+1700
+(1 row)
+to_regtype
+1700
+(1 row)
+to_regtype
+1700
+(1 row)
+ERROR:  invalid type name "time(-1)"
+ERROR:  invalid type name "timestamp(-1)"
+ERROR:  TIMESTAMP(-1) WITH TIME ZONE precision must not be negative
+ERROR:  TIME(-1) precision must not be negative
+ERROR:  TIMESTAMP(-1) precision must not be negative
+ERROR:  TIMESTAMP(-1) WITH TIME ZONE precision must not be negative
+ERROR:  invalid type name "pg_catalog.character()"
+ERROR:  invalid type name "pg_catalog.decimal()"
+to_regtype
+1043
+(1 row)
+to_regtype
+1700
+(1 row)
+to_regtype
+1700
+(1 row)
+to_regtype
+1700
+(1 row)

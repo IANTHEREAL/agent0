@@ -257,6 +257,156 @@ pub(crate) fn strip_regtype_typmod(raw: &str) -> String {
     trimmed.to_string()
 }
 
+fn split_regtype_typmod_parts(raw: &str) -> (String, Option<String>) {
+    let trimmed = raw.trim();
+    if !trimmed.ends_with(')') {
+        return (trimmed.to_string(), None);
+    }
+
+    let mut depth = 0_i32;
+    for (idx, ch) in trimmed.char_indices().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => {
+                depth -= 1;
+                if depth == 0 {
+                    let base = trimmed[..idx].trim_end().to_string();
+                    let inner = trimmed[idx + 1..trimmed.len() - 1].trim().to_string();
+                    return (base, Some(inner));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (trimmed.to_string(), None)
+}
+
+fn parse_typmod_int_list(typmod: &str, original_name: &str) -> Result<Vec<i32>> {
+    let mut out = Vec::new();
+    for part in typmod.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            return Err(invalid_interval_type_name(original_name));
+        }
+        // Allow optional leading '-' followed by digits (PG supports negative scale).
+        let digits = p.strip_prefix('-').unwrap_or(p);
+        if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+            return Err(invalid_interval_type_name(original_name));
+        }
+        out.push(
+            p.parse::<i32>()
+                .map_err(|_| invalid_interval_type_name(original_name))?,
+        );
+    }
+    if out.is_empty() {
+        return Err(invalid_interval_type_name(original_name));
+    }
+    Ok(out)
+}
+
+/// Validate semantic bounds for typmod values of known PostgreSQL types.
+///
+/// PostgreSQL enforces these ranges at type-name parse time (including
+/// inside `to_regtype`):
+///   - varchar / character varying: length >= 1
+///   - bpchar / character: length >= 1
+///   - numeric / decimal: precision 1–1000 (scale is unchecked — PG accepts
+///     scale > precision and negative scale in `to_regtype`)
+fn validate_typmod_bounds(base: &str, args: &[i32]) -> Result<()> {
+    match base {
+        "varchar" | "character varying" => {
+            if args.len() == 1 && args[0] < 1 {
+                return Err(crate::sql::error::SqlError::SqlStructure(
+                    "length for type varchar must be at least 1".to_string(),
+                )
+                .into());
+            }
+        }
+        "bpchar" | "character" => {
+            if args.len() == 1 && args[0] < 1 {
+                return Err(crate::sql::error::SqlError::SqlStructure(
+                    "length for type char must be at least 1".to_string(),
+                )
+                .into());
+            }
+        }
+        "numeric" | "decimal" => {
+            if !args.is_empty() {
+                let precision = args[0];
+                if !(1..=1000).contains(&precision) {
+                    return Err(crate::sql::error::SqlError::SqlStructure(format!(
+                        "NUMERIC precision {} must be between 1 and 1000",
+                        precision
+                    ))
+                    .into());
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Returns `Ok(true)` when the typmod is valid, `Ok(false)` when the caller
+/// should return NULL (PG parity: invalid-but-not-erroneous modifier).
+fn validate_schema_qualified_typmod(base: &str, typmod: &str, original_name: &str) -> Result<bool> {
+    // Empty typmod (parens present but no arguments) is always invalid in PG.
+    if typmod.trim().is_empty() {
+        return Err(invalid_interval_type_name(original_name));
+    }
+    match base {
+        // Typmod arity: 1, with length bounds
+        "varchar" | "bpchar" => {
+            let args = parse_typmod_int_list(typmod, original_name)?;
+            if args.len() != 1 {
+                return Err(invalid_interval_type_name(original_name));
+            }
+            validate_typmod_bounds(base, &args)?;
+            Ok(true)
+        }
+        // Typmod arity: 1, precision must be non-negative (PG clamps >6 with WARNING)
+        "time" | "timestamp" | "timestamptz" => {
+            let args = parse_typmod_int_list(typmod, original_name)?;
+            if args.len() == 1 {
+                if args[0] < 0 {
+                    let type_display = match base {
+                        "timestamptz" => format!("TIMESTAMP({}) WITH TIME ZONE", args[0]),
+                        _ => format!("{}({})", base.to_uppercase(), args[0]),
+                    };
+                    return Err(crate::sql::error::SqlError::SqlStructure(format!(
+                        "{} precision must not be negative",
+                        type_display
+                    ))
+                    .into());
+                }
+                Ok(true)
+            } else {
+                Err(invalid_interval_type_name(original_name))
+            }
+        }
+        // Typmod arity: 1 or 2, with precision/scale bounds
+        "numeric" => {
+            let args = parse_typmod_int_list(typmod, original_name)?;
+            if !(1..=2).contains(&args.len()) {
+                return Err(invalid_interval_type_name(original_name));
+            }
+            validate_typmod_bounds(base, &args)?;
+            Ok(true)
+        }
+        // Parser aliases — not real pg_catalog types.  PG returns NULL for
+        // schema-qualified references; accept any typmod here so we don't
+        // raise an error (the caller returns NULL for these names).
+        "character" | "decimal" => Ok(true),
+        // Builtin type with typmod where typmod is not allowed.
+        _ if pg_catalog_regtype_oid(base).is_some() => {
+            Err(invalid_interval_type_name(original_name))
+        }
+        // Unknown type in known schema: PG resolves to NULL (even with typmod syntax).
+        _ => Ok(true),
+    }
+}
+
 fn invalid_interval_type_name(original_name: &str) -> anyhow::Error {
     crate::sql::error::SqlError::SqlStructure(format!("invalid type name \"{}\"", original_name))
         .into()
@@ -516,14 +666,31 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
         name.value.clone()
     } else if schema.is_some() {
         // Schema-qualified: no interval normalization.
-        // Trailing junk after the type name → ERROR, matching PG behavior.
-        // e.g. `pg_catalog.interval day to second` → ERROR (not NULL).
+        // Bare-word suffix and malformed typmod suffix are syntax errors.
         let ws_normalized = normalize_whitespace(&name.value);
-        let stripped = strip_regtype_typmod(&ws_normalized);
-        if stripped.contains(char::is_whitespace) && !is_multi_word_pg_type(&stripped) {
+        let (base_name, typmod) = split_regtype_typmod_parts(&ws_normalized);
+
+        // PG rejects schema-qualified multi-word forms like
+        // `pg_catalog.double precision` and interval qualifiers.
+        if base_name.contains(char::is_whitespace) {
             return Err(invalid_interval_type_name(&raw));
         }
-        stripped
+        // Parens must form a trailing typmod suffix; otherwise it's junk.
+        if typmod.is_none() && (base_name.contains('(') || base_name.contains(')')) {
+            return Err(invalid_interval_type_name(&raw));
+        }
+        if let Some(tm) = typmod.as_deref() {
+            if !validate_schema_qualified_typmod(&base_name, tm, &raw)? {
+                return Ok(Value::Null);
+            }
+        }
+        // "character" and "decimal" are SQL-standard parser aliases, not
+        // real pg_catalog type names.  PG returns NULL for schema-qualified
+        // references like pg_catalog.character(N) or pg_catalog.decimal(P,S).
+        if matches!(base_name.as_str(), "character" | "decimal") {
+            return Ok(Value::Null);
+        }
+        base_name
     } else {
         let ws_normalized = normalize_whitespace(&name.value);
         let after_interval = normalize_interval_type(&ws_normalized)?;
@@ -535,11 +702,42 @@ pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
             // But PG has valid multi-word type names (double precision,
             // character varying, timestamp with time zone, etc.) that must
             // pass through.
-            let stripped = strip_regtype_typmod(&after_interval);
-            if stripped.contains(char::is_whitespace) && !is_multi_word_pg_type(&stripped) {
+            let (base_part, typmod_part) = split_regtype_typmod_parts(&after_interval);
+            if base_part.contains(char::is_whitespace) && !is_multi_word_pg_type(&base_part) {
                 return Err(invalid_interval_type_name(&raw));
             }
-            stripped
+            // Validate typmod bounds for unqualified types (PG parity).
+            if let Some(ref tm) = typmod_part {
+                if matches!(
+                    base_part.as_str(),
+                    "varchar"
+                        | "character varying"
+                        | "bpchar"
+                        | "character"
+                        | "numeric"
+                        | "decimal"
+                ) {
+                    let args = parse_typmod_int_list(tm, &raw)?;
+                    validate_typmod_bounds(&base_part, &args)?;
+                }
+                // Negative precision for temporal types → ERROR (PG parity).
+                // PG bare path: time(-1) and timestamp(-1) → "invalid type name",
+                // but timestamptz(-1) → precision error (same as schema-qualified).
+                if matches!(base_part.as_str(), "time" | "timestamp" | "timestamptz") {
+                    let args = parse_typmod_int_list(tm, &raw)?;
+                    if args.len() == 1 && args[0] < 0 {
+                        if base_part == "timestamptz" {
+                            return Err(crate::sql::error::SqlError::SqlStructure(format!(
+                                "TIMESTAMP({}) WITH TIME ZONE precision must not be negative",
+                                args[0]
+                            ))
+                            .into());
+                        }
+                        return Err(invalid_interval_type_name(&raw));
+                    }
+                }
+            }
+            base_part
         }
     };
 
@@ -1102,6 +1300,128 @@ mod tests {
             to_regtype(vec![Value::Text("TIMESTAMP WITH TIME ZONE".into())]).unwrap(),
             Value::Int64(pg_types::OID_TIMESTAMPTZ)
         );
+        // Schema-qualified multi-word forms are syntax errors in PG.
+        assert!(to_regtype(vec![Value::Text("pg_catalog.double precision".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("pg_catalog.character varying".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text(
+            "pg_catalog.timestamp with time zone".into()
+        )])
+        .is_err());
+        // Schema-qualified typmods on compatible types resolve.
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog.varchar(5)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_VARCHAR)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog.numeric(10,2)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_NUMERIC)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog.timestamp(3)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIMESTAMP)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog.time(3)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_TIME)
+        );
+        // Schema-qualified typmods on incompatible builtins are errors.
+        assert!(to_regtype(vec![Value::Text("pg_catalog.interval(3)".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("pg_catalog.int4(1)".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("pg_catalog.text(3)".into())]).is_err());
+        // Unknown type in known schema + typmod syntax resolves to NULL.
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog.foo(abc)".into())]).unwrap(),
+            Value::Null
+        );
+        // Typmod semantic bounds: varchar/character length >= 1
+        assert!(to_regtype(vec![Value::Text("varchar(0)".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("character(0)".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("pg_catalog.varchar(0)".into())]).is_err());
+        // "character" is a parser alias, not a real pg_catalog type.
+        // PG returns NULL for pg_catalog.character(...) regardless of typmod.
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog.character(0)".into())]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog.character(5)".into())]).unwrap(),
+            Value::Null
+        );
+        // "decimal" is a parser alias, not a real pg_catalog type.
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog.decimal(10,2)".into())]).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("varchar(1)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_VARCHAR)
+        );
+        // Typmod semantic bounds: numeric precision 1-1000
+        assert!(to_regtype(vec![Value::Text("numeric(0)".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("numeric(1001)".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("pg_catalog.numeric(0)".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("pg_catalog.numeric(1001)".into())]).is_err());
+        assert_eq!(
+            to_regtype(vec![Value::Text("numeric(1)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_NUMERIC)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("numeric(1000)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_NUMERIC)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("numeric(10,10)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_NUMERIC)
+        );
+        // PG accepts scale > precision and negative scale
+        assert_eq!(
+            to_regtype(vec![Value::Text("numeric(10,11)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_NUMERIC)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog.numeric(10,11)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_NUMERIC)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("numeric(10,-2)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_NUMERIC)
+        );
+        assert_eq!(
+            to_regtype(vec![Value::Text("pg_catalog.numeric(10,-2)".into())]).unwrap(),
+            Value::Int64(pg_types::OID_NUMERIC)
+        );
+        // Negative precision for bare temporal types (PG parity):
+        // time/timestamp → "invalid type name", timestamptz → precision error.
+        assert!(to_regtype(vec![Value::Text("time(-1)".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("timestamp(-1)".into())]).is_err());
+        let err = to_regtype(vec![Value::Text("timestamptz(-1)".into())]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("TIMESTAMP(-1) WITH TIME ZONE precision must not be negative"),
+            "{err}"
+        );
+        // Negative precision for schema-qualified temporal types → specific error (PG parity)
+        let err = to_regtype(vec![Value::Text("pg_catalog.time(-1)".into())]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("TIME(-1) precision must not be negative"),
+            "{err}"
+        );
+        let err = to_regtype(vec![Value::Text("pg_catalog.timestamp(-1)".into())]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("TIMESTAMP(-1) precision must not be negative"),
+            "{err}"
+        );
+        let err = to_regtype(vec![Value::Text("pg_catalog.timestamptz(-1)".into())]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("TIMESTAMP(-1) WITH TIME ZONE precision must not be negative"),
+            "{err}"
+        );
+        // Empty typmod (parens present, no arguments) → error (PG parity)
+        assert!(to_regtype(vec![Value::Text("pg_catalog.character()".into())]).is_err());
+        assert!(to_regtype(vec![Value::Text("pg_catalog.decimal()".into())]).is_err());
     }
 
     #[test]

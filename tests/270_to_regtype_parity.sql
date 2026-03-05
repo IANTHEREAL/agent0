@@ -34,7 +34,7 @@ SELECT to_regtype('interval (3)');
 -- Schema resolution: unknown schema + valid typmod structure → NULL
 SELECT to_regtype('noschema.interval(abc)');
 SELECT to_regtype('"PG_CATALOG".interval(abc)');
--- Schema-qualified interval qualifier → NULL (PG treats as literal type lookup)
+-- Schema-qualified interval qualifier → syntax error (PG invalid type name)
 SELECT to_regtype('pg_catalog.interval day to second');
 -- Schema resolution: unknown schema + bare word → syntax error propagates
 SELECT to_regtype('noschema.interval day to second'); -- db9-specific: error text differs from PG
@@ -67,3 +67,34 @@ SELECT to_regtype('integer[]');
 SELECT to_regtype('hstore');
 SELECT to_regtype('hstore[]');
 SELECT to_regtype('varchar(5)');
+
+-- Typmod semantic bounds validation (PG parity: #1425)
+SELECT to_regtype('varchar(0)');
+SELECT to_regtype('character(0)');
+SELECT to_regtype('numeric(0)');
+SELECT to_regtype('numeric(1001)');
+SELECT to_regtype('numeric(10,11)');
+SELECT to_regtype('pg_catalog.varchar(0)');
+SELECT to_regtype('pg_catalog.character(0)');
+SELECT to_regtype('pg_catalog.character(5)');
+SELECT to_regtype('pg_catalog.decimal(10,2)');
+SELECT to_regtype('pg_catalog.numeric(0)');
+SELECT to_regtype('pg_catalog.numeric(1001)');
+SELECT to_regtype('pg_catalog.numeric(10,11)');
+SELECT to_regtype('numeric(10,-2)');
+SELECT to_regtype('pg_catalog.numeric(10,-2)');
+-- Negative precision for temporal types → ERROR (PG parity: #1425)
+SELECT to_regtype('time(-1)');
+SELECT to_regtype('timestamp(-1)');
+SELECT to_regtype('timestamptz(-1)');
+SELECT to_regtype('pg_catalog.time(-1)');
+SELECT to_regtype('pg_catalog.timestamp(-1)');
+SELECT to_regtype('pg_catalog.timestamptz(-1)');
+-- Empty typmod (parens present, no arguments) → ERROR (PG parity: #1425)
+SELECT to_regtype('pg_catalog.character()');
+SELECT to_regtype('pg_catalog.decimal()');
+-- Valid boundary values (should resolve to OIDs)
+SELECT to_regtype('varchar(1)');
+SELECT to_regtype('numeric(1)');
+SELECT to_regtype('numeric(1000)');
+SELECT to_regtype('numeric(10,10)');
