@@ -1,0 +1,86 @@
+     obj_obj
+------------------
+ {"a": 1, "b": 2}
+(1 row)
+
+   obj_override
+-------------------
+ {"a": 1, "b": 99}
+(1 row)
+
+   arr_arr
+--------------
+ [1, 2, 3, 4]
+(1 row)
+
+   scalar_scalar
+--------------------
+ ["hello", "world"]
+(1 row)
+
+ num_num
+---------
+ [1, 2]
+(1 row)
+
+     obj_arr
+------------------
+ [{"a": 1}, 2, 3]
+(1 row)
+
+     arr_obj
+------------------
+ [1, 2, {"a": 3}]
+(1 row)
+
+ scalar_arr
+-------------
+ ["x", 1, 2]
+(1 row)
+
+ arr_scalar
+-------------
+ [1, 2, "x"]
+(1 row)
+
+ empty_obj_merge
+-----------------
+ {"a": 1}
+(1 row)
+
+ obj_empty_merge
+-----------------
+ {"a": 1}
+(1 row)
+
+ empty_arr_concat
+------------------
+ [1, 2]
+(1 row)
+
+ arr_empty_concat
+------------------
+ [1, 2]
+(1 row)
+
+         chained
+--------------------------
+ {"a": 1, "b": 2, "c": 3}
+(1 row)
+
+NOTICE:  table "jsonb_settings" does not exist, skipping
+ id |                       config
+----+----------------------------------------------------
+  1 | {"lang": "fr", "theme": "dark", "timezone": "UTC"}
+(1 row)
+
+     null_obj
+------------------
+ [null, {"a": 1}]
+(1 row)
+
+     obj_null
+------------------
+ [{"a": 1}, null]
+(1 row)
+

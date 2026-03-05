@@ -1,0 +1,88 @@
+ key | value
+-----+-------
+ a   | 1
+ b   | 2
+ c   | 3
+(3 rows)
+
+ key | value
+-----+-------
+ a   | 1
+ b   | hello
+ c   | true
+(3 rows)
+
+ key | value
+-----+-------
+ x   | 10
+ y   | 20
+(2 rows)
+
+ key | value
+-----+-------
+ x   | 10
+ y   | world
+(2 rows)
+
+ value
+-------
+ 1
+ "two"
+ true
+ null
+(4 rows)
+
+ value
+-------
+ 10
+ 20
+ 30
+(3 rows)
+
+   k
+-------
+ alpha
+ beta
+ gamma
+(3 rows)
+
+  k
+-----
+ bar
+ foo
+(2 rows)
+
+  k   |    v
+------+---------
+ age  | 30
+ name | "Alice"
+(2 rows)
+
+ key | value
+-----+-------
+(0 rows)
+
+  key  |     value
+-------+---------------
+ outer | {"inner": 42}
+(1 row)
+
+ key | value
+-----+-------
+(0 rows)
+
+NOTICE:  table "jtest" does not exist, skipping
+ id | key | value
+----+-----+-------
+  1 | a   | 10
+  1 | b   | 20
+  2 | c   | 30
+(3 rows)
+
+ value
+-------
+ hello
+ world
+ test
+(3 rows)
+
