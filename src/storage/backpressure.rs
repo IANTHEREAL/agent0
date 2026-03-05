@@ -310,14 +310,17 @@ impl LatencyTracker {
 
     /// Compute P99 in microseconds.  Returns 0 when no samples recorded.
     fn p99_us(&self) -> u64 {
-        let inner = self.inner.lock().expect("latency tracker lock");
-        if inner.count == 0 {
-            return 0;
-        }
-        let mut snapshot: Vec<u64> = inner.samples[..inner.count].to_vec();
+        let snapshot = {
+            let inner = self.inner.lock().expect("latency tracker lock");
+            if inner.count == 0 {
+                return 0;
+            }
+            inner.samples[..inner.count].to_vec()
+        };
+        let mut snapshot = snapshot;
         snapshot.sort_unstable();
-        let idx = ((inner.count as f64 * 0.99).ceil() as usize).saturating_sub(1);
-        snapshot[idx.min(inner.count - 1)]
+        let idx = ((snapshot.len() as f64 * 0.99).ceil() as usize).saturating_sub(1);
+        snapshot[idx.min(snapshot.len() - 1)]
     }
 }
 
