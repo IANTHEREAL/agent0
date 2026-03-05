@@ -790,8 +790,9 @@ mod tests {
     use tokio::time::{timeout, Duration};
 
     use super::{
-        execute_table_function_with_budget_for_test_backend, list_directory_entries,
-        start_glob_stream_with_budget_for_test_backend,
+        execute_table_function, execute_table_function_with_budget_for_test_backend,
+        infer_table_function_schema, list_directory_entries, start_file_stream, start_glob_stream,
+        start_glob_stream_with_budget_for_test_backend, Fs9Mode,
     };
     use crate::extensions::fs::backend::{FsBackend, FsFileInfo};
     use crate::model::Value;
@@ -936,6 +937,62 @@ mod tests {
 
     fn cleanup(path: &PathBuf) {
         let _ = fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn infer_table_function_schema_without_context_returns_error() {
+        let mode = Fs9Mode::File {
+            path: "/tmp/unused.csv".to_string(),
+            format: None,
+            delimiter: None,
+            header: None,
+        };
+        let err = match infer_table_function_schema("tenant", &mode).await {
+            Ok(_) => panic!("expected missing context error"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("fs9: TiKV client not available in extension context"));
+    }
+
+    #[tokio::test]
+    async fn execute_table_function_without_context_returns_error() {
+        let mode = Fs9Mode::File {
+            path: "/tmp/unused.csv".to_string(),
+            format: None,
+            delimiter: None,
+            header: None,
+        };
+        let err = match execute_table_function("tenant", mode).await {
+            Ok(_) => panic!("expected missing context error"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("fs9: TiKV client not available in extension context"));
+    }
+
+    #[tokio::test]
+    async fn start_file_stream_without_context_returns_error() {
+        let err = match start_file_stream("tenant", "/tmp/unused.csv", None, None, None).await {
+            Ok(_) => panic!("expected missing context error"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("fs9: TiKV client not available in extension context"));
+    }
+
+    #[tokio::test]
+    async fn start_glob_stream_without_context_returns_error() {
+        let err = match start_glob_stream("tenant", "/tmp/*.csv", None, None, None, None).await {
+            Ok(_) => panic!("expected missing context error"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("fs9: TiKV client not available in extension context"));
     }
 
     #[tokio::test]

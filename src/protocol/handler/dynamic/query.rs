@@ -845,8 +845,8 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             };
 
             // Extension context for fs9 schema inference during catalog prefetch.
-            // Without this, fs9 table functions fail backend init because the
-            // task-local extension context does not carry tikv_client.
+            // Without this, fs9 table functions fail with a missing-tikv-client
+            // error from get_backend().
             let tenant_keyspace = executor.tenant_keyspace().to_string();
             let tikv_client = store.transaction_client();
             let ext_opts = crate::extensions::context::ExtensionContextOpts::statement(

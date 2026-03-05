@@ -16,6 +16,10 @@ use sqlparser::ast::{CopySource, CopyTarget, Statement};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 
+fn copy_from_fs9_io_error(err: impl std::fmt::Display) -> PgWireError {
+    user_error("58030", format!("COPY FROM fs9: {}", err))
+}
+
 impl DynamicPgHandler {
     /// Handle `COPY table FROM 'fs9://...' WITH (FORMAT csv|text)`.
     /// Returns `Ok(None)` for non-fs9 paths or FORMAT parquet (fall through).
@@ -274,11 +278,7 @@ impl DynamicPgHandler {
                 if started_txn {
                     let _ = session.rollback().await;
                 }
-                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "58030".to_string(),
-                    format!("COPY FROM fs9: {e}"),
-                ))));
+                return Err(copy_from_fs9_io_error(e));
             }
         };
         let file_data = match backend
@@ -293,11 +293,7 @@ impl DynamicPgHandler {
                 if started_txn {
                     let _ = session.rollback().await;
                 }
-                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "58030".to_string(),
-                    format!("COPY FROM fs9: {}", e),
-                ))));
+                return Err(copy_from_fs9_io_error(e));
             }
         };
 
@@ -688,5 +684,24 @@ impl DynamicPgHandler {
         Ok(Some(vec![pgwire::api::results::Response::Execution(
             pgwire::api::results::Tag::new("COPY").with_rows(result),
         )]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_from_fs9_io_error;
+
+    #[test]
+    fn copy_from_fs9_io_error_maps_to_user_error_58030() {
+        let err = copy_from_fs9_io_error("backend unavailable");
+        match err {
+            pgwire::error::PgWireError::UserError(info) => {
+                assert_eq!(info.code, "58030");
+                assert_eq!(info.severity, "ERROR");
+                assert!(info.message.starts_with("COPY FROM fs9: "));
+                assert!(info.message.contains("backend unavailable"));
+            }
+            other => panic!("expected UserError, got {other:?}"),
+        }
     }
 }
