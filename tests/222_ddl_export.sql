@@ -41,6 +41,16 @@ SELECT object_type, object_name FROM _db9_sys_export_ddl() ORDER BY object_type,
 -- Verify specific DDL content for the main table
 SELECT ddl_sql FROM _db9_sys_export_ddl() WHERE object_name = 'public.export_test_main' AND object_type = 'table';
 
+-- Verify dependency-safe export order metadata:
+-- sequence ownership must be applied after table creation.
+SELECT (
+  (SELECT ddl_order FROM _db9_sys_export_ddl()
+   WHERE object_type = 'table' AND object_name = 'public.export_test_main')
+  <
+  (SELECT ddl_order FROM _db9_sys_export_ddl()
+   WHERE object_type = 'sequence_ownership' AND object_name = 'public.export_test_main_id_seq')
+) AS table_before_sequence_ownership;
+
 -- Cleanup
 DROP MATERIALIZED VIEW export_test_mv;
 DROP VIEW export_test_view;

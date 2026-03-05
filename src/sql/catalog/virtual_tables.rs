@@ -69,6 +69,7 @@ pub fn virtual_table_schema(name: &str) -> Option<TableSchema> {
             col("last_seen_ms_ago", DataType::Int64),
         ],
         "_DB9_SYS_EXPORT_DDL" => vec![
+            col("ddl_order", DataType::Int64),
             col("object_type", DataType::Text),
             col("object_name", DataType::Text),
             col("ddl_sql", DataType::Text),

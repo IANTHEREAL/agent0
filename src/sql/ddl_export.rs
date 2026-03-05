@@ -11,6 +11,7 @@ use super::sequences;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DdlExportRow {
+    pub ddl_order: i64,
     pub object_type: String,
     pub object_name: String,
     pub ddl_sql: String,
@@ -294,6 +295,7 @@ pub async fn export_all_ddl(
     for def in types {
         let object_name = format!("{}.{}", def.schema, def.name);
         rows.push(DdlExportRow {
+            ddl_order: 0,
             object_type: "type".to_string(),
             object_name,
             ddl_sql: type_to_ddl(&def),
@@ -304,6 +306,7 @@ pub async fn export_all_ddl(
     sequences.sort_by_key(|d| d.full_name());
     for def in &sequences {
         rows.push(DdlExportRow {
+            ddl_order: 0,
             object_type: "sequence".to_string(),
             object_name: def.full_name(),
             ddl_sql: sequence_to_ddl(def),
@@ -352,6 +355,7 @@ pub async fn export_all_ddl(
         }
 
         rows.push(DdlExportRow {
+            ddl_order: 0,
             object_type: "table".to_string(),
             object_name: schema.name.clone(),
             ddl_sql: table_to_ddl(&schema, &serial_sequences),
@@ -372,6 +376,7 @@ pub async fn export_all_ddl(
         owned_sequences.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         for (sequence_name, column_name) in owned_sequences {
             rows.push(DdlExportRow {
+                ddl_order: 0,
                 object_type: "sequence_ownership".to_string(),
                 object_name: sequence_name.clone(),
                 ddl_sql: sequence_owned_by_to_ddl(&sequence_name, &schema.name, &column_name),
@@ -380,6 +385,7 @@ pub async fn export_all_ddl(
 
         for idx in &schema.indexes {
             rows.push(DdlExportRow {
+                ddl_order: 0,
                 object_type: "index".to_string(),
                 object_name: idx.name.clone(),
                 ddl_sql: index_to_ddl(&schema.name, idx),
@@ -391,6 +397,7 @@ pub async fn export_all_ddl(
     views.sort_by_key(|v| v.full_name());
     for view in views {
         rows.push(DdlExportRow {
+            ddl_order: 0,
             object_type: "view".to_string(),
             object_name: view.full_name(),
             ddl_sql: view_to_ddl(&view),
@@ -401,6 +408,7 @@ pub async fn export_all_ddl(
     matviews.sort_by_key(|v| v.full_name());
     for matview in matviews {
         rows.push(DdlExportRow {
+            ddl_order: 0,
             object_type: "materialized_view".to_string(),
             object_name: matview.full_name(),
             ddl_sql: matview_to_ddl(&matview.full_name(), &matview.query),
@@ -413,6 +421,7 @@ pub async fn export_all_ddl(
     });
     for trigger in triggers {
         rows.push(DdlExportRow {
+            ddl_order: 0,
             object_type: "trigger".to_string(),
             object_name: format!("{}.{}", trigger.table, trigger.name),
             ddl_sql: trigger_to_ddl(&trigger),
@@ -424,11 +433,16 @@ pub async fn export_all_ddl(
     for proc_name in procedures {
         if let Some(definition) = store.get_procedure(txn, db_id, &proc_name).await? {
             rows.push(DdlExportRow {
+                ddl_order: 0,
                 object_type: "procedure".to_string(),
                 object_name: proc_name.clone(),
                 ddl_sql: procedure_to_ddl(&proc_name, &definition),
             });
         }
+    }
+
+    for (idx, row) in rows.iter_mut().enumerate() {
+        row.ddl_order = i64::try_from(idx + 1).unwrap_or(i64::MAX);
     }
 
     Ok(rows)

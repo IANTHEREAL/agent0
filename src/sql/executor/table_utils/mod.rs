@@ -139,6 +139,7 @@ impl Executor {
                 .into_iter()
                 .map(|entry| {
                     Row::new(vec![
+                        Value::Int64(entry.ddl_order),
                         Value::Text(entry.object_type),
                         Value::Text(entry.object_name),
                         Value::Text(entry.ddl_sql),
