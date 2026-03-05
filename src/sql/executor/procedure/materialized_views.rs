@@ -244,6 +244,7 @@ impl Executor {
             or_replace,
             schema,
             rows_with_rowid,
+            sequence_values,
         )
         .await
     }
@@ -455,7 +456,7 @@ impl Executor {
 
         let result = async {
             let db_id = session.current_database_id();
-            let (txn, _sequence_values, search_path) = session
+            let (txn, sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
             ddl::execute_drop_materialized_view(
@@ -466,6 +467,7 @@ impl Executor {
                 &names,
                 if_exists,
                 cascade,
+                sequence_values,
             )
             .await
         }

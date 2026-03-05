@@ -224,3 +224,168 @@ nextval
 currval
 100
 (1 row)
+lastval
+1
+(1 row)
+currval
+1
+(1 row)
+ERROR:  lastval is not yet defined in this session
+lastval
+1
+(1 row)
+currval
+1
+(1 row)
+lastval
+1
+(1 row)
+currval
+1
+(1 row)
+ERROR:  lastval is not yet defined in this session
+lastval
+1
+(1 row)
+currval
+1
+(1 row)
+lastval
+1
+(1 row)
+ERROR:  lastval is not yet defined in this session
+lastval
+1
+(1 row)
+lastval
+1
+(1 row)
+nextval
+1
+(1 row)
+nextval
+2
+(1 row)
+nextval
+3
+(1 row)
+lastval
+3
+(1 row)
+currval
+3
+(1 row)
+nextval
+1
+(1 row)
+nextval
+1
+(1 row)
+currval
+1
+(1 row)
+lastval
+1
+(1 row)
+nextval
+1
+(1 row)
+ERROR:  lastval is not yet defined in this session
+lastval
+1
+(1 row)
+lastval
+1
+(1 row)
+lastval
+1
+(1 row)
+lastval
+1
+(1 row)
+lastval
+1
+(1 row)
+currval
+1
+(1 row)
+lastval
+1
+(1 row)
+currval
+1
+(1 row)
+lastval
+1
+(1 row)
+currval
+1
+(1 row)
+count
+1
+(1 row)
+lastval
+1
+(1 row)
+currval
+1
+(1 row)
+ERROR:  lastval is not yet defined in this session
+lastval
+1
+(1 row)
+currval
+1
+(1 row)
+count
+1
+(1 row)
+lastval
+2
+(1 row)
+currval
+2
+(1 row)
+count
+1
+(1 row)
+count
+2
+(1 row)
+lastval
+2
+(1 row)
+currval
+2
+(1 row)
+count
+1
+(1 row)
+lastval
+2
+(1 row)
+currval
+2
+(1 row)
+count
+2
+(1 row)
+lastval
+2
+(1 row)
+currval
+2
+(1 row)
+lastval
+1
+(1 row)
+currval
+1
+(1 row)
+ERROR:  lastval is not yet defined in this session
+lastval
+1
+(1 row)
+currval
+1
+(1 row)

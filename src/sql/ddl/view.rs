@@ -14,6 +14,7 @@ use crate::sql::analyzer::{Analyzer, CatalogSnapshot};
 use crate::sql::dml;
 use crate::sql::error::SqlError;
 use crate::sql::names;
+use crate::sql::sequences::SequenceSession;
 use crate::sql::ExecuteResult;
 use crate::storage::TikvStore;
 
@@ -260,6 +261,7 @@ pub async fn execute_drop_view(
     names: &[ObjectName],
     if_exists: bool,
     cascade: bool,
+    sequence_values: &mut SequenceSession,
 ) -> Result<ExecuteResult> {
     // Track names already dropped by CASCADE dependency resolution so that
     // multi-name DROP statements (e.g. DROP VIEW v1, v2 CASCADE where v2
@@ -286,9 +288,12 @@ pub async fn execute_drop_view(
 
         // CASCADE: drop views that depend on this view.
         if cascade {
-            let (dropped, _dropped_seqs) =
+            let (dropped, cascade_seqs) =
                 drop_dependent_views(store, txn, db_id, &resolved.full).await?;
             cascade_dropped.extend(dropped);
+            for seq in cascade_seqs {
+                sequence_values.defer_sequence_drop(seq);
+            }
         }
 
         if !store.drop_view(txn, db_id, &resolved.full).await? && !if_exists {
@@ -309,6 +314,7 @@ pub async fn execute_create_materialized_view(
     or_replace: bool,
     mut schema: TableSchema,
     rows: Vec<Row>,
+    sequence_values: &mut SequenceSession,
 ) -> Result<ExecuteResult> {
     let resolved = names::resolve_ddl_object_name(name, search_path)?;
     if !store.schema_exists(txn, db_id, &resolved.schema).await? {
@@ -331,7 +337,11 @@ pub async fn execute_create_materialized_view(
                     .drop_trigger(txn, db_id, &view_name, &trigger.name)
                     .await?;
             }
-            let _seqs = drop_owned_sequences_for_table(store, txn, db_id, &view_name).await?;
+            let dropped_seqs =
+                drop_owned_sequences_for_table(store, txn, db_id, &view_name).await?;
+            for seq in dropped_seqs {
+                sequence_values.defer_sequence_drop(seq);
+            }
             store.drop_materialized_view(txn, db_id, &view_name).await?;
             store.drop_table(txn, db_id, &view_name).await?;
         } else {
@@ -388,6 +398,7 @@ pub async fn execute_drop_materialized_view(
     names: &[ObjectName],
     if_exists: bool,
     cascade: bool,
+    sequence_values: &mut SequenceSession,
 ) -> Result<ExecuteResult> {
     let mut cascade_dropped: HashSet<String> = HashSet::new();
     let mut last = String::new();
@@ -415,9 +426,12 @@ pub async fn execute_drop_materialized_view(
 
         // CASCADE: drop views/matviews that depend on this materialized view.
         if cascade {
-            let (dropped, _dropped_seqs) =
+            let (dropped, cascade_seqs) =
                 drop_dependent_views(store, txn, db_id, &resolved.full).await?;
             cascade_dropped.extend(dropped);
+            for seq in cascade_seqs {
+                sequence_values.defer_sequence_drop(seq);
+            }
         }
 
         let exists = store
@@ -438,7 +452,11 @@ pub async fn execute_drop_materialized_view(
                     .drop_trigger(txn, db_id, &resolved.full, &trigger.name)
                     .await?;
             }
-            let _seqs = drop_owned_sequences_for_table(store, txn, db_id, &resolved.full).await?;
+            let dropped_seqs =
+                drop_owned_sequences_for_table(store, txn, db_id, &resolved.full).await?;
+            for seq in dropped_seqs {
+                sequence_values.defer_sequence_drop(seq);
+            }
             store.drop_table(txn, db_id, &resolved.full).await?;
         }
         last = resolved.full;

@@ -264,6 +264,7 @@ impl Executor {
                         names,
                         *if_exists,
                         *cascade,
+                        sequence_values,
                     )
                     .await
                 }
