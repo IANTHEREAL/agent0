@@ -25,4 +25,13 @@ SELECT * FROM scores ORDER BY score DESC LIMIT 2;
 -- 4. Pagination (Skip top 2, take next 2)
 SELECT * FROM scores ORDER BY score DESC LIMIT 2 OFFSET 2;
 
+-- 5. LIMIT NULL → returns all rows (PG 17 parity: LIMIT NULL ≡ LIMIT ALL)
+SELECT * FROM scores ORDER BY score LIMIT NULL;
+
+-- 6. LIMIT NULL OFFSET NULL → returns all rows
+SELECT * FROM scores ORDER BY score LIMIT NULL OFFSET NULL;
+
+-- 7. LIMIT NULL OFFSET 2 → skip 2, return rest
+SELECT * FROM scores ORDER BY score LIMIT NULL OFFSET 2;
+
 DROP TABLE scores;

@@ -79,10 +79,12 @@ impl PhysicalOperator for LimitOperator {
     async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
         if let Some(expr) = &self.limit_expr {
-            self.limit = Some(evaluate_limit_bound(expr, ctx.query_ctx, "LIMIT")?);
+            // LIMIT NULL → no limit (PG 17 parity: LIMIT NULL ≡ LIMIT ALL)
+            self.limit = evaluate_limit_bound(expr, ctx.query_ctx, "LIMIT")?;
         }
         if let Some(expr) = &self.offset_expr {
-            self.offset = evaluate_limit_bound(expr, ctx.query_ctx, "OFFSET")?;
+            // OFFSET NULL → offset 0 (PG 17 parity)
+            self.offset = evaluate_limit_bound(expr, ctx.query_ctx, "OFFSET")?.unwrap_or(0);
         }
         // Clamp LIMIT to the DML row cap when set.
         // This prevents excessive memory consumption when a parameter-bound
@@ -162,12 +164,17 @@ impl PhysicalOperator for LimitOperator {
     }
 }
 
-fn evaluate_limit_bound(expr: &TypedExpr, qctx: &QueryContext, clause: &str) -> Result<usize> {
+fn evaluate_limit_bound(
+    expr: &TypedExpr,
+    qctx: &QueryContext,
+    clause: &str,
+) -> Result<Option<usize>> {
     let value = eval_typed_expr(expr, &Row::new(vec![]), qctx)?;
     let n = match value {
         Value::Int32(v) => i64::from(v),
         Value::Int64(v) => v,
-        Value::Null => return Err(anyhow!("{clause} must not be NULL")),
+        // PG 17 parity: NULL means "no bound" (LIMIT NULL ≡ LIMIT ALL, OFFSET NULL ≡ OFFSET 0)
+        Value::Null => return Ok(None),
         other => {
             return Err(anyhow!(
                 "{clause} must evaluate to a non-negative integer, got: {:?}",
@@ -178,7 +185,9 @@ fn evaluate_limit_bound(expr: &TypedExpr, qctx: &QueryContext, clause: &str) -> 
     if n < 0 {
         return Err(anyhow!("{clause} must not be negative"));
     }
-    usize::try_from(n).map_err(|_| anyhow!("{clause} is too large"))
+    usize::try_from(n)
+        .map(Some)
+        .map_err(|_| anyhow!("{clause} is too large"))
 }
 
 #[cfg(test)]
@@ -259,12 +268,21 @@ mod tests {
         let offset_expr = TypedExpr::new(TypedExprKind::Parameter { index: 1 }, DataType::Int64);
         assert_eq!(
             evaluate_limit_bound(&limit_expr, &qctx, "LIMIT").unwrap(),
-            10
+            Some(10)
         );
         assert_eq!(
             evaluate_limit_bound(&offset_expr, &qctx, "OFFSET").unwrap(),
-            5
+            Some(5)
         );
+    }
+
+    #[test]
+    fn test_evaluate_limit_bound_null_returns_none() {
+        let mut qctx = QueryContext::for_tests();
+        qctx.params = vec![Some(Value::Null)];
+        let expr = TypedExpr::new(TypedExprKind::Parameter { index: 0 }, DataType::Int64);
+        assert_eq!(evaluate_limit_bound(&expr, &qctx, "LIMIT").unwrap(), None);
+        assert_eq!(evaluate_limit_bound(&expr, &qctx, "OFFSET").unwrap(), None);
     }
 
     #[test]
