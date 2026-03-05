@@ -1396,14 +1396,21 @@ pub async fn branch_database(
         .map_err(|e| AppError::bad_gateway(format!("Failed to export source schema: {e}")))?;
 
     let ddl_sql_idx = sql_result_column_index(&export_result, "ddl_sql")?;
-    let ddl_script = export_result
+    let ddl_statements: Vec<&str> = export_result
         .rows
         .iter()
         .filter_map(|row| row.get(ddl_sql_idx).and_then(|v| v.as_str()))
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(";\n\n");
+        .collect();
+    // Wrap in a single transaction so that ALTER SEQUENCE ... OWNED BY
+    // can see tables created by preceding CREATE TABLE statements
+    // (read-your-own-writes within the same TiKV transaction).
+    let ddl_script = if ddl_statements.is_empty() {
+        String::new()
+    } else {
+        format!("BEGIN;\n{}\nCOMMIT;", ddl_statements.join(";\n\n"))
+    };
 
     let tenant_id = generate_tenant_id();
     let keyspace = make_keyspace(&tenant_id);

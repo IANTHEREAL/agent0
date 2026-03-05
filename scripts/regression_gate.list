@@ -169,6 +169,7 @@ tests/95_alter_owner.sql
 tests/95_join_using.sql
 tests/99_statement_timeout.sql
 tests/101_server_introspection.sql
+tests/222_ddl_export.sql
 tests/197_sql_keys.sql
 tests/272_to_regtype_timetz.sql
 
