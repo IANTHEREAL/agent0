@@ -674,6 +674,29 @@ pub fn jsonb_array_elements_text(args: Vec<Value>) -> Result<Value> {
     }
 }
 
+/// Quote a field for PostgreSQL composite (record) output.
+/// Rules follow PG's `record_out`: if the value contains `"`, `\`, `,`, `(`, `)`,
+/// whitespace, or is empty, wrap in double-quotes and double any internal `"` or `\`.
+fn composite_quote(s: &str) -> String {
+    let needs_quoting = s.is_empty()
+        || s.contains(|c: char| {
+            c == '"' || c == '\\' || c == ',' || c == '(' || c == ')' || c.is_whitespace()
+        });
+    if !needs_quoting {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' || c == '\\' {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
 pub fn jsonb_each(args: Vec<Value>) -> Result<Value> {
     jsonb_each_impl(args, false)
 }
@@ -695,16 +718,21 @@ fn jsonb_each_impl(args: Vec<Value>, is_text: bool) -> Result<Value> {
             let pairs: Vec<Value> = obj
                 .into_iter()
                 .map(|(k, v)| {
-                    let val_str = if is_text {
-                        match v {
-                            serde_json::Value::String(s) => s,
-                            serde_json::Value::Null => "".to_string(),
-                            other => other.to_string(),
-                        }
+                    if is_text {
+                        let val_part = match v {
+                            serde_json::Value::Null => String::new(),
+                            serde_json::Value::String(s) => composite_quote(&s),
+                            other => composite_quote(&other.to_string()),
+                        };
+                        Value::Text(format!("({},{})", composite_quote(&k), val_part))
                     } else {
-                        v.to_string()
-                    };
-                    Value::Text(format!("({},{})", k, val_str))
+                        let val_str = v.to_string();
+                        Value::Text(format!(
+                            "({},{})",
+                            composite_quote(&k),
+                            composite_quote(&val_str)
+                        ))
+                    }
                 })
                 .collect();
             Ok(Value::Array(pairs))
@@ -958,5 +986,87 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(result, Value::Jsonb("[1,2,42]".into()));
+    }
+
+    #[test]
+    fn jsonb_each_text_null_value_produces_null_repr() {
+        // JSON null → composite text `(a,)` (NULL: nothing after comma)
+        let result = jsonb_each_text(vec![Value::Jsonb(r#"{"a":null}"#.into())]).unwrap();
+        assert_eq!(result, Value::Array(vec![Value::Text("(a,)".into())]));
+    }
+
+    #[test]
+    fn jsonb_each_text_empty_string_quoted() {
+        // Empty string → composite text `(a,"")` (distinct from NULL)
+        let result = jsonb_each_text(vec![Value::Jsonb(r#"{"a":""}"#.into())]).unwrap();
+        assert_eq!(result, Value::Array(vec![Value::Text("(a,\"\")".into())]));
+    }
+
+    #[test]
+    fn jsonb_each_text_null_vs_empty_string_distinct() {
+        // NULL and empty string must be distinguishable in scalar output
+        let result = jsonb_each_text(vec![Value::Jsonb(r#"{"e":"","n":null}"#.into())]).unwrap();
+        if let Value::Array(pairs) = result {
+            assert_eq!(pairs.len(), 2);
+            // jsonb sorts keys alphabetically
+            assert_eq!(pairs[0], Value::Text("(e,\"\")".into()));
+            assert_eq!(pairs[1], Value::Text("(n,)".into()));
+        } else {
+            panic!("expected Array");
+        }
+    }
+
+    #[test]
+    fn jsonb_each_text_composite_quoting_matches_pg() {
+        // PG 17.7: SELECT jsonb_each_text('{"a":"", "b":"\"\"", "c":"hello\"world"}'::jsonb);
+        //   (a,"")
+        //   (b,"""""")
+        //   (c,"hello""world")
+        let result = jsonb_each_text(vec![Value::Jsonb(
+            r#"{"a":"", "b":"\"\"", "c":"hello\"world"}"#.into(),
+        )])
+        .unwrap();
+        if let Value::Array(pairs) = result {
+            assert_eq!(pairs.len(), 3);
+            assert_eq!(pairs[0], Value::Text("(a,\"\")".into()));
+            // b = two literal double-quotes → doubled inside composite quotes: """"""
+            assert_eq!(pairs[1], Value::Text("(b,\"\"\"\"\"\")".into()));
+            // c = hello"world → "hello""world"
+            assert_eq!(pairs[2], Value::Text("(c,\"hello\"\"world\")".into()));
+        } else {
+            panic!("expected Array");
+        }
+    }
+
+    #[test]
+    fn jsonb_each_text_special_chars_quoting() {
+        // Values with spaces, commas, parens need quoting; backslash is doubled
+        let result = jsonb_each_text(vec![Value::Jsonb(
+            r#"{"a":"has space","b":"has,comma","c":"has(paren)","d":"has\\backslash"}"#.into(),
+        )])
+        .unwrap();
+        if let Value::Array(pairs) = result {
+            assert_eq!(pairs[0], Value::Text("(a,\"has space\")".into()));
+            assert_eq!(pairs[1], Value::Text("(b,\"has,comma\")".into()));
+            assert_eq!(pairs[2], Value::Text("(c,\"has(paren)\")".into()));
+            assert_eq!(pairs[3], Value::Text("(d,\"has\\\\backslash\")".into()));
+        } else {
+            panic!("expected Array");
+        }
+    }
+
+    #[test]
+    fn jsonb_each_text_key_quoting() {
+        // Keys with special characters need composite quoting too
+        let result = jsonb_each_text(vec![Value::Jsonb(
+            r#"{"has space":"val","has\"quote":"val"}"#.into(),
+        )])
+        .unwrap();
+        if let Value::Array(pairs) = result {
+            assert_eq!(pairs[0], Value::Text("(\"has space\",val)".into()));
+            assert_eq!(pairs[1], Value::Text("(\"has\"\"quote\",val)".into()));
+        } else {
+            panic!("expected Array");
+        }
     }
 }
