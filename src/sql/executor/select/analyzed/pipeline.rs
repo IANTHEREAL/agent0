@@ -908,7 +908,9 @@ fn json_table_function_rows(
                     })
                     .collect())
             }
-            _ => Err(anyhow!("cannot call jsonb_each on a non-object")),
+            _ if is_jsonb => Err(anyhow!("cannot call jsonb_each on a non-object")),
+            serde_json::Value::Array(_) => Err(anyhow!("cannot deconstruct an array as an object")),
+            _ => Err(anyhow!("cannot deconstruct a scalar")),
         },
         "JSONB_EACH_TEXT" | "JSON_EACH_TEXT" => match json_val {
             serde_json::Value::Object(obj) => {
@@ -928,7 +930,9 @@ fn json_table_function_rows(
                     })
                     .collect())
             }
-            _ => Err(anyhow!("cannot call jsonb_each on a non-object")),
+            _ if is_jsonb => Err(anyhow!("cannot call jsonb_each_text on a non-object")),
+            serde_json::Value::Array(_) => Err(anyhow!("cannot deconstruct an array as an object")),
+            _ => Err(anyhow!("cannot deconstruct a scalar")),
         },
         _ => Err(anyhow!("unsupported json table function: {func_upper}")),
     }

@@ -1,0 +1,16 @@
+ERROR:  cannot call jsonb_each on a non-object
+ERROR:  cannot call jsonb_each_text on a non-object
+ERROR:  cannot deconstruct an array as an object
+ERROR:  cannot deconstruct an array as an object
+ERROR:  cannot call jsonb_each on a non-object
+ERROR:  cannot call jsonb_each_text on a non-object
+ERROR:  cannot deconstruct an array as an object
+ERROR:  cannot deconstruct an array as an object
+ERROR:  cannot call jsonb_each on a non-object
+ERROR:  cannot call jsonb_each_text on a non-object
+ERROR:  cannot deconstruct a scalar
+ERROR:  cannot deconstruct a scalar
+ERROR:  cannot call jsonb_each on a non-object
+ERROR:  cannot call jsonb_each_text on a non-object
+ERROR:  cannot deconstruct a scalar
+ERROR:  cannot deconstruct a scalar

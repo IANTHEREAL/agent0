@@ -34,9 +34,9 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("JSONB_ARRAY_ELEMENTS_TEXT", jsonb_array_elements_text);
     map.insert("JSON_ARRAY_ELEMENTS_TEXT", jsonb_array_elements_text);
     map.insert("JSONB_EACH", jsonb_each);
-    map.insert("JSON_EACH", jsonb_each);
+    map.insert("JSON_EACH", json_each);
     map.insert("JSONB_EACH_TEXT", jsonb_each_text);
-    map.insert("JSON_EACH_TEXT", jsonb_each_text);
+    map.insert("JSON_EACH_TEXT", json_each_text);
 }
 
 pub(crate) fn value_to_json(val: &Value) -> serde_json::Value {
@@ -698,14 +698,27 @@ fn composite_quote(s: &str) -> String {
 }
 
 pub fn jsonb_each(args: Vec<Value>) -> Result<Value> {
-    jsonb_each_impl(args, false)
+    jsonb_each_impl(args, false, true, "jsonb_each")
 }
 
 pub fn jsonb_each_text(args: Vec<Value>) -> Result<Value> {
-    jsonb_each_impl(args, true)
+    jsonb_each_impl(args, true, true, "jsonb_each_text")
 }
 
-fn jsonb_each_impl(args: Vec<Value>, is_text: bool) -> Result<Value> {
+pub fn json_each(args: Vec<Value>) -> Result<Value> {
+    jsonb_each_impl(args, false, false, "json_each")
+}
+
+pub fn json_each_text(args: Vec<Value>) -> Result<Value> {
+    jsonb_each_impl(args, true, false, "json_each_text")
+}
+
+fn jsonb_each_impl(
+    args: Vec<Value>,
+    is_text: bool,
+    is_jsonb: bool,
+    func_name: &str,
+) -> Result<Value> {
     let json_str = match args.into_iter().next() {
         Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
         Some(Value::Null) => return Ok(Value::Null),
@@ -737,7 +750,9 @@ fn jsonb_each_impl(args: Vec<Value>, is_text: bool) -> Result<Value> {
                 .collect();
             Ok(Value::Array(pairs))
         }
-        _ => Err(anyhow!("cannot call jsonb_each on a non-object")),
+        _ if is_jsonb => Err(anyhow!("cannot call {} on a non-object", func_name)),
+        serde_json::Value::Array(_) => Err(anyhow!("cannot deconstruct an array as an object")),
+        _ => Err(anyhow!("cannot deconstruct a scalar")),
     }
 }
 
@@ -1068,5 +1083,69 @@ mod tests {
         } else {
             panic!("expected Array");
         }
+    }
+
+    #[test]
+    fn test_jsonb_each_non_object_error_uses_correct_name() {
+        let err = jsonb_each(vec![Value::Jsonb("[1,2,3]".into())])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "cannot call jsonb_each on a non-object");
+    }
+
+    #[test]
+    fn test_jsonb_each_text_non_object_error_uses_correct_name() {
+        let err = jsonb_each_text(vec![Value::Jsonb("[1,2,3]".into())])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "cannot call jsonb_each_text on a non-object");
+    }
+
+    #[test]
+    fn test_json_each_non_object_error_matches_pg() {
+        let err = json_each(vec![Value::Json("[1,2,3]".into())])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "cannot deconstruct an array as an object");
+    }
+
+    #[test]
+    fn test_json_each_text_non_object_error_matches_pg() {
+        let err = json_each_text(vec![Value::Json("[1,2,3]".into())])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "cannot deconstruct an array as an object");
+    }
+
+    #[test]
+    fn test_jsonb_each_scalar_error_matches_pg() {
+        let err = jsonb_each(vec![Value::Jsonb("1".into())])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "cannot call jsonb_each on a non-object");
+    }
+
+    #[test]
+    fn test_jsonb_each_text_scalar_error_matches_pg() {
+        let err = jsonb_each_text(vec![Value::Jsonb("1".into())])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "cannot call jsonb_each_text on a non-object");
+    }
+
+    #[test]
+    fn test_json_each_scalar_error_matches_pg() {
+        let err = json_each(vec![Value::Json("1".into())])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "cannot deconstruct a scalar");
+    }
+
+    #[test]
+    fn test_json_each_text_scalar_error_matches_pg() {
+        let err = json_each_text(vec![Value::Json("1".into())])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "cannot deconstruct a scalar");
     }
 }

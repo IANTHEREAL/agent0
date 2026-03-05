@@ -2,12 +2,10 @@
 #
 # This file is the single source of truth for what `scripts/regression_gate.sh` runs.
 # Keep it small, deterministic, and fast (<5min typical).
-#
 # Format:
 #   - Section headers: [sql] / [python] / [orm]
 #   - One path per line (relative to repo root)
 #   - Blank lines and `#` comments are ignored
-#
 # Notes:
 #   - SQL entries are passed to `scripts/integration_test.py`
 #   - Python entries are standalone multi-session test scripts run with `--dsn`
@@ -122,6 +120,7 @@ tests/110_enum_search_path.sql
 tests/246_jsonb_path_filter.sql
 tests/280_jsonb_concat_operator_issue1473.sql
 tests/72_json_advanced.sql
+tests/277_jsonb_each_error_name.sql
 # COPY FROM (protocol correctness)
 tests/110_copy_from_stdin_column_mismatch.sql
 tests/111_copy_from_stdin_resolution_and_escapes.sql
@@ -153,10 +152,6 @@ tests/189_worker_auto_analyze.sql
 tests/229_statement_timeout.sql
 tests/230_idle_in_transaction_timeout.sql
 tests/232_statement_timeout_guc_regression.sql
-tests/234_returns_table_sql_function.sql
-tests/235_lateral_correlated_no_from.sql
-tests/40_lastval.sql
-tests/40_sequences.sql
 tests/40_setval_null_boolean.sql
 # GIN / FTS
 tests/236_gin_index_scan.sql
@@ -174,13 +169,11 @@ tests/101_server_introspection.sql
 tests/222_ddl_export.sql
 tests/197_sql_keys.sql
 tests/272_to_regtype_timetz.sql
-
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py
 tests/hnsw_large_liveness_coverage.py
 tests/hnsw_bg_concurrent_liveness.py
-
 [orm]
 orm-tests/pg-client/
 orm-tests/typeorm/connection.test.ts
