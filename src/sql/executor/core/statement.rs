@@ -110,7 +110,7 @@ impl Executor {
                 name: name.clone(),
             },
             "table",
-            format!("{}.{}", schema, name),
+            name,
         )
         .await
     }

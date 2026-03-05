@@ -5,6 +5,7 @@
 use super::super::super::errors::{
     in_failed_sql_transaction_pgwire_error, sqlstate_for_executor_error, user_error,
 };
+use super::super::super::rollback_autocommit_or_mark_failed;
 use super::super::DynamicPgHandler;
 use super::helpers::{parse_copy_text_line, should_add_copy_insert_context};
 use crate::model::Value;
@@ -122,108 +123,79 @@ impl DynamicPgHandler {
             })?;
         }
 
-        // INSERT privilege check
-        {
-            let current_role = session.current_user().map(|s| s.to_string());
-            let txn = session.get_mut_txn().ok_or_else(|| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "XX000".to_string(),
-                    "No transaction".to_string(),
-                )))
-            })?;
-            executor
-                .require_table_privilege(
-                    txn,
-                    current_role.as_deref(),
-                    crate::auth::Privilege::Insert,
-                    &table_name,
-                )
-                .await
-                .map_err(|e| {
+        // All fallible work after begin() is wrapped in an async block so that
+        // every `?` is caught by the single cleanup site below.
+        let result: PgWireResult<usize> = async {
+            // INSERT privilege check
+            {
+                let current_role = session.current_user().map(|s| s.to_string());
+                let txn = session.get_mut_txn().ok_or_else(|| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".to_string(),
-                        "42501".to_string(),
-                        e.to_string(),
+                        "XX000".to_string(),
+                        "No transaction".to_string(),
                     )))
                 })?;
-        }
+                executor
+                    .require_table_privilege(
+                        txn,
+                        current_role.as_deref(),
+                        crate::auth::Privilege::Insert,
+                        &table_name,
+                    )
+                    .await
+                    .map_err(|e| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_string(),
+                            "42501".to_string(),
+                            e.to_string(),
+                        )))
+                    })?;
+            }
 
-        // Resolve table schema (search_path-aware, same as parquet handler)
-        let db_id = session.current_database_id();
-        let search_path: Vec<String> = session.search_path().to_vec();
-        let (resolved_table, table_schema) = {
-            let txn = session.get_mut_txn().ok_or_else(|| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "XX000".to_string(),
-                    "No transaction".to_string(),
-                )))
-            })?;
+            // Resolve table schema (search_path-aware, same as parquet handler)
+            let db_id = session.current_database_id();
+            let search_path: Vec<String> = session.search_path().to_vec();
+            let (resolved_table, table_schema) = {
+                let txn = session.get_mut_txn().ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "XX000".to_string(),
+                        "No transaction".to_string(),
+                    )))
+                })?;
 
-            let normalize_ident = |s: &str| -> String {
-                let trimmed = s.trim();
-                if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() > 1 {
-                    trimmed[1..trimmed.len() - 1].to_string()
-                } else {
-                    trimmed.to_lowercase()
-                }
-            };
-            let (schema_opt, table_ident) = if table_name.contains('.') {
-                let parts: Vec<&str> = table_name.splitn(2, '.').collect();
-                if parts.len() == 2 {
-                    (Some(normalize_ident(parts[0])), normalize_ident(parts[1]))
+                let normalize_ident = |s: &str| -> String {
+                    let trimmed = s.trim();
+                    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() > 1 {
+                        trimmed[1..trimmed.len() - 1].to_string()
+                    } else {
+                        trimmed.to_lowercase()
+                    }
+                };
+                let (schema_opt, table_ident) = if table_name.contains('.') {
+                    let parts: Vec<&str> = table_name.splitn(2, '.').collect();
+                    if parts.len() == 2 {
+                        (Some(normalize_ident(parts[0])), normalize_ident(parts[1]))
+                    } else {
+                        (None, normalize_ident(&table_name))
+                    }
                 } else {
                     (None, normalize_ident(&table_name))
-                }
-            } else {
-                (None, normalize_ident(&table_name))
-            };
-
-            if let Some(schema_ident) = schema_opt {
-                let resolved = format!("{}.{}", schema_ident, table_ident);
-                match executor.store().get_schema(txn, db_id, &resolved).await {
-                    Ok(Some(schema)) => (resolved, schema),
-                    Ok(None) => {
-                        if started_txn {
-                            let _ = session.rollback().await;
-                        }
-                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".to_string(),
-                            "42P01".to_string(),
-                            format!("relation \"{}\" does not exist", table_name),
-                        ))));
-                    }
-                    Err(e) => {
-                        if started_txn {
-                            let _ = session.rollback().await;
-                        }
-                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".to_string(),
-                            "XX000".to_string(),
-                            e.to_string(),
-                        ))));
-                    }
-                }
-            } else {
-                let schemas: Vec<&str> = if search_path.is_empty() {
-                    vec!["public"]
-                } else {
-                    search_path.iter().map(|s| s.as_str()).collect()
                 };
-                let mut found = None;
-                for s in schemas {
-                    let resolved = format!("{}.{}", s, table_ident);
+
+                if let Some(schema_ident) = schema_opt {
+                    let resolved = format!("{}.{}", schema_ident, table_ident);
                     match executor.store().get_schema(txn, db_id, &resolved).await {
-                        Ok(Some(schema)) => {
-                            found = Some((resolved, schema));
-                            break;
+                        Ok(Some(schema)) => (resolved, schema),
+                        Ok(None) => {
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "42P01".to_string(),
+                                format!("relation \"{}\" does not exist", table_name),
+                            ))));
                         }
-                        Ok(None) => continue,
                         Err(e) => {
-                            if started_txn {
-                                let _ = session.rollback().await;
-                            }
                             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                                 "ERROR".to_string(),
                                 "XX000".to_string(),
@@ -231,257 +203,263 @@ impl DynamicPgHandler {
                             ))));
                         }
                     }
-                }
-                match found {
-                    Some(f) => f,
-                    None => {
-                        if started_txn {
-                            let _ = session.rollback().await;
+                } else {
+                    let schemas: Vec<&str> = if search_path.is_empty() {
+                        vec!["public"]
+                    } else {
+                        search_path.iter().map(|s| s.as_str()).collect()
+                    };
+                    let mut found = None;
+                    for s in schemas {
+                        let resolved = format!("{}.{}", s, table_ident);
+                        match executor.store().get_schema(txn, db_id, &resolved).await {
+                            Ok(Some(schema)) => {
+                                found = Some((resolved, schema));
+                                break;
+                            }
+                            Ok(None) => continue,
+                            Err(e) => {
+                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    "XX000".to_string(),
+                                    e.to_string(),
+                                ))));
+                            }
                         }
-                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".to_string(),
-                            "42P01".to_string(),
-                            format!("relation \"{}\" does not exist", table_name),
-                        ))));
+                    }
+                    match found {
+                        Some(f) => f,
+                        None => {
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "42P01".to_string(),
+                                format!("relation \"{}\" does not exist", table_name),
+                            ))));
+                        }
                     }
                 }
-            }
-        };
+            };
 
-        if !crate::extensions::fs::backend::is_backend_available() {
-            if started_txn {
-                let _ = session.rollback().await;
+            if !crate::extensions::fs::backend::is_backend_available() {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "58030".to_string(),
+                    "fs9: TiKV storage backend not available".to_string(),
+                ))));
             }
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_string(),
-                "58030".to_string(),
-                "fs9: TiKV storage backend not available".to_string(),
-            ))));
-        }
-        if !session.is_superuser() {
-            if started_txn {
-                let _ = session.rollback().await;
+            if !session.is_superuser() {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "42501".to_string(),
+                    "fs9: permission denied".to_string(),
+                ))));
             }
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_string(),
-                "42501".to_string(),
-                "fs9: permission denied".to_string(),
-            ))));
-        }
 
-        // Read file bytes from fs9 backend
-        let bare_path = crate::extensions::parquet::reader::strip_fs9_scheme(&filename);
-        let tenant = executor.tenant_keyspace().to_string();
-        let backend = match crate::extensions::fs::backend::get_backend(&tenant).await {
-            Ok(backend) => backend,
-            Err(e) => {
-                if started_txn {
-                    let _ = session.rollback().await;
+            // Read file bytes from fs9 backend
+            let bare_path = crate::extensions::parquet::reader::strip_fs9_scheme(&filename);
+            let tenant = executor.tenant_keyspace().to_string();
+            let backend = crate::extensions::fs::backend::get_backend(&tenant)
+                .await
+                .map_err(copy_from_fs9_io_error)?;
+            let file_data = backend
+                .read_file(
+                    bare_path,
+                    crate::extensions::parquet::fs9_reader::MAX_FS9_PARQUET_FILE_BYTES,
+                )
+                .await
+                .map_err(copy_from_fs9_io_error)?;
+
+            // Prepare column metadata from table schema
+            let column_names: Vec<String> = table_schema
+                .columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            let column_types: Vec<Option<crate::model::DataType>> = table_schema
+                .columns
+                .iter()
+                .map(|c| Some(c.data_type.clone()))
+                .collect();
+
+            let short_table = resolved_table.rsplit('.').next().unwrap_or(&resolved_table);
+
+            // Parse records: CSV format uses csv crate (handles quoting),
+            // TEXT format uses parse_copy_text_line (handles backslash escapes).
+            let is_csv = copy_opts.format == crate::protocol::copy_format::CopyFormat::Csv;
+            let records: Vec<Vec<(String, Value)>> = if is_csv {
+                let mut builder = csv::ReaderBuilder::new();
+                builder
+                    .delimiter(copy_opts.delimiter)
+                    .has_headers(copy_opts.header)
+                    .flexible(true)
+                    .quote(copy_opts.quote);
+                if copy_opts.escape == copy_opts.quote {
+                    builder.double_quote(true);
+                } else {
+                    builder.double_quote(false).escape(Some(copy_opts.escape));
                 }
-                return Err(copy_from_fs9_io_error(e));
-            }
-        };
-        let file_data = match backend
-            .read_file(
-                bare_path,
-                crate::extensions::parquet::fs9_reader::MAX_FS9_PARQUET_FILE_BYTES,
-            )
-            .await
-        {
-            Ok(data) => data,
-            Err(e) => {
-                if started_txn {
-                    let _ = session.rollback().await;
-                }
-                return Err(copy_from_fs9_io_error(e));
-            }
-        };
-
-        // Prepare column metadata from table schema
-        let column_names: Vec<String> = table_schema
-            .columns
-            .iter()
-            .map(|c| c.name.clone())
-            .collect();
-        let column_types: Vec<Option<crate::model::DataType>> = table_schema
-            .columns
-            .iter()
-            .map(|c| Some(c.data_type.clone()))
-            .collect();
-
-        let short_table = resolved_table.rsplit('.').next().unwrap_or(&resolved_table);
-
-        // Parse records: CSV format uses csv crate (handles quoting),
-        // TEXT format uses parse_copy_text_line (handles backslash escapes).
-        let is_csv = copy_opts.format == crate::protocol::copy_format::CopyFormat::Csv;
-        let records: Vec<Vec<(String, Value)>> = if is_csv {
-            let mut builder = csv::ReaderBuilder::new();
-            builder
-                .delimiter(copy_opts.delimiter)
-                .has_headers(copy_opts.header)
-                .flexible(true)
-                .quote(copy_opts.quote);
-            if copy_opts.escape == copy_opts.quote {
-                builder.double_quote(true);
-            } else {
-                builder.double_quote(false).escape(Some(copy_opts.escape));
-            }
-            let mut rdr = builder.from_reader(file_data.as_slice());
-            let mut rows = Vec::new();
-            for (rec_idx, record_result) in rdr.records().enumerate() {
-                let record = record_result.map_err(|e| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(),
-                        "22P04".to_string(),
-                        format!("CSV parse error at line {}: {}", rec_idx + 1, e),
-                    )))
-                })?;
-                let mut col_values = Vec::with_capacity(column_names.len());
-                for (idx, (col_name, col_type)) in
-                    column_names.iter().zip(column_types.iter()).enumerate()
-                {
-                    let val = record.get(idx).unwrap_or("");
-                    let value = if val == copy_opts.null_string {
-                        Value::Null
-                    } else if let Some(dt) = col_type.as_ref() {
-                        executor.parse_value_for_copy(val, dt).map_err(|e| {
-                            PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".to_string(),
-                                "22P02".to_string(),
-                                format!(
-                                    "{}\nCONTEXT:  COPY {}, line {}, column {}: \"{}\"",
-                                    e,
-                                    short_table,
-                                    rec_idx + 1,
-                                    col_name,
-                                    val
-                                ),
-                            )))
-                        })?
-                    } else {
-                        Value::Text(val.to_string())
-                    };
-                    col_values.push((col_name.clone(), value));
-                }
-                rows.push(col_values);
-            }
-            rows
-        } else {
-            // TEXT format: split by newline, reuse parse_copy_text_line
-            let text = String::from_utf8_lossy(&file_data);
-            let mut lines: Vec<&str> = text.lines().collect();
-            if copy_opts.header && !lines.is_empty() {
-                lines.remove(0);
-            }
-            if lines.last().is_some_and(|l| l.is_empty()) {
-                lines.pop();
-            }
-            let mut rows = Vec::with_capacity(lines.len());
-            for (line_idx, line) in lines.iter().enumerate() {
-                let line_no = line_idx + 1;
-                let col_values = parse_copy_text_line(
-                    executor,
-                    &resolved_table,
-                    &column_names,
-                    &column_types,
-                    line_no,
-                    line.as_bytes(),
-                )?;
-                rows.push(col_values);
-            }
-            rows
-        };
-
-        // Insert all parsed rows within QueryContext scope
-        let statement_ts = chrono::Utc::now().timestamp_millis();
-        let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
-        let qctx = session.query_context_for_statement(statement_ts, transaction_ts);
-        let row_count = records.len();
-        let line_numbers: Vec<usize> = (1..=row_count).collect();
-
-        let mut pending_self_fk_keys: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut deferred_self_fk_checks: Vec<(usize, String, String)> = Vec::new();
-
-        let insert_result: PgWireResult<()> =
-            crate::sql::query_context::with_scoped_query_context(&qctx, async {
-                executor
-                    .execute_copy_insert_batch(
-                        &mut session,
-                        &resolved_table,
-                        records,
-                        Some(&mut pending_self_fk_keys),
-                        Some(&mut deferred_self_fk_checks),
-                    )
-                    .await
-                    .map_err(|batch_err| {
-                        let line_no = batch_err
-                            .failed_row_offset()
-                            .and_then(|offset| line_numbers.get(offset).copied());
-                        let err = batch_err.source_error();
-                        let message = if should_add_copy_insert_context(err) {
-                            if let Some(line_no) = line_no {
-                                format!("{}\nCONTEXT:  COPY {}, line {}", err, short_table, line_no)
-                            } else {
-                                err.to_string()
-                            }
-                        } else {
-                            err.to_string()
-                        };
+                let mut rdr = builder.from_reader(file_data.as_slice());
+                let mut rows = Vec::new();
+                for (rec_idx, record_result) in rdr.records().enumerate() {
+                    let record = record_result.map_err(|e| {
                         PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".to_string(),
-                            sqlstate_for_executor_error(err).to_string(),
-                            message,
+                            "22P04".to_string(),
+                            format!("CSV parse error at line {}: {}", rec_idx + 1, e),
                         )))
                     })?;
+                    let mut col_values = Vec::with_capacity(column_names.len());
+                    for (idx, (col_name, col_type)) in
+                        column_names.iter().zip(column_types.iter()).enumerate()
+                    {
+                        let val = record.get(idx).unwrap_or("");
+                        let value = if val == copy_opts.null_string {
+                            Value::Null
+                        } else if let Some(dt) = col_type.as_ref() {
+                            executor.parse_value_for_copy(val, dt).map_err(|e| {
+                                PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    "22P02".to_string(),
+                                    format!(
+                                        "{}\nCONTEXT:  COPY {}, line {}, column {}: \"{}\"",
+                                        e,
+                                        short_table,
+                                        rec_idx + 1,
+                                        col_name,
+                                        val
+                                    ),
+                                )))
+                            })?
+                        } else {
+                            Value::Text(val.to_string())
+                        };
+                        col_values.push((col_name.clone(), value));
+                    }
+                    rows.push(col_values);
+                }
+                rows
+            } else {
+                // TEXT format: split by newline, reuse parse_copy_text_line
+                let text = String::from_utf8_lossy(&file_data);
+                let mut lines: Vec<&str> = text.lines().collect();
+                if copy_opts.header && !lines.is_empty() {
+                    lines.remove(0);
+                }
+                if lines.last().is_some_and(|l| l.is_empty()) {
+                    lines.pop();
+                }
+                let mut rows = Vec::with_capacity(lines.len());
+                for (line_idx, line) in lines.iter().enumerate() {
+                    let line_no = line_idx + 1;
+                    let col_values = parse_copy_text_line(
+                        executor,
+                        &resolved_table,
+                        &column_names,
+                        &column_types,
+                        line_no,
+                        line.as_bytes(),
+                    )?;
+                    rows.push(col_values);
+                }
+                rows
+            };
 
-                // Deferred self-FK validation: all rows are now in storage
-                // within the transaction. Validate accumulated child FK
-                // checks against the complete PK key set (matching STDIN
-                // path behavior in on_copy_done).
-                if !deferred_self_fk_checks.is_empty() {
+            // Insert all parsed rows within QueryContext scope
+            let statement_ts = chrono::Utc::now().timestamp_millis();
+            let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
+            let qctx = session.query_context_for_statement(statement_ts, transaction_ts);
+            let row_count = records.len();
+            let line_numbers: Vec<usize> = (1..=row_count).collect();
+
+            let mut pending_self_fk_keys: HashMap<String, HashSet<String>> = HashMap::new();
+            let mut deferred_self_fk_checks: Vec<(usize, String, String)> = Vec::new();
+
+            let insert_result: PgWireResult<()> =
+                crate::sql::query_context::with_scoped_query_context(&qctx, async {
                     executor
-                        .validate_copy_deferred_self_fk(
+                        .execute_copy_insert_batch(
                             &mut session,
                             &resolved_table,
-                            &deferred_self_fk_checks,
-                            &pending_self_fk_keys,
+                            records,
+                            Some(&mut pending_self_fk_keys),
+                            Some(&mut deferred_self_fk_checks),
                         )
                         .await
-                        .map_err(|e| {
+                        .map_err(|batch_err| {
+                            let line_no = batch_err
+                                .failed_row_offset()
+                                .and_then(|offset| line_numbers.get(offset).copied());
+                            let err = batch_err.source_error();
+                            let message = if should_add_copy_insert_context(err) {
+                                if let Some(line_no) = line_no {
+                                    format!(
+                                        "{}\nCONTEXT:  COPY {}, line {}",
+                                        err, short_table, line_no
+                                    )
+                                } else {
+                                    err.to_string()
+                                }
+                            } else {
+                                err.to_string()
+                            };
                             PgWireError::UserError(Box::new(ErrorInfo::new(
                                 "ERROR".to_string(),
-                                sqlstate_for_executor_error(&e).to_string(),
-                                e.to_string(),
+                                sqlstate_for_executor_error(err).to_string(),
+                                message,
                             )))
                         })?;
+
+                    // Deferred self-FK validation: all rows are now in storage
+                    // within the transaction. Validate accumulated child FK
+                    // checks against the complete PK key set (matching STDIN
+                    // path behavior in on_copy_done).
+                    if !deferred_self_fk_checks.is_empty() {
+                        executor
+                            .validate_copy_deferred_self_fk(
+                                &mut session,
+                                &resolved_table,
+                                &deferred_self_fk_checks,
+                                &pending_self_fk_keys,
+                            )
+                            .await
+                            .map_err(|e| {
+                                PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    sqlstate_for_executor_error(&e).to_string(),
+                                    e.to_string(),
+                                )))
+                            })?;
+                    }
+
+                    Ok(())
+                })
+                .await;
+            insert_result?;
+
+            Ok(row_count)
+        }
+        .await;
+
+        match result {
+            Ok(row_count) => {
+                if started_txn {
+                    session.commit().await.map_err(|e| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_string(),
+                            "XX000".to_string(),
+                            e.to_string(),
+                        )))
+                    })?;
                 }
-
-                Ok(())
-            })
-            .await;
-
-        if let Err(e) = insert_result {
-            if started_txn {
-                let _ = session.rollback().await;
-            } else {
-                session.mark_transaction_failed();
+                Ok(Some(vec![pgwire::api::results::Response::Execution(
+                    pgwire::api::results::Tag::new("COPY").with_rows(row_count),
+                )]))
             }
-            return Err(e);
+            Err(e) => {
+                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                Err(e)
+            }
         }
-
-        if started_txn {
-            session.commit().await.map_err(|e| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "XX000".to_string(),
-                    e.to_string(),
-                )))
-            })?;
-        }
-
-        Ok(Some(vec![pgwire::api::results::Response::Execution(
-            pgwire::api::results::Tag::new("COPY").with_rows(row_count),
-        )]))
     }
 
     pub(in crate::protocol::handler) async fn try_handle_copy_from_parquet<'a, C>(
@@ -597,93 +575,95 @@ impl DynamicPgHandler {
                 .map_err(|e| user_error("XX000", e.to_string()))?;
         }
 
-        let db_id = session.current_database_id();
+        // All fallible work after begin() is wrapped in an async block so that
+        // every `?` is caught by the single cleanup site below.
+        let result: PgWireResult<usize> = async {
+            let db_id = session.current_database_id();
 
-        // Check extension is installed
-        {
-            let txn = session
-                .get_mut_txn()
-                .ok_or_else(|| user_error("XX000", "No transaction"))?;
-            let installed = executor
-                .store()
-                .get_extension(txn, db_id, "parquet")
-                .await
-                .map_err(|e| user_error("XX000", e.to_string()))?;
-            match installed {
-                Some(ref ext) if ext.enabled => {}
-                _ => {
-                    if started_txn {
-                        let _ = session.rollback().await;
+            // Check extension is installed
+            {
+                let txn = session
+                    .get_mut_txn()
+                    .ok_or_else(|| user_error("XX000", "No transaction"))?;
+                let installed = executor
+                    .store()
+                    .get_extension(txn, db_id, "parquet")
+                    .await
+                    .map_err(|e| user_error("XX000", e.to_string()))?;
+                match installed {
+                    Some(ref ext) if ext.enabled => {}
+                    _ => {
+                        return Err(user_error(
+                            "0A000",
+                            "extension \"parquet\" is not installed. Run: CREATE EXTENSION parquet",
+                        ));
                     }
-                    return Err(user_error(
-                        "0A000",
-                        "extension \"parquet\" is not installed. Run: CREATE EXTENSION parquet",
-                    ));
                 }
             }
-        }
 
-        // Require INSERT privilege (same as COPY FROM STDIN)
-        {
-            let current_role = session.current_user().map(|s| s.to_string());
-            let txn = session
-                .get_mut_txn()
-                .ok_or_else(|| user_error("XX000", "No transaction"))?;
-            executor
-                .require_table_privilege(
-                    txn,
-                    current_role.as_deref(),
-                    crate::auth::Privilege::Insert,
-                    &table_name,
-                )
-                .await
-                .map_err(|e| user_error("42501", e.to_string()))?;
-        }
-
-        // Set up statement context (timestamps, connection_id, etc.) required by
-        // QueryContext::from_task_locals() inside execute_copy_from_parquet.
-        let statement_ts = chrono::Utc::now().timestamp_millis();
-        let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
-        let qctx = session.query_context_for_statement(statement_ts, transaction_ts);
-
-        // Delegate streaming import to Executor (has access to dml/check_constraints modules).
-        // Extension context is required for fs9:// URL dispatch in open_batch_stream.
-        let tenant_ks = executor.tenant_keyspace().to_string();
-        let is_super = session.is_superuser();
-        let tikv_client = executor.store().transaction_client();
-        let ext_opts =
-            crate::extensions::context::ExtensionContextOpts::statement(is_super, &tenant_ks)
-                .with_tikv_client(tikv_client);
-        let result = crate::sql::query_context::with_scoped_query_context(&qctx, async {
-            crate::extensions::context::with_context_opts(ext_opts, async {
+            // Require INSERT privilege (same as COPY FROM STDIN)
+            {
+                let current_role = session.current_user().map(|s| s.to_string());
+                let txn = session
+                    .get_mut_txn()
+                    .ok_or_else(|| user_error("XX000", "No transaction"))?;
                 executor
-                    .execute_copy_from_parquet(&mut session, &table_name, &url)
+                    .require_table_privilege(
+                        txn,
+                        current_role.as_deref(),
+                        crate::auth::Privilege::Insert,
+                        &table_name,
+                    )
                     .await
+                    .map_err(|e| user_error("42501", e.to_string()))?;
+            }
+
+            // Set up statement context (timestamps, connection_id, etc.) required by
+            // QueryContext::from_task_locals() inside execute_copy_from_parquet.
+            let statement_ts = chrono::Utc::now().timestamp_millis();
+            let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
+            let qctx = session.query_context_for_statement(statement_ts, transaction_ts);
+
+            // Delegate streaming import to Executor (has access to dml/check_constraints modules).
+            // Extension context is required for fs9:// URL dispatch in open_batch_stream.
+            let tenant_ks = executor.tenant_keyspace().to_string();
+            let is_super = session.is_superuser();
+            let tikv_client = executor.store().transaction_client();
+            let ext_opts =
+                crate::extensions::context::ExtensionContextOpts::statement(is_super, &tenant_ks)
+                    .with_tikv_client(tikv_client);
+            let row_count = crate::sql::query_context::with_scoped_query_context(&qctx, async {
+                crate::extensions::context::with_context_opts(ext_opts, async {
+                    executor
+                        .execute_copy_from_parquet(&mut session, &table_name, &url)
+                        .await
+                })
+                .await
             })
             .await
-        })
+            .map_err(|e| user_error("XX000", e.to_string()))?;
+
+            Ok(row_count)
+        }
         .await;
 
-        if let Err(e) = result {
-            if started_txn {
-                let _ = session.rollback().await;
-            } else {
-                session.mark_transaction_failed();
+        match result {
+            Ok(row_count) => {
+                if started_txn {
+                    session
+                        .commit()
+                        .await
+                        .map_err(|e| user_error("XX000", e.to_string()))?;
+                }
+                Ok(Some(vec![pgwire::api::results::Response::Execution(
+                    pgwire::api::results::Tag::new("COPY").with_rows(row_count),
+                )]))
             }
-            return Err(user_error("XX000", e.to_string()));
+            Err(e) => {
+                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                Err(e)
+            }
         }
-        let result = result.unwrap();
-
-        if started_txn {
-            session
-                .commit()
-                .await
-                .map_err(|e| user_error("XX000", e.to_string()))?;
-        }
-
-        Ok(Some(vec![pgwire::api::results::Response::Execution(
-            pgwire::api::results::Tag::new("COPY").with_rows(result),
-        )]))
     }
 }
 
