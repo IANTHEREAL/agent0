@@ -1,233 +1,141 @@
 # SQL Engine Architecture
 
-> **Contracts**: See [docs/sot/sql-engine.md](../sot/sql-engine.md) for normative specifications.
-> **Navigation**: See [src/sql/AGENTS.md](../../src/sql/AGENTS.md) for detailed code paths and symbols.
-> **Invariants**: See [docs/sot/invariants.md](../sot/invariants.md) for cross-module invariants #1–6.
+> Contracts live in [docs/sot/sql-engine.md](../sot/sql-engine.md). This page explains how the current SQL engine is structured.
 
-## CTE Pre-materialization
+## Canonical Query Pipeline
 
-CTEs are fully materialized before the main query executes:
+The current analyzed `SELECT/WITH` pipeline is:
 
 ```
-WITH clause processing (executor/cte.rs):
-    For each CTE:
-    ├─ Non-recursive: execute_query_with_outer_ctes() → materialize rows
-    └─ Recursive: execute_recursive_cte()
-        ├─ Execute base expression → seed rows
-        ├─ Loop (max 1000 iterations):
-        │   ├─ Execute recursive expression with current rows as CTE
-        │   └─ Append new rows; stop when empty
-        └─ Deduplicate if UNION (not UNION ALL)
-    Result: HashMap<String, (TableSchema, Vec<Row>)>
+query AST
+  → expand_views_in_query()
+  → build_catalog_snapshot()
+  → require_table_privilege() for base tables
+  → Analyzer
+  → rewrite_query()
+  → LogicalPlanner
+  → PhysicalPlanner
+  → build operators
+  → execute operators
+  → postprocess results
 ```
+
+This same semantic entrypoint is used by `EXPLAIN SELECT/WITH`.
 
 ## DML Path
 
-INSERT, UPDATE, DELETE also flow through the Analyzer:
+INSERT, UPDATE, and DELETE use the analyzed DML path:
 
 ```
-INSERT/UPDATE/DELETE
-    → Analyzer::analyze_{insert,update,delete}()
-    → TypedExpr for values/conditions
-    → executor/dml_analyzed.rs: execute with typed expressions
-    → Trigger activation (BEFORE inline, AFTER deferred to commit)
+INSERT / UPDATE / DELETE
+  → Analyzer::analyze_{insert,update,delete}()
+  → typed expressions and coercion checks
+  → executor/dml_analyzed/
+  → index maintenance
+  → trigger handling
+  → optional follow-up enqueue (for example HNSW merge)
 ```
 
-## EXPLAIN Path
+The DML entrypoint is the `src/sql/executor/dml_analyzed/` directory, not the old flat `executor/dml_analyzed.rs` file.
 
-EXPLAIN uses the same analyzed pipeline as execution to guarantee consistency:
+## Prepared Execution and Reparse Boundaries
 
-```
-EXPLAIN query
-    → expand_views_in_query()
-    → Analyzer::analyze_query()
-    → generate_plan_from_analyzed()
-        (same index selection logic as runtime: choose_best_access_path)
-    → Format to PostgreSQL-compatible EXPLAIN output
-```
+Prepared execution reuses prepared/analyzed state where valid, but db9 still has explicit compatibility reparse boundaries:
 
-## Analyzer (`src/sql/analyzer/`)
+- schema drift invalidates prepared state and reparses SQL text;
+- prepared recursive CTE execution falls back to text execution (tracked in `#1516`);
+- parser-boundary raw-SQL utility acceptance exists in the protocol layer for some utility statements that `sqlparser` cannot parse.
 
-Transforms raw SQL AST into typed, resolved intermediate representation.
+These are explicit compatibility shims, not hidden alternative planners for analyzed execution.
 
-> **Contract**: See [docs/sot/sql-engine.md](../sot/sql-engine.md) — every `TypedExpr` node carries a resolved `DataType`. All column references are resolved to positional indices. No unresolved names escape the Analyzer.
+## Optimizer
 
-| File | Purpose |
-|------|---------|
-| `types.rs` | Typed IR definitions: `TypedExpr`, `TypedExprKind`, `AnalyzedQuery`, `AnalyzedStatement` |
-| `query.rs` | Query-level analysis: SELECT/INSERT/UPDATE/DELETE, GROUP BY validation |
-| `expr.rs` | Expression analysis: name resolution, type inference for all expression kinds |
-| `scope.rs` | Scope chain for nested queries, correlated subquery tracking |
-| `catalog.rs` | `CatalogSnapshot`: table/column/function resolution interface |
-| `dml.rs` | DML-specific analysis (INSERT/UPDATE/DELETE type checking) |
-| `literal.rs` | Literal value parsing and type inference |
-
-## Optimizer (`src/sql/optimizer/`)
-
-Cost-based query optimization. Transforms `AnalyzedQuery` into an optimized physical plan. Always ON (single path). Covers single-table, multi-table joins, set operations (UNION/INTERSECT/EXCEPT), CTEs, window functions, and DISTINCT ON. Includes selectivity estimation, index selection, join reordering (DPccp), subquery decorrelation (EXISTS/NOT EXISTS → SemiJoin/AntiJoin), and predicate pushdown. `db9.use_optimizer` remains compatibility/readback only.
+db9 uses an always-on optimizer pipeline:
 
 ```
 AnalyzedQuery
-    → LogicalPlanner::build()     → LogicalPlan (abstract tree)
-    → Rewrite passes (decorrelate, predicate pushdown, join reorder)
-    → PhysicalPlanner::plan()     → PhysicalPlan (with cost estimates)
-    → PhysicalPlan::build_operators() → BoxedOperator (executable)
+  → LogicalPlanner
+  → logical rewrites / decorrelation / pushdown
+  → PhysicalPlanner
+  → operator builder
 ```
 
-| Module | Purpose |
-|--------|---------|
-| `logical_planner/` | AnalyzedQuery → LogicalPlan conversion |
-| `logical_plan.rs` | LogicalPlan IR definition |
-| `physical_planner/` | LogicalPlan → PhysicalPlan with operator selection |
-| `physical_plan.rs` | PhysicalPlan IR definition |
-| `build/` | PhysicalPlan → BoxedOperator (scan, join, aggregate, utils) |
-| `selectivity/` | Selectivity estimation from column statistics |
-| `statistics.rs` | `ColumnStatistics`, `TableStatistics` structures |
-| `rewrite/` | Plan rewrite passes: decorrelation (EXISTS→SemiJoin), predicate pushdown |
-| `join_reorder/` | Cost-based join reordering via DPccp algorithm |
-| `join_keys.rs` | Join key extraction and analysis |
-| `eligibility.rs` | Query eligibility checks for optimizer paths |
-| `window_rewrite.rs` | Window function plan rewriting |
+The optimizer currently handles:
+- single-table and multi-table queries
+- set operations
+- CTEs
+- window functions
+- DISTINCT ON
+- planner-driven index access paths
 
-## Physical Operators (`src/sql/operators/`)
+`db9.use_optimizer` remains a compatibility/readback GUC, not a runtime path switch.
 
-Streaming execution via Volcano iterator model. Each operator implements `open() → next() → close()`.
+## Physical Operators
 
-| Operator | File | Description |
-|----------|------|-------------|
-| TableScan / IndexScan | `scan.rs` | TiKV row retrieval (full scan or index lookup) |
-| Filter | `filter.rs` | WHERE clause predicate evaluation |
-| Project | `project.rs` | Column selection + expression evaluation |
-| NestedLoopJoin | `join.rs` | Streaming outer, materializes right side only |
-| HashJoin | `hash_join/` | Equi-join with in-memory hash table (mod.rs, hash_table.rs) |
-| HashSemiJoin | `hash_semi_join.rs` | Semi/anti-join for EXISTS/NOT EXISTS decorrelation |
-| HashAggregate | `aggregate.rs` | GROUP BY with incremental aggregation |
-| Sort | `sort.rs` | ORDER BY (full materialization required) |
-| Distinct | `distinct.rs` | DISTINCT / UNION deduplication |
-| Window | `window/` | Window functions (mod.rs, access.rs, aggregates.rs, ranking.rs) |
-| Limit | `limit.rs` | LIMIT / OFFSET |
-| SetOperation | `set_operation.rs` | UNION / INTERSECT / EXCEPT |
-| CTE | `cte.rs` | Common Table Expression iteration |
-| TableFunction | `table_function.rs` | UNNEST, generate_series, etc. |
+Representative operator families:
 
-### JOIN Type Support
+| Operator | Purpose |
+|---|---|
+| `TableScan` / `IndexScan` / `RangeIndexScan` / `InListScan` | Base row and B-tree access paths |
+| `GinScan` | Inverted-index posting-list execution with recheck |
+| `HnswScan` | Approximate nearest-neighbor scan over base graph plus visible deltas |
+| `Filter` | Predicate evaluation |
+| `Project` | Expression evaluation and projection |
+| `NestedLoopJoin` / `HashJoin` / `HashSemiJoin` | Join execution |
+| `HashAggregate` | GROUP BY / aggregates |
+| `Sort` / `Limit` / `Distinct` | Ordering, limiting, dedup |
+| `Window` | Window functions |
+| `SetOperation` | UNION / INTERSECT / EXCEPT |
+| `CTE` | CTE iteration/materialization |
+| `TableFunction` | `generate_series`, `unnest`, and other table functions |
 
-| JOIN Type | Supported | Operator | Notes |
-|-----------|-----------|----------|-------|
-| INNER JOIN | Yes | NLJ, HashJoin | Default join type |
-| LEFT OUTER JOIN | Yes | NLJ, HashJoin | NULL-padded right rows for unmatched left |
-| RIGHT OUTER JOIN | Yes | NLJ, HashJoin | NULL-padded left rows for unmatched right |
-| FULL OUTER JOIN | Yes | NLJ, HashJoin | Both-side NULL padding for unmatched rows |
-| CROSS JOIN | Yes | NLJ | Cartesian product |
-| SEMI JOIN | Yes | HashSemiJoin | EXISTS decorrelation |
-| ANTI JOIN | Yes | HashSemiJoin | NOT EXISTS decorrelation |
+## Access Paths
 
-## Executor (`src/sql/executor/`)
+### B-tree
 
-Statement dispatch, DDL/DML execution, and SELECT orchestration.
+Planner access-path selection supports:
+- equality lookups
+- ranges and bounded ranges
+- prefix matching
+- partial indexes
+- expression indexes
+- in-list scans
 
-```
-executor/
-├── core/                      # Statement dispatch + infrastructure
-│   ├── dispatch/              # Statement routing (mod.rs, prepared.rs, utils.rs)
-│   ├── statement.rs           # Privilege checks + common helpers
-│   ├── analyze.rs             # ANALYZE command (statistics collection)
-│   ├── view_rewrite/          # View expansion + privilege enforcement (mod.rs, expr.rs, query.rs, table.rs)
-│   ├── catalog_prefetch/      # Batch catalog lookups (mod.rs, extraction.rs, resolution.rs)
-│   ├── stmt_ddl.rs            # DDL statement execution
-│   ├── stmt_dml.rs            # DML statement execution
-│   ├── stmt_query.rs          # Query statement execution
-│   ├── stmt_rbac.rs           # RBAC statement execution
-│   ├── settings_tableless.rs  # GUC / tableless settings queries
-│   └── observability.rs       # Query observability hooks
-├── select/
-│   └── analyzed/              # Single-path SELECT executor
-│       ├── mod.rs             # Main orchestrator
-│       ├── pipeline.rs        # Query execution pipeline
-│       ├── pre_materialize.rs # CTE/subquery pre-materialization
-│       ├── postprocess.rs     # Result post-processing
-│       ├── rewrite.rs         # Expression simplification
-│       ├── subquery/          # Subquery execution (mod.rs, tests.rs)
-│       └── materialize_catalog.rs # Catalog query materialization
-├── dml_analyzed/              # Analyzed INSERT/UPDATE/DELETE (mod.rs, insert.rs, update.rs, delete.rs)
-├── procedure/                 # CALL + materialized views
-├── table_utils/               # Table function helpers (generate_series)
-├── cte.rs                     # CTE pre-materialization
-├── ddl.rs                     # DDL dispatch
-├── triggers.rs                # Trigger dispatch
-├── default_privileges.rs      # DEFAULT PRIVILEGES management
-├── user_function.rs           # User-defined function execution
-└── bg_sql.rs                  # Background SQL execution (worker integration)
-```
+### GIN
 
-### Materialized Views (`executor/procedure/materialized_views.rs`)
+GIN access-path selection is shipped. The planner can emit `ScanType::GinIndexScan`, and runtime builds `GinScanOperator`.
 
-Three-phase lifecycle:
+Authoritative behavioral contract: [docs/sot/extensions-gin.md](../sot/extensions-gin.md)
 
-1. **CREATE MATERIALIZED VIEW**: Execute the query, auto-generate schema with synthetic `_mv_rowid` primary key, persist metadata and dependency graph, create backing table and seed with initial rows.
-2. **REFRESH MATERIALIZED VIEW**: Re-execute stored query against current data, truncate and reload backing table. Supports `CONCURRENTLY` keyword which enqueues a `BgDdl` task for async refresh via the worker engine.
-3. **DROP MATERIALIZED VIEW**: Remove metadata, triggers, sequences, and backing table. Supports `CASCADE`.
+### HNSW
 
-## Expression System (`src/sql/expr/`)
+The optimizer can choose an HNSW scan for eligible nearest-neighbor orderings. Runtime loads the base HNSW graph plus visible delta entries so read-your-writes semantics hold.
 
-Runtime evaluation of typed expressions against rows.
+Current architecture is delta-log plus background merge, not the earlier process-level graph-cache design.
 
-| Module | Purpose |
-|--------|---------|
-| `typed_eval/` | Core evaluator: `eval_typed_expr(expr, row, ctx) → Value` (mod.rs, arithmetic.rs, helpers.rs) |
-| `typed_fold.rs` | AST tree transformation |
-| `typed_rewrite.rs` | Constant folding, expression rewriting |
-| `traverse/` | Expression tree traversal and visitor utilities |
-| `classify.rs` | Expression classification (aggregate, window, volatile) |
-| `static_eval.rs` | Compile-time constant expression evaluation |
-| `operators.rs` | Binary/unary operator implementations |
-| `numeric.rs` | Numeric arithmetic with overflow handling |
-| `functions/` | 13 categories: array, datetime, encoding, fs9, fts, json, math, misc, pg_compat, regex, string, uuid, vector |
+## CTE Materialization
 
-## Type System (`src/sql/types/`)
-
-Type inference, coercion, and PostgreSQL type mapping.
-
-| Module | Purpose |
-|--------|---------|
-| `registry/` | `FunctionRegistry`: 200+ builtin function signatures (aggregate_window, json, math, misc, string, system, temporal) |
-| `infer.rs` | `TypeInferrer`: core type inference logic |
-| `coercion.rs` | `common_type()` (Text wins) + `comparison_target_type()` (non-Text wins) |
-| `cast/` | CAST between any two types (mod.rs, tests.rs) |
-| `mapping.rs` | PostgreSQL DataType <-> internal Value types |
-
-Two coercion functions with intentionally different behavior:
-- `common_type(T1, T2)` → common supertype for operators (Text wins for mixed types)
-- `comparison_target_type(T1, T2)` → coercion target for comparisons (non-Text wins)
-
-## Catalog (`src/sql/catalog/`)
-
-PostgreSQL system catalog compatibility. 37 virtual table implementations for `pg_catalog`, `information_schema`, and `cron`.
-
-Implements: `pg_class`, `pg_attribute`, `pg_type`, `pg_index`, `pg_namespace`, `pg_constraint`, `pg_proc`, `pg_roles`, `pg_trigger`, `pg_views`, `pg_description`, `pg_database`, `pg_extension`, `pg_depend`, `pg_am`, `pg_collation`, `pg_enum`, `pg_range`, `pg_sequence`, `pg_attrdef`, `pg_db_role_setting`, `pg_tables`, `pg_indexes`, `tables`, `columns`, `schemata`, `sequences`, `routines`, `key_column_usage`, `table_constraints`, `constraint_column_usage`, `check_constraints`, `referential_constraints`, `table_privileges`, `cron_job`, `cron_job_run_details`, `cron_running_jobs`, and more.
-
-## Index Planning (`src/sql/planner/`)
-
-Access path selection. Given a query's WHERE predicates and available indexes, choose the best scan strategy.
-
-Supports:
-- B-tree index scans (equality, range, prefix)
-- Expression indexes (indexes on computed expressions)
-- Partial indexes (indexes with WHERE predicates)
-- Multi-column index prefix matching
-
-Note: `ScanType::GinIndexScan` is reserved for planned future support, but GIN access-path selection is currently disabled so EXPLAIN and runtime behavior stay aligned.
-
-## Statistics (`src/sql/stats.rs` + `optimizer/statistics.rs`)
-
-Per-tenant table statistics for cost-based optimization.
+CTE processing remains explicit:
 
 ```
-ANALYZE table_name
-    → Scan table rows
-    → Compute per-column: distinct count, null fraction, MCV, histogram
-    → Store in TableStatsCache (per-tenant, in-memory)
-    → Used by PhysicalPlanner for selectivity estimation
+WITH processing
+  → non-recursive CTE materialization, or
+  → recursive CTE iteration with bounded loop and dedup rules
+  → materialized CTE map used by downstream execution
 ```
 
-`TableStatsCache` is owned by `TenantEntry` in the connection pool — when the tenant entry is reaped, statistics are dropped automatically.
+Recursive prepared CTE execution is one of the explicit documented reparse/fallback boundaries and is tracked separately in `#1516`.
+
+## EXPLAIN
+
+`EXPLAIN SELECT/WITH` goes through the same analyze/rewrite/planning path as execution so access-path reporting stays aligned with runtime semantics.
+
+## Session-Local Plan Cache
+
+db9 ships a session-local prepared plan cache for eligible prepared statements:
+
+- promotion is execution-count based;
+- cache keys include normalized SQL, parameter types, database, search path, and resolved table IDs;
+- invalidation uses schema-version dependencies.
+
+The broader roadmap item is shared/parameterized reuse beyond this current shipped session-local cache.

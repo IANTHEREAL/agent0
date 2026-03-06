@@ -3,6 +3,11 @@
 **Status**: Draft  
 **Priority（ORM 迁移）**: P1（允许迁移落地），P2（触发器执行语义）
 
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+
 ## 背景与动机
 
 在真实工程迁移中，经常会出现函数与触发器：
@@ -108,4 +113,3 @@ struct TriggerDef {
 若某 ORM 迁移脚本包含 trigger/function（可用最小样例模拟）：
 - 执行迁移 SQL 不失败（阶段 1）
 - 若启用阶段 2：行为一致
-

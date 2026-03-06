@@ -1,5 +1,21 @@
 # Phase 2 Worker Binary Specification
 
+> **Status**: Superseded
+>
+> This document does **not** describe the current shipped architecture.
+> db9 currently runs background work inside the main `db9-server` process via the unified worker engine.
+>
+> Current references:
+> - `docs/sot/worker-cron.md`
+> - `docs/ARCHITECTURE.md`
+> - `docs/architecture/sql-engine.md`
+>
+> Why superseded:
+> - the separate `db9-server-worker` binary described here was not adopted as the current architecture
+> - the current system uses in-process worker execution plus system-keyspace coordination instead
+>
+> This file is kept only as a historical proposal record.
+
 ## Overview
 
 This document specifies the db9-server worker binary — a separate, horizontally-scalable process that executes background tasks (Cron, AsyncTrigger, AutoAnalyze, BgDdl, BgSql) by polling a task queue in TiKV and executing SQL via pgwire loopback to the db9-server server.

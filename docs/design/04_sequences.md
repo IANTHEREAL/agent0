@@ -3,6 +3,19 @@
 **Status**: Draft  
 **Priority（ORM 迁移）**: P0
 
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Some sequence features are now implemented, but this file still describes target scope and bridge options rather than guaranteed shipped behavior.
+>
+> Current implementation-status note:
+> - sequence support exists in the current codebase
+> - `ALTER SEQUENCE ... OWNED BY` is implemented
+> - the broader generic `ALTER SEQUENCE` option surface described here is still not fully shipped
+> - tracked follow-up for common generic `ALTER SEQUENCE` support: `#1517`
+>
+> For current truth, verify against code/tests first; do not treat this file as SSOT.
+
 ## 背景与动机
 
 ORM 迁移与建表普遍依赖自增主键：
@@ -141,4 +154,3 @@ struct SequenceDef {
 ### ORM 测试
 
 - TypeORM/Sequelize/Knex：验证其生成的 SERIAL/IDENTITY 表结构可同步，且 introspection 查询中 sequence 相关表/函数不报错。
-

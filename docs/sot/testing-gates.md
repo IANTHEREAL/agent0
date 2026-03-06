@@ -1,21 +1,19 @@
-# testing-gates — CI merge gates & local reproducibility
+# testing-gates — Repository workflow inventory and local reproducibility
 
 ## Scope
-- CI workflows/jobs that act as merge gates (and what they run).
-- Local reproducibility: how to run the same checks locally.
-- Gate identifiers used by `docs/sot/modules.yaml` (`gate_tests`) and what they mean.
+- Repository workflows/jobs that provide blocking or best-effort signal.
+- Canonical gate identifiers used by `docs/sot/modules.yaml`.
+- Local commands for reproducing the same checks outside GitHub Actions where possible.
 
 ## Non-goals
-- Feature semantics (authoritative: the corresponding module SoT doc).
-- Adding/removing/tuning gates without DR/ADR (see #368 hard rule).
-- Defining runtime configuration keys (SSOT lives in `./ops-config.md`).
+- Feature semantics (authoritative: the corresponding module SoT docs).
+- Claiming GitHub branch-protection settings that are not versioned in-repo.
+- Duplicating runtime config-key definitions (authoritative: `./ops-config.md`).
 
 ## Entrypoints
-- `.github/workflows/regression-gate.yml`
-- `.github/workflows/orm-tests.yml`
-- `.github/workflows/gorm-smoke.yml`
-- `.github/workflows/sqlalchemy-smoke.yml`
+- `.github/workflows/ci.yml`
 - `.github/workflows/doc-lint.yml`
+- `.github/workflows/governance-lint.yml`
 - `scripts/regression_gate.sh`
 - `run_tests.sh`
 - `scripts/integration_test.py`
@@ -24,97 +22,74 @@
 
 ## CI Gates
 
-Evidence baseline: these gates are derived from `.github/workflows/**` job definitions (see entrypoints above).
+Repository truth model:
+- **Workflow-blocking** means a failing job fails its workflow run as defined in the workflow YAML.
+- **Best-effort** means the workflow intentionally allows its core signal to continue on error.
+- This document inventories repository-defined jobs only; it does not assert GitHub branch-protection "required checks".
 
-| Gate ID (used in registry) | Blocking | Category | What it runs (high-level) | Local reproduce |
-|---|---:|---|---|---|
-| `ci:.github/workflows/orm-tests.yml/lint` | Required | Structure | `cargo fmt -- --check` *(non-blocking)* + `cargo clippy` | `cargo fmt -- --check && cargo clippy` |
-| `ci:.github/workflows/orm-tests.yml/test` | Required | Correctness | build + unit tests + bring up TiKV + start `db9-server` + run `scripts/integration_test.py tests/**` + run ORM suites (best-effort thresholded) | `./run_tests.sh` |
-| `ci:.github/workflows/regression-gate.yml/regression-gate` | Required | Correctness | bring up TiKV + start `db9-server` + run `scripts/regression_gate.sh` (SQL regression packs; optional ORM pack) | `./scripts/regression_gate.sh` |
-| `ci:.github/workflows/doc-lint.yml/doc-lint` | Required | Structure | `uv run scripts/doc_lint.py` (SoT registry/doc drift prevention) | `uv run scripts/doc_lint.py` |
-| `ci:.github/workflows/gorm-smoke.yml/gorm-smoke` | Best-effort | Smoke | start TiKV + `db9-server` + run `bash scripts/e2e_tests.sh gorm_smoke` *(step is `continue-on-error: true`)* | `PG_DSN='postgres://admin:admin@127.0.0.1:<port>/postgres?sslmode=disable' bash scripts/e2e_tests.sh gorm_smoke` |
-| `ci:.github/workflows/sqlalchemy-smoke.yml/sqlalchemy-smoke` | Required | Smoke | start TiKV + `db9-server` + run `bash scripts/e2e_tests.sh sqlalchemy_smoke` + `bash scripts/e2e_tests.sh dify_sqlalchemy_compat` | `PG_DSN='postgres://admin:admin@127.0.0.1:<port>/postgres?sslmode=disable' bash scripts/e2e_tests.sh sqlalchemy_smoke && bash scripts/e2e_tests.sh dify_sqlalchemy_compat` |
-
-Blocking definition (evidence-first):
-- **Required**: the job does not use `continue-on-error` for its core checks (it can fail the workflow run).
-- **Best-effort**: the job (or its core test step) is marked `continue-on-error: true` and provides signal without blocking merges.
+| Gate ID | Workflow effect | Category | What it runs | Local reproduce |
+|---|---|---|---|---|
+| `ci:.github/workflows/ci.yml/lint` | Workflow-blocking | Structure | `cargo fmt -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` | `cargo fmt -- --check && cargo clippy --workspace --all-targets -- -D warnings` |
+| `ci:.github/workflows/ci.yml/unit-tests` | Workflow-blocking | Correctness | `cargo test` | `cargo test` |
+| `ci:.github/workflows/ci.yml/regression-gate` | Workflow-blocking | Correctness | Release build artifact + TiKV + `./scripts/regression_gate.sh --skip-unit --skip-build` | `./scripts/regression_gate.sh` |
+| `ci:.github/workflows/ci.yml/integration-tests` | Workflow-blocking | Correctness | Release build artifact + TiKV + `python3 scripts/integration_test.py` over `tests/**` + `orm-tests` npm suite | `./run_tests.sh` |
+| `ci:.github/workflows/ci.yml/gorm-smoke` | Best-effort | Smoke | TiKV + db9 + `bash scripts/e2e_tests.sh gorm_smoke` with `continue-on-error: true` on the smoke step | `PG_DSN='postgres://admin:admin@127.0.0.1:<port>/postgres?sslmode=disable' bash scripts/e2e_tests.sh gorm_smoke` |
+| `ci:.github/workflows/ci.yml/sqlalchemy-smoke` | Workflow-blocking | Smoke | TiKV + db9 + `bash scripts/e2e_tests.sh sqlalchemy_smoke` + `bash scripts/e2e_tests.sh dify_sqlalchemy_compat` | `PG_DSN='postgres://admin:admin@127.0.0.1:<port>/postgres' bash scripts/e2e_tests.sh sqlalchemy_smoke && PG_DSN='postgres://admin:admin@127.0.0.1:<port>/postgres' bash scripts/e2e_tests.sh dify_sqlalchemy_compat` |
+| `ci:.github/workflows/doc-lint.yml/doc-lint` | Workflow-blocking | Documentation | `uv run scripts/doc_lint.py` | `uv run scripts/doc_lint.py` |
+| `ci:.github/workflows/governance-lint.yml/governance-lint` | Workflow-blocking | Governance | PR-body / label / issue-link / size-policy checks via GitHub API | No full local equivalent; reproduce in GitHub Actions or by manually evaluating the workflow script against a PR payload. |
 
 ## Local Repro
 
-Minimal local reproduction commands (>= 3):
+Typical local commands:
 
 ```bash
-# 1) Required: fast regression gate
+cargo fmt -- --check && cargo clippy --workspace --all-targets -- -D warnings
+cargo test
 ./scripts/regression_gate.sh
-
-# 2) Required: full suite (build + unit + integration + ORM)
 ./run_tests.sh
-
-# 3) Required (structure): lint
-cargo fmt -- --check && cargo clippy
-
-# 4) Required (docs): SoT doc-lint
 uv run scripts/doc_lint.py
 ```
 
-Optional smoke signals (best-effort):
+Optional smoke commands against a running db9 instance:
 
 ```bash
-# Requires a running db9-server instance; set connection DSN accordingly.
 PG_DSN='postgres://admin:admin@127.0.0.1:<port>/postgres?sslmode=disable' bash scripts/e2e_tests.sh gorm_smoke
-PG_DSN='postgres://admin:admin@127.0.0.1:<port>/postgres?sslmode=disable' bash scripts/e2e_tests.sh sqlalchemy_smoke
+PG_DSN='postgres://admin:admin@127.0.0.1:<port>/postgres' bash scripts/e2e_tests.sh sqlalchemy_smoke
+PG_DSN='postgres://admin:admin@127.0.0.1:<port>/postgres' bash scripts/e2e_tests.sh dify_sqlalchemy_compat
 ```
-
-Notes:
-- Runtime env keys for starting `db9-server` (e.g. `PD_ENDPOINTS`, `PG_PORT`, TLS env) are SSOT in `./ops-config.md`.
-- Some scripts assume local tooling (`tiup`, `psql/pg_isready`, `python3`, `uv`, `node/npm`, `go`) — see each script’s help and the workflow steps as evidence.
 
 ## SQL Validation Modes (`scripts/integration_test.py`)
 
-`scripts/integration_test.py` is the authoritative test-harness behavior for `tests/*.sql` companion files.
+`scripts/integration_test.py` is the authoritative harness contract for `tests/*.sql`.
 
-Mode contract (current behavior):
-- `.expected` = full output snapshot mode. If present, harness compares normalized query output against `.expected` and returns immediately on pass/fail.
-- `.errors` = expected error substring mode. If present (and `.expected` is absent), harness requires at least one SQL diagnostic line and validates each against allowed patterns.
-- `.assert` = required output fragment mode. If present (and `.expected` is absent), harness requires each assertion needle to appear in output.
+Mode contract:
+- `.expected` = exclusive full-output snapshot mode.
+- `.errors` = expected diagnostic substring mode.
+- `.assert` = required output fragment mode.
 
 Combination rules:
-- `.expected` MUST be treated as exclusive snapshot mode for a test case.
-- `.errors + .assert` is an allowed composite mode when a test must assert both error pattern(s) and additional output fragment(s) in the same run.
-- `.errors` file MUST NOT be empty.
+- `.expected` is exclusive snapshot mode.
+- `.errors + .assert` is allowed when a single test needs both diagnostics and output fragments.
+- `.errors` files MUST NOT be empty.
 
 PostgreSQL parity rule:
-- Before changing any `.expected`, `.errors`, or `.assert` contract for SQL semantics, run the corresponding `.sql` against real PostgreSQL 17.7 and record parity evidence in the PR.
+- Before changing `.expected`, `.errors`, or `.assert` for SQL semantics, run the same `.sql` against PostgreSQL 17.7 and record the evidence.
 
-Test annotation rule (compatibility clarity):
-- New or changed SQL tests that define behavior contracts SHOULD include a top-of-file marker comment:
-  - `PG_PARITY`: expected to match PostgreSQL behavior.
-  - `DB9_DIVERGENCE(<issue-or-adr-id>)`: intentional divergence with explicit governance link.
-- `DB9_DIVERGENCE(...)` tests MUST NOT be merged without a linked SoT section describing rationale, user value, and impact boundary.
+Test annotation rule:
+- New or changed SQL tests that define behavior SHOULD include one of:
+  - `PG_PARITY`
+  - `DB9_DIVERGENCE(<issue-or-adr-id>)`
 
-Marker examples:
-```sql
--- PG_PARITY: verify SQLSTATE and result shape match PostgreSQL 17.7
-```
-
-```sql
--- DB9_DIVERGENCE(#1421): explicit-transaction extension visibility uses transaction-consistent semantics
-```
-
-Evidence bundle rule (required for disputed semantics):
-- Include PostgreSQL version (`SELECT version()`), exact reproduction script, raw SQLSTATE/output, execution date, and db9 counterpart output in the PR.
-- For concurrency semantics, evidence MUST use at least two independent sessions.
+Evidence bundle rule for disputed semantics:
+- Include PostgreSQL version, exact reproduction script, raw SQLSTATE/output, execution date, and db9 counterpart output.
+- Concurrency semantics require at least two independent client sessions.
 
 ## Verification (Gates)
-- CI: run the **Required** gates listed in `## CI Gates`.
-- Local: use the commands in `## Local Repro` to reproduce the same checks outside CI.
-- Registry linkage: module → gate references live in `docs/sot/modules.yaml` (`gate_tests`); this doc defines what each referenced gate ID means.
+- CI gate identifiers are defined in `## CI Gates`.
+- Module-to-gate linkage lives in `docs/sot/modules.yaml`.
+- Local reproduction commands in `## Local Repro` are the standard baseline outside CI.
 
 ## Change Management
-- Any change to a CI workflow/job, script path, or “blocking vs best-effort” behavior MUST update this document and the referenced `gate_tests` in `docs/sot/modules.yaml`.
-- If you add/remove/relax/tighten a gate, create a DR/ADR per #368 rules and record:
-  - why the gate changed,
-  - how to reproduce locally,
-  - rollback plan (how to re-enable/restore the previous signal).
-- If a gate introduces new runtime config requirements, document the config keys in `./ops-config.md` (do not redefine them here).
+- Any change to repository workflow/job inventory, workflow-blocking vs best-effort semantics, or local reproduction commands MUST update this document and the affected `gate_tests` entries in `docs/sot/modules.yaml`.
+- If a gate changes scope or strictness, document the reason, local reproduce path, and rollback plan.
 - Reference: https://github.com/c4pt0r/db9/issues/368

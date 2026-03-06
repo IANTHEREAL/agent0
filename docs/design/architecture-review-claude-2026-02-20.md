@@ -1,5 +1,7 @@
 # db9-server Architecture Review (From Code, Not Docs)
 
+**Status**: Historical
+
 **Reviewed**: All code under `src/` (~170K lines of Rust)
 **Date**: 2026-02-20
 **Method**: Deep-dive code reading across all 7 major subsystems + targeted verification of competing analysis
@@ -8,6 +10,11 @@
 **Revision note**: This is the updated version incorporating verified findings from a competing analysis that focused on the protocol-executor boundary. All claims below are confirmed by reading specific source code.
 
 **Post-PR #847 update**: Reflects state after PR #847 merge (24 files, +1499/-616). Several code smells improved; new observations added.
+
+> **Review record / non-SoT note**
+>
+> This document is a point-in-time architecture review, not a current architecture contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before acting on any recommendation here.
 
 ---
 

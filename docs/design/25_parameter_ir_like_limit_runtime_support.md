@@ -1,6 +1,7 @@
 # Parameter IR Runtime Semantics for LIKE/ILIKE and LIMIT/OFFSET
 
 ## Status
+- **Classification**: Historical
 - Date: 2026-02-20
 - Scope: PR #888 follow-up
 - Issues: #867, #868 (semantic completion), CI regressions on extended protocol

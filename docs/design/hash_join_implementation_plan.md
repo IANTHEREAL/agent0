@@ -1,9 +1,14 @@
 # Hash Join 实现计划
 
-**状态**: 已审核，待实现  
+**Status**: Historical  
 **创建日期**: 2026-01-22  
 **预计工期**: 4 周  
 **优先级**: P1
+
+> **Historical / non-SoT note**
+>
+> This document is an implementation plan snapshot, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
 
 ---
 

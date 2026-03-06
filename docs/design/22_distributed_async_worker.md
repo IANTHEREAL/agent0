@@ -1,5 +1,19 @@
 # 分布式异步任务引擎设计（Cron / Triggers / Background Jobs）
 
+> **Status**: Historical
+>
+> This document describes an earlier distributed-worker direction and is not the current shipped architecture.
+>
+> Current shipped direction:
+> - unified worker engine inside the main `db9-server` process
+> - system-keyspace coordination for background work
+> - no separate external worker microservice as the primary architecture
+>
+> Current references:
+> - `docs/sot/worker-cron.md`
+> - `docs/ARCHITECTURE.md`
+> - `docs/architecture/sql-engine.md`
+
 ## 状态
 
 - **阶段**：设计中

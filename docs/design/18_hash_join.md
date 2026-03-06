@@ -1,9 +1,14 @@
 # Hash Join 设计文档
 
-**状态**: 已审核  
+**Status**: Historical  
 **作者**: AI Assistant  
 **日期**: 2026-01-22  
 **关联**: [实现计划](./hash_join_implementation_plan.md)
+
+> **Historical / non-SoT note**
+>
+> This document is a historical design record, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
 
 ---
 

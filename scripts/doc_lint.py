@@ -25,6 +25,7 @@ MODULES_YAML_PATH = PROJECT_DIR / "docs" / "sot" / "modules.yaml"
 SOT_README_PATH = PROJECT_DIR / "docs" / "sot" / "README.md"
 SOT_DIR = PROJECT_DIR / "docs" / "sot"
 OPS_CONFIG_PATH = SOT_DIR / "ops-config.md"
+DESIGN_DIR = PROJECT_DIR / "docs" / "design"
 
 REQUIRED_MODULE_FIELDS: tuple[str, ...] = (
     "module_id",
@@ -40,6 +41,7 @@ REQUIRED_MODULE_FIELDS: tuple[str, ...] = (
 )
 
 ALLOWED_STATUS: set[str] = {"FULL", "PARTIAL", "TBD"}
+ALLOWED_DESIGN_STATUS: set[str] = {"Draft", "Active", "Historical", "Superseded"}
 
 REQUIRED_DOC_HEADINGS: tuple[str, ...] = (
     "Scope",
@@ -52,6 +54,11 @@ REQUIRED_DOC_HEADINGS: tuple[str, ...] = (
 MARKER_PARITY = "PG_PARITY"
 MARKER_DIVERGENCE_RE = re.compile(r"DB9_DIVERGENCE\(([^)]+)\)")
 MARKER_REF_RE = re.compile(r"^(#\d+|ADR-[A-Za-z0-9._-]+|DR-[A-Za-z0-9._-]+)$")
+DESIGN_INLINE_STATUS_RE = re.compile(r"^\s*>?\s*\*\*(?:Status|状态)\*\*:\s*(Draft|Active|Historical|Superseded)\b")
+DESIGN_STATUS_SECTION_VALUE_RE = re.compile(
+    r"^\s*-\s*(?:\*\*)?(?:Classification|Status)(?:\*\*)?:\s*(Draft|Active|Historical|Superseded)\b"
+)
+SRC_PATH_TOKEN_RE = re.compile(r"\bsrc/[A-Za-z0-9_./:-]+\b")
 
 
 @dataclass(frozen=True)
@@ -258,6 +265,99 @@ def _iter_sot_markdown_files() -> Iterable[Path]:
         yield path
 
 
+def _iter_tracked_design_markdown_files() -> Iterable[Path]:
+    try:
+        out = subprocess.check_output(
+            ["git", "ls-files", "--", "docs/design/*.md"],
+            cwd=PROJECT_DIR,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        rel_paths = [line.strip() for line in out.splitlines() if line.strip()]
+        if rel_paths:
+            for rel in rel_paths:
+                path = PROJECT_DIR / rel
+                if path.name == "README.md":
+                    continue
+                yield path
+            return
+    except Exception:
+        pass
+
+    for path in sorted(DESIGN_DIR.glob("*.md")):
+        if path.name.startswith(".") or path.name == "README.md":
+            continue
+        yield path
+
+
+def _extract_design_status(doc_text: str) -> str | None:
+    lines = doc_text.splitlines()
+
+    for line in lines[:40]:
+        match = DESIGN_INLINE_STATUS_RE.match(line)
+        if match is not None:
+            return match.group(1)
+
+    for idx, line in enumerate(lines[:40]):
+        if line.strip() != "## Status":
+            continue
+        for candidate in lines[idx + 1 : idx + 12]:
+            if candidate.startswith("## "):
+                break
+            match = DESIGN_STATUS_SECTION_VALUE_RE.match(candidate)
+            if match is not None:
+                return match.group(1)
+        return None
+
+    return None
+
+
+def _normalize_src_path_token(token: str) -> str | None:
+    cleaned = token.strip("`[](){}<>,.;")
+    if not cleaned.startswith("src/"):
+        return None
+    if "*" in cleaned:
+        return None
+    if "#L" in cleaned:
+        cleaned = cleaned.split("#L", 1)[0]
+
+    line_ref_match = re.match(r"^(src/[A-Za-z0-9_./-]+):\d+(?::\d+)?$", cleaned)
+    if line_ref_match is not None:
+        cleaned = line_ref_match.group(1)
+
+    return cleaned
+
+
+def _check_active_design_doc_paths(linter: DocLinter, doc_path: Path, doc_text: str) -> None:
+    refs: set[str] = set()
+    for match in SRC_PATH_TOKEN_RE.finditer(doc_text):
+        ref = _normalize_src_path_token(match.group(0))
+        if ref is not None:
+            refs.add(ref)
+
+    for ref in sorted(refs):
+        if not _repo_path_exists(ref):
+            linter.error(
+                f"{doc_path.relative_to(PROJECT_DIR)}: active design doc references missing path: {ref}"
+            )
+
+
+def _check_design_doc_statuses(linter: DocLinter) -> None:
+    for doc_path in _iter_tracked_design_markdown_files():
+        doc_text = _read_text(doc_path)
+        status = _extract_design_status(doc_text)
+        rel = doc_path.relative_to(PROJECT_DIR)
+
+        if status is None:
+            linter.error(
+                f"{rel}: design doc must declare status `{', '.join(sorted(ALLOWED_DESIGN_STATUS))}` within the top section"
+            )
+            continue
+
+        if status == "Active":
+            _check_active_design_doc_paths(linter, doc_path, doc_text)
+
+
 def _check_sot_doc(linter: DocLinter, doc_path: Path, module_ref: str) -> None:
     full_path = doc_path if doc_path.is_absolute() else (PROJECT_DIR / doc_path)
     if not full_path.exists():
@@ -391,7 +491,9 @@ def _report(linter: DocLinter) -> int:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="Fast doc lint for docs/sot/** (drift prevention gate).")
+    parser = argparse.ArgumentParser(
+        description="Fast doc lint for docs/sot/** plus design-doc status hygiene."
+    )
     parser.add_argument("--modules", type=Path, default=MODULES_YAML_PATH, help="Path to docs/sot/modules.yaml")
     parser.add_argument("--readme", type=Path, default=SOT_README_PATH, help="Path to docs/sot/README.md")
     args = parser.parse_args(argv)
@@ -457,6 +559,7 @@ def main(argv: list[str]) -> int:
 
     _check_sot_map(linter, args.readme, module_ids)
     _check_config_ssot(linter)
+    _check_design_doc_statuses(linter)
     _check_changed_sql_contract_markers(linter)
 
     return _report(linter)

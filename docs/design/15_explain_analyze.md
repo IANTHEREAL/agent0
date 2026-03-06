@@ -3,12 +3,25 @@
 **Status**: Draft  
 **Priority（ORM 迁移）**: P3
 
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+>
+> Current implementation-status note:
+> - `EXPLAIN SELECT/WITH` uses the analyzed query pipeline
+> - non-SELECT `EXPLAIN` still returns a trivial placeholder `Result` node
+> - `EXPLAIN (ANALYZE)` currently rejects non-`SELECT/WITH` statements
+> - tracked follow-up for real DML `EXPLAIN` / `EXPLAIN ANALYZE`: `#1518`
+
 ## 背景与动机
 
-db9-server 已支持 `EXPLAIN`（见 `src/sql/executor.rs` + `src/sql/explain.rs`），但 `ANALYZE/VERBOSE` 目前被忽略：
-- `Executor::execute_explain(..., _analyze, _verbose)` 参数未使用
+db9-server 当前的 `EXPLAIN` 面是部分实现状态：
+- `EXPLAIN SELECT/WITH` 已走真实 analyzed query pipeline
+- `EXPLAIN (ANALYZE)` 对 `SELECT/WITH` 已有基础支持
+- 但 DML 的 `EXPLAIN` / `EXPLAIN (ANALYZE)` 仍未达到 PostgreSQL 形状
 
-虽然这不是迁移必需，但对生产排障/性能分析很有价值。
+虽然这不是迁移必需，但它属于核心 SQL introspection/debugging surface，对排障、性能分析、执行路径核对都很重要。
 
 ## 目标（MVP）
 
@@ -21,6 +34,10 @@ db9-server 已支持 `EXPLAIN`（见 `src/sql/executor.rs` + `src/sql/explain.rs
 
 - DML 的 EXPLAIN ANALYZE（有副作用，需谨慎）
 - 统计信息系统与节点级精确 timing（可后续逐步细化）
+
+> Note:
+> The SELECT-only MVP boundary in this draft does **not** mean the broader DML gap is acceptable long-term.
+> PostgreSQL-compatible DML `EXPLAIN` / `EXPLAIN ANALYZE` is now tracked separately in `#1518`.
 
 ## 设计概览
 
@@ -46,4 +63,3 @@ db9-server 已支持 `EXPLAIN`（见 `src/sql/executor.rs` + `src/sql/explain.rs
 新增 `tests/48_explain_analyze.sql`：
 - `EXPLAIN (ANALYZE) SELECT ...` 返回多行文本
 - 包含关键字（例如 `Execution Time`）与行数
-

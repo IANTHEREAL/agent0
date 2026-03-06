@@ -1,47 +1,57 @@
-# Multi-Tenancy Contracts
+# multi-tenancy — Tenant routing and isolation (current behavior)
 
 ## Scope
-
-- Tenant username parsing and keyspace routing.
-- Keyspace isolation invariants for persistent data.
-- Per-tenant resource isolation (stats cache, schema cache).
+- Tenant username parsing and connection-time keyspace routing.
+- Cross-tenant isolation for persistent data and tenant-scoped in-memory state.
+- Per-tenant pooling, caches, and resource accounting.
 
 ## Non-goals
+- Storage key encoding details (authoritative: `./storage-format.md`).
+- RBAC policy semantics (authoritative: `./auth-rbac.md`).
+- pgwire message framing (authoritative: `./protocol-pgwire.md`).
 
-- Storage key encoding details (authoritative: [storage-format](./storage-format.md)).
-- Auth policy and privilege model (authoritative: [auth-rbac](./auth-rbac.md)).
-- pgwire startup message framing (authoritative: [protocol-pgwire](./protocol-pgwire.md)).
+## External Contracts
+- **[Stable] Connection routing via username**
+  - Tenant routing accepts `<keyspace>.<username>` and `<keyspace>:<username>`.
+  - Usernames without a valid separator route to the default keyspace from `PG_KEYSPACE` (or `default` if unset).
+  - Evidence: `src/protocol/handler/tenant.rs`, `src/protocol/handler/dynamic/startup.rs`.
 
-## Contracts (MUST)
+- **[Stable] Keyspace binding is immutable for a connection**
+  - The effective keyspace is chosen during startup/authentication and MUST NOT change for the lifetime of that connection.
+  - Evidence: `src/protocol/handler/dynamic/startup.rs`, `src/pool.rs`.
 
-- **Username format**: Tenant routing MUST support two separator formats:
-  - `<keyspace>.<username>` (dot separator, takes precedence)
-  - `<keyspace>:<username>` (colon separator)
-  - Usernames without a separator MUST route to the default keyspace.
-- **No cross-keyspace access**: A connection bound to keyspace A MUST NOT be able to read or write data in keyspace B. This is enforced at the TiKV client pool level.
-- **All persistent data scoped to tenant**: Every persistent key (tables, indexes, schemas, sequences, auth, statistics, worker tasks) MUST be scoped to the connection's keyspace.
-- **Per-tenant cache isolation**: `TableStatsCache` and schema cache MUST be isolated per tenant. Evicting one tenant's cache MUST NOT affect another's.
-- **Default keyspace**: When no separator is present in the username, the connection MUST route to the keyspace specified by `PG_KEYSPACE` (default: `"default"`).
-- **Keyspace immutability**: The keyspace for a connection MUST be determined at connection time and MUST NOT change for the lifetime of that connection.
+- **[Stable] No cross-keyspace persistent access**
+  - Persistent data access is isolated by TiKV keyspace; a connection bound to keyspace A MUST NOT read or write keyspace B.
+  - Evidence: `src/pool.rs`, `src/storage/tikv_store/mod.rs`.
+
+- **[Stable] Tenant-scoped in-memory resources are isolated**
+  - Tenant pooling isolates at least:
+    - `TriggerBodyCache`,
+    - `TableStatsCache`,
+    - tenant memory accounting,
+    - per-tenant connection/QPS bookkeeping.
+  - Evicting or reaping one tenant entry MUST NOT affect another tenant's caches/accounting.
+  - Evidence: `src/pool.rs`, `src/protocol/handler/dynamic/startup.rs`.
 
 ## Configuration
-
-This module MUST NOT redefine config keys. Relevant keys are defined exactly once in [ops-config](./ops-config.md):
-- `PG_KEYSPACE` — Default keyspace name (default: `"default"`)
-- `DB9_BOOTSTRAP_ADMIN_PASSWORD`, `DB9_BOOTSTRAP_ADMIN_USER` — Per-keyspace bootstrap
+This module MUST NOT redefine config keys. Relevant keys are defined exactly once in `./ops-config.md`.
 
 ## Entrypoints
-
-- `src/protocol/handler/tenant.rs` — `parse_tenant_username()`: username parsing and keyspace extraction
-- `src/pool.rs` — `TikvClientPool`: keyspace-isolated TiKV client acquisition
-- `src/session_context.rs` — Tokio task-local session context (timezone, search path isolation)
+- `src/protocol/handler/tenant.rs`
+- `src/protocol/handler/dynamic/startup.rs`
+- `src/pool.rs`
+- `src/storage/tikv_store/mod.rs`
+- `src/session_context.rs`
 
 ## Verification (Gates)
-
-- `ci:.github/workflows/regression-gate.yml/regression-gate`
-- `ci:.github/workflows/orm-tests.yml/test`
-- `cmd:cargo test`
+Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
+- Gate IDs: `ci:.github/workflows/ci.yml/regression-gate`, `ci:.github/workflows/ci.yml/integration-tests`
+- Local reproduce (typical):
+  - `./scripts/regression_gate.sh`
+  - `./run_tests.sh`
+  - `cargo test`
 
 ## Change Management
-
-Any change to tenant routing, keyspace isolation, or per-tenant resource isolation MUST update this document and the corresponding module entry in `docs/sot/modules.yaml`. Breaking changes require DR/ADR per #368 rules.
+- Any change to tenant routing, keyspace isolation, or tenant-scoped caches/accounting MUST update this document and the corresponding `docs/sot/modules.yaml` entry.
+- Breaking changes require DR/ADR per #368 rules.
+- Reference: https://github.com/c4pt0r/db9/issues/368

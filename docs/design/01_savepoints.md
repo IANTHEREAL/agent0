@@ -3,6 +3,11 @@
 **Status**: Draft  
 **Priority（ORM 迁移）**: P0
 
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+
 ## 背景与动机
 
 多数 ORM 会用 SAVEPOINT 来实现“嵌套事务”（或者把用户代码中的多层 transaction 抽象为 savepoint），例如：

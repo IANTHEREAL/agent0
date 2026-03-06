@@ -3,6 +3,11 @@
 **Status**: Draft  
 **Priority（ORM 迁移）**: P0
 
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+
 ## 背景与动机
 
 ORM 的 migration 引擎高度依赖 `ALTER TABLE` 的一组常见子操作（rename/drop constraint/alter column 等）。当前 db9-server 的 `ALTER TABLE` 支持面偏窄，会直接阻断迁移落地。

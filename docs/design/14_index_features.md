@@ -3,6 +3,11 @@
 **Status**: Draft  
 **Priority（ORM 迁移）**: P1（DDL 兼容），P2（查询加速）
 
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+
 ## 背景与动机
 
 PostgreSQL 迁移里常出现更复杂的索引形式：
@@ -101,4 +106,3 @@ MVP：只保证 DDL 成功并更新 schema 元数据；并在 pg_indexes/indexde
 
 在 `orm-tests/knex` 或 `typeorm` 增加：
 - 使用 schema builder 创建 partial/GIN 的用例（如果 ORM 支持），确保迁移不失败
-

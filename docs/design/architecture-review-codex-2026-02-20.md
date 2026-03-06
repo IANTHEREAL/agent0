@@ -1,8 +1,15 @@
 # db9-server Architecture Review (Codex Independent Report)
 
+**Status**: Historical
+
 **Date**: 2026-02-20  
 **Reviewer**: Codex (independent review)  
 **Method**: code-first inspection (no trust in existing docs), with direct source references from `/home/zhaiyl/Work/agents/w3/db9`
+
+> **Review record / non-SoT note**
+>
+> This document is a point-in-time architecture review, not a current architecture contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before acting on any recommendation here.
 
 ---
 

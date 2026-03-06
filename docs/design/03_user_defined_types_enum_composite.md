@@ -3,6 +3,11 @@
 **Status**: Draft  
 **Priority（ORM 迁移）**: P0（Enum），P2（Composite）
 
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+
 ## 背景与动机
 
 ORM 迁移里最常见的自定义类型是 **Enum**：
@@ -137,4 +142,3 @@ struct UserTypeDef {
 由于 `./run_tests.sh` 当前不跑 Prisma（脚本注释说明），建议两条路径：
 - 在 `orm-tests/typeorm/` 增加 enum schema/migration 测试（TypeORM 会发 pg_catalog 查询）
 - 若未来恢复 Prisma 测试：增加一个最小 Prisma schema 仅包含 enum，跑一次 migrate/sync
-

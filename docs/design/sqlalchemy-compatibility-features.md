@@ -5,6 +5,11 @@
 **Status**: Draft  
 **Related**: `examples/01_python_todo_test/LIMITATIONS.md`
 
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+
 ---
 
 ## Executive Summary

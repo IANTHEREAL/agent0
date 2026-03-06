@@ -1,5 +1,12 @@
 # fs9 WebSocket API 设计
 
+**Status**: Draft
+
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+
 ## 1. 摘要
 
 本文设计一个基于 WebSocket 的文件系统接口，将 db9-server 内置的 `fs9` 嵌入式文件系统（`EmbeddedPageFs`）暴露给非 SQL 客户端（CLI 工具、Web 应用、IDE 插件等）。

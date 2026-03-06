@@ -3,6 +3,11 @@
 **Status**: Draft  
 **Priority（ORM 迁移）**: P3
 
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+
 ## 背景与动机
 
 `LISTEN/NOTIFY` 是 PostgreSQL 常用的轻量 pub/sub 原语，常用于：
@@ -64,4 +69,3 @@ PG 协议的 NOTIFY 会以异步消息（`NotificationResponse`）发给客户�
 并覆盖：
 - `UNLISTEN` 后不再收到
 - keyspace 隔离：tenant_a listen，tenant_b notify 不应触达
-

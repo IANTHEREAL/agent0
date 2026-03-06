@@ -1,10 +1,25 @@
 # CBO Phase 3 — PR 1: Optimizer Entrypoint + Multi-Table Eligibility (NLJ Only)
 
+> **Status**: Historical
+>
+> This document is an old implementation plan and is **not** a current architecture contract.
+>
+> It predates the current shipped optimizer state:
+> - the optimizer is now the single analyzed execution path for supported query shapes
+> - `db9.use_optimizer` is retained only as a compatibility/readback GUC, not a real runtime switch
+> - multiple paths and file references in this plan no longer match the current repository
+>
+> Current references:
+> - `docs/sot/sql-engine.md`
+> - `docs/ARCHITECTURE.md`
+> - `docs/architecture/sql-engine.md`
+
 ## Detailed Implementation Plan
 
-**Goal**: Enable the optimizer pipeline to handle multi-table JOIN queries using NLJ.
+**Original goal**: Enable the optimizer pipeline to handle multi-table JOIN queries using NLJ.
 Fix the `left_col_start` index normalization bug. Extract shared utilities to neutral
-layers. All changes remain behind `db9.use_optimizer` GUC (default OFF).
+layers. At the time, the plan assumed the work would remain behind `db9.use_optimizer`
+GUC (default OFF).
 
 ---
 

@@ -1,9 +1,11 @@
 # Embedding Extension Compatibility Contract
 
 ## Status
+- **Classification**: Active
 - Date: 2026-03-04
-- Scope: PR #1387 review churn and follow-up contract hardening
-- Decision status: Accepted architecture direction; implementation follow-up required
+- Reviewed: 2026-03-06
+- Scope: PR #1387 review churn, contract hardening, and closure of #1421
+- Decision status: Implemented contract; deterministic DB9 visibility model is shipped and covered by tests
 - Source of truth: `docs/sot/extensions-gin.md` (normative), this doc (rationale + decision record)
 
 ## Why This Exists
@@ -24,9 +26,9 @@ Reference: `docs/sot/README.md` section `Compatibility Strategy: PG-Compatible b
 
 ## Observed Behavior (Evidence Summary)
 
-### PostgreSQL 17.7 (two-session reproductions)
+### PostgreSQL 17.9 (local recheck on 2026-03-06)
 - Concurrent `DROP EXTENSION` after `BEGIN` can produce `42883` on extension function calls.
-- Concurrent `CREATE EXTENSION` after `BEGIN` is not reliably explained by a single pure rule in all observed scripts; outcomes can vary with session history and path.
+- Concurrent `CREATE EXTENSION` after `BEGIN` can become visible in the already-open transaction in at least one `hstore` reproduction; the outcome is not cleanly explained by one deterministic snapshot rule across all paths.
 
 ### db9 current behavior (as of this doc date)
 - Embedding visibility gate uses:
@@ -34,6 +36,7 @@ Reference: `docs/sot/README.md` section `Compatibility Strategy: PG-Compatible b
   - explicit-transaction statement path bound to a transaction-consistent snapshot source,
   - autocommit statement path bound to latest committed metadata at statement boundary.
 - Missing extension visibility maps to `42883` (function-not-found semantics).
+- This deterministic DB9 contract was implemented and closed out via `#1421`, with regression coverage in `tests/272_embedding_extension_concurrent_visibility.sql`.
 
 ## Contract Decision
 
@@ -91,7 +94,7 @@ Runtime MUST cover:
 5. Reproduction evidence in PR: PostgreSQL version, scripts, raw outputs, execution date.
 
 ## Follow-up Implementation Work
-Follow-up issues are required for implementation and governance hardening:
+Remaining follow-up issues are governance or operational hardening, not core visibility-contract gaps:
 
 - Add compatibility marker enforcement (`PG_PARITY` / `DB9_DIVERGENCE(...)`) for SQL tests.
   - Tracking: https://github.com/c4pt0r/db9-server/issues/1420

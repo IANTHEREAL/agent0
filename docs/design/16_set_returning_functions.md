@@ -3,6 +3,11 @@
 **Status**: Draft  
 **Priority（ORM 迁移）**: P2
 
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+
 ## 背景与动机
 
 在数据迁移/初始化脚本中，`generate_series` 与 `unnest` 非常常见：
@@ -69,4 +74,3 @@ SRF 表通常很小（迁移脚本常用），MVP 可直接物化 `Vec<Row>`。
 ### ORM 测试（可选）
 
 ORM 迁移中偶尔会用 raw SQL 做数据 backfill。可在 `orm-tests/pg-client` 增加一条 raw query smoke test。
-

@@ -3,6 +3,11 @@
 **Status**: Draft  
 **Priority（ORM 迁移）**: P1（Array），P2（Vector OID）
 
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+
 ## 背景与动机
 
 db9-server 的 SQL 层已经支持数组与向量值：
@@ -83,4 +88,3 @@ db9-server 的 SQL 层已经支持数组与向量值：
 Vector：
 - 若维持 TEXT OID：验证 pg_type/format_type 能发现 vector
 - 若做 OID：验证 `fields[i].dataTypeID == 16385`
-

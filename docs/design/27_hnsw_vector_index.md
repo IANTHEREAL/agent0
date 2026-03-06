@@ -1,6 +1,23 @@
 # HNSW Vector Index Design Document
 
-**Status**: Implemented (merged)
+> **Status**: Superseded
+>
+> This document records the original HNSW design merged in PR `#1241`, but it is **not** the current HNSW architecture.
+>
+> Current shipped architecture:
+> - no process-level HNSW graph cache
+> - delta-log storage for DML writes
+> - background sweep/merge to consolidate deltas into the base graph
+>
+> Current references:
+> - `docs/sot/sql-engine.md`
+> - `docs/ARCHITECTURE.md`
+> - `docs/architecture/sql-engine.md`
+> - `src/sql/hnsw/mod.rs`
+> - `src/sql/hnsw/storage.rs`
+> - `src/worker/gc.rs`
+
+**Historical status**: Original implementation design (superseded)
 **Author**: AI Assistant
 **Date**: 2026-02-28
 **PR**: [#1241](https://github.com/c4pt0r/db9-server/pull/1241)
@@ -32,14 +49,16 @@ SELECT ... ORDER BY <-> LIMIT k → detect pattern → load graph from cache/TiK
                                   usearch ANN search → batch_get rows → return
 ```
 
+Historical note: the diagram above reflects the original design. The current implementation no longer uses the process-level cache described below.
+
 ### Key Design Decisions
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | HNSW library | `usearch` 0.21 (C++ FFI) | Only viable Rust HNSW crate with incremental insert support |
-| Storage model | Whole-graph single KV in TiKV | V1 simplicity: one key per index, suitable for <= 1M vectors |
+| Storage model | Whole-graph single KV in TiKV | Historical original design; current implementation moved to delta-log + background merge |
 | Serialization | Temp-file bridge | `usearch` only supports file-based save/load; save to temp file -> read bytes -> store in TiKV |
-| Graph cache | Process-level LRU with `Arc<RwLock<>>` | Avoids re-loading graph from TiKV on every query |
+| Graph cache | Process-level LRU with `Arc<RwLock<>>` | Historical original design; current implementation intentionally removed this cache |
 | Precision | f64 -> f32 conversion | db9 vectors are `Vec<f64>`, usearch requires `f32`; acceptable precision loss for ANN |
 | Pattern detection | `ORDER BY distance_op LIMIT k` | Matches pgvector's query pattern; detected in the physical planner |
 

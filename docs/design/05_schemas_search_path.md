@@ -3,6 +3,11 @@
 **Status**: Draft  
 **Priority（ORM 迁移）**: P0
 
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+
 ## 背景与动机
 
 PostgreSQL 的 schema（`public`、自定义 schema）与 `search_path` 在 ORM 生态里非常常见：
@@ -123,4 +128,3 @@ MVP 做法：
 - Knex：`knex.schema.withSchema('app')...`（表创建/列变更）
 - Sequelize：`Model.schema('app')` 或迁移中 `schema` 选项
 - TypeORM：DataSource 配置 schema 后同步/迁移一轮
-

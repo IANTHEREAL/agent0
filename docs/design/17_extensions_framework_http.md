@@ -1,5 +1,12 @@
 # 扩展机制与 HTTP 扩展（Supabase 风格）设计
 
+**Status**: Draft
+
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+
 ## 摘要
 
 本文设计一个适用于分布式、多租户（TiKV keyspace 隔离）的 `db9-server` 扩展机制，并在该机制之上实现一个类似 Supabase `http` 扩展（基于 `pgsql-http` 语义）的 HTTP 客户端扩展。
@@ -259,4 +266,3 @@ MVP 必须包含以下保护（避免把数据库变成 SSRF/DoS 工具）：
 3. ORM/工具链：
    - `SELECT * FROM pg_extension` 能返回已安装扩展记录。
    - `pg_proc` 中存在扩展函数行，满足 introspection join。
-

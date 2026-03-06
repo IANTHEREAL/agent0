@@ -1,59 +1,76 @@
-# Worker & Cron Engine Contracts
+# worker-cron — Background task engine and cron scheduling
 
 ## Scope
-
-- Async task engine lifecycle: claim, execute, complete, GC.
-- Task types: Cron, AsyncTrigger, AutoAnalyze, BgDdl, BgSql.
-- Cron expression parsing and scheduling (pg_cron-compatible).
-- Worker coordination across multiple db9-server instances.
+- Worker task lifecycle: enqueue, claim, execute, complete, and garbage collection.
+- Cron scheduling and pg_cron-compatible catalog surfaces.
+- Worker coordination across db9 instances, including HNSW merge discovery/sweep.
 
 ## Non-goals
+- General SQL execution semantics (authoritative: `./sql-engine.md`).
+- Key layout details for worker/cron persistence (authoritative: `./storage-format.md`).
+- RBAC policy semantics (authoritative: `./auth-rbac.md`).
 
-- SQL execution semantics (authoritative: [sql-engine](./sql-engine.md)).
-- Storage key layout (authoritative: [storage-format](./storage-format.md)).
-- Auth policy (authoritative: [auth-rbac](./auth-rbac.md)).
+## External Contracts
+- **[Stable] Task claiming is single-winner**
+  - Worker claims use pessimistic transactions so competing workers cannot both acquire the same task.
+  - Evidence: `src/worker/engine.rs`, `src/storage/tikv_store/worker.rs`.
 
-## Contracts (MUST)
+- **[Stable] No leader election**
+  - Any db9 instance with worker support enabled can participate; there is no coordinator-only node role.
+  - Evidence: `src/worker/engine.rs`, `src/worker/gc.rs`.
 
-- **Exactly-once task execution**: Task claiming MUST use pessimistic TiKV transactions. If two workers attempt to claim the same task, exactly one MUST succeed and the other MUST abort.
-- **No leader election**: All db9-server instances with the worker enabled MUST be equal peers. There MUST be no coordinator or leader node.
-- **Orphan recovery**: Uncompleted claims older than `orphan_timeout_sec` MUST be cleaned by the GC cycle. Orphaned tasks MUST be re-triggered on their next fire time.
-- **Task queue keyspace**: All worker state (queue, claims, results, registry) MUST be stored in the `_sys_worker` system keyspace.
-- **Cron expression format**: Cron jobs MUST use pg_cron-compatible 5-field expressions (`minute hour day-of-month month day-of-week`).
-- **Task execution identity**: Background tasks MUST execute under the identity of the user who enqueued them.
-- **Concurrent job limit**: Each instance MUST stop claiming new tasks when `max_concurrent_jobs` is reached.
+- **[Stable] System-keyspace queue with configurable keyspace name**
+  - Background task metadata lives in the worker system keyspace, which defaults to `_sys_worker` and is configurable via `DB9_WORKER_SYSTEM_KEYSPACE`.
+  - Evidence: `src/worker/config.rs`, `src/worker/mod.rs`, `src/storage/tikv_store/mod.rs`.
 
-## Experimental
+- **[Stable] Shipped task types**
+  - The current task model includes `Cron`, `AsyncTrigger`, `AutoAnalyze`, `BgDdl`, `BgSql`, and `HnswMerge`.
+  - Evidence: `src/worker/types.rs`, `src/worker/engine.rs`.
 
-- **Auto-ANALYZE threshold formula**: `threshold + 0.1 × estimated_row_count` (default threshold = 50). This formula MAY change based on production workload feedback.
+- **[Stable] HNSW sweep is independent from regular GC**
+  - Worker GC runs two timer loops:
+    - orphan-claim / cron cleanup;
+    - HNSW delta backlog sweep that discovers pending merges and enqueues `HnswMerge` tasks.
+  - A long HNSW sweep MUST NOT block normal claim/orphan GC cadence.
+  - Evidence: `src/worker/gc.rs`.
+
+- **[Stable] Background execution identity**
+  - Background jobs execute using the stored user identity associated with the task/registry entry, not an anonymous superuser bypass.
+  - Evidence: `src/worker/engine.rs`, `src/cron/types.rs`.
+
+- **[Stable] Cron expressions use pg_cron-style 5-field syntax**
+  - Current cron scheduling uses `minute hour day-of-month month day-of-week`.
+  - Evidence: `src/cron/parser.rs`, `tests/170_cron_basic.sql`, `tests/178_cron_expressions.sql`.
+
+- **[Experimental] Auto-ANALYZE threshold formula**
+  - Current auto-analyze policy uses `threshold + 0.1 * estimated_row_count` with default threshold `50`.
+  - Evidence: `src/worker/config.rs`, `tests/189_worker_auto_analyze.sql`.
 
 ## Configuration
-
-This module MUST NOT redefine config keys. Relevant keys are defined exactly once in [ops-config](./ops-config.md):
-- `DB9_WORKER_ENABLED`, `DB9_WORKER_POLL_MS`, `DB9_WORKER_MAX_CONCURRENT_JOBS`
-- `DB9_WORKER_ID`, `DB9_WORKER_STATEMENT_TIMEOUT_MS`, `DB9_WORKER_ORPHAN_TIMEOUT_SEC`
-- `DB9_WORKER_GC_BATCH_SIZE`, `DB9_WORKER_SYSTEM_KEYSPACE`
-- `DB9_AUTO_ANALYZE_ENABLED`, `DB9_AUTO_ANALYZE_THRESHOLD`
+This module MUST NOT redefine config keys. Relevant keys are defined exactly once in `./ops-config.md`.
 
 ## Entrypoints
-
-- `src/worker/engine.rs` — Core worker loop: claim tasks, execute, manage state
-- `src/worker/types.rs` — Task types, claims, execution context, retry logic
-- `src/worker/config.rs` — Worker configuration
-- `src/worker/gc.rs` — Garbage collector for completed tasks and orphaned claims
-- `src/worker/metrics.rs` — Worker metrics tracking
-- `src/cron/parser.rs` — PostgreSQL cron expression parser
-- `src/cron/types.rs` — Cron job types, state, metadata
-- `src/cron/config.rs` — Cron configuration
-- `src/cron/worker.rs` — Cron worker task processing
-- `src/cron/process_list.rs` — pg_cron-compatible virtual table for job inspection
+- `src/worker/engine.rs`
+- `src/worker/types.rs`
+- `src/worker/config.rs`
+- `src/worker/gc.rs`
+- `src/worker/metrics.rs`
+- `src/cron/parser.rs`
+- `src/cron/types.rs`
+- `src/cron/config.rs`
+- `src/cron/worker.rs`
+- `src/cron/process_list.rs`
 
 ## Verification (Gates)
-
-- `ci:.github/workflows/regression-gate.yml/regression-gate`
-- `ci:.github/workflows/orm-tests.yml/test`
-- `cmd:python3 scripts/integration_test.py --dsn "$PG_DSN" tests/`
+Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
+- Gate IDs: `ci:.github/workflows/ci.yml/regression-gate`, `ci:.github/workflows/ci.yml/integration-tests`
+- Local reproduce (typical):
+  - `./scripts/regression_gate.sh`
+  - `python3 scripts/integration_test.py --dsn "$PG_DSN" tests/53_trigger_execution.sql`
+  - `python3 scripts/integration_test.py --dsn "$PG_DSN" tests/170_cron_basic.sql`
+  - `python3 scripts/integration_test.py --dsn "$PG_DSN" tests/185_worker_cron_queue.sql`
 
 ## Change Management
-
-Any change to worker/cron semantics (task claiming, GC behavior, cron scheduling) MUST update this document and the corresponding module entry in `docs/sot/modules.yaml`. Breaking changes require DR/ADR per #368 rules.
+- Any change to worker task types, claiming rules, GC behavior, cron scheduling, or HNSW background merge behavior MUST update this document and the corresponding `docs/sot/modules.yaml` entry.
+- Breaking changes require DR/ADR per #368 rules.
+- Reference: https://github.com/c4pt0r/db9/issues/368

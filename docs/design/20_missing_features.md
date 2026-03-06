@@ -1,8 +1,13 @@
 # 设计：Round 3 兼容性补齐（已实现）
 
-**Status**: Implemented  
+**Status**: Historical  
 **重点覆盖**：`generate_series`、`INSERT ... SELECT`、GROUPING SETS/CUBE/ROLLUP、regex 运算符/函数、JSONB 高级操作、系统函数/格式化（`PG_TYPEOF`/`QUOTE_*`/`FORMAT`）  
 **测试**：`tests/67_*.sql` ~ `tests/80_*.sql`
+
+> **Historical / non-SoT note**
+>
+> This document is a historical implementation summary, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
 
 本文件最初用于记录“缺口功能”的实现计划；目前相关功能已在引擎中落地，并由新增的 SQL/ORM 测试覆盖。后续如有新增缺口，可继续在此补充。
 

@@ -3,6 +3,11 @@
 **Status**: Draft  
 **Priority（ORM 迁移）**: P0
 
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+
 ## 背景与动机
 
 当前 db9-server 把 `DATE` 映射为 `TIMESTAMP`（`src/sql/helpers.rs:363`），这会导致：
@@ -80,4 +85,3 @@
 
 - TypeORM：`@Column({ type: 'date' })` round-trip
 - Knex：`table.date('d')` 创建后 introspection 不误报为 timestamp
-

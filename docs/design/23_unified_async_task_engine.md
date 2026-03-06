@@ -2,6 +2,7 @@
 
 ## Status
 
+- **Classification**: Historical
 - **Phase**: Implemented (Phase 1)
 - **Author**: db9-server team
 - **Date**: 2026-02-18

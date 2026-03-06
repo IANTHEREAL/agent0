@@ -1,82 +1,80 @@
-# storage-format — Persistent key layout, format versioning, and isolation invariants
+# storage-format — Persistent layout, serialization, and isolation invariants
 
 ## Scope
-- Key layout / encoding rules (storage format v2 prefixes, `_sys_*`, `t_*/i_*`).
-- TiKV store abstraction (`TikvStore`) and on-disk format version enforcement.
-- Transaction primitives (pessimistic by default; limited optimistic/autocommit helpers).
-- Keyspace routing and **tenant/database isolation invariants**.
+- Storage-format versioning and keyspace/database isolation invariants.
+- High-level persistent key families owned by db9.
+- Serialization contracts for schemas, rows, and other core payloads.
+- TiKV transaction primitives used by the storage layer.
 
 ## Non-goals
-- SQL query semantics and planner/executor behavior (authoritative: `./sql-engine.md`).
-- pgwire protocol and startup messaging (authoritative: `./protocol-pgwire.md`).
-- Auth/RBAC semantics and policy defaults (authoritative: `./auth-rbac.md`).
-- Extension semantics (authoritative: `./extensions-gin.md` for extension-owned surfaces).
+- SQL planning/execution semantics (authoritative: `./sql-engine.md`).
+- pgwire protocol behavior (authoritative: `./protocol-pgwire.md`).
+- RBAC policy semantics (authoritative: `./auth-rbac.md`).
+- Exhaustive prose duplication of every encoder/helper in `src/storage/encoding/**`.
 
 ## External Contracts
-- **[Stable] Storage format v2 marker and compatibility boundary**
-  - Each TiKV keyspace used by db9-server MUST contain a format marker `_sys_format_version` set to big-endian `u32(2)`.
-  - If a keyspace contains `_sys_format_version != 2`, startup MUST fail with an incompatibility error.
-  - If `_sys_format_version` is missing but v1-era table keys exist, startup MUST refuse to auto-upgrade and MUST require re-initialization/migration.
-  - Evidence: `src/storage/tikv_store.rs` (`TikvStore::check_format_version`), `src/storage/encoding.rs` (`encode_format_version_key`, `encode_next_table_id_key`, `encode_schema_prefix`).
+- **[Stable] Storage format v2 marker**
+  - Each db9 TiKV keyspace MUST store `_sys_format_version = u32(2)` in big-endian form.
+  - Keyspaces containing v1-era data MUST NOT be auto-upgraded silently.
+  - Evidence: `src/storage/tikv_store/mod.rs`, `src/storage/encoding/mod.rs`.
 
-- **[Stable] Tenant isolation via TiKV keyspace**
-  - Persistent data for different tenants MUST be isolated by TiKV keyspace.
-  - The storage client MUST be created with `Config::with_keyspace(<tenant>)` when a tenant keyspace is selected.
-  - Evidence: `src/storage/tikv_store.rs` (`new_with_keyspace`), `src/pool.rs` (`TikvClientPool` keyspace selection), `src/main.rs` (`create_keyspace`).
-  - Cross-link: tenant keyspace selection inputs originate from username parsing in `./protocol-pgwire.md`.
+- **[Stable] Tenant isolation uses TiKV keyspace selection**
+  - Persistent data isolation between tenants is implemented by constructing `TikvStore`/`TransactionClient` with the selected TiKV keyspace.
+  - Evidence: `src/storage/tikv_store/mod.rs` (`new_with_keyspace`), `src/pool.rs`.
 
-- **[Stable] Database-scoped prefixing (format v2)**
-  - Within a keyspace, all per-database metadata and user data MUST be partitioned by a fixed binary prefix: `d_{db_id:8bytes}_` (big-endian `u64`).
-  - Database range deletes/scans MUST use lexicographic ranges derived from this prefix.
-  - Evidence: `src/storage/encoding.rs` (`encode_database_data_prefix`, `encode_database_data_range`, `encode_*_v2` helpers), usages in `src/storage/tikv_store.rs`.
+- **[Stable] Database-scoped prefixing inside a keyspace**
+  - Within a keyspace, database-local data is partitioned by the binary prefix `d_{db_id:8bytes}_`.
+  - Database scans/deletes MUST use ranges derived from that prefix.
+  - Evidence: `src/storage/encoding/mod.rs`, `src/storage/tikv_store/mod.rs`.
 
-- **[Stable] Key layout (high-level)**
-  - Keyspace-level metadata keys (format v2) include:
-    - `_sys_next_database_id` (allocator),
-    - `_sys_dbname_<name>` (database name → ID),
-    - `_sys_dbid_<u64be>` (database ID → definition).
-  - Database-scoped keys (format v2) use the `d_{db_id}_` prefix and include:
-    - `sys_schema_*` / `sys_schemadef_*` / `sys_view_*` / `sys_seqdef_*` / `sys_ext_*` / `sys_comment_*` (metadata),
-    - `t_{table_id}_...` (table rows),
-    - `i_{table_id}_{index_id}_...` (secondary indexes, including `..._gin_<token_hash>...` postings).
-  - Evidence: `src/storage/encoding.rs` (module-level key layout comment + `encode_*_v2` functions).
+- **[Stable] High-level key families (non-exhaustive inventory)**
+  - Keyspace-level metadata:
+    - `_sys_next_database_id`,
+    - `_sys_dbname_<name>`,
+    - `_sys_dbid_<u64be>`,
+    - `_sys_format_version`,
+    - system-worker metadata in the configured worker system keyspace.
+  - Database-local metadata and data:
+    - schema/catalog metadata (`sys_schema_*`, `sys_view_*`, `sys_seqdef_*`, `sys_ext_*`, comments, routines, types, cron metadata, stats),
+    - table rows `t_{table_id}_...`,
+    - secondary indexes `i_{table_id}_{index_id}_...`,
+    - GIN postings `i_{table_id}_{index_id}_gin_...`,
+    - HNSW base graph/meta/delta families under `d_{db_id}_hnsw_{table_id}_{index_id}_...`.
+  - The implementation modules, not this prose page, are the exhaustive encoder inventory.
+  - Evidence: `src/storage/encoding/mod.rs`, `src/storage/encoding/metadata_keys.rs`, `src/storage/encoding/data_keys.rs`, `src/sql/hnsw/storage.rs`.
 
-- **[Stable] Value/row/schema serialization**
-  - Table schemas and rows MUST be persisted as serialized blobs and MUST remain backward-compatible on read.
-  - Current behavior:
-    - `TableSchema` and `Row` are stored using `bincode` serialization.
-    - Some stored payloads are versioned with a magic header; deserializers MUST accept legacy unversioned payloads.
-  - Evidence: `src/storage/encoding.rs` (`serialize_schema`/`deserialize_schema`, `serialize_row`/`deserialize_row`, versioned payload helpers).
+- **[Stable] Serialization contracts**
+  - `TableSchema` is serialized as `DB9_SCHEMA_V2` + MessagePack named-map payload.
+  - `Row` is serialized with bincode.
+  - Function definitions use a magic-header + bincode payload.
+  - Schema deserialization rejects legacy V1 payloads and missing schema headers.
+  - Evidence: `src/storage/encoding/serialization.rs`.
 
-- **[Stable] Transaction primitives and non-transactional emulation (sequences)**
-  - The primary transaction mode MUST be pessimistic transactions.
-  - Certain operations that must survive caller rollbacks (e.g., sequences) MAY use an internal auto-committed update helper with bounded retry.
-  - Evidence: `src/storage/tikv_store.rs` (`begin` pessimistic, `autocommit_update_key` comment + retry loop), `src/sql/sequences.rs` (sequence call sites).
+- **[Stable] Transaction primitives**
+  - Primary storage transactions are pessimistic by default.
+  - Some operations that intentionally survive caller rollback (for example sequences) use dedicated autocommitted helper logic with bounded retry.
+  - Evidence: `src/storage/tikv_store/mod.rs`, `src/sql/sequences.rs`.
 
 ## Data Model & Invariants
-- **Isolation invariant (MUST)**: tenant data MUST NOT be accessible across TiKV keyspaces.
-  - Evidence: `src/storage/tikv_store.rs` (`Config::with_keyspace`), `src/pool.rs` (`get_client` by keyspace).
-- **Database partitioning invariant (MUST)**: user tables, indexes, and per-database metadata MUST remain under the database prefix for the selected database ID.
-  - Evidence: `src/storage/encoding.rs` (`encode_*_v2`), database operations in `src/storage/tikv_store.rs`.
-- **Ordering invariant (SHOULD)**: keys used for scans MUST preserve lexicographic order for range scans; index value encodings use memcomparable encoding.
-  - Evidence: `src/storage/encoding.rs` (`encode_value_memcomparable`, key range helpers).
-- **Extension-specific layouts**: storage encodings that exist primarily for extension semantics (e.g., GIN postings) are defined here, while query semantics live in `./extensions-gin.md`.
+- **Tenant isolation invariant**: persistent data MUST NOT cross TiKV keyspaces.
+- **Database partitioning invariant**: user tables, indexes, and database-local metadata MUST remain under the selected database prefix.
+- **Ordering invariant**: scan keys and memcomparable index encodings MUST preserve ordered range-scan behavior.
+- **Serialization invariant**: storage readers MUST reject unsupported schema-format versions instead of silently mis-decoding them.
 
 ## Configuration
-This module MUST NOT redefine config keys. Relevant keys are defined exactly once in `./ops-config.md`:
-- `PD_ENDPOINTS`
-- `PG_KEYSPACE`
+This module MUST NOT redefine config keys. Relevant keys are defined exactly once in `./ops-config.md`.
 
 ## Entrypoints
-- `src/storage/encoding.rs`
-- `src/storage/tikv_store.rs` (`TikvStore`)
-- `src/pool.rs` (`TikvClientPool`)
+- `src/storage/encoding/mod.rs`
+- `src/storage/encoding/serialization.rs`
+- `src/storage/tikv_store/mod.rs`
+- `src/sql/hnsw/storage.rs`
+- `src/pool.rs`
 - `src/txn/mod.rs`
-- `src/main.rs` (`create_keyspace`)
 
 ## Verification (Gates)
 Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
-- Gate IDs: `ci:.github/workflows/regression-gate.yml/regression-gate`, `ci:.github/workflows/orm-tests.yml/test`
+- Gate IDs: `ci:.github/workflows/ci.yml/regression-gate`, `ci:.github/workflows/ci.yml/integration-tests`
 - Local reproduce (typical):
   - `cargo test`
   - `./scripts/regression_gate.sh`
@@ -84,7 +82,6 @@ Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
   - `python3 scripts/integration_test.py --dsn "$PG_DSN" tests/100_create_database.sql`
 
 ## Change Management
-- Any change to key layouts, serialization formats, format version handling, keyspace/database isolation invariants, or transaction primitives MUST update this document and the corresponding module entries in `docs/sot/modules.yaml`.
-- Breaking changes to persistent format or invariants require DR/ADR per #368 rules (impact surface + migration + rollback + verification updates).
+- Any change to format-version handling, key families, serialization formats, or isolation invariants MUST update this document and the corresponding `docs/sot/modules.yaml` entry.
+- Breaking persistent-format changes require DR/ADR per #368 rules.
 - Reference: https://github.com/c4pt0r/db9/issues/368
-

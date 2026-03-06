@@ -1,6 +1,26 @@
-# Design Document Index (ORM Migration Priority)
+# Design Document Index
 
-This directory contains key gap designs and test plans for db9-server from the perspective of "PostgreSQL application developers / ORM migration". Each document includes:
+This directory contains design notes, implementation plans, review records, and gap analyses for db9-server.
+
+`docs/design/**` is **not** the source of truth for current behavior. The authoritative current contracts live under `docs/sot/**`.
+
+Each design document should carry a status banner near the top:
+- `Active`: current design guidance that still matches the intended architecture direction
+- `Draft`: proposal or incomplete design; not a shipped-behavior contract
+- `Historical`: useful record of a past design or implementation plan; not current architecture
+- `Superseded`: explicitly replaced by a newer design or shipped architecture
+
+Tracked design docs are linted for an explicit status classification so that readers and tooling can distinguish live guidance from archived context.
+Only `Active` design docs are required to keep `src/**` references live under `doc_lint.py`; `Draft`, `Historical`, and `Superseded` docs may contain forward-looking or archived paths.
+
+When a design doc conflicts with current code or SoT:
+- SoT wins
+- code and tests decide current implementation truth
+- the design doc should be downgraded to `Historical` or `Superseded` instead of being mistaken for SSOT
+
+The migration-priority list below remains useful as an index, but readers must check each document's status banner before treating it as current guidance.
+
+Each document may include:
 - **Design**: MVP scope, semantics, storage/execution/protocol change points, performance considerations
 - **Test plan**: Unit tests, SQL integration tests (`./run_tests.sh`), ORM test recommendations
 
@@ -40,5 +60,5 @@ This directory contains key gap designs and test plans for db9-server from the p
 ## Vector Search
 
 - `docs/design/27_hnsw_vector_index.md`: HNSW vector index (approximate nearest neighbor search)
-  - pgvector-compatible syntax, usearch FFI, process-level cache, DML maintenance
+  - historical original implementation design; current architecture no longer uses the process-level cache described there
   - PR: [#1241](https://github.com/c4pt0r/db9-server/pull/1241), Issue: [#1220](https://github.com/c4pt0r/db9-server/issues/1220)

@@ -3,6 +3,11 @@
 **Status**: Draft  
 **Priority（ORM 迁移）**: P0
 
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+
 ## 背景与动机
 
 大量 Postgres 生态的迁移脚本/扩展/函数定义会使用 dollar-quoted string：
@@ -95,4 +100,3 @@ MVP 建议实现一个轻量扫描器：
 
 选取一个真实迁移片段（例如 TypeORM migration 中的 `CREATE FUNCTION ... $$`）在 `orm-tests/typeorm/` 增加 smoke test：
 - 执行该 SQL，确保不报 parser/unsupported 错误
-

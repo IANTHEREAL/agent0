@@ -3,6 +3,11 @@
 **Status**: Draft  
 **Priority（ORM 迁移）**: P0
 
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+
 ## 背景与动机
 
 当前 `sqlparser` 的 `NUMERIC/DECIMAL` 在 db9-server 内被映射为 `FLOAT8`（`src/sql/helpers.rs:349`），这会带来：
@@ -124,4 +129,3 @@ MVP 建议：
 - Knex：decimal schema + where 比较
 
 （注：Prisma 测试当前在 `run_tests.sh` 被跳过，但仍建议保留设计与测试计划，后续修复 Prisma boolean 问题后恢复。）
-

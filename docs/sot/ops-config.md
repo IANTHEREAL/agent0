@@ -1,76 +1,165 @@
-# ops-config — Configuration keys & operational defaults
+# ops-config — Runtime configuration registry
 
 ## Scope
-- Runtime configuration keys and defaults (env vars; no CLI flags are currently implemented).
-- TLS configuration and security defaults.
-- Runtime limits/backpressure knobs and their operational meaning.
-- Config key uniqueness: config keys MUST be defined exactly once across SoT docs.
+- Authoritative registry of supported operator-facing runtime inputs.
+- CLI flags, environment variables, defaults, and merge precedence.
+- Security-sensitive operational posture (TLS, insecure escape hatches, bootstrap).
 
 ## Non-goals
-- Feature semantics (authoritative: other module SoT docs).
-- Duplicating config definitions across multiple docs (use cross-links instead).
-- Documenting CI/test-only env vars that are not read by `src/**`.
+- Repeating feature semantics that belong to other SoT modules.
+- Documenting CI-only shell variables that are not read by `src/**`.
+- Treating incidental internal inputs as supported operator knobs.
+
+## External Contracts
+- **[Stable] Merge order for server startup inputs**
+  - Supported CLI flags override their corresponding environment variables.
+  - When a CLI flag is absent, db9 falls back to the environment variable and then to the hardcoded default.
+  - Evidence: `src/cli.rs`, `src/main.rs`.
+
+- **[Stable] Security posture is secure-by-default**
+  - Non-loopback pgwire and fs9 WebSocket listeners refuse cleartext startup unless TLS is configured or the operator explicitly opts into `DB9_INSECURE=1` or `DB9_DEV=1`.
+  - First-superuser bootstrap requires `DB9_BOOTSTRAP_ADMIN_PASSWORD` unless `DB9_DEV=1`.
+  - Evidence: `src/main.rs`, `src/auth/rbac.rs`.
 
 ## Entrypoints
-- `src/main.rs` (server bootstrap; TiKV endpoints; port; keyspace; TLS env wiring)
-- `src/config.rs` (server defaults + embedding env config normalization)
-- `src/tls.rs` (TLS acceptor setup)
-- `src/observability.rs` (observability knobs)
-- `src/extensions/http.rs` (HTTP extension security knob)
-- `src/sql/trigger_worker.rs` (async trigger worker knobs)
-- `src/protocol/handler/portal.rs` (protocol resource limits)
-- `docs/configuration.md` (non-SoT doc; may drift — this file is the SoT for keys)
+- `src/cli.rs`
+- `src/main.rs`
+- `src/config.rs`
+- `src/tls.rs`
+- `src/pool.rs`
+- `src/worker/config.rs`
+- `src/cron/config.rs`
+- `src/storage/backpressure.rs`
+- `src/observability.rs`
+- `src/extensions/http.rs`
+- `src/extensions/fs/ws/protocol.rs`
+- `src/protocol/handler/portal.rs`
+- `src/sql/executor/table_utils/generate_series.rs`
+- `src/storage/tikv_store/mod.rs`
 
 ## Configuration
 
-| Key | Type | Default | Evidence (read site) | Notes |
+### CLI Flags
+
+| Flag | Env fallback | Default | Evidence | Notes |
 |---|---|---|---|---|
-| `PD_ENDPOINTS` | env | `127.0.0.1:2379` | `src/main.rs` (`async_main`) | Comma-separated PD endpoints. |
-| `PG_PORT` | env | `5433` | `src/main.rs` (`async_main`) | Listening port; parse failures fall back to default. |
-| `PG_LISTEN_ADDR` | env | `127.0.0.1` | `src/main.rs` (`async_main`) | Listening address; set to `0.0.0.0` to accept non-loopback connections. When set to non-loopback and TLS is disabled, startup fails unless `DB9_INSECURE=1` or `DB9_DEV=1`. |
-| `PG_KEYSPACE` | env | `default` | `src/main.rs` (`async_main`); `src/sql/trigger_worker.rs` (`bootstrap_active_keyspaces`) | Default tenant keyspace when client username has no explicit keyspace; also used as trigger worker fallback active keyspace. |
-| `PG_TLS_CERT` | env | unset (TLS disabled) | `src/main.rs` (`async_main`) | TLS is enabled only when both `PG_TLS_CERT` and `PG_TLS_KEY` are set and `tls::setup_tls` succeeds. |
-| `PG_TLS_KEY` | env | unset (TLS disabled) | `src/main.rs` (`async_main`) | See `PG_TLS_CERT`. |
-| `PG_REQUIRE_TLS` | env | `false` | `src/main.rs` (`async_main`) | When enabled, server requires TLS for all pgwire connections; startup fails if TLS is not configured. |
-| `DB9_INSECURE` | env | `false` | `src/main.rs` (`async_main`); `src/protocol/handler/dynamic.rs` (`on_startup`) | Explicit escape hatch: allows starting without TLS on non-loopback binds and allows non-TLS cleartext auth for non-loopback clients (unsafe; DO NOT use in production). |
-| `DB9_DEV` | env | `false` | `src/main.rs` (`async_main`); `src/auth/rbac.rs` (`AuthManager::bootstrap`) | Dev-only escape hatch: allows legacy insecure bootstrap (default superuser) and relaxes non-TLS auth restrictions (unsafe; DO NOT use in production). |
-| `DB9_BOOTSTRAP_ADMIN_USER` | env | `admin` | `src/auth/rbac.rs` (`AuthManager::bootstrap`) | Initial superuser username for bootstrapping when no superuser exists yet. |
-| `DB9_BOOTSTRAP_ADMIN_PASSWORD` | env | unset | `src/auth/rbac.rs` (`AuthManager::bootstrap`) | Required to bootstrap the first superuser when no superuser exists yet (non-dev mode). MUST NOT be logged. |
-| `DB9_TOKIO_STACK_MB` | env | `4` | `src/main.rs` (`main`) | Per-runtime worker thread stack size (MiB); must parse as `usize` and be `> 0`. |
-| `DB9_OBS_ENABLED` | env | `true` | `src/observability.rs` (`ObservabilityConfig::from_env`) | Boolean parsing is best-effort; invalid values keep the default. |
-| `DB9_OBS_SAMPLE_EVERY` | env | `1000` | `src/observability.rs` (`ObservabilityConfig::from_env`) | Sample 1 in N statements; must parse as `u64` and be `> 0`. |
-| `DB9_OBS_SLOW_MS` | env | `200` | `src/observability.rs` (`ObservabilityConfig::from_env`) | Slow query threshold in ms; stored internally as µs. |
-| `DB9_OBS_MAX_SAMPLE_EVENTS` | env | `20000` | `src/observability.rs` (`ObservabilityConfig::from_env`) | Cap for sampled events kept in-memory; must be `> 0`. |
-| `DB9_OBS_MAX_SAMPLE_GROUPS` | env | `50` | `src/observability.rs` (`ObservabilityConfig::from_env`) | Cap for distinct query sample groups; must be `> 0`. |
-| `DB9_OBS_MAX_SQL_LEN` | env | `512` | `src/observability.rs` (`ObservabilityConfig::from_env`) | Max SQL length stored for sampled queries; must be `> 0`. |
-| `EMBEDDING_API_KEY` | env | unset | `src/config.rs` (`EmbeddingConfig::from_env`) | API key for embedding provider. When unset, embedding service is unavailable. |
-| `EMBEDDING_ENDPOINT` | env | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1/embeddings` | `src/config.rs` (`embedding_endpoint_from_env`) | Full embeddings endpoint. Path is normalized to end with `/embeddings`. |
-| `EMBEDDING_BASE_URL` | env | unset | `src/config.rs` (`embedding_endpoint_from_env`) | Alias for endpoint base URL. Used only when `EMBEDDING_ENDPOINT` is unset; normalized to `/embeddings`. |
-| `EMBEDDING_MODEL` | env | `text-embedding-v4` | `src/config.rs` (`EmbeddingConfig::from_env`) | Model name. Non-v4 values are normalized/forced to `text-embedding-v4`. |
-| `EMBEDDING_DIMENSIONS` | env | `1024` | `src/config.rs` (`EmbeddingConfig::from_env`) | Default embedding dimensions; must parse as `u32` and be `> 0`. |
-| `DB9_HTTP_ALLOW_INSECURE` | env | `false` | `src/extensions/http.rs` (`allow_insecure_http`) | When true, allows non-HTTPS HTTP extension requests; accepts `"1"` or case-insensitive `"true"`. |
-| `DB9_MAX_GENERATE_SERIES_ROWS` | env | `1000000` | `src/sql/executor/table_utils.rs` (`max_generate_series_rows`) | Guardrail for `generate_series`; must parse as `usize` and be `> 0`. |
-| `DB9_MAX_SUSPENDED_PORTALS` | env | `32` | `src/protocol/handler/portal.rs` (`max_suspended_portals`) | Upper bound for suspended portals kept in memory; must parse as `usize` and be `> 0`. |
-| `DB9_MAX_SUSPENDED_PORTAL_BUFFER_ROWS` | env | `10000` | `src/protocol/handler/portal.rs` (`max_suspended_portal_buffer_rows`) | Row count cap for buffered suspended-portal rows; must parse as `usize` and be `> 0`. |
-| `DB9_MAX_SUSPENDED_PORTAL_BUFFER_BYTES` | env | `16777216` | `src/protocol/handler/portal.rs` (`max_suspended_portal_buffer_bytes`) | Byte cap for buffered suspended-portal rows; must parse as `usize` and be `> 0`. |
-| `DB9_TRIGGER_ENABLED` | env | `true` | `src/sql/trigger_worker.rs` (`TriggerWorkerConfig::from_env`) | Boolean parsing accepts `1/0`, `true/false`, `yes/no`, `on/off` (case-insensitive). |
-| `DB9_TRIGGER_POLL_MS` | env | `100` | `src/sql/trigger_worker.rs` (`TriggerWorkerConfig::from_env`) | Poll interval for background worker; must parse as `u64` and be `> 0`. |
-| `DB9_TRIGGER_GC_INTERVAL_SEC` | env | `60` | `src/sql/trigger_worker.rs` (`TriggerWorkerConfig::from_env`) | GC interval; must parse as `u64` and be `> 0`. |
-| `DB9_TRIGGER_DONE_RETENTION_SEC` | env | `3600` | `src/sql/trigger_worker.rs` (`TriggerWorkerConfig::from_env`) | DONE retention; must parse as `u64` and be `> 0`. |
-| `DB9_TRIGGER_DLQ_RETENTION_DAYS` | env | `7` | `src/sql/trigger_worker.rs` (`TriggerWorkerConfig::from_env`) | DLQ retention; must parse as `u64` and be `> 0`. |
-| `DB9_TRIGGER_ORPHAN_TIMEOUT_SEC` | env | `300` | `src/sql/trigger_worker.rs` (`TriggerWorkerConfig::from_env`) | Orphan timeout; must parse as `u64` and be `> 0`. |
-| `DB9_TRIGGER_QUEUE_LIMIT` | env | `10000` | `src/sql/trigger_worker.rs` (`TriggerWorkerConfig::from_env`) | Default max in-memory queue depth per keyspace; must parse as `usize` and be `> 0`. |
-| `DB9_TRIGGER_BATCH_SIZE` | env | `10` | `src/sql/trigger_worker.rs` (`TriggerWorkerConfig::from_env`) | Default max events per batch; must parse as `usize` and be `> 0`. |
-| `DB9_TRIGGER_MAX_RETRIES` | env | `3` | `src/sql/trigger_worker.rs` (`TriggerWorkerConfig::from_env`) | Default max retries per event; must parse as `u8` and be `> 0`. |
-| `DB9_TRIGGER_NODE_ID` | env | auto-derived | `src/sql/trigger_queue.rs` (`node_id`) | When set, must parse as `u16` and be in `[0, 1023]`; for multi-node deployments, set a unique value per node to avoid ID collisions. |
-| `HOSTNAME` | env | unset | `src/sql/trigger_queue.rs` (`node_id`) | Best-effort input used to derive `DB9_TRIGGER_NODE_ID` when not explicitly set. |
+| `--host` | `PG_LISTEN_ADDR` | `127.0.0.1` | `src/cli.rs`, `src/main.rs` | pgwire listen address. |
+| `--port` | `PG_PORT` | `5433` | `src/cli.rs`, `src/main.rs` | pgwire listen port. |
+| `--pd-endpoints` | `PD_ENDPOINTS` | `127.0.0.1:2379` | `src/cli.rs`, `src/main.rs` | Comma-separated PD endpoints. |
+| `--keyspace` | `PG_KEYSPACE` | `default` | `src/cli.rs`, `src/main.rs` | Default tenant keyspace when username has no explicit override. |
+| `--tls-cert` | `PG_TLS_CERT` | unset | `src/cli.rs`, `src/main.rs` | Requires matching `--tls-key` / `PG_TLS_KEY`. |
+| `--tls-key` | `PG_TLS_KEY` | unset | `src/cli.rs`, `src/main.rs` | Requires matching `--tls-cert` / `PG_TLS_CERT`. |
+| `--help` / `-h` | none | n/a | `src/cli.rs` | Prints usage and exits. |
+| `--version` / `-V` | none | n/a | `src/cli.rs` | Prints build/version info and exits. |
+
+### Core Server, TLS, and Bootstrap
+
+| Key | Default | Evidence | Notes |
+|---|---|---|---|
+| `PD_ENDPOINTS` | `127.0.0.1:2379` | `src/main.rs` | Comma-separated PD endpoints. |
+| `PG_LISTEN_ADDR` | `127.0.0.1` | `src/main.rs` | Non-loopback cleartext startup is refused unless TLS or insecure escape hatch is enabled. |
+| `PG_PORT` | `5433` | `src/main.rs` | pgwire listen port. |
+| `PG_KEYSPACE` | `default` | `src/main.rs` | Default tenant keyspace when username has no keyspace prefix. |
+| `PG_TLS_CERT` | unset | `src/main.rs`, `src/tls.rs` | Enables pgwire TLS only when paired with `PG_TLS_KEY`. |
+| `PG_TLS_KEY` | unset | `src/main.rs`, `src/tls.rs` | Enables pgwire TLS only when paired with `PG_TLS_CERT`. |
+| `PG_REQUIRE_TLS` | `false` | `src/main.rs` | Refuses non-TLS pgwire startup when enabled. |
+| `DB9_INSECURE` | `false` | `src/main.rs` | Explicitly permits insecure non-loopback startup/posture. |
+| `DB9_DEV` | `false` | `src/main.rs`, `src/auth/rbac.rs` | Enables legacy dev bootstrap/insecure development behavior. |
+| `DB9_BOOTSTRAP_ADMIN_USER` | `admin` | `src/auth/rbac.rs` | Initial superuser username when bootstrapping an empty keyspace. |
+| `DB9_BOOTSTRAP_ADMIN_PASSWORD` | unset | `src/auth/rbac.rs` | Required for secure first-superuser bootstrap. |
+| `DB9_TOKIO_STACK_MB` | `8` | `src/main.rs` | Tokio worker thread stack size in MiB. |
+| `RUST_LOG` | `info` | `src/main.rs` | Standard tracing filter input consumed by `EnvFilter::try_from_default_env()`. |
+| `TIKV_CA_PATH` | unset | `src/storage/tikv_store/mod.rs` | Enables TLS for PD/TiKV client when paired with cert/key. |
+| `TIKV_CERT_PATH` | unset | `src/storage/tikv_store/mod.rs` | TiKV client certificate path. |
+| `TIKV_KEY_PATH` | unset | `src/storage/tikv_store/mod.rs` | TiKV client key path. |
+
+### Server Defaults and Tenant Resource Limits
+
+| Key | Default | Evidence | Notes |
+|---|---|---|---|
+| `DB9_STATEMENT_TIMEOUT_MS` | `60000` | `src/config.rs` | Default statement timeout applied to new sessions. |
+| `DB9_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_MS` | `60000` | `src/config.rs` | Default idle-in-transaction timeout applied to new sessions. |
+| `DB9_MAX_CONNECTIONS` | `1000` | `src/config.rs`, `src/main.rs` | Enforced with a connection semaphore; excess connections receive SQLSTATE `53300`. |
+| `DB9_TENANT_QPS_LIMIT` | `0` (disabled) | `src/pool.rs` | Per-tenant QPS limiter. |
+| `DB9_TENANT_MEMORY_QUOTA_BYTES` | `0` (unlimited) | `src/pool.rs` | Per-tenant aggregate statement memory quota. |
+
+### Protocol and SQL Guardrails
+
+| Key | Default | Evidence | Notes |
+|---|---|---|---|
+| `DB9_MAX_SUSPENDED_PORTALS` | `32` | `src/protocol/handler/portal.rs` | Maximum suspended portals retained in memory. |
+| `DB9_MAX_SUSPENDED_PORTAL_BUFFER_ROWS` | `10000` | `src/protocol/handler/portal.rs` | Row cap for buffered suspended-portal results. |
+| `DB9_MAX_SUSPENDED_PORTAL_BUFFER_BYTES` | `16777216` | `src/protocol/handler/portal.rs` | Byte cap for buffered suspended-portal results. |
+| `DB9_MAX_GENERATE_SERIES_ROWS` | `1000000` | `src/sql/executor/table_utils/generate_series.rs` | Guardrail for `generate_series`. |
+
+### Worker and Cron
+
+| Key | Default | Evidence | Notes |
+|---|---|---|---|
+| `DB9_WORKER_ENABLED` | `true` | `src/worker/config.rs` | Master switch for background worker engine. |
+| `DB9_WORKER_POLL_MS` | `60000` | `src/worker/config.rs` | Minimum effective value is `100`. |
+| `DB9_WORKER_MAX_CONCURRENT_JOBS` | `32` | `src/worker/config.rs` | Per-node worker concurrency cap. |
+| `DB9_WORKER_ID` | `<hostname>:<pid>` | `src/worker/config.rs` | Overrides the auto-derived worker ID. |
+| `DB9_WORKER_STATEMENT_TIMEOUT_MS` | `300000` | `src/worker/config.rs` | Statement timeout for worker-executed SQL. |
+| `DB9_CRON_JOB_TIMEOUT_MS` | `1800000` | `src/worker/config.rs` | Execution timeout for cron jobs. |
+| `DB9_WORKER_ORPHAN_TIMEOUT_SEC` | `300` | `src/worker/config.rs` | Claim GC orphan timeout. |
+| `DB9_WORKER_GC_BATCH_SIZE` | `100` | `src/worker/config.rs` | Claim GC batch size. |
+| `DB9_AUTO_ANALYZE_ENABLED` | `true` | `src/worker/config.rs` | Enables worker-driven auto-analyze. |
+| `DB9_AUTO_ANALYZE_THRESHOLD` | `50` | `src/worker/config.rs` | Base threshold used by current auto-analyze policy. |
+| `DB9_WORKER_GC_INTERVAL_SEC` | `600` | `src/worker/config.rs`, `src/worker/gc.rs` | Minimum effective value is `30`. |
+| `DB9_WORKER_HNSW_SWEEP_INTERVAL_SEC` | `600` | `src/worker/config.rs`, `src/worker/gc.rs` | Independent cadence for HNSW delta sweep/enqueue. |
+| `DB9_WORKER_SYSTEM_KEYSPACE` | `_sys_worker` | `src/worker/config.rs` | Keyspace holding background task metadata. |
+| `DB9_CRON_ENABLED` | `true` | `src/cron/config.rs` | Master switch for cron scheduling. |
+| `DB9_CRON_POLL_MS` | `60000` | `src/cron/config.rs` | Values below default are clamped up to `60000`. |
+| `DB9_CRON_MAX_RUNNING_JOBS` | `32` | `src/cron/config.rs` | Concurrent cron jobs per node. |
+| `DB9_CRON_MAX_JOBS_PER_DB` | `50` | `src/cron/config.rs` | Per-database cron job cap. |
+| `DB9_CRON_GC_INTERVAL_SEC` | `3600` | `src/cron/config.rs` | Cron run-history GC cadence. |
+| `DB9_CRON_RUN_RETENTION_DAYS` | `7` | `src/cron/config.rs` | Retention for cron run history. |
+| `DB9_CRON_ORPHAN_TIMEOUT_SEC` | `300` | `src/cron/config.rs` | Cron orphan timeout. |
+
+### Observability, Extensions, and fs9
+
+| Key | Default | Evidence | Notes |
+|---|---|---|---|
+| `DB9_OBS_ENABLED` | `true` | `src/observability.rs` | Enables in-process observability sampling/aggregation. |
+| `DB9_OBS_SAMPLE_EVERY` | `1000` | `src/observability.rs` | Sample one in N statements. |
+| `DB9_OBS_SLOW_MS` | `200` | `src/observability.rs` | Slow-statement threshold in milliseconds. |
+| `DB9_OBS_MAX_SAMPLE_EVENTS` | `20000` | `src/observability.rs` | Maximum sampled events retained. |
+| `DB9_OBS_MAX_SAMPLE_GROUPS` | `50` | `src/observability.rs` | Maximum distinct sampled query groups. |
+| `DB9_OBS_MAX_SQL_LEN` | `512` | `src/observability.rs` | Maximum stored SQL text length for samples. |
+| `DB9_HTTP_ALLOW_INSECURE` | `false` | `src/extensions/http.rs` | Allows `http://` outbound requests when enabled. |
+| `EMBEDDING_API_KEY` | unset | `src/config.rs` | Required for embedding service availability. |
+| `EMBEDDING_ENDPOINT` | DashScope-compatible v1 embeddings URL | `src/config.rs` | Normalized to end in `/embeddings`. |
+| `EMBEDDING_BASE_URL` | unset | `src/config.rs` | Fallback alias when `EMBEDDING_ENDPOINT` is unset. |
+| `EMBEDDING_MODEL` | `text-embedding-v4` | `src/config.rs` | Non-v4 values are forced back to `text-embedding-v4`. |
+| `EMBEDDING_DIMENSIONS` | `1024` | `src/config.rs` | Default embedding dimensions. |
+| `FS9_WS_PORT` | `5480` | `src/main.rs`, `src/extensions/fs/ws/protocol.rs` | `0` disables the fs9 WebSocket server. |
+| `FS9_WS_LISTEN_ADDR` | `127.0.0.1` | `src/main.rs`, `src/extensions/fs/ws/protocol.rs` | Non-loopback cleartext bind is refused unless TLS or insecure escape hatch is enabled. |
+
+### TiKV Backpressure
+
+| Key | Default | Evidence | Notes |
+|---|---|---|---|
+| `DB9_TIKV_BP_ENABLED` | `false` | `src/storage/backpressure.rs` | Enables adaptive TiKV admission control. |
+| `DB9_TIKV_BP_MIN_PERMITS` | `4` | `src/storage/backpressure.rs` | Lower bound for adaptive permit count. |
+| `DB9_TIKV_BP_MAX_PERMITS` | `256` | `src/storage/backpressure.rs` | Upper bound for adaptive permit count. |
+| `DB9_TIKV_BP_LATENCY_THRESHOLD_MS` | `200` | `src/storage/backpressure.rs` | P99 latency threshold driving AIMD decrease. |
+| `DB9_TIKV_BP_WINDOW_SIZE` | `1024` | `src/storage/backpressure.rs` | Rolling latency window size. |
+| `DB9_TIKV_BP_EVAL_INTERVAL` | `128` | `src/storage/backpressure.rs` | Number of completions between evaluations. |
+
+### Unsupported / Incidental Inputs
+- `HOSTNAME` is currently used only as a best-effort ingredient when auto-deriving the default worker ID. It is not treated as a supported configuration contract.
 
 ## Verification (Gates)
-- `ci:.github/workflows/orm-tests.yml/lint` (required): `cargo fmt -- --check && cargo clippy`
-- `ci:.github/workflows/orm-tests.yml/test` (required): `./run_tests.sh` (boots a local non-TLS instance with explicit bootstrap + insecure flags; does not assert TLS handshake)
+Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
+- Gate IDs: `ci:.github/workflows/ci.yml/lint`, `ci:.github/workflows/ci.yml/integration-tests`, `ci:.github/workflows/doc-lint.yml/doc-lint`
+- Local reproduce (typical):
+  - `cargo fmt -- --check && cargo clippy --workspace --all-targets -- -D warnings`
+  - `./run_tests.sh`
+  - `uv run scripts/doc_lint.py`
 
 ## Change Management
-- Any PR that adds/removes/renames a config key, changes a default, or changes security posture (TLS / HTTP insecure) MUST update this document and keep `docs/sot/modules.yaml` + `docs/sot/README.md` consistent.
-- Any change that adds/removes/relaxes/tightens a gate MUST have a DR/ADR per #368 rules and update `docs/sot/testing-gates.md`.
-- Track cross-module overlaps via `xref` in `docs/sot/modules.yaml`; other SoT docs MUST link here instead of restating config keys.
+- Any PR that adds, removes, renames, or changes the default/meaning of a supported operator-facing input MUST update this document and keep `docs/sot/modules.yaml` and `docs/sot/README.md` aligned.
+- New config keys MUST be documented here exactly once; other SoT docs MUST cross-link instead of restating them.
+- Gate changes require corresponding updates in `./testing-gates.md`.
 - Reference: https://github.com/c4pt0r/db9/issues/368

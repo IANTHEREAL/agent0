@@ -3,6 +3,11 @@
 **Status**: Draft  
 **Priority（ORM 迁移）**: P0
 
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+
 ## 背景与动机
 
 ORM 与迁移工具会大量依赖系统表做 introspection（表/列/索引/约束/类型/序列等）。db9-server 已实现了一部分虚拟系统表（`src/sql/information_schema.rs`），但仍存在“空表/字段不足/关联关系不稳定”的风险点：
@@ -100,4 +105,3 @@ ORM 与迁移工具会大量依赖系统表做 introspection（表/列/索引/�
 在 `orm-tests/typeorm/schema.test.ts` / `sequelize/` 增加：
 - 创建包含 enum/sequence/自定义 schema 的结构
 - 触发 ORM introspection（sync/migrations）并确保通过
-

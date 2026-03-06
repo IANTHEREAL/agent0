@@ -3,6 +3,11 @@
 **Status**: Draft  
 **Priority（ORM 迁移）**: P1（迁移间接依赖，pg_dump/restore 常用）
 
+> **Draft / non-SoT note**
+>
+> This document is a design draft, not a current-behavior contract.
+> Validate current behavior against `docs/sot/**`, `docs/ARCHITECTURE.md`, and the implementation under `src/**` before using it for product or compatibility decisions.
+
 ## 背景与动机
 
 db9-server 当前已经通过 pgwire 实现了 `COPY ... FROM STDIN`（用于 `pg_restore`/大批量导入），但仍存在几个关键缺口：
@@ -99,4 +104,3 @@ MVP：
 
 ORM 迁移阶段通常不直接用 COPY，但一些生态工具会用（数据种子/备份恢复）。测试策略：
 - 在 `orm-tests/pg-client` 增加一个最小用例：通过 node-postgres 执行 `COPY ... TO STDOUT` 并读取流（若测试框架允许）
-
