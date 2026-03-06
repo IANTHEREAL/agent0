@@ -16,7 +16,7 @@ use crate::sql::analyzer::types::{
 use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::traverse::for_each_child;
-use crate::sql::expr::typed_eval::eval_const_usize;
+use crate::sql::expr::typed_eval::eval_const_limit_bound;
 use crate::sql::optimizer::BuildContext;
 use crate::sql::types::coercion::comparison_target_type;
 use crate::sql::types::CastContext;
@@ -45,10 +45,11 @@ impl Executor {
         db_id: u64,
         deferred_limit: &Option<(Option<TypedExpr>, Option<TypedExpr>)>,
         lock_timeout: Option<std::time::Duration>,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<(Vec<Row>, bool)> {
         if locks.is_empty() {
-            return Ok(rows);
+            return Ok((rows, false));
         }
+        let deferred_bounds_present = deferred_limit.is_some();
 
         // Extract lock properties.
         let has_skip_locked = has_skip_locked_clause(locks);
@@ -70,7 +71,7 @@ impl Executor {
         };
 
         let Some(table_name) = table_name else {
-            return Ok(rows);
+            return Ok((rows, false));
         };
 
         // Check that the table has a primary key (required for locking).
@@ -84,13 +85,15 @@ impl Executor {
             let limit = deferred_limit
                 .as_ref()
                 .and_then(|(l, _)| l.as_ref())
-                .map(|expr| eval_const_usize(expr, true))
-                .transpose()?;
+                .map(eval_const_limit_bound)
+                .transpose()?
+                .flatten();
             let offset = deferred_limit
                 .as_ref()
                 .and_then(|(_, o)| o.as_ref())
-                .map(|expr| eval_const_usize(expr, true))
+                .map(eval_const_limit_bound)
                 .transpose()?
+                .flatten()
                 .unwrap_or(0);
             let max_locks = limit.map(|l| offset + l);
             let locked_indices = self
@@ -101,7 +104,7 @@ impl Executor {
             // Apply offset + limit to the locked subset.
             let start = offset.min(locked_rows.len());
             let end = limit.map_or(locked_rows.len(), |l| (start + l).min(locked_rows.len()));
-            Ok(locked_rows[start..end].to_vec())
+            Ok((locked_rows[start..end].to_vec(), deferred_bounds_present))
         } else {
             // Apply deferred LIMIT/OFFSET before locking to avoid locking
             // more rows than needed. Without this, `FOR UPDATE LIMIT 1` would
@@ -111,12 +114,14 @@ impl Executor {
             if let Some((ref limit_expr, ref offset_expr)) = deferred_limit {
                 let limit = limit_expr
                     .as_ref()
-                    .map(|expr| eval_const_usize(expr, true))
-                    .transpose()?;
+                    .map(eval_const_limit_bound)
+                    .transpose()?
+                    .flatten();
                 let offset = offset_expr
                     .as_ref()
-                    .map(|expr| eval_const_usize(expr, true))
+                    .map(eval_const_limit_bound)
                     .transpose()?
+                    .flatten()
                     .unwrap_or(0);
                 if limit.is_some() || offset > 0 {
                     let start = offset.min(rows_to_lock.len());
@@ -134,7 +139,7 @@ impl Executor {
                     .lock_rows(txn, db_id, &table_name, &rows_to_lock, lock_timeout)
                     .await?;
             }
-            Ok(rows_to_lock)
+            Ok((rows_to_lock, deferred_bounds_present))
         }
     }
 }

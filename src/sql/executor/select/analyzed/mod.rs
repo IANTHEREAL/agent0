@@ -14,7 +14,7 @@ use crate::sql::analyzer::types::{
 use crate::sql::analyzer::AnalyzedQuery;
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::classify::needs_pre_materialization;
-use crate::sql::expr::typed_eval::eval_const_usize;
+use crate::sql::expr::typed_eval::eval_const_limit_bound;
 use crate::sql::ExecuteResult;
 
 use anyhow::{anyhow, Result};
@@ -547,11 +547,12 @@ impl Executor {
                 .await?;
 
             // ── Step 8: Post-processing ──
+            let mut deferred_bounds_applied = false;
 
             // 8a: FOR UPDATE/SHARE locking (before projection, raw rows have PK).
             if has_locks {
                 let lock_timeout = crate::sql::query_context::QueryContext::current_lock_timeout();
-                rows = self
+                let (locked_rows, applied_in_locks) = self
                     .apply_row_locks(
                         rows,
                         locks,
@@ -563,6 +564,8 @@ impl Executor {
                         lock_timeout,
                     )
                     .await?;
+                rows = locked_rows;
+                deferred_bounds_applied = applied_in_locks;
             }
 
             // 8b: Apply original projection (async expressions + all expressions when passthrough).
@@ -618,30 +621,37 @@ impl Executor {
                 let limit = deferred_limit
                     .as_ref()
                     .and_then(|(l, _)| l.as_ref())
-                    .map(|expr| eval_const_usize(expr, true))
-                    .transpose()?;
+                    .map(eval_const_limit_bound)
+                    .transpose()?
+                    .flatten();
                 let offset = deferred_limit
                     .as_ref()
                     .and_then(|(_, o)| o.as_ref())
-                    .map(|expr| eval_const_usize(expr, true))
+                    .map(eval_const_limit_bound)
                     .transpose()?
+                    .flatten()
                     .unwrap_or(0);
                 rows = sort_projected_rows(rows, deferred_ob, &final_output_schema, limit, offset)?;
-            } else if let Some((ref limit_expr, ref offset_expr)) = deferred_limit {
-                // LIMIT/OFFSET deferred for locking but no deferred ORDER BY.
-                let limit = limit_expr
-                    .as_ref()
-                    .map(|expr| eval_const_usize(expr, true))
-                    .transpose()?;
-                let offset = offset_expr
-                    .as_ref()
-                    .map(|expr| eval_const_usize(expr, true))
-                    .transpose()?
-                    .unwrap_or(0);
-                if limit.is_some() || offset > 0 {
-                    let start = offset.min(rows.len());
-                    let end = limit.map_or(rows.len(), |l| (start + l).min(rows.len()));
-                    rows = rows[start..end].to_vec();
+            } else if !deferred_bounds_applied {
+                // Apply deferred LIMIT/OFFSET here when no deferred ORDER BY was
+                // needed and row-lock processing didn't already consume bounds.
+                if let Some((ref limit_expr, ref offset_expr)) = deferred_limit {
+                    let limit = limit_expr
+                        .as_ref()
+                        .map(eval_const_limit_bound)
+                        .transpose()?
+                        .flatten();
+                    let offset = offset_expr
+                        .as_ref()
+                        .map(eval_const_limit_bound)
+                        .transpose()?
+                        .flatten()
+                        .unwrap_or(0);
+                    if limit.is_some() || offset > 0 {
+                        let start = offset.min(rows.len());
+                        let end = limit.map_or(rows.len(), |l| (start + l).min(rows.len()));
+                        rows = rows[start..end].to_vec();
+                    }
                 }
             }
 

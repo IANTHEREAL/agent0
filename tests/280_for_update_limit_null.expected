@@ -1,0 +1,64 @@
+id
+1
+2
+3
+4
+5
+(5 rows)
+id
+1
+2
+3
+4
+5
+(5 rows)
+id
+1
+2
+3
+4
+5
+(5 rows)
+id
+3
+4
+5
+(3 rows)
+id
+1
+2
+(2 rows)
+id|type_name
+1|int8
+2|int4
+3|int2
+4|text
+5|boolean
+(5 rows)
+id
+(0 rows)
+id
+1
+2
+3
+4
+5
+(5 rows)
+id
+1
+2
+3
+4
+5
+(5 rows)
+id
+1
+2
+3
+4
+5
+(5 rows)
+id
+1
+2
+(2 rows)

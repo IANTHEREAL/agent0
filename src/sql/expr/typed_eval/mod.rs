@@ -102,6 +102,19 @@ pub(crate) fn eval_const_usize(expr: &TypedExpr, null_as_zero: bool) -> Result<u
     }
 }
 
+/// Like `eval_const_usize`, but returns `Ok(None)` for NULL
+/// (PG parity: NULL = ALL/no-bound for LIMIT/OFFSET).
+///
+/// Recursively unwraps CAST chains so nested forms like `NULL::int8::int8`
+/// also return `None`.
+pub(crate) fn eval_const_limit_bound(expr: &TypedExpr) -> Result<Option<usize>> {
+    match &expr.kind {
+        TypedExprKind::Constant(Value::Null) => Ok(None),
+        TypedExprKind::Cast { expr: inner, .. } => eval_const_limit_bound(inner),
+        _ => eval_const_usize(expr, false).map(Some),
+    }
+}
+
 fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Result<Value> {
     match &expr.kind {
         // ── Leaf nodes ──────────────────────────────────────
