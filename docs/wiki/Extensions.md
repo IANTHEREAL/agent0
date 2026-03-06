@@ -22,7 +22,7 @@ Six extensions are currently registered:
 | `hstore` | 2002 | `public` | hstore type (metadata-only for client compatibility) |
 | `fs9` | 2003 | `extensions` | Embedded filesystem operations (read, write, stat, mkdir, remove, glob) |
 | `pg_cron` | 2004 | `cron` | pg_cron-compatible scheduled job management |
-| `parquet` | 2005 | `extensions` | Parquet file import via `read_parquet()` and `COPY FROM ... FORMAT parquet` |
+| `parquet` | 2005 | `extensions` | Parquet file import via `read_parquet()` and `COPY FROM ... WITH (FORMAT parquet)` |
 
 The `fs9` extension implements a full POSIX-like filesystem stored in TiKV with page-based storage, accessible via SQL table functions, scalar functions, and a binary WebSocket protocol for SDKs. The `http` extension provides pgsql-http-compatible table functions with tenant rate limiting and SSRF protection. The `parquet` extension (feature-gated) enables reading Parquet files from HTTP URLs or the embedded filesystem.
 

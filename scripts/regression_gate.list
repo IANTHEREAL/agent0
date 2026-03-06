@@ -179,4 +179,5 @@ tests/hnsw_bg_concurrent_liveness.py
 orm-tests/pg-client/
 orm-tests/typeorm/connection.test.ts
 orm-tests/typeorm/transaction.test.ts
-orm-tests/typeorm/schema.test.ts
+orm-tests/typeorm/schema.test.ts# 1509: docs-only fix (Parquet COPY syntax), covered by existing 242_parquet_error_paths
+tests/242_parquet_error_paths.sql
