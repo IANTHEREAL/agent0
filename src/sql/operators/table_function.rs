@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 use super::{ExecutionContext, PhysicalOperator};
 use crate::model::{Row, TableSchema};
+use crate::sql::analyzer::types::TypedFunctionArg;
 
 pub struct TableFunctionScanOperator {
     schema: TableSchema,
@@ -79,6 +80,102 @@ impl PhysicalOperator for TableFunctionScanOperator {
 
     fn explain_info(&self) -> Option<String> {
         Some("function=fs9".to_string())
+    }
+}
+
+pub struct RuntimeTableFunctionOperator {
+    schema: TableSchema,
+    function_name: String,
+    display_name: String,
+    args: Vec<TypedFunctionArg>,
+    rows: Vec<Row>,
+    position: usize,
+    opened: bool,
+}
+
+impl RuntimeTableFunctionOperator {
+    pub fn new(
+        schema: TableSchema,
+        function_name: String,
+        display_name: String,
+        args: Vec<TypedFunctionArg>,
+    ) -> Self {
+        Self {
+            schema,
+            function_name,
+            display_name,
+            args,
+            rows: Vec::new(),
+            position: 0,
+            opened: false,
+        }
+    }
+}
+
+impl fmt::Debug for RuntimeTableFunctionOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeTableFunctionOperator")
+            .field("schema", &self.schema.name)
+            .field("function_name", &self.function_name)
+            .field("display_name", &self.display_name)
+            .field("opened", &self.opened)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl PhysicalOperator for RuntimeTableFunctionOperator {
+    fn schema(&self) -> &TableSchema {
+        &self.schema
+    }
+
+    async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        let outer_row = ctx.outer_row.clone().unwrap_or_else(|| Row::new(vec![]));
+        self.rows = ctx
+            .executor
+            .execute_table_function_rows(
+                ctx.txn,
+                ctx.db_id,
+                ctx.sequence_values,
+                ctx.search_path,
+                ctx.cte_tables,
+                &self.function_name,
+                &self.args,
+                &outer_row,
+                &self.schema,
+                ctx.query_ctx,
+                &self.display_name,
+            )
+            .await?;
+        self.position = 0;
+        self.opened = true;
+        Ok(())
+    }
+
+    async fn next(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
+        if !self.opened {
+            return Err(anyhow!("Operator not opened"));
+        }
+        let row = self.rows.get(self.position).cloned();
+        if row.is_some() {
+            self.position += 1;
+        }
+        Ok(row)
+    }
+
+    async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        self.rows.clear();
+        self.position = 0;
+        self.opened = false;
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "RuntimeTableFunction"
+    }
+
+    fn explain_info(&self) -> Option<String> {
+        Some(format!("function={}", self.function_name))
     }
 }
 

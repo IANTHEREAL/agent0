@@ -990,6 +990,28 @@ fn mixed_on_condition() -> JoinCondition {
     })
 }
 
+fn correlated_array_subquery_arg() -> TypedExpr {
+    let subquery = AnalyzedQuery {
+        ctes: vec![],
+        body: AnalyzedQueryBody::Values(vec![vec![TypedExpr {
+            kind: TypedExprKind::ColumnRef {
+                scope_depth: 1,
+                column_index: 0,
+                column_name: "id".to_string(),
+            },
+            data_type: DataType::Int64,
+        }]]),
+        order_by: vec![],
+        limit: None,
+        offset: None,
+        output_schema: vec![("v".to_string(), DataType::Int64, None)],
+    };
+    TypedExpr {
+        kind: TypedExprKind::ArraySubquery(Box::new(subquery)),
+        data_type: DataType::Array(Box::new(DataType::Int64)),
+    }
+}
+
 #[test]
 fn test_hash_join_for_equi() {
     let (join, ctx) = make_join_plan(1000, 1000, JoinType::Inner, equi_on_condition());
@@ -1018,6 +1040,65 @@ fn test_hash_join_for_mixed_equi_and_residual() {
     assert!(
         matches!(physical.node, PhysicalNode::HashJoin { .. }),
         "mixed (equi + residual) should produce HashJoin with residual filter"
+    );
+}
+
+#[test]
+fn test_nlj_for_equi_when_table_function_arg_has_correlated_subquery() {
+    let left = LogicalPlan::scan(
+        "left_t".to_string(),
+        None,
+        PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+    );
+    let right = LogicalPlan {
+        node: LogicalNode::TableFunction {
+            function_name: "unnest".to_string(),
+            args: vec![TypedFunctionArg::Positional(correlated_array_subquery_arg())],
+            alias: Some("u".to_string()),
+        },
+        schema: PlanSchema::from_columns(vec![("val".to_string(), DataType::Int64)]),
+    };
+    let mut schema_cols = left.schema.columns.clone();
+    schema_cols.extend(right.schema.columns.clone());
+    let join = LogicalPlan {
+        node: LogicalNode::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinType::Inner,
+            condition: JoinCondition::On(TypedExpr {
+                kind: TypedExprKind::BinaryOp {
+                    left: Box::new(TypedExpr {
+                        kind: TypedExprKind::ColumnRef {
+                            scope_depth: 0,
+                            column_index: 0,
+                            column_name: "id".to_string(),
+                        },
+                        data_type: DataType::Int64,
+                    }),
+                    op: BinaryOp::Eq,
+                    right: Box::new(TypedExpr {
+                        kind: TypedExprKind::ColumnRef {
+                            scope_depth: 0,
+                            column_index: 1,
+                            column_name: "val".to_string(),
+                        },
+                        data_type: DataType::Int64,
+                    }),
+                },
+                data_type: DataType::Boolean,
+            }),
+        },
+        schema: PlanSchema::from_columns(schema_cols),
+    };
+
+    let mut ctx = PlanningContext::empty();
+    ctx.table_stats
+        .insert("left_t".to_string(), make_table_stats(1000, HashMap::new()));
+
+    let physical = PhysicalPlanner::plan(&join, &ctx);
+    assert!(
+        matches!(physical.node, PhysicalNode::NestedLoopJoin { .. }),
+        "correlated table-function RHS must force NLJ"
     );
 }
 

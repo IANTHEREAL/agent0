@@ -5,9 +5,13 @@
 //! and optimizer eligibility (`optimizer/eligibility.rs`) import from here —
 //! no duplication, no dependency inversion.
 //!
-//! Also provides `is_volatile` and `has_correlated_ref` for predicate pushdown.
+//! Also provides `is_volatile`, `has_correlated_ref`, and `has_any_column_ref`
+//! for predicate pushdown and outer-row dependency detection.
 
-use crate::sql::analyzer::types::{FunctionKind, TypedExpr, TypedExprKind};
+use crate::sql::analyzer::types::{
+    AnalyzedDistinct, AnalyzedQuery, AnalyzedQueryBody, AnalyzedTableRef, AnalyzedTableRefKind,
+    FunctionKind, JoinCondition, TypedExpr, TypedExprKind, TypedFunctionArg,
+};
 use crate::sql::expr::traverse::visit_any;
 use crate::sql::expr::typed_fold::is_volatile_or_side_effecting_builtin;
 
@@ -138,11 +142,96 @@ pub(crate) fn has_correlated_ref(expr: &TypedExpr) -> bool {
     )
 }
 
+/// Check if a TypedExpr contains any column reference, regardless of scope.
+///
+/// Table functions in `FROM` require per-row execution whenever any argument
+/// references a column from a previously-bound relation, even if that
+/// reference is encoded as `scope_depth = 0` in the current query scope.
+/// Descends into expression-level subquery payloads as well.
+pub(crate) fn has_any_column_ref(expr: &TypedExpr) -> bool {
+    expr_has_any_column_ref(expr)
+}
+
+fn expr_has_any_column_ref(expr: &TypedExpr) -> bool {
+    visit_any(expr, |node| match &node.kind {
+        TypedExprKind::ColumnRef { .. } => true,
+        TypedExprKind::ScalarSubquery(subquery) | TypedExprKind::ArraySubquery(subquery) => {
+            query_has_any_column_ref(subquery)
+        }
+        TypedExprKind::Exists { subquery, .. }
+        | TypedExprKind::InSubquery { subquery, .. }
+        | TypedExprKind::TupleInSubquery { subquery, .. }
+        | TypedExprKind::AnyAll { subquery, .. } => query_has_any_column_ref(subquery),
+        _ => false,
+    })
+}
+
+fn query_has_any_column_ref(query: &AnalyzedQuery) -> bool {
+    let body_has_column_ref = match &query.body {
+        AnalyzedQueryBody::Select(select) => {
+            let distinct_has_column_ref = match &select.distinct {
+                AnalyzedDistinct::DistinctOn(on_exprs) => {
+                    on_exprs.iter().any(expr_has_any_column_ref)
+                }
+                AnalyzedDistinct::All | AnalyzedDistinct::Distinct => false,
+            };
+            select.from.iter().any(table_ref_has_any_column_ref)
+                || select
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(expr_has_any_column_ref)
+                || select
+                    .projection
+                    .iter()
+                    .any(|projection| expr_has_any_column_ref(&projection.expr))
+                || select.group_by.iter().any(expr_has_any_column_ref)
+                || select.having.as_ref().is_some_and(expr_has_any_column_ref)
+                || distinct_has_column_ref
+        }
+        AnalyzedQueryBody::Values(rows) => rows.iter().flatten().any(expr_has_any_column_ref),
+        AnalyzedQueryBody::SetOperation { left, right, .. } => {
+            query_has_any_column_ref(left) || query_has_any_column_ref(right)
+        }
+    };
+
+    body_has_column_ref
+        || query
+            .order_by
+            .iter()
+            .any(|order_by| expr_has_any_column_ref(&order_by.expr))
+        || query.limit.as_ref().is_some_and(expr_has_any_column_ref)
+        || query.offset.as_ref().is_some_and(expr_has_any_column_ref)
+}
+
+fn table_ref_has_any_column_ref(table_ref: &AnalyzedTableRef) -> bool {
+    match &table_ref.kind {
+        AnalyzedTableRefKind::Table { .. } => false,
+        AnalyzedTableRefKind::Subquery(subquery) => query_has_any_column_ref(subquery),
+        AnalyzedTableRefKind::Function { args, .. } => args.iter().any(|arg| match arg {
+            TypedFunctionArg::Positional(expr) => expr_has_any_column_ref(expr),
+            TypedFunctionArg::Named { expr, .. } => expr_has_any_column_ref(expr),
+        }),
+        AnalyzedTableRefKind::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            table_ref_has_any_column_ref(left)
+                || table_ref_has_any_column_ref(right)
+                || matches!(condition, JoinCondition::On(expr) if expr_has_any_column_ref(expr))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{DataType, Value};
-    use crate::sql::analyzer::types::{BinaryOp, ResolvedFunction};
+    use crate::sql::analyzer::types::{
+        AnalyzedProjection, AnalyzedQuery, AnalyzedQueryBody, AnalyzedSelect, BinaryOp,
+        ResolvedFunction,
+    };
 
     fn bool_const(v: bool) -> TypedExpr {
         TypedExpr::new(
@@ -226,5 +315,62 @@ mod tests {
             DataType::Int64,
         );
         assert!(needs_async(&expr));
+    }
+
+    #[test]
+    fn has_any_column_ref_detects_scope_zero_reference() {
+        let expr = TypedExpr::new(
+            TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: 1,
+                column_name: "t_col".to_string(),
+            },
+            DataType::Int32,
+        );
+
+        assert!(has_any_column_ref(&expr));
+        assert!(!has_correlated_ref(&expr));
+    }
+
+    #[test]
+    fn has_any_column_ref_descends_into_scalar_subquery_payload() {
+        let subquery = AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection: vec![AnalyzedProjection {
+                    expr: TypedExpr::new(
+                        TypedExprKind::ArrayLiteral(vec![TypedExpr::new(
+                            TypedExprKind::ColumnRef {
+                                scope_depth: 1,
+                                column_index: 0,
+                                column_name: "t.id".to_string(),
+                            },
+                            DataType::Int32,
+                        )]),
+                        DataType::Array(Box::new(DataType::Int32)),
+                    ),
+                    output_name: "array_col".to_string(),
+                }],
+                from: vec![],
+                where_clause: None,
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![(
+                "array_col".to_string(),
+                DataType::Array(Box::new(DataType::Int32)),
+                None,
+            )],
+        };
+        let expr = TypedExpr::new(
+            TypedExprKind::ScalarSubquery(Box::new(subquery)),
+            DataType::Array(Box::new(DataType::Int32)),
+        );
+
+        assert!(has_any_column_ref(&expr));
     }
 }

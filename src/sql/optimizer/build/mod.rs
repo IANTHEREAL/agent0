@@ -27,12 +27,12 @@ use anyhow::{anyhow, Result};
 use super::physical_plan::{PhysicalNode, PhysicalPlan};
 use crate::model::{DataType, Row, TableSchema};
 use crate::sql::analyzer::types::{JoinType, SetOpKind, TypedExpr};
-use crate::sql::error::SqlError;
 use crate::sql::expr::typed_eval::eval_const_usize;
 use crate::sql::operators::{
     BoxedOperator, DistinctOnOperator, DistinctOperator, FilterOperator, HashJoinConfig,
     HashJoinOperator, HashJoinType, HashSemiJoinOperator, LimitOperator, NestedLoopJoinOperator,
-    ProjectOperator, SetOperationOperator, SetOperationType, SortOperator, TableScanOperator,
+    ProjectOperator, RuntimeTableFunctionOperator, SetOperationOperator, SetOperationType,
+    SortOperator, TableScanOperator,
 };
 
 /// Context needed to translate a [`PhysicalPlan`] into operator trees.
@@ -154,11 +154,9 @@ impl PhysicalPlan {
 
             PhysicalNode::TableFunction {
                 function_name,
+                args,
                 alias,
-                ..
             } => {
-                // Table functions are pre-executed during context preparation.
-                // Look up by alias first (the key used during pre-loading), then by function name.
                 let key = alias.as_deref().unwrap_or(function_name.as_str());
                 let schema = ctx
                     .table_schemas
@@ -170,12 +168,16 @@ impl PhysicalPlan {
                         .correlated_table_functions
                         .contains(function_name.as_str())
                 {
-                    return Err(SqlError::Unsupported(format!(
-                        "table function {}() has correlated arguments referencing an outer query; \
-                         LATERAL table functions are not yet supported",
-                        function_name
-                    ))
-                    .into());
+                    let mut schema = schema.clone();
+                    if let Some(a) = alias {
+                        schema.from_alias = Some(a.clone());
+                    }
+                    return Ok(Box::new(RuntimeTableFunctionOperator::new(
+                        schema,
+                        function_name.clone(),
+                        key.to_string(),
+                        args.clone(),
+                    )));
                 }
                 let rows = ctx
                     .preloaded_rows

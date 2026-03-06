@@ -15,6 +15,7 @@ mod dml_analyzed;
 mod extensions;
 mod procedure;
 mod select;
+mod table_functions;
 mod table_utils;
 mod text_search;
 pub(crate) mod triggers;

@@ -39,6 +39,21 @@ fn correlated_col_ref(index: usize, name: &str) -> TypedExpr {
     }
 }
 
+fn array_subquery_expr(inner_expr: TypedExpr) -> TypedExpr {
+    let subquery = crate::sql::analyzer::types::AnalyzedQuery {
+        ctes: vec![],
+        body: crate::sql::analyzer::types::AnalyzedQueryBody::Values(vec![vec![inner_expr]]),
+        order_by: vec![],
+        limit: None,
+        offset: None,
+        output_schema: vec![("v".to_string(), DataType::Int64, None)],
+    };
+    TypedExpr {
+        kind: TypedExprKind::ArraySubquery(Box::new(subquery)),
+        data_type: DataType::Array(Box::new(DataType::Int64)),
+    }
+}
+
 fn const_int(v: i64) -> TypedExpr {
     TypedExpr {
         kind: TypedExprKind::Constant(crate::model::Value::Int64(v)),
@@ -855,6 +870,40 @@ fn test_table_function_unresolved_subquery_safety_gate() {
     assert!(
         logical_has_unresolved_subquery(&tf_plan),
         "TableFunction with InSubquery arg must be detected"
+    );
+}
+
+#[test]
+fn test_table_function_arg_depends_on_outer_descends_into_subquery_payload() {
+    let correlated_subquery_arg = array_subquery_expr(correlated_col_ref(0, "outer_id"));
+    assert!(
+        table_function_arg_depends_on_outer(&correlated_subquery_arg),
+        "scope_depth=1 inside subquery payload must be treated as outer dependency"
+    );
+
+    let local_subquery_arg = array_subquery_expr(col_ref(0, "inner_id"));
+    assert!(
+        !table_function_arg_depends_on_outer(&local_subquery_arg),
+        "scope_depth=0 inside nested subquery is local and must not be treated as outer dependency"
+    );
+}
+
+#[test]
+fn test_logical_has_correlated_refs_for_table_function_correlated_subquery_arg() {
+    let tf_plan = LogicalPlan {
+        node: LogicalNode::TableFunction {
+            function_name: "unnest".to_string(),
+            args: vec![crate::sql::analyzer::types::TypedFunctionArg::Positional(
+                array_subquery_expr(correlated_col_ref(0, "outer_id")),
+            )],
+            alias: Some("u".to_string()),
+        },
+        schema: PlanSchema::from_columns(vec![("val".to_string(), DataType::Int64)]),
+    };
+
+    assert!(
+        logical_has_correlated_refs(&tf_plan),
+        "TableFunction arg with correlated subquery payload must be detected as correlated"
     );
 }
 

@@ -6,6 +6,7 @@ use crate::model::DataType;
 use crate::sql::analyzer::types::{JoinCondition, JoinType, TypedExpr, TypedExprKind};
 use crate::sql::expr::classify::has_correlated_ref;
 use crate::sql::operators::JoinType as OpJoinType;
+use crate::sql::optimizer::join_reorder::table_function_arg_depends_on_outer;
 use crate::sql::optimizer::physical_plan::{PhysicalNode, PhysicalPlan};
 
 /// Convert analyzer JoinType to operator JoinType.
@@ -35,10 +36,10 @@ pub(super) fn plan_has_correlated_refs(plan: &PhysicalPlan) -> bool {
         PhysicalNode::Values { rows } => rows.iter().flatten().any(has_correlated_ref),
         PhysicalNode::TableFunction { args, .. } => args.iter().any(|arg| match arg {
             crate::sql::analyzer::types::TypedFunctionArg::Positional(expr) => {
-                has_correlated_ref(expr)
+                table_function_arg_depends_on_outer(expr)
             }
             crate::sql::analyzer::types::TypedFunctionArg::Named { expr, .. } => {
-                has_correlated_ref(expr)
+                table_function_arg_depends_on_outer(expr)
             }
         }),
         PhysicalNode::Filter { predicate, input } => {

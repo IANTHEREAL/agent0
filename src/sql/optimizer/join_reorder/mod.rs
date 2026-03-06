@@ -17,8 +17,12 @@ mod tests;
 use super::logical_plan::{LogicalNode, LogicalPlan};
 use super::physical_planner::PlanningContext;
 use super::rewrite::{conjuncts_to_predicate, split_conjunction};
-use crate::sql::analyzer::types::{JoinCondition, JoinType, TypedExpr};
+use crate::sql::analyzer::types::{
+    AnalyzedDistinct, AnalyzedQuery, AnalyzedQueryBody, AnalyzedTableRef, AnalyzedTableRefKind,
+    JoinCondition, JoinType, TypedExpr, TypedExprKind, TypedFunctionArg,
+};
 use crate::sql::expr::classify::{has_correlated_ref, has_unresolved_subquery};
+use crate::sql::expr::traverse::visit_any;
 
 use algorithms::{dpccp_optimize, greedy_optimize};
 use predicates::{classify_predicates, flatten_recursive, BaseRelation};
@@ -441,17 +445,17 @@ pub(super) fn logical_has_unresolved_subquery(plan: &LogicalPlan) -> bool {
 }
 
 /// Check if a LogicalPlan subtree contains any correlated reference.
-pub(super) fn logical_has_correlated_refs(plan: &LogicalPlan) -> bool {
+pub(crate) fn logical_has_correlated_refs(plan: &LogicalPlan) -> bool {
     match &plan.node {
         LogicalNode::Scan { .. } | LogicalNode::Empty => false,
 
         LogicalNode::Values { rows } => rows.iter().flatten().any(has_correlated_ref),
         LogicalNode::TableFunction { args, .. } => args.iter().any(|arg| match arg {
             crate::sql::analyzer::types::TypedFunctionArg::Positional(expr) => {
-                has_correlated_ref(expr)
+                table_function_arg_depends_on_outer(expr)
             }
             crate::sql::analyzer::types::TypedFunctionArg::Named { expr, .. } => {
-                has_correlated_ref(expr)
+                table_function_arg_depends_on_outer(expr)
             }
         }),
 
@@ -529,6 +533,119 @@ pub(super) fn logical_has_correlated_refs(plan: &LogicalPlan) -> bool {
             logical_has_correlated_refs(left) || logical_has_correlated_refs(right)
         }
         LogicalNode::Subquery { subplan, .. } => logical_has_correlated_refs(subplan),
+    }
+}
+
+/// True when a table-function argument must be evaluated per outer row.
+///
+/// This includes:
+/// - direct column references in the current scope (`scope_depth = 0`)
+/// - references inside nested subqueries that point back to the enclosing scope
+///   (`scope_depth >= subquery_nesting_depth`)
+pub(crate) fn table_function_arg_depends_on_outer(expr: &TypedExpr) -> bool {
+    expr_depends_on_outer_at_depth(expr, 0)
+}
+
+fn expr_depends_on_outer_at_depth(expr: &TypedExpr, subquery_depth: u32) -> bool {
+    visit_any(expr, |node| match &node.kind {
+        TypedExprKind::ColumnRef { scope_depth, .. } => *scope_depth >= subquery_depth,
+        TypedExprKind::ScalarSubquery(subquery) | TypedExprKind::ArraySubquery(subquery) => {
+            query_depends_on_outer_at_depth(subquery, subquery_depth + 1)
+        }
+        TypedExprKind::Exists { subquery, .. }
+        | TypedExprKind::InSubquery { subquery, .. }
+        | TypedExprKind::TupleInSubquery { subquery, .. }
+        | TypedExprKind::AnyAll { subquery, .. } => {
+            query_depends_on_outer_at_depth(subquery, subquery_depth + 1)
+        }
+        _ => false,
+    })
+}
+
+fn query_depends_on_outer_at_depth(query: &AnalyzedQuery, subquery_depth: u32) -> bool {
+    let body_has_outer_dep = match &query.body {
+        AnalyzedQueryBody::Select(select) => {
+            let distinct_has_outer_dep = match &select.distinct {
+                AnalyzedDistinct::DistinctOn(on_exprs) => on_exprs
+                    .iter()
+                    .any(|expr| expr_depends_on_outer_at_depth(expr, subquery_depth)),
+                AnalyzedDistinct::All | AnalyzedDistinct::Distinct => false,
+            };
+            select
+                .from
+                .iter()
+                .any(|table_ref| table_ref_depends_on_outer_at_depth(table_ref, subquery_depth))
+                || select
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(|expr| expr_depends_on_outer_at_depth(expr, subquery_depth))
+                || select
+                    .projection
+                    .iter()
+                    .any(|p| expr_depends_on_outer_at_depth(&p.expr, subquery_depth))
+                || select
+                    .group_by
+                    .iter()
+                    .any(|expr| expr_depends_on_outer_at_depth(expr, subquery_depth))
+                || select
+                    .having
+                    .as_ref()
+                    .is_some_and(|expr| expr_depends_on_outer_at_depth(expr, subquery_depth))
+                || distinct_has_outer_dep
+        }
+        AnalyzedQueryBody::Values(rows) => rows
+            .iter()
+            .flatten()
+            .any(|expr| expr_depends_on_outer_at_depth(expr, subquery_depth)),
+        AnalyzedQueryBody::SetOperation { left, right, .. } => {
+            query_depends_on_outer_at_depth(left, subquery_depth)
+                || query_depends_on_outer_at_depth(right, subquery_depth)
+        }
+    };
+
+    body_has_outer_dep
+        || query
+            .order_by
+            .iter()
+            .any(|order_by| expr_depends_on_outer_at_depth(&order_by.expr, subquery_depth))
+        || query
+            .limit
+            .as_ref()
+            .is_some_and(|expr| expr_depends_on_outer_at_depth(expr, subquery_depth))
+        || query
+            .offset
+            .as_ref()
+            .is_some_and(|expr| expr_depends_on_outer_at_depth(expr, subquery_depth))
+}
+
+fn table_ref_depends_on_outer_at_depth(table_ref: &AnalyzedTableRef, subquery_depth: u32) -> bool {
+    match &table_ref.kind {
+        AnalyzedTableRefKind::Table { .. } => false,
+        AnalyzedTableRefKind::Subquery(subquery) => {
+            query_depends_on_outer_at_depth(subquery, subquery_depth + 1)
+        }
+        AnalyzedTableRefKind::Function { args, .. } => args.iter().any(|arg| match arg {
+            TypedFunctionArg::Positional(expr) => {
+                expr_depends_on_outer_at_depth(expr, subquery_depth)
+            }
+            TypedFunctionArg::Named { expr, .. } => {
+                expr_depends_on_outer_at_depth(expr, subquery_depth)
+            }
+        }),
+        AnalyzedTableRefKind::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            let condition_depends_on_outer = match condition {
+                JoinCondition::On(expr) => expr_depends_on_outer_at_depth(expr, subquery_depth),
+                JoinCondition::Using(_) | JoinCondition::None => false,
+            };
+            table_ref_depends_on_outer_at_depth(left, subquery_depth)
+                || table_ref_depends_on_outer_at_depth(right, subquery_depth)
+                || condition_depends_on_outer
+        }
     }
 }
 

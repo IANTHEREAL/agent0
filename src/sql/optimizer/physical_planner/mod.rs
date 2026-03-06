@@ -693,8 +693,10 @@ impl PhysicalPlanner {
                 // Algorithm selection: HashJoin whenever ON has at least one
                 // cross-boundary equi key (residual conjuncts are evaluated as
                 // hash-join filters), NLJ otherwise.
-                let node = if join_keys::extract_equi_keys_with_residual(condition, left_width)
-                    .is_some()
+                let right_depends_on_outer =
+                    crate::sql::optimizer::join_reorder::logical_has_correlated_refs(right);
+                let node = if !right_depends_on_outer
+                    && join_keys::extract_equi_keys_with_residual(condition, left_width).is_some()
                 {
                     let left_is_build = left_rows <= right_rows;
                     PhysicalNode::HashJoin {

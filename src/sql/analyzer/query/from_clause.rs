@@ -284,7 +284,7 @@ impl<'a> Analyzer<'a> {
                                 crate::sql::names::normalize_ident(&ta.name)
                             }
                         } else {
-                            obj_name.to_lowercase()
+                            "value".to_string()
                         };
                         let out_ty = if obj_name.eq_ignore_ascii_case("json_array_elements") {
                             DataType::Json
@@ -302,7 +302,7 @@ impl<'a> Analyzer<'a> {
                                 crate::sql::names::normalize_ident(&ta.name)
                             }
                         } else {
-                            obj_name.to_lowercase()
+                            "value".to_string()
                         };
                         vec![(col_name, DataType::Text, true, None)]
                     } else if obj_name.eq_ignore_ascii_case("jsonb_each")
