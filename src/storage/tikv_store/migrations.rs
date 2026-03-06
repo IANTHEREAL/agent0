@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::ForeignKeyAction;
 use crate::sql::binder::{extract_relation_references_from_query, RelationDep};
 use crate::storage::backpressure::tikv_op;
 use sqlparser::ast::{Query, Statement};
@@ -11,6 +12,10 @@ const VIEW_BINDINGS_MIGRATION_NAME: &str = "20260223_000001_view_relation_bindin
 const VIEW_BINDINGS_MIGRATION_CHECKSUM: &str = "view_relation_bindings_v2";
 const VIEW_BINDINGS_MIGRATION_SQL_PREVIEW: &str =
     "backfill persisted view/matview relation bindings from legacy deps";
+const NO_PK_FK_CASCADE_MIGRATION_NAME: &str = "20260306_000001_no_pk_fk_cascade_downgrade";
+const NO_PK_FK_CASCADE_MIGRATION_CHECKSUM: &str = "no_pk_fk_cascade_downgrade_v1";
+const NO_PK_FK_CASCADE_MIGRATION_SQL_PREVIEW: &str =
+    "downgrade CASCADE/SET NULL/SET DEFAULT to NO ACTION on no-PK child tables";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelationBindingKind {
@@ -43,6 +48,21 @@ struct RelationBindingBackfillAction {
     kind: RelationBindingKind,
     full_name: String,
     bindings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct NoPkFkDowngradeTarget {
+    db_id: u64,
+    table_name: String,
+    fk_name: String,
+    old_on_delete: ForeignKeyAction,
+    old_on_update: ForeignKeyAction,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct NoPkFkDowngradeApplyResult {
+    fk_name_matched: bool,
+    downgraded_constraints: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,6 +352,54 @@ fn compute_migration_outcome(
     (plan, action)
 }
 
+fn find_no_pk_fk_cascade_targets(schemas: &[(u64, TableSchema)]) -> Vec<NoPkFkDowngradeTarget> {
+    let mut targets = Vec::new();
+    for (db_id, schema) in schemas {
+        if !schema.pk_indices.is_empty() {
+            continue;
+        }
+        for fk in &schema.foreign_keys {
+            if fk.on_delete.requires_child_pk() || fk.on_update.requires_child_pk() {
+                targets.push(NoPkFkDowngradeTarget {
+                    db_id: *db_id,
+                    table_name: schema.name.clone(),
+                    fk_name: fk.name.clone(),
+                    old_on_delete: fk.on_delete.clone(),
+                    old_on_update: fk.on_update.clone(),
+                });
+            }
+        }
+    }
+    targets
+}
+
+fn apply_no_pk_fk_cascade_downgrade(
+    schema: &mut TableSchema,
+    target: &NoPkFkDowngradeTarget,
+) -> NoPkFkDowngradeApplyResult {
+    let mut result = NoPkFkDowngradeApplyResult::default();
+    for fk in &mut schema.foreign_keys {
+        if fk.name != target.fk_name {
+            continue;
+        }
+
+        result.fk_name_matched = true;
+        let mut downgraded = false;
+        if fk.on_delete.requires_child_pk() {
+            fk.on_delete = ForeignKeyAction::NoAction;
+            downgraded = true;
+        }
+        if fk.on_update.requires_child_pk() {
+            fk.on_update = ForeignKeyAction::NoAction;
+            downgraded = true;
+        }
+        if downgraded {
+            result.downgraded_constraints += 1;
+        }
+    }
+    result
+}
+
 impl TikvStore {
     pub async fn record_migration(
         &self,
@@ -490,11 +558,89 @@ impl TikvStore {
         }
         Ok(())
     }
+
+    pub async fn ensure_no_pk_fk_cascade_migration(&self) -> Result<()> {
+        let mut txn = self.begin().await?;
+        let migration_key = self.key(&encode_migration_key(NO_PK_FK_CASCADE_MIGRATION_NAME));
+        if tikv_op!(txn.get(migration_key).await)?.is_some() {
+            tikv_op!(txn.commit().await)?;
+            info!(
+                "Migration {} already applied; skipping",
+                NO_PK_FK_CASCADE_MIGRATION_NAME
+            );
+            return Ok(());
+        }
+
+        let databases = self.list_databases(&mut txn).await?;
+        let mut schemas: Vec<(u64, TableSchema)> = Vec::new();
+        for db in databases {
+            let table_names = self.list_tables(&mut txn, db.id).await?;
+            let table_schemas = self
+                .list_table_schemas(&mut txn, db.id, &table_names)
+                .await?;
+            schemas.extend(table_schemas.into_iter().map(|schema| (db.id, schema)));
+        }
+
+        let targets = find_no_pk_fk_cascade_targets(&schemas);
+        let mut tables_affected: HashSet<(u64, String)> = HashSet::new();
+        let mut fks_downgraded = 0usize;
+        for target in targets {
+            let mut schema = self
+                .get_schema(&mut txn, target.db_id, &target.table_name)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "table '{}' not found during migration {}",
+                        target.table_name,
+                        NO_PK_FK_CASCADE_MIGRATION_NAME
+                    )
+                })?;
+
+            let apply_result = apply_no_pk_fk_cascade_downgrade(&mut schema, &target);
+            if !apply_result.fk_name_matched {
+                return Err(anyhow!(
+                    "constraint '{}' not found on table '{}' during migration {}",
+                    target.fk_name,
+                    target.table_name,
+                    NO_PK_FK_CASCADE_MIGRATION_NAME
+                ));
+            }
+
+            if apply_result.downgraded_constraints > 0 {
+                self.update_schema(&mut txn, target.db_id, schema).await?;
+                tables_affected.insert((target.db_id, target.table_name));
+                fks_downgraded += apply_result.downgraded_constraints;
+            }
+        }
+
+        let applied_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string();
+        let record = MigrationRecord {
+            name: NO_PK_FK_CASCADE_MIGRATION_NAME.to_string(),
+            applied_at,
+            checksum: NO_PK_FK_CASCADE_MIGRATION_CHECKSUM.to_string(),
+            sql_preview: NO_PK_FK_CASCADE_MIGRATION_SQL_PREVIEW.to_string(),
+        };
+        self.record_migration(&mut txn, record).await?;
+        tikv_op!(txn.commit().await)?;
+
+        info!(
+            "Migration {} complete (tables_affected={}, fks_downgraded={})",
+            NO_PK_FK_CASCADE_MIGRATION_NAME,
+            tables_affected.len(),
+            fks_downgraded
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ForeignKeyConstraint;
 
     fn target(
         db_id: u64,
@@ -957,5 +1103,233 @@ mod tests {
         assert!(plan3.actions.is_empty());
         assert_eq!(plan3.skipped_existing, 1);
         assert_eq!(action3, ViewBindingsMigrationMarkerAction::EnsurePresent);
+    }
+
+    fn test_fk(
+        name: &str,
+        on_delete: ForeignKeyAction,
+        on_update: ForeignKeyAction,
+    ) -> ForeignKeyConstraint {
+        ForeignKeyConstraint {
+            name: name.to_string(),
+            columns: vec!["child_id".to_string()],
+            ref_table: "public.parent".to_string(),
+            ref_columns: vec!["id".to_string()],
+            on_delete,
+            on_update,
+        }
+    }
+
+    fn test_schema(
+        table_name: &str,
+        pk_indices: Vec<usize>,
+        foreign_keys: Vec<ForeignKeyConstraint>,
+    ) -> TableSchema {
+        TableSchema {
+            name: table_name.to_string(),
+            pk_indices,
+            foreign_keys,
+            ..TableSchema::default()
+        }
+    }
+
+    fn no_pk_target(table_name: &str, fk_name: &str) -> NoPkFkDowngradeTarget {
+        NoPkFkDowngradeTarget {
+            db_id: 1,
+            table_name: table_name.to_string(),
+            fk_name: fk_name.to_string(),
+            old_on_delete: ForeignKeyAction::Cascade,
+            old_on_update: ForeignKeyAction::NoAction,
+        }
+    }
+
+    #[test]
+    fn find_no_pk_fk_cascade_targets_empty_for_pk_tables() {
+        let schemas = vec![(
+            1,
+            test_schema(
+                "public.child",
+                vec![0],
+                vec![test_fk(
+                    "child_parent_fk",
+                    ForeignKeyAction::Cascade,
+                    ForeignKeyAction::NoAction,
+                )],
+            ),
+        )];
+        let targets = find_no_pk_fk_cascade_targets(&schemas);
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn find_no_pk_fk_cascade_targets_empty_for_safe_actions() {
+        let schemas = vec![(
+            1,
+            test_schema(
+                "public.child",
+                vec![],
+                vec![
+                    test_fk(
+                        "child_parent_fk_1",
+                        ForeignKeyAction::NoAction,
+                        ForeignKeyAction::Restrict,
+                    ),
+                    test_fk(
+                        "child_parent_fk_2",
+                        ForeignKeyAction::Restrict,
+                        ForeignKeyAction::NoAction,
+                    ),
+                ],
+            ),
+        )];
+        let targets = find_no_pk_fk_cascade_targets(&schemas);
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn find_no_pk_fk_cascade_targets_detects_on_delete_cascade() {
+        let schemas = vec![(
+            9,
+            test_schema(
+                "public.child",
+                vec![],
+                vec![test_fk(
+                    "child_parent_fk",
+                    ForeignKeyAction::Cascade,
+                    ForeignKeyAction::NoAction,
+                )],
+            ),
+        )];
+        let targets = find_no_pk_fk_cascade_targets(&schemas);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].db_id, 9);
+        assert_eq!(targets[0].table_name, "public.child");
+        assert_eq!(targets[0].fk_name, "child_parent_fk");
+        assert_eq!(targets[0].old_on_delete, ForeignKeyAction::Cascade);
+        assert_eq!(targets[0].old_on_update, ForeignKeyAction::NoAction);
+    }
+
+    #[test]
+    fn find_no_pk_fk_cascade_targets_detects_on_update_set_null() {
+        let schemas = vec![(
+            5,
+            test_schema(
+                "public.child",
+                vec![],
+                vec![test_fk(
+                    "child_parent_fk",
+                    ForeignKeyAction::NoAction,
+                    ForeignKeyAction::SetNull,
+                )],
+            ),
+        )];
+        let targets = find_no_pk_fk_cascade_targets(&schemas);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].db_id, 5);
+        assert_eq!(targets[0].table_name, "public.child");
+        assert_eq!(targets[0].fk_name, "child_parent_fk");
+        assert_eq!(targets[0].old_on_delete, ForeignKeyAction::NoAction);
+        assert_eq!(targets[0].old_on_update, ForeignKeyAction::SetNull);
+    }
+
+    #[test]
+    fn find_no_pk_fk_cascade_targets_detects_mixed_unsafe_actions() {
+        let schemas = vec![(
+            2,
+            test_schema(
+                "public.child",
+                vec![],
+                vec![test_fk(
+                    "child_parent_fk",
+                    ForeignKeyAction::Cascade,
+                    ForeignKeyAction::SetNull,
+                )],
+            ),
+        )];
+        let targets = find_no_pk_fk_cascade_targets(&schemas);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].db_id, 2);
+        assert_eq!(targets[0].table_name, "public.child");
+        assert_eq!(targets[0].fk_name, "child_parent_fk");
+        assert_eq!(targets[0].old_on_delete, ForeignKeyAction::Cascade);
+        assert_eq!(targets[0].old_on_update, ForeignKeyAction::SetNull);
+    }
+
+    #[test]
+    fn apply_no_pk_fk_cascade_downgrade_handles_duplicate_fk_names() {
+        let mut schema = test_schema(
+            "public.child",
+            vec![],
+            vec![
+                test_fk(
+                    "dup_fk",
+                    ForeignKeyAction::NoAction,
+                    ForeignKeyAction::NoAction,
+                ),
+                test_fk(
+                    "dup_fk",
+                    ForeignKeyAction::Cascade,
+                    ForeignKeyAction::NoAction,
+                ),
+            ],
+        );
+        let target = no_pk_target("public.child", "dup_fk");
+        let result = apply_no_pk_fk_cascade_downgrade(&mut schema, &target);
+
+        assert!(result.fk_name_matched);
+        assert_eq!(result.downgraded_constraints, 1);
+        assert_eq!(schema.foreign_keys[0].on_delete, ForeignKeyAction::NoAction);
+        assert_eq!(schema.foreign_keys[1].on_delete, ForeignKeyAction::NoAction);
+    }
+
+    #[test]
+    fn apply_no_pk_fk_cascade_downgrade_downgrades_all_unsafe_same_name_entries() {
+        let mut schema = test_schema(
+            "public.child",
+            vec![],
+            vec![
+                test_fk(
+                    "dup_fk",
+                    ForeignKeyAction::Cascade,
+                    ForeignKeyAction::NoAction,
+                ),
+                test_fk(
+                    "dup_fk",
+                    ForeignKeyAction::NoAction,
+                    ForeignKeyAction::SetNull,
+                ),
+            ],
+        );
+        let target = no_pk_target("public.child", "dup_fk");
+        let result = apply_no_pk_fk_cascade_downgrade(&mut schema, &target);
+
+        assert!(result.fk_name_matched);
+        assert_eq!(result.downgraded_constraints, 2);
+        assert_eq!(schema.foreign_keys[0].on_delete, ForeignKeyAction::NoAction);
+        assert_eq!(schema.foreign_keys[1].on_update, ForeignKeyAction::NoAction);
+    }
+
+    #[test]
+    fn apply_no_pk_fk_cascade_downgrade_is_idempotent_on_rerun() {
+        let mut schema = test_schema(
+            "public.child",
+            vec![],
+            vec![test_fk(
+                "dup_fk",
+                ForeignKeyAction::Cascade,
+                ForeignKeyAction::SetDefault,
+            )],
+        );
+        let target = no_pk_target("public.child", "dup_fk");
+
+        let first = apply_no_pk_fk_cascade_downgrade(&mut schema, &target);
+        let second = apply_no_pk_fk_cascade_downgrade(&mut schema, &target);
+
+        assert!(first.fk_name_matched);
+        assert_eq!(first.downgraded_constraints, 1);
+        assert!(second.fk_name_matched);
+        assert_eq!(second.downgraded_constraints, 0);
+        assert_eq!(schema.foreign_keys[0].on_delete, ForeignKeyAction::NoAction);
+        assert_eq!(schema.foreign_keys[0].on_update, ForeignKeyAction::NoAction);
     }
 }
