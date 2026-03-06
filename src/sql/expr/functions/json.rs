@@ -722,7 +722,7 @@ fn jsonb_each_impl(
     let json_str = match args.into_iter().next() {
         Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
         Some(Value::Null) => return Ok(Value::Null),
-        _ => return Err(anyhow!("jsonb_each requires json/jsonb argument")),
+        _ => return Err(anyhow!("{} requires json/jsonb argument", func_name)),
     };
     let json_val: serde_json::Value =
         serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
@@ -1083,6 +1083,60 @@ mod tests {
         } else {
             panic!("expected Array");
         }
+    }
+
+    #[test]
+    fn test_json_each_array_error_pg_parity() {
+        let err = json_each(vec![Value::Json("[1]".into())]).unwrap_err();
+        assert_eq!(err.to_string(), "cannot deconstruct an array as an object");
+    }
+
+    #[test]
+    fn test_json_each_scalar_error_pg_parity() {
+        let err = json_each(vec![Value::Json("1".into())]).unwrap_err();
+        assert_eq!(err.to_string(), "cannot deconstruct a scalar");
+    }
+
+    #[test]
+    fn test_json_each_text_array_error_pg_parity() {
+        let err = json_each_text(vec![Value::Json("[1]".into())]).unwrap_err();
+        assert_eq!(err.to_string(), "cannot deconstruct an array as an object");
+    }
+
+    #[test]
+    fn test_json_each_text_scalar_error_pg_parity() {
+        let err = json_each_text(vec![Value::Json("1".into())]).unwrap_err();
+        assert_eq!(err.to_string(), "cannot deconstruct a scalar");
+    }
+
+    #[test]
+    fn test_jsonb_each_array_error_pg_parity() {
+        let err = jsonb_each(vec![Value::Jsonb("[1]".into())]).unwrap_err();
+        assert_eq!(err.to_string(), "cannot call jsonb_each on a non-object");
+    }
+
+    #[test]
+    fn test_jsonb_each_scalar_error_pg_parity() {
+        let err = jsonb_each(vec![Value::Jsonb("1".into())]).unwrap_err();
+        assert_eq!(err.to_string(), "cannot call jsonb_each on a non-object");
+    }
+
+    #[test]
+    fn test_jsonb_each_text_array_error_pg_parity() {
+        let err = jsonb_each_text(vec![Value::Jsonb("[1]".into())]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "cannot call jsonb_each_text on a non-object"
+        );
+    }
+
+    #[test]
+    fn test_jsonb_each_text_scalar_error_pg_parity() {
+        let err = jsonb_each_text(vec![Value::Jsonb("1".into())]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "cannot call jsonb_each_text on a non-object"
+        );
     }
 
     #[test]

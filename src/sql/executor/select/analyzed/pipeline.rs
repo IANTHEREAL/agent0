@@ -859,7 +859,14 @@ fn json_table_function_rows(
                     .map(|k| Row::new(vec![Value::Text(k)]))
                     .collect())
             }
-            _ => Err(anyhow!("cannot call jsonb_object_keys on a non-object")),
+            serde_json::Value::Array(_) => Err(anyhow!(
+                "cannot call {} on an array",
+                func_upper.to_lowercase()
+            )),
+            _ => Err(anyhow!(
+                "cannot call {} on a scalar",
+                func_upper.to_lowercase()
+            )),
         },
         "JSONB_ARRAY_ELEMENTS" | "JSON_ARRAY_ELEMENTS" => match json_val {
             serde_json::Value::Array(arr) => Ok(arr

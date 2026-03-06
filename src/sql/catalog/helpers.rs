@@ -139,6 +139,19 @@ pub fn int_array_col(name: &str) -> ColumnDef {
     }
 }
 
+pub fn timestamptz_col(name: &str) -> ColumnDef {
+    ColumnDef {
+        name: name.to_string(),
+        data_type: DataType::TimestampTz,
+        nullable: true,
+        primary_key: false,
+        unique: false,
+        is_serial: false,
+        default_expr: None,
+        collation: None,
+    }
+}
+
 pub fn text_array_col(name: &str) -> ColumnDef {
     ColumnDef {
         name: name.to_string(),

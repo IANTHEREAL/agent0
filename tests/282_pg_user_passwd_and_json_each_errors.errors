@@ -1,0 +1,10 @@
+cannot call jsonb_each_text on a non-object
+cannot deconstruct an array as an object
+cannot call jsonb_each on a non-object
+cannot deconstruct an array as an object
+cannot call jsonb_each_text on a non-object
+cannot deconstruct an array as an object
+cannot call jsonb_each on a non-object
+cannot deconstruct a scalar
+cannot call jsonb_each_text on a non-object
+cannot deconstruct a scalar

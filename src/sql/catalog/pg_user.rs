@@ -1,4 +1,6 @@
-use super::helpers::{bool_col, int_col, int_val, null_val, text_array_col, text_col, text_val};
+use super::helpers::{
+    bool_col, int_col, int_val, null_val, text_array_col, text_col, text_val, timestamptz_col,
+};
 use super::{ScanContext, VirtualTable};
 use crate::auth::AuthManager;
 use crate::model::{Row, TableSchema, Value};
@@ -31,7 +33,7 @@ impl VirtualTable for PgUser {
                 bool_col("userepl"),
                 bool_col("usebypassrls"),
                 text_col("passwd"),
-                text_col("valuntil"),
+                timestamptz_col("valuntil"),
                 text_array_col("useconfig"),
             ],
             version: 1,
@@ -75,7 +77,7 @@ impl VirtualTable for PgUser {
                 Value::Boolean(is_superuser),
                 Value::Boolean(false),
                 Value::Boolean(false),
-                null_val(),
+                text_val("********"),
                 null_val(),
                 useconfig,
             ])

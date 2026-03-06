@@ -169,6 +169,7 @@ tests/101_server_introspection.sql
 tests/222_ddl_export.sql
 tests/197_sql_keys.sql
 tests/272_to_regtype_timetz.sql
+tests/282_pg_user_passwd_and_json_each_errors.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py
