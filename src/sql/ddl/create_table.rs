@@ -1,6 +1,7 @@
 //! CREATE TABLE, CREATE TABLE AS (CTAS), SELECT INTO, and relation-name
 //! availability checking.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -89,6 +90,7 @@ pub async fn execute_create_table(
         .collect();
 
     let mut foreign_keys: Vec<ForeignKeyConstraint> = Vec::new();
+    let mut fk_name_is_user_specified: Vec<bool> = Vec::new();
     let mut col_defs = Vec::new();
     for col in columns {
         let col_name = normalize_ident(&col.name);
@@ -160,7 +162,10 @@ pub async fn execute_create_table(
                     };
                     let ref_cols: Vec<String> =
                         referred_columns.iter().map(normalize_ident).collect();
-                    let fk_name = format!("{}_{}_fkey", table_object_name, col_name);
+                    let explicit_fk_name = opt.name.as_ref().map(normalize_ident);
+                    let fk_name = explicit_fk_name
+                        .clone()
+                        .unwrap_or_else(|| format!("{}_{}_fkey", table_object_name, col_name));
 
                     if ref_table != table_full_name {
                         let ref_table_schema = store
@@ -195,6 +200,7 @@ pub async fn execute_create_table(
                         on_delete: parse_referential_action(on_delete),
                         on_update: parse_referential_action(on_update),
                     });
+                    fk_name_is_user_specified.push(explicit_fk_name.is_some());
                 }
                 _ => {}
             }
@@ -329,9 +335,9 @@ pub async fn execute_create_table(
                     .full
                 };
                 let ref_cols: Vec<String> = referred_columns.iter().map(normalize_ident).collect();
-                let fk_name = name
-                    .as_ref()
-                    .map(|n| n.value.clone())
+                let explicit_fk_name = name.as_ref().map(normalize_ident);
+                let fk_name = explicit_fk_name
+                    .clone()
                     .unwrap_or_else(|| format!("{}_{}_fkey", table_object_name, fk_cols.join("_")));
 
                 if ref_table != table_full_name {
@@ -367,8 +373,37 @@ pub async fn execute_create_table(
                     on_delete: parse_referential_action(on_delete),
                     on_update: parse_referential_action(on_update),
                 });
+                fk_name_is_user_specified.push(explicit_fk_name.is_some());
             }
             _ => {}
+        }
+    }
+
+    let mut seen_fk_constraint_names: HashSet<String> = HashSet::new();
+    for (fk, is_user_specified) in foreign_keys
+        .iter_mut()
+        .zip(fk_name_is_user_specified.iter().copied())
+    {
+        if is_user_specified && !seen_fk_constraint_names.insert(fk.name.clone()) {
+            return Err(SqlError::DuplicateObject(format!(
+                "constraint \"{}\" for relation \"{}\" already exists",
+                fk.name, table_object_name
+            ))
+            .into());
+        }
+        if is_user_specified || seen_fk_constraint_names.insert(fk.name.clone()) {
+            continue;
+        }
+
+        let base_name = fk.name.clone();
+        let mut suffix = 1usize;
+        loop {
+            let candidate = format!("{base_name}{suffix}");
+            if seen_fk_constraint_names.insert(candidate.clone()) {
+                fk.name = candidate;
+                break;
+            }
+            suffix += 1;
         }
     }
 
