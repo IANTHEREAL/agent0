@@ -179,6 +179,8 @@ tests/296_table_relation_shorthand.sql
 tests/298_named_arg_ordering.sql
 # #1582 – setval() out-of-range error includes (min..max) suffix
 tests/296_setval_out_of_range.sql
+# #1581 / #1508 – COPY FROM STDIN WITH CSV HEADER
+tests/288_copy_csv_header.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py
@@ -189,8 +191,6 @@ orm-tests/pg-client/
 orm-tests/typeorm/connection.test.ts
 orm-tests/typeorm/transaction.test.ts
 orm-tests/typeorm/schema.test.ts
-# #1508 – COPY FROM STDIN WITH CSV HEADER
-tests/288_copy_csv_header.sql
 
 # #1583 – ORDER BY DESC default NULL placement (NULLS FIRST)
 tests/295_order_by_null_placement.sql
