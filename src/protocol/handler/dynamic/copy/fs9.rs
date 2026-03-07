@@ -358,6 +358,7 @@ impl DynamicPgHandler {
                         &column_types,
                         line_no,
                         line.as_bytes(),
+                        &copy_opts,
                     )?;
                     rows.push(col_values);
                 }

@@ -342,15 +342,16 @@ impl DynamicPgHandler {
         &self,
         query: &'a str,
     ) -> PgWireResult<Option<Vec<Response<'a>>>> {
-        let Some((table_name, columns, header)) = DynamicPgHandler::parse_copy_command(query)
-            .map_err(|e| PgWireError::UserError(Box::new(e)))?
+        let Some((table_name, columns, copy_options)) =
+            DynamicPgHandler::parse_copy_command_with_options(query)
+                .map_err(|e| PgWireError::UserError(Box::new(e)))?
         else {
             return Ok(None);
         };
 
         debug!(
-            "COPY FROM STDIN: table={}, columns={:?}",
-            table_name, columns
+            "COPY FROM STDIN: table={}, columns={:?}, format={:?}",
+            table_name, columns, copy_options.format
         );
 
         let state = self.auth();
@@ -586,7 +587,7 @@ impl DynamicPgHandler {
             row_count: 0,
             started_txn,
             reached_end_marker: false,
-            header,
+            copy_options,
             header_skipped: false,
             pending_self_fk_keys: std::collections::HashMap::new(),
             deferred_self_fk_checks: Vec::new(),

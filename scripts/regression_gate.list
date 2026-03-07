@@ -181,3 +181,5 @@ orm-tests/typeorm/connection.test.ts
 orm-tests/typeorm/transaction.test.ts
 orm-tests/typeorm/schema.test.ts# 1509: docs-only fix (Parquet COPY syntax), covered by existing 242_parquet_error_paths
 tests/242_parquet_error_paths.sql
+# #1508 – COPY FROM STDIN WITH CSV HEADER
+tests/288_copy_csv_header.sql

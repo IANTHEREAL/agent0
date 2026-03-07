@@ -2109,6 +2109,7 @@ fn test_parse_copy_command_sqlparser_semantics_after_stdin() {
         r#"COPY "t" FROM STDIN WITH garbage"#,
         r#"COPY t FROM STDIN WITH (;"#,
         r#"COPY t FROM STDIN WITH (FORMAT csv HEADER)"#,
+        r#"COPY t FROM STDIN HEADER WITH (FORMAT csv)"#,
         r#"COPY t FROM STDIN WITH (FORMAT csv,)"#,
         "COPY t FROM STDIN WITH/*unterminated",
     ] {

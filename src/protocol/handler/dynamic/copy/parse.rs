@@ -5,10 +5,13 @@ use super::super::super::errors::error_info;
 use super::super::super::query_parser::strip_leading_whitespace_and_comments;
 use super::super::DynamicPgHandler;
 use pgwire::error::ErrorInfo;
-use sqlparser::ast::{CopySource, CopyTarget, Ident, Statement};
+use sqlparser::ast::{
+    CopyLegacyCsvOption, CopyLegacyOption, CopyOption, CopySource, CopyTarget, Ident, Statement,
+};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+use std::collections::HashSet;
 
 impl DynamicPgHandler {
     /// Parse a COPY FROM STDIN command.
@@ -16,19 +19,56 @@ impl DynamicPgHandler {
     /// not a COPY FROM STDIN.  The `header` flag is `true` when the HEADER
     /// option is present, indicating the first data line must be skipped.
     #[allow(clippy::result_large_err)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::protocol::handler) fn parse_copy_command(
         query: &str,
     ) -> Result<Option<(String, Vec<String>, bool)>, ErrorInfo> {
         // Keep COPY FROM STDIN semantics in one parser implementation.
-        Self::parse_copy_from_stdin_via_sqlparser(query)
+        Self::parse_copy_command_with_options(query)
+            .map(|opt| opt.map(|(table, columns, copy_opts)| (table, columns, copy_opts.header)))
+    }
+
+    /// Parse a COPY FROM STDIN command.
+    /// Returns `(table_name, columns, copy_opts)` or `Ok(None)` if the query is
+    /// not a COPY FROM STDIN.
+    #[allow(clippy::result_large_err)]
+    pub(in crate::protocol::handler) fn parse_copy_command_with_options(
+        query: &str,
+    ) -> Result<
+        Option<(
+            String,
+            Vec<String>,
+            crate::protocol::copy_format::CopyOptions,
+        )>,
+        ErrorInfo,
+    > {
+        Self::parse_copy_from_stdin_via_sqlparser_with_options(query)
     }
 
     /// Parse COPY FROM STDIN using sqlparser.
     /// Returns `(table_name, columns, header)` or `Ok(None)` if the query is not a COPY FROM STDIN.
     #[allow(clippy::result_large_err)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::protocol::handler) fn parse_copy_from_stdin_via_sqlparser(
         query: &str,
     ) -> Result<Option<(String, Vec<String>, bool)>, ErrorInfo> {
+        Self::parse_copy_from_stdin_via_sqlparser_with_options(query)
+            .map(|opt| opt.map(|(table, columns, copy_opts)| (table, columns, copy_opts.header)))
+    }
+
+    /// Parse COPY FROM STDIN using sqlparser.
+    /// Returns `(table_name, columns, copy_opts)` or `Ok(None)` if the query is not a COPY FROM STDIN.
+    #[allow(clippy::result_large_err)]
+    pub(in crate::protocol::handler) fn parse_copy_from_stdin_via_sqlparser_with_options(
+        query: &str,
+    ) -> Result<
+        Option<(
+            String,
+            Vec<String>,
+            crate::protocol::copy_format::CopyOptions,
+        )>,
+        ErrorInfo,
+    > {
         let Some(query_trimmed) = strip_leading_whitespace_and_comments(query) else {
             return Ok(None);
         };
@@ -58,23 +98,12 @@ impl DynamicPgHandler {
         let stmts = match Parser::parse_sql(&dialect, &query_with_semi) {
             Ok(stmts) => stmts,
             Err(first_err) => {
-                // sqlparser 0.40 doesn't support bare `HEADER` after STDIN
-                // (PG 17 does). Normalize `HEADER` → `CSV HEADER` and retry.
-                if let Some(normalized) = Self::normalize_bare_header_after_stdin(&query_with_semi)
+                if let Some(parsed) =
+                    parse_copy_from_stdin_with_legacy_header_fallback(&query_with_semi)?
                 {
-                    // Reject duplicate HEADER: PG 17.7 returns 42601
-                    // "conflicting or redundant options".
-                    if has_duplicate_header_after_stdin(&query_with_semi) {
-                        return Err(error_info(
-                            "42601",
-                            "conflicting or redundant options".to_string(),
-                        ));
-                    }
-                    Parser::parse_sql(&dialect, &normalized)
-                        .map_err(|_| error_info("42601", first_err.to_string()))?
-                } else {
-                    return Err(error_info("42601", first_err.to_string()));
+                    return Ok(Some(parsed));
                 }
+                return Err(error_info("42601", first_err.to_string()));
             }
         };
         let Some(stmt) = stmts.first() else {
@@ -97,6 +126,8 @@ impl DynamicPgHandler {
             return Ok(None);
         }
 
+        validate_copy_from_stdin_options(options, legacy_options)?;
+
         let CopySource::Table {
             table_name,
             columns,
@@ -105,105 +136,10 @@ impl DynamicPgHandler {
             return Ok(None);
         };
 
-        fn format_ident(ident: &Ident) -> String {
-            if ident.quote_style.is_some() {
-                let escaped = ident.value.replace('"', "\"\"");
-                format!("\"{}\"", escaped)
-            } else {
-                ident.value.clone()
-            }
-        }
-
-        let table_str = match table_name.0.as_slice() {
-            [table] => format_ident(table),
-            [schema, table] => format!("{}.{}", format_ident(schema), format_ident(table)),
-            _ => {
-                let canonical_name = table_name
-                    .0
-                    .iter()
-                    .map(|ident| {
-                        if ident.quote_style.is_some() {
-                            ident.value.clone()
-                        } else {
-                            ident.value.to_lowercase()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(".");
-                return Err(error_info(
-                    "0A000",
-                    format!(
-                        "cross-database references are not implemented: \"{}\"",
-                        canonical_name
-                    ),
-                ));
-            }
-        };
-
-        let col_strs: Vec<String> = columns.iter().map(format_ident).collect();
-
-        let header = options
-            .iter()
-            .any(|o| matches!(o, sqlparser::ast::CopyOption::Header(true)))
-            || legacy_options.iter().any(|o| {
-                matches!(
-                    o,
-                    sqlparser::ast::CopyLegacyOption::Csv(csv_opts)
-                        if csv_opts.iter().any(|c| matches!(c, sqlparser::ast::CopyLegacyCsvOption::Header))
-                )
-            });
-
-        Ok(Some((table_str, col_strs, header)))
-    }
-
-    /// Normalize bare `HEADER` option after `FROM STDIN` into `CSV HEADER` so
-    /// that sqlparser 0.40 can parse it. PostgreSQL 17 accepts `COPY t FROM
-    /// STDIN HEADER` as valid syntax, but sqlparser only recognises HEADER as a
-    /// sub-option of the `CSV` legacy keyword.
-    ///
-    /// Returns the rewritten query if bare HEADER was found, `None` otherwise.
-    fn normalize_bare_header_after_stdin(query: &str) -> Option<String> {
-        let upper = query.to_ascii_uppercase();
-        let stdin_kw = b"STDIN";
-        let mut search_from = 0;
-        loop {
-            let abs = find_keyword_outside_comments(upper.as_bytes(), stdin_kw, search_from)?;
-            // Accept whitespace or end-of-block-comment (`*/`) as a word
-            // boundary before STDIN.  `FROM/*c*/STDIN` ends the comment with
-            // `*/`, so the byte before STDIN is `/` preceded by `*`.
-            let is_word_boundary = upper.as_bytes()[abs - 1].is_ascii_whitespace()
-                || (abs >= 2
-                    && upper.as_bytes()[abs - 2] == b'*'
-                    && upper.as_bytes()[abs - 1] == b'/');
-            if abs == 0 || !is_word_boundary {
-                search_from = abs + stdin_kw.len();
-                continue;
-            }
-            let after_stdin = abs + stdin_kw.len();
-            // Skip whitespace AND SQL comments after STDIN.
-            let skip = skip_whitespace_and_comments(&upper[after_stdin..]);
-            let rest = &upper[after_stdin + skip..];
-            if let Some(rest_after_header) = rest.strip_prefix("HEADER") {
-                // Ensure HEADER is a full keyword (not e.g. "HEADERX").
-                let is_word_boundary = rest_after_header.is_empty()
-                    || rest_after_header.starts_with(';')
-                    || rest_after_header.starts_with(char::is_whitespace)
-                    || rest_after_header.starts_with('-') // -- comment
-                    || rest_after_header.starts_with('/'); // /* comment */
-                if is_word_boundary {
-                    // Insert "CSV " before "HEADER" in the original query.
-                    let header_offset =
-                        after_stdin + skip_whitespace_and_comments(&query[after_stdin..]);
-                    let mut result = String::with_capacity(query.len() + 4);
-                    result.push_str(&query[..header_offset]);
-                    result.push_str("CSV ");
-                    result.push_str(&query[header_offset..]);
-                    return Some(result);
-                }
-            }
-            search_from = abs + stdin_kw.len();
-            continue;
-        }
+        let table_str = format_copy_table_name(table_name.0.as_slice())?;
+        let col_strs: Vec<String> = columns.iter().map(format_copy_ident).collect();
+        let copy_opts = copy_options_from_parsed(options, legacy_options)?;
+        Ok(Some((table_str, col_strs, copy_opts)))
     }
 
     /// Returns `true` if the query ends with a `--` line comment that has no
@@ -350,174 +286,515 @@ impl DynamicPgHandler {
     }
 }
 
-/// Find the next occurrence of `keyword` at or after `start`, skipping over
-/// SQL comment bodies (`/* ... */` with nesting, `-- ...\n`), double-quoted
-/// identifiers (`"..."`), and single-quoted string literals (`'...'`).
-/// Returns the absolute byte offset, or `None` if not found.
-fn find_keyword_outside_comments(bytes: &[u8], keyword: &[u8], start: usize) -> Option<usize> {
-    let len = bytes.len();
-    let kw_len = keyword.len();
-    let mut i = start;
-    while i + kw_len <= len {
-        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            // Block comment — skip until closing */, handling nesting.
-            i += 2;
-            let mut depth = 1u32;
-            while i < len && depth > 0 {
-                if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                    depth += 1;
-                    i += 2;
-                } else if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-        } else if i + 1 < len && bytes[i] == b'-' && bytes[i + 1] == b'-' {
-            // Line comment — skip until newline.
-            i += 2;
-            while i < len && bytes[i] != b'\n' {
-                i += 1;
-            }
-            if i < len {
-                i += 1; // skip the newline
-            }
-        } else if bytes[i] == b'"' {
-            // Double-quoted identifier — skip until closing `"`, with `""` escape.
-            i += 1;
-            while i < len {
-                if bytes[i] == b'"' {
-                    i += 1;
-                    if i < len && bytes[i] == b'"' {
-                        i += 1; // escaped `""`, continue
-                    } else {
-                        break; // closing quote
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-        } else if bytes[i] == b'\'' {
-            // Single-quoted string literal — skip until closing `'`, with `''` escape.
-            i += 1;
-            while i < len {
-                if bytes[i] == b'\'' {
-                    i += 1;
-                    if i < len && bytes[i] == b'\'' {
-                        i += 1; // escaped `''`, continue
-                    } else {
-                        break; // closing quote
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-        } else if bytes[i..i + kw_len] == *keyword {
-            return Some(i);
-        } else {
-            i += 1;
-        }
+fn format_copy_ident(ident: &Ident) -> String {
+    if ident.quote_style.is_some() {
+        let escaped = ident.value.replace('"', "\"\"");
+        format!("\"{}\"", escaped)
+    } else {
+        ident.value.clone()
     }
-    None
 }
 
-/// Return the number of leading bytes that are whitespace or SQL comments.
-/// Handles `/* ... */` block comments (with nesting) and `-- ...` line comments.
-fn skip_whitespace_and_comments(s: &str) -> usize {
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    while i < len {
-        if bytes[i].is_ascii_whitespace() {
-            i += 1;
-        } else if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            // Block comment — may be nested (PG supports nested block comments).
-            i += 2;
-            let mut depth = 1u32;
-            while i < len && depth > 0 {
-                if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                    depth += 1;
-                    i += 2;
-                } else if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
+#[allow(clippy::result_large_err)]
+fn format_copy_table_name(parts: &[Ident]) -> Result<String, ErrorInfo> {
+    match parts {
+        [table] => Ok(format_copy_ident(table)),
+        [schema, table] => Ok(format!(
+            "{}.{}",
+            format_copy_ident(schema),
+            format_copy_ident(table)
+        )),
+        _ => {
+            let canonical_name = parts
+                .iter()
+                .map(|ident| {
+                    if ident.quote_style.is_some() {
+                        ident.value.clone()
+                    } else {
+                        ident.value.to_lowercase()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(".");
+            Err(error_info(
+                "0A000",
+                format!(
+                    "cross-database references are not implemented: \"{}\"",
+                    canonical_name
+                ),
+            ))
+        }
+    }
+}
+
+fn token_is_unquoted_keyword(token: Option<&Token>, keyword: &str) -> bool {
+    matches!(
+        token,
+        Some(Token::Word(word))
+            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(keyword)
+    )
+}
+
+fn syntax_error_at_or_near_token(token: &Token) -> ErrorInfo {
+    error_info("42601", format!("syntax error at or near \"{}\"", token))
+}
+
+fn consume_optional_as(tokens: &[Token], idx: &mut usize) {
+    if token_is_unquoted_keyword(tokens.get(*idx), "AS") {
+        *idx += 1;
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_legacy_copy_option_string(tokens: &[Token], idx: &mut usize) -> Result<String, ErrorInfo> {
+    let Some(token) = tokens.get(*idx) else {
+        return Err(error_info("42601", "syntax error at end of input"));
+    };
+    match token {
+        Token::SingleQuotedString(s)
+        | Token::EscapedStringLiteral(s)
+        | Token::NationalStringLiteral(s) => {
+            *idx += 1;
+            Ok(s.clone())
+        }
+        _ => Err(syntax_error_at_or_near_token(token)),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_legacy_copy_char_option(
+    tokens: &[Token],
+    idx: &mut usize,
+    option_name: &str,
+) -> Result<u8, ErrorInfo> {
+    let raw = parse_legacy_copy_option_string(tokens, idx)?;
+    let mut chars = raw.chars();
+    let Some(c) = chars.next() else {
+        return Err(error_info(
+            "0A000",
+            format!(
+                "COPY {} must be a single one-byte character, got: '{}'",
+                option_name, raw
+            ),
+        ));
+    };
+    if chars.next().is_some() || !c.is_ascii() {
+        return Err(error_info(
+            "0A000",
+            format!(
+                "COPY {} must be a single one-byte character, got: '{}'",
+                option_name, raw
+            ),
+        ));
+    }
+    Ok(c as u8)
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_copy_from_stdin_with_legacy_header_fallback(
+    query: &str,
+) -> Result<
+    Option<(
+        String,
+        Vec<String>,
+        crate::protocol::copy_format::CopyOptions,
+    )>,
+    ErrorInfo,
+> {
+    use crate::protocol::copy_format::{CopyFormat, CopyOptions};
+
+    let dialect = PostgreSqlDialect {};
+    let tokens = Tokenizer::new(&dialect, query)
+        .tokenize()
+        .map_err(|e| error_info("42601", e.to_string()))?;
+    let tokens = tokens
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    let mut idx = 0usize;
+
+    if !token_is_unquoted_keyword(tokens.get(idx), "COPY") {
+        return Ok(None);
+    }
+    idx += 1;
+
+    let Some(Token::Word(first_table)) = tokens.get(idx) else {
+        return Ok(None);
+    };
+    let mut table_parts = vec![Ident {
+        value: first_table.value.clone(),
+        quote_style: first_table.quote_style,
+    }];
+    idx += 1;
+
+    while matches!(tokens.get(idx), Some(Token::Period)) {
+        idx += 1;
+        let Some(Token::Word(next_part)) = tokens.get(idx) else {
+            let Some(tok) = tokens.get(idx.saturating_sub(1)) else {
+                return Err(error_info("42601", "syntax error at end of input"));
+            };
+            return Err(syntax_error_at_or_near_token(tok));
+        };
+        table_parts.push(Ident {
+            value: next_part.value.clone(),
+            quote_style: next_part.quote_style,
+        });
+        idx += 1;
+    }
+
+    let mut columns: Vec<String> = Vec::new();
+    if matches!(tokens.get(idx), Some(Token::LParen)) {
+        idx += 1;
+        loop {
+            let Some(token) = tokens.get(idx) else {
+                return Err(error_info("42601", "syntax error at end of input"));
+            };
+            let Token::Word(col_word) = token else {
+                return Err(syntax_error_at_or_near_token(token));
+            };
+            columns.push(format_copy_ident(&Ident {
+                value: col_word.value.clone(),
+                quote_style: col_word.quote_style,
+            }));
+            idx += 1;
+            match tokens.get(idx) {
+                Some(Token::Comma) => {
+                    idx += 1;
                 }
+                Some(Token::RParen) => {
+                    idx += 1;
+                    break;
+                }
+                Some(tok) => return Err(syntax_error_at_or_near_token(tok)),
+                None => return Err(error_info("42601", "syntax error at end of input")),
             }
-        } else if i + 1 < len && bytes[i] == b'-' && bytes[i + 1] == b'-' {
-            // Line comment — skip until newline.
-            i += 2;
-            while i < len && bytes[i] != b'\n' {
-                i += 1;
-            }
-        } else {
+        }
+    }
+
+    if !token_is_unquoted_keyword(tokens.get(idx), "FROM") {
+        return Ok(None);
+    }
+    idx += 1;
+    if !token_is_unquoted_keyword(tokens.get(idx), "STDIN") {
+        return Ok(None);
+    }
+    idx += 1;
+
+    let mut copy_opts = CopyOptions::default();
+    let mut delimiter_set = false;
+    let mut null_string_set = false;
+    let mut seen_legacy: HashSet<CopyOptionKind> = HashSet::new();
+    let mut saw_any_legacy = false;
+    let mut saw_header = false;
+
+    if token_is_unquoted_keyword(tokens.get(idx), "WITH") {
+        idx += 1;
+        if matches!(tokens.get(idx), Some(Token::LParen)) {
+            // Parenthesized WITH (...) options are handled by sqlparser itself.
+            return Ok(None);
+        }
+    }
+
+    while idx < tokens.len() {
+        if matches!(tokens.get(idx), Some(Token::SemiColon)) {
+            idx += 1;
             break;
         }
+        let Some(token) = tokens.get(idx) else {
+            break;
+        };
+        let Token::Word(word) = token else {
+            return Err(syntax_error_at_or_near_token(token));
+        };
+        if word.quote_style.is_some() {
+            return Err(syntax_error_at_or_near_token(token));
+        }
+
+        let keyword = word.value.to_ascii_uppercase();
+        if keyword == "WITH" {
+            // Mixed old/new COPY options syntax, e.g. HEADER WITH (...).
+            return Err(error_info("42601", "syntax error at or near \"WITH\""));
+        }
+
+        saw_any_legacy = true;
+        match keyword.as_str() {
+            "HEADER" => {
+                if !seen_legacy.insert(CopyOptionKind::Header) {
+                    return Err(copy_conflicting_or_redundant_options_error());
+                }
+                copy_opts.header = true;
+                saw_header = true;
+                idx += 1;
+            }
+            "CSV" => {
+                if !seen_legacy.insert(CopyOptionKind::Csv) {
+                    return Err(copy_conflicting_or_redundant_options_error());
+                }
+                copy_opts.format = CopyFormat::Csv;
+                idx += 1;
+            }
+            "DELIMITER" => {
+                if !seen_legacy.insert(CopyOptionKind::Delimiter) {
+                    return Err(copy_conflicting_or_redundant_options_error());
+                }
+                idx += 1;
+                consume_optional_as(&tokens, &mut idx);
+                copy_opts.delimiter =
+                    parse_legacy_copy_char_option(&tokens, &mut idx, "delimiter")?;
+                delimiter_set = true;
+            }
+            "NULL" => {
+                if !seen_legacy.insert(CopyOptionKind::Null) {
+                    return Err(copy_conflicting_or_redundant_options_error());
+                }
+                idx += 1;
+                consume_optional_as(&tokens, &mut idx);
+                copy_opts.null_string = parse_legacy_copy_option_string(&tokens, &mut idx)?;
+                null_string_set = true;
+            }
+            "QUOTE" => {
+                if !seen_legacy.insert(CopyOptionKind::Quote) {
+                    return Err(copy_conflicting_or_redundant_options_error());
+                }
+                idx += 1;
+                consume_optional_as(&tokens, &mut idx);
+                copy_opts.quote = parse_legacy_copy_char_option(&tokens, &mut idx, "quote")?;
+            }
+            "ESCAPE" => {
+                if !seen_legacy.insert(CopyOptionKind::Escape) {
+                    return Err(copy_conflicting_or_redundant_options_error());
+                }
+                idx += 1;
+                consume_optional_as(&tokens, &mut idx);
+                copy_opts.escape = parse_legacy_copy_char_option(&tokens, &mut idx, "escape")?;
+            }
+            "BINARY" => {
+                return Err(error_info("0A000", "COPY FORMAT binary is not supported"));
+            }
+            _ => return Err(syntax_error_at_or_near_token(token)),
+        }
     }
-    i
+
+    if idx < tokens.len() {
+        let Some(tok) = tokens.get(idx) else {
+            return Err(error_info("42601", "syntax error at end of input"));
+        };
+        return Err(syntax_error_at_or_near_token(tok));
+    }
+
+    if !saw_any_legacy || !saw_header {
+        return Ok(None);
+    }
+
+    if copy_opts.format == CopyFormat::Csv {
+        if !delimiter_set {
+            copy_opts.delimiter = b',';
+        }
+        if !null_string_set {
+            copy_opts.null_string.clear();
+        }
+    }
+
+    let table_name = format_copy_table_name(&table_parts)?;
+    Ok(Some((table_name, columns, copy_opts)))
 }
 
-/// Returns `true` if the options region after `FROM STDIN` contains the keyword
-/// `HEADER` more than once, indicating a duplicate/conflicting option.
-///
-/// The scan is anchored to start **after** the `FROM STDIN` clause so that
-/// column names (e.g. `header`) and table names (e.g. `stdin_log`) in the
-/// column list do not participate in the duplicate count.
-fn has_duplicate_header_after_stdin(query: &str) -> bool {
-    let upper = query.to_ascii_uppercase();
-    let bytes = upper.as_bytes();
-    let header_kw = b"HEADER";
-    let from_kw = b"FROM";
-    let stdin_kw = b"STDIN";
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CopyOptionKind {
+    Format,
+    Freeze,
+    Delimiter,
+    Null,
+    Header,
+    Quote,
+    Escape,
+    ForceQuote,
+    ForceNotNull,
+    ForceNull,
+    Encoding,
+    Binary,
+    Csv,
+}
 
-    // Locate `FROM STDIN` with word boundaries on both keywords.
-    let mut from_search = 0;
-    let search_start = loop {
-        let Some(from_pos) = find_keyword_outside_comments(bytes, from_kw, from_search) else {
-            return false;
-        };
-        // Word-boundary check on FROM.
-        let fb = from_pos == 0
-            || (!bytes[from_pos - 1].is_ascii_alphanumeric() && bytes[from_pos - 1] != b'_');
-        let fa_end = from_pos + from_kw.len();
-        let fa = fa_end >= bytes.len()
-            || (!bytes[fa_end].is_ascii_alphanumeric() && bytes[fa_end] != b'_');
-        if fb && fa {
-            // Skip whitespace / comments between FROM and STDIN.
-            let gap = skip_whitespace_and_comments(&upper[fa_end..]);
-            let stdin_start = fa_end + gap;
-            if stdin_start + stdin_kw.len() <= bytes.len()
-                && bytes[stdin_start..stdin_start + stdin_kw.len()] == *stdin_kw
-            {
-                let sa_end = stdin_start + stdin_kw.len();
-                let sa = sa_end >= bytes.len()
-                    || (!bytes[sa_end].is_ascii_alphanumeric() && bytes[sa_end] != b'_');
-                if sa {
-                    break sa_end;
+fn modern_option_kind(opt: &CopyOption) -> CopyOptionKind {
+    match opt {
+        CopyOption::Format(_) => CopyOptionKind::Format,
+        CopyOption::Freeze(_) => CopyOptionKind::Freeze,
+        CopyOption::Delimiter(_) => CopyOptionKind::Delimiter,
+        CopyOption::Null(_) => CopyOptionKind::Null,
+        CopyOption::Header(_) => CopyOptionKind::Header,
+        CopyOption::Quote(_) => CopyOptionKind::Quote,
+        CopyOption::Escape(_) => CopyOptionKind::Escape,
+        CopyOption::ForceQuote(_) => CopyOptionKind::ForceQuote,
+        CopyOption::ForceNotNull(_) => CopyOptionKind::ForceNotNull,
+        CopyOption::ForceNull(_) => CopyOptionKind::ForceNull,
+        CopyOption::Encoding(_) => CopyOptionKind::Encoding,
+    }
+}
+
+fn legacy_option_kind(opt: &CopyLegacyOption) -> CopyOptionKind {
+    match opt {
+        CopyLegacyOption::Binary => CopyOptionKind::Binary,
+        CopyLegacyOption::Delimiter(_) => CopyOptionKind::Delimiter,
+        CopyLegacyOption::Null(_) => CopyOptionKind::Null,
+        CopyLegacyOption::Csv(_) => CopyOptionKind::Csv,
+    }
+}
+
+fn legacy_csv_option_kind(opt: &CopyLegacyCsvOption) -> CopyOptionKind {
+    match opt {
+        CopyLegacyCsvOption::Header => CopyOptionKind::Header,
+        CopyLegacyCsvOption::Quote(_) => CopyOptionKind::Quote,
+        CopyLegacyCsvOption::Escape(_) => CopyOptionKind::Escape,
+        CopyLegacyCsvOption::ForceQuote(_) => CopyOptionKind::ForceQuote,
+        CopyLegacyCsvOption::ForceNotNull(_) => CopyOptionKind::ForceNotNull,
+    }
+}
+
+fn copy_conflicting_or_redundant_options_error() -> ErrorInfo {
+    error_info("42601", "conflicting or redundant options")
+}
+
+fn has_duplicate_copy_options(options: &[CopyOption]) -> bool {
+    let mut seen: HashSet<CopyOptionKind> = HashSet::new();
+    options
+        .iter()
+        .any(|opt| !seen.insert(modern_option_kind(opt)))
+}
+
+fn has_duplicate_copy_legacy_options(legacy_options: &[CopyLegacyOption]) -> bool {
+    let mut seen_legacy: HashSet<CopyOptionKind> = HashSet::new();
+    for opt in legacy_options {
+        let key = legacy_option_kind(opt);
+        if !seen_legacy.insert(key) {
+            return true;
+        }
+        if let CopyLegacyOption::Csv(csv_opts) = opt {
+            let mut seen_csv: HashSet<CopyOptionKind> = HashSet::new();
+            for csv_opt in csv_opts {
+                if !seen_csv.insert(legacy_csv_option_kind(csv_opt)) {
+                    return true;
                 }
             }
         }
-        from_search = from_pos + from_kw.len();
-    };
-    let mut search_from = search_start;
-    let mut count = 0u32;
-    while let Some(pos) = find_keyword_outside_comments(bytes, header_kw, search_from) {
-        let before_ok =
-            pos == 0 || (!bytes[pos - 1].is_ascii_alphanumeric() && bytes[pos - 1] != b'_');
-        let after_end = pos + header_kw.len();
-        let after_ok = after_end >= bytes.len()
-            || (!bytes[after_end].is_ascii_alphanumeric() && bytes[after_end] != b'_');
-        if before_ok && after_ok {
-            count += 1;
-            if count >= 2 {
-                return true;
-            }
-        }
-        search_from = pos + header_kw.len();
     }
     false
+}
+
+fn mixed_modern_legacy_copy_options_syntax_error(legacy_options: &[CopyLegacyOption]) -> ErrorInfo {
+    let near = match legacy_options.first() {
+        Some(CopyLegacyOption::Binary) => "BINARY",
+        Some(CopyLegacyOption::Delimiter(_)) => "DELIMITER",
+        Some(CopyLegacyOption::Null(_)) => "NULL",
+        Some(CopyLegacyOption::Csv(_)) => "CSV",
+        None => "COPY",
+    };
+    error_info("42601", format!("syntax error at or near \"{near}\""))
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_copy_from_stdin_options(
+    options: &[CopyOption],
+    legacy_options: &[CopyLegacyOption],
+) -> Result<(), ErrorInfo> {
+    if !options.is_empty() && !legacy_options.is_empty() {
+        return Err(mixed_modern_legacy_copy_options_syntax_error(
+            legacy_options,
+        ));
+    }
+    if has_duplicate_copy_options(options) || has_duplicate_copy_legacy_options(legacy_options) {
+        return Err(copy_conflicting_or_redundant_options_error());
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn copy_options_from_parsed(
+    options: &[CopyOption],
+    legacy_options: &[CopyLegacyOption],
+) -> Result<crate::protocol::copy_format::CopyOptions, ErrorInfo> {
+    if !options.is_empty() {
+        return crate::protocol::copy_format::CopyOptions::from_copy_options(options)
+            .map_err(|e| error_info("0A000", e));
+    }
+
+    use crate::protocol::copy_format::{CopyFormat, CopyOptions};
+
+    let mut copy_opts = CopyOptions::default();
+    let mut delimiter_set = false;
+    let mut null_string_set = false;
+
+    for opt in legacy_options {
+        match opt {
+            CopyLegacyOption::Binary => {
+                return Err(error_info("0A000", "COPY FORMAT binary is not supported"));
+            }
+            CopyLegacyOption::Delimiter(c) => {
+                if !c.is_ascii() {
+                    return Err(error_info(
+                        "0A000",
+                        format!(
+                            "COPY delimiter must be a single one-byte character, got: '{}'",
+                            c
+                        ),
+                    ));
+                }
+                copy_opts.delimiter = *c as u8;
+                delimiter_set = true;
+            }
+            CopyLegacyOption::Null(s) => {
+                copy_opts.null_string = s.clone();
+                null_string_set = true;
+            }
+            CopyLegacyOption::Csv(csv_opts) => {
+                copy_opts.format = CopyFormat::Csv;
+                for csv_opt in csv_opts {
+                    match csv_opt {
+                        CopyLegacyCsvOption::Header => {
+                            copy_opts.header = true;
+                        }
+                        CopyLegacyCsvOption::Quote(c) => {
+                            if !c.is_ascii() {
+                                return Err(error_info(
+                                    "0A000",
+                                    format!(
+                                        "COPY quote must be a single one-byte character, got: '{}'",
+                                        c
+                                    ),
+                                ));
+                            }
+                            copy_opts.quote = *c as u8;
+                        }
+                        CopyLegacyCsvOption::Escape(c) => {
+                            if !c.is_ascii() {
+                                return Err(error_info(
+                                    "0A000",
+                                    format!(
+                                        "COPY escape must be a single one-byte character, got: '{}'",
+                                        c
+                                    ),
+                                ));
+                            }
+                            copy_opts.escape = *c as u8;
+                        }
+                        CopyLegacyCsvOption::ForceQuote(_)
+                        | CopyLegacyCsvOption::ForceNotNull(_) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    if copy_opts.format == CopyFormat::Csv {
+        if !delimiter_set {
+            copy_opts.delimiter = b',';
+        }
+        if !null_string_set {
+            copy_opts.null_string.clear();
+        }
+    }
+
+    Ok(copy_opts)
 }
 
 #[cfg(test)]
@@ -525,69 +802,79 @@ mod tests {
     use super::*;
 
     #[test]
-    fn find_keyword_skips_double_quoted_identifier() {
-        // "STDIN" inside a double-quoted identifier must be ignored.
-        let input = b"COPY \"x STDIN y\" FROM STDIN;";
-        let upper: Vec<u8> = input.iter().map(|b| b.to_ascii_uppercase()).collect();
-        let result = find_keyword_outside_comments(&upper, b"STDIN", 0);
-        // Should find the bare STDIN after FROM, not the one inside quotes.
-        let expected = upper.windows(5).rposition(|w| w == b"STDIN").unwrap();
-        assert_eq!(result, Some(expected));
-    }
-
-    #[test]
-    fn find_keyword_skips_single_quoted_string() {
-        let input = b"COPY t FROM 'STDIN' STDIN;";
-        let upper: Vec<u8> = input.iter().map(|b| b.to_ascii_uppercase()).collect();
-        let result = find_keyword_outside_comments(&upper, b"STDIN", 0);
-        let expected = upper.windows(5).rposition(|w| w == b"STDIN").unwrap();
-        assert_eq!(result, Some(expected));
-    }
-
-    #[test]
-    fn find_keyword_skips_escaped_quotes() {
-        // Double-quoted identifier with escaped `""` inside.
-        let input = b"COPY \"a\"\"STDIN\" FROM STDIN;";
-        let upper: Vec<u8> = input.iter().map(|b| b.to_ascii_uppercase()).collect();
-        let result = find_keyword_outside_comments(&upper, b"STDIN", 0);
-        let expected = upper.windows(5).rposition(|w| w == b"STDIN").unwrap();
-        assert_eq!(result, Some(expected));
-    }
-
-    #[test]
-    fn no_false_duplicate_header_with_header_column_name() {
-        // `COPY stdin_log (header) FROM STDIN HEADER;` — column name `header`
-        // and table name `stdin_log` must NOT cause a false duplicate rejection.
-        let query = "COPY stdin_log (header) FROM STDIN HEADER;";
+    fn legacy_header_mixed_with_parenthesized_with_rejected() {
+        let err =
+            DynamicPgHandler::parse_copy_command("COPY t FROM STDIN HEADER WITH (FORMAT csv)")
+                .unwrap_err();
+        assert_eq!(err.code, "42601");
         assert!(
-            !has_duplicate_header_after_stdin(query),
-            "should NOT detect duplicate HEADER when 'header' is a column name"
+            err.message.contains("syntax error"),
+            "unexpected message: {}",
+            err.message
         );
     }
 
     #[test]
-    fn duplicate_header_still_rejected() {
-        // Genuine duplicate must still be caught.
-        let query = "COPY t FROM STDIN HEADER HEADER;";
-        assert!(
-            has_duplicate_header_after_stdin(query),
-            "should detect genuine duplicate HEADER"
-        );
+    fn bare_header_keeps_text_format() {
+        let (_, _, opts) =
+            DynamicPgHandler::parse_copy_command_with_options("COPY t FROM STDIN HEADER")
+                .unwrap()
+                .expect("COPY should parse");
+        assert_eq!(opts.format, crate::protocol::copy_format::CopyFormat::Text);
+        assert!(opts.header);
+        assert_eq!(opts.delimiter, b'\t');
+        assert_eq!(opts.null_string, "\\N");
     }
 
     #[test]
-    fn normalize_skips_stdin_inside_quoted_table_name() {
-        // `COPY "x STDIN HEADER y" FROM STDIN HEADER;` — the normalizer must
-        // not match the STDIN inside the quoted identifier.
-        let query = r#"COPY "x STDIN HEADER y" FROM STDIN HEADER;"#;
-        let result =
-            DynamicPgHandler::normalize_bare_header_after_stdin(query).expect("should normalize");
-        // The HEADER after the real STDIN should be prefixed with CSV.
-        assert!(result.contains("CSV HEADER"), "got: {result}");
-        // The quoted identifier must remain untouched.
+    fn bare_header_with_delimiter_keeps_text_format() {
+        let (_, _, opts) = DynamicPgHandler::parse_copy_command_with_options(
+            "COPY t FROM STDIN HEADER DELIMITER '|'",
+        )
+        .unwrap()
+        .expect("COPY should parse");
+        assert_eq!(opts.format, crate::protocol::copy_format::CopyFormat::Text);
+        assert!(opts.header);
+        assert_eq!(opts.delimiter, b'|');
+    }
+
+    #[test]
+    fn bare_header_after_comments_is_accepted() {
+        let (_, _, opts) = DynamicPgHandler::parse_copy_command_with_options(
+            "COPY t /* ignored */ FROM STDIN -- options\nHEADER",
+        )
+        .unwrap()
+        .expect("COPY should parse");
+        assert!(opts.header);
+    }
+
+    #[test]
+    fn duplicate_modern_copy_options_rejected() {
+        for sql in [
+            "COPY t FROM STDIN WITH (FORMAT csv, FORMAT text)",
+            "COPY t FROM STDIN WITH (DELIMITER ',', DELIMITER '|')",
+            "COPY t FROM STDIN WITH (HEADER true, HEADER false)",
+        ] {
+            let err = DynamicPgHandler::parse_copy_from_stdin_via_sqlparser(sql).unwrap_err();
+            assert_eq!(err.code, "42601", "sql: {sql}");
+            assert_eq!(
+                err.message, "conflicting or redundant options",
+                "sql: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_modern_legacy_copy_options_rejected_as_syntax_error() {
+        let err = DynamicPgHandler::parse_copy_from_stdin_via_sqlparser(
+            "COPY t FROM STDIN WITH (FORMAT csv) CSV",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "42601");
         assert!(
-            result.contains(r#""x STDIN HEADER y""#),
-            "quoted ident modified: {result}"
+            err.message.contains("syntax error"),
+            "unexpected message: {}",
+            err.message
         );
     }
 }

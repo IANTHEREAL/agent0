@@ -34,7 +34,7 @@ use super::super::errors::{
 };
 use super::super::rollback_autocommit_or_mark_failed;
 
-use helpers::{copy_display_table_name, parse_copy_text_line, should_add_copy_insert_context};
+use helpers::{copy_display_table_name, parse_copy_input_line, should_add_copy_insert_context};
 
 #[async_trait]
 impl CopyHandler for DynamicPgHandler {
@@ -119,7 +119,7 @@ impl CopyHandler for DynamicPgHandler {
                     }
 
                     // HEADER option: skip the first data line (header row).
-                    if ctx.header && !ctx.header_skipped {
+                    if ctx.copy_options.header && !ctx.header_skipped {
                         ctx.header_skipped = true;
                         continue;
                     }
@@ -128,13 +128,14 @@ impl CopyHandler for DynamicPgHandler {
                         .row_count
                         .saturating_add(rows_to_insert.len())
                         .saturating_add(1);
-                    let col_values = parse_copy_text_line(
+                    let col_values = parse_copy_input_line(
                         executor,
                         &ctx.table_name,
                         &ctx.columns,
                         &ctx.column_types,
                         line_no,
                         &line_bytes,
+                        &ctx.copy_options,
                     )?;
                     rows_to_insert.push((line_no, col_values));
                 }
@@ -307,18 +308,19 @@ impl CopyHandler for DynamicPgHandler {
                 if let Some(final_line_bytes) = ctx.drain_final_line() {
                     if final_line_bytes.as_slice() == b"\\." {
                         ctx.reached_end_marker = true;
-                    } else if ctx.header && !ctx.header_skipped {
+                    } else if ctx.copy_options.header && !ctx.header_skipped {
                         // Header row arrived without trailing newline — skip it.
                         ctx.header_skipped = true;
                     } else if !ctx.reached_end_marker {
                         let line_no = ctx.row_count.saturating_add(1);
-                        let col_values = match parse_copy_text_line(
+                        let col_values = match parse_copy_input_line(
                             executor,
                             &ctx.table_name,
                             &ctx.columns,
                             &ctx.column_types,
                             line_no,
                             &final_line_bytes,
+                            &ctx.copy_options,
                         ) {
                             Ok(values) => values,
                             Err(e) => {

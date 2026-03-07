@@ -14,32 +14,17 @@ pub(in crate::protocol::handler) fn copy_from_stdin_line_too_long_error() -> PgW
     )))
 }
 
-pub(in crate::protocol::handler) fn copy_row_column_mismatch_error(
-    actual: usize,
-    expected: usize,
-) -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".to_string(),
-        "22P04".to_string(),
-        format!(
-            "COPY row has {} columns but {} columns expected",
-            actual, expected
-        ),
-    )))
-}
-
 pub struct CopyContext {
     pub table_name: String,
     pub columns: Vec<String>,
     pub column_types: Vec<Option<DataType>>,
+    pub copy_options: crate::protocol::copy_format::CopyOptions,
     pub query_context: QueryContext,
     pub backpressure_guard: Option<crate::storage::backpressure::BackpressureGuard>,
     pub line_buffer: Vec<u8>,
     pub row_count: usize,
     pub started_txn: bool,
     pub reached_end_marker: bool,
-    /// When true, the first data line is a header row and must be skipped.
-    pub header: bool,
     /// Set to true after the header row has been consumed.
     pub header_skipped: bool,
     /// Accumulated self-referencing FK ref-column keys (PK side) across all
