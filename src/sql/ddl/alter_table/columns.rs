@@ -99,7 +99,7 @@ pub(super) async fn alter_table_add_column(
     if is_serial {
         nullable = false;
     }
-    if !nullable && !is_serial && !has_real_add_column_default(is_serial, default_expr.as_deref()) {
+    if !nullable && !has_real_add_column_default(is_serial, default_expr.as_deref()) {
         let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
         let range: tikv_client::BoundRange = (start..end).into();
         let existing_rows: Vec<_> = txn.scan(range, 1).await?.collect();
@@ -145,24 +145,7 @@ pub(super) async fn alter_table_add_column(
             &serial_col_type,
         );
         seq_def.name = seq_name;
-        let seq_full_name = seq_def.full_name();
         store.create_sequence(txn, db_id, seq_def).await?;
-
-        let new_col_idx = schema.columns.len() - 1;
-        let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
-        let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
-        while let Some(batch) = scanner.next_batch(txn).await? {
-            for pair in batch {
-                let (key, value): (tikv_client::Key, tikv_client::Value) = pair.into();
-                let mut row = crate::storage::deserialize_row(&value)?;
-                fill_row_defaults(&mut row, schema)?;
-                let seq_val = store.nextval_sequence(txn, db_id, &seq_full_name).await?;
-                row.values[new_col_idx] =
-                    coerce_value_for_column(Value::Int64(seq_val), &schema.columns[new_col_idx])?;
-                let row_data = crate::storage::serialize_row(&row)?;
-                txn_put(txn, key.into(), row_data).await?;
-            }
-        }
     }
     schema.version += 1;
     store.update_schema(txn, db_id, schema.clone()).await?;
