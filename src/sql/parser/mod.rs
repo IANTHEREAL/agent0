@@ -12,11 +12,10 @@ mod tokenizer;
 #[cfg(test)]
 mod tests;
 
-use crate::sql::error::SqlError;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use sqlparser::ast::{SelectItem, Statement, WildcardAdditionalOptions};
 use sqlparser::dialect::PostgreSqlDialect;
-use sqlparser::parser::{Parser, ParserError};
+use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
 use preprocess::{
@@ -34,16 +33,9 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             if let Some(stmts) = parse_insert_returning_wildcard_fallback(&dialect, &preprocessed) {
                 return Ok(stmts);
             }
-            Err(SqlError::Syntax(normalize_parser_error_message(&e)).into())
+            Err(anyhow!("SQL parse error: {}", e))
         }
     }
-}
-
-fn normalize_parser_error_message(err: &ParserError) -> String {
-    let raw = err.to_string();
-    raw.strip_prefix("sql parser error: ")
-        .unwrap_or(raw.as_str())
-        .to_string()
 }
 
 fn parse_sql_with_pg_named_arg_compat(
