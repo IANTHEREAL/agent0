@@ -16,6 +16,7 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::{SelectItem, Statement, WildcardAdditionalOptions};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer};
 
 use preprocess::{
     extract_create_index_with_params as extract_create_index_with_params_impl, preprocess_sql,
@@ -26,7 +27,7 @@ use tokenizer::{skip_ws_comments_forward, tokenize_sql_for_rewrite, TokenKind};
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let dialect = PostgreSqlDialect {};
     let preprocessed = preprocess_sql(sql);
-    match Parser::parse_sql(&dialect, &preprocessed) {
+    match parse_sql_with_pg_named_arg_compat(&dialect, &preprocessed) {
         Ok(stmts) => Ok(stmts),
         Err(e) => {
             if let Some(stmts) = parse_insert_returning_wildcard_fallback(&dialect, &preprocessed) {
@@ -35,6 +36,23 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
             Err(anyhow!("SQL parse error: {}", e))
         }
     }
+}
+
+fn parse_sql_with_pg_named_arg_compat(
+    dialect: &PostgreSqlDialect,
+    sql: &str,
+) -> std::result::Result<Vec<Statement>, sqlparser::parser::ParserError> {
+    let mut tokens = Tokenizer::new(dialect, sql).tokenize_with_location()?;
+    for tok in &mut tokens {
+        if tok.token == Token::DuckAssignment {
+            // PostgreSQL accepts `:=` as named-arg syntax in function calls.
+            // sqlparser 0.40 only recognizes `=>` for FunctionArg::Named.
+            tok.token = Token::RArrow;
+        }
+    }
+    Parser::new(dialect)
+        .with_tokens_with_locations(tokens)
+        .parse_statements()
 }
 
 /// Extract raw `CREATE INDEX ... WITH (...)` payloads in source order.
@@ -119,7 +137,7 @@ fn parse_insert_returning_wildcard_fallback(
 
     let mut rewritten = sql.to_string();
     rewritten.replace_range(tokens[returning_idx].start..tokens[star_idx].end, "");
-    let mut stmts = Parser::parse_sql(dialect, &rewritten).ok()?;
+    let mut stmts = parse_sql_with_pg_named_arg_compat(dialect, &rewritten).ok()?;
     if stmts.len() != 1 {
         return None;
     }

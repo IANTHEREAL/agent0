@@ -11,6 +11,37 @@ fn test_parse_select() {
 }
 
 #[test]
+fn test_parse_table_function_named_args_with_colon_equals() {
+    let stmts = parse_sql(
+        "SELECT * FROM extensions.fs9('/tmp/path.csv', format := 'csv', delimiter := '|')",
+    )
+    .unwrap();
+    assert_eq!(stmts.len(), 1);
+
+    let stmt = &stmts[0];
+    let Statement::Query(query) = stmt else {
+        panic!("expected query statement, got {stmt:?}");
+    };
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        panic!("expected SELECT query body");
+    };
+    let from = select.from.first().expect("expected FROM clause");
+    match &from.relation {
+        sqlparser::ast::TableFactor::Table {
+            name,
+            args: Some(args),
+            ..
+        } => {
+            assert_eq!(name.to_string(), "extensions.fs9");
+            assert_eq!(args.len(), 3);
+            assert!(matches!(args[1], sqlparser::ast::FunctionArg::Named { .. }));
+            assert!(matches!(args[2], sqlparser::ast::FunctionArg::Named { .. }));
+        }
+        other => panic!("expected table-valued function call, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_parse_reset_role_rewrite() {
     let stmts = parse_sql("RESET ROLE").unwrap();
     assert_eq!(stmts.len(), 1);
