@@ -129,12 +129,16 @@ impl VirtualTable for Columns {
                         SerialDefaultBehavior::ExplicitExpr(expr) => text_val(expr),
                         SerialDefaultBehavior::ExplicitNull => null_val(),
                         SerialDefaultBehavior::ImplicitSequence => {
-                            let seq_full_name = sequences::serial_column_sequence_full_name(
+                            let seq_full_name = sequences::resolve_serial_sequence_owned_by(
                                 &sequence_defs,
                                 full_table_name,
                                 &col.name,
                             )?;
-                            text_val(&format!("nextval('{}'::regclass)", seq_full_name))
+                            seq_full_name
+                                .map(|full_name| {
+                                    text_val(&format!("nextval('{}'::regclass)", full_name))
+                                })
+                                .unwrap_or(null_val())
                         }
                     }
                 } else {

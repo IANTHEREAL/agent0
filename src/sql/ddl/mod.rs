@@ -301,7 +301,8 @@ pub(super) async fn allocate_implicit_sequence_name(
     }
 
     for suffix in 1_u32..=u32::MAX {
-        let candidate = format!("{}{}", base_name, suffix);
+        let candidate =
+            sequences::implicit_sequence_name_with_suffix(table_name, column_name, suffix);
         if !relation_name_taken_in_schema(store, txn, db_id, schema_name, &candidate, exclude_table)
             .await?
         {

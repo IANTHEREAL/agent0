@@ -20,8 +20,9 @@ use tikv_client::Transaction;
 use super::SequenceSession;
 
 use super::{
-    eval_seq_expr, extract_arg_expr, index_helpers::lookup_indexdef_by_oid,
-    resolve_sequence_full_name_from_value, value_to_i64,
+    eval_seq_expr, extract_arg_expr, format_serial_sequence_name,
+    index_helpers::lookup_indexdef_by_oid, resolve_sequence_full_name_from_value,
+    resolve_serial_sequence, value_to_i64,
 };
 
 fn pg_type_name_from_data_type(data_type: &DataType) -> String {
@@ -68,6 +69,17 @@ fn pg_lastval_arg_type_name(arg: &FunctionArg, schema: Option<&TableSchema>) -> 
     match typed {
         Ok(arg) => pg_lastval_arg_type_name_from_typed(&arg),
         Err(_) => "unknown".to_string(),
+    }
+}
+
+fn is_pg_get_serial_sequence_function_name(func: &Function) -> bool {
+    match func.name.0.as_slice() {
+        [name] => name.value.eq_ignore_ascii_case("pg_get_serial_sequence"),
+        [schema, name] => {
+            schema.value.eq_ignore_ascii_case("pg_catalog")
+                && name.value.eq_ignore_ascii_case("pg_get_serial_sequence")
+        }
+        _ => false,
     }
 }
 
@@ -232,6 +244,40 @@ pub(crate) fn replace_sequence_functions<'a>(
                         let indexdef = lookup_indexdef_by_oid(store, txn, db_id, oid).await?;
                         Ok(value_to_sql_expr(&Value::Text(
                             indexdef.unwrap_or_else(|| "CREATE INDEX".to_string()),
+                        )))
+                    }
+                    "PG_GET_SERIAL_SEQUENCE" if is_pg_get_serial_sequence_function_name(func) => {
+                        let arg0 = extract_arg_expr(&func.args, 0)?;
+                        let arg1 = extract_arg_expr(&func.args, 1)?;
+
+                        let table_arg = match eval_seq_expr(arg0, row, schema)? {
+                            Value::Null => return Ok(value_to_sql_expr(&Value::Null)),
+                            Value::Text(s) => s,
+                            v => v.to_string(),
+                        };
+                        let column_arg = match eval_seq_expr(arg1, row, schema)? {
+                            Value::Null => return Ok(value_to_sql_expr(&Value::Null)),
+                            Value::Text(s) => s,
+                            v => v.to_string(),
+                        };
+
+                        let Some(sequence_full_name) = resolve_serial_sequence(
+                            store,
+                            txn,
+                            db_id,
+                            search_path,
+                            &table_arg,
+                            &column_arg,
+                        )
+                        .await?
+                        else {
+                            return Ok(value_to_sql_expr(&Value::Null));
+                        };
+
+                        let (schema_name, sequence_name) =
+                            names::parse_full_name(&sequence_full_name)?;
+                        Ok(value_to_sql_expr(&Value::Text(
+                            format_serial_sequence_name(&schema_name, &sequence_name),
                         )))
                     }
                     _ => {

@@ -60,12 +60,13 @@ impl VirtualTable for PgAttrdef {
                         SerialDefaultBehavior::ExplicitExpr(expr) => Some(expr.to_string()),
                         SerialDefaultBehavior::ExplicitNull => None,
                         SerialDefaultBehavior::ImplicitSequence => {
-                            let seq_full_name = sequences::serial_column_sequence_full_name(
+                            let seq_full_name = sequences::resolve_serial_sequence_owned_by(
                                 &sequence_defs,
                                 full_table_name,
                                 &col.name,
                             )?;
-                            Some(format!("nextval('{}'::regclass)", seq_full_name))
+                            seq_full_name
+                                .map(|full_name| format!("nextval('{}'::regclass)", full_name))
                         }
                     }
                 } else {

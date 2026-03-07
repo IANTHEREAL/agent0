@@ -20,21 +20,16 @@ pub fn is_row_dependent(expr: &TypedExpr) -> bool {
 
 /// Return true when an expression needs async executor-side materialization.
 pub fn needs_async_materialization(expr: &TypedExpr) -> bool {
-    expr_any(expr, &|node| match &node.kind {
-        TypedExprKind::ScalarSubquery(_)
-        | TypedExprKind::ArraySubquery(_)
-        | TypedExprKind::Exists { .. }
-        | TypedExprKind::InSubquery { .. }
-        | TypedExprKind::TupleInSubquery { .. }
-        | TypedExprKind::AnyAll { .. }
-        | TypedExprKind::AggregateCall { .. }
-        | TypedExprKind::WindowCall { .. } => true,
-        TypedExprKind::FunctionCall { func, .. } => {
-            let name = func.name.to_ascii_uppercase();
-            matches!(name.as_str(), "NEXTVAL" | "CURRVAL" | "SETVAL" | "LASTVAL")
-        }
-        _ => false,
-    })
+    // Keep aggregate/window guarded explicitly (not a valid static-eval target),
+    // and defer async/materialization classification to the shared classifier used
+    // by analyzed SELECT and operator paths.
+    expr_any(expr, &|node| {
+        matches!(
+            &node.kind,
+            TypedExprKind::AggregateCall { .. } | TypedExprKind::WindowCall { .. }
+        )
+    }) || crate::sql::expr::classify::needs_pre_materialization(expr)
+        || crate::sql::expr::classify::needs_async(expr)
 }
 
 /// Evaluate a row-independent typed expression.
@@ -133,6 +128,38 @@ mod tests {
             },
             DataType::Int64,
         );
+        let err = eval_static_typed_expr(&expr, &qctx)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires async materialization"));
+    }
+
+    #[test]
+    fn static_eval_rejects_pg_get_serial_sequence_for_async_materialization() {
+        let qctx = test_qctx();
+        let expr = TypedExpr::new(
+            TypedExprKind::FunctionCall {
+                func: ResolvedFunction {
+                    name: "Pg_Catalog.PG_GET_SERIAL_SEQUENCE".to_string(),
+                    kind: FunctionKind::Builtin,
+                    return_type: DataType::Text,
+                },
+                args: vec![
+                    TypedExpr::new(
+                        TypedExprKind::Constant(Value::Text("public.t".to_string())),
+                        DataType::Text,
+                    ),
+                    TypedExpr::new(
+                        TypedExprKind::Constant(Value::Text("id".to_string())),
+                        DataType::Text,
+                    ),
+                ],
+                order_by: vec![],
+                filter: None,
+            },
+            DataType::Text,
+        );
+
         let err = eval_static_typed_expr(&expr, &qctx)
             .unwrap_err()
             .to_string();

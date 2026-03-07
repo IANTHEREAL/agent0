@@ -11,7 +11,7 @@ use crate::sql::executor::core::Executor;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::query_context::QueryContext;
 
-use crate::sql::sequences::SequenceSession;
+use crate::sql::sequences::{self, SequenceSession};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::future::Future;
@@ -44,6 +44,14 @@ fn advisory_lock_timeout(
                 }
             },
         )
+}
+
+fn is_pg_get_serial_sequence_function_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("PG_GET_SERIAL_SEQUENCE")
+        || name.rsplit_once(".").is_some_and(|(schema, func)| {
+            schema.eq_ignore_ascii_case("PG_CATALOG")
+                && func.eq_ignore_ascii_case("PG_GET_SERIAL_SEQUENCE")
+        })
 }
 
 impl Executor {
@@ -195,6 +203,23 @@ impl Executor {
                     if func.name.eq_ignore_ascii_case("TO_REGTYPE") {
                         let val = self
                             .eval_to_regtype(&new_args, row, txn, db_id, search_path, qctx)
+                            .await?;
+                        return Ok(TypedExpr::new(
+                            TypedExprKind::Constant(val),
+                            expr.data_type.clone(),
+                        ));
+                    }
+
+                    if is_pg_get_serial_sequence_function_name(&func.name) {
+                        let val = self
+                            .eval_pg_get_serial_sequence(
+                                &new_args,
+                                row,
+                                txn,
+                                db_id,
+                                search_path,
+                                qctx,
+                            )
                             .await?;
                         return Ok(TypedExpr::new(
                             TypedExprKind::Constant(val),
@@ -1109,6 +1134,54 @@ impl Executor {
         .await?;
         Ok(oid.map(Value::Int64).unwrap_or(Value::Null))
     }
+
+    async fn eval_pg_get_serial_sequence(
+        &self,
+        args: &[TypedExpr],
+        row: &Row,
+        txn: &mut Transaction,
+        db_id: u64,
+        search_path: &[String],
+        qctx: &QueryContext,
+    ) -> Result<Value> {
+        let Some(table_arg_expr) = args.first() else {
+            return Ok(Value::Null);
+        };
+        let Some(column_arg_expr) = args.get(1) else {
+            return Ok(Value::Null);
+        };
+
+        let table_arg = match eval_typed_expr(table_arg_expr, row, qctx)? {
+            Value::Null => return Ok(Value::Null),
+            Value::Text(s) => s,
+            v => v.to_string(),
+        };
+        let column_arg = match eval_typed_expr(column_arg_expr, row, qctx)? {
+            Value::Null => return Ok(Value::Null),
+            Value::Text(s) => s,
+            v => v.to_string(),
+        };
+
+        let store = self.store();
+        let Some(sequence_full_name) = sequences::resolve_serial_sequence(
+            &store,
+            txn,
+            db_id,
+            search_path,
+            &table_arg,
+            &column_arg,
+        )
+        .await?
+        else {
+            return Ok(Value::Null);
+        };
+
+        let (schema, sequence_name) = crate::sql::names::parse_full_name(&sequence_full_name)?;
+        Ok(Value::Text(sequences::format_serial_sequence_name(
+            &schema,
+            &sequence_name,
+        )))
+    }
 }
 
 fn find_text_column<'a>(
@@ -1518,9 +1591,9 @@ async fn lookup_regtype_oid_with_hstore_extension(
 mod tests {
     use super::{
         advisory_lock_timeout, find_text_column, hstore_extension_oid_for_name,
-        parse_regtype_object_name, regtype_ident_matches, regtype_search_path_schemas,
-        split_regtype_name_parts, strip_regtype_array_dims, strip_regtype_typmod,
-        value_to_bool_strict, value_to_i64, value_to_i64_strict,
+        is_pg_get_serial_sequence_function_name, parse_regtype_object_name, regtype_ident_matches,
+        regtype_search_path_schemas, split_regtype_name_parts, strip_regtype_array_dims,
+        strip_regtype_typmod, value_to_bool_strict, value_to_i64, value_to_i64_strict,
     };
     use crate::model::{ColumnDef, DataType, TableSchema, Value};
     use std::collections::HashMap;
@@ -1872,5 +1945,23 @@ mod tests {
             hstore_extension_oid_for_name(&quoted_upper.0[0], false),
             None
         );
+    }
+    #[test]
+    fn test_pg_get_serial_sequence_name_match_accepts_pg_catalog_and_case_variants() {
+        assert!(is_pg_get_serial_sequence_function_name(
+            "pg_get_serial_sequence"
+        ));
+        assert!(is_pg_get_serial_sequence_function_name(
+            "PG_GET_SERIAL_SEQUENCE"
+        ));
+        assert!(is_pg_get_serial_sequence_function_name(
+            "pg_catalog.pg_get_serial_sequence"
+        ));
+        assert!(is_pg_get_serial_sequence_function_name(
+            "PG_CATALOG.PG_GET_SERIAL_SEQUENCE"
+        ));
+        assert!(!is_pg_get_serial_sequence_function_name(
+            "public.pg_get_serial_sequence"
+        ));
     }
 }

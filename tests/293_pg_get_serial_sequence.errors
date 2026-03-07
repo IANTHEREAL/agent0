@@ -1,0 +1,6 @@
+relation "pgss_missing" does not exist
+column "missing_col" of relation "pgss_basic" does not exist
+cross-database references are not implemented
+invalid name syntax
+column "casecol" of relation "pgss_case" does not exist
+function public.pg_get_serial_sequence(unknown, unknown) does not exist

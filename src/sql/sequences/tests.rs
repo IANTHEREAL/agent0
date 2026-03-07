@@ -64,16 +64,54 @@ mod owned_sequence_lookup_tests {
     fn implicit_sequence_helpers_and_name_normalization() {
         use crate::model::DataType;
         use crate::sql::sequences::{
-            build_implicit_sequence_def, implicit_sequence_name, normalize_sequence_name,
+            build_implicit_sequence_def, format_serial_sequence_name, implicit_sequence_name,
+            implicit_sequence_name_with_suffix, normalize_sequence_name,
         };
         use sqlparser::ast::{Ident, ObjectName};
 
         assert_eq!(implicit_sequence_name("t", "id"), "t_id_seq");
+        assert_eq!(
+            implicit_sequence_name_with_suffix("t", "id", 1),
+            "t_id_seq1"
+        );
 
         let def = build_implicit_sequence_def("public.t", "id", &DataType::Int32);
         assert_eq!(def.schema, "public");
         assert_eq!(def.name, "t_id_seq");
         assert_eq!(def.max_value, i32::MAX as i64);
+
+        let long_table = "tbl_name_with_many_bytes_abcdefghijklmnopqrstuvwxyz_1234567890";
+        let long_col = "column_name_with_many_bytes_abcdefghijklmnopqrstuvwxyz_1234567890";
+        let long_name = implicit_sequence_name(long_table, long_col);
+        assert_eq!(
+            long_name,
+            "tbl_name_with_many_bytes_abcd_column_name_with_many_bytes_a_seq"
+        );
+        assert_eq!(long_name.len(), 63);
+
+        let long_name_with_suffix = implicit_sequence_name_with_suffix(long_table, long_col, 42);
+        assert_eq!(
+            long_name_with_suffix,
+            "tbl_name_with_many_bytes_abc_column_name_with_many_bytes__seq42"
+        );
+        assert_eq!(long_name_with_suffix.len(), 63);
+
+        let utf8_name = implicit_sequence_name("名字名字名字名字名字名字", "列列列列列列列列");
+        assert!(utf8_name.len() <= 63);
+        assert!(utf8_name.ends_with("_seq"));
+
+        assert_eq!(
+            format_serial_sequence_name("public", "mixed_case_seq"),
+            "public.mixed_case_seq"
+        );
+        assert_eq!(
+            format_serial_sequence_name("select", "mixed_case_seq"),
+            "\"select\".mixed_case_seq"
+        );
+        assert_eq!(
+            format_serial_sequence_name("public", "mixed_Case_seq"),
+            "public.\"mixed_Case_seq\""
+        );
 
         let name = ObjectName(vec![Ident::new("my_seq")]);
         let (schema, seq, full) =
@@ -119,6 +157,13 @@ mod owned_sequence_lookup_tests {
         let lastval = first_expr("SELECT lastval()");
         assert!(expr_uses_sequence_functions(&lastval));
         assert!(expr_needs_async_eval(&lastval));
+
+        let serial_seq = first_expr("SELECT pg_get_serial_sequence('public.t', 'id')");
+        assert!(expr_uses_sequence_functions(&serial_seq));
+        assert!(expr_needs_async_eval(&serial_seq));
+
+        let serial_seq_mixed = first_expr("SELECT Pg_GeT_SeRiAl_SeQuEnCe('public.t', 'id')");
+        assert!(expr_needs_async_eval(&serial_seq_mixed));
 
         let current_schema = first_expr("SELECT current_schema()");
         assert!(expr_uses_current_schema(&current_schema));

@@ -94,20 +94,27 @@ async fn eval_column_default_or_null_inner(
             SerialDefaultBehavior::ExplicitNull => return Ok(Value::Null),
             SerialDefaultBehavior::ImplicitSequence => {
                 let seq_full_name = match sequence_defs {
-                    Some(defs) => sequences::serial_column_sequence_full_name(
+                    Some(defs) => sequences::resolve_serial_sequence_owned_by(
                         defs,
                         &schema.name,
                         &column.name,
                     )?,
                     None => {
                         let defs = store.list_sequences(txn, db_id).await?;
-                        sequences::serial_column_sequence_full_name(
+                        sequences::resolve_serial_sequence_owned_by(
                             &defs,
                             &schema.name,
                             &column.name,
                         )?
                     }
-                };
+                }
+                .ok_or_else(|| {
+                    anyhow!(
+                        "SERIAL column \"{}\" of relation \"{}\" has no owned sequence",
+                        column.name,
+                        schema.name
+                    )
+                })?;
 
                 let seq_val = store.nextval_sequence(txn, db_id, &seq_full_name).await?;
                 sequence_values.record_nextval(seq_full_name, seq_val);

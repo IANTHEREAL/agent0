@@ -27,6 +27,14 @@ fn is_pre_materialized_sequence_function(name: &str) -> bool {
         || name.eq_ignore_ascii_case("LASTVAL")
 }
 
+fn is_pg_get_serial_sequence_function(name: &str) -> bool {
+    name.eq_ignore_ascii_case("PG_GET_SERIAL_SEQUENCE")
+        || name.rsplit_once(".").is_some_and(|(schema, func)| {
+            schema.eq_ignore_ascii_case("PG_CATALOG")
+                && func.eq_ignore_ascii_case("PG_GET_SERIAL_SEQUENCE")
+        })
+}
+
 fn is_catalog_dependent_function(func_kind: &FunctionKind, name: &str) -> bool {
     if matches!(func_kind, FunctionKind::UserDefined { .. }) {
         return true;
@@ -38,6 +46,7 @@ fn is_catalog_dependent_function(func_kind: &FunctionKind, name: &str) -> bool {
         || name.eq_ignore_ascii_case("PG_GET_CONSTRAINTDEF")
         || name.eq_ignore_ascii_case("FORMAT_TYPE")
         || name.eq_ignore_ascii_case("TO_REGTYPE")
+        || is_pg_get_serial_sequence_function(name)
     {
         return true;
     }
@@ -372,5 +381,31 @@ mod tests {
         );
 
         assert!(has_any_column_ref(&expr));
+    }
+    #[test]
+    fn needs_async_detects_pg_get_serial_sequence_with_pg_catalog_qualifier() {
+        let expr = TypedExpr::new(
+            TypedExprKind::FunctionCall {
+                func: ResolvedFunction {
+                    name: "Pg_Catalog.PG_GET_SERIAL_SEQUENCE".to_string(),
+                    kind: FunctionKind::Builtin,
+                    return_type: DataType::Text,
+                },
+                args: vec![
+                    TypedExpr::new(
+                        TypedExprKind::Constant(Value::Text("t".to_string())),
+                        DataType::Text,
+                    ),
+                    TypedExpr::new(
+                        TypedExprKind::Constant(Value::Text("id".to_string())),
+                        DataType::Text,
+                    ),
+                ],
+                order_by: vec![],
+                filter: None,
+            },
+            DataType::Text,
+        );
+        assert!(needs_async(&expr));
     }
 }

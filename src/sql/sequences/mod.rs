@@ -57,7 +57,10 @@ pub(crate) fn expr_uses_sequence_functions(expr: &Expr) -> bool {
 
         if let Expr::Function(func) = e {
             let name = function_name_upper(func);
-            if matches!(name.as_str(), "NEXTVAL" | "CURRVAL" | "SETVAL" | "LASTVAL") {
+            if matches!(name.as_str(), "NEXTVAL" | "CURRVAL" | "SETVAL" | "LASTVAL")
+                || (name == "PG_GET_SERIAL_SEQUENCE"
+                    && is_pg_get_serial_sequence_function_name(&func.name))
+            {
                 found = true;
                 return ControlFlow::Break(());
             }
@@ -94,8 +97,42 @@ pub(crate) fn expr_uses_current_schema(expr: &Expr) -> bool {
 /// Check if expression needs async evaluation (sequence functions, current_schema, or potential user functions)
 pub(crate) fn expr_needs_async_eval(expr: &Expr) -> bool {
     expr_uses_sequence_functions(expr)
+        || expr_uses_pg_get_serial_sequence(expr)
         || expr_uses_current_schema(expr)
         || expr_may_have_user_function(expr)
+}
+
+fn expr_uses_pg_get_serial_sequence(expr: &Expr) -> bool {
+    use core::ops::ControlFlow;
+    use sqlparser::ast::visit_expressions;
+
+    let mut found = false;
+    let _ = visit_expressions(expr, |e| {
+        if found {
+            return ControlFlow::Break(());
+        }
+
+        if let Expr::Function(func) = e {
+            if is_pg_get_serial_sequence_function_name(&func.name) {
+                found = true;
+                return ControlFlow::Break(());
+            }
+        }
+
+        ControlFlow::<()>::Continue(())
+    });
+    found
+}
+
+fn is_pg_get_serial_sequence_function_name(name: &ObjectName) -> bool {
+    match name.0.as_slice() {
+        [func] => func.value.eq_ignore_ascii_case("pg_get_serial_sequence"),
+        [schema, func] => {
+            schema.value.eq_ignore_ascii_case("pg_catalog")
+                && func.value.eq_ignore_ascii_case("pg_get_serial_sequence")
+        }
+        _ => false,
+    }
 }
 
 /// Check if expression contains any function call that might be a user-defined function.
@@ -212,8 +249,54 @@ pub(crate) fn normalize_sequence_name(
     ))
 }
 
+const MAX_IDENTIFIER_BYTES: usize = 63;
+
+fn truncate_utf8_to_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn build_implicit_sequence_name_with_label(
+    table_name: &str,
+    column_name: &str,
+    label: &str,
+) -> String {
+    // Match PostgreSQL makeObjectName(): allocate bytes across name1/name2 by
+    // trimming the longer component first, then clip on UTF-8 boundaries.
+    let mut table_bytes = table_name.len();
+    let mut column_bytes = column_name.len();
+    let overhead = 2 + label.len(); // "_" between name1/name2 and "_label"
+    let avail_bytes = MAX_IDENTIFIER_BYTES.saturating_sub(overhead);
+
+    while table_bytes + column_bytes > avail_bytes {
+        if table_bytes > column_bytes {
+            table_bytes -= 1;
+        } else {
+            column_bytes -= 1;
+        }
+    }
+
+    let table_part = truncate_utf8_to_bytes(table_name, table_bytes);
+    let column_part = truncate_utf8_to_bytes(column_name, column_bytes);
+    format!("{}_{}_{}", table_part, column_part, label)
+}
+
 pub(crate) fn implicit_sequence_name(table_name: &str, column_name: &str) -> String {
-    format!("{}_{}_seq", table_name, column_name)
+    build_implicit_sequence_name_with_label(table_name, column_name, "seq")
+}
+
+pub(crate) fn implicit_sequence_name_with_suffix(
+    table_name: &str,
+    column_name: &str,
+    suffix: u32,
+) -> String {
+    build_implicit_sequence_name_with_label(table_name, column_name, &format!("seq{}", suffix))
 }
 
 pub(crate) fn build_implicit_sequence_def(
@@ -347,24 +430,6 @@ pub(crate) fn classify_serial_default(default_expr: Option<&str>) -> SerialDefau
     }
 }
 
-pub(crate) fn serial_column_sequence_full_name(
-    sequences: &[SequenceDef],
-    table_full_name: &str,
-    column_name: &str,
-) -> Result<String> {
-    let (table_schema, table_name) = table_full_name
-        .rsplit_once('.')
-        .unwrap_or(("public", table_full_name));
-    match find_owned_sequence_full_name(sequences, table_full_name, column_name)? {
-        Some(full_name) => Ok(full_name),
-        None => Ok(format!(
-            "{}.{}",
-            table_schema,
-            implicit_sequence_name(table_name, column_name)
-        )),
-    }
-}
-
 pub(crate) fn find_owned_sequence_full_name(
     sequences: &[SequenceDef],
     table_full_name: &str,
@@ -391,6 +456,183 @@ pub(crate) fn find_owned_sequence_full_name(
     }
 
     Ok(Some(first.full_name()))
+}
+
+pub(crate) fn resolve_serial_sequence_owned_by(
+    sequences: &[SequenceDef],
+    table_full_name: &str,
+    column_name: &str,
+) -> Result<Option<String>> {
+    find_owned_sequence_full_name(sequences, table_full_name, column_name)
+}
+
+fn push_identifier_part(parts: &mut Vec<String>, raw: &str, quoted: bool) -> Result<()> {
+    let trimmed = if quoted { raw } else { raw.trim() };
+    if trimmed.is_empty() {
+        return Err(anyhow!("invalid name syntax"));
+    }
+    if quoted {
+        parts.push(trimmed.to_string());
+    } else {
+        parts.push(trimmed.to_lowercase());
+    }
+    Ok(())
+}
+
+fn parse_identifier_parts(token: &str) -> Result<Vec<String>> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("invalid name syntax"));
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut in_quotes = false;
+    let mut part_quoted = false;
+
+    let mut chars = trimmed.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                if in_quotes {
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                        buf.push('"');
+                    } else {
+                        in_quotes = false;
+                    }
+                } else {
+                    in_quotes = true;
+                    part_quoted = true;
+                }
+            }
+            '.' if !in_quotes => {
+                push_identifier_part(&mut parts, &buf, part_quoted)?;
+                buf.clear();
+                part_quoted = false;
+            }
+            _ => buf.push(ch),
+        }
+    }
+
+    if in_quotes {
+        return Err(anyhow!("invalid name syntax"));
+    }
+    push_identifier_part(&mut parts, &buf, part_quoted)?;
+    Ok(parts)
+}
+
+fn parse_table_arg_identifier(table_arg: &str) -> Result<(Option<String>, String)> {
+    let parts = parse_identifier_parts(table_arg)?;
+    match parts.as_slice() {
+        [table] => Ok((None, table.clone())),
+        [schema, table] => Ok((Some(schema.clone()), table.clone())),
+        _ => Err(anyhow!(
+            "cross-database references are not implemented: {}",
+            table_arg.trim()
+        )),
+    }
+}
+
+fn keyword_or_special_ident(ident: &str) -> bool {
+    if ident.is_empty() {
+        return true;
+    }
+
+    let mut chars = ident.chars();
+    let Some(first) = chars.next() else {
+        return true;
+    };
+    if !(first.is_ascii_lowercase() || first == '_') {
+        return true;
+    }
+    for ch in chars {
+        if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '$') {
+            return true;
+        }
+    }
+
+    let upper = ident.to_ascii_uppercase();
+    sqlparser::keywords::ALL_KEYWORDS
+        .binary_search(&upper.as_str())
+        .is_ok()
+}
+
+fn quote_pg_identifier_if_needed(ident: &str) -> String {
+    if keyword_or_special_ident(ident) {
+        format!("\"{}\"", ident.replace('"', "\"\""))
+    } else {
+        ident.to_string()
+    }
+}
+
+pub(crate) fn format_serial_sequence_name(schema: &str, sequence_name: &str) -> String {
+    format!(
+        "{}.{}",
+        quote_pg_identifier_if_needed(schema),
+        quote_pg_identifier_if_needed(sequence_name)
+    )
+}
+
+fn search_path_schemas(search_path: &[String]) -> Vec<&str> {
+    let mut schemas: Vec<&str> = search_path
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| !s.eq_ignore_ascii_case("$user"))
+        .collect();
+    if schemas.is_empty() {
+        schemas.push("public");
+    }
+    schemas
+}
+
+pub(crate) async fn resolve_serial_sequence(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    table_arg: &str,
+    column_arg: &str,
+) -> Result<Option<String>> {
+    let (schema_opt, table_name) = parse_table_arg_identifier(table_arg)?;
+
+    let table_schema = match schema_opt {
+        Some(schema_name) => {
+            let resolved = names::ResolvedName::new(schema_name, table_name.clone())?;
+            store
+                .get_schema(txn, db_id, &resolved.full)
+                .await?
+                .ok_or_else(|| SqlError::RelationNotFound(resolved.full.clone()))?
+        }
+        None => {
+            let mut found = None;
+            for schema_name in search_path_schemas(search_path) {
+                let resolved =
+                    names::ResolvedName::new(schema_name.to_string(), table_name.clone())?;
+                if let Some(schema) = store.get_schema(txn, db_id, &resolved.full).await? {
+                    found = Some(schema);
+                    break;
+                }
+            }
+            found.ok_or_else(|| SqlError::RelationNotFound(table_name.clone()))?
+        }
+    };
+
+    if !table_schema.columns.iter().any(|c| c.name == column_arg) {
+        let rel_name = table_schema
+            .name
+            .rsplit('.')
+            .next()
+            .unwrap_or(table_schema.name.as_str());
+        return Err(anyhow!(
+            "column \"{}\" of relation \"{}\" does not exist",
+            column_arg,
+            rel_name
+        ));
+    }
+
+    let sequence_defs = store.list_sequences(txn, db_id).await?;
+    resolve_serial_sequence_owned_by(&sequence_defs, &table_schema.name, column_arg)
 }
 
 fn eval_i64(expr: &Expr) -> Result<i64> {

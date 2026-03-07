@@ -1,0 +1,7 @@
+basic=public.pgss_basic_id_seq
+basic_schema=public.pgss_basic_id_seq
+non_serial=NULL
+collision=public.pgss_collision_id_seq1
+case_exact=public."pgss_case_CaseCol_seq"
+keyword_schema="select".pgss_kw_id_seq
+long_name=public.pgss_long_table_name_componen_long_column_name_component_bb_seq
