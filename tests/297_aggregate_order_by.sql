@@ -25,6 +25,10 @@ SELECT 'string_nulls_first=' || string_agg(v, ',' ORDER BY ord NULLS FIRST, v)
 FROM t297_aggregate_order_by
 WHERE grp = 1;
 
+SELECT 'string_cast_delim=' || string_agg(v, ';'::text ORDER BY v)
+FROM t297_aggregate_order_by
+WHERE grp = 1;
+
 SELECT grp, string_agg(v, ',' ORDER BY ord, v) AS grouped_order
 FROM t297_aggregate_order_by
 GROUP BY grp

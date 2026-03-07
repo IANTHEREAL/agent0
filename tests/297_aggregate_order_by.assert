@@ -1,6 +1,7 @@
 string_asc=a,aa,b,c,n
 string_desc=c,b,aa,a,n
 string_nulls_first=n,a,aa,b,c
+string_cast_delim=a;aa;b;c;n
 1|a,aa,b,c,n
 2|y,x,z
 array_asc=<null>,a,aa,b,c,n

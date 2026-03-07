@@ -1,0 +1,9 @@
+null_basic=abc
+null_cast_short=abc
+null_cast_explicit=abc
+null_order_asc=abca
+null_order_desc=acba
+1|abca
+2|yxzx
+null_distinct=abc
+mixed=yxzx;y,x,z,x

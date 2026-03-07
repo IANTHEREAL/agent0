@@ -8,6 +8,7 @@ use crate::sql::analyzer::types::{
 };
 use crate::sql::optimizer::logical_plan::PlanSchema;
 use crate::sql::optimizer::physical_plan::{PhysicalCost, PhysicalNode, PhysicalPlan};
+use crate::sql::types::CastContext;
 
 fn test_table_schema() -> TableSchema {
     TableSchema::new(
@@ -613,6 +614,140 @@ fn test_aggregate_delimiter_gets_distinct_slots() {
     );
     assert_eq!(agg_exprs[0].delimiter, Some(",".to_string()));
     assert_eq!(agg_exprs[1].delimiter, Some(";".to_string()));
+}
+
+#[test]
+fn test_aggregate_cast_text_delimiter_is_unwrapped() {
+    let func = make_resolved_func("string_agg");
+    let col = make_col_ref(0, "col", DataType::Text);
+
+    let proj = AnalyzedProjection {
+        expr: TypedExpr {
+            kind: TypedExprKind::AggregateCall {
+                func: func.clone(),
+                args: vec![
+                    col.clone(),
+                    TypedExpr {
+                        kind: TypedExprKind::Cast {
+                            expr: Box::new(TypedExpr {
+                                kind: TypedExprKind::Constant(Value::Text(";".to_string())),
+                                data_type: DataType::Text,
+                            }),
+                            target_type: DataType::Text,
+                            cast_context: CastContext::Explicit,
+                        },
+                        data_type: DataType::Text,
+                    },
+                ],
+                distinct: false,
+                filter: None,
+                order_by: vec![],
+            },
+            data_type: DataType::Text,
+        },
+        output_name: "agg_cast_delim".to_string(),
+    };
+
+    let mut agg_exprs = Vec::new();
+    let mut agg_names = Vec::new();
+    let mut agg_types = Vec::new();
+    collect_agg_exprs_from(
+        &proj.expr,
+        &proj.output_name,
+        &mut agg_exprs,
+        &mut agg_names,
+        &mut agg_types,
+    );
+
+    assert_eq!(agg_exprs.len(), 1);
+    assert_eq!(agg_exprs[0].delimiter, Some(";".to_string()));
+
+    if let TypedExprKind::AggregateCall {
+        func,
+        args,
+        distinct,
+        filter,
+        order_by,
+    } = &proj.expr.kind
+    {
+        assert!(aggregate_identity_matches(
+            &agg_exprs[0],
+            func,
+            args,
+            *distinct,
+            filter,
+            order_by
+        ));
+    } else {
+        panic!("expected AggregateCall");
+    }
+}
+
+#[test]
+fn test_aggregate_cast_null_delimiter_keeps_no_separator_sentinel() {
+    let func = make_resolved_func("string_agg");
+    let col = make_col_ref(0, "col", DataType::Text);
+
+    let proj = AnalyzedProjection {
+        expr: TypedExpr {
+            kind: TypedExprKind::AggregateCall {
+                func: func.clone(),
+                args: vec![
+                    col.clone(),
+                    TypedExpr {
+                        kind: TypedExprKind::Cast {
+                            expr: Box::new(TypedExpr {
+                                kind: TypedExprKind::Constant(Value::Null),
+                                data_type: DataType::Text,
+                            }),
+                            target_type: DataType::Text,
+                            cast_context: CastContext::Explicit,
+                        },
+                        data_type: DataType::Text,
+                    },
+                ],
+                distinct: false,
+                filter: None,
+                order_by: vec![],
+            },
+            data_type: DataType::Text,
+        },
+        output_name: "agg_cast_null_delim".to_string(),
+    };
+
+    let mut agg_exprs = Vec::new();
+    let mut agg_names = Vec::new();
+    let mut agg_types = Vec::new();
+    collect_agg_exprs_from(
+        &proj.expr,
+        &proj.output_name,
+        &mut agg_exprs,
+        &mut agg_names,
+        &mut agg_types,
+    );
+
+    assert_eq!(agg_exprs.len(), 1);
+    assert_eq!(agg_exprs[0].delimiter, Some(String::new()));
+
+    if let TypedExprKind::AggregateCall {
+        func,
+        args,
+        distinct,
+        filter,
+        order_by,
+    } = &proj.expr.kind
+    {
+        assert!(aggregate_identity_matches(
+            &agg_exprs[0],
+            func,
+            args,
+            *distinct,
+            filter,
+            order_by
+        ));
+    } else {
+        panic!("expected AggregateCall");
+    }
 }
 
 #[test]
