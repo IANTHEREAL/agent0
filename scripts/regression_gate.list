@@ -183,6 +183,8 @@ tests/298_named_arg_ordering.sql
 tests/296_setval_out_of_range.sql
 # #1581 / #1508 – COPY FROM STDIN WITH CSV HEADER
 tests/288_copy_csv_header.sql
+# #1580 – pg_get_serial_sequence(int, int) returns correct error
+tests/293_pg_get_serial_sequence.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py
