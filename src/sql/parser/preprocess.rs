@@ -333,6 +333,170 @@ fn preprocess_select_from(sql: &str) -> Option<String> {
     )
 }
 
+fn is_table_relation_name_token(tok: &Token) -> bool {
+    matches!(tok.kind, TokenKind::Word | TokenKind::QuotedIdent)
+}
+
+fn is_table_relation_tail_keyword(tok: &Token) -> bool {
+    is_word_eq(tok, "ORDER")
+        || is_word_eq(tok, "LIMIT")
+        || is_word_eq(tok, "OFFSET")
+        || is_word_eq(tok, "FOR")
+}
+
+fn collect_table_relation_shorthand_rewrite(
+    sql: &str,
+    tokens: &[Token],
+    stmt_start: usize,
+    stmt_end: usize,
+    replacements: &mut Vec<(usize, usize, String)>,
+) {
+    let Some(table_idx) = next_non_ignorable_token(tokens, stmt_start, stmt_end) else {
+        return;
+    };
+    if !is_word_eq(&tokens[table_idx], "TABLE") {
+        return;
+    }
+
+    let Some(relation_idx) = next_non_ignorable_token(tokens, table_idx + 1, stmt_end) else {
+        return;
+    };
+
+    let meaningful: Vec<&Token> = tokens[relation_idx..stmt_end]
+        .iter()
+        .filter(|tok| !is_ignorable_statement_token(tok))
+        .collect();
+    if meaningful.is_empty() {
+        return;
+    }
+
+    let mut cursor = 0usize;
+    let mut saw_only = false;
+    if is_word_eq(meaningful[cursor], "ONLY") {
+        saw_only = true;
+        cursor += 1;
+        if cursor >= meaningful.len() {
+            return;
+        }
+    }
+
+    // `TABLE ONLY <relation>` is valid PostgreSQL shorthand, but sqlparser 0.40
+    // does not parse `SELECT * FROM ONLY <relation>`.
+    // Since db9 does not implement table inheritance, dropping ONLY is a
+    // compatibility-safe parse shim for now.
+    let relation_start_idx = cursor;
+
+    if !is_table_relation_name_token(meaningful[cursor]) {
+        return;
+    }
+    cursor += 1;
+
+    while cursor + 1 < meaningful.len()
+        && meaningful[cursor].kind == TokenKind::Other
+        && meaningful[cursor].text == "."
+        && is_table_relation_name_token(meaningful[cursor + 1])
+    {
+        cursor += 2;
+    }
+
+    let relation_end = meaningful[cursor - 1].end;
+    let mut tail_start = relation_end;
+    let mut rewrite_end = relation_end;
+
+    if cursor < meaningful.len()
+        && meaningful[cursor].kind == TokenKind::Other
+        && meaningful[cursor].text == "*"
+    {
+        // PostgreSQL rejects `TABLE ONLY <relation> *` as a syntax error.
+        // Leave this form untouched so sqlparser reports the syntax error.
+        if saw_only {
+            return;
+        }
+        let star_end = meaningful[cursor].end;
+        tail_start = star_end;
+        rewrite_end = star_end;
+        cursor += 1;
+    }
+
+    if cursor < meaningful.len() && !is_table_relation_tail_keyword(meaningful[cursor]) {
+        return;
+    }
+
+    let relation_start = meaningful[relation_start_idx].start;
+    let relation = sql[relation_start..relation_end].trim();
+    if relation.is_empty() {
+        return;
+    }
+
+    if cursor < meaningful.len() {
+        rewrite_end = meaningful[meaningful.len() - 1].end;
+    }
+    if rewrite_end < tail_start {
+        rewrite_end = tail_start;
+    }
+    let tail = &sql[tail_start..rewrite_end];
+
+    replacements.push((
+        tokens[table_idx].start,
+        rewrite_end,
+        format!("SELECT * FROM {}{}", relation, tail),
+    ));
+}
+
+/// Rewrite PostgreSQL `TABLE [ONLY] <relation>` shorthand to
+/// `SELECT * FROM <relation>`.
+///
+/// Also preserves optional PostgreSQL `ORDER BY`, `LIMIT`, and `OFFSET`
+/// clauses that can follow the relation name.
+///
+/// PostgreSQL treats `TABLE <relation>` as shorthand for querying all rows from
+/// a relation. sqlparser 0.40 does not parse `TABLE` as a standalone statement.
+/// It also does not parse `SELECT ... FROM ONLY <relation>`, so `TABLE ONLY`
+/// is normalized to `SELECT * FROM <relation>` in db9.
+///
+/// Classification: parse-compat shim.
+/// Exit condition: remove when sqlparser-rs supports `TABLE <relation>`.
+fn preprocess_table_relation_shorthand(sql: &str) -> Option<String> {
+    let tokens = tokenize_sql_for_rewrite(sql);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    let mut stmt_start = 0usize;
+
+    while stmt_start < tokens.len() {
+        let mut stmt_end = stmt_start;
+        while stmt_end < tokens.len() && !is_semicolon(&tokens[stmt_end]) {
+            stmt_end += 1;
+        }
+
+        collect_table_relation_shorthand_rewrite(
+            sql,
+            &tokens,
+            stmt_start,
+            stmt_end,
+            &mut replacements,
+        );
+
+        stmt_start = if stmt_end < tokens.len() {
+            stmt_end + 1
+        } else {
+            stmt_end
+        };
+    }
+
+    if replacements.is_empty() {
+        return None;
+    }
+
+    let mut rewritten = sql.to_string();
+    for (start, end, replacement) in replacements.into_iter().rev() {
+        rewritten.replace_range(start..end, &replacement);
+    }
+    Some(rewritten)
+}
+
 /// Rewrite `<type> array` (PostgreSQL array type syntax) to `<type>[]`.
 ///
 /// Classification: parse-normalization shim.
@@ -1013,6 +1177,11 @@ fn preprocess_partition_ancestors_with_ordinality(sql: &str) -> Option<String> {
 ///   What: `SELECT FROM` -> `SELECT TRUE AS _exists FROM`.
 ///   Why: sqlparser 0.40 requires ≥1 SELECT item.
 ///   Exit condition: empty SELECT list support.
+/// - `preprocess_table_relation_shorthand`
+///   What: `TABLE [ONLY] <relation> [ORDER BY/LIMIT/OFFSET ...]`
+///   -> `SELECT * FROM <relation> ...`.
+///   Why: sqlparser 0.40 doesn't parse TABLE as a standalone statement.
+///   Exit condition: TABLE statement support.
 /// - `preprocess_type_array`
 ///   What: `<type> array` -> `<type>[]`.
 ///   Why: sqlparser 0.40 only accepts bracket form.
@@ -1065,6 +1234,9 @@ pub(super) fn preprocess_sql(sql: &str) -> String {
 
     // Activepieces migration compat shims (#885)
     if let Some(rewritten) = preprocess_select_from(&result) {
+        result = rewritten;
+    }
+    if let Some(rewritten) = preprocess_table_relation_shorthand(&result) {
         result = rewritten;
     }
     if let Some(rewritten) = preprocess_type_array(&result) {
@@ -1127,6 +1299,74 @@ mod tests {
     fn preprocess_select_from_ignores_normal_select() {
         assert!(preprocess_select_from("SELECT 1 FROM t").is_none());
         assert!(preprocess_select_from("SELECT * FROM t").is_none());
+    }
+
+    #[test]
+    fn preprocess_table_relation_shorthand_rewrites_simple_relation() {
+        let input = "TABLE mytable";
+        let result = preprocess_table_relation_shorthand(input).unwrap();
+        assert_eq!(result, "SELECT * FROM mytable");
+    }
+
+    #[test]
+    fn preprocess_table_relation_shorthand_rewrites_qualified_and_quoted_relation() {
+        let input = r#"TABLE public."MyTable"; TABLE "other_table";"#;
+        let result = preprocess_table_relation_shorthand(input).unwrap();
+        assert_eq!(
+            result,
+            r#"SELECT * FROM public."MyTable"; SELECT * FROM "other_table";"#
+        );
+    }
+
+    #[test]
+    fn preprocess_table_relation_shorthand_rewrites_order_limit_offset_tails() {
+        let input = "TABLE t ORDER BY id DESC LIMIT 5 OFFSET 1";
+        let result = preprocess_table_relation_shorthand(input).unwrap();
+        assert_eq!(result, "SELECT * FROM t ORDER BY id DESC LIMIT 5 OFFSET 1");
+    }
+
+    #[test]
+    fn preprocess_table_relation_shorthand_rewrites_for_update_tail() {
+        let input = "TABLE t FOR UPDATE";
+        let result = preprocess_table_relation_shorthand(input).unwrap();
+        assert_eq!(result, "SELECT * FROM t FOR UPDATE");
+    }
+
+    #[test]
+    fn preprocess_table_relation_shorthand_rewrites_trailing_star_tails() {
+        let input = "TABLE t *";
+        let result = preprocess_table_relation_shorthand(input).unwrap();
+        assert_eq!(result, "SELECT * FROM t");
+
+        let input = "TABLE t * ORDER BY id";
+        let result = preprocess_table_relation_shorthand(input).unwrap();
+        assert_eq!(result, "SELECT * FROM t ORDER BY id");
+
+        let input = "TABLE t * LIMIT 5";
+        let result = preprocess_table_relation_shorthand(input).unwrap();
+        assert_eq!(result, "SELECT * FROM t LIMIT 5");
+
+        let input = "TABLE t * OFFSET 2";
+        let result = preprocess_table_relation_shorthand(input).unwrap();
+        assert_eq!(result, "SELECT * FROM t OFFSET 2");
+
+        let input = "TABLE t * FOR UPDATE";
+        let result = preprocess_table_relation_shorthand(input).unwrap();
+        assert_eq!(result, "SELECT * FROM t FOR UPDATE");
+    }
+
+    #[test]
+    fn preprocess_table_relation_shorthand_rewrites_only_relation() {
+        let input = "TABLE ONLY t ORDER BY id DESC LIMIT 1";
+        let result = preprocess_table_relation_shorthand(input).unwrap();
+        assert_eq!(result, "SELECT * FROM t ORDER BY id DESC LIMIT 1");
+    }
+
+    #[test]
+    fn preprocess_table_relation_shorthand_ignores_non_table_or_invalid_tails() {
+        assert!(preprocess_table_relation_shorthand("SELECT * FROM t").is_none());
+        assert!(preprocess_table_relation_shorthand("TABLE t WHERE id = 1").is_none());
+        assert!(preprocess_table_relation_shorthand("TABLE ONLY t *").is_none());
     }
 
     #[test]
