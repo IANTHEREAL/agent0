@@ -1,0 +1,7 @@
+session.authorization
+session_authorization
+custom_val_1564
+dotted_matches_set:OK
+pseudo_matches_custom:OK
+dotted_differs_from_pseudo:OK
+pseudo_is_current_user:OK
