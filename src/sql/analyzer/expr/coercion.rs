@@ -185,10 +185,11 @@ impl<'a> Analyzer<'a> {
                 } else {
                     self.analyze_expr(&ob.expr)?
                 };
+                let asc = ob.asc.unwrap_or(true);
                 Ok(TypedOrderByExpr {
                     expr,
-                    asc: ob.asc.unwrap_or(true),
-                    nulls_first: ob.nulls_first.unwrap_or(false),
+                    asc,
+                    nulls_first: ob.nulls_first.unwrap_or(!asc),
                 })
             })
             .collect()
