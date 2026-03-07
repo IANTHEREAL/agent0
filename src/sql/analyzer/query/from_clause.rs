@@ -123,6 +123,7 @@ impl<'a> Analyzer<'a> {
                 };
 
                 // Analyze function arguments, preserving named parameters.
+                self.validate_no_positional_after_named(func_args)?;
                 let mut typed_args = Vec::with_capacity(func_args.len());
                 for arg in func_args {
                     match arg {

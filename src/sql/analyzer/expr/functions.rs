@@ -33,6 +33,25 @@ fn is_two_arg_advisory_lock_function(name: &str) -> bool {
 }
 
 impl<'a> Analyzer<'a> {
+    pub(in crate::sql::analyzer) fn validate_no_positional_after_named(
+        &self,
+        args: &[FunctionArg],
+    ) -> Result<(), AnalyzerError> {
+        let mut seen_named = false;
+        for arg in args {
+            match arg {
+                FunctionArg::Named { .. } => seen_named = true,
+                FunctionArg::Unnamed(_) if seen_named => {
+                    return Err(AnalyzerError::SqlStructure(
+                        "positional argument cannot follow named argument".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     // -- Helper: CASE --
 
     pub(super) fn analyze_case(
@@ -147,6 +166,8 @@ impl<'a> Analyzer<'a> {
     // -- Helper: function analysis --
 
     pub(super) fn analyze_function(&mut self, func: &Function) -> Result<TypedExpr, AnalyzerError> {
+        self.validate_no_positional_after_named(&func.args)?;
+
         let mut func_name = function_name_upper(func);
 
         // Preserve schema prefix for schema-qualified functions (e.g., cron.schedule).

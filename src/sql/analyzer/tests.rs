@@ -44,6 +44,14 @@ fn parse_query(sql: &str) -> sqlparser::ast::Query {
     }
 }
 
+fn parse_query_with_compat(sql: &str) -> sqlparser::ast::Query {
+    let stmts = crate::sql::parser::parse_sql(sql).unwrap();
+    match stmts.into_iter().next().unwrap() {
+        sqlparser::ast::Statement::Query(q) => *q,
+        _ => panic!("expected query"),
+    }
+}
+
 fn text_literal_value(expr: &TypedExpr) -> Option<&str> {
     match &expr.kind {
         TypedExprKind::Constant(crate::model::Value::Text(s)) => Some(s.as_str()),
@@ -1407,6 +1415,40 @@ fn analyze_values_rejects_mismatched_row_width() {
     let query = parse_query("VALUES (1), (1, 2)");
     let err = analyzer.analyze_query(&query).unwrap_err();
     assert!(matches!(err, AnalyzerError::Unsupported(_)));
+}
+
+#[test]
+fn analyze_rejects_positional_after_named_in_from_with_42601() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query_with_compat("SELECT * FROM generate_series(start := 1, 10)");
+
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::SqlStructure(ref msg)
+            if msg == "positional argument cannot follow named argument"
+    ));
+
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42601");
+}
+
+#[test]
+fn analyze_rejects_positional_after_named_in_scalar_call_with_42601() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query_with_compat("SELECT length(str := 'hello', 1)");
+
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::SqlStructure(ref msg)
+            if msg == "positional argument cannot follow named argument"
+    ));
+
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42601");
 }
 
 // ── Implicit cast insertion ─────────────────────────────────

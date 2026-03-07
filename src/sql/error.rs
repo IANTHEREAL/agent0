@@ -355,6 +355,7 @@ impl From<AnalyzerError> for SqlError {
             AnalyzerError::InvalidParameterUsage { index, context } => {
                 SqlError::InvalidParameterUsage { index, context }
             }
+            AnalyzerError::SqlStructure(msg) => SqlError::SqlStructure(msg),
             AnalyzerError::SchemaNotFound(name) => SqlError::InvalidSchemaName(name),
             AnalyzerError::CollationNotFound(_) => SqlError::UndefinedObject(e.to_string()),
             AnalyzerError::CrossDatabaseReference(_) => SqlError::Unsupported(e.to_string()),
@@ -807,6 +808,11 @@ mod tests {
         let ae = AnalyzerError::Unsupported("nope".into());
         let sql: SqlError = ae.into();
         assert_eq!(sql.sqlstate(), "0A000");
+
+        // SqlStructure → 42601
+        let ae = AnalyzerError::SqlStructure("bad syntax".into());
+        let sql: SqlError = ae.into();
+        assert_eq!(sql.sqlstate(), "42601");
 
         // UngroupedColumn → 42803 (was XX000 before error unification)
         let ae = AnalyzerError::UngroupedColumn { name: "x".into() };

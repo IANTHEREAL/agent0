@@ -173,6 +173,10 @@ tests/272_to_regtype_timetz.sql
 tests/282_pg_user_passwd_and_json_each_errors.sql
 # #1562 – := named-argument syntax in table function calls
 tests/295_named_arg_syntax.sql
+# #1563 – TABLE <relation> shorthand
+tests/296_table_relation_shorthand.sql
+# #1578 – positional arg after named arg should be rejected
+tests/298_named_arg_ordering.sql
 # #1582 – setval() out-of-range error includes (min..max) suffix
 tests/296_setval_out_of_range.sql
 [python]
