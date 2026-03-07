@@ -139,74 +139,30 @@ fn is_valid_tail(tail: &str) -> bool {
     }
 }
 
-/// Find the end offset of a quoted SQL identifier (`"..."`) with doubled-quote
-/// escapes, returning the byte index just after the closing quote.
-fn find_quoted_identifier_end(s: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    if bytes.first().copied() != Some(b'"') {
-        return None;
-    }
-    let mut i = 1;
-    while i < bytes.len() {
-        if bytes[i] == b'"' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                i += 2;
-            } else {
-                return Some(i + 1);
-            }
-        } else {
-            i += 1;
-        }
-    }
-    None
-}
-
 /// Extract and validate the GUC name from the text after `RESET`.
 ///
-/// Accepts either:
-/// - a single unquoted SQL identifier (including dotted names like
-///   `db9.use_optimizer`), or
-/// - a quoted identifier (`"session.authorization"`).
-///
-/// The target may be followed by `;`, `--` line comment, or `/* */` block
-/// comment. PostgreSQL treats comments as whitespace, so comments between
-/// `RESET` and the identifier are allowed (e.g. `RESET /*x*/ ALL`).
-///
-/// Returns `None` if the input is empty, malformed (including unterminated
-/// quotes/comments), or contains unexpected trailing tokens.
+/// Accepts a single SQL identifier (including dotted names like `db9.use_optimizer`),
+/// optionally followed by `;`, `--` line comment, or `/* */` block comment.
+/// PostgreSQL treats comments as whitespace, so comments between `RESET` and the
+/// identifier are allowed (e.g. `RESET /*x*/ ALL`).
+/// Returns `None` if the input is empty, starts with a non-identifier character,
+/// contains unexpected trailing tokens, or has an unterminated block comment.
 pub(crate) fn extract_reset_name(after_reset: &str) -> Option<&str> {
     // PostgreSQL treats comments as whitespace — skip them before the identifier.
     let s = skip_ws_and_comments(after_reset)?;
-    let end = if s.starts_with('"') {
-        find_quoted_identifier_end(s)?
-    } else {
-        if s.is_empty() || (!s.as_bytes()[0].is_ascii_alphabetic() && s.as_bytes()[0] != b'_') {
-            return None;
-        }
-        s.bytes()
-            .position(|b| !b.is_ascii_alphanumeric() && b != b'_' && b != b'.')
-            .unwrap_or(s.len())
-    };
+    if s.is_empty() || (!s.as_bytes()[0].is_ascii_alphabetic() && s.as_bytes()[0] != b'_') {
+        return None;
+    }
+    let end = s
+        .bytes()
+        .position(|b| !b.is_ascii_alphanumeric() && b != b'_' && b != b'.')
+        .unwrap_or(s.len());
     let name = &s[..end];
     if is_valid_tail(&s[end..]) {
         Some(name)
     } else {
         None
     }
-}
-
-/// Normalize a RESET target name:
-/// - unquoted targets are returned as-is;
-/// - quoted targets are unquoted and doubled quotes are unescaped.
-pub(crate) fn normalize_reset_name(name: &str) -> Option<String> {
-    if !name.starts_with('"') {
-        return Some(name.to_string());
-    }
-    let end = find_quoted_identifier_end(name)?;
-    if end != name.len() {
-        return None;
-    }
-    Some(name[1..name.len() - 1].replace("\"\"", "\""))
 }
 
 pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
@@ -546,10 +502,6 @@ mod tests {
             classify("RESET DB9.USE_OPTIMIZER;"),
             Some(RawSqlKind::Reset)
         );
-        assert_eq!(
-            classify("RESET \"session.authorization\""),
-            Some(RawSqlKind::Reset)
-        );
         // RESET ROLE is NOT classified as Reset (handled by parser rewrite)
         assert_eq!(classify("RESET ROLE"), None);
     }
@@ -563,20 +515,11 @@ mod tests {
             extract_reset_name("DB9.USE_OPTIMIZER"),
             Some("DB9.USE_OPTIMIZER")
         );
-        assert_eq!(
-            extract_reset_name("\"session.authorization\""),
-            Some("\"session.authorization\"")
-        );
-        assert_eq!(extract_reset_name("\"ALL\""), Some("\"ALL\""));
 
         // Trailing semicolons
         assert_eq!(
             extract_reset_name("DB9.USE_OPTIMIZER;"),
             Some("DB9.USE_OPTIMIZER")
-        );
-        assert_eq!(
-            extract_reset_name("\"session.authorization\";"),
-            Some("\"session.authorization\"")
         );
 
         // Trailing line comments
@@ -619,25 +562,6 @@ mod tests {
         assert_eq!(extract_reset_name(""), None);
         assert_eq!(extract_reset_name("123bad"), None);
         assert_eq!(extract_reset_name("   "), None);
-        assert_eq!(extract_reset_name("\"unterminated"), None);
-        assert_eq!(extract_reset_name("\"ok\"junk"), None);
-    }
-
-    #[test]
-    fn normalize_reset_name_handles_quoted_and_unquoted() {
-        assert_eq!(
-            normalize_reset_name("DB9.USE_OPTIMIZER"),
-            Some("DB9.USE_OPTIMIZER".to_string())
-        );
-        assert_eq!(
-            normalize_reset_name("\"session.authorization\""),
-            Some("session.authorization".to_string())
-        );
-        assert_eq!(
-            normalize_reset_name("\"weird\"\"quote\""),
-            Some("weird\"quote".to_string())
-        );
-        assert_eq!(normalize_reset_name("\"unterminated"), None);
     }
 
     #[test]

@@ -7,7 +7,6 @@ pub(crate) mod catalog_prefetch;
 mod copy;
 mod dispatch;
 mod guc;
-mod guc_engine;
 mod misc;
 mod observability;
 pub(crate) mod plan_cache;
@@ -29,10 +28,9 @@ pub(crate) mod view_rewrite;
 mod tests;
 
 use guc::{
-    normalize_search_path_entries, parse_search_path_guc_value, parse_set_value,
-    set_variable_value_to_string, try_parse_const_bool, try_parse_const_text,
+    normalize_search_path_entries, parse_search_path_guc_value, set_variable_value_to_string,
+    try_parse_const_bool, try_parse_const_text,
 };
-use guc_engine::{check_reserved_guc_reset, check_reserved_guc_write, GucValueInput};
 pub(crate) use misc::starts_with_ignore_ascii_case;
 use misc::{get_skip_reason, get_unsupported_reason, split_sql_statements};
 use observability::{
