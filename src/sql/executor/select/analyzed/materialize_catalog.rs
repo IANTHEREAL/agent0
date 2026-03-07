@@ -1156,6 +1156,9 @@ impl Executor {
             Value::Text(s) => s,
             v => v.to_string(),
         };
+        if table_arg.trim().is_empty() {
+            return Err(anyhow!("invalid name syntax"));
+        }
         let column_arg = match eval_typed_expr(column_arg_expr, row, qctx)? {
             Value::Null => return Ok(Value::Null),
             Value::Text(s) => s,

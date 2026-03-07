@@ -194,3 +194,6 @@ tests/288_copy_csv_header.sql
 
 # #1583 – ORDER BY DESC default NULL placement (NULLS FIRST)
 tests/295_order_by_null_placement.sql
+
+# #1579 – pg_get_serial_sequence('', 'id') should error with invalid name syntax
+tests/298_pg_get_serial_sequence_empty_name.sql

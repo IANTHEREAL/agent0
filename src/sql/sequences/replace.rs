@@ -255,6 +255,9 @@ pub(crate) fn replace_sequence_functions<'a>(
                             Value::Text(s) => s,
                             v => v.to_string(),
                         };
+                        if table_arg.trim().is_empty() {
+                            return Err(anyhow!("invalid name syntax"));
+                        }
                         let column_arg = match eval_seq_expr(arg1, row, schema)? {
                             Value::Null => return Ok(value_to_sql_expr(&Value::Null)),
                             Value::Text(s) => s,
