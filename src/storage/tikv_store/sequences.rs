@@ -79,6 +79,70 @@ pub(super) fn setval_standalone(
     Ok(value)
 }
 
+fn sequence_lookup_candidates(search_path: &[String], sequence_name: &str) -> Vec<String> {
+    if sequence_name.is_empty() {
+        return Vec::new();
+    }
+
+    if let Some((schema, name)) = sequence_name.split_once('.') {
+        if schema.is_empty() || name.is_empty() || name.contains('.') {
+            return Vec::new();
+        }
+        return vec![format!("{}.{}", schema, name)];
+    }
+
+    let mut schemas: Vec<&str> = search_path
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| !s.eq_ignore_ascii_case("$user"))
+        .collect();
+    if schemas.is_empty() {
+        schemas.push("public");
+    }
+
+    schemas
+        .into_iter()
+        .map(|schema| format!("{}.{}", schema, sequence_name))
+        .collect()
+}
+
+fn decode_table_backed_sequence_state(
+    def: &SequenceDef,
+    runtime_state_data: Option<Vec<u8>>,
+    table_counter_data: Option<Vec<u8>>,
+) -> Result<SequenceState> {
+    if let Some(data) = runtime_state_data {
+        return bincode::deserialize(&data).context("Failed to deserialize sequence state");
+    }
+
+    let counter = match table_counter_data {
+        Some(data) => u64::from_be_bytes(
+            data.try_into()
+                .map_err(|_| anyhow!("Invalid sequence value format"))?,
+        ),
+        None => 0,
+    };
+
+    if counter == 0 {
+        Ok(SequenceState {
+            last_value: def.start_value,
+            is_called: false,
+        })
+    } else {
+        let last_value = i64::try_from(counter).map_err(|_| {
+            anyhow!(
+                "Sequence value {} is too large for i64 ({})",
+                counter,
+                def.full_name()
+            )
+        })?;
+        Ok(SequenceState {
+            last_value,
+            is_called: true,
+        })
+    }
+}
+
 impl TikvStore {
     pub async fn next_sequence_oid(&self, _txn: &mut Transaction, db_id: u64) -> Result<u32> {
         const FIRST_SEQUENCE_OID: u32 = 1;
@@ -243,6 +307,55 @@ impl TikvStore {
             }
             None => Ok(None),
         }
+    }
+
+    pub async fn get_sequence_state_by_name(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        search_path: &[String],
+        sequence_name: &str,
+    ) -> Result<Option<(SequenceDef, SequenceState)>> {
+        for candidate in sequence_lookup_candidates(search_path, sequence_name) {
+            let Some(def) = self.get_sequence(txn, db_id, &candidate).await? else {
+                continue;
+            };
+
+            let state = match &def.backing {
+                SequenceBacking::Standalone(embedded_state) => {
+                    let state_key = self.key(&encode_sequence_value_key_v2(db_id, def.oid));
+                    match tikv_op!(txn.get(state_key).await)? {
+                        Some(data) => bincode::deserialize(&data)
+                            .context("Failed to deserialize sequence state")?,
+                        None => embedded_state.clone(),
+                    }
+                }
+                SequenceBacking::TableId(table_id) => {
+                    let runtime_state_data = if def.oid != 0 {
+                        let state_key = self.key(&encode_sequence_value_key_v2(db_id, def.oid));
+                        tikv_op!(txn.get(state_key).await)?
+                    } else {
+                        None
+                    };
+                    let table_counter_data = if runtime_state_data.is_none() {
+                        let key = self.key(&encode_table_sequence_value_key_v2(db_id, *table_id));
+                        tikv_op!(txn.get(key).await)?
+                    } else {
+                        None
+                    };
+
+                    decode_table_backed_sequence_state(
+                        &def,
+                        runtime_state_data,
+                        table_counter_data,
+                    )?
+                }
+            };
+
+            return Ok(Some((def, state)));
+        }
+
+        Ok(None)
     }
 
     /// Ensure a legacy sequence definition has a stable non-zero OID.
@@ -597,5 +710,74 @@ mod tests {
         assert_eq!(max, 10);
         assert_eq!(state.last_value, 10);
         assert!(!state.is_called);
+    }
+
+    #[test]
+    fn decode_table_backed_sequence_state_prefers_runtime_state_after_migration() {
+        let def = SequenceDef {
+            oid: 42,
+            schema: "public".to_string(),
+            name: "legacy_seq".to_string(),
+            start_value: 1,
+            increment: 1,
+            min_value: 1,
+            max_value: i64::MAX,
+            cache_size: 1,
+            is_cycled: false,
+            owned_by: Some(("public.t".to_string(), "id".to_string())),
+            owner: "postgres".to_string(),
+            backing: SequenceBacking::TableId(7),
+        };
+
+        let runtime_state = SequenceState {
+            // Simulates: nextval advanced to 10, then setval(..., false) wrote 42,false.
+            last_value: 42,
+            is_called: false,
+        };
+        let runtime_state_data = Some(bincode::serialize(&runtime_state).unwrap());
+        let stale_table_counter_data = Some(10_u64.to_be_bytes().to_vec());
+
+        let actual =
+            decode_table_backed_sequence_state(&def, runtime_state_data, stale_table_counter_data)
+                .unwrap();
+        assert_eq!(actual, runtime_state);
+    }
+
+    #[test]
+    fn decode_table_backed_sequence_state_falls_back_to_table_counter() {
+        let def = SequenceDef {
+            oid: 42,
+            schema: "public".to_string(),
+            name: "legacy_seq".to_string(),
+            start_value: 5,
+            increment: 1,
+            min_value: 1,
+            max_value: i64::MAX,
+            cache_size: 1,
+            is_cycled: false,
+            owned_by: Some(("public.t".to_string(), "id".to_string())),
+            owner: "postgres".to_string(),
+            backing: SequenceBacking::TableId(7),
+        };
+
+        let called_state =
+            decode_table_backed_sequence_state(&def, None, Some(9_u64.to_be_bytes().to_vec()))
+                .unwrap();
+        assert_eq!(
+            called_state,
+            SequenceState {
+                last_value: 9,
+                is_called: true
+            }
+        );
+
+        let uncalled_state = decode_table_backed_sequence_state(&def, None, None).unwrap();
+        assert_eq!(
+            uncalled_state,
+            SequenceState {
+                last_value: 5,
+                is_called: false
+            }
+        );
     }
 }

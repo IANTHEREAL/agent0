@@ -3,6 +3,7 @@
 
 use crate::model::{ColumnDef, Row, TableSchema, ViewDef};
 use crate::sql::analyzer::{Analyzer, CatalogSnapshot};
+use crate::sql::executor::table_utils::create_sequence_state_table_schema;
 use crate::sql::names;
 use crate::sql::table_functions::infer_system_virtual_table_function_schema;
 use crate::storage::TikvStore;
@@ -632,31 +633,68 @@ pub(super) async fn build_catalog_snapshot_inner(
             continue;
         }
 
-        // Try to resolve as a real table first.
-        if let Some((schema_name, resolved_full, table_schema)) =
-            try_resolve_table(store, txn, db_id, search_path, raw_name).await?
-        {
-            // Add under both bare name and schema-qualified name so the
-            // Analyzer can find it either way.
-            snapshot.add_table(&schema_name, resolved_full.clone(), table_schema.clone());
-            snapshot.add_table(raw_name, resolved_full, table_schema);
-        } else if let Some((resolved_full, view_schema)) = try_resolve_view_as_table(
-            store,
-            txn,
-            db_id,
-            search_path,
-            tenant_keyspace,
-            raw_name,
-            ctes,
-            expanding_views,
-        )
-        .await?
-        {
-            // View resolved: expose to the Analyzer as a table with synthetic schema.
-            let bare_name = raw_name.rsplit('.').next().unwrap_or(raw_name).to_string();
-            snapshot.add_table(&bare_name, resolved_full.clone(), view_schema.clone());
-            snapshot.add_table(raw_name, resolved_full, view_schema);
-        } else if let Some(virtual_schema) =
+        // Resolve table/view/sequence in search_path order (PG relation semantics).
+        let relation_candidates: Vec<String> = if raw_name.contains('.') {
+            vec![raw_name.to_string()]
+        } else if search_path.is_empty() {
+            vec![format!("public.{}", raw_name)]
+        } else {
+            search_path
+                .iter()
+                .map(|schema| format!("{}.{}", schema, raw_name))
+                .collect()
+        };
+
+        let mut resolved_relation = false;
+        for candidate in &relation_candidates {
+            if let Some(table_schema) = store.get_schema(txn, db_id, candidate).await? {
+                let alias_name = raw_name.rsplit('.').next().unwrap_or(raw_name).to_string();
+                snapshot.add_table(&alias_name, candidate.clone(), table_schema.clone());
+                snapshot.add_table(raw_name, candidate.clone(), table_schema);
+                resolved_relation = true;
+                break;
+            }
+
+            if let Some((resolved_full, view_schema)) = try_resolve_view_as_table(
+                store,
+                txn,
+                db_id,
+                search_path,
+                tenant_keyspace,
+                candidate,
+                ctes,
+                expanding_views,
+            )
+            .await?
+            {
+                // View resolved: expose to the Analyzer as a table with synthetic schema.
+                let alias_name = raw_name.rsplit('.').next().unwrap_or(raw_name).to_string();
+                snapshot.add_table(&alias_name, resolved_full.clone(), view_schema.clone());
+                snapshot.add_table(raw_name, resolved_full.clone(), view_schema);
+                resolved_relation = true;
+                break;
+            }
+
+            if let Some((def, _state)) = store
+                .get_sequence_state_by_name(txn, db_id, &[], candidate)
+                .await?
+            {
+                let resolved_full = def.full_name();
+                let schema = create_sequence_state_table_schema(&resolved_full, &def);
+                let alias_name = raw_name.rsplit('.').next().unwrap_or(raw_name).to_string();
+
+                snapshot.add_table(&alias_name, resolved_full.clone(), schema.clone());
+                snapshot.add_table(raw_name, resolved_full.clone(), schema);
+                snapshot.mark_non_base(&resolved_full);
+                resolved_relation = true;
+                break;
+            }
+        }
+        if resolved_relation {
+            continue;
+        }
+
+        if let Some(virtual_schema) =
             crate::sql::information_schema::get_information_schema_schema(raw_name)
         {
             // Virtual table (pg_catalog.*, information_schema.*).

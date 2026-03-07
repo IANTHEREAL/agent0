@@ -1,0 +1,8 @@
+s1_init=1,false
+-- known divergence: PG returns log_cnt=32 after nextval (WAL pre-allocation counter).
+-- db9 has no WAL; log_cnt is always 0. See table_utils/mod.rs:337.
+s2_after_nextval=1,0,true
+s3_after_setval_false=42,false
+s4_qualified=5,false
+s5_serial_after_insert=2,true
+s7_quoted=9,false

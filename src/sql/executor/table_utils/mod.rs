@@ -11,7 +11,7 @@ pub(crate) use generate_series::{generate_series_values_limited, max_generate_se
 use super::super::ddl_export;
 use super::super::information_schema::VirtualTableFilter;
 use super::core::Executor;
-use crate::model::{ColumnDef, DataType, MigrationRecord, Row, TableSchema, Value};
+use crate::model::{ColumnDef, DataType, MigrationRecord, Row, SequenceDef, TableSchema, Value};
 use crate::sql::catalog::virtual_tables::virtual_table_schema;
 use crate::sql::error::SqlError;
 use crate::sql::sequences::SequenceSession;
@@ -41,6 +41,56 @@ fn worker_claim_keyspace_matches(key: &[u8], keyspace: &str) -> bool {
     }
     let claim_keyspace = &key[idx..idx + keyspace_len];
     claim_keyspace == keyspace.as_bytes()
+}
+
+pub(crate) fn create_sequence_state_table_schema(
+    full_name: &str,
+    def: &SequenceDef,
+) -> TableSchema {
+    TableSchema {
+        name: full_name.to_string(),
+        table_id: 0,
+        columns: vec![
+            ColumnDef {
+                name: "last_value".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+                collation: None,
+            },
+            ColumnDef {
+                name: "log_cnt".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+                collation: None,
+            },
+            ColumnDef {
+                name: "is_called".to_string(),
+                data_type: DataType::Boolean,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+                collation: None,
+            },
+        ],
+        version: 0,
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: def.owner.clone(),
+        from_alias: None,
+    }
 }
 
 impl Executor {
@@ -273,6 +323,21 @@ impl Executor {
             if let Some(schema) = self.store().get_schema(txn, db_id, candidate).await? {
                 let rows = self.scan_and_fill(txn, db_id, candidate, &schema).await?;
                 return Ok((schema, rows));
+            }
+
+            if let Some((def, state)) = self
+                .store()
+                .get_sequence_state_by_name(txn, db_id, &[], candidate)
+                .await?
+            {
+                let full_name = def.full_name();
+                let schema = create_sequence_state_table_schema(&full_name, &def);
+                let row = Row::new(vec![
+                    Value::Int64(state.last_value),
+                    Value::Int64(0), /* known divergence: PG log_cnt is a WAL pre-allocation counter; db9 has no WAL, always returns 0 */
+                    Value::Boolean(state.is_called),
+                ]);
+                return Ok((schema, vec![row]));
             }
         }
 
