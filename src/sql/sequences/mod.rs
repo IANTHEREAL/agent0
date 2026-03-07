@@ -7,9 +7,6 @@ pub(crate) mod index_helpers;
 mod replace;
 pub(crate) mod session;
 
-#[cfg(test)]
-mod tests;
-
 // Re-exports to preserve the original `pub(crate)` surface.
 pub(crate) use ddl::{execute_create_sequence, execute_drop_sequence};
 pub(crate) use eval::eval_expr_with_sequences;
@@ -25,7 +22,11 @@ use crate::sql::names;
 use crate::sql::names::{function_name_upper, normalize_ident};
 use crate::storage::TikvStore;
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, ObjectName};
+use sqlparser::ast::{
+    Expr, FunctionArg, FunctionArgExpr, GeneratedAs, ObjectName, Value as SqlValue,
+};
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
 use std::sync::Arc;
 use tikv_client::Transaction;
 
@@ -251,6 +252,119 @@ pub(crate) fn build_implicit_sequence_def(
     }
 }
 
+const IDENTITY_ALWAYS_MARKER: &str = "NULL /* db9_identity_always */";
+const IDENTITY_BY_DEFAULT_MARKER: &str = "NULL /* db9_identity_by_default */";
+const SERIAL_DEFAULT_DROPPED_MARKER: &str = "NULL /* db9_serial_default_dropped */";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SerialDefaultBehavior<'a> {
+    ImplicitSequence,
+    ExplicitExpr(&'a str),
+    ExplicitNull,
+}
+
+pub(crate) fn identity_default_marker(generated_as: &GeneratedAs) -> Option<&'static str> {
+    match generated_as {
+        GeneratedAs::Always => Some(IDENTITY_ALWAYS_MARKER),
+        GeneratedAs::ByDefault => Some(IDENTITY_BY_DEFAULT_MARKER),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_identity_default_marker(default_expr: Option<&str>) -> bool {
+    matches!(
+        default_expr.map(str::trim),
+        Some(IDENTITY_ALWAYS_MARKER | IDENTITY_BY_DEFAULT_MARKER)
+    )
+}
+
+pub(crate) fn serial_default_dropped_marker() -> &'static str {
+    SERIAL_DEFAULT_DROPPED_MARKER
+}
+
+pub(crate) fn is_serial_default_dropped_marker(default_expr: Option<&str>) -> bool {
+    matches!(
+        default_expr.map(str::trim),
+        Some(SERIAL_DEFAULT_DROPPED_MARKER)
+    )
+}
+
+fn parse_default_expr(expr: &str) -> Option<Expr> {
+    let sql = format!("SELECT {}", expr);
+    let dialect = PostgreSqlDialect {};
+    let ast = match Parser::parse_sql(&dialect, &sql) {
+        Ok(ast) => ast,
+        Err(_) => return None,
+    };
+
+    let Some(sqlparser::ast::Statement::Query(q)) = ast.into_iter().next() else {
+        return None;
+    };
+    let sqlparser::ast::SetExpr::Select(s) = *q.body else {
+        return None;
+    };
+    let Some(sqlparser::ast::SelectItem::UnnamedExpr(parsed_expr)) =
+        s.projection.into_iter().next()
+    else {
+        return None;
+    };
+
+    Some(parsed_expr)
+}
+
+fn is_explicit_null_default_expr(expr: &str) -> bool {
+    fn expr_is_explicit_null(expr: &Expr) -> bool {
+        match expr {
+            Expr::Nested(inner) => expr_is_explicit_null(inner),
+            Expr::Value(SqlValue::Null) => true,
+            Expr::Cast { expr, .. } | Expr::TryCast { expr, .. } => expr_is_explicit_null(expr),
+            _ => false,
+        }
+    }
+
+    if expr.trim().eq_ignore_ascii_case("NULL") {
+        return true;
+    }
+
+    let Some(parsed_expr) = parse_default_expr(expr) else {
+        return false;
+    };
+
+    expr_is_explicit_null(&parsed_expr)
+}
+
+pub(crate) fn classify_serial_default(default_expr: Option<&str>) -> SerialDefaultBehavior<'_> {
+    match default_expr {
+        Some(expr) if is_identity_default_marker(Some(expr)) => {
+            SerialDefaultBehavior::ImplicitSequence
+        }
+        Some(expr) if is_serial_default_dropped_marker(Some(expr)) => {
+            SerialDefaultBehavior::ExplicitNull
+        }
+        Some(expr) if is_explicit_null_default_expr(expr) => SerialDefaultBehavior::ExplicitNull,
+        Some(expr) => SerialDefaultBehavior::ExplicitExpr(expr),
+        None => SerialDefaultBehavior::ImplicitSequence,
+    }
+}
+
+pub(crate) fn serial_column_sequence_full_name(
+    sequences: &[SequenceDef],
+    table_full_name: &str,
+    column_name: &str,
+) -> Result<String> {
+    let (table_schema, table_name) = table_full_name
+        .rsplit_once('.')
+        .unwrap_or(("public", table_full_name));
+    match find_owned_sequence_full_name(sequences, table_full_name, column_name)? {
+        Some(full_name) => Ok(full_name),
+        None => Ok(format!(
+            "{}.{}",
+            table_schema,
+            implicit_sequence_name(table_name, column_name)
+        )),
+    }
+}
+
 pub(crate) fn find_owned_sequence_full_name(
     sequences: &[SequenceDef],
     table_full_name: &str,
@@ -410,3 +524,6 @@ pub(crate) async fn resolve_sequence_full_name_from_value(
 
     Ok(names::ResolvedName::new(names::default_schema(search_path).to_string(), seq_name)?.full)
 }
+
+#[cfg(test)]
+mod tests;

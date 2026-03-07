@@ -5,6 +5,7 @@ use super::helpers::{
 use super::{ScanContext, VirtualTable};
 use crate::model::{DataType, Row, TableSchema};
 use crate::sql::sequences;
+use crate::sql::sequences::SerialDefaultBehavior;
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -124,19 +125,18 @@ impl VirtualTable for Columns {
                 };
 
                 let column_default = if col.is_serial {
-                    let seq_full_name = match sequences::find_owned_sequence_full_name(
-                        &sequence_defs,
-                        full_table_name,
-                        &col.name,
-                    )? {
-                        Some(full_name) => full_name,
-                        None => format!(
-                            "{}.{}",
-                            table_schema,
-                            sequences::implicit_sequence_name(&table_name, &col.name)
-                        ),
-                    };
-                    text_val(&format!("nextval('{}'::regclass)", seq_full_name))
+                    match sequences::classify_serial_default(col.default_expr.as_deref()) {
+                        SerialDefaultBehavior::ExplicitExpr(expr) => text_val(expr),
+                        SerialDefaultBehavior::ExplicitNull => null_val(),
+                        SerialDefaultBehavior::ImplicitSequence => {
+                            let seq_full_name = sequences::serial_column_sequence_full_name(
+                                &sequence_defs,
+                                full_table_name,
+                                &col.name,
+                            )?;
+                            text_val(&format!("nextval('{}'::regclass)", seq_full_name))
+                        }
+                    }
                 } else {
                     col.default_expr
                         .as_ref()
