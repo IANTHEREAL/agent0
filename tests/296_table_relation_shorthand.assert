@@ -1,0 +1,4 @@
+# TABLE ONLY <relation> and TABLE <relation> * should both execute.
+1|alpha
+2|beta
+relation "table_relation_shorthand_missing_296" does not exist
