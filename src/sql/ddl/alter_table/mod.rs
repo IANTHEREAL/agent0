@@ -345,12 +345,30 @@ pub async fn execute_alter_table(
 
             match op {
                 AlterColumnOperation::SetDefault { value } => {
+                    if is_identity_column_for_alter_default(&schema, col_idx) {
+                        return Err(anyhow!(
+                            "column \"{}\" of relation \"{}\" is an identity column",
+                            col_name,
+                            table_object_name
+                        ));
+                    }
                     schema.columns[col_idx].default_expr = Some(value.to_string());
                     schema.version += 1;
                     store.update_schema(txn, db_id, schema).await?;
                 }
                 AlterColumnOperation::DropDefault => {
-                    schema.columns[col_idx].default_expr = None;
+                    if is_identity_column_for_alter_default(&schema, col_idx) {
+                        return Err(anyhow!(
+                            "column \"{}\" of relation \"{}\" is an identity column",
+                            col_name,
+                            table_object_name
+                        ));
+                    }
+                    schema.columns[col_idx].default_expr = if schema.columns[col_idx].is_serial {
+                        Some(crate::sql::sequences::serial_default_dropped_marker().to_string())
+                    } else {
+                        None
+                    };
                     schema.version += 1;
                     store.update_schema(txn, db_id, schema).await?;
                 }
@@ -423,6 +441,14 @@ pub async fn execute_alter_table(
         },
         invalidate_table,
     ))
+}
+
+fn is_identity_column_for_alter_default(
+    schema: &crate::model::TableSchema,
+    col_idx: usize,
+) -> bool {
+    let column = &schema.columns[col_idx];
+    crate::sql::sequences::is_identity_default_marker(column.default_expr.as_deref())
 }
 
 #[inline]

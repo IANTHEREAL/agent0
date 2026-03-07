@@ -1,6 +1,7 @@
-use super::helpers::{int_col, int_val, split_schema_and_name, text_col, text_val};
+use super::helpers::{int_col, int_val, text_col, text_val};
 use super::{ScanContext, VirtualTable};
 use crate::model::{Row, TableSchema};
+use crate::sql::sequences::SerialDefaultBehavior;
 use crate::sql::{catalog_oids, sequences};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -44,7 +45,6 @@ impl VirtualTable for PgAttrdef {
         let sequence_defs = ctx.store.list_sequences(ctx.txn, ctx.db_id).await?;
 
         for full_table_name in ctx.user_tables {
-            let (table_schema, table_name) = split_schema_and_name(full_table_name);
             let Some(schema) = ctx
                 .store
                 .get_schema(ctx.txn, ctx.db_id, full_table_name)
@@ -56,19 +56,19 @@ impl VirtualTable for PgAttrdef {
 
             for (i, col) in schema.columns.iter().enumerate() {
                 let expr = if col.is_serial {
-                    let seq_full_name = match sequences::find_owned_sequence_full_name(
-                        &sequence_defs,
-                        full_table_name,
-                        &col.name,
-                    )? {
-                        Some(full_name) => full_name,
-                        None => format!(
-                            "{}.{}",
-                            table_schema,
-                            sequences::implicit_sequence_name(&table_name, &col.name)
-                        ),
-                    };
-                    Some(format!("nextval('{}'::regclass)", seq_full_name))
+                    match sequences::classify_serial_default(col.default_expr.as_deref()) {
+                        SerialDefaultBehavior::ExplicitExpr(expr) => Some(expr.to_string()),
+                        SerialDefaultBehavior::ExplicitNull => None,
+                        SerialDefaultBehavior::ImplicitSequence => {
+                            let seq_full_name = sequences::resolve_serial_sequence_owned_by(
+                                &sequence_defs,
+                                full_table_name,
+                                &col.name,
+                            )?;
+                            seq_full_name
+                                .map(|full_name| format!("nextval('{}'::regclass)", full_name))
+                        }
+                    }
                 } else {
                     col.default_expr.clone()
                 };
