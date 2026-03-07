@@ -1,0 +1,6 @@
+# ORDER BY inside STRING_AGG must match PostgreSQL ordering semantics.
+a,aa,b,c,n
+c,b,aa,a,n
+n,a,aa,b,c
+1|a,aa,b,c,n
+2|y,x,z

@@ -158,7 +158,7 @@ impl PhysicalOperator for HashAggregateOperator {
                     .aggregate_exprs
                     .iter()
                     .map(|agg_expr| {
-                        if agg_expr.func_name == "ARRAY_AGG" && !agg_expr.order_by.is_empty() {
+                        if !agg_expr.order_by.is_empty() {
                             Some(Vec::new())
                         } else {
                             None
@@ -268,7 +268,7 @@ impl PhysicalOperator for HashAggregateOperator {
                     ..
                 } = state;
                 let mut values = group_values;
-                for (i, agg) in aggregators.into_iter().enumerate() {
+                for (i, mut agg) in aggregators.into_iter().enumerate() {
                     if let Some(mut buf) = ordered_agg_buffers.get_mut(i).and_then(Option::take) {
                         let order_by = &self.aggregate_exprs[i].order_by;
                         sort_by_fallible(&mut buf, |(keys_a, _), (keys_b, _)| {
@@ -287,15 +287,11 @@ impl PhysicalOperator for HashAggregateOperator {
                             }
                             Ok(std::cmp::Ordering::Equal)
                         })?;
-                        let sorted_values = buf.into_iter().map(|(_, v)| v).collect::<Vec<_>>();
-                        values.push(if sorted_values.is_empty() {
-                            Value::Null
-                        } else {
-                            Value::Array(sorted_values)
-                        });
-                    } else {
-                        values.push(agg.result());
+                        for (_, sorted_value) in buf {
+                            agg.update(&sorted_value)?;
+                        }
                     }
+                    values.push(agg.result());
                 }
                 let out_row = Row::new(values);
                 try_grow_statement_memory_scope(
