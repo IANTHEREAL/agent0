@@ -1,9 +1,10 @@
 //! Tableless `set_config()` / `current_setting()` fast paths
 
 use super::{
-    normalize_ident, normalize_search_path_entries, parse_search_path_guc_value,
-    try_parse_const_bool, try_parse_const_text, DataType, ExecuteResult, Expr, FunctionArg,
-    FunctionArgExpr, Query, Row, SelectItem, Session, SetExpr, Value,
+    check_reserved_guc_write, normalize_ident, normalize_search_path_entries,
+    parse_search_path_guc_value, try_parse_const_bool, try_parse_const_text, DataType,
+    ExecuteResult, Expr, FunctionArg, FunctionArgExpr, GucValueInput, Query, Row, SelectItem,
+    Session, SetExpr, Value,
 };
 use crate::session_context;
 use crate::sql::error::SqlError;
@@ -171,6 +172,7 @@ pub(super) fn try_execute_set_config_select(
     };
 
     let var_name = var_name.to_lowercase();
+    check_reserved_guc_write(&var_name, &GucValueInput::Literal(new_value.clone()))?;
     if var_name == "search_path" {
         let parsed = parse_search_path_guc_value(&new_value);
         let new_search_path = normalize_search_path_entries(parsed)?;
@@ -422,6 +424,22 @@ mod tests {
             session.show_setting_value("statement_timeout").as_deref(),
             Some("1000ms")
         );
+    }
+
+    #[test]
+    fn set_config_fast_path_rejects_reserved_pseudo_gucs() {
+        let mut session = make_session();
+        let query = parse_query("SELECT set_config('is_superuser', 'on', false)");
+        let err = try_execute_set_config_select(&mut session, &query)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("parameter \"is_superuser\" cannot be changed"));
+
+        let query = parse_query("SELECT set_config('session_authorization', 'x', true)");
+        let err = try_execute_set_config_select(&mut session, &query)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("parameter \"session_authorization\" cannot be changed"));
     }
 
     #[test]

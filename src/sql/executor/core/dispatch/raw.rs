@@ -366,12 +366,16 @@ impl Executor {
     /// `mark_transaction_failed`.
     fn execute_reset(session: &mut Session, sql_trimmed: &str) -> Result<ExecuteResults> {
         let after_kw = sql_trimmed.get(5..).unwrap_or("");
-        let name = crate::sql::raw_sql::extract_reset_name(after_kw)
+        let raw_name = crate::sql::raw_sql::extract_reset_name(after_kw)
             .ok_or_else(|| anyhow!("syntax error at or near \"RESET\""))?;
-        if name.eq_ignore_ascii_case("ALL") {
+        if !raw_name.starts_with('"') && raw_name.eq_ignore_ascii_case("ALL") {
             session.reset_all_settings();
         } else {
-            session.reset_setting(&name.to_lowercase());
+            let name = crate::sql::raw_sql::normalize_reset_name(raw_name)
+                .ok_or_else(|| anyhow!("syntax error at or near \"RESET\""))?;
+            let name = name.to_lowercase();
+            check_reserved_guc_reset(&name)?;
+            session.reset_setting(&name);
         }
         Ok(ExecuteResults::single(ExecuteResult::CommandComplete {
             tag: "RESET",
@@ -522,6 +526,37 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("syntax error"));
+    }
+
+    #[test]
+    fn execute_reset_honors_reserved_pseudo_guc_rules() {
+        let (_, mut session) = make_executor_and_session(true, false);
+
+        let err = Executor::execute_reset(&mut session, "RESET is_superuser")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("parameter \"is_superuser\" cannot be changed"));
+
+        let out = Executor::execute_reset(&mut session, "RESET session_authorization").unwrap();
+        assert_command_tag(out, "RESET");
+    }
+
+    #[test]
+    fn execute_reset_accepts_quoted_dotted_guc_name() {
+        let (_, mut session) = make_executor_and_session(true, false);
+        session
+            .set_known_setting("session.authorization", "ok".to_string())
+            .unwrap();
+        assert_eq!(
+            session
+                .show_setting_value("session.authorization")
+                .as_deref(),
+            Some("ok")
+        );
+
+        let out = Executor::execute_reset(&mut session, "RESET \"session.authorization\"").unwrap();
+        assert_command_tag(out, "RESET");
+        assert_eq!(session.show_setting_value("session.authorization"), None);
     }
 
     #[test]
