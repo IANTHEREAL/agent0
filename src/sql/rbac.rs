@@ -71,6 +71,8 @@ pub async fn execute_alter_role(
     store: &Arc<TikvStore>,
     auth_manager: &AuthManager,
     txn: &mut Transaction,
+    current_user: Option<&str>,
+    session_user: Option<&str>,
     name: &Ident,
     operation: &AlterRoleOperation,
 ) -> Result<ExecuteResult> {
@@ -86,12 +88,52 @@ pub async fn execute_alter_role(
         AlterRoleOperation::RenameRole {
             role_name: new_name,
         } => {
+            let bootstrap_user = auth_manager
+                .get_bootstrap_user(txn, session_user.or(current_user))
+                .await?;
+            if let Some(bootstrap_user) = bootstrap_user.as_ref() {
+                if role_name == bootstrap_user.as_str() {
+                    if session_user == Some(bootstrap_user.as_str()) {
+                        return Err(
+                            SqlError::Unsupported("session user cannot be renamed".into()).into(),
+                        );
+                    }
+                    if current_user == Some(bootstrap_user.as_str()) {
+                        return Err(
+                            SqlError::Unsupported("current user cannot be renamed".into()).into(),
+                        );
+                    }
+                }
+            }
             auth_manager.drop_user(txn, &role_name).await?;
             super::role_settings::rename_role_settings(txn, &role_name, &new_name.value).await?;
             user.name = new_name.value.clone();
             auth_manager.create_user(txn, user).await?;
+            if bootstrap_user.as_deref() == Some(role_name.as_str()) {
+                auth_manager
+                    .persist_bootstrap_user(txn, &new_name.value)
+                    .await?;
+            }
         }
         AlterRoleOperation::WithOptions { options } => {
+            let contains_nosuperuser = options
+                .iter()
+                .any(|opt| matches!(opt, sqlparser::ast::RoleOption::SuperUser(false)));
+            if contains_nosuperuser {
+                let bootstrap_user = auth_manager
+                    .get_bootstrap_user(txn, session_user.or(current_user))
+                    .await?;
+                if should_block_protected_superuser_operation(
+                    user.is_superuser,
+                    bootstrap_user.as_deref(),
+                    &role_name,
+                ) {
+                    return Err(
+                        SqlError::Unsupported("permission denied to alter role".into()).into(),
+                    );
+                }
+            }
+
             for opt in options {
                 match opt {
                     sqlparser::ast::RoleOption::SuperUser(v) => user.is_superuser = *v,
@@ -248,9 +290,14 @@ pub async fn execute_alter_role(
 pub async fn execute_drop_role(
     auth_manager: &AuthManager,
     txn: &mut Transaction,
+    current_user: Option<&str>,
+    session_user: Option<&str>,
     names: &[ObjectName],
     if_exists: bool,
 ) -> Result<ExecuteResult> {
+    let bootstrap_user = auth_manager
+        .get_bootstrap_user(txn, session_user.or(current_user))
+        .await?;
     for name in names {
         let role_name = name
             .0
@@ -258,6 +305,42 @@ pub async fn execute_drop_role(
             .ok_or_else(|| anyhow!("Invalid role name"))?
             .value
             .clone();
+
+        if current_user == Some(role_name.as_str()) {
+            return Err(SqlError::ObjectInUse {
+                message: "current user cannot be dropped".to_string(),
+            }
+            .into());
+        }
+        if session_user == Some(role_name.as_str()) {
+            return Err(SqlError::ObjectInUse {
+                message: "session user cannot be dropped".to_string(),
+            }
+            .into());
+        }
+
+        let target_is_superuser = if let Some(user) = auth_manager.get_user(txn, &role_name).await?
+        {
+            user.is_superuser
+        } else if let Some(role) = auth_manager.get_role(txn, &role_name).await? {
+            role.is_superuser
+        } else {
+            false
+        };
+
+        if should_block_protected_superuser_operation(
+            target_is_superuser,
+            bootstrap_user.as_deref(),
+            &role_name,
+        ) {
+            return Err(SqlError::DependentObjectsStillExist {
+                message: format!(
+                    "cannot drop role {} because it is required by the database system",
+                    role_name
+                ),
+            }
+            .into());
+        }
 
         let dropped = auth_manager.drop_user(txn, &role_name).await?;
         if !dropped && !if_exists {
@@ -285,6 +368,21 @@ pub async fn execute_drop_role(
     }
 
     Ok(ExecuteResult::DropRole)
+}
+
+fn should_block_protected_superuser_operation(
+    target_is_superuser: bool,
+    bootstrap_user: Option<&str>,
+    target_role_name: &str,
+) -> bool {
+    if !target_is_superuser {
+        return false;
+    }
+
+    match bootstrap_user {
+        Some(bootstrap_user) => target_role_name == bootstrap_user,
+        None => true,
+    }
 }
 
 fn parse_privileges(privileges: &Privileges) -> Vec<Privilege> {
@@ -640,5 +738,33 @@ mod tests {
             GrantObjects::AllTablesInSchema { schemas } => assert_eq!(schemas.len(), 1),
             _ => panic!("expected all-tables-in-schema objects"),
         }
+    }
+
+    #[test]
+    fn protected_superuser_op_allows_non_superuser_when_bootstrap_unknown() {
+        assert!(!should_block_protected_superuser_operation(
+            false,
+            None,
+            "regular_user"
+        ));
+    }
+
+    #[test]
+    fn protected_superuser_op_blocks_bootstrap_superuser_when_marker_exists() {
+        assert!(should_block_protected_superuser_operation(
+            true,
+            Some("admin"),
+            "admin"
+        ));
+    }
+
+    #[test]
+    fn protected_superuser_op_blocks_any_superuser_when_bootstrap_unknown() {
+        assert!(should_block_protected_superuser_operation(
+            true, None, "postgres"
+        ));
+        assert!(should_block_protected_superuser_operation(
+            true, None, "admin2"
+        ));
     }
 }

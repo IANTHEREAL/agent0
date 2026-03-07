@@ -254,6 +254,7 @@ impl Executor {
 
             let timeout = session.statement_timeout();
             let current_role = session.current_user().map(|u| u.to_string());
+            let session_user = session.session_user().map(|u| u.to_string());
             let txn_snapshot_ts_version = session.active_txn_start_ts_version();
             let extension_txn_delta = session.extension_delta_snapshot();
             let fut = async {
@@ -272,6 +273,7 @@ impl Executor {
                         stmt,
                         create_index_with_params,
                         current_role.as_deref(),
+                        session_user.as_deref(),
                     )
                     .await?;
                 Ok::<(Vec<ExecuteResult>, ExecuteResult), anyhow::Error>((notices, result))

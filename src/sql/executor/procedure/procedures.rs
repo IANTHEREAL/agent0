@@ -84,6 +84,7 @@ impl Executor {
         }
 
         let current_role = session.current_user().map(|u| u.to_string());
+        let session_user = session.session_user().map(|u| u.to_string());
         let result = async {
             let db_id = session.current_database_id();
             let (txn, sequence_values, search_path) = session
@@ -176,6 +177,7 @@ impl Executor {
                         &stmt,
                         with_params.as_deref(),
                         current_role.as_deref(),
+                        session_user.as_deref(),
                     )
                     .await?;
                 }

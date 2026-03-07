@@ -21,6 +21,7 @@ fn test_execute_statement_on_txn_signature_stays_boxed() {
         &'a [String],
         &'a sqlparser::ast::Statement,
         Option<&'a str>,
+        Option<&'a str>,
     ) -> super::BoxStmtFuture<'a> = super::Executor::execute_statement_on_txn;
 }
 

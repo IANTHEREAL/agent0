@@ -1,0 +1,4 @@
+permission denied to alter role
+cannot drop role admin2 because it is required by the database system
+session user cannot be renamed
+current user cannot be dropped

@@ -16,6 +16,7 @@ impl Executor {
         stmt: &Statement,
         create_index_with_params: Option<&str>,
         current_role: Option<&str>,
+        session_user: Option<&str>,
     ) -> Result<ExecuteResult> {
         match stmt {
             Statement::CreateTable {
@@ -291,7 +292,15 @@ impl Executor {
                         "role".to_string(),
                     )
                     .await?;
-                    rbac::execute_drop_role(&self.auth_manager, txn, names, *if_exists).await
+                    rbac::execute_drop_role(
+                        &self.auth_manager,
+                        txn,
+                        current_role,
+                        session_user,
+                        names,
+                        *if_exists,
+                    )
+                    .await
                 }
                 ObjectType::Sequence => {
                     self.require_privilege(

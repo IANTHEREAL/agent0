@@ -250,6 +250,7 @@ fn execute_statements<'a>(
                             &stmt,
                             with_params.as_deref(),
                             None,
+                            None,
                         )
                         .await?;
                     }
@@ -269,6 +270,7 @@ fn execute_statements<'a>(
                                 sequence_values,
                                 search_path,
                                 &stmt,
+                                None,
                                 None,
                             )
                             .await?;
@@ -291,6 +293,7 @@ fn execute_statements<'a>(
                                     sequence_values,
                                     search_path,
                                     &stmt,
+                                    None,
                                     None,
                                 )
                                 .await?;
@@ -335,6 +338,7 @@ fn execute_statements<'a>(
                                     sequence_values,
                                     search_path,
                                     &stmt,
+                                    None,
                                     None,
                                 )
                                 .await?;
@@ -519,7 +523,15 @@ async fn evaluate_expression(
         let stmts = parse_sql(&sql)?;
         if let Some(stmt) = stmts.first() {
             let result = exec
-                .execute_statement_on_txn(txn, db_id, sequence_values, search_path, stmt, None)
+                .execute_statement_on_txn(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    stmt,
+                    None,
+                    None,
+                )
                 .await?;
             if let ExecuteResult::Select { rows, .. } = result {
                 if let Some(first_row) = rows.first() {

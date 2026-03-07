@@ -13,6 +13,7 @@ impl Executor {
         _search_path: &[String],
         stmt: &Statement,
         current_role: Option<&str>,
+        session_user: Option<&str>,
     ) -> Result<ExecuteResult> {
         match stmt {
             Statement::CreateRole {
@@ -57,8 +58,16 @@ impl Executor {
                     name.value.clone(),
                 )
                 .await?;
-                rbac::execute_alter_role(&self.store, &self.auth_manager, txn, name, operation)
-                    .await
+                rbac::execute_alter_role(
+                    &self.store,
+                    &self.auth_manager,
+                    txn,
+                    current_role,
+                    session_user,
+                    name,
+                    operation,
+                )
+                .await
             }
             Statement::Grant {
                 privileges,

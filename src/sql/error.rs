@@ -187,6 +187,9 @@ pub enum SqlError {
     #[error("{message}")]
     DependentObjectsStillExist { message: String },
 
+    #[error("{message}")]
+    ObjectInUse { message: String },
+
     // Transaction state errors
     #[error("{message}")]
     NoActiveTransaction { message: String },
@@ -283,6 +286,7 @@ impl SqlError {
             Self::InvalidParameterValue { .. } => "22023",
             Self::NullValueNotAllowed { .. } => "22004",
             Self::DependentObjectsStillExist { .. } => "2BP01",
+            Self::ObjectInUse { .. } => "55006",
             Self::NoActiveTransaction { .. } => "25P01",
             Self::DataTypeMismatch { .. } => "42804",
             Self::GroupingError { .. } => "42803",

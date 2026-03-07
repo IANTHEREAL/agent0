@@ -157,7 +157,7 @@ async fn execute_sql_table_function(
     })?;
 
     let result = executor
-        .execute_statement_on_txn(txn, db_id, sequence_values, search_path, stmt, None)
+        .execute_statement_on_txn(txn, db_id, sequence_values, search_path, stmt, None, None)
         .await?;
 
     match result {

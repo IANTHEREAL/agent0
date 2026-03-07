@@ -907,6 +907,7 @@ impl WorkerEngine {
                                 &search_path,
                                 stmt,
                                 None,
+                                None,
                             ),
                         ),
                     ),

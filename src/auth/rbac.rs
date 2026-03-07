@@ -22,6 +22,7 @@ pub fn invalidate_initialized(keyspace: &str) {
 
 const USER_KEY_PREFIX: &[u8] = b"_sys_user_";
 const ROLE_KEY_PREFIX: &[u8] = b"_sys_role_";
+const BOOTSTRAP_USER_KEY: &[u8] = b"_sys_bootstrap_user";
 const DEFAULT_ADMIN_USER: &str = "admin";
 const SCAN_LIMIT: u32 = u32::MAX;
 
@@ -296,6 +297,10 @@ impl AuthManager {
         key
     }
 
+    fn bootstrap_user_key(&self) -> Vec<u8> {
+        BOOTSTRAP_USER_KEY.to_vec()
+    }
+
     /// Read-only probe: returns `true` if at least one superuser exists.
     ///
     /// Results are cached per keyspace — once `true` for a given keyspace,
@@ -335,6 +340,7 @@ impl AuthManager {
 
         let admin = User::new_superuser(&username, &password);
         self.create_user(txn, admin).await?;
+        self.persist_bootstrap_user(txn, &username).await?;
         if config::env_bool("DB9_DEV") {
             tracing::warn!(
                 "DB9_DEV=1: bootstrapped dev superuser '{}' (password from DB9_DEV_ADMIN_PASSWORD)",
@@ -344,6 +350,97 @@ impl AuthManager {
             tracing::info!("Bootstrapped initial superuser '{}'", username);
         }
         Ok(())
+    }
+
+    pub async fn get_bootstrap_user(
+        &self,
+        txn: &mut Transaction,
+        connection_user: Option<&str>,
+    ) -> Result<Option<String>> {
+        self.ensure_bootstrap_user_key(txn, connection_user).await
+    }
+
+    pub async fn persist_bootstrap_user(
+        &self,
+        txn: &mut Transaction,
+        username: &str,
+    ) -> Result<()> {
+        txn_put(txn, self.bootstrap_user_key(), username.as_bytes().to_vec()).await
+    }
+
+    pub async fn ensure_bootstrap_user_key(
+        &self,
+        txn: &mut Transaction,
+        _connection_user: Option<&str>,
+    ) -> Result<Option<String>> {
+        let key = self.bootstrap_user_key();
+        let existing_bootstrap = txn.get(key.clone()).await?;
+        let superusers = if existing_bootstrap.is_none() {
+            self.find_superuser_names(txn).await?
+        } else {
+            Vec::new()
+        };
+
+        let (bootstrap_user, should_persist, ambiguous_superusers) =
+            Self::resolve_bootstrap_user_for_backfill(existing_bootstrap, &superusers)?;
+        if let Some(superusers) = ambiguous_superusers {
+            tracing::error!(
+                "Multiple superusers found without bootstrap marker. Superusers={:?}. Protections are disabled until the marker is set. Set explicitly: INSERT INTO system._sys_bootstrap_user VALUES ('<role>')",
+                superusers
+            );
+        }
+        if should_persist {
+            if let Some(user) = bootstrap_user.as_ref() {
+                txn_put(txn, key, user.as_bytes().to_vec()).await?;
+            }
+        }
+        Ok(bootstrap_user)
+    }
+
+    async fn find_superuser_names(&self, txn: &mut Transaction) -> Result<Vec<String>> {
+        let users = self.list_users(txn).await?;
+        Ok(Self::superuser_names(users.iter()))
+    }
+
+    fn resolve_bootstrap_user_for_backfill(
+        existing_bootstrap: Option<Vec<u8>>,
+        superusers: &[String],
+    ) -> Result<(Option<String>, bool, Option<Vec<String>>)> {
+        // Backfill contract:
+        // - Existing marker always wins.
+        // - Missing marker + exactly one superuser is unambiguous and auto-backfilled.
+        // - Missing marker + multiple superusers is ambiguous; fail fast by disabling
+        //   protections until an explicit marker is manually set.
+        if let Some(user) = Self::decode_bootstrap_user(existing_bootstrap)? {
+            return Ok((Some(user), false, None));
+        }
+
+        match superusers {
+            [] => Ok((None, false, None)),
+            [single] => Ok((Some(single.clone()), true, None)),
+            many => {
+                let mut superuser_names = many.to_vec();
+                superuser_names.sort_unstable();
+                Ok((None, false, Some(superuser_names)))
+            }
+        }
+    }
+
+    fn decode_bootstrap_user(value: Option<Vec<u8>>) -> Result<Option<String>> {
+        match value {
+            Some(bytes) => String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| anyhow!("invalid UTF-8 value in _sys_bootstrap_user")),
+            None => Ok(None),
+        }
+    }
+
+    fn superuser_names<'a>(users: impl IntoIterator<Item = &'a User>) -> Vec<String> {
+        users
+            .into_iter()
+            .filter(|user| user.is_superuser)
+            .map(|user| user.name.clone())
+            .collect()
     }
 
     /// Resolves bootstrap credentials from environment variables.
@@ -1097,5 +1194,67 @@ mod tests {
             !result.unwrap(),
             "no existing user means proceed with creation"
         );
+    }
+
+    #[test]
+    fn backfill_prefers_existing_bootstrap_user_key() {
+        let result = AuthManager::resolve_bootstrap_user_for_backfill(
+            Some(b"admin".to_vec()),
+            &["legacy_admin".to_string()],
+        )
+        .unwrap();
+        assert_eq!(result, (Some("admin".to_string()), false, None));
+    }
+
+    #[test]
+    fn backfill_persists_single_superuser_when_key_missing() {
+        let users = [
+            User::new("app_user", "pass"),
+            User::new_superuser("admin", "pass"),
+        ];
+        let superusers = AuthManager::superuser_names(users.iter());
+        let result = AuthManager::resolve_bootstrap_user_for_backfill(None, &superusers).unwrap();
+        assert_eq!(result, (Some("admin".to_string()), true, None));
+    }
+
+    #[test]
+    fn backfill_disables_protections_when_key_missing_and_multiple_superusers() {
+        let users = [
+            User::new_superuser("zebra", "pass"),
+            User::new("app_user", "pass"),
+            User::new_superuser("postgres", "pass"),
+            User::new_superuser("admin", "pass"),
+        ];
+        let superusers = AuthManager::superuser_names(users.iter());
+        let result = AuthManager::resolve_bootstrap_user_for_backfill(None, &superusers).unwrap();
+        assert_eq!(
+            result,
+            (
+                None,
+                false,
+                Some(vec![
+                    "admin".to_string(),
+                    "postgres".to_string(),
+                    "zebra".to_string()
+                ])
+            )
+        );
+    }
+
+    #[test]
+    fn backfill_returns_none_when_no_superuser_exists() {
+        let users = [User::new("u1", "pass"), User::new("u2", "pass")];
+        let superusers = AuthManager::superuser_names(users.iter());
+        let result = AuthManager::resolve_bootstrap_user_for_backfill(None, &superusers).unwrap();
+        assert_eq!(result, (None, false, None));
+    }
+
+    #[test]
+    fn backfill_rejects_invalid_utf8_bootstrap_key() {
+        let err = AuthManager::resolve_bootstrap_user_for_backfill(Some(vec![0xff]), &[])
+            .expect_err("invalid UTF-8 bootstrap key should fail");
+        assert!(err
+            .to_string()
+            .contains("invalid UTF-8 value in _sys_bootstrap_user"));
     }
 }
