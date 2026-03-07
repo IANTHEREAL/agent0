@@ -129,6 +129,9 @@ pub enum AnalyzerError {
     /// Cross-database reference (SQLSTATE 0A000).
     CrossDatabaseReference(String),
 
+    /// Invalid column reference (SQLSTATE 42P10).
+    InvalidColumnReference(String),
+
     /// Unsupported SQL feature.
     Unsupported(String),
 
@@ -329,6 +332,7 @@ impl fmt::Display for AnalyzerError {
             Self::CrossDatabaseReference(name) => {
                 write!(f, "cross-database references are not implemented: {}", name)
             }
+            Self::InvalidColumnReference(msg) => write!(f, "{}", msg),
             Self::Unsupported(msg) => write!(f, "{}", msg),
             Self::Internal(msg) => write!(f, "internal error: {}", msg),
         }
