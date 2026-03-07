@@ -23,6 +23,17 @@ use super::super::{
 };
 use super::{should_invalidate_stats_for_drop_column, should_invalidate_stats_for_type_change};
 
+fn has_real_add_column_default(is_serial: bool, default_expr: Option<&str>) -> bool {
+    let Some(expr) = default_expr else {
+        return false;
+    };
+    if !is_serial {
+        return true;
+    }
+    !crate::sql::sequences::is_identity_default_marker(Some(expr))
+        && !crate::sql::sequences::is_serial_default_dropped_marker(Some(expr))
+}
+
 /// ADD COLUMN: resolve type, validate NOT NULL + DEFAULT, append column, create
 /// implicit sequence if serial.  Returns `true` when the schema was actually
 /// mutated, `false` for a silent `IF NOT EXISTS` no-op.
@@ -46,6 +57,7 @@ pub(super) async fn alter_table_add_column(
         resolve_column_data_type(store, txn, db_id, search_path, &column_def.data_type).await?;
     let mut nullable = true;
     let mut default_expr = None;
+    let mut identity_generated_as: Option<GeneratedAs> = None;
     for opt in &column_def.options {
         match &opt.option {
             ColumnOption::NotNull => nullable = false,
@@ -57,15 +69,37 @@ pub(super) async fn alter_table_add_column(
             } => {
                 if matches!(generated_as, GeneratedAs::Always | GeneratedAs::ByDefault) {
                     is_serial = true;
+                    identity_generated_as = Some(generated_as.clone());
                 }
             }
             _ => {}
         }
     }
+    let table_name = schema
+        .name
+        .rsplit_once('.')
+        .map_or(schema.name.as_str(), |(_, n)| n);
+    if let Some(generated_as) = identity_generated_as.as_ref() {
+        if default_expr.is_some() {
+            return Err(SqlError::SqlStructure(format!(
+                "both default and identity specified for column \"{}\" of table \"{}\"",
+                col_name, table_name
+            ))
+            .into());
+        }
+        default_expr =
+            crate::sql::sequences::identity_default_marker(generated_as).map(ToString::to_string);
+    } else if is_serial && default_expr.is_some() {
+        return Err(SqlError::SqlStructure(format!(
+            "multiple default values specified for column \"{}\" of table \"{}\"",
+            col_name, table_name
+        ))
+        .into());
+    }
     if is_serial {
         nullable = false;
     }
-    if !nullable && default_expr.is_none() {
+    if !nullable && !has_real_add_column_default(is_serial, default_expr.as_deref()) {
         let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
         let range: tikv_client::BoundRange = (start..end).into();
         let existing_rows: Vec<_> = txn.scan(range, 1).await?.collect();
@@ -337,4 +371,30 @@ pub(super) async fn alter_table_alter_column_set_data_type(
     schema.version += 1;
     store.update_schema(txn, db_id, schema.clone()).await?;
     Ok(type_changed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_real_add_column_default;
+
+    #[test]
+    fn add_column_default_gate_treats_identity_marker_as_no_default() {
+        assert!(!has_real_add_column_default(
+            true,
+            Some("NULL /* db9_identity_by_default */")
+        ));
+    }
+
+    #[test]
+    fn add_column_default_gate_treats_serial_drop_marker_as_no_default() {
+        assert!(!has_real_add_column_default(
+            true,
+            Some("NULL /* db9_serial_default_dropped */")
+        ));
+    }
+
+    #[test]
+    fn add_column_default_gate_accepts_real_default_expr() {
+        assert!(has_real_add_column_default(false, Some("42")));
+    }
 }

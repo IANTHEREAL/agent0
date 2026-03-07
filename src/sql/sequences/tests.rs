@@ -3,7 +3,10 @@
 #[cfg(test)]
 mod owned_sequence_lookup_tests {
     use crate::model::{SequenceBacking, SequenceDef, SequenceState};
-    use crate::sql::sequences::find_owned_sequence_full_name;
+    use crate::sql::sequences::{
+        classify_serial_default, find_owned_sequence_full_name, serial_default_dropped_marker,
+        SerialDefaultBehavior,
+    };
 
     fn make_sequence(full_name: &str, owned_by: Option<(&str, &str)>) -> SequenceDef {
         let (schema, name) = full_name.split_once('.').unwrap_or(("public", full_name));
@@ -126,5 +129,41 @@ mod owned_sequence_lookup_tests {
 
         let builtin = first_expr("SELECT abs(-1)");
         assert!(!expr_needs_async_eval(&builtin));
+    }
+
+    #[test]
+    fn classify_serial_default_only_treats_literal_and_typed_null_as_explicit_null() {
+        assert_eq!(
+            classify_serial_default(Some("NULL")),
+            SerialDefaultBehavior::ExplicitNull
+        );
+        assert_eq!(
+            classify_serial_default(Some(" null ")),
+            SerialDefaultBehavior::ExplicitNull
+        );
+        assert_eq!(
+            classify_serial_default(Some("NULL::INT")),
+            SerialDefaultBehavior::ExplicitNull
+        );
+        assert_eq!(
+            classify_serial_default(Some("CAST(NULL AS INT)")),
+            SerialDefaultBehavior::ExplicitNull
+        );
+        assert_eq!(
+            classify_serial_default(Some(serial_default_dropped_marker())),
+            SerialDefaultBehavior::ExplicitNull
+        );
+        assert!(matches!(
+            classify_serial_default(Some("NULLIF(1, 1)")),
+            SerialDefaultBehavior::ExplicitExpr("NULLIF(1, 1)")
+        ));
+        assert!(matches!(
+            classify_serial_default(Some("(SELECT NULL)")),
+            SerialDefaultBehavior::ExplicitExpr("(SELECT NULL)")
+        ));
+        assert!(matches!(
+            classify_serial_default(Some("42")),
+            SerialDefaultBehavior::ExplicitExpr("42")
+        ));
     }
 }
