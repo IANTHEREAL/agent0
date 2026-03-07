@@ -1,0 +1,2 @@
+setval: value 0 is out of bounds for sequence "t_id_seq" (1..9223372036854775807)
+setval: value 11 is out of bounds for sequence "setval_custom_bounds_seq" (1..10)

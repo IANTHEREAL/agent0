@@ -175,6 +175,8 @@ tests/282_pg_user_passwd_and_json_each_errors.sql
 tests/295_named_arg_syntax.sql
 # #1563 – TABLE <relation> shorthand
 tests/296_table_relation_shorthand.sql
+# #1582 – setval() out-of-range error includes (min..max) suffix
+tests/296_setval_out_of_range.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py

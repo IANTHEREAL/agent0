@@ -67,8 +67,8 @@ pub(super) fn setval_standalone(
     if value < min_value || value > max_value {
         return Err(SqlError::NumericValueOutOfRange {
             message: format!(
-                "setval: value {} is out of bounds for sequence \"{}\"",
-                value, full_name
+                "setval: value {} is out of bounds for sequence \"{}\" ({}..{})",
+                value, full_name, min_value, max_value
             ),
         }
         .into());
@@ -613,13 +613,17 @@ impl TikvStore {
                 .await?;
         }
 
+        let sequence_name = def.name.clone();
+
         match &def.backing {
             SequenceBacking::TableId(table_id) => {
+                let min_value = def.min_value;
+                let max_value = def.max_value;
                 if value < 1 {
                     return Err(SqlError::NumericValueOutOfRange {
                         message: format!(
-                            "setval: value {} is out of bounds for sequence \"{}\"",
-                            value, full_name
+                            "setval: value {} is out of bounds for sequence \"{}\" ({}..{})",
+                            value, sequence_name, min_value, max_value
                         ),
                     }
                     .into());
@@ -630,7 +634,7 @@ impl TikvStore {
                         .map_err(|_| SqlError::NumericValueOutOfRange {
                             message: format!(
                                 "setval: value {} is too large for sequence \"{}\"",
-                                value, full_name
+                                value, sequence_name
                             ),
                         })?;
                 let stored = if is_called {
@@ -640,8 +644,8 @@ impl TikvStore {
                         .checked_sub(1)
                         .ok_or_else(|| SqlError::NumericValueOutOfRange {
                             message: format!(
-                                "setval: value {} is out of bounds for sequence \"{}\"",
-                                value, full_name
+                                "setval: value {} is out of bounds for sequence \"{}\" ({}..{})",
+                                value, sequence_name, min_value, max_value
                             ),
                         })?
                 };
@@ -652,7 +656,7 @@ impl TikvStore {
             SequenceBacking::Standalone(embedded_state) => {
                 let state_key = self.key(&encode_sequence_value_key_v2(db_id, def.oid));
                 let embedded_state = embedded_state.clone();
-                let full_name = full_name.to_string();
+                let sequence_name = sequence_name.clone();
                 let min_value = def.min_value;
                 let max_value = def.max_value;
                 let value_copy = value;
@@ -666,7 +670,7 @@ impl TikvStore {
                     };
 
                     setval_standalone(
-                        &full_name,
+                        &sequence_name,
                         min_value,
                         max_value,
                         &mut state,
