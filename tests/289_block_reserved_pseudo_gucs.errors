@@ -1,0 +1,2 @@
+parameter "is_superuser" cannot be changed
+parameter "session_authorization" cannot be changed

@@ -1,6 +1,6 @@
 //! `SET` / GUC parsing helpers
 
-use super::{Expr, Result, SqlError};
+use super::{Expr, GucValueInput, Result, SqlError};
 use anyhow::anyhow;
 
 pub(super) fn set_variable_value_to_string(value: &[Expr]) -> Result<String> {
@@ -55,6 +55,18 @@ pub(super) fn set_variable_value_to_string(value: &[Expr]) -> Result<String> {
         }
         _ => Err(SqlError::Unsupported(format!("Unsupported SET value: {}", expr)).into()),
     }
+}
+
+pub(super) fn parse_set_value(value: &[Expr]) -> Result<GucValueInput> {
+    if value.len() != 1 {
+        return Err(SqlError::Unsupported("Unsupported SET value list".into()).into());
+    }
+    if let Expr::Identifier(ident) = &value[0] {
+        if ident.value.eq_ignore_ascii_case("default") {
+            return Ok(GucValueInput::DefaultKeyword);
+        }
+    }
+    Ok(GucValueInput::Literal(set_variable_value_to_string(value)?))
 }
 
 pub(super) fn parse_search_path_guc_value(s: &str) -> Vec<String> {

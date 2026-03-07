@@ -52,9 +52,14 @@ pub(super) fn execute_set_variable(
             session.set_search_path(new_search_path);
         }
     } else {
-        let value = set_variable_value_to_string(value)?;
+        let value_input = parse_set_value(value)?;
+        check_reserved_guc_write(&var_name, &value_input)?;
         if local && !session.is_in_transaction() {
-            crate::sql::session::SessionSettings::validate_and_normalize_value(&var_name, &value)?;
+            if let GucValueInput::Literal(value) = &value_input {
+                crate::sql::session::SessionSettings::validate_and_normalize_value(
+                    &var_name, value,
+                )?;
+            }
             return Ok(vec![
                 ExecuteResult::Notice {
                     message: "SET LOCAL can only be used in transaction blocks".to_string(),
@@ -64,6 +69,17 @@ pub(super) fn execute_set_variable(
             ]);
         }
 
+        if var_name == "session_authorization"
+            && matches!(value_input, GucValueInput::DefaultKeyword)
+        {
+            session.reset_setting("session_authorization");
+            return Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }]);
+        }
+
+        let value = match value_input {
+            GucValueInput::DefaultKeyword => "default".to_string(),
+            GucValueInput::Literal(value) => value,
+        };
         if local {
             session.set_local_setting(&var_name, value)?;
         } else {
@@ -171,6 +187,36 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Unsupported search_path value"));
+    }
+
+    #[test]
+    fn execute_set_variable_rejects_reserved_pseudo_guc_before_set_local_warning() {
+        let mut session = make_session();
+        let variable = ObjectName(vec![sqlparser::ast::Ident::new("is_superuser")]);
+        let value = vec![Expr::Identifier(sqlparser::ast::Ident::new("on"))];
+
+        let err = execute_set_variable(&mut session, true, &variable, &value)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("parameter \"is_superuser\" cannot be changed"));
+    }
+
+    #[test]
+    fn execute_set_variable_session_authorization_default_succeeds_literal_rejected() {
+        let mut session = make_session();
+        let (local, variable, value) = parse_set("SET session_authorization = DEFAULT");
+        let out = execute_set_variable(&mut session, local, &variable, &value).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            out[0],
+            ExecuteResult::CommandComplete { tag: "SET" }
+        ));
+
+        let (local, variable, value) = parse_set("SET session_authorization = 'nobody'");
+        let err = execute_set_variable(&mut session, local, &variable, &value)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("parameter \"session_authorization\" cannot be changed"));
     }
 
     #[test]
