@@ -129,14 +129,6 @@ impl CopyOptions {
                     .to_string(),
             );
         }
-        if opts.format != CopyFormat::Csv {
-            if quote_set {
-                return Err("COPY QUOTE requires CSV mode".to_string());
-            }
-            if escape_set {
-                return Err("COPY ESCAPE requires CSV mode".to_string());
-            }
-        }
         // Apply CSV defaults only for options not explicitly set by the user.
         if opts.format == CopyFormat::Csv {
             if !delimiter_set {
@@ -723,55 +715,16 @@ mod tests {
 
     #[test]
     fn test_ascii_quote_accepted() {
-        let opts = CopyOptions::from_copy_options(&[
-            CopyOption::Format(Ident::new("csv")),
-            CopyOption::Quote('\''),
-        ]);
+        let opts = CopyOptions::from_copy_options(&[CopyOption::Quote('\'')]);
         assert!(opts.is_ok());
         assert_eq!(opts.unwrap().quote, b'\'');
     }
 
     #[test]
     fn test_ascii_escape_accepted() {
-        let opts = CopyOptions::from_copy_options(&[
-            CopyOption::Format(Ident::new("csv")),
-            CopyOption::Escape('\\'),
-        ]);
+        let opts = CopyOptions::from_copy_options(&[CopyOption::Escape('\\')]);
         assert!(opts.is_ok());
         assert_eq!(opts.unwrap().escape, b'\\');
-    }
-
-    #[test]
-    fn test_text_mode_quote_rejected() {
-        let err = CopyOptions::from_copy_options(&[
-            CopyOption::Format(Ident::new("text")),
-            CopyOption::Quote('"'),
-        ])
-        .unwrap_err();
-        assert_eq!(err, "COPY QUOTE requires CSV mode");
-    }
-
-    #[test]
-    fn test_text_mode_escape_rejected() {
-        let err = CopyOptions::from_copy_options(&[
-            CopyOption::Format(Ident::new("text")),
-            CopyOption::Escape('\\'),
-        ])
-        .unwrap_err();
-        assert_eq!(err, "COPY ESCAPE requires CSV mode");
-    }
-
-    #[test]
-    fn test_quote_error_precedes_escape() {
-        let err =
-            CopyOptions::from_copy_options(&[CopyOption::Quote('"'), CopyOption::Escape('\\')])
-                .unwrap_err();
-        assert!(err.contains("QUOTE"), "expected QUOTE error, got: {}", err);
-        assert!(
-            !err.contains("escape"),
-            "got ESCAPE error instead of QUOTE: {}",
-            err
-        );
     }
 
     // --- #630: CSV NULL vs empty string disambiguation ---
