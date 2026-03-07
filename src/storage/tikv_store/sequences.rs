@@ -485,8 +485,9 @@ impl TikvStore {
         db_id: u64,
         def: &mut SequenceDef,
     ) -> Result<()> {
-        let SequenceBacking::TableId(table_id) = def.backing.clone() else {
-            return Ok(());
+        let table_id = match &def.backing {
+            SequenceBacking::TableId(table_id) => *table_id,
+            SequenceBacking::Standalone(_) => return Ok(()),
         };
 
         // Only implicit sequences created from SERIAL/IDENTITY are expected to use TableId backing.
@@ -540,6 +541,8 @@ impl TikvStore {
             last_value,
             is_called,
         });
+        // Persist the migrated backing so future calls skip migration entirely.
+        self.update_sequence_def(txn, db_id, def).await?;
         Ok(())
     }
 
@@ -554,8 +557,10 @@ impl TikvStore {
             .await?
             .ok_or_else(|| SqlError::RelationNotFound(full_name.to_string()))?;
 
-        self.maybe_migrate_implicit_sequence_to_standalone(txn, db_id, &mut def)
-            .await?;
+        if matches!(def.backing, SequenceBacking::TableId(_)) {
+            self.maybe_migrate_implicit_sequence_to_standalone(txn, db_id, &mut def)
+                .await?;
+        }
 
         match &def.backing {
             SequenceBacking::TableId(table_id) => {
@@ -603,8 +608,10 @@ impl TikvStore {
             .await?
             .ok_or_else(|| SqlError::RelationNotFound(full_name.to_string()))?;
 
-        self.maybe_migrate_implicit_sequence_to_standalone(txn, db_id, &mut def)
-            .await?;
+        if matches!(def.backing, SequenceBacking::TableId(_)) {
+            self.maybe_migrate_implicit_sequence_to_standalone(txn, db_id, &mut def)
+                .await?;
+        }
 
         match &def.backing {
             SequenceBacking::TableId(table_id) => {
