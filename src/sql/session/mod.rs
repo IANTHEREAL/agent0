@@ -626,8 +626,7 @@ impl Session {
             .or(self.current_user.as_deref())
             .unwrap_or("postgres")
             .to_string();
-        map.insert("session_authorization".to_string(), session_auth.clone());
-        map.insert("session.authorization".to_string(), session_auth);
+        map.insert("session_authorization".to_string(), session_auth);
         map
     }
 
@@ -635,7 +634,7 @@ impl Session {
         match name {
             "is_superuser" => Some(if self.is_superuser { "on" } else { "off" }.to_string()),
             // Session authorization is the authenticated session user (login role).
-            "session_authorization" | "session.authorization" => Some(
+            "session_authorization" => Some(
                 self.session_user
                     .as_deref()
                     .or(self.current_user.as_deref())

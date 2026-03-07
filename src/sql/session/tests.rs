@@ -927,6 +927,58 @@ mod tests {
     }
 
     #[test]
+    fn test_session_authorization_readback_separates_pseudo_and_dotted_guc() {
+        let store = TikvStore::new_stub();
+        let observability = observability::registry().tenant("tenant_session_auth_readback");
+        let mut session = Session::new_with_user_and_database(
+            store,
+            observability,
+            "admin".to_string(),
+            true,
+            190090,
+            1,
+            "postgres".to_string(),
+            0,
+            0,
+        );
+
+        assert_eq!(
+            session
+                .show_setting_value("session_authorization")
+                .as_deref(),
+            Some("admin")
+        );
+        assert_eq!(session.show_setting_value("session.authorization"), None);
+
+        session
+            .set_known_setting("session.authorization", "x".to_string())
+            .expect("set dotted session guc");
+
+        assert_eq!(
+            session
+                .show_setting_value("session_authorization")
+                .as_deref(),
+            Some("admin")
+        );
+        assert_eq!(
+            session
+                .show_setting_value("session.authorization")
+                .as_deref(),
+            Some("x")
+        );
+
+        let snapshot = session.all_settings_snapshot();
+        assert_eq!(
+            snapshot.get("session_authorization").map(String::as_str),
+            Some("admin")
+        );
+        assert_eq!(
+            snapshot.get("session.authorization").map(String::as_str),
+            Some("x")
+        );
+    }
+
+    #[test]
     fn test_show_value_covers_all_known_gucs() {
         use crate::sql::session::settings::KNOWN_GUCS;
         let settings = SessionSettings::new();

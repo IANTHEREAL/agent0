@@ -152,6 +152,7 @@ tests/189_worker_auto_analyze.sql
 tests/229_statement_timeout.sql
 tests/230_idle_in_transaction_timeout.sql
 tests/232_statement_timeout_guc_regression.sql
+tests/291_session_authorization_readback.sql
 tests/40_setval_null_boolean.sql
 # GIN / FTS
 tests/236_gin_index_scan.sql
