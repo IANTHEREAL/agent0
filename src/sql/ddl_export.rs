@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use tikv_client::Transaction;
 
 use super::sequences;
-use super::sequences::SerialDefaultBehavior;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DdlExportRow {
@@ -45,13 +44,9 @@ pub fn table_to_ddl(schema: &TableSchema, serial_sequences: &HashMap<String, Str
             col_sql.push_str(" NOT NULL");
         }
         let default_expr = if col.is_serial {
-            match sequences::classify_serial_default(col.default_expr.as_deref()) {
-                SerialDefaultBehavior::ExplicitExpr(expr) => Some(expr.to_string()),
-                SerialDefaultBehavior::ExplicitNull => None,
-                SerialDefaultBehavior::ImplicitSequence => serial_sequences
-                    .get(&col.name)
-                    .map(|seq_full_name| format!("nextval('{}'::regclass)", seq_full_name)),
-            }
+            serial_sequences
+                .get(&col.name)
+                .map(|seq_full_name| format!("nextval('{}'::regclass)", seq_full_name))
         } else {
             col.default_expr.clone()
         };
@@ -548,70 +543,6 @@ mod tests {
         assert!(
             ddl.contains("CONSTRAINT users_org_fk FOREIGN KEY (id) REFERENCES public.orgs (id)")
         );
-    }
-
-    #[test]
-    fn table_to_ddl_serial_uses_explicit_default_expression() {
-        let schema = TableSchema {
-            name: "public.users".to_string(),
-            table_id: 1,
-            columns: vec![ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: true,
-                default_expr: Some("42".to_string()),
-                collation: None,
-            }],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: "postgres".to_string(),
-            from_alias: None,
-        };
-
-        let mut serial_sequences = HashMap::new();
-        serial_sequences.insert("id".to_string(), "public.users_id_seq".to_string());
-        let ddl = table_to_ddl(&schema, &serial_sequences);
-        assert!(ddl.contains("id INTEGER NOT NULL DEFAULT 42"));
-        assert!(!ddl.contains("nextval("));
-    }
-
-    #[test]
-    fn table_to_ddl_serial_drop_default_omits_default_clause() {
-        let schema = TableSchema {
-            name: "public.users".to_string(),
-            table_id: 1,
-            columns: vec![ColumnDef {
-                name: "id".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: true,
-                default_expr: Some(crate::sql::sequences::serial_default_dropped_marker().into()),
-                collation: None,
-            }],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: "postgres".to_string(),
-            from_alias: None,
-        };
-
-        let mut serial_sequences = HashMap::new();
-        serial_sequences.insert("id".to_string(), "public.users_id_seq".to_string());
-        let ddl = table_to_ddl(&schema, &serial_sequences);
-        assert!(ddl.contains("id INTEGER NOT NULL"));
-        assert!(!ddl.contains("DEFAULT"));
     }
 
     #[test]

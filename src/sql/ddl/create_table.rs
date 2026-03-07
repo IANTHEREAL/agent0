@@ -101,7 +101,6 @@ pub async fn execute_create_table(
         let mut nullable = true;
         let mut unique = false;
         let mut default_expr = None;
-        let mut identity_generated_as: Option<GeneratedAs> = None;
         let collation: Option<String> = col.collation.as_ref().map(|c| c.to_string());
 
         for opt in &col.options {
@@ -131,7 +130,6 @@ pub async fn execute_create_table(
                 } => {
                     if matches!(generated_as, GeneratedAs::Always | GeneratedAs::ByDefault) {
                         is_serial = true;
-                        identity_generated_as = Some(generated_as.clone());
                     }
                 }
                 ColumnOption::ForeignKey {
@@ -206,24 +204,6 @@ pub async fn execute_create_table(
                 }
                 _ => {}
             }
-        }
-
-        if let Some(generated_as) = identity_generated_as.as_ref() {
-            if default_expr.is_some() {
-                return Err(SqlError::SqlStructure(format!(
-                    "both default and identity specified for column \"{}\" of table \"{}\"",
-                    col_name, table_object_name
-                ))
-                .into());
-            }
-            default_expr = crate::sql::sequences::identity_default_marker(generated_as)
-                .map(ToString::to_string);
-        } else if is_serial && default_expr.is_some() {
-            return Err(SqlError::SqlStructure(format!(
-                "multiple default values specified for column \"{}\" of table \"{}\"",
-                col_name, table_object_name
-            ))
-            .into());
         }
 
         if is_serial {

@@ -3,7 +3,6 @@ use super::{ScanContext, VirtualTable};
 use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::catalog_oids;
 use crate::sql::pg_types;
-use crate::sql::sequences::{self, SerialDefaultBehavior};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -133,14 +132,6 @@ impl VirtualTable for PgAttribute {
                         },
                         _ => 0,
                     };
-                    let atthasdef = if col.is_serial {
-                        !matches!(
-                            sequences::classify_serial_default(col.default_expr.as_deref()),
-                            SerialDefaultBehavior::ExplicitNull
-                        )
-                    } else {
-                        col.default_expr.is_some()
-                    };
 
                     rows.push(Row::new(vec![
                         int_val(base_table_oid),
@@ -152,7 +143,7 @@ impl VirtualTable for PgAttribute {
                         text_val("x"), // attstorage: extended
                         text_val(""),  // attcompression
                         Value::Boolean(!col.nullable),
-                        Value::Boolean(atthasdef),
+                        Value::Boolean(col.is_serial || col.default_expr.is_some()),
                         Value::Boolean(false), // attisdropped
                         Value::Boolean(true),  // attislocal
                         int_val(atttypmod),

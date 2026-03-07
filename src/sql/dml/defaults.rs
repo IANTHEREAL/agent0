@@ -15,7 +15,6 @@ use crate::sql::expr::typed_rewrite::materialize_sequences_in_typed_expr;
 use crate::sql::query_context::QueryContext;
 use crate::sql::sequences;
 use crate::sql::sequences::SequenceSession;
-use crate::sql::sequences::SerialDefaultBehavior;
 use crate::sql::value_coercion::coerce_value_for_column;
 use crate::storage::TikvStore;
 
@@ -79,50 +78,47 @@ async fn eval_column_default_or_null_inner(
         .ok_or_else(|| anyhow!("Column index {} out of bounds", column_idx))?;
 
     if column.is_serial {
-        match sequences::classify_serial_default(column.default_expr.as_deref()) {
-            SerialDefaultBehavior::ExplicitExpr(def) => {
-                return eval_default_expr_maybe_sequence(
-                    store,
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    def,
-                )
-                .await;
-            }
-            SerialDefaultBehavior::ExplicitNull => return Ok(Value::Null),
-            SerialDefaultBehavior::ImplicitSequence => {
-                let seq_full_name = match sequence_defs {
-                    Some(defs) => sequences::serial_column_sequence_full_name(
-                        defs,
-                        &schema.name,
-                        &column.name,
-                    )?,
-                    None => {
-                        let defs = store.list_sequences(txn, db_id).await?;
-                        sequences::serial_column_sequence_full_name(
-                            &defs,
-                            &schema.name,
-                            &column.name,
-                        )?
-                    }
-                };
+        let (table_schema, table_name) = schema
+            .name
+            .rsplit_once('.')
+            .unwrap_or(("public", schema.name.as_str()));
 
-                let seq_val = store.nextval_sequence(txn, db_id, &seq_full_name).await?;
-                sequence_values.record_nextval(seq_full_name, seq_val);
-                return match column.data_type {
-                    DataType::Int64 => Ok(Value::Int64(seq_val)),
-                    _ => Ok(Value::Int32(seq_val.try_into().map_err(|_| {
-                        anyhow!(
-                            "serial sequence value {} overflows INT4 for column \"{}\"",
-                            seq_val,
-                            column.name
-                        )
-                    })?)),
-                };
+        let seq_full_name = match sequence_defs {
+            Some(defs) => {
+                match sequences::find_owned_sequence_full_name(defs, &schema.name, &column.name)? {
+                    Some(full_name) => full_name,
+                    None => format!(
+                        "{}.{}",
+                        table_schema,
+                        sequences::implicit_sequence_name(table_name, &column.name)
+                    ),
+                }
             }
-        }
+            None => {
+                let defs = store.list_sequences(txn, db_id).await?;
+                match sequences::find_owned_sequence_full_name(&defs, &schema.name, &column.name)? {
+                    Some(full_name) => full_name,
+                    None => format!(
+                        "{}.{}",
+                        table_schema,
+                        sequences::implicit_sequence_name(table_name, &column.name)
+                    ),
+                }
+            }
+        };
+
+        let seq_val = store.nextval_sequence(txn, db_id, &seq_full_name).await?;
+        sequence_values.record_nextval(seq_full_name, seq_val);
+        return match column.data_type {
+            DataType::Int64 => Ok(Value::Int64(seq_val)),
+            _ => Ok(Value::Int32(seq_val.try_into().map_err(|_| {
+                anyhow!(
+                    "serial sequence value {} overflows INT4 for column \"{}\"",
+                    seq_val,
+                    column.name
+                )
+            })?)),
+        };
     }
 
     if let Some(def) = &column.default_expr {
@@ -172,14 +168,12 @@ pub async fn fill_missing_columns(
     row_vals: &mut [Value],
     indices: &[usize],
 ) -> Result<()> {
-    let sequence_defs = if schema.columns.iter().enumerate().any(|(i, col)| {
-        col.is_serial
-            && !indices.contains(&i)
-            && matches!(
-                sequences::classify_serial_default(col.default_expr.as_deref()),
-                SerialDefaultBehavior::ImplicitSequence
-            )
-    }) {
+    let sequence_defs = if schema
+        .columns
+        .iter()
+        .enumerate()
+        .any(|(i, col)| col.is_serial && !indices.contains(&i))
+    {
         Some(store.list_sequences(txn, db_id).await?)
     } else {
         None
