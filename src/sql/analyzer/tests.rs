@@ -3286,35 +3286,6 @@ fn analyze_to_regtype_unknown_param_infers_text() {
 }
 
 #[test]
-fn analyze_pg_get_serial_sequence_rejects_non_pg_catalog_schema_qualification() {
-    let err = analyze_expr_with_users("public.pg_get_serial_sequence('t', 'id')").unwrap_err();
-    assert!(matches!(
-        err,
-        AnalyzerError::FunctionNotFound {
-            ref name,
-            arg_types
-        } if name == "public.pg_get_serial_sequence"
-            && arg_types
-                == vec![
-                    DataType::UserDefined("unknown".to_string()),
-                    DataType::UserDefined("unknown".to_string())
-                ]
-    ));
-}
-
-#[test]
-fn analyze_pg_get_serial_sequence_accepts_pg_catalog_schema_qualification() {
-    let expr = analyze_expr_with_users("pg_catalog.pg_get_serial_sequence('t', 'id')").unwrap();
-    assert_eq!(expr.data_type, DataType::Text);
-    match &expr.kind {
-        TypedExprKind::FunctionCall { func, .. } => {
-            assert_eq!(func.name, "PG_GET_SERIAL_SEQUENCE");
-        }
-        _ => panic!("expected FunctionCall"),
-    }
-}
-
-#[test]
 fn analyze_to_regtype_rejects_non_text_argument() {
     let catalog = test_catalog();
     let stmt = parse_statement("SELECT to_regtype(1)");

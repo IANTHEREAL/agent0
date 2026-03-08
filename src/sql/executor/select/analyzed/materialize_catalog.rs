@@ -7,7 +7,6 @@
 
 use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::{FunctionKind, TypedExpr, TypedExprKind};
-use crate::sql::error::SqlError;
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::query_context::QueryContext;
@@ -53,58 +52,6 @@ fn is_pg_get_serial_sequence_function_name(name: &str) -> bool {
             schema.eq_ignore_ascii_case("PG_CATALOG")
                 && func.eq_ignore_ascii_case("PG_GET_SERIAL_SEQUENCE")
         })
-}
-
-fn non_pg_catalog_qualified_pg_get_serial_sequence_signature(
-    name: &str,
-    args: &[TypedExpr],
-) -> Option<String> {
-    let (schema, func) = name.rsplit_once(".")?;
-    if schema.is_empty()
-        || schema.eq_ignore_ascii_case("PG_CATALOG")
-        || !func.eq_ignore_ascii_case("PG_GET_SERIAL_SEQUENCE")
-    {
-        return None;
-    }
-    let arg_types = args
-        .iter()
-        .map(pg_get_serial_sequence_arg_type_name)
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(format!(
-        "{}.pg_get_serial_sequence({})",
-        schema.to_lowercase(),
-        arg_types
-    ))
-}
-
-fn pg_type_name_from_data_type(data_type: &DataType) -> String {
-    match data_type {
-        DataType::Boolean => "boolean".to_string(),
-        DataType::Int32 => "integer".to_string(),
-        DataType::Int64 => "bigint".to_string(),
-        DataType::Float64 => "double precision".to_string(),
-        DataType::Numeric { .. } => "numeric".to_string(),
-        _ => data_type.to_string().to_lowercase(),
-    }
-}
-
-fn pg_get_serial_sequence_arg_type_name(arg: &TypedExpr) -> String {
-    if matches!(
-        &arg.kind,
-        TypedExprKind::Constant(Value::Text(_)) | TypedExprKind::Constant(Value::Null)
-    ) {
-        return "unknown".to_string();
-    }
-    pg_type_name_from_data_type(&arg.data_type)
-}
-
-fn pg_get_serial_sequence_accepts_text_arg(arg: &TypedExpr) -> bool {
-    matches!(arg.data_type, DataType::Text | DataType::Varchar(_))
-        || matches!(
-            &arg.kind,
-            TypedExprKind::Constant(Value::Text(_)) | TypedExprKind::Constant(Value::Null)
-        )
 }
 
 impl Executor {
@@ -261,14 +208,6 @@ impl Executor {
                             TypedExprKind::Constant(val),
                             expr.data_type.clone(),
                         ));
-                    }
-
-                    if let Some(signature) =
-                        non_pg_catalog_qualified_pg_get_serial_sequence_signature(
-                            &func.name, &new_args,
-                        )
-                    {
-                        return Err(SqlError::FunctionNotFound(signature).into());
                     }
 
                     if is_pg_get_serial_sequence_function_name(&func.name) {
@@ -1212,28 +1151,10 @@ impl Executor {
             return Ok(Value::Null);
         };
 
-        let table_arg_type = pg_get_serial_sequence_arg_type_name(table_arg_expr);
-        let column_arg_type = pg_get_serial_sequence_arg_type_name(column_arg_expr);
-        if !pg_get_serial_sequence_accepts_text_arg(table_arg_expr)
-            || !pg_get_serial_sequence_accepts_text_arg(column_arg_expr)
-        {
-            return Err(anyhow!(
-                "function pg_get_serial_sequence({}, {}) does not exist",
-                table_arg_type,
-                column_arg_type
-            ));
-        }
-
         let table_arg = match eval_typed_expr(table_arg_expr, row, qctx)? {
             Value::Null => return Ok(Value::Null),
             Value::Text(s) => s,
-            _ => {
-                return Err(anyhow!(
-                    "function pg_get_serial_sequence({}, {}) does not exist",
-                    table_arg_type,
-                    column_arg_type
-                ));
-            }
+            v => v.to_string(),
         };
         if table_arg.trim().is_empty() {
             return Err(anyhow!("invalid name syntax"));
@@ -1241,13 +1162,7 @@ impl Executor {
         let column_arg = match eval_typed_expr(column_arg_expr, row, qctx)? {
             Value::Null => return Ok(Value::Null),
             Value::Text(s) => s,
-            _ => {
-                return Err(anyhow!(
-                    "function pg_get_serial_sequence({}, {}) does not exist",
-                    table_arg_type,
-                    column_arg_type
-                ));
-            }
+            v => v.to_string(),
         };
 
         let store = self.store();
@@ -1679,15 +1594,11 @@ async fn lookup_regtype_oid_with_hstore_extension(
 mod tests {
     use super::{
         advisory_lock_timeout, find_text_column, hstore_extension_oid_for_name,
-        is_pg_get_serial_sequence_function_name,
-        non_pg_catalog_qualified_pg_get_serial_sequence_signature, parse_regtype_object_name,
-        pg_get_serial_sequence_accepts_text_arg, pg_get_serial_sequence_arg_type_name,
-        regtype_ident_matches, regtype_search_path_schemas, split_regtype_name_parts,
-        strip_regtype_array_dims, strip_regtype_typmod, value_to_bool_strict, value_to_i64,
-        value_to_i64_strict,
+        is_pg_get_serial_sequence_function_name, parse_regtype_object_name, regtype_ident_matches,
+        regtype_search_path_schemas, split_regtype_name_parts, strip_regtype_array_dims,
+        strip_regtype_typmod, value_to_bool_strict, value_to_i64, value_to_i64_strict,
     };
     use crate::model::{ColumnDef, DataType, TableSchema, Value};
-    use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
     use std::collections::HashMap;
     use std::time::Duration;
 
@@ -2055,69 +1966,5 @@ mod tests {
         assert!(!is_pg_get_serial_sequence_function_name(
             "public.pg_get_serial_sequence"
         ));
-    }
-
-    #[test]
-    fn test_pg_get_serial_sequence_arg_type_guard_matches_pg_signature_surface() {
-        let int_arg = TypedExpr {
-            kind: TypedExprKind::Constant(Value::Int32(1)),
-            data_type: DataType::Int32,
-        };
-        let text_arg = TypedExpr {
-            kind: TypedExprKind::Constant(Value::Text("t".to_string())),
-            data_type: DataType::Text,
-        };
-        let null_arg = TypedExpr {
-            kind: TypedExprKind::Constant(Value::Null),
-            data_type: DataType::Text,
-        };
-        let varchar_arg = TypedExpr {
-            kind: TypedExprKind::Parameter { index: 0 },
-            data_type: DataType::Varchar(32),
-        };
-
-        assert!(!pg_get_serial_sequence_accepts_text_arg(&int_arg));
-        assert!(pg_get_serial_sequence_accepts_text_arg(&text_arg));
-        assert!(pg_get_serial_sequence_accepts_text_arg(&null_arg));
-        assert!(pg_get_serial_sequence_accepts_text_arg(&varchar_arg));
-
-        assert_eq!(pg_get_serial_sequence_arg_type_name(&int_arg), "integer");
-        assert_eq!(pg_get_serial_sequence_arg_type_name(&text_arg), "unknown");
-        assert_eq!(pg_get_serial_sequence_arg_type_name(&null_arg), "unknown");
-    }
-
-    #[test]
-    fn test_non_pg_catalog_qualified_pg_get_serial_sequence_returns_function_signature() {
-        let text_arg = TypedExpr {
-            kind: TypedExprKind::Constant(Value::Text("t".to_string())),
-            data_type: DataType::Text,
-        };
-        let null_arg = TypedExpr {
-            kind: TypedExprKind::Constant(Value::Null),
-            data_type: DataType::Text,
-        };
-        let signature = non_pg_catalog_qualified_pg_get_serial_sequence_signature(
-            "PUBLIC.PG_GET_SERIAL_SEQUENCE",
-            &[text_arg, null_arg],
-        );
-        assert_eq!(
-            signature,
-            Some("public.pg_get_serial_sequence(unknown, unknown)".to_string())
-        );
-
-        assert_eq!(
-            non_pg_catalog_qualified_pg_get_serial_sequence_signature(
-                "pg_catalog.pg_get_serial_sequence",
-                &[],
-            ),
-            None
-        );
-        assert_eq!(
-            non_pg_catalog_qualified_pg_get_serial_sequence_signature(
-                "pg_get_serial_sequence",
-                &[],
-            ),
-            None
-        );
     }
 }
