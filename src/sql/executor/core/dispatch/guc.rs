@@ -2,6 +2,31 @@
 
 use super::super::*;
 
+fn is_default_set_value(value: &[Expr]) -> bool {
+    if value.len() != 1 {
+        return false;
+    }
+
+    match &value[0] {
+        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case("default"),
+        Expr::CompoundIdentifier(idents) if idents.len() == 1 => {
+            idents[0].value.eq_ignore_ascii_case("default")
+        }
+        Expr::Value(sqlparser::ast::Value::UnQuotedString(s)) => s.eq_ignore_ascii_case("default"),
+        _ => false,
+    }
+}
+
+fn set_local_outside_transaction_notice() -> Vec<ExecuteResult> {
+    vec![
+        ExecuteResult::Notice {
+            message: "SET LOCAL can only be used in transaction blocks".to_string(),
+            severity: "WARNING".to_string(),
+        },
+        ExecuteResult::CommandComplete { tag: "SET" },
+    ]
+}
+
 /// Execute a `SET <variable>` statement synchronously.
 pub(super) fn execute_set_variable(
     session: &mut Session,
@@ -16,6 +41,22 @@ pub(super) fn execute_set_variable(
         .collect::<Vec<_>>()
         .join(".")
         .to_lowercase();
+
+    match check_reserved_guc_write(&var_name) {
+        Ok(()) => {}
+        Err(write_err) => {
+            if is_default_set_value(value) {
+                if local && !session.is_in_transaction() {
+                    return Ok(set_local_outside_transaction_notice());
+                }
+
+                check_reserved_guc_reset(&var_name)?;
+                session.reset_setting(&var_name);
+                return Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }]);
+            }
+            return Err(write_err);
+        }
+    }
 
     if var_name == "search_path" {
         let mut new_search_path = Vec::new();
@@ -37,13 +78,7 @@ pub(super) fn execute_set_variable(
         }
         let new_search_path = normalize_search_path_entries(new_search_path)?;
         if local && !session.is_in_transaction() {
-            return Ok(vec![
-                ExecuteResult::Notice {
-                    message: "SET LOCAL can only be used in transaction blocks".to_string(),
-                    severity: "WARNING".to_string(),
-                },
-                ExecuteResult::CommandComplete { tag: "SET" },
-            ]);
+            return Ok(set_local_outside_transaction_notice());
         }
 
         if local {
@@ -55,13 +90,7 @@ pub(super) fn execute_set_variable(
         let value = set_variable_value_to_string(value)?;
         if local && !session.is_in_transaction() {
             crate::sql::session::SessionSettings::validate_and_normalize_value(&var_name, &value)?;
-            return Ok(vec![
-                ExecuteResult::Notice {
-                    message: "SET LOCAL can only be used in transaction blocks".to_string(),
-                    severity: "WARNING".to_string(),
-                },
-                ExecuteResult::CommandComplete { tag: "SET" },
-            ]);
+            return Ok(set_local_outside_transaction_notice());
         }
 
         if local {
@@ -171,6 +200,34 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Unsupported search_path value"));
+    }
+
+    #[test]
+    fn execute_set_variable_rejects_reserved_pseudo_guc_write() {
+        let mut session = make_session();
+        let (local, variable, value) = parse_set("SET session_authorization = 'evil_user'");
+        let err = execute_set_variable(&mut session, local, &variable, &value)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("parameter \"session_authorization\" cannot be changed"));
+    }
+
+    #[test]
+    fn execute_set_variable_allows_session_authorization_default_reset() {
+        let mut session = make_session();
+        let (local, variable, value) = parse_set("SET session_authorization TO DEFAULT");
+        let out = execute_set_variable(&mut session, local, &variable, &value).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            out[0],
+            ExecuteResult::CommandComplete { tag: "SET" }
+        ));
+        assert_eq!(
+            session
+                .show_setting_value("session_authorization")
+                .as_deref(),
+            Some("postgres")
+        );
     }
 
     #[test]

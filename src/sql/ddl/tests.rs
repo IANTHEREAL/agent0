@@ -245,6 +245,8 @@ fn coerce_jsonb_to_text_produces_canonical_output() {
         unique: false,
         is_serial: false,
         default_expr: None,
+        generation_expr: None,
+        generation_expr_authorized_by: None,
         collation: None,
     };
     let result =
@@ -262,6 +264,8 @@ fn coerce_json_to_text_preserves_raw_format() {
         unique: false,
         is_serial: false,
         default_expr: None,
+        generation_expr: None,
+        generation_expr_authorized_by: None,
         collation: None,
     };
     let result =
@@ -494,6 +498,8 @@ fn coerce_uuid_to_text_for_type_change() {
         unique: false,
         is_serial: false,
         default_expr: None,
+        generation_expr: None,
+        generation_expr_authorized_by: None,
         collation: None,
     };
     let bytes = *uuid::Uuid::nil().as_bytes();

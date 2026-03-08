@@ -149,8 +149,12 @@ impl VirtualTable for PgAttribute {
                         int_val(atttypmod),
                         int_val(0), // attinhcount
                         int_val(attcollation),
-                        int_val(-1),  // attstattarget
-                        text_val(""), // attgenerated
+                        int_val(-1), // attstattarget
+                        text_val(if col.generation_expr.is_some() {
+                            "s"
+                        } else {
+                            ""
+                        }),
                         text_val(""), // attidentity
                     ]));
                 }

@@ -1391,6 +1391,8 @@ mod tests {
                     unique: true,
                     is_serial: false,
                     default_expr: None,
+                    generation_expr: None,
+                    generation_expr_authorized_by: None,
                     collation: None,
                 },
                 ColumnDef {
@@ -1401,6 +1403,8 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    generation_expr: None,
+                    generation_expr_authorized_by: None,
                     collation: None,
                 },
             ],

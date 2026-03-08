@@ -154,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_settings_embedding_model_accepts_only_v4() {
+    fn test_session_settings_embedding_model_is_syntax_only() {
         let mut settings = SessionSettings::new();
         assert!(settings
             .set_known_setting("embedding.model", "text-embedding-v4".to_string())
@@ -165,15 +165,18 @@ mod tests {
         );
 
         assert!(settings
-            .set_known_setting("embedding.model", "TEXT-EMBEDDING-V4".to_string())
+            .set_known_setting(
+                "embedding.model",
+                "tidbcloud_free/amazon/titan-embed-text-v2".to_string()
+            )
             .unwrap());
         assert_eq!(
             settings.show_value("embedding.model").as_deref(),
-            Some("text-embedding-v4")
+            Some("tidbcloud_free/amazon/titan-embed-text-v2")
         );
 
         assert!(settings
-            .set_known_setting("embedding.model", "text-embedding-v3".to_string())
+            .set_known_setting("embedding.model", "   ".to_string())
             .is_err());
     }
 

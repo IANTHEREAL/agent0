@@ -1,0 +1,2 @@
+cannot insert a non-DEFAULT value into column "b"
+column "b" can only be updated to DEFAULT

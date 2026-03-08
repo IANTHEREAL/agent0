@@ -20,6 +20,7 @@ mod tests;
 pub use self::index_selection::choose_btree_access_path_for_typed_filter;
 pub(crate) use self::predicate::collect_typed_eq_predicates;
 
+use self::hnsw_predicate::HnswQueryVector;
 use crate::model::Value;
 
 /// Boolean expression over GIN token hashes.
@@ -100,11 +101,11 @@ pub enum ScanType {
         index_id: u64,
         index_name: String,
         /// The query vector to search for nearest neighbors.
-        query_vector: Vec<Value>,
+        query_vector: HnswQueryVector,
         /// Maximum number of results (from LIMIT clause).
         k: usize,
-        /// Distance metric: "l2", "cosine", or "ip".
-        distance_metric: String,
+        /// Distance metric for HNSW search and SQL distance projection.
+        distance_metric: crate::sql::hnsw::HnswDistanceMetric,
         /// The distance expression for projecting distance values.
         #[allow(dead_code)]
         distance_expr: Option<Box<crate::sql::analyzer::types::TypedExpr>>,

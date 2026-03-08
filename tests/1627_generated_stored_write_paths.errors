@@ -1,0 +1,2 @@
+column "c" is a generated column
+Generated columns cannot be used in COPY.

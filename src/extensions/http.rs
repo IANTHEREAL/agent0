@@ -138,6 +138,8 @@ fn http_response_schema(name: &str) -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
                 collation: None,
             },
             ColumnDef {
@@ -148,6 +150,8 @@ fn http_response_schema(name: &str) -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
                 collation: None,
             },
             ColumnDef {
@@ -158,6 +162,8 @@ fn http_response_schema(name: &str) -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
                 collation: None,
             },
             ColumnDef {
@@ -168,6 +174,8 @@ fn http_response_schema(name: &str) -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
                 collation: None,
             },
         ],

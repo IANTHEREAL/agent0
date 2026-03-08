@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    ColumnDef as SqlColumnDef, ColumnOption, GeneratedAs, ObjectName, TableConstraint,
+    ColumnDef as SqlColumnDef, ColumnOption, GeneratedAs, GeneratedExpressionMode, ObjectName,
+    TableConstraint,
 };
 use tikv_client::Transaction;
 
@@ -26,7 +27,7 @@ use crate::worker::types::IndexState;
 use super::{
     advance_implicit_sequences_for_seeded_rows, assign_generated_check_constraint_names,
     create_implicit_sequences_for_schema, parse_referential_action, resolve_column_data_type,
-    warn_legacy_relname_conflict_scan_once,
+    validate_generated_column_expr, warn_legacy_relname_conflict_scan_once,
 };
 
 fn short_relation_name(name: &str) -> &str {
@@ -102,6 +103,7 @@ pub async fn execute_create_table(
         let mut unique = false;
         let mut default_expr = None;
         let collation: Option<String> = col.collation.as_ref().map(|c| c.to_string());
+        let mut generation_expr_str: Option<String> = None;
 
         for opt in &col.options {
             match &opt.option {
@@ -116,7 +118,16 @@ pub async fn execute_create_table(
                     }
                 }
                 ColumnOption::NotNull => nullable = false,
-                ColumnOption::Default(expr) => default_expr = Some(expr.to_string()),
+                ColumnOption::Default(expr) => {
+                    if generation_expr_str.is_some() {
+                        return Err(SqlError::SqlStructure(format!(
+                            "both default and generation expression specified for column \"{}\" of table \"{}\"",
+                            col_name, table_object_name
+                        ))
+                        .into());
+                    }
+                    default_expr = Some(expr.to_string());
+                }
                 ColumnOption::Check(expr) => {
                     check_constraints.push(CheckConstraint {
                         name: opt.name.as_ref().map(normalize_ident),
@@ -131,6 +142,38 @@ pub async fn execute_create_table(
                     if matches!(generated_as, GeneratedAs::Always | GeneratedAs::ByDefault) {
                         is_serial = true;
                     }
+                }
+                ColumnOption::Generated {
+                    generated_as: GeneratedAs::Always | GeneratedAs::ExpStored,
+                    generation_expr: Some(expr),
+                    ..
+                } => {
+                    if default_expr.is_some() {
+                        return Err(SqlError::SqlStructure(format!(
+                            "both default and generation expression specified for column \"{}\" of table \"{}\"",
+                            col_name, table_object_name
+                        )).into());
+                    }
+                    if is_pk {
+                        return Err(SqlError::SqlStructure(format!(
+                            "generated column \"{}\" cannot be a primary key",
+                            col_name
+                        ))
+                        .into());
+                    }
+                    generation_expr_str = Some(expr.to_string());
+                }
+                // Reject VIRTUAL generated columns (not supported).
+                ColumnOption::Generated {
+                    generation_expr: Some(_),
+                    generation_expr_mode: Some(GeneratedExpressionMode::Virtual),
+                    ..
+                } => {
+                    return Err(SqlError::Unsupported(format!(
+                        "VIRTUAL generated columns are not supported; use STORED for column \"{}\"",
+                        col_name
+                    ))
+                    .into());
                 }
                 ColumnOption::ForeignKey {
                     foreign_table,
@@ -221,6 +264,8 @@ pub async fn execute_create_table(
             unique,
             is_serial,
             default_expr,
+            generation_expr: generation_expr_str,
+            generation_expr_authorized_by: None,
             collation,
         });
     }
@@ -428,7 +473,7 @@ pub async fn execute_create_table(
         }
     }
 
-    let schema = TableSchema {
+    let mut schema = TableSchema {
         name: table_full_name.clone(),
         table_id,
         columns: col_defs,
@@ -441,6 +486,12 @@ pub async fn execute_create_table(
         owner: "postgres".to_string(),
         from_alias: None,
     };
+
+    for column_idx in 0..schema.columns.len() {
+        let authorizer =
+            validate_generated_column_expr(store, txn, db_id, &schema, column_idx).await?;
+        schema.columns[column_idx].generation_expr_authorized_by = authorizer;
+    }
 
     // Validate self-referencing FK constraints against the final built schema.
     for fk in &schema.foreign_keys {
@@ -530,6 +581,8 @@ pub async fn create_table_from_query_result(
         unique: true,
         is_serial: true,
         default_expr: None,
+        generation_expr: None,
+        generation_expr_authorized_by: None,
         collation: None,
     }];
 
@@ -548,6 +601,8 @@ pub async fn create_table_from_query_result(
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
                 collation: None,
             }
         }));
@@ -565,6 +620,8 @@ pub async fn create_table_from_query_result(
                         unique: false,
                         is_serial: false,
                         default_expr: None,
+                        generation_expr: None,
+                        generation_expr_authorized_by: None,
                         collation: None,
                     })
                 })
@@ -636,6 +693,8 @@ pub async fn create_table_from_stream(
         unique: true,
         is_serial: true,
         default_expr: None,
+        generation_expr: None,
+        generation_expr_authorized_by: None,
         collation: None,
     }];
 
@@ -650,6 +709,8 @@ pub async fn create_table_from_stream(
             unique: false,
             is_serial: false,
             default_expr: None,
+            generation_expr: None,
+            generation_expr_authorized_by: None,
             collation: None,
         });
     }
@@ -722,6 +783,8 @@ pub async fn create_table_from_select_into(
         unique: true,
         is_serial: true,
         default_expr: None,
+        generation_expr: None,
+        generation_expr_authorized_by: None,
         collation: None,
     }];
 
@@ -739,6 +802,8 @@ pub async fn create_table_from_select_into(
             unique: false,
             is_serial: false,
             default_expr: None,
+            generation_expr: None,
+            generation_expr_authorized_by: None,
             collation: None,
         }
     }));

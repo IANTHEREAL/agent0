@@ -348,6 +348,8 @@ fn build_returns_table_schema(declared_cols: &[(String, crate::model::DataType)]
             unique: false,
             is_serial: false,
             default_expr: None,
+            generation_expr: None,
+            generation_expr_authorized_by: None,
             collation: None,
         })
         .collect();
@@ -386,6 +388,8 @@ fn build_output_schema(
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
                 collation: None,
             }
         })

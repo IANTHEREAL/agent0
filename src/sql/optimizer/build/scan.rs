@@ -7,11 +7,13 @@ use anyhow::{anyhow, Result};
 use super::BuildContext;
 use crate::model::{DataType, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
+use crate::sql::expr::functions::embedding::embed_query_text_with_cache;
 use crate::sql::operators::{
     BoxedOperator, GinScanOperator, HnswScanOperator, InListScanOperator, IndexScanOperator,
     ProjectOperator, RangeIndexScanOperator, TableScanOperator,
 };
 use crate::sql::optimizer::physical_plan::{PhysicalNode, PhysicalPlan};
+use crate::sql::planner::hnsw_predicate::HnswQueryVector;
 use crate::sql::planner::{collect_typed_eq_predicates, ScanType};
 use crate::sql::value_coercion::coerce_value_for_column;
 
@@ -135,15 +137,33 @@ pub(super) fn build_index_scan_operator(
             k,
             distance_metric,
             distance_expr,
-        } => Ok(Box::new(HnswScanOperator::new(
-            schema,
-            *index_id,
-            index_name.clone(),
-            query_vector.clone(),
-            *k,
-            distance_metric.clone(),
-            distance_expr.as_ref().map(|e| *e.clone()),
-        ))),
+        } => {
+            let query_vector = match query_vector {
+                HnswQueryVector::Constant(values) => values.clone(),
+                HnswQueryVector::PendingEmbedding { text, dimensions } => {
+                    let (function_name, function_signature) =
+                        distance_metric.deferred_embedding_function();
+                    embed_query_text_with_cache(
+                        function_name,
+                        function_signature,
+                        text,
+                        *dimensions,
+                    )?
+                    .into_iter()
+                    .map(Value::Float64)
+                    .collect()
+                }
+            };
+            Ok(Box::new(HnswScanOperator::new(
+                schema,
+                *index_id,
+                index_name.clone(),
+                query_vector,
+                *k,
+                *distance_metric,
+                distance_expr.as_ref().map(|e| *e.clone()),
+            )))
+        }
         // FullTableScan should not appear in PhysicalNode::IndexScan.
         other => Err(anyhow!(
             "Unexpected ScanType {:?} in PhysicalNode::IndexScan for table '{}'",

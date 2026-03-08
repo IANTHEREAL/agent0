@@ -6,6 +6,7 @@
 use crate::model::{Row, Value};
 use crate::sql::analyzer::types::*;
 use crate::sql::error::SqlError;
+use crate::sql::executor::check_reserved_guc_write;
 use crate::sql::query_context::QueryContext;
 use anyhow::{anyhow, Result};
 use std::sync::OnceLock;
@@ -182,6 +183,9 @@ pub(super) fn eval_function_call(
                 }
                 Some(_) => return Err(anyhow!("argument of current_setting must be type boolean")),
             };
+            if let Some(v) = QueryContext::current_setting_snapshot(canonical) {
+                return Ok(Value::Text(v));
+            }
             if let Some(ref snapshot) = qctx.settings_snapshot {
                 return match snapshot.get(canonical) {
                     Some(v) => Ok(Value::Text(v.clone())),
@@ -192,7 +196,63 @@ pub(super) fn eval_function_call(
             // No snapshot (unit tests, DDL contexts) — fall through to error
             return Err(anyhow!("unrecognized configuration parameter \"{}\"", name));
         }
-        "SET_CONFIG" | "PG_CATALOG.SET_CONFIG" => return Ok(Value::Text(String::new())),
+        "SET_CONFIG" | "PG_CATALOG.SET_CONFIG" => {
+            let name = match args.first() {
+                Some(Value::Text(s)) => s.to_lowercase(),
+                Some(Value::Null) | None => return Ok(Value::Null),
+                _ => return Err(anyhow!("set_config requires text argument")),
+            };
+            let value = match args.get(1) {
+                Some(Value::Text(s)) => s.clone(),
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(_) | None => return Err(anyhow!("set_config requires text argument")),
+            };
+            let is_local = match args.get(2) {
+                Some(Value::Boolean(b)) => *b,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Text(s)) => {
+                    match crate::sql::types::cast::cast(
+                        Value::Text(s.clone()),
+                        &crate::model::DataType::Boolean,
+                        crate::sql::types::cast::CastContext::Implicit,
+                    )? {
+                        Value::Boolean(b) => b,
+                        _ => false,
+                    }
+                }
+                Some(_) | None => {
+                    return Err(anyhow!("argument of set_config must be type boolean"))
+                }
+            };
+
+            check_reserved_guc_write(&name)?;
+            let canonical =
+                crate::sql::session::settings::SessionSettings::canonical_setting_name(&name);
+            let normalized_value = if canonical == "search_path" {
+                if value.is_empty() {
+                    String::new()
+                } else {
+                    let parsed = parse_search_path_guc_value(&value);
+                    let normalized = normalize_search_path_entries(parsed)?;
+                    crate::sql::session::settings::SessionSettings::format_search_path_show(
+                        &normalized,
+                    )
+                }
+            } else {
+                crate::sql::session::settings::SessionSettings::validate_and_normalize_value(
+                    canonical, &value,
+                )?
+            };
+            // Match session.is_in_transaction() behavior from the dispatch layer:
+            // outside an explicit transaction, LOCAL changes are dropped at flush,
+            // so they must not leak through runtime current_setting() overrides.
+            let in_transaction =
+                crate::session_context::current_txn_snapshot_ts_version().is_some();
+            if !is_local || in_transaction {
+                QueryContext::record_set_config_mutation(canonical, &normalized_value, is_local);
+            }
+            return Ok(Value::Text(normalized_value));
+        }
         "PG_GET_USERBYID" => return Ok(Value::Text("postgres".to_string())),
         "NEXTVAL" | "CURRVAL" | "SETVAL" | "LASTVAL" => {
             return Err(anyhow!(
@@ -224,6 +284,39 @@ fn split_qualified_function_name(name: &str) -> (Option<&str>, &str) {
         Some((schema, func)) => (Some(schema), func),
         None => (None, name),
     }
+}
+
+fn parse_search_path_guc_value(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in s.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let schema = if token.starts_with('\"') && token.ends_with('\"') && token.len() >= 2 {
+            token[1..token.len() - 1].to_string()
+        } else {
+            token.to_lowercase()
+        };
+        out.push(schema);
+    }
+    out
+}
+
+fn normalize_search_path_entries(mut entries: Vec<String>) -> Result<Vec<String>> {
+    entries.retain(|s| !s.is_empty());
+    if entries.len() == 1 && entries[0].eq_ignore_ascii_case("default") {
+        return Ok(vec!["$user".to_string(), "public".to_string()]);
+    }
+    for schema in &entries {
+        if schema.contains('.') {
+            return Err(anyhow!("schema name '{}' must not contain '.'", schema));
+        }
+    }
+    if entries.is_empty() {
+        entries.push("public".to_string());
+    }
+    Ok(entries)
 }
 
 /// Evaluate TIMEZONE(zone, timestamp) with type-aware direction.

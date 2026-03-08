@@ -1371,6 +1371,8 @@ fn make_schema_with_index() -> TableSchema {
                 unique: true,
                 is_serial: false,
                 default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
                 collation: None,
             },
             ColumnDef {
@@ -1381,6 +1383,8 @@ fn make_schema_with_index() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
                 collation: None,
             },
         ],

@@ -395,17 +395,20 @@ pub struct ColumnDef {
     pub is_serial: bool,
     pub default_expr: Option<String>,
     #[serde(default)]
+    pub generation_expr: Option<String>,
+    #[serde(default)]
+    pub generation_expr_authorized_by: Option<String>,
+    #[serde(default)]
     pub collation: Option<String>,
 }
 
 /// Index definition
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct IndexDef {
     pub name: String,
     pub id: u64,
     pub columns: Vec<String>,
     pub unique: bool,
-    #[serde(default = "default_index_is_constraint")]
     pub is_constraint: bool,
     #[serde(default)]
     pub method: Option<String>,
@@ -428,11 +431,55 @@ pub struct IndexDef {
     pub hnsw_distance_metric: Option<String>,
 }
 
-fn default_index_is_constraint() -> bool {
-    // Backward-compatibility for persisted schemas created before `is_constraint`
-    // existed: those schemas treated every unique index as a UNIQUE constraint
-    // in `pg_constraint`.
-    true
+#[derive(Deserialize)]
+struct IndexDefSerde {
+    name: String,
+    id: u64,
+    columns: Vec<String>,
+    unique: bool,
+    #[serde(default)]
+    is_constraint: Option<bool>,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    predicate: Option<String>,
+    #[serde(default)]
+    expressions: Vec<String>,
+    #[serde(default)]
+    state: IndexState,
+    #[serde(default)]
+    hnsw_m: Option<u16>,
+    #[serde(default)]
+    hnsw_ef_construction: Option<u16>,
+    #[serde(default)]
+    hnsw_distance_metric: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for IndexDef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = IndexDefSerde::deserialize(deserializer)?;
+        let is_constraint = raw
+            .is_constraint
+            .unwrap_or(raw.unique && !raw.columns.is_empty());
+        Ok(Self {
+            name: raw.name,
+            id: raw.id,
+            columns: raw.columns,
+            unique: raw.unique,
+            is_constraint,
+            method: raw.method,
+            predicate: raw.predicate,
+            expressions: raw.expressions,
+            state: raw.state,
+            cached_predicate_conjuncts: None,
+            hnsw_m: raw.hnsw_m,
+            hnsw_ef_construction: raw.hnsw_ef_construction,
+            hnsw_distance_metric: raw.hnsw_distance_metric,
+        })
+    }
 }
 
 pub fn build_predicate_conjunct_cache(predicate: Option<&str>) -> Option<Vec<String>> {

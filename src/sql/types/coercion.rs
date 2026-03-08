@@ -143,6 +143,25 @@ pub fn comparison_target_type(a: &DataType, b: &DataType) -> Option<DataType> {
     }
 }
 
+/// Check if a source type can be assigned to a target type in assignment context.
+///
+/// PostgreSQL assignment coercion is more permissive than implicit comparison
+/// coercion. Text remains universally assignable via I/O coercion; other types
+/// are compatible when they share a common type.
+pub fn is_assignment_compatible(from: &DataType, to: &DataType) -> bool {
+    if matches!(from, DataType::Text) || matches!(to, DataType::Text) {
+        return true;
+    }
+    if let (DataType::Vector(from_dim), DataType::Vector(to_dim)) = (from, to) {
+        return match (*from_dim, *to_dim) {
+            (_, 0) => true,
+            (0, _) => false,
+            (lhs, rhs) => lhs == rhs,
+        };
+    }
+    common_type(from, to).is_some()
+}
+
 pub fn unify_types(types: &[DataType]) -> Option<DataType> {
     if types.is_empty() {
         return None;
@@ -480,5 +499,21 @@ mod tests {
             comparison_target_type(&DataType::Jsonb, &DataType::Text),
             Some(DataType::Jsonb)
         );
+    }
+
+    #[test]
+    fn assignment_compatibility_rejects_unknown_vector_to_concrete_vector() {
+        assert!(!is_assignment_compatible(
+            &DataType::Vector(0),
+            &DataType::Vector(1024)
+        ));
+        assert!(is_assignment_compatible(
+            &DataType::Vector(1024),
+            &DataType::Vector(0)
+        ));
+        assert!(is_assignment_compatible(
+            &DataType::Vector(1024),
+            &DataType::Vector(1024)
+        ));
     }
 }

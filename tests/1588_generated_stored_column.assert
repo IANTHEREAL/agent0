@@ -1,0 +1,10 @@
+insert_basic=5,10
+insert_basic=10,20
+update_basic=20,40
+insert_default=30,60
+update_default=10,20
+gen_expr=(a * 2)
+is_generated=ALWAYS
+is_generated_a=NEVER
+alter_backfill=3,30
+alter_backfill=7,70

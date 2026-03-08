@@ -404,6 +404,9 @@ impl From<AnalyzerError> for SqlError {
             AnalyzerError::DmlWhereNotBoolean { .. } => SqlError::DataTypeMismatch {
                 message: e.to_string(),
             },
+            AnalyzerError::InvalidParameterValue { .. } => SqlError::InvalidParameterValue {
+                message: e.to_string(),
+            },
             other => SqlError::Internal(anyhow::anyhow!("{}", other)),
         }
     }

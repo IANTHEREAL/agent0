@@ -19,6 +19,85 @@ use crate::model::Value;
 
 pub use storage::{metric_from_string, vec_f64_to_f32, HnswIndexHandle, HnswMeta};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswDistanceMetric {
+    L2,
+    Cosine,
+    InnerProduct,
+}
+
+impl HnswDistanceMetric {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::L2 => "l2",
+            Self::Cosine => "cosine",
+            Self::InnerProduct => "ip",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "l2" => Some(Self::L2),
+            "cosine" | "cos" => Some(Self::Cosine),
+            "ip" => Some(Self::InnerProduct),
+            _ => None,
+        }
+    }
+
+    pub fn from_sql_distance_function(func_name: &str) -> Option<Self> {
+        if func_name.eq_ignore_ascii_case("l2_distance")
+            || func_name.eq_ignore_ascii_case("vec_embed_l2_distance")
+        {
+            Some(Self::L2)
+        } else if func_name.eq_ignore_ascii_case("cosine_distance")
+            || func_name.eq_ignore_ascii_case("vec_embed_cosine_distance")
+        {
+            Some(Self::Cosine)
+        } else if func_name.eq_ignore_ascii_case("inner_product")
+            || func_name.eq_ignore_ascii_case("vec_embed_inner_product")
+        {
+            Some(Self::InnerProduct)
+        } else {
+            None
+        }
+    }
+
+    pub fn supports_deferred_embedding(func_name: &str) -> bool {
+        func_name.eq_ignore_ascii_case("vec_embed_l2_distance")
+            || func_name.eq_ignore_ascii_case("vec_embed_cosine_distance")
+            || func_name.eq_ignore_ascii_case("vec_embed_inner_product")
+    }
+
+    pub fn deferred_embedding_function(self) -> (&'static str, &'static str) {
+        match self {
+            Self::L2 => (
+                "vec_embed_l2_distance",
+                "vec_embed_l2_distance(vector, text)",
+            ),
+            Self::Cosine => (
+                "vec_embed_cosine_distance",
+                "vec_embed_cosine_distance(vector, text)",
+            ),
+            Self::InnerProduct => (
+                "vec_embed_inner_product",
+                "vec_embed_inner_product(vector, text)",
+            ),
+        }
+    }
+
+    pub fn normalize_search_distance(self, raw: f64) -> f64 {
+        match self {
+            // usearch returns squared Euclidean distance for MetricKind::L2Sq,
+            // while SQL l2_distance() exposes Euclidean distance.
+            Self::L2 => raw.max(0.0).sqrt(),
+            Self::Cosine => raw,
+            // usearch IP distance is (1 - dot), while SQL inner_product()
+            // exposes the pgvector-compatible negative dot product.
+            Self::InnerProduct => raw - 1.0,
+        }
+    }
+}
+
 /// Default M parameter for HNSW graph connectivity.
 pub const HNSW_DEFAULT_M: usize = 16;
 
@@ -55,6 +134,7 @@ pub fn hnsw_pk_label(pk_values: &[Value]) -> anyhow::Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::HnswDistanceMetric;
     use usearch::ffi::{new_index, IndexOptions, MetricKind, ScalarKind};
 
     #[test]
@@ -199,5 +279,25 @@ mod tests {
             "search should return duplicate labels; got {:?}",
             labels
         );
+    }
+
+    #[test]
+    fn l2_metric_normalizes_squared_distance_to_sql_distance() {
+        assert_eq!(HnswDistanceMetric::L2.normalize_search_distance(25.0), 5.0);
+        assert_eq!(
+            HnswDistanceMetric::Cosine.normalize_search_distance(0.25),
+            0.25
+        );
+        assert_eq!(
+            HnswDistanceMetric::InnerProduct.normalize_search_distance(0.25),
+            -0.75
+        );
+    }
+
+    #[test]
+    fn deferred_embedding_function_supports_inner_product() {
+        let (name, signature) = HnswDistanceMetric::InnerProduct.deferred_embedding_function();
+        assert_eq!(name, "vec_embed_inner_product");
+        assert_eq!(signature, "vec_embed_inner_product(vector, text)");
     }
 }

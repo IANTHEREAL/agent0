@@ -304,8 +304,10 @@ impl Session {
         if !self.pending_param_types.is_empty() {
             qctx.param_types = std::mem::take(&mut self.pending_param_types);
         }
-        // Snapshot all session settings so current_setting() works in expression contexts.
+        // Snapshot both the public SQL-facing settings view and the raw
+        // execution settings view for this statement.
         qctx.settings_snapshot = Some(Arc::new(self.all_settings_snapshot()));
+        qctx.execution_settings_snapshot = Some(Arc::new(self.all_execution_settings_snapshot()));
         qctx.lock_timeout = self.lock_timeout();
         qctx.xact_advisory_lock_used = Some(self.has_xact_advisory_locks.clone());
         qctx.xact_advisory_savepoint_tracker = Some(self.xact_advisory_savepoint_tracker.clone());
@@ -611,10 +613,18 @@ impl Session {
         self.sync_plan_cache_settings();
     }
 
-    /// Snapshot all session settings into a flat map for `current_setting()` in
-    /// expression contexts. Includes both `SessionSettings` values and session-level
-    /// values (`is_superuser`, `session_authorization`).
+    /// Snapshot the public SQL-facing settings view into a flat map for
+    /// `current_setting()` in expression contexts.
     pub(crate) fn all_settings_snapshot(&self) -> HashMap<String, String> {
+        self.show_all_settings()
+            .into_iter()
+            .map(|(name, value, _)| (name, value))
+            .collect()
+    }
+
+    /// Snapshot the raw execution settings into a flat map for internal
+    /// runtime consumers such as embedding resolution.
+    pub(crate) fn all_execution_settings_snapshot(&self) -> HashMap<String, String> {
         let mut map = self.settings.all_values();
         map.insert(
             "is_superuser".to_string(),
@@ -641,6 +651,14 @@ impl Session {
                     .unwrap_or("postgres")
                     .to_string(),
             ),
+            // Mask sensitive settings for display (SHOW command).
+            "embedding.api_key" => {
+                let raw = self.settings.show_value(name);
+                match raw.as_deref() {
+                    Some("") | None => Some("".to_string()),
+                    Some(_) => Some("****".to_string()),
+                }
+            }
             _ => self.settings.show_value(name),
         }
     }
@@ -665,6 +683,14 @@ impl Session {
                 .or(self.current_user.as_deref())
                 .unwrap_or("postgres")
                 .to_string(),
+        );
+        force_insert_setting(
+            &mut all,
+            "embedding.api_key",
+            match self.settings.show_value("embedding.api_key").as_deref() {
+                Some("") | None => "".to_string(),
+                Some(_) => "****".to_string(),
+            },
         );
 
         all

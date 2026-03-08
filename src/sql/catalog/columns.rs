@@ -186,8 +186,15 @@ impl VirtualTable for Columns {
                     null_val(),
                     null_val(),
                     null_val(),
-                    text_val("NEVER"),
-                    null_val(),
+                    if col.generation_expr.is_some() {
+                        text_val("ALWAYS")
+                    } else {
+                        text_val("NEVER")
+                    },
+                    col.generation_expr
+                        .as_ref()
+                        .map(|s| text_val(&format!("({})", s)))
+                        .unwrap_or(null_val()),
                     text_val("YES"),
                 ]));
             }

@@ -1,9 +1,11 @@
 use crate::model::Value;
+use crate::sql::expr::functions::embedding::{
+    embed_query_text_with_cache, require_direct_embedding_superuser,
+};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
 use super::SqlFn;
-
 pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("L2_DISTANCE", l2_distance_fn);
     map.insert("COSINE_DISTANCE", cosine_distance_fn);
@@ -11,6 +13,10 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("VECTOR_DIMS", vector_dims);
     map.insert("VECTOR_NORM", vector_norm_fn);
     map.insert("L2_NORMALIZE", l2_normalize_fn);
+    // Auto-query: embed text at query time then compute distance.
+    map.insert("VEC_EMBED_COSINE_DISTANCE", vec_embed_cosine_distance_fn);
+    map.insert("VEC_EMBED_L2_DISTANCE", vec_embed_l2_distance_fn);
+    map.insert("VEC_EMBED_INNER_PRODUCT", vec_embed_inner_product_fn);
 }
 
 fn extract_vector(val: &Value) -> Result<Vec<f64>> {
@@ -191,9 +197,108 @@ pub fn l2_normalize_fn(args: Vec<Value>) -> Result<Value> {
     Ok(Value::Vector(vec.iter().map(|x| x / norm).collect()))
 }
 
+// ── Auto-query VEC_EMBED_* functions ──
+//
+// These functions take (VECTOR, TEXT) and auto-embed the text argument via
+// the configured embedding service before computing the distance.
+
+fn embed_text_to_vector(
+    function_name: &str,
+    target_dimensions: u32,
+    text: &str,
+) -> Result<Vec<f64>> {
+    let function_signature = match function_name {
+        "vec_embed_cosine_distance" => "vec_embed_cosine_distance(vector, text)",
+        "vec_embed_l2_distance" => "vec_embed_l2_distance(vector, text)",
+        "vec_embed_inner_product" => "vec_embed_inner_product(vector, text)",
+        _ => "vec_embed_*(vector, text)",
+    };
+    embed_query_text_with_cache(function_name, function_signature, text, target_dimensions)
+}
+
+pub fn vec_embed_cosine_distance_fn(args: Vec<Value>) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(anyhow!(
+            "vec_embed_cosine_distance requires exactly 2 arguments"
+        ));
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    require_direct_embedding_superuser("vec_embed_cosine_distance")?;
+    let vec1 = extract_vector(&args[0])?;
+    let target_dimensions = u32::try_from(vec1.len())
+        .map_err(|_| anyhow!("vector dimensions exceed supported range"))?;
+    let vec2 = match &args[1] {
+        Value::Text(text) => {
+            embed_text_to_vector("vec_embed_cosine_distance", target_dimensions, text)?
+        }
+        other => extract_vector(other)?,
+    };
+    let dist = cosine_distance(&vec1, &vec2)?;
+    Ok(Value::Float64(dist))
+}
+
+pub fn vec_embed_l2_distance_fn(args: Vec<Value>) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(anyhow!(
+            "vec_embed_l2_distance requires exactly 2 arguments"
+        ));
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    require_direct_embedding_superuser("vec_embed_l2_distance")?;
+    let vec1 = extract_vector(&args[0])?;
+    let target_dimensions = u32::try_from(vec1.len())
+        .map_err(|_| anyhow!("vector dimensions exceed supported range"))?;
+    let vec2 = match &args[1] {
+        Value::Text(text) => {
+            embed_text_to_vector("vec_embed_l2_distance", target_dimensions, text)?
+        }
+        other => extract_vector(other)?,
+    };
+    let dist = l2_distance(&vec1, &vec2)?;
+    Ok(Value::Float64(dist))
+}
+
+pub fn vec_embed_inner_product_fn(args: Vec<Value>) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(anyhow!(
+            "vec_embed_inner_product requires exactly 2 arguments"
+        ));
+    }
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    require_direct_embedding_superuser("vec_embed_inner_product")?;
+    let vec1 = extract_vector(&args[0])?;
+    let target_dimensions = u32::try_from(vec1.len())
+        .map_err(|_| anyhow!("vector dimensions exceed supported range"))?;
+    let vec2 = match &args[1] {
+        Value::Text(text) => {
+            embed_text_to_vector("vec_embed_inner_product", target_dimensions, text)?
+        }
+        other => extract_vector(other)?,
+    };
+    let prod = inner_product(&vec1, &vec2)?;
+    Ok(Value::Float64(prod))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extensions::context;
+    use std::collections::HashMap;
+    use std::future::Future;
+
+    fn run_with_context<R>(is_superuser: bool, future: impl Future<Output = R>) -> R {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(context::with_context(is_superuser, "default", future))
+    }
 
     #[test]
     fn test_l2_distance() {
@@ -310,5 +415,30 @@ mod tests {
             }
             _ => panic!("Expected vector"),
         }
+    }
+
+    #[test]
+    fn register_includes_vec_embed_inner_product() {
+        let mut map = HashMap::new();
+        register(&mut map);
+        assert!(map.contains_key("VEC_EMBED_INNER_PRODUCT"));
+    }
+
+    #[test]
+    fn vec_embed_functions_short_circuit_null_before_privilege_check() {
+        let result = run_with_context(false, async {
+            vec_embed_cosine_distance_fn(vec![Value::Null, Value::Text("x".into())]).unwrap()
+        });
+        assert_eq!(result, Value::Null);
+
+        let result = run_with_context(false, async {
+            vec_embed_l2_distance_fn(vec![Value::Vector(vec![1.0]), Value::Null]).unwrap()
+        });
+        assert_eq!(result, Value::Null);
+
+        let result = run_with_context(false, async {
+            vec_embed_inner_product_fn(vec![Value::Null, Value::Text("x".into())]).unwrap()
+        });
+        assert_eq!(result, Value::Null);
     }
 }

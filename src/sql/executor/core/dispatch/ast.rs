@@ -15,7 +15,8 @@ use super::super::*;
 use super::guc::{build_show_all_result, execute_set_variable};
 use super::scaffold::DispatchContext;
 use super::transaction::check_observability_statement_permission;
-use super::utils::{validate_transaction_modes, wrap_with_runtime_context, RuntimeSettings};
+use super::utils::validate_transaction_modes;
+use crate::sql::runtime_context::{wrap_with_statement_runtime_context, StatementRuntimeContext};
 
 fn is_dedicated_ast_non_tx_control_statement(stmt: &Statement) -> bool {
     matches!(
@@ -86,17 +87,13 @@ impl Executor {
                 }
             }
             let start = Instant::now();
-            let rt_settings = RuntimeSettings::from_session(session);
-            let extension_txn_delta = session.extension_delta_snapshot();
-            let txn_snapshot_ts_version = session.active_txn_start_ts_version();
-            let stmt_exec: Result<Vec<ExecuteResult>> = wrap_with_runtime_context(
-                &rt_settings,
+            let runtime = StatementRuntimeContext::from_session(
+                session,
                 self.tenant_keyspace(),
-                session.current_database_id(),
-                txn_snapshot_ts_version,
                 self.store.transaction_client(),
-                extension_txn_delta,
-                async {
+            );
+            let stmt_exec: Result<Vec<ExecuteResult>> =
+                wrap_with_statement_runtime_context(&runtime, async {
                     match stmt {
                         // Transaction Control
                         Statement::StartTransaction { modes, .. } => {
@@ -260,9 +257,8 @@ impl Executor {
                             .await
                         }
                     }
-                },
-            )
-            .await;
+                })
+                .await;
 
             if stmt_exec.is_ok() && is_dedicated_ast_non_tx_control_statement(stmt) {
                 session.note_statement_success_in_transaction();

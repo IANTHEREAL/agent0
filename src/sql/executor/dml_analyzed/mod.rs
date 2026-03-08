@@ -12,16 +12,23 @@ use super::super::dml;
 use super::core::Executor;
 use crate::model::{Row, TableSchema, Value};
 use crate::sql::analyzer::types::{AnalyzedProjection, TypedExpr, TypedExprKind};
+use crate::sql::check_constraints::CompiledCheckConstraint;
 use crate::sql::error::SqlError;
 use crate::sql::expr::static_eval::needs_async_materialization;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::expr::typed_fold::fold_typed_expr;
+use crate::sql::generated_columns::{compile_generated_columns, CompiledGeneratedColumn};
 use crate::sql::query_context::QueryContext;
 use crate::sql::sequences::SequenceSession;
 use crate::sql::session::DEFAULT_DML_TABLE_SCAN_MAX_ROWS;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tikv_client::Transaction;
+
+pub(in crate::sql::executor) struct CompiledWriteRowPlan {
+    pub(in crate::sql::executor) generated_columns: Vec<CompiledGeneratedColumn>,
+    pub(in crate::sql::executor) compiled_checks: Vec<CompiledCheckConstraint>,
+}
 
 // ── Executor helper methods ─────────────────────────────────
 
@@ -352,6 +359,103 @@ impl Executor {
             target_columns,
         )
         .await
+    }
+
+    pub(in crate::sql::executor) fn reject_explicit_generated_insert_columns(
+        &self,
+        schema: &TableSchema,
+        column_indices: &[usize],
+    ) -> Result<()> {
+        for &col_idx in column_indices {
+            if let Some(col) = schema.columns.get(col_idx) {
+                if col.generation_expr.is_some() {
+                    return Err(SqlError::SqlStructure(format!(
+                        "cannot insert a non-DEFAULT value into column \"{}\"\nDETAIL:  Column \"{}\" is a generated column.",
+                        col.name, col.name
+                    ))
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(in crate::sql::executor) fn compile_write_row_plan(
+        &self,
+        schema: &TableSchema,
+        qctx: &QueryContext,
+    ) -> Result<CompiledWriteRowPlan> {
+        Ok(CompiledWriteRowPlan {
+            generated_columns: compile_generated_columns(schema, qctx)?,
+            compiled_checks: crate::sql::check_constraints::compile_check_constraints(
+                schema, qctx,
+            )?,
+        })
+    }
+
+    /// Finalize a row after caller-owned source mutation and BEFORE triggers.
+    ///
+    /// This is the single write-path materialization step used by INSERT,
+    /// UPDATE, UPSERT DO UPDATE, and COPY:
+    /// 1. recompute stored generated columns from the current row state
+    /// 2. coerce values / enforce NOT NULL
+    /// 3. validate compiled CHECK constraints
+    pub(in crate::sql::executor) async fn finalize_write_row(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        sequence_values: &mut SequenceSession,
+        search_path: &[String],
+        schema: &TableSchema,
+        plan: &CompiledWriteRowPlan,
+        row_vals: &mut [Value],
+    ) -> Result<()> {
+        let qctx = QueryContext::from_task_locals();
+        for generated in &plan.generated_columns {
+            let col = &schema.columns[generated.column_idx];
+            let eval_row = Row::new(row_vals.to_vec());
+            let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
+            let val = if generated.embedding_authorized {
+                crate::extensions::context::with_embedding_authorized(
+                    self.eval_typed_expr_maybe_async(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        &generated.expr,
+                        &eval_row,
+                        Some(schema),
+                        &empty_ctes,
+                        &qctx,
+                    ),
+                )
+                .await??
+            } else {
+                self.eval_typed_expr_maybe_async(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    &generated.expr,
+                    &eval_row,
+                    Some(schema),
+                    &empty_ctes,
+                    &qctx,
+                )
+                .await?
+            };
+
+            row_vals[generated.column_idx] =
+                crate::sql::value_coercion::coerce_value_for_column(val, col)?;
+        }
+        dml::coerce_row_values(schema, row_vals)?;
+        let row = Row::new(row_vals.to_vec());
+        crate::sql::check_constraints::validate_compiled_check_constraints(
+            schema,
+            &plan.compiled_checks,
+            &row,
+            &qctx,
+        )
     }
 
     /// Evaluate a typed DML assignment value for UPDATE / ON CONFLICT DO UPDATE.

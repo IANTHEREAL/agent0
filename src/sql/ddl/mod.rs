@@ -20,6 +20,7 @@ use crate::sql::analyzer::{Analyzer, CatalogSnapshot, Scope};
 use crate::sql::error::SqlError;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::expr::typed_fold::fold_typed_expr;
+use crate::sql::generated_columns::compile_generated_column;
 use crate::sql::query_context::QueryContext;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{DataType as SqlDataType, Expr, ObjectName};
@@ -162,6 +163,54 @@ pub(super) async fn resolve_column_data_type(
         }
         _ => Ok((sql_datatype_to_internal_strict(sql_type)?, false)),
     }
+}
+
+pub(super) async fn validate_generated_column_expr(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &TableSchema,
+    column_idx: usize,
+) -> Result<Option<String>> {
+    let col = schema
+        .columns
+        .get(column_idx)
+        .ok_or_else(|| anyhow!("generated column index {} out of bounds", column_idx))?;
+    if col.generation_expr.is_none() {
+        return Ok(None);
+    }
+
+    let qctx = QueryContext::from_task_locals();
+    let compiled = compile_generated_column(schema, column_idx, &qctx)?.ok_or_else(|| {
+        anyhow!(
+            "missing generated column expression for column \"{}\"",
+            col.name
+        )
+    })?;
+
+    if !compiled.uses_embedding {
+        return Ok(None);
+    }
+
+    if store
+        .get_extension(txn, db_id, "embedding")
+        .await?
+        .is_none()
+    {
+        return Err(crate::extensions::embedding::embedding_function_not_found(
+            "embed_text(text, text)",
+        ));
+    }
+
+    if !crate::extensions::context::is_superuser() {
+        return Err(SqlError::PermissionDenied {
+            object_type: "generated column".into(),
+            object_name: format!("column \"{}\"", col.name),
+        }
+        .into());
+    }
+
+    Ok(Some(qctx.current_user.to_string()))
 }
 
 pub(super) async fn create_implicit_sequences_for_schema(

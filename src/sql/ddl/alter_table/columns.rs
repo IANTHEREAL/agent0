@@ -3,11 +3,13 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{ColumnOption, GeneratedAs};
+use sqlparser::ast::{ColumnOption, GeneratedAs, GeneratedExpressionMode};
 use tikv_client::Transaction;
 
 use crate::model::{DataType, IndexDef, Value};
 use crate::sql::error::SqlError;
+use crate::sql::expr::typed_eval::eval_typed_expr;
+use crate::sql::generated_columns::compile_generated_column;
 use crate::sql::names::normalize_ident;
 use crate::sql::projection::fill_row_defaults;
 use crate::sql::query_context::QueryContext;
@@ -18,10 +20,32 @@ use crate::txn::txn_put;
 
 use super::super::{
     analyze_row_level_expr, check_expr_references_column, coerce_value_for_type_change,
-    delete_range, eval_row_level_expr, index_prefix_range, resolve_column_data_type, KvScanBatches,
-    DDL_SCAN_BATCH_SIZE,
+    delete_range, eval_row_level_expr, index_prefix_range, resolve_column_data_type,
+    validate_generated_column_expr, KvScanBatches, DDL_SCAN_BATCH_SIZE,
 };
 use super::{should_invalidate_stats_for_drop_column, should_invalidate_stats_for_type_change};
+
+fn has_real_add_column_default(is_serial: bool, default_expr: Option<&str>) -> bool {
+    let Some(expr) = default_expr else {
+        return false;
+    };
+    if !is_serial {
+        return true;
+    }
+    !crate::sql::sequences::is_identity_default_marker(Some(expr))
+        && !crate::sql::sequences::is_serial_default_dropped_marker(Some(expr))
+}
+
+fn generated_embed_add_column_nonempty_table_error(
+    col_name: &str,
+    table_name: &str,
+) -> anyhow::Error {
+    SqlError::Unsupported(format!(
+        "cannot add generated column \"{}\" with EMBED_TEXT to non-empty table \"{}\"; use UPDATE after adding a regular/defaulted column",
+        col_name, table_name
+    ))
+    .into()
+}
 
 /// ADD COLUMN: resolve type, validate NOT NULL + DEFAULT, append column, create
 /// implicit sequence if serial.  Returns `true` when the schema was actually
@@ -46,10 +70,22 @@ pub(super) async fn alter_table_add_column(
         resolve_column_data_type(store, txn, db_id, search_path, &column_def.data_type).await?;
     let mut nullable = true;
     let mut default_expr = None;
+    let mut identity_generated_as: Option<GeneratedAs> = None;
+    let mut generation_expr_str: Option<String> = None;
+    let mut generation_expr_authorized_by: Option<String> = None;
     for opt in &column_def.options {
         match &opt.option {
             ColumnOption::NotNull => nullable = false,
-            ColumnOption::Default(expr) => default_expr = Some(expr.to_string()),
+            ColumnOption::Default(expr) => {
+                if generation_expr_str.is_some() {
+                    return Err(SqlError::SqlStructure(format!(
+                        "both default and generation expression specified for column \"{}\"",
+                        col_name
+                    ))
+                    .into());
+                }
+                default_expr = Some(expr.to_string());
+            }
             ColumnOption::Generated {
                 generated_as,
                 generation_expr: None,
@@ -57,15 +93,62 @@ pub(super) async fn alter_table_add_column(
             } => {
                 if matches!(generated_as, GeneratedAs::Always | GeneratedAs::ByDefault) {
                     is_serial = true;
+                    identity_generated_as = Some(generated_as.clone());
                 }
+            }
+            ColumnOption::Generated {
+                generated_as: GeneratedAs::Always | GeneratedAs::ExpStored,
+                generation_expr: Some(expr),
+                ..
+            } => {
+                if default_expr.is_some() {
+                    return Err(SqlError::SqlStructure(format!(
+                        "both default and generation expression specified for column \"{}\"",
+                        col_name
+                    ))
+                    .into());
+                }
+                generation_expr_str = Some(expr.to_string());
+            }
+            ColumnOption::Generated {
+                generation_expr: Some(_),
+                generation_expr_mode: Some(GeneratedExpressionMode::Virtual),
+                ..
+            } => {
+                return Err(SqlError::Unsupported(format!(
+                    "VIRTUAL generated columns are not supported; use STORED for column \"{}\"",
+                    col_name
+                ))
+                .into());
             }
             _ => {}
         }
     }
+    let table_name = schema
+        .name
+        .rsplit_once('.')
+        .map_or(schema.name.as_str(), |(_, n)| n);
+    if let Some(generated_as) = identity_generated_as.as_ref() {
+        if default_expr.is_some() {
+            return Err(SqlError::SqlStructure(format!(
+                "both default and identity specified for column \"{}\" of table \"{}\"",
+                col_name, table_name
+            ))
+            .into());
+        }
+        default_expr =
+            crate::sql::sequences::identity_default_marker(generated_as).map(ToString::to_string);
+    } else if is_serial && default_expr.is_some() {
+        return Err(SqlError::SqlStructure(format!(
+            "multiple default values specified for column \"{}\" of table \"{}\"",
+            col_name, table_name
+        ))
+        .into());
+    }
     if is_serial {
         nullable = false;
     }
-    if !nullable && !is_serial && default_expr.is_none() {
+    if !nullable && !has_real_add_column_default(is_serial, default_expr.as_deref()) {
         let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
         let range: tikv_client::BoundRange = (start..end).into();
         let existing_rows: Vec<_> = txn.scan(range, 1).await?.collect();
@@ -73,6 +156,38 @@ pub(super) async fn alter_table_add_column(
             return Err(anyhow!("Cannot add NOT NULL column without DEFAULT"));
         }
     }
+
+    if generation_expr_str.is_some() {
+        let mut candidate_schema = schema.clone();
+        candidate_schema.columns.push(crate::model::ColumnDef {
+            name: col_name.clone(),
+            data_type: data_type.clone(),
+            nullable,
+            primary_key: false,
+            unique: false,
+            is_serial,
+            default_expr: default_expr.clone(),
+            generation_expr: generation_expr_str.clone(),
+            generation_expr_authorized_by: None,
+            collation: None,
+        });
+        let new_col_idx = candidate_schema.columns.len() - 1;
+        generation_expr_authorized_by =
+            validate_generated_column_expr(store, txn, db_id, &candidate_schema, new_col_idx)
+                .await?;
+        if generation_expr_authorized_by.is_some() {
+            let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+            let range: tikv_client::BoundRange = (start..end).into();
+            let existing_rows: Vec<_> = txn.scan(range, 1).await?.collect();
+            if !existing_rows.is_empty() {
+                return Err(generated_embed_add_column_nonempty_table_error(
+                    &col_name,
+                    &schema.name,
+                ));
+            }
+        }
+    }
+
     schema.columns.push(crate::model::ColumnDef {
         name: col_name,
         data_type,
@@ -81,6 +196,8 @@ pub(super) async fn alter_table_add_column(
         unique: false,
         is_serial,
         default_expr,
+        generation_expr: generation_expr_str,
+        generation_expr_authorized_by,
         collation: None,
     });
     if is_serial {
@@ -125,6 +242,42 @@ pub(super) async fn alter_table_add_column(
                 let seq_val = store.nextval_sequence(txn, db_id, &seq_full_name).await?;
                 row.values[new_col_idx] =
                     coerce_value_for_column(Value::Int64(seq_val), &schema.columns[new_col_idx])?;
+                let row_data = crate::storage::serialize_row(&row)?;
+                txn_put(txn, key.into(), row_data).await?;
+            }
+        }
+    }
+    // Backfill existing rows for generated stored columns.
+    if let Some(ref gen_expr_str) = schema
+        .columns
+        .last()
+        .and_then(|c| c.generation_expr.clone())
+    {
+        let new_col_idx = schema.columns.len() - 1;
+        let qctx = QueryContext::from_task_locals();
+        let compiled = compile_generated_column(schema, new_col_idx, &qctx)?.ok_or_else(|| {
+            anyhow!(
+                "missing generated column expression for \"{}\"",
+                gen_expr_str
+            )
+        })?;
+        let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+        let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
+        while let Some(batch) = scanner.next_batch(txn).await? {
+            for pair in batch {
+                let (key, value): (tikv_client::Key, tikv_client::Value) = pair.into();
+                let mut row = crate::storage::deserialize_row(&value)?;
+                fill_row_defaults(&mut row, schema)?;
+                let val = if compiled.embedding_authorized {
+                    crate::extensions::context::with_embedding_authorized(async {
+                        eval_typed_expr(&compiled.expr, &row, &qctx)
+                    })
+                    .await??
+                } else {
+                    eval_typed_expr(&compiled.expr, &row, &qctx)?
+                };
+                row.values[new_col_idx] =
+                    coerce_value_for_column(val, &schema.columns[new_col_idx])?;
                 let row_data = crate::storage::serialize_row(&row)?;
                 txn_put(txn, key.into(), row_data).await?;
             }
@@ -354,4 +507,43 @@ pub(super) async fn alter_table_alter_column_set_data_type(
     schema.version += 1;
     store.update_schema(txn, db_id, schema.clone()).await?;
     Ok(type_changed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{generated_embed_add_column_nonempty_table_error, has_real_add_column_default};
+    use crate::sql::error::SqlError;
+
+    #[test]
+    fn add_column_default_gate_treats_identity_marker_as_no_default() {
+        assert!(!has_real_add_column_default(
+            true,
+            Some("NULL /* db9_identity_by_default */")
+        ));
+    }
+
+    #[test]
+    fn add_column_default_gate_treats_serial_drop_marker_as_no_default() {
+        assert!(!has_real_add_column_default(
+            true,
+            Some("NULL /* db9_serial_default_dropped */")
+        ));
+    }
+
+    #[test]
+    fn add_column_default_gate_accepts_real_default_expr() {
+        assert!(has_real_add_column_default(false, Some("42")));
+    }
+
+    #[test]
+    fn generated_embed_add_column_nonempty_table_error_is_unsupported() {
+        let err = generated_embed_add_column_nonempty_table_error("vec", "public.docs");
+        let sql = err
+            .downcast_ref::<SqlError>()
+            .expect("must be backed by SqlError");
+        assert_eq!(sql.sqlstate(), "0A000");
+        assert!(sql
+            .to_string()
+            .contains("cannot add generated column \"vec\" with EMBED_TEXT"));
+    }
 }

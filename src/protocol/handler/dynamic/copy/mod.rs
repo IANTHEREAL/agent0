@@ -36,6 +36,18 @@ use super::super::rollback_autocommit_or_mark_failed;
 
 use helpers::{copy_display_table_name, parse_copy_input_line, should_add_copy_insert_context};
 
+async fn with_copy_statement_context<R: Send>(
+    qctx: &crate::sql::query_context::QueryContext,
+    runtime: &crate::sql::runtime_context::StatementRuntimeContext,
+    future: impl std::future::Future<Output = PgWireResult<R>> + Send,
+) -> PgWireResult<R> {
+    crate::sql::query_context::with_scoped_query_context(
+        qctx,
+        crate::sql::runtime_context::wrap_with_statement_runtime_context(runtime, future),
+    )
+    .await
+}
+
 #[async_trait]
 impl CopyHandler for DynamicPgHandler {
     async fn on_copy_data<C>(&self, _client: &mut C, copy_data: CopyData) -> PgWireResult<()>
@@ -82,6 +94,7 @@ impl CopyHandler for DynamicPgHandler {
             table_name,
             started_txn,
             qctx,
+            runtime,
             mut accumulated_fk_keys,
             mut accumulated_deferred_fk,
         ) = {
@@ -93,6 +106,7 @@ impl CopyHandler for DynamicPgHandler {
             let table_name = ctx.table_name.clone();
             let started_txn = ctx.started_txn;
             let qctx = ctx.query_context.clone();
+            let runtime = ctx.runtime_context.clone();
             let accumulated_fk_keys = std::mem::take(&mut ctx.pending_self_fk_keys);
             let accumulated_deferred_fk = std::mem::take(&mut ctx.deferred_self_fk_checks);
 
@@ -148,6 +162,7 @@ impl CopyHandler for DynamicPgHandler {
                 table_name,
                 started_txn,
                 qctx,
+                runtime,
                 accumulated_fk_keys,
                 accumulated_deferred_fk,
             )
@@ -183,68 +198,67 @@ impl CopyHandler for DynamicPgHandler {
             .map(|(_, col_values)| col_values)
             .collect();
 
-        let insert_res: PgWireResult<()> =
-            crate::sql::query_context::with_scoped_query_context(&qctx, async {
-                let mut session = self.auth().session.lock().await;
+        let insert_res: PgWireResult<()> = with_copy_statement_context(&qctx, &runtime, async {
+            let mut session = self.auth().session.lock().await;
 
-                if self.cancel_token.is_cancelled() {
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "FATAL".to_string(),
-                        "25P03".to_string(),
-                        "terminating connection due to idle-in-transaction timeout".to_string(),
-                    ))));
-                }
+            if self.cancel_token.is_cancelled() {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".to_string(),
+                    "25P03".to_string(),
+                    "terminating connection due to idle-in-transaction timeout".to_string(),
+                ))));
+            }
 
-                if let Err(e) = session.check_idle_in_transaction_timeout() {
-                    let _ = session.rollback().await;
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "FATAL".to_string(),
-                        e.sqlstate().to_string(),
-                        e.to_string(),
-                    ))));
-                }
+            if let Err(e) = session.check_idle_in_transaction_timeout() {
+                let _ = session.rollback().await;
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".to_string(),
+                    e.sqlstate().to_string(),
+                    e.to_string(),
+                ))));
+            }
 
-                if session.is_transaction_failed() {
-                    return Err(in_failed_sql_transaction_pgwire_error());
-                }
+            if session.is_transaction_failed() {
+                return Err(in_failed_sql_transaction_pgwire_error());
+            }
 
-                let savepoints = session.savepoints();
-                crate::txn::with_savepoints(savepoints, async {
-                    executor
-                        .execute_copy_insert_batch(
-                            &mut session,
-                            &table_name,
-                            rows_to_insert,
-                            Some(&mut accumulated_fk_keys),
-                            Some(&mut accumulated_deferred_fk),
-                        )
-                        .await
-                        .map_err(|batch_err| {
-                            let line_no = batch_err
-                                .failed_row_offset()
-                                .and_then(|offset| line_numbers.get(offset).copied());
-                            let err = batch_err.source_error();
-                            error!("COPY insert error: {}", err);
-                            let table = copy_display_table_name(&table_name);
-                            let message = if should_add_copy_insert_context(err) {
-                                if let Some(line_no) = line_no {
-                                    format!("{}\nCONTEXT:  COPY {}, line {}", err, table, line_no)
-                                } else {
-                                    err.to_string()
-                                }
+            let savepoints = session.savepoints();
+            crate::txn::with_savepoints(savepoints, async {
+                executor
+                    .execute_copy_insert_batch(
+                        &mut session,
+                        &table_name,
+                        rows_to_insert,
+                        Some(&mut accumulated_fk_keys),
+                        Some(&mut accumulated_deferred_fk),
+                    )
+                    .await
+                    .map_err(|batch_err| {
+                        let line_no = batch_err
+                            .failed_row_offset()
+                            .and_then(|offset| line_numbers.get(offset).copied());
+                        let err = batch_err.source_error();
+                        error!("COPY insert error: {}", err);
+                        let table = copy_display_table_name(&table_name);
+                        let message = if should_add_copy_insert_context(err) {
+                            if let Some(line_no) = line_no {
+                                format!("{}\nCONTEXT:  COPY {}, line {}", err, table, line_no)
                             } else {
                                 err.to_string()
-                            };
-                            user_error(sqlstate_for_executor_error(err), message)
-                        })?;
+                            }
+                        } else {
+                            err.to_string()
+                        };
+                        user_error(sqlstate_for_executor_error(err), message)
+                    })?;
 
-                    Ok::<(), PgWireError>(())
-                })
-                .await?;
-
-                Ok(())
+                Ok::<(), PgWireError>(())
             })
-            .await;
+            .await?;
+
+            Ok(())
+        })
+        .await;
 
         if let Err(e) = insert_res {
             let mut session = self.auth().session.lock().await;
@@ -280,8 +294,9 @@ impl CopyHandler for DynamicPgHandler {
         let row_count = if let Some(mut ctx) = ctx_opt {
             let executor = &self.auth().executor;
             let qctx = ctx.query_context.clone();
+            let runtime = ctx.runtime_context.clone();
 
-            crate::sql::query_context::with_scoped_query_context(&qctx, async {
+            with_copy_statement_context(&qctx, &runtime, async {
                 let mut session = self.auth().session.lock().await;
 
                 if self.cancel_token.is_cancelled() {
@@ -468,5 +483,60 @@ impl CopyHandler for DynamicPgHandler {
             "XX000",
             format!("COPY IN mode terminated: {}", fail.message),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_copy_statement_context;
+    use crate::sql::query_context::QueryContext;
+    use crate::sql::runtime_context::{RuntimeSettings, StatementRuntimeContext};
+    use pgwire::error::PgWireResult;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn copy_statement_context_provides_full_statement_runtime_context() {
+        let qctx = QueryContext::for_tests();
+        let runtime = StatementRuntimeContext {
+            settings: RuntimeSettings {
+                is_superuser: false,
+                timezone: Arc::from("UTC"),
+                max_sort_bytes: 4096,
+                search_path: Arc::new(vec!["public".to_string()]),
+                text_search_config: Arc::from("simple"),
+            },
+            tenant_keyspace: Arc::from("copy_tenant"),
+            database_id: 88,
+            txn_snapshot_ts_version: Some(1234),
+            tikv_client: None,
+            extension_txn_delta: Arc::new((
+                HashSet::from(["embedding".to_string()]),
+                HashSet::new(),
+            )),
+        };
+
+        let result: PgWireResult<()> = with_copy_statement_context(&qctx, &runtime, async {
+            assert_eq!(
+                crate::extensions::context::tenant_keyspace().as_deref(),
+                Some("copy_tenant")
+            );
+            assert!(!crate::extensions::context::is_superuser());
+            assert_eq!(crate::session_context::current_database_id(), 88);
+            assert_eq!(
+                crate::session_context::current_txn_snapshot_ts_version(),
+                Some(1234)
+            );
+            assert_eq!(
+                crate::session_context::extension_txn_status("embedding"),
+                Some(true)
+            );
+            crate::extensions::context::try_consume_embedding_call()
+                .expect("copy statement should have embedding context");
+            Ok(())
+        })
+        .await;
+
+        result.expect("copy statement context should succeed");
     }
 }

@@ -138,6 +138,10 @@ pub(crate) fn is_volatile_or_side_effecting_builtin(name: &str) -> bool {
             | "CLOCK_TIMESTAMP"
             | "TXID_CURRENT"
             | "EMBEDDING"
+            | "EMBED_TEXT"
+            | "VEC_EMBED_COSINE_DISTANCE"
+            | "VEC_EMBED_L2_DISTANCE"
+            | "VEC_EMBED_INNER_PRODUCT"
     )
 }
 

@@ -167,6 +167,8 @@ pub(crate) fn arrow_schema_to_table_schema(arrow_schema: &ArrowSchema) -> Result
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
                 collation: None,
             })
         })

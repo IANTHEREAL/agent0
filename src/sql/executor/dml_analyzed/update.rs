@@ -13,7 +13,6 @@ use super::{
 };
 use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::{AnalyzedUpdate, TypedExpr, TypedExprKind};
-use crate::sql::check_constraints;
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::projection::fill_row_defaults;
 use crate::sql::query_context::QueryContext;
@@ -59,7 +58,7 @@ impl Executor {
         let qctx = QueryContext::from_task_locals();
         let folded_where = upd.where_clause.as_ref().map(|e| fold_typed_expr(e, &qctx));
         let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
-        let compiled_checks = check_constraints::compile_check_constraints(&schema, &qctx)?;
+        let write_plan = self.compile_write_row_plan(&schema, &qctx)?;
         // Fast path: when WHERE targets a PK or unique key, use point-get
         // instead of a full table scan.  Falls back to scan_and_fill for all
         // other predicate shapes (FROM present, WHERE absent, non-strict
@@ -174,6 +173,7 @@ impl Executor {
             // Truncate to schema column count to strip synthetic ctid appended
             // by append_ctid_to_rows — ctid must never be persisted.
             let mut new_vals = r.values[..schema.columns.len()].to_vec();
+
             for (col_idx, ref typed_expr) in &upd.assignments {
                 let val = self
                     .eval_assignment_value(
@@ -215,16 +215,20 @@ impl Executor {
                 None => continue,
             };
 
-            // Final coercion + check constraints.
+            // Recompute generated columns after BEFORE triggers so that
+            // trigger mutations to source columns are reflected.
             let mut final_vals = new_row.values;
-            dml::coerce_row_values(&schema, &mut final_vals)?;
-            let new_row = Row::new(final_vals);
-            check_constraints::validate_compiled_check_constraints(
+            self.finalize_write_row(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
                 &schema,
-                &compiled_checks,
-                &new_row,
-                &qctx,
-            )?;
+                &write_plan,
+                &mut final_vals,
+            )
+            .await?;
+            let new_row = Row::new(final_vals);
 
             // Persist (defer HNSW maintenance to batch after the loop).
             let updated_row = if has_hnsw {

@@ -248,6 +248,19 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         "L2_NORMALIZE",
         FunctionSignature::same_as_arg(0).with_args(1, Some(1)),
     );
+    // Auto-query VEC_EMBED_* distance functions (VECTOR, TEXT) -> FLOAT8
+    r.register(
+        "VEC_EMBED_COSINE_DISTANCE",
+        FunctionSignature::fixed(DataType::Float64).with_args(2, Some(2)),
+    );
+    r.register(
+        "VEC_EMBED_L2_DISTANCE",
+        FunctionSignature::fixed(DataType::Float64).with_args(2, Some(2)),
+    );
+    r.register(
+        "VEC_EMBED_INNER_PRODUCT",
+        FunctionSignature::fixed(DataType::Float64).with_args(2, Some(2)),
+    );
 
     // Special internal functions
     r.register(

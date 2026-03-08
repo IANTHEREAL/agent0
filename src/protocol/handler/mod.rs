@@ -87,31 +87,53 @@ fn resolve_copy_columns(
     relation_name: &str,
 ) -> PgWireResult<(Vec<String>, Vec<Option<DataType>>)> {
     if columns.is_empty() {
-        let resolved: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-        let types: Vec<Option<DataType>> = schema
+        // PostgreSQL excludes generated columns from COPY's implicit target list.
+        let resolved: Vec<String> = schema
             .columns
             .iter()
-            .map(|c| Some(c.data_type.clone()))
+            .filter(|c| c.generation_expr.is_none())
+            .map(|c| c.name.clone())
             .collect();
-        return Ok((resolved, types));
+        return build_copy_column_resolution(schema, &resolved, relation_name);
     }
 
+    let normalized_columns: Vec<String> = columns
+        .iter()
+        .map(|col| normalize_copy_ident(col))
+        .collect();
+    build_copy_column_resolution(schema, &normalized_columns, relation_name)
+}
+
+fn build_copy_column_resolution(
+    schema: &crate::model::TableSchema,
+    columns: &[String],
+    relation_name: &str,
+) -> PgWireResult<(Vec<String>, Vec<Option<DataType>>)> {
     let mut resolved_columns: Vec<String> = Vec::with_capacity(columns.len());
     let mut column_types: Vec<Option<DataType>> = Vec::with_capacity(columns.len());
     let mut seen: HashSet<String> = HashSet::with_capacity(columns.len());
 
     for col in columns {
-        let normalized = normalize_copy_ident(col);
-        let Some(def) = schema.columns.iter().find(|c| c.name == normalized) else {
+        let Some(def) = schema.columns.iter().find(|c| c.name == *col) else {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_string(),
                 "42703".to_string(),
                 format!(
                     "column \"{}\" of relation \"{}\" does not exist",
-                    normalized, relation_name
+                    col, relation_name
                 ),
             ))));
         };
+
+        if def.generation_expr.is_some() {
+            let mut error_info = ErrorInfo::new(
+                "ERROR".to_string(),
+                "42P10".to_string(),
+                format!("column \"{}\" is a generated column", def.name),
+            );
+            error_info.detail = Some("Generated columns cannot be used in COPY.".to_string());
+            return Err(PgWireError::UserError(Box::new(error_info)));
+        }
 
         if !seen.insert(def.name.clone()) {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(

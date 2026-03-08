@@ -72,6 +72,8 @@ fn test_schema() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
                 collation: None,
             },
             ColumnDef {
@@ -82,6 +84,8 @@ fn test_schema() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
                 collation: None,
             },
         ],

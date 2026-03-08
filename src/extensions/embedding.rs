@@ -1,4 +1,7 @@
-use crate::config::get_embedding_config;
+use crate::config::{
+    canonical_embedding_model, get_embedding_config, normalize_embedding_endpoint, EmbeddingConfig,
+    EmbeddingProvider,
+};
 use crate::extensions::context;
 use crate::extensions::InstalledExtension;
 use crate::model::{ColumnDef, DataType, TableSchema};
@@ -10,6 +13,7 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 use tikv_client::{TimestampExt, TransactionClient};
@@ -29,6 +33,36 @@ struct TenantSemaphore {
 
 static TENANT_SEMAPHORES: LazyLock<DashMap<String, TenantSemaphore>> = LazyLock::new(DashMap::new);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedEmbeddingConfig {
+    pub(crate) provider: EmbeddingProvider,
+    pub(crate) endpoint: String,
+    pub(crate) api_key: String,
+    pub(crate) model: String,
+    pub(crate) dimensions: u32,
+}
+
+impl ResolvedEmbeddingConfig {
+    pub(crate) fn cache_key(&self, text: &str) -> context::EmbeddingCacheKey {
+        let mut hasher = Sha256::new();
+        hasher.update(self.api_key.as_bytes());
+        context::EmbeddingCacheKey {
+            provider: self.provider,
+            endpoint: self.endpoint.clone(),
+            api_key_fingerprint: hex::encode(hasher.finalize()),
+            model: self.model.clone(),
+            dimensions: self.dimensions,
+            text: text.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingSettingsSource {
+    Session,
+    Server,
+}
+
 fn embedding_http_client() -> &'static reqwest::Client {
     EMBEDDING_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -40,8 +74,22 @@ fn embedding_http_client() -> &'static reqwest::Client {
     })
 }
 
+fn current_embedding_settings_source() -> EmbeddingSettingsSource {
+    match context::embedding_execution_mode() {
+        context::EmbeddingExecutionMode::Direct => EmbeddingSettingsSource::Session,
+        context::EmbeddingExecutionMode::AuthorizedGenerated => EmbeddingSettingsSource::Server,
+    }
+}
+
+pub(crate) fn current_embedding_runtime_setting(name: &str) -> Option<String> {
+    match current_embedding_settings_source() {
+        EmbeddingSettingsSource::Session => QueryContext::current_execution_setting_snapshot(name),
+        EmbeddingSettingsSource::Server => None,
+    }
+}
+
 async fn acquire_embedding_permit(tenant: &str) -> Result<OwnedSemaphorePermit> {
-    let limit = QueryContext::current_setting_snapshot("embedding.concurrency")
+    let limit = current_embedding_runtime_setting("embedding.concurrency")
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(EMBEDDING_CONCURRENCY_PER_TENANT);
@@ -89,6 +137,8 @@ pub(crate) fn embedding_usage_table_schema() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
                 collation: None,
             },
             ColumnDef {
@@ -99,6 +149,8 @@ pub(crate) fn embedding_usage_table_schema() -> TableSchema {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
                 collation: None,
             },
         ],
@@ -106,20 +158,122 @@ pub(crate) fn embedding_usage_table_schema() -> TableSchema {
     )
 }
 
-pub(crate) async fn call_embedding_api(
-    text: &str,
-    model: &str,
-    dimensions: u32,
-) -> Result<(Vec<f64>, u64)> {
-    let config = get_embedding_config();
-    let api_key = config.api_key.as_ref().ok_or_else(|| -> anyhow::Error {
-        SqlError::Unsupported("embedding: EMBEDDING_API_KEY not set".into()).into()
-    })?;
+fn resolve_embedding_provider(value: &str) -> Result<EmbeddingProvider> {
+    EmbeddingProvider::parse(value).ok_or_else(|| {
+        SqlError::InvalidParameterValue {
+            message: format!(
+                "invalid value for parameter \"embedding.provider\": \"{}\"; expected 'openai' or 'bedrock'",
+                value
+            ),
+        }
+        .into()
+    })
+}
 
+pub(crate) fn resolve_embedding_config(
+    model_override: Option<&str>,
+    dimensions_override: Option<u32>,
+) -> Result<ResolvedEmbeddingConfig> {
+    resolve_embedding_config_with_lookup(
+        get_embedding_config(),
+        current_embedding_settings_source(),
+        QueryContext::current_execution_setting_snapshot,
+        model_override,
+        dimensions_override,
+    )
+}
+
+fn resolve_embedding_config_with_lookup<F>(
+    static_config: &EmbeddingConfig,
+    settings_source: EmbeddingSettingsSource,
+    lookup: F,
+    model_override: Option<&str>,
+    dimensions_override: Option<u32>,
+) -> Result<ResolvedEmbeddingConfig>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let setting = |name: &str| match settings_source {
+        EmbeddingSettingsSource::Session => lookup(name),
+        EmbeddingSettingsSource::Server => None,
+    };
+
+    let provider_raw =
+        setting("embedding.provider").unwrap_or_else(|| static_config.provider_name.clone());
+    let provider = resolve_embedding_provider(&provider_raw)?;
+    let endpoint_raw =
+        setting("embedding.endpoint").unwrap_or_else(|| static_config.endpoint.clone());
+    let api_key = setting("embedding.api_key")
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| static_config.api_key.clone())
+        .ok_or_else(|| -> anyhow::Error {
+            SqlError::Unsupported("embedding: service not configured on this server".into()).into()
+        })?;
+    let model = model_override
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| setting("embedding.model"))
+        .unwrap_or_else(|| static_config.model.clone());
+    let dimensions = dimensions_override.unwrap_or_else(|| {
+        setting("embedding.dimensions")
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(static_config.dimensions)
+    });
+
+    if provider == EmbeddingProvider::OpenAICompatible
+        && canonical_embedding_model(&model).is_none()
+    {
+        return Err(SqlError::InvalidParameterValue {
+            message: format!(
+                "embedding model \"{}\" is not supported for openai provider; only text-embedding-v4 is supported",
+                model
+            ),
+        }
+        .into());
+    }
+
+    Ok(ResolvedEmbeddingConfig {
+        provider,
+        endpoint: normalize_embedding_endpoint(&endpoint_raw, &provider),
+        api_key,
+        model,
+        dimensions,
+    })
+}
+
+pub(crate) async fn call_embedding_api(
+    config: &ResolvedEmbeddingConfig,
+    text: &str,
+) -> Result<(Vec<f64>, u64)> {
     let tenant = context::tenant_keyspace()
         .ok_or_else(|| anyhow!("embedding: tenant keyspace not available"))?;
     let _permit = acquire_embedding_permit(&tenant).await?;
 
+    match config.provider {
+        EmbeddingProvider::OpenAICompatible => {
+            call_openai_compatible(
+                &config.endpoint,
+                &config.api_key,
+                text,
+                &config.model,
+                config.dimensions,
+            )
+            .await
+        }
+        EmbeddingProvider::Bedrock => {
+            call_bedrock(&config.endpoint, &config.api_key, text, config.dimensions).await
+        }
+    }
+}
+
+async fn call_openai_compatible(
+    endpoint: &str,
+    api_key: &str,
+    text: &str,
+    model: &str,
+    dimensions: u32,
+) -> Result<(Vec<f64>, u64)> {
     let body = serde_json::json!({
         "model": model,
         "input": text,
@@ -128,7 +282,7 @@ pub(crate) async fn call_embedding_api(
     });
 
     let resp = embedding_http_client()
-        .post(&config.endpoint)
+        .post(endpoint)
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&body)
@@ -138,7 +292,11 @@ pub(crate) async fn call_embedding_api(
     if !resp.status().is_success() {
         let status = resp.status();
         let err_body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("embedding: API returned {} — {}", status, err_body));
+        return Err(anyhow!(
+            "embedding: API returned {} \u{2014} {}",
+            status,
+            err_body
+        ));
     }
 
     let json: serde_json::Value = resp.json().await?;
@@ -153,17 +311,60 @@ pub(crate) async fn call_embedding_api(
         .as_array()
         .ok_or_else(|| anyhow!("embedding: response missing 'embedding' array"))?;
 
-    let embedding: Vec<f64> = embedding_arr
-        .iter()
+    let embedding = parse_embedding_array(embedding_arr)?;
+    let tokens_used = json["usage"]["total_tokens"].as_u64().unwrap_or(0);
+    Ok((embedding, tokens_used))
+}
+
+async fn call_bedrock(
+    endpoint: &str,
+    api_key: &str,
+    text: &str,
+    dimensions: u32,
+) -> Result<(Vec<f64>, u64)> {
+    let body = serde_json::json!({
+        "inputText": text,
+        "dimensions": dimensions,
+        "normalize": true
+    });
+
+    let resp = embedding_http_client()
+        .post(endpoint)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err_body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "embedding: API returned {} \u{2014} {}",
+            status,
+            err_body
+        ));
+    }
+
+    let json: serde_json::Value = resp.json().await?;
+
+    let embedding_arr = json["embedding"]
+        .as_array()
+        .ok_or_else(|| anyhow!("embedding: response missing 'embedding' array"))?;
+
+    let embedding = parse_embedding_array(embedding_arr)?;
+    let tokens_used = json["inputTextTokenCount"].as_u64().unwrap_or(0);
+    Ok((embedding, tokens_used))
+}
+
+fn parse_embedding_array(arr: &[serde_json::Value]) -> Result<Vec<f64>> {
+    arr.iter()
         .enumerate()
         .map(|(i, v)| {
             v.as_f64()
                 .ok_or_else(|| anyhow!("embedding: non-float at index {}: {}", i, v))
         })
-        .collect::<Result<Vec<f64>>>()?;
-
-    let tokens_used = json["usage"]["total_tokens"].as_u64().unwrap_or(0);
-    Ok((embedding, tokens_used))
+        .collect::<Result<Vec<f64>>>()
 }
 
 pub(crate) fn embedding_function_not_found(function_signature: &str) -> anyhow::Error {
@@ -289,8 +490,11 @@ mod tests {
     use super::*;
     use crate::extensions::context;
     use crate::sql::error::SqlError;
+    use crate::sql::query_context::{with_scoped_query_context, QueryContext};
     use chrono::{DateTime, Timelike};
+    use std::collections::HashMap;
     use std::env;
+    use std::sync::Arc;
 
     #[test]
     fn tenant_semaphore_key_does_not_expand_with_limit_changes() {
@@ -372,6 +576,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_embedding_config_accepts_bedrock_titan_model() {
+        let mut qctx = QueryContext::for_tests();
+        let mut snapshot = HashMap::new();
+        snapshot.insert("embedding.provider".to_string(), "bedrock".to_string());
+        snapshot.insert(
+            "embedding.model".to_string(),
+            "tidbcloud_free/amazon/titan-embed-text-v2".to_string(),
+        );
+        snapshot.insert("embedding.api_key".to_string(), "test-key".to_string());
+        snapshot.insert(
+            "embedding.endpoint".to_string(),
+            "https://bedrock.example.com/invoke/".to_string(),
+        );
+        qctx.settings_snapshot = Some(Arc::new(snapshot.clone()));
+        qctx.execution_settings_snapshot = Some(Arc::new(snapshot));
+
+        let config =
+            with_scoped_query_context(&qctx, async { resolve_embedding_config(None, None) })
+                .await
+                .expect("bedrock titan model should resolve");
+
+        assert_eq!(config.provider, EmbeddingProvider::Bedrock);
+        assert_eq!(config.model, "tidbcloud_free/amazon/titan-embed-text-v2");
+        assert_eq!(config.endpoint, "https://bedrock.example.com/invoke");
+    }
+
+    #[tokio::test]
+    async fn resolve_embedding_config_rejects_bedrock_titan_model_on_openai() {
+        let mut qctx = QueryContext::for_tests();
+        let mut snapshot = HashMap::new();
+        snapshot.insert("embedding.provider".to_string(), "openai".to_string());
+        snapshot.insert(
+            "embedding.model".to_string(),
+            "tidbcloud_free/amazon/titan-embed-text-v2".to_string(),
+        );
+        snapshot.insert("embedding.api_key".to_string(), "test-key".to_string());
+        snapshot.insert(
+            "embedding.endpoint".to_string(),
+            "https://openai.example.com/v1".to_string(),
+        );
+        qctx.settings_snapshot = Some(Arc::new(snapshot.clone()));
+        qctx.execution_settings_snapshot = Some(Arc::new(snapshot));
+
+        let err = with_scoped_query_context(&qctx, async {
+            resolve_embedding_config(None, None).unwrap_err()
+        })
+        .await;
+        let sql_err = err.downcast_ref::<SqlError>().expect("must be SqlError");
+        assert_eq!(sql_err.sqlstate(), "22023");
+        assert!(sql_err
+            .to_string()
+            .contains("only text-embedding-v4 is supported"));
+    }
+
+    #[tokio::test]
+    async fn resolve_embedding_config_rejects_empty_api_key() {
+        let mut qctx = QueryContext::for_tests();
+        let mut snapshot = HashMap::new();
+        snapshot.insert("embedding.provider".to_string(), "bedrock".to_string());
+        snapshot.insert(
+            "embedding.model".to_string(),
+            "tidbcloud_free/amazon/titan-embed-text-v2".to_string(),
+        );
+        snapshot.insert("embedding.api_key".to_string(), "   ".to_string());
+        snapshot.insert(
+            "embedding.endpoint".to_string(),
+            "https://bedrock.example.com/invoke".to_string(),
+        );
+        qctx.settings_snapshot = Some(Arc::new(snapshot.clone()));
+        qctx.execution_settings_snapshot = Some(Arc::new(snapshot));
+
+        let err = with_scoped_query_context(&qctx, async {
+            resolve_embedding_config(None, None).unwrap_err()
+        })
+        .await;
+        assert!(err
+            .to_string()
+            .contains("service not configured on this server"));
+    }
+
+    #[tokio::test]
+    async fn current_embedding_runtime_setting_is_hidden_in_authorized_generated_mode() {
+        let mut qctx = QueryContext::for_tests();
+        let mut snapshot = HashMap::new();
+        snapshot.insert("embedding.provider".to_string(), "bedrock".to_string());
+        qctx.settings_snapshot = Some(Arc::new(snapshot.clone()));
+        qctx.execution_settings_snapshot = Some(Arc::new(snapshot));
+
+        let direct = context::with_context(false, "default", async {
+            with_scoped_query_context(&qctx, async {
+                current_embedding_runtime_setting("embedding.provider")
+            })
+            .await
+        })
+        .await;
+        assert_eq!(direct.as_deref(), Some("bedrock"));
+
+        let sealed = context::with_context(false, "default", async {
+            with_scoped_query_context(&qctx, async {
+                context::with_embedding_authorized(async {
+                    current_embedding_runtime_setting("embedding.provider")
+                })
+                .await
+            })
+            .await
+            .expect("authorized mode should be available")
+        })
+        .await;
+        assert_eq!(sealed, None);
+    }
+
+    #[test]
+    fn resolve_embedding_config_server_source_ignores_session_overrides() {
+        let static_config = EmbeddingConfig {
+            provider_name: "openai".to_string(),
+            api_key: Some("server-key".to_string()),
+            endpoint: "https://server.example/v1".to_string(),
+            model: "text-embedding-v4".to_string(),
+            dimensions: 1024,
+        };
+        let mut dynamic = HashMap::new();
+        dynamic.insert("embedding.provider".to_string(), "bedrock".to_string());
+        dynamic.insert(
+            "embedding.endpoint".to_string(),
+            "https://attacker.example/invoke".to_string(),
+        );
+        dynamic.insert("embedding.api_key".to_string(), "attacker-key".to_string());
+        dynamic.insert(
+            "embedding.model".to_string(),
+            "tidbcloud_free/amazon/titan-embed-text-v2".to_string(),
+        );
+        dynamic.insert("embedding.dimensions".to_string(), "4096".to_string());
+
+        let config = resolve_embedding_config_with_lookup(
+            &static_config,
+            EmbeddingSettingsSource::Server,
+            |name| dynamic.get(name).cloned(),
+            None,
+            None,
+        )
+        .expect("server source should ignore session overrides");
+
+        assert_eq!(config.provider, EmbeddingProvider::OpenAICompatible);
+        assert_eq!(config.endpoint, "https://server.example/v1/embeddings");
+        assert_eq!(config.api_key, "server-key");
+        assert_eq!(config.model, "text-embedding-v4");
+        assert_eq!(config.dimensions, 1024);
+    }
+
+    #[test]
+    fn cache_key_includes_api_key_identity() {
+        let config_a = ResolvedEmbeddingConfig {
+            provider: EmbeddingProvider::Bedrock,
+            endpoint: "https://bedrock.example.com/invoke".to_string(),
+            api_key: "key-a".to_string(),
+            model: "tidbcloud_free/amazon/titan-embed-text-v2".to_string(),
+            dimensions: 1024,
+        };
+        let config_b = ResolvedEmbeddingConfig {
+            api_key: "key-b".to_string(),
+            ..config_a.clone()
+        };
+
+        let key_a = config_a.cache_key("hello");
+        let key_b = config_b.cache_key("hello");
+
+        assert_ne!(key_a, key_b);
+        assert_ne!(key_a.api_key_fingerprint, key_b.api_key_fingerprint);
+    }
+
+    #[tokio::test]
     #[ignore = "live embedding provider test; requires EMBEDDING_API_KEY and EMBEDDING_BASE_URL/EMBEDDING_ENDPOINT"]
     async fn call_embedding_api_live_returns_expected_dimensions() {
         let has_key = env::var("EMBEDDING_API_KEY")
@@ -404,9 +779,20 @@ mod tests {
                     .filter(|v| *v > 0)
             })
             .unwrap_or(1024);
+        let model = env::var("EMBEDDING_TEST_MODEL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| {
+                env::var("EMBEDDING_MODEL")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            })
+            .unwrap_or_else(|| "text-embedding-v4".to_string());
 
         let (vec, tokens) = context::with_context(true, "default", async move {
-            call_embedding_api("db9 live embedding test", "text-embedding-v4", dims).await
+            let config = resolve_embedding_config(Some(&model), Some(dims))
+                .expect("embedding config should resolve");
+            call_embedding_api(&config, "db9 live embedding test").await
         })
         .await
         .expect("live embedding call should succeed");
@@ -416,5 +802,34 @@ mod tests {
             tokens > 0,
             "provider should report positive token usage for non-empty input"
         );
+    }
+
+    #[test]
+    fn parse_embedding_array_valid() {
+        let arr: Vec<serde_json::Value> = vec![
+            serde_json::json!(0.1),
+            serde_json::json!(0.2),
+            serde_json::json!(-0.5),
+        ];
+        let result = parse_embedding_array(&arr).unwrap();
+        assert_eq!(result.len(), 3);
+        assert!((result[0] - 0.1).abs() < f64::EPSILON);
+        assert!((result[1] - 0.2).abs() < f64::EPSILON);
+        assert!((result[2] - (-0.5)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_embedding_array_rejects_non_float() {
+        let arr: Vec<serde_json::Value> =
+            vec![serde_json::json!(0.1), serde_json::json!("not_a_float")];
+        let err = parse_embedding_array(&arr).unwrap_err();
+        assert!(err.to_string().contains("non-float at index 1"));
+    }
+
+    #[test]
+    fn parse_embedding_array_empty() {
+        let arr: Vec<serde_json::Value> = vec![];
+        let result = parse_embedding_array(&arr).unwrap();
+        assert!(result.is_empty());
     }
 }

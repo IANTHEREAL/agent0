@@ -3,9 +3,6 @@
 
 use super::super::*;
 use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use tikv_client::TransactionClient;
 
 /// Validate and apply transaction modes (isolation level, access mode) from
 /// `BEGIN ISOLATION LEVEL ...` or `START TRANSACTION ...` statements.
@@ -136,102 +133,6 @@ impl Executor {
         }
     }
 }
-// ── Shared runtime helpers ────────────────────────────────────
-
-/// Session settings snapshot used to set up per-statement task-local context.
-///
-/// Both the simple-query and prepared dispatch paths extract the same four
-/// settings before entering the runtime context nesting. This struct avoids
-/// repeating that extraction logic.
-pub(in crate::sql::executor::core) struct RuntimeSettings {
-    pub is_superuser: bool,
-    pub timezone: Arc<str>,
-    pub max_sort_bytes: usize,
-    pub search_path: Arc<Vec<String>>,
-    pub text_search_config: Arc<str>,
-}
-
-impl RuntimeSettings {
-    pub fn from_session(session: &Session) -> Self {
-        Self {
-            is_superuser: session.is_superuser(),
-            timezone: Arc::from(
-                session
-                    .show_setting_value("timezone")
-                    .unwrap_or_else(|| "UTC".to_string()),
-            ),
-            max_sort_bytes: session.max_sort_bytes(),
-            search_path: Arc::new(session.search_path().to_vec()),
-            text_search_config: Arc::from(
-                session
-                    .show_setting_value("default_text_search_config")
-                    .unwrap_or_else(|| {
-                        crate::sql::fts_tokenizers::default_text_search_config().to_string()
-                    }),
-            ),
-        }
-    }
-}
-
-/// Wrap a future in the per-statement task-local runtime context layers:
-/// timezone → max_sort_bytes → search_path → text_search_config → keyspace → database_id
-/// → txn snapshot ts → extension txn delta → extension context.
-///
-/// Returns a boxed future — transparent passthrough (`T`, not `Result<T>`).
-pub(in crate::sql::executor::core) fn wrap_with_runtime_context<'a, T: Send + 'a>(
-    settings: &RuntimeSettings,
-    tenant_keyspace: &'a str,
-    database_id: u64,
-    txn_snapshot_ts_version: Option<u64>,
-    tikv_client: Option<Arc<TransactionClient>>,
-    extension_txn_delta: Arc<crate::session_context::ExtensionTxnDelta>,
-    fut: impl Future<Output = T> + Send + 'a,
-) -> Pin<Box<dyn Future<Output = T> + Send + 'a>> {
-    // Keep the inner statement future boxed across build modes so the task-local
-    // scope chain does not monomorphize into an excessively deep async frame in
-    // release builds.
-    let fut = Box::pin(fut);
-
-    let tz = settings.timezone.clone();
-    let msb = settings.max_sort_bytes;
-    let sp = settings.search_path.clone();
-    let su = settings.is_superuser;
-    let tsc = settings.text_search_config.clone();
-    let ks: Arc<str> = Arc::from(tenant_keyspace);
-    Box::pin(session_context::with_timezone(
-        tz,
-        session_context::with_max_sort_bytes(
-            msb,
-            session_context::with_search_path(
-                sp,
-                session_context::with_text_search_config(
-                    tsc,
-                    session_context::with_keyspace(
-                        ks,
-                        session_context::with_database_id(
-                            database_id,
-                            session_context::with_txn_snapshot_ts_version(
-                                txn_snapshot_ts_version,
-                                session_context::with_extension_txn_delta(
-                                    extension_txn_delta,
-                                    crate::extensions::context::with_context_opts(
-                                        crate::extensions::context::ExtensionContextOpts::statement(
-                                            su,
-                                            tenant_keyspace,
-                                        )
-                                        .with_tikv_client(tikv_client),
-                                        fut,
-                                    ),
-                                ),
-                            ),
-                        ),
-                    ),
-                ),
-            ),
-        ),
-    ))
-}
-
 /// Apply an optional statement timeout to a future.
 ///
 /// If `timeout` is `Some`, wraps the future with `tokio::time::timeout` and
@@ -253,8 +154,6 @@ pub(in crate::sql::executor::core) async fn apply_statement_timeout<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
-
     fn test_session(is_superuser: bool) -> Session {
         let store = crate::storage::TikvStore::new_stub();
         let obs = crate::observability::registry().tenant("ut_dispatch_utils");
@@ -328,49 +227,11 @@ mod tests {
             .set_known_setting("max_sort_bytes", "4096".to_string())
             .unwrap();
 
-        let settings = RuntimeSettings::from_session(&session);
+        let settings = crate::sql::runtime_context::RuntimeSettings::from_session(&session);
         assert_eq!(settings.timezone.as_ref(), "Asia/Shanghai");
         assert_eq!(settings.max_sort_bytes, session.max_sort_bytes());
         assert!(settings.search_path.iter().any(|s| s == "public"));
         assert!(settings.is_superuser);
-    }
-
-    #[tokio::test]
-    async fn wrap_runtime_context_sets_task_locals() {
-        let settings = RuntimeSettings {
-            is_superuser: false,
-            timezone: Arc::from("UTC"),
-            max_sort_bytes: 1234,
-            search_path: Arc::new(vec!["$user".to_string(), "public".to_string()]),
-            text_search_config: Arc::from("simple"),
-        };
-        let out = wrap_with_runtime_context(
-            &settings,
-            "tenant_a",
-            42,
-            Some(999),
-            None,
-            Arc::new((HashSet::new(), HashSet::new())),
-            async {
-                let tz = crate::session_context::current_timezone();
-                let msb = crate::session_context::current_max_sort_bytes();
-                let first_schema = crate::session_context::current_search_path_first_schema();
-                let tenant = crate::extensions::context::tenant_keyspace().unwrap_or_default();
-                let tsc = crate::session_context::current_text_search_config();
-                let db_id = crate::session_context::current_database_id();
-                let txn_ts = crate::session_context::current_txn_snapshot_ts_version();
-                (tz, msb, first_schema, tenant, tsc, db_id, txn_ts)
-            },
-        )
-        .await;
-
-        assert_eq!(out.0.as_ref(), "UTC");
-        assert_eq!(out.1, 1234);
-        assert_eq!(out.2, "public");
-        assert_eq!(out.3, "tenant_a");
-        assert_eq!(out.4.as_ref(), "simple");
-        assert_eq!(out.5, 42);
-        assert_eq!(out.6, Some(999));
     }
 
     #[tokio::test]

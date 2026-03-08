@@ -371,6 +371,7 @@ impl Executor {
         if name.eq_ignore_ascii_case("ALL") {
             session.reset_all_settings();
         } else {
+            crate::sql::executor::check_reserved_guc_reset(name)?;
             session.reset_setting(&name.to_lowercase());
         }
         Ok(ExecuteResults::single(ExecuteResult::CommandComplete {

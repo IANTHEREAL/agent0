@@ -9,6 +9,7 @@ use sqlparser::ast::{self, Expr, Ident, ObjectName, OnInsert, Query, SelectItem,
 use crate::model::{DataType, Value};
 use crate::sql::names::{normalize_ident, split_object_name};
 use crate::sql::types::cast::CastContext;
+use crate::sql::types::coercion::is_assignment_compatible;
 
 use super::error::AnalyzerError;
 use super::scope::Scope;
@@ -37,18 +38,20 @@ impl<'a> Analyzer<'a> {
             .unwrap_or(resolved_name.as_str())
             .to_string();
 
-        // Map column names to indices.
-        let target_columns = if columns.is_empty() {
-            // No column list → all columns in schema order.
-            (0..schema.columns.len()).collect()
+        // Map explicit column names to indices. For INSERT without a column list,
+        // PostgreSQL targets the first N table columns where N is the source arity.
+        let explicit_target_columns = if columns.is_empty() {
+            None
         } else {
-            columns
-                .iter()
-                .map(|ident| {
-                    let col_name = normalize_ident(ident);
-                    self.find_column_index(&schema, &col_name, &resolved_name)
-                })
-                .collect::<Result<Vec<usize>, _>>()?
+            Some(
+                columns
+                    .iter()
+                    .map(|ident| {
+                        let col_name = normalize_ident(ident);
+                        self.find_column_index(&schema, &col_name, &resolved_name)
+                    })
+                    .collect::<Result<Vec<usize>, _>>()?,
+            )
         };
 
         // Build scope for the target table (needed for RETURNING and ON CONFLICT).
@@ -66,13 +69,23 @@ impl<'a> Analyzer<'a> {
             .collect();
 
         // Analyze source rows.
-        let analyzed_source = match source {
+        let (target_columns, analyzed_source) = match source {
             None => {
                 // INSERT ... DEFAULT VALUES
-                AnalyzedInsertSource::DefaultValues
+                (
+                    explicit_target_columns.clone().unwrap_or_default(),
+                    AnalyzedInsertSource::DefaultValues,
+                )
             }
             Some(query) => match &*query.body {
                 SetExpr::Values(Values { rows, .. }) => {
+                    let target_columns = match &explicit_target_columns {
+                        Some(cols) => cols.clone(),
+                        None => self.resolve_implicit_insert_target_columns(
+                            &schema,
+                            rows.first().map(|row| row.len()).unwrap_or(0),
+                        )?,
+                    };
                     let mut analyzed_rows = Vec::with_capacity(rows.len());
                     for row_exprs in rows {
                         // Validate arity.
@@ -94,11 +107,18 @@ impl<'a> Analyzer<'a> {
                         self.scopes.pop();
                         analyzed_rows.push(typed_vals);
                     }
-                    AnalyzedInsertSource::Values(analyzed_rows)
+                    (target_columns, AnalyzedInsertSource::Values(analyzed_rows))
                 }
                 _ => {
                     // INSERT ... SELECT ...
                     let analyzed_query = self.analyze_query(query)?;
+                    let target_columns = match &explicit_target_columns {
+                        Some(cols) => cols.clone(),
+                        None => self.resolve_implicit_insert_target_columns(
+                            &schema,
+                            analyzed_query.output_schema.len(),
+                        )?,
+                    };
 
                     // Validate arity: SELECT output columns must match target columns.
                     if analyzed_query.output_schema.len() != target_columns.len() {
@@ -108,10 +128,14 @@ impl<'a> Analyzer<'a> {
                         });
                     }
 
-                    AnalyzedInsertSource::Query(Box::new(analyzed_query))
+                    (
+                        target_columns,
+                        AnalyzedInsertSource::Query(Box::new(analyzed_query)),
+                    )
                 }
             },
         };
+        self.validate_generated_insert_targets(&schema, &target_columns, &analyzed_source)?;
 
         // Analyze ON CONFLICT.
         let analyzed_on_conflict = if let Some(on) = on_conflict {
@@ -209,10 +233,10 @@ impl<'a> Analyzer<'a> {
                         })?);
                         let col_idx =
                             self.find_column_index(schema, &col_name, table_name_for_errors)?;
-                        assignments.push((
-                            col_idx,
-                            self.analyze_dml_assignment_expr(&assignment.value, schema, col_idx)?,
-                        ));
+                        let typed =
+                            self.analyze_dml_assignment_expr(&assignment.value, schema, col_idx)?;
+                        self.validate_generated_update_target(schema, col_idx, &typed)?;
+                        assignments.push((col_idx, typed));
                     }
 
                     let where_clause = if let Some(ref sel) = do_update.selection {
@@ -248,10 +272,10 @@ impl<'a> Analyzer<'a> {
                     })?);
                     let col_idx =
                         self.find_column_index(schema, &col_name, table_name_for_errors)?;
-                    analyzed_assignments.push((
-                        col_idx,
-                        self.analyze_dml_assignment_expr(&assignment.value, schema, col_idx)?,
-                    ));
+                    let typed =
+                        self.analyze_dml_assignment_expr(&assignment.value, schema, col_idx)?;
+                    self.validate_generated_update_target(schema, col_idx, &typed)?;
+                    analyzed_assignments.push((col_idx, typed));
                 }
 
                 self.scopes.pop();
@@ -342,10 +366,9 @@ impl<'a> Analyzer<'a> {
                     AnalyzerError::Internal("empty assignment target".to_string())
                 })?);
             let col_idx = self.find_column_index(&schema, &col_name, &resolved_name)?;
-            analyzed_assignments.push((
-                col_idx,
-                self.analyze_dml_assignment_expr(&assignment.value, &schema, col_idx)?,
-            ));
+            let typed = self.analyze_dml_assignment_expr(&assignment.value, &schema, col_idx)?;
+            self.validate_generated_update_target(&schema, col_idx, &typed)?;
+            analyzed_assignments.push((col_idx, typed));
         }
 
         // Analyze WHERE.
@@ -521,6 +544,89 @@ impl<'a> Analyzer<'a> {
             })
     }
 
+    fn validate_generated_insert_targets(
+        &self,
+        schema: &crate::model::TableSchema,
+        target_columns: &[usize],
+        source: &AnalyzedInsertSource,
+    ) -> Result<(), AnalyzerError> {
+        match source {
+            AnalyzedInsertSource::DefaultValues => Ok(()),
+            AnalyzedInsertSource::Values(rows) => {
+                for row in rows {
+                    for (&col_idx, expr) in target_columns.iter().zip(row.iter()) {
+                        self.validate_generated_insert_target(schema, col_idx, expr)?;
+                    }
+                }
+                Ok(())
+            }
+            AnalyzedInsertSource::Query(_) => {
+                for &col_idx in target_columns {
+                    let Some(col) = schema.columns.get(col_idx) else {
+                        continue;
+                    };
+                    if col.generation_expr.is_some() {
+                        return Err(AnalyzerError::SqlStructure(format!(
+                            "cannot insert a non-DEFAULT value into column \"{}\"\nDETAIL:  Column \"{}\" is a generated column.",
+                            col.name, col.name
+                        )));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn validate_generated_insert_target(
+        &self,
+        schema: &crate::model::TableSchema,
+        col_idx: usize,
+        expr: &TypedExpr,
+    ) -> Result<(), AnalyzerError> {
+        let Some(col) = schema.columns.get(col_idx) else {
+            return Ok(());
+        };
+        if col.generation_expr.is_some() && !matches!(expr.kind, TypedExprKind::Default) {
+            return Err(AnalyzerError::SqlStructure(format!(
+                "cannot insert a non-DEFAULT value into column \"{}\"\nDETAIL:  Column \"{}\" is a generated column.",
+                col.name, col.name
+            )));
+        }
+        Ok(())
+    }
+
+    fn resolve_implicit_insert_target_columns(
+        &self,
+        schema: &crate::model::TableSchema,
+        source_arity: usize,
+    ) -> Result<Vec<usize>, AnalyzerError> {
+        if source_arity > schema.columns.len() {
+            return Err(AnalyzerError::InsertColumnCountMismatch {
+                columns: schema.columns.len(),
+                values: source_arity,
+            });
+        }
+        Ok((0..source_arity).collect())
+    }
+
+    fn validate_generated_update_target(
+        &self,
+        schema: &crate::model::TableSchema,
+        col_idx: usize,
+        expr: &TypedExpr,
+    ) -> Result<(), AnalyzerError> {
+        let Some(col) = schema.columns.get(col_idx) else {
+            return Ok(());
+        };
+        if col.generation_expr.is_some() && !matches!(expr.kind, TypedExprKind::Default) {
+            return Err(AnalyzerError::SqlStructure(format!(
+                "column \"{}\" can only be updated to DEFAULT\nDETAIL:  Column \"{}\" is a generated column.",
+                col.name, col.name
+            )));
+        }
+        Ok(())
+    }
+
     /// Coerce a value expression to match a target column type.
     ///
     /// Inserts an implicit Assignment cast if the types differ and are compatible.
@@ -628,19 +734,4 @@ impl<'a> Analyzer<'a> {
 /// Check if `DEFAULT` is being used as a value expression.
 fn is_default_expr(expr: &Expr) -> bool {
     matches!(expr, Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case("DEFAULT"))
-}
-
-/// Check if a type can be implicitly cast to another in assignment context.
-///
-/// PostgreSQL's assignment coercion is permissive — most types can be assigned
-/// to compatible types via implicit cast (e.g. Int32 → Int64, Text → anything).
-fn is_assignment_compatible(from: &DataType, to: &DataType) -> bool {
-    use crate::sql::types::coercion::common_type;
-
-    // Text is universally assignable (PostgreSQL I/O coercion).
-    if matches!(from, DataType::Text) || matches!(to, DataType::Text) {
-        return true;
-    }
-    // If there's a common type, assignment is valid.
-    common_type(from, to).is_some()
 }

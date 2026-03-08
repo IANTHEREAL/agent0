@@ -1,14 +1,23 @@
 use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use tikv_client::TransactionClient;
+
+use crate::config::EmbeddingProvider;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionKind {
     Interactive,
     Cron,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingExecutionMode {
+    Direct,
+    AuthorizedGenerated,
 }
 
 #[derive(Clone)]
@@ -50,7 +59,19 @@ pub(crate) struct ExtensionContext {
     execution_kind: ExecutionKind,
     http_requests: Cell<u32>,
     embedding_calls: Cell<u32>,
+    embedding_mode: Cell<EmbeddingExecutionMode>,
+    embedding_cache: RefCell<HashMap<EmbeddingCacheKey, Vec<f64>>>,
     tikv_client: Option<Arc<TransactionClient>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct EmbeddingCacheKey {
+    pub(crate) provider: EmbeddingProvider,
+    pub(crate) endpoint: String,
+    pub(crate) api_key_fingerprint: String,
+    pub(crate) model: String,
+    pub(crate) dimensions: u32,
+    pub(crate) text: String,
 }
 
 tokio::task_local! {
@@ -83,6 +104,8 @@ pub(crate) async fn with_context_opts<R>(
         execution_kind: opts.execution_kind,
         http_requests: Cell::new(0),
         embedding_calls: Cell::new(0),
+        embedding_mode: Cell::new(EmbeddingExecutionMode::Direct),
+        embedding_cache: RefCell::new(HashMap::new()),
         tikv_client: opts.tikv_client,
     };
 
@@ -152,4 +175,43 @@ pub(crate) fn try_consume_embedding_call_with_limit(max_per_statement: u32) -> R
         Ok(())
     })
     .map_err(|_| anyhow!("embedding: extension context not available"))?
+}
+
+pub(crate) fn embedding_execution_mode() -> EmbeddingExecutionMode {
+    CTX.try_with(|ctx| ctx.embedding_mode.get())
+        .unwrap_or(EmbeddingExecutionMode::Direct)
+}
+
+pub(crate) fn is_embedding_authorized() -> bool {
+    embedding_execution_mode() == EmbeddingExecutionMode::AuthorizedGenerated
+}
+
+pub(crate) async fn with_embedding_authorized<R>(future: impl Future<Output = R>) -> Result<R> {
+    let previous = CTX
+        .try_with(|ctx| {
+            let previous = ctx.embedding_mode.get();
+            ctx.embedding_mode
+                .set(EmbeddingExecutionMode::AuthorizedGenerated);
+            previous
+        })
+        .map_err(|_| anyhow!("embedding: extension context not available"))?;
+
+    let result = future.await;
+
+    CTX.try_with(|ctx| ctx.embedding_mode.set(previous))
+        .map_err(|_| anyhow!("embedding: extension context not available"))?;
+    Ok(result)
+}
+
+pub(crate) fn cached_embedding(key: &EmbeddingCacheKey) -> Result<Option<Vec<f64>>> {
+    CTX.try_with(|ctx| ctx.embedding_cache.borrow().get(key).cloned())
+        .map_err(|_| anyhow!("embedding: extension context not available"))
+}
+
+pub(crate) fn cache_embedding(key: EmbeddingCacheKey, vector: Vec<f64>) -> Result<()> {
+    CTX.try_with(|ctx| {
+        ctx.embedding_cache.borrow_mut().insert(key, vector);
+    })
+    .map_err(|_| anyhow!("embedding: extension context not available"))?;
+    Ok(())
 }

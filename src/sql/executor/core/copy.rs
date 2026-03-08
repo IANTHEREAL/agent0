@@ -86,9 +86,9 @@ impl Executor {
                 .ok_or_else(|| SqlError::RelationNotFound(table_name.to_string()))
                 .map_err(CopyInsertBatchError::non_row)?;
             let qctx = crate::sql::query_context::QueryContext::from_task_locals();
-            let compiled_checks =
-                crate::sql::check_constraints::compile_check_constraints(&schema, &qctx)
-                    .map_err(CopyInsertBatchError::non_row)?;
+            let write_plan = self
+                .compile_write_row_plan(&schema, &qctx)
+                .map_err(CopyInsertBatchError::non_row)?;
 
             let enum_cache = dml::build_enum_label_cache(&self.store, txn, db_id, &schema)
                 .await
@@ -115,6 +115,8 @@ impl Executor {
                 }
                 indices.sort_unstable();
                 indices.dedup();
+                self.reject_explicit_generated_insert_columns(&schema, &indices)
+                    .map_err(|e| CopyInsertBatchError::row(row_offset, e))?;
 
                 dml::fill_missing_columns(
                     &self.store,
@@ -128,16 +130,18 @@ impl Executor {
                 )
                 .await
                 .map_err(|e| CopyInsertBatchError::row(row_offset, e))?;
-                dml::coerce_row_values(&schema, &mut row_values)
-                    .map_err(|e| CopyInsertBatchError::row(row_offset, e))?;
-                let row = Row { values: row_values };
-                crate::sql::check_constraints::validate_compiled_check_constraints(
+                self.finalize_write_row(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
                     &schema,
-                    &compiled_checks,
-                    &row,
-                    &qctx,
+                    &write_plan,
+                    &mut row_values,
                 )
+                .await
                 .map_err(|e| CopyInsertBatchError::row(row_offset, e))?;
+                let row = Row { values: row_values };
 
                 // Validate enum values (CPU-only).
                 dml::insert::validate_enum_values(&schema, &row, &enum_cache)
@@ -544,8 +548,7 @@ impl Executor {
         let qctx = crate::sql::query_context::QueryContext::from_task_locals();
         let enum_cache =
             dml::build_enum_label_cache(&self.store, txn, db_id, &table_schema).await?;
-        let compiled_checks =
-            crate::sql::check_constraints::compile_check_constraints(&table_schema, &qctx)?;
+        let write_plan = self.compile_write_row_plan(&table_schema, &qctx)?;
 
         // Stream batches and insert rows with transaction rotation
         use futures::StreamExt;
@@ -573,6 +576,7 @@ impl Executor {
                 }
                 provided_indices.sort_unstable();
                 provided_indices.dedup();
+                self.reject_explicit_generated_insert_columns(&table_schema, &provided_indices)?;
 
                 // Fill defaults for missing columns (serials, DEFAULT expressions)
                 dml::fill_missing_columns(
@@ -587,8 +591,17 @@ impl Executor {
                 )
                 .await?;
 
-                // Coerce types
-                dml::coerce_row_values(&table_schema, &mut row_values).map_err(|e| {
+                self.finalize_write_row(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    &search_path,
+                    &table_schema,
+                    &write_plan,
+                    &mut row_values,
+                )
+                .await
+                .map_err(|e| {
                     anyhow!(
                         "COPY {}, row group {}, row {}: {}",
                         short_table,
@@ -599,23 +612,6 @@ impl Executor {
                 })?;
 
                 let row = Row { values: row_values };
-
-                // Validate check constraints
-                crate::sql::check_constraints::validate_compiled_check_constraints(
-                    &table_schema,
-                    &compiled_checks,
-                    &row,
-                    &qctx,
-                )
-                .map_err(|e| {
-                    anyhow!(
-                        "COPY {}, row group {}, row {}: {}",
-                        short_table,
-                        row_group_num,
-                        row_in_group,
-                        e
-                    )
-                })?;
 
                 // Insert the row (handles indexes, FK etc)
                 let _ = dml::execute_insert_row(

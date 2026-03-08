@@ -534,6 +534,19 @@ pub struct MockCatalogBuilder {
 
 #[allow(dead_code)] // test: mock catalog implementation
 impl MockCatalogBuilder {
+    pub fn table_with_column_defs(mut self, name: &str, columns: Vec<ColumnDef>) -> Self {
+        let schema = TableSchema::new(
+            format!("public.{}", name),
+            1, // dummy table_id
+            columns,
+            vec![], // no pk for test
+        );
+
+        self.snapshot
+            .add_table(name, format!("public.{}", name), schema);
+        self
+    }
+
     /// Add a table with given columns: `(name, type, nullable)`.
     pub fn table(mut self, name: &str, columns: Vec<(&str, DataType, bool)>) -> Self {
         let col_defs: Vec<ColumnDef> = columns
@@ -546,6 +559,8 @@ impl MockCatalogBuilder {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
                 collation: None,
             })
             .collect();
@@ -579,6 +594,8 @@ impl MockCatalogBuilder {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
                 collation: None,
             })
             .collect();
@@ -613,6 +630,8 @@ impl MockCatalogBuilder {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
                 collation: coll.map(|s| s.to_string()),
             })
             .collect();
@@ -698,6 +717,8 @@ mod tests {
                 unique: false,
                 is_serial: false,
                 default_expr: None,
+                generation_expr: None,
+                generation_expr_authorized_by: None,
                 collation: None,
             }],
             vec![],

@@ -37,8 +37,36 @@ pub(crate) fn env_string(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EmbeddingProvider {
+    OpenAICompatible,
+    Bedrock,
+}
+
+impl EmbeddingProvider {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "openai" | "openai_compatible" | "openai-compatible" => Some(Self::OpenAICompatible),
+            "bedrock" | "aws_bedrock" | "aws-bedrock" => Some(Self::Bedrock),
+            _ => None,
+        }
+    }
+
+    pub fn from_env_str(s: &str) -> Self {
+        Self::parse(s).unwrap_or(Self::OpenAICompatible)
+    }
+
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::OpenAICompatible => "openai",
+            Self::Bedrock => "bedrock",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EmbeddingConfig {
+    pub provider_name: String,
     pub api_key: Option<String>,
     pub endpoint: String,
     pub model: String,
@@ -47,24 +75,19 @@ pub struct EmbeddingConfig {
 
 impl EmbeddingConfig {
     pub fn from_env() -> Self {
+        let provider_name =
+            env_string("EMBEDDING_PROVIDER").unwrap_or_else(|| "openai".to_string());
+        let provider = EmbeddingProvider::from_env_str(&provider_name);
+
         let model = env_string("EMBEDDING_MODEL")
-            .map(|value| {
-                if let Some(canonical) = canonical_embedding_model(&value) {
-                    canonical.to_string()
-                } else {
-                    tracing::warn!(
-                        requested = %value,
-                        actual = DEFAULT_EMBEDDING_MODEL,
-                        "unsupported EMBEDDING_MODEL; forcing text-embedding-v4"
-                    );
-                    DEFAULT_EMBEDDING_MODEL.to_string()
-                }
-            })
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
             .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
 
         Self {
+            provider_name: provider.canonical_name().to_string(),
             api_key: env_string("EMBEDDING_API_KEY"),
-            endpoint: embedding_endpoint_from_env(),
+            endpoint: embedding_endpoint_from_env(&provider),
             model,
             dimensions: std::env::var("EMBEDDING_DIMENSIONS")
                 .ok()
@@ -73,21 +96,22 @@ impl EmbeddingConfig {
                 .unwrap_or(DEFAULT_EMBEDDING_DIMENSIONS),
         }
     }
-
-    pub fn is_available(&self) -> bool {
-        self.api_key.is_some()
-    }
 }
 
-fn embedding_endpoint_from_env() -> String {
+fn embedding_endpoint_from_env(provider: &EmbeddingProvider) -> String {
     // Support both EMBEDDING_ENDPOINT and EMBEDDING_BASE_URL naming styles.
     let raw = env_string("EMBEDDING_ENDPOINT")
         .or_else(|| env_string("EMBEDDING_BASE_URL"))
         .unwrap_or_else(|| DEFAULT_EMBEDDING_ENDPOINT.to_string());
-    normalize_embedding_endpoint(&raw)
+    normalize_embedding_endpoint(&raw, provider)
 }
 
-fn normalize_embedding_endpoint(raw: &str) -> String {
+pub(crate) fn normalize_embedding_endpoint(raw: &str, provider: &EmbeddingProvider) -> String {
+    // Bedrock endpoints already contain /invoke in the ARN URL — never append /embeddings.
+    if *provider == EmbeddingProvider::Bedrock {
+        return raw.trim_end_matches('/').to_string();
+    }
+
     if let Ok(mut url) = reqwest::Url::parse(raw) {
         let mut path = url.path().trim_end_matches('/').to_string();
         if path.is_empty() {
@@ -418,49 +442,101 @@ mod tests {
 
     #[test]
     fn test_normalize_embedding_endpoint_base_url() {
+        let openai = EmbeddingProvider::OpenAICompatible;
         assert_eq!(
-            normalize_embedding_endpoint("https://api.openai.com/v1"),
+            normalize_embedding_endpoint("https://api.openai.com/v1", &openai),
             "https://api.openai.com/v1/embeddings"
         );
         assert_eq!(
-            normalize_embedding_endpoint("https://api.openai.com"),
+            normalize_embedding_endpoint("https://api.openai.com", &openai),
             "https://api.openai.com/embeddings"
         );
     }
 
     #[test]
     fn test_normalize_embedding_endpoint_keeps_existing_embeddings_path() {
+        let openai = EmbeddingProvider::OpenAICompatible;
         assert_eq!(
-            normalize_embedding_endpoint("https://api.openai.com/v1/embeddings"),
+            normalize_embedding_endpoint("https://api.openai.com/v1/embeddings", &openai),
             "https://api.openai.com/v1/embeddings"
         );
         assert_eq!(
-            normalize_embedding_endpoint("https://api.openai.com/v1/embeddings/"),
+            normalize_embedding_endpoint("https://api.openai.com/v1/embeddings/", &openai),
             "https://api.openai.com/v1/embeddings"
         );
     }
 
     #[test]
     fn test_normalize_embedding_endpoint_preserves_query() {
+        let openai = EmbeddingProvider::OpenAICompatible;
         assert_eq!(
-            normalize_embedding_endpoint("https://api.openai.com/v1/embeddings?x=1"),
+            normalize_embedding_endpoint("https://api.openai.com/v1/embeddings?x=1", &openai),
             "https://api.openai.com/v1/embeddings?x=1"
         );
         assert_eq!(
-            normalize_embedding_endpoint("https://api.openai.com/v1?x=1"),
+            normalize_embedding_endpoint("https://api.openai.com/v1?x=1", &openai),
             "https://api.openai.com/v1/embeddings?x=1"
         );
     }
 
     #[test]
     fn test_normalize_embedding_endpoint_fallback_for_non_url_inputs() {
+        let openai = EmbeddingProvider::OpenAICompatible;
         assert_eq!(
-            normalize_embedding_endpoint("api.openai.com/v1"),
+            normalize_embedding_endpoint("api.openai.com/v1", &openai),
             "api.openai.com/v1/embeddings"
         );
         assert_eq!(
-            normalize_embedding_endpoint("api.openai.com/v1/embeddings"),
+            normalize_embedding_endpoint("api.openai.com/v1/embeddings", &openai),
             "api.openai.com/v1/embeddings"
+        );
+    }
+
+    #[test]
+    fn test_normalize_bedrock_endpoint_no_embeddings_suffix() {
+        let bedrock = EmbeddingProvider::Bedrock;
+        let url = "https://bedrock-runtime.us-west-2.amazonaws.com/model/arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/example-profile/invoke";
+        assert_eq!(normalize_embedding_endpoint(url, &bedrock), url);
+    }
+
+    #[test]
+    fn test_normalize_bedrock_endpoint_trims_trailing_slash() {
+        let bedrock = EmbeddingProvider::Bedrock;
+        assert_eq!(
+            normalize_embedding_endpoint("https://bedrock.example.com/invoke/", &bedrock),
+            "https://bedrock.example.com/invoke"
+        );
+    }
+
+    #[test]
+    fn test_embedding_provider_from_env_str() {
+        assert_eq!(
+            EmbeddingProvider::from_env_str("bedrock"),
+            EmbeddingProvider::Bedrock
+        );
+        assert_eq!(
+            EmbeddingProvider::from_env_str("BEDROCK"),
+            EmbeddingProvider::Bedrock
+        );
+        assert_eq!(
+            EmbeddingProvider::from_env_str("aws_bedrock"),
+            EmbeddingProvider::Bedrock
+        );
+        assert_eq!(
+            EmbeddingProvider::from_env_str("aws-bedrock"),
+            EmbeddingProvider::Bedrock
+        );
+        assert_eq!(
+            EmbeddingProvider::from_env_str("openai"),
+            EmbeddingProvider::OpenAICompatible
+        );
+        assert_eq!(
+            EmbeddingProvider::from_env_str(""),
+            EmbeddingProvider::OpenAICompatible
+        );
+        assert_eq!(
+            EmbeddingProvider::from_env_str("whatever"),
+            EmbeddingProvider::OpenAICompatible
         );
     }
 }

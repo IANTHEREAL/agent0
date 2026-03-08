@@ -18,6 +18,7 @@ use tikv_client::{BoundRange, Transaction};
 use usearch::ffi::{new_index, Index, IndexOptions, MetricKind, ScalarKind};
 
 use crate::sql::error::SqlError;
+use crate::sql::hnsw::HnswDistanceMetric;
 use crate::storage::TikvStore;
 use crate::txn::{txn_delete, txn_put};
 
@@ -182,10 +183,10 @@ pub fn vec_f64_to_f32(v: &[f64]) -> Vec<f32> {
 }
 
 pub fn metric_from_string(s: &str) -> Result<MetricKind, SqlError> {
-    match s {
-        "l2" => Ok(MetricKind::L2Sq),
-        "cosine" | "cos" => Ok(MetricKind::Cos),
-        "ip" => Ok(MetricKind::IP),
+    match HnswDistanceMetric::from_str(s) {
+        Some(HnswDistanceMetric::L2) => Ok(MetricKind::L2Sq),
+        Some(HnswDistanceMetric::Cosine) => Ok(MetricKind::Cos),
+        Some(HnswDistanceMetric::InnerProduct) => Ok(MetricKind::IP),
         _ => Err(SqlError::Internal(anyhow::anyhow!(
             "Unknown HNSW distance metric: {}",
             s

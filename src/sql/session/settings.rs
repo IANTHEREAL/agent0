@@ -134,6 +134,12 @@ pub(crate) const KNOWN_GUCS: &[GucMeta] = &[
         static_default: None,
     },
     GucMeta {
+        name: "embedding.api_key",
+        immutable: false,
+        description: "Embedding service API key (session override)",
+        static_default: None,
+    },
+    GucMeta {
         name: "embedding.concurrency",
         immutable: false,
         description: "",
@@ -146,6 +152,12 @@ pub(crate) const KNOWN_GUCS: &[GucMeta] = &[
         static_default: None,
     },
     GucMeta {
+        name: "embedding.endpoint",
+        immutable: false,
+        description: "Embedding service endpoint URL (session override)",
+        static_default: None,
+    },
+    GucMeta {
         name: "embedding.max_calls",
         immutable: false,
         description: "",
@@ -155,6 +167,12 @@ pub(crate) const KNOWN_GUCS: &[GucMeta] = &[
         name: "embedding.model",
         immutable: false,
         description: "",
+        static_default: None,
+    },
+    GucMeta {
+        name: "embedding.provider",
+        immutable: false,
+        description: "Embedding provider: openai or bedrock (session override)",
         static_default: None,
     },
     GucMeta {
@@ -674,18 +692,55 @@ impl SessionSettings {
                 }
                 Ok(v.to_string())
             }
-            "embedding.model" => crate::config::canonical_embedding_model(value)
-                .map(|m| m.to_string())
-                .ok_or_else(|| {
-                    SqlError::InvalidParameterValue {
+            "embedding.model" => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return Err(SqlError::InvalidParameterValue {
+                        message: "embedding.model must not be empty".into(),
+                    }
+                    .into());
+                }
+                Ok(trimmed.to_string())
+            }
+            "embedding.provider" => {
+                let normalized = value.trim().to_lowercase();
+                match normalized.as_str() {
+                    "openai" | "openai_compatible" | "openai-compatible" => {
+                        Ok("openai".to_string())
+                    }
+                    "bedrock" | "aws_bedrock" | "aws-bedrock" => Ok("bedrock".to_string()),
+                    _ => Err(SqlError::InvalidParameterValue {
                         message: format!(
-                            "invalid value for parameter \"embedding.model\": \"{}\"; \
-                             only text-embedding-v4 is supported",
+                            "invalid value for parameter \"embedding.provider\": \"{}\"; \
+                             expected 'openai' or 'bedrock'",
                             value
                         ),
                     }
-                    .into()
-                }),
+                    .into()),
+                }
+            }
+            "embedding.endpoint" => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return Err(SqlError::InvalidParameterValue {
+                        message: "embedding.endpoint must not be empty".into(),
+                    }
+                    .into());
+                }
+                Ok(trimmed.to_string())
+            }
+            "embedding.api_key" => {
+                // Accept any non-empty string. Value is stored as-is but
+                // SHOW will return '****' for security.
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return Err(SqlError::InvalidParameterValue {
+                        message: "embedding.api_key must not be empty".into(),
+                    }
+                    .into());
+                }
+                Ok(trimmed.to_string())
+            }
             "embedding.max_calls" | "embedding.concurrency" => {
                 let v: u32 = value
                     .trim()
@@ -1073,6 +1128,28 @@ impl SessionSettings {
                     .cloned()
                     .unwrap_or_else(|| "5".to_string()),
             ),
+            "embedding.provider" => Some(
+                self.extra_settings
+                    .get(canonical)
+                    .cloned()
+                    .unwrap_or_else(|| crate::config::get_embedding_config().provider_name.clone()),
+            ),
+            "embedding.endpoint" => Some(
+                self.extra_settings
+                    .get(canonical)
+                    .cloned()
+                    .unwrap_or_else(|| crate::config::get_embedding_config().endpoint.clone()),
+            ),
+            "embedding.api_key" => {
+                // Return the raw value so that internal snapshot consumers
+                // (e.g. call_embedding_api) receive the real key.
+                // Display masking is applied in Session::show_setting_value().
+                self.extra_settings
+                    .get(canonical)
+                    .cloned()
+                    .or_else(|| crate::config::get_embedding_config().api_key.clone())
+                    .or_else(|| Some("".to_string()))
+            }
             "timezone" => Some(self.timezone.as_deref().unwrap_or("UTC").to_string()),
             "application_name" => Some(self.application_name.as_deref().unwrap_or("").to_string()),
             "client_encoding" => Some(
@@ -1330,6 +1407,9 @@ impl SessionSettings {
         "embedding.dimensions",
         "embedding.max_calls",
         "embedding.concurrency",
+        "embedding.provider",
+        "embedding.endpoint",
+        "embedding.api_key",
         "timezone",
         "application_name",
         "client_encoding",

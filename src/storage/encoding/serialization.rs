@@ -70,114 +70,10 @@ pub fn deserialize_schema(data: &[u8]) -> Result<TableSchema> {
     Ok(schema)
 }
 
-#[derive(serde::Deserialize)]
-struct V2Schema {
-    pub name: String,
-    pub table_id: u64,
-    pub columns: Vec<crate::model::ColumnDef>,
-    pub version: u64,
-    #[serde(default)]
-    pub pk_constraint_name: Option<String>,
-    pub pk_indices: Vec<usize>,
-    pub indexes: Vec<V2IndexDef>,
-    #[serde(default)]
-    pub check_constraints: Vec<crate::model::CheckConstraint>,
-    #[serde(default)]
-    pub foreign_keys: Vec<crate::model::ForeignKeyConstraint>,
-    #[serde(default = "default_v2_owner")]
-    pub owner: String,
-    #[serde(default)]
-    pub from_alias: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct V2IndexDef {
-    pub name: String,
-    pub id: u64,
-    pub columns: Vec<String>,
-    pub unique: bool,
-    #[serde(default)]
-    pub is_constraint: Option<bool>,
-    #[serde(default)]
-    pub method: Option<String>,
-    #[serde(default)]
-    pub predicate: Option<String>,
-    #[serde(default)]
-    pub expressions: Vec<String>,
-    #[serde(default)]
-    pub state: crate::worker::types::IndexState,
-}
-
-impl From<V2Schema> for TableSchema {
-    fn from(s: V2Schema) -> Self {
-        let V2Schema {
-            name,
-            table_id,
-            columns,
-            version,
-            pk_constraint_name,
-            pk_indices,
-            indexes,
-            check_constraints,
-            foreign_keys,
-            owner,
-            from_alias,
-        } = s;
-
-        let decoded_indexes: Vec<crate::model::IndexDef> = indexes
-            .into_iter()
-            .map(|idx| {
-                let is_constraint = idx
-                    .is_constraint
-                    .unwrap_or_else(|| legacy_index_constraint_default(idx.unique, &idx.columns));
-                crate::model::IndexDef {
-                    name: idx.name,
-                    id: idx.id,
-                    columns: idx.columns,
-                    unique: idx.unique,
-                    is_constraint,
-                    method: idx.method,
-                    predicate: idx.predicate,
-                    expressions: idx.expressions,
-                    state: idx.state,
-                    cached_predicate_conjuncts: None,
-                    hnsw_m: None,
-                    hnsw_ef_construction: None,
-                    hnsw_distance_metric: None,
-                }
-            })
-            .collect();
-
-        TableSchema {
-            name,
-            table_id,
-            columns,
-            version,
-            pk_constraint_name,
-            pk_indices,
-            indexes: decoded_indexes,
-            check_constraints,
-            foreign_keys,
-            owner,
-            from_alias,
-        }
-    }
-}
-
 fn deserialize_v2_msgpack(payload: &[u8]) -> Result<TableSchema> {
-    let decoded: V2Schema =
+    let decoded: TableSchema =
         rmp_serde::from_slice(payload).context("Failed to deserialize V2 MessagePack schema")?;
-    Ok(decoded.into())
-}
-
-fn default_v2_owner() -> String {
-    "postgres".to_string()
-}
-
-fn legacy_index_constraint_default(unique: bool, index_columns: &[String]) -> bool {
-    // Legacy V2 payloads without `is_constraint` field: any legacy UNIQUE index
-    // with key columns remains visible as a UNIQUE constraint.
-    unique && !index_columns.is_empty()
+    Ok(decoded)
 }
 
 pub fn serialize_row(row: &Row) -> Result<Vec<u8>> {
@@ -224,6 +120,8 @@ mod tests {
                     unique: true,
                     is_serial: true,
                     default_expr: None,
+                    generation_expr: None,
+                    generation_expr_authorized_by: None,
                     collation: None,
                 },
                 ColumnDef {
@@ -234,6 +132,8 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    generation_expr: None,
+                    generation_expr_authorized_by: None,
                     collation: Some("en_US".into()),
                 },
             ],
@@ -319,6 +219,23 @@ mod tests {
     }
 
     #[test]
+    fn hnsw_index_metadata_survives_v2_roundtrip() {
+        let mut schema = sample_schema();
+        schema.indexes[0].method = Some("hnsw".into());
+        schema.indexes[0].hnsw_m = Some(32);
+        schema.indexes[0].hnsw_ef_construction = Some(128);
+        schema.indexes[0].hnsw_distance_metric = Some("ip".into());
+
+        let data = serialize_schema(&schema).unwrap();
+        let decoded = deserialize_schema(&data).unwrap();
+        let index = &decoded.indexes[0];
+        assert_eq!(index.method.as_deref(), Some("hnsw"));
+        assert_eq!(index.hnsw_m, Some(32));
+        assert_eq!(index.hnsw_ef_construction, Some(128));
+        assert_eq!(index.hnsw_distance_metric.as_deref(), Some("ip"));
+    }
+
+    #[test]
     fn v2_missing_index_constraint_bit_uses_legacy_backward_compat_default() {
         let schema = TableSchema {
             name: "public.legacy".into(),
@@ -332,6 +249,8 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    generation_expr: None,
+                    generation_expr_authorized_by: None,
                     collation: None,
                 },
                 ColumnDef {
@@ -342,6 +261,8 @@ mod tests {
                     unique: false,
                     is_serial: false,
                     default_expr: None,
+                    generation_expr: None,
+                    generation_expr_authorized_by: None,
                     collation: None,
                 },
             ],

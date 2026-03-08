@@ -51,6 +51,27 @@ fn test_ts_rank_registry_supports_pg_overloads() {
 }
 
 #[test]
+fn test_embedding_registry_signatures() {
+    let reg = global_registry();
+
+    let embedding = reg.get("EMBEDDING").expect("EMBEDDING must exist");
+    assert_eq!(embedding.min_args, 1);
+    assert_eq!(embedding.max_args, Some(3));
+    assert_eq!(
+        reg.resolve_return_type("EMBEDDING", &[DataType::Text]),
+        Some(DataType::Vector(0))
+    );
+
+    let embed_text = reg.get("EMBED_TEXT").expect("EMBED_TEXT must exist");
+    assert_eq!(embed_text.min_args, 2);
+    assert_eq!(embed_text.max_args, Some(3));
+    assert_eq!(
+        reg.resolve_return_type("EMBED_TEXT", &[DataType::Text, DataType::Text]),
+        Some(DataType::Vector(0))
+    );
+}
+
+#[test]
 fn test_type_unification() {
     let types = vec![DataType::Int32, DataType::Int64];
     assert_eq!(unify_types(&types), Some(DataType::Int64));

@@ -25,6 +25,35 @@ SELECT string_agg(v, ',' ORDER BY ord NULLS FIRST, v) AS nulls_first_order
 FROM t294_string_agg
 WHERE grp = 1;
 
+-- DISTINCT aggregate ORDER BY accepts only argument-list expressions.
+SELECT string_agg(DISTINCT v, ',' ORDER BY v) AS distinct_order
+FROM t294_string_agg
+WHERE grp = 1;
+
+SELECT string_agg(DISTINCT v::text, ',' ORDER BY v) AS distinct_cast_arg
+FROM t294_string_agg
+WHERE grp = 1;
+
+SELECT string_agg(DISTINCT v, ',' ORDER BY v::text) AS distinct_cast_order
+FROM t294_string_agg
+WHERE grp = 1;
+
+SELECT string_agg(DISTINCT v, ',' ORDER BY v DESC) AS distinct_desc
+FROM t294_string_agg
+WHERE grp = 1;
+
+SELECT string_agg(DISTINCT v, ',' ORDER BY ',')
+FROM t294_string_agg
+WHERE grp = 1;
+
+SELECT string_agg(DISTINCT v, ',' ORDER BY ord)
+FROM t294_string_agg
+WHERE grp = 1;
+
+SELECT array_agg(DISTINCT v ORDER BY ord)
+FROM t294_string_agg
+WHERE grp = 1;
+
 SELECT grp, string_agg(v, ',' ORDER BY ord, v) AS grouped_order
 FROM t294_string_agg
 GROUP BY grp

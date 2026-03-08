@@ -57,7 +57,7 @@ pub fn physical_plan_to_plan_node(
                     table_name: table_name.clone(),
                     alias: alias.clone(),
                     index_name: index_name.clone(),
-                    distance_metric: distance_metric.clone(),
+                    distance_metric: distance_metric.as_str().to_string(),
                     k: *k,
                     cost,
                 }

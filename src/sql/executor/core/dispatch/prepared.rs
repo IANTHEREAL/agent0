@@ -5,8 +5,9 @@ use super::super::prepared_analysis::PreparedAnalysis;
 use super::super::prepared_stmt::PreparedExec;
 use super::super::prepared_stmt::PreparedStatement;
 use super::super::*;
-use super::utils::{apply_statement_timeout, wrap_with_runtime_context, RuntimeSettings};
+use super::utils::apply_statement_timeout;
 use crate::sql::expr::bridge::eval_const_ast_expr;
+use crate::sql::runtime_context::{wrap_with_statement_runtime_context, StatementRuntimeContext};
 use crate::sql::sequences::SequenceSession;
 use crate::sql::types::sql_datatype_to_internal_strict;
 use std::future::Future;
@@ -263,10 +264,11 @@ impl Executor {
         qctx: &'a crate::sql::query_context::QueryContext,
         is_observability_query: bool,
     ) -> Pin<Box<dyn Future<Output = Result<ExecuteResults>> + Send + 'a>> {
-        let rt_settings = RuntimeSettings::from_session(session);
-        let db_id = session.current_database_id();
-        let extension_txn_delta = session.extension_delta_snapshot();
-        let txn_snapshot_ts_version = session.active_txn_start_ts_version();
+        let runtime = StatementRuntimeContext::from_session(
+            session,
+            self.tenant_keyspace(),
+            self.store.transaction_client(),
+        );
         let execute_future: Pin<Box<dyn Future<Output = Result<ExecuteResults>> + Send + 'a>> =
             Box::pin(self.execute_prepared_autocommit(
                 session,
@@ -277,15 +279,7 @@ impl Executor {
                 qctx,
                 is_observability_query,
             ));
-        wrap_with_runtime_context(
-            &rt_settings,
-            self.tenant_keyspace(),
-            db_id,
-            txn_snapshot_ts_version,
-            self.store.transaction_client(),
-            extension_txn_delta,
-            execute_future,
-        )
+        wrap_with_statement_runtime_context(&runtime, execute_future)
     }
 
     async fn execute_prepared_autocommit(

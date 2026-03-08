@@ -6,7 +6,7 @@ use super::{ExecutionContext, PhysicalOperator};
 use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::hnsw::storage::load_hnsw_graph_with_deltas;
-use crate::sql::hnsw::{vec_f64_to_f32, HnswIndexHandle};
+use crate::sql::hnsw::{vec_f64_to_f32, HnswDistanceMetric, HnswIndexHandle};
 use crate::sql::projection::fill_row_defaults;
 
 #[allow(dead_code)] // fields used in explain_info() trait method
@@ -17,7 +17,7 @@ pub struct HnswScanOperator {
     index_name: String,
     query_vector: Vec<Value>,
     k: usize,
-    distance_metric: String,
+    distance_metric: HnswDistanceMetric,
     distance_expr: Option<TypedExpr>,
     row_buffer: Vec<Row>,
     position: usize,
@@ -31,7 +31,7 @@ impl HnswScanOperator {
         index_name: String,
         query_vector: Vec<Value>,
         k: usize,
-        distance_metric: String,
+        distance_metric: HnswDistanceMetric,
         distance_expr: Option<TypedExpr>,
     ) -> Self {
         Self {
@@ -88,6 +88,7 @@ impl HnswScanOperator {
         index: &HnswIndexHandle,
         query_f32: &[f32],
         k: usize,
+        distance_metric: HnswDistanceMetric,
     ) -> Result<Vec<(u64, f64)>> {
         let matches = index
             .search(query_f32, k)
@@ -105,7 +106,10 @@ impl HnswScanOperator {
         let mut ranked_labels = Vec::with_capacity(n);
         for i in 0..n {
             if seen.insert(matches.labels[i]) {
-                ranked_labels.push((matches.labels[i], matches.distances[i] as f64));
+                ranked_labels.push((
+                    matches.labels[i],
+                    distance_metric.normalize_search_distance(matches.distances[i] as f64),
+                ));
             }
         }
 
@@ -197,7 +201,8 @@ impl PhysicalOperator for HnswScanOperator {
         let mut distance_by_label: HashMap<u64, f64>;
 
         loop {
-            let ranked_labels = Self::search_ranked_labels(&hnsw_index, &query_f32, fetch_k)?;
+            let ranked_labels =
+                Self::search_ranked_labels(&hnsw_index, &query_f32, fetch_k, self.distance_metric)?;
             if ranked_labels.is_empty() {
                 self.row_buffer.clear();
                 return Ok(());
@@ -308,7 +313,10 @@ impl PhysicalOperator for HnswScanOperator {
     fn explain_info(&self) -> Option<String> {
         Some(format!(
             "table={}, index={}, metric={}, k={}",
-            self.schema.name, self.index_name, self.distance_metric, self.k
+            self.schema.name,
+            self.index_name,
+            self.distance_metric.as_str(),
+            self.k
         ))
     }
 }

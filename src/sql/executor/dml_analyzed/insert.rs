@@ -14,7 +14,6 @@ use crate::model::{Row, TableSchema, Value};
 use crate::sql::analyzer::types::{
     AnalyzedConflictTarget, AnalyzedInsert, AnalyzedInsertSource, AnalyzedOnConflict,
 };
-use crate::sql::check_constraints;
 use crate::sql::dml::{ConflictBehavior, ConflictTarget, FkRefSchemaCache};
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
@@ -69,7 +68,7 @@ impl Executor {
             }
             _ => None,
         };
-        let compiled_checks = check_constraints::compile_check_constraints(&schema, &qctx)?;
+        let write_plan = self.compile_write_row_plan(&schema, &qctx)?;
         let has_hnsw = schema.indexes.iter().any(|idx| idx.is_hnsw());
         let mut affected = 0;
         let mut inserted = 0usize;
@@ -214,15 +213,20 @@ impl Executor {
                 None => continue,
             };
 
+            // Recompute generated columns after BEFORE triggers so that
+            // trigger mutations to source columns are reflected.
             let mut final_vals = row.values;
-            dml::coerce_row_values(&schema, &mut final_vals)?;
-            let row = Row::new(final_vals);
-            check_constraints::validate_compiled_check_constraints(
+            self.finalize_write_row(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
                 &schema,
-                &compiled_checks,
-                &row,
-                &qctx,
-            )?;
+                &write_plan,
+                &mut final_vals,
+            )
+            .await?;
+            let row = Row::new(final_vals);
 
             let conflict_behavior = match &ins.on_conflict {
                 Some(AnalyzedOnConflict::DoNothing) => ConflictBehavior::DoNothing,
@@ -379,14 +383,17 @@ impl Executor {
                                 };
 
                                 let mut final_vals = updated_row.values;
-                                dml::coerce_row_values(&schema, &mut final_vals)?;
-                                let updated_row = Row::new(final_vals);
-                                check_constraints::validate_compiled_check_constraints(
+                                self.finalize_write_row(
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
                                     &schema,
-                                    &compiled_checks,
-                                    &updated_row,
-                                    &qctx,
-                                )?;
+                                    &write_plan,
+                                    &mut final_vals,
+                                )
+                                .await?;
+                                let updated_row = Row::new(final_vals);
 
                                 let updated_row = if has_hnsw {
                                     // Defer HNSW maintenance to batch after the loop.

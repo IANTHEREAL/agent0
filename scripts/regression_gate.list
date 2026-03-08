@@ -183,6 +183,14 @@ tests/296_setval_out_of_range.sql
 tests/288_copy_csv_header.sql
 # #1573 – string_agg NULL delimiter treated as empty string
 tests/1573_string_agg_null_delimiter.sql
+# #1572 – DISTINCT aggregate ORDER BY validation
+tests/294_string_agg_order_by.sql
+# #1583 – ORDER BY DESC default NULL placement (NULLS FIRST)
+tests/271_jsonb_order_by.sql
+# #1579 – pg_get_serial_sequence('', 'id') should error with invalid name syntax
+tests/293_pg_get_serial_sequence.sql
+# Stored Generated Column (GENERATED ALWAYS AS ... STORED)
+tests/1588_generated_stored_column.sql
 # #1580 – pg_get_serial_sequence(int, int) returns correct error
 tests/293_pg_get_serial_sequence.sql
 # #1583 – ORDER BY DESC default NULL placement (NULLS FIRST)

@@ -104,6 +104,9 @@ pub enum AnalyzerError {
     /// DML: WHERE clause in DML is not boolean.
     DmlWhereNotBoolean { found: DataType },
 
+    /// Invalid function/config parameter value (SQLSTATE 22023).
+    InvalidParameterValue { message: String },
+
     /// SQL structure/syntax error (SQLSTATE 42601).
     SqlStructure(String),
 
@@ -304,6 +307,7 @@ impl fmt::Display for AnalyzerError {
                     found,
                 )
             }
+            Self::InvalidParameterValue { message } => write!(f, "{}", message),
             Self::SqlStructure(msg) => write!(f, "{}", msg),
             Self::IndeterminateParameterType { index } => {
                 write!(f, "could not determine data type of parameter ${}", index)

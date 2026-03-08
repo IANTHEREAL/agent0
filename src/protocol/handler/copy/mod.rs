@@ -20,6 +20,7 @@ pub struct CopyContext {
     pub column_types: Vec<Option<DataType>>,
     pub copy_options: crate::protocol::copy_format::CopyOptions,
     pub query_context: QueryContext,
+    pub runtime_context: crate::sql::runtime_context::StatementRuntimeContext,
     pub backpressure_guard: Option<crate::storage::backpressure::BackpressureGuard>,
     pub line_buffer: Vec<u8>,
     pub row_count: usize,

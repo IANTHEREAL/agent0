@@ -86,6 +86,8 @@ fn test_column(name: &str, data_type: DataType) -> ColumnDef {
         unique: false,
         is_serial: false,
         default_expr: None,
+        generation_expr: None,
+        generation_expr_authorized_by: None,
         collation: None,
     }
 }
@@ -104,6 +106,50 @@ fn test_schema(name: &str, columns: Vec<ColumnDef>) -> TableSchema {
         owner: String::new(),
         from_alias: None,
     }
+}
+
+#[test]
+fn copy_without_explicit_columns_skips_generated_columns() {
+    let mut generated = test_column("derived", DataType::Int32);
+    generated.generation_expr = Some("base + 1".to_string());
+
+    let schema = test_schema(
+        "copy_generated",
+        vec![
+            test_column("id", DataType::Int32),
+            test_column("base", DataType::Int32),
+            generated,
+        ],
+    );
+
+    let (columns, column_types) = resolve_copy_columns(&schema, &[], "copy_generated")
+        .expect("resolve implicit COPY columns");
+
+    assert_eq!(columns, vec!["id", "base"]);
+    assert_eq!(
+        column_types,
+        vec![Some(DataType::Int32), Some(DataType::Int32)]
+    );
+}
+
+#[test]
+fn copy_explicit_generated_column_is_rejected() {
+    let mut generated = test_column("derived", DataType::Int32);
+    generated.generation_expr = Some("base + 1".to_string());
+
+    let schema = test_schema(
+        "copy_generated",
+        vec![
+            test_column("id", DataType::Int32),
+            test_column("base", DataType::Int32),
+            generated,
+        ],
+    );
+
+    let err = resolve_copy_columns(&schema, &[String::from("derived")], "copy_generated")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("column \"derived\" is a generated column"));
 }
 
 static FS9_INFER_NEXT_ID: AtomicU64 = AtomicU64::new(1);

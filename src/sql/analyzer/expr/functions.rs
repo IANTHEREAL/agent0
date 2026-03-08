@@ -7,7 +7,10 @@
 use sqlparser::ast::{self as ast, Expr, Function, FunctionArg, FunctionArgExpr, WindowType};
 
 use crate::model::{DataType, Value};
+use crate::sql::embedding_options::parse_embed_text_json_options_dimensions;
+use crate::sql::expr::static_eval::eval_static_typed_expr;
 use crate::sql::names::function_name_upper;
+use crate::sql::query_context::QueryContext;
 use crate::sql::types::coercion::comparison_target_type;
 use crate::sql::types::mapping::sql_datatype_to_internal;
 use crate::sql::types::registry::global_registry;
@@ -46,6 +49,53 @@ fn pg_get_serial_sequence_error_arg_type(arg: &TypedExpr) -> DataType {
         return DataType::UserDefined("unknown".to_string());
     }
     arg.data_type.clone()
+}
+
+fn static_value(expr: &TypedExpr) -> Option<Value> {
+    match &expr.kind {
+        TypedExprKind::Constant(value) => Some(value.clone()),
+        _ => eval_static_typed_expr(expr, &QueryContext::from_task_locals()).ok(),
+    }
+}
+
+fn constant_u32(expr: &TypedExpr) -> Option<u32> {
+    match static_value(expr)? {
+        Value::Int32(v) if v > 0 => Some(v as u32),
+        Value::Int64(v) if v > 0 && v <= u32::MAX as i64 => Some(v as u32),
+        Value::Text(v) => v.trim().parse::<u32>().ok().filter(|dim| *dim > 0),
+        _ => None,
+    }
+}
+
+fn embed_text_dimensions(expr: &TypedExpr) -> Result<Option<u32>, AnalyzerError> {
+    match static_value(expr) {
+        Some(Value::Text(opts)) => parse_embed_text_json_options_dimensions(&opts)
+            .map_err(|message| AnalyzerError::InvalidParameterValue { message }),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Ok(None),
+    }
+}
+
+fn refine_function_return_type(
+    func_name: &str,
+    args: &[TypedExpr],
+    return_type: DataType,
+) -> Result<DataType, AnalyzerError> {
+    match func_name {
+        "EMBEDDING" => Ok(args
+            .get(2)
+            .and_then(constant_u32)
+            .map(DataType::Vector)
+            .unwrap_or(return_type)),
+        "EMBED_TEXT" => Ok(args
+            .get(2)
+            .map(embed_text_dimensions)
+            .transpose()?
+            .flatten()
+            .map(DataType::Vector)
+            .unwrap_or(return_type)),
+        _ => Ok(return_type),
+    }
 }
 
 impl<'a> Analyzer<'a> {
@@ -325,6 +375,7 @@ impl<'a> Analyzer<'a> {
                     name: func_name.clone(),
                     arg_types: arg_types.clone(),
                 })?;
+            let return_type = refine_function_return_type(&func_name, &analyzed_args, return_type)?;
 
             let resolved = ResolvedFunction {
                 name: func_name.clone(),
@@ -483,6 +534,10 @@ impl<'a> Analyzer<'a> {
             | "TO_TSQUERY"
             | "WEBSEARCH_TO_TSQUERY" => self.coerce_fts_text_signature(func_name, args),
             "EMBEDDING" => self.coerce_embedding_signature(func_name, args),
+            "EMBED_TEXT" => self.coerce_embed_text_signature(func_name, args),
+            "VEC_EMBED_COSINE_DISTANCE" | "VEC_EMBED_L2_DISTANCE" | "VEC_EMBED_INNER_PRODUCT" => {
+                self.coerce_vec_embed_signature(func_name, args)
+            }
             _ if is_two_arg_advisory_lock_function(func_name) => {
                 self.coerce_advisory_lock_two_arg_signature(func_name, args)
             }
@@ -682,6 +737,57 @@ impl<'a> Analyzer<'a> {
         Ok(coerced)
     }
 
+    fn coerce_embed_text_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.len() < 2 || args.len() > 3 {
+            return Ok(args);
+        }
+
+        let arg_types: Vec<DataType> = args.iter().map(|a| a.data_type.clone()).collect();
+        let mut coerced = Vec::with_capacity(args.len());
+        for (idx, arg) in args.into_iter().enumerate() {
+            match idx {
+                0 | 1 => {
+                    let arg_is_text_like = matches!(
+                        arg.data_type,
+                        DataType::Text | DataType::Varchar(_) | DataType::Name
+                    );
+                    if !arg_is_text_like
+                        && !self.is_unresolved_param(&arg)
+                        && !arg.is_null_constant()
+                    {
+                        return Err(AnalyzerError::FunctionNotFound {
+                            name: func_name.to_string(),
+                            arg_types: arg_types.clone(),
+                        });
+                    }
+                    coerced.push(self.coerce_if_needed(arg, &DataType::Text)?);
+                }
+                2 => {
+                    let arg_is_text_like = matches!(
+                        arg.data_type,
+                        DataType::Text | DataType::Varchar(_) | DataType::Name
+                    );
+                    if !arg_is_text_like
+                        && !self.is_unresolved_param(&arg)
+                        && !arg.is_null_constant()
+                    {
+                        return Err(AnalyzerError::FunctionNotFound {
+                            name: func_name.to_string(),
+                            arg_types: arg_types.clone(),
+                        });
+                    }
+                    coerced.push(self.coerce_if_needed(arg, &DataType::Text)?);
+                }
+                _ => unreachable!("arity already validated"),
+            }
+        }
+        Ok(coerced)
+    }
+
     fn coerce_embedding_signature(
         &mut self,
         func_name: &str,
@@ -734,6 +840,49 @@ impl<'a> Analyzer<'a> {
         Ok(coerced)
     }
 
+    fn coerce_vec_embed_signature(
+        &mut self,
+        func_name: &str,
+        args: Vec<TypedExpr>,
+    ) -> Result<Vec<TypedExpr>, AnalyzerError> {
+        if args.len() != 2 {
+            return Ok(args);
+        }
+
+        let arg_types: Vec<DataType> = args.iter().map(|a| a.data_type.clone()).collect();
+        let mut args = args.into_iter();
+        let first = args.next().expect("arity checked");
+        let second = args.next().expect("arity checked");
+
+        let vector_target = match (&first.data_type, &second.data_type) {
+            (DataType::Vector(dim), _) => DataType::Vector(*dim),
+            (_, DataType::Vector(dim)) => DataType::Vector(*dim),
+            _ => DataType::Vector(0),
+        };
+        let first = self.coerce_if_needed(first, &vector_target)?;
+
+        let second = if matches!(second.data_type, DataType::Vector(_)) {
+            self.coerce_if_needed(second, &vector_target)?
+        } else {
+            let second_is_text_like = matches!(
+                second.data_type,
+                DataType::Text | DataType::Varchar(_) | DataType::Name
+            );
+            if !second_is_text_like
+                && !self.is_unresolved_param(&second)
+                && !second.is_null_constant()
+            {
+                return Err(AnalyzerError::FunctionNotFound {
+                    name: func_name.to_string(),
+                    arg_types,
+                });
+            }
+            self.coerce_if_needed(second, &DataType::Text)?
+        };
+
+        Ok(vec![first, second])
+    }
+
     /// Create a resolved scalar FunctionCall from a function name and analyzed args.
     ///
     /// Used for syntax sugar normalization (SUBSTRING -> FunctionCall, etc.).
@@ -752,6 +901,7 @@ impl<'a> Analyzer<'a> {
                 name: name.to_string(),
                 arg_types: arg_types.clone(),
             })?;
+        let return_type = refine_function_return_type(name, &args, return_type)?;
 
         let func = ResolvedFunction {
             name: name.to_string(),

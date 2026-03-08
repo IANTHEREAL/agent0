@@ -5,7 +5,7 @@
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::model::DataType;
+use crate::model::{ColumnDef, DataType};
 use crate::sql::analyzer::catalog::MockCatalog;
 use crate::sql::analyzer::scope::Scope;
 use crate::sql::analyzer::types::*;
@@ -102,6 +102,55 @@ fn test_catalog() -> MockCatalog {
         .build()
 }
 
+fn generated_catalog() -> MockCatalog {
+    MockCatalog::builder()
+        .table_with_column_defs(
+            "gen_users",
+            vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    generation_expr: None,
+                    generation_expr_authorized_by: None,
+                    collation: None,
+                },
+                ColumnDef {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    generation_expr: None,
+                    generation_expr_authorized_by: None,
+                    collation: None,
+                },
+                ColumnDef {
+                    name: "name_vec".to_string(),
+                    data_type: DataType::Vector(1024),
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                    generation_expr: Some(
+                        "EMBED_TEXT('text-embedding-v4', name, '{\"dimensions\":1024}')"
+                            .to_string(),
+                    ),
+                    generation_expr_authorized_by: Some("admin".to_string()),
+                    collation: None,
+                },
+            ],
+        )
+        .build()
+}
+
 fn analyze_expr_with_users(sql: &str) -> Result<TypedExpr, AnalyzerError> {
     let catalog = test_catalog();
     let mut scope = Scope::new();
@@ -117,6 +166,31 @@ fn analyze_expr_with_users(sql: &str) -> Result<TypedExpr, AnalyzerError> {
             ("active".to_string(), DataType::Boolean, true, None),
             ("score".to_string(), DataType::Float64, true, None),
             ("created_at".to_string(), DataType::Timestamp, true, None),
+        ],
+    );
+    Analyzer::analyze_expr_with_scope(&catalog, scope, &parse_expr(sql))
+}
+
+fn analyze_expr_with_vector_column(sql: &str) -> Result<TypedExpr, AnalyzerError> {
+    let catalog = MockCatalog::builder()
+        .table(
+            "docs",
+            vec![
+                ("id", DataType::Int32, false),
+                ("content", DataType::Text, true),
+                ("content_vec", DataType::Vector(256), true),
+            ],
+        )
+        .build();
+    let mut scope = Scope::new();
+    scope.allow_aggregates = true;
+    scope.allow_windows = true;
+    scope.add_table(
+        "docs",
+        &[
+            ("id".to_string(), DataType::Int32, false, None),
+            ("content".to_string(), DataType::Text, true, None),
+            ("content_vec".to_string(), DataType::Vector(256), true, None),
         ],
     );
     Analyzer::analyze_expr_with_scope(&catalog, scope, &parse_expr(sql))
@@ -1645,183 +1719,139 @@ fn analyze_unknown_function_passthrough() {
 }
 
 #[test]
-fn analyze_embedding_wrong_arg_type_is_42883() {
-    let err = analyze_expr_with_users("embedding(42)").unwrap_err();
-    assert!(matches!(
-        err,
-        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embedding")
-    ));
-    let sql: crate::sql::error::SqlError = err.into();
-    assert_eq!(sql.sqlstate(), "42883");
-}
-
-#[test]
-fn analyze_embedding_first_arg_int_column_is_42883() {
-    let err = analyze_expr_with_users("embedding(age)").unwrap_err();
-    assert!(matches!(
-        err,
-        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embedding")
-    ));
-    let sql: crate::sql::error::SqlError = err.into();
-    assert_eq!(sql.sqlstate(), "42883");
-}
-
-#[test]
-fn analyze_embedding_zero_args_is_42883() {
-    let err = analyze_expr_with_users("embedding()").unwrap_err();
-    assert!(matches!(
-        err,
-        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embedding")
-    ));
-    let sql: crate::sql::error::SqlError = err.into();
-    assert_eq!(sql.sqlstate(), "42883");
-}
-
-#[test]
-fn analyze_embedding_wrong_optional_arg_types_are_42883() {
-    let err = analyze_expr_with_users("embedding('hi', 1, 'bad')").unwrap_err();
-    assert!(matches!(
-        err,
-        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embedding")
-    ));
-    let sql: crate::sql::error::SqlError = err.into();
-    assert_eq!(sql.sqlstate(), "42883");
-}
-
-#[test]
-fn analyze_embedding_string_literal_dimensions_is_accepted() {
-    let expr = analyze_expr_with_users("embedding('hi', 'text-embedding-v4', '1024')").unwrap();
+fn analyze_embed_text_accepts_text_arguments() {
+    let expr = analyze_expr_with_users(
+        "embed_text('tidbcloud_free/amazon/titan-embed-text-v2', name, '{\"dimensions\":256}')",
+    )
+    .unwrap();
+    assert_eq!(expr.data_type, DataType::Vector(256));
     assert!(matches!(expr.kind, TypedExprKind::FunctionCall { .. }));
 }
 
 #[test]
-fn analyze_embedding_string_literal_dimensions_explicit_int_cast_is_accepted() {
+fn analyze_embed_text_rejects_non_text_model_arg() {
+    let err = analyze_expr_with_users("embed_text(age, name)").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embed_text")
+    ));
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
+#[test]
+fn analyze_embedding_accepts_text_arguments() {
+    let expr = analyze_expr_with_users("embedding(name, 'text-embedding-v4', '1024')").unwrap();
+    assert_eq!(expr.data_type, DataType::Vector(1024));
+    assert!(matches!(expr.kind, TypedExprKind::FunctionCall { .. }));
+}
+
+#[test]
+fn analyze_embedding_rejects_non_text_model_arg() {
+    let err = analyze_expr_with_users("embedding(name, age)").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embedding")
+    ));
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
+#[test]
+fn analyze_embedding_rejects_non_literal_text_dimensions_arg() {
+    let err = analyze_expr_with_users("embedding(name, 'text-embedding-v4', name)").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embedding")
+    ));
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
+#[test]
+fn analyze_embed_text_rejects_non_text_input_arg() {
+    let err =
+        analyze_expr_with_users("embed_text('tidbcloud_free/amazon/titan-embed-text-v2', age)")
+            .unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embed_text")
+    ));
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
+#[test]
+fn analyze_embed_text_rejects_non_text_json_options_arg() {
+    let err = analyze_expr_with_users(
+        "embed_text('tidbcloud_free/amazon/titan-embed-text-v2', name, age)",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embed_text")
+    ));
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
+#[test]
+fn analyze_embed_text_accepts_null_json_options() {
+    let expr = analyze_expr_with_users(
+        "embed_text('tidbcloud_free/amazon/titan-embed-text-v2', name, NULL)",
+    )
+    .unwrap();
+    assert_eq!(expr.data_type, DataType::Vector(0));
+    assert!(matches!(expr.kind, TypedExprKind::FunctionCall { .. }));
+}
+
+#[test]
+fn analyze_embed_text_too_many_args_is_42883() {
+    let err = analyze_expr_with_users(
+        "embed_text('tidbcloud_free/amazon/titan-embed-text-v2', name, '{\"dimensions\":256}', 'extra')",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embed_text")
+    ));
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "42883");
+}
+
+#[test]
+fn analyze_embed_text_rejects_invalid_json_options_literal() {
+    let err = analyze_expr_with_users(
+        "embed_text('tidbcloud_free/amazon/titan-embed-text-v2', name, '{\"dimensions\":\"256\"}')",
+    )
+    .unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "22023");
+    assert!(sql
+        .to_string()
+        .contains("embed_text: dimensions must be a number"));
+}
+
+#[test]
+fn analyze_embed_text_rejects_invalid_casted_json_options_constant() {
+    let err = analyze_expr_with_users(
+        "embed_text('tidbcloud_free/amazon/titan-embed-text-v2', name, 123::text)",
+    )
+    .unwrap_err();
+    let sql: crate::sql::error::SqlError = err.into();
+    assert_eq!(sql.sqlstate(), "22023");
+    assert!(sql
+        .to_string()
+        .contains("embed_text: JSON options must be an object"));
+}
+
+#[test]
+fn analyze_vec_embed_inner_product_accepts_vector_and_text() {
     let expr =
-        analyze_expr_with_users("embedding('hi', 'text-embedding-v4', '1024'::int)").unwrap();
+        analyze_expr_with_vector_column("vec_embed_inner_product(content_vec, 'query text')")
+            .unwrap();
+    assert_eq!(expr.data_type, DataType::Float64);
     assert!(matches!(expr.kind, TypedExprKind::FunctionCall { .. }));
-}
-
-#[test]
-fn analyze_embedding_string_literal_dimensions_explicit_text_cast_is_42883() {
-    let err =
-        analyze_expr_with_users("embedding('hi', 'text-embedding-v4', '1024'::text)").unwrap_err();
-    assert!(matches!(
-        err,
-        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embedding")
-    ));
-    let sql: crate::sql::error::SqlError = err.into();
-    assert_eq!(sql.sqlstate(), "42883");
-}
-
-#[test]
-fn analyze_embedding_null_model_with_string_dimensions_is_accepted() {
-    let expr = analyze_expr_with_users("embedding('hi', NULL, '1024')").unwrap();
-    assert!(matches!(expr.kind, TypedExprKind::FunctionCall { .. }));
-}
-
-#[test]
-fn analyze_embedding_null_model_with_int_dimensions_is_accepted() {
-    let expr = analyze_expr_with_users("embedding('hi', NULL, 1024)").unwrap();
-    assert!(matches!(expr.kind, TypedExprKind::FunctionCall { .. }));
-}
-
-#[test]
-fn analyze_embedding_first_arg_text_column_is_accepted() {
-    let expr = analyze_expr_with_users("embedding(name)").unwrap();
-    assert!(matches!(expr.kind, TypedExprKind::FunctionCall { .. }));
-}
-
-#[test]
-fn analyze_embedding_first_arg_null_is_accepted() {
-    let expr = analyze_expr_with_users("embedding(NULL)").unwrap();
-    assert!(matches!(expr.kind, TypedExprKind::FunctionCall { .. }));
-}
-
-#[test]
-fn analyze_embedding_first_arg_explicit_text_cast_is_accepted() {
-    let expr = analyze_expr_with_users("embedding(age::text)").unwrap();
-    assert!(matches!(expr.kind, TypedExprKind::FunctionCall { .. }));
-}
-
-#[test]
-fn analyze_embedding_second_arg_text_column_is_accepted() {
-    let expr = analyze_expr_with_users("embedding('hi', name)").unwrap();
-    assert!(matches!(expr.kind, TypedExprKind::FunctionCall { .. }));
-}
-
-#[test]
-fn analyze_embedding_second_arg_explicit_text_cast_is_accepted() {
-    let expr = analyze_expr_with_users("embedding('hi', age::text)").unwrap();
-    assert!(matches!(expr.kind, TypedExprKind::FunctionCall { .. }));
-}
-
-#[test]
-fn analyze_embedding_second_arg_int_column_is_42883() {
-    let err = analyze_expr_with_users("embedding('hi', age)").unwrap_err();
-    assert!(matches!(
-        err,
-        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embedding")
-    ));
-    let sql: crate::sql::error::SqlError = err.into();
-    assert_eq!(sql.sqlstate(), "42883");
-}
-
-#[test]
-fn analyze_embedding_text_column_dimensions_is_42883() {
-    let err = analyze_expr_with_users("embedding('hi', 'text-embedding-v4', name)").unwrap_err();
-    assert!(matches!(
-        err,
-        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embedding")
-    ));
-    let sql: crate::sql::error::SqlError = err.into();
-    assert_eq!(sql.sqlstate(), "42883");
-}
-
-#[test]
-fn analyze_embedding_text_column_dimensions_with_explicit_cast_is_accepted() {
-    let expr = analyze_expr_with_users("embedding('hi', 'text-embedding-v4', name::int)").unwrap();
-    assert!(matches!(expr.kind, TypedExprKind::FunctionCall { .. }));
-}
-
-#[test]
-fn analyze_embedding_null_dimensions_is_accepted() {
-    let expr = analyze_expr_with_users("embedding('hi', 'text-embedding-v4', NULL)").unwrap();
-    assert!(matches!(expr.kind, TypedExprKind::FunctionCall { .. }));
-}
-
-#[test]
-fn analyze_embedding_null_model_and_null_dimensions_is_accepted() {
-    let expr = analyze_expr_with_users("embedding('hi', NULL, NULL)").unwrap();
-    assert!(matches!(expr.kind, TypedExprKind::FunctionCall { .. }));
-}
-
-#[test]
-fn analyze_embedding_int_dimensions_column_is_accepted() {
-    let expr = analyze_expr_with_users("embedding('hi', 'text-embedding-v4', age)").unwrap();
-    assert!(matches!(expr.kind, TypedExprKind::FunctionCall { .. }));
-}
-
-#[test]
-fn analyze_embedding_null_model_with_text_column_dimensions_is_42883() {
-    let err = analyze_expr_with_users("embedding('hi', NULL, name)").unwrap_err();
-    assert!(matches!(
-        err,
-        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embedding")
-    ));
-    let sql: crate::sql::error::SqlError = err.into();
-    assert_eq!(sql.sqlstate(), "42883");
-}
-
-#[test]
-fn analyze_embedding_too_many_args_is_42883() {
-    let err =
-        analyze_expr_with_users("embedding('hi', 'text-embedding-v4', 1024, 'extra')").unwrap_err();
-    assert!(matches!(
-        err,
-        AnalyzerError::FunctionNotFound { ref name, .. } if name.eq_ignore_ascii_case("embedding")
-    ));
-    let sql: crate::sql::error::SqlError = err.into();
-    assert_eq!(sql.sqlstate(), "42883");
 }
 
 #[test]
@@ -2396,6 +2426,64 @@ fn analyze_insert_column_count_mismatch() {
 }
 
 #[test]
+fn analyze_insert_generated_column_rejected_at_analysis() {
+    let catalog = generated_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement(
+        "INSERT INTO gen_users (id, name, name_vec) VALUES (1, 'alice', '[1,2,3]')",
+    );
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    assert!(
+        matches!(err, AnalyzerError::SqlStructure(ref msg) if msg.contains("cannot insert a non-DEFAULT value into column \"name_vec\"")),
+        "expected generated-column insert rejection, got {:?}",
+        err
+    );
+}
+
+#[test]
+fn analyze_insert_generated_column_default_is_allowed() {
+    let catalog = generated_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt =
+        parse_statement("INSERT INTO gen_users (id, name, name_vec) VALUES (1, 'alice', DEFAULT)");
+    let analyzed = analyzer
+        .analyze_statement(&stmt)
+        .expect("analysis should succeed");
+    match analyzed {
+        AnalyzedStatement::Insert(ins) => match ins.source {
+            AnalyzedInsertSource::Values(rows) => {
+                assert!(matches!(rows[0][2].kind, TypedExprKind::Default));
+            }
+            other => panic!("expected VALUES source, got {:?}", other),
+        },
+        other => panic!("expected insert, got {:?}", other),
+    }
+}
+
+#[test]
+fn analyze_insert_without_column_list_targets_first_n_columns() {
+    let catalog = generated_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("INSERT INTO gen_users VALUES (1, 'alice')");
+    let analyzed = analyzer
+        .analyze_statement(&stmt)
+        .expect("analysis should succeed");
+    match analyzed {
+        AnalyzedStatement::Insert(ins) => {
+            assert_eq!(ins.target_columns, vec![0, 1]);
+            match ins.source {
+                AnalyzedInsertSource::Values(rows) => {
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].len(), 2);
+                }
+                other => panic!("expected VALUES source, got {:?}", other),
+            }
+        }
+        other => panic!("expected insert, got {:?}", other),
+    }
+}
+
+#[test]
 fn analyze_delete_simple() {
     let catalog = test_catalog();
     let mut analyzer = Analyzer::new(&catalog);
@@ -2505,6 +2593,19 @@ fn analyze_update_set_default_assignment() {
         }
         _ => panic!("expected AnalyzedStatement::Update"),
     }
+}
+
+#[test]
+fn analyze_update_generated_column_rejected_at_analysis() {
+    let catalog = generated_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("UPDATE gen_users SET name_vec = '[1,2,3]' WHERE id = 1");
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    assert!(
+        matches!(err, AnalyzerError::SqlStructure(ref msg) if msg.contains("column \"name_vec\" can only be updated to DEFAULT")),
+        "expected generated-column update rejection, got {:?}",
+        err
+    );
 }
 
 #[test]
@@ -2671,6 +2772,22 @@ fn analyze_insert_on_conflict_do_update_target_table_qualified_column() {
         },
         _ => panic!("expected AnalyzedStatement::Insert"),
     }
+}
+
+#[test]
+fn analyze_insert_on_conflict_generated_column_assignment_rejected_at_analysis() {
+    let catalog = generated_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement(
+        "INSERT INTO gen_users (id, name) VALUES (1, 'alice') \
+         ON CONFLICT (id) DO UPDATE SET name_vec = '[1,2,3]'",
+    );
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    assert!(
+        matches!(err, AnalyzerError::SqlStructure(ref msg) if msg.contains("column \"name_vec\" can only be updated to DEFAULT")),
+        "expected generated-column ON CONFLICT rejection, got {:?}",
+        err
+    );
 }
 
 #[test]

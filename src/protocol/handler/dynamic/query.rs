@@ -356,7 +356,15 @@ impl DynamicPgHandler {
 
         let state = self.auth();
         let executor = &state.executor;
-        let (resolved_table, resolved_columns, column_types, col_count, started_txn, qctx) = {
+        let (
+            resolved_table,
+            resolved_columns,
+            column_types,
+            col_count,
+            started_txn,
+            qctx,
+            runtime_context,
+        ) = {
             let mut session = state.session.lock().await;
 
             // Recheck after acquiring lock — watchdog may have fired in the gap.
@@ -565,6 +573,13 @@ impl DynamicPgHandler {
                     }
                 };
 
+            let runtime_context =
+                crate::sql::runtime_context::StatementRuntimeContext::from_session(
+                    &session,
+                    executor.tenant_keyspace(),
+                    executor.store().transaction_client(),
+                );
+
             let col_count = resolved_columns.len();
             (
                 resolved_table,
@@ -573,6 +588,7 @@ impl DynamicPgHandler {
                 col_count,
                 started_txn,
                 qctx,
+                runtime_context,
             )
         };
 
@@ -582,6 +598,7 @@ impl DynamicPgHandler {
             columns: resolved_columns,
             column_types,
             query_context: qctx,
+            runtime_context,
             backpressure_guard: None,
             line_buffer: Vec::new(),
             row_count: 0,

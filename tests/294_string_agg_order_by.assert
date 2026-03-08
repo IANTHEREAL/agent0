@@ -2,5 +2,9 @@
 a,aa,b,c,n
 c,b,aa,a,n
 n,a,aa,b,c
+a,aa,b,c,n
+a,aa,b,c,n
+a,aa,b,c,n
+n,c,b,aa,a
 1|a,aa,b,c,n
 2|y,x,z
