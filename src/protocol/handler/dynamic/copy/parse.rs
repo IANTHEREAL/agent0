@@ -594,14 +594,6 @@ fn parse_copy_from_stdin_with_legacy_header_fallback(
             copy_opts.null_string.clear();
         }
     }
-    if copy_opts.format != CopyFormat::Csv {
-        if seen_legacy.contains(&CopyOptionKind::Quote) {
-            return Err(error_info("0A000", "COPY QUOTE requires CSV mode"));
-        }
-        if seen_legacy.contains(&CopyOptionKind::Escape) {
-            return Err(error_info("0A000", "COPY ESCAPE requires CSV mode"));
-        }
-    }
 
     let table_name = format_copy_table_name(&table_parts)?;
     Ok(Some((table_name, columns, copy_opts)))
