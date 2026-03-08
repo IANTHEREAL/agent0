@@ -1,2 +1,0 @@
-null value in column "id" of relation "serial_alter_default_t" violates not-null constraint
-multiple default values specified
