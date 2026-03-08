@@ -3315,6 +3315,105 @@ fn analyze_pg_get_serial_sequence_accepts_pg_catalog_schema_qualification() {
 }
 
 #[test]
+fn analyze_pg_get_serial_sequence_quoted_pg_catalog_uppercase_returns_schema_not_found() {
+    let err =
+        analyze_expr_with_users("\"PG_CATALOG\".pg_get_serial_sequence('t', 'id')").unwrap_err();
+    assert!(
+        matches!(err, AnalyzerError::SchemaNotFound(ref name) if name == "PG_CATALOG"),
+        "expected SchemaNotFound(PG_CATALOG), got: {:?}",
+        err
+    );
+}
+
+#[test]
+fn analyze_pg_get_serial_sequence_name_type_args_accepted() {
+    let expr = analyze_expr_with_users("pg_get_serial_sequence('t'::name, 'id'::name)").unwrap();
+    assert_eq!(expr.data_type, DataType::Text);
+}
+
+#[test]
+fn analyze_pg_get_serial_sequence_cross_database_reference() {
+    let err = analyze_expr_with_users("foo.public.pg_get_serial_sequence('t', 'id')").unwrap_err();
+    assert!(
+        matches!(err, AnalyzerError::CrossDatabaseReference(_)),
+        "expected CrossDatabaseReference, got: {:?}",
+        err
+    );
+}
+
+#[test]
+fn analyze_pg_get_serial_sequence_schema_qualified_int_args_includes_schema_in_error() {
+    // P1 regression lock: public.pg_get_serial_sequence(1,2) must include
+    // the schema prefix in the error, not the bare function name.
+    let err = analyze_expr_with_users("public.pg_get_serial_sequence(1, 2)").unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AnalyzerError::FunctionNotFound {
+                ref name,
+                ..
+            } if name == "public.pg_get_serial_sequence"
+        ),
+        "expected FunctionNotFound with schema-qualified name, got: {:?}",
+        err
+    );
+}
+
+#[test]
+fn analyze_pg_get_serial_sequence_existing_schema_returns_function_not_found() {
+    // P1 regression lock: existing schema outside search_path must return
+    // FunctionNotFound (42883), NOT SchemaNotFound (3F000).
+    let catalog = MockCatalog::builder()
+        .table(
+            "users",
+            vec![
+                ("id", DataType::Int32, false),
+                ("name", DataType::Text, true),
+            ],
+        )
+        .schema("s1")
+        .build();
+    let mut scope = Scope::new();
+    scope.allow_aggregates = true;
+    scope.allow_windows = true;
+    scope.add_table(
+        "users",
+        &[
+            ("id".to_string(), DataType::Int32, false, None),
+            ("name".to_string(), DataType::Text, true, None),
+        ],
+    );
+    let err = Analyzer::analyze_expr_with_scope(
+        &catalog,
+        scope,
+        &parse_expr("s1.pg_get_serial_sequence(1, 2)"),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AnalyzerError::FunctionNotFound {
+                ref name,
+                ..
+            } if name == "s1.pg_get_serial_sequence"
+        ),
+        "expected FunctionNotFound for existing schema s1, got: {:?}",
+        err
+    );
+}
+
+#[test]
+fn analyze_pg_get_serial_sequence_nonexistent_schema_returns_schema_not_found() {
+    // Unknown schema must still return SchemaNotFound (3F000).
+    let err = analyze_expr_with_users("nosuch.pg_get_serial_sequence(1, 2)").unwrap_err();
+    assert!(
+        matches!(err, AnalyzerError::SchemaNotFound(ref name) if name == "nosuch"),
+        "expected SchemaNotFound(nosuch), got: {:?}",
+        err
+    );
+}
+
+#[test]
 fn analyze_to_regtype_rejects_non_text_argument() {
     let catalog = test_catalog();
     let stmt = parse_statement("SELECT to_regtype(1)");

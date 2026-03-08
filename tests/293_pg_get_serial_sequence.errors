@@ -5,3 +5,8 @@ invalid name syntax
 column "casecol" of relation "pgss_case" does not exist
 function pg_get_serial_sequence(integer, integer) does not exist
 function public.pg_get_serial_sequence(unknown, unknown) does not exist
+function public.pg_get_serial_sequence(integer, integer) does not exist
+schema "PG_CATALOG" does not exist
+cross-database references are not implemented: foo.public.pg_get_serial_sequence
+function pgss_s1.pg_get_serial_sequence(integer, integer) does not exist
+schema "pgss_nosuch" does not exist

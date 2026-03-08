@@ -100,11 +100,13 @@ fn pg_get_serial_sequence_arg_type_name(arg: &TypedExpr) -> String {
 }
 
 fn pg_get_serial_sequence_accepts_text_arg(arg: &TypedExpr) -> bool {
-    matches!(arg.data_type, DataType::Text | DataType::Varchar(_))
-        || matches!(
-            &arg.kind,
-            TypedExprKind::Constant(Value::Text(_)) | TypedExprKind::Constant(Value::Null)
-        )
+    matches!(
+        arg.data_type,
+        DataType::Text | DataType::Varchar(_) | DataType::Name
+    ) || matches!(
+        &arg.kind,
+        TypedExprKind::Constant(Value::Text(_)) | TypedExprKind::Constant(Value::Null)
+    )
 }
 
 impl Executor {
@@ -1224,8 +1226,16 @@ impl Executor {
             ));
         }
 
-        let table_arg = match eval_typed_expr(table_arg_expr, row, qctx)? {
-            Value::Null => return Ok(Value::Null),
+        // Evaluate both arguments before validation.
+        // Strict function semantics: any NULL argument → NULL result.
+        let table_val = eval_typed_expr(table_arg_expr, row, qctx)?;
+        let column_val = eval_typed_expr(column_arg_expr, row, qctx)?;
+
+        if matches!(table_val, Value::Null) || matches!(column_val, Value::Null) {
+            return Ok(Value::Null);
+        }
+
+        let table_arg = match table_val {
             Value::Text(s) => s,
             _ => {
                 return Err(anyhow!(
@@ -1235,8 +1245,10 @@ impl Executor {
                 ));
             }
         };
-        let column_arg = match eval_typed_expr(column_arg_expr, row, qctx)? {
-            Value::Null => return Ok(Value::Null),
+        if table_arg.trim().is_empty() {
+            return Err(SqlError::InvalidName("invalid name syntax".to_string()).into());
+        }
+        let column_arg = match column_val {
             Value::Text(s) => s,
             _ => {
                 return Err(anyhow!(
@@ -2073,10 +2085,16 @@ mod tests {
             data_type: DataType::Varchar(32),
         };
 
+        let name_arg = TypedExpr {
+            kind: TypedExprKind::Constant(Value::Text("t".to_string())),
+            data_type: DataType::Name,
+        };
+
         assert!(!pg_get_serial_sequence_accepts_text_arg(&int_arg));
         assert!(pg_get_serial_sequence_accepts_text_arg(&text_arg));
         assert!(pg_get_serial_sequence_accepts_text_arg(&null_arg));
         assert!(pg_get_serial_sequence_accepts_text_arg(&varchar_arg));
+        assert!(pg_get_serial_sequence_accepts_text_arg(&name_arg));
 
         assert_eq!(pg_get_serial_sequence_arg_type_name(&int_arg), "integer");
         assert_eq!(pg_get_serial_sequence_arg_type_name(&text_arg), "unknown");

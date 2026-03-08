@@ -3,6 +3,7 @@
 
 use crate::model::{DataType, Row, TableSchema, Value};
 use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
+use crate::sql::error::SqlError;
 use crate::sql::expr::compile::{compile_const_expr, compile_row_expr_for_table};
 use crate::sql::names;
 use crate::sql::names::function_name_upper;
@@ -250,13 +251,25 @@ pub(crate) fn replace_sequence_functions<'a>(
                         let arg0 = extract_arg_expr(&func.args, 0)?;
                         let arg1 = extract_arg_expr(&func.args, 1)?;
 
-                        let table_arg = match eval_seq_expr(arg0, row, schema)? {
-                            Value::Null => return Ok(value_to_sql_expr(&Value::Null)),
+                        // Evaluate both arguments before validation.
+                        // Strict function semantics: any NULL argument → NULL result.
+                        let table_val = eval_seq_expr(arg0, row, schema)?;
+                        let column_val = eval_seq_expr(arg1, row, schema)?;
+
+                        if matches!(table_val, Value::Null) || matches!(column_val, Value::Null) {
+                            return Ok(value_to_sql_expr(&Value::Null));
+                        }
+
+                        let table_arg = match table_val {
                             Value::Text(s) => s,
                             v => v.to_string(),
                         };
-                        let column_arg = match eval_seq_expr(arg1, row, schema)? {
-                            Value::Null => return Ok(value_to_sql_expr(&Value::Null)),
+                        if table_arg.trim().is_empty() {
+                            return Err(
+                                SqlError::InvalidName("invalid name syntax".to_string()).into()
+                            );
+                        }
+                        let column_arg = match column_val {
                             Value::Text(s) => s,
                             v => v.to_string(),
                         };

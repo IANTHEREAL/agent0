@@ -39,6 +39,9 @@ SELECT 'long_name=' || COALESCE(
     'NULL'
 ) AS probe;
 
+-- name type implicit cast to text (PG allows name -> text)
+SELECT 'name_cast=' || COALESCE(pg_get_serial_sequence('pgss_basic'::name, 'id'::name), 'NULL') AS probe;
+
 SELECT pg_get_serial_sequence('pgss_missing', 'id');
 SELECT pg_get_serial_sequence('pgss_basic', 'missing_col');
 SELECT pg_get_serial_sequence('db.public.pgss_basic', 'id');
@@ -46,6 +49,19 @@ SELECT pg_get_serial_sequence('', 'id');
 SELECT pg_get_serial_sequence('pgss_case', 'casecol');
 SELECT pg_get_serial_sequence(1, 2);
 SELECT public.pg_get_serial_sequence('t', 'id');
+-- P1: schema-qualified call with wrong arg types must include schema in error
+SELECT public.pg_get_serial_sequence(1, 2);
+-- quoted "PG_CATALOG" is case-sensitive: schema does not exist
+SELECT "PG_CATALOG".pg_get_serial_sequence('pgss_basic', 'id');
+-- 3-part qualifier is a cross-database reference
+SELECT foo.public.pg_get_serial_sequence('pgss_basic', 'id');
+-- P1: existing schema outside search_path → function-not-found (42883), not schema-not-found (3F000)
+DROP SCHEMA IF EXISTS pgss_s1 CASCADE;
+CREATE SCHEMA pgss_s1;
+SELECT pgss_s1.pg_get_serial_sequence(1, 2);
+-- nonexistent schema → schema-not-found (3F000)
+SELECT pgss_nosuch.pg_get_serial_sequence(1, 2);
+DROP SCHEMA IF EXISTS pgss_s1 CASCADE;
 
 DROP TABLE IF EXISTS pgss_basic CASCADE;
 DROP TABLE IF EXISTS pgss_collision CASCADE;

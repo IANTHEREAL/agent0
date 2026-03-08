@@ -233,6 +233,10 @@ pub enum SqlError {
     #[error("{message}")]
     InvalidAuthorizationSpecification { message: String },
 
+    // Name syntax errors
+    #[error("{0}")]
+    InvalidName(String),
+
     // Unsupported features
     #[error("{0}")]
     Unsupported(String),
@@ -299,6 +303,7 @@ impl SqlError {
             Self::NoDataFound => "P0002",
             Self::TooManyRows => "P0003",
             Self::InvalidAuthorizationSpecification { .. } => "28000",
+            Self::InvalidName(_) => "42602",
             Self::Unsupported(_) => "0A000",
             Self::Internal(_) => "XX000",
         }
@@ -624,6 +629,10 @@ mod tests {
             }
             .sqlstate(),
             "28000"
+        );
+        assert_eq!(
+            SqlError::InvalidName("invalid name syntax".into()).sqlstate(),
+            "42602"
         );
         assert_eq!(SqlError::Unsupported("x".into()).sqlstate(), "0A000");
         let internal = SqlError::Internal(anyhow::anyhow!("boom"));

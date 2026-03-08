@@ -398,7 +398,23 @@ pub(super) async fn prefetch_scalar_functions(
     function_names: &[ObjectName],
     snapshot: &mut CatalogSnapshot,
 ) -> Result<()> {
+    // Track schema qualifiers we've already checked to avoid redundant lookups.
+    let mut checked_schemas: HashSet<String> = HashSet::new();
+
     for func_name in function_names {
+        // For schema-qualified function calls (e.g. s1.my_func), record
+        // whether the schema exists so the Analyzer can distinguish
+        // "function not found in existing schema" (42883) from
+        // "schema does not exist" (3F000).
+        if func_name.0.len() >= 2 {
+            let schema = names::normalize_ident(&func_name.0[0]);
+            if checked_schemas.insert(schema.clone())
+                && store.schema_exists(txn, db_id, &schema).await?
+            {
+                snapshot.add_schema(&schema);
+            }
+        }
+
         let Some((resolved_full, func_def)) =
             try_resolve_function_def(store, txn, db_id, search_path, func_name).await?
         else {

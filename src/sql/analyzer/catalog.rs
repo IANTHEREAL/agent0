@@ -82,6 +82,13 @@ pub trait Catalog: Send + Sync {
 
     /// Get a collation definition by name.
     fn get_collation(&self, name: &str) -> Option<CollationDef>;
+
+    /// Check whether a schema (namespace) is known to exist.
+    ///
+    /// Returns `true` for built-in schemas (`public`, `pg_catalog`,
+    /// `information_schema`, `extensions`) and any user-created schema
+    /// that was discovered during catalog prefetch.
+    fn schema_exists(&self, name: &str) -> bool;
 }
 
 // ── CatalogSnapshot ─────────────────────────────────────────
@@ -109,6 +116,9 @@ pub struct CatalogSnapshot {
     /// Qualified names that are NOT base tables (CTEs, virtual catalog tables).
     /// Used by `base_table_full_names()` to exclude non-privileged entries.
     non_base_names: HashSet<String>,
+    /// Schemas known to exist (user-created schemas discovered during prefetch).
+    /// Built-in schemas are checked separately in `schema_exists()`.
+    known_schemas: HashSet<String>,
 }
 
 impl CatalogSnapshot {
@@ -124,6 +134,7 @@ impl CatalogSnapshot {
             search_path,
             database_id,
             non_base_names: HashSet::new(),
+            known_schemas: HashSet::new(),
         }
     }
 
@@ -159,6 +170,14 @@ impl CatalogSnapshot {
     /// Add a user-defined collation to the snapshot.
     pub fn add_collation(&mut self, name: &str, def: CollationDef) {
         self.collations.insert(name.to_lowercase(), def);
+    }
+
+    /// Register a user-created schema as known to exist.
+    ///
+    /// The name should already be normalized by `normalize_ident` (unquoted →
+    /// lowercased, quoted → case-preserved).
+    pub fn add_schema(&mut self, name: &str) {
+        self.known_schemas.insert(name.to_string());
     }
 
     /// Check if a table name is already in the snapshot.
@@ -234,6 +253,9 @@ impl CatalogSnapshot {
             self.table_functions
                 .entry(key.clone())
                 .or_insert_with(|| schema.clone());
+        }
+        for schema_name in &other.known_schemas {
+            self.known_schemas.insert(schema_name.clone());
         }
     }
 
@@ -344,6 +366,16 @@ impl Catalog for CatalogSnapshot {
             _ => self.collations.get(&lower).cloned(),
         }
     }
+
+    fn schema_exists(&self, name: &str) -> bool {
+        // Built-in schemas are matched exactly (names are already normalized
+        // by normalize_ident: unquoted → lowercase, quoted → case-preserved).
+        // This ensures "PG_CATALOG" (quoted) does NOT match pg_catalog.
+        matches!(
+            name,
+            "public" | "pg_catalog" | "information_schema" | "extensions"
+        ) || self.known_schemas.contains(name)
+    }
 }
 
 // ── NullCatalog ─────────────────────────────────────────────
@@ -403,6 +435,10 @@ impl Catalog for NullCatalog {
 
     fn get_collation(&self, _name: &str) -> Option<CollationDef> {
         None
+    }
+
+    fn schema_exists(&self, _name: &str) -> bool {
+        false
     }
 }
 
@@ -482,6 +518,10 @@ impl Catalog for MockCatalog {
 
     fn get_collation(&self, name: &str) -> Option<CollationDef> {
         self.snapshot.get_collation(name)
+    }
+
+    fn schema_exists(&self, name: &str) -> bool {
+        self.snapshot.schema_exists(name)
     }
 }
 
@@ -600,6 +640,12 @@ impl MockCatalogBuilder {
                 deterministic: true,
             },
         );
+        self
+    }
+
+    /// Register a user-created schema as known to exist.
+    pub fn schema(mut self, name: &str) -> Self {
+        self.snapshot.add_schema(name);
         self
     }
 
