@@ -195,6 +195,8 @@ tests/1588_generated_stored_column.sql
 tests/293_pg_get_serial_sequence.sql
 # #1583 – ORDER BY DESC default NULL placement (NULLS FIRST)
 tests/295_order_by_null_placement.sql
+# #1629 – computed generated columns parity (CREATE TABLE + ALTER TABLE ADD COLUMN)
+tests/1629_generated_column_reject.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py
