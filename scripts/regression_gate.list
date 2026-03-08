@@ -183,6 +183,8 @@ tests/296_setval_out_of_range.sql
 tests/288_copy_csv_header.sql
 # #1573 – string_agg NULL delimiter treated as empty string
 tests/1573_string_agg_null_delimiter.sql
+# #1580 – pg_get_serial_sequence(int, int) returns correct error
+tests/293_pg_get_serial_sequence.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py

@@ -32,6 +32,22 @@ fn is_two_arg_advisory_lock_function(name: &str) -> bool {
     )
 }
 
+fn function_schema_name(func: &Function) -> Option<String> {
+    (func.name.0.len() > 1).then(|| func.name.0[0].value.to_lowercase())
+}
+
+fn pg_get_serial_sequence_error_arg_type(arg: &TypedExpr) -> DataType {
+    if matches!(
+        &arg.kind,
+        TypedExprKind::Constant(Value::Text(_)) | TypedExprKind::Constant(Value::Null)
+    ) {
+        // PostgreSQL reports string literals as unknown in unresolved function
+        // signatures (e.g. function f(unknown) does not exist).
+        return DataType::UserDefined("unknown".to_string());
+    }
+    arg.data_type.clone()
+}
+
 impl<'a> Analyzer<'a> {
     pub(in crate::sql::analyzer) fn validate_no_positional_after_named(
         &self,
@@ -190,6 +206,24 @@ impl<'a> Analyzer<'a> {
             .map(|a| self.analyze_expr(a))
             .collect::<Result<_, _>>()?;
         let analyzed_args = self.apply_function_arg_context(func_name.as_str(), analyzed_args)?;
+        let schema_name = function_schema_name(func);
+
+        if func_name == "PG_GET_SERIAL_SEQUENCE"
+            && schema_name
+                .as_deref()
+                .is_some_and(|schema| !schema.eq_ignore_ascii_case("pg_catalog"))
+        {
+            return Err(AnalyzerError::FunctionNotFound {
+                name: format!(
+                    "{}.pg_get_serial_sequence",
+                    schema_name.as_deref().unwrap_or_default()
+                ),
+                arg_types: analyzed_args
+                    .iter()
+                    .map(pg_get_serial_sequence_error_arg_type)
+                    .collect(),
+            });
+        }
 
         let arg_types: Vec<DataType> = analyzed_args.iter().map(|a| a.data_type.clone()).collect();
 

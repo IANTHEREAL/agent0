@@ -44,6 +44,7 @@ SELECT pg_get_serial_sequence('pgss_basic', 'missing_col');
 SELECT pg_get_serial_sequence('db.public.pgss_basic', 'id');
 SELECT pg_get_serial_sequence('', 'id');
 SELECT pg_get_serial_sequence('pgss_case', 'casecol');
+SELECT pg_get_serial_sequence(1, 2);
 SELECT public.pg_get_serial_sequence('t', 'id');
 
 DROP TABLE IF EXISTS pgss_basic CASCADE;
