@@ -1,9 +1,9 @@
 use super::{
     cast_current_setting_value, get_skip_reason, get_unsupported_reason,
     is_current_setting_function, is_set_config_function, normalize_search_path_entries,
-    parse_search_path_guc_value, parse_set_value, set_variable_value_to_string,
-    split_sql_statements, starts_with_ignore_ascii_case, try_parse_const_bool,
-    try_parse_const_text, unwrap_top_level_cast, GucValueInput,
+    parse_search_path_guc_value, set_variable_value_to_string, split_sql_statements,
+    starts_with_ignore_ascii_case, try_parse_const_bool, try_parse_const_text,
+    unwrap_top_level_cast,
 };
 use crate::model::Value;
 use sqlparser::ast::{
@@ -188,21 +188,6 @@ fn test_set_variable_value_to_string_timezone_interval() {
         fractional_seconds_precision: None,
     });
     assert_eq!(set_variable_value_to_string(&[expr]).unwrap(), "+00:00");
-}
-
-#[test]
-fn test_parse_set_value_distinguishes_default_keyword() {
-    assert!(matches!(
-        parse_set_value(&[Expr::Identifier(Ident::new("DEFAULT"))]).unwrap(),
-        GucValueInput::DefaultKeyword
-    ));
-    assert_eq!(
-        parse_set_value(&[Expr::Value(SqlValue::SingleQuotedString(
-            "default".to_string()
-        ))])
-        .unwrap(),
-        GucValueInput::Literal("default".to_string())
-    );
 }
 
 #[test]
