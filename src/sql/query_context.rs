@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::model::Value;
@@ -21,21 +21,8 @@ tokio::task_local! {
     static QUERY_PARAMS: Vec<Option<Value>>;
     static QUERY_PARAM_TYPES: Vec<Option<crate::model::DataType>>;
     static SETTINGS_SNAPSHOT: Arc<HashMap<String, String>>;
-    static SETTINGS_RUNTIME_OVERRIDES: Arc<Mutex<HashMap<String, String>>>;
-    static PENDING_SET_CONFIG_MUTATIONS: Arc<Mutex<Vec<SetConfigMutation>>>;
     static XACT_ADVISORY_LOCK_USED: Arc<AtomicBool>;
     static XACT_ADVISORY_SAVEPOINT_TRACKER: Arc<tokio::sync::Mutex<XactAdvisorySavepointTracker>>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SetConfigMutation {
-    pub(crate) name: String,
-    pub(crate) value: String,
-    pub(crate) is_local: bool,
-}
-
-fn lock_ignoring_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[derive(Debug, Clone)]
@@ -312,64 +299,10 @@ impl QueryContext {
     pub(crate) fn current_setting_snapshot(name: &str) -> Option<String> {
         let canonical =
             crate::sql::session::settings::SessionSettings::canonical_setting_name(name);
-        if let Some(override_value) = SETTINGS_RUNTIME_OVERRIDES
-            .try_with(|overrides| lock_ignoring_poison(overrides).get(canonical).cloned())
-            .ok()
-            .flatten()
-        {
-            return Some(override_value);
-        }
         SETTINGS_SNAPSHOT
             .try_with(|s| s.get(canonical).cloned())
             .ok()
             .flatten()
-    }
-
-    pub(crate) fn set_runtime_setting_override(name: &str, value: &str) {
-        let canonical =
-            crate::sql::session::settings::SessionSettings::canonical_setting_name(name)
-                .to_string();
-        let value = value.to_string();
-        let _ = SETTINGS_RUNTIME_OVERRIDES.try_with(|overrides| {
-            lock_ignoring_poison(overrides).insert(canonical, value);
-        });
-    }
-
-    pub(crate) fn remove_runtime_setting_override(name: &str) {
-        let canonical =
-            crate::sql::session::settings::SessionSettings::canonical_setting_name(name);
-        let _ = SETTINGS_RUNTIME_OVERRIDES.try_with(|overrides| {
-            lock_ignoring_poison(overrides).remove(canonical);
-        });
-    }
-
-    pub(crate) fn clear_runtime_setting_overrides() {
-        let _ = SETTINGS_RUNTIME_OVERRIDES.try_with(|overrides| {
-            lock_ignoring_poison(overrides).clear();
-        });
-    }
-
-    pub(crate) fn record_set_config_mutation(name: &str, value: &str, is_local: bool) {
-        let canonical =
-            crate::sql::session::settings::SessionSettings::canonical_setting_name(name)
-                .to_string();
-        let value = value.to_string();
-
-        Self::set_runtime_setting_override(&canonical, &value);
-
-        let _ = PENDING_SET_CONFIG_MUTATIONS.try_with(|pending| {
-            lock_ignoring_poison(pending).push(SetConfigMutation {
-                name: canonical,
-                value,
-                is_local,
-            });
-        });
-    }
-
-    pub(crate) fn take_set_config_mutations() -> Vec<SetConfigMutation> {
-        PENDING_SET_CONFIG_MUTATIONS
-            .try_with(|pending| std::mem::take(&mut *lock_ignoring_poison(pending)))
-            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -457,22 +390,16 @@ where
             xact_advisory_savepoint_tracker,
             XACT_ADVISORY_LOCK_USED.scope(
                 xact_advisory_lock_used,
-                SETTINGS_RUNTIME_OVERRIDES.scope(
-                    Arc::new(Mutex::new(HashMap::new())),
-                    PENDING_SET_CONFIG_MUTATIONS.scope(
-                        Arc::new(Mutex::new(Vec::new())),
-                        SETTINGS_SNAPSHOT.scope(
-                            snapshot,
-                            QUERY_PARAM_TYPES.scope(
-                                qctx.param_types.clone(),
-                                QUERY_PARAMS.scope(
-                                    qctx.params.clone(),
-                                    crate::sql::statement_time::with_timestamps(
-                                        qctx.statement_timestamp_ms,
-                                        qctx.transaction_timestamp_ms,
-                                        fut,
-                                    ),
-                                ),
+                SETTINGS_SNAPSHOT.scope(
+                    snapshot,
+                    QUERY_PARAM_TYPES.scope(
+                        qctx.param_types.clone(),
+                        QUERY_PARAMS.scope(
+                            qctx.params.clone(),
+                            crate::sql::statement_time::with_timestamps(
+                                qctx.statement_timestamp_ms,
+                                qctx.transaction_timestamp_ms,
+                                fut,
                             ),
                         ),
                     ),
@@ -580,71 +507,6 @@ mod tests {
             })
             .await;
         assert_eq!(result, None);
-    }
-
-    #[tokio::test]
-    async fn set_config_mutations_are_scoped_and_drained() {
-        let qctx = QueryContext::for_tests();
-
-        let out = with_scoped_query_context(&qctx, async {
-            QueryContext::record_set_config_mutation("statement_timeout", "200ms", false);
-            QueryContext::record_set_config_mutation("timezone", "UTC", true);
-            QueryContext::take_set_config_mutations()
-        })
-        .await;
-
-        assert_eq!(
-            out,
-            vec![
-                SetConfigMutation {
-                    name: "statement_timeout".to_string(),
-                    value: "200ms".to_string(),
-                    is_local: false,
-                },
-                SetConfigMutation {
-                    name: "timezone".to_string(),
-                    value: "UTC".to_string(),
-                    is_local: true,
-                },
-            ]
-        );
-        assert!(QueryContext::take_set_config_mutations().is_empty());
-    }
-
-    #[tokio::test]
-    async fn runtime_setting_overrides_can_be_removed_and_cleared() {
-        let mut qctx = QueryContext::for_tests();
-        let mut snapshot = HashMap::new();
-        snapshot.insert("statement_timeout".to_string(), "0".to_string());
-        snapshot.insert("timezone".to_string(), "UTC".to_string());
-        qctx.settings_snapshot = Some(Arc::new(snapshot));
-
-        with_scoped_query_context(&qctx, async {
-            QueryContext::record_set_config_mutation("statement_timeout", "450ms", false);
-            assert_eq!(
-                QueryContext::current_setting_snapshot("statement_timeout").as_deref(),
-                Some("450ms")
-            );
-
-            QueryContext::remove_runtime_setting_override("statement_timeout");
-            assert_eq!(
-                QueryContext::current_setting_snapshot("statement_timeout").as_deref(),
-                Some("0")
-            );
-
-            QueryContext::set_runtime_setting_override("timezone", "Asia/Shanghai");
-            assert_eq!(
-                QueryContext::current_setting_snapshot("timezone").as_deref(),
-                Some("Asia/Shanghai")
-            );
-
-            QueryContext::clear_runtime_setting_overrides();
-            assert_eq!(
-                QueryContext::current_setting_snapshot("timezone").as_deref(),
-                Some("UTC")
-            );
-        })
-        .await;
     }
 
     #[test]

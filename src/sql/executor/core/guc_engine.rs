@@ -6,7 +6,7 @@ use crate::sql::session::SessionSettings;
 use anyhow::Result;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GucValueInput {
+pub(super) enum GucValueInput {
     DefaultKeyword,
     Literal(String),
 }
@@ -38,7 +38,7 @@ pub(super) fn classify_guc(name: &str) -> GucKind {
     GucKind::UnknownCompat
 }
 
-pub(crate) fn check_reserved_guc_write(name: &str, input: &GucValueInput) -> Result<()> {
+pub(super) fn check_reserved_guc_write(name: &str, input: &GucValueInput) -> Result<()> {
     match classify_guc(name) {
         GucKind::ReadOnlyPseudo => Err(SqlError::InvalidParameterValue {
             message: "parameter \"is_superuser\" cannot be changed".to_string(),

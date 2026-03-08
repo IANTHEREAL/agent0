@@ -250,39 +250,6 @@ pub(in crate::sql::executor::core) async fn apply_statement_timeout<T>(
     }
 }
 
-pub(in crate::sql::executor::core) fn apply_pending_set_config_mutations(
-    session: &mut Session,
-) -> Result<()> {
-    let pending = crate::sql::query_context::QueryContext::take_set_config_mutations();
-    for mutation in pending {
-        if mutation.name == "search_path" {
-            let normalized = if mutation.value.is_empty() {
-                Vec::new()
-            } else {
-                let parsed = parse_search_path_guc_value(&mutation.value);
-                normalize_search_path_entries(parsed)?
-            };
-            if mutation.is_local {
-                if session.is_in_transaction() {
-                    session.set_local_search_path(normalized);
-                }
-            } else {
-                session.set_search_path(normalized);
-            }
-            continue;
-        }
-
-        if mutation.is_local {
-            if session.is_in_transaction() {
-                session.set_local_setting(&mutation.name, mutation.value)?;
-            }
-        } else {
-            session.set_known_setting(&mutation.name, mutation.value)?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,29 +391,6 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("statement timeout"));
-    }
-
-    #[tokio::test]
-    async fn apply_pending_set_config_mutations_preserves_explicit_empty_search_path() {
-        let mut session = test_session(true);
-        let qctx = crate::sql::query_context::QueryContext::for_tests();
-
-        crate::sql::query_context::with_scoped_query_context(&qctx, async {
-            crate::sql::query_context::QueryContext::record_set_config_mutation(
-                "search_path",
-                "",
-                false,
-            );
-            apply_pending_set_config_mutations(&mut session)
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(
-            session.show_setting_value("search_path").as_deref(),
-            Some("")
-        );
-        assert!(session.search_path().is_empty());
     }
 
     #[tokio::test]
