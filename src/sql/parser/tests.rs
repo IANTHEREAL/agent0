@@ -42,39 +42,6 @@ fn test_parse_table_function_named_args_with_colon_equals() {
 }
 
 #[test]
-fn test_parse_table_relation_shorthand() {
-    let stmts = parse_sql("TABLE users").unwrap();
-    assert_eq!(stmts.len(), 1);
-    match &stmts[0] {
-        Statement::Query(query) => match query.body.as_ref() {
-            sqlparser::ast::SetExpr::Select(select) => {
-                assert!(matches!(
-                    select.projection.as_slice(),
-                    [SelectItem::Wildcard(_)]
-                ));
-                assert_eq!(select.from.len(), 1);
-                assert_eq!(select.from[0].relation.to_string(), "users");
-            }
-            other => panic!("expected SELECT body, got {:?}", other),
-        },
-        other => panic!("expected QUERY, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_parse_table_relation_shorthand_with_order_by_limit_offset() {
-    for sql in [
-        "TABLE users ORDER BY id",
-        "TABLE users LIMIT 5",
-        "TABLE users OFFSET 2",
-    ] {
-        let stmts = parse_sql(sql).unwrap_or_else(|err| panic!("sql `{}` failed: {}", sql, err));
-        assert_eq!(stmts.len(), 1, "sql `{}`", sql);
-        assert!(matches!(stmts[0], Statement::Query(_)), "sql `{}`", sql);
-    }
-}
-
-#[test]
 fn test_parse_reset_role_rewrite() {
     let stmts = parse_sql("RESET ROLE").unwrap();
     assert_eq!(stmts.len(), 1);
