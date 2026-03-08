@@ -370,12 +370,17 @@ impl Executor {
             .ok_or_else(|| anyhow!("syntax error at or near \"RESET\""))?;
         if !raw_name.starts_with('"') && raw_name.eq_ignore_ascii_case("ALL") {
             session.reset_all_settings();
+            crate::sql::query_context::QueryContext::clear_runtime_setting_overrides();
         } else {
             let name = crate::sql::raw_sql::normalize_reset_name(raw_name)
                 .ok_or_else(|| anyhow!("syntax error at or near \"RESET\""))?;
             let name = name.to_lowercase();
             check_reserved_guc_reset(&name)?;
-            session.reset_setting(&name);
+            let canonical =
+                crate::sql::session::settings::SessionSettings::canonical_setting_name(&name)
+                    .to_string();
+            session.reset_setting(&canonical);
+            crate::sql::query_context::QueryContext::remove_runtime_setting_override(&canonical);
         }
         Ok(ExecuteResults::single(ExecuteResult::CommandComplete {
             tag: "RESET",
@@ -388,6 +393,9 @@ mod tests {
     use super::*;
     use crate::config::ServerConfig;
     use crate::sql::executor::core::dispatch::scaffold::DispatchContext;
+    use crate::sql::query_context::QueryContext;
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn make_executor_and_session(
         is_superuser: bool,
@@ -620,5 +628,30 @@ mod tests {
         assert!(executor
             .try_dispatch_raw_passthrough(&mut session, &other_ctx)
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_reset_clears_runtime_override_map_entries() {
+        let (_, mut session) = make_executor_and_session(true, false);
+        let mut qctx = QueryContext::for_tests();
+        let mut snapshot = HashMap::new();
+        snapshot.insert("statement_timeout".to_string(), "0".to_string());
+        qctx.settings_snapshot = Some(Arc::new(snapshot));
+
+        crate::sql::query_context::with_scoped_query_context(&qctx, async {
+            QueryContext::record_set_config_mutation("statement_timeout", "450ms", false);
+            assert_eq!(
+                QueryContext::current_setting_snapshot("statement_timeout").as_deref(),
+                Some("450ms")
+            );
+
+            Executor::execute_reset(&mut session, "RESET statement_timeout").unwrap();
+
+            assert_eq!(
+                QueryContext::current_setting_snapshot("statement_timeout").as_deref(),
+                Some("0")
+            );
+        })
+        .await;
     }
 }

@@ -5,7 +5,10 @@ use super::super::prepared_analysis::PreparedAnalysis;
 use super::super::prepared_stmt::PreparedExec;
 use super::super::prepared_stmt::PreparedStatement;
 use super::super::*;
-use super::utils::{apply_statement_timeout, wrap_with_runtime_context, RuntimeSettings};
+use super::utils::{
+    apply_pending_set_config_mutations, apply_statement_timeout, wrap_with_runtime_context,
+    RuntimeSettings,
+};
 use crate::sql::expr::bridge::eval_const_ast_expr;
 use crate::sql::sequences::SequenceSession;
 use crate::sql::types::sql_datatype_to_internal_strict;
@@ -234,6 +237,9 @@ impl Executor {
                         (Err(err), false)
                     }
                 };
+                if exec_result.is_ok() {
+                    apply_pending_set_config_mutations(session)?;
+                }
 
                 if exec_result.is_err() && session.is_in_transaction() {
                     session.mark_transaction_failed();

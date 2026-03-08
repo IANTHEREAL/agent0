@@ -15,7 +15,10 @@ use super::super::*;
 use super::guc::{build_show_all_result, execute_set_variable};
 use super::scaffold::DispatchContext;
 use super::transaction::check_observability_statement_permission;
-use super::utils::{validate_transaction_modes, wrap_with_runtime_context, RuntimeSettings};
+use super::utils::{
+    apply_pending_set_config_mutations, validate_transaction_modes, wrap_with_runtime_context,
+    RuntimeSettings,
+};
 
 fn is_dedicated_ast_non_tx_control_statement(stmt: &Statement) -> bool {
     matches!(
@@ -36,6 +39,55 @@ fn is_dedicated_ast_non_tx_control_statement(stmt: &Statement) -> bool {
             | Statement::Execute { .. }
             | Statement::Deallocate { .. }
     )
+}
+
+fn sync_runtime_setting_override_from_session(session: &Session, name: &str) {
+    let canonical = crate::sql::session::settings::SessionSettings::canonical_setting_name(name);
+    if let Some(value) = session.show_setting_value(canonical) {
+        crate::sql::query_context::QueryContext::set_runtime_setting_override(canonical, &value);
+    } else {
+        crate::sql::query_context::QueryContext::remove_runtime_setting_override(canonical);
+    }
+}
+
+fn sync_runtime_setting_overrides_for_statement(session: &Session, stmt: &Statement) {
+    match stmt {
+        Statement::SetVariable { variable, .. } => {
+            let var_name = variable
+                .0
+                .iter()
+                .map(normalize_ident)
+                .collect::<Vec<_>>()
+                .join(".")
+                .to_lowercase();
+            sync_runtime_setting_override_from_session(session, &var_name);
+        }
+        Statement::SetTimeZone { .. } => {
+            sync_runtime_setting_override_from_session(session, "timezone");
+        }
+        Statement::SetNames { .. } => {
+            sync_runtime_setting_override_from_session(session, "client_encoding");
+        }
+        Statement::SetTransaction { modes, .. } => {
+            for mode in modes {
+                match mode {
+                    TransactionMode::IsolationLevel(_) => {
+                        sync_runtime_setting_override_from_session(
+                            session,
+                            "transaction_isolation",
+                        );
+                    }
+                    TransactionMode::AccessMode(_) => {
+                        sync_runtime_setting_override_from_session(
+                            session,
+                            "default_transaction_read_only",
+                        );
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 impl Executor {
@@ -89,7 +141,7 @@ impl Executor {
             let rt_settings = RuntimeSettings::from_session(session);
             let extension_txn_delta = session.extension_delta_snapshot();
             let txn_snapshot_ts_version = session.active_txn_start_ts_version();
-            let stmt_exec: Result<Vec<ExecuteResult>> = wrap_with_runtime_context(
+            let mut stmt_exec: Result<Vec<ExecuteResult>> = wrap_with_runtime_context(
                 &rt_settings,
                 self.tenant_keyspace(),
                 session.current_database_id(),
@@ -264,6 +316,14 @@ impl Executor {
             )
             .await;
 
+            if stmt_exec.is_ok() {
+                if let Err(err) = apply_pending_set_config_mutations(session) {
+                    stmt_exec = Err(err);
+                } else {
+                    sync_runtime_setting_overrides_for_statement(session, stmt);
+                }
+            }
+
             if stmt_exec.is_ok() && is_dedicated_ast_non_tx_control_statement(stmt) {
                 session.note_statement_success_in_transaction();
             }
@@ -326,6 +386,9 @@ impl Executor {
 mod tests {
     use super::*;
     use crate::sql::executor::core::dispatch::scaffold::DispatchContext;
+    use crate::sql::query_context::QueryContext;
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn make_executor_and_session() -> (Executor, Session) {
         let store = crate::storage::TikvStore::new_stub();
@@ -625,5 +688,39 @@ mod tests {
             ExecuteResult::CommandComplete { tag: "SET" }
         ));
         assert!(matches!(out[1], ExecuteResult::Select { .. }));
+    }
+
+    #[tokio::test]
+    async fn dispatch_parsed_statements_set_clears_non_fast_path_set_config_override() {
+        let (executor, mut session) = make_executor_and_session();
+        let mut qctx = QueryContext::for_tests();
+        let mut snapshot = HashMap::new();
+        snapshot.insert("statement_timeout".to_string(), "0".to_string());
+        qctx.settings_snapshot = Some(Arc::new(snapshot));
+
+        crate::sql::query_context::with_scoped_query_context(&qctx, async {
+            QueryContext::set_runtime_setting_override("statement_timeout", "450ms");
+            assert_eq!(
+                QueryContext::current_setting_snapshot("statement_timeout").as_deref(),
+                Some("450ms")
+            );
+
+            let sql = "SET statement_timeout = 0";
+            let ctx = DispatchContext::new(sql, &session);
+            let out = executor
+                .dispatch_parsed_statements(&mut session, sql, &ctx)
+                .await
+                .unwrap()
+                .into_vec();
+            assert!(matches!(
+                out.as_slice(),
+                [ExecuteResult::CommandComplete { tag: "SET" }]
+            ));
+            assert_eq!(
+                QueryContext::current_setting_snapshot("statement_timeout").as_deref(),
+                Some("0")
+            );
+        })
+        .await;
     }
 }
