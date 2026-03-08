@@ -1,7 +1,6 @@
 extname|extversion
-fs9|1.0.0
 http|1.0.0
-(2 rows)
+(1 row)
 proname
 http_delete
 http_get

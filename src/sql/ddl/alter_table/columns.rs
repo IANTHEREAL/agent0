@@ -25,15 +25,16 @@ use super::super::{
 };
 use super::{should_invalidate_stats_for_drop_column, should_invalidate_stats_for_type_change};
 
-fn has_real_add_column_default(is_serial: bool, default_expr: Option<&str>) -> bool {
-    let Some(expr) = default_expr else {
+fn can_materialize_existing_rows_for_add_column(
+    is_serial: bool,
+    default_expr: Option<&str>,
+    generation_expr: Option<&str>,
+) -> bool {
+    if crate::sql::sequences::is_serial_default_dropped_marker(default_expr) {
         return false;
-    };
-    if !is_serial {
-        return true;
     }
-    !crate::sql::sequences::is_identity_default_marker(Some(expr))
-        && !crate::sql::sequences::is_serial_default_dropped_marker(Some(expr))
+
+    is_serial || default_expr.is_some() || generation_expr.is_some()
 }
 
 fn generated_embed_add_column_nonempty_table_error(
@@ -148,7 +149,13 @@ pub(super) async fn alter_table_add_column(
     if is_serial {
         nullable = false;
     }
-    if !nullable && !has_real_add_column_default(is_serial, default_expr.as_deref()) {
+    if !nullable
+        && !can_materialize_existing_rows_for_add_column(
+            is_serial,
+            default_expr.as_deref(),
+            generation_expr_str.as_deref(),
+        )
+    {
         let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
         let range: tikv_client::BoundRange = (start..end).into();
         let existing_rows: Vec<_> = txn.scan(range, 1).await?.collect();
@@ -511,28 +518,44 @@ pub(super) async fn alter_table_alter_column_set_data_type(
 
 #[cfg(test)]
 mod tests {
-    use super::{generated_embed_add_column_nonempty_table_error, has_real_add_column_default};
+    use super::{
+        can_materialize_existing_rows_for_add_column,
+        generated_embed_add_column_nonempty_table_error,
+    };
     use crate::sql::error::SqlError;
 
     #[test]
-    fn add_column_default_gate_treats_identity_marker_as_no_default() {
-        assert!(!has_real_add_column_default(
+    fn add_column_gate_accepts_identity_backfill_path() {
+        assert!(can_materialize_existing_rows_for_add_column(
             true,
-            Some("NULL /* db9_identity_by_default */")
+            Some("NULL /* db9_identity_by_default */"),
+            None,
         ));
     }
 
     #[test]
-    fn add_column_default_gate_treats_serial_drop_marker_as_no_default() {
-        assert!(!has_real_add_column_default(
-            true,
-            Some("NULL /* db9_serial_default_dropped */")
+    fn add_column_gate_accepts_generated_column_backfill_path() {
+        assert!(can_materialize_existing_rows_for_add_column(
+            false,
+            None,
+            Some("(x * 10)"),
         ));
     }
 
     #[test]
-    fn add_column_default_gate_accepts_real_default_expr() {
-        assert!(has_real_add_column_default(false, Some("42")));
+    fn add_column_gate_rejects_plain_not_null_column_without_value_path() {
+        assert!(!can_materialize_existing_rows_for_add_column(
+            false, None, None
+        ));
+    }
+
+    #[test]
+    fn add_column_gate_rejects_serial_default_drop_marker() {
+        assert!(!can_materialize_existing_rows_for_add_column(
+            false,
+            Some("NULL /* db9_serial_default_dropped */"),
+            None,
+        ));
     }
 
     #[test]
