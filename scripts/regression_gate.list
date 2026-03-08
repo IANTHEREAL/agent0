@@ -185,6 +185,8 @@ tests/288_copy_csv_header.sql
 tests/1573_string_agg_null_delimiter.sql
 # #1580 – pg_get_serial_sequence(int, int) returns correct error
 tests/293_pg_get_serial_sequence.sql
+# #1583 – ORDER BY DESC default NULL placement (NULLS FIRST)
+tests/295_order_by_null_placement.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py
@@ -195,3 +197,4 @@ orm-tests/pg-client/
 orm-tests/typeorm/connection.test.ts
 orm-tests/typeorm/transaction.test.ts
 orm-tests/typeorm/schema.test.ts
+
