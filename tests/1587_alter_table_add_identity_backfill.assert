@@ -1,7 +1,0 @@
-empty_always_next=1
-always_backfill=1,2,3
-always_next=4
-by_default_backfill=1,2
-by_default_next=3
-bigserial_backfill=1,2,3,4,5
-bigserial_next=6
