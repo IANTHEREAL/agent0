@@ -195,7 +195,3 @@ orm-tests/pg-client/
 orm-tests/typeorm/connection.test.ts
 orm-tests/typeorm/transaction.test.ts
 orm-tests/typeorm/schema.test.ts
-
-# #1579 – pg_get_serial_sequence('', 'id') should error with invalid name syntax
-tests/298_pg_get_serial_sequence_empty_name.sql
-
