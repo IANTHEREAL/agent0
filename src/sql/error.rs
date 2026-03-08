@@ -49,9 +49,6 @@ pub enum SqlError {
     #[error("column reference \"{0}\" is ambiguous")]
     AmbiguousColumn(String),
 
-    #[error("{0}")]
-    InvalidColumnReference(String),
-
     #[error("function {0} does not exist")]
     FunctionNotFound(String),
 
@@ -256,7 +253,6 @@ impl SqlError {
             Self::SequenceNotFound(_) => "42P01",
             Self::ColumnNotFound { .. } => "42703",
             Self::AmbiguousColumn(_) => "42702",
-            Self::InvalidColumnReference(_) => "42P10",
             Self::FunctionNotFound(_) => "42883",
             Self::InvalidInputSyntax { .. } => "22P02",
             Self::InvalidCast { .. } => "42846",
@@ -327,7 +323,6 @@ impl From<AnalyzerError> for SqlError {
                 }
             }
             AnalyzerError::AmbiguousColumn { name, .. } => SqlError::AmbiguousColumn(name),
-            AnalyzerError::InvalidColumnReference(msg) => SqlError::InvalidColumnReference(msg),
             AnalyzerError::TableNotFound(name) => SqlError::RelationNotFound(name),
             AnalyzerError::FunctionNotFound { name, arg_types } => {
                 let types: Vec<_> = arg_types
@@ -435,10 +430,6 @@ mod tests {
             "42703"
         );
         assert_eq!(SqlError::AmbiguousColumn("c".into()).sqlstate(), "42702");
-        assert_eq!(
-            SqlError::InvalidColumnReference("bad ref".into()).sqlstate(),
-            "42P10"
-        );
         assert_eq!(SqlError::FunctionNotFound("f".into()).sqlstate(), "42883");
         assert_eq!(
             SqlError::InvalidInputSyntax {
@@ -787,11 +778,6 @@ mod tests {
         };
         let sql: SqlError = ae.into();
         assert_eq!(sql.sqlstate(), "42702");
-
-        // InvalidColumnReference → 42P10
-        let ae = AnalyzerError::InvalidColumnReference("bad ref".into());
-        let sql: SqlError = ae.into();
-        assert_eq!(sql.sqlstate(), "42P10");
 
         // FunctionNotFound → 42883
         let ae = AnalyzerError::FunctionNotFound {

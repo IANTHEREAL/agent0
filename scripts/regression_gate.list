@@ -187,12 +187,6 @@ tests/288_copy_csv_header.sql
 tests/293_pg_get_serial_sequence.sql
 # #1573 – string_agg NULL delimiter treated as empty string
 tests/1573_string_agg_null_delimiter.sql
-# #1572 – DISTINCT aggregate ORDER BY validation
-tests/294_distinct_agg_order_by.sql
-# #1583 – ORDER BY DESC default NULL placement (NULLS FIRST)
-tests/295_order_by_null_placement.sql
-# #1579 – pg_get_serial_sequence('', 'id') should error with invalid name syntax
-tests/298_pg_get_serial_sequence_empty_name.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py
@@ -203,3 +197,10 @@ orm-tests/pg-client/
 orm-tests/typeorm/connection.test.ts
 orm-tests/typeorm/transaction.test.ts
 orm-tests/typeorm/schema.test.ts
+
+# #1583 – ORDER BY DESC default NULL placement (NULLS FIRST)
+tests/295_order_by_null_placement.sql
+
+# #1579 – pg_get_serial_sequence('', 'id') should error with invalid name syntax
+tests/298_pg_get_serial_sequence_empty_name.sql
+
