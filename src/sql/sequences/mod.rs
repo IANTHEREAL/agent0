@@ -535,36 +535,8 @@ fn parse_table_arg_identifier(table_arg: &str) -> Result<(Option<String>, String
     }
 }
 
-fn keyword_or_special_ident(ident: &str) -> bool {
-    if ident.is_empty() {
-        return true;
-    }
-
-    let mut chars = ident.chars();
-    let Some(first) = chars.next() else {
-        return true;
-    };
-    if !(first.is_ascii_lowercase() || first == '_') {
-        return true;
-    }
-    for ch in chars {
-        if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '$') {
-            return true;
-        }
-    }
-
-    let upper = ident.to_ascii_uppercase();
-    sqlparser::keywords::ALL_KEYWORDS
-        .binary_search(&upper.as_str())
-        .is_ok()
-}
-
 fn quote_pg_identifier_if_needed(ident: &str) -> String {
-    if keyword_or_special_ident(ident) {
-        format!("\"{}\"", ident.replace('"', "\"\""))
-    } else {
-        ident.to_string()
-    }
+    crate::sql::quoting::quote_ident(ident)
 }
 
 pub(crate) fn format_serial_sequence_name(schema: &str, sequence_name: &str) -> String {

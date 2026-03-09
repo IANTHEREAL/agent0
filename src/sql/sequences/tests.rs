@@ -124,6 +124,27 @@ mod owned_sequence_lookup_tests {
         assert!(err.contains("Invalid sequence name"));
     }
 
+    // Boundary keyword tests from issue #1671 — validated against PG 17.
+    // Ensures format_serial_sequence_name delegates to quoting::quote_ident
+    // and produces PG-compatible quoting for all six boundary keywords.
+    #[test]
+    fn format_serial_sequence_name_pg_boundary_keywords() {
+        use crate::sql::sequences::format_serial_sequence_name;
+
+        // PG RESERVED_KEYWORD — must quote
+        assert_eq!(format_serial_sequence_name("column", "s"), "\"column\".s");
+        // PG TYPE_FUNC_NAME_KEYWORD — must quote
+        assert_eq!(format_serial_sequence_name("cross", "s"), "\"cross\".s");
+        // PG RESERVED_KEYWORD — must quote
+        assert_eq!(format_serial_sequence_name("select", "s"), "\"select\".s");
+        // Not a PG keyword — must NOT quote
+        assert_eq!(format_serial_sequence_name("tables", "s"), "tables.s");
+        // PG UNRESERVED_KEYWORD — must NOT quote
+        assert_eq!(format_serial_sequence_name("view", "s"), "view.s");
+        // Not a PG keyword — must NOT quote
+        assert_eq!(format_serial_sequence_name("name", "s"), "name.s");
+    }
+
     #[test]
     fn expression_async_detection_flags_sequence_current_schema_and_unknown_function() {
         use crate::sql::sequences::{
