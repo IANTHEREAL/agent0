@@ -1,4 +1,4 @@
-use crate::model::Value;
+use crate::model::{DataType, Value};
 use crate::sql::pg_types;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -69,6 +69,48 @@ fn pg_typeof_name(val: &Value) -> String {
         Value::Vector(_) => "vector".to_string(),
         Value::Tsvector(_) => "tsvector".to_string(),
         Value::Tsquery(_) => "tsquery".to_string(),
+    }
+}
+
+pub(crate) fn pg_typeof_name_for_datatype(dt: &DataType) -> String {
+    match dt {
+        DataType::Boolean => "boolean".to_string(),
+        DataType::Int32 => "integer".to_string(),
+        DataType::Int64 => "bigint".to_string(),
+        DataType::Float64 => "double precision".to_string(),
+        DataType::Numeric { .. } => "numeric".to_string(),
+        DataType::Text => "text".to_string(),
+        DataType::Bytes => "bytea".to_string(),
+        DataType::Timestamp => "timestamp without time zone".to_string(),
+        DataType::TimestampTz => "timestamp with time zone".to_string(),
+        DataType::Date => "date".to_string(),
+        DataType::Time => "time without time zone".to_string(),
+        DataType::Interval => "interval".to_string(),
+        DataType::Uuid => "uuid".to_string(),
+        DataType::Json => "json".to_string(),
+        DataType::Jsonb => "jsonb".to_string(),
+        DataType::Array(inner) => format!("{}[]", pg_typeof_name_for_datatype(inner)),
+        DataType::Vector(_) => "vector".to_string(),
+        DataType::Tsvector => "tsvector".to_string(),
+        DataType::Tsquery => "tsquery".to_string(),
+        DataType::Name => "name".to_string(),
+        DataType::Varchar(_) => "character varying".to_string(),
+        DataType::UserDefined(name) if name.eq_ignore_ascii_case("regclass") => {
+            "regclass".to_string()
+        }
+        DataType::UserDefined(name) if name.eq_ignore_ascii_case("pg_catalog.regclass") => {
+            "regclass".to_string()
+        }
+        DataType::UserDefined(name) if name.eq_ignore_ascii_case("regtype") => {
+            "regtype".to_string()
+        }
+        DataType::UserDefined(name) if name.eq_ignore_ascii_case("pg_catalog.regtype") => {
+            "regtype".to_string()
+        }
+        DataType::UserDefined(name) => name
+            .strip_prefix("pg_catalog.")
+            .unwrap_or(name.as_str())
+            .to_string(),
     }
 }
 
@@ -164,6 +206,23 @@ struct RegTypeIdent {
     quoted: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParsedRegtypeLookupKind {
+    SearchPath,
+    SpecialBuiltin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedRegtypeLookup {
+    pub(crate) schema: Option<String>,
+    pub(crate) name: String,
+    pub(crate) is_array: bool,
+    pub(crate) quoted: bool,
+    pub(crate) typmod: Option<String>,
+    pub(crate) display_name: String,
+    pub(crate) kind: ParsedRegtypeLookupKind,
+}
+
 /// Collapse all runs of whitespace (spaces, tabs, newlines) to a single
 /// ASCII space. Matches PostgreSQL's whitespace normalization for type
 /// names like `interval  day   to   second` or `interval\tday`.
@@ -171,53 +230,583 @@ fn normalize_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Parse a single identifier: quoted preserves case, unquoted lowercases.
-fn parse_regtype_ident(raw: &str) -> RegTypeIdent {
-    let trimmed = raw.trim();
-    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        RegTypeIdent {
-            value: trimmed[1..trimmed.len() - 1].to_string(),
-            quoted: true,
-        }
-    } else {
-        RegTypeIdent {
-            value: trimmed.to_lowercase(),
-            quoted: false,
-        }
+fn regtype_display_name(schema: Option<&str>, name: &str) -> String {
+    match schema {
+        Some(schema) => format!("{schema}.{name}"),
+        None => name.to_string(),
     }
 }
 
-/// Parse a regtype input into (schema, name).
-///
-/// Splits at the last unquoted `.` for schema.name separation.
-/// Each component follows PostgreSQL identifier rules:
-///   - Quoted (double-quoted): strip outer quotes, preserve case
-///   - Unquoted: lowercase
-fn parse_regtype_input(raw: &str) -> (Option<RegTypeIdent>, RegTypeIdent) {
-    let trimmed = raw.trim();
+fn invalid_type_name(original_name: &str) -> anyhow::Error {
+    crate::sql::error::SqlError::SqlStructure(format!("invalid type name \"{}\"", original_name))
+        .into()
+}
 
-    // Find the last '.' outside double quotes to split schema.name.
+fn unterminated_quoted_identifier(original_name: &str) -> anyhow::Error {
+    crate::sql::error::SqlError::SqlStructure(format!(
+        "unterminated quoted identifier at or near \"{}\"",
+        original_name
+    ))
+    .into()
+}
+
+fn zero_length_delimited_identifier(original_name: &str) -> anyhow::Error {
+    crate::sql::error::SqlError::SqlStructure(format!(
+        "zero-length delimited identifier at or near \"{}\"",
+        original_name
+    ))
+    .into()
+}
+
+fn cross_database_reference(original_name: &str) -> anyhow::Error {
+    crate::sql::error::SqlError::Unsupported(format!(
+        "cross-database references are not implemented: {}",
+        original_name
+    ))
+    .into()
+}
+
+fn type_modifier_not_allowed(display_name: &str) -> anyhow::Error {
+    crate::sql::error::SqlError::SqlStructure(format!(
+        "type modifier is not allowed for type \"{}\"",
+        display_name
+    ))
+    .into()
+}
+
+fn invalid_interval_type_modifier() -> anyhow::Error {
+    crate::sql::error::SqlError::SqlStructure("invalid INTERVAL type modifier".to_string()).into()
+}
+
+/// Parse a single identifier: quoted preserves case, unquoted lowercases.
+fn parse_regtype_ident(raw: &str, original_name: &str) -> Result<RegTypeIdent> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(RegTypeIdent {
+            value: String::new(),
+            quoted: false,
+        });
+    }
+
+    if trimmed.starts_with('"') {
+        if trimmed.len() < 2 || !trimmed.ends_with('"') {
+            return Err(unterminated_quoted_identifier(original_name));
+        }
+
+        let mut value = String::new();
+        let mut chars = trimmed[1..trimmed.len() - 1].chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    value.push('"');
+                } else {
+                    return Err(invalid_type_name(original_name));
+                }
+            } else {
+                value.push(ch);
+            }
+        }
+
+        if value.is_empty() {
+            return Err(zero_length_delimited_identifier(original_name));
+        }
+
+        return Ok(RegTypeIdent {
+            value,
+            quoted: true,
+        });
+    }
+
+    if trimmed.contains('"') {
+        return Err(invalid_type_name(original_name));
+    }
+
+    Ok(RegTypeIdent {
+        value: trimmed.to_lowercase(),
+        quoted: false,
+    })
+}
+
+fn split_regtype_input_parts(raw: &str) -> Result<Vec<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let bytes = trimmed.as_bytes();
+    let mut i = 0usize;
     let mut in_quotes = false;
-    let mut last_dot = None;
-    for (i, c) in trimmed.char_indices() {
-        match c {
-            '"' => in_quotes = !in_quotes,
-            '.' if !in_quotes => last_dot = Some(i),
-            _ => {}
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if in_quotes && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                } else {
+                    in_quotes = !in_quotes;
+                    i += 1;
+                }
+            }
+            b'.' if !in_quotes => {
+                parts.push(trimmed[start..i].to_string());
+                start = i + 1;
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
 
-    let (schema_raw, name_raw) = match last_dot {
-        Some(pos) => (Some(&trimmed[..pos]), &trimmed[pos + 1..]),
-        None => (None, trimmed),
+    if in_quotes {
+        return Err(unterminated_quoted_identifier(trimmed));
+    }
+
+    parts.push(trimmed[start..].to_string());
+    Ok(parts)
+}
+
+fn contains_unquoted_paren(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut i = 0usize;
+    let mut in_quotes = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if in_quotes && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                } else {
+                    in_quotes = !in_quotes;
+                    i += 1;
+                }
+            }
+            b'(' | b')' if !in_quotes => return true,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+fn split_regtype_typmod_parts(raw: &str) -> Result<(String, Option<String>)> {
+    let trimmed = raw.trim();
+    if !trimmed.ends_with(')') {
+        return Ok((trimmed.to_string(), None));
+    }
+
+    let bytes = trimmed.as_bytes();
+    let mut i = 0usize;
+    let mut in_quotes = false;
+    let mut depth = 0i32;
+    let mut typmod_start = None;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if in_quotes && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                } else {
+                    in_quotes = !in_quotes;
+                    i += 1;
+                }
+            }
+            b'(' if !in_quotes => {
+                if depth == 0 {
+                    typmod_start = Some(i);
+                }
+                depth += 1;
+                i += 1;
+            }
+            b')' if !in_quotes => {
+                if depth == 0 {
+                    return Err(invalid_type_name(trimmed));
+                }
+                depth -= 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    if in_quotes || depth != 0 {
+        return Err(invalid_type_name(trimmed));
+    }
+
+    let Some(typmod_start) = typmod_start else {
+        return Ok((trimmed.to_string(), None));
+    };
+    let base = trimmed[..typmod_start].trim_end().to_string();
+    let inner = trimmed[typmod_start + 1..trimmed.len() - 1]
+        .trim()
+        .to_string();
+    Ok((base, Some(inner)))
+}
+
+fn split_temporal_typmod<'a>(
+    raw: &'a str,
+    original_name: &str,
+) -> Result<(Option<String>, &'a str)> {
+    let trimmed = raw.trim_start();
+    if !trimmed.starts_with('(') {
+        return Ok((None, trimmed));
+    }
+
+    let close = trimmed
+        .find(')')
+        .ok_or_else(|| invalid_type_name(original_name))?;
+    let inner = trimmed[1..close].trim().to_string();
+    if inner.is_empty() {
+        return Err(invalid_type_name(original_name));
+    }
+
+    Ok((Some(inner), trimmed[close + 1..].trim_start()))
+}
+
+fn parse_nonnegative_typmod_int_list(typmod: &str, original_name: &str) -> Result<Vec<i32>> {
+    let mut out = Vec::new();
+    for part in typmod.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+            return Err(invalid_type_name(original_name));
+        }
+        out.push(
+            trimmed
+                .parse::<i32>()
+                .map_err(|_| invalid_type_name(original_name))?,
+        );
+    }
+    if out.is_empty() {
+        return Err(invalid_type_name(original_name));
+    }
+    Ok(out)
+}
+
+fn parse_temporal_special_lookup(
+    raw: &str,
+    keyword: &str,
+) -> Result<Option<(String, Option<String>, String)>> {
+    let normalized = normalize_whitespace(raw);
+    let lower = normalized.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix(keyword) else {
+        return Ok(None);
     };
 
-    let schema = schema_raw.map(parse_regtype_ident);
-    let name = parse_regtype_ident(name_raw);
+    if !rest.is_empty() {
+        let first = rest.chars().next().unwrap_or_default();
+        if !first.is_whitespace() && first != '(' {
+            return Ok(None);
+        }
+    }
 
-    (schema, name)
+    let (typmod, rest) = split_temporal_typmod(&normalized[keyword.len()..], raw)?;
+    let rest = normalize_whitespace(rest).to_ascii_lowercase();
+
+    let canonical = match (keyword, rest.as_str()) {
+        ("time", "") | ("time", "without time zone") => "time",
+        ("time", "with time zone") => "timetz",
+        ("timestamp", "") | ("timestamp", "without time zone") => "timestamp",
+        ("timestamp", "with time zone") => "timestamptz",
+        _ => return Err(invalid_type_name(raw)),
+    };
+
+    if let Some(tm) = typmod.as_deref() {
+        let args = parse_nonnegative_typmod_int_list(tm, raw)?;
+        if args.len() != 1 {
+            return Err(invalid_type_name(raw));
+        }
+    }
+
+    Ok(Some((
+        canonical.to_string(),
+        typmod,
+        normalize_whitespace(raw).to_ascii_lowercase(),
+    )))
 }
 
+fn parse_special_builtin_lookup(raw: &str, is_array: bool) -> Result<Option<ParsedRegtypeLookup>> {
+    let normalized = normalize_whitespace(raw);
+    let normalized_lower = normalized.to_ascii_lowercase();
+
+    if let Some((name, typmod, display_name)) = parse_temporal_special_lookup(raw, "time")? {
+        return Ok(Some(ParsedRegtypeLookup {
+            schema: None,
+            name,
+            is_array,
+            quoted: false,
+            typmod,
+            display_name,
+            kind: ParsedRegtypeLookupKind::SpecialBuiltin,
+        }));
+    }
+
+    if let Some((name, typmod, display_name)) = parse_temporal_special_lookup(raw, "timestamp")? {
+        return Ok(Some(ParsedRegtypeLookup {
+            schema: None,
+            name,
+            is_array,
+            quoted: false,
+            typmod,
+            display_name,
+            kind: ParsedRegtypeLookupKind::SpecialBuiltin,
+        }));
+    }
+
+    if normalized_lower.starts_with("interval") && normalize_interval_type(raw)? == "interval" {
+        return Ok(Some(ParsedRegtypeLookup {
+            schema: None,
+            name: "interval".to_string(),
+            is_array,
+            quoted: false,
+            typmod: None,
+            display_name: "interval".to_string(),
+            kind: ParsedRegtypeLookupKind::SpecialBuiltin,
+        }));
+    }
+
+    let (base, typmod) = split_regtype_typmod_parts(&normalized_lower)?;
+    if typmod.as_deref().is_some_and(str::is_empty) {
+        return Err(invalid_type_name(raw));
+    }
+
+    if base.contains(char::is_whitespace)
+        && !matches!(
+            base.as_str(),
+            "double precision" | "character varying" | "bit varying"
+        )
+    {
+        return Err(invalid_type_name(raw));
+    }
+
+    let name = match base.as_str() {
+        "boolean" => Some("bool"),
+        "smallint" => Some("int2"),
+        "integer" | "int" => Some("int4"),
+        "bigint" => Some("int8"),
+        "real" => Some("float4"),
+        "double precision" => {
+            if typmod.is_some() {
+                return Err(invalid_type_name(raw));
+            }
+            Some("float8")
+        }
+        "character varying" | "varchar" => Some("varchar"),
+        "character" => Some("bpchar"),
+        "numeric" | "decimal" => Some("numeric"),
+        "bit varying" => Some("bit varying"),
+        _ => None,
+    };
+
+    match base.as_str() {
+        "boolean" | "smallint" | "integer" | "int" | "bigint" | "real" | "double precision" => {
+            if typmod.is_some() {
+                return Err(invalid_type_name(raw));
+            }
+        }
+        "character varying" | "varchar" | "character" | "bit varying" => {
+            if let Some(tm) = typmod.as_deref() {
+                let args = parse_nonnegative_typmod_int_list(tm, raw)?;
+                if args.len() != 1 {
+                    return Err(invalid_type_name(raw));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(name.map(|name| ParsedRegtypeLookup {
+        schema: None,
+        name: name.to_string(),
+        is_array,
+        quoted: false,
+        typmod,
+        display_name: base,
+        kind: ParsedRegtypeLookupKind::SpecialBuiltin,
+    }))
+}
+
+pub(crate) fn resolve_builtin_regtype_lookup(lookup: &ParsedRegtypeLookup) -> Option<i64> {
+    let base_oid = match lookup.kind {
+        ParsedRegtypeLookupKind::SpecialBuiltin => pg_types::pg_catalog_regtype_oid(&lookup.name),
+        ParsedRegtypeLookupKind::SearchPath => {
+            pg_types::actual_pg_catalog_regtype_oid(&lookup.name)
+        }
+    }?;
+
+    if lookup.is_array {
+        pg_types::regtype_array_oid(base_oid)
+    } else {
+        Some(base_oid)
+    }
+}
+
+pub(crate) fn validate_resolved_regtype_typmod(
+    lookup: &ParsedRegtypeLookup,
+    resolved_oid: Option<i64>,
+    is_user_defined: bool,
+) -> Result<()> {
+    let Some(typmod) = lookup.typmod.as_deref() else {
+        return Ok(());
+    };
+    let Some(oid) = resolved_oid else {
+        return Ok(());
+    };
+
+    if is_user_defined {
+        return Err(type_modifier_not_allowed(&lookup.display_name));
+    }
+
+    match oid {
+        pg_types::OID_VARCHAR => {
+            let args = parse_resolved_typmod_int_list(typmod, &lookup.display_name)?;
+            if args.len() != 1 {
+                return Err(invalid_type_name(&lookup.display_name));
+            }
+            validate_typmod_bounds("varchar", &args)
+        }
+        pg_types::OID_BPCHAR => {
+            let args = parse_resolved_typmod_int_list(typmod, &lookup.display_name)?;
+            if args.len() != 1 {
+                return Err(invalid_type_name(&lookup.display_name));
+            }
+            validate_typmod_bounds("bpchar", &args)
+        }
+        pg_types::OID_NUMERIC => {
+            let args = parse_resolved_typmod_int_list(typmod, &lookup.display_name)?;
+            if !(1..=2).contains(&args.len()) {
+                return Err(invalid_type_name(&lookup.display_name));
+            }
+            validate_typmod_bounds("numeric", &args)
+        }
+        pg_types::OID_TIME
+        | pg_types::OID_TIMETZ
+        | pg_types::OID_TIMESTAMP
+        | pg_types::OID_TIMESTAMPTZ => {
+            let args = parse_resolved_typmod_int_list(typmod, &lookup.display_name)?;
+            if args.len() != 1 {
+                return Err(invalid_type_name(&lookup.display_name));
+            }
+            if args[0] < 0 {
+                let type_display = match oid {
+                    pg_types::OID_TIMESTAMPTZ => {
+                        format!("TIMESTAMP({}) WITH TIME ZONE", args[0])
+                    }
+                    pg_types::OID_TIMETZ => format!("TIME({}) WITH TIME ZONE", args[0]),
+                    pg_types::OID_TIMESTAMP => format!("TIMESTAMP({})", args[0]),
+                    _ => format!("TIME({})", args[0]),
+                };
+                return Err(crate::sql::error::SqlError::SqlStructure(format!(
+                    "{} precision must not be negative",
+                    type_display
+                ))
+                .into());
+            }
+            Ok(())
+        }
+        pg_types::OID_INTERVAL => Err(invalid_interval_type_modifier()),
+        _ => Err(type_modifier_not_allowed(&lookup.display_name)),
+    }
+}
+
+pub(crate) fn parse_regtype_lookup(raw: &str) -> Result<Option<ParsedRegtypeLookup>> {
+    let trimmed = raw.trim();
+    let (without_array, is_array) = strip_regtype_array_dims(trimmed);
+    let parts = split_regtype_input_parts(&without_array)?;
+
+    match parts.as_slice() {
+        [] => Ok(None),
+        [single] => {
+            if single.trim().is_empty() {
+                return Ok(None);
+            }
+
+            if !single.trim_start().starts_with('"') {
+                if let Some(special) = parse_special_builtin_lookup(single, is_array)? {
+                    return Ok(Some(special));
+                }
+            }
+
+            let (base, typmod) = split_regtype_typmod_parts(single)?;
+            if typmod.as_deref().is_some_and(str::is_empty) {
+                return Err(invalid_type_name(trimmed));
+            }
+            if contains_unquoted_paren(&base) {
+                return Err(invalid_type_name(trimmed));
+            }
+
+            let ident = parse_regtype_ident(&base, trimmed)?;
+            if ident.value.is_empty() {
+                return Ok(None);
+            }
+            if !ident.quoted && base.contains(char::is_whitespace) {
+                return Err(invalid_type_name(trimmed));
+            }
+
+            Ok(Some(ParsedRegtypeLookup {
+                schema: None,
+                name: ident.value.clone(),
+                is_array,
+                quoted: ident.quoted,
+                typmod,
+                display_name: regtype_display_name(None, &ident.value),
+                kind: ParsedRegtypeLookupKind::SearchPath,
+            }))
+        }
+        [schema_raw, name_raw] => {
+            let schema = parse_regtype_ident(schema_raw, trimmed)?;
+            let (base, typmod) = split_regtype_typmod_parts(name_raw)?;
+            if typmod.as_deref().is_some_and(str::is_empty) {
+                return Err(invalid_type_name(trimmed));
+            }
+            if contains_unquoted_paren(&base) {
+                return Err(invalid_type_name(trimmed));
+            }
+
+            let name = parse_regtype_ident(&base, trimmed)?;
+            if schema.value.is_empty() || name.value.is_empty() {
+                return Ok(None);
+            }
+            if !name.quoted && base.contains(char::is_whitespace) {
+                return Err(invalid_type_name(trimmed));
+            }
+
+            Ok(Some(ParsedRegtypeLookup {
+                schema: Some(schema.value.clone()),
+                name: name.value.clone(),
+                is_array,
+                quoted: name.quoted,
+                typmod,
+                display_name: regtype_display_name(Some(&schema.value), &name.value),
+                kind: ParsedRegtypeLookupKind::SearchPath,
+            }))
+        }
+        _ => Err(cross_database_reference(trimmed)),
+    }
+}
+
+pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
+    let mut iter = args.into_iter();
+    let raw = match iter.next() {
+        Some(Value::Text(s)) => s,
+        Some(Value::Null) | None => return Ok(Value::Null),
+        _ => return Err(anyhow::anyhow!("function to_regtype(text) does not exist")),
+    };
+
+    let Some(lookup) = parse_regtype_lookup(&raw)? else {
+        return Ok(Value::Null);
+    };
+
+    let oid = match lookup.kind {
+        ParsedRegtypeLookupKind::SpecialBuiltin => resolve_builtin_regtype_lookup(&lookup),
+        ParsedRegtypeLookupKind::SearchPath => match lookup.schema.as_deref() {
+            Some("pg_catalog") => resolve_builtin_regtype_lookup(&lookup),
+            Some(_) => None,
+            None => resolve_builtin_regtype_lookup(&lookup),
+        },
+    };
+
+    validate_resolved_regtype_typmod(&lookup, oid, false)?;
+    Ok(oid.map(Value::Int64).unwrap_or(Value::Null))
+}
 pub(crate) fn strip_regtype_array_dims(raw: &str) -> (String, bool) {
     let mut name = raw.trim().to_string();
     let mut is_array = false;
@@ -233,72 +822,22 @@ pub(crate) fn strip_regtype_array_dims(raw: &str) -> (String, bool) {
     (name, is_array)
 }
 
-pub(crate) fn strip_regtype_typmod(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if !trimmed.ends_with(')') {
-        return trimmed.to_string();
-    }
-
-    let mut depth = 0_i32;
-    for (idx, ch) in trimmed.char_indices().rev() {
-        match ch {
-            ')' => depth += 1,
-            '(' => {
-                depth -= 1;
-                if depth == 0 {
-                    return trimmed[..idx].trim_end().to_string();
-                }
-            }
-            _ => {}
-        }
-    }
-    trimmed.to_string()
-}
-
-fn split_regtype_typmod_parts(raw: &str) -> (String, Option<String>) {
-    let trimmed = raw.trim();
-    if !trimmed.ends_with(')') {
-        return (trimmed.to_string(), None);
-    }
-
-    let mut depth = 0_i32;
-    for (idx, ch) in trimmed.char_indices().rev() {
-        match ch {
-            ')' => depth += 1,
-            '(' => {
-                depth -= 1;
-                if depth == 0 {
-                    let base = trimmed[..idx].trim_end().to_string();
-                    let inner = trimmed[idx + 1..trimmed.len() - 1].trim().to_string();
-                    return (base, Some(inner));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    (trimmed.to_string(), None)
-}
-
-fn parse_typmod_int_list(typmod: &str, original_name: &str) -> Result<Vec<i32>> {
+fn parse_resolved_typmod_int_list(typmod: &str, original_name: &str) -> Result<Vec<i32>> {
     let mut out = Vec::new();
     for part in typmod.split(',') {
-        let p = part.trim();
-        if p.is_empty() {
-            return Err(invalid_interval_type_name(original_name));
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            return Err(invalid_type_name(original_name));
         }
-        // Allow optional leading '-' followed by digits (PG supports negative scale).
-        let digits = p.strip_prefix('-').unwrap_or(p);
-        if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
-            return Err(invalid_interval_type_name(original_name));
-        }
-        out.push(
-            p.parse::<i32>()
-                .map_err(|_| invalid_interval_type_name(original_name))?,
-        );
+        out.push(trimmed.parse::<i32>().map_err(|_| {
+            crate::sql::error::SqlError::InvalidInputSyntax {
+                type_name: "integer".to_string(),
+                value: trimmed.to_string(),
+            }
+        })?);
     }
     if out.is_empty() {
-        return Err(invalid_interval_type_name(original_name));
+        return Err(invalid_type_name(original_name));
     }
     Ok(out)
 }
@@ -346,87 +885,9 @@ fn validate_typmod_bounds(base: &str, args: &[i32]) -> Result<()> {
     Ok(())
 }
 
-/// Returns `Ok(true)` when the typmod is valid, `Ok(false)` when the caller
-/// should return NULL (PG parity: invalid-but-not-erroneous modifier).
-fn validate_schema_qualified_typmod(base: &str, typmod: &str, original_name: &str) -> Result<bool> {
-    // Empty typmod (parens present but no arguments) is always invalid in PG.
-    if typmod.trim().is_empty() {
-        return Err(invalid_interval_type_name(original_name));
-    }
-    match base {
-        // Typmod arity: 1, with length bounds
-        "varchar" | "bpchar" => {
-            let args = parse_typmod_int_list(typmod, original_name)?;
-            if args.len() != 1 {
-                return Err(invalid_interval_type_name(original_name));
-            }
-            validate_typmod_bounds(base, &args)?;
-            Ok(true)
-        }
-        // Typmod arity: 1, precision must be non-negative (PG clamps >6 with WARNING)
-        "time" | "timetz" | "timestamp" | "timestamptz" => {
-            let args = parse_typmod_int_list(typmod, original_name)?;
-            if args.len() == 1 {
-                if args[0] < 0 {
-                    let type_display = match base {
-                        "timestamptz" => format!("TIMESTAMP({}) WITH TIME ZONE", args[0]),
-                        "timetz" => format!("TIME({}) WITH TIME ZONE", args[0]),
-                        _ => format!("{}({})", base.to_uppercase(), args[0]),
-                    };
-                    return Err(crate::sql::error::SqlError::SqlStructure(format!(
-                        "{} precision must not be negative",
-                        type_display
-                    ))
-                    .into());
-                }
-                Ok(true)
-            } else {
-                Err(invalid_interval_type_name(original_name))
-            }
-        }
-        // Typmod arity: 1 or 2, with precision/scale bounds
-        "numeric" => {
-            let args = parse_typmod_int_list(typmod, original_name)?;
-            if !(1..=2).contains(&args.len()) {
-                return Err(invalid_interval_type_name(original_name));
-            }
-            validate_typmod_bounds(base, &args)?;
-            Ok(true)
-        }
-        // Parser aliases — not real pg_catalog types.  PG returns NULL for
-        // schema-qualified references; accept any typmod here so we don't
-        // raise an error (the caller returns NULL for these names).
-        "character" | "decimal" => Ok(true),
-        // Builtin type with typmod where typmod is not allowed.
-        _ if pg_catalog_regtype_oid(base).is_some() => {
-            Err(invalid_interval_type_name(original_name))
-        }
-        // Unknown type in known schema: PG resolves to NULL (even with typmod syntax).
-        _ => Ok(true),
-    }
-}
-
 fn invalid_interval_type_name(original_name: &str) -> anyhow::Error {
     crate::sql::error::SqlError::SqlStructure(format!("invalid type name \"{}\"", original_name))
         .into()
-}
-
-/// Check if a name is a known PostgreSQL multi-word type.
-///
-/// PostgreSQL's grammar has special syntax for certain multi-word type names
-/// like `double precision`, `character varying`, `timestamp with time zone`,
-/// etc.  These contain spaces but are valid type names, not trailing junk.
-fn is_multi_word_pg_type(name: &str) -> bool {
-    matches!(
-        name,
-        "double precision"
-            | "character varying"
-            | "timestamp with time zone"
-            | "timestamp without time zone"
-            | "time with time zone"
-            | "time without time zone"
-            | "bit varying"
-    )
 }
 
 /// Validate interval precision inside `(N)`.
@@ -549,227 +1010,7 @@ pub(crate) fn normalize_interval_type(name: &str) -> Result<String> {
     }
 
     // Unknown qualifier.
-    Err(invalid_interval_type_name(name.trim()))
-}
-
-fn regtype_array_oid(base_oid: i64) -> Option<i64> {
-    match base_oid {
-        pg_types::OID_BOOL => Some(pg_types::OID_BOOL_ARRAY),
-        pg_types::OID_BYTEA => Some(pg_types::OID_BYTEA_ARRAY),
-        pg_types::OID_NAME => Some(pg_types::OID_NAME_ARRAY),
-        pg_types::OID_INT2 => Some(pg_types::OID_INT2_ARRAY),
-        pg_types::OID_INT4 => Some(pg_types::OID_INT4_ARRAY),
-        pg_types::OID_TEXT => Some(pg_types::OID_TEXT_ARRAY),
-        pg_types::OID_BPCHAR => Some(pg_types::OID_BPCHAR_ARRAY),
-        pg_types::OID_VARCHAR => Some(pg_types::OID_VARCHAR_ARRAY),
-        pg_types::OID_INT8 => Some(pg_types::OID_INT8_ARRAY),
-        pg_types::OID_FLOAT4 => Some(pg_types::OID_FLOAT4_ARRAY),
-        pg_types::OID_FLOAT8 => Some(pg_types::OID_FLOAT8_ARRAY),
-        pg_types::OID_OID => Some(pg_types::OID_OID_ARRAY),
-        pg_types::OID_TIMESTAMP => Some(pg_types::OID_TIMESTAMP_ARRAY),
-        pg_types::OID_DATE => Some(pg_types::OID_DATE_ARRAY),
-        pg_types::OID_TIME => Some(pg_types::OID_TIME_ARRAY),
-        pg_types::OID_TIMETZ => Some(pg_types::OID_TIMETZ_ARRAY),
-        pg_types::OID_TIMESTAMPTZ => Some(pg_types::OID_TIMESTAMPTZ_ARRAY),
-        pg_types::OID_INTERVAL => Some(pg_types::OID_INTERVAL_ARRAY),
-        pg_types::OID_NUMERIC => Some(pg_types::OID_NUMERIC_ARRAY),
-        pg_types::OID_JSON => Some(pg_types::OID_JSON_ARRAY),
-        pg_types::OID_UUID => Some(pg_types::OID_UUID_ARRAY),
-        pg_types::OID_JSONB => Some(pg_types::OID_JSONB_ARRAY),
-        pg_types::OID_HSTORE => Some(pg_types::OID_HSTORE_ARRAY),
-        _ => None,
-    }
-}
-
-fn pg_catalog_regtype_oid(name: &str) -> Option<i64> {
-    match name {
-        "bool" | "boolean" => Some(pg_types::OID_BOOL),
-        "bytea" => Some(pg_types::OID_BYTEA),
-        "name" => Some(pg_types::OID_NAME),
-        "int2" | "smallint" => Some(pg_types::OID_INT2),
-        "int4" | "integer" | "int" => Some(pg_types::OID_INT4),
-        "int8" | "bigint" => Some(pg_types::OID_INT8),
-        "text" => Some(pg_types::OID_TEXT),
-        "oid" => Some(pg_types::OID_OID),
-        "json" => Some(pg_types::OID_JSON),
-        "float4" | "real" => Some(pg_types::OID_FLOAT4),
-        "float8" | "double precision" => Some(pg_types::OID_FLOAT8),
-        "bpchar" | "character" => Some(pg_types::OID_BPCHAR),
-        "varchar" | "character varying" => Some(pg_types::OID_VARCHAR),
-        "date" => Some(pg_types::OID_DATE),
-        "time" | "time without time zone" => Some(pg_types::OID_TIME),
-        "timetz" | "time with time zone" => Some(pg_types::OID_TIMETZ),
-        "timestamp" | "timestamp without time zone" => Some(pg_types::OID_TIMESTAMP),
-        "timestamptz" | "timestamp with time zone" => Some(pg_types::OID_TIMESTAMPTZ),
-        "interval" => Some(pg_types::OID_INTERVAL),
-        "numeric" | "decimal" => Some(pg_types::OID_NUMERIC),
-        "uuid" => Some(pg_types::OID_UUID),
-        "tsvector" => Some(pg_types::OID_TSVECTOR),
-        "tsquery" => Some(pg_types::OID_TSQUERY),
-        "jsonb" => Some(pg_types::OID_JSONB),
-        "vector" => Some(pg_types::OID_VECTOR),
-        _ => None,
-    }
-}
-
-pub fn to_regtype(args: Vec<Value>) -> Result<Value> {
-    let mut iter = args.into_iter();
-    let raw = match iter.next() {
-        Some(Value::Text(s)) => s,
-        Some(Value::Null) | None => return Ok(Value::Null),
-        _ => return Err(anyhow::anyhow!("function to_regtype(text) does not exist")),
-    };
-
-    // Step 1: Strip array suffix `[]`.
-    let (without_array, is_array) = strip_regtype_array_dims(&raw);
-
-    // Step 2: Parse into structured schema.name with quoting semantics.
-    // Split BEFORE interval processing so that schema-qualified interval
-    // types like `pg_catalog.interval day to second` are handled correctly.
-    let (schema, name) = parse_regtype_input(&without_array);
-    if name.value.is_empty() {
-        return Ok(Value::Null);
-    }
-
-    // Step 3: Early-exit for unknown schemas.
-    // If schema is present and doesn't match `pg_catalog`, the type cannot
-    // resolve — return NULL.  However, PG's raw parser still catches syntax
-    // errors regardless of schema: `noschema.interval(abc)` → NULL (valid
-    // parse, schema not found), but `noschema.interval garbage` → ERROR
-    // (bare word after type name is a parse error).
-    //
-    // For schema-qualified types PG uses the general `typename(typmod)`
-    // grammar, so a trailing `(...)` is a valid typmod expression.  A bare
-    // word after the identifier (without parens) is a syntax error.
-    if let Some(ref s) = schema {
-        if s.value != "pg_catalog" {
-            if !name.quoted {
-                let trimmed = name.value.trim();
-                // Check for a bare-word suffix after the type identifier.
-                // Unknown schema + any trailing bare word → syntax error.
-                // PG only allows parenthesized typmods after schema-qualified
-                // type names; interval qualifiers are NOT valid here.
-                if let Some(ws_pos) = trimmed.find(char::is_whitespace) {
-                    let after = trimmed[ws_pos..].trim_start();
-                    if !after.is_empty() && !after.starts_with('(') {
-                        return Err(invalid_interval_type_name(&raw));
-                    }
-                }
-            }
-            return Ok(Value::Null);
-        }
-    }
-
-    // Step 4: Resolve the type name.
-    // Quoted names: literal value (no interval processing, no typmod stripping).
-    // Unquoted names: normalize whitespace, validate interval forms, strip typmod.
-    let resolved_name = if name.quoted {
-        name.value.clone()
-    } else if schema.is_some() {
-        // Schema-qualified: no interval normalization.
-        // Bare-word suffix and malformed typmod suffix are syntax errors.
-        let ws_normalized = normalize_whitespace(&name.value);
-        let (base_name, typmod) = split_regtype_typmod_parts(&ws_normalized);
-
-        // PG rejects schema-qualified multi-word forms like
-        // `pg_catalog.double precision` and interval qualifiers.
-        if base_name.contains(char::is_whitespace) {
-            return Err(invalid_interval_type_name(&raw));
-        }
-        // Parens must form a trailing typmod suffix; otherwise it's junk.
-        if typmod.is_none() && (base_name.contains('(') || base_name.contains(')')) {
-            return Err(invalid_interval_type_name(&raw));
-        }
-        if let Some(tm) = typmod.as_deref() {
-            if !validate_schema_qualified_typmod(&base_name, tm, &raw)? {
-                return Ok(Value::Null);
-            }
-        }
-        // "character" and "decimal" are SQL-standard parser aliases, not
-        // real pg_catalog type names.  PG returns NULL for schema-qualified
-        // references like pg_catalog.character(N) or pg_catalog.decimal(P,S).
-        if matches!(base_name.as_str(), "character" | "decimal") {
-            return Ok(Value::Null);
-        }
-        base_name
-    } else {
-        let ws_normalized = normalize_whitespace(&name.value);
-        let after_interval = normalize_interval_type(&ws_normalized)?;
-        if after_interval == "interval" {
-            after_interval
-        } else {
-            // Bare-word trailing junk check for non-interval unqualified types.
-            // e.g. `to_regtype('int4 garbage')` → ERROR, matching PG behavior.
-            // But PG has valid multi-word type names (double precision,
-            // character varying, timestamp with time zone, etc.) that must
-            // pass through.
-            let (base_part, typmod_part) = split_regtype_typmod_parts(&after_interval);
-            if base_part.contains(char::is_whitespace) && !is_multi_word_pg_type(&base_part) {
-                return Err(invalid_interval_type_name(&raw));
-            }
-            // Validate typmod bounds for unqualified types (PG parity).
-            if let Some(ref tm) = typmod_part {
-                if matches!(
-                    base_part.as_str(),
-                    "varchar"
-                        | "character varying"
-                        | "bpchar"
-                        | "character"
-                        | "numeric"
-                        | "decimal"
-                ) {
-                    let args = parse_typmod_int_list(tm, &raw)?;
-                    validate_typmod_bounds(&base_part, &args)?;
-                }
-                // Negative precision for temporal types → ERROR (PG parity).
-                // PG bare path: time(-1) and timestamp(-1) → "invalid type name",
-                // but timestamptz(-1)/timetz(-1) → precision error (same as schema-qualified).
-                if matches!(
-                    base_part.as_str(),
-                    "time" | "timetz" | "timestamp" | "timestamptz"
-                ) {
-                    let args = parse_typmod_int_list(tm, &raw)?;
-                    if args.len() == 1 && args[0] < 0 {
-                        if base_part == "timestamptz" {
-                            return Err(crate::sql::error::SqlError::SqlStructure(format!(
-                                "TIMESTAMP({}) WITH TIME ZONE precision must not be negative",
-                                args[0]
-                            ))
-                            .into());
-                        }
-                        if base_part == "timetz" {
-                            return Err(crate::sql::error::SqlError::SqlStructure(format!(
-                                "TIME({}) WITH TIME ZONE precision must not be negative",
-                                args[0]
-                            ))
-                            .into());
-                        }
-                        return Err(invalid_interval_type_name(&raw));
-                    }
-                }
-            }
-            base_part
-        }
-    };
-
-    // Step 5: Look up OID with `_typename` alias folding.
-    let base_oid = pg_catalog_regtype_oid(&resolved_name).or_else(|| {
-        if name.quoted {
-            return None;
-        }
-        resolved_name
-            .strip_prefix('_')
-            .and_then(pg_catalog_regtype_oid)
-            .and_then(regtype_array_oid)
-    });
-
-    let oid = if is_array {
-        base_oid.and_then(regtype_array_oid)
-    } else {
-        base_oid
-    };
-
-    Ok(oid.map(Value::Int64).unwrap_or(Value::Null))
+    Err(invalid_type_name(name.trim()))
 }
 
 pub fn pg_is_in_recovery(_args: Vec<Value>) -> Result<Value> {
@@ -1628,6 +1869,50 @@ mod tests {
             to_regtype(vec![Value::Text("\"PG_CATALOG\".interval(abc)".into())]).unwrap(),
             Value::Null
         );
+    }
+
+    #[test]
+    fn test_to_regtype_quoted_identifier_errors() {
+        let err = to_regtype(vec![Value::Text("\"text".into())]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unterminated quoted identifier at or near \"\"text\""),
+            "{err}"
+        );
+
+        let err = to_regtype(vec![Value::Text("\"\"".into())]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("zero-length delimited identifier at or near \"\"\"\""),
+            "{err}"
+        );
+
+        let err = to_regtype(vec![Value::Text("\"text\"(3)".into())]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("type modifier is not allowed for type \"text\""),
+            "{err}"
+        );
+
+        assert_eq!(
+            to_regtype(vec![Value::Text("\"TEXT\"(3)".into())]).unwrap(),
+            Value::Null
+        );
+
+        let err = to_regtype(vec![Value::Text("a.b.c".into())]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cross-database references are not implemented: a.b.c"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_regtype_lookup_unescapes_quoted_identifiers() {
+        let lookup = parse_regtype_lookup("\"a\"\"b\"").unwrap().unwrap();
+        assert_eq!(lookup.name, "a\"b");
+        assert!(lookup.quoted);
+        assert_eq!(lookup.kind, ParsedRegtypeLookupKind::SearchPath);
     }
 
     #[test]

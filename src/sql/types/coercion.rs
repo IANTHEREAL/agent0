@@ -17,6 +17,17 @@
 
 use crate::model::DataType;
 
+fn is_oid_alias_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::UserDefined(name)
+            if name.eq_ignore_ascii_case("regclass")
+                || name.eq_ignore_ascii_case("pg_catalog.regclass")
+                || name.eq_ignore_ascii_case("regtype")
+                || name.eq_ignore_ascii_case("pg_catalog.regtype")
+    )
+}
+
 pub fn type_precedence(dt: &DataType) -> i32 {
     match dt {
         DataType::Boolean => 10,
@@ -109,6 +120,12 @@ pub fn comparison_target_type(a: &DataType, b: &DataType) -> Option<DataType> {
     }
 
     match (a, b) {
+        (alias, DataType::Int32 | DataType::Int64) if is_oid_alias_type(alias) => {
+            Some(alias.clone())
+        }
+        (DataType::Int32 | DataType::Int64, alias) if is_oid_alias_type(alias) => {
+            Some(alias.clone())
+        }
         // Text-like vs typed side -> typed side wins.
         (DataType::Text, other) | (DataType::Name, other)
             if *other != DataType::Text && *other != DataType::Name =>
@@ -448,6 +465,19 @@ mod tests {
         assert_eq!(
             comparison_target_type(&DataType::Name, &DataType::Int64),
             Some(DataType::Int64)
+        );
+    }
+
+    #[test]
+    fn comparison_regclass_vs_int64_yields_regclass() {
+        let regclass = DataType::UserDefined("pg_catalog.regclass".to_string());
+        assert_eq!(
+            comparison_target_type(&regclass, &DataType::Int64),
+            Some(regclass.clone())
+        );
+        assert_eq!(
+            comparison_target_type(&DataType::Int64, &regclass),
+            Some(regclass)
         );
     }
 

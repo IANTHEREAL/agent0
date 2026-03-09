@@ -47,6 +47,13 @@ NULL
 to_regtype
 23
 (1 row)
+ERROR:  unterminated quoted identifier at or near ""text"
+ERROR:  zero-length delimited identifier at or near """"
+ERROR:  type modifier is not allowed for type "text"
+to_regtype
+NULL
+(1 row)
+ERROR:  cross-database references are not implemented: a.b.c
 to_regtype
 1186
 (1 row)
@@ -155,3 +162,14 @@ to_regtype
 to_regtype
 1700
 (1 row)
+DROP SCHEMA
+CREATE SCHEMA
+CREATE TYPE
+SET
+?column?
+t
+(1 row)
+ERROR:  type modifier is not allowed for type "a"b"
+RESET
+DROP TYPE
+DROP SCHEMA

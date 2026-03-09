@@ -334,6 +334,7 @@ fn is_catalog_dependent_function_check(
     if name.eq_ignore_ascii_case("PG_GET_INDEXDEF")
         || name.eq_ignore_ascii_case("PG_GET_CONSTRAINTDEF")
         || name.eq_ignore_ascii_case("FORMAT_TYPE")
+        || name.eq_ignore_ascii_case("TO_REGCLASS")
     {
         return true;
     }

@@ -146,7 +146,10 @@ pub(super) async fn resolve_column_data_type(
                     let Some(resolved_type) = resolved_type else {
                         return Ok((sql_datatype_to_internal_strict(sql_type)?, false));
                     };
-                    let full_name = resolved_type.full;
+                    if resolved_type.is_builtin() {
+                        return Ok((sql_datatype_to_internal_strict(sql_type)?, false));
+                    }
+                    let full_name = resolved_type.resolved_name().full.clone();
                     match store.get_type(txn, db_id, &full_name).await? {
                         Some(def) => match def.kind {
                             crate::model::UserTypeKind::Enum { .. } => {

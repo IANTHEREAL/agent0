@@ -372,7 +372,13 @@ impl Executor {
             )
             .await?
             .ok_or_else(|| anyhow!("type \"{}\" does not exist", cmd.type_name()))?;
-            let full_name = resolved.full;
+            if resolved.is_builtin() {
+                return Err(anyhow!(
+                    "must be owner of type {}",
+                    resolved.resolved_name().name
+                ));
+            }
+            let full_name = resolved.resolved_name().full.clone();
 
             let result = match cmd {
                 AlterTypeCommand::RenameType { new_name, .. } => {
@@ -487,7 +493,13 @@ impl Executor {
                     }
                     continue;
                 };
-                full_names.push(resolved.full);
+                if resolved.is_builtin() {
+                    return Err(anyhow!(
+                        "must be owner of type {}",
+                        resolved.resolved_name().name
+                    ));
+                }
+                full_names.push(resolved.resolved_name().full.clone());
             }
             udt::drop_types(&store, txn, db_id, &full_names, if_exists).await
         }

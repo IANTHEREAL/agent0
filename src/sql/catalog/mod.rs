@@ -73,6 +73,9 @@ pub trait VirtualTable: Send + Sync {
     fn name(&self) -> &str;
     #[allow(dead_code)] // framework: virtual table trait API
     fn schema_name(&self) -> &str;
+    fn relkind(&self) -> &str {
+        self::helpers::RELKIND_TABLE
+    }
     fn schema(&self) -> TableSchema;
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>>;
 }
@@ -143,6 +146,10 @@ impl CatalogRegistry {
     pub fn get(&self, name: &str) -> Option<&dyn VirtualTable> {
         self.tables.get(name).map(|t| t.as_ref())
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = &dyn VirtualTable> {
+        self.tables.values().map(|t| t.as_ref())
+    }
 }
 
 static CATALOG: std::sync::LazyLock<CatalogRegistry> =
@@ -150,6 +157,48 @@ static CATALOG: std::sync::LazyLock<CatalogRegistry> =
 
 pub fn global_catalog() -> &'static CatalogRegistry {
     &CATALOG
+}
+
+const VIRTUAL_RELATION_OID_BASE: i64 = 90_000_000_000;
+
+static VIRTUAL_RELATIONS: std::sync::LazyLock<Vec<(String, String)>> =
+    std::sync::LazyLock::new(|| {
+        let mut relations: Vec<(String, String)> = global_catalog()
+            .iter()
+            .map(|table| (table.schema_name().to_string(), table.name().to_string()))
+            .collect();
+        relations.sort();
+        relations
+    });
+
+pub(crate) fn virtual_relation_oid(schema: &str, name: &str) -> Option<i64> {
+    VIRTUAL_RELATIONS
+        .iter()
+        .position(|(rel_schema, rel_name)| rel_schema == schema && rel_name == name)
+        .map(|idx| VIRTUAL_RELATION_OID_BASE + idx as i64)
+}
+
+pub(crate) fn virtual_relation_name(oid: i64) -> Option<(String, String)> {
+    let idx = usize::try_from(oid.checked_sub(VIRTUAL_RELATION_OID_BASE)?).ok()?;
+    VIRTUAL_RELATIONS.get(idx).cloned()
+}
+
+pub(crate) fn catalog_relation_oid(schema: &str, name: &str) -> Option<i64> {
+    if schema == "pg_catalog" {
+        if let Some(oid) = crate::sql::catalog_oids::pg_catalog_relation_oid(name) {
+            return Some(oid);
+        }
+    }
+
+    virtual_relation_oid(schema, name)
+}
+
+pub(crate) fn catalog_relation_name(oid: i64) -> Option<(String, String)> {
+    if let Some(name) = crate::sql::catalog_oids::pg_catalog_relation_name(oid) {
+        return Some(("pg_catalog".to_string(), name.to_string()));
+    }
+
+    virtual_relation_name(oid)
 }
 
 #[cfg(test)]
@@ -497,5 +546,70 @@ mod tests {
     fn registry_returns_none_for_unknown() {
         let catalog = global_catalog();
         assert!(catalog.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn virtual_relation_oid_round_trips_pg_catalog_and_information_schema_views() {
+        let pg_tables_oid = virtual_relation_oid("pg_catalog", "pg_tables").expect("pg_tables oid");
+        assert_eq!(
+            virtual_relation_name(pg_tables_oid),
+            Some(("pg_catalog".to_string(), "pg_tables".to_string()))
+        );
+
+        let info_tables_oid =
+            virtual_relation_oid("information_schema", "tables").expect("tables oid");
+        assert_eq!(
+            virtual_relation_name(info_tables_oid),
+            Some(("information_schema".to_string(), "tables".to_string()))
+        );
+    }
+
+    #[test]
+    fn catalog_relation_oid_prefers_bootstrap_pg_catalog_oid() {
+        assert_eq!(catalog_relation_oid("pg_catalog", "pg_class"), Some(1259));
+        assert_eq!(
+            catalog_relation_oid("pg_catalog", "pg_tables"),
+            virtual_relation_oid("pg_catalog", "pg_tables")
+        );
+        assert_eq!(
+            catalog_relation_oid("information_schema", "tables"),
+            virtual_relation_oid("information_schema", "tables")
+        );
+    }
+
+    #[test]
+    fn catalog_relation_name_resolves_bootstrap_and_virtual_relations() {
+        assert_eq!(
+            catalog_relation_name(1259),
+            Some(("pg_catalog".to_string(), "pg_class".to_string()))
+        );
+
+        let oid = virtual_relation_oid("information_schema", "tables").expect("tables oid");
+        assert_eq!(
+            catalog_relation_name(oid),
+            Some(("information_schema".to_string(), "tables".to_string()))
+        );
+    }
+
+    #[test]
+    fn registry_exposes_view_relkind_for_virtual_views() {
+        assert_eq!(
+            global_catalog()
+                .get("pg_tables")
+                .expect("pg_tables")
+                .relkind(),
+            helpers::RELKIND_VIEW
+        );
+        assert_eq!(
+            global_catalog().get("tables").expect("tables").relkind(),
+            helpers::RELKIND_VIEW
+        );
+        assert_eq!(
+            global_catalog()
+                .get("pg_class")
+                .expect("pg_class")
+                .relkind(),
+            helpers::RELKIND_TABLE
+        );
     }
 }

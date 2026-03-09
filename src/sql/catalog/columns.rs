@@ -20,6 +20,10 @@ impl VirtualTable for Columns {
         "information_schema"
     }
 
+    fn relkind(&self) -> &str {
+        super::helpers::RELKIND_VIEW
+    }
+
     fn schema(&self) -> TableSchema {
         TableSchema {
             table_id: 0,

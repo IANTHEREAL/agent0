@@ -98,6 +98,12 @@ impl FunctionRegistry {
         self.functions.get(&name.to_uppercase())
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &FunctionSignature)> {
+        self.functions
+            .iter()
+            .map(|(name, sig)| (name.as_str(), sig))
+    }
+
     pub fn resolve_return_type(&self, name: &str, arg_types: &[DataType]) -> Option<DataType> {
         let sig = self.functions.get(&name.to_uppercase())?;
         Some(match &sig.return_type {

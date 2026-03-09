@@ -19,6 +19,10 @@ impl VirtualTable for PgStatUserTables {
         "pg_catalog"
     }
 
+    fn relkind(&self) -> &str {
+        super::helpers::RELKIND_VIEW
+    }
+
     fn schema(&self) -> TableSchema {
         TableSchema {
             table_id: 0,

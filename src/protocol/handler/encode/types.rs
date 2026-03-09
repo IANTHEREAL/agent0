@@ -25,6 +25,8 @@ pub(in crate::protocol::handler) fn pgtype_to_datatype(pg: &Type) -> Option<Data
             precision: None,
             scale: None,
         }),
+        Type::REGCLASS => Some(DataType::UserDefined("pg_catalog.regclass".to_string())),
+        Type::REGTYPE => Some(DataType::UserDefined("pg_catalog.regtype".to_string())),
         Type::NAME => Some(DataType::Name),
         Type::INT2_VECTOR => Some(DataType::UserDefined("int2vector".to_string())),
         Type::OID_VECTOR => Some(DataType::UserDefined("oidvector".to_string())),
@@ -78,6 +80,18 @@ pub(in crate::protocol::handler) fn datatype_to_pgtype(dt: Option<&DataType>) ->
         Some(DataType::Tsquery) => Type::TSQUERY,
         Some(DataType::UserDefined(s)) if s.eq_ignore_ascii_case("int2vector") => Type::INT2_VECTOR,
         Some(DataType::UserDefined(s)) if s.eq_ignore_ascii_case("oidvector") => Type::OID_VECTOR,
+        Some(DataType::UserDefined(s))
+            if s.eq_ignore_ascii_case("regclass")
+                || s.eq_ignore_ascii_case("pg_catalog.regclass") =>
+        {
+            Type::REGCLASS
+        }
+        Some(DataType::UserDefined(s))
+            if s.eq_ignore_ascii_case("regtype")
+                || s.eq_ignore_ascii_case("pg_catalog.regtype") =>
+        {
+            Type::REGTYPE
+        }
         Some(DataType::UserDefined(s)) if s == "char" => Type::CHAR,
         Some(DataType::Varchar(_)) => Type::VARCHAR,
         Some(DataType::Vector(_))
@@ -103,5 +117,33 @@ mod tests {
     fn pgtype_to_datatype_maps_oidvector() {
         let dt = pgtype_to_datatype(&Type::OID_VECTOR);
         assert_eq!(dt, Some(DataType::UserDefined("oidvector".to_string())));
+    }
+
+    #[test]
+    fn datatype_to_pgtype_maps_regclass_and_regtype() {
+        assert_eq!(
+            datatype_to_pgtype(Some(&DataType::UserDefined(
+                "pg_catalog.regclass".to_string()
+            ))),
+            Type::REGCLASS
+        );
+        assert_eq!(
+            datatype_to_pgtype(Some(&DataType::UserDefined(
+                "pg_catalog.regtype".to_string()
+            ))),
+            Type::REGTYPE
+        );
+    }
+
+    #[test]
+    fn pgtype_to_datatype_maps_regclass_and_regtype() {
+        assert_eq!(
+            pgtype_to_datatype(&Type::REGCLASS),
+            Some(DataType::UserDefined("pg_catalog.regclass".to_string()))
+        );
+        assert_eq!(
+            pgtype_to_datatype(&Type::REGTYPE),
+            Some(DataType::UserDefined("pg_catalog.regtype".to_string()))
+        );
     }
 }

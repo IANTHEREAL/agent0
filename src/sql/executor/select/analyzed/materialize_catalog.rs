@@ -265,6 +265,16 @@ impl Executor {
                         ));
                     }
 
+                    if func.name.eq_ignore_ascii_case("TO_REGCLASS") {
+                        let val = self
+                            .eval_to_regclass(&new_args, row, txn, db_id, search_path, qctx)
+                            .await?;
+                        return Ok(TypedExpr::new(
+                            TypedExprKind::Constant(val),
+                            expr.data_type.clone(),
+                        ));
+                    }
+
                     if let Some(signature) =
                         non_pg_catalog_qualified_pg_get_serial_sequence_signature(
                             &func.name, &new_args,
@@ -468,26 +478,84 @@ impl Executor {
                     expr: inner,
                     target_type,
                     cast_context,
-                } => Ok(TypedExpr {
-                    kind: TypedExprKind::Cast {
-                        expr: Box::new(
-                            self.materialize_catalog_functions(
-                                inner,
-                                row,
-                                schema,
+                } => {
+                    let materialized_inner = self
+                        .materialize_catalog_functions(
+                            inner,
+                            row,
+                            schema,
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            qctx,
+                        )
+                        .await?;
+
+                    if *target_type == DataType::Text
+                        && matches!(
+                            &materialized_inner.data_type,
+                            DataType::UserDefined(name)
+                                if name.eq_ignore_ascii_case("regclass")
+                                    || name.eq_ignore_ascii_case("pg_catalog.regclass")
+                        )
+                    {
+                        if let TypedExprKind::Constant(Value::Int64(oid)) = &materialized_inner.kind
+                        {
+                            if let Some(relname) = lookup_relname_by_regclass_oid(
+                                self.store().as_ref(),
                                 txn,
                                 db_id,
-                                sequence_values,
+                                *oid,
                                 search_path,
-                                qctx,
                             )
-                            .await?,
-                        ),
-                        target_type: target_type.clone(),
-                        cast_context: *cast_context,
-                    },
-                    data_type: expr.data_type.clone(),
-                }),
+                            .await?
+                            {
+                                return Ok(TypedExpr::new(
+                                    TypedExprKind::Constant(Value::Text(relname)),
+                                    DataType::Text,
+                                ));
+                            }
+                        }
+                    }
+
+                    if *target_type == DataType::Text
+                        && matches!(
+                            &materialized_inner.data_type,
+                            DataType::UserDefined(name)
+                                if name.eq_ignore_ascii_case("regtype")
+                                    || name.eq_ignore_ascii_case("pg_catalog.regtype")
+                        )
+                    {
+                        if let TypedExprKind::Constant(value) = &materialized_inner.kind {
+                            if let Some(oid) = value_to_i64(value) {
+                                if let Some(typname) = lookup_regtype_text_by_oid(
+                                    self.store().as_ref(),
+                                    txn,
+                                    db_id,
+                                    oid,
+                                    search_path,
+                                )
+                                .await?
+                                {
+                                    return Ok(TypedExpr::new(
+                                        TypedExprKind::Constant(Value::Text(typname)),
+                                        DataType::Text,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::Cast {
+                            expr: Box::new(materialized_inner),
+                            target_type: target_type.clone(),
+                            cast_context: *cast_context,
+                        },
+                        data_type: expr.data_type.clone(),
+                    })
+                }
                 TypedExprKind::IsTest {
                     expr: inner,
                     test,
@@ -1171,27 +1239,61 @@ impl Executor {
             _ => return Err(anyhow!("function to_regtype(text) does not exist")),
         };
 
-        // Fast path for pg_catalog builtins handled by the scalar function
-        // implementation.
-        let resolved_builtin =
-            crate::sql::expr::functions::pg_compat::to_regtype(vec![Value::Text(raw.clone())])?;
-        if !matches!(resolved_builtin, Value::Null) {
-            return Ok(resolved_builtin);
-        }
+        let Some(lookup) = crate::sql::expr::functions::pg_compat::parse_regtype_lookup(&raw)?
+        else {
+            return Ok(Value::Null);
+        };
 
-        let (without_array, is_array) = strip_regtype_array_dims(&raw);
-        let normalized = strip_regtype_typmod(&without_array);
-        if normalized.trim().is_empty() {
+        let store = self.store();
+        let resolved =
+            lookup_regtype_oid_with_hstore_extension(&store, txn, db_id, &lookup, search_path)
+                .await?;
+        crate::sql::expr::functions::pg_compat::validate_resolved_regtype_typmod(
+            &lookup,
+            resolved.map(|resolved| resolved.oid),
+            resolved.is_some_and(|resolved| resolved.is_user_defined),
+        )?;
+        Ok(resolved
+            .map(|resolved| Value::Int64(resolved.oid))
+            .unwrap_or(Value::Null))
+    }
+
+    async fn eval_to_regclass(
+        &self,
+        args: &[TypedExpr],
+        row: &Row,
+        txn: &mut Transaction,
+        db_id: u64,
+        search_path: &[String],
+        qctx: &QueryContext,
+    ) -> Result<Value> {
+        let Some(arg0) = args.first() else {
+            return Ok(Value::Null);
+        };
+
+        let raw = match eval_typed_expr(arg0, row, qctx)? {
+            Value::Null => return Ok(Value::Null),
+            Value::Text(s) => s,
+            _ => return Err(anyhow!("function to_regclass(text) does not exist")),
+        };
+
+        let (schema_opt, name) =
+            crate::sql::names::parse_regclass_input(&raw).map_err(|input| {
+                SqlError::Unsupported(format!(
+                    "cross-database references are not implemented: \"{}\"",
+                    input
+                ))
+            })?;
+        if name.is_empty() {
             return Ok(Value::Null);
         }
 
-        let store = self.store();
-        let oid = lookup_regtype_oid_with_hstore_extension(
-            &store,
+        let oid = crate::sql::names::resolve_existing_relation_oid(
+            self.store().as_ref(),
             txn,
             db_id,
-            &normalized,
-            is_array,
+            schema_opt.as_deref(),
+            &name,
             search_path,
         )
         .await?;
@@ -1294,101 +1396,6 @@ fn find_text_column<'a>(
         return Some((schema, idx));
     }
     None
-}
-
-use crate::sql::expr::functions::pg_compat::{strip_regtype_array_dims, strip_regtype_typmod};
-
-fn split_regtype_name_parts(raw: &str) -> Option<Vec<String>> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut chars = raw.chars().peekable();
-    let mut in_quotes = false;
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' => {
-                current.push(ch);
-                if in_quotes {
-                    if chars.peek() == Some(&'"') {
-                        current.push('"');
-                        chars.next();
-                    } else {
-                        in_quotes = false;
-                    }
-                } else {
-                    in_quotes = true;
-                }
-            }
-            '.' if !in_quotes => {
-                parts.push(current);
-                current = String::new();
-            }
-            _ => current.push(ch),
-        }
-    }
-
-    if in_quotes {
-        return None;
-    }
-
-    parts.push(current);
-    Some(parts)
-}
-
-fn parse_regtype_ident(raw: &str) -> Option<sqlparser::ast::Ident> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    if trimmed.starts_with('"') || trimmed.ends_with('"') {
-        if !(trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"')) {
-            return None;
-        }
-        let mut out = String::new();
-        let mut chars = trimmed[1..trimmed.len() - 1].chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '"' {
-                if chars.peek() == Some(&'"') {
-                    out.push('"');
-                    chars.next();
-                } else {
-                    return None;
-                }
-            } else {
-                out.push(ch);
-            }
-        }
-        let mut ident = sqlparser::ast::Ident::new(out);
-        ident.quote_style = Some('"');
-        return Some(ident);
-    }
-
-    if trimmed.contains('"') {
-        return None;
-    }
-
-    Some(sqlparser::ast::Ident::new(trimmed.to_lowercase()))
-}
-
-fn parse_regtype_object_name(raw: &str) -> Option<sqlparser::ast::ObjectName> {
-    let parts = split_regtype_name_parts(raw)?;
-    if parts.is_empty() || parts.len() > 2 {
-        return None;
-    }
-    let mut idents = Vec::with_capacity(parts.len());
-    for p in parts {
-        idents.push(parse_regtype_ident(&p)?);
-    }
-    Some(sqlparser::ast::ObjectName(idents))
-}
-
-fn regtype_ident_matches(ident: &sqlparser::ast::Ident, expected: &str) -> bool {
-    if ident.quote_style.is_some() {
-        ident.value == expected
-    } else {
-        ident.value.eq_ignore_ascii_case(expected)
-    }
 }
 
 fn value_to_i64(v: &Value) -> Option<i64> {
@@ -1579,22 +1586,208 @@ async fn lookup_typname_by_oid(
         .map(|t| t.name))
 }
 
-fn regtype_search_path_schemas(search_path: &[String]) -> Vec<&str> {
-    let mut schemas: Vec<&str> = search_path
-        .iter()
-        .map(|s| s.as_str())
-        .filter(|s| !s.eq_ignore_ascii_case("$user"))
-        .collect();
-    if schemas.is_empty() {
-        schemas.push("public");
+async fn lookup_regtype_text_by_oid(
+    store: &crate::storage::TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    oid: i64,
+    search_path: &[String],
+) -> Result<Option<String>> {
+    if let Some(name) = crate::sql::pg_types::regtype_text_for_oid(oid) {
+        return Ok(Some(name.to_string()));
     }
-    schemas
+
+    let mut types = store.list_types(txn, db_id).await?;
+    types.sort_by_key(|t| t.oid);
+    let Some(udt) = types.into_iter().find(|t| t.oid as i64 == oid) else {
+        return Ok(None);
+    };
+
+    format_visible_regtype_name(store, txn, db_id, &udt.schema, &udt.name, search_path)
+        .await
+        .map(Some)
 }
 
-fn hstore_extension_oid_for_name(name: &sqlparser::ast::Ident, is_array: bool) -> Option<i64> {
-    let base_oid = if regtype_ident_matches(name, "hstore") {
+fn format_visible_name(schema: &str, name: &str, visible_unqualified: bool) -> String {
+    if visible_unqualified {
+        crate::sql::quoting::quote_ident(name)
+    } else {
+        format!(
+            "{}.{}",
+            crate::sql::quoting::quote_ident(schema),
+            crate::sql::quoting::quote_ident(name)
+        )
+    }
+}
+
+async fn format_visible_regclass_relname(
+    store: &crate::storage::TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &str,
+    name: &str,
+    oid: i64,
+    search_path: &[String],
+) -> Result<String> {
+    let visible_unqualified = crate::sql::names::resolve_existing_relation_oid(
+        store,
+        txn,
+        db_id,
+        None,
+        name,
+        search_path,
+    )
+    .await?
+    .is_some_and(|resolved_oid| resolved_oid == oid);
+
+    Ok(format_visible_name(schema, name, visible_unqualified))
+}
+
+async fn format_visible_regtype_name(
+    store: &crate::storage::TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &str,
+    name: &str,
+    search_path: &[String],
+) -> Result<String> {
+    let visible_unqualified = crate::sql::names::resolve_visible_type_full_name(
+        store,
+        txn,
+        db_id,
+        None,
+        name,
+        search_path,
+    )
+    .await?
+    .is_some_and(|resolved| {
+        let resolved = resolved.resolved_name();
+        resolved.schema == schema && resolved.name == name
+    });
+
+    Ok(format_visible_name(schema, name, visible_unqualified))
+}
+
+async fn lookup_relname_by_regclass_oid(
+    store: &crate::storage::TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    oid: i64,
+    search_path: &[String],
+) -> Result<Option<String>> {
+    if let Some((schema, name)) = crate::sql::catalog::catalog_relation_name(oid) {
+        return format_visible_regclass_relname(
+            store,
+            txn,
+            db_id,
+            &schema,
+            &name,
+            oid,
+            search_path,
+        )
+        .await
+        .map(Some);
+    }
+
+    let all_tables = store.list_tables(txn, db_id).await?;
+    for table_full in &all_tables {
+        let Some(table_schema) = store.get_schema(txn, db_id, table_full).await? else {
+            continue;
+        };
+        let (schema, table_name) =
+            crate::sql::names::parse_full_name(table_full).unwrap_or_default();
+        if crate::sql::catalog_oids::pg_class_table_oid(table_schema.table_id)? == oid {
+            return format_visible_regclass_relname(
+                store,
+                txn,
+                db_id,
+                &schema,
+                &table_name,
+                oid,
+                search_path,
+            )
+            .await
+            .map(Some);
+        }
+        for idx in &table_schema.indexes {
+            if crate::sql::catalog_oids::pg_class_index_oid(table_schema.table_id, idx.id)? == oid {
+                return format_visible_regclass_relname(
+                    store,
+                    txn,
+                    db_id,
+                    &schema,
+                    &idx.name,
+                    oid,
+                    search_path,
+                )
+                .await
+                .map(Some);
+            }
+        }
+        if !table_schema.pk_indices.is_empty()
+            && crate::sql::catalog_oids::pg_class_pk_index_oid(table_schema.table_id)? == oid
+        {
+            let pk_name = table_schema
+                .pk_constraint_name
+                .clone()
+                .unwrap_or_else(|| format!("{}_pkey", table_name));
+            return format_visible_regclass_relname(
+                store,
+                txn,
+                db_id,
+                &schema,
+                &pk_name,
+                oid,
+                search_path,
+            )
+            .await
+            .map(Some);
+        }
+    }
+
+    for view_def in store.list_views(txn, db_id).await? {
+        if crate::sql::catalog_oids::pg_class_view_oid(view_def.oid) == oid {
+            return format_visible_regclass_relname(
+                store,
+                txn,
+                db_id,
+                &view_def.schema,
+                &view_def.name,
+                oid,
+                search_path,
+            )
+            .await
+            .map(Some);
+        }
+    }
+
+    for seq_def in store.list_sequences(txn, db_id).await? {
+        if crate::sql::catalog_oids::pg_class_sequence_oid(seq_def.oid) == oid {
+            return format_visible_regclass_relname(
+                store,
+                txn,
+                db_id,
+                &seq_def.schema,
+                &seq_def.name,
+                oid,
+                search_path,
+            )
+            .await
+            .map(Some);
+        }
+    }
+
+    Ok(None)
+}
+
+fn regtype_search_path_schemas(search_path: &[String]) -> Vec<String> {
+    crate::sql::names::type_search_path_schemas(search_path)
+}
+
+fn hstore_extension_oid_for_name(name: &str, is_array: bool) -> Option<i64> {
+    let base_oid = if name == "hstore" {
         Some(crate::sql::pg_types::OID_HSTORE)
-    } else if regtype_ident_matches(name, "_hstore") {
+    } else if name == "_hstore" {
         Some(crate::sql::pg_types::OID_HSTORE_ARRAY)
     } else {
         None
@@ -1614,7 +1807,7 @@ async fn lookup_hstore_extension_oid_if_enabled(
     store: &Arc<crate::storage::TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    name: &sqlparser::ast::Ident,
+    name: &str,
     is_array: bool,
 ) -> Result<Option<i64>> {
     let Some(ext_oid) = hstore_extension_oid_for_name(name, is_array) else {
@@ -1629,74 +1822,127 @@ async fn lookup_hstore_extension_oid_if_enabled(
     Ok(Some(ext_oid))
 }
 
+#[derive(Clone, Copy)]
+struct ResolvedRegtypeOid {
+    oid: i64,
+    is_user_defined: bool,
+}
+
+fn builtin_regtype_oid_in_schema(
+    schema: &str,
+    name: &str,
+    is_array: bool,
+) -> Option<ResolvedRegtypeOid> {
+    if schema != "pg_catalog" {
+        return None;
+    }
+
+    let base_oid = crate::sql::pg_types::actual_pg_catalog_regtype_oid(name)?;
+    let oid = if is_array {
+        crate::sql::pg_types::regtype_array_oid(base_oid)?
+    } else {
+        base_oid
+    };
+    Some(ResolvedRegtypeOid {
+        oid,
+        is_user_defined: false,
+    })
+}
+
+async fn resolve_regtype_in_schema(
+    store: &Arc<crate::storage::TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &str,
+    name: &str,
+    is_array: bool,
+) -> Result<Option<ResolvedRegtypeOid>> {
+    if let Some(builtin) = builtin_regtype_oid_in_schema(schema, name, is_array) {
+        return Ok(Some(builtin));
+    }
+
+    let full_name = format!("{}.{}", schema, name);
+    let Some(def) = store.get_type(txn, db_id, &full_name).await? else {
+        return Ok(None);
+    };
+
+    if is_array {
+        // db9 does not synthesize array OIDs for user-defined base types yet.
+        return Ok(None);
+    }
+
+    Ok(Some(ResolvedRegtypeOid {
+        oid: def.oid as i64,
+        is_user_defined: true,
+    }))
+}
+
 async fn lookup_regtype_oid_with_hstore_extension(
     store: &Arc<crate::storage::TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    normalized_type_name: &str,
-    is_array: bool,
+    lookup: &crate::sql::expr::functions::pg_compat::ParsedRegtypeLookup,
     search_path: &[String],
-) -> Result<Option<i64>> {
-    let Some(type_name) = parse_regtype_object_name(normalized_type_name) else {
-        return Ok(None);
-    };
-    let parts = type_name.0;
-    match parts.as_slice() {
-        [name] => {
-            for schema in regtype_search_path_schemas(search_path) {
-                let full_name = format!("{}.{}", schema, name.value);
-                if let Some(def) = store.get_type(txn, db_id, &full_name).await? {
-                    if is_array {
-                        // db9 does not synthesize array OIDs for user-defined base types yet.
-                        return Ok(None);
-                    }
-                    return Ok(Some(def.oid as i64));
-                }
-
-                if schema == "public" {
-                    if let Some(ext_oid) =
-                        lookup_hstore_extension_oid_if_enabled(store, txn, db_id, name, is_array)
-                            .await?
-                    {
-                        return Ok(Some(ext_oid));
-                    }
-                }
-            }
-            Ok(None)
-        }
-        [schema, name] => {
-            let full_name = format!("{}.{}", schema.value, name.value);
-            if let Some(def) = store.get_type(txn, db_id, &full_name).await? {
-                if is_array {
-                    // db9 does not synthesize array OIDs for user-defined base types yet.
-                    return Ok(None);
-                }
-                return Ok(Some(def.oid as i64));
-            }
-
-            if regtype_ident_matches(schema, "public") {
-                return lookup_hstore_extension_oid_if_enabled(store, txn, db_id, name, is_array)
-                    .await;
-            }
-            Ok(None)
-        }
-        _ => Ok(None),
+) -> Result<Option<ResolvedRegtypeOid>> {
+    if lookup.kind
+        == crate::sql::expr::functions::pg_compat::ParsedRegtypeLookupKind::SpecialBuiltin
+    {
+        return Ok(
+            crate::sql::expr::functions::pg_compat::resolve_builtin_regtype_lookup(lookup).map(
+                |oid| ResolvedRegtypeOid {
+                    oid,
+                    is_user_defined: false,
+                },
+            ),
+        );
     }
+
+    let schemas: Vec<String> = match lookup.schema.as_deref() {
+        Some(schema) => vec![schema.to_string()],
+        None => regtype_search_path_schemas(search_path),
+    };
+
+    for schema in schemas {
+        if let Some(resolved) =
+            resolve_regtype_in_schema(store, txn, db_id, &schema, &lookup.name, lookup.is_array)
+                .await?
+        {
+            return Ok(Some(resolved));
+        }
+
+        if schema == "public" {
+            if let Some(ext_oid) = lookup_hstore_extension_oid_if_enabled(
+                store,
+                txn,
+                db_id,
+                &lookup.name,
+                lookup.is_array,
+            )
+            .await?
+            {
+                return Ok(Some(ResolvedRegtypeOid {
+                    oid: ext_oid,
+                    is_user_defined: false,
+                }));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        advisory_lock_timeout, find_text_column, hstore_extension_oid_for_name,
-        is_pg_get_serial_sequence_function_name,
-        non_pg_catalog_qualified_pg_get_serial_sequence_signature, parse_regtype_object_name,
+        advisory_lock_timeout, find_text_column, format_visible_name,
+        hstore_extension_oid_for_name, is_pg_get_serial_sequence_function_name,
+        non_pg_catalog_qualified_pg_get_serial_sequence_signature,
         pg_get_serial_sequence_accepts_text_arg, pg_get_serial_sequence_arg_type_name,
-        regtype_ident_matches, regtype_search_path_schemas, split_regtype_name_parts,
-        strip_regtype_array_dims, strip_regtype_typmod, value_to_bool_strict, value_to_i64,
-        value_to_i64_strict,
+        regtype_search_path_schemas, value_to_bool_strict, value_to_i64, value_to_i64_strict,
     };
     use crate::model::{ColumnDef, DataType, TableSchema, Value};
     use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
+    use crate::sql::expr::functions::pg_compat::strip_regtype_array_dims;
     use std::collections::HashMap;
     use std::time::Duration;
 
@@ -1961,7 +2207,7 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_regtype_array_dims_and_typmod() {
+    fn test_strip_regtype_array_dims() {
         assert_eq!(
             strip_regtype_array_dims("integer[]"),
             ("integer".to_string(), true)
@@ -1970,91 +2216,55 @@ mod tests {
             strip_regtype_array_dims("\"MyType\"[][]"),
             ("\"MyType\"".to_string(), true)
         );
-        assert_eq!(strip_regtype_typmod("varchar(5)"), "varchar".to_string());
-        assert_eq!(strip_regtype_typmod("numeric(10,2)"), "numeric".to_string());
-        assert_eq!(strip_regtype_typmod("\"MyType\""), "\"MyType\"".to_string());
     }
 
     #[test]
-    fn test_parse_regtype_object_name_preserves_quoted_case() {
-        let unquoted = parse_regtype_object_name("mytype").expect("parse unquoted");
-        assert_eq!(unquoted.0.len(), 1);
-        assert_eq!(unquoted.0[0].value, "mytype");
-        assert!(unquoted.0[0].quote_style.is_none());
-
-        let quoted = parse_regtype_object_name("\"MyType\"").expect("parse quoted");
-        assert_eq!(quoted.0.len(), 1);
-        assert_eq!(quoted.0[0].value, "MyType");
-        assert_eq!(quoted.0[0].quote_style, Some('"'));
-
-        let qualified =
-            parse_regtype_object_name("\"MySchema\".\"MyType\"").expect("parse qualified");
-        assert_eq!(qualified.0.len(), 2);
-        assert_eq!(qualified.0[0].value, "MySchema");
-        assert_eq!(qualified.0[0].quote_style, Some('"'));
-        assert_eq!(qualified.0[1].value, "MyType");
-        assert_eq!(qualified.0[1].quote_style, Some('"'));
-    }
-
-    #[test]
-    fn test_regtype_ident_matches_respects_quoted_case() {
-        let unquoted = parse_regtype_object_name("HSTORE").expect("parse unquoted");
-        assert!(regtype_ident_matches(&unquoted.0[0], "hstore"));
-        assert!(regtype_ident_matches(&unquoted.0[0], "HSTORE"));
-
-        let quoted = parse_regtype_object_name("\"HSTORE\"").expect("parse quoted");
-        assert!(!regtype_ident_matches(&quoted.0[0], "hstore"));
-        assert!(regtype_ident_matches(&quoted.0[0], "HSTORE"));
-    }
-
-    #[test]
-    fn test_parse_regtype_object_name_rejects_invalid_shapes() {
-        assert!(parse_regtype_object_name("").is_none());
-        assert!(parse_regtype_object_name("\"unterminated").is_none());
-        assert!(parse_regtype_object_name("a.b.c").is_none());
-    }
-
-    #[test]
-    fn test_split_regtype_name_parts_handles_escaped_quotes() {
-        let parts = split_regtype_name_parts("\"A\".\"B\"").expect("split");
-        assert_eq!(parts, vec!["\"A\"".to_string(), "\"B\"".to_string()]);
-        let escaped = split_regtype_name_parts("\"A\"\"B\"").expect("split escaped");
-        assert_eq!(escaped, vec!["\"A\"\"B\"".to_string()]);
-    }
-
-    #[test]
-    fn test_regtype_search_path_schemas_preserves_order_and_defaults_public() {
+    fn test_regtype_search_path_schemas_prepends_implicit_pg_catalog() {
         let path = vec!["$user".to_string(), "s1".to_string(), "public".to_string()];
         let schemas = regtype_search_path_schemas(&path);
-        assert_eq!(schemas, vec!["s1", "public"]);
-        assert_eq!(regtype_search_path_schemas(&[]), vec!["public"]);
+        assert_eq!(schemas, vec!["pg_catalog", "s1", "public"]);
+        assert_eq!(
+            regtype_search_path_schemas(&[]),
+            vec!["pg_catalog", "public"]
+        );
     }
 
     #[test]
     fn test_hstore_extension_oid_for_name_respects_identifier_and_array_rules() {
-        let hstore = parse_regtype_object_name("hstore").expect("parse");
         assert_eq!(
-            hstore_extension_oid_for_name(&hstore.0[0], false),
+            hstore_extension_oid_for_name("hstore", false),
             Some(crate::sql::pg_types::OID_HSTORE)
         );
         assert_eq!(
-            hstore_extension_oid_for_name(&hstore.0[0], true),
+            hstore_extension_oid_for_name("hstore", true),
             Some(crate::sql::pg_types::OID_HSTORE_ARRAY)
         );
 
-        let array_alias = parse_regtype_object_name("_hstore").expect("parse");
         assert_eq!(
-            hstore_extension_oid_for_name(&array_alias.0[0], false),
+            hstore_extension_oid_for_name("_hstore", false),
             Some(crate::sql::pg_types::OID_HSTORE_ARRAY)
         );
-        assert_eq!(hstore_extension_oid_for_name(&array_alias.0[0], true), None);
+        assert_eq!(hstore_extension_oid_for_name("_hstore", true), None);
 
-        let quoted_upper = parse_regtype_object_name("\"HSTORE\"").expect("parse quoted");
+        assert_eq!(hstore_extension_oid_for_name("HSTORE", false), None);
+    }
+
+    #[test]
+    fn test_format_visible_name_quotes_mixed_case_and_qualifies_hidden_objects() {
         assert_eq!(
-            hstore_extension_oid_for_name(&quoted_upper.0[0], false),
-            None
+            format_visible_name("public", "simple_name", true),
+            "simple_name"
+        );
+        assert_eq!(
+            format_visible_name("public", "CamelType", true),
+            "\"CamelType\""
+        );
+        assert_eq!(
+            format_visible_name("pr1659_regtype", "CamelType", false),
+            "pr1659_regtype.\"CamelType\""
         );
     }
+
     #[test]
     fn test_pg_get_serial_sequence_name_match_accepts_pg_catalog_and_case_variants() {
         assert!(is_pg_get_serial_sequence_function_name(

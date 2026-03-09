@@ -46,6 +46,7 @@ fn is_catalog_dependent_function(func_kind: &FunctionKind, name: &str) -> bool {
         || name.eq_ignore_ascii_case("PG_GET_CONSTRAINTDEF")
         || name.eq_ignore_ascii_case("FORMAT_TYPE")
         || name.eq_ignore_ascii_case("TO_REGTYPE")
+        || name.eq_ignore_ascii_case("TO_REGCLASS")
         || is_pg_get_serial_sequence_function(name)
     {
         return true;
@@ -316,6 +317,27 @@ mod tests {
                 },
                 args: vec![TypedExpr::new(
                     TypedExprKind::Constant(Value::Text("integer".to_string())),
+                    DataType::Text,
+                )],
+                order_by: vec![],
+                filter: None,
+            },
+            DataType::Int64,
+        );
+        assert!(needs_async(&expr));
+    }
+
+    #[test]
+    fn needs_async_detects_catalog_dependent_to_regclass() {
+        let expr = TypedExpr::new(
+            TypedExprKind::FunctionCall {
+                func: ResolvedFunction {
+                    name: "to_regclass".to_string(),
+                    kind: FunctionKind::Builtin,
+                    return_type: DataType::Int64,
+                },
+                args: vec![TypedExpr::new(
+                    TypedExprKind::Constant(Value::Text("public.my_table".to_string())),
                     DataType::Text,
                 )],
                 order_by: vec![],

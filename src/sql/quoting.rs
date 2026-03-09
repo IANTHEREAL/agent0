@@ -34,9 +34,16 @@ fn is_simple_unquoted_ident(ident: &str) -> bool {
 
 fn is_sql_keyword(ident: &str) -> bool {
     let upper = ident.to_ascii_uppercase();
-    sqlparser::keywords::ALL_KEYWORDS
-        .binary_search(&upper.as_str())
+    let Ok(idx) = sqlparser::keywords::ALL_KEYWORDS.binary_search(&upper.as_str()) else {
+        return false;
+    };
+    let keyword = sqlparser::keywords::ALL_KEYWORDS_INDEX[idx];
+    sqlparser::keywords::RESERVED_FOR_TABLE_ALIAS
+        .binary_search(&keyword)
         .is_ok()
+        || sqlparser::keywords::RESERVED_FOR_COLUMN_ALIAS
+            .binary_search(&keyword)
+            .is_ok()
 }
 
 #[cfg(test)]
@@ -56,6 +63,11 @@ mod tests {
     #[test]
     fn quote_ident_allows_simple_unquoted_ident() {
         assert_eq!(quote_ident("my_table"), "my_table");
+    }
+
+    #[test]
+    fn quote_ident_does_not_quote_non_reserved_keywords() {
+        assert_eq!(quote_ident("tables"), "tables");
     }
 
     #[test]

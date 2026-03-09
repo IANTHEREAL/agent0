@@ -28,6 +28,49 @@ fn normalize_relation_name(schema: &str, relation: &str) -> String {
     }
 }
 
+fn relation_row(
+    oid: i64,
+    relname: &str,
+    relnamespace: i64,
+    relkind: &str,
+    relowner: i64,
+    relam: i64,
+    relhasindex: bool,
+    relnatts: i64,
+    relchecks: i64,
+    relhasrules: bool,
+    relhastriggers: bool,
+) -> Row {
+    Row::new(vec![
+        int_val(oid),
+        text_val(relname),
+        int_val(relnamespace),
+        int_val(0), // reltype
+        int_val(0), // reloftype
+        text_val(relkind),
+        int_val(relowner),
+        int_val(relam),
+        int_val(0), // reltuples
+        int_val(0), // relpages
+        int_val(0), // reltoastrelid
+        Value::Boolean(relhasindex),
+        Value::Boolean(true), // relispopulated
+        text_val("p"),        // relpersistence
+        int_val(relnatts),
+        int_val(relchecks),
+        Value::Boolean(relhasrules),
+        Value::Boolean(relhastriggers),
+        Value::Boolean(false),          // relhassubclass
+        Value::Boolean(false),          // relrowsecurity
+        Value::Boolean(false),          // relforcerowsecurity
+        text_val(RELREPLIDENT_DEFAULT), // relreplident
+        Value::Boolean(false),          // relispartition
+        null_val(),                     // relpartbound
+        int_val(0),                     // reltablespace
+        null_val(),                     // reloptions
+    ])
+}
+
 fn tables_with_fk_internal_triggers(
     table_schemas: &HashMap<String, TableSchema>,
 ) -> HashSet<String> {
@@ -236,34 +279,19 @@ impl VirtualTable for PgClass {
             let seq_oid = catalog_oids::pg_class_sequence_oid(seq.oid);
             let namespace_oid = schema_oid(ctx.schema_oids, &seq.schema);
             let relowner = owner_role_oid(Some(&seq.owner), ctx.current_user);
-            rows.push(Row::new(vec![
-                int_val(seq_oid),
-                text_val(&seq.name),
-                int_val(namespace_oid),
-                int_val(0), // reltype
-                int_val(0), // reloftype
-                text_val(RELKIND_SEQUENCE),
-                int_val(relowner),
-                int_val(0),                     // relam
-                int_val(0),                     // reltuples
-                int_val(0),                     // relpages
-                int_val(0),                     // reltoastrelid
-                Value::Boolean(false),          // relhasindex
-                Value::Boolean(true),           // relispopulated
-                text_val("p"),                  // relpersistence
-                int_val(0),                     // relnatts
-                int_val(0),                     // relchecks
-                Value::Boolean(false),          // relhasrules
-                Value::Boolean(false),          // relhastriggers
-                Value::Boolean(false),          // relhassubclass
-                Value::Boolean(false),          // relrowsecurity
-                Value::Boolean(false),          // relforcerowsecurity
-                text_val(RELREPLIDENT_DEFAULT), // relreplident
-                Value::Boolean(false),          // relispartition
-                null_val(),                     // relpartbound
-                int_val(0),                     // reltablespace
-                null_val(),                     // reloptions
-            ]));
+            rows.push(relation_row(
+                seq_oid,
+                &seq.name,
+                namespace_oid,
+                RELKIND_SEQUENCE,
+                relowner,
+                0,
+                false,
+                0,
+                0,
+                false,
+                false,
+            ));
         }
 
         let views = ctx
@@ -275,34 +303,50 @@ impl VirtualTable for PgClass {
             let namespace_oid = schema_oid(ctx.schema_oids, &view_def.schema);
             let view_oid = catalog_oids::pg_class_view_oid(view_def.oid);
             let relowner = owner_role_oid(Some(&view_def.owner), ctx.current_user);
-            rows.push(Row::new(vec![
-                int_val(view_oid),
-                text_val(&view_def.name),
-                int_val(namespace_oid),
-                int_val(0), // reltype
-                int_val(0), // reloftype
-                text_val(RELKIND_VIEW),
-                int_val(relowner),
-                int_val(0),                     // relam
-                int_val(0),                     // reltuples
-                int_val(0),                     // relpages
-                int_val(0),                     // reltoastrelid
-                Value::Boolean(false),          // relhasindex
-                Value::Boolean(true),           // relispopulated
-                text_val("p"),                  // relpersistence
-                int_val(0),                     // relnatts
-                int_val(0),                     // relchecks
-                Value::Boolean(false),          // relhasrules
-                Value::Boolean(false),          // relhastriggers
-                Value::Boolean(false),          // relhassubclass
-                Value::Boolean(false),          // relrowsecurity
-                Value::Boolean(false),          // relforcerowsecurity
-                text_val(RELREPLIDENT_DEFAULT), // relreplident
-                Value::Boolean(false),          // relispartition
-                null_val(),                     // relpartbound
-                int_val(0),                     // reltablespace
-                null_val(),                     // reloptions
-            ]));
+            rows.push(relation_row(
+                view_oid,
+                &view_def.name,
+                namespace_oid,
+                RELKIND_VIEW,
+                relowner,
+                0,
+                false,
+                0,
+                0,
+                false,
+                false,
+            ));
+        }
+
+        let mut virtual_tables: Vec<&dyn VirtualTable> =
+            crate::sql::catalog::global_catalog().iter().collect();
+        virtual_tables.sort_by(|lhs, rhs| {
+            lhs.schema_name()
+                .cmp(rhs.schema_name())
+                .then(lhs.name().cmp(rhs.name()))
+        });
+
+        for table in virtual_tables {
+            let Some(oid) =
+                crate::sql::catalog::catalog_relation_oid(table.schema_name(), table.name())
+            else {
+                continue;
+            };
+            let namespace_oid = schema_oid(ctx.schema_oids, table.schema_name());
+            let relnatts = table.schema().columns.len() as i64;
+            rows.push(relation_row(
+                oid,
+                table.name(),
+                namespace_oid,
+                table.relkind(),
+                catalog_oids::pg_role_oid("postgres"),
+                0,
+                false,
+                relnatts,
+                0,
+                false,
+                false,
+            ));
         }
 
         Ok(rows)

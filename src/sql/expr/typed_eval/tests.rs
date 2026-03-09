@@ -475,6 +475,44 @@ fn test_cast() {
     );
 }
 
+#[test]
+fn test_cast_regtype_to_text_uses_postgres_display_name() {
+    let row = empty_row();
+    let qctx = test_qctx();
+
+    let cast_expr = TypedExpr::new(
+        TypedExprKind::Cast {
+            expr: Box::new(const_expr(
+                Value::Int64(crate::sql::pg_types::OID_INT4),
+                DataType::UserDefined("pg_catalog.regtype".to_string()),
+            )),
+            target_type: DataType::Text,
+            cast_context: CastContext::Explicit,
+        },
+        DataType::Text,
+    );
+    assert_eq!(
+        eval_typed_expr(&cast_expr, &row, &qctx).unwrap(),
+        Value::Text("integer".into())
+    );
+
+    let timetz_cast = TypedExpr::new(
+        TypedExprKind::Cast {
+            expr: Box::new(const_expr(
+                Value::Int64(crate::sql::pg_types::OID_TIMETZ),
+                DataType::UserDefined("pg_catalog.regtype".to_string()),
+            )),
+            target_type: DataType::Text,
+            cast_context: CastContext::Explicit,
+        },
+        DataType::Text,
+    );
+    assert_eq!(
+        eval_typed_expr(&timetz_cast, &row, &qctx).unwrap(),
+        Value::Text("time with time zone".into())
+    );
+}
+
 // ── IsTest ──────────────────────────────────────────────
 
 #[test]
@@ -996,6 +1034,33 @@ fn test_function_call_abs() {
     assert_eq!(
         eval_typed_expr(&abs, &row, &qctx).unwrap(),
         Value::Float64(42.0)
+    );
+}
+
+#[test]
+fn test_function_call_pg_typeof_uses_typed_argument_type() {
+    let row = empty_row();
+    let qctx = test_qctx();
+
+    let pg_typeof = TypedExpr::new(
+        TypedExprKind::FunctionCall {
+            func: ResolvedFunction {
+                name: "pg_typeof".into(),
+                kind: FunctionKind::Builtin,
+                return_type: DataType::UserDefined("pg_catalog.regtype".to_string()),
+            },
+            args: vec![const_expr(
+                Value::Int64(1259),
+                DataType::UserDefined("pg_catalog.regclass".to_string()),
+            )],
+            order_by: vec![],
+            filter: None,
+        },
+        DataType::UserDefined("pg_catalog.regtype".to_string()),
+    );
+    assert_eq!(
+        eval_typed_expr(&pg_typeof, &row, &qctx).unwrap(),
+        Value::Text("regclass".into())
     );
 }
 

@@ -35,7 +35,8 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
     );
     r.register(
         "PG_TYPEOF",
-        FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
+        FunctionSignature::fixed(DataType::UserDefined("pg_catalog.regtype".to_string()))
+            .with_args(1, Some(1)),
     );
     r.register(
         "VERSION",
@@ -105,7 +106,13 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
     );
     r.register(
         "TO_REGTYPE",
-        FunctionSignature::fixed(DataType::Int64).with_args(1, Some(1)),
+        FunctionSignature::fixed(DataType::UserDefined("pg_catalog.regtype".to_string()))
+            .with_args(1, Some(1)),
+    );
+    r.register(
+        "TO_REGCLASS",
+        FunctionSignature::fixed(DataType::UserDefined("pg_catalog.regclass".to_string()))
+            .with_args(1, Some(1)),
     );
     r.register(
         "PG_GET_INDEXDEF",

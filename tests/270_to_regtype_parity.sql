@@ -27,6 +27,13 @@ SELECT to_regtype('pg_catalog."_INT4"');
 SELECT to_regtype('"PG_CATALOG".int4');
 SELECT to_regtype('"pg_catalog".int4');
 
+-- Quoted identifier parsing and typmod validation
+SELECT to_regtype('"text');
+SELECT to_regtype('""');
+SELECT to_regtype('"text"(3)');
+SELECT to_regtype('"TEXT"(3)');
+SELECT to_regtype('a.b.c');
+
 -- Interval whitespace normalization
 SELECT to_regtype('interval  day   to   second');
 SELECT to_regtype('interval (3)');
@@ -98,3 +105,13 @@ SELECT to_regtype('varchar(1)');
 SELECT to_regtype('numeric(1)');
 SELECT to_regtype('numeric(1000)');
 SELECT to_regtype('numeric(10,10)');
+
+DROP SCHEMA IF EXISTS pr270_to_regtype_quotes CASCADE;
+CREATE SCHEMA pr270_to_regtype_quotes;
+CREATE TYPE pr270_to_regtype_quotes."a""b" AS ENUM ('x');
+SET search_path = pr270_to_regtype_quotes, public;
+SELECT to_regtype('"a""b"') IS NOT NULL;
+SELECT to_regtype('"a""b"(3)');
+RESET search_path;
+DROP TYPE pr270_to_regtype_quotes."a""b";
+DROP SCHEMA pr270_to_regtype_quotes;

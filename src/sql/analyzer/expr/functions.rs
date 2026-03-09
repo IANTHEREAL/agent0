@@ -39,6 +39,15 @@ fn function_schema_name(func: &Function) -> Option<String> {
     (func.name.0.len() > 1).then(|| crate::sql::names::normalize_ident(&func.name.0[0]))
 }
 
+fn function_qualified_name(func: &Function) -> String {
+    func.name
+        .0
+        .iter()
+        .map(crate::sql::names::normalize_ident)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 fn pg_get_serial_sequence_error_arg_type(arg: &TypedExpr) -> DataType {
     if matches!(
         &arg.kind,
@@ -99,6 +108,36 @@ fn refine_function_return_type(
 }
 
 impl<'a> Analyzer<'a> {
+    fn validate_pg_catalog_only_function_qualification(
+        &self,
+        func: &Function,
+        func_name: &str,
+        analyzed_args: &[TypedExpr],
+    ) -> Result<(), AnalyzerError> {
+        if func.name.0.len() >= 3 {
+            return Err(AnalyzerError::CrossDatabaseReference(
+                function_qualified_name(func),
+            ));
+        }
+
+        let Some(schema) = function_schema_name(func) else {
+            return Ok(());
+        };
+        if schema == "pg_catalog" {
+            return Ok(());
+        }
+        if self.catalog.schema_exists(&schema) {
+            return Err(AnalyzerError::FunctionNotFound {
+                name: format!("{}.{}", schema, func_name.to_lowercase()),
+                arg_types: analyzed_args
+                    .iter()
+                    .map(pg_get_serial_sequence_error_arg_type)
+                    .collect(),
+            });
+        }
+        Err(AnalyzerError::SchemaNotFound(schema))
+    }
+
     pub(in crate::sql::analyzer) fn validate_no_positional_after_named(
         &self,
         args: &[FunctionArg],
@@ -255,44 +294,15 @@ impl<'a> Analyzer<'a> {
             .iter()
             .map(|a| self.analyze_expr(a))
             .collect::<Result<_, _>>()?;
-        let schema_name = function_schema_name(func);
-
-        // Schema qualification check for pg_get_serial_sequence MUST run before
-        // apply_function_arg_context so that schema-qualified calls with wrong arg
-        // types (e.g. public.pg_get_serial_sequence(1,2)) report the schema-qualified
-        // signature in the error, matching PostgreSQL behavior.
-        if func_name == "PG_GET_SERIAL_SEQUENCE" {
-            // 3+ part qualifier → cross-database reference (e.g. foo.public.pg_get_serial_sequence)
-            if func.name.0.len() >= 3 {
-                let full_name = func
-                    .name
-                    .0
-                    .iter()
-                    .map(crate::sql::names::normalize_ident)
-                    .collect::<Vec<_>>()
-                    .join(".");
-                return Err(AnalyzerError::CrossDatabaseReference(full_name));
-            }
-
-            // 2-part qualifier: schema != pg_catalog (exact match after ident normalization)
-            if let Some(ref schema) = schema_name {
-                if schema != "pg_catalog" {
-                    // PostgreSQL distinguishes: known schema → "function not found" (42883),
-                    // unknown schema → "schema does not exist" (3F000).
-                    // Check actual schema existence via catalog (built-ins +
-                    // user-created schemas discovered during prefetch).
-                    if self.catalog.schema_exists(schema) {
-                        return Err(AnalyzerError::FunctionNotFound {
-                            name: format!("{}.pg_get_serial_sequence", schema),
-                            arg_types: analyzed_args
-                                .iter()
-                                .map(pg_get_serial_sequence_error_arg_type)
-                                .collect(),
-                        });
-                    }
-                    return Err(AnalyzerError::SchemaNotFound(schema.clone()));
-                }
-            }
+        // PostgreSQL builtin functions like pg_get_serial_sequence, to_regclass,
+        // and to_regtype only exist in pg_catalog. Schema-qualified validation
+        // must run before argument-context coercion so error signatures preserve
+        // the original qualified function name.
+        if matches!(
+            func_name.as_str(),
+            "PG_GET_SERIAL_SEQUENCE" | "TO_REGCLASS" | "TO_REGTYPE"
+        ) {
+            self.validate_pg_catalog_only_function_qualification(func, &func_name, &analyzed_args)?;
         }
 
         let analyzed_args = self.apply_function_arg_context(func_name.as_str(), analyzed_args)?;
@@ -527,7 +537,7 @@ impl<'a> Analyzer<'a> {
             "PG_GET_SERIAL_SEQUENCE" => {
                 self.coerce_pg_get_serial_sequence_signature(func_name, args)
             }
-            "TO_REGTYPE" => self.coerce_to_regtype_signature(func_name, args),
+            "TO_REGTYPE" | "TO_REGCLASS" => self.coerce_to_regtype_signature(func_name, args),
             "TO_TSVECTOR"
             | "PLAINTO_TSQUERY"
             | "PHRASETO_TSQUERY"
@@ -702,7 +712,7 @@ impl<'a> Analyzer<'a> {
         );
         if !arg_is_text_like && !self.is_unresolved_param(&arg) && !arg.is_null_constant() {
             return Err(AnalyzerError::FunctionNotFound {
-                name: func_name.to_string(),
+                name: func_name.to_lowercase(),
                 arg_types,
             });
         }

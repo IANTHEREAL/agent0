@@ -2,6 +2,7 @@ use super::helpers::{int_col, int_val, owner_role_oid, schema_oid, text_col, tex
 use super::{ScanContext, VirtualTable};
 use crate::model::{Row, TableSchema};
 use crate::sql::catalog_oids;
+use crate::sql::types::registry::{global_registry, ReturnType};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -49,29 +50,34 @@ impl VirtualTable for PgProc {
 
         let mut rows = Vec::new();
 
-        for (oid, name, prorettype) in [
-            (1001_i64, "format_type", 25_i64),
-            (1002, "pg_get_expr", 25),
-            (1003, "pg_get_indexdef", 25),
-            (1004, "pg_get_constraintdef", 25),
-            (1005, "version", 25),
-            (1006, "current_schema", 25),
-            (1007, "current_database", 25),
-            (1008, "current_user", 25),
-            (1009, "set_config", 25),
-            (1010, "pg_is_in_recovery", 16),
-            (1011, "pg_backend_pid", 23),
-            (1012, "pg_postmaster_start_time", 1184),
-            (1013, "current_schemas", 1009), // returns text[]
-            (1014, "pg_get_userbyid", 25),   // returns text (name)
-        ] {
+        let mut builtin_funcs: Vec<(String, &crate::sql::types::registry::FunctionSignature)> =
+            global_registry()
+                .iter()
+                .filter_map(|(name, sig)| match &sig.return_type {
+                    ReturnType::Fixed(_) => Some((name.to_ascii_lowercase(), sig)),
+                    _ => None,
+                })
+                .collect();
+        builtin_funcs.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
+
+        for (name, sig) in builtin_funcs {
+            let ReturnType::Fixed(prorettype) = &sig.return_type else {
+                continue;
+            };
+            let prokind = if sig.is_aggregate {
+                "a"
+            } else if sig.is_window {
+                "w"
+            } else {
+                "f"
+            };
             rows.push(Row::new(vec![
-                int_val(oid),
-                text_val(name),
+                int_val(catalog_oids::pg_builtin_function_oid(&name)),
+                text_val(&name),
                 int_val(pg_catalog_oid),
                 int_val(catalog_oids::pg_role_oid("postgres")),
-                int_val(prorettype),
-                text_val("f"),
+                int_val(crate::sql::pg_types::oid_and_typlen_for_datatype(prorettype).0),
+                text_val(prokind),
             ]));
         }
 

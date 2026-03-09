@@ -17,7 +17,7 @@ mod helpers;
 #[cfg(test)]
 mod tests;
 
-use crate::model::{Row, Value};
+use crate::model::{DataType, Row, Value};
 use crate::sql::analyzer::types::*;
 use crate::sql::expr::operators::compare_values;
 use crate::sql::expr::typed_fold::is_fold_candidate;
@@ -170,6 +170,25 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
             cast_context,
         } => {
             let val = eval_typed_expr(inner, row, qctx)?;
+            if *target_type == DataType::Text {
+                if let DataType::UserDefined(name) = &inner.data_type {
+                    if name.eq_ignore_ascii_case("regtype")
+                        || name.eq_ignore_ascii_case("pg_catalog.regtype")
+                    {
+                        if let Some(oid) = match &val {
+                            Value::Int32(n) => Some(*n as i64),
+                            Value::Int64(n) => Some(*n),
+                            _ => None,
+                        } {
+                            if let Some(display_name) =
+                                crate::sql::pg_types::regtype_text_for_oid(oid)
+                            {
+                                return Ok(Value::Text(display_name.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
             cast::cast(val, target_type, *cast_context)
         }
 
@@ -471,6 +490,14 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
 
         // ── Functions ───────────────────────────────────────
         TypedExprKind::FunctionCall { func, args, .. } => {
+            if func.name.eq_ignore_ascii_case("PG_TYPEOF") && args.len() == 1 {
+                return Ok(Value::Text(
+                    crate::sql::expr::functions::pg_compat::pg_typeof_name_for_datatype(
+                        &args[0].data_type,
+                    ),
+                ));
+            }
+
             // TIMEZONE needs the input TypedExpr data_type to decide direction.
             if func.name.eq_ignore_ascii_case("TIMEZONE") && args.len() == 2 {
                 return eval_timezone(&args[0], &args[1], row, qctx);

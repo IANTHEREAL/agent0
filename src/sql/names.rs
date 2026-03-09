@@ -50,6 +50,24 @@ impl ResolvedName {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolvedTypeName {
+    Builtin { resolved: ResolvedName, oid: i64 },
+    UserDefined { resolved: ResolvedName, oid: i64 },
+}
+
+impl ResolvedTypeName {
+    pub(crate) fn resolved_name(&self) -> &ResolvedName {
+        match self {
+            Self::Builtin { resolved, .. } | Self::UserDefined { resolved, .. } => resolved,
+        }
+    }
+
+    pub(crate) fn is_builtin(&self) -> bool {
+        matches!(self, Self::Builtin { .. })
+    }
+}
+
 pub(crate) fn default_schema(search_path: &[String]) -> &str {
     search_path
         .iter()
@@ -134,6 +152,110 @@ fn search_path_schemas(search_path: &[String]) -> Vec<&str> {
         schemas.push("public");
     }
     schemas
+}
+
+fn implicit_pg_catalog_search_path_schemas(search_path: &[String]) -> Vec<String> {
+    let mut schemas: Vec<String> = search_path_schemas(search_path)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    if !schemas.iter().any(|s| s == "pg_catalog") {
+        schemas.insert(0, "pg_catalog".to_string());
+    }
+
+    schemas
+}
+
+/// PostgreSQL relation lookup order.
+///
+/// `pg_catalog` is implicitly searched first unless explicitly listed in the
+/// search_path. When no explicit schema remains after filtering `$user`,
+/// PostgreSQL still treats `public` as the default user schema.
+pub(crate) fn relation_search_path_schemas(search_path: &[String]) -> Vec<String> {
+    implicit_pg_catalog_search_path_schemas(search_path)
+}
+
+/// PostgreSQL type lookup order for regtype visibility.
+///
+/// Like relation lookup, type names implicitly search `pg_catalog` first
+/// unless it appears explicitly in `search_path`.
+pub(crate) fn type_search_path_schemas(search_path: &[String]) -> Vec<String> {
+    implicit_pg_catalog_search_path_schemas(search_path)
+}
+
+pub(crate) async fn resolve_existing_relation_oid(
+    store: &crate::storage::TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema_opt: Option<&str>,
+    name: &str,
+    search_path: &[String],
+) -> Result<Option<i64>> {
+    let schemas: Vec<String> = match schema_opt {
+        Some(schema) => vec![schema.to_string()],
+        None => relation_search_path_schemas(search_path),
+    };
+    let all_tables = store.list_tables(txn, db_id).await?;
+
+    for schema in &schemas {
+        if let Some(oid) = crate::sql::catalog::catalog_relation_oid(schema, name) {
+            return Ok(Some(oid));
+        }
+
+        let full = format!("{}.{}", schema, name);
+
+        if let Some(table_schema) = store.get_schema(txn, db_id, &full).await? {
+            let oid = crate::sql::catalog_oids::pg_class_table_oid(table_schema.table_id)?;
+            return Ok(Some(oid));
+        }
+
+        if let Some(view_def) = store.get_view(txn, db_id, &full).await? {
+            return Ok(Some(crate::sql::catalog_oids::pg_class_view_oid(
+                view_def.oid,
+            )));
+        }
+
+        if let Some(seq_def) = store.get_sequence(txn, db_id, &full).await? {
+            return Ok(Some(crate::sql::catalog_oids::pg_class_sequence_oid(
+                seq_def.oid,
+            )));
+        }
+
+        for table_full in &all_tables {
+            if !table_full.starts_with(schema.as_str())
+                || table_full.as_bytes().get(schema.len()) != Some(&b'.')
+            {
+                continue;
+            }
+            if let Some(table_schema) = store.get_schema(txn, db_id, table_full).await? {
+                for idx in &table_schema.indexes {
+                    if idx.name == name {
+                        let oid = crate::sql::catalog_oids::pg_class_index_oid(
+                            table_schema.table_id,
+                            idx.id,
+                        )?;
+                        return Ok(Some(oid));
+                    }
+                }
+
+                if !table_schema.pk_indices.is_empty() {
+                    let (_, table_name) = parse_full_name(table_full).unwrap_or_default();
+                    let pk_name = table_schema
+                        .pk_constraint_name
+                        .clone()
+                        .unwrap_or_else(|| format!("{}_pkey", table_name));
+                    if pk_name == name {
+                        let oid =
+                            crate::sql::catalog_oids::pg_class_pk_index_oid(table_schema.table_id)?;
+                        return Ok(Some(oid));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 pub(crate) async fn resolve_existing_table_name(
@@ -330,25 +452,144 @@ pub(crate) async fn resolve_existing_type_name(
     db_id: u64,
     name: &ObjectName,
     search_path: &[String],
-) -> Result<Option<ResolvedName>> {
+) -> Result<Option<ResolvedTypeName>> {
     let (schema_opt, obj) = split_object_name(name)?;
-    match schema_opt {
-        Some(schema) => {
-            let resolved = ResolvedName::new(schema, obj)?;
-            Ok(store
-                .get_type(txn, db_id, &resolved.full)
-                .await?
-                .map(|_| resolved))
+    resolve_existing_type_full_name(store, txn, db_id, schema_opt.as_deref(), &obj, search_path)
+        .await
+}
+
+pub(crate) async fn resolve_type_in_schema(
+    store: &crate::storage::TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &str,
+    name: &str,
+) -> Result<Option<ResolvedTypeName>> {
+    if schema == "pg_catalog" {
+        if let Some(oid) = crate::sql::pg_types::visible_pg_catalog_regtype_oid(name) {
+            return Ok(Some(ResolvedTypeName::Builtin {
+                resolved: ResolvedName::new(schema.to_string(), name.to_string())?,
+                oid,
+            }));
         }
-        None => {
-            for schema in search_path_schemas(search_path) {
-                let resolved = ResolvedName::new(schema.to_string(), obj.clone())?;
-                if store.get_type(txn, db_id, &resolved.full).await?.is_some() {
-                    return Ok(Some(resolved));
+    }
+
+    let resolved = ResolvedName::new(schema.to_string(), name.to_string())?;
+    let Some(def) = store.get_type(txn, db_id, &resolved.full).await? else {
+        return Ok(None);
+    };
+
+    Ok(Some(ResolvedTypeName::UserDefined {
+        resolved,
+        oid: def.oid as i64,
+    }))
+}
+
+pub(crate) async fn resolve_existing_type_full_name(
+    store: &crate::storage::TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema_opt: Option<&str>,
+    name: &str,
+    search_path: &[String],
+) -> Result<Option<ResolvedTypeName>> {
+    let schemas: Vec<String> = match schema_opt {
+        Some(schema) => vec![schema.to_string()],
+        None => type_search_path_schemas(search_path),
+    };
+
+    for schema in schemas {
+        if let Some(resolved) = resolve_type_in_schema(store, txn, db_id, &schema, name).await? {
+            return Ok(Some(resolved));
+        }
+    }
+
+    Ok(None)
+}
+
+pub(crate) async fn resolve_visible_type_full_name(
+    store: &crate::storage::TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema_opt: Option<&str>,
+    name: &str,
+    search_path: &[String],
+) -> Result<Option<ResolvedTypeName>> {
+    resolve_existing_type_full_name(store, txn, db_id, schema_opt, name, search_path).await
+}
+
+/// Parse a `to_regclass(text)` input string into `(Option<schema>, name)`.
+///
+/// Handles PostgreSQL identifier quoting rules:
+/// - Unquoted identifiers are lowercased via [`normalize_ident_str`].
+/// - Quoted identifiers (`"Foo"`) preserve case; `""` inside quotes is an
+///   escaped double-quote character.
+/// - A dot inside `"..."` is literal (not a separator).
+///
+/// Returns `None` for the schema component when the input is unqualified.
+/// Returns `Err(input)` for three-or-more part names (cross-database references).
+pub(crate) fn parse_regclass_input(input: &str) -> Result<(Option<String>, String), String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok((None, String::new()));
+    }
+
+    let parts = split_dotted_ident(trimmed);
+    match parts.as_slice() {
+        [single] => Ok((None, normalize_ident_part(single))),
+        [schema, name] => Ok((
+            Some(normalize_ident_part(schema)),
+            normalize_ident_part(name),
+        )),
+        _ => {
+            // Three-or-more parts: cross-database reference, not supported in PG.
+            Err(trimmed.to_string())
+        }
+    }
+}
+
+/// Split a dotted identifier string respecting double-quoted segments.
+fn split_dotted_ident(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            // Skip to closing quote (handle escaped "")
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2; // escaped double-quote
+                    } else {
+                        i += 1; // closing quote
+                        break;
+                    }
+                } else {
+                    i += 1;
                 }
             }
-            Ok(None)
+        } else if bytes[i] == b'.' {
+            parts.push(&s[start..i]);
+            start = i + 1;
+            i += 1;
+        } else {
+            i += 1;
         }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Normalize a single identifier part: strip quotes and unescape, or lowercase.
+fn normalize_ident_part(part: &str) -> String {
+    let trimmed = part.trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() > 1 {
+        // Quoted: strip outer quotes and unescape internal ""
+        trimmed[1..trimmed.len() - 1].replace("\"\"", "\"")
+    } else {
+        trimmed.to_lowercase()
     }
 }
 
@@ -399,5 +640,91 @@ mod tests {
         assert!(parse_full_name("a.b.c").is_err());
         assert!(parse_full_name("a.").is_err());
         assert!(parse_full_name(".b").is_err());
+    }
+
+    #[test]
+    fn parse_regclass_input_unqualified_lowercased() {
+        let (schema, name) = parse_regclass_input("MyTable").unwrap();
+        assert_eq!(schema, None);
+        assert_eq!(name, "mytable");
+    }
+
+    #[test]
+    fn parse_regclass_input_quoted_preserves_case() {
+        let (schema, name) = parse_regclass_input("\"MixedCase\"").unwrap();
+        assert_eq!(schema, None);
+        assert_eq!(name, "MixedCase");
+    }
+
+    #[test]
+    fn parse_regclass_input_schema_qualified() {
+        let (schema, name) = parse_regclass_input("public.my_table").unwrap();
+        assert_eq!(schema, Some("public".to_string()));
+        assert_eq!(name, "my_table");
+    }
+
+    #[test]
+    fn parse_regclass_input_quoted_schema_qualified() {
+        let (schema, name) = parse_regclass_input("\"MySchema\".\"MyTable\"").unwrap();
+        assert_eq!(schema, Some("MySchema".to_string()));
+        assert_eq!(name, "MyTable");
+    }
+
+    #[test]
+    fn parse_regclass_input_escaped_double_quote() {
+        let (schema, name) = parse_regclass_input("\"has\"\"quote\"").unwrap();
+        assert_eq!(schema, None);
+        assert_eq!(name, "has\"quote");
+    }
+
+    #[test]
+    fn parse_regclass_input_dot_inside_quoted_name() {
+        let (schema, name) = parse_regclass_input("\"schema.table\"").unwrap();
+        assert_eq!(schema, None);
+        assert_eq!(name, "schema.table");
+    }
+
+    #[test]
+    fn parse_regclass_input_three_parts_is_cross_database_error() {
+        let err = parse_regclass_input("a.b.c").unwrap_err();
+        assert_eq!(err, "a.b.c");
+    }
+
+    #[test]
+    fn relation_search_path_schemas_prepends_implicit_pg_catalog() {
+        let schemas = relation_search_path_schemas(&["$user".to_string(), "public".to_string()]);
+        assert_eq!(schemas, vec!["pg_catalog", "public"]);
+    }
+
+    #[test]
+    fn relation_search_path_schemas_preserves_explicit_pg_catalog_position() {
+        let schemas = relation_search_path_schemas(&[
+            "$user".to_string(),
+            "public".to_string(),
+            "pg_catalog".to_string(),
+        ]);
+        assert_eq!(schemas, vec!["public", "pg_catalog"]);
+    }
+
+    #[test]
+    fn relation_search_path_schemas_defaults_to_pg_catalog_then_public() {
+        let schemas = relation_search_path_schemas(&[]);
+        assert_eq!(schemas, vec!["pg_catalog", "public"]);
+    }
+
+    #[test]
+    fn type_search_path_schemas_prepends_implicit_pg_catalog() {
+        let schemas = type_search_path_schemas(&["$user".to_string(), "public".to_string()]);
+        assert_eq!(schemas, vec!["pg_catalog", "public"]);
+    }
+
+    #[test]
+    fn type_search_path_schemas_preserves_explicit_pg_catalog_position() {
+        let schemas = type_search_path_schemas(&[
+            "$user".to_string(),
+            "public".to_string(),
+            "pg_catalog".to_string(),
+        ]);
+        assert_eq!(schemas, vec!["public", "pg_catalog"]);
     }
 }

@@ -21,37 +21,6 @@ fn is_regtype_udt(udt: &str) -> bool {
     udt.eq_ignore_ascii_case("regtype") || udt.eq_ignore_ascii_case("pg_catalog.regtype")
 }
 
-/// Resolve well-known pg_catalog relation names to their fixed OIDs.
-///
-/// These OIDs match PostgreSQL's bootstrap catalog and are used by JDBC
-/// drivers in queries like `d.classoid = 'pg_class'::regclass`.
-fn regclass_catalog_oid(name: &str) -> Option<i64> {
-    match name {
-        "pg_class" => Some(1259),
-        "pg_type" => Some(1247),
-        "pg_attribute" => Some(1249),
-        "pg_proc" => Some(1255),
-        "pg_namespace" => Some(2615),
-        "pg_constraint" => Some(2606),
-        "pg_attrdef" => Some(2604),
-        "pg_index" => Some(2610),
-        "pg_database" => Some(1262),
-        "pg_tablespace" => Some(1213),
-        "pg_description" => Some(2609),
-        "pg_shdescription" => Some(2396),
-        "pg_extension" => Some(3079),
-        "pg_am" => Some(2601),
-        "pg_trigger" => Some(2620),
-        "pg_depend" => Some(2608),
-        "pg_roles" => Some(12000),
-        "pg_authid" => Some(1260),
-        "pg_collation" => Some(3456),
-        "pg_enum" => Some(3501),
-        "pg_sequence" => Some(2224),
-        _ => None,
-    }
-}
-
 /// Controls which type conversions are allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CastContext {
@@ -614,7 +583,7 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             let name = normalized
                 .strip_prefix("pg_catalog.")
                 .unwrap_or(normalized.as_str());
-            if let Some(oid) = regclass_catalog_oid(name) {
+            if let Some(oid) = crate::sql::catalog_oids::pg_catalog_relation_oid(name) {
                 return Ok(Value::Int64(oid));
             }
             Err(SqlError::InvalidInputSyntax {
@@ -674,24 +643,7 @@ pub(crate) fn coerce_text_to_numeric(v: Value) -> Result<Value> {
 /// strip double-quote delimiters, drop schema qualification, and map
 /// internal short aliases to their canonical SQL display names.
 fn normalize_regtype(s: &str) -> String {
-    // 1. Remove double quotes: `"pg_catalog"."int4"` → `pg_catalog.int4`
-    let stripped = s.replace('"', "");
-    // 2. Take last dot-separated component: `pg_catalog.int4` → `int4`
-    let name = stripped.rsplit('.').next().unwrap_or(&stripped);
-    // 3. Map short aliases to display names (matches real PostgreSQL behavior)
-    match name.to_lowercase().as_str() {
-        "int2" | "smallint" => "smallint".to_string(),
-        "int4" | "integer" | "int" | "serial" => "integer".to_string(),
-        "int8" | "bigint" | "bigserial" => "bigint".to_string(),
-        "float4" | "real" => "real".to_string(),
-        "float8" => "double precision".to_string(),
-        "bool" => "boolean".to_string(),
-        "varchar" => "character varying".to_string(),
-        "timestamp" => "timestamp without time zone".to_string(),
-        "timestamptz" => "timestamp with time zone".to_string(),
-        "time" | "timetz" => "time without time zone".to_string(),
-        other => other.to_string(),
-    }
+    crate::sql::pg_types::canonical_regtype_name(s)
 }
 
 #[cfg(test)]

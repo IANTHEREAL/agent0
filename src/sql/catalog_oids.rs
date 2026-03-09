@@ -5,6 +5,7 @@ const INDEX_OID_BASE: i64 = 20_000_000_000;
 const SEQUENCE_OID_BASE: i64 = 30_000_000_000;
 const VIEW_OID_BASE: i64 = 40_000_000_000;
 const FUNCTION_OID_BASE: i64 = 50_000_000_000;
+const BUILTIN_FUNCTION_OID_BASE: i64 = 55_000_000_000;
 const TRIGGER_OID_BASE: i64 = 60_000_000_000;
 const ATTRDEF_OID_BASE: i64 = 70_000_000_000;
 const ROLE_OID_BASE: i64 = 80_000_000_000;
@@ -54,6 +55,11 @@ pub fn pg_proc_function_oid(function_oid: u32) -> i64 {
     FUNCTION_OID_BASE + function_oid as i64
 }
 
+pub fn pg_builtin_function_oid(function_name: &str) -> i64 {
+    let lower = function_name.to_ascii_lowercase();
+    BUILTIN_FUNCTION_OID_BASE + (fnv1a_64(lower.as_bytes()) % 1_000_000_000) as i64
+}
+
 pub fn pg_trigger_oid(trigger_oid: u32) -> i64 {
     TRIGGER_OID_BASE + trigger_oid as i64
 }
@@ -87,4 +93,63 @@ pub fn pg_role_oid(role_name: &str) -> i64 {
     const ROLE_HASH_RANGE: u64 = 1_000_000_000;
     let h = fnv1a_64(role_name.as_bytes());
     ROLE_OID_BASE + (h % ROLE_HASH_RANGE) as i64
+}
+
+/// Fixed PostgreSQL bootstrap OIDs for core `pg_catalog` relations.
+///
+/// These are authoritative PostgreSQL catalog contracts, not db9-generated IDs.
+/// Keep this as the single source of truth for places that need to resolve
+/// well-known virtual catalog relations to their real PostgreSQL OIDs.
+pub fn pg_catalog_relation_oid(name: &str) -> Option<i64> {
+    match name {
+        "pg_class" => Some(1259),
+        "pg_type" => Some(1247),
+        "pg_attribute" => Some(1249),
+        "pg_proc" => Some(1255),
+        "pg_namespace" => Some(2615),
+        "pg_constraint" => Some(2606),
+        "pg_attrdef" => Some(2604),
+        "pg_index" => Some(2610),
+        "pg_database" => Some(1262),
+        "pg_tablespace" => Some(1213),
+        "pg_description" => Some(2609),
+        "pg_shdescription" => Some(2396),
+        "pg_extension" => Some(3079),
+        "pg_am" => Some(2601),
+        "pg_trigger" => Some(2620),
+        "pg_depend" => Some(2608),
+        "pg_roles" => Some(12000),
+        "pg_authid" => Some(1260),
+        "pg_collation" => Some(3456),
+        "pg_enum" => Some(3501),
+        "pg_sequence" => Some(2224),
+        _ => None,
+    }
+}
+
+pub fn pg_catalog_relation_name(oid: i64) -> Option<&'static str> {
+    match oid {
+        1259 => Some("pg_class"),
+        1247 => Some("pg_type"),
+        1249 => Some("pg_attribute"),
+        1255 => Some("pg_proc"),
+        2615 => Some("pg_namespace"),
+        2606 => Some("pg_constraint"),
+        2604 => Some("pg_attrdef"),
+        2610 => Some("pg_index"),
+        1262 => Some("pg_database"),
+        1213 => Some("pg_tablespace"),
+        2609 => Some("pg_description"),
+        2396 => Some("pg_shdescription"),
+        3079 => Some("pg_extension"),
+        2601 => Some("pg_am"),
+        2620 => Some("pg_trigger"),
+        2608 => Some("pg_depend"),
+        12000 => Some("pg_roles"),
+        1260 => Some("pg_authid"),
+        3456 => Some("pg_collation"),
+        3501 => Some("pg_enum"),
+        2224 => Some("pg_sequence"),
+        _ => None,
+    }
 }

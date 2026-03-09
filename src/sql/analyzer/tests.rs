@@ -3399,7 +3399,44 @@ fn analyze_to_regtype_unknown_param_infers_text() {
     let AnalyzedStatement::Query(q) = result else {
         panic!("expected query statement");
     };
-    assert_eq!(q.output_schema[0].1, DataType::Int64);
+    assert_eq!(
+        q.output_schema[0].1,
+        DataType::UserDefined("pg_catalog.regtype".to_string())
+    );
+}
+
+#[test]
+fn analyze_to_regclass_unknown_param_infers_text() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT to_regclass($1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 1, &[None]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    let types = analyzer.finalize_param_types().unwrap();
+    assert_eq!(types, vec![DataType::Text]);
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+    assert_eq!(
+        q.output_schema[0].1,
+        DataType::UserDefined("pg_catalog.regclass".to_string())
+    );
+}
+
+#[test]
+fn analyze_pg_typeof_returns_regtype() {
+    let catalog = test_catalog();
+    let stmt = parse_statement("SELECT pg_typeof(1)");
+    let mut analyzer = Analyzer::new_with_params(&catalog, 0, &[]);
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+
+    let AnalyzedStatement::Query(q) = result else {
+        panic!("expected query statement");
+    };
+    assert_eq!(
+        q.output_schema[0].1,
+        DataType::UserDefined("pg_catalog.regtype".to_string())
+    );
 }
 
 #[test]
@@ -3435,6 +3472,46 @@ fn analyze_pg_get_serial_sequence_accepts_pg_catalog_schema_qualification() {
 fn analyze_pg_get_serial_sequence_quoted_pg_catalog_uppercase_returns_schema_not_found() {
     let err =
         analyze_expr_with_users("\"PG_CATALOG\".pg_get_serial_sequence('t', 'id')").unwrap_err();
+    assert!(
+        matches!(err, AnalyzerError::SchemaNotFound(ref name) if name == "PG_CATALOG"),
+        "expected SchemaNotFound(PG_CATALOG), got: {:?}",
+        err
+    );
+}
+
+#[test]
+fn analyze_to_regclass_quoted_pg_catalog_uppercase_returns_schema_not_found() {
+    let err = analyze_expr_with_users("\"PG_CATALOG\".to_regclass('pg_class')").unwrap_err();
+    assert!(
+        matches!(err, AnalyzerError::SchemaNotFound(ref name) if name == "PG_CATALOG"),
+        "expected SchemaNotFound(PG_CATALOG), got: {:?}",
+        err
+    );
+}
+
+#[test]
+fn analyze_to_regclass_nonexistent_schema_returns_schema_not_found() {
+    let err = analyze_expr_with_users("nosuchschema.to_regclass('pg_class')").unwrap_err();
+    assert!(
+        matches!(err, AnalyzerError::SchemaNotFound(ref name) if name == "nosuchschema"),
+        "expected SchemaNotFound(nosuchschema), got: {:?}",
+        err
+    );
+}
+
+#[test]
+fn analyze_to_regclass_cross_database_reference() {
+    let err = analyze_expr_with_users("foo.public.to_regclass('pg_class')").unwrap_err();
+    assert!(
+        matches!(err, AnalyzerError::CrossDatabaseReference(_)),
+        "expected CrossDatabaseReference, got: {:?}",
+        err
+    );
+}
+
+#[test]
+fn analyze_to_regtype_quoted_pg_catalog_uppercase_returns_schema_not_found() {
+    let err = analyze_expr_with_users("\"PG_CATALOG\".to_regtype('int4')").unwrap_err();
     assert!(
         matches!(err, AnalyzerError::SchemaNotFound(ref name) if name == "PG_CATALOG"),
         "expected SchemaNotFound(PG_CATALOG), got: {:?}",
