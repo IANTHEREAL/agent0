@@ -103,6 +103,10 @@ pub struct Session {
     /// Cleared on COMMIT/ROLLBACK, savepoint-scoped within a transaction block.
     pub(crate) extension_delta: ExtensionDelta,
     pub(crate) extension_delta_savepoints: Vec<ExtensionDeltaSavepoint>,
+    /// True when executing a multi-statement simple-query batch (implicit transaction).
+    /// LOCAL mutations should persist across statements within the batch, matching
+    /// PostgreSQL's implicit transaction semantics for multi-statement simple queries.
+    in_implicit_batch: bool,
 }
 
 /// Force-insert or overwrite a setting in a sorted `(name, value, description)` vec.
@@ -169,6 +173,7 @@ impl Session {
             )),
             extension_delta: ExtensionDelta::default(),
             extension_delta_savepoints: Vec::new(),
+            in_implicit_batch: false,
         }
     }
 
@@ -224,6 +229,7 @@ impl Session {
             )),
             extension_delta: ExtensionDelta::default(),
             extension_delta_savepoints: Vec::new(),
+            in_implicit_batch: false,
         }
     }
 
@@ -435,6 +441,16 @@ impl Session {
         )
     }
 
+    /// Whether we are inside a multi-statement simple-query batch (implicit transaction).
+    pub(crate) fn in_implicit_batch(&self) -> bool {
+        self.in_implicit_batch
+    }
+
+    /// Mark the session as inside (or outside) a multi-statement simple-query batch.
+    pub(crate) fn set_in_implicit_batch(&mut self, v: bool) {
+        self.in_implicit_batch = v;
+    }
+
     pub fn is_transaction_failed(&self) -> bool {
         #[cfg(test)]
         if self.test_force_failed_transaction {
@@ -637,6 +653,18 @@ impl Session {
             .unwrap_or("postgres")
             .to_string();
         map.insert("session_authorization".to_string(), session_auth);
+        // Thread effective reset-default values for tenant-configurable
+        // timeout GUCs so set_config(name, NULL, ...) can return the
+        // correct post-reset value (PG parity #1559).
+        map.insert(
+            "_reset_default.statement_timeout".to_string(),
+            self.settings.reset_default_show_value("statement_timeout"),
+        );
+        map.insert(
+            "_reset_default.idle_in_transaction_session_timeout".to_string(),
+            self.settings
+                .reset_default_show_value("idle_in_transaction_session_timeout"),
+        );
         map
     }
 

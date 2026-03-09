@@ -1,0 +1,5 @@
+not_a_timeout
+parameter "is_superuser" cannot be changed
+SET requires parameter name
+parameter "is_superuser" cannot be changed
+unrecognized configuration parameter "_reset_default.statement_timeout"

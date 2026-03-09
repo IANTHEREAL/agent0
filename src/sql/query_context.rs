@@ -33,6 +33,9 @@ pub(crate) struct SetConfigMutation {
     pub(crate) name: String,
     pub(crate) value: String,
     pub(crate) is_local: bool,
+    /// When true, the mutation resets the setting to its boot default
+    /// (equivalent to RESET <name>). `value` is ignored by the flush path.
+    pub(crate) is_reset: bool,
 }
 
 fn lock_ignoring_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -312,6 +315,20 @@ impl QueryContext {
             .flatten()
     }
 
+    /// Read a setting from the base snapshot only (bypassing runtime overrides).
+    ///
+    /// Used for NULL-reset resolution where we need the authoritative session
+    /// value (e.g. `session_authorization` must resolve to the login role, not
+    /// a value mutated by a prior `set_config` in the same statement).
+    pub(crate) fn base_setting_snapshot(name: &str) -> Option<String> {
+        let canonical =
+            crate::sql::session::settings::SessionSettings::canonical_setting_name(name);
+        SETTINGS_SNAPSHOT
+            .try_with(|s| s.get(canonical).cloned())
+            .ok()
+            .flatten()
+    }
+
     /// Read a setting from the current statement's settings snapshot.
     ///
     /// Returns `None` when there is no scoped snapshot or the key is absent.
@@ -351,6 +368,20 @@ impl QueryContext {
             .flatten()
     }
 
+    /// Read a reset-default value from the execution settings snapshot.
+    ///
+    /// These are internal `_reset_default.<name>` entries carrying the effective
+    /// post-reset value for tenant-configurable GUCs. They live only in the
+    /// execution snapshot (never in the public snapshot), so they are invisible
+    /// to `current_setting()` while still available for NULL-reset resolution.
+    pub(crate) fn reset_default_from_snapshot(guc_name: &str) -> Option<String> {
+        let key = format!("_reset_default.{}", guc_name);
+        EXECUTION_SETTINGS_SNAPSHOT
+            .try_with(|s| s.get(&key).cloned())
+            .ok()
+            .flatten()
+    }
+
     pub(crate) fn set_runtime_setting_override(name: &str, value: &str) {
         let canonical =
             crate::sql::session::settings::SessionSettings::canonical_setting_name(name)
@@ -361,7 +392,6 @@ impl QueryContext {
         });
     }
 
-    #[cfg(test)]
     pub(crate) fn remove_runtime_setting_override(name: &str) {
         let canonical =
             crate::sql::session::settings::SessionSettings::canonical_setting_name(name);
@@ -390,11 +420,32 @@ impl QueryContext {
                 name: canonical,
                 value,
                 is_local,
+                is_reset: false,
             });
         });
     }
 
-    #[cfg(test)]
+    /// Record a RESET mutation (PG parity: set_config(name, NULL, is_local)).
+    /// Sets the runtime override to the boot default so that current_setting()
+    /// in the same statement sees the post-reset value, and records an is_reset
+    /// mutation for the flush path.
+    pub(crate) fn record_set_config_reset(name: &str, is_local: bool, boot_default: &str) {
+        let canonical =
+            crate::sql::session::settings::SessionSettings::canonical_setting_name(name)
+                .to_string();
+
+        Self::set_runtime_setting_override(&canonical, boot_default);
+
+        let _ = PENDING_SET_CONFIG_MUTATIONS.try_with(|pending| {
+            lock_ignoring_poison(pending).push(SetConfigMutation {
+                name: canonical,
+                value: String::new(),
+                is_local,
+                is_reset: true,
+            });
+        });
+    }
+
     pub(crate) fn take_set_config_mutations() -> Vec<SetConfigMutation> {
         PENDING_SET_CONFIG_MUTATIONS
             .try_with(|pending| std::mem::take(&mut *lock_ignoring_poison(pending)))
@@ -644,11 +695,13 @@ mod tests {
                     name: "statement_timeout".to_string(),
                     value: "200ms".to_string(),
                     is_local: false,
+                    is_reset: false,
                 },
                 SetConfigMutation {
                     name: "timezone".to_string(),
                     value: "UTC".to_string(),
                     is_local: true,
+                    is_reset: false,
                 },
             ]
         );

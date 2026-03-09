@@ -152,6 +152,9 @@ tests/189_worker_auto_analyze.sql
 tests/229_statement_timeout.sql
 tests/230_idle_in_transaction_timeout.sql
 tests/232_statement_timeout_guc_regression.sql
+# #1559 – set_config / SET LOCAL session GUC parity
+tests/237_set_local.sql
+tests/293_set_config_non_fast_path.sql
 tests/291_session_authorization_readback.sql
 # #1564 – dotted session.authorization readback aliasing
 tests/297_session_authorization_dotted.sql

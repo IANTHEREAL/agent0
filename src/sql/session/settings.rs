@@ -1052,6 +1052,73 @@ impl SessionSettings {
         self.settings_savepoint_stack = savepoint_stack;
     }
 
+    /// Return the boot-default display value for a GUC (what SHOW returns after RESET).
+    ///
+    /// Static variant that returns the hardcoded PG boot default.
+    /// For tenant-configurable timeouts, prefer `reset_default_show_value()`
+    /// which uses the session's configured defaults.
+    pub(crate) fn boot_default_show_value(name: &str) -> String {
+        let canonical = Self::canonical_setting_name(name);
+        match canonical {
+            "search_path" => Self::format_search_path_show(&Self::default_search_path()),
+            "statement_timeout"
+            | "lock_timeout"
+            | "idle_in_transaction_session_timeout"
+            | "db9.retry_timeout" => Self::format_timeout_show(0),
+            "db9.dml_table_scan_max_rows" => DEFAULT_DML_TABLE_SCAN_MAX_ROWS.to_string(),
+            "db9.max_sort_bytes" => DEFAULT_MAX_SORT_BYTES.to_string(),
+            "db9.prepared_plan_cache_size" => "128".to_string(),
+            "db9.prepared_plan_cache_min_exec" => "5".to_string(),
+            "hnsw.ef_search" => "40".to_string(),
+            "db9.retry_max_attempts" => "64".to_string(),
+            "db9.use_optimizer" => "on".to_string(),
+            "timezone" => "UTC".to_string(),
+            "application_name" => String::new(),
+            "client_encoding" => "UTF8".to_string(),
+            "standard_conforming_strings" => "on".to_string(),
+            "check_function_bodies" => "on".to_string(),
+            "xmloption" => "content".to_string(),
+            "client_min_messages" => "notice".to_string(),
+            "row_security" => "on".to_string(),
+            "default_tablespace" => String::new(),
+            "default_table_access_method" => "heap".to_string(),
+            "transaction_isolation" => "repeatable read".to_string(),
+            "default_transaction_read_only" => "off".to_string(),
+            // Immutable / computed GUCs.
+            "server_version" => "16.0".to_string(),
+            "server_version_num" => "160000".to_string(),
+            "server_encoding" => "UTF8".to_string(),
+            "datestyle" => "ISO, MDY".to_string(),
+            "integer_datetimes" => "on".to_string(),
+            "intervalstyle" => "postgres".to_string(),
+            _ => {
+                // Fall back to static_default from KNOWN_GUCS registry.
+                KNOWN_GUCS
+                    .iter()
+                    .find(|g| g.name == canonical)
+                    .and_then(|g| g.static_default)
+                    .map(String::from)
+                    .unwrap_or_default()
+            }
+        }
+    }
+
+    /// Return the effective post-reset display value for a GUC.
+    ///
+    /// Like `boot_default_show_value()` but uses the session's configured
+    /// defaults for `statement_timeout` and
+    /// `idle_in_transaction_session_timeout` instead of hardcoded 0.
+    pub(crate) fn reset_default_show_value(&self, name: &str) -> String {
+        let canonical = Self::canonical_setting_name(name);
+        match canonical {
+            "statement_timeout" => Self::format_timeout_show(self.default_statement_timeout_ms),
+            "idle_in_transaction_session_timeout" => {
+                Self::format_timeout_show(self.default_idle_in_transaction_session_timeout_ms)
+            }
+            _ => Self::boot_default_show_value(name),
+        }
+    }
+
     /// Get a session setting value in a Postgres-like string form, for `SHOW`.
     pub(crate) fn show_value(&self, name: &str) -> Option<String> {
         let canonical = Self::canonical_setting_name(name);

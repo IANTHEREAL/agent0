@@ -676,6 +676,33 @@ mod tests {
     }
 
     #[test]
+    fn test_reset_default_show_value_uses_configured_defaults() {
+        let settings_zero = SessionSettings::new();
+        assert_eq!(
+            settings_zero.reset_default_show_value("statement_timeout"),
+            "0"
+        );
+        assert_eq!(
+            settings_zero.reset_default_show_value("idle_in_transaction_session_timeout"),
+            "0"
+        );
+        assert_eq!(settings_zero.reset_default_show_value("timezone"), "UTC");
+        let settings_nonzero = SessionSettings::new_with_defaults(60_000, 30_000);
+        assert_eq!(
+            settings_nonzero.reset_default_show_value("statement_timeout"),
+            "60000ms"
+        );
+        assert_eq!(
+            settings_nonzero.reset_default_show_value("idle_in_transaction_session_timeout"),
+            "30000ms"
+        );
+        assert_eq!(
+            settings_nonzero.reset_default_show_value("lock_timeout"),
+            "0"
+        );
+    }
+
+    #[test]
     fn test_statement_timeout_getter_with_nonzero_default() {
         let settings = SessionSettings::new_with_defaults(5_000, 0);
         assert_eq!(

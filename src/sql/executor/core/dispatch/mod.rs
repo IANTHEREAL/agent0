@@ -73,12 +73,30 @@ impl Executor {
             return self.execute_single(session, statement).await;
         }
 
+        // Multi-statement batch: PostgreSQL wraps these in an implicit
+        // transaction, so SET LOCAL effects persist across statements.
+        // Set the flag so apply_pending_set_config_mutations applies LOCAL
+        // mutations to session local_overrides instead of dropping them.
+        session.set_in_implicit_batch(true);
         let mut results = Vec::new();
-        for statement in statements {
-            let ExecuteResults(mut statement_results) =
-                self.execute_single(session, statement).await?;
-            results.append(&mut statement_results);
+        let batch_result = async {
+            for statement in statements {
+                let ExecuteResults(mut statement_results) =
+                    self.execute_single(session, statement).await?;
+                results.append(&mut statement_results);
+            }
+            Ok::<_, anyhow::Error>(())
         }
+        .await;
+        // Clean up: revert LOCAL overrides accumulated during the implicit
+        // batch (mirrors COMMIT clearing local_overrides in explicit txns).
+        // Only clear if we didn't enter an explicit transaction during the
+        // batch (e.g. a bare BEGIN inside the batch).
+        if !session.is_in_transaction() {
+            session.clear_local_overrides();
+        }
+        session.set_in_implicit_batch(false);
+        batch_result?;
         Ok(ExecuteResults(results))
     }
 

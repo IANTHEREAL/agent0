@@ -6,7 +6,7 @@
 use crate::model::{Row, Value};
 use crate::sql::analyzer::types::*;
 use crate::sql::error::SqlError;
-use crate::sql::executor::check_reserved_guc_write;
+use crate::sql::executor::{check_reserved_guc_reset, check_reserved_guc_write};
 use crate::sql::query_context::QueryContext;
 use anyhow::{anyhow, Result};
 use std::sync::OnceLock;
@@ -197,19 +197,27 @@ pub(super) fn eval_function_call(
             return Err(anyhow!("unrecognized configuration parameter \"{}\"", name));
         }
         "SET_CONFIG" | "PG_CATALOG.SET_CONFIG" => {
+            // PG parity: NULL name → error (SQLSTATE 22004).
             let name = match args.first() {
                 Some(Value::Text(s)) => s.to_lowercase(),
-                Some(Value::Null) | None => return Ok(Value::Null),
+                Some(Value::Null) | None => {
+                    return Err(SqlError::NullValueNotAllowed {
+                        message: "SET requires parameter name".to_string(),
+                    }
+                    .into());
+                }
                 _ => return Err(anyhow!("set_config requires text argument")),
             };
-            let value = match args.get(1) {
-                Some(Value::Text(s)) => s.clone(),
-                Some(Value::Null) => return Ok(Value::Null),
+            // PG parity: NULL value → RESET (handled below after is_local).
+            let value: Option<String> = match args.get(1) {
+                Some(Value::Text(s)) => Some(s.clone()),
+                Some(Value::Null) => None,
                 Some(_) | None => return Err(anyhow!("set_config requires text argument")),
             };
+            // PG parity: NULL is_local → false (session scope).
             let is_local = match args.get(2) {
                 Some(Value::Boolean(b)) => *b,
-                Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Null) => false,
                 Some(Value::Text(s)) => {
                     match crate::sql::types::cast::cast(
                         Value::Text(s.clone()),
@@ -225,9 +233,44 @@ pub(super) fn eval_function_call(
                 }
             };
 
-            check_reserved_guc_write(&name)?;
             let canonical =
                 crate::sql::session::settings::SessionSettings::canonical_setting_name(&name);
+
+            // NULL value → RESET: return boot-default value (PG parity).
+            // Guard: reserved pseudo-GUCs must be rejected even on NULL reset.
+            let Some(value) = value else {
+                check_reserved_guc_reset(&name)?;
+                // session_authorization resets to the session's login role,
+                // not the current role after SET ROLE (PG parity).
+                // Read from base snapshot which holds the authoritative
+                // session_authorization set at statement start.
+                let default_value = if canonical == "session_authorization" {
+                    QueryContext::base_setting_snapshot("session_authorization").unwrap_or_else(
+                        || {
+                            QueryContext::current_user_name()
+                                .map(|u| u.to_string())
+                                .unwrap_or_default()
+                        },
+                    )
+                } else {
+                    // Read the effective reset default from the execution snapshot
+                    // for tenant-configurable GUCs (e.g. statement_timeout) whose
+                    // default can differ from the hardcoded boot default.
+                    // These values are stored as _reset_default.<name> entries in
+                    // the execution snapshot only (never in the public snapshot),
+                    // so they are invisible to current_setting() while still
+                    // available for NULL-reset resolution.
+                    QueryContext::reset_default_from_snapshot(canonical).unwrap_or_else(|| {
+                        crate::sql::session::settings::SessionSettings::boot_default_show_value(
+                            canonical,
+                        )
+                    })
+                };
+                QueryContext::record_set_config_reset(canonical, is_local, &default_value);
+                return Ok(Value::Text(default_value));
+            };
+
+            check_reserved_guc_write(&name)?;
             let normalized_value = if canonical == "search_path" {
                 if value.is_empty() {
                     String::new()
@@ -243,14 +286,13 @@ pub(super) fn eval_function_call(
                     canonical, &value,
                 )?
             };
-            // Match session.is_in_transaction() behavior from the dispatch layer:
-            // outside an explicit transaction, LOCAL changes are dropped at flush,
-            // so they must not leak through runtime current_setting() overrides.
-            let in_transaction =
-                crate::session_context::current_txn_snapshot_ts_version().is_some();
-            if !is_local || in_transaction {
-                QueryContext::record_set_config_mutation(canonical, &normalized_value, is_local);
-            }
+            // Always record the mutation: the runtime override gives same-statement
+            // visibility to current_setting(), and the flush layer
+            // (apply_pending_set_config_mutations) already drops is_local mutations
+            // outside explicit transactions.  Runtime overrides are per-statement
+            // scoped (fresh HashMap in with_scoped_query_context), so they cannot
+            // leak to subsequent statements.
+            QueryContext::record_set_config_mutation(canonical, &normalized_value, is_local);
             return Ok(Value::Text(normalized_value));
         }
         "PG_GET_USERBYID" => return Ok(Value::Text("postgres".to_string())),
@@ -305,9 +347,9 @@ fn parse_search_path_guc_value(s: &str) -> Vec<String> {
 
 fn normalize_search_path_entries(mut entries: Vec<String>) -> Result<Vec<String>> {
     entries.retain(|s| !s.is_empty());
-    if entries.len() == 1 && entries[0].eq_ignore_ascii_case("default") {
-        return Ok(vec!["$user".to_string(), "public".to_string()]);
-    }
+    // NOTE: No `default` keyword rewrite here. set_config() takes text values,
+    // so 'default' is a literal schema name (PG parity). The DEFAULT keyword
+    // rewrite belongs only in the SET statement path (guc.rs).
     for schema in &entries {
         if schema.contains('.') {
             return Err(anyhow!("schema name '{}' must not contain '.'", schema));

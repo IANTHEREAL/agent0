@@ -133,6 +133,99 @@ impl Executor {
         }
     }
 }
+pub(in crate::sql::executor::core) fn apply_pending_set_config_mutations(
+    session: &mut Session,
+) -> Result<()> {
+    use crate::sql::query_context::QueryContext;
+
+    let pending = QueryContext::take_set_config_mutations();
+    for mutation in pending {
+        // LOCAL mutations outside an explicit transaction:
+        // - Single-statement implicit tx: LOCAL has no lasting effect (PG parity).
+        //   Clean up the runtime override so it doesn't leak.
+        // - Multi-statement batch (implicit transaction): LOCAL persists for the
+        //   remainder of the batch, matching PostgreSQL's implicit transaction
+        //   semantics.  The caller (execute()) clears local_overrides after the
+        //   batch completes.
+        if mutation.is_local && !session.is_in_transaction() && !session.in_implicit_batch() {
+            QueryContext::remove_runtime_setting_override(&mutation.name);
+            continue;
+        }
+
+        // is_reset: NULL value in set_config() → RESET to boot default.
+        if mutation.is_reset {
+            if mutation.is_local {
+                // LOCAL reset: set a LOCAL override to the effective default so
+                // the reset is transaction-scoped and reverts on COMMIT/ROLLBACK.
+                // Using reset_setting() here would mutate the session-level
+                // value and leak past transaction end.
+                let boot = session.settings().reset_default_show_value(&mutation.name);
+                if mutation.name == "search_path" {
+                    let entries = parse_search_path_guc_value(&boot);
+                    session.set_local_search_path(entries);
+                } else {
+                    session.set_local_setting(&mutation.name, boot)?;
+                }
+            } else {
+                // PG parity: for custom GUCs (not in the known registry),
+                // NULL reset preserves the setting as empty string rather
+                // than removing it.  reset_setting() removes custom GUCs
+                // from extra_settings, so use set_known_setting("") instead.
+                let is_known = crate::sql::session::settings::KNOWN_GUCS
+                    .iter()
+                    .any(|g| g.name == mutation.name);
+                if is_known {
+                    session.reset_setting(&mutation.name);
+                } else {
+                    session.set_known_setting(&mutation.name, String::new())?;
+                }
+            }
+            continue;
+        }
+
+        if mutation.name == "search_path" {
+            // Values from the typed eval handler are already normalized;
+            // just parse them back into a list without re-applying the
+            // DEFAULT keyword rewrite (which belongs only in SET statement).
+            let entries = if mutation.value.is_empty() {
+                Vec::new()
+            } else {
+                parse_search_path_guc_value(&mutation.value)
+            };
+            if mutation.is_local {
+                session.set_local_search_path(entries);
+            } else {
+                session.set_search_path(entries);
+            }
+            continue;
+        }
+
+        if mutation.is_local {
+            session.set_local_setting(&mutation.name, mutation.value)?;
+        } else {
+            session.set_known_setting(&mutation.name, mutation.value)?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_search_path_guc_value(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in s.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let schema = if token.starts_with('\"') && token.ends_with('\"') && token.len() >= 2 {
+            token[1..token.len() - 1].to_string()
+        } else {
+            token.to_lowercase()
+        };
+        out.push(schema);
+    }
+    out
+}
+
 /// Apply an optional statement timeout to a future.
 ///
 /// If `timeout` is `Some`, wraps the future with `tokio::time::timeout` and
@@ -252,6 +345,81 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("statement timeout"));
+    }
+
+    #[tokio::test]
+    async fn apply_pending_set_config_mutations_preserves_explicit_empty_search_path() {
+        let mut session = test_session(true);
+        let qctx = crate::sql::query_context::QueryContext::for_tests();
+
+        crate::sql::query_context::with_scoped_query_context(&qctx, async {
+            crate::sql::query_context::QueryContext::record_set_config_mutation(
+                "search_path",
+                "",
+                false,
+            );
+            apply_pending_set_config_mutations(&mut session)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            session.show_setting_value("search_path").as_deref(),
+            Some("")
+        );
+        assert!(session.search_path().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_pending_local_mutation_outside_tx_clears_runtime_override() {
+        use crate::sql::query_context::QueryContext;
+        let mut session = test_session(true);
+        let qctx = QueryContext::for_tests();
+
+        crate::sql::query_context::with_scoped_query_context(&qctx, async {
+            // Record a LOCAL mutation (is_local = true).
+            QueryContext::record_set_config_mutation("statement_timeout", "550ms", true);
+            // Same-statement visibility: override is present.
+            assert_eq!(
+                QueryContext::current_setting_snapshot("statement_timeout").as_deref(),
+                Some("550ms")
+            );
+
+            // Session is NOT in a transaction → LOCAL is dropped.
+            apply_pending_set_config_mutations(&mut session).unwrap();
+
+            // Runtime override must also be cleaned up so it doesn't leak
+            // to later statements in the same batch.
+            assert_ne!(
+                QueryContext::current_setting_snapshot("statement_timeout").as_deref(),
+                Some("550ms"),
+                "LOCAL override must be cleaned up after statement flush outside transaction"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn apply_pending_local_mutation_in_implicit_batch_persists() {
+        use crate::sql::query_context::QueryContext;
+        let mut session = test_session(true);
+        // Simulate multi-statement batch (implicit transaction).
+        session.set_in_implicit_batch(true);
+        let qctx = QueryContext::for_tests();
+
+        crate::sql::query_context::with_scoped_query_context(&qctx, async {
+            QueryContext::record_set_config_mutation("statement_timeout", "550ms", true);
+            apply_pending_set_config_mutations(&mut session).unwrap();
+
+            // LOCAL mutation must persist as a local_override on the session
+            // (not dropped) because we are in an implicit batch.
+            assert_eq!(
+                session.show_setting_value("statement_timeout").as_deref(),
+                Some("550ms"),
+                "LOCAL must persist across statements in an implicit batch"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
