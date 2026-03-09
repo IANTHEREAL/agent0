@@ -199,6 +199,8 @@ tests/295_order_by_null_placement.sql
 tests/1628_to_regclass.sql
 # #1629 – computed generated columns parity (CREATE TABLE + ALTER TABLE ADD COLUMN)
 tests/1629_generated_column_reject.sql
+# #1658 – pg_class materialized views report relkind='m' instead of 'r'
+tests/30_matview_relkind.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py

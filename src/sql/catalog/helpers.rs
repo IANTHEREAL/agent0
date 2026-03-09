@@ -12,6 +12,7 @@ pub const RELKIND_TABLE: &str = "r";
 pub const RELKIND_INDEX: &str = "i";
 pub const RELKIND_SEQUENCE: &str = "S";
 pub const RELKIND_VIEW: &str = "v";
+pub const RELKIND_MATVIEW: &str = "m";
 
 // --- pg_class column defaults ---
 /// Bootstrap superuser OID used as `relowner`.

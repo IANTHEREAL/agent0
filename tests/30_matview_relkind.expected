@@ -1,0 +1,5 @@
+relname|relkind
+mv_relkind_test|m
+t_relkind_test|r
+v_relkind_test|v
+(3 rows)

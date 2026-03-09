@@ -1,7 +1,7 @@
 use super::helpers::{
     access_method_oid, bool_col, int_col, int_val, null_val, owner_role_oid, schema_oid,
     split_schema_and_name, text_array_col, text_col, text_val, AM_BTREE_OID, RELKIND_INDEX,
-    RELKIND_SEQUENCE, RELKIND_TABLE, RELKIND_VIEW, RELREPLIDENT_DEFAULT,
+    RELKIND_MATVIEW, RELKIND_SEQUENCE, RELKIND_TABLE, RELKIND_VIEW, RELREPLIDENT_DEFAULT,
 };
 use super::{ScanContext, VirtualTable};
 use crate::model::{Row, TableSchema, Value};
@@ -157,6 +157,14 @@ impl VirtualTable for PgClass {
                 table_schemas.insert(full_table_name.to_string(), schema);
             }
         }
+        let matview_backing_tables: HashSet<String> = ctx
+            .store
+            .list_materialized_views(ctx.txn, ctx.db_id)
+            .await?
+            .into_iter()
+            .map(|mv| mv.full_name())
+            .collect();
+
         let tables_with_fk_internal_triggers = tables_with_fk_internal_triggers(&table_schemas);
         let mut tables_with_user_triggers = HashSet::new();
         for trigger in ctx.store.list_triggers(ctx.txn, ctx.db_id).await? {
@@ -175,13 +183,18 @@ impl VirtualTable for PgClass {
                 let relnatts = schema.columns.len() as i64;
                 let relchecks = schema.check_constraints.len() as i64;
                 let relowner = owner_role_oid(Some(&schema.owner), ctx.current_user);
+                let relkind = if matview_backing_tables.contains(full_table_name) {
+                    RELKIND_MATVIEW
+                } else {
+                    RELKIND_TABLE
+                };
                 rows.push(Row::new(vec![
                     int_val(table_oid),
                     text_val(&table_name),
                     int_val(namespace_oid),
                     int_val(0), // reltype
                     int_val(0), // reloftype
-                    text_val(RELKIND_TABLE),
+                    text_val(relkind),
                     int_val(relowner),
                     int_val(0), // relam
                     int_val(0), // reltuples
