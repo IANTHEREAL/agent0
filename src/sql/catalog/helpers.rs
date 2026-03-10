@@ -1,4 +1,5 @@
 use crate::model::{ColumnDef, DataType, IndexDef, Value};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 // --- pg_constraint.contype constants ---
@@ -302,7 +303,10 @@ pub fn data_type_to_pg_type(dt: &DataType) -> &'static str {
             DataType::Text => "text[]",
             DataType::Name => "name[]",
             DataType::Varchar(_) => "character varying[]",
-            _ => "anyarray",
+            // PostgreSQL reports data_type='ARRAY' for user-defined element
+            // types (e.g. mood[]).  All other unrecognised element types also
+            // map to "ARRAY" as a safe fallback.
+            _ => "ARRAY",
         },
         DataType::Json => "json",
         DataType::Jsonb => "jsonb",
@@ -316,37 +320,46 @@ pub fn data_type_to_pg_type(dt: &DataType) -> &'static str {
     }
 }
 
-pub fn data_type_to_udt_name(dt: &DataType) -> &'static str {
+pub fn data_type_to_udt_name(dt: &DataType) -> Cow<'static, str> {
     match dt {
-        DataType::Boolean => "bool",
-        DataType::Int32 => "int4",
-        DataType::Int64 => "int8",
-        DataType::Float64 => "float8",
-        DataType::Text => "text",
-        DataType::Name => "name",
-        DataType::Bytes => "bytea",
-        DataType::Timestamp => "timestamp",
-        DataType::TimestampTz => "timestamptz",
-        DataType::Date => "date",
-        DataType::Interval => "interval",
-        DataType::Uuid => "uuid",
+        DataType::Boolean => "bool".into(),
+        DataType::Int32 => "int4".into(),
+        DataType::Int64 => "int8".into(),
+        DataType::Float64 => "float8".into(),
+        DataType::Text => "text".into(),
+        DataType::Name => "name".into(),
+        DataType::Bytes => "bytea".into(),
+        DataType::Timestamp => "timestamp".into(),
+        DataType::TimestampTz => "timestamptz".into(),
+        DataType::Date => "date".into(),
+        DataType::Interval => "interval".into(),
+        DataType::Uuid => "uuid".into(),
         DataType::Array(inner) => match inner.as_ref() {
-            DataType::Int32 => "_int4",
-            DataType::Int64 => "_int8",
-            DataType::Text => "_text",
-            DataType::Name => "_name",
-            DataType::Varchar(_) => "_varchar",
-            _ => "anyarray",
+            DataType::Int32 => "_int4".into(),
+            DataType::Int64 => "_int8".into(),
+            DataType::Text => "_text".into(),
+            DataType::Name => "_name".into(),
+            DataType::Varchar(_) => "_varchar".into(),
+            // PostgreSQL uses underscore-prefixed element type name for
+            // array UDT names (e.g. mood[] → _mood).
+            DataType::UserDefined(full_udt) => {
+                let type_name = full_udt
+                    .rsplit_once('.')
+                    .map(|(_, name)| name)
+                    .unwrap_or(full_udt.as_str());
+                format!("_{}", type_name).into()
+            }
+            _ => "_unknown".into(),
         },
-        DataType::Json => "json",
-        DataType::Jsonb => "jsonb",
-        DataType::Vector(_) => "vector",
-        DataType::Time => "time",
-        DataType::UserDefined(_) => "text",
-        DataType::Numeric { .. } => "numeric",
-        DataType::Tsvector => "tsvector",
-        DataType::Tsquery => "tsquery",
-        DataType::Varchar(_) => "varchar",
+        DataType::Json => "json".into(),
+        DataType::Jsonb => "jsonb".into(),
+        DataType::Vector(_) => "vector".into(),
+        DataType::Time => "time".into(),
+        DataType::UserDefined(_) => "text".into(),
+        DataType::Numeric { .. } => "numeric".into(),
+        DataType::Tsvector => "tsvector".into(),
+        DataType::Tsquery => "tsquery".into(),
+        DataType::Varchar(_) => "varchar".into(),
     }
 }
 
@@ -361,9 +374,65 @@ pub fn format_epoch_ms(epoch_ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::is_unique_constraint_index;
-    use crate::model::IndexDef;
+    use super::{data_type_to_pg_type, data_type_to_udt_name, is_unique_constraint_index};
+    use crate::model::{DataType, IndexDef};
     use crate::worker::types::IndexState;
+
+    #[test]
+    fn pg_type_for_enum_array_returns_array() {
+        let dt = DataType::Array(Box::new(DataType::UserDefined("public.mood".into())));
+        assert_eq!(data_type_to_pg_type(&dt), "ARRAY");
+    }
+
+    #[test]
+    fn pg_type_for_unqualified_enum_array_returns_array() {
+        let dt = DataType::Array(Box::new(DataType::UserDefined("mood".into())));
+        assert_eq!(data_type_to_pg_type(&dt), "ARRAY");
+    }
+
+    #[test]
+    fn udt_name_for_enum_array_has_underscore_prefix() {
+        let dt = DataType::Array(Box::new(DataType::UserDefined("public.mood".into())));
+        assert_eq!(data_type_to_udt_name(&dt).as_ref(), "_mood");
+    }
+
+    #[test]
+    fn udt_name_for_unqualified_enum_array_has_underscore_prefix() {
+        let dt = DataType::Array(Box::new(DataType::UserDefined("mood".into())));
+        assert_eq!(data_type_to_udt_name(&dt).as_ref(), "_mood");
+    }
+
+    #[test]
+    fn pg_type_for_builtin_arrays_unchanged() {
+        assert_eq!(
+            data_type_to_pg_type(&DataType::Array(Box::new(DataType::Int32))),
+            "integer[]"
+        );
+        assert_eq!(
+            data_type_to_pg_type(&DataType::Array(Box::new(DataType::Int64))),
+            "bigint[]"
+        );
+        assert_eq!(
+            data_type_to_pg_type(&DataType::Array(Box::new(DataType::Text))),
+            "text[]"
+        );
+    }
+
+    #[test]
+    fn udt_name_for_builtin_arrays_unchanged() {
+        assert_eq!(
+            data_type_to_udt_name(&DataType::Array(Box::new(DataType::Int32))).as_ref(),
+            "_int4"
+        );
+        assert_eq!(
+            data_type_to_udt_name(&DataType::Array(Box::new(DataType::Int64))).as_ref(),
+            "_int8"
+        );
+        assert_eq!(
+            data_type_to_udt_name(&DataType::Array(Box::new(DataType::Text))).as_ref(),
+            "_text"
+        );
+    }
 
     #[test]
     fn unique_constraint_filter_requires_constraint_bit() {

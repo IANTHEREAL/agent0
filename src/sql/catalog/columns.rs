@@ -97,19 +97,43 @@ impl VirtualTable for Columns {
             let full_table_name = &schema.name;
             let (table_schema, table_name) = split_schema_and_name(full_table_name);
             for (i, col) in schema.columns.iter().enumerate() {
-                let (data_type_str, udt_schema, udt_name) = match &col.data_type {
+                // PostgreSQL reports enum/UDT columns as data_type='USER-DEFINED'
+                // with udt_schema/udt_name pointing to the actual type.
+                // For enum[] (Array(UserDefined(...))), PostgreSQL reports
+                // data_type='ARRAY' and udt_name='_<type_name>' (underscore-
+                // prefixed element type name).
+                let (data_type_str, udt_schema_owned, udt_name_owned);
+                match &col.data_type {
                     DataType::UserDefined(full_udt) => {
                         let (schema_name, type_name) = full_udt
                             .rsplit_once('.')
                             .unwrap_or(("public", full_udt.as_str()));
-                        ("USER-DEFINED", schema_name, type_name)
+                        data_type_str = "USER-DEFINED";
+                        udt_schema_owned = schema_name.to_string();
+                        udt_name_owned = type_name.to_string();
+                    }
+                    DataType::Array(inner)
+                        if matches!(inner.as_ref(), DataType::UserDefined(_)) =>
+                    {
+                        if let DataType::UserDefined(full_udt) = inner.as_ref() {
+                            let (schema_name, type_name) = full_udt
+                                .rsplit_once('.')
+                                .unwrap_or(("public", full_udt.as_str()));
+                            data_type_str = "ARRAY";
+                            udt_schema_owned = schema_name.to_string();
+                            udt_name_owned = format!("_{}", type_name);
+                        } else {
+                            unreachable!()
+                        }
                     }
                     _ => {
                         let pg_type = data_type_to_pg_type(&col.data_type);
                         let udt = data_type_to_udt_name(&col.data_type);
-                        (pg_type, "pg_catalog", udt)
+                        data_type_str = pg_type;
+                        udt_schema_owned = "pg_catalog".to_string();
+                        udt_name_owned = udt.to_string();
                     }
-                };
+                }
                 let is_nullable = if col.nullable { "YES" } else { "NO" };
                 let ordinal = (i + 1) as i64;
 
@@ -175,8 +199,8 @@ impl VirtualTable for Columns {
                     null_val(),
                     null_val(),
                     text_val(ctx.database_name),
-                    text_val(udt_schema),
-                    text_val(udt_name),
+                    text_val(&udt_schema_owned),
+                    text_val(&udt_name_owned),
                     null_val(),
                     null_val(),
                     null_val(),

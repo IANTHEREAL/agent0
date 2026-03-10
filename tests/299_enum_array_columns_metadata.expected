@@ -1,0 +1,4 @@
+column_name|data_type|udt_schema|udt_name
+feel|USER-DEFINED|public|mood_meta
+tags|ARRAY|public|_mood_meta
+(2 rows)
