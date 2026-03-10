@@ -1,2 +1,6 @@
-is of type INTEGER but expression is of type JSONB
-
+but expression is of type
+but expression is of type
+but expression is of type
+# PG-DIVERGENCE: is of type INTEGER but expression is of type JSONB
+# PG-DIVERGENCE: is of type INTEGER but expression is of type JSONB
+# PG-DIVERGENCE: is of type INTEGER but expression is of type JSONB
