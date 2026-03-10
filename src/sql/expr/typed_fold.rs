@@ -142,6 +142,20 @@ pub(crate) fn is_volatile_or_side_effecting_builtin(name: &str) -> bool {
             | "VEC_EMBED_COSINE_DISTANCE"
             | "VEC_EMBED_L2_DISTANCE"
             | "VEC_EMBED_INNER_PRODUCT"
+            // fs9 builtins perform filesystem IO against embedded PageFS and
+            // must execute under statement runtime context, never during
+            // analysis-time constant folding.
+            | "FS9_READ"
+            | "FS9_WRITE"
+            | "FS9_EXISTS"
+            | "FS9_SIZE"
+            | "FS9_MTIME"
+            | "FS9_REMOVE"
+            | "FS9_MKDIR"
+            | "FS9_READ_AT"
+            | "FS9_WRITE_AT"
+            | "FS9_APPEND"
+            | "FS9_TRUNCATE"
     )
 }
 
@@ -253,6 +267,36 @@ mod tests {
                 filter: None,
             },
             DataType::Float64,
+        );
+
+        let folded = fold_typed_expr(&expr, &qctx);
+        assert!(matches!(folded.kind, TypedExprKind::FunctionCall { .. }));
+    }
+
+    #[test]
+    fn fs9_builtins_are_execution_time_only() {
+        assert!(is_volatile_or_side_effecting_builtin("FS9_WRITE"));
+        assert!(is_volatile_or_side_effecting_builtin("fs9_exists"));
+    }
+
+    #[test]
+    fn does_not_fold_fs9_builtin_with_constant_args() {
+        let qctx = test_qctx();
+        let expr = TypedExpr::new(
+            TypedExprKind::FunctionCall {
+                func: ResolvedFunction {
+                    name: "fs9_exists".to_string(),
+                    kind: FunctionKind::Builtin,
+                    return_type: DataType::Boolean,
+                },
+                args: vec![TypedExpr::new(
+                    TypedExprKind::Constant(Value::Text("/tmp/fs9-fold-test".to_string())),
+                    DataType::Text,
+                )],
+                order_by: vec![],
+                filter: None,
+            },
+            DataType::Boolean,
         );
 
         let folded = fold_typed_expr(&expr, &qctx);

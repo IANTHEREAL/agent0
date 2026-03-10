@@ -1,5 +1,7 @@
 Only http:// and https:// URLs are supported for Parquet import
+Only http:// and https:// URLs are supported for Parquet import
 parquet: access to host
 parquet: access to IP address
 does not support column lists
+FORMAT parquet
 FORMAT parquet

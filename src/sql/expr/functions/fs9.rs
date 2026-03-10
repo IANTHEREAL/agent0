@@ -84,6 +84,20 @@ fn expect_text_arg(name: &str, arg: Value, position: usize) -> Result<Option<Str
     }
 }
 
+fn expect_file_data_arg(name: &str, arg: Value, position: usize) -> Result<Option<Vec<u8>>> {
+    match arg {
+        Value::Null => Ok(None),
+        Value::Text(s) => Ok(Some(s.into_bytes())),
+        Value::Bytes(bytes) => Ok(Some(bytes)),
+        other => Err(anyhow!(
+            "{}: argument {} must be TEXT or BYTEA, got {}",
+            name,
+            position,
+            other.type_display_name()
+        )),
+    }
+}
+
 /// Bridge sync SqlFn to async backend calls. Safe because scalar functions
 /// run on the tokio worker pool and `block_in_place` is the documented pattern.
 fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
@@ -115,24 +129,23 @@ pub fn fs9_write(args: Vec<Value>) -> Result<Value> {
     ensure_permissions()?;
     let mut args_iter = args.into_iter();
     let path = expect_text_arg("fs9_write", args_iter.next().unwrap_or(Value::Null), 1)?;
-    let content = expect_text_arg("fs9_write", args_iter.next().unwrap_or(Value::Null), 2)?;
+    let content = expect_file_data_arg("fs9_write", args_iter.next().unwrap_or(Value::Null), 2)?;
 
     let (path, content) = match (path, content) {
         (Some(p), Some(c)) => (p, c),
         _ => return Ok(Value::Null),
     };
 
-    let content_bytes = content.as_bytes();
-    if content_bytes.len() > crate::extensions::fs::MAX_BYTES_PER_FILE {
+    if content.len() > crate::extensions::fs::MAX_BYTES_PER_FILE {
         return Err(anyhow!(
             "fs9_write: content too large: {} bytes (max {})",
-            content_bytes.len(),
+            content.len(),
             crate::extensions::fs::MAX_BYTES_PER_FILE
         ));
     }
 
     let bk = get_backend_sync()?;
-    let len = run_async(bk.write_file(&path, content_bytes))?;
+    let len = run_async(bk.write_file(&path, &content))?;
     Ok(Value::Int64(len as i64))
 }
 
@@ -357,7 +370,7 @@ pub fn fs9_write_at(args: Vec<Value>) -> Result<Value> {
             ))
         }
     };
-    let data = match expect_text_arg(
+    let data = match expect_file_data_arg(
         "fs9_write_at",
         args.get(2).cloned().unwrap_or(Value::Null),
         2,
@@ -369,7 +382,7 @@ pub fn fs9_write_at(args: Vec<Value>) -> Result<Value> {
         return Err(anyhow!("fs9_write_at: data exceeds maximum file size"));
     }
     let bk = get_backend_sync()?;
-    let written = run_async(bk.write_file_at(&path, offset, data.as_bytes()))?;
+    let written = run_async(bk.write_file_at(&path, offset, &data))?;
     Ok(Value::Int64(written as i64))
 }
 
@@ -383,16 +396,16 @@ pub fn fs9_append(args: Vec<Value>) -> Result<Value> {
         Some(p) => p,
         None => return Ok(Value::Null),
     };
-    let data = match expect_text_arg("fs9_append", args.get(1).cloned().unwrap_or(Value::Null), 1)?
-    {
-        Some(d) => d,
-        None => return Ok(Value::Null),
-    };
+    let data =
+        match expect_file_data_arg("fs9_append", args.get(1).cloned().unwrap_or(Value::Null), 1)? {
+            Some(d) => d,
+            None => return Ok(Value::Null),
+        };
     if data.len() > crate::extensions::fs::MAX_BYTES_PER_FILE {
         return Err(anyhow!("fs9_append: data exceeds maximum file size"));
     }
     let bk = get_backend_sync()?;
-    let written = run_async(bk.append_file(&path, data.as_bytes()))?;
+    let written = run_async(bk.append_file(&path, &data))?;
     Ok(Value::Int64(written as i64))
 }
 
@@ -436,6 +449,28 @@ pub fn fs9_truncate(args: Vec<Value>) -> Result<Value> {
 mod tests {
     use super::*;
     use crate::extensions::context;
+
+    #[test]
+    fn expect_file_data_arg_accepts_text_and_bytes() {
+        assert_eq!(
+            expect_file_data_arg("fs9_write", Value::Text("abc".into()), 2).unwrap(),
+            Some(b"abc".to_vec())
+        );
+        assert_eq!(
+            expect_file_data_arg("fs9_write", Value::Bytes(vec![0xde, 0xad]), 2).unwrap(),
+            Some(vec![0xde, 0xad])
+        );
+    }
+
+    #[test]
+    fn expect_file_data_arg_rejects_non_file_types() {
+        let err = expect_file_data_arg("fs9_write", Value::Boolean(true), 2)
+            .expect_err("boolean must be rejected");
+        assert_eq!(
+            err.to_string(),
+            "fs9_write: argument 2 must be TEXT or BYTEA, got BOOLEAN"
+        );
+    }
 
     #[tokio::test]
     async fn test_fs9_backend_unavailable_without_tikv_context() {

@@ -1,13 +1,14 @@
 # fs9 Extension
 
-`fs9` is a built-in extension table function for db9-server that enables querying the server's local filesystem directly via SQL. It supports directory listing, single-file reading, and glob-based multi-file matching, with decoders for CSV, TSV, JSONL, and raw text formats.
+`fs9` is a built-in filesystem extension for db9-server. It exposes the database's embedded PageFS storage, backed by TiKV, through SQL table/scalar functions. It supports directory listing, single-file reading, and glob-based multi-file matching, with decoders for CSV, TSV, JSONL, raw text, and Parquet.
 
 ## 1. Overview
 
-- **Functionality**: Exposes filesystem data as SQL tables.
+- **Functionality**: Exposes embedded fs9/PageFS data as SQL tables.
 - **Permissions**: Superuser only.
 - **Schema**: Functions live under the `extensions` schema, invoked as `extensions.fs9(...)`.
 - **Installation**: Requires `CREATE EXTENSION fs9;` to enable.
+- **Path contract**: Paths such as `/data/users.csv` or `/tmp/report.csv` refer to fs9's internal filesystem namespace, not the host machine's local disk.
 
 ## 2. Local Deployment / Quick Start
 
@@ -214,16 +215,15 @@ To ensure system stability, `fs9` enforces the following limits:
 
 ## 10. Architecture
 
-`fs9` uses a backend abstraction to allow future extensibility.
+`fs9` uses a backend abstraction, but the current runtime contract is a single embedded PageFS backend stored in TiKV.
 
 ```
 FsBackend (Trait)
-  |-- LocalFsBackend    <- Current: reads local disk via tokio::fs
-  |-- Fs9HttpBackend    <- Future: HTTP calls to a remote fs9 server
+  |-- EmbeddedFsBackend <- Current: embedded PageFS stored in TiKV
 ```
 
 **Design**:
-- **FsBackend trait**: Defines four core methods: `stat`, `readdir`, `read_file`, `exists`.
+- **FsBackend trait**: Defines the filesystem operations used by SQL functions and table functions.
 - **Decoupled**: Decoders and glob logic are independent of the backend implementation.
 
 **Source layout**:
@@ -231,7 +231,8 @@ FsBackend (Trait)
 | File | Purpose |
 |------|---------|
 | `src/extensions/fs/mod.rs` | Entry point, mode enum, execution routing |
-| `src/extensions/fs/backend.rs` | FsBackend trait and LocalFsBackend implementation |
+| `src/extensions/fs/backend.rs` | FsBackend trait and embedded backend construction |
+| `src/extensions/fs/embedded/` | Embedded PageFS implementation persisted in TiKV |
 | `src/extensions/fs/decoders.rs` | CSV, JSONL, text, and directory decoders |
 | `src/extensions/fs/glob.rs` | Glob pattern expansion |
 
@@ -250,9 +251,6 @@ cargo test extensions::fs
 Requires a running db9-server server with a TiKV cluster.
 
 ```bash
-# Create test fixtures
-python3 tests/160_fs9_basic_load.py --port 5433 --user admin --password admin
-
 # Run SQL integration tests
 python3 scripts/integration_test.py --dsn "postgres://admin:admin@127.0.0.1:5433/postgres" \
     tests/160_fs9_basic.sql \

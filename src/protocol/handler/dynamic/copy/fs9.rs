@@ -240,34 +240,48 @@ impl DynamicPgHandler {
                 }
             };
 
-            if !crate::extensions::fs::backend::is_backend_available() {
-                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "58030".to_string(),
-                    "fs9: TiKV storage backend not available".to_string(),
-                ))));
-            }
-            if !session.is_superuser() {
-                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "42501".to_string(),
-                    "fs9: permission denied".to_string(),
-                ))));
-            }
+            let statement_ts = chrono::Utc::now().timestamp_millis();
+            let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
+            let qctx = session.query_context_for_statement(statement_ts, transaction_ts);
+            let runtime = crate::sql::runtime_context::StatementRuntimeContext::from_session(
+                &session,
+                executor.tenant_keyspace(),
+                executor.store().transaction_client(),
+            );
 
-            // Read file bytes from fs9 backend
-            let bare_path = crate::extensions::parquet::reader::strip_fs9_scheme(&filename);
-            let tenant = executor.tenant_keyspace().to_string();
-            let backend = crate::extensions::fs::backend::get_backend(&tenant)
-                .await
-                .map_err(copy_from_fs9_io_error)?;
-            let file_data = backend
-                .read_file(
-                    bare_path,
-                    crate::extensions::parquet::fs9_reader::MAX_FS9_PARQUET_FILE_BYTES,
-                )
-                .await
-                .map_err(copy_from_fs9_io_error)?;
+            // Read file bytes from fs9 backend under the same statement runtime
+            // contract as the later COPY insert work, so extension context
+            // (tenant keyspace + TiKV client) is present for fs9 IO.
+            let file_data = super::with_copy_statement_context(&qctx, &runtime, async {
+                if !crate::extensions::fs::backend::is_backend_available() {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "58030".to_string(),
+                        "fs9: TiKV storage backend not available".to_string(),
+                    ))));
+                }
+                if !session.is_superuser() {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "42501".to_string(),
+                        "fs9: permission denied".to_string(),
+                    ))));
+                }
+
+                let bare_path = crate::extensions::parquet::reader::strip_fs9_scheme(&filename);
+                let tenant = executor.tenant_keyspace().to_string();
+                let backend = crate::extensions::fs::backend::get_backend(&tenant)
+                    .await
+                    .map_err(copy_from_fs9_io_error)?;
+                backend
+                    .read_file(
+                        bare_path,
+                        crate::extensions::parquet::fs9_reader::MAX_FS9_PARQUET_FILE_BYTES,
+                    )
+                    .await
+                    .map_err(copy_from_fs9_io_error)
+            })
+            .await?;
 
             // Prepare column metadata from table schema
             let column_names: Vec<String> = table_schema
@@ -365,15 +379,7 @@ impl DynamicPgHandler {
                 rows
             };
 
-            // Insert all parsed rows within QueryContext scope
-            let statement_ts = chrono::Utc::now().timestamp_millis();
-            let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
-            let qctx = session.query_context_for_statement(statement_ts, transaction_ts);
-            let runtime = crate::sql::runtime_context::StatementRuntimeContext::from_session(
-                &session,
-                executor.tenant_keyspace(),
-                executor.store().transaction_client(),
-            );
+            // Insert all parsed rows within the same statement runtime scope.
             let row_count = records.len();
             let line_numbers: Vec<usize> = (1..=row_count).collect();
 

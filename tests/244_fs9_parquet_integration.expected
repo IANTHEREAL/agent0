@@ -1,0 +1,26 @@
+id|name|value
+0|row_0|0
+1|row_1|1.5
+2|row_2|3
+3|row_3|4.5
+4|row_4|6
+(5 rows)
+id|name|value
+0|row_0|0
+1|row_1|1.5
+2|row_2|3
+3|row_3|4.5
+4|row_4|6
+(5 rows)
+count
+100
+(1 row)
+count
+10
+(1 row)
+count
+100
+(1 row)
+fs9_remove
+3
+(1 row)

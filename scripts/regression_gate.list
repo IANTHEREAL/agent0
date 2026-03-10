@@ -206,6 +206,8 @@ tests/1629_generated_column_reject.sql
 tests/30_matview_relkind.sql
 # #1565 – block set_config() writes to reserved pseudo-GUCs
 tests/563_reserved_guc_set_config.sql
+# #1686 – fs9 embedded PageFS contract (COPY FROM fs9://, constant-fold guard)
+tests/244_fs9_parquet_integration.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py

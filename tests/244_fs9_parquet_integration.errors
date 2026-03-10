@@ -1,4 +1,0 @@
-embedded_fs: NotFound: /tests/parquet_testdata/basic.parquet
-column "id" does not exist
-fs9: TiKV storage backend not available
-relation "e2e_ctas_test" does not exist

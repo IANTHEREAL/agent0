@@ -1,9 +1,5 @@
--- fs9 + parquet/CSV local integration tests
--- Requires:
---   1) db9-server started with --features parquet
---   2) fs9 local backend configured (default for local filesystem)
---   3) tests/parquet_testdata/basic.parquet (100 rows: id int32, name text, value float8)
---   4) tests/parquet_testdata/test_copy.csv (10 rows with header: id,name,value)
+-- fs9 + parquet/CSV integration against embedded pagefs.
+-- Fixture files are staged into fs9 by 244_fs9_parquet_integration_load.py.
 
 CREATE EXTENSION IF NOT EXISTS fs9;
 CREATE EXTENSION IF NOT EXISTS parquet;
@@ -36,5 +32,9 @@ SELECT count(*) FROM e2e_ctas_test;
 DROP TABLE IF EXISTS e2e_parquet_test;
 DROP TABLE IF EXISTS e2e_csv_test;
 DROP TABLE IF EXISTS e2e_ctas_test;
+SELECT CASE
+    WHEN fs9_exists('tests/parquet_testdata/') THEN fs9_remove('tests/parquet_testdata/', true)
+    ELSE 0
+END;
 DROP EXTENSION IF EXISTS parquet;
 DROP EXTENSION IF EXISTS fs9;
