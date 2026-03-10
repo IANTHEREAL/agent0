@@ -15,7 +15,7 @@ A DATABASE FOR AI BY AI
                               │ PostgreSQL Wire Protocol (pgwire 0.28)
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                      db9-server Server                         │
+│                      db9-server Server                      │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │  Protocol: Simple Query, Extended Query, COPY         │  │
 │  ├───────────────────────────────────────────────────────┤  │
