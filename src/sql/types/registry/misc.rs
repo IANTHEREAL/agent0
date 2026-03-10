@@ -331,6 +331,14 @@ pub(super) fn register(r: &mut super::FunctionRegistry) {
         "FS9_TRUNCATE",
         FunctionSignature::fixed(DataType::Boolean).with_args(2, Some(2)),
     );
+    r.register(
+        "FS9_REMOVE",
+        FunctionSignature::fixed(DataType::Int64).with_args(1, Some(2)),
+    );
+    r.register(
+        "FS9_MKDIR",
+        FunctionSignature::fixed(DataType::Boolean).with_args(1, Some(2)),
+    );
 
     // Background SQL functions
     r.register(
