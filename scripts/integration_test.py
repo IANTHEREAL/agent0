@@ -695,116 +695,6 @@ def run_sql_file(
     return result.stdout or "", result.returncode
 
 
-@dataclass
-class ErrorMatchResult:
-    """Result of matching expected error patterns against actual error lines."""
-
-    unexpected: List[str]
-    unmatched_expected: List[str]
-
-    @property
-    def ok(self) -> bool:
-        return not self.unexpected and not self.unmatched_expected
-
-
-def match_errors(
-    expected_patterns: List[str], actual_errors: List[str]
-) -> ErrorMatchResult:
-    """Bipartite-matching cardinality check for .errors validation.
-
-    Each expected pattern must be matched by a distinct actual error line
-    (substring match), and each actual error line must be matched by some
-    expected pattern.  Duplicate expected patterns each consume a separate
-    actual line.
-
-    Uses maximum bipartite matching (Kuhn's augmenting-path algorithm) so
-    that overlapping substring patterns (e.g. "err" vs "err A") are assigned
-    optimally rather than greedily.
-    """
-    # Build adjacency: expected[i] can match actual[j] iff exp ⊆ actual
-    adj: List[List[int]] = [[] for _ in range(len(expected_patterns))]
-    for i, exp in enumerate(expected_patterns):
-        for j, actual in enumerate(actual_errors):
-            if exp in actual:
-                adj[i].append(j)
-
-    # Kuhn's algorithm — maximum bipartite matching
-    match_of_actual: List[int] = [-1] * len(actual_errors)
-
-    def _augment(v: int, visited: List[bool]) -> bool:
-        for to in adj[v]:
-            if not visited[to]:
-                visited[to] = True
-                if match_of_actual[to] == -1 or _augment(match_of_actual[to], visited):
-                    match_of_actual[to] = v
-                    return True
-        return False
-
-    for i in range(len(expected_patterns)):
-        _augment(i, [False] * len(actual_errors))
-
-    matched_expected = set(
-        match_of_actual[j] for j in range(len(actual_errors)) if match_of_actual[j] != -1
-    )
-    unmatched_expected = [
-        expected_patterns[i] for i in range(len(expected_patterns)) if i not in matched_expected
-    ]
-    unexpected = [actual_errors[j] for j in range(len(actual_errors)) if match_of_actual[j] == -1]
-    return ErrorMatchResult(unexpected=unexpected, unmatched_expected=unmatched_expected)
-
-
-def match_errors_unified(
-    expected_patterns: List[str],
-    divergence_patterns: List[str],
-    actual_errors: List[str],
-) -> ErrorMatchResult:
-    """Unified bipartite matching for .errors + PG-DIVERGENCE patterns.
-
-    Combines expected and divergence patterns into a single bipartite
-    matching, processing expected patterns first to give them priority.
-    Augmenting paths ensure optimal assignment across both categories,
-    eliminating the order-dependent false failures of two-phase matching.
-
-    Returns ErrorMatchResult where:
-    - unmatched_expected: expected patterns with no matching actual (failure)
-    - unexpected: actual errors not matched by any pattern (failure)
-    - Unmatched divergence patterns are silently ignored (optional absorbers)
-    """
-    n_exp = len(expected_patterns)
-    all_patterns = expected_patterns + divergence_patterns
-
-    # Build adjacency: pattern[i] can match actual[j] iff pattern ⊆ actual
-    adj: List[List[int]] = [[] for _ in range(len(all_patterns))]
-    for i, pat in enumerate(all_patterns):
-        for j, actual in enumerate(actual_errors):
-            if pat in actual:
-                adj[i].append(j)
-
-    # Kuhn's algorithm — process expected patterns first for priority
-    match_of_actual: List[int] = [-1] * len(actual_errors)
-
-    def _augment(v: int, visited: List[bool]) -> bool:
-        for to in adj[v]:
-            if not visited[to]:
-                visited[to] = True
-                if match_of_actual[to] == -1 or _augment(match_of_actual[to], visited):
-                    match_of_actual[to] = v
-                    return True
-        return False
-
-    for i in range(len(all_patterns)):
-        _augment(i, [False] * len(actual_errors))
-
-    matched_pattern_indices = set(
-        match_of_actual[j] for j in range(len(actual_errors)) if match_of_actual[j] != -1
-    )
-    unmatched_expected = [
-        expected_patterns[i] for i in range(n_exp) if i not in matched_pattern_indices
-    ]
-    unexpected = [actual_errors[j] for j in range(len(actual_errors)) if match_of_actual[j] == -1]
-    return ErrorMatchResult(unexpected=unexpected, unmatched_expected=unmatched_expected)
-
-
 def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
     expected_file = sql_file.with_suffix(".expected")
     errors_file = sql_file.with_suffix(".errors")
@@ -952,47 +842,40 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
 
     errors_ok = True
     if errors_file.exists():
-        expected_errors = []
-        divergence_patterns = []
-        for line in errors_file.read_text().strip().split("\n"):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if stripped.startswith("# PG-DIVERGENCE:"):
-                pattern = stripped[len("# PG-DIVERGENCE:"):].strip()
-                if pattern:
-                    divergence_patterns.append(pattern)
-            elif stripped.startswith("#"):
-                continue
-            else:
-                expected_errors.append(stripped)
-
-        if not expected_errors and not divergence_patterns:
+        expected_errors = [
+            line.strip()
+            for line in errors_file.read_text().strip().split("\n")
+            if line.strip()
+        ]
+        if not expected_errors:
             log_test(sql_file.name, TestResult.FAILED, ".errors file is empty")
             return TestResult.FAILED
 
         actual_errors = [
             line for line in output.split("\n") if any(p in line for p in error_patterns)
         ]
-        if not actual_errors and expected_errors:
+        if not actual_errors:
             log_test(sql_file.name, TestResult.FAILED, "expected SQL errors but query succeeded")
             return TestResult.FAILED
 
-        result = match_errors_unified(expected_errors, divergence_patterns, actual_errors)
-
-        if result.unmatched_expected:
-            log_test(
-                sql_file.name,
-                TestResult.FAILED,
-                f"{len(result.unmatched_expected)} expected error pattern(s) not observed",
-            )
-            for line in result.unmatched_expected[:5]:
-                print(f"  {RED}NOT OBSERVED: {line}{NC}")
-            return TestResult.FAILED
-
-        if result.unexpected:
+        matched_errors = [
+            actual
+            for actual in actual_errors
+            if any(exp in actual for exp in expected_errors)
+        ]
+        unexpected_errors = [
+            actual
+            for actual in actual_errors
+            if not any(exp in actual for exp in expected_errors)
+        ]
+        if unexpected_errors:
             log_test(sql_file.name, TestResult.FAILED, "unexpected SQL errors")
-            for line in result.unexpected[:3]:
+            for line in unexpected_errors[:3]:
+                print(f"  {RED}{line}{NC}")
+            return TestResult.FAILED
+        if not matched_errors:
+            log_test(sql_file.name, TestResult.FAILED, "SQL errors did not match .errors patterns")
+            for line in actual_errors[:3]:
                 print(f"  {RED}{line}{NC}")
             return TestResult.FAILED
         errors_ok = True
