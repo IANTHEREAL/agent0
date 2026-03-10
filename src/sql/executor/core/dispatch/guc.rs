@@ -429,58 +429,75 @@ mod tests {
     }
 
     /// Bug B fix: SET LOCAL is_superuser = 'on' outside txn → Err + pending notice.
+    /// Regression test for #1622: WARNING SQLSTATE must be 25P01 (PG parity).
     #[test]
     fn set_local_is_superuser_outside_txn_queues_notice_and_errors() {
         let mut session = make_session();
         let (_, variable, value) = parse_set("SET LOCAL is_superuser = 'on'");
-        let err = execute_set_variable(&mut session, true, &variable, &value)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("parameter \"is_superuser\" cannot be changed"));
+        let err = execute_set_variable(&mut session, true, &variable, &value).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("parameter \"is_superuser\" cannot be changed"));
+        // Error SQLSTATE must be 55P02 (cant_change_runtime_param)
+        let sql_err = err.downcast_ref::<crate::sql::error::SqlError>().unwrap();
+        assert_eq!(sql_err.sqlstate(), "55P02");
         let notices = session.drain_pending_notices();
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].0, "WARNING");
-        assert!(notices[0]
-            .2
-            .contains("SET LOCAL can only be used in transaction blocks"));
+        assert_eq!(notices[0].1, "25P01"); // SQLSTATE: no_active_sql_transaction
+        assert_eq!(
+            notices[0].2,
+            "SET LOCAL can only be used in transaction blocks"
+        );
     }
 
     /// Bug A fix: SET LOCAL is_superuser TO DEFAULT outside txn → Err + pending notice.
+    /// Regression test for #1622: WARNING SQLSTATE must be 25P01 (PG parity).
     #[test]
     fn set_local_is_superuser_default_outside_txn_queues_notice_and_errors() {
         let mut session = make_session();
         let (_, variable, value) = parse_set("SET LOCAL is_superuser TO DEFAULT");
-        let err = execute_set_variable(&mut session, true, &variable, &value)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("parameter \"is_superuser\" cannot be changed"));
+        let err = execute_set_variable(&mut session, true, &variable, &value).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("parameter \"is_superuser\" cannot be changed"));
+        let sql_err = err.downcast_ref::<crate::sql::error::SqlError>().unwrap();
+        assert_eq!(sql_err.sqlstate(), "55P02");
         let notices = session.drain_pending_notices();
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].0, "WARNING");
-        assert!(notices[0]
-            .2
-            .contains("SET LOCAL can only be used in transaction blocks"));
+        assert_eq!(notices[0].1, "25P01");
+        assert_eq!(
+            notices[0].2,
+            "SET LOCAL can only be used in transaction blocks"
+        );
     }
 
     /// SET LOCAL session_authorization = 'evil' outside txn via execute_set_variable
     /// (bypass) → Err "parameter cannot be changed" + pending notice.
+    /// Regression test for #1622: WARNING SQLSTATE must be 25P01 (PG parity).
     #[test]
     fn set_local_session_auth_outside_txn_via_set_variable_returns_reserved_error() {
         let mut session = make_session();
         let (_, variable, value) = parse_set("SET LOCAL session_authorization = 'evil_user'");
-        let err = execute_set_variable(&mut session, true, &variable, &value)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("parameter \"session_authorization\" cannot be changed"));
+        let err = execute_set_variable(&mut session, true, &variable, &value).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("parameter \"session_authorization\" cannot be changed"));
+        let sql_err = err.downcast_ref::<crate::sql::error::SqlError>().unwrap();
+        assert_eq!(sql_err.sqlstate(), "55P02");
         let notices = session.drain_pending_notices();
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].0, "WARNING");
-        assert!(notices[0]
-            .2
-            .contains("SET LOCAL can only be used in transaction blocks"));
+        assert_eq!(notices[0].1, "25P01");
+        assert_eq!(
+            notices[0].2,
+            "SET LOCAL can only be used in transaction blocks"
+        );
     }
 
     /// SET LOCAL session_authorization TO DEFAULT outside txn → Ok with WARNING + SET.
+    /// Regression test for #1622: WARNING SQLSTATE must be 25P01 (PG parity).
     #[test]
     fn set_local_session_auth_default_outside_txn_warns_and_succeeds() {
         let mut session = make_session();
@@ -489,9 +506,10 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(matches!(
             &out[0],
-            ExecuteResult::Notice { severity, message, .. }
+            ExecuteResult::Notice { severity, sqlstate, message }
             if severity == "WARNING"
-                && message.contains("SET LOCAL can only be used in transaction blocks")
+                && sqlstate == "25P01"
+                && message == "SET LOCAL can only be used in transaction blocks"
         ));
         assert!(matches!(
             out[1],
@@ -578,6 +596,7 @@ mod tests {
 
     /// SET LOCAL session_authorization = '<session_user>' outside txn →
     /// WARNING + SET (fast path, same role)
+    /// Regression test for #1622: WARNING SQLSTATE must be 25P01 (PG parity).
     #[tokio::test]
     async fn set_local_session_auth_same_role_outside_txn_warns_and_succeeds() {
         let executor = make_executor();
@@ -590,9 +609,10 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(matches!(
             &out[0],
-            ExecuteResult::Notice { severity, message, .. }
+            ExecuteResult::Notice { severity, sqlstate, message }
             if severity == "WARNING"
-                && message.contains("SET LOCAL can only be used in transaction blocks")
+                && sqlstate == "25P01"
+                && message == "SET LOCAL can only be used in transaction blocks"
         ));
         assert!(matches!(
             out[1],
@@ -601,6 +621,7 @@ mod tests {
     }
 
     /// SET LOCAL session_authorization TO DEFAULT outside txn → WARNING + SET
+    /// Regression test for #1622: WARNING SQLSTATE must be 25P01 (PG parity).
     #[tokio::test]
     async fn set_local_session_auth_default_outside_txn_via_executor() {
         let executor = make_executor();
@@ -613,9 +634,10 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(matches!(
             &out[0],
-            ExecuteResult::Notice { severity, message, .. }
+            ExecuteResult::Notice { severity, sqlstate, message }
             if severity == "WARNING"
-                && message.contains("SET LOCAL can only be used in transaction blocks")
+                && sqlstate == "25P01"
+                && message == "SET LOCAL can only be used in transaction blocks"
         ));
         assert!(matches!(
             out[1],

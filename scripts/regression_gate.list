@@ -221,7 +221,7 @@ orm-tests/typeorm/schema.test.ts
 
 # #1579 – pg_get_serial_sequence('', 'id') should error with invalid name syntax
 tests/298_pg_get_serial_sequence_empty_name.sql
-# #1656 – SET LOCAL reserved pseudo-GUC warning/error ordering
+# #1656 / #1622 – SET LOCAL reserved pseudo-GUC warning/error ordering + SQLSTATE parity
 tests/1662_set_local_reserved_guc.sql
 # #1685 – UDT array type resolution across DDL and analyzer
 tests/249_enum_array_validation.sql
