@@ -1168,4 +1168,123 @@ mod tests {
         assert_eq!(session.plan_cache().capacity(), 128);
         assert_eq!(session.plan_cache().min_exec(), 5);
     }
+
+    #[test]
+    fn set_local_session_auth_rollback_to_savepoint_restores_identity() {
+        let store = TikvStore::new_stub();
+        let observability = observability::registry().tenant("tenant_sp_auth");
+        let mut session = Session::new_with_user_and_database(
+            store,
+            observability,
+            "alice".to_string(),
+            true,
+            1,
+            1,
+            "postgres".to_string(),
+            0,
+            0,
+        );
+
+        // Simulate entering a transaction.
+        session.force_test_transaction_state(true, false);
+
+        // Snapshot at savepoint sp1 — identity is alice (superuser).
+        session.push_session_auth_savepoint("sp1".to_string());
+
+        // SET LOCAL session_authorization 'bob' (non-superuser)
+        session.save_session_auth_for_local();
+        session.set_session_authorization("bob".to_string(), false);
+        assert_eq!(session.session_user(), Some("bob"));
+        assert_eq!(session.current_user(), Some("bob"));
+        assert!(!session.is_superuser());
+
+        // ROLLBACK TO SAVEPOINT sp1 — identity must revert to alice.
+        session.rollback_session_auth_to_savepoint("sp1");
+        assert_eq!(session.session_user(), Some("alice"));
+        assert_eq!(session.current_user(), Some("alice"));
+        assert!(session.is_superuser());
+    }
+
+    #[test]
+    fn set_local_session_auth_nested_savepoints_rollback() {
+        let store = TikvStore::new_stub();
+        let observability = observability::registry().tenant("tenant_nested_sp_auth");
+        let mut session = Session::new_with_user_and_database(
+            store,
+            observability,
+            "alice".to_string(),
+            true,
+            1,
+            1,
+            "postgres".to_string(),
+            0,
+            0,
+        );
+
+        session.force_test_transaction_state(true, false);
+
+        // SAVEPOINT sp1
+        session.push_session_auth_savepoint("sp1".to_string());
+
+        // SET LOCAL session_authorization 'bob'
+        session.save_session_auth_for_local();
+        session.set_session_authorization("bob".to_string(), false);
+
+        // SAVEPOINT sp2
+        session.push_session_auth_savepoint("sp2".to_string());
+
+        // SET LOCAL session_authorization 'charlie'
+        session.set_session_authorization("charlie".to_string(), false);
+
+        assert_eq!(session.session_user(), Some("charlie"));
+
+        // ROLLBACK TO SAVEPOINT sp2 — reverts to bob.
+        session.rollback_session_auth_to_savepoint("sp2");
+        assert_eq!(session.session_user(), Some("bob"));
+        assert!(!session.is_superuser());
+
+        // ROLLBACK TO SAVEPOINT sp1 — reverts to alice.
+        session.rollback_session_auth_to_savepoint("sp1");
+        assert_eq!(session.session_user(), Some("alice"));
+        assert!(session.is_superuser());
+    }
+
+    #[test]
+    fn set_local_session_auth_release_savepoint_keeps_identity() {
+        let store = TikvStore::new_stub();
+        let observability = observability::registry().tenant("tenant_release_sp_auth");
+        let mut session = Session::new_with_user_and_database(
+            store,
+            observability,
+            "alice".to_string(),
+            true,
+            1,
+            1,
+            "postgres".to_string(),
+            0,
+            0,
+        );
+
+        session.force_test_transaction_state(true, false);
+
+        // SAVEPOINT sp1
+        session.push_session_auth_savepoint("sp1".to_string());
+
+        // SET LOCAL session_authorization 'bob'
+        session.save_session_auth_for_local();
+        session.set_session_authorization("bob".to_string(), false);
+
+        // SAVEPOINT sp2
+        session.push_session_auth_savepoint("sp2".to_string());
+
+        // RELEASE SAVEPOINT sp2 — identity stays bob.
+        session.release_session_auth_savepoint("sp2");
+        assert_eq!(session.session_user(), Some("bob"));
+        assert!(!session.is_superuser());
+
+        // ROLLBACK TO sp1 — reverts to alice.
+        session.rollback_session_auth_to_savepoint("sp1");
+        assert_eq!(session.session_user(), Some("alice"));
+        assert!(session.is_superuser());
+    }
 }

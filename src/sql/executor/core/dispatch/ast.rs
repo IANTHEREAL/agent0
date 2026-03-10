@@ -198,7 +198,21 @@ impl Executor {
                             variable,
                             value,
                             ..
-                        } => execute_set_variable(session, *local, variable, value).await,
+                        } => {
+                            // session_authorization is a reserved pseudo-GUC
+                            // that needs async role lookup for PG-parity
+                            // branching (existence + permission checks).
+                            let is_session_auth = variable.0.len() == 1
+                                && variable.0[0]
+                                    .value
+                                    .eq_ignore_ascii_case("session_authorization");
+                            if is_session_auth {
+                                self.execute_set_session_authorization(session, *local, value)
+                                    .await
+                            } else {
+                                execute_set_variable(session, *local, variable, value)
+                            }
+                        }
                         Statement::SetTimeZone { local, value, .. } => {
                             let value = set_variable_value_to_string(std::slice::from_ref(value))?;
                             if *local && !session.is_in_transaction() {
@@ -210,6 +224,7 @@ impl Executor {
                                         message: "SET LOCAL can only be used in transaction blocks"
                                             .to_string(),
                                         severity: "WARNING".to_string(),
+                                        sqlstate: "25P01".to_string(),
                                     },
                                     ExecuteResult::CommandComplete { tag: "SET" },
                                 ]);

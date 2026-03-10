@@ -349,6 +349,7 @@ pub async fn alter_type_add_value(
             return Ok(ExecuteResult::Notice {
                 message: format!("enum label \"{}\" already exists, skipping", new_label),
                 severity: "NOTICE".to_string(),
+                sqlstate: "00000".to_string(),
             });
         }
         return Err(anyhow!("enum label \"{}\" already exists", new_label));

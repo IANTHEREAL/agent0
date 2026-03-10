@@ -274,13 +274,13 @@ where
     let mut last: Option<Response<'static>> = None;
     for result in results.into_vec() {
         match result {
-            ExecuteResult::Notice { message, severity } => {
+            ExecuteResult::Notice {
+                message,
+                severity,
+                sqlstate,
+            } => {
                 if client_allows_message(client_min_messages, &severity) {
-                    let notice = NoticeResponse::from(ErrorInfo::new(
-                        severity,
-                        "00000".to_string(),
-                        message,
-                    ));
+                    let notice = NoticeResponse::from(ErrorInfo::new(severity, sqlstate, message));
                     client
                         .send(PgWireBackendMessage::NoticeResponse(notice))
                         .await?;

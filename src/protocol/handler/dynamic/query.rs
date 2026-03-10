@@ -731,16 +731,18 @@ impl SimpleQueryHandler for DynamicPgHandler {
                 session.record_command_complete();
                 let mut responses: Vec<Response<'a>> = Vec::new();
                 for result in results.into_vec() {
-                    if let ExecuteResult::Notice { message, severity } = result {
+                    if let ExecuteResult::Notice {
+                        message,
+                        severity,
+                        sqlstate,
+                    } = result
+                    {
                         if client_allows_message(
                             session.show_setting_value("client_min_messages").as_deref(),
                             &severity,
                         ) {
-                            let notice = NoticeResponse::from(ErrorInfo::new(
-                                severity,
-                                "00000".to_string(),
-                                message,
-                            ));
+                            let notice =
+                                NoticeResponse::from(ErrorInfo::new(severity, sqlstate, message));
                             client
                                 .send(PgWireBackendMessage::NoticeResponse(notice))
                                 .await?;
@@ -752,6 +754,19 @@ impl SimpleQueryHandler for DynamicPgHandler {
                 Ok(responses)
             }
             Err(e) => {
+                // Drain pending notices (e.g., SET LOCAL warning before reserved-GUC error)
+                for (severity, sqlstate, message) in session.drain_pending_notices() {
+                    if client_allows_message(
+                        session.show_setting_value("client_min_messages").as_deref(),
+                        &severity,
+                    ) {
+                        let notice =
+                            NoticeResponse::from(ErrorInfo::new(severity, sqlstate, message));
+                        client
+                            .send(PgWireBackendMessage::NoticeResponse(notice))
+                            .await?;
+                    }
+                }
                 error!("Query execution error: {}", e);
                 let mut error_info = ErrorInfo::new(
                     "ERROR".to_string(),
@@ -1250,6 +1265,19 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                 Ok(resp?)
             }
             Err(e) => {
+                // Drain pending notices (e.g., SET LOCAL warning before reserved-GUC error)
+                for (severity, sqlstate, message) in session.drain_pending_notices() {
+                    if client_allows_message(
+                        session.show_setting_value("client_min_messages").as_deref(),
+                        &severity,
+                    ) {
+                        let notice =
+                            NoticeResponse::from(ErrorInfo::new(severity, sqlstate, message));
+                        client
+                            .send(PgWireBackendMessage::NoticeResponse(notice))
+                            .await?;
+                    }
+                }
                 error!("Extended query execution error: {}", e);
                 Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_string(),

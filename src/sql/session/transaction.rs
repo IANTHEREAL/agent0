@@ -56,7 +56,8 @@ impl Session {
         }
         self.settings
             .push_settings_savepoint(name_for_settings.clone());
-        self.push_extension_delta_savepoint(name_for_settings);
+        self.push_extension_delta_savepoint(name_for_settings.clone());
+        self.push_session_auth_savepoint(name_for_settings);
         self.last_sequence_values.push_savepoint(name_for_seq);
         Ok(())
     }
@@ -78,6 +79,7 @@ impl Session {
         }
         self.settings.release_settings_savepoint(name);
         self.release_extension_delta_savepoint(name);
+        self.release_session_auth_savepoint(name);
         self.last_sequence_values.release_savepoint(name);
         Ok(())
     }
@@ -131,6 +133,7 @@ impl Session {
         // PostgreSQL restores it; tracking that session-state undo separately from SET LOCAL.
         self.settings.rollback_settings_to_savepoint(name);
         self.rollback_extension_delta_to_savepoint(name);
+        self.rollback_session_auth_to_savepoint(name);
         self.last_sequence_values.rollback_to_savepoint(name);
         self.sync_plan_cache_settings();
         self.release_rolled_back_xact_advisory_locks(rolled_back_xact_locks);
@@ -154,6 +157,7 @@ impl Session {
                 self.state = TransactionState::Active(txn);
                 self.extension_delta = super::ExtensionDelta::default();
                 self.extension_delta_savepoints.clear();
+                self.session_auth_savepoints.clear();
                 self.transaction_timestamp_ms = Some(ts);
                 self.tx_statement_count = 0;
                 Ok(())
@@ -176,6 +180,7 @@ impl Session {
         self.tx_statement_count = 0;
         self.extension_delta = super::ExtensionDelta::default();
         self.extension_delta_savepoints.clear();
+        self.session_auth_savepoints.clear();
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
                 self.savepoints.reset().await?;
@@ -224,6 +229,7 @@ impl Session {
         self.tx_statement_count = 0;
         self.extension_delta = super::ExtensionDelta::default();
         self.extension_delta_savepoints.clear();
+        self.session_auth_savepoints.clear();
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
                 self.savepoints.reset().await?;

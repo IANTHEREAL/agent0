@@ -311,6 +311,7 @@ mod tests {
             ExecuteResult::Notice {
                 message: "note".to_string(),
                 severity: "NOTICE".to_string(),
+                sqlstate: "00000".to_string(),
             },
         ]);
 

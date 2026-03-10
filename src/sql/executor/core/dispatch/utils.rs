@@ -125,6 +125,7 @@ impl Executor {
                     notices.push(ExecuteResult::Notice {
                         message: format!("table \"{}\" does not exist, skipping", base),
                         severity: "NOTICE".to_string(),
+                        sqlstate: "00000".to_string(),
                     });
                 }
                 Ok(notices)

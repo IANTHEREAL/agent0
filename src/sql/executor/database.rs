@@ -441,6 +441,7 @@ impl Executor {
                 results.push(ExecuteResult::Notice {
                     message: format!("database \"{}\" already exists, skipping", cmd.name),
                     severity: "NOTICE".to_string(),
+                    sqlstate: "00000".to_string(),
                 });
             }
             results.push(ExecuteResult::CommandComplete {
@@ -496,6 +497,7 @@ impl Executor {
                 results.push(ExecuteResult::Notice {
                     message: format!("database \"{}\" does not exist, skipping", cmd.name),
                     severity: "NOTICE".to_string(),
+                    sqlstate: "00000".to_string(),
                 });
             }
             Ok((dropped, results))

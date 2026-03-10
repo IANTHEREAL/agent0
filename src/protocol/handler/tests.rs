@@ -2540,6 +2540,7 @@ async fn test_extended_query_notice_emits_notice_response() {
         ExecuteResult::Notice {
             message: "table \"flow3_notice_test\" does not exist, skipping".to_string(),
             severity: "NOTICE".to_string(),
+            sqlstate: "00000".to_string(),
         },
         ExecuteResult::CommandComplete { tag: "DROP TABLE" },
     ]);
@@ -2582,6 +2583,7 @@ async fn test_extended_query_notice_respects_client_min_messages() {
         ExecuteResult::Notice {
             message: "test notice".to_string(),
             severity: "NOTICE".to_string(),
+            sqlstate: "00000".to_string(),
         },
         ExecuteResult::CommandComplete { tag: "DROP TABLE" },
     ]);

@@ -154,6 +154,7 @@ pub enum ExecuteResult {
     Notice {
         message: String,
         severity: String,
+        sqlstate: String,
     },
     /// Streaming SELECT for CTAS — consumed by DDL, never sent over wire.
     SelectStream {

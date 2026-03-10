@@ -48,6 +48,28 @@ pub(crate) struct ExtensionDeltaSavepoint {
     snapshot: ExtensionDelta,
 }
 
+/// Saved session authorization state for SET LOCAL session_authorization.
+/// Captured before the first SET LOCAL in a transaction, restored on COMMIT/ROLLBACK.
+#[derive(Clone)]
+struct LocalSessionAuthSave {
+    session_user: Option<String>,
+    session_user_is_superuser: bool,
+    current_user: Option<String>,
+    is_superuser: bool,
+}
+
+/// Savepoint-scoped snapshot of session authorization identity fields.
+/// Used to restore identity on ROLLBACK TO SAVEPOINT (PG parity).
+#[derive(Clone)]
+struct SessionAuthSavepoint {
+    name: String,
+    session_user: Option<String>,
+    session_user_is_superuser: bool,
+    current_user: Option<String>,
+    is_superuser: bool,
+    local_session_auth_save: Option<LocalSessionAuthSave>,
+}
+
 pub struct Session {
     pub(crate) store: Arc<TikvStore>,
     pub(crate) observability: Arc<TenantObservability>,
@@ -59,6 +81,10 @@ pub struct Session {
     pub(crate) savepoints: Arc<SavepointState>,
     last_sequence_values: SequenceSession,
     settings: SessionSettings,
+    /// Original authenticated user at connection time. Never changes after construction.
+    /// Used by `SET SESSION AUTHORIZATION DEFAULT` to restore the initial identity.
+    authenticated_user: Option<String>,
+    authenticated_user_is_superuser: bool,
     /// Authenticated session user (login role). This does not change with `SET ROLE`.
     session_user: Option<String>,
     session_user_is_superuser: bool,
@@ -107,6 +133,15 @@ pub struct Session {
     /// LOCAL mutations should persist across statements within the batch, matching
     /// PostgreSQL's implicit transaction semantics for multi-statement simple queries.
     in_implicit_batch: bool,
+    /// Pending notices queued during execution (e.g., SET LOCAL warning before
+    /// a reserved-GUC error). Drained by the protocol handler after each statement.
+    pending_notices: Vec<(String, String, String)>,
+    /// Saved session authorization state for SET LOCAL session_authorization.
+    /// Captured before the first SET LOCAL in a transaction, restored on COMMIT/ROLLBACK.
+    local_session_auth_save: Option<LocalSessionAuthSave>,
+    /// Savepoint-scoped snapshots of session authorization identity.
+    /// Used to restore identity on ROLLBACK TO SAVEPOINT (PG parity).
+    session_auth_savepoints: Vec<SessionAuthSavepoint>,
 }
 
 /// Force-insert or overwrite a setting in a sorted `(name, value, description)` vec.
@@ -152,6 +187,8 @@ impl Session {
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: SequenceSession::new(),
             settings,
+            authenticated_user: None,
+            authenticated_user_is_superuser: false,
             session_user: None,
             session_user_is_superuser: false,
             current_user: None,
@@ -174,6 +211,9 @@ impl Session {
             extension_delta: ExtensionDelta::default(),
             extension_delta_savepoints: Vec::new(),
             in_implicit_batch: false,
+            pending_notices: Vec::new(),
+            local_session_auth_save: None,
+            session_auth_savepoints: Vec::new(),
         }
     }
 
@@ -208,6 +248,8 @@ impl Session {
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: SequenceSession::new(),
             settings,
+            authenticated_user: Some(username.clone()),
+            authenticated_user_is_superuser: is_superuser,
             session_user: Some(username.clone()),
             session_user_is_superuser: is_superuser,
             current_user: Some(username),
@@ -230,6 +272,9 @@ impl Session {
             extension_delta: ExtensionDelta::default(),
             extension_delta_savepoints: Vec::new(),
             in_implicit_batch: false,
+            pending_notices: Vec::new(),
+            local_session_auth_save: None,
+            session_auth_savepoints: Vec::new(),
         }
     }
 
@@ -241,6 +286,20 @@ impl Session {
         self.session_user.as_deref()
     }
 
+    /// Whether the original authenticated (session) user is a superuser.
+    /// Unlike [`is_superuser`], this is not affected by `SET ROLE`.
+    pub fn session_user_is_superuser(&self) -> bool {
+        self.session_user_is_superuser
+    }
+
+    /// Whether the initial authenticated user (at connection time) is a superuser.
+    /// Never changes after construction. Used for `SET SESSION AUTHORIZATION`
+    /// permission checks (PG bases permission on the login role, not the
+    /// currently effective session user).
+    pub fn authenticated_user_is_superuser(&self) -> bool {
+        self.authenticated_user_is_superuser
+    }
+
     pub fn is_superuser(&self) -> bool {
         self.is_superuser
     }
@@ -248,6 +307,96 @@ impl Session {
     pub(crate) fn set_current_role(&mut self, role: String, is_superuser: bool) {
         self.current_user = Some(role);
         self.is_superuser = is_superuser;
+    }
+
+    /// Change the session authorization to a new role.
+    /// Updates both session_user and current_user to the target role.
+    pub(crate) fn set_session_authorization(&mut self, role: String, is_superuser: bool) {
+        self.session_user = Some(role.clone());
+        self.session_user_is_superuser = is_superuser;
+        self.current_user = Some(role);
+        self.is_superuser = is_superuser;
+    }
+
+    /// Reset session authorization to the original authenticated user.
+    /// Called by `SET SESSION AUTHORIZATION DEFAULT`.
+    pub(crate) fn reset_session_authorization(&mut self) {
+        self.session_user = self.authenticated_user.clone();
+        self.session_user_is_superuser = self.authenticated_user_is_superuser;
+        self.current_user = self.authenticated_user.clone();
+        self.is_superuser = self.authenticated_user_is_superuser;
+    }
+
+    /// Save session authorization state before applying SET LOCAL session_authorization.
+    /// Only saves if no prior save exists (first SET LOCAL in the transaction wins).
+    pub(crate) fn save_session_auth_for_local(&mut self) {
+        if self.local_session_auth_save.is_none() {
+            self.local_session_auth_save = Some(LocalSessionAuthSave {
+                session_user: self.session_user.clone(),
+                session_user_is_superuser: self.session_user_is_superuser,
+                current_user: self.current_user.clone(),
+                is_superuser: self.is_superuser,
+            });
+        }
+    }
+
+    /// Clear any saved SET LOCAL session_authorization snapshot.
+    /// Called when a non-LOCAL SET session_authorization succeeds inside a transaction,
+    /// so that COMMIT/ROLLBACK does not restore stale identity state.
+    pub(crate) fn clear_local_session_auth_save(&mut self) {
+        self.local_session_auth_save = None;
+    }
+
+    /// Restore session authorization state saved by SET LOCAL session_authorization.
+    /// Called during clear_local_overrides (COMMIT/ROLLBACK).
+    fn restore_local_session_auth(&mut self) {
+        if let Some(save) = self.local_session_auth_save.take() {
+            self.session_user = save.session_user;
+            self.session_user_is_superuser = save.session_user_is_superuser;
+            self.current_user = save.current_user;
+            self.is_superuser = save.is_superuser;
+        }
+    }
+
+    pub(crate) fn push_session_auth_savepoint(&mut self, name: String) {
+        self.session_auth_savepoints.push(SessionAuthSavepoint {
+            name,
+            session_user: self.session_user.clone(),
+            session_user_is_superuser: self.session_user_is_superuser,
+            current_user: self.current_user.clone(),
+            is_superuser: self.is_superuser,
+            local_session_auth_save: self.local_session_auth_save.clone(),
+        });
+    }
+
+    pub(crate) fn rollback_session_auth_to_savepoint(&mut self, name: &str) {
+        let Some(target_idx) = self
+            .session_auth_savepoints
+            .iter()
+            .rposition(|sp| sp.name == name)
+        else {
+            return;
+        };
+
+        let snapshot = self.session_auth_savepoints[target_idx].clone();
+        self.session_user = snapshot.session_user;
+        self.session_user_is_superuser = snapshot.session_user_is_superuser;
+        self.current_user = snapshot.current_user;
+        self.is_superuser = snapshot.is_superuser;
+        self.local_session_auth_save = snapshot.local_session_auth_save;
+        self.session_auth_savepoints.truncate(target_idx + 1);
+    }
+
+    pub(crate) fn release_session_auth_savepoint(&mut self, name: &str) {
+        let Some(target_idx) = self
+            .session_auth_savepoints
+            .iter()
+            .rposition(|sp| sp.name == name)
+        else {
+            return;
+        };
+
+        self.session_auth_savepoints.truncate(target_idx);
     }
 
     pub(crate) fn reset_role(&mut self) {
@@ -617,6 +766,7 @@ impl Session {
 
     pub(crate) fn clear_local_overrides(&mut self) {
         self.settings.clear_local_overrides();
+        self.restore_local_session_auth();
         self.sync_plan_cache_settings();
     }
 
@@ -747,5 +897,23 @@ impl Session {
             self.settings.prepared_plan_cache_size(),
             self.settings.prepared_plan_cache_min_exec(),
         );
+    }
+
+    /// Queue a notice to be delivered by the protocol handler.
+    /// Used when a warning must precede an error in the same statement
+    /// (e.g., SET LOCAL outside transaction before a reserved-GUC error).
+    pub(crate) fn push_pending_notice(
+        &mut self,
+        severity: String,
+        sqlstate: String,
+        message: String,
+    ) {
+        self.pending_notices.push((severity, sqlstate, message));
+    }
+
+    /// Drain all pending notices. Called by the protocol handler to emit
+    /// notices before an error response or at statement completion.
+    pub fn drain_pending_notices(&mut self) -> Vec<(String, String, String)> {
+        std::mem::take(&mut self.pending_notices)
     }
 }
