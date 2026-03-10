@@ -18,6 +18,8 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
+use super::error::SqlError;
+
 use preprocess::{
     extract_create_index_with_params as extract_create_index_with_params_impl, preprocess_sql,
 };
@@ -26,7 +28,7 @@ use tokenizer::{skip_ws_comments_forward, tokenize_sql_for_rewrite, TokenKind};
 /// Parse a SQL string into AST statements
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let dialect = PostgreSqlDialect {};
-    let preprocessed = preprocess_sql(sql);
+    let preprocessed = preprocess_sql(sql).map_err(SqlError::Syntax)?;
     match parse_sql_with_pg_named_arg_compat(&dialect, &preprocessed) {
         Ok(stmts) => Ok(stmts),
         Err(e) => {

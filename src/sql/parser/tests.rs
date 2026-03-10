@@ -1,7 +1,9 @@
 //! Tests for the SQL parser module.
 
 use super::*;
-use operator_rewrite::{rewrite_jsonb_exists_ops, rewrite_vector_distance_ops};
+use operator_rewrite::{
+    rewrite_jsonb_exists_ops, rewrite_table_shorthand, rewrite_vector_distance_ops,
+};
 use preprocess::{preprocess_create_sequence, preprocess_sql};
 
 #[test]
@@ -186,14 +188,17 @@ fn test_parse_reset_role_via_rewrite() {
 
 #[test]
 fn test_rewrite_reset_role_is_statement_aware() {
-    assert_eq!(preprocess_sql("RESET ROLE"), "SET ROLE NONE");
-    assert_eq!(preprocess_sql("SELECT 'RESET ROLE'"), "SELECT 'RESET ROLE'");
+    assert_eq!(preprocess_sql("RESET ROLE").unwrap(), "SET ROLE NONE");
     assert_eq!(
-        preprocess_sql("-- RESET ROLE\nSELECT 1"),
+        preprocess_sql("SELECT 'RESET ROLE'").unwrap(),
+        "SELECT 'RESET ROLE'"
+    );
+    assert_eq!(
+        preprocess_sql("-- RESET ROLE\nSELECT 1").unwrap(),
         "-- RESET ROLE\nSELECT 1"
     );
     assert_eq!(
-        preprocess_sql("RESET ROLE; SELECT 'RESET ROLE';"),
+        preprocess_sql("RESET ROLE; SELECT 'RESET ROLE';").unwrap(),
         "SET ROLE NONE; SELECT 'RESET ROLE';"
     );
 }
@@ -202,37 +207,37 @@ fn test_rewrite_reset_role_is_statement_aware() {
 fn test_rewrite_does_not_touch_non_role_reset() {
     // Non-ROLE RESET is handled by the executor's raw SQL path (RawSqlKind::Reset),
     // not by parser rewrite. The parser should leave them unchanged.
-    assert_eq!(preprocess_sql("RESET timezone"), "RESET timezone");
-    assert_eq!(preprocess_sql("RESET ALL"), "RESET ALL");
+    assert_eq!(preprocess_sql("RESET timezone").unwrap(), "RESET timezone");
+    assert_eq!(preprocess_sql("RESET ALL").unwrap(), "RESET ALL");
     // RESET ROLE is still rewritten
-    assert_eq!(preprocess_sql("RESET ROLE"), "SET ROLE NONE");
+    assert_eq!(preprocess_sql("RESET ROLE").unwrap(), "SET ROLE NONE");
 }
 
 #[test]
 fn test_rewrite_user_role_aliases_is_statement_aware() {
     assert_eq!(
-        preprocess_sql("CREATE USER bob"),
+        preprocess_sql("CREATE USER bob").unwrap(),
         "CREATE ROLE bob WITH LOGIN"
     );
     assert_eq!(
-        preprocess_sql("CREATE USER bob WITH PASSWORD 'test123'"),
+        preprocess_sql("CREATE USER bob WITH PASSWORD 'test123'").unwrap(),
         "CREATE ROLE bob WITH LOGIN PASSWORD 'test123'"
     );
     assert_eq!(
-        preprocess_sql("ALTER USER bob WITH LOGIN"),
+        preprocess_sql("ALTER USER bob WITH LOGIN").unwrap(),
         "ALTER ROLE bob WITH LOGIN"
     );
-    assert_eq!(preprocess_sql("DROP USER bob"), "DROP ROLE bob");
+    assert_eq!(preprocess_sql("DROP USER bob").unwrap(), "DROP ROLE bob");
     assert_eq!(
-        preprocess_sql("SELECT 'CREATE USER bob'"),
+        preprocess_sql("SELECT 'CREATE USER bob'").unwrap(),
         "SELECT 'CREATE USER bob'"
     );
     assert_eq!(
-        preprocess_sql("-- CREATE USER bob\nSELECT 1"),
+        preprocess_sql("-- CREATE USER bob\nSELECT 1").unwrap(),
         "-- CREATE USER bob\nSELECT 1"
     );
     assert_eq!(
-        preprocess_sql("CREATE USER bob; SELECT 'DROP USER bob';"),
+        preprocess_sql("CREATE USER bob; SELECT 'DROP USER bob';").unwrap(),
         "CREATE ROLE bob WITH LOGIN; SELECT 'DROP USER bob';"
     );
 }
@@ -240,7 +245,7 @@ fn test_rewrite_user_role_aliases_is_statement_aware() {
 #[test]
 fn test_rewrite_user_role_aliases_does_not_touch_user_mapping() {
     let sql = "CREATE USER MAPPING FOR CURRENT_USER SERVER s";
-    assert_eq!(preprocess_sql(sql), sql);
+    assert_eq!(preprocess_sql(sql).unwrap(), sql);
 }
 
 #[test]
@@ -316,30 +321,30 @@ fn test_explain_analyze_verbose_with_parens() {
 #[test]
 fn test_preprocess_explain() {
     assert_eq!(
-        preprocess_sql("EXPLAIN (ANALYZE) SELECT 1"),
+        preprocess_sql("EXPLAIN (ANALYZE) SELECT 1").unwrap(),
         "EXPLAIN ANALYZE SELECT 1"
     );
     assert_eq!(
-        preprocess_sql("EXPLAIN (ANALYZE, VERBOSE) SELECT 1"),
+        preprocess_sql("EXPLAIN (ANALYZE, VERBOSE) SELECT 1").unwrap(),
         "EXPLAIN ANALYZE  VERBOSE SELECT 1"
     );
     assert_eq!(
-        preprocess_sql("EXPLAIN ANALYZE SELECT 1"),
+        preprocess_sql("EXPLAIN ANALYZE SELECT 1").unwrap(),
         "EXPLAIN ANALYZE SELECT 1"
     );
-    assert_eq!(preprocess_sql("SELECT 1"), "SELECT 1");
+    assert_eq!(preprocess_sql("SELECT 1").unwrap(), "SELECT 1");
 }
 
 #[test]
 fn test_all_any_subqueries_parse_via_parse_compat_wrapper() {
     let all_sql = "SELECT 1 = ALL (SELECT x FROM t)";
-    let all_preprocessed = preprocess_sql(all_sql);
+    let all_preprocessed = preprocess_sql(all_sql).unwrap();
     assert_eq!(all_preprocessed, "SELECT 1 = ALL (ARRAY(SELECT x FROM t))");
     let stmts = parse_sql(all_sql).unwrap();
     assert_eq!(stmts.len(), 1);
 
     let any_sql = "SELECT 1 > ANY (SELECT x FROM t)";
-    let any_preprocessed = preprocess_sql(any_sql);
+    let any_preprocessed = preprocess_sql(any_sql).unwrap();
     assert_eq!(any_preprocessed, "SELECT 1 > ANY (ARRAY(SELECT x FROM t))");
     let stmts = parse_sql(any_sql).unwrap();
     assert_eq!(stmts.len(), 1);
@@ -348,11 +353,11 @@ fn test_all_any_subqueries_parse_via_parse_compat_wrapper() {
 #[test]
 fn test_preprocess_keeps_all_any_inside_literals_and_comments() {
     assert_eq!(
-        preprocess_sql("SELECT '1 = ALL (SELECT x FROM t)'"),
+        preprocess_sql("SELECT '1 = ALL (SELECT x FROM t)'").unwrap(),
         "SELECT '1 = ALL (SELECT x FROM t)'"
     );
     assert_eq!(
-        preprocess_sql("-- 1 > ANY (SELECT x FROM t)\nSELECT 1"),
+        preprocess_sql("-- 1 > ANY (SELECT x FROM t)\nSELECT 1").unwrap(),
         "-- 1 > ANY (SELECT x FROM t)\nSELECT 1"
     );
 }
@@ -513,4 +518,281 @@ fn test_rewrite_vector_distance_parses() {
     let sql = "SELECT v <-> '[1,0,0]'::vector(3) FROM vec_test";
     let stmts = parse_sql(sql).unwrap();
     assert_eq!(stmts.len(), 1);
+}
+
+// ── TABLE shorthand rewrite tests ──
+
+#[test]
+fn test_table_shorthand_basic() {
+    assert_eq!(
+        rewrite_table_shorthand("TABLE mytable").unwrap(),
+        "SELECT * FROM mytable"
+    );
+}
+
+#[test]
+fn test_table_shorthand_only() {
+    assert_eq!(
+        rewrite_table_shorthand("TABLE ONLY t ORDER BY id LIMIT 5").unwrap(),
+        "SELECT * FROM t ORDER BY id LIMIT 5"
+    );
+}
+
+#[test]
+fn test_table_shorthand_star() {
+    assert_eq!(
+        rewrite_table_shorthand("TABLE t * ORDER BY id LIMIT 5").unwrap(),
+        "SELECT * FROM t ORDER BY id LIMIT 5"
+    );
+}
+
+#[test]
+fn test_table_shorthand_only_star_rejected() {
+    // PG rejects TABLE ONLY <rel> * — ONLY and * are mutually exclusive.
+    let err = rewrite_table_shorthand("TABLE ONLY t *").unwrap_err();
+    assert!(
+        err.contains("at or near"),
+        "expected position hint, got: {err}"
+    );
+}
+
+#[test]
+fn test_table_shorthand_schema_qualified() {
+    assert_eq!(
+        rewrite_table_shorthand("TABLE myschema.mytable").unwrap(),
+        "SELECT * FROM myschema.mytable"
+    );
+}
+
+#[test]
+fn test_table_shorthand_quoted() {
+    assert_eq!(
+        rewrite_table_shorthand(r#"TABLE "MyTable""#).unwrap(),
+        r#"SELECT * FROM "MyTable""#
+    );
+}
+
+#[test]
+fn test_table_shorthand_case_insensitive() {
+    assert_eq!(
+        rewrite_table_shorthand("table mytable").unwrap(),
+        "SELECT * FROM mytable"
+    );
+}
+
+#[test]
+fn test_table_shorthand_ignores_ddl() {
+    let sql = "CREATE TABLE t (id int)";
+    assert_eq!(rewrite_table_shorthand(sql).unwrap(), sql);
+}
+
+#[test]
+fn test_table_shorthand_ignores_alter() {
+    let sql = "ALTER TABLE t ADD COLUMN c INT";
+    assert_eq!(rewrite_table_shorthand(sql).unwrap(), sql);
+}
+
+#[test]
+fn test_table_shorthand_ignores_drop() {
+    let sql = "DROP TABLE t";
+    assert_eq!(rewrite_table_shorthand(sql).unwrap(), sql);
+}
+
+#[test]
+fn test_table_shorthand_explain() {
+    assert_eq!(
+        rewrite_table_shorthand("EXPLAIN TABLE t").unwrap(),
+        "EXPLAIN SELECT * FROM t"
+    );
+}
+
+#[test]
+fn test_table_shorthand_explain_analyze() {
+    assert_eq!(
+        rewrite_table_shorthand("EXPLAIN ANALYZE TABLE t").unwrap(),
+        "EXPLAIN ANALYZE SELECT * FROM t"
+    );
+}
+
+#[test]
+fn test_table_shorthand_multi_stmt() {
+    assert_eq!(
+        rewrite_table_shorthand("TABLE t1; CREATE TABLE t2 (id int)").unwrap(),
+        "SELECT * FROM t1; CREATE TABLE t2 (id int)"
+    );
+}
+
+#[test]
+fn test_table_shorthand_trailing_offset_fetch() {
+    assert_eq!(
+        rewrite_table_shorthand("TABLE t OFFSET 5 FETCH NEXT 10 ROWS ONLY").unwrap(),
+        "SELECT * FROM t OFFSET 5 FETCH NEXT 10 ROWS ONLY"
+    );
+}
+
+#[test]
+fn test_table_shorthand_for_update() {
+    assert_eq!(
+        rewrite_table_shorthand("TABLE t FOR UPDATE").unwrap(),
+        "SELECT * FROM t FOR UPDATE"
+    );
+}
+
+#[test]
+fn test_table_shorthand_ignores_string_literal() {
+    let sql = "SELECT 'TABLE mytable'";
+    assert_eq!(rewrite_table_shorthand(sql).unwrap(), sql);
+}
+
+#[test]
+fn test_table_shorthand_ignores_comment() {
+    let sql = "-- TABLE mytable\nSELECT 1";
+    assert_eq!(rewrite_table_shorthand(sql).unwrap(), sql);
+}
+
+// ── Regression guards (prevents `relation "only" does not exist`) ──
+
+#[test]
+fn test_table_shorthand_only_not_relation() {
+    let sql = "TABLE ONLY t ORDER BY id LIMIT 5";
+    let stmts = parse_sql(sql).unwrap();
+    assert_eq!(stmts.len(), 1);
+    assert!(matches!(stmts[0], Statement::Query(_)));
+}
+
+#[test]
+fn test_table_shorthand_star_not_relation() {
+    let sql = "TABLE t * ORDER BY id";
+    let stmts = parse_sql(sql).unwrap();
+    assert_eq!(stmts.len(), 1);
+    assert!(matches!(stmts[0], Statement::Query(_)));
+}
+
+#[test]
+fn test_table_shorthand_only_star_rejected_parse() {
+    // PG rejects TABLE ONLY <rel> * at parse time.
+    assert!(parse_sql("TABLE ONLY t *").is_err());
+}
+
+// ── Malformed-syntax negatives ──
+
+#[test]
+fn test_table_shorthand_bare_only_fails() {
+    assert!(parse_sql("TABLE ONLY").is_err());
+}
+
+#[test]
+fn test_table_shorthand_bare_table_fails() {
+    assert!(parse_sql("TABLE").is_err());
+}
+
+#[test]
+fn test_table_shorthand_basic_parses() {
+    let stmts = parse_sql("TABLE mytable").unwrap();
+    assert_eq!(stmts.len(), 1);
+    assert!(matches!(stmts[0], Statement::Query(_)));
+}
+
+#[test]
+fn test_table_shorthand_via_preprocess_sql() {
+    assert_eq!(
+        preprocess_sql("TABLE mytable").unwrap(),
+        "SELECT * FROM mytable"
+    );
+    assert_eq!(
+        preprocess_sql("TABLE ONLY t ORDER BY id DESC LIMIT 1").unwrap(),
+        "SELECT * FROM t ORDER BY id DESC LIMIT 1"
+    );
+    assert_eq!(
+        preprocess_sql("TABLE t * ORDER BY id DESC LIMIT 1").unwrap(),
+        "SELECT * FROM t ORDER BY id DESC LIMIT 1"
+    );
+    assert_eq!(
+        preprocess_sql("CREATE TABLE t (id int)").unwrap(),
+        "CREATE TABLE t (id int)"
+    );
+}
+
+#[test]
+fn test_table_shorthand_invalid_tail_rejected() {
+    // PG rejects non-TABLE clauses after TABLE <relation>.
+    assert!(rewrite_table_shorthand("TABLE t WHERE x = 1").is_err());
+    assert!(rewrite_table_shorthand("TABLE t GROUP BY id").is_err());
+    assert!(parse_sql("TABLE t WHERE x = 1").is_err());
+}
+
+// ── P1 blocker regression tests ──
+
+#[test]
+fn test_table_shorthand_as_alias_not_rewritten() {
+    // P1: SELECT 1 AS table must NOT be rewritten — AS is not a TABLE shorthand position.
+    let sql = r#"SELECT 1 AS "table""#;
+    assert_eq!(rewrite_table_shorthand(sql).unwrap(), sql);
+}
+
+#[test]
+fn test_table_shorthand_as_alias_parses() {
+    // Ensure SELECT ... AS table_alias round-trips through parser.
+    let stmts = parse_sql(r#"SELECT 1 AS "table""#).unwrap();
+    assert_eq!(stmts.len(), 1);
+}
+
+#[test]
+fn test_table_shorthand_with_cte() {
+    // P1: WITH cte AS (...) TABLE cte must be recognized as TABLE shorthand.
+    assert_eq!(
+        rewrite_table_shorthand("WITH cte AS (SELECT 1 AS x) TABLE cte").unwrap(),
+        "WITH cte AS (SELECT 1 AS x) SELECT * FROM cte"
+    );
+}
+
+#[test]
+fn test_table_shorthand_with_cte_parses() {
+    let stmts = parse_sql("WITH cte AS (SELECT 1 AS x) TABLE cte").unwrap();
+    assert_eq!(stmts.len(), 1);
+    assert!(matches!(stmts[0], Statement::Query(_)));
+}
+
+#[test]
+fn test_table_shorthand_union_distinct() {
+    // P2: UNION DISTINCT TABLE must be recognized.
+    assert_eq!(
+        rewrite_table_shorthand("SELECT 1 UNION DISTINCT TABLE t").unwrap(),
+        "SELECT 1 UNION DISTINCT SELECT * FROM t"
+    );
+}
+
+#[test]
+fn test_table_shorthand_except_distinct() {
+    assert_eq!(
+        rewrite_table_shorthand("SELECT 1 EXCEPT DISTINCT TABLE t").unwrap(),
+        "SELECT 1 EXCEPT DISTINCT SELECT * FROM t"
+    );
+}
+
+#[test]
+fn test_table_shorthand_explain_format_text() {
+    // P2: EXPLAIN (FORMAT TEXT) TABLE t after preprocess_explain becomes
+    // EXPLAIN FORMAT TEXT TABLE t — TEXT must be recognized as EXPLAIN context.
+    assert_eq!(
+        rewrite_table_shorthand("EXPLAIN FORMAT TEXT TABLE t").unwrap(),
+        "EXPLAIN FORMAT TEXT SELECT * FROM t"
+    );
+}
+
+#[test]
+fn test_table_shorthand_explain_costs_off() {
+    assert_eq!(
+        rewrite_table_shorthand("EXPLAIN COSTS OFF TABLE t").unwrap(),
+        "EXPLAIN COSTS OFF SELECT * FROM t"
+    );
+}
+
+#[test]
+fn test_table_shorthand_explain_options_via_preprocess() {
+    // Full pipeline: EXPLAIN (FORMAT TEXT) TABLE t
+    assert_eq!(
+        preprocess_sql("EXPLAIN (FORMAT TEXT) TABLE t").unwrap(),
+        "EXPLAIN FORMAT TEXT SELECT * FROM t"
+    );
 }

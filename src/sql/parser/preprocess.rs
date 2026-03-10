@@ -9,8 +9,8 @@ use regex::Regex;
 
 use super::operator_rewrite::{
     rewrite_all_any_subquery_parse_compat, rewrite_at_time_zone_placeholders,
-    rewrite_jsonb_exists_ops, rewrite_reset_role, rewrite_user_role_aliases,
-    rewrite_vector_distance_ops,
+    rewrite_jsonb_exists_ops, rewrite_reset_role, rewrite_table_shorthand,
+    rewrite_user_role_aliases, rewrite_vector_distance_ops,
 };
 use super::tokenizer::{tokenize_sql_for_rewrite, Token, TokenKind};
 
@@ -1046,7 +1046,7 @@ fn preprocess_partition_ancestors_with_ordinality(sql: &str) -> Option<String> {
 ///   functions.
 ///   Exit condition: parser support for generic `WITH ORDINALITY` plus native
 ///   partition ancestry support.
-pub(super) fn preprocess_sql(sql: &str) -> String {
+pub(super) fn preprocess_sql(sql: &str) -> Result<String, String> {
     let mut result = sql.to_string();
 
     if let Some(reset) = preprocess_reset_role(&result) {
@@ -1089,6 +1089,9 @@ pub(super) fn preprocess_sql(sql: &str) -> String {
         result = rewritten;
     }
 
+    // TABLE shorthand rewrite (parse-normalization shim)
+    result = rewrite_table_shorthand(&result)?;
+
     // Parse-compat rewrites only: these normalize syntax for sqlparser-rs
     // limitations and must not perform semantic query-shape rewrites.
     result = rewrite_all_any_subquery_parse_compat(&result);
@@ -1108,7 +1111,7 @@ pub(super) fn preprocess_sql(sql: &str) -> String {
     // (see `parse_sql()`), and the original SQL is preserved for execution/binding.
     result = rewrite_at_time_zone_placeholders(&result);
 
-    result
+    Ok(result)
 }
 
 #[cfg(test)]

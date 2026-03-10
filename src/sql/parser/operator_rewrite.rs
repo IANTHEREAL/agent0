@@ -578,3 +578,253 @@ fn collect_user_role_alias_rewrite(
     };
     replacements.push((insert_at, insert_at, suffix));
 }
+
+/// Rewrite PostgreSQL TABLE <relation> shorthand to SELECT * FROM <relation>.
+///
+/// Handles three forms:
+/// - `TABLE <relation>` -> `SELECT * FROM <relation>`
+/// - `TABLE ONLY <relation>` -> `SELECT * FROM <relation>` (ONLY stripped)
+/// - `TABLE <relation> *` -> `SELECT * FROM <relation>` (* stripped)
+///
+/// Trailing clauses (ORDER BY, LIMIT, OFFSET, FETCH, FOR) are preserved verbatim.
+/// DDL statements (CREATE TABLE, ALTER TABLE, DROP TABLE) are not affected.
+///
+/// Classification: parse-normalization shim.
+/// Exit condition: remove when sqlparser-rs supports TABLE shorthand natively.
+pub(super) fn rewrite_table_shorthand(sql: &str) -> Result<String, String> {
+    let tokens = tokenize_sql_for_rewrite(sql);
+    if tokens.is_empty() {
+        return Ok(sql.to_string());
+    }
+
+    let mut mods: Vec<(usize, usize, String)> = Vec::new();
+
+    for (i, tok) in tokens.iter().enumerate() {
+        if tok.kind != TokenKind::Word || !tok.text.eq_ignore_ascii_case("TABLE") {
+            continue;
+        }
+        if !is_table_shorthand_position(&tokens, i) {
+            continue;
+        }
+
+        let next = skip_ws_comments_forward(&tokens, i + 1, tokens.len());
+        if next >= tokens.len() {
+            continue;
+        }
+
+        // Detect ONLY keyword.
+        let has_only =
+            tokens[next].kind == TokenKind::Word && tokens[next].text.eq_ignore_ascii_case("ONLY");
+
+        let rel_start = if has_only {
+            skip_ws_comments_forward(&tokens, next + 1, tokens.len())
+        } else {
+            next
+        };
+        if rel_start >= tokens.len() {
+            continue;
+        }
+
+        // Relation must begin with an identifier.
+        if !matches!(
+            tokens[rel_start].kind,
+            TokenKind::Word | TokenKind::QuotedIdent
+        ) {
+            continue;
+        }
+
+        // Consume schema-qualified parts: schema.table
+        let mut rel_end = rel_start;
+        let mut pos = skip_ws_comments_forward(&tokens, rel_start + 1, tokens.len());
+        while pos < tokens.len() && tokens[pos].text == "." {
+            let after_dot = skip_ws_comments_forward(&tokens, pos + 1, tokens.len());
+            if after_dot < tokens.len()
+                && matches!(
+                    tokens[after_dot].kind,
+                    TokenKind::Word | TokenKind::QuotedIdent
+                )
+            {
+                rel_end = after_dot;
+                pos = skip_ws_comments_forward(&tokens, after_dot + 1, tokens.len());
+            } else {
+                break;
+            }
+        }
+
+        // Check for trailing `*` (inheritance wildcard - stripped since we don't
+        // support table inheritance).
+        let after_rel = skip_ws_comments_forward(&tokens, rel_end + 1, tokens.len());
+        let has_star = after_rel < tokens.len() && tokens[after_rel].text == "*";
+
+        // P1: TABLE ONLY <relation> * is a syntax error in PostgreSQL —
+        // ONLY and * are mutually exclusive inheritance modifiers.
+        if has_only && has_star {
+            return Err("at or near \"*\"".to_string());
+        }
+
+        // P2: Validate tail grammar — only TABLE-valid clauses are allowed
+        // after the relation (ORDER BY, LIMIT, OFFSET, FETCH, FOR, set ops,
+        // statement terminators). Reject non-PG tails like WHERE, GROUP BY, etc.
+        let tail_start = if has_star {
+            skip_ws_comments_forward(&tokens, after_rel + 1, tokens.len())
+        } else {
+            after_rel
+        };
+        if tail_start < tokens.len() {
+            let tail_tok = &tokens[tail_start];
+            let valid_tail = match tail_tok.kind {
+                TokenKind::Punct => matches!(tail_tok.text.as_str(), ";" | ")"),
+                TokenKind::Word => {
+                    let upper = tail_tok.text.to_uppercase();
+                    matches!(
+                        upper.as_str(),
+                        "ORDER"
+                            | "LIMIT"
+                            | "OFFSET"
+                            | "FETCH"
+                            | "FOR"
+                            | "UNION"
+                            | "INTERSECT"
+                            | "EXCEPT"
+                    )
+                }
+                _ => false,
+            };
+            if !valid_tail {
+                return Err(format!("at or near \"{}\"", tail_tok.text));
+            }
+        }
+
+        // Replace range: TABLE [ONLY] -> SELECT * FROM
+        let replace_end = if has_only { tokens[next].end } else { tok.end };
+        mods.push((tok.start, replace_end, "SELECT * FROM".to_string()));
+
+        // Strip trailing inheritance `*`.
+        if has_star {
+            mods.push((tokens[rel_end].end, tokens[after_rel].end, String::new()));
+        }
+    }
+
+    if mods.is_empty() {
+        return Ok(sql.to_string());
+    }
+
+    // Apply in reverse byte order so earlier indices stay valid.
+    mods.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut result = sql.to_string();
+    for (start, end, replacement) in mods {
+        result.replace_range(start..end, &replacement);
+    }
+    Ok(result)
+}
+
+/// Returns `true` when the `TABLE` token at `table_idx` is at a position
+/// where PostgreSQL allows the `TABLE <relation>` shorthand.
+fn is_table_shorthand_position(tokens: &[Token], table_idx: usize) -> bool {
+    let mut prev_idx = table_idx;
+    loop {
+        if prev_idx == 0 {
+            return true;
+        }
+        prev_idx -= 1;
+        if !matches!(
+            tokens[prev_idx].kind,
+            TokenKind::Whitespace | TokenKind::Comment
+        ) {
+            break;
+        }
+    }
+
+    let prev = &tokens[prev_idx];
+
+    // Statement separator, subquery open paren, or CTE close paren.
+    if matches!(prev.text.as_str(), ";" | "(" | ")") {
+        return true;
+    }
+
+    if prev.kind == TokenKind::Word {
+        let upper = prev.text.to_uppercase();
+
+        // Set operations: UNION TABLE, INTERSECT TABLE, EXCEPT TABLE.
+        if matches!(upper.as_str(), "UNION" | "INTERSECT" | "EXCEPT") {
+            return true;
+        }
+
+        // Set operations with ALL or DISTINCT: UNION ALL TABLE, EXCEPT DISTINCT TABLE.
+        if matches!(upper.as_str(), "ALL" | "DISTINCT") {
+            let pp = prev_non_ws(tokens, prev_idx);
+            if let Some(pp) = pp {
+                if tokens[pp].kind == TokenKind::Word {
+                    let pp_upper = tokens[pp].text.to_uppercase();
+                    return matches!(pp_upper.as_str(), "UNION" | "INTERSECT" | "EXCEPT");
+                }
+            }
+        }
+
+        // EXPLAIN context: EXPLAIN TABLE, EXPLAIN ANALYZE TABLE,
+        // and after preprocess_explain normalization, e.g.
+        // EXPLAIN FORMAT TEXT TABLE (was EXPLAIN (FORMAT TEXT) TABLE).
+        if is_in_explain_context(tokens, prev_idx) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Walk backward from `from_idx` through known EXPLAIN option keywords/values
+/// to determine if we are inside an EXPLAIN statement.
+fn is_in_explain_context(tokens: &[Token], from_idx: usize) -> bool {
+    let mut idx = from_idx;
+    loop {
+        if tokens[idx].kind != TokenKind::Word {
+            return false;
+        }
+        let upper = tokens[idx].text.to_uppercase();
+        if upper == "EXPLAIN" {
+            return true;
+        }
+        // Known EXPLAIN option keywords and their values (post preprocess_explain).
+        if !matches!(
+            upper.as_str(),
+            "ANALYZE"
+                | "VERBOSE"
+                | "FORMAT"
+                | "COSTS"
+                | "BUFFERS"
+                | "TIMING"
+                | "SUMMARY"
+                | "SETTINGS"
+                | "WAL"
+                | "TEXT"
+                | "JSON"
+                | "YAML"
+                | "XML"
+                | "ON"
+                | "OFF"
+                | "TRUE"
+                | "FALSE"
+        ) {
+            return false;
+        }
+        match prev_non_ws(tokens, idx) {
+            Some(prev) => idx = prev,
+            None => return false,
+        }
+    }
+}
+
+/// Skip whitespace/comments backward from `idx - 1`, returning the index
+/// of the previous non-trivial token, or `None` if none exists.
+fn prev_non_ws(tokens: &[Token], idx: usize) -> Option<usize> {
+    let mut i = idx;
+    loop {
+        if i == 0 {
+            return None;
+        }
+        i -= 1;
+        if !matches!(tokens[i].kind, TokenKind::Whitespace | TokenKind::Comment) {
+            return Some(i);
+        }
+    }
+}
