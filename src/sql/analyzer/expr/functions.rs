@@ -12,7 +12,6 @@ use crate::sql::expr::static_eval::eval_static_typed_expr;
 use crate::sql::names::function_name_upper;
 use crate::sql::query_context::QueryContext;
 use crate::sql::types::coercion::comparison_target_type;
-use crate::sql::types::mapping::sql_datatype_to_internal;
 use crate::sql::types::registry::global_registry;
 
 use crate::sql::analyzer::error::AnalyzerError;
@@ -450,16 +449,14 @@ impl<'a> Analyzer<'a> {
 
         // Not in builtin registry -- check catalog for UDF
         if let Ok(Some(func_def)) = self.catalog.resolve_function(&func_name, None, &arg_types) {
-            let return_type = sql_datatype_to_internal(&sqlparser::ast::DataType::Custom(
-                sqlparser::ast::ObjectName(vec![ast::Ident::new(&func_def.return_type)]),
-                vec![],
-            ))
-            .map_err(|e| {
-                AnalyzerError::Unsupported(format!(
-                    "UDF {}: unsupported return type '{}': {}",
-                    func_name, func_def.return_type, e
-                ))
-            })?;
+            let return_type = self
+                .resolve_sql_type_text(&func_def.return_type)
+                .map_err(|e| {
+                    AnalyzerError::Unsupported(format!(
+                        "UDF {}: unsupported return type '{}': {}",
+                        func_name, func_def.return_type, e
+                    ))
+                })?;
 
             let resolved = ResolvedFunction {
                 name: func_name,

@@ -5,7 +5,7 @@
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::model::{ColumnDef, DataType};
+use crate::model::{ColumnDef, DataType, UserTypeKind};
 use crate::sql::analyzer::catalog::MockCatalog;
 use crate::sql::analyzer::scope::Scope;
 use crate::sql::analyzer::types::*;
@@ -2361,6 +2361,32 @@ fn analyze_insert_values() {
         }
         _ => panic!("expected AnalyzedStatement::Insert"),
     }
+}
+
+#[test]
+fn analyze_insert_enum_array_cast_resolves_search_path_udt() {
+    let catalog = MockCatalog::builder()
+        .table(
+            "t_enum_arr",
+            vec![(
+                "moods",
+                DataType::Array(Box::new(DataType::UserDefined("public.mood".to_string()))),
+                false,
+            )],
+        )
+        .user_defined_type(
+            "public",
+            "mood",
+            UserTypeKind::Enum {
+                labels: vec!["happy".to_string(), "sad".to_string()],
+            },
+        )
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt =
+        parse_statement("INSERT INTO t_enum_arr (moods) VALUES (ARRAY['happy', 'sad']::mood[])");
+    let result = analyzer.analyze_statement(&stmt);
+    assert!(result.is_ok(), "unexpected analyzer error: {result:?}");
 }
 
 #[test]

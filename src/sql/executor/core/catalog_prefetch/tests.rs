@@ -221,6 +221,23 @@ fn test_extract_scalar_functions_from_statement() {
 }
 
 #[test]
+fn test_extract_type_names_from_statement_collects_udt_array_cast() {
+    let stmt = parse_stmt("INSERT INTO t_enum_arr(moods) VALUES (ARRAY['happy']::mood[])");
+    let names = extract_type_names_from_statement(&stmt);
+    let keys: HashSet<String> = names
+        .iter()
+        .map(|name| {
+            name.0
+                .iter()
+                .map(crate::sql::names::normalize_ident)
+                .collect::<Vec<_>>()
+                .join(".")
+        })
+        .collect();
+    assert!(keys.contains("mood"));
+}
+
+#[test]
 fn test_extract_table_function_calls_basic() {
     let query = parse_query("SELECT * FROM generate_series(1, 3)");
     let calls = extract_table_function_calls(&query);

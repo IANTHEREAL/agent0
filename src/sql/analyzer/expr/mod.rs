@@ -17,7 +17,6 @@ use sqlparser::ast::{self as ast, BinaryOperator, Expr, TrimWhereField};
 use crate::model::{DataType, Value};
 use crate::sql::types::cast::CastContext;
 use crate::sql::types::coercion::{common_type, comparison_target_type, unify_types};
-use crate::sql::types::mapping::sql_datatype_to_internal;
 
 use super::error::AnalyzerError;
 use super::types::*;
@@ -224,6 +223,78 @@ impl<'a> Analyzer<'a> {
         comparison_target_type(&left_expr.data_type, right_type)
     }
 
+    fn resolve_catalog_custom_type(
+        &self,
+        name: &ast::ObjectName,
+    ) -> Result<Option<DataType>, AnalyzerError> {
+        let (schema_opt, type_name) = crate::sql::names::split_object_name(name)
+            .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+        let resolved = self
+            .catalog
+            .resolve_type(&type_name, schema_opt.as_deref())
+            .map_err(|e| AnalyzerError::Internal(e.to_string()))?;
+        Ok(resolved.map(|udt| DataType::UserDefined(format!("{}.{}", udt.schema, udt.name))))
+    }
+
+    fn resolve_sql_data_type(&self, data_type: &ast::DataType) -> Result<DataType, AnalyzerError> {
+        match data_type {
+            ast::DataType::Array(inner) => {
+                let inner_type = match inner {
+                    ast::ArrayElemTypeDef::AngleBracket(inner_type)
+                    | ast::ArrayElemTypeDef::SquareBracket(inner_type) => {
+                        self.resolve_sql_data_type(inner_type)?
+                    }
+                    ast::ArrayElemTypeDef::None => DataType::Text,
+                };
+                Ok(DataType::Array(Box::new(inner_type)))
+            }
+            ast::DataType::Custom(name, _) => {
+                if let Some(resolved) = self.resolve_catalog_custom_type(name)? {
+                    Ok(resolved)
+                } else {
+                    crate::sql::types::mapping::sql_datatype_to_internal(data_type)
+                        .map_err(|e| AnalyzerError::Unsupported(e.to_string()))
+                }
+            }
+            _ => crate::sql::types::mapping::sql_datatype_to_internal(data_type)
+                .map_err(|e| AnalyzerError::Unsupported(e.to_string())),
+        }
+    }
+
+    fn resolve_sql_type_text(&self, type_text: &str) -> Result<DataType, AnalyzerError> {
+        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+        let sql = format!("SELECT CAST(NULL AS {})", type_text);
+        let stmt = sqlparser::parser::Parser::parse_sql(&dialect, &sql)
+            .map_err(|e| {
+                AnalyzerError::Unsupported(format!("unsupported type '{}': {}", type_text, e))
+            })?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                AnalyzerError::Internal("empty parsed statement for type resolution".to_string())
+            })?;
+
+        let ast::Statement::Query(query) = stmt else {
+            return Err(AnalyzerError::Internal(
+                "type resolution parse did not produce a query".to_string(),
+            ));
+        };
+        let ast::SetExpr::Select(select) = &*query.body else {
+            return Err(AnalyzerError::Internal(
+                "type resolution parse did not produce a SELECT".to_string(),
+            ));
+        };
+        let Some(ast::SelectItem::UnnamedExpr(ast::Expr::Cast { data_type, .. })) =
+            select.projection.first()
+        else {
+            return Err(AnalyzerError::Internal(
+                "type resolution parse did not produce a CAST".to_string(),
+            ));
+        };
+
+        self.resolve_sql_data_type(data_type)
+    }
+
     /// Analyze an expression, producing a fully-typed IR node.
     ///
     /// This is the core single-pass analysis: name resolution and type checking
@@ -275,8 +346,7 @@ impl<'a> Analyzer<'a> {
                 expr, data_type, ..
             } => {
                 let inner = self.analyze_expr(expr)?;
-                let target = sql_datatype_to_internal(data_type)
-                    .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                let target = self.resolve_sql_data_type(data_type)?;
                 // Explicit cast resolves parameter type: `$1::int4`
                 if let TypedExprKind::Parameter { index } = &inner.kind {
                     let was_unresolved = self.is_unresolved_param(&inner);
@@ -300,8 +370,7 @@ impl<'a> Analyzer<'a> {
 
             // -- Typed string literal (DATE '...', TIMESTAMP '...') --
             Expr::TypedString { data_type, value } => {
-                let target = sql_datatype_to_internal(data_type)
-                    .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                let target = self.resolve_sql_data_type(data_type)?;
                 let parsed = self.parse_typed_literal(value, &target)?;
                 Ok(TypedExpr::new(TypedExprKind::Constant(parsed), target))
             }

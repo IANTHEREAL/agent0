@@ -4,7 +4,9 @@
 //! `CatalogSnapshot` implementation is built by pre-fetching all referenced
 //! relations from TiKV before analysis begins (async fetch → sync analysis).
 
-use crate::model::{ColumnDef, DataType, FunctionDef, TableSchema, UserTypeDef, ViewDef};
+use crate::model::{
+    ColumnDef, DataType, FunctionDef, TableSchema, UserTypeDef, UserTypeKind, ViewDef,
+};
 use crate::sql::collation::CollationDef;
 use std::collections::{HashMap, HashSet};
 
@@ -253,6 +255,27 @@ impl CatalogSnapshot {
             self.table_functions
                 .entry(key.clone())
                 .or_insert_with(|| schema.clone());
+        }
+        for (key, view) in &other.views {
+            self.views
+                .entry(key.clone())
+                .or_insert_with(|| view.clone());
+        }
+        for (key, func) in &other.functions {
+            self.functions
+                .entry(key.clone())
+                .or_insert_with(|| func.clone());
+        }
+        for (key, udt) in &other.types {
+            self.types.entry(key.clone()).or_insert_with(|| udt.clone());
+        }
+        for (key, coll) in &other.collations {
+            self.collations
+                .entry(key.clone())
+                .or_insert_with(|| coll.clone());
+        }
+        for qualified_name in &other.non_base_names {
+            self.non_base_names.insert(qualified_name.clone());
         }
         for schema_name in &other.known_schemas {
             self.known_schemas.insert(schema_name.clone());
@@ -665,6 +688,23 @@ impl MockCatalogBuilder {
     /// Register a user-created schema as known to exist.
     pub fn schema(mut self, name: &str) -> Self {
         self.snapshot.add_schema(name);
+        self
+    }
+
+    /// Register a user-defined type.
+    pub fn user_defined_type(mut self, schema_name: &str, name: &str, kind: UserTypeKind) -> Self {
+        let full_name = format!("{}.{}", schema_name, name);
+        self.snapshot.add_schema(schema_name);
+        self.snapshot.add_type(
+            &full_name,
+            UserTypeDef {
+                oid: 1,
+                schema: schema_name.to_string(),
+                name: name.to_string(),
+                kind,
+                owner: "postgres".to_string(),
+            },
+        );
         self
     }
 

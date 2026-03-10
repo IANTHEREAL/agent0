@@ -4,6 +4,20 @@ use super::*;
 use crate::worker::types::IndexState;
 
 #[test]
+fn serial_column_type_is_top_level_only() {
+    use sqlparser::ast::{ArrayElemTypeDef, DataType as SqlDataType, Ident, ObjectName};
+
+    let serial = SqlDataType::Custom(ObjectName(vec![Ident::new("SERIAL")]), vec![]);
+    assert_eq!(
+        serial_column_type(&serial).unwrap(),
+        Some((DataType::Int32, true))
+    );
+
+    let serial_array = SqlDataType::Array(ArrayElemTypeDef::SquareBracket(Box::new(serial)));
+    assert_eq!(serial_column_type(&serial_array).unwrap(), None);
+}
+
+#[test]
 fn create_table_default_current_timestamp_precision_is_preserved() {
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;

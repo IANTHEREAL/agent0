@@ -20,8 +20,14 @@ use sqlparser::ast::{Query, Statement};
 use std::collections::{HashMap, HashSet};
 use tikv_client::Transaction;
 
-use extraction::{extract_dml_table_names, extract_scalar_function_names_from_statement};
-use resolution::{build_catalog_snapshot_inner, prefetch_scalar_functions, try_resolve_table};
+use extraction::{
+    extract_dml_table_names, extract_scalar_function_names_from_statement,
+    extract_type_names_from_statement,
+};
+use resolution::{
+    build_catalog_snapshot_inner, prefetch_scalar_functions, prefetch_type_references,
+    try_resolve_table,
+};
 
 /// Build a `CatalogSnapshot` for the given query by pre-fetching all referenced
 /// table schemas from the store.
@@ -97,6 +103,9 @@ pub(crate) async fn build_catalog_snapshot_for_statement(
         &mut snapshot,
     )
     .await?;
+
+    let type_names = extract_type_names_from_statement(stmt);
+    prefetch_type_references(store, txn, db_id, search_path, &type_names, &mut snapshot).await?;
 
     // Prefetch user-defined collations for Analyzer resolution.
     let collation_defs = store.list_collations(txn, db_id).await?;

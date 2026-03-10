@@ -14,6 +14,7 @@ use tikv_client::Transaction;
 
 use super::extraction::{
     extract_scalar_function_names, extract_table_function_calls, extract_table_names,
+    extract_type_names,
 };
 
 fn literal_expr_to_text(expr: &Expr) -> Option<String> {
@@ -439,6 +440,50 @@ pub(super) async fn prefetch_scalar_functions(
     Ok(())
 }
 
+pub(super) async fn prefetch_type_references(
+    store: &TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    type_names: &[ObjectName],
+    snapshot: &mut CatalogSnapshot,
+) -> Result<()> {
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for type_name in type_names {
+        let resolved = match names::resolve_existing_type_name(
+            store,
+            txn,
+            db_id,
+            type_name,
+            search_path,
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(_) => continue,
+        };
+        let Some(resolved) = resolved else {
+            continue;
+        };
+        if resolved.is_builtin() {
+            continue;
+        }
+
+        let full_name = resolved.resolved_name().full.clone();
+        if !seen.insert(full_name.clone()) {
+            continue;
+        }
+
+        let Some(def) = store.get_type(txn, db_id, &full_name).await? else {
+            continue;
+        };
+        snapshot.add_type(&full_name, def);
+    }
+
+    Ok(())
+}
+
 pub(super) async fn prefetch_table_function_schemas(
     store: &TikvStore,
     txn: &mut Transaction,
@@ -758,6 +803,9 @@ pub(super) async fn build_catalog_snapshot_inner(
         &mut snapshot,
     )
     .await?;
+
+    let type_names = extract_type_names(query);
+    prefetch_type_references(store, txn, db_id, search_path, &type_names, &mut snapshot).await?;
 
     // 6. Prefetch user-defined collations for Analyzer resolution.
     let collation_defs = store.list_collations(txn, db_id).await?;
