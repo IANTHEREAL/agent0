@@ -162,11 +162,29 @@ pub(crate) fn session_auth_different_user_error_sync(
 }
 
 pub(crate) fn check_reserved_guc_reset(name: &str) -> Result<()> {
+    check_reserved_guc_reset_with_original(name, name)
+}
+
+/// Like `check_reserved_guc_reset` but uses `original` (which preserves quoted
+/// case) in error messages for PostgreSQL parity.
+///
+/// PostgreSQL always wraps the parameter name in double quotes in the error
+/// message regardless of whether the identifier was originally quoted.  When
+/// `original` already starts with `"` (from the raw-SQL quoted-identifier
+/// parser) it is used as-is; otherwise quotes are added.
+pub(crate) fn check_reserved_guc_reset_with_original(name: &str, original: &str) -> Result<()> {
     match classify_guc(name) {
-        GucKind::ReadOnlyPseudo => Err(SqlError::CantChangeRuntimeParam {
-            message: "parameter \"is_superuser\" cannot be changed".to_string(),
+        GucKind::ReadOnlyPseudo => {
+            let display = if original.starts_with('"') {
+                original.to_string()
+            } else {
+                format!("\"{}\"", original)
+            };
+            Err(SqlError::CantChangeRuntimeParam {
+                message: format!("parameter {} cannot be changed", display),
+            }
+            .into())
         }
-        .into()),
         GucKind::SessionAuthPseudo => Ok(()),
         GucKind::SearchPath | GucKind::Known | GucKind::UnknownCompat => Ok(()),
     }

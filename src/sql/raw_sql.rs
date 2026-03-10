@@ -139,30 +139,245 @@ fn is_valid_tail(tail: &str) -> bool {
     }
 }
 
-/// Extract and validate the GUC name from the text after `RESET`.
-///
-/// Accepts a single SQL identifier (including dotted names like `db9.use_optimizer`),
-/// optionally followed by `;`, `--` line comment, or `/* */` block comment.
-/// PostgreSQL treats comments as whitespace, so comments between `RESET` and the
-/// identifier are allowed (e.g. `RESET /*x*/ ALL`).
-/// Returns `None` if the input is empty, starts with a non-identifier character,
-/// contains unexpected trailing tokens, or has an unterminated block comment.
-pub(crate) fn extract_reset_name(after_reset: &str) -> Option<&str> {
-    // PostgreSQL treats comments as whitespace — skip them before the identifier.
-    let s = skip_ws_and_comments(after_reset)?;
-    if s.is_empty() || (!s.as_bytes()[0].is_ascii_alphabetic() && s.as_bytes()[0] != b'_') {
-        return None;
+/// Parsed result from `extract_reset_name` / `parse_reset_var_name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResetName {
+    /// Normalized name: lowercase, dotted segments joined (e.g. `session.authorization`).
+    pub name: String,
+    /// Original token text preserving quoted case (e.g. `"IS_SUPERUSER"`, `"AlL"`).
+    /// For unquoted identifiers this is the same as `name`.
+    pub original: String,
+    /// Whether the first (or only) segment was a quoted identifier.
+    pub first_quoted: bool,
+}
+
+/// Parse a quoted identifier starting at `"`.  Returns `(original_content, lowercase_content, rest)`
+/// where `rest` is the slice after the closing quote.  Handles `""` escape.
+/// Rejects zero-length identifiers (`""`) to match PostgreSQL.
+fn parse_quoted_identifier(s: &str) -> Option<(String, String, &str)> {
+    debug_assert!(s.starts_with('"'));
+    let inner = &s[1..];
+    let mut chars = inner.char_indices();
+    let mut original = String::new();
+    while let Some((i, ch)) = chars.next() {
+        if ch == '"' {
+            let rest_after_quote = &inner[i + 1..];
+            if rest_after_quote.starts_with('"') {
+                // Escaped double-quote (`""`)
+                original.push('"');
+                chars.next(); // skip the second quote
+            } else {
+                // End of identifier — reject zero-length
+                if original.is_empty() {
+                    return None;
+                }
+                let lowercase = original.to_lowercase();
+                return Some((original, lowercase, rest_after_quote));
+            }
+        } else {
+            original.push(ch);
+        }
     }
-    let end = s
-        .bytes()
-        .position(|b| !b.is_ascii_alphanumeric() && b != b'_' && b != b'.')
-        .unwrap_or(s.len());
-    let name = &s[..end];
-    if is_valid_tail(&s[end..]) {
-        Some(name)
+    None // unterminated
+}
+
+/// Check if an uppercase word is a PostgreSQL 17 keyword that cannot be used
+/// as an unquoted `ColId` (reserved_keyword + type_func_name_keyword).
+fn is_pg_non_colid_keyword(upper: &str) -> bool {
+    matches!(
+        upper,
+        // ── reserved_keyword (PG 17 kwlist.h) ──
+        "ALL"
+            | "ANALYSE"
+            | "ANALYZE"
+            | "AND"
+            | "ANY"
+            | "ARRAY"
+            | "AS"
+            | "ASC"
+            | "ASYMMETRIC"
+            | "BOTH"
+            | "CASE"
+            | "CAST"
+            | "CHECK"
+            | "COLLATE"
+            | "COLUMN"
+            | "CONSTRAINT"
+            | "CREATE"
+            | "CURRENT_CATALOG"
+            | "CURRENT_DATE"
+            | "CURRENT_ROLE"
+            | "CURRENT_TIME"
+            | "CURRENT_TIMESTAMP"
+            | "CURRENT_USER"
+            | "DEFAULT"
+            | "DEFERRABLE"
+            | "DESC"
+            | "DISTINCT"
+            | "DO"
+            | "ELSE"
+            | "END"
+            | "EXCEPT"
+            | "FALSE"
+            | "FETCH"
+            | "FOR"
+            | "FOREIGN"
+            | "FROM"
+            | "GRANT"
+            | "GROUP"
+            | "HAVING"
+            | "IN"
+            | "INITIALLY"
+            | "INTERSECT"
+            | "INTO"
+            | "LATERAL"
+            | "LEADING"
+            | "LIMIT"
+            | "LOCALTIME"
+            | "LOCALTIMESTAMP"
+            | "NOT"
+            | "NULL"
+            | "OFFSET"
+            | "ON"
+            | "ONLY"
+            | "OR"
+            | "ORDER"
+            | "PLACING"
+            | "PRIMARY"
+            | "REFERENCES"
+            | "RETURNING"
+            | "SELECT"
+            | "SESSION_USER"
+            | "SOME"
+            | "SYMMETRIC"
+            | "SYSTEM_USER"
+            | "TABLE"
+            | "THEN"
+            | "TO"
+            | "TRAILING"
+            | "TRUE"
+            | "UNION"
+            | "UNIQUE"
+            | "USER"
+            | "USING"
+            | "VARIADIC"
+            | "WHEN"
+            | "WHERE"
+            | "WINDOW"
+            | "WITH"
+            // ── type_func_name_keyword (PG 17 kwlist.h) ──
+            | "AUTHORIZATION"
+            | "BINARY"
+            | "COLLATION"
+            | "CONCURRENTLY"
+            | "CROSS"
+            | "CURRENT_SCHEMA"
+            | "FREEZE"
+            | "FULL"
+            | "ILIKE"
+            | "INNER"
+            | "IS"
+            | "ISNULL"
+            | "JOIN"
+            | "LEFT"
+            | "LIKE"
+            | "NATURAL"
+            | "NOTNULL"
+            | "OUTER"
+            | "OVERLAPS"
+            | "RIGHT"
+            | "SIMILAR"
+            | "TABLESAMPLE"
+            | "VERBOSE"
+    )
+}
+
+/// Parse a single `ColId` segment: quoted identifier or unquoted identifier.
+///
+/// When `check_keywords` is true, rejects unquoted words that are PG non-ColId
+/// keywords (e.g. `AUTHORIZATION`, `DEFAULT`, `ALL`).
+///
+/// Returns `(original_text, normalized_lowercase_text, was_quoted, remaining_input)`.
+fn parse_colid_segment(s: &str, check_keywords: bool) -> Option<(String, String, bool, &str)> {
+    if s.starts_with('"') {
+        let (original, lowercase, rest) = parse_quoted_identifier(s)?;
+        Some((original, lowercase, true, rest))
+    } else if s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+        let end = s
+            .bytes()
+            .position(|b| !b.is_ascii_alphanumeric() && b != b'_')
+            .unwrap_or(s.len());
+        let word = &s[..end];
+        if check_keywords && is_pg_non_colid_keyword(&word.to_ascii_uppercase()) {
+            return None;
+        }
+        let lower = word.to_ascii_lowercase();
+        Some((lower.clone(), lower, false, &s[end..]))
     } else {
         None
     }
+}
+
+/// Core parser for a PostgreSQL `var_name`: `ColId { '.' ColId }*`.
+///
+/// `check_keywords`: when true, unquoted non-ColId keywords are rejected.
+fn parse_reset_target(after_reset: &str, check_keywords: bool) -> Option<ResetName> {
+    let s = skip_ws_and_comments(after_reset)?;
+    if s.is_empty() {
+        return None;
+    }
+    let (first_orig, first_lower, first_quoted, mut rest) = parse_colid_segment(s, check_keywords)?;
+    let mut name = first_lower;
+    let mut original = if first_quoted {
+        format!("\"{}\"", first_orig)
+    } else {
+        first_orig
+    };
+    loop {
+        match skip_ws_and_comments(rest) {
+            None => return None,
+            Some(r) => rest = r,
+        }
+        if rest.starts_with('.') {
+            let after_dot = &rest[1..];
+            let s2 = skip_ws_and_comments(after_dot)?;
+            let (seg_orig, seg_lower, seg_quoted, r) = parse_colid_segment(s2, check_keywords)?;
+            name.push('.');
+            name.push_str(&seg_lower);
+            original.push('.');
+            if seg_quoted {
+                original.push('"');
+                original.push_str(&seg_orig);
+                original.push('"');
+            } else {
+                original.push_str(&seg_orig);
+            }
+            rest = r;
+        } else {
+            break;
+        }
+    }
+    if is_valid_tail(rest) {
+        Some(ResetName {
+            name,
+            original,
+            first_quoted,
+        })
+    } else {
+        None
+    }
+}
+
+/// Permissive parser for `classify`: accepts any identifier token including
+/// reserved keywords (so that `RESET ALL` is recognized as the Reset kind).
+pub(crate) fn extract_reset_name(after_reset: &str) -> Option<ResetName> {
+    parse_reset_target(after_reset, false)
+}
+
+/// Strict parser for `execute_reset`: rejects unquoted non-ColId keywords
+/// (e.g. `RESET DEFAULT` → syntax error, matching PostgreSQL).
+pub(crate) fn parse_reset_var_name(after_reset: &str) -> Option<ResetName> {
+    parse_reset_target(after_reset, true)
 }
 
 pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
@@ -294,8 +509,10 @@ pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
         && sql_upper[..5].eq_ignore_ascii_case("RESET")
         && sql_upper.as_bytes()[5].is_ascii_whitespace()
     {
-        if let Some(name) = extract_reset_name(&sql_upper[5..]) {
-            if !name.eq_ignore_ascii_case("ROLE") {
+        if let Some(rn) = extract_reset_name(&sql_upper[5..]) {
+            // Unquoted ROLE is rewritten to SET ROLE NONE in the parser layer;
+            // quoted "ROLE" is a regular parameter name and should be handled here.
+            if rn.name != "role" || rn.first_quoted {
                 return Some(RawSqlKind::Reset);
             }
         }
@@ -506,62 +723,189 @@ mod tests {
         assert_eq!(classify("RESET ROLE"), None);
     }
 
+    /// Helper: assert that `extract_reset_name` returns a name with
+    /// `first_quoted == false` and the expected lowercase name.
+    fn assert_unquoted(input: &str, expected_name: &str) {
+        let rn = extract_reset_name(input).unwrap_or_else(|| {
+            panic!("expected Some for {:?}, got None", input);
+        });
+        assert_eq!(rn.name, expected_name, "name mismatch for {:?}", input);
+        assert!(!rn.first_quoted, "expected unquoted for {:?}", input);
+    }
+
     #[test]
     fn extract_reset_name_basic_and_comments() {
-        // Basic identifiers
-        assert_eq!(extract_reset_name("TIMEZONE"), Some("TIMEZONE"));
-        assert_eq!(extract_reset_name("ALL"), Some("ALL"));
-        assert_eq!(
-            extract_reset_name("DB9.USE_OPTIMIZER"),
-            Some("DB9.USE_OPTIMIZER")
-        );
+        // Basic identifiers (permissive: accepts keywords like ALL)
+        assert_unquoted("TIMEZONE", "timezone");
+        assert_unquoted("ALL", "all");
+        assert_unquoted("DB9.USE_OPTIMIZER", "db9.use_optimizer");
 
         // Trailing semicolons
-        assert_eq!(
-            extract_reset_name("DB9.USE_OPTIMIZER;"),
-            Some("DB9.USE_OPTIMIZER")
-        );
+        assert_unquoted("DB9.USE_OPTIMIZER;", "db9.use_optimizer");
 
         // Trailing line comments
-        assert_eq!(extract_reset_name("TIMEZONE -- note"), Some("TIMEZONE"));
-        assert_eq!(extract_reset_name("ALL -- note"), Some("ALL"));
+        assert_unquoted("TIMEZONE -- note", "timezone");
+        assert_unquoted("ALL -- note", "all");
 
         // Trailing block comments
-        assert_eq!(extract_reset_name("ALL /* note */"), Some("ALL"));
+        assert_unquoted("ALL /* note */", "all");
 
         // Leading whitespace (tab, spaces)
-        assert_eq!(extract_reset_name("\tTIMEZONE"), Some("TIMEZONE"));
-        assert_eq!(extract_reset_name("  TIMEZONE"), Some("TIMEZONE"));
+        assert_unquoted("\tTIMEZONE", "timezone");
+        assert_unquoted("  TIMEZONE", "timezone");
 
         // Issue 1: junk after comments must be rejected
         assert_eq!(extract_reset_name("ALL /* note */ junk"), None);
         assert_eq!(extract_reset_name("timezone -- note\njunk"), None);
         assert_eq!(extract_reset_name("ALL /* unterminated"), None);
 
-        // Issue 2: comments before identifier (PostgreSQL treats comments as whitespace)
-        assert_eq!(extract_reset_name("/*x*/ ALL"), Some("ALL"));
-        assert_eq!(extract_reset_name("-- comment\nALL"), Some("ALL"));
+        // Issue 2: comments before identifier
+        assert_unquoted("/*x*/ ALL", "all");
+        assert_unquoted("-- comment\nALL", "all");
         assert_eq!(extract_reset_name("/* unterminated"), None);
 
         // Nested block comments
-        assert_eq!(
-            extract_reset_name("/* outer /* inner */ */ ALL"),
-            Some("ALL")
-        );
-        assert_eq!(
-            extract_reset_name("ALL /* outer /* inner */ */"),
-            Some("ALL")
-        );
-        assert_eq!(extract_reset_name("ALL /* outer /* inner */"), None); // unterminated nesting
+        assert_unquoted("/* outer /* inner */ */ ALL", "all");
+        assert_unquoted("ALL /* outer /* inner */ */", "all");
+        assert_eq!(extract_reset_name("ALL /* outer /* inner */"), None);
 
         // Multiple semicolons and mixed trailing
-        assert_eq!(extract_reset_name("ALL ; -- comment"), Some("ALL"));
-        assert_eq!(extract_reset_name("ALL ; /* note */"), Some("ALL"));
+        assert_unquoted("ALL ; -- comment", "all");
+        assert_unquoted("ALL ; /* note */", "all");
 
         // Invalid inputs
         assert_eq!(extract_reset_name(""), None);
         assert_eq!(extract_reset_name("123bad"), None);
         assert_eq!(extract_reset_name("   "), None);
+    }
+
+    #[test]
+    fn extract_reset_name_quoted_identifiers() {
+        // Simple quoted identifier — preserves original case
+        let rn = extract_reset_name("\"is_superuser\"").unwrap();
+        assert_eq!(rn.name, "is_superuser");
+        assert_eq!(rn.original, "\"is_superuser\"");
+        assert!(rn.first_quoted);
+
+        // Quoted ALL — original preserves uppercase
+        let rn = extract_reset_name("\"ALL\"").unwrap();
+        assert_eq!(rn.name, "all");
+        assert_eq!(rn.original, "\"ALL\"");
+        assert!(rn.first_quoted);
+
+        // Mixed case quoted — original preserves exact spelling
+        let rn = extract_reset_name("\"AlL\"").unwrap();
+        assert_eq!(rn.name, "all");
+        assert_eq!(rn.original, "\"AlL\"");
+        assert!(rn.first_quoted);
+
+        // Quoted IS_SUPERUSER — original preserves uppercase
+        let rn = extract_reset_name("\"IS_SUPERUSER\"").unwrap();
+        assert_eq!(rn.name, "is_superuser");
+        assert_eq!(rn.original, "\"IS_SUPERUSER\"");
+        assert!(rn.first_quoted);
+
+        // Fully qualified dotted with both segments quoted
+        let rn = extract_reset_name("\"session\".\"authorization\"").unwrap();
+        assert_eq!(rn.name, "session.authorization");
+        assert_eq!(rn.original, "\"session\".\"authorization\"");
+        assert!(rn.first_quoted);
+
+        // Mixed: quoted first, unquoted second
+        let rn = extract_reset_name("\"session\".foo").unwrap();
+        assert_eq!(rn.name, "session.foo");
+        assert_eq!(rn.original, "\"session\".foo");
+        assert!(rn.first_quoted);
+
+        // Mixed: unquoted first, quoted second
+        let rn = extract_reset_name("foo.\"bar\"").unwrap();
+        assert_eq!(rn.name, "foo.bar");
+        assert_eq!(rn.original, "foo.\"bar\"");
+        assert!(!rn.first_quoted);
+
+        // Quoted with escaped double quotes
+        let rn = extract_reset_name("\"a\"\"b\"").unwrap();
+        assert_eq!(rn.name, "a\"b");
+        assert!(rn.first_quoted);
+
+        // Quoted with trailing semicolons/comments
+        let rn = extract_reset_name("\"is_superuser\"; -- note").unwrap();
+        assert_eq!(rn.name, "is_superuser");
+        assert!(rn.first_quoted);
+
+        // Unterminated quoted identifier
+        assert_eq!(extract_reset_name("\"unterminated"), None);
+    }
+
+    #[test]
+    fn reject_zero_length_quoted_identifiers() {
+        // PostgreSQL rejects zero-length delimited identifiers
+        assert_eq!(extract_reset_name("\"\""), None);
+        assert_eq!(extract_reset_name("\"\".foo"), None);
+        assert_eq!(extract_reset_name("foo.\"\""), None);
+        assert_eq!(parse_reset_var_name("\"\""), None);
+        assert_eq!(parse_reset_var_name("\"\".\"x\""), None);
+    }
+
+    #[test]
+    fn utf8_quoted_identifiers_preserved() {
+        // UTF-8 content must not be corrupted
+        let rn = extract_reset_name("\"café\"").unwrap();
+        assert_eq!(rn.name, "café");
+        assert_eq!(rn.original, "\"café\"");
+        assert!(rn.first_quoted);
+
+        let rn = extract_reset_name("\"日本語\"").unwrap();
+        assert_eq!(rn.name, "日本語");
+        assert!(rn.first_quoted);
+    }
+
+    #[test]
+    fn parse_reset_var_name_strict_keyword_rejection() {
+        // Strict mode rejects unquoted non-ColId keywords
+        assert!(parse_reset_var_name("DEFAULT").is_none());
+        assert!(parse_reset_var_name("ALL").is_none());
+        assert!(parse_reset_var_name("AUTHORIZATION").is_none());
+        assert!(parse_reset_var_name("SELECT").is_none());
+
+        // But quoted keywords are fine
+        assert!(parse_reset_var_name("\"ALL\"").is_some());
+        assert!(parse_reset_var_name("\"DEFAULT\"").is_some());
+        assert!(parse_reset_var_name("\"AUTHORIZATION\"").is_some());
+
+        // Mixed dotted: unquoted non-ColId keyword in second segment
+        assert!(parse_reset_var_name("\"session\".authorization").is_none());
+
+        // Mixed dotted: quoted keyword in second segment is fine
+        let rn = parse_reset_var_name("\"session\".\"authorization\"").unwrap();
+        assert_eq!(rn.name, "session.authorization");
+
+        // Regular identifiers pass strict mode
+        let rn = parse_reset_var_name("timezone").unwrap();
+        assert_eq!(rn.name, "timezone");
+        assert!(!rn.first_quoted);
+
+        let rn = parse_reset_var_name("db9.use_optimizer").unwrap();
+        assert_eq!(rn.name, "db9.use_optimizer");
+    }
+
+    #[test]
+    fn classify_reset_quoted_identifiers() {
+        // Quoted identifiers are now classified as Reset
+        assert_eq!(classify("RESET \"IS_SUPERUSER\""), Some(RawSqlKind::Reset));
+        assert_eq!(classify("RESET \"ALL\""), Some(RawSqlKind::Reset));
+
+        // Quoted ROLE is classified as Reset (it's a parameter name, not the keyword)
+        assert_eq!(classify("RESET \"ROLE\""), Some(RawSqlKind::Reset));
+
+        // Unquoted ROLE is still excluded
+        assert_eq!(classify("RESET ROLE"), None);
+
+        // Dotted quoted names
+        assert_eq!(
+            classify("RESET \"SESSION\".\"AUTHORIZATION\""),
+            Some(RawSqlKind::Reset)
+        );
     }
 
     #[test]

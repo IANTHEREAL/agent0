@@ -1,0 +1,2 @@
+-- Readback confirms no side effects from rejected resets
+is_superuser=on

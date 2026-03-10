@@ -365,14 +365,42 @@ impl Executor {
     /// Passthrough: no instrumented dispatch, no observability record, no auto
     /// `mark_transaction_failed`.
     fn execute_reset(session: &mut Session, sql_trimmed: &str) -> Result<ExecuteResults> {
+        use crate::sql::error::SqlError;
+
         let after_kw = sql_trimmed.get(5..).unwrap_or("");
-        let name = crate::sql::raw_sql::extract_reset_name(after_kw)
-            .ok_or_else(|| anyhow!("syntax error at or near \"RESET\""))?;
-        if name.eq_ignore_ascii_case("ALL") {
+
+        // PG grammar: `RESET ALL` is a keyword production, `RESET var_name`
+        // uses ColId.  Use the permissive parser to detect ALL first, then
+        // the strict parser (with ColId keyword rejection) for var_name.
+        let permissive = crate::sql::raw_sql::extract_reset_name(after_kw)
+            .ok_or_else(|| SqlError::Syntax("syntax error at or near \"RESET\"".to_string()))?;
+
+        if permissive.name == "all" && !permissive.first_quoted {
+            // RESET ALL — reset all settings to defaults.
             session.reset_all_settings();
+        } else if permissive.name == "all" && permissive.first_quoted {
+            // RESET "ALL" — PG treats quoted ALL as a parameter name, not the
+            // keyword.  No such parameter exists → 42704.
+            // Preserve original quoted case in the error message.
+            return Err(SqlError::UndefinedObject(format!(
+                "unrecognized configuration parameter {}",
+                permissive.original
+            ))
+            .into());
         } else {
-            crate::sql::executor::check_reserved_guc_reset(name)?;
-            session.reset_setting(&name.to_lowercase());
+            // For non-ALL names, apply strict ColId grammar with keyword rejection.
+            let rn = crate::sql::raw_sql::parse_reset_var_name(after_kw)
+                .ok_or_else(|| SqlError::Syntax("syntax error at or near \"RESET\"".to_string()))?;
+            // Quoted "ROLE" must reset effective role state, not just the setting.
+            if rn.name == "role" && rn.first_quoted {
+                session.reset_role();
+            } else {
+                crate::sql::executor::check_reserved_guc_reset_with_original(
+                    &rn.name,
+                    &rn.original,
+                )?;
+                session.reset_setting(&rn.name);
+            }
         }
         Ok(ExecuteResults::single(ExecuteResult::CommandComplete {
             tag: "RESET",
@@ -519,10 +547,102 @@ mod tests {
     #[test]
     fn execute_reset_rejects_invalid_syntax() {
         let (_, mut session) = make_executor_and_session(true, false);
-        let err = Executor::execute_reset(&mut session, "RESET")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("syntax error"));
+        let err = Executor::execute_reset(&mut session, "RESET").unwrap_err();
+        assert!(err.to_string().contains("syntax error"));
+        let sql_err = err.downcast_ref::<crate::sql::error::SqlError>().unwrap();
+        assert_eq!(sql_err.sqlstate(), "42601");
+    }
+
+    #[test]
+    fn execute_reset_quoted_is_superuser() {
+        let (_, mut session) = make_executor_and_session(true, false);
+        let err = Executor::execute_reset(&mut session, "RESET \"is_superuser\"").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("parameter \"is_superuser\" cannot be changed"),
+            "unexpected: {}",
+            err
+        );
+        let sql_err = err.downcast_ref::<crate::sql::error::SqlError>().unwrap();
+        assert_eq!(sql_err.sqlstate(), "55P02");
+    }
+
+    #[test]
+    fn execute_reset_quoted_is_superuser_preserves_case() {
+        let (_, mut session) = make_executor_and_session(true, false);
+        // Uppercase quoted form should preserve the original case in the error
+        let err = Executor::execute_reset(&mut session, "RESET \"IS_SUPERUSER\"").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("parameter \"IS_SUPERUSER\" cannot be changed"),
+            "unexpected: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn execute_reset_quoted_all() {
+        let (_, mut session) = make_executor_and_session(true, false);
+        let err = Executor::execute_reset(&mut session, "RESET \"ALL\"").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unrecognized configuration parameter \"ALL\""),
+            "unexpected: {}",
+            err
+        );
+        let sql_err = err.downcast_ref::<crate::sql::error::SqlError>().unwrap();
+        assert_eq!(sql_err.sqlstate(), "42704");
+    }
+
+    #[test]
+    fn execute_reset_quoted_all_lowercase_preserves_case() {
+        let (_, mut session) = make_executor_and_session(true, false);
+        let err = Executor::execute_reset(&mut session, "RESET \"all\"").unwrap_err();
+        // Original case "all" must appear in the error message
+        assert!(
+            err.to_string()
+                .contains("unrecognized configuration parameter \"all\""),
+            "unexpected: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn execute_reset_quoted_role_resets_role_state() {
+        let (_, mut session) = make_executor_and_session(true, false);
+        // RESET "ROLE" should succeed and reset role (not error as unknown param)
+        let result = Executor::execute_reset(&mut session, "RESET \"ROLE\"");
+        assert!(
+            result.is_ok(),
+            "RESET \"ROLE\" should succeed: {:?}",
+            result
+        );
+        assert_command_tag(result.unwrap(), "RESET");
+    }
+
+    #[test]
+    fn execute_reset_rejects_empty_quoted_identifier() {
+        let (_, mut session) = make_executor_and_session(true, false);
+        let err = Executor::execute_reset(&mut session, "RESET \"\"").unwrap_err();
+        assert!(err.to_string().contains("syntax error"));
+    }
+
+    #[test]
+    fn execute_reset_reserved_keyword_gives_syntax_error() {
+        let (_, mut session) = make_executor_and_session(true, false);
+        // DEFAULT is a reserved keyword, not a valid ColId
+        let err = Executor::execute_reset(&mut session, "RESET DEFAULT").unwrap_err();
+        assert!(err.to_string().contains("syntax error"));
+        let sql_err = err.downcast_ref::<crate::sql::error::SqlError>().unwrap();
+        assert_eq!(sql_err.sqlstate(), "42601");
+    }
+
+    #[test]
+    fn execute_reset_dotted_quoted_name() {
+        let (_, mut session) = make_executor_and_session(true, false);
+        // RESET "session"."authorization" resets a custom GUC (not the pseudo-GUC)
+        let result = Executor::execute_reset(&mut session, "RESET \"session\".\"authorization\"");
+        assert!(result.is_ok());
     }
 
     #[test]

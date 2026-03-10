@@ -24,7 +24,7 @@ fn column_not_found_display(column: &str, hint: &Option<String>) -> String {
 #[derive(Debug, thiserror::Error)]
 pub enum SqlError {
     // Syntax / parsing
-    #[error("syntax error: {0}")]
+    #[error("{0}")]
     Syntax(String),
 
     #[error("syntax error in tsquery: \"{query}\"")]
