@@ -488,7 +488,7 @@ pub fn quote_ident(args: Vec<Value>) -> Result<Value> {
         Some(v) => {
             let type_name = v
                 .data_type()
-                .map(|t| t.to_string().to_lowercase())
+                .map(|t| t.pg_display_name())
                 .unwrap_or_else(|| "unknown".to_string());
             anyhow::bail!("function quote_ident({}) does not exist", type_name)
         }
@@ -685,8 +685,8 @@ mod tests {
     fn test_quote_ident_rejects_numeric() {
         let err = quote_ident(vec![Value::Float64(1.5)]).unwrap_err();
         assert!(
-            err.to_string().contains("quote_ident(double)"),
-            "expected double type in error, got: {}",
+            err.to_string().contains("quote_ident(double precision)"),
+            "expected double precision type in error, got: {}",
             err
         );
     }

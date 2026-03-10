@@ -28,17 +28,6 @@ use crate::sql::sequences::SequenceSession;
 use super::postprocess::build_any_all_rhs_constant_expr;
 use super::subquery::is_correlated_query;
 
-fn pg_type_name_from_data_type(data_type: &DataType) -> String {
-    match data_type {
-        DataType::Boolean => "boolean".to_string(),
-        DataType::Int32 => "integer".to_string(),
-        DataType::Int64 => "bigint".to_string(),
-        DataType::Float64 => "double precision".to_string(),
-        DataType::Numeric { .. } => "numeric".to_string(),
-        _ => data_type.to_string().to_lowercase(),
-    }
-}
-
 fn pg_lastval_arg_type_name(arg: &TypedExpr) -> String {
     if matches!(
         &arg.kind,
@@ -53,7 +42,7 @@ fn pg_lastval_arg_type_name(arg: &TypedExpr) -> String {
         return "numeric".to_string();
     }
 
-    pg_type_name_from_data_type(&arg.data_type)
+    arg.data_type.pg_display_name()
 }
 
 impl Executor {

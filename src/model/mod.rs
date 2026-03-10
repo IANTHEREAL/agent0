@@ -122,6 +122,23 @@ impl fmt::Display for DataType {
     }
 }
 
+impl DataType {
+    /// Return the PostgreSQL-canonical lowercase type name for use in error
+    /// messages (e.g. `FunctionNotFound`).  This matches the names PostgreSQL
+    /// itself emits in diagnostic messages, which differ from the internal OID
+    /// names (int4, float8, …) and from our `Display` impl (uppercase).
+    pub fn pg_display_name(&self) -> String {
+        match self {
+            DataType::Boolean => "boolean".to_string(),
+            DataType::Int32 => "integer".to_string(),
+            DataType::Int64 => "bigint".to_string(),
+            DataType::Float64 => "double precision".to_string(),
+            DataType::Numeric { .. } => "numeric".to_string(),
+            _ => self.to_string().to_lowercase(),
+        }
+    }
+}
+
 /// Interval representation with separate months and milliseconds.
 /// This matches PostgreSQL's behavior where months are calendar-aware.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]

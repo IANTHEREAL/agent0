@@ -138,7 +138,7 @@ pub(super) fn eval_function_call(
                 Some(other) => {
                     let type_name = other
                         .data_type()
-                        .map(|dt| dt.to_string().to_lowercase())
+                        .map(|dt| dt.pg_display_name())
                         .unwrap_or_else(|| "unknown".to_string());
                     return Err(crate::sql::error::SqlError::FunctionNotFound(format!(
                         "current_schemas({})",

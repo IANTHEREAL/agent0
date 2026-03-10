@@ -1,7 +1,7 @@
 //! `replace_sequence_functions` -- recursive AST rewriting for NEXTVAL/CURRVAL/SETVAL/LASTVAL/
 //! CURRENT_SCHEMA/PG_GET_INDEXDEF dispatch and user function evaluation.
 
-use crate::model::{DataType, Row, TableSchema, Value};
+use crate::model::{Row, TableSchema, Value};
 use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
 use crate::sql::error::SqlError;
 use crate::sql::expr::compile::{compile_const_expr, compile_row_expr_for_table};
@@ -26,17 +26,6 @@ use super::{
     resolve_serial_sequence, value_to_i64,
 };
 
-fn pg_type_name_from_data_type(data_type: &DataType) -> String {
-    match data_type {
-        DataType::Boolean => "boolean".to_string(),
-        DataType::Int32 => "integer".to_string(),
-        DataType::Int64 => "bigint".to_string(),
-        DataType::Float64 => "double precision".to_string(),
-        DataType::Numeric { .. } => "numeric".to_string(),
-        _ => data_type.to_string().to_lowercase(),
-    }
-}
-
 fn pg_lastval_arg_type_name_from_typed(arg: &TypedExpr) -> String {
     if matches!(
         &arg.kind,
@@ -51,7 +40,7 @@ fn pg_lastval_arg_type_name_from_typed(arg: &TypedExpr) -> String {
         return "numeric".to_string();
     }
 
-    pg_type_name_from_data_type(&arg.data_type)
+    arg.data_type.pg_display_name()
 }
 
 fn pg_lastval_arg_type_name(arg: &FunctionArg, schema: Option<&TableSchema>) -> String {

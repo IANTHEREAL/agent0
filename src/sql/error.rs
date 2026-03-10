@@ -339,10 +339,7 @@ impl From<AnalyzerError> for SqlError {
             AnalyzerError::AmbiguousColumn { name, .. } => SqlError::AmbiguousColumn(name),
             AnalyzerError::TableNotFound(name) => SqlError::RelationNotFound(name),
             AnalyzerError::FunctionNotFound { name, arg_types } => {
-                let types: Vec<_> = arg_types
-                    .iter()
-                    .map(|t| t.to_string().to_lowercase())
-                    .collect();
+                let types: Vec<_> = arg_types.iter().map(|t| t.pg_display_name()).collect();
                 SqlError::FunctionNotFound(format!("{}({})", name, types.join(", ")))
             }
             AnalyzerError::InvalidLiteral {
