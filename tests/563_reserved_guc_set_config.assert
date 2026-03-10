@@ -1,0 +1,2 @@
+-- Readback must return the server-assigned value, not a user-injected one
+is_superuser=on

@@ -6,7 +6,9 @@
 use crate::model::{Row, Value};
 use crate::sql::analyzer::types::*;
 use crate::sql::error::SqlError;
-use crate::sql::executor::{check_reserved_guc_reset, check_reserved_guc_write};
+use crate::sql::executor::{
+    check_reserved_guc_reset, check_reserved_guc_write, session_auth_different_user_error_sync,
+};
 use crate::sql::query_context::QueryContext;
 use anyhow::{anyhow, Result};
 use std::sync::OnceLock;
@@ -271,6 +273,21 @@ pub(super) fn eval_function_call(
             };
 
             check_reserved_guc_write(&name)?;
+            if canonical == "session_authorization" {
+                // Use session_user (not current_user) for PG parity: SET ROLE
+                // changes current_user but session_authorization checks the
+                // authenticated login role.
+                let session_user = QueryContext::base_setting_snapshot("session_authorization")
+                    .unwrap_or_else(|| qctx.current_user.to_string());
+                if value == session_user {
+                    // Same-user set is a no-op; return the current value.
+                    return Ok(Value::Text(session_user));
+                }
+                // Different user: produce PG-parity error
+                // (role-not-found vs permission-denied).
+                let store = qctx.store_ref.as_ref().map(|s| s.0.as_ref());
+                return Err(session_auth_different_user_error_sync(&value, store));
+            }
             let normalized_value = if canonical == "search_path" {
                 if value.is_empty() {
                     String::new()

@@ -1,0 +1,3 @@
+parameter "is_superuser" cannot be changed
+role "evil_user" does not exist
+parameter "is_superuser" cannot be changed

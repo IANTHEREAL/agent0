@@ -198,7 +198,7 @@ impl Executor {
                             variable,
                             value,
                             ..
-                        } => execute_set_variable(session, *local, variable, value),
+                        } => execute_set_variable(session, *local, variable, value).await,
                         Statement::SetTimeZone { local, value, .. } => {
                             let value = set_variable_value_to_string(std::slice::from_ref(value))?;
                             if *local && !session.is_in_transaction() {

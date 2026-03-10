@@ -140,6 +140,10 @@ pub enum SqlError {
         object_name: String,
     },
 
+    /// Generic SQLSTATE 42501 with a free-form message (e.g. session_authorization denial).
+    #[error("{message}")]
+    InsufficientPrivilege { message: String },
+
     // Duplicate object
     #[error("relation \"{0}\" already exists")]
     DuplicateRelation(String),
@@ -177,6 +181,9 @@ pub enum SqlError {
     DuplicateObject(String),
 
     // Parameter value errors
+    #[error("{message}")]
+    CantChangeRuntimeParam { message: String },
+
     #[error("{message}")]
     InvalidParameterValue { message: String },
 
@@ -278,6 +285,7 @@ impl SqlError {
             Self::StatementTooComplex { .. } => "54001",
             Self::InFailedTransaction => "25P02",
             Self::PermissionDenied { .. } => "42501",
+            Self::InsufficientPrivilege { .. } => "42501",
             Self::DuplicateRelation(_) => "42P07",
             Self::IndeterminateParameterType { .. } => "42P18",
             Self::InconsistentParameterTypes { .. } => "42P18",
@@ -287,6 +295,7 @@ impl SqlError {
             Self::DuplicateSchema(_) => "42P06",
             Self::UndefinedObject(_) => "42704",
             Self::DuplicateObject(_) => "42710",
+            Self::CantChangeRuntimeParam { .. } => "55P02",
             Self::InvalidParameterValue { .. } => "22023",
             Self::NullValueNotAllowed { .. } => "22004",
             Self::DependentObjectsStillExist { .. } => "2BP01",
@@ -557,6 +566,13 @@ mod tests {
         assert_eq!(SqlError::UndefinedObject("o".into()).sqlstate(), "42704");
         assert_eq!(SqlError::DuplicateObject("o".into()).sqlstate(), "42710");
         assert_eq!(
+            SqlError::CantChangeRuntimeParam {
+                message: "parameter \"is_superuser\" cannot be changed".into()
+            }
+            .sqlstate(),
+            "55P02"
+        );
+        assert_eq!(
             SqlError::InvalidParameterValue {
                 message: "bad".into()
             }
@@ -750,6 +766,14 @@ mod tests {
         let anyhow_err: anyhow::Error = sql_err.into();
         let recovered = anyhow_err.downcast_ref::<SqlError>().unwrap();
         assert_eq!(recovered.sqlstate(), "28000");
+
+        // CantChangeRuntimeParam → 55P02
+        let sql_err = SqlError::CantChangeRuntimeParam {
+            message: "parameter \"is_superuser\" cannot be changed".into(),
+        };
+        let anyhow_err: anyhow::Error = sql_err.into();
+        let recovered = anyhow_err.downcast_ref::<SqlError>().unwrap();
+        assert_eq!(recovered.sqlstate(), "55P02");
     }
 
     #[test]

@@ -12,6 +12,18 @@ use std::time::Duration;
 
 use crate::model::Value;
 use crate::sql::advisory_locks::AdvisoryLockMode;
+use crate::storage::TikvStore;
+
+/// Wrapper around `Arc<TikvStore>` that implements `Debug` so it can live
+/// inside `QueryContext` (which derives `Debug`).
+#[derive(Clone)]
+pub(crate) struct StoreRef(pub(crate) Arc<TikvStore>);
+
+impl std::fmt::Debug for StoreRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<store>")
+    }
+}
 
 tokio::task_local! {
     static CONNECTION_ID: i64;
@@ -26,6 +38,7 @@ tokio::task_local! {
     static PENDING_SET_CONFIG_MUTATIONS: Arc<Mutex<Vec<SetConfigMutation>>>;
     static XACT_ADVISORY_LOCK_USED: Arc<AtomicBool>;
     static XACT_ADVISORY_SAVEPOINT_TRACKER: Arc<tokio::sync::Mutex<XactAdvisorySavepointTracker>>;
+    static STORE_REF: Option<StoreRef>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +175,9 @@ pub struct QueryContext {
     /// Per-session savepoint tracker for xact-scoped advisory locks.
     pub xact_advisory_savepoint_tracker:
         Option<Arc<tokio::sync::Mutex<XactAdvisorySavepointTracker>>>,
+    /// Store reference for sync expression evaluation paths that need
+    /// async auth lookups (e.g., session_authorization role-existence check).
+    pub(crate) store_ref: Option<StoreRef>,
 }
 
 impl QueryContext {
@@ -187,6 +203,7 @@ impl QueryContext {
             lock_timeout: None,
             xact_advisory_lock_used: None,
             xact_advisory_savepoint_tracker: None,
+            store_ref: None,
         }
     }
 
@@ -292,6 +309,7 @@ impl QueryContext {
         qctx.xact_advisory_savepoint_tracker =
             XACT_ADVISORY_SAVEPOINT_TRACKER.try_with(|t| t.clone()).ok();
         qctx.execution_settings_snapshot = EXECUTION_SETTINGS_SNAPSHOT.try_with(|s| s.clone()).ok();
+        qctx.store_ref = STORE_REF.try_with(|s| s.clone()).ok().flatten();
         qctx
     }
 
@@ -537,26 +555,29 @@ where
         qctx.database_name.clone(),
         qctx.current_user.clone(),
         qctx.timezone.clone(),
-        XACT_ADVISORY_SAVEPOINT_TRACKER.scope(
-            xact_advisory_savepoint_tracker,
-            XACT_ADVISORY_LOCK_USED.scope(
-                xact_advisory_lock_used,
-                SETTINGS_RUNTIME_OVERRIDES.scope(
-                    Arc::new(Mutex::new(HashMap::new())),
-                    PENDING_SET_CONFIG_MUTATIONS.scope(
-                        Arc::new(Mutex::new(Vec::new())),
-                        EXECUTION_SETTINGS_SNAPSHOT.scope(
-                            execution_snapshot,
-                            SETTINGS_SNAPSHOT.scope(
-                                snapshot,
-                                QUERY_PARAM_TYPES.scope(
-                                    qctx.param_types.clone(),
-                                    QUERY_PARAMS.scope(
-                                        qctx.params.clone(),
-                                        crate::sql::statement_time::with_timestamps(
-                                            qctx.statement_timestamp_ms,
-                                            qctx.transaction_timestamp_ms,
-                                            fut,
+        STORE_REF.scope(
+            qctx.store_ref.clone(),
+            XACT_ADVISORY_SAVEPOINT_TRACKER.scope(
+                xact_advisory_savepoint_tracker,
+                XACT_ADVISORY_LOCK_USED.scope(
+                    xact_advisory_lock_used,
+                    SETTINGS_RUNTIME_OVERRIDES.scope(
+                        Arc::new(Mutex::new(HashMap::new())),
+                        PENDING_SET_CONFIG_MUTATIONS.scope(
+                            Arc::new(Mutex::new(Vec::new())),
+                            EXECUTION_SETTINGS_SNAPSHOT.scope(
+                                execution_snapshot,
+                                SETTINGS_SNAPSHOT.scope(
+                                    snapshot,
+                                    QUERY_PARAM_TYPES.scope(
+                                        qctx.param_types.clone(),
+                                        QUERY_PARAMS.scope(
+                                            qctx.params.clone(),
+                                            crate::sql::statement_time::with_timestamps(
+                                                qctx.statement_timestamp_ms,
+                                                qctx.transaction_timestamp_ms,
+                                                fut,
+                                            ),
                                         ),
                                     ),
                                 ),

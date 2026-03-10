@@ -27,8 +27,8 @@ fn set_local_outside_transaction_notice() -> Vec<ExecuteResult> {
     ]
 }
 
-/// Execute a `SET <variable>` statement synchronously.
-pub(super) fn execute_set_variable(
+/// Execute a `SET <variable>` statement.
+pub(super) async fn execute_set_variable(
     session: &mut Session,
     local: bool,
     variable: &sqlparser::ast::ObjectName,
@@ -56,6 +56,28 @@ pub(super) fn execute_set_variable(
             }
             return Err(write_err);
         }
+    }
+
+    // session_authorization: DEFAULT resets, same-user set is a no-op, others rejected.
+    if var_name == "session_authorization" {
+        if is_default_set_value(value) {
+            if local && !session.is_in_transaction() {
+                return Ok(set_local_outside_transaction_notice());
+            }
+            session.reset_setting(&var_name);
+            return Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }]);
+        }
+        let set_value = set_variable_value_to_string(value)?;
+        let current = session.session_user().unwrap_or("postgres");
+        if set_value == current {
+            // Same-user set is a no-op, but SET LOCAL outside txn emits PG warning.
+            if local && !session.is_in_transaction() {
+                return Ok(set_local_outside_transaction_notice());
+            }
+            return Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }]);
+        }
+        // Different user: produce PG-parity error (role-not-found vs permission-denied).
+        return Err(session_auth_different_user_error(&set_value, &session.store).await);
     }
 
     if var_name == "search_path" {
@@ -157,11 +179,13 @@ mod tests {
         (local, variable, value)
     }
 
-    #[test]
-    fn execute_set_variable_updates_known_setting() {
+    #[tokio::test]
+    async fn execute_set_variable_updates_known_setting() {
         let mut session = make_session();
         let (local, variable, value) = parse_set("SET statement_timeout = 1500");
-        let out = execute_set_variable(&mut session, local, &variable, &value).unwrap();
+        let out = execute_set_variable(&mut session, local, &variable, &value)
+            .await
+            .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(
             session.show_setting_value("statement_timeout").as_deref(),
@@ -169,15 +193,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn execute_set_variable_search_path_local_outside_txn_returns_warning_notice() {
+    #[tokio::test]
+    async fn execute_set_variable_search_path_local_outside_txn_returns_warning_notice() {
         let mut session = make_session();
         let variable = ObjectName(vec![sqlparser::ast::Ident::new("search_path")]);
         let value = vec![Expr::Value(SqlValue::SingleQuotedString(
             "public, pg_catalog".to_string(),
         ))];
 
-        let out = execute_set_variable(&mut session, true, &variable, &value).unwrap();
+        let out = execute_set_variable(&mut session, true, &variable, &value)
+            .await
+            .unwrap();
         assert_eq!(out.len(), 2);
         assert!(matches!(out[0], ExecuteResult::Notice { .. }));
         assert!(matches!(
@@ -186,8 +212,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn execute_set_variable_rejects_unsupported_search_path_expr() {
+    #[tokio::test]
+    async fn execute_set_variable_rejects_unsupported_search_path_expr() {
         let mut session = make_session();
         let variable = ObjectName(vec![sqlparser::ast::Ident::new("search_path")]);
         let value = vec![Expr::BinaryOp {
@@ -197,26 +223,80 @@ mod tests {
         }];
 
         let err = execute_set_variable(&mut session, false, &variable, &value)
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("Unsupported search_path value"));
     }
 
-    #[test]
-    fn execute_set_variable_rejects_reserved_pseudo_guc_write() {
+    #[tokio::test]
+    async fn execute_set_variable_allows_session_authorization_same_user() {
+        let mut session = make_session();
+        // Session user is "postgres" (from make_session).
+        let (local, variable, value) = parse_set("SET session_authorization = 'postgres'");
+        let out = execute_set_variable(&mut session, local, &variable, &value)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            out[0],
+            ExecuteResult::CommandComplete { tag: "SET" }
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_set_variable_rejects_session_authorization_different_user() {
         let mut session = make_session();
         let (local, variable, value) = parse_set("SET session_authorization = 'evil_user'");
         let err = execute_set_variable(&mut session, local, &variable, &value)
+            .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("parameter \"session_authorization\" cannot be changed"));
+        // Stub store falls back to permission-denied (no TiKV client for role lookup).
+        // Error must include the target role name (PG parity).
+        assert!(
+            err.contains("permission denied to set session authorization \"evil_user\""),
+            "unexpected error: {err}"
+        );
     }
 
-    #[test]
-    fn execute_set_variable_allows_session_authorization_default_reset() {
+    #[tokio::test]
+    async fn execute_set_variable_rejects_session_authorization_mixed_case() {
+        let mut session = make_session();
+        // "Postgres" (capital P) must NOT match "postgres" — case-sensitive comparison.
+        let (local, variable, value) = parse_set("SET session_authorization = 'Postgres'");
+        let err = execute_set_variable(&mut session, local, &variable, &value)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("permission denied to set session authorization \"Postgres\""),
+            "mixed-case must be rejected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_set_variable_session_authorization_local_same_user_outside_txn_warns() {
+        let mut session = make_session();
+        let (_, variable, value) = parse_set("SET LOCAL session_authorization = 'postgres'");
+        let out = execute_set_variable(&mut session, true, &variable, &value)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], ExecuteResult::Notice { .. }));
+        assert!(matches!(
+            out[1],
+            ExecuteResult::CommandComplete { tag: "SET" }
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_set_variable_allows_session_authorization_default_reset() {
         let mut session = make_session();
         let (local, variable, value) = parse_set("SET session_authorization TO DEFAULT");
-        let out = execute_set_variable(&mut session, local, &variable, &value).unwrap();
+        let out = execute_set_variable(&mut session, local, &variable, &value)
+            .await
+            .unwrap();
         assert_eq!(out.len(), 1);
         assert!(matches!(
             out[0],
@@ -230,11 +310,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_show_all_result_emits_select_shape() {
+    #[tokio::test]
+    async fn build_show_all_result_emits_select_shape() {
         let mut session = make_session();
         let (local, variable, value) = parse_set("SET statement_timeout = 1000");
-        let _ = execute_set_variable(&mut session, local, &variable, &value).unwrap();
+        let _ = execute_set_variable(&mut session, local, &variable, &value)
+            .await
+            .unwrap();
 
         let out = build_show_all_result(&session, std::sync::Arc::from("UTC"));
         let ExecuteResult::Select {

@@ -1,3 +1,8 @@
+// Rust 1.94+ deepened async-block layout computation; the `do_query` async
+// chain in `protocol::handler::dynamic::query` needs depth 130, exceeding the
+// default limit of 128.  256 gives comfortable headroom.
+#![recursion_limit = "256"]
+
 mod auth;
 mod cli;
 mod config;

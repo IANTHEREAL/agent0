@@ -317,6 +317,7 @@ impl Session {
         qctx.lock_timeout = self.lock_timeout();
         qctx.xact_advisory_lock_used = Some(self.has_xact_advisory_locks.clone());
         qctx.xact_advisory_savepoint_tracker = Some(self.xact_advisory_savepoint_tracker.clone());
+        qctx.store_ref = Some(crate::sql::query_context::StoreRef(self.store.clone()));
         qctx
     }
 

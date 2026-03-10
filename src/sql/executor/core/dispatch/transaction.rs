@@ -190,7 +190,7 @@ impl Executor {
         create_index_with_params: Option<&str>,
     ) -> Result<Vec<ExecuteResult>> {
         if let Statement::Query(query) = stmt {
-            if let Some(result) = try_execute_set_config_select(session, query.as_ref())? {
+            if let Some(result) = try_execute_set_config_select(session, query.as_ref()).await? {
                 return Ok(vec![result]);
             }
             if let Some(result) = try_execute_current_setting_select(session, query.as_ref())? {

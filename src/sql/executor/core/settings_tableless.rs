@@ -1,9 +1,10 @@
 //! Tableless `set_config()` / `current_setting()` fast paths
 
 use super::{
-    normalize_ident, normalize_search_path_entries, parse_search_path_guc_value,
-    try_parse_const_bool, try_parse_const_text, DataType, ExecuteResult, Expr, FunctionArg,
-    FunctionArgExpr, Query, Row, SelectItem, Session, SetExpr, Value,
+    check_reserved_guc_write, normalize_ident, normalize_search_path_entries,
+    parse_search_path_guc_value, session_auth_different_user_error, try_parse_const_bool,
+    try_parse_const_text, DataType, ExecuteResult, Expr, FunctionArg, FunctionArgExpr, Query, Row,
+    SelectItem, Session, SetExpr, Value,
 };
 use crate::session_context;
 use crate::sql::error::SqlError;
@@ -108,7 +109,7 @@ pub(super) fn is_current_setting_function(name: &sqlparser::ast::ObjectName) -> 
     }
 }
 
-pub(super) fn try_execute_set_config_select(
+pub(super) async fn try_execute_set_config_select(
     session: &mut Session,
     query: &Query,
 ) -> Result<Option<ExecuteResult>> {
@@ -171,6 +172,24 @@ pub(super) fn try_execute_set_config_select(
     };
 
     let var_name = var_name.to_lowercase();
+    check_reserved_guc_write(&var_name)?;
+    if var_name == "session_authorization" {
+        let session_user = session.session_user().unwrap_or("postgres");
+        if new_value == session_user {
+            // Same-user set is a no-op; return the current value.
+            let current = session
+                .show_setting_value("session_authorization")
+                .unwrap_or_else(|| "postgres".to_string());
+            return Ok(Some(ExecuteResult::Select {
+                columns: vec![alias.unwrap_or_else(|| "set_config".to_string())],
+                column_types: Some(vec![DataType::Text]),
+                rows: vec![Row::new(vec![Value::Text(current)])],
+                timezone: session_context::current_timezone(),
+            }));
+        }
+        // Different user: produce PG-parity error (role-not-found vs permission-denied).
+        return Err(session_auth_different_user_error(&new_value, &session.store).await);
+    }
     if var_name == "search_path" {
         let parsed = parse_search_path_guc_value(&new_value);
         let new_search_path = normalize_search_path_entries(parsed)?;
@@ -405,11 +424,12 @@ mod tests {
         assert!(is_current_setting_function(&current_qualified));
     }
 
-    #[test]
-    fn set_config_fast_path_returns_select_result() {
+    #[tokio::test]
+    async fn set_config_fast_path_returns_select_result() {
         let mut session = make_session();
         let query = parse_query("SELECT set_config('statement_timeout', '1000', false)");
         let result = try_execute_set_config_select(&mut session, &query)
+            .await
             .unwrap()
             .expect("should fast-path");
 
@@ -448,6 +468,67 @@ mod tests {
             panic!("expected select");
         };
         assert_eq!(rows[0].values, vec![Value::Null]);
+    }
+
+    #[tokio::test]
+    async fn set_config_rejects_is_superuser() {
+        let mut session = make_session();
+        let query = parse_query("SELECT set_config('is_superuser', 'on', false)");
+        let err = try_execute_set_config_select(&mut session, &query)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("parameter \"is_superuser\" cannot be changed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_config_allows_session_authorization_same_user() {
+        let mut session = make_session();
+        // Session user is "postgres" (from make_session's database arg).
+        let query = parse_query("SELECT set_config('session_authorization', 'postgres', false)");
+        let result = try_execute_set_config_select(&mut session, &query)
+            .await
+            .unwrap()
+            .expect("should fast-path for same-user session_authorization");
+        let ExecuteResult::Select { rows, .. } = result else {
+            panic!("expected select result");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, vec![Value::Text("postgres".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn set_config_rejects_session_authorization_different_user() {
+        let mut session = make_session();
+        let query = parse_query("SELECT set_config('session_authorization', 'evil_user', false)");
+        let err = try_execute_set_config_select(&mut session, &query)
+            .await
+            .unwrap_err()
+            .to_string();
+        // Stub store falls back to permission-denied (no TiKV client for role lookup).
+        // Error must include the target role name (PG parity).
+        assert!(
+            err.contains("permission denied to set session authorization \"evil_user\""),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_config_rejects_session_authorization_mixed_case() {
+        let mut session = make_session();
+        // "Postgres" (capital P) must NOT match "postgres" — case-sensitive (PG parity).
+        let query = parse_query("SELECT set_config('session_authorization', 'Postgres', false)");
+        let err = try_execute_set_config_select(&mut session, &query)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("permission denied to set session authorization \"Postgres\""),
+            "mixed-case must be rejected: {err}"
+        );
     }
 
     #[test]

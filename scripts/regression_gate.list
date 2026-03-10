@@ -204,6 +204,8 @@ tests/1628_to_regclass.sql
 tests/1629_generated_column_reject.sql
 # #1658 – pg_class materialized views report relkind='m' instead of 'r'
 tests/30_matview_relkind.sql
+# #1565 – block set_config() writes to reserved pseudo-GUCs
+tests/563_reserved_guc_set_config.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py
