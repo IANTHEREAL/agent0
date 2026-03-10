@@ -364,6 +364,22 @@ impl<'a> Analyzer<'a> {
                 });
             }
 
+            // quote_ident() only accepts text-like types (text, varchar, name).
+            // PG rejects non-text arguments with SQLSTATE 42883.
+            if func_name == "QUOTE_IDENT" {
+                if let Some(arg_type) = arg_types.first() {
+                    if !matches!(
+                        arg_type,
+                        DataType::Text | DataType::Varchar(_) | DataType::Name
+                    ) {
+                        return Err(AnalyzerError::FunctionNotFound {
+                            name: func_name.to_lowercase(),
+                            arg_types: arg_types.clone(),
+                        });
+                    }
+                }
+            }
+
             // Reject window-only functions used without OVER clause.
             // Functions like ROW_NUMBER(), RANK() are meaningless without a window.
             if sig.is_window && !sig.is_aggregate && func.over.is_none() {

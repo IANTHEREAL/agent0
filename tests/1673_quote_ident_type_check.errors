@@ -1,0 +1,4 @@
+function quote_ident(integer) does not exist
+function quote_ident(boolean) does not exist
+function quote_ident(numeric) does not exist
+function quote_ident(integer) does not exist

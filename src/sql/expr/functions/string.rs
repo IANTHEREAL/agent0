@@ -485,7 +485,13 @@ pub fn quote_ident(args: Vec<Value>) -> Result<Value> {
     let val = match args.into_iter().next() {
         Some(Value::Text(s)) => s,
         Some(Value::Null) => return Ok(Value::Null),
-        Some(v) => v.to_string(),
+        Some(v) => {
+            let type_name = v
+                .data_type()
+                .map(|t| t.to_string().to_lowercase())
+                .unwrap_or_else(|| "unknown".to_string());
+            anyhow::bail!("function quote_ident({}) does not exist", type_name)
+        }
         None => return Ok(Value::Null),
     };
     Ok(Value::Text(quoting::quote_ident(&val)))
@@ -657,10 +663,37 @@ mod tests {
 
     #[test]
     fn test_quote_ident_non_text_arg() {
-        assert_eq!(
-            quote_ident(vec![Value::Int32(123)]).unwrap(),
-            Value::Text("\"123\"".to_string())
+        let err = quote_ident(vec![Value::Int32(123)]).unwrap_err();
+        assert!(
+            err.to_string().contains("quote_ident(integer)"),
+            "expected integer type in error, got: {}",
+            err
         );
+    }
+
+    #[test]
+    fn test_quote_ident_rejects_boolean() {
+        let err = quote_ident(vec![Value::Boolean(true)]).unwrap_err();
+        assert!(
+            err.to_string().contains("quote_ident(boolean)"),
+            "expected boolean type in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_quote_ident_rejects_numeric() {
+        let err = quote_ident(vec![Value::Float64(1.5)]).unwrap_err();
+        assert!(
+            err.to_string().contains("quote_ident(double)"),
+            "expected double type in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_quote_ident_null_returns_null() {
+        assert_eq!(quote_ident(vec![Value::Null]).unwrap(), Value::Null);
     }
 
     #[test]

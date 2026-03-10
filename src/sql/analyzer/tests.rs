@@ -1047,6 +1047,36 @@ fn analyze_generate_subscripts_rejects_non_array_first_arg() {
 }
 
 #[test]
+fn analyze_quote_ident_rejects_integer_arg() {
+    let err = analyze_expr_with_users("quote_ident(42)").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound {
+            ref name,
+            ref arg_types
+        } if name == "quote_ident" && arg_types == &[DataType::Int32]
+    ));
+}
+
+#[test]
+fn analyze_quote_ident_accepts_text_arg() {
+    let expr = analyze_expr_with_users("quote_ident('hello')").unwrap();
+    assert_eq!(expr.data_type, DataType::Text);
+}
+
+#[test]
+fn analyze_quote_ident_rejects_null_cast_to_int() {
+    let err = analyze_expr_with_users("quote_ident(NULL::int)").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::FunctionNotFound {
+            ref name,
+            ref arg_types
+        } if name == "quote_ident" && arg_types == &[DataType::Int32]
+    ));
+}
+
+#[test]
 fn analyze_pg_get_indexdef_coerces_column_no_and_pretty() {
     let expr = analyze_expr_with_users("pg_get_indexdef(1, '1', 'true')").unwrap();
     assert_eq!(expr.data_type, DataType::Text);
