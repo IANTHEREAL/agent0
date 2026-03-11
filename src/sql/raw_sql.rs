@@ -502,9 +502,9 @@ pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
         return Some(RawSqlKind::Analyze);
     }
 
-    // RESET <guc> / RESET ALL — but NOT RESET ROLE (which is rewritten in the parser).
-    // Accept any ASCII whitespace (space, tab, etc.) after "RESET", and validate
-    // that only a single identifier token follows (trailing comments/semicolons OK).
+    // RESET <guc> / RESET ALL / RESET "quoted" — but NOT unquoted RESET ROLE
+    // (which is rewritten in the parser). Double-quoted ROLE is treated as a
+    // regular GUC name, not the keyword.
     if sql_upper.len() > 5
         && sql_upper[..5].eq_ignore_ascii_case("RESET")
         && sql_upper.as_bytes()[5].is_ascii_whitespace()
@@ -721,6 +721,11 @@ mod tests {
         );
         // RESET ROLE is NOT classified as Reset (handled by parser rewrite)
         assert_eq!(classify("RESET ROLE"), None);
+        // Double-quoted identifiers are classified as Reset (#1662)
+        assert_eq!(classify("RESET \"ALL\""), Some(RawSqlKind::Reset));
+        assert_eq!(classify("RESET \"timezone\""), Some(RawSqlKind::Reset));
+        // Quoted ROLE IS classified as Reset (quoting prevents keyword interpretation)
+        assert_eq!(classify("RESET \"ROLE\""), Some(RawSqlKind::Reset));
     }
 
     /// Helper: assert that `extract_reset_name` returns a name with
@@ -777,6 +782,17 @@ mod tests {
         assert_eq!(extract_reset_name(""), None);
         assert_eq!(extract_reset_name("123bad"), None);
         assert_eq!(extract_reset_name("   "), None);
+
+        // Double-quoted identifiers (#1662) — covered in detail by
+        // `extract_reset_name_quoted_identifiers`; quick smoke here.
+        let rn = extract_reset_name("\"ALL\"").unwrap();
+        assert_eq!(rn.name, "all");
+        assert!(rn.first_quoted);
+
+        // Invalid quoted identifiers
+        assert_eq!(extract_reset_name("\"\""), None); // empty
+        assert_eq!(extract_reset_name("\"unterminated"), None);
+        assert_eq!(extract_reset_name("\"ALL\" junk"), None);
     }
 
     #[test]

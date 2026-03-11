@@ -1,0 +1,12 @@
+statement_timeout
+5000ms
+(1 row)
+statement_timeout
+60000ms
+(1 row)
+ERROR:  unrecognized configuration parameter "ALL"
+ERROR:  unrecognized configuration parameter "definitely_missing_guc_1662"
+ERROR:  unrecognized configuration parameter "FooBar_NoSuchGuc"
+statement_timeout
+60000ms
+(1 row)

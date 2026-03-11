@@ -217,6 +217,8 @@ tests/1662_set_local_reserved_guc.sql
 tests/249_enum_array_validation.sql
 # #1599 – non-ASCII COPY QUOTE/ESCAPE/DELIMITER returns 0A000 instead of 42601
 tests/1599_copy_non_ascii_quote_escape.sql
+# #1662 – RESET "ALL" quoted-identifier parity + unknown-param SQLSTATE 42704
+tests/1662_reset_quoted_all.sql
 [python]
 tests/advisory_locks_savepoint.py
 tests/idle_in_transaction_reaper_midquery_1124.py

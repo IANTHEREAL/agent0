@@ -360,7 +360,7 @@ impl Executor {
         }))
     }
 
-    /// Execute `RESET <guc>` or `RESET ALL`.
+    /// Execute `RESET <guc>`, `RESET ALL`, or `RESET "quoted"`.
     ///
     /// Passthrough: no instrumented dispatch, no observability record, no auto
     /// `mark_transaction_failed`.
@@ -399,6 +399,21 @@ impl Executor {
                     &rn.name,
                     &rn.original,
                 )?;
+                // PostgreSQL errors on unknown parameters (SQLSTATE 42704).
+                // Dotted names (custom GUC namespaces like `db9.foo`) are exempt —
+                // PG silently accepts `RESET ns.key` even when the key is unknown.
+                if !rn.name.contains('.') && session.show_setting_value(&rn.name).is_none() {
+                    // Use original token text (case-preserved) for the error
+                    // message, stripping surrounding SQL double-quotes so the
+                    // message reads e.g. `"FOOBAR"` not `"foobar"` for quoted
+                    // identifiers — matching PostgreSQL behavior.
+                    let display = rn.original.trim_matches('"');
+                    return Err(SqlError::UndefinedObject(format!(
+                        "unrecognized configuration parameter \"{}\"",
+                        display
+                    ))
+                    .into());
+                }
                 session.reset_setting(&rn.name);
             }
         }
@@ -643,6 +658,48 @@ mod tests {
         // RESET "session"."authorization" resets a custom GUC (not the pseudo-GUC)
         let result = Executor::execute_reset(&mut session, "RESET \"session\".\"authorization\"");
         assert!(result.is_ok());
+    }
+
+    /// `RESET "ALL"` (quoted) must NOT reset all settings — it must be treated
+    /// as an unknown parameter name and error with SQLSTATE 42704 (#1662).
+    #[test]
+    fn execute_reset_quoted_all_is_not_keyword() {
+        let (_, mut session) = make_executor_and_session(true, false);
+        session
+            .set_known_setting("statement_timeout", "5000".to_string())
+            .unwrap();
+
+        let err = Executor::execute_reset(&mut session, "RESET \"ALL\"").unwrap_err();
+        let msg = err.to_string();
+        // Must preserve quoted original case: "ALL" not "all" (#1662).
+        assert!(
+            msg.contains("unrecognized configuration parameter \"ALL\""),
+            "expected case-preserved quoted error, got: {msg}"
+        );
+
+        // Verify settings were NOT reset (statement_timeout still modified).
+        assert_eq!(
+            session.show_setting_value("statement_timeout").as_deref(),
+            Some("5000ms")
+        );
+    }
+
+    /// `RESET unknown_param` must error with SQLSTATE 42704 (#1662).
+    #[test]
+    fn execute_reset_unknown_param_errors() {
+        let (_, mut session) = make_executor_and_session(true, false);
+        let err =
+            Executor::execute_reset(&mut session, "RESET definitely_missing_setting").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unrecognized configuration parameter \"definitely_missing_setting\""),
+            "expected unrecognized parameter error, got: {msg}"
+        );
+        // Verify SQLSTATE is 42704
+        let sql_err = err
+            .downcast_ref::<crate::sql::error::SqlError>()
+            .expect("must be SqlError");
+        assert_eq!(sql_err.sqlstate(), "42704");
     }
 
     #[test]
