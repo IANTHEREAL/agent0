@@ -47,6 +47,16 @@ use super::super::{
     send_notices_and_get_last_response_with_format, CopyContext,
 };
 
+/// Read the `bytea_output` session setting and return the corresponding enum.
+fn parse_bytea_output_from_session(
+    session: &crate::sql::Session,
+) -> crate::sql::bytea::ByteaOutput {
+    match session.show_setting_value("bytea_output").as_deref() {
+        Some("escape") => crate::sql::bytea::ByteaOutput::Escape,
+        _ => crate::sql::bytea::ByteaOutput::Hex,
+    }
+}
+
 /// Returns true for SELECT/INSERT/UPDATE/DELETE -- statements that require
 /// Analyzer output for correct Describe schema.  Uses parse_sql for
 /// precise AST classification (handles SELECT\n, WITH\t, etc.).
@@ -749,7 +759,8 @@ impl SimpleQueryHandler for DynamicPgHandler {
                         }
                         continue;
                     }
-                    responses.push(result_to_response(result)?);
+                    let bytea_output = parse_bytea_output_from_session(&session);
+                    responses.push(result_to_response(result, bytea_output)?);
                 }
                 Ok(responses)
             }
@@ -1260,6 +1271,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                     session.show_setting_value("client_min_messages"),
                     results,
                     &portal.result_column_format,
+                    parse_bytea_output_from_session(&session),
                 )
                 .await;
                 Ok(resp?)

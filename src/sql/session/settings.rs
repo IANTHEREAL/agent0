@@ -759,6 +759,20 @@ impl SessionSettings {
                 }
                 Ok(v.to_string())
             }
+            "bytea_output" => {
+                let normalized = value.trim().to_lowercase();
+                match normalized.as_str() {
+                    "hex" | "escape" => Ok(normalized),
+                    _ => Err(SqlError::InvalidParameterValue {
+                        message: format!(
+                            "invalid value for parameter \"bytea_output\": \"{}\"; \
+                             available values: \"hex\", \"escape\"",
+                            value
+                        ),
+                    }
+                    .into()),
+                }
+            }
             "hnsw.ef_search" => {
                 let v: u16 = value
                     .trim()

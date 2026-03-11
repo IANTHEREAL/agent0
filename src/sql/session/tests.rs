@@ -1287,4 +1287,37 @@ mod tests {
         assert_eq!(session.session_user(), Some("alice"));
         assert!(session.is_superuser());
     }
+
+    // --- bytea_output GUC validation (#1538) ---
+
+    #[test]
+    fn bytea_output_accepts_hex_and_escape() {
+        let mut settings = SessionSettings::new_with_defaults(0, 0);
+        // Default is hex.
+        assert_eq!(settings.show_value("bytea_output").as_deref(), Some("hex"));
+        // SET to escape.
+        settings
+            .set_known_setting("bytea_output", "escape".to_string())
+            .unwrap();
+        assert_eq!(
+            settings.show_value("bytea_output").as_deref(),
+            Some("escape")
+        );
+        // SET to hex.
+        settings
+            .set_known_setting("bytea_output", "hex".to_string())
+            .unwrap();
+        assert_eq!(settings.show_value("bytea_output").as_deref(), Some("hex"));
+    }
+
+    #[test]
+    fn bytea_output_rejects_invalid_values() {
+        let mut settings = SessionSettings::new_with_defaults(0, 0);
+        assert!(settings
+            .set_known_setting("bytea_output", "base64".to_string())
+            .is_err());
+        assert!(settings
+            .set_known_setting("bytea_output", "".to_string())
+            .is_err());
+    }
 }

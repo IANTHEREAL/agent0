@@ -230,6 +230,14 @@ fn prepared_websearch_to_tsquery_unknown_param_parse_contract_resolves_text() {
 }
 
 fn encode_value_to_string(value: &Value, col_type: Option<&DataType>) -> String {
+    encode_value_to_string_with_bytea_output(value, col_type, crate::sql::bytea::ByteaOutput::Hex)
+}
+
+fn encode_value_to_string_with_bytea_output(
+    value: &Value,
+    col_type: Option<&DataType>,
+    bytea_output: crate::sql::bytea::ByteaOutput,
+) -> String {
     let fields = vec![FieldInfo::new(
         "col".to_string(),
         None,
@@ -240,7 +248,15 @@ fn encode_value_to_string(value: &Value, col_type: Option<&DataType>) -> String 
     let fields = Arc::new(fields);
     let mut encoder = DataRowEncoder::new(fields);
     let tz = crate::model::timestamp::TimeZoneSpec::parse("UTC");
-    encode_value(&mut encoder, value, col_type, tz, FieldFormat::Text).unwrap();
+    encode_value(
+        &mut encoder,
+        value,
+        col_type,
+        tz,
+        FieldFormat::Text,
+        bytea_output,
+    )
+    .unwrap();
     let row = encoder.finish().unwrap();
 
     assert_eq!(row.field_count, 1);
@@ -2372,7 +2388,11 @@ fn test_count_sql_parameters_ignores_comments_and_identifier_tokens() {
 
 #[test]
 fn test_result_to_response_transaction_start_is_not_empty_query() {
-    let resp = result_to_response(ExecuteResult::TransactionStart { tag: "BEGIN" }).unwrap();
+    let resp = result_to_response(
+        ExecuteResult::TransactionStart { tag: "BEGIN" },
+        crate::sql::bytea::ByteaOutput::Hex,
+    )
+    .unwrap();
     match resp {
         Response::TransactionStart(tag) => {
             let complete = CommandComplete::from(tag);
@@ -2384,7 +2404,11 @@ fn test_result_to_response_transaction_start_is_not_empty_query() {
 
 #[test]
 fn test_result_to_response_transaction_end_is_not_empty_query() {
-    let resp = result_to_response(ExecuteResult::TransactionEnd { tag: "COMMIT" }).unwrap();
+    let resp = result_to_response(
+        ExecuteResult::TransactionEnd { tag: "COMMIT" },
+        crate::sql::bytea::ByteaOutput::Hex,
+    )
+    .unwrap();
     match resp {
         Response::TransactionEnd(tag) => {
             let complete = CommandComplete::from(tag);
@@ -2396,7 +2420,11 @@ fn test_result_to_response_transaction_end_is_not_empty_query() {
 
 #[test]
 fn test_result_to_response_command_complete_is_execution() {
-    let resp = result_to_response(ExecuteResult::CommandComplete { tag: "SET" }).unwrap();
+    let resp = result_to_response(
+        ExecuteResult::CommandComplete { tag: "SET" },
+        crate::sql::bytea::ByteaOutput::Hex,
+    )
+    .unwrap();
     match resp {
         Response::Execution(tag) => {
             let complete = CommandComplete::from(tag);
@@ -2408,7 +2436,8 @@ fn test_result_to_response_command_complete_is_execution() {
 
 #[test]
 fn test_result_to_response_empty_is_empty_query() {
-    let resp = result_to_response(ExecuteResult::Empty).unwrap();
+    let resp =
+        result_to_response(ExecuteResult::Empty, crate::sql::bytea::ByteaOutput::Hex).unwrap();
     assert!(matches!(resp, Response::EmptyQuery));
 }
 
@@ -2425,6 +2454,7 @@ async fn test_result_to_response_with_format_uses_per_column_formats() {
             timezone: Arc::<str>::from("UTC"),
         },
         &Format::Individual(vec![1, 0]),
+        crate::sql::bytea::ByteaOutput::Hex,
     )
     .unwrap();
 
@@ -2467,6 +2497,7 @@ async fn test_result_to_response_with_format_falls_back_to_text_for_array_binary
             timezone: Arc::<str>::from("UTC"),
         },
         &Format::UnifiedBinary,
+        crate::sql::bytea::ByteaOutput::Hex,
     )
     .unwrap();
 
@@ -2499,6 +2530,7 @@ async fn test_result_to_response_does_not_rewrite_question_column_by_value() {
             timezone: Arc::<str>::from("UTC"),
         },
         &Format::UnifiedText,
+        crate::sql::bytea::ByteaOutput::Hex,
     )
     .unwrap();
 
@@ -2522,6 +2554,7 @@ async fn test_result_to_response_preserves_explicit_version_column_name() {
             timezone: Arc::<str>::from("UTC"),
         },
         &Format::UnifiedText,
+        crate::sql::bytea::ByteaOutput::Hex,
     )
     .unwrap();
 
@@ -2787,6 +2820,7 @@ async fn assert_describe_execute_metadata_agreement(
             timezone: Arc::<str>::from("UTC"),
         },
         &Format::UnifiedText,
+        crate::sql::bytea::ByteaOutput::Hex,
     )
     .expect("encode execute response");
     let execute_fields = extract_query_schema(execute_resp);
@@ -3169,6 +3203,7 @@ fn test_encode_value_date_binary_uses_unix_epoch_days() {
         Some(&DataType::Date),
         tz,
         FieldFormat::Binary,
+        crate::sql::bytea::ByteaOutput::Hex,
     )
     .unwrap();
     let row = encoder.finish().unwrap();
@@ -3197,6 +3232,7 @@ fn test_encode_value_interval_binary_preserves_days_and_remainder() {
         Some(&DataType::Interval),
         tz,
         FieldFormat::Binary,
+        crate::sql::bytea::ByteaOutput::Hex,
     )
     .unwrap();
     let row = encoder.finish().unwrap();
@@ -3809,6 +3845,7 @@ fn test_encode_jsonb_binary_canonical() {
         Some(&DataType::Jsonb),
         tz,
         FieldFormat::Binary,
+        crate::sql::bytea::ByteaOutput::Hex,
     )
     .unwrap();
     let row = encoder.finish().unwrap();
@@ -3940,4 +3977,35 @@ fn test_decode_parameters_unknown_binary_fallback_returns_text() {
 
     let values = decode_parameters(&portal).unwrap();
     assert_eq!(values, vec![Some(Value::Text("hello".to_string()))]);
+}
+
+// --- bytea_output GUC tests (#1538) ---
+
+#[test]
+fn test_bytea_output_hex_default() {
+    // Default bytea_output=hex: \x prefix + hex digits.
+    let s = encode_value_to_string(&Value::Bytes(vec![0x61, 0x62]), None);
+    assert_eq!(s, "\\x6162");
+}
+
+#[test]
+fn test_bytea_output_escape_mode() {
+    // bytea_output=escape: printable ASCII as-is, control/high bytes as octal.
+    let s = encode_value_to_string_with_bytea_output(
+        &Value::Bytes(vec![0x61, 0x62]),
+        None,
+        crate::sql::bytea::ByteaOutput::Escape,
+    );
+    // PostgreSQL: decode('6162','hex') with bytea_output=escape → 'ab'
+    assert_eq!(s, "ab");
+}
+
+#[test]
+fn test_bytea_output_escape_with_control_chars() {
+    let s = encode_value_to_string_with_bytea_output(
+        &Value::Bytes(vec![0x00, 0x01, 0xff]),
+        None,
+        crate::sql::bytea::ByteaOutput::Escape,
+    );
+    assert_eq!(s, "\\000\\001\\377");
 }

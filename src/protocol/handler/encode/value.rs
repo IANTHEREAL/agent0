@@ -1,4 +1,5 @@
 use crate::model::{DataType, Value};
+use crate::sql::bytea::ByteaOutput;
 use pgwire::api::results::{DataRowEncoder, FieldFormat};
 use pgwire::api::Type;
 use pgwire::error::{PgWireError, PgWireResult};
@@ -38,11 +39,12 @@ pub(in crate::protocol::handler) fn encode_value(
     col_type: Option<&DataType>,
     tz: crate::model::timestamp::TimeZoneSpec,
     format: FieldFormat,
+    bytea_output: ByteaOutput,
 ) -> PgWireResult<()> {
     if format == FieldFormat::Binary {
         return encode_value_binary(encoder, value, col_type, tz);
     }
-    encode_value_text(encoder, value, col_type, tz)
+    encode_value_text(encoder, value, col_type, tz, bytea_output)
 }
 
 /// Text-format encoding (original behavior).
@@ -51,6 +53,7 @@ fn encode_value_text(
     value: &Value,
     col_type: Option<&DataType>,
     tz: crate::model::timestamp::TimeZoneSpec,
+    bytea_output: ByteaOutput,
 ) -> PgWireResult<()> {
     match value {
         Value::Null => encoder.encode_field(&None::<String>),
@@ -70,7 +73,10 @@ fn encode_value_text(
         }
         Value::Float64(f) => encoder.encode_field(&format_float8_pg_text(*f)),
         Value::Text(s) => encoder.encode_field(s),
-        Value::Bytes(b) => encoder.encode_field(&format!("\\x{}", hex::encode(b))),
+        Value::Bytes(b) => match bytea_output {
+            ByteaOutput::Hex => encoder.encode_field(&format!("\\x{}", hex::encode(b))),
+            ByteaOutput::Escape => encoder.encode_field(&crate::sql::bytea::format_bytea_escape(b)),
+        },
         Value::Timestamp(ts) => encode_timestamp_text(encoder, *ts, col_type, tz),
         Value::Interval(iv) => encoder.encode_field(&iv.to_string()),
         Value::Uuid(bytes) => {

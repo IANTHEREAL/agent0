@@ -255,6 +255,7 @@ where
         client_min_messages,
         results,
         &Format::UnifiedText,
+        crate::sql::bytea::ByteaOutput::Hex,
     )
     .await
 }
@@ -264,6 +265,7 @@ async fn send_notices_and_get_last_response_with_format<C>(
     client_min_messages: Option<String>,
     results: crate::sql::ExecuteResults,
     result_format: &Format,
+    bytea_output: crate::sql::bytea::ByteaOutput,
 ) -> PgWireResult<Response<'static>>
 where
     C: Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -287,7 +289,11 @@ where
                 }
             }
             other => {
-                last = Some(result_to_response_with_format(other, result_format)?);
+                last = Some(result_to_response_with_format(
+                    other,
+                    result_format,
+                    bytea_output,
+                )?);
             }
         }
     }

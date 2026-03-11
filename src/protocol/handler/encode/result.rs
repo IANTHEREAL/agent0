@@ -2,6 +2,7 @@ use super::types::datatype_to_pgtype;
 use super::value::encode_value;
 use crate::model::DataType;
 use crate::pool::try_shrink_statement_memory_scope;
+use crate::sql::bytea::ByteaOutput;
 use crate::sql::memory::estimate_row_size;
 use crate::sql::ExecuteResult;
 use futures::stream;
@@ -15,8 +16,9 @@ use std::sync::Arc;
 
 pub(in crate::protocol::handler) fn result_to_response(
     result: ExecuteResult,
+    bytea_output: ByteaOutput,
 ) -> PgWireResult<Response<'static>> {
-    result_to_response_with_format(result, &Format::UnifiedText)
+    result_to_response_with_format(result, &Format::UnifiedText, bytea_output)
 }
 
 fn supports_binary_result_type(pg_type: &Type) -> bool {
@@ -57,6 +59,7 @@ pub(in crate::protocol::handler) fn effective_result_format(
 pub(in crate::protocol::handler) fn result_to_response_with_format(
     result: ExecuteResult,
     result_format: &Format,
+    bytea_output: ByteaOutput,
 ) -> PgWireResult<Response<'static>> {
     match result {
         ExecuteResult::Select {
@@ -121,7 +124,7 @@ pub(in crate::protocol::handler) fn result_to_response_with_format(
                     for (i, value) in row.values.iter().enumerate() {
                         let col_type = internal_types.get(i);
                         let format = field_formats.get(i).copied().unwrap_or(FieldFormat::Text);
-                        encode_value(&mut encoder, value, col_type, tz, format)?;
+                        encode_value(&mut encoder, value, col_type, tz, format, bytea_output)?;
                     }
                     encoder.finish()
                 })();

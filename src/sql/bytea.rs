@@ -2,6 +2,40 @@
 
 use anyhow::{anyhow, Result};
 
+/// PostgreSQL `bytea_output` session setting: controls text-format rendering of `BYTEA` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ByteaOutput {
+    /// `\x` prefix followed by hex digits (PostgreSQL default since 9.0).
+    #[default]
+    Hex,
+    /// Legacy octal-escape format (`byteaout()` semantics).
+    Escape,
+}
+
+/// Format `BYTEA` value for wire output in `escape` mode (`byteaout()` semantics).
+///
+/// PostgreSQL `byteaout()` in escape mode:
+/// - Printable ASCII bytes (0x20..=0x7e) except backslash → emitted as-is.
+/// - Backslash → `\\`.
+/// - Everything else (0x00..=0x1f, 0x7f, 0x80..=0xff) → `\ooo` (octal).
+pub(crate) fn format_bytea_escape(bytes: &[u8]) -> String {
+    let mut out = Vec::with_capacity(bytes.len());
+    for &b in bytes {
+        match b {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            0x20..=0x7e => out.push(b),
+            _ => {
+                out.push(b'\\');
+                out.push(b'0' + ((b >> 6) & 0x07));
+                out.push(b'0' + ((b >> 3) & 0x07));
+                out.push(b'0' + (b & 0x07));
+            }
+        }
+    }
+    // SAFETY: output contains only printable ASCII and octal escape sequences.
+    unsafe { String::from_utf8_unchecked(out) }
+}
+
 /// Returns the bit value (0/1) at `bit_index` in `bytes`.
 ///
 /// Semantics match PostgreSQL `get_bit(bytea, int)`:
@@ -318,5 +352,44 @@ mod tests {
     fn escape_decode_rejects_invalid_octal() {
         assert!(decode_escape(r"\8").is_err());
         assert!(decode_escape(r"\999").is_err());
+    }
+
+    #[test]
+    fn bytea_output_default_is_hex() {
+        assert_eq!(ByteaOutput::default(), ByteaOutput::Hex);
+    }
+
+    #[test]
+    fn format_bytea_escape_printable_ascii() {
+        // Printable ASCII bytes (0x20..=0x7e) except backslash are emitted as-is.
+        assert_eq!(format_bytea_escape(b"ab"), "ab");
+        assert_eq!(format_bytea_escape(b"Hello, World!"), "Hello, World!");
+    }
+
+    #[test]
+    fn format_bytea_escape_backslash() {
+        assert_eq!(format_bytea_escape(b"\\"), "\\\\");
+        assert_eq!(format_bytea_escape(b"a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn format_bytea_escape_control_chars() {
+        // byteaout() escapes control chars 0x00-0x1f and 0x7f (unlike encode(escape)).
+        assert_eq!(format_bytea_escape(&[0x00]), "\\000");
+        assert_eq!(format_bytea_escape(&[0x01]), "\\001");
+        assert_eq!(format_bytea_escape(&[0x1f]), "\\037");
+        assert_eq!(format_bytea_escape(&[0x7f]), "\\177");
+    }
+
+    #[test]
+    fn format_bytea_escape_high_bytes() {
+        assert_eq!(format_bytea_escape(&[0x80]), "\\200");
+        assert_eq!(format_bytea_escape(&[0xff]), "\\377");
+    }
+
+    #[test]
+    fn format_bytea_escape_matches_pg_byteaout() {
+        // PostgreSQL: SELECT decode('6162', 'hex') with bytea_output=escape → 'ab'
+        assert_eq!(format_bytea_escape(&[0x61, 0x62]), "ab");
     }
 }
