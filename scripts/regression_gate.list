@@ -193,6 +193,7 @@ tests/271_jsonb_order_by.sql
 # Stored Generated Column (GENERATED ALWAYS AS ... STORED)
 tests/1588_generated_stored_column.sql
 # #1580 – pg_get_serial_sequence(int, int) returns correct error
+# #1661 – pg_catalog-qualified pg_get_serial_sequence includes schema in error
 tests/293_pg_get_serial_sequence.sql
 # #1583 – ORDER BY DESC default NULL placement (NULLS FIRST)
 tests/295_order_by_null_placement.sql

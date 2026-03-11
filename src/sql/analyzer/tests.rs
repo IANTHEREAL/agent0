@@ -3653,6 +3653,24 @@ fn analyze_pg_get_serial_sequence_existing_schema_returns_function_not_found() {
 }
 
 #[test]
+fn analyze_pg_get_serial_sequence_pg_catalog_qualified_int_args_includes_schema_in_error() {
+    // pg_catalog.pg_get_serial_sequence(1,2) must include the pg_catalog
+    // prefix in the error, matching PostgreSQL parity.
+    let err = analyze_expr_with_users("pg_catalog.pg_get_serial_sequence(1, 2)").unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AnalyzerError::FunctionNotFound {
+                ref name,
+                ..
+            } if name == "pg_catalog.pg_get_serial_sequence"
+        ),
+        "expected FunctionNotFound with pg_catalog-qualified name, got: {:?}",
+        err
+    );
+}
+
+#[test]
 fn analyze_pg_get_serial_sequence_nonexistent_schema_returns_schema_not_found() {
     // Unknown schema must still return SchemaNotFound (3F000).
     let err = analyze_expr_with_users("nosuch.pg_get_serial_sequence(1, 2)").unwrap_err();

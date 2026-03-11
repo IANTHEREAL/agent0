@@ -304,7 +304,8 @@ impl<'a> Analyzer<'a> {
             self.validate_pg_catalog_only_function_qualification(func, &func_name, &analyzed_args)?;
         }
 
-        let analyzed_args = self.apply_function_arg_context(func_name.as_str(), analyzed_args)?;
+        let analyzed_args =
+            self.apply_function_arg_context(func_name.as_str(), analyzed_args, func)?;
 
         let arg_types: Vec<DataType> = analyzed_args.iter().map(|a| a.data_type.clone()).collect();
 
@@ -537,6 +538,7 @@ impl<'a> Analyzer<'a> {
         &mut self,
         func_name: &str,
         args: Vec<TypedExpr>,
+        func: &Function,
     ) -> Result<Vec<TypedExpr>, AnalyzerError> {
         match func_name {
             // Vector distance functions require vector arguments. This provides
@@ -548,7 +550,7 @@ impl<'a> Analyzer<'a> {
             "GENERATE_SUBSCRIPTS" => self.coerce_generate_subscripts_signature(func_name, args),
             "PG_GET_INDEXDEF" => self.coerce_pg_get_indexdef_signature(args),
             "PG_GET_SERIAL_SEQUENCE" => {
-                self.coerce_pg_get_serial_sequence_signature(func_name, args)
+                self.coerce_pg_get_serial_sequence_signature(func, func_name, args)
             }
             "TO_REGTYPE" | "TO_REGCLASS" => self.coerce_to_regtype_signature(func_name, args),
             "TO_TSVECTOR"
@@ -682,6 +684,7 @@ impl<'a> Analyzer<'a> {
 
     fn coerce_pg_get_serial_sequence_signature(
         &mut self,
+        func: &Function,
         func_name: &str,
         args: Vec<TypedExpr>,
     ) -> Result<Vec<TypedExpr>, AnalyzerError> {
@@ -697,8 +700,12 @@ impl<'a> Analyzer<'a> {
                 DataType::Text | DataType::Varchar(_) | DataType::Name
             );
             if !arg_is_text_like && !self.is_unresolved_param(&arg) && !arg.is_null_constant() {
+                let display_name = match function_schema_name(func) {
+                    Some(schema) => format!("{}.{}", schema, func_name.to_lowercase()),
+                    None => func_name.to_lowercase(),
+                };
                 return Err(AnalyzerError::FunctionNotFound {
-                    name: func_name.to_lowercase(),
+                    name: display_name,
                     arg_types,
                 });
             }

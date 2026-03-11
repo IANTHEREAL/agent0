@@ -51,6 +51,8 @@ SELECT pg_get_serial_sequence(1, 2);
 SELECT public.pg_get_serial_sequence('t', 'id');
 -- P1: schema-qualified call with wrong arg types must include schema in error
 SELECT public.pg_get_serial_sequence(1, 2);
+-- pg_catalog-qualified call with wrong arg types must include schema in error
+SELECT pg_catalog.pg_get_serial_sequence(1, 2);
 -- quoted "PG_CATALOG" is case-sensitive: schema does not exist
 SELECT "PG_CATALOG".pg_get_serial_sequence('pgss_basic', 'id');
 -- 3-part qualifier is a cross-database reference
