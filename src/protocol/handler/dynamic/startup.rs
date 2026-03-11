@@ -4,7 +4,7 @@
 //! [`StartupHandler`] trait implementation.
 
 use super::{AuthenticatedState, DynamicPgHandler};
-use crate::auth::AuthManager;
+use crate::auth::{dispatch_db9_auth, AuthManager, Db9AuthDispatchFailure};
 use crate::config;
 use crate::observability;
 use crate::sql::{Executor, Session};
@@ -34,6 +34,7 @@ pub(in crate::protocol::handler) struct AuthResult {
     pub is_superuser: bool,
     /// PostgreSQL `rolconnlimit`. Negative means unlimited.
     pub connection_limit: i32,
+    pub failure_reason: Option<String>,
 }
 
 impl DynamicPgHandler {
@@ -224,6 +225,7 @@ impl DynamicPgHandler {
                         is_authenticated: false,
                         is_superuser: false,
                         connection_limit: -1,
+                        failure_reason: None,
                     });
                 }
             }
@@ -237,6 +239,7 @@ impl DynamicPgHandler {
                         is_authenticated: false,
                         is_superuser: false,
                         connection_limit: -1,
+                        failure_reason: None,
                     });
                 }
             }
@@ -276,11 +279,56 @@ impl DynamicPgHandler {
             .await
             .context("Failed to begin transaction")?;
 
-        match auth_manager
-            .authenticate(&mut txn, username, password)
+        let auth_mode = config::db9_auth_mode();
+        let auth_outcome: Result<(Option<crate::auth::User>, Option<String>), anyhow::Error> =
+            dispatch_db9_auth(
+                &auth_manager,
+                &mut txn,
+                auth_mode,
+                &ks_name,
+                username,
+                password,
+            )
             .await
-        {
-            Ok(Some(user)) => {
+            .and_then(|(user, failure)| {
+                if let Some(user) = user.as_ref() {
+                    if !user.can_login {
+                        return Err(
+                            crate::sql::error::SqlError::InvalidAuthorizationSpecification {
+                                message: format!(
+                                    "role \"{}\" is not permitted to log in",
+                                    username
+                                ),
+                            }
+                            .into(),
+                        );
+                    }
+                }
+
+                let failure_reason = match failure {
+                    Some(Db9AuthDispatchFailure::TokenRequired) => {
+                        Some("Token authentication required (DB9_AUTH_MODE=token)".to_string())
+                    }
+                    Some(Db9AuthDispatchFailure::JwtFailed(err)) => Some(format!(
+                        "Token authentication failed for user \"{username}\": {err}"
+                    )),
+                    Some(Db9AuthDispatchFailure::JwtUserNotFound) => Some(format!(
+                        "Token authentication failed for user \"{username}\""
+                    )),
+                    Some(Db9AuthDispatchFailure::ConnectKeyFailed(err)) => Some(format!(
+                        "Connect-key authentication failed for user \"{username}\": {err}"
+                    )),
+                    Some(Db9AuthDispatchFailure::ConnectKeyUserNotFound) => Some(format!(
+                        "Connect-key authentication failed for user \"{username}\""
+                    )),
+                    None => None,
+                };
+
+                Ok((user, failure_reason))
+            });
+
+        match auth_outcome {
+            Ok((Some(user), _)) => {
                 if let Err(e) = txn.rollback().await {
                     warn!("rollback failed after auth success: {}", e);
                 }
@@ -288,9 +336,10 @@ impl DynamicPgHandler {
                     is_authenticated: true,
                     is_superuser: user.is_superuser,
                     connection_limit: user.connection_limit,
+                    failure_reason: None,
                 })
             }
-            Ok(None) => {
+            Ok((None, failure_reason)) => {
                 if let Err(e) = txn.rollback().await {
                     warn!("rollback failed after auth rejection: {}", e);
                 }
@@ -298,6 +347,7 @@ impl DynamicPgHandler {
                     is_authenticated: false,
                     is_superuser: false,
                     connection_limit: -1,
+                    failure_reason,
                 })
             }
             Err(e) => {
@@ -351,6 +401,25 @@ impl StartupHandler for DynamicPgHandler {
                 let require_tls = config::env_bool("PG_REQUIRE_TLS");
                 let dev_mode = config::env_bool("DB9_DEV");
                 let insecure_mode = config::env_bool("DB9_INSECURE");
+                let auth_mode = config::db9_auth_mode();
+
+                if matches!(
+                    auth_mode,
+                    config::Db9AuthMode::Both | config::Db9AuthMode::Token
+                ) && !client.is_secure()
+                    && !dev_mode
+                    && !insecure_mode
+                {
+                    let error_info = ErrorInfo::new(
+                        "FATAL".to_owned(),
+                        "28000".to_owned(),
+                        format!(
+                            "TLS is required for token authentication (DB9_AUTH_MODE={}). Reconnect with sslmode=require and ensure server TLS is configured (PG_TLS_CERT/PG_TLS_KEY).",
+                            auth_mode.canonical_name()
+                        ),
+                    );
+                    return Err(PgWireError::UserError(Box::new(error_info)));
+                }
 
                 if require_tls && !client.is_secure() {
                     let error_info = ErrorInfo::new(
@@ -410,6 +479,7 @@ impl StartupHandler for DynamicPgHandler {
                         is_authenticated,
                         is_superuser,
                         connection_limit,
+                        failure_reason,
                     }) => {
                         if is_authenticated {
                             self.init_executor(
@@ -476,14 +546,14 @@ impl StartupHandler for DynamicPgHandler {
                                 });
                             }
                         } else {
-                            let error_info = ErrorInfo::new(
-                                "FATAL".to_owned(),
-                                "28P01".to_owned(),
+                            let message = failure_reason.unwrap_or_else(|| {
                                 format!(
                                     "Password authentication failed for user \"{}\"",
                                     actual_user
-                                ),
-                            );
+                                )
+                            });
+                            let error_info =
+                                ErrorInfo::new("FATAL".to_owned(), "28P01".to_owned(), message);
                             return Err(PgWireError::UserError(Box::new(error_info)));
                         }
                     }
@@ -576,6 +646,7 @@ mod tests {
             is_authenticated: true,
             is_superuser: true,
             connection_limit: -1,
+            failure_reason: None,
         };
         assert!(r.is_authenticated);
         assert!(r.is_superuser);
@@ -587,6 +658,7 @@ mod tests {
             is_authenticated: false,
             is_superuser: false,
             connection_limit: -1,
+            failure_reason: None,
         };
         assert!(!r.is_authenticated);
         assert!(!r.is_superuser);
@@ -598,11 +670,13 @@ mod tests {
             is_authenticated: true,
             is_superuser: false,
             connection_limit: 5,
+            failure_reason: None,
         };
         let AuthResult {
             is_authenticated,
             is_superuser,
             connection_limit,
+            ..
         } = r;
         assert!(is_authenticated);
         assert!(!is_superuser);

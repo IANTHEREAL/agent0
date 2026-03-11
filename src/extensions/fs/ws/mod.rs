@@ -96,9 +96,9 @@ async fn handle_connection(
                 return Ok(());
             }
         };
-        handle_ws_connection(tls_stream, peer_addr, pool, tracker).await
+        handle_ws_connection(tls_stream, peer_addr, pool, tracker, true).await
     } else {
-        handle_ws_connection(stream, peer_addr, pool, tracker).await
+        handle_ws_connection(stream, peer_addr, pool, tracker, false).await
     }
 }
 
@@ -107,6 +107,7 @@ async fn handle_ws_connection<S>(
     peer_addr: SocketAddr,
     pool: Arc<TikvClientPool>,
     tracker: Arc<WsConnectionTracker>,
+    is_secure: bool,
 ) -> Result<(), WsIoError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -161,7 +162,7 @@ where
         return Ok(());
     };
 
-    let session = match auth::handle_auth(&id, &username, &password, &pool).await {
+    let session = match auth::handle_auth(&id, &username, &password, &pool, is_secure).await {
         Ok(session) => session,
         Err(err_response) => {
             send_response(&mut ws_stream, &err_response).await?;

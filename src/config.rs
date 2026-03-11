@@ -37,6 +37,44 @@ pub(crate) fn env_string(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Db9AuthMode {
+    Password,
+    Both,
+    Token,
+}
+
+impl Db9AuthMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "password" => Some(Self::Password),
+            "both" => Some(Self::Both),
+            "token" => Some(Self::Token),
+            _ => None,
+        }
+    }
+
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Password => "password",
+            Self::Both => "both",
+            Self::Token => "token",
+        }
+    }
+}
+
+static DB9_AUTH_MODE: OnceLock<Db9AuthMode> = OnceLock::new();
+
+pub(crate) fn db9_auth_mode() -> Db9AuthMode {
+    *DB9_AUTH_MODE.get_or_init(|| match env_string("DB9_AUTH_MODE") {
+        Some(raw) => Db9AuthMode::parse(&raw).unwrap_or_else(|| {
+            tracing::warn!("Invalid DB9_AUTH_MODE value '{raw}', falling back to 'password'");
+            Db9AuthMode::Password
+        }),
+        None => Db9AuthMode::Password,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EmbeddingProvider {
     OpenAICompatible,

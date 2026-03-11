@@ -17,6 +17,13 @@
   - Outside `DB9_DEV=1`, missing bootstrap credentials on an uninitialized keyspace MUST fail closed.
   - Evidence: `src/auth/rbac.rs` (`AuthManager::bootstrap`), `src/protocol/handler/dynamic/startup.rs` (`authenticate_user`), `src/main.rs` (startup bootstrap for the default keyspace).
 
+- **[Stable] Passwordless auth via connect-token / connect-key**
+  - Authentication mode is controlled by `DB9_AUTH_MODE` (`password|both|token`).
+  - In `token` mode, the pgwire `PasswordMessage` is treated as DB9 auth material (JWT connect-token or `db9ck_` connect-key) and legacy password auth is rejected.
+  - In `both` mode, legacy password auth is accepted, but token-like auth material MUST validate (no fallback to password on validation failure).
+  - Token auth binds token identity (`tid`/`usr`, or connect-key introspection `tenant_id`/`role`) to the startup identity (tenant keyspace + requested role).
+  - Evidence: `src/config.rs`, `src/auth/db9_auth.rs`, `src/protocol/handler/dynamic/startup.rs`, `src/extensions/fs/ws/auth.rs`.
+
 - **[Stable] Password hashing and verification**
   - Stored passwords MUST use `SHA-256(password || salt)` with a per-user random salt.
   - Password changes MUST rotate the salt.
@@ -29,6 +36,7 @@
 - **[Stable] User/role DDL surface**
   - `CREATE ROLE` creates a stored identity and accepts the currently implemented option subset, including `LOGIN/NOLOGIN`, `PASSWORD`, `SUPERUSER`, `CREATEDB`, `CREATEROLE`, and `CONNECTION LIMIT`.
   - `ALTER ROLE ... WITH` applies the supported options, including password changes.
+  - When `DB9_AUTH_MODE=token`, password DDL (`CREATE/ALTER ROLE ... PASSWORD`) is rejected.
   - `DROP ROLE` removes the stored identity.
   - Evidence: `src/sql/rbac.rs`, `src/sql/executor/core/stmt_rbac.rs`, `tests/23_rbac.sql`.
 

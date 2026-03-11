@@ -63,6 +63,7 @@
 | `PG_TLS_CERT` | unset | `src/main.rs`, `src/tls.rs` | Enables pgwire TLS only when paired with `PG_TLS_KEY`. |
 | `PG_TLS_KEY` | unset | `src/main.rs`, `src/tls.rs` | Enables pgwire TLS only when paired with `PG_TLS_CERT`. |
 | `PG_REQUIRE_TLS` | `false` | `src/main.rs` | Refuses non-TLS pgwire startup when enabled. |
+| `DB9_AUTH_MODE` | `password` | `src/config.rs`, `src/protocol/handler/dynamic/startup.rs` | Authentication mode: `password` (legacy), `both` (password + token), `token` (token only). |
 | `DB9_INSECURE` | `false` | `src/main.rs` | Explicitly permits insecure non-loopback startup/posture. |
 | `DB9_DEV` | `false` | `src/main.rs`, `src/auth/rbac.rs` | Enables legacy dev bootstrap/insecure development behavior. |
 | `DB9_BOOTSTRAP_ADMIN_USER` | `admin` | `src/auth/rbac.rs` | Initial superuser username when bootstrapping an empty keyspace. |
@@ -72,6 +73,18 @@
 | `TIKV_CA_PATH` | unset | `src/storage/tikv_store/mod.rs` | Enables TLS for PD/TiKV client when paired with cert/key. |
 | `TIKV_CERT_PATH` | unset | `src/storage/tikv_store/mod.rs` | TiKV client certificate path. |
 | `TIKV_KEY_PATH` | unset | `src/storage/tikv_store/mod.rs` | TiKV client key path. |
+
+### Token Authentication (JWT / Connect-key)
+
+| Key | Default | Evidence | Notes |
+|---|---|---|---|
+| `DB9_AUTH_JWKS_URL` | unset | `src/auth/db9_auth.rs` | JWT verification via remote JWKS (preferred). |
+| `DB9_AUTH_JWT_PUBLIC_KEY` | unset | `src/auth/db9_auth.rs` | JWT verification via RSA public key (PEM). |
+| `DB9_AUTH_JWT_ALGORITHM` | `RS256` | `src/auth/db9_auth.rs` | Allowed JWT algorithms (comma-separated). Default: `RS256`. |
+| `DB9_AUTH_ISSUER` | unset | `src/auth/db9_auth.rs` | Optional JWT issuer constraint. |
+| `DB9_AUTH_AUDIENCE` | `db9-server` | `src/auth/db9_auth.rs` | JWT audience constraint. |
+| `DB9_AUTH_CONNECT_KEY_INTROSPECT_URL` | unset | `src/auth/db9_auth.rs` | Connect-key introspection endpoint URL. |
+| `DB9_AUTH_CONNECT_KEY_INTROSPECT_API_KEY` | unset | `src/auth/db9_auth.rs` | Optional `X-API-Key` header for connect-key introspection. |
 
 ### Server Defaults and Tenant Resource Limits
 

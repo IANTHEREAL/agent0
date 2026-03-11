@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::auth::AuthManager;
+use crate::auth::{dispatch_db9_auth, AuthManager, Db9AuthDispatchFailure};
+use crate::config;
 use crate::extensions::fs::backend::FsBackend;
 use crate::extensions::fs::embedded::EmbeddedFsBackend;
 use crate::extensions::fs::ws::protocol::{WsErrorCode, WsResponse};
@@ -21,9 +22,30 @@ pub(crate) async fn handle_auth(
     username: &str,
     password: &str,
     pool: &TikvClientPool,
+    is_secure: bool,
 ) -> Result<WsSession, WsResponse> {
     let (parsed_keyspace, actual_user) = parse_tenant_username(username);
     let keyspace = parsed_keyspace.unwrap_or_else(|| "default".to_string());
+
+    let auth_mode = config::db9_auth_mode();
+    let dev_mode = config::env_bool("DB9_DEV");
+    let insecure_mode = config::env_bool("DB9_INSECURE");
+    if matches!(
+        auth_mode,
+        config::Db9AuthMode::Both | config::Db9AuthMode::Token
+    ) && !is_secure
+        && !dev_mode
+        && !insecure_mode
+    {
+        return Err(WsResponse::error(
+            id,
+            WsErrorCode::Eauth,
+            format!(
+                "TLS is required for token authentication (DB9_AUTH_MODE={}). Reconnect using WSS and ensure server TLS is configured (PG_TLS_CERT/PG_TLS_KEY).",
+                auth_mode.canonical_name()
+            ),
+        ));
+    }
 
     let tenant_handle = pool.acquire(Some(keyspace.clone())).await.map_err(|err| {
         WsResponse::error(id, WsErrorCode::Eio, format!("pool acquire failed: {err}"))
@@ -66,28 +88,65 @@ pub(crate) async fn handle_auth(
         WsResponse::error(id, WsErrorCode::Eio, format!("txn begin failed: {err}"))
     })?;
 
-    let user = auth_manager
-        .authenticate(&mut auth_txn, &actual_user, password)
-        .await
-        .map_err(|err| {
-            WsResponse::error(
+    let (user, failure) = match dispatch_db9_auth(
+        &auth_manager,
+        &mut auth_txn,
+        auth_mode,
+        &keyspace,
+        &actual_user,
+        password,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let _ = auth_txn.rollback().await;
+            return Err(WsResponse::error(
                 id,
                 WsErrorCode::Eio,
                 format!("authentication query failed: {err}"),
-            )
-        })?;
+            ));
+        }
+    };
 
     let user = match user {
         Some(user) => user,
         None => {
             let _ = auth_txn.rollback().await;
-            return Err(WsResponse::error(
-                id,
-                WsErrorCode::Eauth,
-                format!("password authentication failed for user \"{actual_user}\""),
-            ));
+            let response = match failure {
+                Some(Db9AuthDispatchFailure::TokenRequired) => WsResponse::error(
+                    id,
+                    WsErrorCode::Eauth,
+                    "token authentication required (DB9_AUTH_MODE=token)",
+                ),
+                Some(Db9AuthDispatchFailure::JwtFailed(err)) => WsResponse::error(
+                    id,
+                    WsErrorCode::Eauth,
+                    format!("token authentication failed for user \"{actual_user}\": {err}"),
+                ),
+                Some(Db9AuthDispatchFailure::ConnectKeyFailed(err)) => WsResponse::error(
+                    id,
+                    WsErrorCode::Eauth,
+                    format!("connect-key authentication failed for user \"{actual_user}\": {err}"),
+                ),
+                _ => WsResponse::error(
+                    id,
+                    WsErrorCode::Eauth,
+                    format!("authentication failed for user \"{actual_user}\""),
+                ),
+            };
+            return Err(response);
         }
     };
+
+    if !user.can_login {
+        let _ = auth_txn.rollback().await;
+        return Err(WsResponse::error(
+            id,
+            WsErrorCode::Eauth,
+            format!("role \"{actual_user}\" is not permitted to log in"),
+        ));
+    }
 
     if !user.is_superuser {
         let _ = auth_txn.rollback().await;

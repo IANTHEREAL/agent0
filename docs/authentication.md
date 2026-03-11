@@ -5,10 +5,49 @@ db9-server implements PostgreSQL-compatible authentication and role-based access
 ## Overview
 
 - **Password Authentication**: Cleartext password authentication
+- **Token/Connect-key Authentication**: Treat pgwire `PasswordMessage` as DB9 auth material (JWT connect-token or `db9ck_` connect-key)
 - **Per-Keyspace Users**: Each keyspace has its own user database
 - **RBAC**: Role-based access control with privileges on tables
 - **Superuser**: Full access to all operations
 - **Bootstrap User**: First superuser created via explicit bootstrap env vars
+
+## Auth Modes (`DB9_AUTH_MODE`)
+
+`DB9_AUTH_MODE` controls what db9-server expects in the pgwire “password” field:
+
+- `password` (default): legacy password authentication.
+- `both`: password auth + token/connect-key auth (if the provided secret looks like a JWT / `db9ck_` connect-key, it must validate; no fallback to password on validation failure).
+- `token`: token/connect-key only (password auth is rejected).
+
+When token auth is enabled (`both` / `token`), db9-server requires TLS unless `DB9_DEV=1` or `DB9_INSECURE=1`.
+
+### Security & Migration Notes
+
+- `DB9_AUTH_MODE=both` requires TLS for **all** pgwire connections (including legacy password clients): the server cannot know whether the client will send a token or a password until it receives the auth secret.
+- In `both` mode, passwords that look like tokens (JWT-like strings or any password starting with `db9ck_`) will be treated as token material; if token validation fails, there is **no fallback** to password auth. Rotate such passwords before enabling `both`.
+- fs9 WebSocket authentication follows the same TLS requirement when token auth is enabled.
+
+## Token Authentication (psql)
+
+JWT connect-token (JWKS URL preferred):
+
+```bash
+export DB9_AUTH_MODE=token
+export DB9_AUTH_JWKS_URL=https://example.com/.well-known/jwks.json
+# Optional: set if your tokens use a non-RS256 alg (comma-separated, e.g. RS384,ES256)
+# export DB9_AUTH_JWT_ALGORITHM=RS256
+
+PGPASSWORD="<JWT_CONNECT_TOKEN>" psql -h 127.0.0.1 -p 5433 -U "<tenant>.admin" -d postgres
+```
+
+Connect-key (introspection):
+
+```bash
+export DB9_AUTH_MODE=token
+export DB9_AUTH_CONNECT_KEY_INTROSPECT_URL=https://example.com/internal/connect-keys/introspect
+
+PGPASSWORD="db9ck_<connect_key>" psql -h 127.0.0.1 -p 5433 -U "<tenant>.admin" -d postgres
+```
 
 ## Default User
 
@@ -29,6 +68,8 @@ ALTER ROLE admin WITH PASSWORD 'your_secure_password';
 ```
 
 ## Creating Users
+
+Note: `PASSWORD` DDL is rejected when `DB9_AUTH_MODE=token`.
 
 ### Basic User
 
