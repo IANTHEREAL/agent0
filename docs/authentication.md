@@ -49,6 +49,96 @@ export DB9_AUTH_CONNECT_KEY_INTROSPECT_URL=https://example.com/internal/connect-
 PGPASSWORD="db9ck_<connect_key>" psql -h 127.0.0.1 -p 5433 -U "<tenant>.admin" -d postgres
 ```
 
+### Connect-Key Introspection Contract
+
+When `DB9_AUTH_CONNECT_KEY_INTROSPECT_URL` is configured, db9-server validates
+`db9ck_*` connect-keys by POSTing to the introspection endpoint.
+
+#### Request
+
+```http
+POST <DB9_AUTH_CONNECT_KEY_INTROSPECT_URL>
+Content-Type: application/json
+X-API-Key: <DB9_AUTH_CONNECT_KEY_INTROSPECT_API_KEY>   # if configured
+```
+
+```json
+{
+  "connect_key": "db9ck_<key>",
+  "key": "db9ck_<key>"
+}
+```
+
+Both `connect_key` and `key` carry the same value. Some backends expect `key`,
+others `connect_key`; db9-server sends both for compatibility.
+
+#### Response
+
+```json
+{
+  "active": true,
+  "revoked": false,
+  "expired": false,
+  "tenant_id": "my_tenant",
+  "role": "admin",
+  "expires_at": "2026-12-31T23:59:59Z",
+  "revoked_at": null
+}
+```
+
+| Field | Type | Required | Aliases | Notes |
+|-------|------|----------|---------|-------|
+| `tenant_id` | string | **yes** | `tenantId`, `tid` | Must match the tenant keyspace from the login username. |
+| `role` | string | **yes** | `usr`, `user` | Must match the requested role from the login username. |
+| `active` | bool | no | — | `false` → rejected as "inactive". Absent/`null` treated as active. |
+| `revoked` | bool | no | — | `true` → rejected as "revoked". |
+| `expired` | bool | no | — | `true` → rejected as "expired". |
+| `expires_at` | int or string | no | `expiresAt` | Unix seconds (int) or RFC 3339 string. Rejected if in the past. |
+| `revoked_at` | int or string | no | `revokedAt` | **Any non-null value means revoked** — to indicate "not revoked", omit the field or set it to `null`. |
+
+#### `revoked_at` Semantics
+
+The `revoked_at` field uses presence-based semantics:
+
+- **Present and non-null** (any value, including `0` / epoch): the key is treated as revoked.
+- **`null` or absent**: the key is not revoked (from this field's perspective).
+
+This is independent of the `revoked` boolean flag — either one can trigger rejection.
+
+#### Validation Order
+
+db9-server evaluates response fields in this order (first failure wins):
+
+1. `active == false` → reject ("inactive")
+2. `revoked == true` → reject ("revoked")
+3. `expired == true` → reject ("expired")
+4. `revoked_at` is present and non-null → reject ("revoked")
+5. `expires_at` is in the past → reject ("expired")
+6. `tenant_id` missing → reject; present but mismatched → reject
+7. `role` missing → reject; present but mismatched → reject
+
+Boolean flags and timestamps are checked independently — both can trigger rejection.
+
+#### Examples
+
+Active key (minimal required fields):
+
+```json
+{ "tenant_id": "acme", "role": "admin" }
+```
+
+Revoked key (via `revoked_at`):
+
+```json
+{ "tenant_id": "acme", "role": "admin", "revoked_at": 1700000000 }
+```
+
+Revoked key (via boolean flag):
+
+```json
+{ "tenant_id": "acme", "role": "admin", "revoked": true }
+```
+
 ## Default User
 
 There is **no implicit default password** in non-dev mode. When a keyspace has no superuser yet, bootstrap the initial superuser by setting:

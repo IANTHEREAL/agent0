@@ -83,7 +83,7 @@
 | `DB9_AUTH_JWT_ALGORITHM` | `RS256` | `src/auth/db9_auth.rs` | Allowed JWT algorithms (comma-separated). Default: `RS256`. |
 | `DB9_AUTH_ISSUER` | unset | `src/auth/db9_auth.rs` | Optional JWT issuer constraint. |
 | `DB9_AUTH_AUDIENCE` | `db9-server` | `src/auth/db9_auth.rs` | JWT audience constraint. |
-| `DB9_AUTH_CONNECT_KEY_INTROSPECT_URL` | unset | `src/auth/db9_auth.rs` | Connect-key introspection endpoint URL. |
+| `DB9_AUTH_CONNECT_KEY_INTROSPECT_URL` | unset | `src/auth/db9_auth.rs` | Connect-key introspection endpoint URL. Request/response contract: see [docs/authentication.md §Connect-Key Introspection Contract](../authentication.md#connect-key-introspection-contract). |
 | `DB9_AUTH_CONNECT_KEY_INTROSPECT_API_KEY` | unset | `src/auth/db9_auth.rs` | Optional `X-API-Key` header for connect-key introspection. |
 
 ### Server Defaults and Tenant Resource Limits

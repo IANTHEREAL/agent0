@@ -22,6 +22,7 @@
   - In `token` mode, the pgwire `PasswordMessage` is treated as DB9 auth material (JWT connect-token or `db9ck_` connect-key) and legacy password auth is rejected.
   - In `both` mode, legacy password auth is accepted, but token-like auth material MUST validate (no fallback to password on validation failure).
   - Token auth binds token identity (`tid`/`usr`, or connect-key introspection `tenant_id`/`role`) to the startup identity (tenant keyspace + requested role).
+  - Connect-key introspection request/response contract: see [docs/authentication.md §Connect-Key Introspection Contract](../authentication.md#connect-key-introspection-contract). Key semantic: `revoked_at` present and non-null means the key is revoked; `tenant_id` and `role` are required response fields.
   - Evidence: `src/config.rs`, `src/auth/db9_auth.rs`, `src/protocol/handler/dynamic/startup.rs`, `src/extensions/fs/ws/auth.rs`.
 
 - **[Stable] Password hashing and verification**
