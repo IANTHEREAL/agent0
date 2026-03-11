@@ -83,6 +83,31 @@ struct Db9ConnectTokenClaims {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ConnectKeyIntrospectTimeValue {
+    Seconds(i64),
+    String(String),
+}
+
+#[derive(Debug, Deserialize)]
+struct ConnectKeyIntrospectResponse {
+    #[serde(default)]
+    active: Option<bool>,
+    #[serde(default)]
+    revoked: Option<bool>,
+    #[serde(default)]
+    expired: Option<bool>,
+    #[serde(default, alias = "tenantId", alias = "tid", alias = "tenant_id")]
+    tenant_id: Option<String>,
+    #[serde(default, alias = "usr", alias = "user", alias = "role")]
+    role: Option<String>,
+    #[serde(default, alias = "expiresAt", alias = "expires_at")]
+    expires_at: Option<ConnectKeyIntrospectTimeValue>,
+    #[serde(default, alias = "revokedAt", alias = "revoked_at")]
+    revoked_at: Option<ConnectKeyIntrospectTimeValue>,
+}
+
+#[derive(Debug, Deserialize)]
 struct Jwks {
     keys: Vec<Jwk>,
 }
@@ -120,6 +145,83 @@ fn http_client() -> &'static reqwest::Client {
 
 fn jwks_cache() -> &'static Mutex<Option<JwksCacheEntry>> {
     JWKS_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn validate_connect_key_introspection(
+    info: &ConnectKeyIntrospectResponse,
+    tenant_id: &str,
+    expected_role: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Db9AuthError> {
+    if matches!(info.active, Some(false)) {
+        return Err(Db9AuthError::InvalidConnectKey {
+            reason: "inactive".to_string(),
+        });
+    }
+
+    if matches!(info.revoked, Some(true)) {
+        return Err(Db9AuthError::InvalidConnectKey {
+            reason: "revoked".to_string(),
+        });
+    }
+
+    if matches!(info.expired, Some(true)) {
+        return Err(Db9AuthError::InvalidConnectKey {
+            reason: "expired".to_string(),
+        });
+    }
+
+    if info.revoked_at.is_some() {
+        return Err(Db9AuthError::InvalidConnectKey {
+            reason: "revoked".to_string(),
+        });
+    }
+
+    if let Some(expires_at) = &info.expires_at {
+        let is_expired = match expires_at {
+            ConnectKeyIntrospectTimeValue::Seconds(ts) => *ts <= now.timestamp(),
+            ConnectKeyIntrospectTimeValue::String(raw) => {
+                chrono::DateTime::parse_from_rfc3339(raw).map_err(|err| {
+                    Db9AuthError::InvalidConnectKey {
+                        reason: format!("invalid expires_at: {err}"),
+                    }
+                })? < now
+            }
+        };
+        if is_expired {
+            return Err(Db9AuthError::InvalidConnectKey {
+                reason: "expired".to_string(),
+            });
+        }
+    }
+
+    let actual_tenant_id =
+        info.tenant_id
+            .as_deref()
+            .ok_or_else(|| Db9AuthError::InvalidConnectKey {
+                reason: "missing tenant_id".to_string(),
+            })?;
+    let actual_role = info
+        .role
+        .as_deref()
+        .ok_or_else(|| Db9AuthError::InvalidConnectKey {
+            reason: "missing role".to_string(),
+        })?;
+
+    if actual_tenant_id != tenant_id {
+        return Err(Db9AuthError::TenantMismatch {
+            expected: tenant_id.to_string(),
+            actual: actual_tenant_id.to_string(),
+        });
+    }
+    if actual_role != expected_role {
+        return Err(Db9AuthError::RoleMismatch {
+            expected: expected_role.to_string(),
+            actual: actual_role.to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 pub(crate) async fn verify_jwt_connect_token(
@@ -182,31 +284,6 @@ pub(crate) async fn verify_connect_key(
         key: &'a str,
     }
 
-    #[derive(Debug, Deserialize)]
-    #[serde(untagged)]
-    enum TimeValue {
-        Seconds(i64),
-        String(String),
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct IntrospectResponse {
-        #[serde(default)]
-        active: Option<bool>,
-        #[serde(default)]
-        revoked: Option<bool>,
-        #[serde(default)]
-        expired: Option<bool>,
-        #[serde(default, alias = "tenantId", alias = "tid", alias = "tenant_id")]
-        tenant_id: Option<String>,
-        #[serde(default, alias = "usr", alias = "user", alias = "role")]
-        role: Option<String>,
-        #[serde(default, alias = "expiresAt", alias = "expires_at")]
-        expires_at: Option<TimeValue>,
-        #[serde(default, alias = "revokedAt", alias = "revoked_at")]
-        revoked_at: Option<TimeValue>,
-    }
-
     let mut req = http_client()
         .post(&introspect_url)
         .json(&IntrospectRequest {
@@ -236,75 +313,12 @@ pub(crate) async fn verify_connect_key(
         });
     }
 
-    let info: IntrospectResponse =
+    let info: ConnectKeyIntrospectResponse =
         serde_json::from_str(&body).map_err(|err| Db9AuthError::InvalidConnectKey {
             reason: format!("introspection parse failed: {err}"),
         })?;
 
-    if matches!(info.active, Some(false)) {
-        return Err(Db9AuthError::InvalidConnectKey {
-            reason: "inactive".to_string(),
-        });
-    }
-
-    if matches!(info.revoked, Some(true)) {
-        return Err(Db9AuthError::InvalidConnectKey {
-            reason: "revoked".to_string(),
-        });
-    }
-
-    if matches!(info.expired, Some(true)) {
-        return Err(Db9AuthError::InvalidConnectKey {
-            reason: "expired".to_string(),
-        });
-    }
-
-    if info.revoked_at.is_some() {
-        return Err(Db9AuthError::InvalidConnectKey {
-            reason: "revoked".to_string(),
-        });
-    }
-
-    if let Some(expires_at) = info.expires_at {
-        let now = chrono::Utc::now();
-        let is_expired = match expires_at {
-            TimeValue::Seconds(ts) => ts <= now.timestamp(),
-            TimeValue::String(raw) => {
-                chrono::DateTime::parse_from_rfc3339(&raw).map_err(|err| {
-                    Db9AuthError::InvalidConnectKey {
-                        reason: format!("invalid expires_at: {err}"),
-                    }
-                })? < now
-            }
-        };
-        if is_expired {
-            return Err(Db9AuthError::InvalidConnectKey {
-                reason: "expired".to_string(),
-            });
-        }
-    }
-
-    let actual_tenant_id = info
-        .tenant_id
-        .ok_or_else(|| Db9AuthError::InvalidConnectKey {
-            reason: "missing tenant_id".to_string(),
-        })?;
-    let actual_role = info.role.ok_or_else(|| Db9AuthError::InvalidConnectKey {
-        reason: "missing role".to_string(),
-    })?;
-
-    if actual_tenant_id != tenant_id {
-        return Err(Db9AuthError::TenantMismatch {
-            expected: tenant_id.to_string(),
-            actual: actual_tenant_id,
-        });
-    }
-    if actual_role != expected_role {
-        return Err(Db9AuthError::RoleMismatch {
-            expected: expected_role.to_string(),
-            actual: actual_role,
-        });
-    }
+    validate_connect_key_introspection(&info, tenant_id, expected_role, chrono::Utc::now())?;
 
     Ok(())
 }
@@ -585,5 +599,100 @@ JwIDAQAB
             classify_db9_auth_material("secret123"),
             Db9AuthMaterialKind::Password
         );
+    }
+
+    fn parse_utc(value: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn validate_connect_key_introspection_backend_schema_happy_path() {
+        let now = parse_utc("2026-03-11T00:00:00Z");
+        let body = r#"{
+            "active": true,
+            "revoked": false,
+            "expired": false,
+            "tenant_id": "t1",
+            "role": "admin",
+            "expires_at": "2026-03-11T00:00:10Z"
+        }"#;
+        let info: ConnectKeyIntrospectResponse = serde_json::from_str(body).unwrap();
+        validate_connect_key_introspection(&info, "t1", "admin", now).unwrap();
+    }
+
+    #[test]
+    fn validate_connect_key_introspection_inactive_is_denied() {
+        let now = parse_utc("2026-03-11T00:00:00Z");
+        let body = r#"{ "active": false }"#;
+        let info: ConnectKeyIntrospectResponse = serde_json::from_str(body).unwrap();
+        let err = validate_connect_key_introspection(&info, "t1", "admin", now).unwrap_err();
+        assert!(matches!(
+            err,
+            Db9AuthError::InvalidConnectKey { reason } if reason == "inactive"
+        ));
+    }
+
+    #[test]
+    fn validate_connect_key_introspection_expired_timestamp_is_denied() {
+        let now = parse_utc("2026-03-11T00:00:00Z");
+        let body = r#"{
+            "active": true,
+            "tenant_id": "t1",
+            "role": "admin",
+            "expires_at": "2026-03-10T23:59:59Z"
+        }"#;
+        let info: ConnectKeyIntrospectResponse = serde_json::from_str(body).unwrap();
+        let err = validate_connect_key_introspection(&info, "t1", "admin", now).unwrap_err();
+        assert!(matches!(
+            err,
+            Db9AuthError::InvalidConnectKey { reason } if reason == "expired"
+        ));
+    }
+
+    #[test]
+    fn validate_connect_key_introspection_invalid_expires_at_is_denied() {
+        let now = parse_utc("2026-03-11T00:00:00Z");
+        let body = r#"{
+            "active": true,
+            "tenant_id": "t1",
+            "role": "admin",
+            "expires_at": "nope"
+        }"#;
+        let info: ConnectKeyIntrospectResponse = serde_json::from_str(body).unwrap();
+        let err = validate_connect_key_introspection(&info, "t1", "admin", now).unwrap_err();
+        assert!(matches!(
+            err,
+            Db9AuthError::InvalidConnectKey { reason } if reason.starts_with("invalid expires_at:")
+        ));
+    }
+
+    #[test]
+    fn validate_connect_key_introspection_legacy_schema_is_accepted() {
+        let now = parse_utc("2026-03-11T00:00:00Z");
+        let body = r#"{
+            "tenantId": "t1",
+            "user": "admin",
+            "expiresAt": 9999999999
+        }"#;
+        let info: ConnectKeyIntrospectResponse = serde_json::from_str(body).unwrap();
+        validate_connect_key_introspection(&info, "t1", "admin", now).unwrap();
+    }
+
+    #[test]
+    fn validate_connect_key_introspection_legacy_revoked_at_is_denied() {
+        let now = parse_utc("2026-03-11T00:00:00Z");
+        let body = r#"{
+            "tenantId": "t1",
+            "user": "admin",
+            "revokedAt": 1
+        }"#;
+        let info: ConnectKeyIntrospectResponse = serde_json::from_str(body).unwrap();
+        let err = validate_connect_key_introspection(&info, "t1", "admin", now).unwrap_err();
+        assert!(matches!(
+            err,
+            Db9AuthError::InvalidConnectKey { reason } if reason == "revoked"
+        ));
     }
 }
