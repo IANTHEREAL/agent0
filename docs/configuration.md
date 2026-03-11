@@ -15,6 +15,13 @@ This document is a convenience overview. The authoritative list of config keys +
 | `PG_TLS_CERT` | (unset) | TLS cert path (PEM); enable TLS only when both cert+key are set |
 | `PG_TLS_KEY` | (unset) | TLS key path (PEM; PKCS#8 or RSA) |
 | `PG_REQUIRE_TLS` | `false` | Require TLS for all pgwire connections |
+| `DB9_AUTH_MODE` | `password` | Authentication mode: `password` (legacy), `both` (password + token), `token` (token only) |
+| `DB9_AUTH_JWKS_URL` | (unset) | JWT verification via remote JWKS (preferred) |
+| `DB9_AUTH_JWT_PUBLIC_KEY` | (unset) | JWT verification via RSA public key (PEM) |
+| `DB9_AUTH_ISSUER` | (unset) | Optional JWT issuer constraint |
+| `DB9_AUTH_AUDIENCE` | `db9-server` | JWT audience constraint |
+| `DB9_AUTH_CONNECT_KEY_INTROSPECT_URL` | (unset) | Connect-key introspection endpoint URL |
+| `DB9_AUTH_CONNECT_KEY_INTROSPECT_API_KEY` | (unset) | Optional `X-API-Key` header for connect-key introspection |
 | `DB9_BOOTSTRAP_ADMIN_USER` | `admin` | Initial superuser name for bootstrapping |
 | `DB9_BOOTSTRAP_ADMIN_PASSWORD` | (unset) | Initial superuser password for bootstrapping (required when no superuser exists yet) |
 | `DB9_DEV` | `false` | Dev-only escape hatch (legacy insecure bootstrap) |

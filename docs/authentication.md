@@ -5,10 +5,41 @@ db9-server implements PostgreSQL-compatible authentication and role-based access
 ## Overview
 
 - **Password Authentication**: Cleartext password authentication
+- **Token/Connect-key Authentication**: Treat pgwire `PasswordMessage` as DB9 auth material (JWT connect-token or `db9ck_` connect-key)
 - **Per-Keyspace Users**: Each keyspace has its own user database
 - **RBAC**: Role-based access control with privileges on tables
 - **Superuser**: Full access to all operations
 - **Bootstrap User**: First superuser created via explicit bootstrap env vars
+
+## Auth Modes (`DB9_AUTH_MODE`)
+
+`DB9_AUTH_MODE` controls what db9-server expects in the pgwire “password” field:
+
+- `password` (default): legacy password authentication.
+- `both`: password auth + token/connect-key auth (if the provided secret looks like a JWT / `db9ck_` connect-key, it must validate; no fallback to password on validation failure).
+- `token`: token/connect-key only (password auth is rejected).
+
+When token auth is enabled (`both` / `token`), pgwire requires TLS unless `DB9_DEV=1` or `DB9_INSECURE=1`.
+
+## Token Authentication (psql)
+
+JWT connect-token (JWKS URL preferred):
+
+```bash
+export DB9_AUTH_MODE=token
+export DB9_AUTH_JWKS_URL=https://example.com/.well-known/jwks.json
+
+PGPASSWORD="<JWT_CONNECT_TOKEN>" psql -h 127.0.0.1 -p 5433 -U "<tenant>.admin" -d postgres
+```
+
+Connect-key (introspection):
+
+```bash
+export DB9_AUTH_MODE=token
+export DB9_AUTH_CONNECT_KEY_INTROSPECT_URL=https://example.com/internal/connect-keys/introspect
+
+PGPASSWORD="db9ck_<connect_key>" psql -h 127.0.0.1 -p 5433 -U "<tenant>.admin" -d postgres
+```
 
 ## Default User
 
@@ -29,6 +60,8 @@ ALTER ROLE admin WITH PASSWORD 'your_secure_password';
 ```
 
 ## Creating Users
+
+Note: `PASSWORD` DDL is rejected when `DB9_AUTH_MODE=token`.
 
 ### Basic User
 
