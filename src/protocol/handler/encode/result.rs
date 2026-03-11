@@ -278,7 +278,14 @@ pub(in crate::protocol::handler) fn result_to_response_with_format(
                 encoder.encode_field(&col.primary_key)?;
 
                 let default_val = if col.is_serial {
-                    Some("SERIAL (AUTO_INC)".to_string())
+                    use crate::sql::sequences::{classify_serial_default, SerialDefaultBehavior};
+                    match classify_serial_default(col.default_expr.as_deref()) {
+                        SerialDefaultBehavior::ImplicitSequence => {
+                            Some("SERIAL (AUTO_INC)".to_string())
+                        }
+                        SerialDefaultBehavior::ExplicitExpr(expr) => Some(expr.to_string()),
+                        SerialDefaultBehavior::ExplicitNull => None,
+                    }
                 } else {
                     col.default_expr.clone()
                 };

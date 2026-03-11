@@ -5,7 +5,7 @@ DROP EXTENSION IF EXISTS pg_cron;
 CREATE EXTENSION IF NOT EXISTS pg_cron;
 
 -- Setup: create multiple jobs with varying schedules
-SELECT cron.schedule('vtab_every_min', '* * * * *', 'SELECT 1');
+SELECT cron.schedule('vtab_every_min', '59 23 31 12 *', 'SELECT 1');
 SELECT cron.schedule('vtab_hourly', '0 * * * *', 'SELECT 2');
 SELECT cron.schedule('vtab_daily', '0 0 * * *', 'VACUUM');
 
@@ -23,7 +23,7 @@ SELECT jobname FROM cron.job WHERE active = true ORDER BY jobname;
 SELECT jobname FROM cron.job WHERE active = false;
 
 -- Test: filter by schedule pattern
-SELECT jobname, schedule FROM cron.job WHERE schedule = '* * * * *';
+SELECT jobname, schedule FROM cron.job WHERE schedule = '59 23 31 12 *';
 
 -- Test: filter by command
 SELECT jobname FROM cron.job WHERE command = 'VACUUM';

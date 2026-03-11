@@ -55,23 +55,13 @@ impl VirtualTable for PgAttrdef {
             let table_oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
 
             for (i, col) in schema.columns.iter().enumerate() {
-                let expr = if col.is_serial {
-                    let seq_full_name = match sequences::find_owned_sequence_full_name(
-                        &sequence_defs,
-                        full_table_name,
-                        &col.name,
-                    )? {
-                        Some(full_name) => full_name,
-                        None => format!(
-                            "{}.{}",
-                            table_schema,
-                            sequences::implicit_sequence_name(&table_name, &col.name)
-                        ),
-                    };
-                    Some(format!("nextval('{}'::regclass)", seq_full_name))
-                } else {
-                    col.default_expr.clone()
-                };
+                let expr = sequences::resolve_serial_display_default(
+                    col,
+                    &sequence_defs,
+                    full_table_name,
+                    &table_schema,
+                    &table_name,
+                )?;
                 let Some(expr) = expr else {
                     continue;
                 };

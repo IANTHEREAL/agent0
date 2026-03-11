@@ -71,12 +71,21 @@ use crate::model::DataType;
 #[cfg(test)]
 use sqlparser::ast::Expr;
 
-/// Fill default values for missing columns in a row
+/// Fill default values for missing columns in a row.
+///
+/// Serial columns are skipped (pushed as `Null`) because their defaults
+/// contain `nextval(...)` which requires async sequence evaluation.
+/// Callers that backfill serial columns (e.g. `alter_table_add_column`)
+/// overwrite the placeholder with the real sequence value.
 pub fn fill_row_defaults(row: &mut Row, schema: &TableSchema) -> Result<()> {
     if row.values.len() < schema.columns.len() {
         for i in row.values.len()..schema.columns.len() {
             let col = &schema.columns[i];
-            let val = if let Some(expr_str) = &col.default_expr {
+            let val = if col.is_serial {
+                // Serial defaults use nextval() which needs async/txn context;
+                // push a placeholder — the backfill caller supplies the real value.
+                Value::Null
+            } else if let Some(expr_str) = &col.default_expr {
                 eval_default_expr(expr_str)?
             } else {
                 Value::Null
@@ -473,6 +482,58 @@ mod tests {
         scope.allow_aggregates = true;
         scope.allow_windows = true;
         assert_eq!(analyze_expr_type(expr, scope), DataType::Boolean);
+    }
+
+    /// P0-1 regression: `fill_row_defaults` must NOT try to evaluate a serial
+    /// column's `nextval(...)` default — it should push `Null` as a placeholder
+    /// for the caller-supplied backfill value.
+    #[test]
+    fn fill_row_defaults_skips_serial_nextval() {
+        let schema = TableSchema {
+            name: "public.t".to_string(),
+            table_id: 1,
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: true,
+                    unique: true,
+                    is_serial: false,
+                    default_expr: None,
+                    generation_expr: None,
+                    generation_expr_authorized_by: None,
+                    collation: None,
+                },
+                ColumnDef {
+                    name: "seq_col".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: true,
+                    default_expr: Some("nextval('public.t_seq_col_seq')".to_string()),
+                    generation_expr: None,
+                    generation_expr_authorized_by: None,
+                    collation: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: Some("t_pkey".to_string()),
+            pk_indices: vec![0],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: "postgres".to_string(),
+            from_alias: None,
+        };
+
+        // Row has only the first column — fill_row_defaults must pad the serial
+        // column with Null instead of erroring on nextval evaluation.
+        let mut row = Row::new(vec![Value::Int32(1)]);
+        fill_row_defaults(&mut row, &schema).unwrap();
+        assert_eq!(row.values.len(), 2);
+        assert_eq!(row.values[1], Value::Null); // placeholder for serial
     }
 
     #[test]

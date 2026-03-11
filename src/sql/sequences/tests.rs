@@ -145,6 +145,58 @@ mod owned_sequence_lookup_tests {
         assert_eq!(format_serial_sequence_name("name", "s"), "name.s");
     }
 
+    /// P0-2 regression: `format_nextval_default` must quote mixed-case identifiers
+    /// so that `parse_sequence_name_token` preserves case during resolution.
+    #[test]
+    fn format_nextval_default_quotes_mixed_case() {
+        use crate::sql::sequences::format_nextval_default;
+
+        // Lowercase names need no quoting.
+        assert_eq!(
+            format_nextval_default("public.t_id_seq"),
+            "nextval('public.t_id_seq')"
+        );
+        // Mixed-case sequence name must be double-quoted inside the regclass string.
+        assert_eq!(
+            format_nextval_default("public.MyTable_MyCol_seq"),
+            "nextval('public.\"MyTable_MyCol_seq\"')"
+        );
+        // Schema with reserved keyword must be quoted.
+        assert_eq!(
+            format_nextval_default("select.t_id_seq"),
+            "nextval('\"select\".t_id_seq')"
+        );
+    }
+
+    /// P1-1 regression: `resolve_serial_display_default` must propagate errors
+    /// from `find_owned_sequence_full_name` (e.g. multiple owned sequences)
+    /// instead of swallowing them with `.ok().flatten()`.
+    #[test]
+    fn resolve_serial_display_default_propagates_multiple_owned_error() {
+        use crate::model::ColumnDef;
+        use crate::sql::sequences::resolve_serial_display_default;
+
+        let col = ColumnDef {
+            name: "id".to_string(),
+            data_type: crate::model::DataType::Int32,
+            nullable: false,
+            primary_key: true,
+            unique: true,
+            is_serial: true,
+            default_expr: None, // ImplicitSequence behavior
+            generation_expr: None,
+            generation_expr_authorized_by: None,
+            collation: None,
+        };
+        let sequences = vec![
+            make_sequence("public.s1", Some(("public.t", "id"))),
+            make_sequence("public.s2", Some(("public.t", "id"))),
+        ];
+        let err = resolve_serial_display_default(&col, &sequences, "public.t", "public", "t")
+            .unwrap_err();
+        assert!(err.to_string().contains("Multiple sequences"));
+    }
+
     #[test]
     fn expression_async_detection_flags_sequence_current_schema_and_unknown_function() {
         use crate::sql::sequences::{

@@ -257,25 +257,40 @@ pub(super) async fn create_implicit_sequences_for_schema(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
-    schema: &TableSchema,
+    schema: &mut TableSchema,
     exclude_table: Option<&str>,
 ) -> Result<()> {
-    for col in &schema.columns {
+    let schema_name = schema.name.clone();
+    let mut any_updated = false;
+
+    for col in &mut schema.columns {
         if col.is_serial {
             let seq_name = allocate_implicit_sequence_name(
                 store,
                 txn,
                 db_id,
-                &schema.name,
+                &schema_name,
                 &col.name,
                 exclude_table,
             )
             .await?;
             let mut seq_def =
-                sequences::build_implicit_sequence_def(&schema.name, &col.name, &col.data_type);
+                sequences::build_implicit_sequence_def(&schema_name, &col.name, &col.data_type);
             seq_def.name = seq_name;
+            let seq_full_name = seq_def.full_name();
             store.create_sequence(txn, db_id, seq_def).await?;
+            // Persist explicit nextval default so classify_serial_default
+            // can dispatch correctly after ALTER COLUMN SET/DROP DEFAULT.
+            // Skip if default_expr is already set (identity markers, etc.).
+            if col.default_expr.is_none() {
+                col.default_expr = Some(sequences::format_nextval_default(&seq_full_name));
+                any_updated = true;
+            }
         }
+    }
+    if any_updated {
+        schema.version += 1;
+        store.update_schema(txn, db_id, schema.clone()).await?;
     }
     Ok(())
 }

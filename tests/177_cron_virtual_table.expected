@@ -11,7 +11,7 @@ alter_job
 NULL
 (1 row)
 jobid|schedule|command|nodename|nodeport|database|username|active|jobname
-1|* * * * *|SELECT 1|localhost|5433|postgres|admin|t|vtab_every_min
+1|59 23 31 12 *|SELECT 1|localhost|5433|postgres|admin|t|vtab_every_min
 2|0 * * * *|SELECT 2|localhost|5433|postgres|admin|f|vtab_hourly
 3|0 0 * * *|VACUUM|localhost|5433|postgres|admin|t|vtab_daily
 (3 rows)
@@ -23,7 +23,7 @@ jobname
 vtab_hourly
 (1 row)
 jobname|schedule
-vtab_every_min|* * * * *
+vtab_every_min|59 23 31 12 *
 (1 row)
 jobname
 vtab_daily

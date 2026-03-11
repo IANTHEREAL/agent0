@@ -151,25 +151,15 @@ impl VirtualTable for Columns {
                     _ => (null_val(), null_val(), null_val()),
                 };
 
-                let column_default = if col.is_serial {
-                    let seq_full_name = match sequences::find_owned_sequence_full_name(
-                        &sequence_defs,
-                        full_table_name,
-                        &col.name,
-                    )? {
-                        Some(full_name) => full_name,
-                        None => format!(
-                            "{}.{}",
-                            table_schema,
-                            sequences::implicit_sequence_name(&table_name, &col.name)
-                        ),
-                    };
-                    text_val(&format!("nextval('{}'::regclass)", seq_full_name))
-                } else {
-                    col.default_expr
-                        .as_ref()
-                        .map(|s| text_val(s))
-                        .unwrap_or(null_val())
+                let column_default = match sequences::resolve_serial_display_default(
+                    col,
+                    &sequence_defs,
+                    full_table_name,
+                    &table_schema,
+                    &table_name,
+                )? {
+                    Some(s) => text_val(&s),
+                    None => null_val(),
                 };
 
                 rows.push(Row::new(vec![

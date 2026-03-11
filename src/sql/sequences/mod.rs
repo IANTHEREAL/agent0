@@ -361,7 +361,6 @@ pub(crate) fn is_identity_default_marker(default_expr: Option<&str>) -> bool {
     )
 }
 
-#[cfg(test)]
 pub(crate) fn serial_default_dropped_marker() -> &'static str {
     SERIAL_DEFAULT_DROPPED_MARKER
 }
@@ -428,6 +427,36 @@ pub(crate) fn classify_serial_default(default_expr: Option<&str>) -> SerialDefau
         Some(expr) if is_explicit_null_default_expr(expr) => SerialDefaultBehavior::ExplicitNull,
         Some(expr) => SerialDefaultBehavior::ExplicitExpr(expr),
         None => SerialDefaultBehavior::ImplicitSequence,
+    }
+}
+
+/// Shared helper for catalog/wire surfaces: resolve what to display as the
+/// column default for a serial/identity column, dispatching through
+/// `classify_serial_default` so that all consumers share one code path.
+pub(crate) fn resolve_serial_display_default(
+    col: &crate::model::ColumnDef,
+    sequence_defs: &[SequenceDef],
+    table_full_name: &str,
+    table_schema: &str,
+    table_name: &str,
+) -> Result<Option<String>> {
+    if !col.is_serial {
+        return Ok(col.default_expr.clone());
+    }
+    match classify_serial_default(col.default_expr.as_deref()) {
+        SerialDefaultBehavior::ImplicitSequence => {
+            let seq = find_owned_sequence_full_name(sequence_defs, table_full_name, &col.name)?
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}.{}",
+                        table_schema,
+                        implicit_sequence_name(table_name, &col.name)
+                    )
+                });
+            Ok(Some(format!("nextval('{}'::regclass)", seq)))
+        }
+        SerialDefaultBehavior::ExplicitExpr(expr) => Ok(Some(expr.to_string())),
+        SerialDefaultBehavior::ExplicitNull => Ok(None),
     }
 }
 
@@ -545,6 +574,18 @@ pub(crate) fn format_serial_sequence_name(schema: &str, sequence_name: &str) -> 
         quote_pg_identifier_if_needed(schema),
         quote_pg_identifier_if_needed(sequence_name)
     )
+}
+
+/// Build the persisted `nextval(...)` default expression for a serial column.
+///
+/// Uses `format_serial_sequence_name` so that mixed-case or keyword identifiers
+/// are double-quoted inside the regclass string, preventing lowercasing during
+/// later `parse_sequence_name_token` resolution.
+pub(crate) fn format_nextval_default(seq_full_name: &str) -> String {
+    let (schema, name) = seq_full_name
+        .split_once('.')
+        .unwrap_or(("public", seq_full_name));
+    format!("nextval('{}')", format_serial_sequence_name(schema, name))
 }
 
 fn search_path_schemas(search_path: &[String]) -> Vec<&str> {

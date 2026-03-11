@@ -1,0 +1,8 @@
+ERROR:  column "id" of relation "t1458_id1" is an identity column
+ERROR:  column "id" of relation "t1458_id2" is an identity column
+id,v
+1,a
+(1 row)
+v,id
+existing,1
+(1 row)

@@ -237,6 +237,11 @@ pub(super) async fn alter_table_add_column(
         seq_def.name = seq_name;
         let seq_full_name = seq_def.full_name();
         store.create_sequence(txn, db_id, seq_def).await?;
+        // Persist explicit nextval default (matching CREATE TABLE path).
+        let last_col = schema.columns.last_mut().expect("column just pushed");
+        if last_col.default_expr.is_none() {
+            last_col.default_expr = Some(sequences::format_nextval_default(&seq_full_name));
+        }
 
         let new_col_idx = schema.columns.len() - 1;
         let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);

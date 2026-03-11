@@ -345,12 +345,40 @@ pub async fn execute_alter_table(
 
             match op {
                 AlterColumnOperation::SetDefault { value } => {
+                    if schema.columns[col_idx].is_serial
+                        && crate::sql::sequences::is_identity_default_marker(
+                            schema.columns[col_idx].default_expr.as_deref(),
+                        )
+                    {
+                        return Err(SqlError::SqlStructure(format!(
+                            "column \"{}\" of relation \"{}\" is an identity column",
+                            col_name, table_object_name
+                        ))
+                        .into());
+                    }
                     schema.columns[col_idx].default_expr = Some(value.to_string());
                     schema.version += 1;
                     store.update_schema(txn, db_id, schema).await?;
                 }
                 AlterColumnOperation::DropDefault => {
-                    schema.columns[col_idx].default_expr = None;
+                    if schema.columns[col_idx].is_serial
+                        && crate::sql::sequences::is_identity_default_marker(
+                            schema.columns[col_idx].default_expr.as_deref(),
+                        )
+                    {
+                        return Err(SqlError::SqlStructure(format!(
+                            "column \"{}\" of relation \"{}\" is an identity column\nHINT:  Use ALTER TABLE ... ALTER COLUMN ... DROP IDENTITY instead.",
+                            col_name, table_object_name
+                        ))
+                        .into());
+                    }
+                    if schema.columns[col_idx].is_serial {
+                        schema.columns[col_idx].default_expr = Some(
+                            crate::sql::sequences::serial_default_dropped_marker().to_string(),
+                        );
+                    } else {
+                        schema.columns[col_idx].default_expr = None;
+                    }
                     schema.version += 1;
                     store.update_schema(txn, db_id, schema).await?;
                 }

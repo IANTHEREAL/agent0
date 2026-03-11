@@ -104,6 +104,7 @@ pub async fn execute_create_table(
         let mut default_expr = None;
         let collation: Option<String> = col.collation.as_ref().map(|c| c.to_string());
         let mut generation_expr_str: Option<String> = None;
+        let mut identity_generated_as: Option<GeneratedAs> = None;
 
         for opt in &col.options {
             match &opt.option {
@@ -141,6 +142,7 @@ pub async fn execute_create_table(
                 } => {
                     if matches!(generated_as, GeneratedAs::Always | GeneratedAs::ByDefault) {
                         is_serial = true;
+                        identity_generated_as = Some(generated_as.clone());
                     }
                 }
                 ColumnOption::Generated {
@@ -249,6 +251,24 @@ pub async fn execute_create_table(
             }
         }
 
+        // Set identity marker in default_expr (matching ADD COLUMN path).
+        if let Some(ref generated_as) = identity_generated_as {
+            if default_expr.is_some() {
+                return Err(SqlError::SqlStructure(format!(
+                    "both default and identity specified for column \"{}\" of table \"{}\"",
+                    col_name, table_object_name
+                ))
+                .into());
+            }
+            default_expr = crate::sql::sequences::identity_default_marker(generated_as)
+                .map(ToString::to_string);
+        } else if is_serial && default_expr.is_some() {
+            return Err(SqlError::SqlStructure(format!(
+                "multiple default values specified for column \"{}\" of table \"{}\"",
+                col_name, table_object_name
+            ))
+            .into());
+        }
         if is_serial {
             nullable = false;
         }
@@ -520,8 +540,8 @@ pub async fn execute_create_table(
     }
 
     store.create_table(txn, db_id, schema.clone()).await?;
-    create_implicit_sequences_for_schema(store, txn, db_id, &schema, Some(schema.name.as_str()))
-        .await?;
+    let excl = schema.name.clone();
+    create_implicit_sequences_for_schema(store, txn, db_id, &mut schema, Some(&excl)).await?;
 
     // Reserve relation names for PK constraint and unique indexes so that
     // CREATE INDEX cannot reuse these names in the same schema.
@@ -635,7 +655,7 @@ pub async fn create_table_from_query_result(
     // Use empty-name sentinel (not None) so legacy fallback checks do not
     // synthesize "<table>_pkey" from pk_indices.
     let pk_constraint_name = Some(String::new());
-    let schema = TableSchema {
+    let mut schema = TableSchema {
         name: table_name.to_string(),
         table_id,
         columns: col_defs,
@@ -649,8 +669,8 @@ pub async fn create_table_from_query_result(
         from_alias: None,
     };
     store.create_table(txn, db_id, schema.clone()).await?;
-    create_implicit_sequences_for_schema(store, txn, db_id, &schema, Some(schema.name.as_str()))
-        .await?;
+    let excl = schema.name.clone();
+    create_implicit_sequences_for_schema(store, txn, db_id, &mut schema, Some(&excl)).await?;
 
     let row_count = result_rows.len();
     for (i, row) in result_rows.into_iter().enumerate() {
@@ -719,7 +739,7 @@ pub async fn create_table_from_stream(
     // Streaming CTAS uses an internal synthetic row-id PK for storage only;
     // same convention as batch CTAS — empty-name sentinel.
     let pk_constraint_name = Some(String::new());
-    let schema = TableSchema {
+    let mut schema = TableSchema {
         name: table_name.to_string(),
         table_id,
         columns: col_defs,
@@ -733,8 +753,8 @@ pub async fn create_table_from_stream(
         from_alias: None,
     };
     store.create_table(txn, db_id, schema.clone()).await?;
-    create_implicit_sequences_for_schema(store, txn, db_id, &schema, Some(schema.name.as_str()))
-        .await?;
+    let excl = schema.name.clone();
+    create_implicit_sequences_for_schema(store, txn, db_id, &mut schema, Some(&excl)).await?;
 
     use futures::StreamExt;
     let mut row_stream = stream.0;
@@ -814,7 +834,7 @@ pub async fn create_table_from_select_into(
     // Use empty-name sentinel (not None) so legacy fallback checks do not
     // synthesize "<table>_pkey" from pk_indices.
     let pk_constraint_name = Some(String::new());
-    let schema = TableSchema {
+    let mut schema = TableSchema {
         name: table_name.to_string(),
         table_id,
         columns: col_defs,
@@ -828,8 +848,8 @@ pub async fn create_table_from_select_into(
         from_alias: None,
     };
     store.create_table(txn, db_id, schema.clone()).await?;
-    create_implicit_sequences_for_schema(store, txn, db_id, &schema, Some(schema.name.as_str()))
-        .await?;
+    let excl = schema.name.clone();
+    create_implicit_sequences_for_schema(store, txn, db_id, &mut schema, Some(&excl)).await?;
 
     let row_count = result_rows.len();
     for (i, row) in result_rows.into_iter().enumerate() {
