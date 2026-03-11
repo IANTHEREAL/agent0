@@ -1,0 +1,38 @@
+ value
+-------
+ 1
+ 2
+ 3
+(3 rows)
+
+ value
+-------
+ 1
+ 2
+ 3
+(3 rows)
+
+ value
+-------
+ a
+ b
+(2 rows)
+
+ value
+-------
+ a
+ b
+(2 rows)
+
+ v
+---
+ 1
+ 2
+(2 rows)
+
+ value
+-------
+ 10
+ 20
+(2 rows)
+

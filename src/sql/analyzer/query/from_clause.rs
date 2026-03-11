@@ -278,34 +278,16 @@ impl<'a> Analyzer<'a> {
                     } else if obj_name.eq_ignore_ascii_case("jsonb_array_elements")
                         || obj_name.eq_ignore_ascii_case("json_array_elements")
                     {
-                        let col_name = if let Some(ta) = alias {
-                            if !ta.columns.is_empty() {
-                                crate::sql::names::normalize_ident(&ta.columns[0])
-                            } else {
-                                "value".to_string()
-                            }
-                        } else {
-                            "value".to_string()
-                        };
                         let out_ty = if obj_name.eq_ignore_ascii_case("json_array_elements") {
                             DataType::Json
                         } else {
                             DataType::Jsonb
                         };
-                        vec![(col_name, out_ty, false, None)]
+                        vec![("value".to_string(), out_ty, false, None)]
                     } else if obj_name.eq_ignore_ascii_case("jsonb_array_elements_text")
                         || obj_name.eq_ignore_ascii_case("json_array_elements_text")
                     {
-                        let col_name = if let Some(ta) = alias {
-                            if !ta.columns.is_empty() {
-                                crate::sql::names::normalize_ident(&ta.columns[0])
-                            } else {
-                                "value".to_string()
-                            }
-                        } else {
-                            "value".to_string()
-                        };
-                        vec![(col_name, DataType::Text, true, None)]
+                        vec![("value".to_string(), DataType::Text, true, None)]
                     } else if obj_name.eq_ignore_ascii_case("jsonb_each")
                         || obj_name.eq_ignore_ascii_case("json_each")
                     {
